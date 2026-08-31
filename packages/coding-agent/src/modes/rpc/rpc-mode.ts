@@ -38,6 +38,12 @@ import type {
 	RpcSlashCommand,
 } from "./rpc-types.ts";
 
+// ponytail: 256 commands and 16 MiB cover normal startup while bounding untrusted pre-bind input.
+const MAX_QUEUED_STARTUP_COMMANDS = 256;
+const MAX_STARTUP_INPUT_BYTES = 16 * 1024 * 1024;
+// Preserve a bounded response path when buffered commands fill the queue.
+const MAX_STARTUP_UI_RESPONSE_BYTES = 1024 * 1024;
+const MAX_BUFFERED_STARTUP_BYTES = MAX_STARTUP_INPUT_BYTES - MAX_STARTUP_UI_RESPONSE_BYTES;
 // Keep branch pages well below the gateway's 64 MiB JSONL record limit.
 const BRANCH_PAGE_SERIALIZED_RESPONSE_TARGET_BYTES = 32 * 1024 * 1024;
 const MAX_ISSUED_BRANCH_PAGE_LEAVES = 32;
@@ -153,13 +159,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	// Pending extension UI requests waiting for response
 	const pendingExtensionRequests = new Map<
 		string,
-		{ resolve: (value: any) => void; reject: (error: Error) => void }
+		{ resolve: (response: RpcExtensionUIResponse) => void; cancel: () => void }
 	>();
+	let inputEnded = false;
 	const issuedBranchPageCursors = new Map<string, IssuedBranchPageCursor>();
 
 	// Shutdown request flag
 	let shutdownRequested = false;
-	let shuttingDown = false;
+	let shutdownPromise: Promise<never> | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
 	/** Helper for dialog methods with signal/timeout support */
@@ -169,29 +176,29 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		request: Record<string, unknown>,
 		parseResponse: (response: RpcExtensionUIResponse) => T,
 	): Promise<T> {
-		if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
+		if (inputEnded || opts?.signal?.aborted) return Promise.resolve(defaultValue);
 
 		const id = crypto.randomUUID();
-		return new Promise((resolve, reject) => {
-			let timeoutId: ReturnType<typeof setTimeout> | undefined;
+		return new Promise<T>((resolve) => {
+			let timeoutId: NodeJS.Timeout | undefined;
 
 			const cleanup = () => {
-				if (timeoutId) clearTimeout(timeoutId);
+				clearTimeout(timeoutId);
 				opts?.signal?.removeEventListener("abort", onAbort);
 				pendingExtensionRequests.delete(id);
 			};
 
-			const onAbort = () => {
+			const resolveDefault = () => {
 				cleanup();
 				resolve(defaultValue);
+			};
+			const onAbort = () => {
+				resolveDefault();
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
 			if (opts?.timeout) {
-				timeoutId = setTimeout(() => {
-					cleanup();
-					resolve(defaultValue);
-				}, opts.timeout);
+				timeoutId = setTimeout(resolveDefault, opts.timeout);
 			}
 
 			pendingExtensionRequests.set(id, {
@@ -199,7 +206,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					cleanup();
 					resolve(parseResponse(response));
 				},
-				reject,
+				cancel: resolveDefault,
 			});
 			output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 		});
@@ -326,24 +333,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return "";
 		},
 
-		async editor(title: string, prefill?: string): Promise<string | undefined> {
-			const id = crypto.randomUUID();
-			return new Promise((resolve, reject) => {
-				pendingExtensionRequests.set(id, {
-					resolve: (response: RpcExtensionUIResponse) => {
-						if ("cancelled" in response && response.cancelled) {
-							resolve(undefined);
-						} else if ("value" in response) {
-							resolve(response.value);
-						} else {
-							resolve(undefined);
-						}
-					},
-					reject,
-				});
-				output({ type: "extension_ui_request", id, method: "editor", title, prefill } as RpcExtensionUIRequest);
-			});
-		},
+		editor: (title, prefill) =>
+			createDialogPromise<string | undefined>(
+				undefined,
+				undefined,
+				{ method: "editor", title, prefill },
+				(response) =>
+					"cancelled" in response && response.cancelled
+						? undefined
+						: "value" in response
+							? response.value
+							: undefined,
+			),
 
 		addAutocompleteProvider(): void {
 			// Autocomplete provider composition is not supported in RPC mode
@@ -486,9 +487,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 	};
 
-	await rebindSession();
-	registerSignalHandlers();
-
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
 		const id = command.id;
@@ -514,10 +512,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 							}
 						},
 					})
-					.catch((e) => {
+					.catch((e: unknown) => {
 						if (!preflightSucceeded) {
-							output(error(id, "prompt", e.message));
+							output(error(id, "prompt", e instanceof Error ? e.message : String(e)));
 						}
+					})
+					.finally(() => {
+						void checkShutdownRequested();
 					});
 				return undefined;
 			}
@@ -988,63 +989,62 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 */
 	let detachInput = () => {};
 
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
-		if (shuttingDown) {
-			process.exit(exitCode);
+	// Read input before session_start handlers can await extension UI. Ordinary
+	// commands wait for the initial bind, while UI responses resolve immediately.
+	let extensionBindingsComplete = false;
+	let drainingStartupCommands = false;
+	let startupDrainComplete = false;
+	let startupFatal = false;
+	let startupInputCount = 0;
+	let startupInputBytes = 0;
+	let startupCommands: RpcCommand[] = [];
+	const startupCommandWork: Promise<void>[] = [];
+
+	const cancelPendingExtensionRequests = () => {
+		for (const pending of [...pendingExtensionRequests.values()]) {
+			pending.cancel();
 		}
-		shuttingDown = true;
-		for (const cleanup of signalCleanupHandlers) {
-			cleanup();
-		}
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
-		await runtimeHost.dispose();
+	};
+
+	const failStartupOverflow = (command: { id?: string; type: string }) => {
+		if (startupFatal) return;
+		startupFatal = true;
+		inputEnded = true;
+		output(error(command.id, command.type, "RPC startup command queue limit exceeded"));
+		startupCommands = [];
+		startupInputCount = 0;
+		startupInputBytes = 0;
 		detachInput();
 		process.stdin.pause();
-		if (signal !== "SIGTERM") {
-			await flushRawStdout();
-		}
-		process.exit(exitCode);
+		cancelPendingExtensionRequests();
+	};
+
+	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+		if (shutdownPromise) return shutdownPromise;
+		shutdownPromise = (async (): Promise<never> => {
+			for (const cleanup of signalCleanupHandlers) {
+				cleanup();
+			}
+			session.stopMessageEntryIdCapture();
+			unsubscribe?.();
+			unsubscribeBackpressure?.();
+			await runtimeHost.dispose();
+			detachInput();
+			process.stdin.pause();
+			if (signal !== "SIGTERM") {
+				await flushRawStdout();
+			}
+			return process.exit(exitCode);
+		})();
+		return shutdownPromise;
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested) return;
+		if (!shutdownRequested || session.isStreaming) return;
 		await shutdown();
 	}
 
-	const handleInputLine = async (line: string) => {
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(line);
-		} catch (parseError: unknown) {
-			output(
-				error(
-					undefined,
-					"parse",
-					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
-				),
-			);
-			await waitForRawStdoutBackpressure();
-			return;
-		}
-
-		// Handle extension UI responses
-		if (
-			typeof parsed === "object" &&
-			parsed !== null &&
-			"type" in parsed &&
-			parsed.type === "extension_ui_response"
-		) {
-			const response = parsed as RpcExtensionUIResponse;
-			const pending = pendingExtensionRequests.get(response.id);
-			if (pending) {
-				pendingExtensionRequests.delete(response.id);
-				pending.resolve(response);
-			}
-			return;
-		}
-
-		const command = parsed as RpcCommand;
+	const handleCommandInput = async (command: RpcCommand): Promise<void> => {
 		try {
 			const response = await handleCommand(command);
 			if (response) {
@@ -1064,20 +1064,136 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 	};
 
-	const onInputEnd = () => {
-		void shutdown();
+	const handleInputLine = async (line: string) => {
+		if (startupFatal) return;
+
+		const isStartupInput = !extensionBindingsComplete || drainingStartupCommands;
+		let inputBytes = 0;
+		let usesStartupResponseReserve = false;
+		if (isStartupInput) {
+			// Reserve before parsing so malformed records cannot evade the startup input bound.
+			inputBytes = Buffer.byteLength(line);
+			if (
+				startupInputCount < MAX_QUEUED_STARTUP_COMMANDS &&
+				startupInputBytes + inputBytes <= MAX_BUFFERED_STARTUP_BYTES
+			) {
+				startupInputCount++;
+				startupInputBytes += inputBytes;
+			} else if (pendingExtensionRequests.size > 0 && inputBytes <= MAX_STARTUP_UI_RESPONSE_BYTES) {
+				usesStartupResponseReserve = true;
+			} else {
+				failStartupOverflow({ type: "parse" });
+				return;
+			}
+		}
+
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch (parseError: unknown) {
+			if (usesStartupResponseReserve) {
+				failStartupOverflow({ type: "parse" });
+				return;
+			}
+			output(
+				error(
+					undefined,
+					"parse",
+					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+				),
+			);
+			await waitForRawStdoutBackpressure();
+			return;
+		}
+
+		// UI responses must not wait for session_start to finish binding extensions.
+		if (
+			typeof parsed === "object" &&
+			parsed !== null &&
+			"type" in parsed &&
+			parsed.type === "extension_ui_response"
+		) {
+			if (isStartupInput && !usesStartupResponseReserve) {
+				startupInputCount--;
+				startupInputBytes -= inputBytes;
+			}
+			const response = parsed as RpcExtensionUIResponse;
+			const pending = pendingExtensionRequests.get(response.id);
+			if (pending) {
+				pendingExtensionRequests.delete(response.id);
+				pending.resolve(response);
+			}
+			return;
+		}
+
+		if (usesStartupResponseReserve) {
+			failStartupOverflow({ type: "parse" });
+			return;
+		}
+
+		const command = parsed as RpcCommand;
+
+		if (isStartupInput) {
+			startupCommands.push(command);
+			return;
+		}
+
+		await handleCommandInput(command);
 	};
-	process.stdin.on("end", onInputEnd);
+
+	const onInputEnd = () => {
+		inputEnded = true;
+		cancelPendingExtensionRequests();
+		if (startupDrainComplete) {
+			void Promise.allSettled(startupCommandWork).then(() => shutdown());
+		}
+	};
 
 	detachInput = (() => {
-		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
-			void handleInputLine(line);
-		});
+		const detachJsonl = attachJsonlLineReader(
+			process.stdin,
+			(line) => {
+				void handleInputLine(line);
+			},
+			{
+				getMaxBufferedBytes: () =>
+					!extensionBindingsComplete || drainingStartupCommands
+						? MAX_STARTUP_INPUT_BYTES - startupInputBytes
+						: undefined,
+				onBufferOverflow: () => failStartupOverflow({ type: "parse" }),
+			},
+		);
+		process.stdin.on("end", onInputEnd);
 		return () => {
 			detachJsonl();
 			process.stdin.off("end", onInputEnd);
 		};
 	})();
+
+	await rebindSession();
+	if (startupFatal) return shutdown(1);
+	registerSignalHandlers();
+
+	extensionBindingsComplete = true;
+	drainingStartupCommands = true;
+	while (!startupFatal && startupCommands.length > 0) {
+		const commands = startupCommands;
+		startupCommands = [];
+		for (const command of commands) {
+			if (startupFatal) break;
+			startupCommandWork.push(handleCommandInput(command));
+		}
+		await Promise.resolve();
+	}
+	drainingStartupCommands = false;
+	if (startupFatal) return shutdown(1);
+	await Promise.allSettled(startupCommandWork);
+	startupDrainComplete = true;
+	startupInputCount = 0;
+	startupInputBytes = 0;
+	if (inputEnded) {
+		void shutdown();
+	}
 
 	// Keep process alive forever
 	return new Promise(() => {});

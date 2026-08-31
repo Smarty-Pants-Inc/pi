@@ -62,4 +62,26 @@ describe("RPC JSONL framing", () => {
 
 		expect(lines).toEqual(['{"a":1}']);
 	});
+
+	test("drops an oversized unterminated record before emitting it", async () => {
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from('{"payload":"xxxxxxxx'), Buffer.from('{"a":1}\n')]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line) => lines.push(line), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual([]);
+		expect(overflows).toBe(1);
+	});
 });

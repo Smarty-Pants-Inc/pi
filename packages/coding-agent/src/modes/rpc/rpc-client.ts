@@ -18,6 +18,7 @@ import type {
 	RpcBranchEntriesPageRequest,
 	RpcCommand,
 	RpcExtensionUIRequest,
+	RpcExtensionUIResponseBody,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -193,6 +194,32 @@ export class RpcClient {
 				this.eventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Respond to an extension UI request without waiting for an RPC response.
+	 */
+	async respondToExtensionUI(id: string, response: RpcExtensionUIResponseBody): Promise<void> {
+		const childProcess = this.process;
+		const stdin = childProcess?.stdin;
+		if (!childProcess || !stdin) {
+			throw new Error("Client not started");
+		}
+		if (this.exitError) {
+			throw this.exitError;
+		}
+		if (childProcess.exitCode !== null) {
+			const error = this.createProcessExitError(childProcess.exitCode, childProcess.signalCode);
+			this.exitError = error;
+			throw error;
+		}
+		if (stdin.destroyed || !stdin.writable) {
+			const error = new Error(`Agent process stdin is not writable. Stderr: ${this.stderr}`);
+			this.exitError = error;
+			throw error;
+		}
+
+		stdin.write(serializeJsonLine({ ...response, type: "extension_ui_response", id }));
 	}
 
 	/**
