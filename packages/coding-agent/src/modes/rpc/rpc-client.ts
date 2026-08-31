@@ -13,7 +13,14 @@ import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
+import type {
+	RpcBranchEntriesPage,
+	RpcBranchEntriesPageRequest,
+	RpcCommand,
+	RpcResponse,
+	RpcSessionState,
+	RpcSlashCommand,
+} from "./rpc-types.ts";
 
 // ============================================================================
 // Types
@@ -412,6 +419,14 @@ export class RpcClient {
 	async getEntries(since?: string): Promise<{ entries: SessionEntry[]; leafId: string | null }> {
 		const response = await this.send({ type: "get_entries", since });
 		return this.getData<{ entries: SessionEntry[]; leafId: string | null }>(response);
+	}
+
+	/**
+	 * Get one backwards page from a session branch.
+	 */
+	async getBranchEntriesPage(request: RpcBranchEntriesPageRequest): Promise<RpcBranchEntriesPage> {
+		const response = await this.send({ ...request, type: "get_branch_entries_page" });
+		return this.getData<RpcBranchEntriesPage>(response);
 	}
 
 	/**

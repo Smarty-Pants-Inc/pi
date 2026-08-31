@@ -38,6 +38,45 @@ import type {
 	RpcSlashCommand,
 } from "./rpc-types.ts";
 
+// Keep branch pages well below the gateway's 64 MiB JSONL record limit.
+const BRANCH_PAGE_SERIALIZED_RESPONSE_TARGET_BYTES = 32 * 1024 * 1024;
+const MAX_ISSUED_BRANCH_PAGE_LEAVES = 32;
+
+// Brent's algorithm detects parent cycles across page boundaries with constant state.
+type BranchPageTraversalState = {
+	tortoiseId: string;
+	power: number;
+	steps: number;
+};
+
+type IssuedBranchPageCursor = {
+	cursor: string;
+	nextEntryId: string;
+	traversal: BranchPageTraversalState;
+};
+
+function advanceBranchPageTraversal(
+	state: BranchPageTraversalState | undefined,
+	entryId: string,
+): BranchPageTraversalState | undefined {
+	if (!state) {
+		return { tortoiseId: entryId, power: 1, steps: 0 };
+	}
+
+	const steps = state.steps + 1;
+	if (entryId === state.tortoiseId) {
+		return undefined;
+	}
+	if (steps === state.power) {
+		return {
+			tortoiseId: entryId,
+			power: Math.min(state.power * 2, Number.MAX_SAFE_INTEGER),
+			steps: 0,
+		};
+	}
+	return { ...state, steps };
+}
+
 // Re-export types for consumers
 export type {
 	RpcCommand,
@@ -81,6 +120,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		string,
 		{ resolve: (value: any) => void; reject: (error: Error) => void }
 	>();
+	const issuedBranchPageCursors = new Map<string, IssuedBranchPageCursor>();
 
 	// Shutdown request flag
 	let shutdownRequested = false;
@@ -316,6 +356,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
+		issuedBranchPageCursors.clear();
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
 			mode: "rpc",
@@ -646,6 +687,162 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					entries = entries.slice(sinceIndex + 1);
 				}
 				return success(id, "get_entries", { entries, leafId: sessionManager.getLeafId() });
+			}
+
+			case "get_branch_entries_page": {
+				if (!Number.isSafeInteger(command.limit) || command.limit < 1 || command.limit > 256) {
+					return error(id, "get_branch_entries_page", "limit must be a safe integer between 1 and 256");
+				}
+
+				const sessionManager = session.sessionManager;
+				const leafId = command.leafId ?? sessionManager.getLeafId();
+				if (leafId === null) {
+					if (command.before !== undefined) {
+						return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
+					}
+					return success(id, "get_branch_entries_page", { entries: [], leafId, complete: true });
+				}
+
+				const leaf = sessionManager.getEntry(leafId);
+				if (!leaf) {
+					return error(id, "get_branch_entries_page", `Leaf not found: ${leafId}`);
+				}
+
+				let current: typeof leaf | undefined = leaf;
+				let traversal: BranchPageTraversalState | undefined;
+				let currentWasPrevisited = false;
+				if (command.before !== undefined) {
+					const cursor = sessionManager.getEntry(command.before);
+					if (!cursor) {
+						return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
+					}
+
+					const issuedCursor = issuedBranchPageCursors.get(leafId);
+					if (issuedCursor?.cursor === command.before && issuedCursor.nextEntryId === cursor.parentId) {
+						issuedBranchPageCursors.delete(leafId);
+						issuedBranchPageCursors.set(leafId, issuedCursor);
+						traversal = issuedCursor.traversal;
+						currentWasPrevisited = true;
+					} else {
+						const visitedAncestorIds = new Set<string>();
+						let ancestor = leaf;
+						while (true) {
+							if (ancestor.parentId === ancestor.id || !visitedAncestorIds.add(ancestor.id)) {
+								return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
+							}
+							traversal = advanceBranchPageTraversal(traversal, ancestor.id);
+							if (!traversal) {
+								return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
+							}
+							if (ancestor.id === cursor.id) {
+								break;
+							}
+							if (!ancestor.parentId) {
+								return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
+							}
+							const parent = sessionManager.getEntry(ancestor.parentId);
+							if (!parent) {
+								return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
+							}
+							if (visitedAncestorIds.has(parent.id)) {
+								return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
+							}
+							ancestor = parent;
+						}
+					}
+
+					current = cursor.parentId ? sessionManager.getEntry(cursor.parentId) : undefined;
+				}
+
+				const completeResponseEnvelopeBytes = Buffer.byteLength(
+					serializeJsonLine(success(id, "get_branch_entries_page", { entries: [], leafId, complete: true })),
+				);
+				const incompleteResponseEnvelopeBytes = Buffer.byteLength(
+					serializeJsonLine(
+						success(id, "get_branch_entries_page", {
+							entries: [],
+							leafId,
+							nextCursor: "",
+							complete: false,
+						}),
+					),
+				);
+				const entries: (typeof leaf)[] = [];
+				const visitedEntryIds = new Set<string>();
+				let serializedEntriesBytes = 0;
+				while (current && entries.length < command.limit) {
+					if (current.parentId === current.id || !visitedEntryIds.add(current.id)) {
+						return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
+					}
+					const serializedEntry = JSON.stringify(current);
+					if (serializedEntry === undefined) {
+						return error(id, "get_branch_entries_page", "Branch entry could not be serialized");
+					}
+					const entryBytes = Buffer.byteLength(serializedEntry);
+					const atRoot = current.parentId === null;
+					const responseEnvelopeBytes = atRoot
+						? completeResponseEnvelopeBytes
+						: incompleteResponseEnvelopeBytes + Buffer.byteLength(JSON.stringify(current.id)) - 2;
+					const candidateEntriesBytes = serializedEntriesBytes + (entries.length > 0 ? 1 : 0) + entryBytes;
+					if (responseEnvelopeBytes + candidateEntriesBytes > BRANCH_PAGE_SERIALIZED_RESPONSE_TARGET_BYTES) {
+						if (entries.length === 0) {
+							return error(
+								id,
+								"get_branch_entries_page",
+								"Branch entry exceeds the 32 MiB serialized response target",
+							);
+						}
+						break;
+					}
+
+					if (!currentWasPrevisited) {
+						traversal = advanceBranchPageTraversal(traversal, current.id);
+						if (!traversal) {
+							return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
+						}
+					}
+					currentWasPrevisited = false;
+					entries.push(current);
+					serializedEntriesBytes = candidateEntriesBytes;
+					if (current.parentId !== null && visitedEntryIds.has(current.parentId)) {
+						return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
+					}
+					if (current.parentId === null) {
+						current = undefined;
+					} else if (entries.length < command.limit) {
+						current = sessionManager.getEntry(current.parentId);
+					}
+				}
+				const complete = current === undefined;
+				entries.reverse();
+				const nextCursorEntry = complete ? undefined : entries[0];
+				const nextCursor = nextCursorEntry?.id;
+				if (complete) {
+					issuedBranchPageCursors.delete(leafId);
+				} else if (nextCursorEntry && nextCursorEntry.parentId !== null && traversal) {
+					const nextTraversal = advanceBranchPageTraversal(traversal, nextCursorEntry.parentId);
+					if (!nextTraversal) {
+						return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
+					}
+					issuedBranchPageCursors.delete(leafId);
+					issuedBranchPageCursors.set(leafId, {
+						cursor: nextCursorEntry.id,
+						nextEntryId: nextCursorEntry.parentId,
+						traversal: nextTraversal,
+					});
+					if (issuedBranchPageCursors.size > MAX_ISSUED_BRANCH_PAGE_LEAVES) {
+						const oldestLeafId = issuedBranchPageCursors.keys().next().value;
+						if (oldestLeafId !== undefined) {
+							issuedBranchPageCursors.delete(oldestLeafId);
+						}
+					}
+				}
+				return success(id, "get_branch_entries_page", {
+					entries,
+					leafId,
+					...(nextCursor !== undefined ? { nextCursor } : {}),
+					complete,
+				});
 			}
 
 			case "get_tree": {

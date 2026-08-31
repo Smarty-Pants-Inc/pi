@@ -352,6 +352,8 @@ export {
 	type JsonAgentSessionEvent,
 	type ModelInfo,
 	type PrintModeOptions,
+	type RpcBranchEntriesPage,
+	type RpcBranchEntriesPageRequest,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,
