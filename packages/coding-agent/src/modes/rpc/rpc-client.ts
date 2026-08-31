@@ -17,6 +17,7 @@ import type {
 	RpcBranchEntriesPage,
 	RpcBranchEntriesPageRequest,
 	RpcCommand,
+	RpcExtensionUIRequest,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -54,7 +55,15 @@ export interface ModelInfo {
 	reasoning: boolean;
 }
 
-export type RpcEventListener = (event: JsonAgentSessionEvent) => void;
+export type RpcMessageEndEvent = Extract<JsonAgentSessionEvent, { type: "message_end" }> & { entryId?: string };
+
+/** RPC events, including extension UI requests. */
+export type RpcAgentSessionEvent =
+	| Exclude<JsonAgentSessionEvent, { type: "message_end" }>
+	| RpcExtensionUIRequest
+	| RpcMessageEndEvent;
+
+export type RpcEventListener = (event: RpcAgentSessionEvent) => void;
 
 // ============================================================================
 // RPC Client
@@ -496,9 +505,9 @@ export class RpcClient {
 	/**
 	 * Collect events until agent becomes idle.
 	 */
-	collectEvents(timeout = 60000): Promise<JsonAgentSessionEvent[]> {
+	collectEvents(timeout = 60000): Promise<RpcAgentSessionEvent[]> {
 		return new Promise((resolve, reject) => {
-			const events: JsonAgentSessionEvent[] = [];
+			const events: RpcAgentSessionEvent[] = [];
 			const timer = setTimeout(() => {
 				unsubscribe();
 				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
@@ -518,7 +527,7 @@ export class RpcClient {
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
-	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<JsonAgentSessionEvent[]> {
+	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<RpcAgentSessionEvent[]> {
 		const eventsPromise = this.collectEvents(timeout);
 		await this.prompt(message, images);
 		return eventsPromise;
@@ -542,7 +551,7 @@ export class RpcClient {
 
 			// Otherwise it's an event
 			for (const listener of this.eventListeners) {
-				listener(data as JsonAgentSessionEvent);
+				listener(data as RpcAgentSessionEvent);
 			}
 		} catch {
 			// Ignore non-JSON lines
