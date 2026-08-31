@@ -193,6 +193,71 @@ describe("RPC startup extension UI", () => {
 		}
 	});
 
+	it("times out every untimed startup dialog and drains queued RPC commands", async () => {
+		const listenerSnapshot = takeListenerSnapshot();
+		const dialogRequests: Array<Record<string, unknown>> = [];
+		const cancelRequests: Array<Record<string, unknown>> = [];
+		const dialogDefaults: Array<boolean | string | undefined> = [];
+		let sessionStartComplete = false;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", async (_event, ctx) => {
+						const results = await Promise.all([
+							ctx.ui.confirm("Confirm", "Continue?"),
+							ctx.ui.select("Select", ["choice"]),
+							ctx.ui.input("Input", "Type here"),
+							ctx.ui.editor("Editor", "Prefill"),
+						]);
+						dialogDefaults.push(...results);
+						sessionStartComplete = true;
+					});
+				},
+			],
+		});
+
+		vi.useFakeTimers();
+		rpcIo.onOutputLine = (line) => {
+			const record = JSON.parse(line) as Record<string, unknown>;
+			if (record.type !== "extension_ui_request") return;
+			if (record.method === "cancel") cancelRequests.push(record);
+			else if (["confirm", "select", "input", "editor"].includes(String(record.method))) dialogRequests.push(record);
+		};
+
+		try {
+			void runRpcMode(createRuntimeHost(harness));
+			for (let attempt = 0; attempt < 20 && dialogRequests.length < 4; attempt++) await Promise.resolve();
+
+			expect(dialogRequests.map((request) => request.method)).toEqual(["confirm", "select", "input", "editor"]);
+			expect(dialogRequests.map((request) => request.timeout)).toEqual([300_000, 300_000, 300_000, 300_000]);
+			const lineHandler = rpcIo.lineHandler;
+			if (!lineHandler) throw new Error("Expected an attached input handler for queued startup RPC");
+			lineHandler(JSON.stringify({ id: "state-after-dialog-timeout", type: "get_state" }));
+
+			await vi.advanceTimersByTimeAsync(299_999);
+			expect(sessionStartComplete).toBe(false);
+			expect(cancelRequests).toEqual([]);
+
+			await vi.advanceTimersByTimeAsync(1);
+			for (let attempt = 0; attempt < 40 && !sessionStartComplete; attempt++) await Promise.resolve();
+
+			expect(sessionStartComplete).toBe(true);
+			expect(dialogDefaults).toEqual([false, undefined, undefined, undefined]);
+			expect(cancelRequests).toHaveLength(4);
+			expect(cancelRequests.every((request) => request.timedOut === true)).toBe(true);
+			expect(cancelRequests.map((request) => request.targetId).sort()).toEqual(
+				dialogRequests.map((request) => request.id).sort(),
+			);
+			expect(rpcIo.outputLines.map((line) => JSON.parse(line) as Record<string, unknown>)).toContainEqual(
+				expect.objectContaining({ id: "state-after-dialog-timeout", type: "response", success: true }),
+			);
+		} finally {
+			vi.useRealTimers();
+			harness.cleanup();
+			restoreListeners(listenerSnapshot);
+		}
+	});
+
 	it("accepts a dialog response after 256 buffered startup commands", async () => {
 		const listenerSnapshot = takeListenerSnapshot();
 		let sessionStartComplete = false;

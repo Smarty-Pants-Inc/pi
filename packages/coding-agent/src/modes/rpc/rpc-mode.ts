@@ -43,6 +43,8 @@ const MAX_QUEUED_STARTUP_COMMANDS = 256;
 const MAX_STARTUP_INPUT_BYTES = 16 * 1024 * 1024;
 // Preserve a bounded response path when buffered commands fill the queue.
 const MAX_STARTUP_UI_RESPONSE_BYTES = 1024 * 1024;
+// Match Pi's default five-minute idle window while keeping every RPC dialog finite.
+const MAX_RPC_EXTENSION_UI_WAIT_MS = 5 * 60_000;
 const MAX_BUFFERED_STARTUP_BYTES = MAX_STARTUP_INPUT_BYTES - MAX_STARTUP_UI_RESPONSE_BYTES;
 // Keep branch pages well below the gateway's 64 MiB JSONL record limit.
 const BRANCH_PAGE_SERIALIZED_RESPONSE_TARGET_BYTES = 32 * 1024 * 1024;
@@ -178,9 +180,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	): Promise<T> {
 		if (inputEnded || opts?.signal?.aborted) return Promise.resolve(defaultValue);
 
+		const configuredTimeout = opts?.timeout;
+		const timeout =
+			typeof configuredTimeout === "number" && Number.isFinite(configuredTimeout) && configuredTimeout > 0
+				? Math.min(configuredTimeout, MAX_RPC_EXTENSION_UI_WAIT_MS)
+				: MAX_RPC_EXTENSION_UI_WAIT_MS;
 		const id = crypto.randomUUID();
 		return new Promise<T>((resolve) => {
 			let timeoutId: NodeJS.Timeout | undefined;
+			let settled = false;
 
 			const cleanup = () => {
 				clearTimeout(timeoutId);
@@ -188,27 +196,38 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				pendingExtensionRequests.delete(id);
 			};
 
-			const resolveDefault = () => {
+			const resolveDefault = (notifyClient: boolean, timedOut = false) => {
+				if (settled) return;
+				settled = true;
 				cleanup();
+				if (notifyClient && !inputEnded) {
+					output({
+						type: "extension_ui_request",
+						id: crypto.randomUUID(),
+						method: "cancel",
+						targetId: id,
+						...(timedOut ? { timedOut: true } : {}),
+					} as RpcExtensionUIRequest);
+				}
 				resolve(defaultValue);
 			};
 			const onAbort = () => {
-				resolveDefault();
+				resolveDefault(true);
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
 
-			if (opts?.timeout) {
-				timeoutId = setTimeout(resolveDefault, opts.timeout);
-			}
+			timeoutId = setTimeout(() => resolveDefault(true, true), timeout);
 
 			pendingExtensionRequests.set(id, {
 				resolve: (response: RpcExtensionUIResponse) => {
+					if (settled) return;
+					settled = true;
 					cleanup();
 					resolve(parseResponse(response));
 				},
-				cancel: resolveDefault,
+				cancel: () => resolveDefault(false),
 			});
-			output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
+			output({ type: "extension_ui_request", id, ...request, timeout } as RpcExtensionUIRequest);
 		});
 	}
 
@@ -217,17 +236,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 */
 	const createExtensionUIContext = (): ExtensionUIContext => ({
 		select: (title, options, opts) =>
-			createDialogPromise(opts, undefined, { method: "select", title, options, timeout: opts?.timeout }, (r) =>
+			createDialogPromise(opts, undefined, { method: "select", title, options }, (r) =>
 				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
 			),
 
 		confirm: (title, message, opts) =>
-			createDialogPromise(opts, false, { method: "confirm", title, message, timeout: opts?.timeout }, (r) =>
+			createDialogPromise(opts, false, { method: "confirm", title, message }, (r) =>
 				"cancelled" in r && r.cancelled ? false : "confirmed" in r ? r.confirmed : false,
 			),
 
 		input: (title, placeholder, opts) =>
-			createDialogPromise(opts, undefined, { method: "input", title, placeholder, timeout: opts?.timeout }, (r) =>
+			createDialogPromise(opts, undefined, { method: "input", title, placeholder }, (r) =>
 				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
 			),
 
