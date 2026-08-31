@@ -17,6 +17,19 @@ import type { SourceInfo } from "../../core/source-info.ts";
 // RPC Commands (stdin)
 // ============================================================================
 
+export interface RpcBranchEntriesPageRequest {
+	limit: number;
+	before?: string;
+	leafId?: string;
+}
+
+export interface RpcBranchEntriesPage {
+	entries: SessionEntry[];
+	leafId: string | null;
+	nextCursor?: string;
+	complete: boolean;
+}
+
 export type RpcCommand =
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -63,6 +76,7 @@ export type RpcCommand =
 	| { id?: string; type: "clone" }
 	| { id?: string; type: "get_fork_messages" }
 	| { id?: string; type: "get_entries"; since?: string }
+	| ({ id?: string; type: "get_branch_entries_page" } & RpcBranchEntriesPageRequest)
 	| { id?: string; type: "get_tree" }
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
@@ -206,6 +220,13 @@ export type RpcResponse =
 			command: "get_entries";
 			success: true;
 			data: { entries: SessionEntry[]; leafId: string | null };
+	  }
+	| {
+			id?: string;
+			type: "response";
+			command: "get_branch_entries_page";
+			success: true;
+			data: RpcBranchEntriesPage;
 	  }
 	| {
 			id?: string;
