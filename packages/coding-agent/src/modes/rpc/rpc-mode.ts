@@ -96,8 +96,43 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
 
+	const pendingOutputWrites: Array<() => void> = [];
+	let outputFlushScheduled = false;
+	let flushingOutput = false;
+
+	const flushPendingOutputWrites = () => {
+		flushingOutput = true;
+		try {
+			for (let index = 0; index < pendingOutputWrites.length; index++) {
+				pendingOutputWrites[index]!();
+			}
+		} finally {
+			pendingOutputWrites.length = 0;
+			flushingOutput = false;
+			outputFlushScheduled = false;
+		}
+	};
+
+	const queueOutput = (write: () => void) => {
+		if (flushingOutput || pendingOutputWrites.length > 0) {
+			pendingOutputWrites.push(write);
+		} else {
+			write();
+		}
+	};
+
+	const deferOutput = (write: () => void) => {
+		pendingOutputWrites.push(write);
+		if (!outputFlushScheduled && !flushingOutput) {
+			outputFlushScheduled = true;
+			queueMicrotask(flushPendingOutputWrites);
+		}
+	};
+
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		writeRawStdout(serializeJsonLine(obj));
+		queueOutput(() => {
+			writeRawStdout(serializeJsonLine(obj));
+		});
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -355,7 +390,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	});
 
 	const rebindSession = async (): Promise<void> => {
+		session.stopMessageEntryIdCapture();
+		unsubscribe?.();
+		unsubscribe = undefined;
+		unsubscribeBackpressure?.();
+		unsubscribeBackpressure = undefined;
+
 		session = runtimeHost.session;
+		session.stopMessageEntryIdCapture();
 		issuedBranchPageCursors.clear();
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
@@ -391,13 +433,37 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			},
 		});
 
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
+		session.startMessageEntryIdCapture();
 		unsubscribe = session.subscribe((event) => {
-			output(toJsonEvent(event));
-			if (event.type === "agent_settled") {
-				void checkShutdownRequested();
+			const eventSession = session;
+			const writeEvent = (entryId?: string) => {
+				writeRawStdout(
+					serializeJsonLine(entryId !== undefined ? { ...toJsonEvent(event), entryId } : toJsonEvent(event)),
+				);
+				if (event.type === "agent_settled") {
+					void checkShutdownRequested();
+				}
+			};
+			const emitEvent = (entryId?: string) => {
+				queueOutput(() => writeEvent(entryId));
+			};
+
+			if (event.type !== "message_end") {
+				emitEvent();
+				return;
 			}
+
+			if (event.message.role === "custom") {
+				const entryId = eventSession.takeMessageEntryId(event.message);
+				if (entryId !== undefined) {
+					emitEvent(entryId);
+					return;
+				}
+			}
+
+			const message = event.message;
+			deferOutput(() => writeEvent(eventSession.takeMessageEntryId(message)));
+			return;
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
 			await waitForRawStdoutBackpressure();
