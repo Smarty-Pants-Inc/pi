@@ -305,11 +305,14 @@ export type RpcExtensionUIRequest =
 // Extension UI Commands (stdin)
 // ============================================================================
 
+/** Payload for responding to an extension UI request. */
+export type RpcExtensionUIResponseBody = { value: string } | { confirmed: boolean } | { cancelled: true };
+
 /** Response to an extension UI request */
-export type RpcExtensionUIResponse =
-	| { type: "extension_ui_response"; id: string; value: string }
-	| { type: "extension_ui_response"; id: string; confirmed: boolean }
-	| { type: "extension_ui_response"; id: string; cancelled: true };
+export type RpcExtensionUIResponse = RpcExtensionUIResponseBody & {
+	type: "extension_ui_response";
+	id: string;
+};
 
 // ============================================================================
 // Helper type for extracting command types

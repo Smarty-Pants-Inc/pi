@@ -361,6 +361,7 @@ export {
 	type RpcEventListener,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
+	type RpcExtensionUIResponseBody,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,

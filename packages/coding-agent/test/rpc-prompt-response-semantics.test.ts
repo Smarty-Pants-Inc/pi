@@ -281,6 +281,108 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
+	it("serializes a string prompt rejection as failure text", async () => {
+		const { lineHandler, session, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
+		const prompt = vi.spyOn(session, "prompt").mockRejectedValue("plain rejection");
+
+		try {
+			lineHandler(JSON.stringify({ id: "string-rejection", type: "prompt", message: "Hello" }));
+
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "string-rejection")).toEqual([
+					{
+						id: "string-rejection",
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: "plain rejection",
+					},
+				]);
+			});
+		} finally {
+			prompt.mockRestore();
+			await cleanup();
+		}
+	});
+
+	it("shuts down after an extension command requests it without an agent run", async () => {
+		const outputOrder: string[] = [];
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+			outputOrder.push("exit");
+			return undefined;
+		}) as never);
+		const { lineHandler, runtimeHost, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("shutdown", {
+						description: "Request shutdown",
+						handler: async (_args, ctx) => {
+							await Promise.resolve();
+							ctx.shutdown();
+						},
+					});
+				},
+			],
+		});
+		rpcIo.onOutputLine = (line) => {
+			const record = JSON.parse(line) as Record<string, unknown>;
+			if (record.id === "extension-shutdown" && record.type === "response" && record.success === true) {
+				outputOrder.push("response");
+			}
+		};
+
+		try {
+			lineHandler(JSON.stringify({ id: "extension-shutdown", type: "prompt", message: "/shutdown" }));
+
+			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+			expect(outputOrder.slice(0, 2)).toEqual(["response", "exit"]);
+			expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_start")).toBe(false);
+			expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			exit.mockRestore();
+			await cleanup();
+		}
+	});
+
+	it("defers an extension-requested shutdown until the active agent run settles", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+		const { lineHandler, runtimeHost, session, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 500,
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("shutdown", {
+						description: "Request shutdown",
+						handler: async (_args, ctx) => {
+							ctx.shutdown();
+						},
+					});
+				},
+			],
+		});
+
+		try {
+			lineHandler(JSON.stringify({ id: "active-run", type: "prompt", message: "Start" }));
+			await vi.waitFor(() => expect(session.isStreaming).toBe(true));
+
+			lineHandler(JSON.stringify({ id: "live-shutdown", type: "prompt", message: "/shutdown" }));
+			await vi.waitFor(() => {
+				expect(getPromptResponses(rpcIo.outputLines, "live-shutdown")).toMatchObject([{ success: true }]);
+			});
+			expect(exit).not.toHaveBeenCalled();
+			expect(runtimeHost.dispose).not.toHaveBeenCalled();
+
+			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0), { timeout: 2_000 });
+			expect(session.isStreaming).toBe(false);
+			expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			exit.mockRestore();
+			await cleanup();
+		}
+	});
+
 	it("emits one success response when prompt preflight succeeds", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
 
