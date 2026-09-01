@@ -1190,7 +1190,7 @@ There are two categories of extension UI methods:
 - **Dialog methods** (`select`, `confirm`, `input`, `editor`): emit an `extension_ui_request` on stdout and block until the client sends back an `extension_ui_response` on stdin with the matching `id`.
 - **Fire-and-forget methods** (`notify`, `setStatus`, `setWidget`, `setTitle`, `set_editor_text`): emit an `extension_ui_request` on stdout but do not expect a response. The client can display the information or ignore it.
 
-If a dialog method includes a `timeout` field, the agent-side will auto-resolve with a default value when the timeout expires. The client does not need to track timeouts.
+Every dialog request includes an enforced timeout in milliseconds. Pi honors shorter positive finite extension timeouts and otherwise uses a five-minute maximum. When Pi resolves the dialog locally because its timeout or abort signal fires, it emits a `cancel` request naming the original dialog so clients can dismiss stale UI.
 
 Some `ExtensionUIContext` methods are not supported or degraded in RPC mode because they require direct TUI access:
 - `custom()` returns `undefined`
@@ -1210,7 +1210,7 @@ All requests have `type: "extension_ui_request"`, a unique `id`, and a `method` 
 
 #### select
 
-Prompt the user to choose from a list. Dialog methods with a `timeout` field include the timeout in milliseconds; the agent auto-resolves with `undefined` if the client doesn't respond in time.
+Every dialog request includes its effective timeout in milliseconds; the agent auto-resolves with `undefined` if the client doesn't respond in time.
 
 ```json
 {
@@ -1252,7 +1252,8 @@ Prompt the user for free-form text.
   "id": "uuid-3",
   "method": "input",
   "title": "Enter a value",
-  "placeholder": "type something..."
+  "placeholder": "type something...",
+  "timeout": 300000
 }
 ```
 
@@ -1268,11 +1269,26 @@ Open a multi-line text editor with optional prefilled content.
   "id": "uuid-4",
   "method": "editor",
   "title": "Edit some text",
-  "prefill": "Line 1\nLine 2\nLine 3"
+  "prefill": "Line 1\nLine 2\nLine 3",
+  "timeout": 300000
 }
 ```
 
 Expected response: `extension_ui_response` with `value` (the edited text) or `cancelled: true`.
+
+#### cancel
+
+Dismiss a dialog that Pi resolved locally. `targetId` is the original dialog request ID. No response is expected.
+
+```json
+{
+  "type": "extension_ui_request",
+  "id": "uuid-5",
+  "method": "cancel",
+  "targetId": "uuid-4",
+  "timedOut": true
+}
+```
 
 #### notify
 
@@ -1281,7 +1297,7 @@ Display a notification. Fire-and-forget, no response expected.
 ```json
 {
   "type": "extension_ui_request",
-  "id": "uuid-5",
+  "id": "uuid-6",
   "method": "notify",
   "message": "Command blocked by user",
   "notifyType": "warning"
