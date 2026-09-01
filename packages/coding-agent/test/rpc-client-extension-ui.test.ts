@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { isMatchingDialogCancel } from "../examples/rpc-extension-ui.ts";
 import { RpcClient } from "../src/modes/rpc/rpc-client.ts";
 import type { RpcExtensionUIRequest, RpcExtensionUIResponseBody } from "../src/modes/rpc/rpc-types.ts";
 
@@ -143,5 +144,11 @@ describe("RpcClient extension UI", () => {
 			type: "extension_ui_response",
 			id: "request-id",
 		});
+	});
+
+	test("dismisses only the active dialog for RPC cancellation", () => {
+		expect(isMatchingDialogCancel("active-dialog", { method: "cancel", targetId: "active-dialog" })).toBe(true);
+		expect(isMatchingDialogCancel("active-dialog", { method: "cancel", targetId: "stale-dialog" })).toBe(false);
+		expect(isMatchingDialogCancel("active-dialog", { method: "notify", targetId: "active-dialog" })).toBe(false);
 	});
 });
