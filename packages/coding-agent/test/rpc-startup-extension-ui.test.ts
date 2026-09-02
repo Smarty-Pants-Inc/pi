@@ -429,6 +429,7 @@ describe("RPC startup extension UI", () => {
 					command: "parse",
 					error: "RPC startup command queue limit exceeded",
 					success: false,
+					fatal: true,
 				}),
 			);
 			expect(rpcIo.lineHandler).toBeUndefined();
@@ -507,6 +508,7 @@ describe("RPC startup extension UI", () => {
 				expect.objectContaining({
 					command: "parse",
 					success: false,
+					fatal: true,
 				}),
 			]);
 			expect(
@@ -591,6 +593,7 @@ describe("RPC startup extension UI", () => {
 						command: "parse",
 						error: "RPC startup command queue limit exceeded",
 						success: false,
+						fatal: true,
 					}),
 				]);
 				expect(executeBash).not.toHaveBeenCalled();

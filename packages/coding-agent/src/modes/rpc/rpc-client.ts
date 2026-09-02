@@ -37,13 +37,18 @@ type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
 
 function isFatalErrorResponse(data: unknown): data is RpcFatalErrorResponse {
 	if (typeof data !== "object" || data === null) return false;
-	const response = data as Partial<RpcFatalErrorResponse>;
 	return (
-		response.id === undefined &&
-		response.type === "response" &&
-		response.command === "parse" &&
-		response.success === false &&
-		typeof response.error === "string"
+		"fatal" in data &&
+		data.fatal === true &&
+		(!("id" in data) || data.id === undefined) &&
+		"type" in data &&
+		data.type === "response" &&
+		"command" in data &&
+		data.command === "parse" &&
+		"success" in data &&
+		data.success === false &&
+		"error" in data &&
+		typeof data.error === "string"
 	);
 }
 

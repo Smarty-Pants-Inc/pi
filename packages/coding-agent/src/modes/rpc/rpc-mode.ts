@@ -1034,6 +1034,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			type: "response",
 			command: "parse",
 			success: false,
+			fatal: true,
 			error: "RPC startup command queue limit exceeded",
 		} satisfies RpcFatalErrorResponse);
 		startupCommands = [];

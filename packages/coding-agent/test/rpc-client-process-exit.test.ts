@@ -6,6 +6,10 @@ import { RpcClient } from "../src/modes/rpc/rpc-client.ts";
 
 const tempDirs: string[] = [];
 
+type RpcClientPrivate = {
+	exitError: Error | null;
+};
+
 function writeChildScript(contents: string): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-rpc-client-exit-"));
 	tempDirs.push(dir);
@@ -42,6 +46,7 @@ process.stdout.write(JSON.stringify({
 	type: "response",
 	command: "parse",
 	success: false,
+	fatal: true,
 	error: "RPC startup command queue limit exceeded",
 }) + "\\n");
 setTimeout(() => process.exit(1), 10);
@@ -52,5 +57,63 @@ setTimeout(() => process.exit(1), 10);
 
 		await expect(client.start()).rejects.toThrow("RPC startup command queue limit exceeded");
 		expect(events).toEqual([]);
+	});
+	test("keeps an uncorrelated parse error nonfatal after startup", async () => {
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+let input = "";
+let sentParseError = false;
+
+process.stdin.on("data", (chunk) => {
+	input += chunk;
+	while (true) {
+		const newlineIndex = input.indexOf("\\n");
+		if (newlineIndex === -1) return;
+		const line = input.slice(0, newlineIndex);
+		input = input.slice(newlineIndex + 1);
+		if (!line) continue;
+		const command = JSON.parse(line);
+		if (!sentParseError) {
+			sentParseError = true;
+			process.stdout.write(JSON.stringify({
+				type: "response",
+				command: "parse",
+				success: false,
+				error: "Failed to parse command: Unexpected token",
+			}) + "\\n");
+		}
+		process.stdout.write(JSON.stringify({
+			id: command.id,
+			type: "response",
+			command: command.type,
+			success: true,
+			data: { commands: [] },
+		}) + "\\n");
+	}
+});
+`),
+		});
+		// Reach private state to verify the uncorrelated error did not become terminal.
+		const privateClient = client as unknown as RpcClientPrivate;
+		const events: unknown[] = [];
+		client.onEvent((event) => events.push(event));
+
+		try {
+			await client.start();
+
+			await expect(client.getCommands()).resolves.toEqual([]);
+			await expect(client.getCommands()).resolves.toEqual([]);
+			expect(privateClient.exitError).toBeNull();
+			expect(events).toEqual([
+				{
+					type: "response",
+					command: "parse",
+					success: false,
+					error: "Failed to parse command: Unexpected token",
+				},
+			]);
+		} finally {
+			await client.stop();
+		}
 	});
 });

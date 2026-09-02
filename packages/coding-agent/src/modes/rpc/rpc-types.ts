@@ -132,6 +132,7 @@ export type RpcFatalErrorResponse = {
 	type: "response";
 	command: "parse";
 	success: false;
+	fatal: true;
 	error: string;
 };
 
