@@ -1018,7 +1018,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	let startupInputCount = 0;
 	let startupInputBytes = 0;
 	let startupCommands: RpcCommand[] = [];
-	const startupCommandWork: Promise<void>[] = [];
+	const pendingCommandWork = new Set<Promise<void>>();
 
 	const cancelPendingExtensionRequests = () => {
 		for (const pending of [...pendingExtensionRequests.values()]) {
@@ -1086,6 +1086,22 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				),
 			);
 			await waitForRawStdoutBackpressure();
+		}
+	};
+
+	const trackCommandInput = (command: RpcCommand): Promise<void> => {
+		const work = handleCommandInput(command);
+		pendingCommandWork.add(work);
+		void work.then(
+			() => pendingCommandWork.delete(work),
+			() => pendingCommandWork.delete(work),
+		);
+		return work;
+	};
+
+	const waitForPendingCommandWork = async (): Promise<void> => {
+		while (pendingCommandWork.size > 0) {
+			await Promise.allSettled(pendingCommandWork);
 		}
 	};
 
@@ -1165,14 +1181,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return;
 		}
 
-		await handleCommandInput(command);
+		await trackCommandInput(command);
 	};
 
 	const onInputEnd = () => {
 		inputEnded = true;
 		cancelPendingExtensionRequests();
 		if (startupDrainComplete) {
-			void Promise.allSettled(startupCommandWork).then(() => shutdown());
+			void waitForPendingCommandWork().then(() => shutdown());
 		}
 	};
 
@@ -1209,11 +1225,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			startupCommands = [];
 			for (const command of commands) {
 				if (startupFatal) break;
-				startupCommandWork.push(handleCommandInput(command));
+				trackCommandInput(command);
 			}
 			await Promise.resolve();
 		}
-		await Promise.allSettled(startupCommandWork);
+		await waitForPendingCommandWork();
 		if (startupCommands.length === 0) break;
 	}
 	if (startupFatal) return shutdown(1);

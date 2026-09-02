@@ -755,7 +755,7 @@ describe("RPC startup extension UI", () => {
 		}
 	});
 
-	it("waits for a command accepted while startup work settles before EOF shutdown", async () => {
+	it("waits for a command scheduled after startup drain before EOF shutdown", async () => {
 		const listenerSnapshot = takeListenerSnapshot();
 		let sessionStartComplete = false;
 		let startupInputSent = false;
@@ -807,19 +807,23 @@ describe("RPC startup extension UI", () => {
 			}
 			if (record.type !== "response" || record.id !== "startup-bash" || lateCommandSent) return;
 
-			lateCommandSent = true;
-			const lineHandler = rpcIo.lineHandler;
-			if (!lineHandler) {
-				throw new Error("Expected an attached input handler for the late startup command");
-			}
-			lineHandler(JSON.stringify({ id: "late-bash", type: "bash", command: "late" }));
-			const onInputEnd = (process.stdin.listeners("end") as NodeListener[]).find(
-				(listener) => !listenerSnapshot.stdinEnd.includes(listener),
-			);
-			if (!onInputEnd) {
-				throw new Error("Expected RPC mode to listen for stdin EOF");
-			}
-			onInputEnd.call(process.stdin);
+			// Let the startup drain's promise continuations run before the next input callback.
+
+			setImmediate(() => {
+				lateCommandSent = true;
+				const lineHandler = rpcIo.lineHandler;
+				if (!lineHandler) {
+					throw new Error("Expected an attached input handler for the late startup command");
+				}
+				lineHandler(JSON.stringify({ id: "late-bash", type: "bash", command: "late" }));
+				const onInputEnd = (process.stdin.listeners("end") as NodeListener[]).find(
+					(listener) => !listenerSnapshot.stdinEnd.includes(listener),
+				);
+				if (!onInputEnd) {
+					throw new Error("Expected RPC mode to listen for stdin EOF");
+				}
+				onInputEnd.call(process.stdin);
+			});
 		};
 
 		try {
