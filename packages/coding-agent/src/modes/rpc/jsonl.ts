@@ -40,9 +40,9 @@ export function attachJsonlLineReader(
 		bufferedBytes = 0;
 	};
 
-	const exceedsBufferLimit = (additionalBytes = 0) => {
+	const exceedsBufferLimit = () => {
 		const maxBufferedBytes = options.getMaxBufferedBytes?.();
-		if (maxBufferedBytes === undefined || bufferedBytes + additionalBytes <= maxBufferedBytes) return false;
+		if (maxBufferedBytes === undefined || bufferedBytes <= maxBufferedBytes) return false;
 		stopped = true;
 		resetBuffer();
 		options.onBufferOverflow?.();
@@ -59,7 +59,11 @@ export function attachJsonlLineReader(
 		const value = typeof chunk === "string" ? chunk : decoder.write(chunk);
 		buffer += value;
 		if (trackBufferedBytes) {
-			bufferedBytes += chunkBytes;
+			// Count raw chunks rather than decoded lines: malformed bytes may become U+FFFD.
+			const lastNewlineIndex = typeof chunk === "string" ? chunk.lastIndexOf("\n") : chunk.lastIndexOf(0x0a);
+			const unframedBytes =
+				lastNewlineIndex === -1 ? chunkBytes : Buffer.byteLength(chunk.slice(lastNewlineIndex + 1));
+			bufferedBytes = lastNewlineIndex === -1 ? bufferedBytes + unframedBytes : unframedBytes;
 		}
 
 		while (true) {
@@ -70,9 +74,7 @@ export function attachJsonlLineReader(
 
 			const line = buffer.slice(0, newlineIndex);
 			buffer = buffer.slice(newlineIndex + 1);
-			if (trackBufferedBytes) {
-				bufferedBytes = Math.max(0, bufferedBytes - Buffer.byteLength(line) - 1);
-			}
+
 			emitLine(line);
 		}
 

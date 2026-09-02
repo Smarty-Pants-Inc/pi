@@ -46,6 +46,31 @@ describe("RPC JSONL framing", () => {
 		expect(lines).toEqual(['{"a":1}', '{"b":2}']);
 	});
 
+	test("preserves a multibyte character split across byte chunks", async () => {
+		const line = '{"text":"€"}';
+		const bytes = Buffer.from(`${line}\n`);
+		const splitIndex = bytes.indexOf("€") + 1;
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([bytes.subarray(0, splitIndex), bytes.subarray(splitIndex)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (received) => lines.push(received), {
+			getMaxBufferedBytes: () => Buffer.byteLength(line),
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual([line]);
+		expect(overflows).toBe(0);
+	});
+
 	test("emits a final line without trailing LF", async () => {
 		const lines: string[] = [];
 		const stream = Readable.from([Buffer.from('{"a":1}')]);
@@ -107,6 +132,28 @@ describe("RPC JSONL framing", () => {
 
 		expect(received).toEqual(lines);
 		expect(overflows).toBe(0);
+	});
+
+	test("counts raw invalid UTF-8 bytes across an LF boundary", async () => {
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from([0x80]), Buffer.from(`\n${"x".repeat(17)}`)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line) => lines.push(line), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual(["�"]);
+		expect(overflows).toBe(1);
 	});
 
 	test("drops an oversized unterminated record before emitting it", async () => {
