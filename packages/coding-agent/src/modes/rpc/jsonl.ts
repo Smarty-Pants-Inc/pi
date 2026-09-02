@@ -23,17 +23,21 @@ type JsonlLineReaderOptions = {
  * Unicode separators that are valid inside JSON strings and therefore does not
  * implement strict JSONL framing. A buffer limit drops unframed input before
  * invoking its overflow callback.
+ *
+ * The optional second `onLine` argument is the raw frame byte length, including a
+ * terminating LF when present. It avoids charging decoded replacement text.
  */
 export function attachJsonlLineReader(
 	stream: Readable,
-	onLine: (line: string) => void,
+	onLine: (line: string, rawFramedByteLength?: number) => void,
 	options: JsonlLineReaderOptions = {},
 ): () => void {
 	const decoder = new StringDecoder("utf8");
 	let buffer = "";
 	let bufferedBytes = 0;
 	let stopped = false;
-	const trackBufferedBytes = options.getMaxBufferedBytes !== undefined;
+	const completedLineByteLengths: number[] = [];
+	let completedLineByteLengthIndex = 0;
 
 	const resetBuffer = () => {
 		buffer = "";
@@ -45,42 +49,47 @@ export function attachJsonlLineReader(
 		if (maxBufferedBytes === undefined || bufferedBytes <= maxBufferedBytes) return false;
 		stopped = true;
 		resetBuffer();
+		completedLineByteLengths.length = 0;
+		completedLineByteLengthIndex = 0;
 		options.onBufferOverflow?.();
 		return true;
 	};
 
-	const emitLine = (line: string) => {
-		onLine(line.endsWith("\r") ? line.slice(0, -1) : line);
-	};
-
 	const onData = (chunk: string | Buffer) => {
 		if (stopped) return;
-		const chunkBytes = typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
-		const value = typeof chunk === "string" ? chunk : decoder.write(chunk);
-		buffer += value;
-		if (trackBufferedBytes) {
-			// Count raw chunks rather than decoded lines: malformed bytes may become U+FFFD.
-			const lastNewlineIndex = typeof chunk === "string" ? chunk.lastIndexOf("\n") : chunk.lastIndexOf(0x0a);
-			const unframedBytes =
-				lastNewlineIndex === -1 ? chunkBytes : Buffer.byteLength(chunk.slice(lastNewlineIndex + 1));
-			bufferedBytes = lastNewlineIndex === -1 ? bufferedBytes + unframedBytes : unframedBytes;
-		}
 
+		let start = 0;
+		while (true) {
+			const newlineIndex = typeof chunk === "string" ? chunk.indexOf("\n", start) : chunk.indexOf(0x0a, start);
+			if (newlineIndex === -1) break;
+
+			bufferedBytes +=
+				typeof chunk === "string" ? Buffer.byteLength(chunk.slice(start, newlineIndex)) : newlineIndex - start;
+			bufferedBytes++;
+			completedLineByteLengths.push(bufferedBytes);
+			bufferedBytes = 0;
+			start = newlineIndex + 1;
+		}
+		bufferedBytes += typeof chunk === "string" ? Buffer.byteLength(chunk.slice(start)) : chunk.byteLength - start;
+
+		buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
 		while (true) {
 			const newlineIndex = buffer.indexOf("\n");
-			if (newlineIndex === -1) {
-				break;
-			}
+			if (newlineIndex === -1) break;
 
 			const line = buffer.slice(0, newlineIndex);
 			buffer = buffer.slice(newlineIndex + 1);
-
-			emitLine(line);
+			onLine(
+				line.endsWith("\r") ? line.slice(0, -1) : line,
+				completedLineByteLengths[completedLineByteLengthIndex++]!,
+			);
+		}
+		if (completedLineByteLengthIndex === completedLineByteLengths.length) {
+			completedLineByteLengths.length = 0;
+			completedLineByteLengthIndex = 0;
 		}
 
-		if (trackBufferedBytes) {
-			exceedsBufferLimit();
-		}
+		exceedsBufferLimit();
 	};
 
 	const onEnd = () => {
@@ -89,8 +98,9 @@ export function attachJsonlLineReader(
 		if (exceedsBufferLimit()) return;
 		if (buffer.length > 0) {
 			const line = buffer;
+			const rawFramedByteLength = bufferedBytes;
 			resetBuffer();
-			emitLine(line);
+			onLine(line.endsWith("\r") ? line.slice(0, -1) : line, rawFramedByteLength);
 		}
 	};
 

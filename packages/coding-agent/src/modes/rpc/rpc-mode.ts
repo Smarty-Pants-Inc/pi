@@ -1089,15 +1089,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 	};
 
-	const handleInputLine = async (line: string) => {
+	const handleInputLine = async (line: string, rawFramedByteLength?: number) => {
 		if (startupFatal) return;
 
 		const isStartupInput = !extensionBindingsComplete || drainingStartupCommands;
 		let inputBytes = 0;
 		let usesStartupResponseReserve = false;
 		if (isStartupInput) {
-			// Reserve before parsing so malformed records cannot evade the startup input bound.
-			inputBytes = Buffer.byteLength(line);
+			// Reserve raw frame bytes before parsing; invalid UTF-8 can expand when decoded.
+			inputBytes = rawFramedByteLength ?? Buffer.byteLength(line);
 			if (
 				startupInputCount < MAX_QUEUED_STARTUP_COMMANDS &&
 				startupInputBytes + inputBytes <= MAX_BUFFERED_STARTUP_BYTES
@@ -1179,8 +1179,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	detachInput = (() => {
 		const detachJsonl = attachJsonlLineReader(
 			process.stdin,
-			(line) => {
-				void handleInputLine(line);
+			(line, rawFramedByteLength) => {
+				void handleInputLine(line, rawFramedByteLength);
 			},
 			{
 				getMaxBufferedBytes: () =>
@@ -1203,18 +1203,21 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 	extensionBindingsComplete = true;
 	drainingStartupCommands = true;
-	while (!startupFatal && startupCommands.length > 0) {
-		const commands = startupCommands;
-		startupCommands = [];
-		for (const command of commands) {
-			if (startupFatal) break;
-			startupCommandWork.push(handleCommandInput(command));
+	while (!startupFatal) {
+		while (!startupFatal && startupCommands.length > 0) {
+			const commands = startupCommands;
+			startupCommands = [];
+			for (const command of commands) {
+				if (startupFatal) break;
+				startupCommandWork.push(handleCommandInput(command));
+			}
+			await Promise.resolve();
 		}
-		await Promise.resolve();
+		await Promise.allSettled(startupCommandWork);
+		if (startupCommands.length === 0) break;
 	}
-	drainingStartupCommands = false;
 	if (startupFatal) return shutdown(1);
-	await Promise.allSettled(startupCommandWork);
+	drainingStartupCommands = false;
 	startupDrainComplete = true;
 	startupInputCount = 0;
 	startupInputBytes = 0;

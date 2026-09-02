@@ -71,6 +71,26 @@ describe("RPC JSONL framing", () => {
 		expect(overflows).toBe(0);
 	});
 
+	test("reports raw framed bytes for malformed UTF-8", async () => {
+		const rawRecord = Buffer.concat([Buffer.from('{"text":"'), Buffer.from([0x80, 0x80]), Buffer.from('"}')]);
+		const records: Array<{ line: string; rawFramedByteLength: number | undefined }> = [];
+		const stream = Readable.from([
+			rawRecord.subarray(0, rawRecord.byteLength - 1),
+			Buffer.concat([rawRecord.subarray(rawRecord.byteLength - 1), Buffer.from("\n")]),
+		]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line, rawFramedByteLength) => records.push({ line, rawFramedByteLength }));
+
+		await done;
+
+		expect(records).toEqual([{ line: rawRecord.toString(), rawFramedByteLength: rawRecord.byteLength + 1 }]);
+		expect(Buffer.byteLength(records[0]!.line)).toBeGreaterThan(rawRecord.byteLength);
+	});
+
 	test("emits a final line without trailing LF", async () => {
 		const lines: string[] = [];
 		const stream = Readable.from([Buffer.from('{"a":1}')]);

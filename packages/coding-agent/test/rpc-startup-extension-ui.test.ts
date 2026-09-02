@@ -6,7 +6,7 @@ import { createHarness, type Harness } from "./suite/harness.ts";
 
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
-	lineHandler: undefined as ((line: string) => void) | undefined,
+	lineHandler: undefined as ((line: string, rawFramedByteLength?: number) => void) | undefined,
 	onOutputLine: undefined as ((line: string) => void) | undefined,
 	backpressureWaits: 0,
 }));
@@ -26,14 +26,16 @@ vi.mock("../src/core/output-guard.js", () => ({
 vi.mock("../src/modes/interactive/theme/theme.js", () => ({ theme: {} }));
 
 vi.mock("../src/modes/rpc/jsonl.js", () => ({
-	attachJsonlLineReader: vi.fn((_stream: NodeJS.ReadableStream, onLine: (line: string) => void) => {
-		rpcIo.lineHandler = onLine;
-		return () => {
-			if (rpcIo.lineHandler === onLine) {
-				rpcIo.lineHandler = undefined;
-			}
-		};
-	}),
+	attachJsonlLineReader: vi.fn(
+		(_stream: NodeJS.ReadableStream, onLine: (line: string, rawFramedByteLength?: number) => void) => {
+			rpcIo.lineHandler = onLine;
+			return () => {
+				if (rpcIo.lineHandler === onLine) {
+					rpcIo.lineHandler = undefined;
+				}
+			};
+		},
+	),
 	serializeJsonLine: (value: unknown) => `${JSON.stringify(value)}\n`,
 }));
 
@@ -605,6 +607,70 @@ describe("RPC startup extension UI", () => {
 		},
 	);
 
+	it("accepts an in-bound malformed UTF-8 startup record using its raw framed byte length", async () => {
+		const listenerSnapshot = takeListenerSnapshot();
+		let sessionStartComplete = false;
+		let startupInputSent = false;
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", async (_event, ctx) => {
+						await ctx.ui.confirm("Confirm", "Continue?");
+						sessionStartComplete = true;
+					});
+				},
+			],
+		});
+		const executeBash = vi.spyOn(harness.session, "executeBash").mockResolvedValue({
+			output: "",
+			exitCode: undefined,
+			cancelled: true,
+			truncated: false,
+		});
+		const rawRecord = Buffer.concat([
+			Buffer.from('{"id":"malformed-startup","type":"bash","command":"'),
+			Buffer.alloc(6 * 1024 * 1024, 0x80),
+			Buffer.from('"}'),
+		]);
+		const decodedRecord = rawRecord.toString();
+		expect(rawRecord.byteLength).toBeLessThan(15 * 1024 * 1024);
+		expect(Buffer.byteLength(decodedRecord)).toBeGreaterThan(16 * 1024 * 1024);
+
+		rpcIo.onOutputLine = (line) => {
+			const request = JSON.parse(line) as Record<string, unknown>;
+			if (request.type !== "extension_ui_request" || startupInputSent) return;
+			const response = responseForUiRequest(request);
+			const lineHandler = rpcIo.lineHandler;
+			if (!response || !lineHandler) {
+				throw new Error("Expected an attached input handler for the startup dialog");
+			}
+
+			startupInputSent = true;
+			lineHandler(decodedRecord, rawRecord.byteLength + 1);
+			lineHandler(JSON.stringify(response));
+		};
+
+		try {
+			void runRpcMode(createRuntimeHost(harness));
+
+			await vi.waitFor(() => {
+				expect(sessionStartComplete).toBe(true);
+				expect(executeBash).toHaveBeenCalledOnce();
+			});
+
+			expect(exit).not.toHaveBeenCalled();
+			expect(rpcIo.outputLines.map((line) => JSON.parse(line) as Record<string, unknown>)).toContainEqual(
+				expect.objectContaining({ id: "malformed-startup", type: "response", command: "bash", success: true }),
+			);
+		} finally {
+			executeBash.mockRestore();
+			exit.mockRestore();
+			harness.cleanup();
+			restoreListeners(listenerSnapshot);
+		}
+	});
+
 	it("waits for concurrent startup command responses before EOF shutdown", async () => {
 		const listenerSnapshot = takeListenerSnapshot();
 		let sessionStartComplete = false;
@@ -682,6 +748,111 @@ describe("RPC startup extension UI", () => {
 			expect(shutdownAfterBashResponse).toBe(true);
 		} finally {
 			resolveBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
+			executeBash.mockRestore();
+			exit.mockRestore();
+			harness.cleanup();
+			restoreListeners(listenerSnapshot);
+		}
+	});
+
+	it("waits for a command accepted while startup work settles before EOF shutdown", async () => {
+		const listenerSnapshot = takeListenerSnapshot();
+		let sessionStartComplete = false;
+		let startupInputSent = false;
+		let lateCommandSent = false;
+		let resolveStartupBash!: (result: BashResult) => void;
+		let resolveLateBash!: (result: BashResult) => void;
+		let shutdownAfterLateResponse = false;
+		const dispose = vi.fn(async () => {
+			shutdownAfterLateResponse = rpcIo.outputLines.some((line) => {
+				const record = JSON.parse(line) as Record<string, unknown>;
+				return record.type === "response" && record.id === "late-bash" && record.success === true;
+			});
+		});
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", async (_event, ctx) => {
+						await ctx.ui.confirm("Confirm", "Continue?");
+						sessionStartComplete = true;
+					});
+				},
+			],
+		});
+		const startupBash = new Promise<BashResult>((resolve) => {
+			resolveStartupBash = resolve;
+		});
+		const lateBash = new Promise<BashResult>((resolve) => {
+			resolveLateBash = resolve;
+		});
+		const executeBash = vi
+			.spyOn(harness.session, "executeBash")
+			.mockImplementation((command) => (command === "startup" ? startupBash : lateBash));
+
+		rpcIo.onOutputLine = (line) => {
+			const record = JSON.parse(line) as Record<string, unknown>;
+			if (record.type === "extension_ui_request") {
+				if (startupInputSent) return;
+				const response = responseForUiRequest(record);
+				const lineHandler = rpcIo.lineHandler;
+				if (!response || !lineHandler) {
+					throw new Error("Expected an attached input handler for the startup dialog");
+				}
+
+				startupInputSent = true;
+				lineHandler(JSON.stringify(response));
+				lineHandler(JSON.stringify({ id: "startup-bash", type: "bash", command: "startup" }));
+				return;
+			}
+			if (record.type !== "response" || record.id !== "startup-bash" || lateCommandSent) return;
+
+			lateCommandSent = true;
+			const lineHandler = rpcIo.lineHandler;
+			if (!lineHandler) {
+				throw new Error("Expected an attached input handler for the late startup command");
+			}
+			lineHandler(JSON.stringify({ id: "late-bash", type: "bash", command: "late" }));
+			const onInputEnd = (process.stdin.listeners("end") as NodeListener[]).find(
+				(listener) => !listenerSnapshot.stdinEnd.includes(listener),
+			);
+			if (!onInputEnd) {
+				throw new Error("Expected RPC mode to listen for stdin EOF");
+			}
+			onInputEnd.call(process.stdin);
+		};
+
+		try {
+			void runRpcMode({
+				session: harness.session,
+				newSession: vi.fn(async () => ({ cancelled: true })),
+				switchSession: vi.fn(async () => ({ cancelled: true })),
+				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+				dispose,
+				setRebindSession: vi.fn(),
+			} as unknown as AgentSessionRuntime);
+
+			await vi.waitFor(() => {
+				expect(sessionStartComplete).toBe(true);
+				expect(executeBash).toHaveBeenCalledOnce();
+			});
+
+			resolveStartupBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
+			await vi.waitFor(() => {
+				expect(lateCommandSent).toBe(true);
+				expect(executeBash).toHaveBeenCalledTimes(2);
+			});
+			expect(dispose).not.toHaveBeenCalled();
+
+			resolveLateBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
+			await vi.waitFor(() => {
+				expect(dispose).toHaveBeenCalledOnce();
+				expect(exit).toHaveBeenCalledWith(0);
+			});
+			expect(shutdownAfterLateResponse).toBe(true);
+		} finally {
+			resolveStartupBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
+			resolveLateBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
 			executeBash.mockRestore();
 			exit.mockRestore();
 			harness.cleanup();
