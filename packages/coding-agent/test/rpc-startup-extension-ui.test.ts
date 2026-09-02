@@ -309,6 +309,64 @@ describe("RPC startup extension UI", () => {
 		}
 	});
 
+	it("rejects an unmatched dialog response after filling the startup command bound", async () => {
+		const listenerSnapshot = takeListenerSnapshot();
+		let startupInputSent = false;
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", async (_event, ctx) => {
+						await ctx.ui.confirm("Confirm", "Continue?");
+					});
+				},
+			],
+		});
+
+		rpcIo.onOutputLine = (line) => {
+			const record = JSON.parse(line) as Record<string, unknown>;
+			if (record.type !== "extension_ui_request" || startupInputSent) return;
+			const lineHandler = rpcIo.lineHandler;
+			if (!lineHandler) throw new Error("Expected an attached input handler for the startup dialog");
+			startupInputSent = true;
+			for (let index = 0; index < 255; index++) {
+				lineHandler(JSON.stringify({ id: `startup-${index}`, type: "get_state" }));
+			}
+			lineHandler(JSON.stringify({ type: "extension_ui_response", id: "stale", confirmed: true }));
+			lineHandler(JSON.stringify({ id: "startup-overflow", type: "get_state" }));
+			const onInputEnd = (process.stdin.listeners("end") as NodeListener[]).find(
+				(listener) => !listenerSnapshot.stdinEnd.includes(listener),
+			);
+			onInputEnd?.call(process.stdin);
+		};
+
+		try {
+			void runRpcMode(createRuntimeHost(harness));
+
+			await vi.waitFor(() => {
+				expect(exit).toHaveBeenCalledOnce();
+			});
+
+			const responses = rpcIo.outputLines
+				.map((line) => JSON.parse(line) as Record<string, unknown>)
+				.filter((record) => record.type === "response");
+			expect(responses).toHaveLength(1);
+			expect(responses[0]).toEqual(
+				expect.objectContaining({
+					command: "parse",
+					error: "RPC startup command queue limit exceeded",
+					success: false,
+				}),
+			);
+			expect(rpcIo.lineHandler).toBeUndefined();
+			expect(exit).toHaveBeenCalledWith(1);
+		} finally {
+			exit.mockRestore();
+			harness.cleanup();
+			restoreListeners(listenerSnapshot);
+		}
+	});
+
 	it("fails on the first startup queue overflow without draining queued commands", async () => {
 		const listenerSnapshot = takeListenerSnapshot();
 		const dialogResults: Array<boolean | string | undefined> = [];

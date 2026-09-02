@@ -1132,15 +1132,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			"type" in parsed &&
 			parsed.type === "extension_ui_response"
 		) {
-			if (isStartupInput && !usesStartupResponseReserve) {
-				startupInputCount--;
-				startupInputBytes -= inputBytes;
-			}
 			const response = parsed as RpcExtensionUIResponse;
 			const pending = pendingExtensionRequests.get(response.id);
 			if (pending) {
+				if (isStartupInput && !usesStartupResponseReserve) {
+					startupInputCount--;
+					startupInputBytes -= inputBytes;
+				}
 				pendingExtensionRequests.delete(response.id);
 				pending.resolve(response);
+			} else if (usesStartupResponseReserve) {
+				failStartupOverflow({ type: "parse" });
 			}
 			return;
 		}
