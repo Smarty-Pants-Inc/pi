@@ -330,6 +330,8 @@ export class AgentSession {
 	private _pendingNextTurnMessages: CustomMessage[] = [];
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
 	private _pendingCustomMessages: CustomMessage[] = [];
+	/** FIFO entry IDs keyed by live message objects for the active capture epoch. */
+	private _messageEntryIds: WeakMap<AgentMessage, string[]> | undefined;
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -675,19 +677,21 @@ export class AgentSession {
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
-				this.sessionManager.appendCustomMessageEntry(
+				const entryId = this.sessionManager.appendCustomMessageEntry(
 					event.message.customType,
 					event.message.content,
 					event.message.display,
 					event.message.details,
 				);
+				this._recordMessageEntryId(event.message, entryId);
 			} else if (
 				event.message.role === "user" ||
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				const entryId = this.sessionManager.appendMessage(event.message);
+				this._recordMessageEntryId(event.message, entryId);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -997,6 +1001,42 @@ export class AgentSession {
 	/** All messages including custom types like BashExecutionMessage */
 	get messages(): AgentMessage[] {
 		return this.agent.state.messages;
+	}
+
+	/** Starts a new capture epoch for live persisted message entry IDs. */
+	startMessageEntryIdCapture(): void {
+		this._messageEntryIds = new WeakMap<AgentMessage, string[]>();
+	}
+
+	/** Stops capture and discards all entry IDs from the active epoch. */
+	stopMessageEntryIdCapture(): void {
+		this._messageEntryIds = undefined;
+	}
+
+	/** Takes the next persisted entry ID for a live message emission. */
+	takeMessageEntryId(message: AgentMessage): string | undefined {
+		const capture = this._messageEntryIds;
+		if (!capture) return undefined;
+		const entryIds = capture.get(message);
+		if (!entryIds) return undefined;
+
+		const entryId = entryIds.shift();
+		if (entryIds.length === 0) {
+			capture.delete(message);
+		}
+		return entryId;
+	}
+
+	private _recordMessageEntryId(message: AgentMessage, entryId: string): void {
+		const capture = this._messageEntryIds;
+		if (!capture) return;
+
+		const entryIds = capture.get(message);
+		if (entryIds) {
+			entryIds.push(entryId);
+		} else {
+			capture.set(message, [entryId]);
+		}
 	}
 
 	/** Current steering mode */
@@ -1516,12 +1556,13 @@ export class AgentSession {
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
 		this.agent.state.messages.push(appMessage);
-		this.sessionManager.appendCustomMessageEntry(
+		const entryId = this.sessionManager.appendCustomMessageEntry(
 			appMessage.customType,
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
 		);
+		this._recordMessageEntryId(appMessage, entryId);
 		this._emit({ type: "message_start", message: appMessage });
 		this._emit({ type: "message_end", message: appMessage });
 	}
