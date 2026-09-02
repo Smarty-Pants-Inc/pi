@@ -345,6 +345,7 @@ export {
 } from "./core/trust-manager.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
+export type { RpcAgentSessionEvent, RpcMessageEndEvent } from "./modes/index.ts";
 // Run modes for programmatic SDK usage
 export {
 	InteractiveMode,
@@ -352,12 +353,15 @@ export {
 	type JsonAgentSessionEvent,
 	type ModelInfo,
 	type PrintModeOptions,
+	type RpcBranchEntriesPage,
+	type RpcBranchEntriesPageRequest,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,
 	type RpcEventListener,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
+	type RpcExtensionUIResponseBody,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,
