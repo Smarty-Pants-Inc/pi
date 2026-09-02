@@ -126,6 +126,15 @@ export interface RpcSessionState {
 // RPC Responses (stdout)
 // ============================================================================
 
+/** Uncorrelated response emitted before RPC startup exits after input overflow. */
+export type RpcFatalErrorResponse = {
+	id?: undefined;
+	type: "response";
+	command: "parse";
+	success: false;
+	error: string;
+};
+
 // Success responses with data
 export type RpcResponse =
 	// Prompting (async - events follow)

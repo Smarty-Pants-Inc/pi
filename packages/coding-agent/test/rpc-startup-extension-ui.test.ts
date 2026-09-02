@@ -258,6 +258,77 @@ describe("RPC startup extension UI", () => {
 		}
 	});
 
+	it("cleans up when SIGTERM arrives during an unanswered session_start dialog", async () => {
+		const listenerSnapshot = takeListenerSnapshot();
+		let dialogId: string | undefined;
+		let sessionStartComplete = false;
+		let startupLineHandler: ((line: string) => void) | undefined;
+		const dispose = vi.fn(async () => {});
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_start", async (_event, ctx) => {
+						await ctx.ui.confirm("Confirm", "Continue?");
+						sessionStartComplete = true;
+					});
+				},
+			],
+		});
+
+		rpcIo.onOutputLine = (line) => {
+			const request = JSON.parse(line) as Record<string, unknown>;
+			if (
+				request.type !== "extension_ui_request" ||
+				request.method !== "confirm" ||
+				typeof request.id !== "string"
+			) {
+				return;
+			}
+			dialogId = request.id;
+			startupLineHandler = rpcIo.lineHandler;
+		};
+
+		try {
+			void runRpcMode({
+				session: harness.session,
+				newSession: vi.fn(async () => ({ cancelled: true })),
+				switchSession: vi.fn(async () => ({ cancelled: true })),
+				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
+				dispose,
+				setRebindSession: vi.fn(),
+			} as unknown as AgentSessionRuntime);
+
+			await vi.waitFor(() => {
+				expect(dialogId).toBeDefined();
+				expect(startupLineHandler).toBeDefined();
+			});
+			const existingSigtermListeners =
+				listenerSnapshot.signals.find((snapshot) => snapshot.signal === "SIGTERM")?.listeners ?? [];
+			const signalHandler = (process.listeners("SIGTERM") as NodeListener[]).find(
+				(listener) => !existingSigtermListeners.includes(listener),
+			);
+			if (!signalHandler || !startupLineHandler || !dialogId) {
+				throw new Error("Expected SIGTERM handler and pending startup dialog");
+			}
+
+			signalHandler();
+			await vi.waitFor(() => {
+				expect(dispose).toHaveBeenCalledOnce();
+				expect(rpcIo.lineHandler).toBeUndefined();
+				expect(exit).toHaveBeenCalledWith(143);
+				expect(process.listeners("SIGTERM")).not.toContain(signalHandler);
+			});
+
+			startupLineHandler(JSON.stringify({ type: "extension_ui_response", id: dialogId, confirmed: true }));
+			await vi.waitFor(() => expect(sessionStartComplete).toBe(true));
+		} finally {
+			exit.mockRestore();
+			harness.cleanup();
+			restoreListeners(listenerSnapshot);
+		}
+	});
+
 	it("accepts a dialog response after 256 buffered startup commands", async () => {
 		const listenerSnapshot = takeListenerSnapshot();
 		let sessionStartComplete = false;

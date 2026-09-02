@@ -63,6 +63,52 @@ describe("RPC JSONL framing", () => {
 		expect(lines).toEqual(['{"a":1}']);
 	});
 
+	test("accepts a maximum-sized record followed by LF", async () => {
+		const line = "x".repeat(16);
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from(`${line}\n`)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (received) => lines.push(received), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual([line]);
+		expect(overflows).toBe(0);
+	});
+
+	test("accepts multiple complete records in one bounded chunk", async () => {
+		const lines = ["a".repeat(16), "b".repeat(16)];
+		const received: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from(`${lines.join("\n")}\n`)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line) => received.push(line), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(received).toEqual(lines);
+		expect(overflows).toBe(0);
+	});
+
 	test("drops an oversized unterminated record before emitting it", async () => {
 		const lines: string[] = [];
 		let overflows = 0;

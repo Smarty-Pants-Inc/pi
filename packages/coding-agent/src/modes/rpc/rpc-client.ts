@@ -19,6 +19,7 @@ import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponseBody,
+	RpcFatalErrorResponse,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -33,6 +34,18 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 
 /** RpcCommand without the id field (for internal send) */
 type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
+
+function isFatalErrorResponse(data: unknown): data is RpcFatalErrorResponse {
+	if (typeof data !== "object" || data === null) return false;
+	const response = data as Partial<RpcFatalErrorResponse>;
+	return (
+		response.id === undefined &&
+		response.type === "response" &&
+		response.command === "parse" &&
+		response.success === false &&
+		typeof response.error === "string"
+	);
+}
 
 export interface RpcClientOptions {
 	/** Path to the CLI entry point (default: searches for dist/cli.js) */
@@ -123,7 +136,7 @@ export class RpcClient {
 
 		childProcess.once("exit", (code, signal) => {
 			if (this.process !== childProcess) return;
-			const error = this.createProcessExitError(code, signal);
+			const error = this.exitError ?? this.createProcessExitError(code, signal);
 			this.exitError = error;
 			this.rejectPendingRequests(error);
 		});
@@ -148,6 +161,10 @@ export class RpcClient {
 
 		// Wait a moment for process to initialize
 		await new Promise((resolve) => setTimeout(resolve, 100));
+
+		if (this.exitError) {
+			throw this.exitError;
+		}
 
 		if (this.process.exitCode !== null) {
 			const error = this.exitError ?? this.createProcessExitError(this.process.exitCode, this.process.signalCode);
@@ -567,6 +584,13 @@ export class RpcClient {
 	private handleLine(line: string): void {
 		try {
 			const data = JSON.parse(line);
+
+			if (isFatalErrorResponse(data)) {
+				const error = new Error(data.error);
+				this.exitError = error;
+				this.rejectPendingRequests(error);
+				return;
+			}
 
 			// Check if it's a response to a pending request
 			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {

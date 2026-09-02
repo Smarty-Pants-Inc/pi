@@ -33,6 +33,7 @@ import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcFatalErrorResponse,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -1025,11 +1026,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 	};
 
-	const failStartupOverflow = (command: { id?: string; type: string }) => {
+	const failStartupOverflow = () => {
 		if (startupFatal) return;
 		startupFatal = true;
 		inputEnded = true;
-		output(error(command.id, command.type, "RPC startup command queue limit exceeded"));
+		output({
+			type: "response",
+			command: "parse",
+			success: false,
+			error: "RPC startup command queue limit exceeded",
+		} satisfies RpcFatalErrorResponse);
 		startupCommands = [];
 		startupInputCount = 0;
 		startupInputBytes = 0;
@@ -1101,7 +1107,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			} else if (pendingExtensionRequests.size > 0 && inputBytes <= MAX_STARTUP_UI_RESPONSE_BYTES) {
 				usesStartupResponseReserve = true;
 			} else {
-				failStartupOverflow({ type: "parse" });
+				failStartupOverflow();
 				return;
 			}
 		}
@@ -1111,7 +1117,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			parsed = JSON.parse(line);
 		} catch (parseError: unknown) {
 			if (usesStartupResponseReserve) {
-				failStartupOverflow({ type: "parse" });
+				failStartupOverflow();
 				return;
 			}
 			output(
@@ -1142,13 +1148,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 				pendingExtensionRequests.delete(response.id);
 				pending.resolve(response);
 			} else if (usesStartupResponseReserve) {
-				failStartupOverflow({ type: "parse" });
+				failStartupOverflow();
 			}
 			return;
 		}
 
 		if (usesStartupResponseReserve) {
-			failStartupOverflow({ type: "parse" });
+			failStartupOverflow();
 			return;
 		}
 
@@ -1181,7 +1187,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					!extensionBindingsComplete || drainingStartupCommands
 						? MAX_STARTUP_INPUT_BYTES - startupInputBytes
 						: undefined,
-				onBufferOverflow: () => failStartupOverflow({ type: "parse" }),
+				onBufferOverflow: failStartupOverflow,
 			},
 		);
 		process.stdin.on("end", onInputEnd);
@@ -1191,9 +1197,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		};
 	})();
 
+	registerSignalHandlers();
 	await rebindSession();
 	if (startupFatal) return shutdown(1);
-	registerSignalHandlers();
 
 	extensionBindingsComplete = true;
 	drainingStartupCommands = true;

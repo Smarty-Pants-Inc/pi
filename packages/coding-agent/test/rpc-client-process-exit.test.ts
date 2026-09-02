@@ -35,4 +35,22 @@ process.stdin.resume();
 
 		await expect(client.getCommands()).rejects.toThrow(/Agent process exited \(code=43 signal=null\)/);
 	});
+	test("surfaces fatal startup overflow without treating it as an agent event", async () => {
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+process.stdout.write(JSON.stringify({
+	type: "response",
+	command: "parse",
+	success: false,
+	error: "RPC startup command queue limit exceeded",
+}) + "\\n");
+setTimeout(() => process.exit(1), 10);
+`),
+		});
+		const events: unknown[] = [];
+		client.onEvent((event) => events.push(event));
+
+		await expect(client.start()).rejects.toThrow("RPC startup command queue limit exceeded");
+		expect(events).toEqual([]);
+	});
 });

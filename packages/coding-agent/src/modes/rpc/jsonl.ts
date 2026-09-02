@@ -56,8 +56,6 @@ export function attachJsonlLineReader(
 	const onData = (chunk: string | Buffer) => {
 		if (stopped) return;
 		const chunkBytes = typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
-		if (trackBufferedBytes && exceedsBufferLimit(chunkBytes)) return;
-
 		const value = typeof chunk === "string" ? chunk : decoder.write(chunk);
 		buffer += value;
 		if (trackBufferedBytes) {
@@ -67,7 +65,7 @@ export function attachJsonlLineReader(
 		while (true) {
 			const newlineIndex = buffer.indexOf("\n");
 			if (newlineIndex === -1) {
-				return;
+				break;
 			}
 
 			const line = buffer.slice(0, newlineIndex);
@@ -76,6 +74,10 @@ export function attachJsonlLineReader(
 				bufferedBytes = Math.max(0, bufferedBytes - Buffer.byteLength(line) - 1);
 			}
 			emitLine(line);
+		}
+
+		if (trackBufferedBytes) {
+			exceedsBufferLimit();
 		}
 	};
 
