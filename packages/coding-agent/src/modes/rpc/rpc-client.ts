@@ -13,7 +13,16 @@ import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
+import type {
+	RpcBranchEntriesPage,
+	RpcBranchEntriesPageRequest,
+	RpcCommand,
+	RpcExtensionUIRequest,
+	RpcExtensionUIResponseBody,
+	RpcResponse,
+	RpcSessionState,
+	RpcSlashCommand,
+} from "./rpc-types.ts";
 
 // ============================================================================
 // Types
@@ -47,7 +56,15 @@ export interface ModelInfo {
 	reasoning: boolean;
 }
 
-export type RpcEventListener = (event: JsonAgentSessionEvent) => void;
+export type RpcMessageEndEvent = Extract<JsonAgentSessionEvent, { type: "message_end" }> & { entryId?: string };
+
+/** RPC events, including extension UI requests. */
+export type RpcAgentSessionEvent =
+	| Exclude<JsonAgentSessionEvent, { type: "message_end" }>
+	| RpcExtensionUIRequest
+	| RpcMessageEndEvent;
+
+export type RpcEventListener = (event: RpcAgentSessionEvent) => void;
 
 // ============================================================================
 // RPC Client
@@ -177,6 +194,32 @@ export class RpcClient {
 				this.eventListeners.splice(index, 1);
 			}
 		};
+	}
+
+	/**
+	 * Respond to an extension UI request without waiting for an RPC response.
+	 */
+	async respondToExtensionUI(id: string, response: RpcExtensionUIResponseBody): Promise<void> {
+		const childProcess = this.process;
+		const stdin = childProcess?.stdin;
+		if (!childProcess || !stdin) {
+			throw new Error("Client not started");
+		}
+		if (this.exitError) {
+			throw this.exitError;
+		}
+		if (childProcess.exitCode !== null) {
+			const error = this.createProcessExitError(childProcess.exitCode, childProcess.signalCode);
+			this.exitError = error;
+			throw error;
+		}
+		if (stdin.destroyed || !stdin.writable) {
+			const error = new Error(`Agent process stdin is not writable. Stderr: ${this.stderr}`);
+			this.exitError = error;
+			throw error;
+		}
+
+		stdin.write(serializeJsonLine({ ...response, type: "extension_ui_response", id }));
 	}
 
 	/**
@@ -415,6 +458,14 @@ export class RpcClient {
 	}
 
 	/**
+	 * Get one backwards page from a session branch.
+	 */
+	async getBranchEntriesPage(request: RpcBranchEntriesPageRequest): Promise<RpcBranchEntriesPage> {
+		const response = await this.send({ ...request, type: "get_branch_entries_page" });
+		return this.getData<RpcBranchEntriesPage>(response);
+	}
+
+	/**
 	 * Get the session entry tree.
 	 */
 	async getTree(): Promise<{ tree: SessionTreeNode[]; leafId: string | null }> {
@@ -481,9 +532,9 @@ export class RpcClient {
 	/**
 	 * Collect events until agent becomes idle.
 	 */
-	collectEvents(timeout = 60000): Promise<JsonAgentSessionEvent[]> {
+	collectEvents(timeout = 60000): Promise<RpcAgentSessionEvent[]> {
 		return new Promise((resolve, reject) => {
-			const events: JsonAgentSessionEvent[] = [];
+			const events: RpcAgentSessionEvent[] = [];
 			const timer = setTimeout(() => {
 				unsubscribe();
 				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
@@ -503,7 +554,7 @@ export class RpcClient {
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
-	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<JsonAgentSessionEvent[]> {
+	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<RpcAgentSessionEvent[]> {
 		const eventsPromise = this.collectEvents(timeout);
 		await this.prompt(message, images);
 		return eventsPromise;
@@ -527,7 +578,7 @@ export class RpcClient {
 
 			// Otherwise it's an event
 			for (const listener of this.eventListeners) {
-				listener(data as JsonAgentSessionEvent);
+				listener(data as RpcAgentSessionEvent);
 			}
 		} catch {
 			// Ignore non-JSON lines
