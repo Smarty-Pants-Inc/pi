@@ -696,15 +696,15 @@ describe("AgentSession compaction characterization", () => {
 			const preparationReleased = new Promise<void>((resolve) => {
 				releasePreparation = resolve;
 			});
-			let firstPreparation = true;
+			let pauseNextPreparation = false;
 			const harness = await createHarness({
 				models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
 				settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
 				extensionFactories: [
 					(pi) => {
 						pi.on("session_before_compact", async (event) => {
-							if (firstPreparation) {
-								firstPreparation = false;
+							if (pauseNextPreparation) {
+								pauseNextPreparation = false;
 								markPreparationStarted();
 								await preparationReleased;
 							}
@@ -730,6 +730,9 @@ describe("AgentSession compaction characterization", () => {
 				async () => {
 					await harness.session[queue](clearedTexts[0], images);
 					await harness.session[queue](clearedTexts[1]);
+					// Seed/pre-prompt compaction must finish without waiting for this
+					// test's release. Arm the pause only after the target input is queued.
+					pauseNextPreparation = true;
 					// A completed assistant turn selects either queue before preparation.
 					return fauxAssistantMessage(`large-response:${"x".repeat(10_000)}`);
 				},
@@ -744,6 +747,8 @@ describe("AgentSession compaction characterization", () => {
 			let clearedMessages: AgentMessage[] = [];
 			try {
 				await preparationStarted;
+				expect(harness.faux.state.callCount).toBe(2);
+				expect(enqueue).toHaveBeenCalledTimes(2);
 				expect(harness.session.agent.hasQueuedMessages()).toBe(true);
 				await harness.session[queue](clearedTexts[2]);
 				clearedMessages = enqueue.mock.calls.map(([message]) => message);
