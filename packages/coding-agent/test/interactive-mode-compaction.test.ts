@@ -106,7 +106,7 @@ describe("InteractiveMode compaction events", () => {
 		);
 	});
 
-	test("renders retained entries and appends the latest summary cost at the bottom", async () => {
+	test.each([false, true])("renders a successful compaction and flushes its queue (willRetry: %s)", async (willRetry) => {
 		const usage: Usage = {
 			input: 10,
 			output: 20,
@@ -169,14 +169,14 @@ describe("InteractiveMode compaction events", () => {
 
 		await handleEvent.call(fakeThis, {
 			type: "compaction_end",
-			reason: "manual",
+			reason: willRetry ? "overflow" : "manual",
 			result: {
 				tokensBefore: 123,
 				summary: "summary",
 				usage,
 			},
 			aborted: false,
-			willRetry: false,
+			willRetry,
 		});
 
 		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
@@ -194,7 +194,59 @@ describe("InteractiveMode compaction events", () => {
 			kind: "compaction",
 			usage,
 		});
-		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry });
+	});
+
+	test.each([
+		{ reason: "manual" as const, aborted: false },
+		{ reason: "manual" as const, aborted: true },
+		{ reason: "threshold" as const, aborted: true },
+		{ reason: "overflow" as const, aborted: false },
+	])("retains exact queued input after $reason compaction (aborted: $aborted)", async ({ reason, aborted }) => {
+		const queued = [
+			{ text: "  original steering\n", mode: "steer" },
+			{ text: "original follow-up", mode: "followUp" },
+		];
+		const before = structuredClone(queued);
+		const fakeThis = {
+			isInitialized: true,
+			compactionQueuedMessages: queued,
+			footer: { invalidate: vi.fn() },
+			autoCompactionEscapeHandler: undefined,
+			autoCompactionLoader: undefined,
+			defaultEditor: {},
+			statusContainer: { clear: vi.fn() },
+			clearStatusIndicator: vi.fn(),
+			showError: vi.fn(),
+			showStatus: vi.fn(),
+			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
+			settingsManager: { getShowTerminalProgress: () => false },
+			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+		};
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+			this: typeof fakeThis,
+			event: {
+				type: "compaction_end";
+				reason: "manual" | "threshold" | "overflow";
+				result: undefined;
+				aborted: boolean;
+				willRetry: boolean;
+				errorMessage?: string;
+			},
+		) => Promise<void>;
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason,
+			result: undefined,
+			aborted,
+			willRetry: false,
+			errorMessage: aborted ? undefined : "synthetic compaction failure",
+		});
+
+		expect(fakeThis.flushCompactionQueue).not.toHaveBeenCalled();
+		expect(fakeThis.compactionQueuedMessages).toBe(queued);
+		expect(queued).toEqual(before);
 	});
 
 	test("updates the working state when the same agent run resumes after compaction", async () => {

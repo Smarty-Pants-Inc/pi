@@ -3443,7 +3443,10 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new Text(theme.fg("error", event.errorMessage), 1, 0));
 					}
 				}
-				void this.flushCompactionQueue({ willRetry: event.willRetry });
+				// Failed or cancelled compaction must not submit queued work or restart compaction.
+				if (event.result && !event.aborted) {
+					void this.flushCompactionQueue({ willRetry: event.willRetry });
+				}
 				this.ui.requestRender();
 				break;
 			}

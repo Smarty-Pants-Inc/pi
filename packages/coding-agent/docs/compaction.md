@@ -108,6 +108,20 @@ For split turns, Pi generates two summaries and merges them:
 1. **History summary**: Previous context (if any)
 2. **Turn prefix summary**: The early part of the split turn
 
+### Failures, Cancellation, and Deadline
+
+Manual and automatic session compaction have a **20-minute total deadline**, starting before compaction authentication and extension preparation. History and turn-prefix summaries, retries, and retry backoff share that deadline. It is not reset when a request completes or a retry starts. Expiry reports a compaction failure; explicit cancellation reports an aborted compaction. Late summary results cannot append a checkpoint.
+
+Built-in compaction allows **one transient retry across both summaries**, using the existing retry classifier and a two-second backoff. Non-retryable failures and cancellation are not retried. Ordinary agent and branch-summary requests still use `settings.retry`; changing that setting does not change compaction's allowance.
+
+Why 20 minutes: a split compaction can require two serial summary requests. The default allows two ten-minute SDK request windows in total, with retries using the remaining time rather than adding more windows. Ten minutes is the existing OpenAI SDK request-timeout precedent, not a measured bound for every provider. The normal history-summary output allowance remains 13,107 tokens with the default reserve, and reasoning effort is unchanged. This limit bounds an operation that could otherwise wait indefinitely; it does not guarantee that every model or long history can finish within it.
+
+If compaction fails or is cancelled before a new prompt, `prompt()` rejects without appending or sending that prompt. The processed text and attachments stay in the existing steering queue, or the follow-up queue when requested. `preflightResult` receives `false`. Recover the queued input before resubmitting it to avoid duplicates. A failed between-turn compaction also stops continuation rather than sending unchanged oversized context.
+
+Interactive input queued during compaction is only submitted after a successful, non-aborted result. Failure and cancellation leave its text and steering/follow-up modes unchanged. These queues are in memory, not durable storage; process loss can still lose them.
+
+The deadline aborts requests and stops Pi's waits. It cannot force an extension or provider that ignores its signal to stop remote work; their late promises remain observed, but their results do not restart compaction or publish a summary.
+
 ### Cut Point Rules
 
 Valid cut points are:
