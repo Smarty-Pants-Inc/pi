@@ -544,12 +544,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images);
+				await session.steer(command.message, command.images, { source: "rpc" });
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images);
+				await session.followUp(command.message, command.images, { source: "rpc" });
 				return success(id, "follow_up");
 			}
 
@@ -1066,7 +1066,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested || session.isStreaming) return;
+		if (!shutdownRequested || !session.isIdle) return;
 		await shutdown();
 	}
 
@@ -1177,7 +1177,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 		const command = parsed as RpcCommand;
 
-		if (isStartupInput) {
+		// Once bound, incoming commands may unblock pending startup work.
+		// Startup byte/count limits above still apply until that work settles.
+		if (!extensionBindingsComplete) {
 			startupCommands.push(command);
 			return;
 		}

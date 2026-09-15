@@ -1,19 +1,20 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, type Harness } from "../harness.ts";
 
 /**
  * Regression for #6647: compaction runs a single non-retried summarization call, so a
  * transient mid-stream socket death (`terminated`) failed the whole compaction.
- * Verifies that summarization now reuses `settings.retry` (bounded retries with
- * exponential backoff gated on isRetryableAssistantError), emits
- * `summarization_retry_*` events, and that aborts / non-retryable errors are not retried.
+ * Compaction retains transient retry through the existing classifier/backoff,
+ * but now has one operation-wide retry independent of ordinary settings.retry.
+ * Aborts and non-retryable errors remain terminal.
  */
 describe("#6647 compaction retries transient summarization failures", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
+		vi.useRealTimers();
 		while (harnesses.length > 0) {
 			harnesses.pop()?.cleanup();
 		}
@@ -94,18 +95,19 @@ describe("#6647 compaction retries transient summarization failures", () => {
 			...fauxAssistantMessage("recovered summary"),
 			usage: createUsage(10),
 		};
-		const getCallCount = useScriptedStreamFn(harness, [error("terminated"), error("terminated"), success]);
-
-		const result = await harness.session.compact();
+		const getCallCount = useScriptedStreamFn(harness, [error("terminated"), success]);
+		vi.useFakeTimers();
+		const compaction = harness.session.compact();
+		await vi.advanceTimersByTimeAsync(2000);
+		const result = await compaction;
 
 		expect(result.summary).toContain("recovered summary");
-		expect(getCallCount()).toBe(3); // 1 initial + 2 retries
+		expect(getCallCount()).toBe(2); // 1 initial + 1 compaction retry
 		const starts = harness.eventsOfType("summarization_retry_scheduled");
 		const ends = harness.eventsOfType("summarization_retry_finished");
-		expect(starts).toHaveLength(2);
+		expect(starts).toHaveLength(1);
 		expect(ends).toHaveLength(1);
-		expect(starts[0]).toMatchObject({ attempt: 1, maxAttempts: 3, errorMessage: "terminated" });
-		expect(starts[1]).toMatchObject({ attempt: 2, maxAttempts: 3 });
+		expect(starts[0]).toMatchObject({ attempt: 1, maxAttempts: 1, delayMs: 2000, errorMessage: "terminated" });
 		expect(ends[0]).toMatchObject({ type: "summarization_retry_finished" });
 		// model.* referenced to keep imports honest
 		expect(model.id).toBeTruthy();
@@ -128,7 +130,7 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		expect(harness.eventsOfType("summarization_retry_scheduled")).toHaveLength(0);
 	});
 
-	it("does not retry when retry is disabled", async () => {
+	it("keeps compaction retry independent of disabled ordinary retries", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
@@ -139,13 +141,15 @@ describe("#6647 compaction retries transient summarization failures", () => {
 			usage: createUsage(10),
 		};
 		const getCallCount = useScriptedStreamFn(harness, [error]);
-
-		await expect(harness.session.compact()).rejects.toThrow("terminated");
-		expect(getCallCount()).toBe(1);
-		expect(harness.eventsOfType("summarization_retry_scheduled")).toHaveLength(0);
+		vi.useFakeTimers();
+		const failure = expect(harness.session.compact()).rejects.toThrow("terminated");
+		await vi.advanceTimersByTimeAsync(2000);
+		await failure;
+		expect(getCallCount()).toBe(2);
+		expect(harness.eventsOfType("summarization_retry_scheduled")).toHaveLength(1);
 	});
 
-	it("stops retrying after maxRetries and reports failure", async () => {
+	it("stops after the compaction allowance rather than the ordinary maxRetries", async () => {
 		const harness = await createHarness({ withConfiguredAuth: false });
 		harnesses.push(harness);
 		seedCompactableSession(harness);
@@ -157,13 +161,67 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		};
 		const getCallCount = useScriptedStreamFn(harness, [error, error, error]);
 
-		await expect(harness.session.compact()).rejects.toThrow("terminated");
-		expect(getCallCount()).toBe(3); // 1 initial + 2 retries
+		vi.useFakeTimers();
+		const failure = expect(harness.session.compact()).rejects.toThrow("terminated");
+		await vi.advanceTimersByTimeAsync(2000);
+		await failure;
+		expect(getCallCount()).toBe(2);
 		const starts = harness.eventsOfType("summarization_retry_scheduled");
 		const ends = harness.eventsOfType("summarization_retry_finished");
-		expect(starts).toHaveLength(2);
+		expect(starts).toHaveLength(1);
 		expect(ends).toHaveLength(1);
 		expect(ends[0]).toMatchObject({ type: "summarization_retry_finished" });
+	});
+
+	it("shares its single retry between history and turn-prefix summaries", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.sessionManager.appendMessage({ role: "user", content: "split turn", timestamp: Date.now() });
+		harness.sessionManager.appendMessage(fauxAssistantMessage("retained assistant response"));
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		const error = fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" });
+		harness.setResponses([
+			error,
+			fauxAssistantMessage("history summary"),
+			error,
+			fauxAssistantMessage("must not retry prefix"),
+		]);
+		vi.useFakeTimers();
+		const failure = expect(harness.session.compact()).rejects.toThrow("terminated");
+		await vi.advanceTimersByTimeAsync(2000);
+		await failure;
+		expect(harness.faux.state.callCount).toBe(3);
+		expect(harness.getPendingResponseCount()).toBe(1);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+		expect(harness.eventsOfType("summarization_retry_scheduled")).toHaveLength(1);
+	});
+
+	it("leaves ordinary agent retries under settings.retry", async () => {
+		const harness = await createHarness({
+			settings: {
+				compaction: { enabled: false },
+				retry: { enabled: true, maxRetries: 2, baseDelayMs: 0 },
+			},
+		});
+		harnesses.push(harness);
+		const error = fauxAssistantMessage("", { stopReason: "error", errorMessage: "terminated" });
+		harness.setResponses([error, error, fauxAssistantMessage("ordinary retry succeeded")]);
+		await harness.session.prompt("ordinary prompt");
+		expect(harness.faux.state.callCount).toBe(3);
+		expect(harness.session.getLastAssistantText()).toBe("ordinary retry succeeded");
+		expect(harness.eventsOfType("auto_retry_start")).toHaveLength(2);
+	});
+
+	it("does not persist a provider-aborted summary", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		seedCompactableSession(harness);
+		harness.setResponses([fauxAssistantMessage("incomplete summary", { stopReason: "aborted" })]);
+		await expect(harness.session.compact()).rejects.toThrow("Compaction cancelled");
+		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ aborted: true });
 	});
 
 	it("aborts an in-flight retry backoff via abortCompaction", async () => {
