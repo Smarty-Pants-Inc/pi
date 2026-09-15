@@ -760,28 +760,51 @@ describe("experimental durable server composition", () => {
 
 		const activeWatches = new Set<string>();
 		const removedWatches: string[] = [];
-		function trackWatch<T>(name: string, state: ReplicatedState<T>): void {
-			const subscribe = state.subscribe.bind(state);
-			const watch = vi.spyOn(state, "subscribe").mockImplementation((listener) => {
-				activeWatches.add(name);
-				const unsubscribe = subscribe(listener);
-				return () => {
-					activeWatches.delete(name);
-					removedWatches.push(name);
-					unsubscribe();
-				};
-			});
-			onTestFinished(() => watch.mockRestore());
+		function trackWatch<T>(name: string, state: ReplicatedState<T>): ReplicatedState<T> {
+			return {
+				get value() {
+					return state.value;
+				},
+				subscribe(listener) {
+					const unsubscribe = state.subscribe(listener);
+					activeWatches.add(name);
+					return () => {
+						unsubscribe();
+						activeWatches.delete(name);
+						removedWatches.push(name);
+					};
+				},
+			};
 		}
 		const realActivate = activateBuiltinClientServices;
 		const activate = vi
 			.spyOn(clientRuntimeModule, "activateBuiltinClientServices")
 			.mockImplementation(async (server) => {
 				const activated = await realActivate(server);
-				trackWatch("transcript", activated.transcript.state);
-				trackWatch("connection", activated.server.connection);
-				trackWatch("attachment", activated.session.attachment);
-				return activated;
+				return {
+					...activated,
+					transcript: { state: trackWatch("transcript", activated.transcript.state) },
+					server: {
+						connection: trackWatch("connection", activated.server.connection),
+						get acceptsUnavailableServices() {
+							return activated.server.acceptsUnavailableServices;
+						},
+						catalogue: activated.server.catalogue.bind(activated.server),
+						open: activated.server.open.bind(activated.server),
+						dispose: activated.server.dispose.bind(activated.server),
+					},
+					session: {
+						attachment: trackWatch("attachment", activated.session.attachment),
+						get acceptsUnavailableServices() {
+							return activated.session.acceptsUnavailableServices;
+						},
+						catalogue: activated.session.catalogue.bind(activated.session),
+						open: activated.session.open.bind(activated.session),
+						whenAttached: activated.session.whenAttached.bind(activated.session),
+						whenDetached: activated.session.whenDetached.bind(activated.session),
+						dispose: activated.session.dispose.bind(activated.session),
+					},
+				};
 			});
 		onTestFinished(() => activate.mockRestore());
 		let receiveResponse!: (response: AgentOperationResponse) => void;
@@ -831,19 +854,24 @@ describe("experimental durable server composition", () => {
 				},
 			},
 		);
-		void prompting.then(
+		const promptSettled = prompting.then(
 			() => {
 				finished = true;
+				throw new Error("Client returned before worker-loss barriers completed");
 			},
-			() => {
+			(error: unknown) => {
 				finished = true;
+				throw error;
 			},
 		);
 		let workerKilled = false;
 		try {
-			const response = await responseReceived;
+			const response = await Promise.race([responseReceived, promptSettled]);
 			expect(response).toMatchObject({ accepted: true, error: null, operationId: expect.any(String) });
-			expect(await publication.held(BACKGROUND_CONTEXT)).toEqual({ type: "run_end", runId: response.operationId });
+			expect(await Promise.race([publication.held(BACKGROUND_CONTEXT), promptSettled])).toEqual({
+				type: "run_end",
+				runId: response.operationId,
+			});
 			expect(finished).toBe(false);
 			expect([...activeWatches].sort()).toEqual(["attachment", "connection", "transcript"]);
 			expect(removedWatches).toEqual([]);
