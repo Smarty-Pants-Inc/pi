@@ -89,7 +89,7 @@ describe("AgentSession retry and event characterization", () => {
 				expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error", errorMessage });
 				expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 				expect(harness.session.isRetrying).toBe(false);
-				expect(harness.session.hasPendingMessages).toBe(false);
+				expect(harness.session.pendingMessageCount).toBe(0);
 			});
 
 			it.each([
