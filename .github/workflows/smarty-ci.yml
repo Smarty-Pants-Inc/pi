@@ -353,7 +353,7 @@ jobs:
         npm run build:offline
         git diff --exit-code HEAD --
         PI_JOB
-    - name: agent-first
+    - name: interactive-compaction
       timeout-minutes: 5
       run: |
         set -o pipefail
@@ -366,26 +366,26 @@ jobs:
           NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
-          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/agent-first.log"
-        cd packages/agent
-        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/agent.test.ts test/agent-loop.test.ts
-        PI_JOB
-    - name: compaction-first
-      timeout-minutes: 5
-      run: |
-        set -o pipefail
-        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
-          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
-          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
-          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
-          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
-          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
-          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
-          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
-          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
-          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/compaction-first.log"
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/interactive-compaction.log"
         cd packages/coding-agent
-        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/suite/agent-session-compaction.test.ts test/suite/regressions/pre-prompt-compaction-no-continue.test.ts
+        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/interactive-mode-compaction.test.ts
+        PI_JOB
+    - name: rpc-prompt-semantics
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/rpc-prompt-semantics.log"
+        cd packages/coding-agent
+        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/rpc-prompt-response-semantics.test.ts test/rpc-startup-extension-ui.test.ts
         PI_JOB
     - name: Retain complete or partial stage with modes
       if: always()
