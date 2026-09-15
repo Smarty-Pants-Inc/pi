@@ -211,8 +211,10 @@ describe("InteractiveMode compaction events", () => {
 			{ text: "original follow-up", mode: "followUp" },
 		];
 		const before = structuredClone(queued);
+		initTheme("dark");
 		const fakeThis = {
 			isInitialized: true,
+			chatContainer: new Container(),
 			compactionQueuedMessages: queued,
 			footer: { invalidate: vi.fn() },
 			autoCompactionEscapeHandler: undefined,
@@ -250,6 +252,9 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.flushCompactionQueue).not.toHaveBeenCalled();
 		expect(fakeThis.compactionQueuedMessages).toBe(queued);
 		expect(queued).toEqual(before);
+		if (reason === "overflow" && !aborted) {
+			expect(stripAnsi(fakeThis.chatContainer.render(120).join("\n"))).toContain("synthetic compaction failure");
+		}
 	});
 
 	test("updates the working state when the same agent run resumes after compaction", async () => {

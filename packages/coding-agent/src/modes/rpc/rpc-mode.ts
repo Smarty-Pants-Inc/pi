@@ -1177,7 +1177,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 		const command = parsed as RpcCommand;
 
-		if (isStartupInput) {
+		// Once bound, incoming commands may unblock pending startup work.
+		// Startup byte/count limits above still apply until that work settles.
+		if (!extensionBindingsComplete) {
 			startupCommands.push(command);
 			return;
 		}

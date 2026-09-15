@@ -421,6 +421,10 @@ describe("RPC prompt response semantics", () => {
 	it.each(["compaction", "tree"] as const)(
 		"defers extension-requested shutdown until non-streaming %s work completes",
 		async (work) => {
+			let releaseStartup = () => {};
+			const startupReleased = new Promise<void>((resolve) => {
+				releaseStartup = resolve;
+			});
 			let workStarted = false;
 			let releaseWork = () => {};
 			const workReleased = new Promise<void>((resolve) => {
@@ -437,6 +441,7 @@ describe("RPC prompt response semantics", () => {
 				responseDelayMs: 0,
 				extensionFactories: [
 					(pi) => {
+						pi.on("session_start", () => startupReleased);
 						pi.on("session_before_compact", async (event) => {
 							workStarted = true;
 							await workReleased;
@@ -487,6 +492,8 @@ describe("RPC prompt response semantics", () => {
 							: { id: "held-work", type: "prompt", message: "/tree-work" },
 					),
 				);
+				// Dispatch the held operation from the startup backlog, not an already-idle RPC loop.
+				releaseStartup();
 				await vi.waitFor(() => expect(workStarted).toBe(true));
 				expect(session.isStreaming).toBe(false);
 				expect(session.isCompacting).toBe(true);
@@ -503,6 +510,7 @@ describe("RPC prompt response semantics", () => {
 				releaseWork();
 				await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
 				expect(order).toEqual(["work response", "dispose", "exit"]);
+				expect(getPromptResponses(rpcIo.outputLines, "shutdown-held-work")).toHaveLength(1);
 				expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
 				expect(session.isIdle).toBe(true);
 				expect(sessionManager.getEntries()).toContainEqual(
@@ -512,6 +520,7 @@ describe("RPC prompt response semantics", () => {
 					}),
 				);
 			} finally {
+				releaseStartup();
 				releaseWork();
 				await session.abort();
 				await sleep(0);
