@@ -223,7 +223,7 @@ jobs:
         if-no-files-found: error
         retention-days: 7
   emergency-compaction:
-    name: Pi emergency compaction regressions
+    name: Pi capacity complete affected files diagnostic
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -238,6 +238,8 @@ jobs:
         assert os.environ['GITHUB_REPOSITORY']=='Smarty-Pants-Inc/pi'
         for key in ('EXPECTED_SOURCE','EXPECTED_TREE'):
             assert re.fullmatch('[0-9a-f]{40}',os.environ[key]),key
+        assert os.environ['EXPECTED_SOURCE']=='e9ff868ae6cb659ed5ef0d9b238383a49902ddd2'
+        assert os.environ['EXPECTED_TREE']=='df0cb1b8e4dc807286371f8be9384cddd010bff1'
         PY
       timeout-minutes: 2
     - name: Checkout exact qualification source
@@ -273,13 +275,17 @@ jobs:
         os_release=pathlib.Path('/etc/os-release').read_text()
         assert 'VERSION_ID="24.04"' in os_release and 'ID=ubuntu' in os_release
         record={k:os.environ.get(k) for k in ('EXPECTED_SOURCE','EXPECTED_TREE','DEFINITION_SHA','GITHUB_REPOSITORY','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','GITHUB_SHA','GITHUB_WORKFLOW_REF','RUNNER_NAME','RUNNER_OS','RUNNER_ARCH')}
+        record['workspace']=str(pathlib.Path.cwd())
+        record['node']=subprocess.check_output(['node','--version'],text=True).strip()
+        assert record['node']=='v22.23.2'
         record['actual_tree']=actual_tree
         record['os_release']=os_release
-        record['scope']='Fast faux regressions only; not full smarty-ci, packaging, landing, Bun, affected-session or activation acceptance'
+        record['scope']='Both complete capacity retry files only; not full smarty-ci, PR11 remote-runtime, packaging, landing or activation acceptance'
         pathlib.Path(os.environ['RUNNER_TEMP'],'pi-emergency/evidence/identity.json').write_text(json.dumps(record,indent=2)+'\n')
         PY
         { node --version; npm --version; git --version; uname -a; id; getconf _NPROCESSORS_ONLN; free -b; df -k .; } > "$RUNNER_TEMP/pi-emergency/evidence/tools-and-host.txt"
         sha256sum "$(command -v node)" package-lock.json package.json > "$RUNNER_TEMP/pi-emergency/evidence/input-sha256.txt"
+        sha256sum package-lock.json package.json packages/coding-agent/src/experimental/client.ts packages/coding-agent/test/experimental-remote-runtime.test.ts packages/coding-agent/test/fixtures/faux-session-worker.ts packages/coding-agent/vitest.config.ts vitest.base.ts packages/coding-agent/package.json packages/ai/package.json packages/ai/scripts/generate-models.ts packages/ai/src/utils/retry.ts packages/ai/test/retry.test.ts packages/coding-agent/test/suite/agent-session-retry-events.test.ts packages/ai/vitest.config.ts packages/coding-agent/test/suite/harness.ts packages/ai/src/providers/faux.ts packages/coding-agent/src/core/agent-session.ts > "$RUNNER_TEMP/pi-emergency/evidence/source-controls-before.sha256"
         test ! -L .local
         mkdir -p .local
         python3 - <<'PY'
@@ -336,6 +342,7 @@ jobs:
         find "$EVIDENCE_DIR/model-data" -type f -print0 | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/model-data-sha256.txt"
         PI_JOB
     - name: fast-build
+      id: capacity_build
       timeout-minutes: 5
       run: |
         set -o pipefail
@@ -352,7 +359,7 @@ jobs:
         npm run build:offline
         git diff --exit-code HEAD --
         PI_JOB
-    - name: agent-first
+    - name: ai-retry
       timeout-minutes: 5
       run: |
         set -o pipefail
@@ -365,11 +372,12 @@ jobs:
           NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
-          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/agent-first.log"
-        cd packages/agent
-        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/agent.test.ts test/agent-loop.test.ts
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/ai-retry.log"
+        cd packages/ai
+        node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run --maxWorkers=1 --no-file-parallelism --reporter=dot --reporter=github-actions --reporter=json --outputFile.json="$EVIDENCE_DIR/ai-retry.json" test/retry.test.ts
         PI_JOB
-    - name: compaction-first
+    - name: agent-session-retry-events
+      if: ${{ !cancelled() && steps.capacity_build.outcome == 'success' }}
       timeout-minutes: 5
       run: |
         set -o pipefail
@@ -382,9 +390,9 @@ jobs:
           NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
-          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/compaction-first.log"
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/agent-session-retry-events.log"
         cd packages/coding-agent
-        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/suite/agent-session-compaction.test.ts test/suite/regressions/pre-prompt-compaction-no-continue.test.ts
+        node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run --maxWorkers=1 --no-file-parallelism --reporter=dot --reporter=github-actions --reporter=json --outputFile.json="$EVIDENCE_DIR/agent-session-retry-events.json" test/suite/agent-session-retry-events.test.ts
         PI_JOB
     - name: Retain complete or partial stage with modes
       if: always()
@@ -399,6 +407,7 @@ jobs:
         fi
         if git rev-parse --is-inside-work-tree; then
           git diff --binary HEAD -- > "$evidence/after-job-source.diff"
+          sha256sum package-lock.json package.json packages/coding-agent/src/experimental/client.ts packages/coding-agent/test/experimental-remote-runtime.test.ts packages/coding-agent/test/fixtures/faux-session-worker.ts packages/coding-agent/vitest.config.ts vitest.base.ts packages/coding-agent/package.json packages/ai/package.json packages/ai/scripts/generate-models.ts packages/ai/src/utils/retry.ts packages/ai/test/retry.test.ts packages/coding-agent/test/suite/agent-session-retry-events.test.ts packages/ai/vitest.config.ts packages/coding-agent/test/suite/harness.ts packages/ai/src/providers/faux.ts packages/coding-agent/src/core/agent-session.ts > "$evidence/source-controls-after.sha256"
         fi
         df -k . "$evidence" > "$evidence/final-disk.txt"
     - name: Upload actual evidence even after failure
@@ -406,7 +415,7 @@ jobs:
       timeout-minutes: 5
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
-        name: pi-compaction-${{ github.run_id }}-${{ github.run_attempt }}
+        name: pi-capacity-focused-${{ github.run_id }}-${{ github.run_attempt }}
         path: ${{ runner.temp }}/pi-emergency/evidence
         include-hidden-files: true
         if-no-files-found: error
