@@ -25,7 +25,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText } from "@earendil-works/pi-ai";
+import { contentText, retryDelayMs, type RetryPolicy } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -48,6 +48,7 @@ import {
 	streamSimple,
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { stripFrontmatter } from "../utils/frontmatter.ts";
 import { sleep } from "../utils/sleep.ts";
 import { normalizeToolResultImages } from "../utils/tool-result-images.ts";
@@ -182,7 +183,6 @@ export type AgentSessionEvent =
 			reason: "manual" | "threshold" | "overflow";
 	  }
 	| { type: "summarization_retry_finished" }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "bash_execution_update"; id?: string; delta: string };
 
 /** Listener function for agent session events */
@@ -300,9 +300,20 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 	return tokens;
 }
 
-// ============================================================================
-// Constants
-// ============================================================================
+// A split compaction has two serial summaries. Allow two existing 10-minute
+// SDK request windows in total, including retries and backoff, not per attempt.
+const COMPACTION_TIMEOUT_MS = 20 * 60_000;
+const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, baseDelayMs: 2000 };
+
+// Boolean values retain the continuation decision; failures must not look like
+// a skipped check or successful compaction with nothing queued.
+type CompactionOutcome = boolean | "failed" | "aborted";
+
+function startCompactionDeadline(controller: AbortController): ReturnType<typeof setTimeout> {
+	return setTimeout(() => {
+		controller.abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
+	}, COMPACTION_TIMEOUT_MS);
+}
 
 // ============================================================================
 // AgentSession Class
@@ -336,6 +347,7 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	private _stopAfterCompactionFailure = false;
 	private _overflowRecoveryAttempted = false;
 
 	// Branch summarization state
@@ -544,7 +556,7 @@ export class AgentSession {
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings();
+		const settings = this.settingsManager.getCompactionSettings(model);
 
 		if (
 			!model ||
@@ -554,7 +566,14 @@ export class AgentSession {
 			return context;
 		}
 
-		await this._runAutoCompaction("threshold", false);
+		const outcome = await this._runAutoCompaction("threshold", false);
+		if (outcome === "failed" || outcome === "aborted") {
+			// Stop this run rather than sending unchanged oversized context or
+			// turning a compaction timeout into an ordinary agent retry.
+			this._stopAfterCompactionFailure = true;
+			this.agent.abort();
+			throw new Error(`Compaction ${outcome} before the next assistant turn`);
+		}
 		return {
 			...context,
 			messages: this.agent.state.messages.slice(),
@@ -604,9 +623,18 @@ export class AgentSession {
 		});
 	}
 
-	private async _emitSessionCompactFailed(event: Omit<SessionCompactFailedEvent, "type">): Promise<void> {
+	private async _emitSessionCompactFailed(
+		event: Omit<SessionCompactFailedEvent, "type">,
+		signal?: AbortSignal,
+	): Promise<void> {
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
-			await this._extensionRunner.emit({ type: "session_compact_failed", ...event });
+			try {
+				await raceWithAbortSignal(this._extensionRunner.emit({ type: "session_compact_failed", ...event }), signal);
+			} catch (error) {
+				// A terminal notification cannot extend an expired compaction or
+				// replace its failed/aborted outcome. Its promise stays observed.
+				if (!signal?.aborted) throw error;
+			}
 		}
 	}
 
@@ -620,7 +648,7 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
-		if (this._isAgentRunActive || !this._resolveIdleWait) {
+		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
 		const resolve = this._resolveIdleWait;
@@ -926,9 +954,9 @@ export class AgentSession {
 		return this._isAgentRunActive;
 	}
 
-	/** Whether the session has no active agent run, retry, auto-compaction, or queued continuation. */
+	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive;
+		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
 	/** Current effective system prompt (includes any per-turn extension modifications) */
@@ -1144,6 +1172,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		this._stopAfterCompactionFailure = false;
 		this._isAgentRunActive = true;
 		try {
 			await this.agent.prompt(messages);
@@ -1161,6 +1190,10 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
+		if (this._stopAfterCompactionFailure) {
+			this._stopAfterCompactionFailure = false;
+			return false;
+		}
 		if (!msg) {
 			return false;
 		}
@@ -1179,13 +1212,33 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		if (await this._checkCompaction(msg)) {
-			return true;
-		}
+		const compaction = await this._checkCompaction(msg);
+		if (compaction === "failed" || compaction === "aborted") return false;
+		if (compaction) return true;
 
 		// The agent loop drains both queues before emitting agent_end. Any messages
 		// here were queued by agent_end extension handlers and need a continuation.
 		return this.agent.hasQueuedMessages();
+	}
+
+	private async _runInputHandlers(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: InputSource,
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+		if (!this._extensionRunner.hasHandlers("input")) {
+			return { text, images };
+		}
+
+		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		if (inputResult.action === "handled") {
+			return undefined;
+		}
+		if (inputResult.action === "transform") {
+			return { text: inputResult.text, images: inputResult.images ?? images };
+		}
+		return { text, images };
 	}
 
 	/**
@@ -1214,31 +1267,27 @@ export class AgentSession {
 				}
 			}
 
-			if (this._compactionAbortController !== undefined) {
+			if (
+				this._compactionAbortController !== undefined ||
+				(this._autoCompactionAbortController !== undefined && !this.isStreaming)
+			) {
 				throw new Error(
 					"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
 				);
 			}
 
 			// Emit input event for extension interception (before skill/template expansion)
-			let currentText = text;
-			let currentImages = options?.images;
-			if (this._extensionRunner.hasHandlers("input")) {
-				const inputResult = await this._extensionRunner.emitInput(
-					currentText,
-					currentImages,
-					options?.source ?? "interactive",
-					this.isStreaming ? options?.streamingBehavior : undefined,
-				);
-				if (inputResult.action === "handled") {
-					preflightResult?.(true);
-					return;
-				}
-				if (inputResult.action === "transform") {
-					currentText = inputResult.text;
-					currentImages = inputResult.images ?? currentImages;
-				}
+			const processedInput = await this._runInputHandlers(
+				text,
+				options?.images,
+				options?.source ?? "interactive",
+				this.isStreaming ? options?.streamingBehavior : undefined,
+			);
+			if (!processedInput) {
+				preflightResult?.(true);
+				return;
 			}
+			const { text: currentText, images: currentImages } = processedInput;
 
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
@@ -1291,7 +1340,19 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
+				const outcome = await this._checkCompaction(lastAssistant, false);
+				if (outcome === "failed" || outcome === "aborted") {
+					// Input handlers and expansion already ran. Retain that exact input
+					// in the existing queue, including attachments, without starting a run.
+					const behavior = options?.streamingBehavior ?? "steer";
+					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
+					else await this._queueSteer(expandedText, currentImages);
+					throw new Error(
+						`Prompt not sent: compaction ${outcome === "aborted" ? "was cancelled" : "failed"}. ` +
+							`Input is retained in the ${behavior} queue. ` +
+							"Compact successfully or recover the queued input before resubmitting.",
+					);
+				}
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -1417,25 +1478,45 @@ export class AgentSession {
 		}
 	}
 
+	private async _queueUserInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		behavior: "steer" | "followUp",
+		source: InputSource,
+	): Promise<void> {
+		if (text.startsWith("/")) {
+			this._throwIfExtensionCommand(text);
+		}
+
+		const processedInput = await this._runInputHandlers(
+			text,
+			images,
+			source,
+			this.isStreaming ? behavior : undefined,
+		);
+		if (!processedInput) return;
+
+		let expandedText = this._expandSkillCommand(processedInput.text);
+		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+
+		if (behavior === "steer") {
+			await this._queueSteer(expandedText, processedInput.images);
+		} else {
+			await this._queueFollowUp(expandedText, processedInput.images);
+		}
+	}
+
 	/**
 	 * Queue a steering message while the agent is running.
 	 * Delivered after the current assistant turn finishes executing its tool calls,
 	 * before the next LLM call.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
+	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
-		}
-
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		await this._queueSteer(expandedText, images);
+	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
+		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
 	}
 
 	/**
@@ -1443,19 +1524,11 @@ export class AgentSession {
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
+	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[]): Promise<void> {
-		// Check for extension commands (cannot be queued)
-		if (text.startsWith("/")) {
-			this._throwIfExtensionCommand(text);
-		}
-
-		// Expand skill commands and prompt templates
-		let expandedText = this._expandSkillCommand(text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-
-		await this._queueFollowUp(expandedText, images);
+	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
+		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
 	}
 
 	/**
@@ -1660,6 +1733,8 @@ export class AgentSession {
 	 */
 	async abort(): Promise<void> {
 		this.abortRetry();
+		this.abortCompaction();
+		this.abortBranchSummary();
 		this.agent.abort();
 		await this.waitForIdle();
 	}
@@ -1947,20 +2022,35 @@ export class AgentSession {
 		env: Record<string, string> | undefined,
 		reason: "manual" | "threshold" | "overflow",
 	): Promise<CompactionResult> {
-		return compact(
-			preparation,
-			requestModel,
-			apiKey,
-			headers,
-			customInstructions,
-			signal,
-			this.thinkingLevel,
-			this.agent.streamFunction,
-			env,
-			this.settingsManager.getRetrySettings(),
-			this._summarizationRetryCallbacks({ source: "compaction", reason }),
-			undefined, // sessionId
-		);
+		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
+		try {
+			return await raceWithAbortSignal(
+				compact(
+					preparation,
+					requestModel,
+					apiKey,
+					headers,
+					customInstructions,
+					signal,
+					this.thinkingLevel,
+					this.agent.streamFunction,
+					env,
+					COMPACTION_RETRY_POLICY,
+					callbacks,
+					undefined, // sessionId
+				),
+				signal,
+			);
+		} finally {
+			// Also clear a retry indicator when abort wins over an uncooperative
+			// provider. The callback is idempotent and does not restart work.
+			await callbacks.onRetryFinished?.(false, 0);
+		}
+	}
+
+	private _clearManualCompactionState(controller: AbortController): void {
+		if (this._compactionAbortController === controller) this._compactionAbortController = undefined;
+		this._resolveIdleWaitIfIdle();
 	}
 
 	/**
@@ -1980,19 +2070,26 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
-		this._compactionAbortController = new AbortController();
-		this._emit({ type: "compaction_start", reason: "manual" });
+		const controller = new AbortController();
+		this._compactionAbortController = controller;
+		const signal = controller.signal;
+		const timeout = startCompactionDeadline(controller);
 		let fromExtension = false;
 
 		try {
-			if (!this.model) {
+			this._emit({ type: "compaction_start", reason: "manual" });
+			const model = this.model;
+			if (!model) {
 				throw new Error(formatNoModelSelectedMessage());
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			const settings = this.settingsManager.getCompactionSettings(model);
+			const { model: requestModel, apiKey, headers, env } = await raceWithAbortSignal(
+				this._getSummarizationRequestAuth(model),
+				signal,
+			);
 
 			const pathEntries = this.sessionManager.getBranch();
-			const settings = this.settingsManager.getCompactionSettings();
 
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
@@ -2007,15 +2104,18 @@ export class AgentSession {
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				const result = (await this._extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: pathEntries,
-					customInstructions,
-					reason: "manual",
-					willRetry: false,
-					signal: this._compactionAbortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
+				const result = (await raceWithAbortSignal(
+					this._extensionRunner.emit({
+						type: "session_before_compact",
+						preparation,
+						branchEntries: pathEntries,
+						customInstructions,
+						reason: "manual",
+						willRetry: false,
+						signal,
+					}),
+					signal,
+				)) as SessionBeforeCompactResult | undefined;
 
 				if (result?.cancel) {
 					throw new Error("Compaction cancelled");
@@ -2048,7 +2148,7 @@ export class AgentSession {
 					apiKey,
 					headers,
 					customInstructions,
-					this._compactionAbortController.signal,
+					signal,
 					env,
 					"manual",
 				);
@@ -2059,9 +2159,7 @@ export class AgentSession {
 				details = result.details;
 			}
 
-			if (this._compactionAbortController.signal.aborted) {
-				throw new Error("Compaction cancelled");
-			}
+			signal.throwIfAborted();
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
@@ -2075,13 +2173,16 @@ export class AgentSession {
 				| undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				await this._extensionRunner.emit({
-					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
-					fromExtension,
-					reason: "manual",
-					willRetry: false,
-				});
+				await raceWithAbortSignal(
+					this._extensionRunner.emit({
+						type: "session_compact",
+						compactionEntry: savedCompactionEntry,
+						fromExtension,
+						reason: "manual",
+						willRetry: false,
+					}),
+					signal,
+				);
 			}
 
 			const compactionResult: CompactionResult = {
@@ -2093,7 +2194,8 @@ export class AgentSession {
 				details,
 			};
 			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
-			this._compactionAbortController = undefined;
+			clearTimeout(timeout);
+			this._clearManualCompactionState(controller);
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
@@ -2106,7 +2208,7 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
-			this._compactionAbortController = undefined;
+			this._clearManualCompactionState(controller);
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
@@ -2115,16 +2217,14 @@ export class AgentSession {
 				willRetry: false,
 				errorMessage,
 			});
-			await this._emitSessionCompactFailed({
-				reason: "manual",
-				errorMessage,
-				aborted,
-				willRetry: false,
-				fromExtension,
-			});
-			throw error;
+			await this._emitSessionCompactFailed(
+				{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
+				signal,
+			);
+			throw aborted ? new Error("Compaction cancelled", { cause: error }) : error;
 		} finally {
-			this._compactionAbortController = undefined;
+			clearTimeout(timeout);
+			this._clearManualCompactionState(controller);
 		}
 	}
 
@@ -2162,10 +2262,10 @@ export class AgentSession {
 	 *
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
-	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
+	 * @returns A continuation decision, or an explicit failed/aborted outcome that blocks a pending prompt.
 	 */
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings();
+	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<CompactionOutcome> {
+		const settings = this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
@@ -2223,7 +2323,7 @@ export class AgentSession {
 					willRetry: false,
 					fromExtension: false,
 				});
-				return false;
+				return "failed";
 			}
 
 			// Case 1: remove the failed or truncated message from agent state, compact, and
@@ -2278,19 +2378,28 @@ export class AgentSession {
 	 *
 	 * @param reason Automatic trigger selected by `_checkCompaction()`
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
-	 * @returns Whether the post-run loop should call `agent.continue()`
+	 * @returns A continuation decision, or an explicit failed/aborted outcome.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
-		const settings = this.settingsManager.getCompactionSettings();
+	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<CompactionOutcome> {
+		const model = this.model;
+		const settings = this.settingsManager.getCompactionSettings(model);
+		if (this.isCompacting) return "failed";
+		const controller = new AbortController();
+		this._autoCompactionAbortController = controller;
+		const signal = controller.signal;
+		const timeout = startCompactionDeadline(controller);
 		let started = false;
 		let fromExtension = false;
 
 		try {
-			if (!this.model) {
+			if (!model) {
 				return false;
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model);
+			const { model: requestModel, apiKey, headers, env } = await raceWithAbortSignal(
+				this._getSummarizationRequestAuth(model),
+				signal,
+			);
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2299,38 +2408,28 @@ export class AgentSession {
 				return false;
 			}
 
-			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
+			signal.throwIfAborted();
 			started = true;
+			this._emit({ type: "compaction_start", reason });
 
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				const extensionResult = (await this._extensionRunner.emit({
-					type: "session_before_compact",
-					preparation,
-					branchEntries: pathEntries,
-					customInstructions: undefined,
-					reason,
-					willRetry,
-					signal: this._autoCompactionAbortController.signal,
-				})) as SessionBeforeCompactResult | undefined;
+				const extensionResult = (await raceWithAbortSignal(
+					this._extensionRunner.emit({
+						type: "session_before_compact",
+						preparation,
+						branchEntries: pathEntries,
+						customInstructions: undefined,
+						reason,
+						willRetry,
+						signal,
+					}),
+					signal,
+				)) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
-					this._emit({
-						type: "compaction_end",
-						reason,
-						result: undefined,
-						aborted: true,
-						willRetry: false,
-					});
-					await this._emitSessionCompactFailed({
-						reason,
-						aborted: true,
-						willRetry: false,
-						fromExtension: false,
-					});
-					return false;
+					throw new Error("Compaction cancelled");
 				}
 
 				if (extensionResult?.compaction) {
@@ -2360,7 +2459,7 @@ export class AgentSession {
 					apiKey,
 					headers,
 					undefined,
-					this._autoCompactionAbortController.signal,
+					signal,
 					env,
 					reason,
 				);
@@ -2371,22 +2470,7 @@ export class AgentSession {
 				details = compactResult.details;
 			}
 
-			if (this._autoCompactionAbortController.signal.aborted) {
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: true,
-					willRetry: false,
-				});
-				await this._emitSessionCompactFailed({
-					reason,
-					aborted: true,
-					willRetry: false,
-					fromExtension,
-				});
-				return false;
-			}
+			signal.throwIfAborted();
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
 			const newEntries = this.sessionManager.getEntries();
@@ -2400,13 +2484,16 @@ export class AgentSession {
 				| undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				await this._extensionRunner.emit({
-					type: "session_compact",
-					compactionEntry: savedCompactionEntry,
-					fromExtension,
-					reason,
-					willRetry,
-				});
+				await raceWithAbortSignal(
+					this._extensionRunner.emit({
+						type: "session_compact",
+						compactionEntry: savedCompactionEntry,
+						fromExtension,
+						reason,
+						willRetry,
+					}),
+					signal,
+				);
 			}
 
 			const result: CompactionResult = {
@@ -2417,6 +2504,8 @@ export class AgentSession {
 				usage,
 				details,
 			};
+			clearTimeout(timeout);
+			if (this._autoCompactionAbortController === controller) this._autoCompactionAbortController = undefined;
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
 
 			if (willRetry) {
@@ -2436,31 +2525,25 @@ export class AgentSession {
 			// Continue once so queued messages are delivered.
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
-			const errorMessage = error instanceof Error ? error.message : "compaction failed";
-			if (started) {
-				const formattedErrorMessage =
-					reason === "overflow"
-						? `Context overflow recovery failed: ${errorMessage}`
-						: `Auto-compaction failed: ${errorMessage}`;
-				this._emit({
-					type: "compaction_end",
-					reason,
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage: formattedErrorMessage,
-				});
-				await this._emitSessionCompactFailed({
-					reason,
-					errorMessage: formattedErrorMessage,
-					aborted: false,
-					willRetry: false,
-					fromExtension,
-				});
+			const message = error instanceof Error ? error.message : "compaction failed";
+			const aborted = message === "Compaction cancelled" || (error instanceof Error && error.name === "AbortError");
+			const errorMessage = aborted
+				? undefined
+				: reason === "overflow"
+					? `Context overflow recovery failed: ${message}`
+					: `Auto-compaction failed: ${message}`;
+			if (started || signal.aborted) {
+				this._emit({ type: "compaction_end", reason, result: undefined, aborted, willRetry: false, errorMessage });
+				await this._emitSessionCompactFailed(
+					{ reason, errorMessage, aborted, willRetry: false, fromExtension },
+					signal,
+				);
 			}
-			return false;
+			return aborted ? "aborted" : "failed";
 		} finally {
-			this._autoCompactionAbortController = undefined;
+			clearTimeout(timeout);
+			if (this._autoCompactionAbortController === controller) this._autoCompactionAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 
@@ -2891,16 +2974,17 @@ export class AgentSession {
 	}
 
 	/**
-	 * Retry policy + callbacks shared by compaction and branch-summary summarization calls.
-	 * Uses the same `settings.retry` budget/backoff as agent-turn retries so a single transient
-	 * stream drop no longer fails the whole operation. `source` carries the context
-	 * the TUI needs to render the retry and recreate the underlying indicator.
+	 * Retry notifications shared by compaction and branch summaries. Their policies
+	 * are separate: compaction has an operation-wide retry allowance, while branch
+	 * summaries retain settings.retry. `source` selects the TUI indicator.
 	 */
 	private _summarizationRetryCallbacks(
 		source: { source: "branchSummary" } | { source: "compaction"; reason: "manual" | "threshold" | "overflow" },
 	): RetryCallbacks {
+		let retrying = false;
 		return {
 			onRetryScheduled: (attempt, maxAttempts, delayMs, errorMessage) => {
+				retrying = true;
 				this._emit({
 					type: "summarization_retry_scheduled",
 					attempt,
@@ -2916,6 +3000,8 @@ export class AgentSession {
 				});
 			},
 			onRetryFinished: () => {
+				if (!retrying) return;
+				retrying = false;
 				this._emit({ type: "summarization_retry_finished" });
 			},
 		};
@@ -2939,7 +3025,7 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		const delayMs = retryDelayMs(settings, this._retryAttempt);
 
 		this._emit({
 			type: "auto_retry_start",
@@ -3151,6 +3237,11 @@ export class AgentSession {
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
+		if (this.isCompacting) {
+			throw new Error(
+				"Wait for the current compaction or tree navigation to finish before navigating the session tree.",
+			);
+		}
 
 		const oldLeafId = this.sessionManager.getLeafId();
 
@@ -3333,6 +3424,7 @@ export class AgentSession {
 			return { editorText, cancelled: false, summaryEntry };
 		} finally {
 			this._branchSummaryAbortController = undefined;
+			this._resolveIdleWaitIfIdle();
 		}
 	}
 

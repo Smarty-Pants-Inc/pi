@@ -101,17 +101,26 @@ export async function runAgentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	const newMessages: AgentMessage[] = [...prompts];
+	const hadPrompts = prompts.length > 0;
+	const newMessages: AgentMessage[] = [];
 	const currentContext: AgentContext = {
 		...context,
-		messages: [...context.messages, ...prompts],
+		messages: [...context.messages],
 	};
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
+	// continue() can pass a queue reservation. Iterate the live array after
+	// each awaited event; clear may invalidate the remaining prompts.
 	for (const prompt of prompts) {
 		await emit({ type: "message_start", message: prompt });
 		await emit({ type: "message_end", message: prompt });
+		currentContext.messages.push(prompt);
+		newMessages.push(prompt);
+	}
+	if (hadPrompts && newMessages.length === 0) {
+		await emit({ type: "agent_end", messages: newMessages });
+		return newMessages;
 	}
 
 	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
@@ -166,11 +175,10 @@ async function runLoop(
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let hasMoreToolCalls = true;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
-		let hasMoreToolCalls = true;
-
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0) {
 			if (lastCompletedTurn) {
@@ -194,19 +202,25 @@ async function runLoop(
 				if (pendingMessages.length === 0) {
 					pendingMessages = (await config.getSteeringMessages?.()) || [];
 				}
+				if (!hasMoreToolCalls && pendingMessages.length === 0) break;
 				await emit({ type: "turn_start" });
 			}
 
-			// Process pending messages (inject before next assistant response)
+			// Iterate the live reservation before each message_start. Clearing it
+			// during preparation or an awaited event invalidates undelivered input.
+			let injectedMessages = false;
 			if (pendingMessages.length > 0) {
 				for (const message of pendingMessages) {
 					await emit({ type: "message_start", message });
 					await emit({ type: "message_end", message });
 					currentContext.messages.push(message);
 					newMessages.push(message);
+					injectedMessages = true;
 				}
 				pendingMessages = [];
 			}
+			// An awaited turn_start listener can clear the last reason to continue.
+			if (!hasMoreToolCalls && !injectedMessages) break;
 
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
@@ -518,6 +532,15 @@ async function executeToolCallsParallel(
 		}
 
 		finalizedCalls.push(async () => {
+			if (signal?.aborted) {
+				const finalized = {
+					toolCall,
+					result: createErrorToolResult("Operation aborted"),
+					isError: true,
+				} satisfies FinalizedToolCallOutcome;
+				await emitToolExecutionEnd(finalized, emit);
+				return finalized;
+			}
 			const executed = await executePreparedToolCall(preparation, signal, emit);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,

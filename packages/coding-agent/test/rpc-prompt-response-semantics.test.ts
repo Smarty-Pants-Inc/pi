@@ -197,9 +197,7 @@ async function createRuntimeHost(options: {
 		},
 		cleanup: async () => {
 			try {
-				if (session.isStreaming) {
-					await session.abort();
-				}
+				await session.abort();
 			} catch {
 				// ignore test cleanup failures
 			}
@@ -382,6 +380,146 @@ describe("RPC prompt response semantics", () => {
 			await cleanup();
 		}
 	});
+
+	it("reports RPC input provenance for steering and follow-up commands", async () => {
+		const inputs: Array<{ text: string; source: string }> = [];
+		const { lineHandler, session, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						inputs.push({ text: event.text, source: event.source });
+					});
+				},
+			],
+		});
+
+		try {
+			for (const type of ["steer", "follow_up"] as const) {
+				lineHandler(JSON.stringify({ id: type, type, message: `${type} input` }));
+				await vi.waitFor(() => {
+					expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
+						id: type,
+						type: "response",
+						command: type,
+						success: true,
+					});
+				});
+			}
+			expect(inputs).toEqual([
+				{ text: "steer input", source: "rpc" },
+				{ text: "follow_up input", source: "rpc" },
+			]);
+			expect(session.getSteeringMessages()).toEqual(["steer input"]);
+			expect(session.getFollowUpMessages()).toEqual(["follow_up input"]);
+		} finally {
+			await cleanup();
+		}
+	});
+
+	it.each(["compaction", "tree"] as const)(
+		"defers extension-requested shutdown until non-streaming %s work completes",
+		async (work) => {
+			let workStarted = false;
+			let releaseWork = () => {};
+			const workReleased = new Promise<void>((resolve) => {
+				releaseWork = resolve;
+			});
+			let targetId = "";
+			const order: string[] = [];
+			const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+				order.push("exit");
+				return undefined;
+			}) as never);
+			const { lineHandler, runtimeHost, session, sessionManager, cleanup } = await startRpcMode({
+				withAuth: true,
+				responseDelayMs: 0,
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", async (event) => {
+							workStarted = true;
+							await workReleased;
+							return {
+								compaction: {
+									summary: "completed compaction",
+									firstKeptEntryId: event.preparation.firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							};
+						});
+						pi.on("session_before_tree", async () => {
+							workStarted = true;
+							await workReleased;
+							return { summary: { summary: "completed tree summary" } };
+						});
+						pi.registerCommand("tree-work", {
+							handler: async (_args, ctx) => {
+								await ctx.navigateTree(targetId, { summarize: true });
+							},
+						});
+						pi.registerCommand("shutdown", {
+							handler: async (_args, ctx) => ctx.shutdown(),
+						});
+					},
+				],
+			});
+			session.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+			targetId = sessionManager.appendMessage({ role: "user", content: "history", timestamp: Date.now() });
+			sessionManager.appendMessage(createAssistantMessage("prior answer"));
+			session.agent.state.messages = sessionManager.buildSessionContext().messages;
+			vi.mocked(runtimeHost.dispose).mockImplementation(async () => {
+				expect(session.isIdle).toBe(true);
+				order.push("dispose");
+			});
+			rpcIo.onOutputLine = (line) => {
+				const record = JSON.parse(line) as Record<string, unknown>;
+				if (record.type === "response" && record.id === "held-work" && record.success === true) {
+					order.push("work response");
+				}
+			};
+
+			try {
+				lineHandler(
+					JSON.stringify(
+						work === "compaction"
+							? { id: "held-work", type: "compact" }
+							: { id: "held-work", type: "prompt", message: "/tree-work" },
+					),
+				);
+				await vi.waitFor(() => expect(workStarted).toBe(true));
+				expect(session.isStreaming).toBe(false);
+				expect(session.isCompacting).toBe(true);
+				expect(session.isIdle).toBe(false);
+
+				lineHandler(JSON.stringify({ id: "shutdown-held-work", type: "prompt", message: "/shutdown" }));
+				await vi.waitFor(() => {
+					expect(getPromptResponses(rpcIo.outputLines, "shutdown-held-work")).toMatchObject([{ success: true }]);
+				});
+				await sleep(0);
+				expect(exit).not.toHaveBeenCalled();
+				expect(runtimeHost.dispose).not.toHaveBeenCalled();
+
+				releaseWork();
+				await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+				expect(order).toEqual(["work response", "dispose", "exit"]);
+				expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
+				expect(session.isIdle).toBe(true);
+				expect(sessionManager.getEntries()).toContainEqual(
+					expect.objectContaining({
+						type: work === "compaction" ? "compaction" : "branch_summary",
+						summary: work === "compaction" ? "completed compaction" : "completed tree summary",
+					}),
+				);
+			} finally {
+				releaseWork();
+				await session.abort();
+				await sleep(0);
+				await cleanup();
+				exit.mockRestore();
+			}
+		},
+	);
 
 	it("emits one success response when prompt preflight succeeds", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });

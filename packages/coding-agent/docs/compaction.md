@@ -2,12 +2,12 @@
 
 LLMs have limited context windows. When conversations grow too long, Pi uses compaction to summarize older content while preserving recent work. This page covers both auto-compaction and branch summarization.
 
-**Source files** ([pi-mono](https://github.com/earendil-works/pi-mono)):
-- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
-- [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
-- [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
-- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
-- [`packages/coding-agent/src/core/extensions/types.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts) - Extension event types
+**Source files** ([pi](https://github.com/earendil-works/pi)):
+- [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
+- [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
+- [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
+- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
+- [`packages/coding-agent/src/core/extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) - Extension event types
 
 For TypeScript definitions in your project, inspect `node_modules/@earendil-works/pi-coding-agent/dist/`.
 
@@ -108,6 +108,20 @@ For split turns, Pi generates two summaries and merges them:
 1. **History summary**: Previous context (if any)
 2. **Turn prefix summary**: The early part of the split turn
 
+### Failures, Cancellation, and Deadline
+
+Manual and automatic session compaction have a **20-minute total deadline**, starting before compaction authentication and extension preparation. History and turn-prefix summaries, retries, and retry backoff share that deadline. It is not reset when a request completes or a retry starts. Expiry reports a compaction failure; explicit cancellation reports an aborted compaction. Late summary results cannot append a checkpoint.
+
+Built-in compaction allows **one transient retry across both summaries**, using the existing retry classifier and a two-second backoff. Non-retryable failures and cancellation are not retried. Ordinary agent and branch-summary requests still use `settings.retry`; changing that setting does not change compaction's allowance.
+
+Why 20 minutes: a split compaction can require two serial summary requests. The default allows two ten-minute SDK request windows in total, with retries using the remaining time rather than adding more windows. Ten minutes is the existing OpenAI SDK request-timeout precedent, not a measured bound for every provider. The normal history-summary output allowance remains 13,107 tokens with the default reserve, and reasoning effort is unchanged. This limit bounds an operation that could otherwise wait indefinitely; it does not guarantee that every model or long history can finish within it.
+
+If compaction fails or is cancelled before a new prompt, `prompt()` rejects without appending or sending that prompt. The processed text and attachments stay in the existing steering queue, or the follow-up queue when requested. `preflightResult` receives `false`. Recover the queued input before resubmitting it to avoid duplicates. A failed between-turn compaction also stops continuation rather than sending unchanged oversized context.
+
+Interactive input queued during compaction is only submitted after a successful, non-aborted result. Failure and cancellation leave its text and steering/follow-up modes unchanged. These queues are in memory, not durable storage; process loss can still lose them.
+
+The deadline aborts requests and stops Pi's waits. It cannot force an extension or provider that ignores its signal to stop remote work; their late promises remain observed, but their results do not restart compaction or publish a summary.
+
 ### Cut Point Rules
 
 Valid cut points are:
@@ -120,7 +134,7 @@ Never cut at tool results (they must stay with their tool call).
 
 ### CompactionEntry Structure
 
-Defined in [`session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts):
+Defined in [`session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts):
 
 ```typescript
 interface CompactionEntry<T = unknown> {
@@ -145,7 +159,7 @@ interface CompactionDetails {
 
 Extensions can store any JSON-serializable data in `details`. The default compaction tracks file operations, but custom extension implementations can use their own structure. Generated and extension-provided summaries store their LLM `usage` when available so session totals include summarization work.
 
-See [`prepareCompaction()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage }`.
+See [`prepareCompaction()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) and [`compact()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) for the implementation. For direct programmatic summarization, `generateSummary()` returns the summary text and `generateSummaryWithUsage()` returns `{ text, usage }`.
 
 ## Branch Summarization
 
@@ -188,7 +202,7 @@ This means file tracking accumulates across multiple compactions or nested branc
 
 ### BranchSummaryEntry Structure
 
-Defined in [`session-manager.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts):
+Defined in [`session-manager.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/session-manager.ts):
 
 ```typescript
 interface BranchSummaryEntry<T = unknown> {
@@ -212,7 +226,7 @@ interface BranchSummaryDetails {
 
 Same as compaction, extensions can store custom data in `details`.
 
-See [`collectEntriesForBranchSummary()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), [`prepareBranchEntries()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), and [`generateBranchSummary()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) for the implementation.
+See [`collectEntriesForBranchSummary()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), [`prepareBranchEntries()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), and [`generateBranchSummary()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) for the implementation.
 
 ## Summary Format
 
@@ -256,7 +270,7 @@ path/to/changed.ts
 
 ### Message Serialization
 
-Before summarization, messages are serialized to text via [`serializeConversation()`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts):
+Before summarization, messages are serialized to text via [`serializeConversation()`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/utils.ts):
 
 ```
 [User]: What they said
@@ -272,7 +286,7 @@ Tool results are truncated to 2000 characters during serialization. Content beyo
 
 ## Custom Summarization via Extensions
 
-Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](https://github.com/earendil-works/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts) for event type definitions.
+Extensions can intercept and customize both compaction and branch summarization. See [`extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) for event type definitions.
 
 ### session_before_compact
 
@@ -288,7 +302,7 @@ pi.on("session_before_compact", async (event, ctx) => {
   // preparation.fileOps - extracted file operations
   // preparation.tokensBefore - context tokens before compaction
   // preparation.firstKeptEntryId - where kept messages start
-  // preparation.settings - compaction settings
+  // preparation.settings - effective settings after applying model overrides
 
   // branchEntries - all entries on current branch (for custom state)
   // reason - "manual" (/compact), "threshold", or "overflow"
@@ -416,3 +430,29 @@ Configure compaction in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settin
 | `keepRecentTokens` | `20000` | Recent tokens to keep (not summarized) |
 
 Disable auto-compaction with `"enabled": false`. You can still compact manually with `/compact`.
+
+### Per-model overrides
+
+Use `compaction.modelOverrides` to tune token budgets for different models:
+
+```json
+{
+  "compaction": {
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000,
+    "modelOverrides": {
+      "some-provider/big-model": {
+        "reserveTokens": 400000
+      }
+    }
+  }
+}
+```
+
+For a model with a 1M context window, this override triggers compaction above 600K tokens and keeps the ordinary 20000 recent tokens. Other models retain the ordinary 16384-token reserve. `reserveTokens` also influences summarization output limits, capped by the model's maximum output tokens; it is not solely a trigger threshold.
+
+Keys are exact, case-sensitive `provider/modelId` values, including any slashes within the model ID. Each `reserveTokens` and `keepRecentTokens` value falls back independently from the model override to the ordinary setting to the built-in default. Values must be non-negative safe integers. Invalid values in the matching model override produce an error when read; only omitted fields fall back to the ordinary setting. Model override entries must be objects. Invalid ordinary token settings produce an error when read, even if the active model has a valid override. Only omitted ordinary values use built-in defaults. `enabled` remains global, not model-specific.
+
+These resolved values are used for manual compaction, all automatic threshold checks, overflow recovery, and extension-visible `preparation.settings`. Model switches affect subsequent checks and compactions without changing ordinary settings. Compaction already in progress uses the model and settings captured for that operation. Branch summarization settings are unaffected.
+
+Overrides work in both global and project settings. The files merge recursively before lookup, so a global model-specific value beats a project-wide fallback; a project must override that model entry to change it. See [settings.md](settings.md#per-model-compaction-overrides) for details.

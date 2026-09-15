@@ -124,6 +124,8 @@ export interface AgentOptions {
 
 class PendingMessageQueue {
 	private messages: AgentMessage[] = [];
+	private reserved = 0;
+	private selected: AgentMessage[] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -138,23 +140,34 @@ class PendingMessageQueue {
 		return this.messages.length > 0;
 	}
 
-	drain(): AgentMessage[] {
-		if (this.mode === "all") {
-			const drained = this.messages.slice();
-			this.messages = [];
-			return drained;
-		}
+	reserve(): AgentMessage[] {
+		// The loop can fail preparation after taking a batch. Keep the original
+		// messages here until message_start, including their images and order.
+		const end = this.mode === "all" ? this.messages.length : Math.min(this.reserved + 1, this.messages.length);
+		// ponytail: Selection is serial per queue. Keep the exact returned array
+		// so clear can invalidate its iterator. Concurrent selectors would need
+		// separate reservations.
+		this.selected = this.messages.slice(this.reserved, end);
+		this.reserved = end;
+		return this.selected;
+	}
 
-		const first = this.messages[0];
-		if (!first) {
-			return [];
+	consume(message: AgentMessage): void {
+		const index = this.messages.indexOf(message);
+		if (index >= 0 && index < this.reserved) {
+			this.messages.splice(index, 1);
+			this.reserved--;
 		}
-		this.messages = this.messages.slice(1);
-		return [first];
+	}
+
+	release(): void {
+		this.selected.length = 0;
+		this.reserved = 0;
 	}
 
 	clear(): void {
 		this.messages = [];
+		this.release();
 	}
 }
 
@@ -369,13 +382,13 @@ export class Agent {
 		}
 
 		if (lastMessage.role === "assistant") {
-			const queuedSteering = this.steeringQueue.drain();
+			const queuedSteering = this.steeringQueue.reserve();
 			if (queuedSteering.length > 0) {
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
-			const queuedFollowUps = this.followUpQueue.drain();
+			const queuedFollowUps = this.followUpQueue.reserve();
 			if (queuedFollowUps.length > 0) {
 				await this.runPromptMessages(queuedFollowUps);
 				return;
@@ -477,9 +490,9 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.drain();
+				return this.steeringQueue.reserve();
 			},
-			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getFollowUpMessages: async () => this.followUpQueue.reserve(),
 		};
 	}
 
@@ -527,6 +540,10 @@ export class Agent {
 	}
 
 	private finishRun(): void {
+		// No message_start means no ownership transfer. A later prompt or
+		// continuation can take the exact unseen batch before newer input.
+		this.steeringQueue.release();
+		this.followUpQueue.release();
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -544,6 +561,8 @@ export class Agent {
 	private async processEvents(event: AgentEvent): Promise<void> {
 		switch (event.type) {
 			case "message_start":
+				this.steeringQueue.consume(event.message);
+				this.followUpQueue.consume(event.message);
 				this._state.streamingMessage = event.message;
 				break;
 
