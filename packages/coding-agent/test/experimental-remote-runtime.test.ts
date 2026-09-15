@@ -1,18 +1,20 @@
 import { lstat, mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Context, createFacetHost, defineFacet, defineService } from "@earendil-works/chord";
+import { type Context, createFacetHost, defineFacet, defineService, type ReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { LaneWatchEvent } from "@earendil-works/pi-agent-core";
 import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { ExampleFacetService } from "../examples/plugins/pi-example-plugin/src/contract.ts";
 import { runClient } from "../src/experimental/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "../src/experimental/client-runtime.ts";
+import * as clientRuntimeModule from "../src/experimental/client-runtime.ts";
 import { createPresentationFacetLoaders } from "../src/experimental/plugins/bundled.ts";
 import * as processRuntime from "../src/experimental/process.ts";
 import { type RunningServer, startServer } from "../src/experimental/server.ts";
-import { AgentController } from "../src/experimental/services/agent-controller.ts";
+import { AgentController, type AgentOperationResponse } from "../src/experimental/services/agent-controller.ts";
 import { createSessionServiceSource, type SessionAttachmentState } from "../src/experimental/services/connection.ts";
 import { Models } from "../src/experimental/services/models.ts";
 import { PresentationPlugins, SessionPlugins } from "../src/experimental/services/plugins.ts";
@@ -24,6 +26,7 @@ import {
 	createExperimentalSessions,
 	readExperimentalSessionState,
 } from "./experimental-session-support.ts";
+import { TerminalPublication } from "./fixtures/faux-session-worker.ts";
 import { KeyedProbe } from "./fixtures/keyed-service.ts";
 
 const servers = new Set<RunningServer>();
@@ -624,6 +627,275 @@ describe("experimental durable server composition", () => {
 				"run_end",
 			]),
 		);
+	});
+
+	// PR #11: the operation response must not dispose a still-publishing Transcript.
+	for (const outcome of ["completed", "deferred", "disconnect"] as const) {
+		test(`joins the prompt response with terminal publication (${outcome})`, async ({ onTestFinished }) => {
+			const spawn = vi
+				.spyOn(processRuntime, "spawnInternalProcess")
+				.mockImplementation((role, args, options) =>
+					realSpawnInternalProcess(
+						role,
+						args,
+						role === "session-worker" ? { ...options, entryUrl: fauxWorkerEntryUrl } : options,
+					),
+				);
+			onTestFinished(() => spawn.mockRestore());
+			const { directory, runtime } = await makeServer();
+			const controlClient = await attachClient(runtime, "demo-1");
+			const services = createSessionServiceBinding(controlClient, { services: [TerminalPublication] });
+			await services.ready(BACKGROUND_CONTEXT);
+			const publication = services.use(TerminalPublication);
+			await publication.hold(outcome === "deferred", BACKGROUND_CONTEXT);
+
+			let receiveResponse!: (response: AgentOperationResponse) => void;
+			const responseReceived = new Promise<AgentOperationResponse>((resolve) => {
+				receiveResponse = resolve;
+			});
+			let promptClient: Client | undefined;
+			const realRequest = Client.prototype.request;
+			const request = vi
+				.spyOn(Client.prototype, "request")
+				.mockImplementation(async function (this: Client, target, call, signal) {
+					const result = await realRequest.call(this, target, call, signal);
+					if (call.serviceId === AgentController.id && call.member === "prompt") {
+						promptClient = this;
+						receiveResponse(result as AgentOperationResponse);
+					}
+					return result;
+				});
+			onTestFinished(() => request.mockRestore());
+			let releaseCallback!: () => void;
+			const callbackGate = new Promise<void>((resolve) => {
+				releaseCallback = resolve;
+			});
+			let enterCallback!: () => void;
+			const callbackEntered = new Promise<void>((resolve) => {
+				enterCallback = resolve;
+			});
+			const events: LaneWatchEvent[] = [];
+			let finished = false;
+			const prompting = runClient(
+				{ command: "client", sessionId: "demo-1", prompt: "question" },
+				{
+					directory,
+					async onEvent(event) {
+						events.push(event);
+						if (event.type === "run_end" || event.type === "run_suspend") {
+							enterCallback();
+							await callbackGate;
+						}
+					},
+				},
+			);
+			void prompting.then(
+				() => {
+					finished = true;
+				},
+				() => {
+					finished = true;
+				},
+			);
+			try {
+				const response = await responseReceived;
+				expect(response).toMatchObject({ accepted: true, error: null, operationId: expect.any(String) });
+				const terminal = await publication.held(BACKGROUND_CONTEXT);
+				expect(terminal).toEqual({
+					type: outcome === "deferred" ? "run_suspend" : "run_end",
+					runId: response.operationId,
+				});
+				expect(events.filter((event) => event.type === "run_end" || event.type === "run_suspend")).toEqual([]);
+				expect(finished).toBe(false);
+				if (outcome === "disconnect") {
+					if (promptClient === undefined) throw new Error("Prompt client was not captured");
+					promptClient.disconnect("terminal publication disconnected");
+					await expect(prompting).rejects.toThrow("terminal publication disconnected");
+					expect(finished).toBe(true);
+				} else {
+					await publication.release(BACKGROUND_CONTEXT);
+					await Promise.race([
+						callbackEntered,
+						prompting.then(() => {
+							throw new Error("Client returned before terminal callback delivery");
+						}),
+					]);
+					expect(finished).toBe(false);
+					releaseCallback();
+					await expect(prompting).resolves.toMatchObject({
+						kind: "prompted",
+						text: outcome === "deferred" ? "" : "deterministic remote answer",
+					});
+					expect(events.filter((event) => event.type === "run_end" || event.type === "run_suspend")).toEqual([
+						expect.objectContaining(terminal),
+					]);
+				}
+			} finally {
+				releaseCallback();
+				await publication.release(BACKGROUND_CONTEXT);
+				await prompting.catch(() => {});
+				await services.dispose(BACKGROUND_CONTEXT);
+			}
+		});
+	}
+
+	// PR #11: worker loss releases the Session attachment, not the public connection.
+	test("rejects held terminal publication after internal worker loss and removes its watches", async ({ onTestFinished }) => {
+		const spawn = vi
+			.spyOn(processRuntime, "spawnInternalProcess")
+			.mockImplementation((role, args, options) =>
+				realSpawnInternalProcess(
+					role,
+					args,
+					role === "session-worker" ? { ...options, entryUrl: fauxWorkerEntryUrl } : options,
+				),
+			);
+		onTestFinished(() => spawn.mockRestore());
+		const { directory, runtime } = await makeServer();
+		const controlClient = await attachClient(runtime, "demo-1");
+		const services = createSessionServiceBinding(controlClient, { services: [TerminalPublication] });
+		await services.ready(BACKGROUND_CONTEXT);
+		const publication = services.use(TerminalPublication);
+		await publication.hold(false, BACKGROUND_CONTEXT);
+
+		const activeWatches = new Set<string>();
+		const removedWatches: string[] = [];
+		function trackWatch<T>(name: string, state: ReplicatedState<T>): void {
+			const subscribe = state.subscribe.bind(state);
+			const watch = vi.spyOn(state, "subscribe").mockImplementation((listener) => {
+				activeWatches.add(name);
+				const unsubscribe = subscribe(listener);
+				return () => {
+					activeWatches.delete(name);
+					removedWatches.push(name);
+					unsubscribe();
+				};
+			});
+			onTestFinished(() => watch.mockRestore());
+		}
+		const realActivate = activateBuiltinClientServices;
+		const activate = vi
+			.spyOn(clientRuntimeModule, "activateBuiltinClientServices")
+			.mockImplementation(async (server) => {
+				const activated = await realActivate(server);
+				trackWatch("transcript", activated.transcript.state);
+				trackWatch("connection", activated.server.connection);
+				trackWatch("attachment", activated.session.attachment);
+				return activated;
+			});
+		onTestFinished(() => activate.mockRestore());
+		let receiveResponse!: (response: AgentOperationResponse) => void;
+		const responseReceived = new Promise<AgentOperationResponse>((resolve) => {
+			receiveResponse = resolve;
+		});
+		let promptClient: Client | undefined;
+		const realRequest = Client.prototype.request;
+		const request = vi
+			.spyOn(Client.prototype, "request")
+			.mockImplementation(async function (this: Client, target, call, signal) {
+				const result = await realRequest.call(this, target, call, signal);
+				if (call.serviceId === AgentController.id && call.member === "prompt") {
+					promptClient = this;
+					receiveResponse(result as AgentOperationResponse);
+				}
+				return result;
+			});
+		onTestFinished(() => request.mockRestore());
+		const disposalStates: {
+			connected: boolean;
+			attachment: Client["attachment"];
+			active: string[];
+			removed: string[];
+		}[] = [];
+		const realDispose = Client.prototype.dispose;
+		const dispose = vi.spyOn(Client.prototype, "dispose").mockImplementation(function (this: Client) {
+			if (this === promptClient) {
+				disposalStates.push({
+					connected: this.connected,
+					attachment: this.attachment,
+					active: [...activeWatches],
+					removed: [...removedWatches].sort(),
+				});
+			}
+			return realDispose.call(this);
+		});
+		onTestFinished(() => dispose.mockRestore());
+		const events: LaneWatchEvent[] = [];
+		let finished = false;
+		const prompting = runClient(
+			{ command: "client", sessionId: "demo-1", prompt: "question" },
+			{
+				directory,
+				onEvent: (event) => {
+					events.push(event);
+				},
+			},
+		);
+		void prompting.then(
+			() => {
+				finished = true;
+			},
+			() => {
+				finished = true;
+			},
+		);
+		let workerKilled = false;
+		try {
+			const response = await responseReceived;
+			expect(response).toMatchObject({ accepted: true, error: null, operationId: expect.any(String) });
+			expect(await publication.held(BACKGROUND_CONTEXT)).toEqual({ type: "run_end", runId: response.operationId });
+			expect(finished).toBe(false);
+			expect([...activeWatches].sort()).toEqual(["attachment", "connection", "transcript"]);
+			expect(removedWatches).toEqual([]);
+			expect(promptClient?.connected).toBe(true);
+			const workerPid = runtime.workerPids.get("demo-1");
+			if (workerPid === undefined) throw new Error("Session worker was not captured");
+			process.kill(workerPid, "SIGKILL");
+			workerKilled = true;
+			await expect(prompting).rejects.toThrow("Session demo-1 attachment lost while waiting for terminal publication");
+			expect(finished).toBe(true);
+			expect(disposalStates).toEqual([
+				{
+					connected: true,
+					attachment: undefined,
+					active: [],
+					removed: ["attachment", "connection", "transcript"],
+				},
+			]);
+			expect(controlClient.connected).toBe(true);
+			expect(events.filter((event) => event.type === "run_end" || event.type === "run_suspend")).toEqual([]);
+		} finally {
+			if (!workerKilled) await publication.release(BACKGROUND_CONTEXT);
+			await prompting.catch(() => {});
+			await services.dispose(BACKGROUND_CONTEXT);
+		}
+	});
+
+	test("rejects prompt admission without waiting for a terminal event", async ({ onTestFinished }) => {
+		const spawn = vi
+			.spyOn(processRuntime, "spawnInternalProcess")
+			.mockImplementation((role, args, options) =>
+				realSpawnInternalProcess(
+					role,
+					args,
+					role === "session-worker" ? { ...options, entryUrl: fauxWorkerEntryUrl } : options,
+				),
+			);
+		onTestFinished(() => spawn.mockRestore());
+		const { directory } = await makeServer();
+		const events: string[] = [];
+		await expect(
+			runClient(
+				{ command: "client", sessionId: "demo-1", prompt: "" },
+				{
+					directory,
+					onEvent: (event) => {
+						events.push(event.type);
+					},
+				},
+			),
+		).rejects.toThrow("Acceptance must append at least one message");
+		expect(events).toEqual([]);
 	});
 
 	test("replicates terminal operation state after consecutive prompts", async ({ onTestFinished }) => {

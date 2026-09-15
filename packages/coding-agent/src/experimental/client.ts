@@ -81,29 +81,55 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 
 		const agent = match.agent;
 		const completedText = new Map<string, string>();
+		const terminalRuns = new Set<string>();
+		let response: AgentOperationResponse | undefined;
+		let resolveTerminal!: () => void;
+		let rejectTerminal!: (error: unknown) => void;
+		const terminal = new Promise<void>((resolve, reject) => {
+			resolveTerminal = resolve;
+			rejectTerminal = reject;
+		});
+		// Observe connection or attachment failure even while the prompt RPC is still pending.
+		void terminal.catch(() => {});
 		let deliveryTail = Promise.resolve();
 		const unsubscribe = match.transcript.state.subscribe((value, _context, delivery) => {
 			if (delivery.kind !== "update" || value.event === null) return;
 			const event = value.event;
+			if (event.type === "run_end" || event.type === "run_suspend") {
+				terminalRuns.add(event.runId);
+				if (response?.accepted && response.operationId === event.runId) resolveTerminal();
+			}
 			deliveryTail = deliveryTail.then(async () => {
 				if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
 					completedText.set(event.runId, messageText(event.message));
 				}
 				await options.onEvent?.(event);
 			});
+			void deliveryTail.catch(() => {});
 		});
 		if (match.transcript.state.value?.snapshot === null || match.transcript.state.value?.snapshot === undefined) {
 			unsubscribe();
 			throw new Error("Transcript has no initialized snapshot");
 		}
-		let response: AgentOperationResponse;
+		const unsubscribeConnection = match.server.connection.subscribe((state) => {
+			if (state.status === "disconnected") rejectTerminal(new Error(state.reason));
+		});
+		const unsubscribeAttachment = match.session.attachment.subscribe((state) => {
+			if (state.status !== "attached" || state.sessionId !== sessionId) {
+				rejectTerminal(new Error(`Session ${sessionId} attachment lost while waiting for terminal publication`));
+			}
+		});
 		try {
 			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
+			if (!response.accepted) throw new Error(response.error.message);
+			// The RPC response and Transcript publication have independent delivery tails.
+			if (!terminalRuns.has(response.operationId)) await terminal;
 		} finally {
 			unsubscribe();
+			unsubscribeConnection();
+			unsubscribeAttachment();
 			await deliveryTail;
 		}
-		if (!response.accepted) throw new Error(response.error.message);
 		if (response.error !== null) throw new Error(response.error.message);
 		return {
 			kind: "prompted",
