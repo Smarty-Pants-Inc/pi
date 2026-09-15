@@ -1,0 +1,414 @@
+name: smarty-ci
+# Aggregate check required by the reviewed Mergify queue.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - mergify/merge-queue/**
+      - tmp-mergify/merge-queue/**
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact separately accepted successor source commit
+        required: true
+        type: string
+      source_tree:
+        description: Exact accepted successor source tree
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smarty-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  smarty-ci:
+    name: ${{ github.event_name == 'workflow_dispatch' && 'Pi full gate not requested' || 'smarty-ci' }}
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+    - name: Checkout exact qualification source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ github.sha }}
+        persist-credentials: false
+      timeout-minutes: 5
+    - name: Setup Node22
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 22.23.2
+      timeout-minutes: 5
+    - name: Receive source identity and prepare private job state
+      env:
+        EXPECTED_SOURCE: ${{ github.sha }}
+        EXPECTED_TREE: ''
+        DEFINITION_SHA: ${{ github.workflow_sha }}
+      run: |
+        umask 077
+        mkdir -m 700 "$RUNNER_TEMP/pi-emergency"
+        mkdir -p "$RUNNER_TEMP/pi-emergency"/{evidence,home/.config,tmp,cache}
+        touch "$RUNNER_TEMP/pi-emergency/npm-userconfig" "$RUNNER_TEMP/pi-emergency/npm-globalconfig"
+        python3 - <<'PY'
+        import json,os,pathlib,subprocess
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['EXPECTED_SOURCE']
+        actual_tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
+        if os.environ['EXPECTED_TREE']:
+            assert actual_tree==os.environ['EXPECTED_TREE']
+            assert actual_tree not in {'4d498710fc83ab1d34053dd03080c117a98d3a11','4e119a8542a59a94dd3f195c54ec72ecc172f00a','96fa8e837eb95739e80fee9442922bf6a21e9220'},'blocked predecessor source'
+        assert not subprocess.check_output(['git','diff','HEAD','--'])
+        assert os.uname().machine=='x86_64' and os.uname().sysname=='Linux'
+        os_release=pathlib.Path('/etc/os-release').read_text()
+        assert 'VERSION_ID="24.04"' in os_release and 'ID=ubuntu' in os_release
+        record={k:os.environ.get(k) for k in ('EXPECTED_SOURCE','EXPECTED_TREE','DEFINITION_SHA','GITHUB_REPOSITORY','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','GITHUB_SHA','GITHUB_WORKFLOW_REF','RUNNER_NAME','RUNNER_OS','RUNNER_ARCH')}
+        record['actual_tree']=actual_tree
+        record['os_release']=os_release
+        record['scope']='Full event-source build/check/test and Node package gate; not Bun, affected-session or activation acceptance'
+        pathlib.Path(os.environ['RUNNER_TEMP'],'pi-emergency/evidence/identity.json').write_text(json.dumps(record,indent=2)+'\n')
+        PY
+        { node --version; npm --version; git --version; uname -a; id; getconf _NPROCESSORS_ONLN; free -b; df -k .; } > "$RUNNER_TEMP/pi-emergency/evidence/tools-and-host.txt"
+        sha256sum "$(command -v node)" package-lock.json package.json > "$RUNNER_TEMP/pi-emergency/evidence/input-sha256.txt"
+        test ! -L .local
+        mkdir -p .local
+        python3 - <<'PY'
+        import base64,pathlib
+        with pathlib.Path('.local/pack-stage.mjs').open('xb') as f:
+            f.write(base64.b64decode('Ly8gQ0ktb25seSBpbnZvY2F0aW9uIGZyb20gdGhlIGV4YWN0IGNoZWNrb3V0IHJvb3QgYWZ0ZXIgY2hlY2svYnVpbGQgUEFTUy4KLy8gUGxhY2UgdGhpcyBmcm96ZW4gZHJpdmVyIGF0IDxjaGVja291dD4vLmxvY2FsL3BhY2stc3RhZ2UubWpzLiBOZXZlciBydW4gb24gRGV2MS4KaW1wb3J0IGFzc2VydCBmcm9tICJub2RlOmFzc2VydC9zdHJpY3QiOwppbXBvcnQgeyBleGVjRmlsZVN5bmMgfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBjcmVhdGVIYXNoIH0gZnJvbSAibm9kZTpjcnlwdG8iOwppbXBvcnQgeyBleGlzdHNTeW5jLCBta2RpclN5bmMsIHJlYWRGaWxlU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gIm5vZGU6ZnMiOwppbXBvcnQgeyBpc0Fic29sdXRlLCBqb2luLCByZWxhdGl2ZSwgcmVzb2x2ZSB9IGZyb20gIm5vZGU6cGF0aCI7CmltcG9ydCB7IHBhY2tSZWxlYXNlUGFja2FnZXMsIGluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyLCBzbW9rZVRlc3RDb2RpbmdBZ2VudENvbnN1bWVyIH0gZnJvbSAiLi4vc2NyaXB0cy9jb2RpbmctYWdlbnQtY29uc3VtZXIubWpzIjsKaW1wb3J0IHsgZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMgfSBmcm9tICIuLi9zY3JpcHRzL3JlbGVhc2UtcGFja2FnZXMubWpzIjsKCmFzc2VydC5lcXVhbChwcm9jZXNzLmFyZ3YubGVuZ3RoLCAzLCAib25lIGZyZXNoIGFic29sdXRlIG91dHB1dCBkaXJlY3RvcnkgcmVxdWlyZWQiKTsKYXNzZXJ0KGlzQWJzb2x1dGUocHJvY2Vzcy5hcmd2WzJdKSk7CmNvbnN0IHJvb3QgPSBwcm9jZXNzLmN3ZCgpOwphc3NlcnQuZXF1YWwoSlNPTi5wYXJzZShyZWFkRmlsZVN5bmMoam9pbihyb290LCAicGFja2FnZS5qc29uIiksICJ1dGY4IikpLm5hbWUsICJwaS1tb25vcmVwbyIpOwpjb25zdCBvdXQgPSByZXNvbHZlKHByb2Nlc3MuYXJndlsyXSk7CmNvbnN0IHJlbCA9IHJlbGF0aXZlKHJvb3QsIG91dCk7CmFzc2VydChyZWwgPT09ICIuLiIgfHwgcmVsLnN0YXJ0c1dpdGgoIi4uLyIpIHx8IGlzQWJzb2x1dGUocmVsKSwgIm91dHB1dCBtdXN0IGJlIG91dHNpZGUgc291cmNlIik7CmFzc2VydCghZXhpc3RzU3luYyhvdXQpLCAicmV0YWluIGV4aXN0aW5nL3BhcnRpYWwgb3V0cHV0OyBuZXZlciBvdmVyd3JpdGUiKTsKZXhlY0ZpbGVTeW5jKCJnaXQiLCBbImRpZmYiLCAiLS1leGl0LWNvZGUiLCAiSEVBRCIsICItLSJdLCB7IHN0ZGlvOiAiaW5oZXJpdCIgfSk7CmNvbnN0IHNvdXJjZSA9IGV4ZWNGaWxlU3luYygiZ2l0IiwgWyJyZXYtcGFyc2UiLCAiSEVBRCJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpjb25zdCB0cmVlID0gZXhlY0ZpbGVTeW5jKCJnaXQiLCBbInJldi1wYXJzZSIsICJIRUFEXnt0cmVlfSJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpta2RpclN5bmMob3V0LCB7IG1vZGU6IDBvNzAwIH0pOwpjb25zdCB0YXJiYWxscyA9IHBhY2tSZWxlYXNlUGFja2FnZXMoZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMoKSwgam9pbihvdXQsICJ0YXJiYWxscyIpKTsKY29uc3QgY29uc3VtZXIgPSBqb2luKG91dCwgIm5vZGUiKTsKaW5zdGFsbENvZGluZ0FnZW50Q29uc3VtZXIoY29uc3VtZXIsIHRhcmJhbGxzKTsKc21va2VUZXN0Q29kaW5nQWdlbnRDb25zdW1lcihjb25zdW1lcik7CmV4ZWNGaWxlU3luYygiZ2l0IiwgWyJkaWZmIiwgIi0tZXhpdC1jb2RlIiwgIkhFQUQiLCAiLS0iXSwgeyBzdGRpbzogImluaGVyaXQiIH0pOwpjb25zdCBwYWNrYWdlcyA9IFsuLi50YXJiYWxsc10ubWFwKChbbmFtZSwgcGF0aF0pID0+IHsKICBjb25zdCBieXRlcyA9IHJlYWRGaWxlU3luYyhwYXRoKTsKICByZXR1cm4geyBuYW1lLCBwYXRoOiByZWxhdGl2ZShvdXQsIHBhdGgpLCBieXRlczogYnl0ZXMubGVuZ3RoLCBzaGEyNTY6IGNyZWF0ZUhhc2goInNoYTI1NiIpLnVwZGF0ZShieXRlcykuZGlnZXN0KCJoZXgiKSB9Owp9KTsKd3JpdGVGaWxlU3luYyhqb2luKG91dCwgIlNPVVJDRS1BTkQtUEFDS0FHRVMuanNvbiIpLCBKU09OLnN0cmluZ2lmeSh7IHNvdXJjZSwgdHJlZSwgcGxhdGZvcm06IHByb2Nlc3MucGxhdGZvcm0sIGFyY2g6IHByb2Nlc3MuYXJjaCwgbm9kZTogcHJvY2Vzcy52ZXJzaW9uLCBwYWNrYWdlcywgc2NvcGU6ICJOb2RlIFNESy9DTEkgY29uc3VtZXIgc21va2Ugb25seTsgbm90IHByb3ZpZGVyLCBhZmZlY3RlZC1zZXNzaW9uLCBCdW4sIGZsZWV0IG9yIGluc3RhbGxhdGlvbiBhY2NlcHRhbmNlIiB9LCBudWxsLCAyKSArICJcbiIsIHsgZmxhZzogInd4IiwgbW9kZTogMG82MDAgfSk7Cg=='))
+        PY
+        printf '%s\n' 'da47a9e55f6a50f53729ec199bb52f27150001b66438cdd3187ed99b73534f78  .local/pack-stage.mjs' | sha256sum --check
+        cp .local/pack-stage.mjs "$RUNNER_TEMP/pi-emergency/evidence/"
+      timeout-minutes: 2
+    - name: Existing disposable system dependencies
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        {
+          sudo apt-get update &&
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep &&
+          sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
+        } 2>&1 | tee "$RUNNER_TEMP/pi-emergency/evidence/system-dependencies.log"
+    - name: dependencies
+      timeout-minutes: 10
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/dependencies.log"
+        npm ci --ignore-scripts
+        PI_JOB
+    - name: public-model-data
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/public-model-data.log"
+        npm run hydrate:model-data
+        npm --prefix packages/ai run check:model-data
+        git diff --exit-code HEAD --
+        cp -a packages/ai/src/providers/data "$EVIDENCE_DIR/model-data"
+        find "$EVIDENCE_DIR/model-data" -type f -print0 | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/model-data-sha256.txt"
+        PI_JOB
+    - name: build
+      timeout-minutes: 10
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/build.log"
+        npm run build:offline
+        git diff --exit-code HEAD --
+        PI_JOB
+    - name: check
+      timeout-minutes: 10
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/check.log"
+        npm run check
+        git diff --exit-code HEAD --
+        PI_JOB
+    - name: complete-tests
+      timeout-minutes: 30
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/complete-tests.log"
+        ./test.sh
+        git diff --exit-code HEAD --
+        PI_JOB
+    - name: node-stage
+      timeout-minutes: 10
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/node-stage.log"
+        node .local/pack-stage.mjs "$STAGE_DIR"
+        git diff --exit-code HEAD --
+        PI_JOB
+    - name: Retain complete or partial stage with modes
+      if: always()
+      timeout-minutes: 3
+      run: |
+        umask 077
+        evidence="$RUNNER_TEMP/pi-emergency/evidence"
+        mkdir -p "$evidence"
+        if test -d "$RUNNER_TEMP/pi-emergency/stage"; then
+          tar -C "$RUNNER_TEMP/pi-emergency/stage" -czf "$evidence/node-stage.tar.gz" .
+          sha256sum "$evidence/node-stage.tar.gz" > "$evidence/node-stage.tar.gz.sha256"
+        fi
+        if git rev-parse --is-inside-work-tree; then
+          git diff --binary HEAD -- > "$evidence/after-job-source.diff"
+        fi
+        df -k . "$evidence" > "$evidence/final-disk.txt"
+    - name: Upload actual evidence even after failure
+      if: always()
+      timeout-minutes: 5
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: pi-compaction-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/pi-emergency/evidence
+        include-hidden-files: true
+        if-no-files-found: error
+        retention-days: 7
+  emergency-compaction:
+    name: Pi emergency compaction regressions
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+    - name: Validate exact source syntax
+      env:
+        EXPECTED_SOURCE: ${{ inputs.source_sha }}
+        EXPECTED_TREE: ${{ inputs.source_tree }}
+      run: |
+        python3 - <<'PY'
+        import os,re
+        assert os.environ['GITHUB_REPOSITORY']=='Smarty-Pants-Inc/pi'
+        for key in ('EXPECTED_SOURCE','EXPECTED_TREE'):
+            assert re.fullmatch('[0-9a-f]{40}',os.environ[key]),key
+        PY
+      timeout-minutes: 2
+    - name: Checkout exact qualification source
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ inputs.source_sha }}
+        persist-credentials: false
+      timeout-minutes: 5
+    - name: Setup Node22
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+      with:
+        node-version: 22.23.2
+      timeout-minutes: 5
+    - name: Receive source identity and prepare private job state
+      env:
+        EXPECTED_SOURCE: ${{ inputs.source_sha }}
+        EXPECTED_TREE: ${{ inputs.source_tree }}
+        DEFINITION_SHA: ${{ github.workflow_sha }}
+      run: |
+        umask 077
+        mkdir -m 700 "$RUNNER_TEMP/pi-emergency"
+        mkdir -p "$RUNNER_TEMP/pi-emergency"/{evidence,home/.config,tmp,cache}
+        touch "$RUNNER_TEMP/pi-emergency/npm-userconfig" "$RUNNER_TEMP/pi-emergency/npm-globalconfig"
+        python3 - <<'PY'
+        import json,os,pathlib,subprocess
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==os.environ['EXPECTED_SOURCE']
+        actual_tree=subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()
+        if os.environ['EXPECTED_TREE']:
+            assert actual_tree==os.environ['EXPECTED_TREE']
+            assert actual_tree not in {'4d498710fc83ab1d34053dd03080c117a98d3a11','4e119a8542a59a94dd3f195c54ec72ecc172f00a','96fa8e837eb95739e80fee9442922bf6a21e9220'},'blocked predecessor source'
+        assert not subprocess.check_output(['git','diff','HEAD','--'])
+        assert os.uname().machine=='x86_64' and os.uname().sysname=='Linux'
+        os_release=pathlib.Path('/etc/os-release').read_text()
+        assert 'VERSION_ID="24.04"' in os_release and 'ID=ubuntu' in os_release
+        record={k:os.environ.get(k) for k in ('EXPECTED_SOURCE','EXPECTED_TREE','DEFINITION_SHA','GITHUB_REPOSITORY','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','GITHUB_SHA','GITHUB_WORKFLOW_REF','RUNNER_NAME','RUNNER_OS','RUNNER_ARCH')}
+        record['actual_tree']=actual_tree
+        record['os_release']=os_release
+        record['scope']='Fast faux regressions only; not full smarty-ci, packaging, landing, Bun, affected-session or activation acceptance'
+        pathlib.Path(os.environ['RUNNER_TEMP'],'pi-emergency/evidence/identity.json').write_text(json.dumps(record,indent=2)+'\n')
+        PY
+        { node --version; npm --version; git --version; uname -a; id; getconf _NPROCESSORS_ONLN; free -b; df -k .; } > "$RUNNER_TEMP/pi-emergency/evidence/tools-and-host.txt"
+        sha256sum "$(command -v node)" package-lock.json package.json > "$RUNNER_TEMP/pi-emergency/evidence/input-sha256.txt"
+        test ! -L .local
+        mkdir -p .local
+        python3 - <<'PY'
+        import base64,pathlib
+        with pathlib.Path('.local/pack-stage.mjs').open('xb') as f:
+            f.write(base64.b64decode('Ly8gQ0ktb25seSBpbnZvY2F0aW9uIGZyb20gdGhlIGV4YWN0IGNoZWNrb3V0IHJvb3QgYWZ0ZXIgY2hlY2svYnVpbGQgUEFTUy4KLy8gUGxhY2UgdGhpcyBmcm96ZW4gZHJpdmVyIGF0IDxjaGVja291dD4vLmxvY2FsL3BhY2stc3RhZ2UubWpzLiBOZXZlciBydW4gb24gRGV2MS4KaW1wb3J0IGFzc2VydCBmcm9tICJub2RlOmFzc2VydC9zdHJpY3QiOwppbXBvcnQgeyBleGVjRmlsZVN5bmMgfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBjcmVhdGVIYXNoIH0gZnJvbSAibm9kZTpjcnlwdG8iOwppbXBvcnQgeyBleGlzdHNTeW5jLCBta2RpclN5bmMsIHJlYWRGaWxlU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gIm5vZGU6ZnMiOwppbXBvcnQgeyBpc0Fic29sdXRlLCBqb2luLCByZWxhdGl2ZSwgcmVzb2x2ZSB9IGZyb20gIm5vZGU6cGF0aCI7CmltcG9ydCB7IHBhY2tSZWxlYXNlUGFja2FnZXMsIGluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyLCBzbW9rZVRlc3RDb2RpbmdBZ2VudENvbnN1bWVyIH0gZnJvbSAiLi4vc2NyaXB0cy9jb2RpbmctYWdlbnQtY29uc3VtZXIubWpzIjsKaW1wb3J0IHsgZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMgfSBmcm9tICIuLi9zY3JpcHRzL3JlbGVhc2UtcGFja2FnZXMubWpzIjsKCmFzc2VydC5lcXVhbChwcm9jZXNzLmFyZ3YubGVuZ3RoLCAzLCAib25lIGZyZXNoIGFic29sdXRlIG91dHB1dCBkaXJlY3RvcnkgcmVxdWlyZWQiKTsKYXNzZXJ0KGlzQWJzb2x1dGUocHJvY2Vzcy5hcmd2WzJdKSk7CmNvbnN0IHJvb3QgPSBwcm9jZXNzLmN3ZCgpOwphc3NlcnQuZXF1YWwoSlNPTi5wYXJzZShyZWFkRmlsZVN5bmMoam9pbihyb290LCAicGFja2FnZS5qc29uIiksICJ1dGY4IikpLm5hbWUsICJwaS1tb25vcmVwbyIpOwpjb25zdCBvdXQgPSByZXNvbHZlKHByb2Nlc3MuYXJndlsyXSk7CmNvbnN0IHJlbCA9IHJlbGF0aXZlKHJvb3QsIG91dCk7CmFzc2VydChyZWwgPT09ICIuLiIgfHwgcmVsLnN0YXJ0c1dpdGgoIi4uLyIpIHx8IGlzQWJzb2x1dGUocmVsKSwgIm91dHB1dCBtdXN0IGJlIG91dHNpZGUgc291cmNlIik7CmFzc2VydCghZXhpc3RzU3luYyhvdXQpLCAicmV0YWluIGV4aXN0aW5nL3BhcnRpYWwgb3V0cHV0OyBuZXZlciBvdmVyd3JpdGUiKTsKZXhlY0ZpbGVTeW5jKCJnaXQiLCBbImRpZmYiLCAiLS1leGl0LWNvZGUiLCAiSEVBRCIsICItLSJdLCB7IHN0ZGlvOiAiaW5oZXJpdCIgfSk7CmNvbnN0IHNvdXJjZSA9IGV4ZWNGaWxlU3luYygiZ2l0IiwgWyJyZXYtcGFyc2UiLCAiSEVBRCJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpjb25zdCB0cmVlID0gZXhlY0ZpbGVTeW5jKCJnaXQiLCBbInJldi1wYXJzZSIsICJIRUFEXnt0cmVlfSJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpta2RpclN5bmMob3V0LCB7IG1vZGU6IDBvNzAwIH0pOwpjb25zdCB0YXJiYWxscyA9IHBhY2tSZWxlYXNlUGFja2FnZXMoZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMoKSwgam9pbihvdXQsICJ0YXJiYWxscyIpKTsKY29uc3QgY29uc3VtZXIgPSBqb2luKG91dCwgIm5vZGUiKTsKaW5zdGFsbENvZGluZ0FnZW50Q29uc3VtZXIoY29uc3VtZXIsIHRhcmJhbGxzKTsKc21va2VUZXN0Q29kaW5nQWdlbnRDb25zdW1lcihjb25zdW1lcik7CmV4ZWNGaWxlU3luYygiZ2l0IiwgWyJkaWZmIiwgIi0tZXhpdC1jb2RlIiwgIkhFQUQiLCAiLS0iXSwgeyBzdGRpbzogImluaGVyaXQiIH0pOwpjb25zdCBwYWNrYWdlcyA9IFsuLi50YXJiYWxsc10ubWFwKChbbmFtZSwgcGF0aF0pID0+IHsKICBjb25zdCBieXRlcyA9IHJlYWRGaWxlU3luYyhwYXRoKTsKICByZXR1cm4geyBuYW1lLCBwYXRoOiByZWxhdGl2ZShvdXQsIHBhdGgpLCBieXRlczogYnl0ZXMubGVuZ3RoLCBzaGEyNTY6IGNyZWF0ZUhhc2goInNoYTI1NiIpLnVwZGF0ZShieXRlcykuZGlnZXN0KCJoZXgiKSB9Owp9KTsKd3JpdGVGaWxlU3luYyhqb2luKG91dCwgIlNPVVJDRS1BTkQtUEFDS0FHRVMuanNvbiIpLCBKU09OLnN0cmluZ2lmeSh7IHNvdXJjZSwgdHJlZSwgcGxhdGZvcm06IHByb2Nlc3MucGxhdGZvcm0sIGFyY2g6IHByb2Nlc3MuYXJjaCwgbm9kZTogcHJvY2Vzcy52ZXJzaW9uLCBwYWNrYWdlcywgc2NvcGU6ICJOb2RlIFNESy9DTEkgY29uc3VtZXIgc21va2Ugb25seTsgbm90IHByb3ZpZGVyLCBhZmZlY3RlZC1zZXNzaW9uLCBCdW4sIGZsZWV0IG9yIGluc3RhbGxhdGlvbiBhY2NlcHRhbmNlIiB9LCBudWxsLCAyKSArICJcbiIsIHsgZmxhZzogInd4IiwgbW9kZTogMG82MDAgfSk7Cg=='))
+        PY
+        printf '%s\n' 'da47a9e55f6a50f53729ec199bb52f27150001b66438cdd3187ed99b73534f78  .local/pack-stage.mjs' | sha256sum --check
+        cp .local/pack-stage.mjs "$RUNNER_TEMP/pi-emergency/evidence/"
+      timeout-minutes: 2
+    - name: Existing disposable system dependencies
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        {
+          sudo apt-get update &&
+          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep &&
+          sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
+        } 2>&1 | tee "$RUNNER_TEMP/pi-emergency/evidence/system-dependencies.log"
+    - name: dependencies
+      timeout-minutes: 10
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/dependencies.log"
+        npm ci --ignore-scripts
+        PI_JOB
+    - name: public-model-data
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/public-model-data.log"
+        npm run hydrate:model-data
+        npm --prefix packages/ai run check:model-data
+        git diff --exit-code HEAD --
+        cp -a packages/ai/src/providers/data "$EVIDENCE_DIR/model-data"
+        find "$EVIDENCE_DIR/model-data" -type f -print0 | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/model-data-sha256.txt"
+        PI_JOB
+    - name: fast-build
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/fast-build.log"
+        npm run build:offline
+        git diff --exit-code HEAD --
+        PI_JOB
+    - name: agent-first
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/agent-first.log"
+        cd packages/agent
+        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/agent.test.ts test/agent-loop.test.ts
+        PI_JOB
+    - name: compaction-first
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/compaction-first.log"
+        cd packages/coding-agent
+        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/suite/agent-session-compaction.test.ts test/suite/regressions/pre-prompt-compaction-no-continue.test.ts
+        PI_JOB
+    - name: Retain complete or partial stage with modes
+      if: always()
+      timeout-minutes: 3
+      run: |
+        umask 077
+        evidence="$RUNNER_TEMP/pi-emergency/evidence"
+        mkdir -p "$evidence"
+        if test -d "$RUNNER_TEMP/pi-emergency/stage"; then
+          tar -C "$RUNNER_TEMP/pi-emergency/stage" -czf "$evidence/node-stage.tar.gz" .
+          sha256sum "$evidence/node-stage.tar.gz" > "$evidence/node-stage.tar.gz.sha256"
+        fi
+        if git rev-parse --is-inside-work-tree; then
+          git diff --binary HEAD -- > "$evidence/after-job-source.diff"
+        fi
+        df -k . "$evidence" > "$evidence/final-disk.txt"
+    - name: Upload actual evidence even after failure
+      if: always()
+      timeout-minutes: 5
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: pi-compaction-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/pi-emergency/evidence
+        include-hidden-files: true
+        if-no-files-found: error
+        retention-days: 7
