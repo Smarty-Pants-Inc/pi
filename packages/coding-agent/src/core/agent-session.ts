@@ -25,7 +25,7 @@ import type {
 	PrepareNextTurnContext,
 	ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, retryDelayMs, type RetryPolicy } from "@earendil-works/pi-ai";
+import { contentText, type RetryPolicy, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -2084,10 +2084,12 @@ export class AgentSession {
 			}
 
 			const settings = this.settingsManager.getCompactionSettings(model);
-			const { model: requestModel, apiKey, headers, env } = await raceWithAbortSignal(
-				this._getSummarizationRequestAuth(model),
-				signal,
-			);
+			const {
+				model: requestModel,
+				apiKey,
+				headers,
+				env,
+			} = await raceWithAbortSignal(this._getSummarizationRequestAuth(model), signal);
 
 			const pathEntries = this.sessionManager.getBranch();
 
@@ -2264,7 +2266,10 @@ export class AgentSession {
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
 	 * @returns A continuation decision, or an explicit failed/aborted outcome that blocks a pending prompt.
 	 */
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<CompactionOutcome> {
+	private async _checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+	): Promise<CompactionOutcome> {
 		const settings = this.settingsManager.getCompactionSettings(this.model);
 		if (!settings.enabled) return false;
 
@@ -2396,10 +2401,12 @@ export class AgentSession {
 				return false;
 			}
 
-			const { model: requestModel, apiKey, headers, env } = await raceWithAbortSignal(
-				this._getSummarizationRequestAuth(model),
-				signal,
-			);
+			const {
+				model: requestModel,
+				apiKey,
+				headers,
+				env,
+			} = await raceWithAbortSignal(this._getSummarizationRequestAuth(model), signal);
 
 			const pathEntries = this.sessionManager.getBranch();
 

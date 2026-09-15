@@ -19,7 +19,10 @@ type SessionWithCompactionInternals = {
 		assistantMessage: AssistantMessage,
 		skipAbortedCheck?: boolean,
 	) => Promise<boolean | "failed" | "aborted">;
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean | "failed" | "aborted">;
+	_runAutoCompaction: (
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+	) => Promise<boolean | "failed" | "aborted">;
 };
 
 function createUsage(totalTokens: number) {
@@ -665,9 +668,7 @@ describe("AgentSession compaction characterization", () => {
 			expect(recoveredRequest.filter((message) => queuedTexts.includes(getMessageText(message)))).toEqual(
 				queuedMessages,
 			);
-			const starts = harness
-				.eventsOfType("message_start")
-				.filter((event) => queuedMessages.includes(event.message));
+			const starts = harness.eventsOfType("message_start").filter((event) => queuedMessages.includes(event.message));
 			expect(starts).toHaveLength(queuedMessages.length);
 			for (const [index, event] of starts.entries()) {
 				expect(event.message).toBe(queuedMessages[index]);
@@ -1264,7 +1265,10 @@ describe("AgentSession compaction characterization", () => {
 			vi.useFakeTimers();
 			const operation =
 				mode === "manual" ? harness.session.compact() : harness.session.prompt("pending after timeout");
-			const outcome = operation.then(() => undefined, (error: unknown) => error);
+			const outcome = operation.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
 			try {
 				await vi.advanceTimersByTimeAsync(1_199_999);
 				const calls = phase === "prefix" || phase === "retry" ? 2 : 1;
