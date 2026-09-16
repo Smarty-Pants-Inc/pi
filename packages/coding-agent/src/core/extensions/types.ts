@@ -1645,7 +1645,12 @@ export interface SendUserMessageOptions {
  * A transformed input can be appended but must not be acknowledged as the original content. */
 export type UserMessageReceipt =
 	| (SessionAppendReceipt & { contentChanged: boolean })
-	| { status: "handled" | "not_written" | "unknown"; sessionId: string; sessionFile: string | undefined; error?: unknown };
+	| {
+			status: "handled" | "not_written" | "unknown";
+			sessionId: string;
+			sessionFile: string | undefined;
+			error?: unknown;
+	  };
 
 export type SendUserMessageWithReceiptHandler = (
 	content: string | (TextContent | ImageContent)[],

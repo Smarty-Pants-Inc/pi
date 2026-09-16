@@ -661,7 +661,10 @@ export class AgentSession {
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			const submission = this._appendMessages.get(event.message);
-			if (submission) { submission.queued = false; submission.started = true; }
+			if (submission) {
+				submission.queued = false;
+				submission.started = true;
+			}
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
 				// Check steering queue first
@@ -707,10 +710,17 @@ export class AgentSession {
 				const submission = this._appendMessages.get(event.message);
 				try {
 					if (submission) {
-						if (submission.settled || this._disposed || submission.sessionId !== this.sessionId || submission.sessionFile !== this.sessionFile) {
+						if (
+							submission.settled ||
+							this._disposed ||
+							submission.sessionId !== this.sessionId ||
+							submission.sessionFile !== this.sessionFile
+						) {
 							throw new Error("User submission session is no longer current");
 						}
-						const contentChanged = event.message.role !== "user" || JSON.stringify(event.message.content) !== submission.originalContent;
+						const contentChanged =
+							event.message.role !== "user" ||
+							JSON.stringify(event.message.content) !== submission.originalContent;
 						const receipt = this.sessionManager.appendMessageWithReceipt(event.message);
 						submission.finish({ ...receipt, contentChanged });
 					} else {
@@ -720,8 +730,12 @@ export class AgentSession {
 					if (error instanceof SessionPersistenceError && error.outcome === "not_written") {
 						this.agent.state.messages = this.agent.state.messages.filter((message) => message !== event.message);
 					}
-					submission?.finish({ status: error instanceof SessionPersistenceError ? error.outcome : "unknown",
-						sessionId: submission.sessionId, sessionFile: submission.sessionFile, error });
+					submission?.finish({
+						status: error instanceof SessionPersistenceError ? error.outcome : "unknown",
+						sessionId: submission.sessionId,
+						sessionFile: submission.sessionFile,
+						error,
+					});
 					throw error;
 				}
 			}
@@ -918,8 +932,12 @@ export class AgentSession {
 	dispose(): void {
 		this._disposed = true;
 		for (const submission of this._pendingUserAppends) {
-			submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile,
-				error: new Error("Session disposed before user append") });
+			submission.finish({
+				status: "not_written",
+				sessionId: submission.sessionId,
+				sessionFile: submission.sessionFile,
+				error: new Error("Session disposed before user append"),
+			});
 		}
 		try {
 			this.abortRetry();
@@ -1153,8 +1171,13 @@ export class AgentSession {
 			}
 		} finally {
 			for (const submission of this._pendingUserAppends) {
-				if (submission.started) submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile,
-					error: new Error("User message processing stopped before append") });
+				if (submission.started)
+					submission.finish({
+						status: "not_written",
+						sessionId: submission.sessionId,
+						sessionFile: submission.sessionFile,
+						error: new Error("User message processing stopped before append"),
+					});
 			}
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
@@ -1218,7 +1241,11 @@ export class AgentSession {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
-					submission?.finish({ status: "handled", sessionId: submission.sessionId, sessionFile: submission.sessionFile });
+					submission?.finish({
+						status: "handled",
+						sessionId: submission.sessionId,
+						sessionFile: submission.sessionFile,
+					});
 					preflightResult?.(true);
 					return;
 				}
@@ -1241,7 +1268,11 @@ export class AgentSession {
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
-					submission?.finish({ status: "handled", sessionId: submission.sessionId, sessionFile: submission.sessionFile });
+					submission?.finish({
+						status: "handled",
+						sessionId: submission.sessionId,
+						sessionFile: submission.sessionFile,
+					});
 					preflightResult?.(true);
 					return;
 				}
@@ -1362,7 +1393,13 @@ export class AgentSession {
 			return;
 		}
 
-		if (this._disposed || (submission && (submission.settled || submission.sessionId !== this.sessionId || submission.sessionFile !== this.sessionFile))) {
+		if (
+			this._disposed ||
+			(submission &&
+				(submission.settled ||
+					submission.sessionId !== this.sessionId ||
+					submission.sessionFile !== this.sessionFile))
+		) {
 			throw new Error("User submission session is no longer current");
 		}
 		preflightResult?.(true);
@@ -1480,7 +1517,10 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		if (submission) { submission.queued = true; this._appendMessages.set(message, submission); }
+		if (submission) {
+			submission.queued = true;
+			this._appendMessages.set(message, submission);
+		}
 		this.agent.steer(message);
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
@@ -1496,7 +1536,10 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		if (submission) { submission.queued = true; this._appendMessages.set(message, submission); }
+		if (submission) {
+			submission.queued = true;
+			this._appendMessages.set(message, submission);
+		}
 		this.agent.followUp(message);
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
@@ -1606,10 +1649,18 @@ export class AgentSession {
 	}
 
 	/** Resolves at the original writer's append boundary, independently of provider completion. */
-	sendUserMessageWithReceipt(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): Promise<UserMessageReceipt> {
+	sendUserMessageWithReceipt(
+		content: string | (TextContent | ImageContent)[],
+		options?: SendUserMessageOptions,
+	): Promise<UserMessageReceipt> {
 		return new Promise((resolve) => {
 			const submission: PendingUserAppend = {
-				sessionId: this.sessionId, sessionFile: this.sessionFile, originalContent: "", queued: false, started: false, settled: false,
+				sessionId: this.sessionId,
+				sessionFile: this.sessionFile,
+				originalContent: "",
+				queued: false,
+				started: false,
+				settled: false,
 				finish: (receipt) => {
 					if (submission.settled) return;
 					submission.settled = true;
@@ -1618,12 +1669,24 @@ export class AgentSession {
 				},
 			};
 			this._pendingUserAppends.add(submission);
-			void this._sendUserMessage(content, options, submission).then(() => {
-				if (!submission.queued) submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile });
-			}, (error: unknown) => {
-				submission.finish({ status: error instanceof SessionPersistenceError ? error.outcome : "not_written",
-					sessionId: submission.sessionId, sessionFile: submission.sessionFile, error });
-			});
+			void this._sendUserMessage(content, options, submission).then(
+				() => {
+					if (!submission.queued)
+						submission.finish({
+							status: "not_written",
+							sessionId: submission.sessionId,
+							sessionFile: submission.sessionFile,
+						});
+				},
+				(error: unknown) => {
+					submission.finish({
+						status: error instanceof SessionPersistenceError ? error.outcome : "not_written",
+						sessionId: submission.sessionId,
+						sessionFile: submission.sessionFile,
+						error,
+					});
+				},
+			);
 		});
 	}
 
@@ -1677,8 +1740,13 @@ export class AgentSession {
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
 		for (const submission of this._pendingUserAppends) {
-			if (submission.queued) submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile,
-				error: new Error("Queued user message cleared before append") });
+			if (submission.queued)
+				submission.finish({
+					status: "not_written",
+					sessionId: submission.sessionId,
+					sessionFile: submission.sessionFile,
+					error: new Error("Queued user message cleared before append"),
+				});
 		}
 		this._emitQueueUpdate();
 		return { steering, followUp };

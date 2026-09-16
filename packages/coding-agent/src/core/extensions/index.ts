@@ -129,7 +129,6 @@ export type {
 	SendUserMessageHandler,
 	SendUserMessageOptions,
 	SendUserMessageWithReceiptHandler,
-	UserMessageReceipt,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -175,6 +174,7 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageReceipt,
 	WidgetPlacement,
 	WorkingIndicatorOptions,
 	WriteToolCallEvent,

@@ -74,14 +74,23 @@ export class SessionPersistenceError extends Error {
 	readonly entry: SessionEntry;
 	readonly code: string | undefined;
 
-	constructor(outcome: "not_written" | "unknown", sessionId: string, sessionFile: string, entry: SessionEntry, cause: unknown) {
+	constructor(
+		outcome: "not_written" | "unknown",
+		sessionId: string,
+		sessionFile: string,
+		entry: SessionEntry,
+		cause: unknown,
+	) {
 		super(`Session append ${outcome}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
 		this.name = "SessionPersistenceError";
 		this.outcome = outcome;
 		this.sessionId = sessionId;
 		this.sessionFile = sessionFile;
 		this.entry = entry;
-		this.code = cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string" ? cause.code : undefined;
+		this.code =
+			cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string"
+				? cause.code
+				: undefined;
 	}
 }
 
@@ -1069,7 +1078,8 @@ export class SessionManager {
 	private _persist(entry: SessionEntry, immediately: boolean): SessionAppendReceipt["status"] {
 		if (this.persistenceError) throw this.persistenceError;
 		if (!this.persist || !this.sessionFile) return "memory";
-		const hasAssistant = (entry.type === "message" && entry.message.role === "assistant") ||
+		const hasAssistant =
+			(entry.type === "message" && entry.message.role === "assistant") ||
 			this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!this.flushed && !immediately && !hasAssistant) return "deferred";
 
@@ -1090,10 +1100,18 @@ export class SessionManager {
 				offset += count;
 			}
 		} catch (cause) {
-			failure = new SessionPersistenceError(writeAttempted ? "unknown" : "not_written", this.sessionId, this.sessionFile, entry, cause);
+			failure = new SessionPersistenceError(
+				writeAttempted ? "unknown" : "not_written",
+				this.sessionId,
+				this.sessionFile,
+				entry,
+				cause,
+			);
 		}
 		if (fd !== undefined) {
-			try { closeSync(fd); } catch (cause) {
+			try {
+				closeSync(fd);
+			} catch (cause) {
 				failure ??= new SessionPersistenceError("unknown", this.sessionId, this.sessionFile, entry, cause);
 			}
 		}
@@ -1128,7 +1146,10 @@ export class SessionManager {
 		return this._appendMessage(message, true);
 	}
 
-	private _appendMessage(message: Message | CustomMessage | BashExecutionMessage, immediately: boolean): SessionAppendReceipt {
+	private _appendMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		immediately: boolean,
+	): SessionAppendReceipt {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1137,7 +1158,13 @@ export class SessionManager {
 			message,
 		};
 		const status = this._appendEntry(entry, immediately);
-		return { status, sessionId: this.sessionId, sessionFile: this.sessionFile, entryId: entry.id, parentId: entry.parentId };
+		return {
+			status,
+			sessionId: this.sessionId,
+			sessionFile: this.sessionFile,
+			entryId: entry.id,
+			parentId: entry.parentId,
+		};
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */

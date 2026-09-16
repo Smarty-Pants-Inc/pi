@@ -1,6 +1,6 @@
-import * as fs from "fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as fs from "fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionManager, SessionPersistenceError } from "../../src/core/session-manager.ts";
 
@@ -34,7 +34,11 @@ describe("original-writer append receipts", () => {
 		fs.renameSync(file, `${file}.retained`);
 		fs.mkdirSync(file);
 		let failure: unknown;
-		try { session.appendMessage({ role: "user", content: "failed", timestamp: 2 }); } catch (error) { failure = error; }
+		try {
+			session.appendMessage({ role: "user", content: "failed", timestamp: 2 });
+		} catch (error) {
+			failure = error;
+		}
 		expect(failure).toBeInstanceOf(SessionPersistenceError);
 		expect((failure as SessionPersistenceError).outcome).toBe("not_written");
 		expect(session.getBranch().map((entry) => entry.id)).toEqual([parent]);
@@ -52,7 +56,9 @@ describe("original-writer append receipts", () => {
 			expect(() => session.appendMessage({ role: "user", content: "denied", timestamp: 1 })).toThrow(/EACCES/);
 			expect(session.getBranch()).toEqual([]);
 			expect(fs.readFileSync(file)).toEqual(before);
-		} finally { fs.chmodSync(file, 0o600); }
+		} finally {
+			fs.chmodSync(file, 0o600);
+		}
 	});
 
 	it("keeps legacy buffering but explicitly persists the first receipted user without a seed turn", () => {
@@ -61,7 +67,11 @@ describe("original-writer append receipts", () => {
 		expect(fs.existsSync(session.getSessionFile()!)).toBe(false);
 		const receipt = session.appendMessageWithReceipt({ role: "user", content: "saved", timestamp: 2 });
 		expect(receipt).toMatchObject({ status: "appended", sessionId: session.getSessionId(), parentId: buffered });
-		const entries = fs.readFileSync(receipt.sessionFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		const entries = fs
+			.readFileSync(receipt.sessionFile!, "utf8")
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line));
 		expect(entries.slice(1).map((entry) => entry.id)).toEqual([buffered, receipt.entryId]);
 		expect(entries.at(-1)).toEqual(session.getEntry(receipt.entryId));
 		expect(entries.filter((entry) => entry.message?.role === "assistant")).toEqual([]);
@@ -77,7 +87,11 @@ describe("original-writer append receipts", () => {
 			throw cause;
 		});
 		let failure: unknown;
-		try { session.appendMessageWithReceipt({ role: "user", content: "uncertain", timestamp: 1 }); } catch (error) { failure = error; }
+		try {
+			session.appendMessageWithReceipt({ role: "user", content: "uncertain", timestamp: 1 });
+		} catch (error) {
+			failure = error;
+		}
 		expect(failure).toBeInstanceOf(SessionPersistenceError);
 		expect((failure as SessionPersistenceError).outcome).toBe("unknown");
 		expect((failure as Error).cause).toBe(cause);
@@ -85,7 +99,9 @@ describe("original-writer append receipts", () => {
 		expect(session.getBranch()).toEqual([]);
 		const partial = fs.readFileSync(file);
 		expect(partial).toEqual(Buffer.concat([before, Buffer.from('{"type":"message"')]));
-		expect(() => session.appendMessage({ role: "user", content: "do not retry", timestamp: 2 })).toThrow(failure as Error);
+		expect(() => session.appendMessage({ role: "user", content: "do not retry", timestamp: 2 })).toThrow(
+			failure as Error,
+		);
 		expect(() => session.newSession()).toThrow(failure as Error);
 		expect(fs.readFileSync(file)).toEqual(partial);
 		expect(vi.mocked(fs.writeSync)).toHaveBeenCalledTimes(1);
