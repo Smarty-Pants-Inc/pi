@@ -4,6 +4,7 @@ import { randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
+	constants,
 	createReadStream,
 	existsSync,
 	mkdirSync,
@@ -12,6 +13,7 @@ import {
 	readSync,
 	statSync,
 	writeFileSync,
+	writeSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
 import { join, resolve } from "path";
@@ -53,6 +55,34 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+}
+
+/** Successful synchronous writes, not fsync/power-loss durability or provider acceptance. */
+export interface SessionAppendReceipt {
+	status: "appended" | "deferred" | "memory";
+	sessionId: string;
+	sessionFile: string | undefined;
+	entryId: string;
+	parentId: string | null;
+}
+
+/** An unknown write fences this manager. Retain the file for read-only reconciliation; do not resend. */
+export class SessionPersistenceError extends Error {
+	readonly outcome: "not_written" | "unknown";
+	readonly sessionId: string;
+	readonly sessionFile: string;
+	readonly entry: SessionEntry;
+	readonly code: string | undefined;
+
+	constructor(outcome: "not_written" | "unknown", sessionId: string, sessionFile: string, entry: SessionEntry, cause: unknown) {
+		super(`Session append ${outcome}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+		this.name = "SessionPersistenceError";
+		this.outcome = outcome;
+		this.sessionId = sessionId;
+		this.sessionFile = sessionFile;
+		this.entry = entry;
+		this.code = cause && typeof cause === "object" && "code" in cause && typeof cause.code === "string" ? cause.code : undefined;
+	}
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -193,6 +223,7 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionDir"
 	| "getSessionId"
 	| "getSessionFile"
+	| "getPersistenceError"
 	| "getLeafId"
 	| "getLeafEntry"
 	| "getEntry"
@@ -860,6 +891,7 @@ export class SessionManager {
 	private cwd: string;
 	private persist: boolean;
 	private flushed: boolean = false;
+	private persistenceError: SessionPersistenceError | undefined;
 	private fileEntries: FileEntry[] = [];
 	private byId: Map<string, SessionEntry> = new Map();
 	private labelsById: Map<string, string> = new Map();
@@ -896,6 +928,7 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		if (this.persistenceError) throw this.persistenceError;
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
@@ -924,6 +957,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		if (this.persistenceError) throw this.persistenceError;
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -991,6 +1025,7 @@ export class SessionManager {
 	}
 
 	private _rewriteFile(): void {
+		if (this.persistenceError) throw this.persistenceError;
 		if (!this.persist || !this.sessionFile) return;
 		const fd = openSync(this.sessionFile, "w");
 		try {
@@ -1026,40 +1061,56 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	_persist(entry: SessionEntry): void {
-		if (!this.persist || !this.sessionFile) return;
-
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
-			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
-			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
-				this.flushed = false;
-			}
-			return;
-		}
-
-		if (!this.flushed) {
-			const fd = openSync(this.sessionFile, "wx");
-			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
-			} finally {
-				closeSync(fd);
-			}
-			this.flushed = true;
-		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
-		}
+	/** The first uncertain append remains available even though the entry was not indexed. */
+	getPersistenceError(): SessionPersistenceError | undefined {
+		return this.persistenceError;
 	}
 
-	private _appendEntry(entry: SessionEntry): void {
+	private _persist(entry: SessionEntry, immediately: boolean): SessionAppendReceipt["status"] {
+		if (this.persistenceError) throw this.persistenceError;
+		if (!this.persist || !this.sessionFile) return "memory";
+		const hasAssistant = (entry.type === "message" && entry.message.role === "assistant") ||
+			this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
+		if (!this.flushed && !immediately && !hasAssistant) return "deferred";
+
+		let fd: number | undefined;
+		let writeAttempted = false;
+		let failure: SessionPersistenceError | undefined;
+		try {
+			// Serialize before opening/creating anything. A new file is exclusive; an
+			// existing file must still exist. Never truncate or repair on append failure.
+			const entries = this.flushed ? [entry] : [...this.fileEntries, entry];
+			const bytes = Buffer.from(entries.map((value) => `${JSON.stringify(value)}\n`).join(""));
+			fd = openSync(this.sessionFile, this.flushed ? constants.O_WRONLY | constants.O_APPEND : "wx");
+			let offset = 0;
+			while (offset < bytes.length) {
+				writeAttempted = true;
+				const count = writeSync(fd, bytes, offset, bytes.length - offset);
+				if (count <= 0) throw new Error("Session append made no progress");
+				offset += count;
+			}
+		} catch (cause) {
+			failure = new SessionPersistenceError(writeAttempted ? "unknown" : "not_written", this.sessionId, this.sessionFile, entry, cause);
+		}
+		if (fd !== undefined) {
+			try { closeSync(fd); } catch (cause) {
+				failure ??= new SessionPersistenceError("unknown", this.sessionId, this.sessionFile, entry, cause);
+			}
+		}
+		if (failure) {
+			if (failure.outcome === "unknown") this.persistenceError = failure;
+			throw failure;
+		}
+		this.flushed = true;
+		return "appended";
+	}
+
+	private _appendEntry(entry: SessionEntry, immediately = false): SessionAppendReceipt["status"] {
+		const status = this._persist(entry, immediately);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		return status;
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1069,6 +1120,15 @@ export class SessionManager {
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		return this._appendMessage(message, false).entryId;
+	}
+
+	/** Opt in to first-file persistence without an assistant/provider seed turn. */
+	appendMessageWithReceipt(message: Message | CustomMessage | BashExecutionMessage): SessionAppendReceipt {
+		return this._appendMessage(message, true);
+	}
+
+	private _appendMessage(message: Message | CustomMessage | BashExecutionMessage, immediately: boolean): SessionAppendReceipt {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1076,8 +1136,8 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 		};
-		this._appendEntry(entry);
-		return entry.id;
+		const status = this._appendEntry(entry, immediately);
+		return { status, sessionId: this.sessionId, sessionFile: this.sessionFile, entryId: entry.id, parentId: entry.parentId };
 	}
 
 	/** Append a thinking level change as child of current leaf, then advance leaf. Returns entry id. */
@@ -1403,7 +1463,6 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		const fromId = this.leafId ?? "root";
-		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
@@ -1425,6 +1484,7 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		if (this.persistenceError) throw this.persistenceError;
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {

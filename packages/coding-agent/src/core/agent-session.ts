@@ -96,6 +96,7 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import type { SendUserMessageOptions, UserMessageReceipt } from "./extensions/types.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -103,7 +104,7 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { getLatestCompactionEntry } from "./session-manager.ts";
+import { getLatestCompactionEntry, SessionPersistenceError } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -286,6 +287,16 @@ export interface SessionStats {
 	contextUsage?: ContextUsage;
 }
 
+interface PendingUserAppend {
+	sessionId: string;
+	sessionFile: string | undefined;
+	originalContent: string;
+	queued: boolean;
+	started: boolean;
+	settled: boolean;
+	finish(receipt: UserMessageReceipt): void;
+}
+
 interface ToolDefinitionEntry {
 	definition: ToolDefinition;
 	sourceInfo: SourceInfo;
@@ -318,6 +329,10 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	private _disposed = false;
+	private readonly _appendOptions = new WeakMap<PromptOptions, PendingUserAppend>();
+	private readonly _appendMessages = new WeakMap<AgentMessage, PendingUserAppend>();
+	private readonly _pendingUserAppends = new Set<PendingUserAppend>();
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
 
@@ -645,6 +660,8 @@ export class AgentSession {
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
+			const submission = this._appendMessages.get(event.message);
+			if (submission) { submission.queued = false; submission.started = true; }
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
 				// Check steering queue first
@@ -685,8 +702,28 @@ export class AgentSession {
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
-				// Regular LLM message - persist as SessionMessageEntry
-				this.sessionManager.appendMessage(event.message);
+				// The private message-object association survives native queues and cannot
+				// credit a foreign message with equal text. Hooks have now finished.
+				const submission = this._appendMessages.get(event.message);
+				try {
+					if (submission) {
+						if (submission.settled || this._disposed || submission.sessionId !== this.sessionId || submission.sessionFile !== this.sessionFile) {
+							throw new Error("User submission session is no longer current");
+						}
+						const contentChanged = event.message.role !== "user" || JSON.stringify(event.message.content) !== submission.originalContent;
+						const receipt = this.sessionManager.appendMessageWithReceipt(event.message);
+						submission.finish({ ...receipt, contentChanged });
+					} else {
+						this.sessionManager.appendMessage(event.message);
+					}
+				} catch (error) {
+					if (error instanceof SessionPersistenceError && error.outcome === "not_written") {
+						this.agent.state.messages = this.agent.state.messages.filter((message) => message !== event.message);
+					}
+					submission?.finish({ status: error instanceof SessionPersistenceError ? error.outcome : "unknown",
+						sessionId: submission.sessionId, sessionFile: submission.sessionFile, error });
+					throw error;
+				}
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -879,6 +916,11 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this._disposed = true;
+		for (const submission of this._pendingUserAppends) {
+			submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile,
+				error: new Error("Session disposed before user append") });
+		}
 		try {
 			this.abortRetry();
 			this.abortCompaction();
@@ -1110,6 +1152,10 @@ export class AgentSession {
 				await this.agent.continue();
 			}
 		} finally {
+			for (const submission of this._pendingUserAppends) {
+				if (submission.started) submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile,
+					error: new Error("User message processing stopped before append") });
+			}
 			this._systemPromptOverride = undefined;
 			this._flushPendingBashMessages();
 			this._flushPendingCustomMessages();
@@ -1159,15 +1205,20 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
+		const submission = options && this._appendOptions.get(options);
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			if (this._disposed) throw new Error("Session disposed");
+			const persistenceError = this.sessionManager.getPersistenceError();
+			if (persistenceError) throw persistenceError;
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
+					submission?.finish({ status: "handled", sessionId: submission.sessionId, sessionFile: submission.sessionFile });
 					preflightResult?.(true);
 					return;
 				}
@@ -1190,6 +1241,7 @@ export class AgentSession {
 					this.isStreaming ? options?.streamingBehavior : undefined,
 				);
 				if (inputResult.action === "handled") {
+					submission?.finish({ status: "handled", sessionId: submission.sessionId, sessionFile: submission.sessionFile });
 					preflightResult?.(true);
 					return;
 				}
@@ -1214,9 +1266,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, submission);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, currentImages, submission);
 				}
 				preflightResult?.(true);
 				return;
@@ -1261,11 +1313,9 @@ export class AgentSession {
 			if (currentImages) {
 				userContent.push(...currentImages);
 			}
-			messages.push({
-				role: "user",
-				content: userContent,
-				timestamp: Date.now(),
-			});
+			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
+			if (submission) this._appendMessages.set(userMessage, submission);
+			messages.push(userMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -1312,6 +1362,9 @@ export class AgentSession {
 			return;
 		}
 
+		if (this._disposed || (submission && (submission.settled || submission.sessionId !== this.sessionId || submission.sessionFile !== this.sessionFile))) {
+			throw new Error("User submission session is no longer current");
+		}
 		preflightResult?.(true);
 		await this._runAgentPrompt(messages);
 	}
@@ -1420,35 +1473,33 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
-		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
+	private async _queueSteer(text: string, images?: ImageContent[], submission?: PendingUserAppend): Promise<void> {
+		if (this._disposed || submission?.settled) throw new Error("User submission session is no longer current");
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		if (submission) { submission.queued = true; this._appendMessages.set(message, submission); }
+		this.agent.steer(message);
+		this._steeringMessages.push(text);
+		this._emitQueueUpdate();
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
+	private async _queueFollowUp(text: string, images?: ImageContent[], submission?: PendingUserAppend): Promise<void> {
+		if (this._disposed || submission?.settled) throw new Error("User submission session is no longer current");
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		if (submission) { submission.queued = true; this._appendMessages.set(message, submission); }
+		this.agent.followUp(message);
+		this._followUpMessages.push(text);
+		this._emitQueueUpdate();
 	}
 
 	/**
@@ -1549,7 +1600,37 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options?: SendUserMessageOptions,
+	): Promise<void> {
+		await this._sendUserMessage(content, options);
+	}
+
+	/** Resolves at the original writer's append boundary, independently of provider completion. */
+	sendUserMessageWithReceipt(content: string | (TextContent | ImageContent)[], options?: SendUserMessageOptions): Promise<UserMessageReceipt> {
+		return new Promise((resolve) => {
+			const submission: PendingUserAppend = {
+				sessionId: this.sessionId, sessionFile: this.sessionFile, originalContent: "", queued: false, started: false, settled: false,
+				finish: (receipt) => {
+					if (submission.settled) return;
+					submission.settled = true;
+					this._pendingUserAppends.delete(submission);
+					resolve(receipt);
+				},
+			};
+			this._pendingUserAppends.add(submission);
+			void this._sendUserMessage(content, options, submission).then(() => {
+				if (!submission.queued) submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile });
+			}, (error: unknown) => {
+				submission.finish({ status: error instanceof SessionPersistenceError ? error.outcome : "not_written",
+					sessionId: submission.sessionId, sessionFile: submission.sessionFile, error });
+			});
+		});
+	}
+
+	private async _sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: SendUserMessageOptions,
+		submission?: PendingUserAppend,
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
@@ -1571,12 +1652,17 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		await this.prompt(text, {
+		const promptOptions: PromptOptions = {
 			expandPromptTemplates: options?.expandPromptTemplates ?? false,
 			streamingBehavior: options?.deliverAs,
 			images,
 			source: "extension",
-		});
+		};
+		if (submission) {
+			submission.originalContent = JSON.stringify([{ type: "text", text }, ...(images ?? [])]);
+			this._appendOptions.set(promptOptions, submission);
+		}
+		await this.prompt(text, promptOptions);
 	}
 
 	/**
@@ -1590,6 +1676,10 @@ export class AgentSession {
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this.agent.clearAllQueues();
+		for (const submission of this._pendingUserAppends) {
+			if (submission.queued) submission.finish({ status: "not_written", sessionId: submission.sessionId, sessionFile: submission.sessionFile,
+				error: new Error("Queued user message cleared before append") });
+		}
 		this._emitQueueUpdate();
 		return { steering, followUp };
 	}
@@ -2590,6 +2680,7 @@ export class AgentSession {
 						});
 					});
 				},
+				sendUserMessageWithReceipt: (content, options) => this.sendUserMessageWithReceipt(content, options),
 				appendEntry: (customType, data) => {
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);

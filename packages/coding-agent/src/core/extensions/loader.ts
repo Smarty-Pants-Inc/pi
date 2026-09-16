@@ -367,6 +367,14 @@ function createExtensionAPI(
 			runtime.sendUserMessage(content, options);
 		},
 
+		sendUserMessageWithReceipt(content, options) {
+			assertActive();
+			if (!runtime.sendUserMessageWithReceipt) {
+				return Promise.reject(new Error("User message append receipts are not supported by this runtime"));
+			}
+			return runtime.sendUserMessageWithReceipt(content, options);
+		},
+
 		appendEntry(customType: string, data?: unknown): void {
 			assertActive();
 			runtime.appendEntry(customType, data);

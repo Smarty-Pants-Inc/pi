@@ -60,6 +60,7 @@ import type {
 	CompactionEntry,
 	CustomEntry,
 	ReadonlySessionManager,
+	SessionAppendReceipt,
 	SessionEntry,
 	SessionManager,
 } from "../session-manager.ts";
@@ -1377,6 +1378,12 @@ export interface ExtensionAPI {
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): void;
 
+	/** Wait for this submission's append outcome, not completion of its model turn.
+	 * Uses normal input hooks and queues. Persists the first file without a seed turn.
+	 * Do not await from an event/tool that must return before queued input can run.
+	 * Older runtimes lack this method; custom runtimes without support reject. */
+	sendUserMessageWithReceipt: SendUserMessageWithReceiptHandler;
+
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
 
@@ -1628,6 +1635,23 @@ export type SendMessageHandler = <T = unknown>(
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 
+export interface SendUserMessageOptions {
+	deliverAs?: "steer" | "followUp";
+	expandPromptTemplates?: boolean;
+}
+
+/** Correlated to this call, not to matching text or the most recent entry.
+ * Appended means successful native writes, not fsync, provider success, or human acceptance.
+ * A transformed input can be appended but must not be acknowledged as the original content. */
+export type UserMessageReceipt =
+	| (SessionAppendReceipt & { contentChanged: boolean })
+	| { status: "handled" | "not_written" | "unknown"; sessionId: string; sessionFile: string | undefined; error?: unknown };
+
+export type SendUserMessageWithReceiptHandler = (
+	content: string | (TextContent | ImageContent)[],
+	options?: SendUserMessageOptions,
+) => Promise<UserMessageReceipt>;
+
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
 	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
@@ -1696,6 +1720,8 @@ export interface ExtensionRuntimeState {
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
+	/** Optional for custom hosts; absence never falls back to an unreceipted send. */
+	sendUserMessageWithReceipt?: SendUserMessageWithReceiptHandler;
 	appendEntry: AppendEntryHandler;
 	setSessionName: SetSessionNameHandler;
 	getSessionName: GetSessionNameHandler;
