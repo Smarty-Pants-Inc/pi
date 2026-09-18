@@ -49,20 +49,24 @@ export { radiusProvider };
 
 /** Providers present in the generated catalog. `KnownProvider` additionally
  * includes purely dynamic providers (e.g. "radius") that have no static
- * catalog entry. */
-export type BuiltinProvider = keyof typeof MODELS;
+ * catalog entry. Kimi remains a typed optional provider when its catalog is omitted. */
+export type BuiltinProvider = keyof typeof MODELS | "kimi-coding";
 
+type OptionalBuiltinCatalog = Record<string, Model<"anthropic-messages">>;
+type BuiltinCatalog<TProvider extends BuiltinProvider> = TProvider extends keyof typeof MODELS
+	? (typeof MODELS)[TProvider]
+	: OptionalBuiltinCatalog;
 type BuiltinModelApi<
 	TProvider extends BuiltinProvider,
-	TModelId extends keyof (typeof MODELS)[TProvider],
-> = (typeof MODELS)[TProvider][TModelId] extends { api: infer TApi } ? (TApi extends Api ? TApi : never) : never;
+	TModelId extends keyof BuiltinCatalog<TProvider>,
+> = BuiltinCatalog<TProvider>[TModelId] extends { api: infer TApi } ? (TApi extends Api ? TApi : never) : never;
 
 /** Typed read of the generated built-in catalog. */
-export function getBuiltinModel<TProvider extends BuiltinProvider, TModelId extends keyof (typeof MODELS)[TProvider]>(
+export function getBuiltinModel<TProvider extends BuiltinProvider, TModelId extends keyof BuiltinCatalog<TProvider>>(
 	provider: TProvider,
 	modelId: TModelId,
 ): Model<BuiltinModelApi<TProvider, TModelId>> {
-	const models = MODELS[provider] as Record<string, Model<Api>> | undefined;
+	const models = (MODELS as unknown as Partial<Record<BuiltinProvider, Record<string, Model<Api>>>>)[provider];
 	return models?.[modelId as string] as Model<BuiltinModelApi<TProvider, TModelId>>;
 }
 
@@ -78,11 +82,9 @@ export function getBuiltinModelDataGeneratedAt(): number | undefined {
 
 export function getBuiltinModels<TProvider extends BuiltinProvider>(
 	provider: TProvider,
-): Model<BuiltinModelApi<TProvider, keyof (typeof MODELS)[TProvider]>>[] {
-	const models = MODELS[provider] as Record<string, Model<Api>> | undefined;
-	return models
-		? (Object.values(models) as Model<BuiltinModelApi<TProvider, keyof (typeof MODELS)[TProvider]>>[])
-		: [];
+): Model<BuiltinModelApi<TProvider, keyof BuiltinCatalog<TProvider>>>[] {
+	const models = (MODELS as unknown as Partial<Record<BuiltinProvider, Record<string, Model<Api>>>>)[provider];
+	return models ? (Object.values(models) as Model<BuiltinModelApi<TProvider, keyof BuiltinCatalog<TProvider>>>[]) : [];
 }
 
 /** All built-in providers, freshly constructed. */

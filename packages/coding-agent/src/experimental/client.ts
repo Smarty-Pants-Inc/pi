@@ -81,6 +81,12 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 
 		const agent = match.agent;
 		const completedText = new Map<string, string>();
+		const terminalRunIds = new Set<string>();
+		let operationId: string | undefined;
+		let resolveTerminal: (() => void) | undefined;
+		const terminal = new Promise<void>((resolve) => {
+			resolveTerminal = resolve;
+		});
 		let deliveryTail = Promise.resolve();
 		const unsubscribe = match.transcript.state.subscribe((value, _context, delivery) => {
 			if (delivery.kind !== "update" || value.event === null) return;
@@ -90,6 +96,10 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 					completedText.set(event.runId, messageText(event.message));
 				}
 				await options.onEvent?.(event);
+				if (event.type === "run_end" || event.type === "run_suspend") {
+					terminalRunIds.add(event.runId);
+					if (event.runId === operationId) resolveTerminal?.();
+				}
 			});
 		});
 		if (match.transcript.state.value?.snapshot === null || match.transcript.state.value?.snapshot === undefined) {
@@ -99,6 +109,10 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 		let response: AgentOperationResponse;
 		try {
 			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
+			if (response.accepted) {
+				operationId = response.operationId;
+				if (!terminalRunIds.has(operationId)) await terminal;
+			}
 		} finally {
 			unsubscribe();
 			await deliveryTail;
