@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
+import { filterOmittedProviders } from "../scripts/model-data.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const temporaryRoots: string[] = [];
@@ -13,6 +14,17 @@ afterEach(() => {
 });
 
 describe("strict model generation", () => {
+	it("omits Kimi while retaining other providers", () => {
+		const models = [
+			{ provider: "kimi-coding", id: "k3" },
+			{ provider: "anthropic", id: "claude-sonnet" },
+		];
+
+		expect(filterOmittedProviders(models, new Set(["kimi-coding"]))).toEqual([
+			{ provider: "anthropic", id: "claude-sonnet" },
+		]);
+	});
+
 	it("fails before mutating generated data when an Individual model loses tool support", () => {
 		const fixtureRoot = mkdtempSync(join(tmpdir(), "pi-generate-models-"));
 		temporaryRoots.push(fixtureRoot);
