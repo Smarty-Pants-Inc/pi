@@ -46,6 +46,51 @@ describe("RPC JSONL framing", () => {
 		expect(lines).toEqual(['{"a":1}', '{"b":2}']);
 	});
 
+	test("preserves a multibyte character split across byte chunks", async () => {
+		const line = '{"text":"€"}';
+		const bytes = Buffer.from(`${line}\n`);
+		const splitIndex = bytes.indexOf("€") + 1;
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([bytes.subarray(0, splitIndex), bytes.subarray(splitIndex)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (received) => lines.push(received), {
+			getMaxBufferedBytes: () => Buffer.byteLength(line),
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual([line]);
+		expect(overflows).toBe(0);
+	});
+
+	test("reports raw framed bytes for malformed UTF-8", async () => {
+		const rawRecord = Buffer.concat([Buffer.from('{"text":"'), Buffer.from([0x80, 0x80]), Buffer.from('"}')]);
+		const records: Array<{ line: string; rawFramedByteLength: number | undefined }> = [];
+		const stream = Readable.from([
+			rawRecord.subarray(0, rawRecord.byteLength - 1),
+			Buffer.concat([rawRecord.subarray(rawRecord.byteLength - 1), Buffer.from("\n")]),
+		]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line, rawFramedByteLength) => records.push({ line, rawFramedByteLength }));
+
+		await done;
+
+		expect(records).toEqual([{ line: rawRecord.toString(), rawFramedByteLength: rawRecord.byteLength + 1 }]);
+		expect(Buffer.byteLength(records[0]!.line)).toBeGreaterThan(rawRecord.byteLength);
+	});
+
 	test("emits a final line without trailing LF", async () => {
 		const lines: string[] = [];
 		const stream = Readable.from([Buffer.from('{"a":1}')]);
@@ -61,5 +106,95 @@ describe("RPC JSONL framing", () => {
 		await done;
 
 		expect(lines).toEqual(['{"a":1}']);
+	});
+
+	test("accepts a maximum-sized record followed by LF", async () => {
+		const line = "x".repeat(16);
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from(`${line}\n`)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (received) => lines.push(received), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual([line]);
+		expect(overflows).toBe(0);
+	});
+
+	test("accepts multiple complete records in one bounded chunk", async () => {
+		const lines = ["a".repeat(16), "b".repeat(16)];
+		const received: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from(`${lines.join("\n")}\n`)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line) => received.push(line), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(received).toEqual(lines);
+		expect(overflows).toBe(0);
+	});
+
+	test("counts raw invalid UTF-8 bytes across an LF boundary", async () => {
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from([0x80]), Buffer.from(`\n${"x".repeat(17)}`)]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line) => lines.push(line), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual(["�"]);
+		expect(overflows).toBe(1);
+	});
+
+	test("drops an oversized unterminated record before emitting it", async () => {
+		const lines: string[] = [];
+		let overflows = 0;
+		const stream = Readable.from([Buffer.from('{"payload":"xxxxxxxx'), Buffer.from('{"a":1}\n')]);
+
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", resolve);
+		});
+
+		attachJsonlLineReader(stream, (line) => lines.push(line), {
+			getMaxBufferedBytes: () => 16,
+			onBufferOverflow: () => {
+				overflows++;
+			},
+		});
+
+		await done;
+
+		expect(lines).toEqual([]);
+		expect(overflows).toBe(1);
 	});
 });

@@ -712,6 +712,7 @@ export async function generateSummaryWithUsage(
 		callbacks,
 	);
 
+	if (response.stopReason === "aborted") throw new DOMException("Compaction cancelled", "AbortError");
 	const failure = getSummarizationFailure(response, "Summarization");
 	if (failure) {
 		throw new Error(failure);
@@ -880,6 +881,28 @@ export async function compact(
 		settings,
 	} = preparation;
 
+	// One retry allowance for the operation, not a fresh allowance for each
+	// split summary. Do not mutate the caller's policy or retry ordinary turns.
+	if (retry) {
+		retry = { ...retry };
+		const remaining = retry;
+		const callerCallbacks = callbacks;
+		callbacks = {
+			...callbacks,
+			onRetryScheduled: (...args) => {
+				signal?.throwIfAborted();
+				remaining.maxRetries = Math.max(0, remaining.maxRetries - 1);
+				return callerCallbacks?.onRetryScheduled?.(...args);
+			},
+			onRetryAttemptStart: async () => {
+				signal?.throwIfAborted();
+				await callerCallbacks?.onRetryAttemptStart?.();
+				signal?.throwIfAborted();
+			},
+		};
+	}
+	signal?.throwIfAborted();
+
 	// Generate summaries and merge into one
 	let summary: string;
 	let summaryUsage: Usage;
@@ -907,6 +930,7 @@ export async function compact(
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
 		}
+		signal?.throwIfAborted();
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
@@ -946,6 +970,7 @@ export async function compact(
 		summaryUsage = result.usage;
 	}
 
+	signal?.throwIfAborted();
 	// Compute file lists and append to summary
 	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
 	summary += formatFileOperations(readFiles, modifiedFiles);
@@ -997,6 +1022,7 @@ async function generateTurnPrefixSummary(
 		callbacks,
 	);
 
+	if (response.stopReason === "aborted") throw new DOMException("Compaction cancelled", "AbortError");
 	const failure = getSummarizationFailure(response, "Turn prefix summarization");
 	if (failure) {
 		throw new Error(failure);
