@@ -3,8 +3,8 @@ import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { filterOmittedProviders } from "../scripts/model-data.ts";
 import { afterEach, describe, expect, it } from "vitest";
+import { filterOmittedProviders } from "../scripts/model-data.ts";
 
 const packageRoot = fileURLToPath(new URL("..", import.meta.url));
 const temporaryRoots: string[] = [];

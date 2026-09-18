@@ -5,7 +5,8 @@ import { MODELS } from "../models.generated.ts";
 import { createProvider, type Provider } from "../models.ts";
 import type { Model } from "../types.ts";
 
-const kimiCodingModels = (MODELS as unknown as Record<string, Record<string, Model<"anthropic-messages">>>)["kimi-coding"] ?? {};
+const kimiCodingModels =
+	(MODELS as unknown as Record<string, Record<string, Model<"anthropic-messages">>>)["kimi-coding"] ?? {};
 
 export function kimiCodingProvider(): Provider<"anthropic-messages"> {
 	return createProvider({
