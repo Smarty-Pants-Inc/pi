@@ -26,6 +26,7 @@ import type {
 import {
 	assertExactModelIds,
 	createModelDataManifest,
+	filterOmittedProviders,
 	type ModelDataStructure,
 	MODEL_DATA_MANIFEST_FILE,
 	readModelDataProviderIds,
@@ -43,12 +44,14 @@ function readGeneratorOptions(args: string[]): {
 	jsonOnly: boolean;
 	jsonOutputDir: string | undefined;
 	pretty: boolean;
+	omitProviderIds: Set<string>;
 } {
 	let strict = false;
 	let dataOnly = false;
 	let jsonOnly = false;
 	let jsonOutputDir: string | undefined;
 	let pretty = false;
+	const omitProviderIds = new Set<string>();
 
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
@@ -68,6 +71,12 @@ function readGeneratorOptions(args: string[]): {
 			pretty = true;
 			continue;
 		}
+		if (arg === "--omit-provider") {
+			const providerId = args[++index];
+			if (!providerId) throw new Error("--omit-provider requires a provider ID");
+			omitProviderIds.add(providerId);
+			continue;
+		}
 		if (arg === "--json-output") {
 			const value = args[++index];
 			if (!value) throw new Error("--json-output requires a directory");
@@ -79,7 +88,7 @@ function readGeneratorOptions(args: string[]): {
 
 	if (jsonOnly && !jsonOutputDir) throw new Error("--json-only requires --json-output");
 	if (dataOnly && (jsonOnly || jsonOutputDir)) throw new Error("--data-only cannot be combined with JSON catalog output");
-	return { strict, dataOnly, jsonOnly, jsonOutputDir, pretty };
+	return { strict, dataOnly, jsonOnly, jsonOutputDir, pretty, omitProviderIds };
 }
 
 const generatorOptions = readGeneratorOptions(process.argv.slice(2));
@@ -2955,8 +2964,9 @@ async function generateModels() {
 	applyAnthropicAllowedFallbackModelMetadata(allModels.filter(isAnthropicFallbackMetadataModel));
 
 	// Group by provider and deduplicate by model ID
+	const retainedModels = filterOmittedProviders(allModels, generatorOptions.omitProviderIds);
 	const providers: Record<string, Record<string, Model<any>>> = {};
-	for (const model of allModels) {
+	for (const model of retainedModels) {
 		if (!providers[model.provider]) {
 			providers[model.provider] = {};
 		}
@@ -2978,9 +2988,10 @@ async function generateModels() {
 
 	const serializeJson = (value: unknown) => `${JSON.stringify(value, null, generatorOptions.pretty ? 2 : undefined)}\n`;
 	const writeJson = (path: string, value: unknown) => writeFileSync(path, serializeJson(value));
-	const generatedDataProviderIds = generatorOptions.dataOnly
+	const generatedDataProviderIds = (generatorOptions.dataOnly
 		? readModelDataProviderIds(packageRoot)
-		: sortedProviderIds;
+		: sortedProviderIds
+	).filter((providerId) => !generatorOptions.omitProviderIds.has(providerId));
 	const missingProviderIds = generatedDataProviderIds.filter((providerId) => !jsonProviders[providerId]);
 	if (missingProviderIds.length > 0) {
 		throw new Error(`Cannot hydrate missing providers: ${missingProviderIds.join(", ")}`);
@@ -3029,7 +3040,10 @@ async function generateModels() {
 			);
 			validateModelDataDirectory(modelDataStructure, stagedDataDir);
 
-			if (!generatorOptions.dataOnly) {
+			if (!generatorOptions.dataOnly || generatorOptions.omitProviderIds.size > 0) {
+				const sourceProviderIds = generatorOptions.dataOnly
+					? readModelDataProviderIds(packageRoot).filter((providerId) => !generatorOptions.omitProviderIds.has(providerId))
+					: sortedProviderIds;
 				const previousShardContents = new Map(
 					readdirSync(providersDir)
 						.filter((entry) => entry.endsWith(".models.ts"))
@@ -3054,7 +3068,7 @@ async function generateModels() {
 				const catalogConstName = (providerId: string) =>
 					`${providerId.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}_MODELS`;
 				const generatedShardFiles = new Set<string>();
-				for (const providerId of sortedProviderIds) {
+				for (const providerId of sourceProviderIds) {
 					let output = generatedHeader;
 					output += `import values from "./data/${providerId}.json" with { type: "json" };\n`;
 					output += `import { flattenModelCatalog, type ModelCatalog } from "../model-catalog.ts";\n\n`;
@@ -3069,15 +3083,15 @@ async function generateModels() {
 				}
 
 				let output = generatedHeader;
-				for (const providerId of sortedProviderIds) {
+				for (const providerId of sourceProviderIds) {
 					output += `import { ${catalogConstName(providerId)} } from "./providers/${providerId}.models.ts";\n`;
 				}
 				output += `\nexport const MODELS: {\n`;
-				for (const providerId of sortedProviderIds) {
+				for (const providerId of sourceProviderIds) {
 					output += `\treadonly ${JSON.stringify(providerId)}: typeof ${catalogConstName(providerId)};\n`;
 				}
 				output += `} = {\n`;
-				for (const providerId of sortedProviderIds) {
+				for (const providerId of sourceProviderIds) {
 					output += `\t${JSON.stringify(providerId)}: ${catalogConstName(providerId)},\n`;
 				}
 				output += `};\n`;
@@ -3122,8 +3136,8 @@ async function generateModels() {
 	}
 
 	// Print statistics
-	const totalModels = allModels.length;
-	const reasoningModels = allModels.filter(m => m.reasoning).length;
+	const totalModels = retainedModels.length;
+	const reasoningModels = retainedModels.filter(m => m.reasoning).length;
 
 	console.log(`\nModel Statistics:`);
 	console.log(`  Total tool-capable models: ${totalModels}`);

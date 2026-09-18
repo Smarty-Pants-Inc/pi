@@ -46,10 +46,10 @@ describe("builtin providers", () => {
 		const all = models.getModels();
 		expect(all.length).toBeGreaterThan(500);
 
-		// Static providers list models immediately; Radius is purely dynamic.
+		// Radius is purely dynamic; Kimi Coding may be omitted from generated catalogs.
 		for (const provider of providers) {
 			const list = models.getModels(provider.id);
-			if (provider.id === "radius") expect(list).toEqual([]);
+			if (provider.id === "radius" || provider.id === "kimi-coding") expect(list).toEqual([]);
 			else expect(list.length).toBeGreaterThan(0);
 			expect(list.every((m) => m.provider === provider.id)).toBe(true);
 		}
@@ -78,17 +78,20 @@ describe("builtin providers", () => {
 		}
 	});
 
-	it("uses API-equivalent implied pricing for Kimi Coding subscription models", () => {
-		const models = builtinModels();
-		const expectedCosts = {
-			k3: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
-			"kimi-for-coding-highspeed": { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
-		};
+	it.skipIf(!getBuiltinModel("kimi-coding", "k3"))(
+		"uses API-equivalent implied pricing for Kimi Coding subscription models",
+		() => {
+			const models = builtinModels();
+			const expectedCosts = {
+				k3: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
+				"kimi-for-coding-highspeed": { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
+			};
 
-		for (const [modelId, cost] of Object.entries(expectedCosts)) {
-			expect(models.getModel("kimi-coding", modelId)?.cost).toEqual(cost);
-		}
-	});
+			for (const [modelId, cost] of Object.entries(expectedCosts)) {
+				expect(models.getModel("kimi-coding", modelId)?.cost).toEqual(cost);
+			}
+		},
+	);
 
 	it("resolves Anthropic bearer auth from env with auth token precedence", async () => {
 		const models = createModels({

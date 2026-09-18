@@ -1,8 +1,12 @@
 import { anthropicMessagesApi } from "../api/anthropic-messages.lazy.ts";
 import { envApiKeyAuth, lazyOAuth } from "../auth/helpers.ts";
 import { loadKimiCodingOAuth } from "../auth/oauth/load.ts";
+import { MODELS } from "../models.generated.ts";
 import { createProvider, type Provider } from "../models.ts";
-import { KIMI_CODING_MODELS } from "./kimi-coding.models.ts";
+import type { Model } from "../types.ts";
+
+const kimiCodingModels =
+	(MODELS as unknown as Record<string, Record<string, Model<"anthropic-messages">>>)["kimi-coding"] ?? {};
 
 export function kimiCodingProvider(): Provider<"anthropic-messages"> {
 	return createProvider({
@@ -18,7 +22,7 @@ export function kimiCodingProvider(): Provider<"anthropic-messages"> {
 				load: loadKimiCodingOAuth,
 			}),
 		},
-		models: Object.values(KIMI_CODING_MODELS),
+		models: Object.values(kimiCodingModels),
 		api: anthropicMessagesApi(),
 	});
 }
