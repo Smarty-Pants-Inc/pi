@@ -10,10 +10,16 @@ import type {
 	SessionStartEvent,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import {
+	assertOrdinaryRuntime,
+	bindOrdinaryOptions,
+	type OrdinaryOwnerContext,
+	ordinaryOwnerForFactory,
+	ordinaryOwnerOf,
+} from "./ordinary-owner-context.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
 import { assertUnownedSessionManager, SessionManager } from "./session-manager.ts";
-import { currentSessionOwnership } from "./session-ownership.ts";
 
 /**
  * Result returned by runtime creation.
@@ -85,6 +91,8 @@ export class AgentSessionRuntime {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
 	private _modelFallbackMessage?: string;
+	readonly #owner?: OrdinaryOwnerContext;
+	#ownerDisposal?: Promise<void>;
 
 	constructor(
 		_session: AgentSession,
@@ -93,8 +101,11 @@ export class AgentSessionRuntime {
 		_diagnostics: AgentSessionRuntimeDiagnostic[] = [],
 		_modelFallbackMessage?: string,
 	) {
-		if (currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
-		assertUnownedSessionManager(_session.sessionManager);
+		const owner = ordinaryOwnerForFactory(createRuntime);
+		assertOrdinaryRuntime(_session.sessionManager, owner, createRuntime);
+		owner?.assertServices(_services);
+		owner?.assertSessionStart(_session);
+		this.#owner = owner;
 		this._session = _session;
 		this._services = _services;
 		this.createRuntime = createRuntime;
@@ -138,20 +149,25 @@ export class AgentSessionRuntime {
 		this.beforeSessionInvalidate = beforeSessionInvalidate;
 	}
 
-	#captureOutgoing(): OutgoingSession {
-		if (currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+	#captureOutgoing(allowOwned = false): OutgoingSession {
+		if (this.#owner && !allowOwned)
+			throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: replacement requires separate receiving");
 		const session = this.session;
 		const sessionManager = session.sessionManager;
-		assertUnownedSessionManager(sessionManager);
+		assertOrdinaryRuntime(sessionManager, this.#owner, this.createRuntime);
+		this.#owner?.assertSessionStart(session);
 		return { session, sessionManager };
 	}
 
-	#assertCurrent(outgoing: OutgoingSession): void {
-		if (currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+	#assertIdentity(outgoing: OutgoingSession): void {
 		if (this.session !== outgoing.session || outgoing.session.sessionManager !== outgoing.sessionManager) {
 			throw new Error("OWNER_RUNTIME_SESSION_CHANGED");
 		}
-		assertUnownedSessionManager(outgoing.sessionManager);
+	}
+
+	#assertCurrent(outgoing: OutgoingSession): void {
+		this.#assertIdentity(outgoing);
+		assertOrdinaryRuntime(outgoing.sessionManager, this.#owner, this.createRuntime);
 	}
 
 	private async emitBeforeSwitch(
@@ -450,7 +466,42 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(): Promise<void> {
-		const outgoing = this.#captureOutgoing();
+		if (this.#ownerDisposal) return this.#ownerDisposal;
+		const outgoing = this.#captureOutgoing(true);
+		if (this.#owner) {
+			// Publish the shared task before invoking close callbacks. Sealed-owner
+			// terminal persistence checks identity, not active-owner permission.
+			let resolve!: () => void;
+			let reject!: (cause: unknown) => void;
+			this.#ownerDisposal = new Promise<void>((done, failed) => {
+				resolve = done;
+				reject = failed;
+			});
+			try {
+				void this.#owner
+					.close({
+						stop: () => {
+							this.#assertIdentity(outgoing);
+							return outgoing.session.abort();
+						},
+						persist: async () => {
+							this.#assertIdentity(outgoing);
+							await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+								type: "session_shutdown",
+								reason: "quit",
+							});
+							this.#assertIdentity(outgoing);
+							this.beforeSessionInvalidate?.();
+							this.#assertIdentity(outgoing);
+							outgoing.session.dispose();
+						},
+					})
+					.then(resolve, reject);
+			} catch (cause) {
+				reject(cause);
+			}
+			return this.#ownerDisposal;
+		}
 		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
 			type: "session_shutdown",
 			reason: "quit",
@@ -477,13 +528,16 @@ export async function createAgentSessionRuntime(
 		sessionStartEvent?: SessionStartEvent;
 	},
 ): Promise<AgentSessionRuntime> {
-	if (currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+	const owner = ordinaryOwnerOf(options);
 	const sessionManager = options.sessionManager;
-	assertUnownedSessionManager(sessionManager);
+	assertOrdinaryRuntime(sessionManager, owner, createRuntime);
 	const { cwd, agentDir, sessionStartEvent } = options;
 	const retained = Object.freeze({ cwd, agentDir, sessionStartEvent, sessionManager });
 	assertSessionCwdExists(sessionManager, retained.cwd);
-	const { session, services, diagnostics, modelFallbackMessage } = await createRuntime(retained);
+	const { session, services, diagnostics, modelFallbackMessage } = await (owner
+		? owner.within(() => createRuntime(bindOrdinaryOptions(retained, owner)))
+		: createRuntime(retained));
+	assertOrdinaryRuntime(session.sessionManager, owner, createRuntime);
 	return new AgentSessionRuntime(session, services, createRuntime, diagnostics, modelFallbackMessage);
 }
 

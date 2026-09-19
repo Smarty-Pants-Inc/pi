@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { stream as streamResponses } from "../src/api/openai-responses.ts";
 import {
 	observeResponsesEvidence,
 	type ResponsesEvidence,
 	readResponsesUsage,
 	withResponsesEvidence,
 } from "../src/api/responses-evidence.ts";
+import type { Model } from "../src/types.ts";
 
 // Synthetic decoded events through the production observer, NOT native/provider proof.
 const response = (status = "completed", usage: unknown = { input_tokens: 7, output_tokens: 3, total_tokens: 10 }) => ({
@@ -28,6 +30,47 @@ async function collect(values: Array<{ type: string; response?: unknown }>) {
 }
 
 describe("Responses native-event accounting", () => {
+	it("connects the production parser to the original transport Response", async () => {
+		const model: Model<"openai-responses"> = {
+			id: "synthetic-model",
+			name: "Synthetic",
+			api: "openai-responses",
+			provider: "openai",
+			baseUrl: "https://synthetic.invalid/v1",
+			reasoning: false,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 4096,
+			maxTokens: 128,
+		};
+		const receipts: Readonly<ResponsesEvidence>[] = [];
+		const result = await streamResponses(
+			model,
+			{ messages: [] },
+			{
+				apiKey: "synthetic-not-a-credential",
+				maxRetries: 0,
+				fetch: async () => {
+					const event = { type: "response.completed", sequence_number: 0, response: response() };
+					const http = new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+						headers: { "content-type": "text/event-stream" },
+					});
+					observeResponsesEvidence(http, model.id, (receipt) => receipts.push(receipt));
+					return http;
+				},
+			},
+		).result();
+		expect(result.stopReason).toBe("stop");
+		expect(receipts).toHaveLength(1);
+		expect(receipts[0]).toMatchObject({
+			responseId: "resp_synthetic",
+			terminal: "completed",
+			streamEnded: true,
+			conflict: false,
+			usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10 },
+		});
+	});
+
 	it("preserves actual raw totals without fabricating optional counters or cost", async () => {
 		const receipts = await collect([{ type: "response.completed", response: response() }]);
 		expect(receipts).toHaveLength(1);

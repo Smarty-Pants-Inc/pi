@@ -10,6 +10,8 @@ import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefi
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
+import { assertOrdinaryRuntime, bindOrdinaryOptions, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
+import { bindOrdinaryPairedContext } from "./ordinary-request-pair.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
@@ -172,9 +174,62 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	if (currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+	const owner = ordinaryOwnerOf(options);
+	if (!owner && currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
 	const suppliedManager = options.sessionManager;
-	if (suppliedManager !== undefined) assertUnownedSessionManager(suppliedManager);
+	if (owner) {
+		if (!suppliedManager) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+		assertOrdinaryRuntime(suppliedManager, owner);
+		// Retain each selected input before callbacks or asynchronous preparation.
+		const {
+			cwd,
+			agentDir,
+			resourceLoader,
+			modelRuntime,
+			settingsManager,
+			model,
+			customTools,
+			scopedModels,
+			noTools,
+			excludeTools,
+			tools,
+			thinkingLevel,
+			sessionStartEvent,
+		} = options;
+		options = Object.freeze({
+			cwd,
+			agentDir,
+			resourceLoader,
+			modelRuntime,
+			settingsManager,
+			model,
+			customTools,
+			scopedModels,
+			noTools,
+			excludeTools,
+			tools: tools?.slice(),
+			thinkingLevel,
+			sessionStartEvent,
+			sessionManager: suppliedManager,
+		});
+		owner.assertSdkInputs(options);
+		const allowed = owner.decision.record.provider;
+		if (
+			!model ||
+			model.provider !== allowed.provider ||
+			model.id !== allowed.model ||
+			model.api !== allowed.api ||
+			model.baseUrl !== allowed.baseUrl ||
+			customTools?.length ||
+			scopedModels?.length ||
+			noTools ||
+			excludeTools?.length ||
+			!options.tools ||
+			options.tools.some((name) => !["read", "write", "edit", "sense"].includes(name))
+		) {
+			throw new Error("OWNER_RUNTIME_SCOPE");
+		}
+	} else if (suppliedManager !== undefined) assertUnownedSessionManager(suppliedManager);
 	const cwd = resolvePath(options.cwd ?? suppliedManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
@@ -267,6 +322,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	).filter((name) => !excludedToolNameSet?.has(name));
 
 	let agent: Agent;
+	let pairedContext: ReturnType<typeof bindOrdinaryPairedContext> | undefined;
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -314,7 +370,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			thinkingLevel,
 			tools: [],
 		},
-		convertToLlm: convertToLlmWithBlockImages,
+		convertToLlm: (messages) => {
+			const converted = convertToLlmWithBlockImages(messages);
+			pairedContext?.converted(messages, converted);
+			return converted;
+		},
 		streamFn: async (model, context, options) => {
 			const providerRetrySettings = settingsManager.getProviderRetrySettings();
 			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
@@ -363,14 +423,16 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			});
 		},
 		sessionId: sessionManager.getSessionId(),
-		transformContext: async (messages) => {
+		transformContext: async (messages, signal) => {
+			const selected = pairedContext?.select(messages, signal) ?? messages;
 			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
+			const transformed = runner ? await runner.emitContext(selected) : selected;
+			pairedContext?.transformed(transformed, signal);
+			return transformed;
 		},
 		steeringMode: settingsManager.getSteeringMode(),
 		followUpMode: settingsManager.getFollowUpMode(),
-		transport: settingsManager.getTransport(),
+		transport: owner?.decision.record.provider.transport ?? settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
 	});
@@ -389,7 +451,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		sessionManager.appendThinkingLevelChange(thinkingLevel);
 	}
 
-	const session = new AgentSession({
+	const sessionConfig = {
 		agent,
 		sessionManager,
 		settingsManager,
@@ -403,7 +465,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
-	});
+	};
+	owner?.assertActive();
+	const session = new AgentSession(owner ? bindOrdinaryOptions(sessionConfig, owner) : sessionConfig);
+	owner?.bindSession(session);
+	owner?.installProviderGuard(session);
+	if (owner) pairedContext = bindOrdinaryPairedContext(owner, session, convertToLlmWithBlockImages);
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

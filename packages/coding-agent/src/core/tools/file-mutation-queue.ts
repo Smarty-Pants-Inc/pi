@@ -1,5 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
+import { currentSessionOwnership } from "../session-ownership.ts";
 
 const fileMutationQueues = new Map<string, Promise<void>>();
 let registrationQueue = Promise.resolve();
@@ -30,8 +31,14 @@ async function getMutationQueueKey(filePath: string): Promise<string> {
  * Operations for different files still run in parallel.
  */
 export async function withFileMutationQueue<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+	const owner = currentSessionOwnership();
+	owner?.assertActive();
 	const registration = registrationQueue.then(async () => {
-		const key = await getMutationQueueKey(filePath);
+		owner?.assertActive();
+		// Native owned operations refuse symlinks; use their lexical key
+		// without an unowned realpath lookup.
+		const key = owner ? resolve(filePath) : await getMutationQueueKey(filePath);
+		owner?.assertActive();
 		const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
 
 		let releaseNext!: () => void;
@@ -51,7 +58,10 @@ export async function withFileMutationQueue<T>(filePath: string, fn: () => Promi
 	const { key, currentQueue, chainedQueue, releaseNext } = await registration;
 	await currentQueue;
 	try {
-		return await fn();
+		owner?.assertActive();
+		const result = await (owner ? owner.within(fn) : fn());
+		owner?.assertActive();
+		return result;
 	} finally {
 		releaseNext();
 		if (fileMutationQueues.get(key) === chainedQueue) {
