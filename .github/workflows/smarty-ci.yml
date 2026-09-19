@@ -196,6 +196,11 @@ jobs:
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/node-stage.log"
         node .local/pack-stage.mjs "$STAGE_DIR"
+        mapfile -t emitted_archives < <(find "$STAGE_DIR/tarballs" -maxdepth 1 -type f -name "*.tgz" -print | sort)
+        test "${#emitted_archives[@]}" -gt 0
+        for archive in "${emitted_archives[@]}"; do
+          python3 scripts/check-package-bin-modes.py "$archive"
+        done
         git diff --exit-code HEAD --
         PI_JOB
     - name: Retain complete or partial stage with modes
