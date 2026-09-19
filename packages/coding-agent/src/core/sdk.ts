@@ -13,7 +13,8 @@ import { ModelRuntime } from "./model-runtime.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
-import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
+import { assertUnownedSessionManager, getDefaultSessionDir, SessionManager } from "./session-manager.ts";
+import { currentSessionOwnership } from "./session-ownership.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import { time } from "./timings.ts";
 import {
@@ -171,7 +172,10 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
+	if (currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+	const suppliedManager = options.sessionManager;
+	if (suppliedManager !== undefined) assertUnownedSessionManager(suppliedManager);
+	const cwd = resolvePath(options.cwd ?? suppliedManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
@@ -180,7 +184,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
 
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
-	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	const sessionManager = suppliedManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });

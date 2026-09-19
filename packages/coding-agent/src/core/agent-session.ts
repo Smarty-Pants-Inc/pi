@@ -104,7 +104,8 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { getLatestCompactionEntry } from "./session-manager.ts";
+import { assertUnownedSessionManager, getLatestCompactionEntry } from "./session-manager.ts";
+import { currentSessionOwnership } from "./session-ownership.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -397,8 +398,11 @@ export class AgentSession {
 	private _systemPromptOverride?: string;
 
 	constructor(config: AgentSessionConfig) {
+		if (currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+		const sessionManager = config.sessionManager;
+		assertUnownedSessionManager(sessionManager);
 		this.agent = config.agent;
-		this.sessionManager = config.sessionManager;
+		this.sessionManager = sessionManager;
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;

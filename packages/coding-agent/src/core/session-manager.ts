@@ -14,7 +14,7 @@ import {
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
+import { dirname, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -26,6 +26,8 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import { materializeOwnedEntry, parseOwnedSessionEntries } from "./owned-session-entries.ts";
+import { OwnedJournal } from "./owner-effects.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -865,6 +867,8 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	readonly #ownedJournal?: OwnedJournal;
+	private ownedBytes: Buffer = Buffer.alloc(0);
 
 	private constructor(
 		cwd: string,
@@ -873,10 +877,37 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
+		ownedJournal?: OwnedJournal,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
+		this.#ownedJournal = ownedJournal;
+		if (ownedJournal) {
+			ownedJournal.assertActive();
+			this.sessionFile = ownedJournal.file;
+			this.sessionId = ownedJournal.sessionId;
+			this.persist = true;
+			this.ownedBytes = ownedJournal.read();
+			try {
+				this.fileEntries =
+					this.ownedBytes.length > 0
+						? parseOwnedSessionEntries(this.ownedBytes, this.sessionId)
+						: [materializeOwnedEntry(ownedJournal.initialHeader)];
+				const header = this.fileEntries[0] as SessionHeader;
+				this.cwd = header.cwd;
+				this.flushed = this.ownedBytes.length > 0;
+				this._buildIndex();
+			} catch (error) {
+				try {
+					ownedJournal.quarantine();
+				} catch (cleanup) {
+					throw new AggregateError([error, cleanup], "OWNER_JOURNAL_QUARANTINE_FAILED", { cause: error });
+				}
+				throw error;
+			}
+			return;
+		}
 		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
@@ -896,6 +927,7 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
@@ -924,6 +956,7 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
+		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
@@ -991,6 +1024,10 @@ export class SessionManager {
 	}
 
 	private _rewriteFile(): void {
+		if (this.#ownedJournal) {
+			this.persistCurrent();
+			return;
+		}
 		if (!this.persist || !this.sessionFile) return;
 		const fd = openSync(this.sessionFile, "w");
 		try {
@@ -1004,6 +1041,20 @@ export class SessionManager {
 
 	isPersisted(): boolean {
 		return this.persist;
+	}
+
+	/** Do not silently bind owned storage to the still-unbound ordinary factories. */
+	assertUnownedRuntime(): void {
+		assertUnownedSessionManager(this);
+	}
+
+	static assertUnownedRuntime(manager: unknown): asserts manager is SessionManager {
+		if (manager === null || typeof manager !== "object" || !(#ownedJournal in manager)) {
+			throw new Error("OWNER_RUNTIME_MANAGER_REQUIRED");
+		}
+		if (manager.#ownedJournal) {
+			throw new Error("OWNER_PROFILE_UNAVAILABLE: coherent runtime effect binding is incomplete");
+		}
 	}
 
 	getCwd(): string {
@@ -1027,6 +1078,10 @@ export class SessionManager {
 	}
 
 	_persist(entry: SessionEntry): void {
+		if (this.#ownedJournal) {
+			this.persistCurrent();
+			return;
+		}
 		if (!this.persist || !this.sessionFile) return;
 
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
@@ -1056,10 +1111,53 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		if (this.#ownedJournal) {
+			this.#ownedJournal.assertWritable();
+			const admitted = materializeOwnedEntry(entry);
+			const prefix = this.flushed ? this.ownedBytes : this.encodeOwnedEntries();
+			const bytes = Buffer.concat([prefix, Buffer.from(`${JSON.stringify(admitted)}\n`)]);
+			const selected = parseOwnedSessionEntries(bytes, this.sessionId);
+			const published = selected[selected.length - 1] as SessionEntry;
+			// Publish before changing the canonical index or acknowledging the entry.
+			this.#ownedJournal.commit(bytes);
+			this.ownedBytes = bytes;
+			this.flushed = true;
+			this.fileEntries.push(published);
+			this.byId.set(published.id, published);
+			this.leafId = published.id;
+			return;
+		}
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this._persist(entry);
+	}
+
+	private encodeOwnedEntries(): Buffer {
+		return Buffer.from(
+			`${this.fileEntries.map((entry) => JSON.stringify(materializeOwnedEntry(entry))).join("\n")}\n`,
+		);
+	}
+
+	private ownedView<T>(value: T): T {
+		return this.#ownedJournal ? structuredClone(value) : value;
+	}
+
+	/** Durable owned acknowledgment, including header/control-only sessions. */
+	persistCurrent(): { sessionId: string; file: string; bytes: number; sha256: string } {
+		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		this.#ownedJournal.assertWritable();
+		const bytes = this.flushed ? this.ownedBytes : this.encodeOwnedEntries();
+		const receipt = this.#ownedJournal.commit(bytes);
+		this.ownedBytes = bytes;
+		this.flushed = true;
+		return { sessionId: this.sessionId, file: this.#ownedJournal.file, ...receipt };
+	}
+
+	/** Exclusion is already held by the concrete native capability before any load. */
+	static openOwned(cwd: string, journal: OwnedJournal): SessionManager {
+		OwnedJournal.assertOriginal(journal);
+		return new SessionManager(cwd, dirname(journal.file), undefined, true, undefined, undefined, journal);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1211,11 +1309,11 @@ export class SessionManager {
 	}
 
 	getLeafEntry(): SessionEntry | undefined {
-		return this.leafId ? this.byId.get(this.leafId) : undefined;
+		return this.ownedView(this.leafId ? this.byId.get(this.leafId) : undefined);
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
-		return this.byId.get(id);
+		return this.ownedView(this.byId.get(id));
 	}
 
 	/**
@@ -1228,7 +1326,7 @@ export class SessionManager {
 				children.push(entry);
 			}
 		}
-		return children;
+		return this.ownedView(children);
 	}
 
 	/**
@@ -1280,7 +1378,7 @@ export class SessionManager {
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
-		return path;
+		return this.ownedView(path);
 	}
 
 	/**
@@ -1288,7 +1386,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+		return this.ownedView(buildContextEntries(this.getEntries(), this.leafId, this.byId));
 	}
 
 	/**
@@ -1296,7 +1394,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+		return this.ownedView(buildSessionContext(this.getEntries(), this.leafId, this.byId));
 	}
 
 	/**
@@ -1304,7 +1402,7 @@ export class SessionManager {
 	 */
 	getHeader(): SessionHeader | null {
 		const h = this.fileEntries.find((e) => e.type === "session");
-		return h ? (h as SessionHeader) : null;
+		return this.ownedView(h ? (h as SessionHeader) : null);
 	}
 
 	/**
@@ -1313,7 +1411,7 @@ export class SessionManager {
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
-		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
+		return this.ownedView(this.fileEntries.filter((e): e is SessionEntry => e.type !== "session"));
 	}
 
 	/**
@@ -1372,6 +1470,7 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
+		this.#ownedJournal?.assertActive();
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
@@ -1384,6 +1483,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
+		this.#ownedJournal?.assertActive();
 		this.leafId = null;
 	}
 
@@ -1402,8 +1502,9 @@ export class SessionManager {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		this.#ownedJournal?.assertActive();
 		const fromId = this.leafId ?? "root";
-		this.leafId = branchFromId;
+		if (!this.#ownedJournal) this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
@@ -1425,6 +1526,33 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
+		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
+		return this.selectBranchedSession(leafId);
+	}
+
+	/** Select once through the maintained branch/label algorithm into a detached child. */
+	forkSelected(leafId: string | null, journal: OwnedJournal): SessionManager {
+		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		OwnedJournal.assertOriginal(journal);
+		this.#ownedJournal.assertActive();
+		if (journal.sessionId === this.sessionId || journal.file === this.sessionFile || journal.read().length !== 0) {
+			throw new Error("OWNER_FRESH_CHILD_REQUIRED");
+		}
+		const child = SessionManager.openOwned(this.cwd, journal);
+		const header = materializeOwnedEntry({ ...child.getHeader()!, parentSession: this.sessionFile });
+		if (leafId === null) {
+			child.fileEntries = [header];
+		} else {
+			const scratch = SessionManager.inMemory(this.cwd, undefined, this.fileEntries.map(materializeOwnedEntry));
+			scratch.selectBranchedSession(leafId, header);
+			child.fileEntries = parseOwnedSessionEntries(scratch.encodeOwnedEntries(), journal.sessionId);
+		}
+		child._buildIndex();
+		child.persistCurrent();
+		return child;
+	}
+
+	private selectBranchedSession(leafId: string, selectedHeader?: SessionHeader): string | undefined {
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
@@ -1459,12 +1587,12 @@ export class SessionManager {
 			pathParentId = entry.id;
 		}
 
-		const newSessionId = createSessionId();
-		const timestamp = new Date().toISOString();
+		const newSessionId = selectedHeader?.id ?? createSessionId();
+		const timestamp = selectedHeader?.timestamp ?? new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 		const newSessionFile = join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
 
-		const header: SessionHeader = {
+		const header: SessionHeader = selectedHeader ?? {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
 			id: newSessionId,
@@ -1744,3 +1872,7 @@ export class SessionManager {
 		}
 	}
 }
+
+/** Captured original validator; an instance method or copied prototype is not a fence. */
+export const assertUnownedSessionManager: (manager: unknown) => asserts manager is SessionManager =
+	SessionManager.assertUnownedRuntime;
