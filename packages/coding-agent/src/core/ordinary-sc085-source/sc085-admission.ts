@@ -110,7 +110,7 @@ function validateCommon(value: Record<string, unknown>): void {
 	Object.values(value.authority).forEach(reference);
 	assert(Array.isArray(value.checkpoints) && value.checkpoints.length === 5, "SC085_CHECKPOINT_COUNT");
 	const checkpoints: unknown[] = value.checkpoints;
-	let first: Record<string, unknown> | undefined;
+	const first = new Map<string, Record<string, unknown>>();
 	for (const [index, checkpoint] of checkpoints.entries()) {
 		object(checkpoint, "change sourceSha256 sourceBytes watches");
 		integer(checkpoint.change);
@@ -119,23 +119,31 @@ function validateCommon(value: Record<string, unknown>): void {
 		const payload = index === 1 ? "" : index === 3 ? `${"X".repeat(1025)}\n` : FINAL;
 		assert.equal(checkpoint.sourceBytes, Buffer.byteLength(payload), "SC085_SOURCE_BYTES");
 		assert.equal(checkpoint.sourceSha256, sha(Buffer.from(payload)), "SC085_CONFORMANCE_HASH");
-		assert(Array.isArray(checkpoint.watches) && checkpoint.watches.length === 1, "SC085_SINGLE_WATCH");
-		const watch: unknown = checkpoint.watches[0];
-		object(watch, "watchId executionKey stateNamespace outcome body diagnostic");
-		text(watch.watchId);
-		text(watch.executionKey);
-		if (typeof watch.stateNamespace === "string") text(watch.stateNamespace);
-		else {
-			object(watch.stateNamespace, "kind");
-			assert.equal(watch.stateNamespace.kind, "original-setup", "SC085_NAMESPACE_SELECTOR");
+		assert(Array.isArray(checkpoint.watches) && [1, 8].includes(checkpoint.watches.length), "SC085_WATCH_COHORT");
+		const ids = new Set<string>();
+		const executions = new Set<string>();
+		for (const watch of checkpoint.watches as unknown[]) {
+			object(watch, "watchId executionKey stateNamespace outcome body diagnostic");
+			text(watch.watchId);
+			text(watch.executionKey);
+			if (typeof watch.stateNamespace === "string") text(watch.stateNamespace);
+			else {
+				object(watch.stateNamespace, "kind");
+				assert.equal(watch.stateNamespace.kind, "original-setup", "SC085_NAMESPACE_SELECTOR");
+			}
+			const invalid = index === 1 || index === 3;
+			assert.equal(watch.outcome, invalid ? "EXIT_NONZERO" : "OK", "SC085_OUTCOME");
+			assert.equal(watch.body, invalid ? "" : FINAL.trim(), "SC085_BODY");
+			assert.equal(watch.diagnostic, invalid ? DIAGNOSTIC : null, "SC085_DIAGNOSTIC");
+			assert(!ids.has(watch.watchId) && !executions.has(watch.executionKey), "SC085_DUPLICATE_WATCH");
+			ids.add(watch.watchId);
+			executions.add(watch.executionKey);
+			if (index === 0) first.set(watch.watchId, watch);
+			const original = first.get(watch.watchId);
+			assert(original && watch.executionKey === original.executionKey, "SC085_WATCH_REBOUND");
+			assert.deepEqual(watch.stateNamespace, original.stateNamespace, "SC085_NAMESPACE_REBOUND");
 		}
-		const invalid = index === 1 || index === 3;
-		assert.equal(watch.outcome, invalid ? "EXIT_NONZERO" : "OK", "SC085_OUTCOME");
-		assert.equal(watch.body, invalid ? "" : FINAL.trim(), "SC085_BODY");
-		assert.equal(watch.diagnostic, invalid ? DIAGNOSTIC : null, "SC085_DIAGNOSTIC");
-		first ??= watch;
-		assert(watch.watchId === first.watchId && watch.executionKey === first.executionKey, "SC085_WATCH_REBOUND");
-		assert.deepEqual(watch.stateNamespace, first.stateNamespace, "SC085_NAMESPACE_REBOUND");
+		assert.deepEqual([...ids].sort(), [...first.keys()].sort(), "SC085_COHORT_REBOUND");
 	}
 }
 

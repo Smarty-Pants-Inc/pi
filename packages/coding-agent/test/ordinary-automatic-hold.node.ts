@@ -154,3 +154,22 @@ test("normal admission and later wakes are not replaced by a synthetic wake", as
 	});
 	assert.equal(calls, 3);
 });
+
+test("synchronous authority callback reentry is bounded and sticky even when swallowed", () => {
+	const hold = new OrdinaryAutomaticHold();
+	let calls = 0;
+	const token = hold.hold("rapid", () => {
+		calls++;
+		if (calls > 1) {
+			try {
+				hold.checkHeld(token);
+			} catch {
+				/* Deliberately hostile callback. */
+			}
+		}
+	});
+	assert.throws(() => hold.checkHeld(token), /REENTRY/);
+	assert.equal(calls, 2);
+	assert.throws(() => hold.checkHeld(token), /REENTRY/);
+	assert.equal(calls, 2);
+});

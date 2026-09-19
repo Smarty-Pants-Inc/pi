@@ -66,7 +66,7 @@ export class OrdinarySc085Setup {
 	#lost = false;
 	#used = false;
 	#joined?: { raw: SetupRawRef; event: OrdinaryValidatedSetup; originalRequestId: string };
-	#latest?: Execution;
+	readonly #latest = new Map<string, Execution>();
 
 	constructor(owner: OrdinaryValidatedSetup["owner"], maxBytes: number) {
 		this.#owner = Object.freeze({ ...owner });
@@ -131,7 +131,13 @@ export class OrdinarySc085Setup {
 			captured.result = copy;
 			// Core's checkpoint drains older work. Retain its latest completed
 			// original execution, not all 1000 refreshes or event-supplied facts.
-			if (afterSetup) this.#latest = captured;
+			if (afterSetup) {
+				if (!this.#joined?.event.setup.settlement.samples.some((sample) => sample.watchId === captured.watchId)) {
+					this.#lost = true;
+					return;
+				}
+				this.#latest.set(captured.watchId, captured);
+			}
 		};
 	}
 
@@ -140,7 +146,7 @@ export class OrdinarySc085Setup {
 	receive(
 		event: OrdinaryValidatedSetup,
 		original: OriginalSetupRequest,
-		retained: ReadonlyMap<string, Uint8Array>,
+		retained: Pick<ReadonlyMap<string, Uint8Array>, "get">,
 		record: (value: unknown) => SetupRawRef,
 		checkCurrent: () => void,
 	): SetupRawRef {
@@ -235,47 +241,57 @@ export class OrdinarySc085Setup {
 			"OWNER_SC085_SETUP_EXPOSURE_JOIN",
 		);
 		assert(
-			settlement.samples.length === 1 && frame.views.length === 1 && receipt.views.length === 1,
+			[1, 8].includes(settlement.samples.length) &&
+				frame.views.length === settlement.samples.length &&
+				receipt.views.length === settlement.samples.length &&
+				new Set(settlement.samples.map((sample) => sample.watchId)).size === settlement.samples.length &&
+				new Set(settlement.samples.map((sample) => sample.executionId)).size === settlement.samples.length &&
+				new Set(frame.views.map((view) => view.id)).size === frame.views.length &&
+				new Set(receipt.views.map((view) => view.id)).size === receipt.views.length,
 			"OWNER_SC085_SETUP_COHORT",
 		);
-		const sample = settlement.samples[0];
-		exact(sample, ["executionId", "watchId", "generation", "request", "result"]);
-		exact(sample.request, ["executionKey", "stateNamespace", "sampleTime", "deadline"]);
-		assert(typeof sample.executionId === "string" && sample.executionId, "OWNER_SC085_SETUP_EXECUTION_ID");
-		const matches = this.#executions.filter(
-			(execution) =>
-				execution.watchId === sample.watchId &&
-				execution.generation === sample.generation &&
-				isDeepStrictEqual(execution.request, sample.request) &&
-				execution.result &&
-				isDeepStrictEqual(execution.result, sample.result),
-		);
-		assert(matches.length === 1, "OWNER_SC085_SETUP_ORIGINAL_EXECUTION");
-		const view = frame.views[0],
-			exposed = receipt.views[0];
-		assert(
-			view.id === sample.watchId &&
-				view.generation === sample.generation &&
-				view.source === matches[0].execution.source &&
-				view.definitionRevision === matches[0].execution.revision &&
-				exposed.id === view.id &&
-				exposed.generation === view.generation &&
-				exposed.fingerprint === view.sample.fingerprint &&
-				view.sample.outcome === sample.result.outcome &&
-				view.sample.body === sample.result.body &&
-				view.sample.startedAt === sample.result.startedAt &&
-				view.sample.completedAt === sample.result.completedAt &&
-				view.sample.diagnosticRef === sample.result.diagnosticRef,
-			"OWNER_SC085_SETUP_RESULT_EXPOSURE",
-		);
+		const executions: { originalExecution: Execution; coreExecutionId: string }[] = [];
+		for (const sample of settlement.samples) {
+			exact(sample, ["executionId", "watchId", "generation", "request", "result"]);
+			exact(sample.request, ["executionKey", "stateNamespace", "sampleTime", "deadline"]);
+			assert(typeof sample.executionId === "string" && sample.executionId, "OWNER_SC085_SETUP_EXECUTION_ID");
+			const matches = this.#executions.filter(
+				(execution) =>
+					execution.watchId === sample.watchId &&
+					execution.generation === sample.generation &&
+					isDeepStrictEqual(execution.request, sample.request) &&
+					execution.result &&
+					isDeepStrictEqual(execution.result, sample.result),
+			);
+			assert(matches.length === 1, "OWNER_SC085_SETUP_ORIGINAL_EXECUTION");
+			const view = frame.views.find((view) => view.id === sample.watchId),
+				exposed = receipt.views.find((view) => view.id === sample.watchId);
+			assert(
+				view &&
+					exposed &&
+					view.id === sample.watchId &&
+					view.generation === sample.generation &&
+					view.source === matches[0].execution.source &&
+					view.definitionRevision === matches[0].execution.revision &&
+					exposed.id === view.id &&
+					exposed.generation === view.generation &&
+					exposed.fingerprint === view.sample.fingerprint &&
+					view.sample.outcome === sample.result.outcome &&
+					view.sample.body === sample.result.body &&
+					view.sample.startedAt === sample.result.startedAt &&
+					view.sample.completedAt === sample.result.completedAt &&
+					view.sample.diagnosticRef === sample.result.diagnosticRef,
+				"OWNER_SC085_SETUP_RESULT_EXPOSURE",
+			);
+			executions.push({ originalExecution: structuredClone(matches[0]), coreExecutionId: sample.executionId });
+		}
 		checkCurrent();
 		const receiptValue = {
 			kind: "ordinary-sc085-validated-setup/1",
 			owner: this.#owner,
 			event: selected,
 			originalRequestId: original.requestId,
-			originalExecution: structuredClone(matches[0]),
-			coreExecutionId: sample.executionId,
+			executions,
 			executionIdBasis: "core-refresh-correlation-not-native-authority",
 			originalExposure: structuredClone(original.exposure),
 		};
@@ -287,7 +303,7 @@ export class OrdinarySc085Setup {
 	}
 
 	checkpoint(value: OrdinaryObservedRefresh, retained: ReadonlyMap<string, Uint8Array>) {
-		assert(this.#joined && this.#latest?.result && !this.#lost, "OWNER_SC085_CHECKPOINT_UNAVAILABLE");
+		assert(this.#joined && this.#latest.size > 0 && !this.#lost, "OWNER_SC085_CHECKPOINT_UNAVAILABLE");
 		const event = structuredClone(value),
 			settlement = event.settlement;
 		assert(
@@ -303,7 +319,9 @@ export class OrdinarySc085Setup {
 			event.index === 1000 &&
 				event.id === settlement.refreshId &&
 				settlement.ownerEpoch === this.#owner.ownerEpoch &&
-				settlement.samples.length === 1,
+				settlement.samples.length === this.#joined.event.setup.settlement.samples.length &&
+				new Set(settlement.samples.map((sample) => sample.watchId)).size === settlement.samples.length &&
+				new Set(settlement.samples.map((sample) => sample.executionId)).size === settlement.samples.length,
 			"OWNER_SC085_CHECKPOINT_IDENTITY",
 		);
 		for (const [ref, expected] of [
@@ -336,39 +354,49 @@ export class OrdinarySc085Setup {
 				"OWNER_SC085_CHECKPOINT_RETAINED",
 			);
 		}
-		const sample = settlement.samples[0],
-			setup = this.#joined.event.setup.settlement.samples[0],
-			original = this.#latest;
-		assert(
-			isDeepStrictEqual(Object.keys(sample).sort(), ["executionId", "generation", "request", "result", "watchId"]) &&
-				typeof sample.executionId === "string" &&
-				sample.executionId.length > 0,
-			"OWNER_SC085_CHECKPOINT_SAMPLE",
-		);
-		const baseline = this.#executions.find(
-			(execution) =>
-				execution.watchId === setup.watchId &&
-				execution.generation === setup.generation &&
-				isDeepStrictEqual(execution.request, setup.request) &&
-				isDeepStrictEqual(execution.result, setup.result),
-		);
-		assert(
-			baseline &&
-				isDeepStrictEqual(original.execution, baseline.execution) &&
-				isDeepStrictEqual(original.input, baseline.input),
-			"OWNER_SC085_CHECKPOINT_DEFINITION_CHANGED",
-		);
-		assert(
-			sample.watchId === setup.watchId &&
-				sample.generation === setup.generation &&
-				sample.request.executionKey === setup.request.executionKey &&
-				sample.request.stateNamespace === setup.request.stateNamespace &&
-				sample.watchId === original.watchId &&
-				sample.generation === original.generation &&
-				isDeepStrictEqual(sample.request, original.request) &&
-				isDeepStrictEqual(sample.result, original.result),
-			"OWNER_SC085_CHECKPOINT_ORIGINAL_EXECUTION",
-		);
+		for (const sample of settlement.samples) {
+			const setup = this.#joined.event.setup.settlement.samples.find(
+				(selected) => selected.watchId === sample.watchId,
+			);
+			const original = this.#latest.get(sample.watchId);
+			assert(setup && original?.result, "OWNER_SC085_CHECKPOINT_COHORT");
+			assert(
+				isDeepStrictEqual(Object.keys(sample).sort(), [
+					"executionId",
+					"generation",
+					"request",
+					"result",
+					"watchId",
+				]) &&
+					typeof sample.executionId === "string" &&
+					sample.executionId.length > 0,
+				"OWNER_SC085_CHECKPOINT_SAMPLE",
+			);
+			const baseline = this.#executions.find(
+				(execution) =>
+					execution.watchId === setup.watchId &&
+					execution.generation === setup.generation &&
+					isDeepStrictEqual(execution.request, setup.request) &&
+					isDeepStrictEqual(execution.result, setup.result),
+			);
+			assert(
+				baseline &&
+					isDeepStrictEqual(original.execution, baseline.execution) &&
+					isDeepStrictEqual(original.input, baseline.input),
+				"OWNER_SC085_CHECKPOINT_DEFINITION_CHANGED",
+			);
+			assert(
+				sample.watchId === setup.watchId &&
+					sample.generation === setup.generation &&
+					sample.request.executionKey === setup.request.executionKey &&
+					sample.request.stateNamespace === setup.request.stateNamespace &&
+					sample.watchId === original.watchId &&
+					sample.generation === original.generation &&
+					isDeepStrictEqual(sample.request, original.request) &&
+					isDeepStrictEqual(sample.result, original.result),
+				"OWNER_SC085_CHECKPOINT_ORIGINAL_EXECUTION",
+			);
+		}
 		return event;
 	}
 

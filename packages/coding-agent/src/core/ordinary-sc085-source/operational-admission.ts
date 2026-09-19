@@ -6,6 +6,7 @@ import { OrdinaryOperationalAudit, type Sc085StampSelector } from "../ordinary-o
 import { assertOrdinaryOwner, OrdinaryOwnerContext } from "../ordinary-owner-context.ts";
 import {
 	type OperationalBinding,
+	type OriginalCIInitialProjection,
 	type OriginalCISelection,
 	type ReceivedCIData,
 	receiveOriginalCIAuthorization,
@@ -29,6 +30,7 @@ import type {
 	HeldOperationalFile,
 	SourceAdmissionPorts as OperationalHostProviders,
 	OpsBinding as PreviousOpsBinding,
+	Sc085Plan,
 } from "./source-contracts.ts";
 
 type OpsBinding = PreviousOpsBinding | "source-diagnostics";
@@ -41,6 +43,108 @@ import {
 } from "./references/sense/src/adapters/codex/pilot-canonical.ts";
 
 type RawRef = FoundationInstruction["providerModule"];
+const initialConditionNames = [
+	"inheritedHardLimit",
+	"initialFdRoster",
+	"aggregateTasksMembership",
+	"noForeignTableSharers",
+	"noMigrationOrEscape",
+	"noLimitRaiseOrExternalMutation",
+	"targetAllocationSemantics",
+] as const;
+export interface OperationalEpochSource {
+	version: 1;
+	kind: "original-ci-operational-epoch-source";
+	repositoryId: string;
+	runId: string;
+	attempt: string;
+	controlSha: string;
+	workflowSha: string;
+	allocation: { id: string; session: string };
+	resourceEpoch: string;
+	owner: RawRef;
+	ownerUid: string;
+	ownerEpoch: string;
+	limits: RawRef;
+	receiving: RawRef;
+	phasePlan: RawRef;
+	clockContract: RawRef;
+	initialConditions: Record<(typeof initialConditionNames)[number], RawRef>;
+}
+/** Closed DATA decoder only. Parent role/physical custody must additionally be
+ * authenticated from the original selected declaration and graph, never inferred
+ * from this document's owner Ref or its workload Host UID. */
+export function parseOperationalEpochSource(raw: Uint8Array): OperationalEpochSource {
+	const value = parseCanonicalPilotDecision(raw);
+	fields(
+		value,
+		"version kind repositoryId runId attempt controlSha workflowSha allocation resourceEpoch owner ownerUid ownerEpoch limits receiving phasePlan clockContract initialConditions",
+	);
+	assert(value.version === 1 && value.kind === "original-ci-operational-epoch-source", "OPS_EPOCH_SOURCE_KIND");
+	for (const key of ["repositoryId", "runId", "attempt"])
+		assert(typeof value[key] === "string" && /^[1-9][0-9]{0,19}$/.test(value[key]), "OPS_EPOCH_SOURCE_TUPLE");
+	for (const key of ["controlSha", "workflowSha"])
+		assert(typeof value[key] === "string" && /^[a-f0-9]{40}$/.test(value[key]), "OPS_EPOCH_SOURCE_COMMIT");
+	assert(
+		typeof value.ownerUid === "string" &&
+			/^[1-9][0-9]{0,19}$/.test(value.ownerUid) &&
+			BigInt(value.ownerUid) <= 2147483647n,
+		"OPS_EPOCH_SOURCE_HOST_UID",
+	);
+	assert(
+		typeof value.resourceEpoch === "string" &&
+			value.resourceEpoch.length > 0 &&
+			[...value.resourceEpoch].length <= 256 &&
+			![...value.resourceEpoch].some(
+				(character) => /\s/u.test(character) || character.codePointAt(0)! < 32 || character === "\u007f",
+			),
+		"OPS_EPOCH_SOURCE_RESOURCE_EPOCH",
+	);
+	assert.equal(value.ownerEpoch, value.resourceEpoch, "OPS_EPOCH_SOURCE_PARENT_EPOCH");
+	fields(value.allocation, "id session");
+	assert(
+		typeof value.allocation.id === "string" &&
+			value.allocation.id.length > 0 &&
+			[...value.allocation.id].length <= 256 &&
+			![...value.allocation.id].some((character) => character.codePointAt(0)! < 32 || character === "\u007f"),
+		"OPS_EPOCH_SOURCE_ALLOCATION",
+	);
+	assert.equal(
+		value.allocation.session,
+		`allocation-${createHash("sha256").update(value.allocation.id, "utf8").digest("hex")}`,
+		"OPS_EPOCH_SOURCE_SESSION",
+	);
+	fields(value.initialConditions, initialConditionNames.join(" "));
+	for (const ref of [
+		value.owner,
+		value.limits,
+		value.receiving,
+		value.phasePlan,
+		value.clockContract,
+		...Object.values(value.initialConditions),
+	]) {
+		fields(ref, "path sha256");
+		assert(
+			typeof ref.path === "string" &&
+				ref.path.startsWith("/") &&
+				ref.path.length <= 4096 &&
+				!ref.path
+					.split("/")
+					.some(
+						(part, index, parts) =>
+							part === "." ||
+							part === ".." ||
+							(part === "" && index > 0 && !(parts.length === 2 && index === 1)),
+					) &&
+				![...ref.path].some((character) => character.codePointAt(0)! < 32) &&
+				typeof ref.sha256 === "string" &&
+				/^[a-f0-9]{64}$/.test(ref.sha256),
+			"OPS_EPOCH_SOURCE_REF",
+		);
+	}
+	return structuredClone(value) as unknown as OperationalEpochSource;
+}
+
 export interface Sc085PreflightPlan {
 	protocol: "sense-ops-sc085-plan/2";
 	preflight: RawRef;
@@ -244,13 +348,134 @@ export function joinOperationalTuple(
 		Number.isSafeInteger(auth.issued_at) &&
 			Number.isSafeInteger(auth.expires_at) &&
 			auth.issued_at * 1000 <= now &&
-			now < auth.expires_at * 1000 &&
 			auth.expires_at > auth.issued_at &&
 			auth.expires_at - auth.issued_at <= 600,
 		"OPS_CI_EXPIRED",
 	);
 	return structuredClone(binding);
 }
+/** Numeric DATA checks only, never continuation authority. Production supplies a
+ * continued deadline only for its already-bound child, AFTER each successful
+ * pinned original CI read authenticates the same released-in-time custody. */
+export function assertOperationalAdmissionTime(
+	authorization: Pick<ReceivedCIData["authorization"], "issued_at" | "expires_at">,
+	allocation: { notBeforeMs: number; expiresMs: number },
+	clock: { firstWall: number; firstMono: number; lastWall: number; lastMono: number; now: number; mono: number },
+	continuedDeadlineWallMs?: number,
+): void {
+	const { firstWall, firstMono, lastWall, lastMono, now, mono } = clock;
+	const issued = authorization.issued_at * 1000;
+	const bootstrapEnd = authorization.expires_at * 1000;
+	const end = Math.min(allocation.expiresMs, continuedDeadlineWallMs ?? bootstrapEnd);
+	assert(
+		Number.isSafeInteger(issued) &&
+			Number.isSafeInteger(bootstrapEnd) &&
+			bootstrapEnd > issued &&
+			bootstrapEnd - issued <= 600_000 &&
+			Number.isSafeInteger(allocation.notBeforeMs) &&
+			Number.isSafeInteger(allocation.expiresMs) &&
+			(continuedDeadlineWallMs === undefined || Number.isSafeInteger(continuedDeadlineWallMs)) &&
+			Number.isSafeInteger(now) &&
+			Number.isSafeInteger(firstWall) &&
+			Number.isSafeInteger(lastWall) &&
+			Number.isFinite(mono) &&
+			Number.isFinite(firstMono) &&
+			Number.isFinite(lastMono) &&
+			now >= lastWall &&
+			lastWall >= firstWall &&
+			mono >= lastMono &&
+			lastMono >= firstMono &&
+			now >= issued &&
+			now >= allocation.notBeforeMs &&
+			now < end &&
+			mono - firstMono < end - firstWall,
+		"OPS_ADMISSION_EXPIRED_OR_CLOCK_REGRESSION",
+	);
+}
+/** DATA retention correspondence after the original helper's private projection.
+ * No file read, sibling lookup, controller exchange or effect permission here. */
+export function verifyOperationalInitialRetention(
+	projection: OriginalCIInitialProjection,
+	binding: OperationalBinding,
+	retained: ReadonlyMap<string, Uint8Array>,
+): RawRef {
+	for (const entry of [projection.release, projection.initial]) {
+		assert(sha(entry.bytes) === entry.raw.sha256, "OPS_INITIAL_PROJECTION_MUTATED");
+		assert(
+			sc085RetainedBytes(
+				entry.raw,
+				retained,
+				entry === projection.release ? 2 * 1024 * 1024 : 4 * 1024 * 1024,
+			).equals(Buffer.from(entry.bytes)),
+			"OPS_INITIAL_BYTES_NOT_RETAINED",
+		);
+	}
+	const release: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(projection.release.bytes));
+	fields(
+		release,
+		"version kind entry captureSha256 initial authorizationId wrapper issuanceLink releasedNs releasedWallSeconds",
+	);
+	assert.deepEqual(release.initial, projection.initial.raw, "OPS_INITIAL_RELEASE_CARRIER");
+	const initial: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(projection.initial.bytes));
+	fields(
+		initial,
+		"version kind receivingReference runId allocationId sessionId profileSha256 resourceEpoch aggregate launcher preexec original records",
+	);
+	assert(initial.version === 1 && initial.kind === "ordinary-resource-initial/1", "OPS_INITIAL_KIND");
+	fields(initial.preexec, "nofile initialFdAndTasks raw");
+	fields(initial.original, "scope epoch enforcement initialFd");
+	assert(Array.isArray(initial.records) && initial.records.length <= 96, "OPS_INITIAL_RECORD_COUNT");
+	const records = new Map<string, RawRef>();
+	let total = 0;
+	for (const row of initial.records) {
+		fields(row, "raw base64");
+		fields(row.raw, "path sha256");
+		assert(
+			typeof row.raw.path === "string" &&
+				typeof row.raw.sha256 === "string" &&
+				/^[a-f0-9]{64}$/.test(row.raw.sha256),
+			"OPS_INITIAL_RECORD_REF",
+		);
+		assert(
+			typeof row.base64 === "string" && row.base64.length <= 4 * Math.ceil((2 * 1024 * 1024 - total) / 3),
+			"OPS_INITIAL_RECORD_ENCODING",
+		);
+		const bytes = Buffer.from(row.base64, "base64");
+		total += bytes.length;
+		assert(
+			total <= 2 * 1024 * 1024 &&
+				bytes.toString("base64") === row.base64 &&
+				!records.has(row.raw.path) &&
+				sha(bytes) === row.raw.sha256,
+			"OPS_INITIAL_RECORD_RETENTION",
+		);
+		const ref = { path: row.raw.path, sha256: row.raw.sha256 };
+		assert(sc085RetainedBytes(ref, retained, 2 * 1024 * 1024).equals(bytes), "OPS_INITIAL_RECORD_NOT_RETAINED");
+		records.set(ref.path, ref);
+	}
+	const bound = binding.fd_slot_bound;
+	assert(bound, "OPS_INITIAL_PREFLIGHT_REQUIRED");
+	assert.deepEqual(initial.original.scope, bound.scope, "OPS_INITIAL_SCOPE");
+	assert.deepEqual(initial.original.epoch, bound.epoch, "OPS_INITIAL_EPOCH");
+	assert.deepEqual(initial.original.initialFd, bound.proofs.initialFdRoster, "OPS_INITIAL_FD_ROSTER");
+	assert.deepEqual(initial.preexec.initialFdAndTasks, initial.original.initialFd, "OPS_INITIAL_FD_CAPTURE");
+	for (const ref of [
+		initial.preexec.raw,
+		...Object.values(initial.original),
+		...Object.values(bound.proofs),
+		...Object.values(bound.otherResources).map((row) => row.evidence),
+	]) {
+		fields(ref, "path sha256");
+		assert(typeof ref.path === "string", "OPS_INITIAL_RECORD_REF");
+		assert.deepEqual(records.get(ref.path), ref, "OPS_INITIAL_REQUIRED_RECORD");
+	}
+	fields(initial.preexec.raw, "path sha256");
+	assert.equal(initial.preexec.raw.sha256, release.captureSha256, "OPS_INITIAL_CAPTURE_HASH");
+	assert.equal(initial.runId, binding.operational_run_id, "OPS_INITIAL_RUN");
+	assert.equal(initial.profileSha256, binding.native.profile.sha256, "OPS_INITIAL_PROFILE");
+	return { ...projection.release.raw };
+}
+
 function freeze<T>(value: T): T {
 	if (value && typeof value === "object") {
 		for (const child of Object.values(value)) freeze(child);
@@ -265,7 +490,11 @@ export function createOperationalAdmission(
 	inputs: OperationalAdmissionInputs,
 ): OperationalHostProviders["admission"] & {
 	preflight(input: OperationalHostInstruction): void;
-	preflightSc085(input: OperationalHostInstruction, originalBytes: Uint8Array): Promise<void>;
+	preflightSc085(
+		input: OperationalHostInstruction,
+		originalBytes: Uint8Array,
+		retainInitial: (projection: OriginalCIInitialProjection) => void,
+	): Promise<void>;
 	receiveFdSlotPreflight(): IndependentlyAdmittedFdSlotPreflight;
 	receiveFdSlotBoundExpectation(): IndependentlyAdmittedFdSlotExpectation;
 } {
@@ -286,42 +515,86 @@ export function createOperationalAdmission(
 	const firstWall = lastWall,
 		firstMono = lastMono;
 	let issuedGrant: { notBeforeWallMs: number; expiresWallMs: number } | undefined;
-	const receiveTuple = (operation: Operation, input?: OperationalHostInstruction, originalBytes?: Uint8Array) => {
-		assert(
-			["preflight", "configure", "request", "burst", "refresh", "boundary"].includes(operation),
-			"OPS_ADMISSION_OPERATION",
-		);
-		const facts = inspectOperationalAdmission(retained);
-		assert.equal(facts.instructionSha256, sha(initial), "OPS_ADMISSION_INSTRUCTION_DRIFT");
-		if (input !== undefined) assert.deepEqual(input, facts.requested, "OPS_ADMISSION_INPUT_MISMATCH");
-		if (originalBytes !== undefined)
-			assert(Buffer.from(originalBytes).equals(Buffer.from(initial)), "OPS_ADMISSION_INPUT_BYTES");
-		const data = receiveOriginalCIAuthorization(retained.authority);
-		const binding = joinOperationalTuple(data, retained, facts, operation);
-		const now = Date.now(),
-			mono = performance.now(),
-			allocation = facts.nativeCorrespondence.admission.allocation;
-		assert(
-			Number.isSafeInteger(now) &&
-				Number.isFinite(mono) &&
-				now >= lastWall &&
-				mono >= lastMono &&
-				now >= allocation.notBeforeMs &&
-				now < allocation.expiresMs &&
-				mono - firstMono < Math.min(allocation.expiresMs, data.authorization.expires_at * 1000) - firstWall,
-			"OPS_ADMISSION_EXPIRED_OR_CLOCK_REGRESSION",
-		);
-		lastWall = now;
-		lastMono = mono;
-		issuedGrant = {
-			notBeforeWallMs: data.authorization.issued_at * 1000,
-			expiresWallMs: data.authorization.expires_at * 1000,
-		};
-		assert(allocation.scopeOpen, "OPS_ADMISSION_DECLARED_SCOPE_CLOSED");
-		// Recheck held inputs/producer refs after the finite original authority read.
-		assert.deepEqual(inspectOperationalAdmission(retained), facts, "OPS_ADMISSION_CUSTODY_DRIFT");
-		return binding;
+	let originalAuthorization: ReceivedCIData | undefined;
+	let originalInitial: OriginalCIInitialProjection | undefined;
+	let receivingActive = false;
+	const guarded = <T>(action: () => T): T => {
+		checkFailure();
+		if (receivingActive) return fail(new Error("OPS_SYNCHRONOUS_AUTHORITY_REENTRY"));
+		receivingActive = true;
+		try {
+			const value = action();
+			checkFailure();
+			return value;
+		} catch (error) {
+			return fail(error);
+		} finally {
+			receivingActive = false;
+		}
 	};
+	const readRetained = (ref: RawRef) => guarded(() => sc085RetainedBytes(ref, retained.retained));
+	const receiveTuple = (
+		operation: Operation,
+		input?: OperationalHostInstruction,
+		originalBytes?: Uint8Array,
+		retainInitial?: (projection: OriginalCIInitialProjection) => void,
+	) =>
+		guarded(() => {
+			assert(
+				["preflight", "configure", "request", "burst", "refresh", "boundary"].includes(operation),
+				"OPS_ADMISSION_OPERATION",
+			);
+			const facts = inspectOperationalAdmission(retained);
+			assert.equal(facts.instructionSha256, sha(initial), "OPS_ADMISSION_INSTRUCTION_DRIFT");
+			if (input !== undefined) assert.deepEqual(input, facts.requested, "OPS_ADMISSION_INPUT_MISMATCH");
+			if (originalBytes !== undefined)
+				assert(Buffer.from(originalBytes).equals(Buffer.from(initial)), "OPS_ADMISSION_INPUT_BYTES");
+			assert(
+				!retainInitial ||
+					(operation === "preflight" && stage === "new" && !originalAuthorization && !originalInitial),
+				"OPS_CI_INITIAL_ONCE",
+			);
+			const receivedInitial = retainInitial
+				? receiveOriginalCIAuthorization(retained.authority, retained.receiving.ref, "preflight", true)
+				: undefined;
+			const data = receivedInitial
+				? receivedInitial.authorization
+				: receiveOriginalCIAuthorization(retained.authority, retained.receiving.ref, operation);
+			if (originalAuthorization) assert.deepEqual(data, originalAuthorization, "OPS_CI_AUTHORIZATION_CHANGED");
+			const binding = joinOperationalTuple(data, retained, facts, operation);
+			if (receivedInitial) {
+				// Already inside the original supplier guard. No nested guard around
+				// this storage-only callback, and no caller-supplied authority result.
+				const completion: unknown = retainInitial!(structuredClone(receivedInitial.projection));
+				assert(completion === undefined, "OPS_CI_INITIAL_RETENTION_MUST_BE_SYNCHRONOUS");
+				checkFailure();
+				verifyOperationalInitialRetention(receivedInitial.projection, binding, retained.retained);
+				originalInitial = structuredClone(receivedInitial.projection);
+			}
+			if (originalInitial) verifyOperationalInitialRetention(originalInitial, binding, retained.retained);
+			const now = Date.now(),
+				mono = performance.now(),
+				allocation = facts.nativeCorrespondence.admission.allocation;
+			assertOperationalAdmissionTime(
+				data.authorization,
+				allocation,
+				{ firstWall, firstMono, lastWall, lastMono, now, mono },
+				stage === "bound"
+					? Math.min(selection!.intent.validity.expiresWallMs, selection!.clock.validity.expiresWallMs)
+					: undefined,
+			);
+			originalAuthorization ??= freeze(structuredClone(data));
+			lastWall = now;
+			lastMono = mono;
+			issuedGrant = {
+				notBeforeWallMs: data.authorization.issued_at * 1000,
+				expiresWallMs: data.authorization.expires_at * 1000,
+			};
+			assert(allocation.scopeOpen, "OPS_ADMISSION_DECLARED_SCOPE_CLOSED");
+			// Recheck held inputs/producer refs after the finite original authority read.
+			assert.deepEqual(inspectOperationalAdmission(retained), facts, "OPS_ADMISSION_CUSTODY_DRIFT");
+			return binding;
+		});
 	const nativePending = (): never => {
 		throw new Error("OPS_NATIVE_CURRENT_PERMISSION_API_UNAVAILABLE:original-Pi-owner");
 	};
@@ -329,6 +602,9 @@ export function createOperationalAdmission(
 	// option/callback/JSON can supply the expected intent or permission predicate.
 	let stage: "new" | "bootstrap" | "binding" | "bound" | "failed" = "new";
 	let firstFailure: { error: unknown } | undefined;
+	const checkFailure = () => {
+		if (firstFailure) throw firstFailure.error;
+	};
 	const fail = (error: unknown): never => {
 		firstFailure ??= { error };
 		stage = "failed";
@@ -348,7 +624,7 @@ export function createOperationalAdmission(
 		assert(stage !== "failed", "SC085_RECEIVING_FAILED");
 		assert(selection, "SC085_BOOTSTRAP_REQUIRED");
 		const binding = receiveTuple(operation);
-		const current = selectSc085(binding, retained, firstWall, issuedGrant!, stage !== "bound");
+		const current = guarded(() => selectSc085(binding, retained, firstWall, issuedGrant!, stage !== "bound"));
 		assert.deepEqual(current, selection, "SC085_ORIGINAL_SELECTION_CHANGED");
 		if (stage !== "bound") assert(operation === "preflight", "SC085_CHILD_NOT_BOUND");
 		return { binding, current };
@@ -364,7 +640,7 @@ export function createOperationalAdmission(
 					originalClose.evidence,
 				"SC085_ORIGINAL_CLEAN_CLOSE_REQUIRED",
 			);
-			sc085RetainedBytes(originalClose.evidence, retained.retained);
+			readRetained(originalClose.evidence);
 		} else assert(originalClose.phase === "open", "SC085_CHILD_EFFECTS_CLOSED");
 		if (child) {
 			if (!terminalAccounting) {
@@ -372,24 +648,31 @@ export function createOperationalAdmission(
 				checkSc085Budget(current, permission, stage !== "bound");
 			}
 			if (bound && expectedCapsule && expectedQualification) {
-				receiveSc085Admission(bound.admission, expectedCapsule, retained.retained);
-				receiveSc085AuditClockQualification(
-					expectedCapsule.clock.qualification,
-					expectedQualification,
-					retained.retained,
+				guarded(() => receiveSc085Admission(bound!.admission, expectedCapsule, retained.retained));
+				guarded(() =>
+					receiveSc085AuditClockQualification(
+						expectedCapsule!.clock.qualification,
+						expectedQualification,
+						retained.retained,
+					),
 				);
-				sc085RetainedBytes(bound.binding, retained.retained);
+				readRetained(bound.binding);
 			}
 		}
 		return binding;
 	};
 	const result = Object.freeze({
-		async preflightSc085(input: OperationalHostInstruction, originalBytes: Uint8Array) {
+		async preflightSc085(
+			input: OperationalHostInstruction,
+			originalBytes: Uint8Array,
+			retainInitial: (projection: OriginalCIInitialProjection) => void,
+		) {
 			try {
 				if (firstFailure) throw firstFailure.error;
 				assert(stage === "new", "SC085_BOOTSTRAP_ONCE");
-				const binding = receiveTuple("preflight", input, originalBytes);
-				selection = selectSc085(binding, retained, firstWall, issuedGrant!);
+				assert(typeof retainInitial === "function", "OPS_CI_INITIAL_RETENTION_REQUIRED");
+				const binding = receiveTuple("preflight", input, originalBytes, retainInitial);
+				selection = guarded(() => selectSc085(binding, retained, firstWall, issuedGrant!));
 				stage = "bootstrap";
 				recheck("preflight");
 			} catch (error) {
@@ -413,7 +696,7 @@ export function createOperationalAdmission(
 				// expectation/child-owner binding. Do not promote input/sibling JSON,
 				// producer refs or a caller-supplied object into that missing authority.
 				// This precise refusal is before Foundation native.preflightSc085.
-				receiveSc085Admission(input.sc085.admission, undefined, retained.retained);
+				guarded(() => receiveSc085Admission((input.sc085 as Sc085Plan).admission, undefined, retained.retained));
 			}
 			return nativePending();
 		},
@@ -450,7 +733,8 @@ export function createOperationalAdmission(
 			throw new Error("OPS_FD_FINAL_EXPECTATION_REQUIRES_ORIGINAL_CI_OWNER_CAPTURE");
 		},
 		receiveFdSlotPreflight() {
-			const value = receiveTuple("preflight").fd_slot_bound;
+			const binding = receiveTuple("preflight");
+			const value = binding.fd_slot_bound;
 			assert(value !== null, "OPS_FD_EXPECTATION_NOT_ADMITTED");
 			// Independent selection only. Linux still validates real proof bytes/facts;
 			// native current permission and other producers remain required by the host.
@@ -461,7 +745,7 @@ export function createOperationalAdmission(
 				...Object.values(value.otherResources).map((item) => item.evidence),
 			];
 			for (const ref of refs) {
-				const raw = retained.retained.get(ref.path);
+				const raw = guarded(() => retained.retained.get(ref.path));
 				assert(raw && sha(raw) === ref.sha256, "OPS_FD_EXPECTATION_RAW_NOT_RETAINED");
 			}
 			return freeze(structuredClone(value));
@@ -469,9 +753,8 @@ export function createOperationalAdmission(
 	});
 	sc085Failures.set(result, {
 		fail,
-		check() {
-			if (firstFailure) throw firstFailure.error;
-		},
+		guarded,
+		check: checkFailure,
 	});
 	sc085Stores.set(result, retained.retained);
 	sc085Bootstraps.set(result, () => {
@@ -484,7 +767,7 @@ export function createOperationalAdmission(
 					policy: selected.policy,
 					clockPolicy: selected.clock,
 					uncertaintyMs: selected.uncertaintyMs,
-					application: parseOrdinaryOwnerRecord(bytes(retained.decision)).application,
+					application: guarded(() => parseOrdinaryOwnerRecord(bytes(retained.decision)).application),
 					receiverInterval: {
 						firstWallMs: firstWall,
 						firstMonotonicMs: firstMono,
@@ -492,7 +775,6 @@ export function createOperationalAdmission(
 						deadlineWallMs: Math.min(
 							selected.intent.validity.expiresWallMs,
 							selected.clock.validity.expiresWallMs,
-							issuedGrant!.expiresWallMs,
 						),
 					},
 				}),
@@ -562,9 +844,9 @@ export function createOperationalAdmission(
 						binding: bound!.binding,
 						policy: selection!.policy,
 					};
-					const ref = store!.bytes(Buffer.from(`${JSON.stringify(evidence)}\n`));
+					const ref = guarded(() => store!.bytes(Buffer.from(`${JSON.stringify(evidence)}\n`)));
 					assert.deepEqual(
-						JSON.parse(sc085RetainedBytes(ref, retained.retained).toString("utf8")),
+						JSON.parse(readRetained(ref).toString("utf8")),
 						evidence,
 						"SC085_ORIGINAL_CLOSE_STORAGE",
 					);
@@ -626,7 +908,7 @@ export function createOperationalAdmission(
 						Math.min(
 							selected.clock.validity.expiresWallMs,
 							selected.intent.validity.expiresWallMs,
-							issuedGrant!.expiresWallMs,
+							stage === "bound" ? selected.intent.validity.expiresWallMs : issuedGrant!.expiresWallMs,
 						),
 				"SC085_BOOTSTRAP_STAMP_VALIDITY",
 			);
@@ -640,12 +922,8 @@ export function createOperationalAdmission(
 				wallMs,
 				uncertaintyMs: null,
 			};
-			const raw = recorder.bytes(Buffer.from(`${JSON.stringify(original)}\n`));
-			assert.deepEqual(
-				JSON.parse(sc085RetainedBytes(raw, retained.retained).toString("utf8")),
-				original,
-				"SC085_BOOTSTRAP_SAMPLE_STORAGE",
-			);
+			const raw = guarded(() => recorder.bytes(Buffer.from(`${JSON.stringify(original)}\n`)));
+			assert.deepEqual(JSON.parse(readRetained(raw).toString("utf8")), original, "SC085_BOOTSTRAP_SAMPLE_STORAGE");
 			// This qualification ref is the independently selected original BOOTSTRAP
 			// policy, not a child-shaped Sc085AuditClockQualificationV1 with fake owner.
 			const qualification = selected.intent.clockRequirement.qualificationPolicy;
@@ -663,12 +941,8 @@ export function createOperationalAdmission(
 				accountingPhase: terminalAccounting ? "post-original-child-close" : "original-open-interval",
 				originalChildClose: terminalAccounting ? originalClose.evidence! : null,
 			};
-			const viewRef = recorder.bytes(Buffer.from(`${JSON.stringify(view)}\n`));
-			assert.deepEqual(
-				JSON.parse(sc085RetainedBytes(viewRef, retained.retained).toString("utf8")),
-				view,
-				"SC085_BOOTSTRAP_VIEW_STORAGE",
-			);
+			const viewRef = guarded(() => recorder.bytes(Buffer.from(`${JSON.stringify(view)}\n`)));
+			assert.deepEqual(JSON.parse(readRetained(viewRef).toString("utf8")), view, "SC085_BOOTSTRAP_VIEW_STORAGE");
 			assert((originalClose.phase === "clean") === terminalAccounting, "SC085_ACCOUNTING_PHASE_CHANGED");
 			recheck("preflight", terminalAccounting); // Parent/current refs and same latch after storage.
 			lastBootstrapWall = wallMs;
@@ -703,10 +977,12 @@ export function createOperationalAdmission(
 				"SC085_ORIGINAL_BOUND_CHILD_REQUIRED",
 			);
 			recheck("boundary"); // Completed evidence never demands a FUTURE turn.
-			const q = receiveSc085AuditClockQualification(
-				expectedCapsule.clock.qualification,
-				expectedQualification,
-				retained.retained,
+			const q = guarded(() =>
+				receiveSc085AuditClockQualification(
+					expectedCapsule!.clock.qualification,
+					expectedQualification,
+					retained.retained,
+				),
 			);
 			if (selector.kind === "request") fields(selector, "kind requestId phase");
 			else if (selector.kind === "exposure") fields(selector, "kind requestId");
@@ -718,7 +994,7 @@ export function createOperationalAdmission(
 			assert.deepEqual(original.scope, q.owner, "SC085_STAMP_ORIGINAL_SCOPE");
 			assert.deepEqual(
 				original.clockIdentity,
-				JSON.parse(sc085RetainedBytes(q.nativeIdentity, retained.retained).toString("utf8")),
+				JSON.parse(readRetained(q.nativeIdentity).toString("utf8")),
 				"SC085_STAMP_ORIGINAL_IDENTITY",
 			);
 			const stamp = original.stamp,
@@ -736,12 +1012,8 @@ export function createOperationalAdmission(
 						Math.min(q.validity.expiresWallMs, expectedCapsule.validity.expiresWallMs),
 				"SC085_STAMP_VALIDITY",
 			);
-			const raw = store.bytes(Buffer.from(`${JSON.stringify(original)}\n`));
-			assert.deepEqual(
-				JSON.parse(sc085RetainedBytes(raw, retained.retained).toString("utf8")),
-				original,
-				"SC085_STAMP_STORAGE",
-			);
+			const raw = guarded(() => store!.bytes(Buffer.from(`${JSON.stringify(original)}\n`)));
+			assert.deepEqual(JSON.parse(readRetained(raw).toString("utf8")), original, "SC085_STAMP_STORAGE");
 			const view = {
 				protocol: "sense-ops-sc085-qualified-stamp/1",
 				original: raw,
@@ -752,12 +1024,8 @@ export function createOperationalAdmission(
 				wallMs: stamp.wallMs,
 				uncertaintyMs,
 			};
-			const viewRef = store.bytes(Buffer.from(`${JSON.stringify(view)}\n`));
-			assert.deepEqual(
-				JSON.parse(sc085RetainedBytes(viewRef, retained.retained).toString("utf8")),
-				view,
-				"SC085_QUALIFIED_VIEW_STORAGE",
-			);
+			const viewRef = guarded(() => store!.bytes(Buffer.from(`${JSON.stringify(view)}\n`)));
+			assert.deepEqual(JSON.parse(readRetained(viewRef).toString("utf8")), view, "SC085_QUALIFIED_VIEW_STORAGE");
 			recheck("boundary");
 			return {
 				clockId: view.clockId,
@@ -811,12 +1079,8 @@ export function createOperationalAdmission(
 					audit.timeOriginMs === performance.timeOrigin,
 				"SC085_ORIGINAL_AUDIT_SOURCE",
 			);
-			const nativeIdentity = recorder.bytes(Buffer.from(`${JSON.stringify(audit)}\n`));
-			assert.deepEqual(
-				JSON.parse(sc085RetainedBytes(nativeIdentity, retained.retained).toString("utf8")),
-				audit,
-				"SC085_AUDIT_STORAGE",
-			);
+			const nativeIdentity = guarded(() => recorder.bytes(Buffer.from(`${JSON.stringify(audit)}\n`)));
+			assert.deepEqual(JSON.parse(readRetained(nativeIdentity).toString("utf8")), audit, "SC085_AUDIT_STORAGE");
 			const qualification: Sc085AuditClockQualificationV1 = {
 				protocol: "sense-ops-sc085-audit-clock/1",
 				owner: identity,
@@ -827,8 +1091,8 @@ export function createOperationalAdmission(
 				mapping: { kind: "same-original-source", nativeClockId: audit.id, uncertaintyMs: selected.uncertaintyMs },
 				validity: selected.clock.validity,
 			};
-			const qualifiedRef = recorder.bytes(canonicalSc085AuditClockQualification(qualification));
-			receiveSc085AuditClockQualification(qualifiedRef, qualification, retained.retained);
+			const qualifiedRef = guarded(() => recorder.bytes(canonicalSc085AuditClockQualification(qualification)));
+			guarded(() => receiveSc085AuditClockQualification(qualifiedRef, qualification, retained.retained));
 			const capsule: Sc085AdmissionV1 = {
 				protocol: "sense-ops-sc085-admission/1",
 				runId: intent.runId,
@@ -845,8 +1109,8 @@ export function createOperationalAdmission(
 				validity: intent.validity,
 				authority: intent.authority,
 			};
-			const admission = recorder.bytes(canonicalPilotDecision(capsule));
-			const received = receiveSc085Admission(admission, capsule, retained.retained);
+			const admission = guarded(() => recorder.bytes(canonicalPilotDecision(capsule)));
+			const received = guarded(() => receiveSc085Admission(admission, capsule, retained.retained));
 			const requested = instruction(initial),
 				plan = requested.sc085;
 			assert(isPlan2(plan), "SC085_PLAN2_REQUIRED");
@@ -883,16 +1147,13 @@ export function createOperationalAdmission(
 				owner: identity,
 				permission,
 			};
-			const binding = recorder.bytes(Buffer.from(`${JSON.stringify(evidence)}\n`));
-			assert.deepEqual(
-				JSON.parse(sc085RetainedBytes(binding, retained.retained).toString("utf8")),
-				evidence,
-				"SC085_BINDING_STORAGE",
-			);
+			const binding = guarded(() => recorder.bytes(Buffer.from(`${JSON.stringify(evidence)}\n`)));
+			assert.deepEqual(JSON.parse(readRetained(binding).toString("utf8")), evidence, "SC085_BINDING_STORAGE");
 			// Publish private bound state only after both byte receiving and native
 			// authentication. Failure poisons this once path; caller owns original close.
 			// Include retention/qualification costs before publishing the full binding.
 			checkSc085Budget(selected, nativePermission(owner, "preflight", intent.nativeReceiving), true);
+			receiveCurrentParent("preflight"); // B must finish inside the original bootstrap window.
 			// Storage may catch a nested known-route violation. Its original cause
 			// still poisons THIS supplier; never publish bound state over that latch.
 			sc085Failures.get(result)!.check();
@@ -900,7 +1161,7 @@ export function createOperationalAdmission(
 			store = recorder;
 			expectedCapsule = structuredClone(capsule);
 			expectedQualification = structuredClone(qualification);
-			bound = { preflight: { ...plan.preflight }, admission, binding };
+			bound = { primaryWatchId: selected.primaryWatchId, preflight: { ...plan.preflight }, admission, binding };
 			stage = "bound";
 			recheck("preflight");
 			return structuredClone(bound);
@@ -912,6 +1173,8 @@ export function createOperationalAdmission(
 }
 
 export interface Sc085Bound {
+	/** Derived from the original admitted instruction.with, never an author field. */
+	primaryWatchId: string;
 	preflight: RawRef;
 	admission: RawRef;
 	binding: RawRef;
@@ -963,7 +1226,17 @@ interface ReceivingRoute {
 	phase: "prepared" | "entered" | "bound" | "failed";
 	owner?: OrdinaryOwnerContext;
 }
-const sc085Failures = new WeakMap<object, { check(): void; fail(error: unknown): never }>();
+const sc085Failures = new WeakMap<
+	object,
+	{ check(): void; fail(error: unknown): never; guarded<T>(action: () => T): T }
+>();
+/** Synchronous original storage callbacks cannot reenter an authority read. This
+ * is a private routing guard, not a cached permission or replacement recorder. */
+export function guardSc085OriginalCallback<T>(receiving: Sc085OriginalReceiving, action: () => T): T {
+	const route = originalReceivings.get(receiving);
+	assert(route, "SC085_ORIGINAL_RECEIVING_PHASE");
+	return sc085Failures.get(route.supplier)!.guarded(action);
+}
 /** Only an already registered supplier can be poisoned. This is internal control
  * flow, not a caller-provided verifier or another authority registry. */
 function withSc085Supplier<T>(supplier: object, action: () => T): T {
@@ -1263,6 +1536,54 @@ export interface Sc085ClockPolicyV1 {
 	uncertaintyMs: string | null;
 	validity: { notBeforeWallMs: number; expiresWallMs: number };
 }
+/** DATA correspondence only; the enclosing supplier authenticates instruction and
+ * intent bytes before this selection. Preserve every peer, independent of order. */
+export function selectSc085PrimaryWatch(
+	controls: readonly unknown[],
+	checkpoints: Sc085AdmissionV1["checkpoints"],
+): string {
+	assert([1, 8].includes(controls.length), "SC085_CONTROL_COHORT");
+	const watches = controls.map((control) => {
+		assert(control !== null && typeof control === "object" && !Array.isArray(control), "SC085_CONTROL_WATCH");
+		const value = control as Record<string, unknown>;
+		assert(
+			value.op === "watch" &&
+				typeof value.id === "string" &&
+				value.id.length > 0 &&
+				typeof value.source === "string" &&
+				value.source.length > 0 &&
+				(value.wake === "change" || value.wake === "never"),
+			"SC085_CONTROL_WATCH",
+		);
+		if (controls.length === 8) assert(value.every === "1s", "SC085_CONTROL_CADENCE");
+		return value;
+	});
+	if (controls.length === 8) {
+		const selectedSource = watches.find((watch) => watch.wake === "change");
+		assert(selectedSource, "SC085_UNIQUE_PRIMARY");
+		fields(selectedSource.input, "path");
+		assert(
+			typeof selectedSource.input.path === "string" && selectedSource.input.path.length > 0,
+			"SC085_CONTROL_INPUT",
+		);
+		for (const watch of watches) {
+			assert.equal(watch.source, selectedSource.source, "SC085_CONTROL_SOURCE");
+			assert.deepEqual(watch.input, selectedSource.input, "SC085_CONTROL_INPUT");
+		}
+	}
+	const ids = watches.map((watch) => watch.id as string);
+	assert(new Set(ids).size === ids.length, "SC085_CONTROL_DUPLICATE");
+	const primary = watches.filter((watch) => watch.wake === "change");
+	assert(primary.length === 1, "SC085_UNIQUE_PRIMARY");
+	for (const checkpoint of checkpoints)
+		assert.deepEqual(
+			checkpoint.watches.map((watch) => watch.watchId).sort(),
+			[...ids].sort(),
+			"SC085_CONTROL_EXPECTATIONS",
+		);
+	return primary[0].id as string;
+}
+
 function selectSc085(
 	binding: OperationalBinding,
 	inputs: OperationalAdmissionInputs,
@@ -1270,8 +1591,21 @@ function selectSc085(
 	issuedGrant: { notBeforeWallMs: number; expiresWallMs: number },
 	reserve = true,
 ) {
-	const selected = parseCanonicalPilotDecision(sc085RetainedBytes(binding.policy, inputs.retained));
-	fields(selected, "protocol intent bootstrap cleanupReserveMs");
+	// receiveTuple authenticates the ENTIRE policy through the pinned original CI
+	// helper before this call. Keep its full raw ref; never accept a detached intent
+	// or rehash these four operands as a replacement policy. CI metadata stays in
+	// the same retained canonical document and original issuance joins.
+	const document = parseCanonicalPilotDecision(sc085RetainedBytes(binding.policy, inputs.retained));
+	assert(document !== null && typeof document === "object" && !Array.isArray(document), "SC085_POLICY_OBJECT");
+	const policy = document as Record<string, unknown>;
+	for (const name of ["protocol", "intent", "bootstrap", "cleanupReserveMs"])
+		assert(Object.hasOwn(policy, name), "SC085_POLICY_FIELDS");
+	const selected = {
+		protocol: policy.protocol,
+		intent: policy.intent,
+		bootstrap: policy.bootstrap,
+		cleanupReserveMs: policy.cleanupReserveMs,
+	};
 	assert.equal(selected.protocol, "sense-ops-sc085-issued-policy/1", "SC085_ORIGINAL_POLICY_UNAVAILABLE");
 	assert.deepEqual(selected.bootstrap, ["accounting", "native-receive"], "SC085_BOOTSTRAP_PERMISSION");
 	safe(selected.cleanupReserveMs);
@@ -1286,10 +1620,12 @@ function selectSc085(
 	const intent = receiveSc085PreflightIntent(plan.preflight, expected, inputs.retained);
 	const native = parseOrdinaryOwnerRecord(bytes(inputs.decision));
 	assert.equal(intent.allocationId, native.admission.allocation.id, "SC085_PREFLIGHT_ALLOCATION");
+	// The pinned original helper authenticates this immutable policy's phase-plan
+	// deadline. The short release/start window is not the operational lifetime.
 	assert(
 		intent.validity.notBeforeWallMs >=
 			Math.max(issuedGrant.notBeforeWallMs, native.admission.allocation.notBeforeMs) &&
-			intent.validity.expiresWallMs <= Math.min(issuedGrant.expiresWallMs, native.admission.allocation.expiresMs),
+			intent.validity.expiresWallMs <= native.admission.allocation.expiresMs,
 		"SC085_ORIGINAL_GRANT_WINDOW",
 	);
 	assert.deepEqual(intent.nativeReceiving, binding.native, "SC085_PREFLIGHT_NATIVE");
@@ -1356,6 +1692,7 @@ function selectSc085(
 			"SC085_BOOTSTRAP_NO_FIT",
 		);
 	return {
+		primaryWatchId: selectSc085PrimaryWatch(requested.with, intent.checkpoints),
 		policy: { ...binding.policy },
 		intent,
 		clock: structuredClone(clockValue) as unknown as Sc085ClockPolicyV1,

@@ -19,6 +19,7 @@ interface Hold {
 export class OrdinaryAutomaticHold {
 	#hold?: Hold;
 	#failure?: { cause: unknown };
+	#checking = false;
 
 	#assertHealthy(): void {
 		if (this.#failure) throw this.#failure.cause;
@@ -26,13 +27,21 @@ export class OrdinaryAutomaticHold {
 
 	#check(hold: Hold): void {
 		this.#assertHealthy();
-		try {
-			hold.check();
-		} catch (cause) {
+		if (this.#checking) {
+			const cause = new Error("OWNER_AUTOMATIC_HOLD_REENTRY");
 			this.fail(cause);
 			throw cause;
 		}
-		this.#assertHealthy();
+		this.#checking = true;
+		try {
+			hold.check();
+			this.#assertHealthy();
+		} catch (cause) {
+			this.fail(cause);
+			throw cause;
+		} finally {
+			this.#checking = false;
+		}
 	}
 
 	#original(token: object): Hold {

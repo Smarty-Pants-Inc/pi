@@ -205,7 +205,7 @@ export class OrdinaryOperationalAudit {
 	 * No authority is created here; the owner supplies its own current check. */
 	registerValidatedSetupReceiver(
 		register: (receive: (event: OrdinaryValidatedSetup) => Promise<SetupRawRef>) => void,
-		retained: ReadonlyMap<string, Uint8Array>,
+		retained: Pick<ReadonlyMap<string, Uint8Array>, "get">,
 		record: (value: unknown) => SetupRawRef,
 		checkCurrent: () => void,
 	): void {
@@ -235,7 +235,7 @@ export class OrdinaryOperationalAudit {
 	 * Matching this event proves association only, never source authority. */
 	receiveValidatedSetup(
 		event: OrdinaryValidatedSetup,
-		retained: ReadonlyMap<string, Uint8Array>,
+		retained: Pick<ReadonlyMap<string, Uint8Array>, "get">,
 		record: (value: unknown) => SetupRawRef,
 		checkCurrent: () => void,
 	): SetupRawRef {
