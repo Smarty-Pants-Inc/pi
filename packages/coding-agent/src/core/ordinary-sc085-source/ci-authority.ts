@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import type { RawRef } from "./fd-slot-expectation.ts";
 import type { IndependentlyAdmittedFdSlotPreflight } from "./fd-slot-preflight.ts";
+import type { SourceAdmissionPorts } from "./source-contracts.ts";
 
 // Exact proposed ORIGINAL controller overlay, not caller-selectable executable code.
 export const OPERATIONAL_CONTROLLER_SHA256 = "fdf74629e6a1da89ab9ba9c84c5824eb9b912ec1c2b668c2eb80e98b4505ae61";
@@ -62,11 +63,102 @@ export interface ReceivedCIData {
 	};
 	manifest_sha256: string;
 }
+export interface OriginalCIInitialProjection {
+	release: { raw: RawRef; bytes: Uint8Array };
+	initial: { raw: RawRef; bytes: Uint8Array };
+}
+export interface ReceivedCIInitial {
+	authorization: ReceivedCIData;
+	projection: OriginalCIInitialProjection;
+}
+
+/** DATA decoder for the private same-helper projection, not independent authority. */
+export function parseOriginalCIInitial(raw: Uint8Array): ReceivedCIInitial {
+	assert(raw.byteLength <= 9 * 1024 * 1024, "OPS_CI_INITIAL_OUTPUT_LIMIT");
+	function fields(value: unknown, names: string): asserts value is Record<string, unknown> {
+		assert(value !== null && typeof value === "object" && !Array.isArray(value), "OPS_CI_INITIAL_OBJECT");
+		assert.deepEqual(Object.keys(value).sort(), names.split(" ").sort(), "OPS_CI_INITIAL_FIELDS");
+	}
+	const packet: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
+	fields(packet, "version kind authorization release initial");
+	assert(packet.version === 1 && packet.kind === "original-ci-operational-initial-receiving", "OPS_CI_INITIAL_KIND");
+	const decode = (value: unknown, limit: number) => {
+		fields(value, "raw base64");
+		fields(value.raw, "path sha256");
+		assert(
+			typeof value.raw.path === "string" &&
+				isAbsolute(value.raw.path) &&
+				!/[\u0000-\u001f]/.test(value.raw.path) &&
+				!value.raw.path
+					.split("/")
+					.slice(1)
+					.some((part) => !part || part === "." || part === "..") &&
+				typeof value.raw.sha256 === "string" &&
+				/^[a-f0-9]{64}$/.test(value.raw.sha256),
+			"OPS_CI_INITIAL_REF",
+		);
+		assert(
+			typeof value.base64 === "string" && value.base64.length <= 4 * Math.ceil(limit / 3),
+			"OPS_CI_INITIAL_ENCODING",
+		);
+		const bytes = Buffer.from(value.base64, "base64");
+		assert(bytes.length <= limit && bytes.toString("base64") === value.base64, "OPS_CI_INITIAL_ENCODING");
+		assert(createHash("sha256").update(bytes).digest("hex") === value.raw.sha256, "OPS_CI_INITIAL_HASH");
+		return { raw: { path: value.raw.path, sha256: value.raw.sha256 }, bytes };
+	};
+	const release = decode(packet.release, 2 * 1024 * 1024);
+	const initial = decode(packet.initial, 4 * 1024 * 1024);
+	const released: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(release.bytes));
+	fields(
+		released,
+		"version kind entry captureSha256 initial authorizationId wrapper issuanceLink releasedNs releasedWallSeconds",
+	);
+	assert(released.version === 1 && released.kind === "original-ci-operational-release", "OPS_CI_INITIAL_RELEASE");
+	assert.deepEqual(released.initial, initial.raw, "OPS_CI_INITIAL_CARRIER");
+	assert.deepEqual(released.wrapper, packet.authorization, "OPS_CI_INITIAL_AUTHORIZATION");
+	const authorization = packet.authorization as ReceivedCIData;
+	assert(authorization && released.authorizationId === authorization.authorization_id, "OPS_CI_INITIAL_AUTHORIZATION");
+	return { authorization, projection: { release, initial } };
+}
+
 /** Nonmutating ORIGINAL authorization transport. No caller response/callback injection,
  * sudo, network, file-permission changes, issue/serve/run or native allocation path.
- * Needs actual separately installed matching control and existing canonical access;
- * absent/inaccessible STATE/policy/intent is refusal, never a copied-file fallback. */
-export function receiveOriginalCIAuthorization(selection: OriginalCISelection): ReceivedCIData {
+ * The independently held receiving ref selects the original per-job readonly reply
+ * directory. The helper sends its own nonce on original worker stdout via FD2;
+ * its unchanged public wrapper alone returns on captured stdout. No direct STATE
+ * access or copied-file fallback. Missing protected context/bind/reply refuses.
+ * Continuation requires the reviewed exact helper pin to authenticate the original
+ * released-in-time receipt, unchanged authorization/reservation/parent/controller
+ * PID-start/invocation/boot and original phase-plan deadline on EVERY read. Its
+ * unchanged JSON wrapper is data, not a caller-selectable continuation flag. */
+export function receiveOriginalCIAuthorization(
+	selection: OriginalCISelection,
+	nativeReceiving: RawRef,
+	operation: "preflight",
+	initial: true,
+): ReceivedCIInitial;
+export function receiveOriginalCIAuthorization(
+	selection: OriginalCISelection,
+	nativeReceiving: RawRef,
+	operation: Parameters<SourceAdmissionPorts["admission"]["check"]>[0],
+): ReceivedCIData;
+export function receiveOriginalCIAuthorization(
+	selection: OriginalCISelection,
+	nativeReceiving: RawRef,
+	operation: Parameters<SourceAdmissionPorts["admission"]["check"]>[0],
+	initial = false,
+): ReceivedCIData | ReceivedCIInitial {
+	assert(!initial || operation === "preflight", "OPS_CI_INITIAL_OPERATION");
+	assert(
+		["preflight", "configure", "request", "burst", "refresh", "boundary"].includes(operation),
+		"OPS_CI_OPERATION",
+	);
+	assert(
+		isAbsolute(nativeReceiving.path) &&
+			!nativeReceiving.path.includes("\0") &&
+			/^[a-f0-9]{64}$/.test(nativeReceiving.sha256),
+		"OPS_CI_NATIVE_RECEIVING",
+	);
 	assert(
 		/^[a-f0-9]{64}$/.test(selection.authorizationId) && /^[a-f0-9]{64}$/.test(selection.releaseSha256),
 		"OPS_CI_SELECTION",
@@ -86,7 +178,7 @@ export function receiveOriginalCIAuthorization(selection: OriginalCISelection): 
 	protectedPath();
 	const fd = openSync(selection.controller.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
 	const errors: unknown[] = [];
-	let received: ReceivedCIData | undefined;
+	let received: ReceivedCIData | ReceivedCIInitial | undefined;
 	try {
 		const before = fstatSync(fd);
 		assert(
@@ -115,16 +207,29 @@ export function receiveOriginalCIAuthorization(selection: OriginalCISelection): 
 		check();
 		const raw = execFileSync(
 			"/usr/bin/python3",
-			["-I", "-B", selection.controller.path, "receive-operational", selection.authorizationId],
+			[
+				"-I",
+				"-B",
+				selection.controller.path,
+				"receive-operational",
+				selection.authorizationId,
+				operation,
+				nativeReceiving.path,
+				nativeReceiving.sha256,
+				...(initial ? ["initial"] : []),
+			],
 			{
 				env: { PATH: "/usr/bin:/bin", LANG: "C" },
 				timeout: 5000,
-				maxBuffer: 65536,
-				stdio: ["ignore", "pipe", "pipe"],
+				maxBuffer: initial ? 9 * 1024 * 1024 : 65536,
+				stdio: ["ignore", "pipe", 1],
 			},
 		);
 		check();
-		const result = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)) as ReceivedCIData;
+		const projection = initial ? parseOriginalCIInitial(raw) : undefined;
+		const result = projection
+			? projection.authorization
+			: (JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)) as ReceivedCIData);
 		assert(
 			result.version === 1 &&
 				result.kind === "original-ci-operational-authorization" &&
@@ -133,7 +238,7 @@ export function receiveOriginalCIAuthorization(selection: OriginalCISelection): 
 				result.authorization.release_sha256 === selection.releaseSha256,
 			"OPS_CI_ORIGINAL_PROVENANCE",
 		);
-		received = result;
+		received = projection ?? result;
 	} catch (cause) {
 		errors.push(cause);
 	}

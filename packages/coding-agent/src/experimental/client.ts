@@ -84,9 +84,13 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 		const terminalRunIds = new Set<string>();
 		let operationId: string | undefined;
 		let resolveTerminal: (() => void) | undefined;
-		const terminal = new Promise<void>((resolve) => {
+		let rejectTerminal!: (error: unknown) => void;
+		const terminal = new Promise<void>((resolve, reject) => {
 			resolveTerminal = resolve;
+			rejectTerminal = reject;
 		});
+		// Observe attachment/connection loss while the prompt RPC is still pending.
+		void terminal.catch(() => {});
 		let deliveryTail = Promise.resolve();
 		const unsubscribe = match.transcript.state.subscribe((value, _context, delivery) => {
 			if (delivery.kind !== "update" || value.event === null) return;
@@ -101,11 +105,20 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 					if (event.runId === operationId) resolveTerminal?.();
 				}
 			});
+			void deliveryTail.catch(rejectTerminal);
 		});
 		if (match.transcript.state.value?.snapshot === null || match.transcript.state.value?.snapshot === undefined) {
 			unsubscribe();
 			throw new Error("Transcript has no initialized snapshot");
 		}
+		const unsubscribeConnection = match.server.connection.subscribe((state) => {
+			if (state.status === "disconnected") rejectTerminal(new Error(state.reason));
+		});
+		const unsubscribeAttachment = match.session.attachment.subscribe((state) => {
+			if (state.status !== "attached" || state.sessionId !== sessionId) {
+				rejectTerminal(new Error(`Session ${sessionId} attachment lost while waiting for terminal publication`));
+			}
+		});
 		let response: AgentOperationResponse;
 		try {
 			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
@@ -115,6 +128,8 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 			}
 		} finally {
 			unsubscribe();
+			unsubscribeConnection();
+			unsubscribeAttachment();
 			await deliveryTail;
 		}
 		if (!response.accepted) throw new Error(response.error.message);
