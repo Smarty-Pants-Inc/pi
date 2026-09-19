@@ -26,6 +26,7 @@ import {
 	bindSc085OriginalChild,
 	checkSc085Operation,
 	enterSc085OriginalReceiving,
+	guardSc085OriginalCallback,
 	receiveSc085OriginalStorage,
 	type Sc085OriginalReceiving,
 } from "./ordinary-sc085-source/operational-admission.ts";
@@ -617,8 +618,8 @@ export class OrdinaryOwnerContext {
 			const storage = receiveSc085OriginalStorage(receiving, this);
 			this.operationalAudit.registerValidatedSetupReceiver(
 				retained.sc085SetupReceiver,
-				storage.retained,
-				(value) => storage.record(value),
+				{ get: (path) => guardSc085OriginalCallback(receiving, () => storage.retained.get(path)) },
+				(value) => guardSc085OriginalCallback(receiving, () => storage.record(value)),
 				() => checkSc085Operation(receiving, this, "boundary"),
 			);
 		} else if (retained?.sc085SetupReceiver) throw new Error("OWNER_SC085_RECEIVING_REQUIRED");

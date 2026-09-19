@@ -14,6 +14,54 @@ const wrappedDnsLookupError =
 	"The pending stream has been canceled (caused by: getaddrinfo ENOTFOUND bedrock-runtime.us-east-1.amazonaws.com)";
 
 describe("provider retry classification", () => {
+	it.each([
+		"Selected model is at capacity. Please try a different model.",
+		'{"message":"Selected model is at capacity. Please try a different model."}',
+		"SELECTED MODEL IS AT CAPACITY. PLEASE TRY A DIFFERENT MODEL.",
+		"slow_down",
+		'{"error":{"code":"slow_down"}}',
+		"(SLOW_DOWN): request deferred",
+		"server_is_overloaded",
+	])("matches exact capacity text and delimited codes: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each([
+		"Selected model is at capacity! Please try a different model.",
+		"Selected model is at capacity. Please try a different model!",
+		"Unselected model is at capacity. Please try a different model.",
+		"Selected model is at capacity.",
+		"Please try a different model.",
+		"at capacity; try again",
+		"request limit reached",
+		"slow down",
+		"preslow_down",
+		"slow_downstream",
+		"slow_down_extra",
+		"_slow_down",
+	])("does not broaden capacity matching: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
+	it.each([
+		"GoUsageLimitError",
+		"FreeUsageLimitError",
+		"Monthly usage limit reached",
+		"available balance",
+		"insufficient_quota",
+		"out of budget",
+		"quota exceeded",
+		"billing",
+	])("keeps exclusions ahead of capacity matching: %s", (limit) => {
+		for (const capacity of ["Selected model is at capacity. Please try a different model.", "slow_down"]) {
+			expect(
+				isRetryableAssistantError(
+					fauxAssistantMessage("", { stopReason: "error", errorMessage: `${limit}: ${capacity}` }),
+				),
+			).toBe(false);
+		}
+	});
+
 	it("matches explicit provider retry guidance", () => {
 		expect(
 			isRetryableAssistantError(

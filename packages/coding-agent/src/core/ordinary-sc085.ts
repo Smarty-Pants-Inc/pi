@@ -6,6 +6,7 @@ import type { OrdinaryOwnerContext } from "./ordinary-owner-context.ts";
 import type { OrdinaryObservedRefresh, SetupRawRef } from "./ordinary-sc085-setup.ts";
 import {
 	checkSc085Operation,
+	guardSc085OriginalCallback,
 	qualifySc085OriginalStamp,
 	receiveSc085ChildBinding,
 	receiveSc085OriginalStorage,
@@ -22,7 +23,9 @@ export function createOriginalSc085(
 ) {
 	const bound = receiveSc085ChildBinding(receiving, context);
 	const storage = receiveSc085OriginalStorage(receiving, context);
-	const admission = parseSc085Admission(sc085RetainedBytes(bound.admission, storage.retained));
+	const admission = guardSc085OriginalCallback(receiving, () =>
+		parseSc085Admission(sc085RetainedBytes(bound.admission, storage.retained)),
+	);
 	const audit = context.operationalAudit;
 	let failure: { cause: unknown } | undefined;
 	let deadlineTimer: unknown;
@@ -70,8 +73,10 @@ export function createOriginalSc085(
 	const record = (value: unknown, operation: "burst" | "boundary" = "burst") => {
 		check(operation);
 		const expected: unknown = JSON.parse(JSON.stringify(value));
-		const raw = structuredClone(storage.record(structuredClone(expected)));
-		const retained = storage.retained.get(raw.path);
+		const raw = structuredClone(
+			guardSc085OriginalCallback(receiving, () => storage.record(structuredClone(expected))),
+		);
+		const retained = guardSc085OriginalCallback(receiving, () => storage.retained.get(raw.path));
 		assert(
 			retained &&
 				createHash("sha256").update(retained).digest("hex") === raw.sha256 &&
@@ -103,15 +108,23 @@ export function createOriginalSc085(
 				);
 				assert(segment === "rapid" ? !state : state?.phase === "sealed", "OWNER_SC085_HOLD_ORDER");
 				const baseline = audit.validatedSetup();
-				const setup = baseline.event.setup.settlement.samples[0],
-					expected = admission.checkpoints[0].watches[0];
+				const samples = baseline.event.setup.settlement.samples;
+				const expectedWatches = admission.checkpoints[0].watches;
 				assert(
-					setup.watchId === expected.watchId &&
-						setup.request.executionKey === expected.executionKey &&
-						(typeof expected.stateNamespace !== "string" ||
-							expected.stateNamespace === setup.request.stateNamespace),
+					samples.length === expectedWatches.length &&
+						samples.some((sample) => sample.watchId === bound.primaryWatchId),
 					"OWNER_SC085_SETUP_SCOPE",
 				);
+				for (const expected of expectedWatches) {
+					const setup = samples.find((sample) => sample.watchId === expected.watchId);
+					assert(
+						setup &&
+							setup.request.executionKey === expected.executionKey &&
+							(typeof expected.stateNamespace !== "string" ||
+								expected.stateNamespace === setup.request.stateNamespace),
+						"OWNER_SC085_SETUP_SCOPE",
+					);
+				}
 				const cursor = audit.mark();
 				// Refuse a busy original session before parking any admission.
 				audit.sc085FailureEvidence(cursor);
@@ -161,15 +174,25 @@ export function createOriginalSc085(
 				check();
 				gate.checkHeld(token);
 				assert(held.segment === "rapid" && held.phase === "held", "OWNER_SC085_RELEASE_ORDER");
-				const final = audit.validateSc085Checkpoint(checkpoint, storage.retained);
-				const expected = admission.checkpoints[0].watches[0],
-					sample = final.settlement.samples[0];
+				const final = guardSc085OriginalCallback(receiving, () =>
+					audit.validateSc085Checkpoint(checkpoint, storage.retained),
+				);
 				assert(
-					sample.result.outcome === expected.outcome &&
-						sample.result.body === expected.body &&
-						(expected.diagnostic === null ? sample.result.diagnosticRef === undefined : false),
+					final.settlement.samples.length === admission.checkpoints[0].watches.length &&
+						final.settlement.samples.some((sample) => sample.watchId === bound.primaryWatchId),
 					"OWNER_SC085_FINAL_SAMPLE",
 				);
+				for (const expected of admission.checkpoints[0].watches) {
+					const sample = final.settlement.samples.find((sample) => sample.watchId === expected.watchId);
+					assert(
+						sample &&
+							sample.request.executionKey === expected.executionKey &&
+							sample.result.outcome === expected.outcome &&
+							sample.result.body === expected.body &&
+							(expected.diagnostic === null ? sample.result.diagnosticRef === undefined : false),
+						"OWNER_SC085_FINAL_SAMPLE",
+					);
+				}
 				held.releaseCursor = audit.mark();
 				const released = qualifySc085OriginalStamp(receiving, context, {
 					kind: "window",
@@ -225,6 +248,10 @@ export function createOriginalSc085(
 				);
 				held.phase = "sealing";
 				const exposure = qualifySc085OriginalStamp(receiving, context, { kind: "exposure", requestId });
+				let previousObserved = exposure.monotonicMs;
+				let wakes = 0;
+				// At most one initial wait and one qualified early-wake correction.
+				// Refusal never shortens the required absolute observation interval.
 				for (;;) {
 					check("boundary");
 					const measured = audit.sc085RapidEvidence(held.cursor, held.releaseCursor, requestId);
@@ -250,6 +277,12 @@ export function createOriginalSc085(
 						"OWNER_SC085_COALESCING",
 					);
 					if (elapsed < admission.observation.unchangedMs) {
+						assert(
+							wakes < 2 && (wakes === 0 || end.monotonicMs > previousObserved),
+							"OWNER_SC085_OBSERVATION_NO_PROGRESS",
+						);
+						previousObserved = end.monotonicMs;
+						wakes++;
 						const remaining = context.inspectCurrentPermission().remainingMs;
 						assert(remaining > 0, "OWNER_SC085_OBSERVATION_EXPIRED");
 						await wait(Math.min(Math.ceil(admission.observation.unchangedMs - elapsed), remaining));
