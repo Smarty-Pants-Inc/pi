@@ -23,6 +23,7 @@ function createFixture(t, { importServer = false, declareServer = false } = {}) 
 			type: "module",
 			exports: isAgent ? {
 				".": "./dist/index.js",
+				"./ordinary": { types: "./dist/ordinary.d.ts", import: "./dist/ordinary.js" },
 				"./client": { source: "./src/client/index.ts" },
 				"./experimental/plugin": { source: "./src/experimental/plugin.ts" },
 			} : "./dist/index.js",
@@ -48,6 +49,32 @@ export class ModelRuntime { static create() {} }
 			...(isAgent ? {
 				"dist/cli.js": 'console.log("1.0.0");',
 				"dist/bundle/cli.js": 'console.log("1.0.0");',
+				// Synthetic contract fixtures only, not the real loader, owner or installed Pi proof.
+				"dist/ordinary.js": `
+import { fileURLToPath } from "node:url";
+export { captureOrdinaryRequestPair, consumeOrdinaryPairedInput } from "./core/ordinary-request-pair.js";
+export const ordinaryApplicationPath = fileURLToPath(import.meta.url);
+export function assertOrdinaryOwner() { throw new Error("OWNER_PROFILE_UNAVAILABLE: no received ordinary owner"); }
+`,
+				"dist/ordinary.d.ts": "export {};",
+				"dist/core/ordinary-request-pair.js": `
+export function captureOrdinaryRequestPair() { throw new Error("Synthetic capture must not be invoked"); }
+export function consumeOrdinaryPairedInput() { throw new Error("Synthetic consumer must not be invoked"); }
+`,
+				"dist/core/ordinary-owner-context.js": "export class OrdinaryOwnerContext {}",
+				"dist/core/extensions/loader.js": `
+import { captureOrdinaryRequestPair, consumeOrdinaryPairedInput } from "../../ordinary.js";
+export async function loadExtensions() {
+  return {
+    errors: [],
+    extensions: [{ messageRenderers: new Map([
+      ["ordinary-capture-identity", captureOrdinaryRequestPair],
+      ["ordinary-consume-identity", consumeOrdinaryPairedInput],
+    ]) }],
+    runtime: { invalidate() {} },
+  };
+}
+`,
 			} : {}),
 		};
 		for (const [path, content] of Object.entries(files)) {
@@ -71,16 +98,65 @@ test("installs only coding-agent directly and uses overrides only for declared r
 		assert.equal(existsSync(join(directory, "node_modules", name)), false);
 	}
 	smokeTestCodingAgentConsumer(directory);
+	const proofPath = join(directory, "ordinary-consumer-proof.json");
+	const proof = JSON.parse(readFileSync(proofPath, "utf8"));
+	assert.equal(proof.schema, "pi-installed-ordinary-consumer/1");
+	assert.equal(proof.status, "PASS");
+	assert.equal(proof.scope, "installed-public-export-and-original-function-identity");
+	assert.deepEqual(proof.checks, {
+		publicEntry: true, originalCapture: true, originalConsume: true, extensionLoaderIdentity: true, forgedOwnerRefused: true,
+	});
+	assert.equal(proof.nativeReceiving, false);
+	assert.equal(proof.providerOrGrantOperations, false);
+	assert.equal(Object.keys(proof.files).length, 6);
+	for (const hash of Object.values(proof.files)) assert.match(hash, /^[a-f0-9]{64}$/);
 
 	const nested = join(directory, "node_modules", codingAgentName, "node_modules/@earendil-works/pi-server");
 	mkdirSync(nested, { recursive: true });
 	writeFileSync(join(nested, "package.json"), JSON.stringify({ name: "@earendil-works/pi-server", version: "1.0.0" }));
 	assert.throws(() => smokeTestCodingAgentConsumer(directory), /pi-server must not be installed/);
+	assert.equal(existsSync(proofPath), false);
 	rmSync(nested, { recursive: true });
 
 	const experimental = join(directory, "node_modules", codingAgentName, "dist/experimental");
 	mkdirSync(experimental);
 	assert.throws(() => smokeTestCodingAgentConsumer(directory), /contains development-only code/);
+});
+
+// These failures exercise the probe with synthetic packages, not actual Pi artifact qualification.
+test("requires the ordinary export and rejects changed public or loader function identities", (t) => {
+	const directory = createFixture(t);
+	const packageDir = join(directory, "node_modules", codingAgentName);
+	const proofPath = join(directory, "ordinary-consumer-proof.json");
+	const cases = [
+		["package.json", text => {
+			const manifest = JSON.parse(text);
+			delete manifest.exports["./ordinary"];
+			return JSON.stringify(manifest);
+		}],
+		["dist/ordinary.js", text => text.replace(
+			"captureOrdinaryRequestPair, consumeOrdinaryPairedInput",
+			"captureOrdinaryRequestPair, captureOrdinaryRequestPair as consumeOrdinaryPairedInput",
+		)],
+		["dist/core/extensions/loader.js", text => text.replace(
+			'["ordinary-consume-identity", consumeOrdinaryPairedInput]',
+			'["ordinary-consume-identity", () => {}]',
+		)],
+	];
+	for (const [path, change] of cases) {
+		const file = join(packageDir, path);
+		const original = readFileSync(file, "utf8");
+		const changed = change(original);
+		assert.notEqual(changed, original);
+		writeFileSync(file, changed);
+		writeFileSync(proofPath, "stale proof");
+		try {
+			assert.throws(() => smokeTestCodingAgentConsumer(directory), /ERR_PACKAGE_PATH_NOT_EXPORTED|AssertionError/, path);
+			assert.equal(existsSync(proofPath), false);
+		} finally {
+			writeFileSync(file, original);
+		}
+	}
 });
 
 // #9132: smoke-test the public SDK, not just a bundled CLI that hides missing imports.
