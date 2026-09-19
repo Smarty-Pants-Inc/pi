@@ -4,6 +4,8 @@ import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } 
 import { type Static, Type } from "typebox";
 import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import { ordinaryOwnerOf } from "../ordinary-owner-context.ts";
+import { currentSessionOwnership } from "../session-ownership.ts";
 import {
 	applyEditsToNormalizedContent,
 	detectLineEnding,
@@ -144,6 +146,8 @@ export function createEditToolDefinition(
 	cwd: string,
 	options?: EditToolOptions,
 ): ToolDefinition<typeof editSchema, EditToolDetails | undefined, EditRenderState> {
+	const owner = options && ordinaryOwnerOf(options);
+	if (owner && options?.operations) throw new Error("OWNER_TOOL_OPERATIONS");
 	const ops = options?.operations ?? defaultEditOperations;
 	return {
 		name: "edit",
@@ -157,59 +161,79 @@ export function createEditToolDefinition(
 		renderShell: "self",
 		prepareArguments: prepareEditArguments,
 		async execute(_toolCallId, input: EditToolInput, signal?: AbortSignal, _onUpdate?, ctx?: ExtensionContext) {
+			if (!owner && currentSessionOwnership()) throw new Error("OWNER_TOOL_BINDING_REQUIRED");
+			owner?.assertActive();
+			if (owner && ctx && (ctx.sessionManager !== owner.owner.manager || ctx.cwd !== cwd))
+				throw new Error("OWNER_TOOL_CONTEXT");
 			const { path, edits } = validateEditInput(input);
-			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
+			const absolutePath = resolveToCwd(path, owner ? cwd : ctx?.cwd || cwd);
+			const target = owner?.fileTarget(absolutePath, true);
+			const execute = () =>
+				withFileMutationQueue(absolutePath, async () => {
+					// Do not reject from an abort event listener here: that would release the
+					// mutation queue while an in-flight filesystem operation may still finish.
+					// Checking signal.aborted after each await observes the same aborts while
+					// keeping the queue locked until the current operation has settled.
+					const throwIfAborted = (): void => {
+						if (signal?.aborted) throw new Error("Operation aborted");
+						owner?.assertActive();
+					};
 
-			return withFileMutationQueue(absolutePath, async () => {
-				// Do not reject from an abort event listener here: that would release the
-				// mutation queue while an in-flight filesystem operation may still finish.
-				// Checking signal.aborted after each await observes the same aborts while
-				// keeping the queue locked until the current operation has settled.
-				const throwIfAborted = (): void => {
-					if (signal?.aborted) throw new Error("Operation aborted");
-				};
-
-				throwIfAborted();
-
-				// Check if file exists.
-				try {
-					await ops.access(absolutePath);
-				} catch (error: unknown) {
 					throwIfAborted();
-					const errorMessage =
-						error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
-					throw new Error(`Could not edit file: ${path}. ${errorMessage}.`);
-				}
-				throwIfAborted();
 
-				// Read the file.
-				const buffer = await ops.readFile(absolutePath);
-				const rawContent = buffer.toString("utf-8");
-				throwIfAborted();
+					// Check if file exists.
+					try {
+						if (!owner) await ops.access(absolutePath);
+					} catch (error: unknown) {
+						throwIfAborted();
+						const errorMessage =
+							error instanceof Error && "code" in error ? `Error code: ${error.code}` : String(error);
+						throw new Error(`Could not edit file: ${path}. ${errorMessage}.`);
+					}
+					throwIfAborted();
 
-				// Strip BOM before matching. The model will not include an invisible BOM in oldText.
-				const { bom, text: content } = splitBom(rawContent);
-				const originalEnding = detectLineEnding(content);
-				const normalizedContent = normalizeToLF(content);
-				const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
-				throwIfAborted();
+					// Read the file.
+					const buffer =
+						owner && target
+							? await owner.owner.readFile(target.root, target.relativePath, signal)
+							: await ops.readFile(absolutePath);
+					const rawContent = buffer.toString("utf-8");
+					throwIfAborted();
 
-				const finalContent = bom + restoreLineEndings(newContent, originalEnding);
-				await ops.writeFile(absolutePath, finalContent);
-				throwIfAborted();
+					// Strip BOM before matching. The model will not include an invisible BOM in oldText.
+					const { bom, text: content } = splitBom(rawContent);
+					const originalEnding = detectLineEnding(content);
+					const normalizedContent = normalizeToLF(content);
+					const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+					throwIfAborted();
 
-				const diffResult = generateDiffString(baseContent, newContent);
-				const patch = generateUnifiedPatch(path, baseContent, newContent);
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
-						},
-					],
-					details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
-				};
-			});
+					const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+					if (owner && target) {
+						await owner.owner.writeFile(
+							target.root,
+							target.relativePath,
+							Buffer.from(finalContent),
+							buffer,
+							signal,
+						);
+					} else {
+						await ops.writeFile(absolutePath, finalContent);
+					}
+					throwIfAborted();
+
+					const diffResult = generateDiffString(baseContent, newContent);
+					const patch = generateUnifiedPatch(path, baseContent, newContent);
+					return {
+						content: [
+							{
+								type: "text" as const,
+								text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+							},
+						],
+						details: { diff: diffResult.diff, patch, firstChangedLine: diffResult.firstChangedLine },
+					};
+				});
+			return owner ? owner.within(execute) : execute();
 		},
 		...editRenderers,
 	};

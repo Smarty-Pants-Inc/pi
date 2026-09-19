@@ -88,6 +88,8 @@ import {
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
+import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
+import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -402,6 +404,8 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
+	private userInputInFlight = false;
+	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private activeWorkingIndicatorEmbedded = false;
 	private readonly idleStatus = new IdleStatus();
@@ -465,6 +469,7 @@ export class InteractiveMode {
 
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
+	private compactionQueueTransfers = 0;
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -507,9 +512,6 @@ export class InteractiveMode {
 	private get session(): AgentSession {
 		return this.runtimeHost.session;
 	}
-	private get agent() {
-		return this.session.agent;
-	}
 	private get sessionManager() {
 		return this.session.sessionManager;
 	}
@@ -519,11 +521,17 @@ export class InteractiveMode {
 
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
+		const originalSession = this.session;
+		this.stagingAudit = bindOrdinaryTuiAudit(runtimeHost.services, originalSession, this, () => {
+			if (this.session !== originalSession) throw new Error("OWNER_RUNTIME_SESSION");
+			return this.stagingState();
+		});
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
 		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
+			if (this.compactionQueueTransfers > 0) throw new Error("OWNER_TUI_TRANSFER_PENDING");
 			this.resetExtensionUI();
 		});
 		this.runtimeHost.setRebindSession(async () => {
@@ -536,7 +544,7 @@ export class InteractiveMode {
 			showHardwareCursor: this.settingsManager.getShowHardwareCursor(),
 			logDirectory: getAgentDir(),
 			onRightClickPaste: this.onRightClickPaste,
-			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
+			fullscreenCopyOnSelect: !this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect(),
 		});
 		this.ui = createInteractiveTuiReference(() => this.renderer);
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
@@ -581,6 +589,15 @@ export class InteractiveMode {
 			onChanged: () => this.updateEditorBorderColor(),
 			initialThemeSetting: options.initialThemeSetting,
 		});
+	}
+
+	private stagingState(): NativeTuiAuditState {
+		return {
+			pendingUserInputs: this.pendingUserInputs.length,
+			userInputInFlight: this.userInputInFlight,
+			compactionQueuedMessages: this.compactionQueuedMessages.length,
+			compactionQueueTransfers: this.compactionQueueTransfers,
+		};
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
@@ -822,7 +839,7 @@ export class InteractiveMode {
 			logDirectory: getAgentDir(),
 			terminal,
 			onRightClickPaste: this.onRightClickPaste,
-			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
+			fullscreenCopyOnSelect: !this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect(),
 		});
 		nextUi.setClearOnShrink(clearOnShrink);
 		nextUi.onDebug = onDebug;
@@ -973,11 +990,13 @@ export class InteractiveMode {
 		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
 		// so slow downloads do not make startup appear frozen.
 		// Both are needed: fd for autocomplete, rg for grep tool and bash commands.
-		const [fdPath] = await Promise.all([
-			ensureTool("fd", (status) => this.showManagedToolStatus(status)),
-			ensureTool("rg", (status) => this.showManagedToolStatus(status)),
-		]);
-		this.fdPath = fdPath;
+		if (!this.stagingAudit) {
+			const [fdPath] = await Promise.all([
+				ensureTool("fd", (status) => this.showManagedToolStatus(status)),
+				ensureTool("rg", (status) => this.showManagedToolStatus(status)),
+			]);
+			this.fdPath = fdPath;
+		}
 
 		// Enable the remaining input handlers only after managed-tool setup completes.
 		this.setupKeyHandlers();
@@ -1034,7 +1053,7 @@ export class InteractiveMode {
 	async run(): Promise<void> {
 		await this.init();
 
-		if (!process.env.PI_OFFLINE) {
+		if (!this.stagingAudit && !process.env.PI_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
 			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
@@ -1043,34 +1062,37 @@ export class InteractiveMode {
 				.finally(() => clearTimeout(timeout));
 		}
 
-		// Start version check asynchronously
-		checkForNewPiVersion(this.version).then((newRelease) => {
-			if (newRelease) {
-				this.showNewVersionNotification(newRelease);
-			}
-		});
-
-		// Start package update check asynchronously
-		this.checkForPackageUpdates()
-			.then((updates) => {
-				if (updates.length > 0) {
-					this.showPackageUpdateNotification(updates);
-				}
-			})
-			.finally(() => {
-				// On Windows, npm can overwrite the shared console title while checking
-				// extension package versions. Restore Pi's title after the startup check.
-				if (process.platform === "win32" && this.isInitialized) {
-					this.updateTerminalTitle();
+		// These optional processes/network requests have no owned recipe grant.
+		if (!this.stagingAudit) {
+			// Start version check asynchronously
+			checkForNewPiVersion(this.version).then((newRelease) => {
+				if (newRelease) {
+					this.showNewVersionNotification(newRelease);
 				}
 			});
 
-		// Check tmux keyboard setup asynchronously
-		this.checkTmuxKeyboardSetup().then((warning) => {
-			if (warning) {
-				this.showWarning(warning);
-			}
-		});
+			// Start package update check asynchronously
+			this.checkForPackageUpdates()
+				.then((updates) => {
+					if (updates.length > 0) {
+						this.showPackageUpdateNotification(updates);
+					}
+				})
+				.finally(() => {
+					// On Windows, npm can overwrite the shared console title while checking
+					// extension package versions. Restore Pi's title after the startup check.
+					if (process.platform === "win32" && this.isInitialized) {
+						this.updateTerminalTitle();
+					}
+				});
+
+			// Check tmux keyboard setup asynchronously
+			this.checkTmuxKeyboardSetup().then((warning) => {
+				if (warning) {
+					this.showWarning(warning);
+				}
+			});
+		}
 
 		// Show startup warnings
 		const {
@@ -1132,10 +1154,17 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				await this.session.prompt(userInput);
+				const prompt = this.session.prompt(userInput);
+				// Original session preflight owns the input before TUI staging clears.
+				this.userInputInFlight = false;
+				this.stagingAudit?.("input-transferred");
+				await prompt;
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
+			} finally {
+				this.userInputInFlight = false;
+				this.stagingAudit?.("input-settled");
 			}
 		}
 	}
@@ -1237,7 +1266,7 @@ export class InteractiveMode {
 	}
 
 	private reportInstallTelemetry(version: string): void {
-		if (process.env.PI_OFFLINE) {
+		if (this.stagingAudit || process.env.PI_OFFLINE) {
 			return;
 		}
 
@@ -1856,10 +1885,17 @@ export class InteractiveMode {
 	 * Initialize the extension system with TUI-based UI context.
 	 */
 	private async bindCurrentSessionExtensions(): Promise<void> {
+		const session = this.session;
 		const uiContext = this.createExtensionUIContext();
-		await this.session.bindExtensions({
+		await session.bindExtensions({
 			uiContext,
 			mode: "tui",
+			hasPendingInput: () =>
+				this.session !== session ||
+				this.pendingUserInputs.length > 0 ||
+				this.userInputInFlight ||
+				this.compactionQueuedMessages.length > 0 ||
+				this.compactionQueueTransfers > 0,
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			},
@@ -1941,7 +1977,7 @@ export class InteractiveMode {
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
 		this.applyFullscreenScrollbarSetting();
 		if (this.renderer instanceof TuiAltScreen) {
-			this.renderer.setCopyOnSelect(this.settingsManager.getFullscreenCopyOnSelect());
+			this.renderer.setCopyOnSelect(!this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect());
 		}
 		this.footer.setSession(this.session);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
@@ -2004,6 +2040,7 @@ export class InteractiveMode {
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
+		this.stagingAudit?.("session-render-clear");
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
@@ -2918,6 +2955,10 @@ export class InteractiveMode {
 	}
 
 	private async handleRightClickPaste(): Promise<void> {
+		if (this.stagingAudit) {
+			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
+			return;
+		}
 		const target = this.renderer.getFocusedComponent();
 		const handleInput = target?.handleInput;
 		if (!target || !handleInput) return;
@@ -2932,6 +2973,10 @@ export class InteractiveMode {
 	}
 
 	private async handleClipboardPaste(): Promise<void> {
+		if (this.stagingAudit) {
+			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
+			return;
+		}
 		try {
 			const image = await readClipboardImage();
 			if (image) {
@@ -3151,6 +3196,7 @@ export class InteractiveMode {
 				this.onInputCallback(text);
 			} else {
 				this.pendingUserInputs.push(text);
+				this.stagingAudit?.("input-enqueued");
 			}
 			this.editor.addToHistory?.(text);
 		};
@@ -3911,12 +3957,16 @@ export class InteractiveMode {
 	async getUserInput(): Promise<string> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
+			this.userInputInFlight = true;
+			this.stagingAudit?.("input-dequeued");
 			return queuedInput;
 		}
 
 		return new Promise((resolve) => {
 			this.onInputCallback = (text: string) => {
 				this.onInputCallback = undefined;
+				this.userInputInFlight = true;
+				this.stagingAudit?.("input-delivered");
 				resolve(text);
 			};
 		});
@@ -3986,7 +4036,7 @@ export class InteractiveMode {
 		this.stop();
 		await this.runtimeHost.dispose();
 
-		const resumeCommand = formatResumeCommand(this.sessionManager);
+		const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
 		if (resumeCommand) {
 			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
 		}
@@ -4247,6 +4297,10 @@ export class InteractiveMode {
 	}
 
 	private async handleOpenExternalEditor(): Promise<void> {
+		if (this.stagingAudit) {
+			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
+			return;
+		}
 		const editorCmd = this.settingsManager.getExternalEditorCommand();
 		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
 		this.ui.stop();
@@ -4362,6 +4416,7 @@ export class InteractiveMode {
 			.filter((msg) => msg.mode === "followUp")
 			.map((msg) => msg.text);
 		this.compactionQueuedMessages = [];
+		this.stagingAudit?.("queues-cleared");
 		return {
 			steering: [...steering, ...compactionSteering],
 			followUp: [...followUp, ...compactionFollowUp],
@@ -4393,7 +4448,7 @@ export class InteractiveMode {
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
-				this.agent.abort();
+				void this.session.abort();
 			}
 			return 0;
 		}
@@ -4403,13 +4458,14 @@ export class InteractiveMode {
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
-			this.agent.abort();
+			void this.session.abort();
 		}
 		return allQueued.length;
 	}
 
 	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
 		this.compactionQueuedMessages.push({ text, mode });
+		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
@@ -4432,12 +4488,25 @@ export class InteractiveMode {
 		}
 
 		const queuedMessages = [...this.compactionQueuedMessages];
-		this.compactionQueuedMessages = [];
-		this.updatePendingMessagesDisplay();
-
-		const restoreQueue = (error: unknown) => {
-			this.session.clearQueue();
-			this.compactionQueuedMessages = queuedMessages;
+		const session = this.session;
+		const pending = new Set(queuedMessages);
+		const restored = new Set<CompactionQueuedMessage>();
+		const restoreQueue = (error: unknown, failed = [...pending]) => {
+			const retained = failed.filter((message) => {
+				pending.delete(message);
+				if (restored.has(message)) return false;
+				restored.add(message);
+				return true;
+			});
+			const restoring = new Set([
+				...retained,
+				...this.compactionQueuedMessages.filter((message) => restored.has(message)),
+			]);
+			this.compactionQueuedMessages = [
+				...queuedMessages.filter((message) => restoring.has(message)),
+				...this.compactionQueuedMessages.filter((message) => !restoring.has(message)),
+			];
+			this.stagingAudit?.("compaction-restored");
 			this.updatePendingMessagesDisplay();
 			this.showError(
 				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
@@ -4446,17 +4515,27 @@ export class InteractiveMode {
 			);
 		};
 
+		this.compactionQueueTransfers++;
+		this.stagingAudit?.("compaction-transfer-start");
 		try {
+			this.compactionQueuedMessages = [];
+			this.stagingAudit?.("compaction-transfer-dequeued");
+			this.updatePendingMessagesDisplay();
 			if (options?.willRetry) {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.text)) {
-						await this.session.prompt(message.text);
+						await session.prompt(message.text, {
+							onInputTransferred: () => {
+								pending.delete(message);
+							},
+						});
 					} else if (message.mode === "followUp") {
-						await this.session.followUp(message.text);
+						await session.followUp(message.text);
 					} else {
-						await this.session.steer(message.text);
+						await session.steer(message.text);
 					}
+					pending.delete(message);
 				}
 				this.updatePendingMessagesDisplay();
 				return;
@@ -4467,7 +4546,12 @@ export class InteractiveMode {
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await this.session.prompt(message.text);
+					await session.prompt(message.text, {
+						onInputTransferred: () => {
+							pending.delete(message);
+						},
+					});
+					pending.delete(message);
 				}
 				return;
 			}
@@ -4478,30 +4562,58 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await this.session.prompt(message.text);
+				await session.prompt(message.text, {
+					onInputTransferred: () => {
+						pending.delete(message);
+					},
+				});
+				pending.delete(message);
 			}
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
-			const promptPromise = this.session
-				.prompt(firstPrompt.text, { streamingBehavior: firstPrompt.mode })
+			let firstTransferred = false;
+			const started = session.prompt(firstPrompt.text, {
+				streamingBehavior: firstPrompt.mode,
+				onInputTransferred: () => {
+					firstTransferred = true;
+				},
+			});
+			// This promise alone owns restoration of its input, even if a later transfer fails.
+			pending.delete(firstPrompt);
+			const promptPromise = started
 				.catch((error) => {
-					restoreQueue(error);
+					restoreQueue(error, firstTransferred ? [] : [firstPrompt]);
+				})
+				.finally(() => {
+					this.compactionQueueTransfers--;
+					this.stagingAudit?.("compaction-prompt-settled");
 				});
+			// The detached prompt can restore staging after this flush returns.
+			this.compactionQueueTransfers++;
+			this.stagingAudit?.("compaction-prompt-pending");
 
 			// Queue remaining messages
 			for (const message of rest) {
 				if (this.isExtensionCommand(message.text)) {
-					await this.session.prompt(message.text);
+					await session.prompt(message.text, {
+						onInputTransferred: () => {
+							pending.delete(message);
+						},
+					});
 				} else if (message.mode === "followUp") {
-					await this.session.followUp(message.text);
+					await session.followUp(message.text);
 				} else {
-					await this.session.steer(message.text);
+					await session.steer(message.text);
 				}
+				pending.delete(message);
 			}
 			this.updatePendingMessagesDisplay();
 			void promptPromise;
 		} catch (error) {
 			restoreQueue(error);
+		} finally {
+			this.compactionQueueTransfers--;
+			this.stagingAudit?.("compaction-transfer-settled");
 		}
 	}
 
@@ -4774,7 +4886,8 @@ export class InteractiveMode {
 					},
 					onFullscreenCopyOnSelectChange: (enabled) => {
 						this.settingsManager.setFullscreenCopyOnSelect(enabled);
-						if (this.renderer instanceof TuiAltScreen) this.renderer.setCopyOnSelect(enabled);
+						if (this.renderer instanceof TuiAltScreen)
+							this.renderer.setCopyOnSelect(!this.stagingAudit && enabled);
 					},
 					onWarningsChange: (warnings) => {
 						this.settingsManager.setWarnings(warnings);
@@ -5339,6 +5452,10 @@ export class InteractiveMode {
 				initialFilterMode,
 			);
 			selector.onCopy = async (text) => {
+				if (this.stagingAudit) {
+					this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
+					return;
+				}
 				if (!text) {
 					this.showError("Selected entry has no text to copy");
 					return;
@@ -6152,6 +6269,10 @@ export class InteractiveMode {
 	}
 
 	private async handleShareCommand(): Promise<void> {
+		if (this.stagingAudit) {
+			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
+			return;
+		}
 		await shareSession({
 			session: this.session,
 			ui: this.ui,
@@ -6165,6 +6286,10 @@ export class InteractiveMode {
 	private async handleCopyCommand(
 		options: { flashConfirmation?: boolean; preferSelection?: boolean } = {},
 	): Promise<void> {
+		if (this.stagingAudit) {
+			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
+			return;
+		}
 		if (
 			options.preferSelection &&
 			this.ui instanceof TuiAltScreen &&
@@ -6448,6 +6573,10 @@ export class InteractiveMode {
 	}
 
 	private handleDebugCommand(): void {
+		if (this.stagingAudit) {
+			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
+			return;
+		}
 		const width = this.ui.terminal.columns;
 		const height = this.ui.terminal.rows;
 		const allLines = this.ui.render(width);
@@ -6602,6 +6731,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.stagingAudit?.("detached");
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

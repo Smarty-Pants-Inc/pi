@@ -1,0 +1,325 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import type { OrdinaryAutomaticHold } from "./ordinary-automatic-hold.ts";
+import type { OrdinaryOwnerContext } from "./ordinary-owner-context.ts";
+import type { OrdinaryObservedRefresh, SetupRawRef } from "./ordinary-sc085-setup.ts";
+import {
+	checkSc085Operation,
+	qualifySc085OriginalStamp,
+	receiveSc085ChildBinding,
+	receiveSc085OriginalStorage,
+	type Sc085OriginalReceiving,
+} from "./ordinary-sc085-source/operational-admission.ts";
+import { parseSc085Admission, sc085RetainedBytes } from "./ordinary-sc085-source/sc085-admission.ts";
+
+/** Original context only: fixed Source authentication, existing admission gate,
+ * provenance and audit. This creates neither an issuer nor another wake path. */
+export function createOriginalSc085(
+	context: OrdinaryOwnerContext,
+	receiving: Sc085OriginalReceiving,
+	gate: OrdinaryAutomaticHold,
+) {
+	const bound = receiveSc085ChildBinding(receiving, context);
+	const storage = receiveSc085OriginalStorage(receiving, context);
+	const admission = parseSc085Admission(sc085RetainedBytes(bound.admission, storage.retained));
+	const audit = context.operationalAudit;
+	let failure: { cause: unknown } | undefined;
+	let deadlineTimer: unknown;
+	let cancelWait: ((cause: unknown) => void) | undefined;
+	let state:
+		| {
+				token: object;
+				segment: "rapid" | "failures";
+				phase: "held" | "released" | "sealing" | "sealed" | "finishing" | "finished";
+				cursor: object;
+				deadline: number;
+				raw?: SetupRawRef;
+				releaseCursor?: object;
+				requestId?: string;
+		  }
+		| undefined;
+	const cancel = (cause: unknown) => {
+		failure ??= { cause };
+		if (deadlineTimer !== undefined) audit.clock.clearTimeout(deadlineTimer);
+		deadlineTimer = undefined;
+		gate.fail(failure.cause);
+		cancelWait?.(failure.cause);
+	};
+	const check = (operation: "burst" | "boundary" = "burst") => {
+		if (failure) throw failure.cause;
+		try {
+			checkSc085Operation(receiving, context, operation);
+			if (
+				state &&
+				(state.phase === "held" || state.phase === "finishing") &&
+				audit.clock.monotonic() >= state.deadline
+			) {
+				throw new Error("OWNER_SC085_MAX_HOLD");
+			}
+		} catch (cause) {
+			cancel(cause);
+			throw failure!.cause;
+		}
+	};
+	const original = (token: object) => {
+		if (failure) throw failure.cause;
+		if (!state || state.token !== token) throw new Error("OWNER_SC085_HOLD_TOKEN");
+		return state;
+	};
+	const record = (value: unknown, operation: "burst" | "boundary" = "burst") => {
+		check(operation);
+		const expected: unknown = JSON.parse(JSON.stringify(value));
+		const raw = structuredClone(storage.record(structuredClone(expected)));
+		const retained = storage.retained.get(raw.path);
+		assert(
+			retained &&
+				createHash("sha256").update(retained).digest("hex") === raw.sha256 &&
+				isDeepStrictEqual(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(retained)), expected),
+			"OWNER_SC085_RECORDER",
+		);
+		check(operation);
+		return raw;
+	};
+	const wait = (ms: number) =>
+		new Promise<void>((resolve, reject) => {
+			const timer = audit.clock.setTimeout(() => {
+				cancelWait = undefined;
+				resolve();
+			}, ms);
+			cancelWait = (cause) => {
+				audit.clock.clearTimeout(timer);
+				cancelWait = undefined;
+				reject(cause);
+			};
+		});
+	const methods = Object.freeze({
+		async hold(selected: SetupRawRef, segment: "rapid" | "failures") {
+			try {
+				check();
+				assert(
+					isDeepStrictEqual(selected, bound.admission) && (segment === "rapid" || segment === "failures"),
+					"OWNER_SC085_ADMISSION",
+				);
+				assert(segment === "rapid" ? !state : state?.phase === "sealed", "OWNER_SC085_HOLD_ORDER");
+				const baseline = audit.validatedSetup();
+				const setup = baseline.event.setup.settlement.samples[0],
+					expected = admission.checkpoints[0].watches[0];
+				assert(
+					setup.watchId === expected.watchId &&
+						setup.request.executionKey === expected.executionKey &&
+						(typeof expected.stateNamespace !== "string" ||
+							expected.stateNamespace === setup.request.stateNamespace),
+					"OWNER_SC085_SETUP_SCOPE",
+				);
+				const cursor = audit.mark();
+				// Refuse a busy original session before parking any admission.
+				audit.sc085FailureEvidence(cursor);
+				const start = qualifySc085OriginalStamp(receiving, context, { kind: "window", cursor, edge: "start" });
+				state = {
+					token: Object.freeze({}),
+					segment,
+					phase: "held",
+					cursor,
+					deadline: start.monotonicMs + admission.validity.maxHoldMs - 2 * start.uncertaintyMs,
+				};
+				state.token = gate.hold(segment, () =>
+					check(state?.phase === "sealing" || state?.phase === "sealed" ? "boundary" : "burst"),
+				);
+				check();
+				deadlineTimer = audit.clock.setTimeout(
+					() => cancel(new Error("OWNER_SC085_MAX_HOLD")),
+					Math.max(0, state.deadline - audit.clock.monotonic()),
+				);
+				state.raw = record({
+					kind: "ordinary-sc085-held/1",
+					segment,
+					admission: bound.admission,
+					binding: bound.binding,
+					baseline: baseline.raw,
+					start,
+				});
+				return { token: state.token, raw: state.raw };
+			} catch (cause) {
+				cancel(cause);
+				throw failure!.cause;
+			}
+		},
+		checkHeld(token: object): void {
+			try {
+				original(token);
+				check();
+				gate.checkHeld(token);
+			} catch (cause) {
+				cancel(cause);
+				throw failure!.cause;
+			}
+		},
+		async release(token: object, checkpoint: OrdinaryObservedRefresh) {
+			try {
+				const held = original(token);
+				check();
+				gate.checkHeld(token);
+				assert(held.segment === "rapid" && held.phase === "held", "OWNER_SC085_RELEASE_ORDER");
+				const final = audit.validateSc085Checkpoint(checkpoint, storage.retained);
+				const expected = admission.checkpoints[0].watches[0],
+					sample = final.settlement.samples[0];
+				assert(
+					sample.result.outcome === expected.outcome &&
+						sample.result.body === expected.body &&
+						(expected.diagnostic === null ? sample.result.diagnosticRef === undefined : false),
+					"OWNER_SC085_FINAL_SAMPLE",
+				);
+				held.releaseCursor = audit.mark();
+				const released = qualifySc085OriginalStamp(receiving, context, {
+					kind: "window",
+					cursor: held.releaseCursor,
+					edge: "start",
+				});
+				check();
+				held.phase = "released";
+				if (deadlineTimer !== undefined) audit.clock.clearTimeout(deadlineTimer);
+				deadlineTimer = undefined;
+				const captured = await context.requestProvenance.captureAutomatic(
+					(enroll) => gate.release(token, enroll),
+					Math.min(admission.validity.expiresWallMs, context.decision.allocation.expiresMs),
+					(reservation) => {
+						check();
+						const row = audit.joinedRequest(reservation);
+						assert(
+							row.nativeAccepted && row.nativeOperationRetired && row.kind === "with-view",
+							"OWNER_SC085_AUTOMATIC_ACCEPTANCE",
+						);
+						const exposed = audit.requestExposure(row.requestId);
+						assert(
+							exposed.frame.hash === final.settlement.publication.hash &&
+								exposed.frame.revision === final.settlement.publication.revision,
+							"OWNER_SC085_FINAL_EXPOSURE",
+						);
+						return { requestId: row.requestId };
+					},
+				);
+				held.requestId = captured.requestId;
+				const correlation = record({
+					kind: "ordinary-sc085-automatic-correlation/1",
+					hold: held.raw,
+					released,
+					checkpoint: final,
+					requestId: captured.requestId,
+					request: audit.requestEvidence(captured.requestId),
+					exposure: audit.requestExposure(captured.requestId),
+				});
+				return { requestId: captured.requestId, correlation };
+			} catch (cause) {
+				cancel(cause);
+				throw failure!.cause;
+			}
+		},
+		async seal(token: object, requestId: string) {
+			try {
+				const held = original(token);
+				check("boundary");
+				assert(
+					held.phase === "released" && held.releaseCursor && held.requestId === requestId,
+					"OWNER_SC085_SEAL_ORDER",
+				);
+				held.phase = "sealing";
+				const exposure = qualifySc085OriginalStamp(receiving, context, { kind: "exposure", requestId });
+				for (;;) {
+					check("boundary");
+					const measured = audit.sc085RapidEvidence(held.cursor, held.releaseCursor, requestId);
+					const end = qualifySc085OriginalStamp(receiving, context, {
+						kind: "window",
+						cursor: measured.observedCursor,
+						edge: "start",
+					});
+					assert(
+						end.clockId === exposure.clockId &&
+							end.monotonicMs === measured.observedUntil.monotonicMs &&
+							exposure.monotonicMs === measured.exposureAt.monotonicMs,
+						"OWNER_SC085_SEAL_CLOCK_JOIN",
+					);
+					const elapsed = end.monotonicMs - exposure.monotonicMs - exposure.uncertaintyMs - end.uncertaintyMs;
+					assert(
+						measured.startsWhileHeld === 0 &&
+							measured.pendingPeak <= 1 &&
+							measured.concurrentTurnPeak <= 1 &&
+							measured.automaticTurns === 1 &&
+							measured.otherRunStarts === 0 &&
+							measured.repeatedUnchangedWakes === 0,
+						"OWNER_SC085_COALESCING",
+					);
+					if (elapsed < admission.observation.unchangedMs) {
+						const remaining = context.inspectCurrentPermission().remainingMs;
+						assert(remaining > 0, "OWNER_SC085_OBSERVATION_EXPIRED");
+						await wait(Math.min(Math.ceil(admission.observation.unchangedMs - elapsed), remaining));
+						continue;
+					}
+					const { observedCursor, ...evidence } = measured;
+					const raw = record(
+						{
+							kind: "ordinary-sc085-sealed/1",
+							hold: held.raw,
+							requestId,
+							evidence,
+							exposure,
+							end,
+							guaranteedUnchangedMs: elapsed,
+							requiredUnchangedMs: admission.observation.unchangedMs,
+						},
+						"boundary",
+					);
+					assert(audit.observeSince(observedCursor).events.length === 0, "OWNER_SC085_SEAL_REENTRANCY");
+					gate.sealed(token);
+					held.phase = "sealed";
+					const fact = (value: number) => ({ value, raw, unknown: null });
+					return {
+						raw,
+						startsWhileHeld: fact(measured.startsWhileHeld),
+						pendingPeak: fact(measured.pendingPeak),
+						concurrentTurnPeak: fact(measured.concurrentTurnPeak),
+						automaticTurns: fact(measured.automaticTurns),
+						repeatedUnchangedWakes: fact(measured.repeatedUnchangedWakes),
+					};
+				}
+			} catch (cause) {
+				cancel(cause);
+				throw failure!.cause;
+			}
+		},
+		async finishFailures(token: object) {
+			try {
+				const held = original(token);
+				check();
+				gate.checkHeld(token);
+				assert(held.segment === "failures" && held.phase === "held", "OWNER_SC085_FAILURE_ORDER");
+				held.phase = "finishing";
+				await gate.finishFailures(token);
+				// Let the original awaiting Core admission settle its own intention.
+				await Promise.resolve();
+				check();
+				const measured = audit.sc085FailureEvidence(held.cursor);
+				assert(
+					measured.starts === 0 && measured.turns === 0 && measured.requests === 0,
+					"OWNER_SC085_FAILURE_STARTED_TURN",
+				);
+				const end = qualifySc085OriginalStamp(receiving, context, {
+					kind: "window",
+					cursor: measured.endCursor,
+					edge: "start",
+				});
+				const { endCursor, ...evidence } = measured;
+				const raw = record({ kind: "ordinary-sc085-failures-finished/1", hold: held.raw, evidence, end });
+				assert(audit.observeSince(endCursor).events.length === 0, "OWNER_SC085_FAILURE_REENTRANCY");
+				held.phase = "finished";
+				if (deadlineTimer !== undefined) audit.clock.clearTimeout(deadlineTimer);
+				deadlineTimer = undefined;
+				return raw;
+			} catch (cause) {
+				cancel(cause);
+				throw failure!.cause;
+			}
+		},
+	});
+	return Object.freeze({ methods, cancel });
+}

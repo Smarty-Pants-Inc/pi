@@ -30,6 +30,13 @@ import type {
 
 export type { QueueMode } from "./types.ts";
 
+export interface AgentLifecycleObservation {
+	type: string;
+	activeRun: boolean;
+	steering: number;
+	followUp: number;
+}
+
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
 		(message) => message.role === "user" || message.role === "assistant" || message.role === "toolResult",
@@ -140,6 +147,10 @@ class PendingMessageQueue {
 		return this.messages.length > 0;
 	}
 
+	get size(): number {
+		return this.messages.length;
+	}
+
 	reserve(): AgentMessage[] {
 		// The loop can fail preparation after taking a batch. Keep the original
 		// messages here until message_start, including their images and order.
@@ -215,6 +226,8 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private lifecycleObserver?: (event: Readonly<AgentLifecycleObservation>) => void;
+	private observeStream?: (stream: StreamFn, signal: AbortSignal) => StreamFn;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -265,6 +278,45 @@ export class Agent {
 		return () => this.listeners.delete(listener);
 	}
 
+	/** Lifecycle observations precede asynchronous listeners. Queue transfer
+	 * observations follow message_end listeners so a failure cannot skip persistence.
+	 * Binding during a run is refused because it would omit that run's start.
+	 * The optional wrapper follows only original loop stream calls, not direct calls. */
+	observeLifecycle(
+		observer: (event: Readonly<AgentLifecycleObservation>) => void,
+		observeStream?: (stream: StreamFn, signal: AbortSignal) => StreamFn,
+	): () => void {
+		if (this.activeRun || this.lifecycleObserver)
+			throw new Error("Agent lifecycle observer requires an unobserved idle agent");
+		this.lifecycleObserver = observer;
+		this.observeStream = observeStream;
+		let attached = true;
+		const detach = () => {
+			if (!attached) return;
+			attached = false;
+			this.lifecycleObserver = undefined;
+			this.observeStream = undefined;
+		};
+		try {
+			this.observe("attached");
+		} catch (error) {
+			detach();
+			throw error;
+		}
+		return detach;
+	}
+
+	private observe(type: string): void {
+		this.lifecycleObserver?.(
+			Object.freeze({
+				type,
+				activeRun: this.activeRun !== undefined,
+				steering: this.steeringQueue.size,
+				followUp: this.followUpQueue.size,
+			}),
+		);
+	}
+
 	/**
 	 * Current agent state.
 	 *
@@ -295,21 +347,25 @@ export class Agent {
 	/** Queue a message to be injected after the current assistant turn finishes. */
 	steer(message: AgentMessage): void {
 		this.steeringQueue.enqueue(message);
+		this.observe("queue_update");
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
 	followUp(message: AgentMessage): void {
 		this.followUpQueue.enqueue(message);
+		this.observe("queue_update");
 	}
 
 	/** Remove all queued steering messages. */
 	clearSteeringQueue(): void {
 		this.steeringQueue.clear();
+		this.observe("queue_update");
 	}
 
 	/** Remove all queued follow-up messages. */
 	clearFollowUpQueue(): void {
 		this.followUpQueue.clear();
+		this.observe("queue_update");
 	}
 
 	/** Remove all queued steering and follow-up messages. */
@@ -430,7 +486,7 @@ export class Agent {
 				this.createLoopConfig(options),
 				(event) => this.processEvents(event),
 				signal,
-				this.streamFunction,
+				this.observeStream?.(this.streamFunction, signal) ?? this.streamFunction,
 			);
 		});
 	}
@@ -442,7 +498,7 @@ export class Agent {
 				this.createLoopConfig(),
 				(event) => this.processEvents(event),
 				signal,
-				this.streamFunction,
+				this.observeStream?.(this.streamFunction, signal) ?? this.streamFunction,
 			);
 		});
 	}
@@ -513,6 +569,7 @@ export class Agent {
 		this._state.errorMessage = undefined;
 
 		try {
+			this.observe("run_start");
 			await executor(abortController.signal);
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
@@ -549,6 +606,7 @@ export class Agent {
 		this._state.pendingToolCalls = new Set<string>();
 		this.activeRun?.resolve();
 		this.activeRun = undefined;
+		this.observe("run_settled");
 	}
 
 	/**
@@ -559,6 +617,14 @@ export class Agent {
 	 * and `finishRun()` clears runtime-owned state.
 	 */
 	private async processEvents(event: AgentEvent): Promise<void> {
+		if (
+			event.type === "agent_start" ||
+			event.type === "agent_end" ||
+			event.type === "turn_start" ||
+			event.type === "turn_end"
+		) {
+			this.observe(event.type);
+		}
 		switch (event.type) {
 			case "message_start":
 				this.steeringQueue.consume(event.message);
@@ -607,5 +673,8 @@ export class Agent {
 		for (const listener of this.listeners) {
 			await listener(event, signal);
 		}
+		// The session persists input through message_end listeners. A throwing
+		// observer must not skip that transfer after the queue consumed the input.
+		if (event.type === "message_end") this.observe("queue_update");
 	}
 }

@@ -5,6 +5,14 @@ import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
 import { ModelRuntime } from "./model-runtime.ts";
+import { InMemoryCodingAgentModelsStore } from "./models-store.ts";
+import {
+	assertOrdinaryOwner,
+	assertOrdinaryRuntime,
+	bindOrdinaryOptions,
+	ordinaryOwnerOf,
+} from "./ordinary-owner-context.ts";
+import { createOrdinaryResourceLoader } from "./ordinary-resource-loader.ts";
 import {
 	DefaultResourceLoader,
 	type DefaultResourceLoaderOptions,
@@ -13,6 +21,7 @@ import {
 } from "./resource-loader.ts";
 import { type CreateAgentSessionOptions, type CreateAgentSessionResult, createAgentSession } from "./sdk.ts";
 import type { SessionManager } from "./session-manager.ts";
+import { currentSessionOwnership } from "./session-ownership.ts";
 import { SettingsManager } from "./settings-manager.ts";
 
 /**
@@ -135,23 +144,39 @@ function applyExtensionFlagValues(
 export async function createAgentSessionServices(
 	options: CreateAgentSessionServicesOptions,
 ): Promise<AgentSessionServices> {
+	const owner = ordinaryOwnerOf(options);
+	if (!owner && currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+	if (owner) {
+		assertOrdinaryOwner(owner);
+		options = Object.freeze({ ...options });
+		if (
+			options.cwd !== owner.owner.manager.getCwd() ||
+			options.extensionFlagValues ||
+			options.resourceLoaderOptions ||
+			options.resourceLoaderReloadOptions ||
+			options.modelRuntime
+		)
+			throw new Error("OWNER_RUNTIME_SERVICES_INPUT");
+	}
 	const cwd = resolvePath(options.cwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
+	const modelOptions = {
+		authPath: join(agentDir, "auth.json"),
+		modelsPath: join(agentDir, "models.json"),
+		signal: options.modelRuntimeSignal,
+		...(owner
+			? { allowModelNetwork: false, refreshOnCreate: false, modelsStore: new InMemoryCodingAgentModelsStore() }
+			: {}),
+	};
 	const modelRuntime =
 		options.modelRuntime ??
-		(await ModelRuntime.create({
-			authPath: join(agentDir, "auth.json"),
-			modelsPath: join(agentDir, "models.json"),
-			signal: options.modelRuntimeSignal,
-		}));
+		(await ModelRuntime.create(owner ? bindOrdinaryOptions(modelOptions, owner) : modelOptions));
+	owner?.assertActive();
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
-	const resourceLoader = new DefaultResourceLoader({
-		...(options.resourceLoaderOptions ?? {}),
-		cwd,
-		agentDir,
-		settingsManager,
-	});
-	await resourceLoader.reload(options.resourceLoaderReloadOptions);
+	const resourceLoader = owner
+		? await owner.within(() => createOrdinaryResourceLoader(owner))
+		: new DefaultResourceLoader({ ...(options.resourceLoaderOptions ?? {}), cwd, agentDir, settingsManager });
+	if (!owner) await resourceLoader.reload(options.resourceLoaderReloadOptions);
 
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
 	const extensionsResult = resourceLoader.getExtensions();
@@ -179,10 +204,10 @@ export async function createAgentSessionServices(
 		}
 	}
 	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
-	await modelRuntime.refresh({ allowNetwork: false });
+	if (!owner) await modelRuntime.refresh({ allowNetwork: false });
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
-	return {
+	const services: AgentSessionServices = {
 		cwd,
 		agentDir,
 		modelRuntime,
@@ -190,6 +215,8 @@ export async function createAgentSessionServices(
 		resourceLoader,
 		diagnostics,
 	};
+	owner?.bindServices(services);
+	return services;
 }
 
 /**
@@ -202,13 +229,18 @@ export async function createAgentSessionServices(
 export async function createAgentSessionFromServices(
 	options: CreateAgentSessionFromServicesOptions,
 ): Promise<CreateAgentSessionResult> {
-	return createAgentSession({
-		cwd: options.services.cwd,
-		agentDir: options.services.agentDir,
-		modelRuntime: options.services.modelRuntime,
-		settingsManager: options.services.settingsManager,
-		resourceLoader: options.services.resourceLoader,
-		sessionManager: options.sessionManager,
+	const owner = ordinaryOwnerOf(options);
+	const sessionManager = options.sessionManager;
+	assertOrdinaryRuntime(sessionManager, owner);
+	const services = options.services;
+	owner?.assertServices(services);
+	const sessionOptions = {
+		cwd: services.cwd,
+		agentDir: services.agentDir,
+		modelRuntime: services.modelRuntime,
+		settingsManager: services.settingsManager,
+		resourceLoader: services.resourceLoader,
+		sessionManager,
 		model: options.model,
 		thinkingLevel: options.thinkingLevel,
 		scopedModels: options.scopedModels,
@@ -217,5 +249,6 @@ export async function createAgentSessionFromServices(
 		noTools: options.noTools,
 		customTools: options.customTools,
 		sessionStartEvent: options.sessionStartEvent,
-	});
+	};
+	return createAgentSession(owner ? bindOrdinaryOptions(sessionOptions, owner) : sessionOptions);
 }

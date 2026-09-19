@@ -39,9 +39,11 @@ import {
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
-import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
+import { AuthStorage as DefaultAuthStorage, ReadOnlyAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
+import { ORDINARY_CREDENTIAL_PLACEHOLDER } from "./ordinary-credential-delivery.ts";
+import { assertOrdinaryOwner, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
 import {
 	type AuthStatus,
 	type CompatibilityRequestConfig,
@@ -54,6 +56,7 @@ import {
 } from "./provider-composer.ts";
 import { withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
+import { currentSessionOwnership } from "./session-ownership.ts";
 
 interface ModelRuntimeSnapshot {
 	all: readonly Model<Api>[];
@@ -128,6 +131,7 @@ function mergeHeaders(
 
 /** Configured pi-ai Models collection used by coding-agent and SDK consumers. */
 export class ModelRuntime implements Models {
+	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	private readonly models: MutableModels;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
@@ -158,7 +162,9 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
+		ordinaryOwner?: OrdinaryOwnerContext,
 	) {
+		this.#ordinaryOwner = ordinaryOwner;
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
@@ -170,10 +176,27 @@ export class ModelRuntime implements Models {
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
-		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
+		const owner = ordinaryOwnerOf(options);
+		if (!owner && currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+		if (owner) {
+			assertOrdinaryOwner(owner);
+			options = Object.freeze({ ...options });
+			if (
+				options.credentials ||
+				options.allowModelNetwork !== false ||
+				options.refreshOnCreate !== false ||
+				!(options.modelsStore instanceof InMemoryCodingAgentModelsStore)
+			)
+				throw new Error("OWNER_MODEL_RUNTIME_INPUT");
+		}
+		const credentials = new RuntimeCredentials(
+			options.credentials ??
+				(owner ? new ReadOnlyAuthStorage(options.authPath) : DefaultAuthStorage.create(options.authPath)),
+		);
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
-		const config = await ModelConfig.load(modelsPath);
+		const config = await (owner ? owner.within(() => ModelConfig.load(modelsPath)) : ModelConfig.load(modelsPath));
+		owner?.assertActive();
 		const modelsStore =
 			options.modelsStore ??
 			(modelsPath
@@ -193,7 +216,8 @@ export class ModelRuntime implements Models {
 			modelsPath,
 			modelsStore,
 			providers,
-			process.env.PI_OFFLINE === undefined,
+			!owner && process.env.PI_OFFLINE === undefined,
+			owner,
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -213,6 +237,7 @@ export class ModelRuntime implements Models {
 		} finally {
 			if (timeout) clearTimeout(timeout);
 		}
+		owner?.assertActive();
 		return runtime;
 	}
 
@@ -382,10 +407,12 @@ export class ModelRuntime implements Models {
 	}
 
 	getProviders(): readonly Provider[] {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_HANDLE_SCOPE");
 		return this.models.getProviders();
 	}
 
 	getProvider(providerId: string): Provider | undefined {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_HANDLE_SCOPE");
 		return this.models.getProvider(providerId);
 	}
 
@@ -398,10 +425,28 @@ export class ModelRuntime implements Models {
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
+		if (this.#ordinaryOwner) {
+			this.#ordinaryOwner.assertCredentialBinding();
+			options?.signal?.throwIfAborted();
+			return providerId === this.#ordinaryOwner.decision.record.provider.provider
+				? { type: "api_key", source: "protected H delivery" }
+				: undefined;
+		}
 		return this.models.checkAuth(providerId, options);
 	}
 
 	async getAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly Model<Api>[]> {
+		if (this.#ordinaryOwner) {
+			this.#ordinaryOwner.assertCredentialBinding();
+			options?.signal?.throwIfAborted();
+			const allowed = this.#ordinaryOwner.decision.record.provider;
+			return this.models
+				.getModels(providerId)
+				.filter(
+					(model) =>
+						model.provider === allowed.provider && model.id === allowed.model && model.api === allowed.api,
+				);
+		}
 		if (providerId) {
 			const errorSeq = ++this.availabilityErrorSeq;
 			try {
@@ -420,6 +465,13 @@ export class ModelRuntime implements Models {
 	}
 
 	getAvailableSnapshot(): readonly Model<Api>[] {
+		if (this.#ordinaryOwner) {
+			this.#ordinaryOwner.assertCredentialBinding();
+			const allowed = this.#ordinaryOwner.decision.record.provider;
+			return this.snapshot.all.filter(
+				(model) => model.provider === allowed.provider && model.id === allowed.model && model.api === allowed.api,
+			);
+		}
 		return this.snapshot.available;
 	}
 
@@ -448,6 +500,7 @@ export class ModelRuntime implements Models {
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
 	getCompatibilityRequestConfig(model: Model<Api>): CompatibilityRequestConfig {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_HANDLE_SCOPE");
 		return resolveCompatibilityRequestConfig(
 			model,
 			this.config.getProvider(model.provider),
@@ -464,6 +517,10 @@ export class ModelRuntime implements Models {
 	}
 
 	hasConfiguredAuth(providerId: string): boolean {
+		if (this.#ordinaryOwner) {
+			this.#ordinaryOwner.assertCredentialBinding();
+			return providerId === this.#ordinaryOwner.decision.record.provider.provider;
+		}
 		return this.snapshot.configuredProviders.has(providerId);
 	}
 
@@ -473,6 +530,27 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | Model<Api>,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
+		const owner = this.#ordinaryOwner;
+		if (owner) {
+			owner.assertCredentialBinding();
+			const allowed = owner.decision.record.provider;
+			const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
+			if (
+				providerId !== allowed.provider ||
+				(overrides.apiKey !== undefined && overrides.apiKey !== ORDINARY_CREDENTIAL_PLACEHOLDER) ||
+				overrides.env !== undefined ||
+				(typeof providerOrModel !== "string" &&
+					(providerOrModel.id !== allowed.model || providerOrModel.api !== allowed.api))
+			) {
+				throw new Error("OWNER_AUTH_SCOPE");
+			}
+			overrides.signal?.throwIfAborted();
+			// The original transport alone receives the credential at final dispatch.
+			return {
+				auth: { apiKey: ORDINARY_CREDENTIAL_PLACEHOLDER, baseUrl: allowed.baseUrl },
+				source: "protected H delivery",
+			};
+		}
 		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
 		const resolution = await this.models.getAuth(providerOrModel, overrides);
 		if (!resolution) return undefined;
@@ -534,6 +612,7 @@ export class ModelRuntime implements Models {
 	}
 
 	setRuntimeApiKey(providerId: string, apiKey: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.setRuntimeApiKey(providerId, apiKey);
@@ -547,6 +626,7 @@ export class ModelRuntime implements Models {
 	}
 
 	removeRuntimeApiKey(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.removeRuntimeApiKey(providerId);
@@ -555,10 +635,17 @@ export class ModelRuntime implements Models {
 	}
 
 	listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
+		if (this.#ordinaryOwner) {
+			this.#ordinaryOwner.assertCredentialBinding();
+			options?.signal?.throwIfAborted();
+			return Promise.resolve([]);
+		}
 		return this.credentials.list(options);
 	}
 
 	getProviderAuthStatus(providerId: string): AuthStatus {
+		if (this.#ordinaryOwner)
+			return this.hasConfiguredAuth(providerId) ? { configured: true, source: "runtime" } : { configured: false };
 		if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
 		if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
 		const configured = configuredRequestAuthStatus(
@@ -578,6 +665,11 @@ export class ModelRuntime implements Models {
 		model: Model<Api>;
 		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
 	}> {
+		const owner = this.#ordinaryOwner;
+		owner?.assertCredentialBinding();
+		owner?.assertNativeTokenReservation();
+		owner?.assertSubmission();
+		owner?.assertPreparedFetch(options?.fetch);
 		const provider = this.models.getProvider(model.provider);
 		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
 		const resolution = await this.getAuth(model, {
@@ -595,9 +687,26 @@ export class ModelRuntime implements Models {
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
+		const preparedModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		if (owner) {
+			owner.assertCredentialBinding();
+			owner.assertNativeTokenReservation();
+			owner.assertPreparedFetch(providerOptions.fetch);
+			owner.assertSubmission();
+			const allowed = owner.decision.record.provider;
+			if (
+				this.models.getProvider(model.provider) !== provider ||
+				preparedModel.provider !== allowed.provider ||
+				preparedModel.id !== allowed.model ||
+				preparedModel.api !== allowed.api ||
+				preparedModel.baseUrl !== allowed.baseUrl
+			) {
+				throw new Error("OWNER_PREPARED_PROVIDER_IDENTITY");
+			}
+		}
 		return {
 			provider,
-			model: resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model,
+			model: preparedModel,
 			options: {
 				...providerOptions,
 				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
@@ -617,6 +726,7 @@ export class ModelRuntime implements Models {
 				model,
 				options as (StreamOptions & ModelsRequestTransforms) | undefined,
 			);
+			this.#ordinaryOwner?.assertSubmission();
 			return prepared.provider.stream(
 				prepared.model as Model<TApi>,
 				context,
@@ -636,6 +746,7 @@ export class ModelRuntime implements Models {
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
 			const prepared = await this.prepareRequest(model, options);
+			this.#ordinaryOwner?.assertSubmission();
 			return prepared.provider.streamSimple(prepared.model, context, prepared.options as SimpleStreamOptions);
 		});
 	}
@@ -679,6 +790,7 @@ export class ModelRuntime implements Models {
 	}
 
 	login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(interaction.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			const credential = await this.models.login(providerId, type, { ...interaction, signal });
@@ -688,6 +800,7 @@ export class ModelRuntime implements Models {
 	}
 
 	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			await this.models.logout(providerId, { signal });
@@ -696,6 +809,7 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_MODEL_REFRESH_REQUIRES_RECEIVING");
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
 		if (options.providers) {
@@ -739,6 +853,7 @@ export class ModelRuntime implements Models {
 	}
 
 	registerNativeProvider(provider: Provider): void {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		if (!provider.id.trim()) throw new Error("Provider id must not be empty.");
 		this.extensionProviders.delete(provider.id);
 		this.nativeExtensionProviders.set(provider.id, provider);
@@ -748,6 +863,7 @@ export class ModelRuntime implements Models {
 	}
 
 	registerProvider(providerId: string, config: ProviderConfigInput): void {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		// Validate the incoming registration on its own, like the legacy registry:
 		// a broken re-registration must throw without touching the stored config.
 		validateExtensionProvider(providerId, this.builtins.get(providerId), this.config.getProvider(providerId), config);
@@ -786,6 +902,7 @@ export class ModelRuntime implements Models {
 	}
 
 	unregisterProvider(providerId: string): void {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		this.extensionProviders.delete(providerId);
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);

@@ -4,6 +4,8 @@
 
 import { spawn } from "node:child_process";
 import { waitForChildProcess } from "../utils/child-process.ts";
+import type { OwnedProcessRequest } from "./owner-effects.ts";
+import { currentSessionOwnership, ownershipOf, type SessionOwnership } from "./session-ownership.ts";
 
 /**
  * Options for executing shell commands.
@@ -27,6 +29,41 @@ export interface ExecResult {
 	killed: boolean;
 }
 
+/** Private host request scope, not an extension option or a permission grant. */
+export type OwnedExecScope = Pick<OwnedProcessRequest, "roots" | "environment" | "readOnly">;
+
+/** Capture the original owner during construction. Missing scope never falls
+ * back to an unowned process. Native admission checks every request. */
+export function createExecCommand(owner: SessionOwnership | undefined, scope?: OwnedExecScope): typeof execCommand {
+	if (!owner) {
+		if (scope) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
+		return execCommand;
+	}
+	if (ownershipOf(owner.manager) !== owner) throw new Error("OWNER_NATIVE_CONSTRUCTION");
+	owner.assertActive();
+	const requestScope = scope && {
+		roots: [...scope.roots],
+		environment: [...scope.environment],
+		readOnly: scope.readOnly,
+	};
+	owner.assertActive();
+	return async (command, args, cwd, options) => {
+		owner.assertActive();
+		if (!requestScope) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
+		const result = await owner.runProcess(
+			{ ...requestScope, command, argv0: command, args, cwd },
+			{ signal: options?.signal, timeoutMs: options?.timeout },
+		);
+		// Native retirement is required. Timeout or unknown custody rejects.
+		return {
+			stdout: result.stdout,
+			stderr: result.stderr,
+			code: result.signal ? 128 + result.signal : result.code,
+			killed: result.signal !== 0,
+		};
+	};
+}
+
 /**
  * Execute a shell command and return stdout/stderr/code.
  * Supports timeout and abort signal.
@@ -37,6 +74,7 @@ export async function execCommand(
 	cwd: string,
 	options?: ExecOptions,
 ): Promise<ExecResult> {
+	if (currentSessionOwnership()) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
 	return new Promise((resolve) => {
 		const proc = spawn(command, args, {
 			cwd,

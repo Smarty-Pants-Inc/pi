@@ -15,15 +15,15 @@
 
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
-import type {
+import {
 	Agent,
-	AgentContext,
-	AgentEvent,
-	AgentMessage,
-	AgentState,
-	AgentTool,
-	PrepareNextTurnContext,
-	ThinkingLevel,
+	type AgentContext,
+	type AgentEvent,
+	type AgentMessage,
+	type AgentState,
+	type AgentTool,
+	type PrepareNextTurnContext,
+	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import { contentText, type RetryPolicy, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
@@ -100,6 +100,9 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
+import type { OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
+import { assertOrdinaryRuntime, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
+import { createOrdinaryToolDefinitions } from "./ordinary-tools.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
@@ -113,6 +116,11 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+
+// Read the original active-run boundary, not a replaceable instance accessor or mutable state flag.
+const originalAgentSignal = Object.getOwnPropertyDescriptor(Agent.prototype, "signal")!.get! as (
+	this: Agent,
+) => AbortSignal | undefined;
 
 // ============================================================================
 // Skill Block Parsing
@@ -231,6 +239,8 @@ export interface AgentSessionConfig {
 }
 
 export interface ExtensionBindings {
+	/** Mode-owned submitted input awaiting transfer, not unsent editor drafts. */
+	hasPendingInput?: () => boolean;
 	uiContext?: ExtensionUIContext;
 	mode?: ExtensionMode;
 	commandContextActions?: ExtensionCommandContextActions;
@@ -251,6 +261,9 @@ export interface PromptOptions {
 	source?: InputSource;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
+	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
+	 * Unlike preflight acceptance, this remains true if the operation later fails. */
+	onInputTransferred?: () => void;
 }
 
 /** Options for model/thinking mutations. */
@@ -321,8 +334,12 @@ function startCompactionDeadline(controller: AbortController): ReturnType<typeof
 
 export class AgentSession {
 	readonly agent: Agent;
+	readonly #originalAgent: Agent;
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
+	readonly #ordinaryOwner?: OrdinaryOwnerContext;
+	#ordinaryPreflights = 0;
+	#pendingModeInput?: () => boolean;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -397,8 +414,16 @@ export class AgentSession {
 	private _systemPromptOverride?: string;
 
 	constructor(config: AgentSessionConfig) {
+		const owner = ordinaryOwnerOf(config);
+		const sessionManager = config.sessionManager;
+		assertOrdinaryRuntime(sessionManager, owner);
+		if (owner && (config.baseToolsOverride || config.customTools?.length || config.scopedModels?.length)) {
+			throw new Error("OWNER_RUNTIME_SCOPE");
+		}
+		this.#ordinaryOwner = owner;
 		this.agent = config.agent;
-		this.sessionManager = config.sessionManager;
+		this.#originalAgent = this.agent;
+		this.sessionManager = sessionManager;
 		this.settingsManager = config.settingsManager;
 		this._scopedModels = config.scopedModels ?? [];
 		this._resourceLoader = config.resourceLoader;
@@ -422,6 +447,8 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		this.#ordinaryOwner?.bindSessionAdmission(this, (recheck, enroll) => this.#requestOrdinaryWake(recheck, enroll));
+		this.#auditState("session_attached");
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -537,9 +564,12 @@ export class AgentSession {
 
 			const content = hookResult?.content ?? result.content ?? [];
 			// Runs after the extension hook so images injected or replaced by extensions are normalized too.
-			const normalizedContent = await normalizeToolResultImages(content, {
-				autoResizeImages: this.settingsManager.getImageAutoResize(),
-			});
+			this.#ordinaryOwner?.assertActive();
+			const normalizedContent = this.#ordinaryOwner
+				? content
+				: await normalizeToolResultImages(content, {
+						autoResizeImages: this.settingsManager.getImageAutoResize(),
+					});
 
 			if (!hookResult && normalizedContent === content) {
 				return undefined;
@@ -555,6 +585,7 @@ export class AgentSession {
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+		this.#ordinaryOwner?.assertNativeTokenReservation();
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 
@@ -608,8 +639,32 @@ export class AgentSession {
 	// Event Subscription
 	// =========================================================================
 
+	#auditState(kind: string, attempt: number | null = null): void {
+		this.#ordinaryOwner?.operationalAudit.session(kind, {
+			activeRun: this._isAgentRunActive,
+			preflights: this.#ordinaryPreflights,
+			compacting: this.isCompacting,
+			retrying: this.isRetrying,
+			steering: this._steeringMessages.length,
+			followUp: this._followUpMessages.length,
+			attempt,
+		});
+	}
+
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
+		if (
+			event.type === "queue_update" ||
+			event.type === "compaction_start" ||
+			event.type === "compaction_end" ||
+			event.type === "auto_retry_start" ||
+			event.type === "auto_retry_end" ||
+			event.type === "summarization_retry_scheduled" ||
+			event.type === "summarization_retry_attempt_start" ||
+			event.type === "summarization_retry_finished"
+		) {
+			this.#auditState(event.type, "attempt" in event ? event.attempt : null);
+		}
 		for (const l of this._eventListeners) {
 			l(event);
 		}
@@ -659,6 +714,7 @@ export class AgentSession {
 
 	private async _emitAgentSettled(): Promise<void> {
 		this._isAgentRunActive = false;
+		this.#auditState("session_run_settled");
 		try {
 			await this._extensionRunner.emit({ type: "agent_settled" });
 			this._emit({ type: "agent_settled" });
@@ -700,6 +756,11 @@ export class AgentSession {
 		// Notify all listeners
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
+		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
+		else this._persistAgentEvent(event);
+	};
+
+	private _persistAgentEvent(event: AgentEvent): void {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			// Check if this is a custom message from extensions
@@ -753,7 +814,7 @@ export class AgentSession {
 		if (event.type === "turn_end") {
 			this._flushPendingCustomMessages();
 		}
-	};
+	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		const settings = this.settingsManager.getRetrySettings();
@@ -912,12 +973,13 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
 		try {
 			this.abortRetry();
 			this.abortCompaction();
 			this.abortBranchSummary();
 			this.abortBash();
-			this.agent.abort();
+			this.#originalAgent.abort();
 		} catch {
 			// Dispose must succeed even if an abort hook throws.
 		}
@@ -1171,19 +1233,59 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+	private async _runAgentPrompt(
+		messages: AgentMessage | AgentMessage[],
+		promptToken?: object,
+		automaticEnrollment?: OriginalAutomaticEnrollment,
+		onInputTransferred?: () => void,
+	): Promise<void> {
+		this.#ordinaryOwner?.assertSubmission();
+		const agent = this.#originalAgent;
+		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
+		const dispatch = async (continuation = false) => {
+			this.#ordinaryOwner?.assertSubmission();
+			this.#ordinaryOwner?.assertSessionStart(this);
+			if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
+			// No await or external callback may separate this check from dispatch.
+			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
+			const run = continuation ? agent.continue() : agent.prompt(messages);
+			try {
+				if (!continuation) onInputTransferred?.();
+			} catch (cause) {
+				// A failing observer must not detach the already-started original run.
+				try {
+					await run;
+				} catch (error) {
+					throw new AggregateError([cause, error], "INPUT_TRANSFER_OBSERVER_FAILED", { cause });
+				}
+				throw cause;
+			}
+			await run;
+		};
 		this._stopAfterCompactionFailure = false;
 		this._isAgentRunActive = true;
+		this.#auditState("session_run_start");
 		try {
-			await this.agent.prompt(messages);
+			if (automaticEnrollment) await automaticEnrollment(() => dispatch());
+			else if (this.#ordinaryOwner)
+				await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(), messages);
+			else await dispatch();
 			while (await this._handlePostAgentRun()) {
-				await this.agent.continue();
+				if (this.#ordinaryOwner) await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true));
+				else await dispatch(true);
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
-			await this._emitAgentSettled();
+			const persist = () => {
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			};
+			try {
+				if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(persist);
+				else persist();
+			} finally {
+				await this._emitAgentSettled();
+			}
 		}
 	}
 
@@ -1251,8 +1353,34 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (!this.#ordinaryOwner) return this._prompt(text, options);
+		this.#ordinaryOwner.assertSessionStart(this);
+		this.#ordinaryPreflights++;
+		this.#auditState("preflight_start");
+		let pending = true;
+		const release = () => {
+			if (pending) {
+				pending = false;
+				this.#ordinaryPreflights--;
+				this.#auditState("preflight_settled");
+			}
+		};
+		try {
+			await this.#ordinaryOwner.requestProvenance.prompt((token) => this._prompt(text, options, release, token));
+		} finally {
+			release();
+		}
+	}
+
+	private async _prompt(
+		text: string,
+		options?: PromptOptions,
+		releasePreflight?: () => void,
+		promptToken?: object,
+	): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
+		const onInputTransferred = options?.onInputTransferred;
 		let messages: AgentMessage[] | undefined;
 
 		try {
@@ -1262,6 +1390,7 @@ export class AgentSession {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
+					onInputTransferred?.();
 					preflightResult?.(true);
 					return;
 				}
@@ -1284,6 +1413,7 @@ export class AgentSession {
 				this.isStreaming ? options?.streamingBehavior : undefined,
 			);
 			if (!processedInput) {
+				onInputTransferred?.();
 				preflightResult?.(true);
 				return;
 			}
@@ -1308,6 +1438,7 @@ export class AgentSession {
 				} else {
 					await this._queueSteer(expandedText, currentImages);
 				}
+				onInputTransferred?.();
 				preflightResult?.(true);
 				return;
 			}
@@ -1347,6 +1478,7 @@ export class AgentSession {
 					const behavior = options?.streamingBehavior ?? "steer";
 					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
 					else await this._queueSteer(expandedText, currentImages);
+					onInputTransferred?.();
 					throw new Error(
 						`Prompt not sent: compaction ${outcome === "aborted" ? "was cancelled" : "failed"}. ` +
 							`Input is retained in the ${behavior} queue. ` +
@@ -1415,7 +1547,9 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
-		await this._runAgentPrompt(messages);
+		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
+		releasePreflight?.();
+		await run;
 	}
 
 	/**
@@ -1479,6 +1613,27 @@ export class AgentSession {
 	}
 
 	private async _queueUserInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		behavior: "steer" | "followUp",
+		source: InputSource,
+	): Promise<void> {
+		this.#ordinaryOwner?.assertSessionStart(this);
+		if (this.#ordinaryOwner) {
+			this.#ordinaryPreflights++;
+			this.#auditState("queued_preflight_start");
+		}
+		try {
+			await this._prepareQueuedInput(text, images, behavior, source);
+		} finally {
+			if (this.#ordinaryOwner) {
+				this.#ordinaryPreflights--;
+				this.#auditState("queued_preflight_settled");
+			}
+		}
+	}
+
+	private async _prepareQueuedInput(
 		text: string,
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
@@ -1732,10 +1887,12 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_ABORTED"));
+		this.#ordinaryOwner?.stopAutomatic();
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();
-		this.agent.abort();
+		this.#originalAgent.abort();
 		await this.waitForIdle();
 	}
 
@@ -2022,6 +2179,7 @@ export class AgentSession {
 		env: Record<string, string> | undefined,
 		reason: "manual" | "threshold" | "overflow",
 	): Promise<CompactionResult> {
+		this.#ordinaryOwner?.requestProvenance.interrupt(new Error("OWNER_REQUEST_CAPTURE_AUXILIARY"));
 		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
 		try {
 			return await raceWithAbortSignal(
@@ -2050,6 +2208,7 @@ export class AgentSession {
 
 	private _clearManualCompactionState(controller: AbortController): void {
 		if (this._compactionAbortController === controller) this._compactionAbortController = undefined;
+		this.#auditState("manual_compaction_settled");
 		this._resolveIdleWaitIfIdle();
 	}
 
@@ -2391,6 +2550,7 @@ export class AgentSession {
 		if (this.isCompacting) return "failed";
 		const controller = new AbortController();
 		this._autoCompactionAbortController = controller;
+		this.#auditState("auto_compaction_preparing");
 		const signal = controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let started = false;
@@ -2550,6 +2710,7 @@ export class AgentSession {
 		} finally {
 			clearTimeout(timeout);
 			if (this._autoCompactionAbortController === controller) this._autoCompactionAbortController = undefined;
+			this.#auditState("auto_compaction_settled");
 			this._resolveIdleWaitIfIdle();
 		}
 	}
@@ -2566,7 +2727,49 @@ export class AgentSession {
 		return this.settingsManager.getCompactionEnabled();
 	}
 
+	async #requestOrdinaryWake(
+		recheck: () => boolean,
+		enroll?: OriginalAutomaticEnrollment,
+	): Promise<"started" | "suppressed"> {
+		const owner = this.#ordinaryOwner;
+		if (!owner) return "suppressed";
+		const ready = () => {
+			owner.assertSessionStart(this);
+			if ((this._extensionMode === "tui" && !this.#pendingModeInput) || this.#pendingModeInput?.()) return false;
+			owner.assertSessionStart(this);
+			return (
+				owner.canSubmitNative() &&
+				this.#ordinaryPreflights === 0 &&
+				this.isIdle &&
+				!this.#originalAgent.state.isStreaming &&
+				!this.isRetrying &&
+				!this.isBashRunning &&
+				!this.#originalAgent.hasQueuedMessages() &&
+				this.pendingMessageCount === 0
+			);
+		};
+		if (!ready() || !recheck() || !ready()) return "suppressed";
+		if (!owner.spendAutomatic()) return "suppressed";
+		const completion = this._runAgentPrompt([], undefined, enroll).catch((error: unknown) => {
+			try {
+				owner.stopAutomatic();
+			} catch (cleanup) {
+				error = new AggregateError([error, cleanup], "OWNER_AUTOMATIC_STOP_FAILED", { cause: error });
+			}
+			this._extensionRunner.emitError({
+				extensionPath: "<ordinary-owner>",
+				event: "sense_wake",
+				error: error instanceof Error ? error.message : String(error),
+			});
+			if (enroll) throw error;
+		});
+		if (enroll) await completion;
+		return "started";
+	}
+
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		this.#ordinaryOwner?.assertSessionStart(this);
+		if (bindings.hasPendingInput !== undefined) this.#pendingModeInput = bindings.hasPendingInput;
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}
@@ -2893,17 +3096,19 @@ export class AgentSession {
 		const autoResizeImages = this.settingsManager.getImageAutoResize();
 		const shellCommandPrefix = this.settingsManager.getShellCommandPrefix();
 		const shellPath = this.settingsManager.getShellPath();
-		const baseToolDefinitions = this._baseToolsOverride
-			? Object.fromEntries(
-					Object.entries(this._baseToolsOverride).map(([name, tool]) => [
-						name,
-						createToolDefinitionFromAgentTool(tool),
-					]),
-				)
-			: createAllToolDefinitions(this._cwd, {
-					read: { autoResizeImages },
-					bash: { commandPrefix: shellCommandPrefix, shellPath },
-				});
+		const baseToolDefinitions = this.#ordinaryOwner
+			? createOrdinaryToolDefinitions(this.#ordinaryOwner, autoResizeImages)
+			: this._baseToolsOverride
+				? Object.fromEntries(
+						Object.entries(this._baseToolsOverride).map(([name, tool]) => [
+							name,
+							createToolDefinitionFromAgentTool(tool),
+						]),
+					)
+				: createAllToolDefinitions(this._cwd, {
+						read: { autoResizeImages },
+						bash: { commandPrefix: shellCommandPrefix, shellPath },
+					});
 
 		this._baseToolDefinitions = new Map(
 			Object.entries(baseToolDefinitions).map(([name, tool]) => [name, tool as ToolDefinition]),
@@ -2940,6 +3145,7 @@ export class AgentSession {
 	}
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: reload requires separate receiving");
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
@@ -3050,6 +3256,7 @@ export class AgentSession {
 
 		// Wait with exponential backoff (abortable)
 		this._retryAbortController = new AbortController();
+		this.#auditState("retry_wait_start", this._retryAttempt);
 		try {
 			await sleep(delayMs, this._retryAbortController.signal);
 		} catch {
@@ -3065,6 +3272,7 @@ export class AgentSession {
 			return false;
 		} finally {
 			this._retryAbortController = undefined;
+			this.#auditState("retry_wait_settled", this._retryAttempt);
 		}
 
 		return true;
@@ -3112,6 +3320,7 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 
@@ -3241,6 +3450,7 @@ export class AgentSession {
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: tree requires separate receiving");
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
@@ -3565,6 +3775,7 @@ export class AgentSession {
 	 * @returns Path to exported file
 	 */
 	async exportToHtml(outputPath?: string, options: { themeName?: string } = {}): Promise<string> {
+		if (this.#ordinaryOwner) throw new Error("OWNER_EXPORT_SCOPE_REQUIRED");
 		const themeName = [options.themeName, this.settingsManager.getTheme()].find(
 			(candidate) => candidate !== undefined && getThemeByName(candidate) !== undefined,
 		);
@@ -3590,6 +3801,7 @@ export class AgentSession {
 	 * @returns The resolved output file path.
 	 */
 	exportToJsonl(outputPath?: string): string {
+		if (this.#ordinaryOwner) throw new Error("OWNER_EXPORT_SCOPE_REQUIRED");
 		return exportSessionToJsonl(this.sessionManager, outputPath);
 	}
 
