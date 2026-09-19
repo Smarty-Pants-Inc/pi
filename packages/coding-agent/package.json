@@ -16,6 +16,10 @@
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js"
 		},
+		"./ordinary": {
+			"types": "./dist/ordinary.d.ts",
+			"import": "./dist/ordinary.js"
+		},
 		"./rpc-entry": {
 			"import": "./dist/bundle/rpc-entry.js"
 		},

@@ -288,9 +288,109 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(2);
 	});
 
+	test.each([false, true])("keeps detached prompt transfers staged until settlement (reject: %s)", async (reject) => {
+		let resolvePrompt!: () => void;
+		let rejectPrompt!: (error: Error) => void;
+		const prompt = new Promise<void>((resolve, reject) => {
+			resolvePrompt = resolve;
+			rejectPrompt = reject;
+		});
+		const queued = [{ text: "original input", mode: "steer" as const }];
+		const snapshots: { kind: string; transfers: number; queued: number }[] = [];
+		const fakeThis = {
+			compactionQueuedMessages: [...queued],
+			compactionQueueTransfers: 0,
+			session: {
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockReturnValue(prompt),
+				steer: vi.fn(),
+				followUp: vi.fn(),
+			},
+			stagingAudit: (kind: string) =>
+				snapshots.push({
+					kind,
+					transfers: fakeThis.compactionQueueTransfers,
+					queued: fakeThis.compactionQueuedMessages.length,
+				}),
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showError: vi.fn(),
+		};
+		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+		) => Promise<void>;
+		await flush.call(fakeThis);
+		expect(fakeThis.compactionQueuedMessages).toEqual([]);
+		expect(fakeThis.compactionQueueTransfers).toBe(1);
+		expect(snapshots[0]).toEqual({ kind: "compaction-transfer-start", transfers: 1, queued: 1 });
+		const intervening = { text: "newly staged input", mode: "steer" as const };
+		fakeThis.compactionQueuedMessages.push(intervening);
+		if (reject) rejectPrompt(new Error("preflight failed"));
+		else resolvePrompt();
+		await vi.waitFor(() => expect(fakeThis.compactionQueueTransfers).toBe(0));
+		expect(fakeThis.compactionQueuedMessages).toEqual(reject ? [...queued, intervening] : [intervening]);
+		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		expect(fakeThis.showError).toHaveBeenCalledTimes(reject ? 1 : 0);
+		if (reject) expect(snapshots).toContainEqual({ kind: "compaction-restored", transfers: 1, queued: 2 });
+	});
+
+	test.each([false, true])(
+		"partial transfer preserves accepted messages and restores failures in order (prompt fails first: %s)",
+		async (promptFirst) => {
+			let rejectPrompt!: (cause: Error) => void;
+			let rejectTail!: (cause: Error) => void;
+			const prompt = new Promise<void>((_, reject) => {
+				rejectPrompt = reject;
+			});
+			const tail = new Promise<void>((_, reject) => {
+				rejectTail = reject;
+			});
+			const batch = [
+				{ text: "A", mode: "steer" as const },
+				{ text: "accepted", mode: "followUp" as const },
+				{ text: "C", mode: "followUp" as const },
+			];
+			const fakeThis = {
+				compactionQueuedMessages: [...batch],
+				compactionQueueTransfers: 0,
+				session: {
+					prompt: vi.fn(() => prompt),
+					clearQueue: vi.fn(),
+					steer: vi.fn(),
+					followUp: vi.fn().mockResolvedValueOnce(undefined).mockReturnValueOnce(tail),
+				},
+				isExtensionCommand: () => false,
+				updatePendingMessagesDisplay: vi.fn(),
+				showError: vi.fn(),
+			};
+			const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+				this: typeof fakeThis,
+			) => Promise<void>;
+			const completion = flush.call(fakeThis);
+			await vi.waitFor(() => expect(fakeThis.session.followUp).toHaveBeenCalledTimes(2));
+			const intervening = { text: "B", mode: "steer" as const };
+			fakeThis.compactionQueuedMessages.push(intervening);
+			if (promptFirst) {
+				rejectPrompt(new Error("first"));
+				await vi.waitFor(() => expect(fakeThis.showError).toHaveBeenCalledTimes(1));
+				rejectTail(new Error("tail"));
+			} else {
+				rejectTail(new Error("tail"));
+				await completion;
+				expect(fakeThis.compactionQueuedMessages).toEqual([batch[2], intervening]);
+				rejectPrompt(new Error("first"));
+			}
+			await completion;
+			await vi.waitFor(() => expect(fakeThis.compactionQueueTransfers).toBe(0));
+			expect(fakeThis.compactionQueuedMessages).toEqual([batch[0], batch[2], intervening]);
+			expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		},
+	);
+
 	test("preserves steering behavior when flushing into an active agent run", async () => {
 		const fakeThis = {
 			compactionQueuedMessages: [{ text: "change direction", mode: "steer" as const }],
+			compactionQueueTransfers: 0,
 			session: {
 				clearQueue: vi.fn(),
 				prompt: vi.fn().mockResolvedValue(undefined),
@@ -309,7 +409,10 @@ describe("InteractiveMode compaction events", () => {
 
 		await flushCompactionQueue.call(fakeThis, { willRetry: false });
 
-		expect(fakeThis.session.prompt).toHaveBeenCalledWith("change direction", { streamingBehavior: "steer" });
+		expect(fakeThis.session.prompt).toHaveBeenCalledWith(
+			"change direction",
+			expect.objectContaining({ streamingBehavior: "steer" }),
+		);
 		expect(fakeThis.compactionQueuedMessages).toEqual([]);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 	});

@@ -71,6 +71,7 @@ export {
 	shouldCompact,
 } from "./harness/compaction/compaction.ts";
 export * from "./harness/context.ts";
+export { createGate, type GateControl } from "./harness/execution/effect-gate.ts";
 export * from "./harness/messages.ts";
 export * from "./harness/prompt-templates.ts";
 export * from "./harness/result.ts";

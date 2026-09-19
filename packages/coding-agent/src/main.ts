@@ -6,6 +6,7 @@
  */
 
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { type ImageContent, modelsAreEqual } from "@earendil-works/pi-ai";
 import { setCapabilityOverrides } from "@earendil-works/pi-tui";
 import chalk from "chalk";
@@ -34,7 +35,11 @@ import { createProjectTrustContext } from "./cli/project-trust.ts";
 import { selectSession } from "./cli/session-picker.ts";
 import { shouldRunFirstTimeSetup, showFirstTimeSetup, showStartupSelector } from "./cli/startup-ui.ts";
 import { APP_NAME, ENV_SESSION_DIR, expandTildePath, getAgentDir, getPackageDir, VERSION } from "./config.ts";
-import { type CreateAgentSessionRuntimeFactory, createAgentSessionRuntime } from "./core/agent-session-runtime.ts";
+import {
+	type AgentSessionRuntime,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionRuntime,
+} from "./core/agent-session-runtime.ts";
 import {
 	type AgentSessionRuntimeDiagnostic,
 	createAgentSessionFromServices,
@@ -47,6 +52,8 @@ import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
+import { receiveOrdinaryOwner } from "./core/ordinary-owner-context.ts";
+import { createOrdinaryRuntime } from "./core/ordinary-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
 import type { CreateAgentSessionOptions } from "./core/sdk.ts";
@@ -560,6 +567,85 @@ export interface MainOptions {
 }
 
 export async function main(args: string[], options?: MainOptions) {
+	const parsed = parseArgs(args);
+	// Receive before migrations, resource discovery, trust hooks or model fallback.
+	// Unsupported owned invocations never fall through to the unowned bootstrap.
+	if (parsed.ownerHostProfile || parsed.diagnostics.some((entry) => entry.message.includes("--owner-host-profile"))) {
+		if (!parsed.ownerHostProfile || parsed.diagnostics.length)
+			throw new Error("OWNER_PROFILE_UNAVAILABLE: invalid owned selector");
+		if (
+			args.length !== 2 ||
+			args[0] !== "--owner-host-profile" ||
+			options?.extensionFactories?.length ||
+			!process.stdin.isTTY ||
+			!process.stdout.isTTY
+		)
+			throw new Error("OWNER_ORDINARY_MODE_UNAVAILABLE");
+		const owner = await receiveOrdinaryOwner(parsed.ownerHostProfile, fileURLToPath(import.meta.url));
+		let runtime: AgentSessionRuntime | undefined;
+		let interactive: InteractiveMode | undefined;
+		let hostClosed = false;
+		let hostCloseFailure: { cause: unknown } | undefined;
+		const closeHost = () => {
+			if (hostCloseFailure) throw hostCloseFailure.cause;
+			if (hostClosed) return;
+			try {
+				owner.owner.host.close();
+				hostClosed = true;
+			} catch (cause) {
+				hostCloseFailure = { cause };
+				throw cause;
+			}
+		};
+		// Interactive shutdown may exit after runtime disposal. Preserve the final
+		// host check, but never retry a close whose custody is uncertain.
+		const onExit = () => {
+			try {
+				closeHost();
+			} catch {
+				process.exitCode = 1;
+				process.stderr.write("OWNER_HOST_EXIT_HAS_CUSTODY\n");
+			}
+		};
+		process.once("exit", onExit);
+		const errors: unknown[] = [];
+		try {
+			runtime = await createOrdinaryRuntime(owner, getAgentDir());
+			setCapabilityOverrides(runtime.services.settingsManager.getTerminalCapabilityOverrides());
+			setThemeJsonValidator(validateThemeJson);
+			initTheme(runtime.services.settingsManager.getTheme(), true);
+			const mode = new InteractiveMode(runtime, { startupDiagnostics: [...runtime.diagnostics] });
+			interactive = mode;
+			await owner.within(() => mode.run());
+		} catch (cause) {
+			errors.push(cause);
+		}
+		try {
+			interactive?.stop();
+		} catch (cause) {
+			errors.push(cause);
+		}
+		try {
+			if (runtime) await runtime.dispose();
+			else await owner.close();
+		} catch (cause) {
+			errors.push(cause);
+		}
+		try {
+			closeHost();
+		} catch (cause) {
+			errors.push(cause);
+		}
+		try {
+			stopThemeWatcher();
+		} catch (cause) {
+			errors.push(cause);
+		}
+		if (hostClosed) process.removeListener("exit", onExit);
+		if (errors.length === 1) throw errors[0];
+		if (errors.length) throw new AggregateError(errors, "OWNER_ORDINARY_FAILED", { cause: errors[0] });
+		return;
+	}
 	resetTimings();
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
@@ -600,7 +686,6 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-	const parsed = parseArgs(args);
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;

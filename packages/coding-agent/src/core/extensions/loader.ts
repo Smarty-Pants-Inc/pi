@@ -25,17 +25,21 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../
 // NOTE: This import works because loader.ts exports are NOT re-exported from index.ts,
 // avoiding a circular dependency. Extensions can import from @earendil-works/pi-coding-agent.
 import * as _bundledPiCodingAgent from "../../index.ts";
+import * as _bundledPiOrdinary from "../../ordinary.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
-import type { ExecOptions } from "../exec.ts";
-import { execCommand } from "../exec.ts";
+import { createExecCommand, type ExecOptions, execCommand, type OwnedExecScope } from "../exec.ts";
+import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "../ordinary-owner-context.ts";
+import { createOrdinarySenseExtension, type OrdinarySenseEntry } from "../ordinary-sense.ts";
 import { readPiManifest } from "../pi-manifest.ts";
+import { currentSessionOwnership, ownershipOf, type SessionOwnership } from "../session-ownership.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
 import type {
 	EntryRenderer,
 	Extension,
 	ExtensionAPI,
+	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime,
 	LoadExtensionsResult,
@@ -64,6 +68,7 @@ const VIRTUAL_MODULES: Record<string, unknown> = {
 	"@earendil-works/pi-ai/oauth": _bundledPiAiOauth,
 	"@earendil-works/pi-ai/providers/all": _bundledPiAiProviders,
 	"@earendil-works/pi-coding-agent": _bundledPiCodingAgent,
+	"@earendil-works/pi-coding-agent/ordinary": _bundledPiOrdinary,
 	"@mariozechner/pi-agent-core": _bundledPiAgentCore,
 	"@mariozechner/pi-tui": _bundledPiTui,
 	"@mariozechner/pi-ai": _bundledPiAiCompat,
@@ -120,6 +125,7 @@ function getAliases(): Record<string, string> {
 
 	_aliases = {
 		"@earendil-works/pi-coding-agent": piCodingAgentEntry,
+		"@earendil-works/pi-coding-agent/ordinary": path.resolve(__dirname, "../..", "ordinary.js"),
 		"@earendil-works/pi-agent-core": piAgentCoreEntry,
 		"@earendil-works/pi-tui": piTuiEntry,
 		"@earendil-works/pi-ai/providers/all": piAiProvidersEntry,
@@ -174,13 +180,33 @@ function useExtensionCacheCwd(cwd: string): ExtensionCacheToken {
  * Create a runtime with throwing stubs for action methods.
  * Runner.bindCore() replaces these with real implementations.
  */
+const runtimeOwners = new WeakMap<
+	ExtensionRuntime,
+	{
+		owner: SessionOwnership | undefined;
+		exec: typeof execCommand;
+	}
+>();
+
 export function createExtensionRuntime(): ExtensionRuntime {
+	return createRuntime(currentSessionOwnership());
+}
+
+/** Private host construction; not re-exported by extensions/index. */
+export function createOwnedExtensionRuntime(owner: SessionOwnership, scope?: OwnedExecScope): ExtensionRuntime {
+	if (!owner || ownershipOf(owner.manager) !== owner) throw new Error("OWNER_NATIVE_CONSTRUCTION");
+	return createRuntime(owner, scope);
+}
+
+function createRuntime(owner: SessionOwnership | undefined, scope?: OwnedExecScope): ExtensionRuntime {
+	const exec = createExecCommand(owner, scope);
 	const notInitialized = () => {
 		throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
 	};
 	const state: { staleMessage?: string } = {};
 	const eventBusUnsubscribers = new Set<() => void>();
 	const assertActive = () => {
+		owner?.assertActive();
 		if (state.staleMessage) {
 			throw new Error(state.staleMessage);
 		}
@@ -241,6 +267,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		},
 	};
 
+	runtimeOwners.set(runtime, { owner, exec });
 	return runtime;
 }
 
@@ -255,6 +282,9 @@ function createExtensionAPI(
 	cwd: string,
 	eventBus: EventBus,
 ): { api: ExtensionAPI; commit: () => void; discard: () => void } {
+	const binding = runtimeOwners.get(runtime);
+	if (currentSessionOwnership() && !binding?.owner) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+	const execute = binding?.exec ?? execCommand;
 	const pendingFlagValues = new Map<string, boolean | string>();
 	const pendingRuntimeChanges: Array<() => void> = [];
 	const loadingUnsubscribers: Array<() => void> = [];
@@ -263,6 +293,7 @@ function createExtensionAPI(
 		if (state === "failed") {
 			throw new Error(`Extension "${extension.path}" failed to load and its API is no longer active.`);
 		}
+		binding?.owner?.assertActive();
 		runtime.assertActive();
 	};
 	const applyRuntimeChange = (change: () => void) => {
@@ -311,7 +342,7 @@ function createExtensionAPI(
 			shortcut: KeyId,
 			options: {
 				description?: string;
-				handler: (ctx: import("./types.ts").ExtensionContext) => Promise<void> | void;
+				handler: (ctx: ExtensionContext) => Promise<void> | void;
 			},
 		): void {
 			assertActive();
@@ -394,7 +425,7 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			return execute(command, args, options?.cwd ?? cwd, options);
 		},
 
 		getActiveTools(): string[] {
@@ -555,8 +586,10 @@ async function initializeExtension(
 ): Promise<Extension> {
 	const extension = createExtension(extensionPath, resolvedPath);
 	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
+	const owner = runtimeOwners.get(runtime)?.owner;
 	try {
-		await factory(load.api);
+		await (owner ? owner.within(() => factory(load.api)) : factory(load.api));
+		owner?.assertActive();
 		load.commit();
 	} catch (error) {
 		load.discard();
@@ -576,7 +609,12 @@ async function loadExtension(
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
 	try {
-		const factory = await loadExtensionModule(resolvedPath, cacheToken);
+		const owner = runtimeOwners.get(runtime)?.owner;
+		if (currentSessionOwnership() && !owner) throw new Error("OWNER_RUNTIME_OWNERSHIP");
+		const factory = await (owner
+			? owner.within(() => loadExtensionModule(resolvedPath, cacheToken))
+			: loadExtensionModule(resolvedPath, cacheToken));
+		owner?.assertActive();
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
@@ -589,6 +627,51 @@ async function loadExtension(
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
+}
+
+/** Load only the descriptor-pinned Sense entry with original private ports. */
+export async function loadOwnedSenseExtension(context: OrdinaryOwnerContext): Promise<LoadExtensionsResult> {
+	assertOrdinaryOwner(context);
+	const extensionPath = context.decision.record.sense.path;
+	const runtime = createOwnedExtensionRuntime(context.owner);
+	const eventBus = createEventBus();
+	const loader = createJiti(import.meta.url, {
+		fsCache: false,
+		moduleCache: false,
+		virtualModules: VIRTUAL_MODULES,
+		tryNative: false,
+		alias: {},
+		nativeModules: [],
+		transformModules: [],
+		tsconfigPaths: false,
+	});
+	const loaded: unknown = context.within(() =>
+		loader.evalModule(context.readSenseEntry(), {
+			filename: extensionPath,
+			async: false,
+			forceTranspile: true,
+		}),
+	);
+	context.assertActive();
+	if (!loaded || typeof loaded !== "object") throw new Error("OWNER_SENSE_ENTRY_REQUIRED");
+	const factory = createOrdinarySenseExtension(context, loaded as OrdinarySenseEntry);
+	const extension = await initializeExtension(
+		factory,
+		extensionPath,
+		extensionPath,
+		context.owner.manager.getCwd(),
+		eventBus,
+		runtime,
+	);
+	context.assertSenseInstalled();
+	if (
+		!extension.tools.has("sense") ||
+		runtime.pendingProviderRegistrations.length ||
+		runtime.pendingNativeProviderRegistrations.length
+	) {
+		throw new Error("OWNER_SENSE_ENTRY_CONTRACT");
+	}
+	return { extensions: [extension], errors: [], runtime };
 }
 
 /**
