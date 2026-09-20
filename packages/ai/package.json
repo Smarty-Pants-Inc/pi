@@ -59,7 +59,7 @@
 		"generate-image-models": "node scripts/generate-image-models.ts --strict",
 		"check:model-data": "node scripts/check-model-data.ts",
 		"build": "npm run generate-models && npm run build:offline",
-		"build:offline": "npm run check:model-data && tsgo -p tsconfig.build.json && shx rm -rf dist/providers/data && shx cp -r src/providers/data dist/providers/data",
+		"build:offline": "npm run check:model-data && tsgo -p tsconfig.build.json && shx chmod 755 dist/cli.js && shx rm -rf dist/providers/data && shx cp -r src/providers/data dist/providers/data",
 		"test": "vitest --run",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
