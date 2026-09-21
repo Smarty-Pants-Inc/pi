@@ -1,5 +1,16 @@
 import { constants as bufferConstants } from "buffer";
-import { appendFileSync, closeSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync, writeSync } from "fs";
+import {
+	appendFileSync,
+	closeSync,
+	existsSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+	writeSync,
+} from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -337,6 +348,114 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 
 	afterEach(() => {
 		rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it.each(["empty", "v3"] as const)("persists first-turn entries on one explicit %s owner", (kind) => {
+		const file = join(tempDir, "explicit.jsonl");
+		const header = {
+			type: "session",
+			version: 3,
+			id: "retained-id",
+			timestamp: "2026-01-01T00:00:00Z",
+			cwd: tempDir,
+		};
+		const prefix = {
+			type: "custom",
+			id: "00000001",
+			parentId: null,
+			timestamp: header.timestamp,
+			customType: "history",
+			data: { retained: true },
+		};
+		writeFileSync(file, kind === "empty" ? "" : `${JSON.stringify(header)}\n${JSON.stringify(prefix)}\n`);
+		const manager = SessionManager.open(file, tempDir, tempDir);
+		const beforeHeader = structuredClone(manager.getHeader());
+		const beforeEntries = structuredClone(manager.getEntries());
+		const beforeBytes = readFileSync(file);
+		const id = manager.getSessionId();
+		if (kind === "v3") {
+			expect(beforeHeader).toEqual(header);
+			expect(beforeEntries).toEqual([prefix]);
+		}
+
+		const custom = manager.appendCustomEntry("control-fixture", { phase: "intent" });
+		const user = manager.appendMessage({ role: "user", content: "first user", timestamp: 1 });
+
+		const bytes = readFileSync(file);
+		const rows = bytes
+			.toString("utf8")
+			.trimEnd()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(manager.getSessionId()).toBe(id);
+		expect(manager.getSessionFile()).toBe(file);
+		expect(manager.getCwd()).toBe(tempDir);
+		expect(manager.getHeader()).toEqual(beforeHeader);
+		expect(manager.getEntries().slice(0, beforeEntries.length)).toEqual(beforeEntries);
+		expect(manager.getEntries()).toHaveLength(beforeEntries.length + 2);
+		expect(rows).toEqual(JSON.parse(JSON.stringify([manager.getHeader(), ...manager.getEntries()])));
+		// Append characterization, not a semantic-validator rule or stable-storage proof.
+		expect(bytes.subarray(0, beforeBytes.length)).toEqual(beforeBytes);
+		expect(manager.getEntry(custom)).toMatchObject({
+			parentId: beforeEntries.at(-1)?.id ?? null,
+			customType: "control-fixture",
+			data: { phase: "intent" },
+		});
+		expect(manager.getEntry(user)).toMatchObject({
+			parentId: custom,
+			message: { role: "user", content: "first user", timestamp: 1 },
+		});
+		expect(manager.getLeafId()).toBe(user);
+		expect(manager.getEntries().some((entry) => entry.type === "message" && entry.message.role === "assistant")).toBe(
+			false,
+		);
+	});
+
+	it("defers first-turn disk persistence on a newly created owner", () => {
+		const manager = SessionManager.create(tempDir, tempDir);
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a session file path");
+		const custom = manager.appendCustomEntry("control-fixture", { phase: "intent" });
+		const user = manager.appendMessage({ role: "user", content: "pending", timestamp: 1 });
+
+		expect(manager.getEntries()).toHaveLength(2);
+		expect(manager.getEntry(custom)).toMatchObject({ data: { phase: "intent" } });
+		expect(manager.getEntry(user)).toMatchObject({
+			parentId: custom,
+			message: { role: "user", content: "pending", timestamp: 1 },
+		});
+		expect(manager.getLeafId()).toBe(user);
+		expect(existsSync(file)).toBe(false);
+	});
+
+	it("exposes manager/disk divergence when an explicit-owner append fails", () => {
+		const file = join(tempDir, "explicit.jsonl");
+		writeFileSync(file, "");
+		const manager = SessionManager.open(file, tempDir, tempDir);
+		const retainedId = manager.appendCustomEntry("history", { retained: true });
+		const before = structuredClone(manager.getEntries());
+		const header = structuredClone(manager.getHeader());
+		const bytes = readFileSync(file);
+		const retained = join(tempDir, "retained.jsonl");
+		renameSync(file, retained);
+		// Isolated pre-write path fault; not partial-write, crash or recovery qualification.
+		mkdirSync(file);
+
+		expect(() => manager.appendCustomEntry("failed-intent", { once: true })).toThrow();
+
+		expect(readFileSync(retained)).toEqual(bytes);
+		expect(manager.getHeader()).toEqual(header);
+		expect(manager.getSessionFile()).toBe(file);
+		expect(manager.getEntries().slice(0, before.length)).toEqual(before);
+		expect(manager.getEntries()).toHaveLength(before.length + 1);
+		const failed = manager.getEntries().at(-1);
+		expect(failed).toMatchObject({
+			parentId: retainedId,
+			customType: "failed-intent",
+			data: { once: true },
+		});
+		expect(manager.getLeafId()).toBe(failed?.id);
+		// No second append, replacement manager or attempted repair after ambiguity.
 	});
 
 	it("truncates and rewrites empty file with valid header", () => {
