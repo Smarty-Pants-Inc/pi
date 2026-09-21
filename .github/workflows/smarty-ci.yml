@@ -228,7 +228,7 @@ jobs:
         if-no-files-found: error
         retention-days: 7
   emergency-compaction:
-    name: Pi emergency compaction regressions
+    name: Pi persistence precommit checks
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -243,6 +243,8 @@ jobs:
         assert os.environ['GITHUB_REPOSITORY']=='Smarty-Pants-Inc/pi'
         for key in ('EXPECTED_SOURCE','EXPECTED_TREE'):
             assert re.fullmatch('[0-9a-f]{40}',os.environ[key]),key
+        assert os.environ['EXPECTED_SOURCE']=='45a41b0448ae03a74fbb2caaf7ba799ca2e8d5b2'
+        assert os.environ['EXPECTED_TREE']=='fe2b51ab1b587d64d9532fd5426c0b73e2456027'
         PY
       timeout-minutes: 2
     - name: Checkout exact qualification source
@@ -280,21 +282,46 @@ jobs:
         record={k:os.environ.get(k) for k in ('EXPECTED_SOURCE','EXPECTED_TREE','DEFINITION_SHA','GITHUB_REPOSITORY','GITHUB_RUN_ID','GITHUB_RUN_ATTEMPT','GITHUB_JOB','GITHUB_SHA','GITHUB_WORKFLOW_REF','RUNNER_NAME','RUNNER_OS','RUNNER_ARCH')}
         record['actual_tree']=actual_tree
         record['os_release']=os_release
-        record['scope']='Fast faux regressions only; not full smarty-ci, packaging, landing, Bun, affected-session or activation acceptance'
+        record['scope']='Exact uncommitted persistence candidate: full npm check and five complete test files; not full smarty-ci, packaging, retained-runtime, native or activation acceptance'
         pathlib.Path(os.environ['RUNNER_TEMP'],'pi-emergency/evidence/identity.json').write_text(json.dumps(record,indent=2)+'\n')
         PY
         { node --version; npm --version; git --version; uname -a; id; getconf _NPROCESSORS_ONLN; free -b; df -k .; } > "$RUNNER_TEMP/pi-emergency/evidence/tools-and-host.txt"
         sha256sum "$(command -v node)" package-lock.json package.json > "$RUNNER_TEMP/pi-emergency/evidence/input-sha256.txt"
-        test ! -L .local
-        mkdir -p .local
-        python3 - <<'PY'
-        import base64,pathlib
-        with pathlib.Path('.local/pack-stage.mjs').open('xb') as f:
-            f.write(base64.b64decode('Ly8gQ0ktb25seSBpbnZvY2F0aW9uIGZyb20gdGhlIGV4YWN0IGNoZWNrb3V0IHJvb3QgYWZ0ZXIgY2hlY2svYnVpbGQgUEFTUy4KLy8gUGxhY2UgdGhpcyBmcm96ZW4gZHJpdmVyIGF0IDxjaGVja291dD4vLmxvY2FsL3BhY2stc3RhZ2UubWpzLiBOZXZlciBydW4gb24gRGV2MS4KaW1wb3J0IGFzc2VydCBmcm9tICJub2RlOmFzc2VydC9zdHJpY3QiOwppbXBvcnQgeyBleGVjRmlsZVN5bmMgfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBjcmVhdGVIYXNoIH0gZnJvbSAibm9kZTpjcnlwdG8iOwppbXBvcnQgeyBleGlzdHNTeW5jLCBta2RpclN5bmMsIHJlYWRGaWxlU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gIm5vZGU6ZnMiOwppbXBvcnQgeyBpc0Fic29sdXRlLCBqb2luLCByZWxhdGl2ZSwgcmVzb2x2ZSB9IGZyb20gIm5vZGU6cGF0aCI7CmltcG9ydCB7IHBhY2tSZWxlYXNlUGFja2FnZXMsIGluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyLCBzbW9rZVRlc3RDb2RpbmdBZ2VudENvbnN1bWVyIH0gZnJvbSAiLi4vc2NyaXB0cy9jb2RpbmctYWdlbnQtY29uc3VtZXIubWpzIjsKaW1wb3J0IHsgZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMgfSBmcm9tICIuLi9zY3JpcHRzL3JlbGVhc2UtcGFja2FnZXMubWpzIjsKCmFzc2VydC5lcXVhbChwcm9jZXNzLmFyZ3YubGVuZ3RoLCAzLCAib25lIGZyZXNoIGFic29sdXRlIG91dHB1dCBkaXJlY3RvcnkgcmVxdWlyZWQiKTsKYXNzZXJ0KGlzQWJzb2x1dGUocHJvY2Vzcy5hcmd2WzJdKSk7CmNvbnN0IHJvb3QgPSBwcm9jZXNzLmN3ZCgpOwphc3NlcnQuZXF1YWwoSlNPTi5wYXJzZShyZWFkRmlsZVN5bmMoam9pbihyb290LCAicGFja2FnZS5qc29uIiksICJ1dGY4IikpLm5hbWUsICJwaS1tb25vcmVwbyIpOwpjb25zdCBvdXQgPSByZXNvbHZlKHByb2Nlc3MuYXJndlsyXSk7CmNvbnN0IHJlbCA9IHJlbGF0aXZlKHJvb3QsIG91dCk7CmFzc2VydChyZWwgPT09ICIuLiIgfHwgcmVsLnN0YXJ0c1dpdGgoIi4uLyIpIHx8IGlzQWJzb2x1dGUocmVsKSwgIm91dHB1dCBtdXN0IGJlIG91dHNpZGUgc291cmNlIik7CmFzc2VydCghZXhpc3RzU3luYyhvdXQpLCAicmV0YWluIGV4aXN0aW5nL3BhcnRpYWwgb3V0cHV0OyBuZXZlciBvdmVyd3JpdGUiKTsKZXhlY0ZpbGVTeW5jKCJnaXQiLCBbImRpZmYiLCAiLS1leGl0LWNvZGUiLCAiSEVBRCIsICItLSJdLCB7IHN0ZGlvOiAiaW5oZXJpdCIgfSk7CmNvbnN0IHNvdXJjZSA9IGV4ZWNGaWxlU3luYygiZ2l0IiwgWyJyZXYtcGFyc2UiLCAiSEVBRCJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpjb25zdCB0cmVlID0gZXhlY0ZpbGVTeW5jKCJnaXQiLCBbInJldi1wYXJzZSIsICJIRUFEXnt0cmVlfSJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpta2RpclN5bmMob3V0LCB7IG1vZGU6IDBvNzAwIH0pOwpjb25zdCB0YXJiYWxscyA9IHBhY2tSZWxlYXNlUGFja2FnZXMoZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMoKSwgam9pbihvdXQsICJ0YXJiYWxscyIpKTsKY29uc3QgY29uc3VtZXIgPSBqb2luKG91dCwgIm5vZGUiKTsKaW5zdGFsbENvZGluZ0FnZW50Q29uc3VtZXIoY29uc3VtZXIsIHRhcmJhbGxzKTsKc21va2VUZXN0Q29kaW5nQWdlbnRDb25zdW1lcihjb25zdW1lcik7CmV4ZWNGaWxlU3luYygiZ2l0IiwgWyJkaWZmIiwgIi0tZXhpdC1jb2RlIiwgIkhFQUQiLCAiLS0iXSwgeyBzdGRpbzogImluaGVyaXQiIH0pOwpjb25zdCBwYWNrYWdlcyA9IFsuLi50YXJiYWxsc10ubWFwKChbbmFtZSwgcGF0aF0pID0+IHsKICBjb25zdCBieXRlcyA9IHJlYWRGaWxlU3luYyhwYXRoKTsKICByZXR1cm4geyBuYW1lLCBwYXRoOiByZWxhdGl2ZShvdXQsIHBhdGgpLCBieXRlczogYnl0ZXMubGVuZ3RoLCBzaGEyNTY6IGNyZWF0ZUhhc2goInNoYTI1NiIpLnVwZGF0ZShieXRlcykuZGlnZXN0KCJoZXgiKSB9Owp9KTsKd3JpdGVGaWxlU3luYyhqb2luKG91dCwgIlNPVVJDRS1BTkQtUEFDS0FHRVMuanNvbiIpLCBKU09OLnN0cmluZ2lmeSh7IHNvdXJjZSwgdHJlZSwgcGxhdGZvcm06IHByb2Nlc3MucGxhdGZvcm0sIGFyY2g6IHByb2Nlc3MuYXJjaCwgbm9kZTogcHJvY2Vzcy52ZXJzaW9uLCBwYWNrYWdlcywgc2NvcGU6ICJOb2RlIFNESy9DTEkgY29uc3VtZXIgc21va2Ugb25seTsgbm90IHByb3ZpZGVyLCBhZmZlY3RlZC1zZXNzaW9uLCBCdW4sIGZsZWV0IG9yIGluc3RhbGxhdGlvbiBhY2NlcHRhbmNlIiB9LCBudWxsLCAyKSArICJcbiIsIHsgZmxhZzogInd4IiwgbW9kZTogMG82MDAgfSk7Cg=='))
-        PY
-        printf '%s\n' 'da47a9e55f6a50f53729ec199bb52f27150001b66438cdd3187ed99b73534f78  .local/pack-stage.mjs' | sha256sum --check
-        cp .local/pack-stage.mjs "$RUNNER_TEMP/pi-emergency/evidence/"
       timeout-minutes: 2
+    - name: Apply exact reviewed precommit DATA patch
+      timeout-minutes: 2
+      run: |
+        set -euo pipefail
+        umask 077
+        python3 - <<'PY'
+        import base64,hashlib,json,os,pathlib,subprocess,zlib
+        evidence=pathlib.Path(os.environ['RUNNER_TEMP'],'pi-emergency/evidence')
+        patch=zlib.decompress(base64.b64decode('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',validate=True))
+        manifest=zlib.decompress(base64.b64decode('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',validate=True))
+        assert len(patch)==17982 and hashlib.sha256(patch).hexdigest()=='a8d1b5eb56388fb2db8fb1183c28d4a5be7f7acae79841d752a9ff04347d17d7'
+        assert len(manifest)==11259 and hashlib.sha256(manifest).hexdigest()=='9ea458a4d2a333586dce74be43f109cae127d8e4e7be83af5a76caf86596d092'
+        data=json.loads(manifest)
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()==data['base']
+        assert subprocess.check_output(['git','rev-parse','HEAD^{tree}'],text=True).strip()==data['baseTree']
+        assert not subprocess.check_output(['git','status','--porcelain','--untracked-files=all'])
+        with (evidence/'SOURCE.patch').open('xb') as f: f.write(patch)
+        with (evidence/'SOURCE.json').open('xb') as f: f.write(manifest)
+        subprocess.run(['git','apply','--index','--check',str(evidence/'SOURCE.patch')],check=True)
+        subprocess.run(['git','apply','--index',str(evidence/'SOURCE.patch')],check=True)
+        tree=subprocess.check_output(['git','write-tree'],text=True).strip()
+        assert tree==data['candidateTree']
+        paths=subprocess.check_output(['git','diff','--cached','--name-only','HEAD'],text=True).splitlines()
+        assert sorted(paths)==sorted(row['path'] for row in data['files'])
+        for row in data['files']+data['unchangedInputs']:
+            path=pathlib.Path(row['path'])
+            assert path.is_file() and not path.is_symlink()
+            raw=path.read_bytes()
+            assert len(raw)==row['bytes'] and hashlib.sha256(raw).hexdigest()==row['sha256'],row['path']
+        subprocess.run(['git','diff','--exit-code','--'],check=True)
+        (evidence/'candidate-identity.json').write_text(json.dumps(dict(base=data['base'],baseTree=data['baseTree'],candidateTree=tree,patchSHA256=data['patch']['sha256'],sourceManifestSHA256=hashlib.sha256(manifest).hexdigest(),candidateCommit=None,sourceOnly=True),indent=2)+'\n')
+        PY
+        { node -p 'JSON.stringify({node:process.version,platform:process.platform,arch:process.arch,maxStringLength:require("node:buffer").constants.MAX_STRING_LENGTH})'; df -k . "$RUNNER_TEMP/pi-emergency/tmp"; } > "$RUNNER_TEMP/pi-emergency/evidence/sparse-file-resource-inputs.txt"
+        sha256sum "$(readlink -f "$(command -v npm)")" >> "$RUNNER_TEMP/pi-emergency/evidence/input-sha256.txt"
     - name: Existing disposable system dependencies
       timeout-minutes: 5
       run: |
@@ -319,6 +346,9 @@ jobs:
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/dependencies.log"
         npm ci --ignore-scripts
+        test "$(git rev-parse HEAD)" = "45a41b0448ae03a74fbb2caaf7ba799ca2e8d5b2"
+        test "$(git write-tree)" = "66a10373a381faa3ccb8514cc81d580e363e9f24"
+        git diff --exit-code 66a10373a381faa3ccb8514cc81d580e363e9f24 --
         PI_JOB
     - name: public-model-data
       timeout-minutes: 5
@@ -336,12 +366,14 @@ jobs:
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/public-model-data.log"
         npm run hydrate:model-data
         npm --prefix packages/ai run check:model-data
-        git diff --exit-code HEAD --
+        test "$(git rev-parse HEAD)" = "45a41b0448ae03a74fbb2caaf7ba799ca2e8d5b2"
+        test "$(git write-tree)" = "66a10373a381faa3ccb8514cc81d580e363e9f24"
+        git diff --exit-code 66a10373a381faa3ccb8514cc81d580e363e9f24 --
         cp -a packages/ai/src/providers/data "$EVIDENCE_DIR/model-data"
         find "$EVIDENCE_DIR/model-data" -type f -print0 | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/model-data-sha256.txt"
         PI_JOB
-    - name: fast-build
-      timeout-minutes: 5
+    - name: check
+      timeout-minutes: 10
       run: |
         set -o pipefail
         env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
@@ -353,11 +385,13 @@ jobs:
           NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
-          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/fast-build.log"
-        npm run build:offline
-        git diff --exit-code HEAD --
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/check.log"
+        npm run check
+        test "$(git rev-parse HEAD)" = "45a41b0448ae03a74fbb2caaf7ba799ca2e8d5b2"
+        test "$(git write-tree)" = "66a10373a381faa3ccb8514cc81d580e363e9f24"
+        git diff --exit-code 66a10373a381faa3ccb8514cc81d580e363e9f24 --
         PI_JOB
-    - name: agent-first
+    - name: full-file-operations
       timeout-minutes: 5
       run: |
         set -o pipefail
@@ -370,40 +404,61 @@ jobs:
           NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
-          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/agent-first.log"
-        cd packages/agent
-        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/agent.test.ts test/agent-loop.test.ts
-        PI_JOB
-    - name: compaction-first
-      timeout-minutes: 5
-      run: |
-        set -o pipefail
-        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
-          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
-          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
-          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
-          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
-          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
-          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
-          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
-          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
-          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/compaction-first.log"
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/full-file-operations.log"
         cd packages/coding-agent
-        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/suite/agent-session-compaction.test.ts test/suite/regressions/pre-prompt-compaction-no-continue.test.ts
+        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/session-manager/file-operations.test.ts
+        cd ../..
+        test "$(git rev-parse HEAD)" = "45a41b0448ae03a74fbb2caaf7ba799ca2e8d5b2"
+        test "$(git write-tree)" = "66a10373a381faa3ccb8514cc81d580e363e9f24"
+        git diff --exit-code 66a10373a381faa3ccb8514cc81d580e363e9f24 --
         PI_JOB
-    - name: Retain complete or partial stage with modes
+    - name: affected-faux-suites
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/affected-faux-suites.log"
+        cd packages/coding-agent
+        node ../../node_modules/vitest/dist/cli.js --run --maxWorkers=1 --no-file-parallelism test/suite/agent-session-compaction.test.ts test/suite/agent-session-prompt.test.ts test/suite/agent-session-bash-persistence.test.ts test/suite/regressions/8724-in-memory-fork-active-tool.test.ts
+        cd ../..
+        test "$(git rev-parse HEAD)" = "45a41b0448ae03a74fbb2caaf7ba799ca2e8d5b2"
+        test "$(git write-tree)" = "66a10373a381faa3ccb8514cc81d580e363e9f24"
+        git diff --exit-code 66a10373a381faa3ccb8514cc81d580e363e9f24 --
+        PI_JOB
+    - name: Retain final source state including failure deltas
       if: always()
       timeout-minutes: 3
       run: |
+        set -euo pipefail
         umask 077
         evidence="$RUNNER_TEMP/pi-emergency/evidence"
         mkdir -p "$evidence"
-        if test -d "$RUNNER_TEMP/pi-emergency/stage"; then
-          tar -C "$RUNNER_TEMP/pi-emergency/stage" -czf "$evidence/node-stage.tar.gz" .
-          sha256sum "$evidence/node-stage.tar.gz" > "$evidence/node-stage.tar.gz.sha256"
-        fi
         if git rev-parse --is-inside-work-tree; then
+          git rev-parse HEAD HEAD^{tree} > "$evidence/after-job-head-tree.txt"
+          git write-tree > "$evidence/after-job-index-tree.txt"
+          git status --porcelain --untracked-files=all > "$evidence/after-job-status.txt"
           git diff --binary HEAD -- > "$evidence/after-job-source.diff"
+          git diff --binary --cached HEAD -- > "$evidence/after-job-index.diff"
+          if git cat-file -e 66a10373a381faa3ccb8514cc81d580e363e9f24; then
+            git diff --binary 66a10373a381faa3ccb8514cc81d580e363e9f24 -- > "$evidence/after-job-candidate.diff"
+            test "$(git rev-parse HEAD)" = "45a41b0448ae03a74fbb2caaf7ba799ca2e8d5b2"
+            test "$(git write-tree)" = "66a10373a381faa3ccb8514cc81d580e363e9f24"
+            git diff --exit-code 66a10373a381faa3ccb8514cc81d580e363e9f24 --
+          else
+            printf '%s\n' 'Expected candidate tree absent; not accepted' > "$evidence/candidate-missing.txt"
+            exit 1
+          fi
+        else
+          printf '%s\n' 'Checkout unavailable; not accepted' > "$evidence/checkout-missing.txt"
+          exit 1
         fi
         df -k . "$evidence" > "$evidence/final-disk.txt"
     - name: Upload actual evidence even after failure
