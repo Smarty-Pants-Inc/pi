@@ -4,6 +4,9 @@ import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { createGate, type GateControl } from "@earendil-works/pi-agent-core";
 import type { ResponsesEvidence } from "@earendil-works/pi-ai/api/responses-evidence";
+import { observeRejectedSyncResult } from "../utils/observe-rejected-sync-result.ts";
+import { captureOrdinaryClockObservation } from "./ordinary-clock.ts";
+import type { OriginalClockObservation } from "./ordinary-clock-evidence.ts";
 import type { OwnedCountRequest, OwnedProviderExchange } from "./ordinary-provider-transport.ts";
 import {
 	type OwnedEffectRequest,
@@ -16,13 +19,14 @@ import {
 	type OwnerAllocationClaim,
 	type OwnerHost,
 } from "./owner-effects.ts";
-import { SessionManager } from "./session-manager.ts";
+import { persistOwnedTerminalSession, SessionManager } from "./session-manager.ts";
 
 const inspectOriginalJournalResources = OwnedJournal.prototype.inspectResources;
 const inspectOriginalJournalPermission = OwnedJournal.prototype.inspectPermission;
 const constructionKey = Symbol("session-ownership");
 const owners = new WeakMap<SessionManager, SessionOwnership>();
 const context = new AsyncLocalStorage<SessionOwnership>();
+const effectOperations = new WeakMap<OwnedEffect, ReturnType<OwnedJournal["beginOperation"]>>();
 
 type Phase = "opening" | "active" | "draining" | "terminal" | "closed" | "quarantined";
 
@@ -100,6 +104,7 @@ export class SessionOwnership {
 	#allowTerminal!: () => void;
 	#phase: Phase = "opening";
 	#closeTask?: Promise<void>;
+	#closesAt?: number;
 
 	private constructor(
 		key: symbol,
@@ -357,7 +362,7 @@ export class SessionOwnership {
 	async effect<T>(
 		request: OwnedEffectRequest,
 		action: (effect: OwnedEffect) => Promise<T> | T,
-		options: { signal?: AbortSignal } = {},
+		options: { signal?: AbortSignal; completed?: (original: OriginalClockObservation) => void } = {},
 	): Promise<T> {
 		const signal = options.signal;
 		this.assertActive();
@@ -418,16 +423,34 @@ export class SessionOwnership {
 				},
 				removeSnapshot: (path: string) => dispatch(() => retained.removeSnapshot(path)),
 			});
+			effectOperations.set(effect, retained);
 			gate.signal.throwIfAborted();
 			result = await context.run(this, () => action(effect));
 		} catch (error) {
 			errors.push(error);
 		}
+		let observerResult: unknown;
 		try {
-			operation?.complete(errors.length > 0);
+			await operation?.complete(errors.length > 0, options.completed && !errors.length
+				? (complete) => {
+					// Persistence has settled, but this original receipt is not yet
+					// accepted. Capture its one-use completion, not worker readiness.
+					const original = captureOrdinaryClockObservation("native-operation-completion", complete);
+					observerResult = options.completed!(original.observation);
+					if (observerResult !== undefined) throw new Error("OWNER_COMPLETION_OBSERVER_SYNC");
+				}
+				: undefined);
 		} catch (error) {
 			errors.push(error);
 			this.#phase = "quarantined";
+			try {
+				this.#journal.quarantine();
+			} catch (cleanup) {
+				errors.push(cleanup);
+			}
+			// No new completion/persistence attempt. A before-edge failure uses
+			// only the retained receipt; constructor/species limits remain C6.
+			observeRejectedSyncResult(observerResult);
 		}
 		signal?.removeEventListener("abort", abort);
 		this.#pending.delete(pending);
@@ -456,13 +479,16 @@ export class SessionOwnership {
 	/** Native clone, real pipes, subtree drain and explicit retirement. No fake
 	 * ChildProcess and no success inferred from leader exit or an abort race. */
 	runProcess(request: OwnedProcessRequest, options: OwnedProcessOptions = {}): Promise<OwnedProcessResult> {
+		const limit = this.host.profile.limits;
+		const timeoutMs = options.timeoutMs;
+		if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0))
+			return Promise.reject(new Error("OWNER_PROCESS_TIMEOUT_LIMIT"));
+		const timeout = Math.min(timeoutMs ?? limit.processTimeoutMs, limit.processTimeoutMs);
+		const deadline = performance.now() + timeout;
 		return this.effect(
-			{ kind: "process" },
+			{ kind: "process", timeoutMs: timeout },
 			async (effect) => {
-				const limit = this.host.profile.limits;
-				const { timeoutMs, stdin, capture, onData } = options;
-				if (timeoutMs !== undefined && (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0))
-					throw new Error("OWNER_PROCESS_TIMEOUT_LIMIT");
+				const { stdin, capture, onData } = options;
 				const inputSize = typeof stdin === "string" ? Buffer.byteLength(stdin) : (stdin?.byteLength ?? 0);
 				if (inputSize > limit.outputBytes) throw new Error("OWNER_STDIN_LIMIT");
 				let pid = -1;
@@ -479,25 +505,30 @@ export class SessionOwnership {
 				let captured = 0;
 				let retired = false;
 				const errors: unknown[] = [];
-				const timeout = Math.min(timeoutMs ?? limit.processTimeoutMs, limit.processTimeoutMs);
-				const deadline = performance.now() + timeout;
-				const process = effect.dispatch(() => this.#journal.prepareProcess(request));
+				const process = effect.dispatch(() => this.#journal.prepareProcess(request, timeout));
+				effectOperations.get(effect)!.bindProcess(process);
 				let stopDeadline = Infinity;
 				let stopping = false;
+				const stopFailed = (error: unknown) => {
+					errors.push(error);
+					this.#phase = "quarantined";
+					try {
+						this.#journal.quarantine();
+					} catch (cleanup) {
+						errors.push(cleanup);
+					}
+				};
 				const stop = () => {
 					if (stopping) return;
 					stopping = true;
-					stopDeadline = performance.now() + limit.closeTimeoutMs;
+					stopDeadline = Math.min(
+						Math.min(performance.now(), deadline) + limit.closeTimeoutMs,
+						this.#closesAt ?? Infinity,
+					);
 					try {
-						process.stop();
+						void process.stop().catch(stopFailed);
 					} catch (error) {
-						errors.push(error);
-						this.#phase = "quarantined";
-						try {
-							this.#journal.quarantine();
-						} catch (cleanup) {
-							errors.push(cleanup);
-						}
+						stopFailed(error);
 					}
 				};
 				const abort = () => {
@@ -529,7 +560,8 @@ export class SessionOwnership {
 							else if (performance.now() >= deadline) errors.push(new Error("OWNER_PROCESS_TIMEOUT"));
 							stop();
 						}
-						const status = process.poll();
+						if (performance.now() >= stopDeadline) throw new Error("OWNER_PROCESS_NOT_DRAINED");
+						const status = await process.poll();
 						code = status.code;
 						signal = status.signal;
 						if (status.error && !errors.length)
@@ -555,12 +587,22 @@ export class SessionOwnership {
 								}
 							}
 						}
-						if (status.drained) {
-							process.retire();
-							retired = true;
-							break;
+						// Accept neither a late sample nor a late retirement merely because
+						// the timer callback has not run yet.
+						if (!stopping && (status.sampleExpired || performance.now() >= deadline)) {
+							errors.push(new Error("OWNER_PROCESS_TIMEOUT"));
+							stop();
 						}
 						if (performance.now() >= stopDeadline) throw new Error("OWNER_PROCESS_NOT_DRAINED");
+						if (status.drained) {
+							await process.retire();
+							retired = true; // Never replay an acknowledged retirement.
+							if (!stopping && performance.now() >= deadline) {
+								errors.push(new Error("OWNER_PROCESS_TIMEOUT"));
+							}
+							if (performance.now() >= stopDeadline) throw new Error("OWNER_PROCESS_NOT_DRAINED");
+							break;
+						}
 						if (status.dispatched && !stopping && !inputClosed) {
 							try {
 								const written = effect.dispatch(() => process.write(input.subarray(0, 131_072)));
@@ -580,7 +622,7 @@ export class SessionOwnership {
 				} finally {
 					clearTimeout(timer);
 					effect.signal.removeEventListener("abort", abort);
-					if (!retired) {
+					if (!retired || performance.now() >= stopDeadline) {
 						stop();
 						this.#phase = "quarantined";
 						try {
@@ -644,13 +686,26 @@ export class SessionOwnership {
 	}): Promise<void> {
 		if (this.#phase === "closed") return;
 		const errors: unknown[] = [];
+		// The received budget starts before seal and includes synchronous work.
+		// This rejects late success; it cannot preempt a blocking native syscall.
+		const closesAt = performance.now() + this.host.profile.limits.closeTimeoutMs;
+		this.#closesAt = closesAt;
+		const checkDeadline = () => {
+			if (performance.now() >= closesAt) throw new Error("OWNER_CLOSE_NOT_SETTLED");
+		};
 		if (this.#phase === "quarantined") errors.push(new Error("OWNER_CLOSE_QUARANTINED"));
 		let releaseAttempted = false;
+		let closeFailure: AggregateError | undefined;
 		this.#phase = "draining";
+		let sealing: Promise<void>;
 		try {
-			this.#journal.seal();
+			sealing = this.#journal.seal().catch((error: unknown) => {
+				errors.push(error);
+			});
+			checkDeadline();
 		} catch (error) {
 			errors.push(error);
+			sealing = Promise.resolve();
 		}
 		for (const effect of this.#pending) effect.control.close(new Error("STALE_OWNER"));
 		// Start cancellation before waiting. Do not await a callback that itself
@@ -665,48 +720,72 @@ export class SessionOwnership {
 			errors.push(error);
 		});
 		const timeout = new AbortController();
-		const deadline = delay(this.host.profile.limits.closeTimeoutMs, undefined, { signal: timeout.signal }).then(
+		const deadline = delay(Math.max(0, closesAt - performance.now()), undefined, { signal: timeout.signal }).then(
 			() => {
 				throw new Error("OWNER_CLOSE_NOT_SETTLED");
 			},
 		);
 		try {
+			await Promise.race([sealing, deadline]);
+			checkDeadline();
 			const drain = Promise.all([...this.#pending].map((effect) => effect.settled));
 			await Promise.race([drain, deadline]);
+			checkDeadline();
 			if (this.#pending.size) throw new Error("OWNER_CLOSE_NOT_SETTLED");
 			if (this.phase === "quarantined") errors.push(new Error("OWNER_CLOSE_QUARANTINED"));
 			this.#phase = errors.length ? "quarantined" : "terminal";
 			this.#allowTerminal();
 			await Promise.race([observedStop, deadline]);
+			checkDeadline();
 			try {
 				await Promise.race([Promise.resolve(hooks.settle?.()), deadline]);
+				checkDeadline();
 			} catch (error) {
 				errors.push(error);
 			}
 			if (!errors.length) {
 				try {
-					await Promise.race([Promise.resolve(this.#journal.terminal(() => hooks.persist?.())), deadline]);
+					await Promise.race([this.#journal.terminal(async () => {
+						await hooks.persist?.();
+						checkDeadline();
+						await persistOwnedTerminalSession(this.manager);
+					}), deadline]);
+					checkDeadline();
 				} catch (error) {
 					errors.push(error);
 				}
 			}
-			if (errors.length) throw new AggregateError(errors, "OWNER_CLOSE_FAILED");
+			if (errors.length) {
+				closeFailure = new AggregateError(errors, "OWNER_CLOSE_FAILED", { cause: errors[0] });
+				throw closeFailure;
+			}
 			releaseAttempted = true;
-			this.#journal.release();
+			await Promise.race([this.#journal.release(), deadline]);
+			checkDeadline();
 			this.#phase = "closed";
 		} catch (error) {
+			// Preserve earlier seal/stop failures if a deadline becomes the final error.
+			const failure = errors.length && !errors.includes(error) && error !== closeFailure
+				? new AggregateError([...errors, error], "OWNER_CLOSE_FAILED", { cause: errors[0] }) : error;
 			this.#phase = "quarantined";
 			this.#allowTerminal();
 			// Release can consume JA before its reply is lost. Do not follow an
 			// attempted release with another control-record write.
-			if (!releaseAttempted) {
+			if (releaseAttempted) {
+				// Cancellation only: never another control-record write or release.
+				try {
+					this.#journal.cancelLifecycle();
+				} catch (cleanup) {
+					throw new AggregateError([failure, cleanup], "OWNER_CLOSE_QUARANTINED", { cause: failure });
+				}
+			} else {
 				try {
 					this.#journal.quarantine();
 				} catch (cleanup) {
-					throw new AggregateError([error, cleanup], "OWNER_CLOSE_QUARANTINED");
+					throw new AggregateError([failure, cleanup], "OWNER_CLOSE_QUARANTINED", { cause: failure });
 				}
 			}
-			throw error;
+			throw failure;
 		} finally {
 			timeout.abort();
 		}

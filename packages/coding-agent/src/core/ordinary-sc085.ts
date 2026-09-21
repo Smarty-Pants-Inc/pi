@@ -134,7 +134,8 @@ export function createOriginalSc085(
 					segment,
 					phase: "held",
 					cursor,
-					deadline: start.monotonicMs + admission.validity.maxHoldMs - 2 * start.uncertaintyMs,
+					// Local timer only; never subtract the local clock from a parent-domain projection.
+					deadline: audit.observeSince(cursor).start.monotonicMs + admission.validity.maxHoldMs - 2 * start.uncertaintyMs,
 				};
 				state.token = gate.hold(segment, () =>
 					check(state?.phase === "sealing" || state?.phase === "sealed" ? "boundary" : "burst"),
@@ -248,7 +249,8 @@ export function createOriginalSc085(
 				);
 				held.phase = "sealing";
 				const exposure = qualifySc085OriginalStamp(receiving, context, { kind: "exposure", requestId });
-				let previousObserved = exposure.monotonicMs;
+				let previousObserved = BigInt(exposure.monotonicNs);
+				const requiredNs = BigInt(admission.observation.unchangedMs) * 1_000_000n;
 				let wakes = 0;
 				// At most one initial wait and one qualified early-wake correction.
 				// Refusal never shortens the required absolute observation interval.
@@ -260,13 +262,25 @@ export function createOriginalSc085(
 						cursor: measured.observedCursor,
 						edge: "start",
 					});
-					assert(
-						end.clockId === exposure.clockId &&
-							end.monotonicMs === measured.observedUntil.monotonicMs &&
-							exposure.monotonicMs === measured.exposureAt.monotonicMs,
-						"OWNER_SC085_SEAL_CLOCK_JOIN",
-					);
-					const elapsed = end.monotonicMs - exposure.monotonicMs - exposure.uncertaintyMs - end.uncertaintyMs;
+					assert.equal(end.clockId, exposure.clockId, "OWNER_SC085_SEAL_CLOCK_JOIN");
+					assert.deepEqual(end.basis, exposure.basis, "OWNER_SC085_SEAL_BASIS_JOIN");
+					// Join the entire original stamp (including witness, sequence and meaning),
+					// not equality between local milliseconds and a parent-domain projection.
+					for (const [qualified, originalStamp] of [
+						[end, measured.observedUntil],
+						[exposure, measured.exposureAt],
+					] as const) {
+						const original: unknown = guardSc085OriginalCallback(receiving, () =>
+							JSON.parse(sc085RetainedBytes(qualified.original, storage.retained).toString("utf8")),
+						);
+						assert(original !== null && typeof original === "object", "OWNER_SC085_SEAL_ORIGINAL");
+						assert.deepEqual((original as Record<string, unknown>).stamp, originalStamp, "OWNER_SC085_SEAL_ORIGINAL");
+						assert(originalStamp.parent && originalStamp.clockSequence && originalStamp.eventMeaning, "OWNER_SC085_SEAL_WITNESS");
+						assert.equal(qualified.monotonicNs, originalStamp.parent.after.monotonicNs, "OWNER_SC085_SEAL_AFTER");
+					}
+					const endNs = BigInt(end.monotonicNs);
+					assert(endNs >= BigInt(exposure.monotonicNs), "OWNER_SC085_SEAL_CLOCK_REGRESSION");
+					const elapsedNs = endNs - BigInt(exposure.monotonicNs) - BigInt(exposure.uncertaintyNs) - BigInt(end.uncertaintyNs);
 					assert(
 						measured.startsWhileHeld === 0 &&
 							measured.pendingPeak <= 1 &&
@@ -276,16 +290,19 @@ export function createOriginalSc085(
 							measured.repeatedUnchangedWakes === 0,
 						"OWNER_SC085_COALESCING",
 					);
-					if (elapsed < admission.observation.unchangedMs) {
+					if (elapsedNs < requiredNs) {
 						assert(
-							wakes < 2 && (wakes === 0 || end.monotonicMs > previousObserved),
+							wakes < 2 && (wakes === 0 || endNs > previousObserved),
 							"OWNER_SC085_OBSERVATION_NO_PROGRESS",
 						);
-						previousObserved = end.monotonicMs;
+						previousObserved = endNs;
 						wakes++;
 						const remaining = context.inspectCurrentPermission().remainingMs;
 						assert(remaining > 0, "OWNER_SC085_OBSERVATION_EXPIRED");
-						await wait(Math.min(Math.ceil(admission.observation.unchangedMs - elapsed), remaining));
+						// Scheduling projection only, rounded up. Acceptance after waking stays exact ns.
+						const waitMs = Number((requiredNs - elapsedNs + 999_999n) / 1_000_000n);
+						assert(Number.isSafeInteger(waitMs) && waitMs > 0, "OWNER_SC085_SEAL_WAIT_RANGE");
+						await wait(Math.min(waitMs, remaining));
 						continue;
 					}
 					const { observedCursor, ...evidence } = measured;
@@ -297,7 +314,9 @@ export function createOriginalSc085(
 							evidence,
 							exposure,
 							end,
-							guaranteedUnchangedMs: elapsed,
+							guaranteedUnchangedNs: String(elapsedNs),
+							guaranteedUnchangedMs: Number(elapsedNs / 1_000_000n),
+							requiredUnchangedNs: String(requiredNs),
 							requiredUnchangedMs: admission.observation.unchangedMs,
 						},
 						"boundary",

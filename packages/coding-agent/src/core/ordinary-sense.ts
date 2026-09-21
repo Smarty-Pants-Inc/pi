@@ -1,12 +1,17 @@
 import type { AgentSession } from "./agent-session.ts";
 import type { ExtensionAPI, ExtensionFactory } from "./extensions/types.ts";
+import { hasOriginalClockEvidence } from "./ordinary-clock.ts";
 import { createOrdinaryDefinitionPorts, type OrdinarySenseScope } from "./ordinary-definitions.ts";
 import { createOrdinaryExecutor } from "./ordinary-executor.ts";
 import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "./ordinary-owner-context.ts";
 import { createOrdinaryProviderIntegration } from "./ordinary-provider.ts";
 import type { consumeOrdinaryPairedInput } from "./ordinary-request-pair.ts";
 import type { OrdinaryValidatedSetup, SetupRawRef } from "./ordinary-sc085-setup.ts";
-import type { SessionManager } from "./session-manager.ts";
+import {
+	appendOwnedTerminalEntry,
+	persistOwnedTerminalSession,
+	type SessionManager,
+} from "./session-manager.ts";
 import type { OwnedJournalView } from "./session-ownership.ts";
 
 // Structural types for the one deployment-pinned bundle, not package discovery
@@ -143,6 +148,11 @@ export interface OrdinarySenseEntry {
 			};
 			fault(code: string): void;
 			wakeIntention?(event: { ownerEpoch: string; pending: boolean }): void;
+			exposureTransition?(
+				frame: OrdinaryExposureFrame,
+				receipt: OrdinaryExposureReceipt,
+				transition: () => void,
+			): void;
 			exposure?(frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt): void;
 		};
 		canSubmit(): boolean;
@@ -238,6 +248,15 @@ export function createOrdinarySenseExtension(
 				},
 				fault: () => context.owner.quarantine(),
 				wakeIntention: (event) => context.operationalAudit.wakeIntention(event),
+				...(hasOriginalClockEvidence()
+					? {
+							exposureTransition: (
+								frame: OrdinaryExposureFrame,
+								receipt: OrdinaryExposureReceipt,
+								transition: () => void,
+							) => context.operationalAudit.exposureTransition(frame, receipt, transition),
+						}
+					: {}),
 				exposure: (frame, receipt) => context.operationalAudit.exposure(frame, receipt),
 			},
 			canSubmit: () => context.canSubmitNative(),
@@ -251,6 +270,8 @@ export function createOrdinarySenseExtension(
 		bindSession: (session) => bridge.bindSession(session),
 		installProviderGuard: (session) => provider.install(session),
 		canSubmit: () => bridge.canSubmit(),
+		providerIdle: () => provider.isIdle(),
+		joinProvider: () => provider.join(),
 		async close() {
 			const results = await Promise.allSettled([
 				Promise.resolve().then(() => bridge.close()),
@@ -259,8 +280,8 @@ export function createOrdinarySenseExtension(
 			const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
 			if (errors.length) throw new AggregateError(errors, "OWNER_SENSE_CLOSE_FAILED", { cause: errors[0] });
 			const state = await executor.retained();
-			await context.owner.terminal(() => {
-				manager.appendCustomEntry("smarty-sense:ordinary-retention-v1", {
+			await context.owner.terminal(async () => {
+				await appendOwnedTerminalEntry(manager, "smarty-sense:ordinary-retention-v1", {
 					protocol: 1,
 					allocation: record.admission.allocation.id,
 					ownerEpoch: context.owner.grant,
@@ -269,7 +290,7 @@ export function createOrdinarySenseExtension(
 					snapshots: definitions.retained(),
 					state,
 				});
-				journal.flush(manager);
+				await persistOwnedTerminalSession(manager);
 			});
 		},
 	});

@@ -14,6 +14,7 @@ const ports = vi.hoisted(() => ({
 	stamp: vi.fn(),
 	admission: vi.fn(),
 	callback: vi.fn(),
+	retainedBytes: vi.fn(),
 }));
 vi.mock("../src/core/ordinary-sc085-source/operational-admission.ts", () => ({
 	checkSc085Operation: ports.check,
@@ -24,7 +25,7 @@ vi.mock("../src/core/ordinary-sc085-source/operational-admission.ts", () => ({
 }));
 vi.mock("../src/core/ordinary-sc085-source/sc085-admission.ts", () => ({
 	parseSc085Admission: ports.admission,
-	sc085RetainedBytes: () => Buffer.from("{}"),
+	sc085RetainedBytes: ports.retainedBytes,
 }));
 beforeEach(() => {
 	vi.resetAllMocks();
@@ -82,6 +83,14 @@ async function fixture(observations: number[], uncertainty = 0) {
 		observation: { unchangedMs: 1000 },
 	});
 	const retained = new Map<string, Uint8Array>();
+	ports.retainedBytes.mockImplementation((selected: typeof ref) => Buffer.from(retained.get(selected.path) ?? "{}"));
+	// Synthetic local/parent domains deliberately differ. No physical qualification.
+	const originalStamp = (time: number) => ({
+		monotonicMs: time,
+		clockSequence: String(time + 1),
+		eventMeaning: "synthetic-window",
+		parent: { after: { monotonicNs: String(BigInt(time) * 1_000_000n + 1_000_000_000n) } },
+	});
 	ports.storage.mockReturnValue({
 		retained,
 		record(value: unknown) {
@@ -97,13 +106,23 @@ async function fixture(observations: number[], uncertainty = 0) {
 		(_receiving: unknown, _context: unknown, selector: { kind: string; cursor?: object }) => {
 			boundary();
 			boundary();
+			const time = selector.cursor ? (observed.get(selector.cursor) ?? 0) : 0;
+			const stamp = originalStamp(time);
+			const originalBytes = Buffer.from(JSON.stringify({ stamp }));
+			const original = { path: `/synthetic/stamp-${retained.size}`, sha256: createHash("sha256").update(originalBytes).digest("hex") };
+			retained.set(original.path, originalBytes);
 			return {
 				clockId: "synthetic",
-				monotonicMs: selector.cursor ? (observed.get(selector.cursor) ?? 0) : 0,
+				monotonicMs: time + 1000,
+				monotonicNs: stamp.parent.after.monotonicNs,
+				uncertaintyNs: String(BigInt(uncertainty) * 1_000_000n),
+				conversionErrorNs: "0",
+				basis: ref,
+				guard: ref,
 				uncertaintyMs: uncertainty,
 				wallMs: Date.now(),
 				raw: ref,
-				original: ref,
+				original,
 				qualification: ref,
 			};
 		},
@@ -127,7 +146,7 @@ async function fixture(observations: number[], uncertainty = 0) {
 		}),
 		requestExposure: () => ({ frame: { hash: "final", revision: 1 } }),
 		requestEvidence: () => ({}),
-		observeSince: () => ({ events: [] }),
+		observeSince: () => ({ events: [], start: { monotonicMs: 0 } }),
 		sc085RapidEvidence: () => {
 			const time = observations[iterations++];
 			if (time === undefined) throw new Error("fixture observed beyond bounded samples");
@@ -135,8 +154,8 @@ async function fixture(observations: number[], uncertainty = 0) {
 			observed.set(observedCursor, time);
 			return {
 				observedCursor,
-				observedUntil: { monotonicMs: time },
-				exposureAt: { monotonicMs: 0 },
+				observedUntil: originalStamp(time),
+				exposureAt: originalStamp(0),
 				startsWhileHeld: 0,
 				pendingPeak: 1,
 				concurrentTurnPeak: 1,

@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { isDeepStrictEqual } from "node:util";
-import { ordinaryClock } from "./ordinary-clock.ts";
+import { observeRejectedSyncResult } from "../utils/observe-rejected-sync-result.ts";
+import { hasOriginalClockEvidence, ordinaryClock } from "./ordinary-clock.ts";
+import type { OriginalClockObservation, OriginalClockWitness } from "./ordinary-clock-evidence.ts";
 import type { OrdinaryExecutionRequest } from "./ordinary-executor.ts";
 import { type NativeRequestSource, nonViewRequest, requestCost, requestDigest } from "./ordinary-request-evidence.ts";
 import {
@@ -29,11 +31,16 @@ export interface NativeAuditStamp {
 	/** Local observations are not a qualified mapping into the caller's Clock. */
 	clockId: string;
 	uncertaintyMs: null;
+	/** Separate direct parent-domain evidence, never a performance offset. */
+	parent?: OriginalClockWitness;
+	clockSequence?: string;
+	eventMeaning?: string;
 }
 /** Select retained originals, never a timestamp supplied by the host caller. */
 export type Sc085StampSelector =
 	| { kind: "request"; requestId: string; phase: "prepared" | "dispatch" | "settled" | "retired" }
 	| { kind: "exposure"; requestId: string }
+	| { kind: "compaction"; entryId: string }
 	| { kind: "window"; cursor: object; edge: "start" | "end" };
 
 export interface NativeSessionAuditState {
@@ -120,6 +127,9 @@ export class OrdinaryOperationalAudit {
 			wakePending: boolean | null;
 		}
 	>();
+	#exposureTransitionFailure?: { cause: unknown };
+	#pendingExposure?: { frame: OrdinaryExposureFrame; receipt: OrdinaryExposureReceipt; at: NativeAuditStamp };
+	#exposureTransitionActive = false;
 	#exposureBytes = 0;
 	#exposureLost = false;
 	readonly #notified = new Set<string>();
@@ -282,7 +292,16 @@ export class OrdinaryOperationalAudit {
 		return this.clock;
 	}
 
-	#stamp(): NativeAuditStamp {
+	#stamp(eventMeaning?: string): NativeAuditStamp {
+		if (eventMeaning && hasOriginalClockEvidence()) {
+			const observed = ordinaryClock.capture(eventMeaning, () => this.#stamp());
+			return {
+				...observed.value,
+				parent: observed.witness,
+				clockSequence: observed.sequence,
+				eventMeaning: observed.eventMeaning,
+			};
+		}
 		return {
 			monotonicMs: this.clock.monotonic(),
 			wallMs: this.clock.wallTime(),
@@ -377,6 +396,55 @@ export class OrdinaryOperationalAudit {
 		this.#exposureSink = sink;
 	}
 
+	/** Core calls this around its actual accepted mutation, BEFORE evidence
+	 * delivery. The later exposure callback consumes, never resamples, this edge. */
+	exposureTransition(frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt, transition: () => void): void {
+		let discarded: unknown;
+		try {
+			if (this.#exposureTransitionFailure) throw this.#exposureTransitionFailure.cause;
+			if (
+				this.#closed ||
+				this.#lost ||
+				this.#pendingExposure ||
+				this.#exposureTransitionActive ||
+				frame.ownerEpoch !== this.#scope.ownerEpoch ||
+				receipt.ownerEpoch !== this.#scope.ownerEpoch ||
+				frame.scope.sessionId !== this.#scope.sessionId ||
+				receipt.scope.sessionId !== this.#scope.sessionId
+			)
+				throw new Error("OWNER_EXPOSURE_TRANSITION");
+			this.#exposureTransitionActive = true;
+			const originals = structuredClone({ frame, receipt });
+			const captured = ordinaryClock.capture("core-exposure-transition", () => {
+				const result: unknown = transition();
+				discarded = result;
+				if (result !== undefined) throw new Error("OWNER_EXPOSURE_TRANSITION_SYNC");
+				if (this.#exposureTransitionFailure) throw this.#exposureTransitionFailure.cause;
+				if (this.#closed || this.#lost) throw new Error("OWNER_EXPOSURE_TRANSITION_LOST");
+				return this.#stamp();
+			});
+			if (!isDeepStrictEqual(originals, { frame, receipt })) throw new Error("OWNER_EXPOSURE_TRANSITION_CHANGED");
+			this.#pendingExposure = {
+				...originals,
+				at: {
+					...captured.value,
+					parent: captured.witness,
+					clockSequence: captured.sequence,
+					eventMeaning: captured.eventMeaning,
+				},
+			};
+		} catch (cause) {
+			this.#lost = true;
+			this.#exposureTransitionFailure ??= { cause };
+			// This wrapper discards before outer capture receives a value. Seal
+			// audit/clock failure before assimilating any forbidden thenable.
+			observeRejectedSyncResult(discarded);
+			throw this.#exposureTransitionFailure.cause;
+		} finally {
+			this.#exposureTransitionActive = false;
+		}
+	}
+
 	exposure(frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt): void {
 		if (this.#closed) {
 			this.#lost = true;
@@ -393,7 +461,16 @@ export class OrdinaryOperationalAudit {
 				return;
 			}
 			const key = JSON.stringify([receipt.decisionId, receipt.attemptId]);
-			const retained = structuredClone({ frame, receipt, at: this.#stamp() });
+			const pending = this.#pendingExposure;
+			if (
+				hasOriginalClockEvidence() &&
+				(!pending ||
+					this.#exposureTransitionActive ||
+					!isDeepStrictEqual({ frame: pending.frame, receipt: pending.receipt }, { frame, receipt }))
+			)
+				throw new Error("OWNER_EXPOSURE_TRANSITION_MISSING");
+			this.#pendingExposure = undefined;
+			const retained = structuredClone({ frame, receipt, at: pending?.at ?? this.#stamp() });
 			const bytes = Buffer.byteLength(JSON.stringify(retained), "utf8");
 			if (
 				this.#exposures.has(key) ||
@@ -574,7 +651,7 @@ export class OrdinaryOperationalAudit {
 			: 0;
 		this.#activeWindow = Object.freeze({});
 		this.#windowStart = this.#sequence;
-		this.#windowStartedAt = this.#stamp();
+		this.#windowStartedAt = this.#stamp("original-window-start");
 		this.#turnPeak = Number(this.#currentTurn !== null);
 		this.#events = [];
 		this.#initialNativeState = this.#nativeState;
@@ -597,7 +674,7 @@ export class OrdinaryOperationalAudit {
 			startSequence: this.#windowStart,
 			endSequence: this.#sequence,
 			startedAt: this.#windowStartedAt ? { ...this.#windowStartedAt } : null,
-			finishedAt: this.#stamp(),
+			finishedAt: this.#stamp("original-window-finish"),
 			clockIdentity: this.clockIdentity,
 			coreClockSupplied: this.#coreClockSupplied,
 			events: structuredClone(this.#events),
@@ -629,6 +706,41 @@ export class OrdinaryOperationalAudit {
 		};
 	}
 
+	prepareRequest(reserve: () => TokenReservation, bytes: Uint8Array): TokenReservation {
+		const transition = () => {
+			const reservation = reserve();
+			this.request(reservation, bytes);
+			return reservation;
+		};
+		if (!hasOriginalClockEvidence()) return transition();
+		const captured = ordinaryClock.capture("request-preparation", transition);
+		const original = this.#requests.get(captured.value)!;
+		original.preparedAt = {
+			...original.preparedAt,
+			parent: captured.witness,
+			clockSequence: captured.sequence,
+			eventMeaning: captured.eventMeaning,
+		};
+		return captured.value;
+	}
+
+	/** Called by the original parser evidence callback, not the root receiver. */
+	recordSettlement(reservation: TokenReservation, reconcile: () => void): void {
+		if (!hasOriginalClockEvidence()) {
+			reconcile();
+			return;
+		}
+		const captured = ordinaryClock.capture("parser-evidence-reconciliation", reconcile);
+		const original = this.#requests.get(reservation);
+		if (!original?.settledAt) throw new Error("OWNER_AUDIT_ORIGINAL_SETTLEMENT");
+		original.settledAt = {
+			...original.settledAt,
+			parent: captured.witness,
+			clockSequence: captured.sequence,
+			eventMeaning: captured.eventMeaning,
+		};
+	}
+
 	request(reservation: TokenReservation, bytes: Uint8Array): void {
 		if (
 			this.#closed ||
@@ -656,11 +768,29 @@ export class OrdinaryOperationalAudit {
 	}
 
 	/** Actual final native authorization boundary, before original socket bytes. */
-	dispatch(reservation: TokenReservation): void {
+	dispatch(reservation: TokenReservation): void;
+	dispatch<T>(reservation: TokenReservation, authorize: () => T): T;
+	dispatch<T = undefined>(reservation: TokenReservation, authorize?: () => T): T | undefined {
 		const request = this.#requests.get(reservation);
 		if (!request || request.dispatchAt) throw new Error("OWNER_AUDIT_DISPATCH");
-		request.dispatchAt = this.#stamp();
+		const transition = () => {
+			const value = authorize?.();
+			request.dispatchAt = this.#stamp();
+			return value;
+		};
+		let value: T | undefined;
+		if (hasOriginalClockEvidence()) {
+			const observed = ordinaryClock.capture("dispatch-authorization", transition);
+			value = observed.value;
+			request.dispatchAt = {
+				...request.dispatchAt!,
+				parent: observed.witness,
+				clockSequence: observed.sequence,
+				eventMeaning: observed.eventMeaning,
+			};
+		} else value = transition();
 		this.event("provider", "inference-dispatch-authorized", reservation.requestId);
+		return value;
 	}
 
 	settlement(value: TokenSettlement): void {
@@ -679,11 +809,22 @@ export class OrdinaryOperationalAudit {
 		this.#notify();
 	}
 
-	retired(reservation: TokenReservation): void {
+	retired(reservation: TokenReservation, completion?: OriginalClockObservation): void {
 		const request = this.#requests.get(reservation);
 		if (!request || request.retired) throw new Error("OWNER_AUDIT_RETIREMENT");
+		if (hasOriginalClockEvidence() && (!completion || completion.eventMeaning !== "native-operation-completion"))
+			throw new Error("OWNER_AUDIT_ORIGINAL_COMPLETION");
 		request.retired = true;
-		request.retiredAt = this.#stamp();
+		request.retiredAt = completion
+			? {
+					...completion.local,
+					clockId: this.clockIdentity.id,
+					uncertaintyMs: null,
+					parent: structuredClone(completion.parent),
+					clockSequence: completion.sequence,
+					eventMeaning: completion.eventMeaning,
+				}
+			: this.#stamp();
 		this.event("provider", "inference-operation-retired", reservation.requestId);
 		this.#notify();
 	}
@@ -843,7 +984,7 @@ export class OrdinaryOperationalAudit {
 		this.#cursors.set(cursor, {
 			window: this.#activeWindow,
 			sequence: this.#sequence,
-			at: this.#stamp(),
+			at: this.#stamp("original-window-cursor"),
 			runId: this.#currentRun,
 			turnId: this.#currentTurn,
 			nativeState: this.#nativeState ? Object.freeze({ ...this.#nativeState }) : null,
@@ -1061,8 +1202,12 @@ export class OrdinaryOperationalAudit {
 	/** Private Source binding resolves only this audit's original records. Raw
 	 * null uncertainty stays null; independent qualification must retain a
 	 * separate view referencing this sample and its received qualification. */
-	resolveSc085Stamp(selector: Sc085StampSelector) {
+	assertSc085ClockCoverage(): void {
 		if (this.#closed || this.#lost || !this.#coreClockSupplied) throw new Error("OWNER_SC085_CLOCK_COVERAGE");
+	}
+
+	resolveSc085Stamp(selector: Sc085StampSelector) {
+		this.assertSc085ClockCoverage();
 		let stamp: NativeAuditStamp | null;
 		switch (selector.kind) {
 			case "request": {
@@ -1152,6 +1297,7 @@ export class OrdinaryOperationalAudit {
 	}
 
 	close(retired = false): void {
+		if (this.#pendingExposure || this.#exposureTransitionActive) this.#lost = true;
 		if (this.#tui) this.tui(this.#tui.source, "owner-close");
 		if (
 			this.#tuiState &&

@@ -102,12 +102,18 @@ import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
 import type { OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
 import { assertOrdinaryRuntime, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
+import type { OriginalCompactionAttempt } from "./ordinary-compaction.ts";
 import { createOrdinaryToolDefinitions } from "./ordinary-tools.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
-import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { getLatestCompactionEntry } from "./session-manager.ts";
+import type { BranchSummaryEntry, CompactionEntry, SessionEntry } from "./session-manager.ts";
+import {
+	appendOwnedTerminalCustomMessage,
+	appendOwnedTerminalMessage,
+	getLatestCompactionEntry,
+	SessionManager,
+} from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -116,6 +122,8 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+
+const appendOriginalCompaction = SessionManager.prototype.appendCompaction;
 
 // Read the original active-run boundary, not a replaceable instance accessor or mutable state flag.
 const originalAgentSignal = Object.getOwnPropertyDescriptor(Agent.prototype, "signal")!.get! as (
@@ -447,7 +455,11 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		this.#ordinaryOwner?.bindSessionAdmission(this, (recheck, enroll) => this.#requestOrdinaryWake(recheck, enroll));
+		this.#ordinaryOwner?.bindSessionAdmission(
+			this,
+			(recheck, enroll) => this.#requestOrdinaryWake(recheck, enroll),
+			(attempt) => this.#compactOriginal(attempt),
+		);
 		this.#auditState("session_attached");
 	}
 
@@ -757,30 +769,48 @@ export class AgentSession {
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
-		else this._persistAgentEvent(event);
+		else await this._persistAgentEvent(event);
 	};
 
-	private _persistAgentEvent(event: AgentEvent): void {
+	private async _persistAgentEvent(event: AgentEvent): Promise<void> {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
-				const entryId = this.sessionManager.appendCustomMessageEntry(
-					event.message.customType,
-					event.message.content,
-					event.message.display,
-					event.message.details,
-				);
-				this._recordMessageEntryId(event.message, entryId);
+				const entryId = this.#ordinaryOwner
+					? await appendOwnedTerminalCustomMessage(
+							this.sessionManager,
+							event.message.customType,
+							event.message.content,
+							event.message.display,
+							event.message.details,
+						)
+					: this.sessionManager.appendCustomMessageEntry(
+							event.message.customType,
+							event.message.content,
+							event.message.display,
+							event.message.details,
+						);
+				try {
+					this._recordMessageEntryId(event.message, entryId);
+				} catch (error) {
+					this._retainTerminalPublicationFailure(error);
+				}
 			} else if (
 				event.message.role === "user" ||
 				event.message.role === "assistant" ||
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				const entryId = this.sessionManager.appendMessage(event.message);
-				this._recordMessageEntryId(event.message, entryId);
+				const entryId = this.#ordinaryOwner
+					? await appendOwnedTerminalMessage(this.sessionManager, event.message)
+					: this.sessionManager.appendMessage(event.message);
+				try {
+					this._recordMessageEntryId(event.message, entryId);
+				} catch (error) {
+					this._retainTerminalPublicationFailure(error);
+				}
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
@@ -812,7 +842,8 @@ export class AgentSession {
 		// extension and listener dispatch above also picks up messages that turn_end
 		// handlers queued.
 		if (event.type === "turn_end") {
-			this._flushPendingCustomMessages();
+			if (this.#ordinaryOwner) await this._flushPendingCustomMessagesOwnedTerminal();
+			else this._flushPendingCustomMessages();
 		}
 	}
 
@@ -1117,6 +1148,16 @@ export class AgentSession {
 		return entryId;
 	}
 
+	private _retainTerminalPublicationFailure(error: unknown): never {
+		if (!this.#ordinaryOwner) throw error;
+		try {
+			this.#ordinaryOwner.owner.quarantine();
+		} catch (cleanup) {
+			throw new AggregateError([error, cleanup], "OWNER_TERMINAL_PUBLICATION_UNKNOWN", { cause: error });
+		}
+		throw error;
+	}
+
 	private _recordMessageEntryId(message: AgentMessage, entryId: string): void {
 		const capture = this._messageEntryIds;
 		if (!capture) return;
@@ -1243,6 +1284,7 @@ export class AgentSession {
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 		const dispatch = async (continuation = false) => {
+			this.#ordinaryOwner?.assertCompactionIdle();
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
 			if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
@@ -1276,16 +1318,32 @@ export class AgentSession {
 			}
 		} finally {
 			this._systemPromptOverride = undefined;
-			const persist = () => {
-				this._flushPendingBashMessages();
-				this._flushPendingCustomMessages();
+			const persist = async () => {
+				if (this.#ordinaryOwner) {
+					await this._flushPendingBashMessagesOwnedTerminal();
+					await this._flushPendingCustomMessagesOwnedTerminal();
+				} else {
+					this._flushPendingBashMessages();
+					this._flushPendingCustomMessages();
+				}
 			};
+			let persistenceFailure: { cause: unknown } | undefined;
 			try {
 				if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(persist);
-				else persist();
-			} finally {
-				await this._emitAgentSettled();
+				else await persist();
+			} catch (error) {
+				persistenceFailure = { cause: error };
 			}
+			try {
+				await this._emitAgentSettled();
+			} catch (notificationFailure) {
+				if (persistenceFailure)
+					throw new AggregateError([persistenceFailure.cause, notificationFailure], "OWNER_SETTLEMENT_FAILED", {
+						cause: persistenceFailure.cause,
+					});
+				throw notificationFailure;
+			}
+			if (persistenceFailure) throw persistenceFailure.cause;
 		}
 	}
 
@@ -1355,6 +1413,7 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		if (!this.#ordinaryOwner) return this._prompt(text, options);
 		this.#ordinaryOwner.assertSessionStart(this);
+		this.#ordinaryOwner.assertCompactionIdle();
 		this.#ordinaryPreflights++;
 		this.#auditState("preflight_start");
 		let pending = true;
@@ -1443,9 +1502,14 @@ export class AgentSession {
 				return;
 			}
 
-			// Flush any pending bash and custom messages before the new prompt
-			this._flushPendingBashMessages();
-			this._flushPendingCustomMessages();
+			// Flush any pending bash and custom messages before the new prompt.
+			if (this.#ordinaryOwner) {
+				await this._flushPendingBashMessagesOwnedTerminal();
+				await this._flushPendingCustomMessagesOwnedTerminal();
+			} else {
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			}
 
 			// Validate model
 			if (!this.model) {
@@ -1619,6 +1683,7 @@ export class AgentSession {
 		source: InputSource,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSessionStart(this);
+		this.#ordinaryOwner?.assertCompactionIdle();
 		if (this.#ordinaryOwner) {
 			this.#ordinaryPreflights++;
 			this.#auditState("queued_preflight_start");
@@ -1690,6 +1755,7 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -1707,6 +1773,7 @@ export class AgentSession {
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
@@ -1752,6 +1819,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
 			role: "custom" as const,
 			customType: message.customType,
@@ -1795,10 +1863,53 @@ export class AgentSession {
 		this._emit({ type: "message_end", message: appMessage });
 	}
 
-	/**
-	 * Append custom messages queued while the agent was running.
-	 * Called once the current turn's tool results are in agent state and session history.
-	 */
+	#pendingFlushTail: Promise<void> = Promise.resolve();
+
+	#queuePendingFlush(flush: () => Promise<void>): Promise<void> {
+		// Share ordering across bash/custom flush callers; retain rejection so a
+		// failed or uncertain append cannot be attempted again by run-finally.
+		const run = this.#pendingFlushTail.then(flush);
+		this.#pendingFlushTail = run;
+		void run.catch(() => {});
+		return run;
+	}
+
+	private _flushPendingCustomMessagesOwnedTerminal(): Promise<void> {
+		return this.#queuePendingFlush(async () => {
+			while (this._pendingCustomMessages.length) {
+				const message = this._pendingCustomMessages[0];
+				const id = await appendOwnedTerminalCustomMessage(this.sessionManager,
+					message.customType, message.content, message.display, message.details);
+				// Leave the failed message and suffix retained if persistence fails.
+				try {
+					this._pendingCustomMessages.shift();
+					this.agent.state.messages.push(message);
+					this._recordMessageEntryId(message, id);
+					this._emit({ type: "message_start", message });
+					this._emit({ type: "message_end", message });
+				} catch (error) {
+					this._retainTerminalPublicationFailure(error);
+				}
+			}
+		});
+	}
+
+	private _flushPendingBashMessagesOwnedTerminal(): Promise<void> {
+		return this.#queuePendingFlush(async () => {
+			while (this._pendingBashMessages.length) {
+				const message = this._pendingBashMessages[0];
+				await appendOwnedTerminalMessage(this.sessionManager, message);
+				try {
+					this._pendingBashMessages.shift();
+					this.agent.state.messages.push(message);
+				} catch (error) {
+					this._retainTerminalPublicationFailure(error);
+				}
+			}
+		});
+	}
+
+	/** Flush the non-owned queue without changing its synchronous behavior. */
 	private _flushPendingCustomMessages(): void {
 		if (this._pendingCustomMessages.length === 0) return;
 
@@ -2169,7 +2280,7 @@ export class AgentSession {
 	// =========================================================================
 
 	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
-	private async _runDefaultCompaction(
+	async #runDefaultCompaction(
 		preparation: CompactionPreparation,
 		requestModel: Model<any>,
 		apiKey: string | undefined,
@@ -2178,9 +2289,12 @@ export class AgentSession {
 		signal: AbortSignal,
 		env: Record<string, string> | undefined,
 		reason: "manual" | "threshold" | "overflow",
+		attempt?: OriginalCompactionAttempt,
 	): Promise<CompactionResult> {
 		this.#ordinaryOwner?.requestProvenance.interrupt(new Error("OWNER_REQUEST_CAPTURE_AUXILIARY"));
 		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
+		const stream = this.agent.streamFunction;
+		const summaryStream: typeof stream = attempt ? (...args) => attempt.request(() => stream(...args)) : stream;
 		try {
 			return await raceWithAbortSignal(
 				compact(
@@ -2191,7 +2305,7 @@ export class AgentSession {
 					customInstructions,
 					signal,
 					this.thinkingLevel,
-					this.agent.streamFunction,
+					summaryStream,
 					env,
 					COMPACTION_RETRY_POLICY,
 					callbacks,
@@ -2229,9 +2343,18 @@ export class AgentSession {
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
 		await this.abort();
+		this.#ordinaryOwner?.assertCompactionIdle();
+		return this.#compactSession(customInstructions);
+	}
+
+	/** Same session implementation; manual cancellation stays in its entry wrapper. */
+	async #compactSession(
+		customInstructions?: string,
+		attempt?: OriginalCompactionAttempt,
+	): Promise<CompactionResult> {
 		const controller = new AbortController();
 		this._compactionAbortController = controller;
-		const signal = controller.signal;
+		const signal = attempt ? AbortSignal.any([controller.signal, attempt.signal]) : controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let fromExtension = false;
 
@@ -2262,9 +2385,11 @@ export class AgentSession {
 				throw new Error("Nothing to compact (session too small)");
 			}
 
+			attempt?.check();
+			attempt?.prepare(preparation);
 			let extensionCompaction: CompactionResult | undefined;
 
-			if (this._extensionRunner.hasHandlers("session_before_compact")) {
+			if (!attempt && this._extensionRunner.hasHandlers("session_before_compact")) {
 				const result = (await raceWithAbortSignal(
 					this._extensionRunner.emit({
 						type: "session_before_compact",
@@ -2303,7 +2428,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by automatic compaction.
-				const result = await this._runDefaultCompaction(
+				const result = await this.#runDefaultCompaction(
 					preparation,
 					requestModel,
 					apiKey,
@@ -2312,6 +2437,7 @@ export class AgentSession {
 					signal,
 					env,
 					"manual",
+					attempt,
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2322,14 +2448,22 @@ export class AgentSession {
 
 			signal.throwIfAborted();
 
-			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			if (attempt) await attempt.settle();
+			signal.throwIfAborted();
+			attempt?.check();
+			const append = () => attempt
+				? appendOriginalCompaction.call(this.sessionManager, summary, firstKeptEntryId, tokensBefore, details, false, usage)
+				: this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			const compactionId = attempt
+				? attempt.append({ summary, firstKeptEntryId, tokensBefore, details, usage }, this.sessionManager.getLeafId(), append)
+				: append();
 			const newEntries = this.sessionManager.getEntries();
 			const sessionContext = this.sessionManager.buildSessionContext();
 			this.agent.state.messages = sessionContext.messages;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
-			// Get the saved compaction entry for the extension event
-			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
+			// Match the actual append, even when an earlier entry has the same summary.
+			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.id === compactionId) as
 				| CompactionEntry
 				| undefined;
 
@@ -2354,7 +2488,9 @@ export class AgentSession {
 				usage,
 				details,
 			};
-			// compaction_end listeners may submit queued prompts, so expose idle state before notifying them.
+			attempt?.check();
+			// Manual listeners may submit queued prompts. The selected operation's
+			// separate owner fence remains active through all completion hooks.
 			clearTimeout(timeout);
 			this._clearManualCompactionState(controller);
 			this._emit({
@@ -2387,6 +2523,41 @@ export class AgentSession {
 			clearTimeout(timeout);
 			this._clearManualCompactionState(controller);
 		}
+	}
+
+	/** Private captured constructor closure; no public AgentSession method or abort. */
+	async #compactOriginal(attempt: OriginalCompactionAttempt): Promise<CompactionResult> {
+		const owner = this.#ordinaryOwner;
+		if (!owner) throw new Error("OPS_COMPACTION_ORIGINAL_OWNER_REQUIRED");
+		owner.assertSessionStart(this);
+		if (this.#ordinaryPreflights || !this.isIdle || this.isRetrying || this.isBashRunning ||
+			originalAgentSignal.call(this.#originalAgent) || this.#originalAgent.hasQueuedMessages() ||
+			this.pendingMessageCount || (this._extensionMode === "tui" && !this.#pendingModeInput) ||
+			this.#pendingModeInput?.()) throw new Error("OPS_COMPACTION_SESSION_NOT_IDLE");
+		owner.assertSessionStart(this);
+		const model = this.model;
+		const stream = this.agent.streamFunction;
+		const branchIdentity = () => JSON.stringify(this.sessionManager.getBranch().filter((entry) =>
+			!(entry.type === "custom" && ["smarty-sense:count-reservation-v1", "smarty-sense:count-qualification-v1",
+				"smarty-sense:provider-reservation-v1", "smarty-sense:provider-usage-v1"].includes(entry.customType))));
+		let branch = branchIdentity();
+		const checkState = () => {
+			owner.assertSessionStart(this);
+			this._compactionAbortController?.signal.throwIfAborted();
+			if (this.model !== model || this.agent.streamFunction !== stream || this.#ordinaryPreflights ||
+				this._isAgentRunActive || this.isRetrying || this.isBashRunning ||
+				this.#originalAgent.hasQueuedMessages() || this.pendingMessageCount || this.#pendingModeInput?.() ||
+				branchIdentity() !== branch)
+				throw new Error("OPS_COMPACTION_SESSION_CHANGED");
+		};
+		attempt.fence(checkState);
+		return this.#compactSession(undefined, {
+			...attempt,
+			append: (result, beforeLeaf, invoke) => {
+				attempt.check();
+				return attempt.append(result, beforeLeaf, invoke, () => { branch = branchIdentity(); });
+			},
+		});
 	}
 
 	/**
@@ -2620,7 +2791,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this._runDefaultCompaction(
+				const compactResult = await this.#runDefaultCompaction(
 					preparation,
 					requestModel,
 					apiKey,
@@ -2734,6 +2905,7 @@ export class AgentSession {
 		const owner = this.#ordinaryOwner;
 		if (!owner) return "suppressed";
 		const ready = () => {
+			try { owner.assertCompactionIdle(); } catch { return false; }
 			owner.assertSessionStart(this);
 			if ((this._extensionMode === "tui" && !this.#pendingModeInput) || this.#pendingModeInput?.()) return false;
 			owner.assertSessionStart(this);

@@ -5,6 +5,8 @@ import type { ResponsesEvidence } from "@earendil-works/pi-ai/api/responses-evid
 import type { AgentSession } from "./agent-session.ts";
 import type { CreateAgentSessionRuntimeFactory } from "./agent-session-runtime.ts";
 import type { AgentSessionServices } from "./agent-session-services.ts";
+import { OriginalCompaction, type OriginalCompactionAttempt } from "./ordinary-compaction.ts";
+import type { CompactionResult } from "./compaction/compaction.ts";
 import { OrdinaryAutomaticHold, type OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
 import { assertCountSemantics, type CountSemantics, parseCountSemantics } from "./ordinary-count-semantics.ts";
 import { receivePreparedCredential } from "./ordinary-credential-binding.ts";
@@ -28,9 +30,11 @@ import {
 	enterSc085OriginalReceiving,
 	guardSc085OriginalCallback,
 	receiveSc085OriginalStorage,
+	receiveSc085Compaction,
+	qualifySc085OriginalStamp,
 	type Sc085OriginalReceiving,
 } from "./ordinary-sc085-source/operational-admission.ts";
-import type { OrdinaryOperationalHooks } from "./ordinary-sense.ts";
+import type { OrdinaryCapture, OrdinaryOperationalHooks } from "./ordinary-sense.ts";
 import {
 	OrdinaryTokenBudget,
 	type TokenCountPlan,
@@ -82,6 +86,8 @@ export interface OrdinarySenseBridge {
 	bindSession(session: AgentSession): void;
 	installProviderGuard(session: AgentSession): void;
 	canSubmit(): boolean;
+	providerIdle(): boolean;
+	joinProvider(): Promise<void>;
 	close(): Promise<void>;
 }
 
@@ -114,6 +120,7 @@ export class OrdinaryOwnerContext {
 	#session?: AgentSession;
 	#bindingSession = false;
 	#guardInstalled = false;
+	#guardStream?: AgentSession["agent"]["streamFunction"];
 	readonly #automaticHold = new OrdinaryAutomaticHold();
 	readonly #sc085Receiving?: Sc085OriginalReceiving;
 	#sc085?: ReturnType<typeof createOriginalSc085>;
@@ -123,6 +130,9 @@ export class OrdinaryOwnerContext {
 		requestWake(recheck: () => boolean, enroll?: OriginalAutomaticEnrollment): Promise<"started" | "suppressed">;
 	};
 	readonly #preparedFetches = new WeakSet<typeof globalThis.fetch>();
+	readonly #compaction: OriginalCompaction;
+	#compactSession?: (attempt: OriginalCompactionAttempt) => Promise<CompactionResult>;
+	#compactionRetained?: { path: string; sha256: string };
 
 	constructor(
 		key: symbol,
@@ -136,6 +146,7 @@ export class OrdinaryOwnerContext {
 	) {
 		if (key !== constructionKey || ownershipOf(owner.manager) !== owner) throw new Error("OWNER_NATIVE_CONSTRUCTION");
 		this.owner = owner;
+		this.#compaction = new OriginalCompaction(owner.host.profile.storage.journalBytes);
 		this.#sc085Receiving = sc085;
 		this.decision = decision;
 		this.profilePath = profilePath;
@@ -374,11 +385,17 @@ export class OrdinaryOwnerContext {
 	bindSessionAdmission(
 		session: AgentSession,
 		requestWake: (recheck: () => boolean, enroll?: OriginalAutomaticEnrollment) => Promise<"started" | "suppressed">,
+		compactSession: (attempt: OriginalCompactionAttempt) => Promise<CompactionResult>,
 	): void {
 		this.assertActive();
 		if (this.#admission || session.sessionManager !== this.owner.manager)
 			throw new Error("OWNER_SESSION_ADMISSION_BINDING");
 		const agent = session.agent;
+		// A prior imported transcript has no complete original observation ledger.
+		if (session.sessionManager.getEntries().some((entry) =>
+			entry.type === "message" || entry.type === "compaction" || entry.type === "branch_summary"))
+			this.#compaction.invalidateHistory();
+		this.#compactSession = compactSession;
 		this.#admission = Object.freeze({ session, agent, requestWake });
 		this.#auditSubscriptions.push(
 			agent.observeLifecycle(
@@ -474,7 +491,7 @@ export class OrdinaryOwnerContext {
 			this.#admission?.session !== session ||
 			session.sessionManager !== this.owner.manager ||
 			session.agent !== this.#admission.agent ||
-			!this.#guardInstalled
+			!this.#guardInstalled || session.agent.streamFunction !== this.#guardStream
 		) {
 			throw new Error("OWNER_SESSION_START_BINDING");
 		}
@@ -488,6 +505,7 @@ export class OrdinaryOwnerContext {
 		this.#guardInstalled = true;
 		try {
 			this.#sense!.installProviderGuard(session);
+			this.#guardStream = session.agent.streamFunction;
 			this.assertActive();
 		} catch (error) {
 			this.#stopped = true;
@@ -508,6 +526,8 @@ export class OrdinaryOwnerContext {
 			bindSession: bridge.bindSession.bind(bridge),
 			installProviderGuard: bridge.installProviderGuard.bind(bridge),
 			canSubmit: bridge.canSubmit.bind(bridge),
+			providerIdle: bridge.providerIdle.bind(bridge),
+			joinProvider: bridge.joinProvider.bind(bridge),
 			close: bridge.close.bind(bridge),
 		});
 		this.assertActive();
@@ -537,6 +557,7 @@ export class OrdinaryOwnerContext {
 	}
 
 	assertSubmission(): void {
+		this.#compaction.assertProvider();
 		this.assertActive();
 		if (this.#session) this.assertSessionStart(this.#session);
 		if (!this.#session || this.#bindingSession || !this.#sense?.canSubmit())
@@ -544,6 +565,61 @@ export class OrdinaryOwnerContext {
 		// The bridge can reenter shutdown while answering. Its boolean cannot
 		// revive the original owner after that callback returns.
 		this.assertSessionStart(this.#session);
+	}
+
+	assertCompactionIdle(): void {
+		this.#compaction.assertIdle();
+	}
+
+	observeCompactionContext(capture: OrdinaryCapture | null): void {
+		this.#compaction.observe(capture);
+	}
+
+	assertCompactionRequest(value: unknown): void {
+		this.#compaction.assertRequest(value);
+	}
+
+	compactionReceipt() {
+		return this.#compaction.snapshot();
+	}
+
+	compactionEvidence() {
+		return { receipt: this.#compaction.snapshot(), lastRetained: this.#compactionRetained ? { ...this.#compactionRetained } : null };
+	}
+
+	/** Exact original route and captured private session, never manual compact(). */
+	async compactOriginal(receiving: Sc085OriginalReceiving, signal: AbortSignal) {
+		if (receiving !== this.#sc085Receiving || !this.#session || !this.#compactSession)
+			throw new Error("OPS_COMPACTION_ORIGINAL_RECEIVING_REQUIRED");
+		const selected = receiveSc085Compaction(receiving, this);
+		const storage = receiveSc085OriginalStorage(receiving, this);
+		const session = this.#session;
+		const invoke = this.#compactSession;
+		if (!this.#sense?.providerIdle()) throw new Error("OPS_COMPACTION_PROVIDER_NOT_IDLE");
+		return this.within(() => this.#compaction.run({
+			identity: {
+				ownerEpoch: this.owner.grant, sessionId: this.owner.sessionId,
+				allocationId: this.decision.allocation.id, method: selected.method,
+			},
+			signal,
+			join: () => this.#sense!.joinProvider(),
+			qualify: (entryId) => qualifySc085OriginalStamp(receiving, this, { kind: "compaction", entryId }).raw,
+			check: () => {
+				this.assertSessionStart(session);
+				this.assertCredentialBinding();
+				this.assertNativeTokenReservation();
+				checkSc085Operation(receiving, this, "boundary");
+			},
+			record: (value) => guardSc085OriginalCallback(receiving, () => {
+				const raw = storage.bytes(Buffer.from(`${JSON.stringify(value)}\n`));
+				const retained = storage.retained.get(raw.path);
+				if (!retained || createHash("sha256").update(retained).digest("hex") !== raw.sha256 ||
+					Buffer.from(retained).toString("utf8") !== `${JSON.stringify(value)}\n`)
+					throw new Error("OPS_COMPACTION_RECEIPT_RETENTION");
+				this.#compactionRetained = { ...raw };
+			}),
+			invoke,
+		}));
 	}
 
 	fileTarget(path: string, writable: boolean): { root: number; relativePath: string } {

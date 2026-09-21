@@ -13,7 +13,8 @@ import {
 import type { Sc085OriginalReceiving } from "./core/ordinary-sc085-source/operational-admission.ts";
 import { SessionOwnership } from "./core/session-ownership.ts";
 
-export { ordinaryClock } from "./core/ordinary-clock.ts";
+export { ordinaryClock, prepareOrdinaryClock, readOrdinaryClockPreparation } from "./core/ordinary-clock.ts";
+export type { NativeClockSample, OriginalClockWitness } from "./core/ordinary-clock-evidence.ts";
 export { captureOrdinaryRequestPair, consumeOrdinaryPairedInput } from "./core/ordinary-request-pair.ts";
 export type { Sc085OriginalReceiving } from "./core/ordinary-sc085-source/operational-admission.ts";
 export {
@@ -26,14 +27,33 @@ export {
 	receiveSc085ChildBinding,
 } from "./core/ordinary-sc085-source/operational-admission.ts";
 
+export { createOperationalOutsideFinal } from "./core/ordinary-sc085-source/outside-final.ts";
+export type {
+	OriginalOutsideFinalReceiver,
+	OriginalOutsideFinalSelection,
+	OriginalOutsideOriginalData,
+} from "./core/ordinary-sc085-source/outside-final.ts";
+export { serveOperationalOutsideFinal } from "./core/ordinary-sc085-source/outside-final-pipe.ts";
+export type {
+	OriginalOutsideClockCoverage,
+	OriginalOutsideFinalData,
+	OriginalOutsideFinalResult,
+	OriginalOutsideGraphSelection,
+	OriginalOutsideStagedData,
+	OriginalOutsideTerminalSelection,
+} from "./core/ordinary-sc085-source/outside-final-data.ts";
+
 // Keep the native reader original even if a consumer replaces a public prototype method.
 const inspectOriginalOwnerResources = SessionOwnership.prototype.inspectResources;
 const assertOriginalContextActive = OrdinaryOwnerContext.prototype.assertActive;
+const compactOriginalSession = OrdinaryOwnerContext.prototype.compactOriginal;
+const readOriginalCompactionEvidence = OrdinaryOwnerContext.prototype.compactionEvidence;
 
 export { assertOrdinaryOwner };
 export type { OrdinaryOwnerContext };
 export type { NativeAuditStamp, OrdinaryDiagnosticSink } from "./core/ordinary-operational-audit.ts";
 export type { NativeRequestSource } from "./core/ordinary-request-evidence.ts";
+export type { OriginalCompactionReceipt } from "./core/ordinary-compaction.ts";
 export type {
 	OrdinaryOperationalResourceInspection,
 	OrdinaryResourceRef,
@@ -76,6 +96,24 @@ export function ordinarySc085(owner: OrdinaryOwnerContext) {
 	const methods = owner.sc085;
 	if (!methods) throw new Error("OWNER_SC085_RECEIVING_REQUIRED");
 	return methods;
+}
+
+/** Private selected compaction only; not four-method crossing readiness. The
+ * original receiving/owner/session, rather than caller callbacks, select the work. */
+export async function compactOrdinarySession(
+	owner: OrdinaryOwnerContext,
+	receiving: Sc085OriginalReceiving,
+	signal: AbortSignal,
+) {
+	assertOrdinaryOwner(owner);
+	await compactOriginalSession.call(owner, receiving, signal);
+	return readOriginalCompactionEvidence.call(owner);
+}
+
+/** Failure DATA remains readable after cancellation/retirement; lastRetained can
+ * precede the current receipt if a later recorder operation failed. No replay. */
+export function readOrdinaryCompactionReceipt(owner: OrdinaryOwnerContext) {
+	return readOriginalCompactionEvidence.call(owner);
 }
 
 /** Current native observations only. Original pre-exec proof is never reconstructed. */

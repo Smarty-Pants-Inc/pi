@@ -54,6 +54,15 @@ describe("closed epoch-source data decoder, not parent-role authority", () => {
 		receiving: ref,
 		phasePlan: ref,
 		clockContract: ref,
+		host: { ...ref, path: "/original/host-source" },
+		enforcementMethod: {
+			qualificationAuthority: ref,
+			qualification: ref,
+			source: ref,
+			mechanisms: [ref],
+			validity: { startNs: "1", endNs: "2" },
+			guardRules: { kind: "original-ci-enforcement-guards/1", invariants: [{ uninterpreted: true }], source: ref },
+		},
 		initialConditions: Object.fromEntries(
 			[
 				"inheritedHardLimit",
@@ -69,7 +78,40 @@ describe("closed epoch-source data decoder, not parent-role authority", () => {
 	test("preserves declared parent epoch and separate workload UID as data only", () => {
 		expect(parseOperationalEpochSource(canonicalPilotDecision(epoch))).toEqual(epoch);
 	});
+	test("nested method invariants remain nonempty unknown DATA, not string-only qualification", () => {
+		const method = epoch.enforcementMethod;
+		for (const invariants of [[{ uninterpreted: true }], [null], [1]])
+			expect(
+				parseOperationalEpochSource(
+					canonicalPilotDecision({
+						...epoch,
+						enforcementMethod: {
+							...method,
+							guardRules: { ...method.guardRules, invariants },
+						},
+					}),
+				).enforcementMethod.guardRules.invariants,
+			).toEqual(invariants);
+		for (const changed of [
+			{ ...method, mechanisms: [] },
+			{ ...method, validity: { startNs: "2", endNs: "2" } },
+			{ ...method, guardRules: { ...method.guardRules, invariants: [] } },
+		])
+			expect(() =>
+				parseOperationalEpochSource(canonicalPilotDecision({ ...epoch, enforcementMethod: changed })),
+			).toThrow();
+		const { enforcementMethod: _method, ...predecessor } = epoch;
+		expect(() => parseOperationalEpochSource(canonicalPilotDecision(predecessor))).toThrow();
+	});
+	test("rejects the predecessor missing selected host instead of guessing a sibling", () => {
+		const { host: _host, ...predecessor } = epoch;
+		expect(() => parseOperationalEpochSource(canonicalPilotDecision(predecessor))).toThrow();
+	});
 	test.each([
+		{ host: null },
+		{ host: { ...ref, path: "/original/../host" } },
+		{ host: { ...ref, qualifier: true } },
+		{ hostRef: ref },
 		{ repositoryId: "01" },
 		{ repositoryId: "1".repeat(21) },
 		{ ownerUid: "0" },

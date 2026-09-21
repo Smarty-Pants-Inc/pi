@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type { ResponsesEvidence } from "@earendil-works/pi-ai/api/responses-evidence";
 import type { AgentSession } from "./agent-session.ts";
+import { hasOriginalClockEvidence } from "./ordinary-clock.ts";
+import type { OriginalClockObservation } from "./ordinary-clock-evidence.ts";
 import { ORDINARY_CREDENTIAL_PLACEHOLDER } from "./ordinary-credential-delivery.ts";
 import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "./ordinary-owner-context.ts";
 import {
@@ -79,25 +81,31 @@ export function createOrdinaryProviderIntegration(
 			const bytes = new Uint8Array(await request.arrayBuffer());
 			assertSend();
 			if (bytes.length > maxRequestBytes) throw new Error("OWNER_PROVIDER_REQUEST_BYTES");
-			assertOrdinaryProviderPayload(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)), admitted);
+			const payload: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+			context.assertCompactionRequest(payload);
+			assertOrdinaryProviderPayload(payload, admitted);
 			// No DNS/TCP/count attempt when independently admitted authority or provider
 			// semantics is absent. A matching origin or integer response is not support.
 			context.assertNativeTokenReservation();
 			if (request.headers.has("expect")) throw new Error("OWNER_PROVIDER_EXPECT_HEADER");
 			const countProjection = projectResponsesTokenCount(bytes, admitted);
 			const bindPairedReservation = prepareOrdinaryPairedRequest(context, bytes);
-			const reservation = context.reserveProviderTokens(randomUUID(), countProjection.payloadHash);
-			context.operationalAudit.request(reservation, bytes);
+			const reservation = context.operationalAudit.prepareRequest(
+				() => context.reserveProviderTokens(randomUUID(), countProjection.payloadHash),
+				bytes,
+			);
 			const joinRetirement = context.requestProvenance.request(reservation);
 			let evidenceRecorded = false;
 			const recordEvidence = (evidence: Readonly<ResponsesEvidence>) => {
 				if (evidenceRecorded) throw new Error("OWNER_USAGE_DUPLICATE");
 				evidenceRecorded = true;
 				try {
-					const receipt = context.reconcileProviderTokens(reservation, evidence);
-					context.publishProviderUsage(receipt);
-					if (receipt.disposition === "over-budget" || evidence.conflict)
-						throw new Error("OWNER_PROVIDER_USAGE_LIMIT");
+					context.operationalAudit.recordSettlement(reservation, () => {
+						const receipt = context.reconcileProviderTokens(reservation, evidence);
+						context.publishProviderUsage(receipt);
+						if (receipt.disposition === "over-budget" || evidence.conflict)
+							throw new Error("OWNER_PROVIDER_USAGE_LIMIT");
+					});
 				} catch (cause) {
 					errors.push(cause);
 					throw cause;
@@ -155,8 +163,9 @@ export function createOrdinaryProviderIntegration(
 							countRequest,
 							authority.wireModel,
 							1024,
-							(finalRequest) => {
+							(finalRequest, finalBytes) => {
 								assertSend();
+								context.assertCompactionRequest(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(finalBytes)));
 								context.assertNativeTokenReservation();
 								signal.throwIfAborted();
 								return context.authorizeProviderRequest(finalRequest);
@@ -182,6 +191,7 @@ export function createOrdinaryProviderIntegration(
 				);
 				// Native count completeOperation has returned before a usable receipt exists.
 				const qualification = context.qualifyProviderCount(plan, counted);
+				let completion: OriginalClockObservation | undefined;
 				assertSend();
 				await owner.effect(
 					{
@@ -211,25 +221,35 @@ export function createOrdinaryProviderIntegration(
 							prepared,
 							admitted.wireModel,
 							owner.host.profile.limits.outputBytes,
-							(finalRequest, finalBytes) => {
-								// Recheck after durable spending, DNS, TCP and TLS setup, immediately
-								// before HTTP request bytes are queued on the original native socket.
-								context.assertNativeTokenReservation();
-								assertSend();
-								signal.throwIfAborted();
-								const outgoing = context.authorizeProviderRequest(finalRequest);
-								context.consumeProviderQualification(qualification, reservation, finalBytes);
-								context.operationalAudit.dispatch(reservation);
-								return outgoing;
-							},
+							(finalRequest, finalBytes) =>
+								context.operationalAudit.dispatch(reservation, () => {
+									// Recheck after durable spending, DNS, TCP and TLS setup, immediately
+									// before HTTP request bytes are queued on the original native socket.
+									context.assertNativeTokenReservation();
+									assertSend();
+									signal.throwIfAborted();
+									context.assertCompactionRequest(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(finalBytes)));
+									const outgoing = context.authorizeProviderRequest(finalRequest);
+									context.consumeProviderQualification(qualification, reservation, finalBytes);
+									return outgoing;
+								}),
 							recordEvidence,
 						);
 						void exchange.response.then(resolve, reject);
 						await exchange.settled;
 					},
-					{ signal: request.signal },
+					{
+						signal: request.signal,
+						...(hasOriginalClockEvidence()
+							? {
+									completed: (original: OriginalClockObservation) => {
+										completion = original;
+									},
+								}
+							: {}),
+					},
 				);
-				context.operationalAudit.retired(reservation);
+				context.operationalAudit.retired(reservation, completion);
 			})();
 			joinRetirement(task);
 			const observed = task.then(
@@ -273,6 +293,12 @@ export function createOrdinaryProviderIntegration(
 		},
 	);
 	return Object.freeze({
+		isIdle(): boolean { return pending.size === 0 && errors.length === 0 && !closed; },
+		async join(): Promise<void> {
+			const settled = await Promise.allSettled([...pending]);
+			const failures = [...errors, ...settled.flatMap((value) => value.status === "rejected" ? [value.reason] : [])];
+			if (failures.length) throw new AggregateError(failures, "OWNER_PROVIDER_NOT_RETIRED", { cause: failures[0] });
+		},
 		install(session: AgentSession): void {
 			context.assertActive();
 			if (installed || closed || session.sessionManager !== owner.manager)
@@ -323,6 +349,7 @@ export function createOrdinaryProviderIntegration(
 			const removeCommon = entry.installPiRequestGuard(session, {
 				takeCapture: () => {
 					const capture = bridge.takeCapture();
+					context.observeCompactionContext(capture);
 					context.operationalAudit.capture(capture);
 					recordOrdinaryPairedView(context, capture);
 					return capture;

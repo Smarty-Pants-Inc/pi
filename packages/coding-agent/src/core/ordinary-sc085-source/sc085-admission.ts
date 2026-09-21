@@ -19,14 +19,14 @@ export interface Sc085PreflightIntentV1 {
 	validity: Sc085AdmissionV1["validity"];
 	authority: Sc085AdmissionV1["authority"];
 }
-export interface Sc085AuditClockQualificationV1 {
-	protocol: "sense-ops-sc085-audit-clock/1";
+export interface Sc085AuditClockQualificationV2 {
+	protocol: "sense-ops-sc085-audit-clock/2";
 	owner: Sc085AdmissionV1["owner"];
 	admittedClockId: string;
 	nativeIdentity: RawRef;
 	source: "node:perf_hooks.performance";
 	sourceIdentity: RawRef;
-	mapping: { kind: "same-original-source"; nativeClockId: string; uncertaintyMs: number | null };
+	mapping: { kind: "original-native-clock-witness"; nativeClockId: string; contract: RawRef; basis: RawRef; producer: RawRef; implementation: RawRef; uncertaintyNs: string };
 	validity: { notBeforeWallMs: number; expiresWallMs: number };
 }
 
@@ -175,42 +175,33 @@ export function parseSc085PreflightIntent(raw: Uint8Array): Sc085PreflightIntent
 	integer(value.clockRequirement.maxUncertaintyMs);
 	return structuredClone(value) as unknown as Sc085PreflightIntentV1;
 }
-function validateQualification(value: unknown): asserts value is Sc085AuditClockQualificationV1 {
+function validateQualification(value: unknown): asserts value is Sc085AuditClockQualificationV2 {
 	object(value, "protocol owner admittedClockId nativeIdentity source sourceIdentity mapping validity");
-	assert.equal(value.protocol, "sense-ops-sc085-audit-clock/1", "SC085_CLOCK_PROTOCOL");
+	assert.equal(value.protocol, "sense-ops-sc085-audit-clock/2", "SC085_CLOCK_PROTOCOL");
 	object(value.owner, "ownerEpoch sessionId allocationId");
 	Object.values(value.owner).forEach(text);
 	text(value.admittedClockId);
 	reference(value.nativeIdentity);
 	reference(value.sourceIdentity);
 	assert.equal(value.source, "node:perf_hooks.performance", "SC085_CLOCK_SOURCE");
-	object(value.mapping, "kind nativeClockId uncertaintyMs");
-	assert.equal(value.mapping.kind, "same-original-source", "SC085_CLOCK_MAPPING");
+	object(value.mapping, "kind nativeClockId contract basis producer implementation uncertaintyNs");
+	assert.equal(value.mapping.kind, "original-native-clock-witness", "SC085_CLOCK_MAPPING");
 	text(value.mapping.nativeClockId);
-	const u = value.mapping.uncertaintyMs;
-	assert(
-		u === null || (typeof u === "number" && Number.isFinite(u) && u >= 0 && !Object.is(u, -0)),
-		"SC085_CLOCK_UNCERTAINTY",
-	);
+	for (const key of ["contract", "basis", "producer", "implementation"]) reference(value.mapping[key]);
+	assert(typeof value.mapping.uncertaintyNs === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value.mapping.uncertaintyNs) && BigInt(value.mapping.uncertaintyNs) <= 1_000_000_000n, "SC085_CLOCK_UNCERTAINTY");
 	object(value.validity, "notBeforeWallMs expiresWallMs");
 	integer(value.validity.notBeforeWallMs);
 	integer(value.validity.expiresWallMs);
 	assert(value.validity.expiresWallMs > value.validity.notBeforeWallMs, "SC085_CLOCK_VALIDITY");
 }
-/** Reuse the existing canonical recipe; only the agreed uncertainty scalar has a
- * finite fractional numeric domain. Native timeOrigin/stamps remain raw refs. */
-export function canonicalSc085AuditClockQualification(value: Sc085AuditClockQualificationV1): Buffer {
+/** Exact integer mapping metadata; no local performance-to-parent conversion. */
+export function canonicalSc085AuditClockQualification(value: Sc085AuditClockQualificationV2): Buffer {
 	validateQualification(value);
-	const base = canonicalPilotDecision({ ...value, mapping: { ...value.mapping, uncertaintyMs: null } });
-	const raw = Buffer.from(
-		base
-			.toString("utf8")
-			.replace('"uncertaintyMs":null', `"uncertaintyMs":${JSON.stringify(value.mapping.uncertaintyMs)}`),
-	);
+	const raw = canonicalPilotDecision(value);
 	assert(raw.length <= 65536, "SC085_CLOCK_BOUND");
 	return raw;
 }
-export function parseSc085AuditClockQualification(raw: Uint8Array): Sc085AuditClockQualificationV1 {
+export function parseSc085AuditClockQualification(raw: Uint8Array): Sc085AuditClockQualificationV2 {
 	assert(raw.byteLength > 0 && raw.byteLength <= 65536, "SC085_CLOCK_BOUND");
 	const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw));
 	validateQualification(value);
@@ -246,16 +237,18 @@ export function receiveSc085PreflightIntent(
 }
 export function receiveSc085AuditClockQualification(
 	ref: RawRef,
-	expected: Sc085AuditClockQualificationV1 | undefined,
+	expected: Sc085AuditClockQualificationV2 | undefined,
 	retained: ReadonlyMap<string, Uint8Array>,
-): Sc085AuditClockQualificationV1 {
+): Sc085AuditClockQualificationV2 {
 	assert(expected !== undefined, "SC085_INDEPENDENT_CLOCK_UNAVAILABLE");
 	const independent = parseSc085AuditClockQualification(canonicalSc085AuditClockQualification(expected));
 	const value = parseSc085AuditClockQualification(sc085RetainedBytes(ref, retained));
 	assert.deepEqual(value, independent, "SC085_INDEPENDENT_CLOCK_MISMATCH");
 	sc085RetainedBytes(value.nativeIdentity, retained);
 	sc085RetainedBytes(value.sourceIdentity, retained);
-	assert(value.mapping.uncertaintyMs !== null, "SC085_CLOCK_UNQUALIFIED");
+	for (const ref of [value.mapping.contract, value.mapping.basis, value.mapping.producer]) sc085RetainedBytes(ref, retained);
+	// implementation is an actual artifact Ref, not JSON copied into the recorder.
+	// The prepared original loader and parent receiver enforce its identity.
 	return value;
 }
 
