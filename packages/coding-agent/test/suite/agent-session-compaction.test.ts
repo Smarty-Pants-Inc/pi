@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -102,7 +103,7 @@ function seedCompactableSession(harness: Harness): void {
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 
-async function createAbortableCompactionHarness(): Promise<{
+async function createAbortableCompactionHarness(persistSession = false): Promise<{
 	harness: Harness;
 	compactionStarted: Promise<void>;
 }> {
@@ -111,6 +112,7 @@ async function createAbortableCompactionHarness(): Promise<{
 		markCompactionStarted = resolve;
 	});
 	const harness = await createHarness({
+		persistSession,
 		settings: { compaction: { keepRecentTokens: 1 } },
 		extensionFactories: [
 			(pi) => {
@@ -188,6 +190,170 @@ describe("AgentSession compaction characterization", () => {
 		expect(statsAfter.tokens.cacheWrite).toBe(statsBefore.tokens.cacheWrite + summaryUsage.cacheWrite);
 		expect(statsAfter.cost).toBe(statsBefore.cost + summaryUsage.cost.total);
 		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+	});
+
+	it("public compact preserves persisted history and continues on the same manager", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first reply"), fauxAssistantMessage("second reply")]);
+		await harness.session.prompt("first");
+		await harness.session.prompt("second");
+		expect(harness.getPendingResponseCount()).toBe(0);
+		const manager = harness.sessionManager;
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a persisted session");
+		const header = structuredClone(manager.getHeader());
+		const originalId = manager.getSessionId();
+		const cwd = manager.getCwd();
+		const labelTarget = manager.getEntries()[0]!.id;
+		manager.appendLabelChange(labelTarget, "retained label");
+		// Reference text only: this does not qualify artifact contents or custody.
+		manager.appendCustomEntry("artifact-reference-fixture", { path: "kept-artifact.txt" });
+		const prefix = structuredClone(manager.getEntries());
+		const beforeBytes = readFileSync(file);
+		// This fixture splits the second turn: one history and one turn-prefix summary.
+		harness.setResponses([fauxAssistantMessage("history summary"), fauxAssistantMessage("turn prefix summary")]);
+
+		const result = await harness.session.compact();
+
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(result.summary).toBe("history summary\n\n---\n\n**Turn Context (split turn):**\n\nturn prefix summary");
+		expect(harness.session.sessionManager).toBe(manager);
+		expect(manager.getSessionId()).toBe(originalId);
+		expect(manager.getSessionFile()).toBe(file);
+		expect(manager.getCwd()).toBe(cwd);
+		expect(manager.getHeader()).toEqual(header);
+		expect(manager.getEntries().slice(0, prefix.length)).toEqual(prefix);
+		expect(manager.getEntries()).toHaveLength(prefix.length + 1);
+		const compactedBytes = readFileSync(file);
+		expect(compactedBytes.subarray(0, beforeBytes.length)).toEqual(beforeBytes);
+		expect(
+			compactedBytes
+				.toString("utf8")
+				.trimEnd()
+				.split("\n")
+				.map((line) => JSON.parse(line)),
+		).toEqual(JSON.parse(JSON.stringify([header, ...manager.getEntries()])));
+		const compactions = manager.getEntries().filter((entry) => entry.type === "compaction");
+		expect(compactions).toHaveLength(1);
+		expect(compactions[0]).toMatchObject({
+			parentId: prefix.at(-1)?.id,
+			summary: result.summary,
+			firstKeptEntryId: result.firstKeptEntryId,
+			tokensBefore: result.tokensBefore,
+			usage: result.usage,
+		});
+		expect(prefix.find((entry) => entry.id === result.firstKeptEntryId)).toMatchObject({
+			type: "message",
+			message: { role: "assistant", content: [{ type: "text", text: "second reply" }] },
+		});
+		expect(manager.getLeafId()).toBe(compactions[0]?.id);
+		expect(manager.getLabel(labelTarget)).toBe("retained label");
+		expect(harness.session.messages).toEqual(manager.buildSessionContext().messages);
+		expect(harness.session.messages[0]).toMatchObject({ role: "compactionSummary", summary: result.summary });
+		expect(harness.session.getLastAssistantText()).toBe("second reply");
+		const compacted = structuredClone(manager.getEntries());
+		const controlId = manager.appendCustomEntry("control-fixture", { phase: "after-compaction" });
+		expect(manager.getEntry(controlId)?.parentId).toBe(compactions[0]?.id);
+		harness.setResponses([fauxAssistantMessage("continued")]);
+
+		await harness.session.prompt("continue explicitly");
+
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.sessionManager).toBe(manager);
+		expect(manager.getSessionId()).toBe(originalId);
+		expect(manager.getSessionFile()).toBe(file);
+		expect(manager.getCwd()).toBe(cwd);
+		expect(manager.getHeader()).toEqual(header);
+		expect(manager.getEntries().slice(0, compacted.length)).toEqual(compacted);
+		expect(harness.session.getLastAssistantText()).toBe("continued");
+		expect(manager.getEntries().slice(compacted.length + 1)).toMatchObject([
+			{
+				type: "message",
+				parentId: controlId,
+				message: { role: "user", content: [{ text: "continue explicitly" }] },
+			},
+			{ type: "message", message: { role: "assistant", content: [{ text: "continued" }] } },
+		]);
+		const bytes = readFileSync(file);
+		const rows = bytes
+			.toString("utf8")
+			.trimEnd()
+			.split("\n")
+			.map((line) => JSON.parse(line));
+		expect(rows).toEqual(JSON.parse(JSON.stringify([header, ...manager.getEntries()])));
+		expect(bytes.subarray(0, compactedBytes.length)).toEqual(compactedBytes);
+		expect(manager.getLeafId()).toBe(manager.getEntries().at(-1)?.id);
+	});
+
+	it("public compact can reject after persisting when a completion observer throws", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false, keepRecentTokens: 1 }, retry: { enabled: false } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("first reply"), fauxAssistantMessage("second reply")]);
+		await harness.session.prompt("first");
+		await harness.session.prompt("second");
+		expect(harness.getPendingResponseCount()).toBe(0);
+		const manager = harness.sessionManager;
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a persisted session");
+		const header = structuredClone(manager.getHeader());
+		const originalId = manager.getSessionId();
+		const prefix = structuredClone(manager.getEntries());
+		const beforeBytes = readFileSync(file);
+		harness.setResponses([fauxAssistantMessage("history summary"), fauxAssistantMessage("turn prefix summary")]);
+		let thrown = false;
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "compaction_end" && event.reason === "manual" && event.result && !thrown) {
+				thrown = true;
+				throw new Error("post-write observer failure");
+			}
+		});
+
+		try {
+			await expect(harness.session.compact()).rejects.toThrow("post-write observer failure");
+		} finally {
+			unsubscribe();
+		}
+
+		expect(thrown).toBe(true);
+		expect(harness.getPendingResponseCount()).toBe(0);
+		expect(harness.session.sessionManager).toBe(manager);
+		expect(manager.getSessionId()).toBe(originalId);
+		expect(manager.getSessionFile()).toBe(file);
+		expect(manager.getHeader()).toEqual(header);
+		expect(manager.getEntries().slice(0, prefix.length)).toEqual(prefix);
+		expect(manager.getEntries()).toHaveLength(prefix.length + 1);
+		const compactions = manager.getEntries().filter((entry) => entry.type === "compaction");
+		expect(compactions).toHaveLength(1);
+		expect(compactions[0]).toMatchObject({
+			parentId: prefix.at(-1)?.id,
+			summary: "history summary\n\n---\n\n**Turn Context (split turn):**\n\nturn prefix summary",
+		});
+		const bytes = readFileSync(file);
+		expect(bytes.subarray(0, beforeBytes.length)).toEqual(beforeBytes);
+		expect(
+			bytes
+				.toString("utf8")
+				.trimEnd()
+				.split("\n")
+				.map((line) => JSON.parse(line)),
+		).toEqual(JSON.parse(JSON.stringify([header, ...manager.getEntries()])));
+		expect(manager.getLeafId()).toBe(compactions[0]?.id);
+		expect(harness.eventsOfType("compaction_end")).toHaveLength(2);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			result: undefined,
+			aborted: false,
+			willRetry: false,
+			errorMessage: "Compaction failed: post-write observer failure",
+		});
+		expect(harness.session.isIdle).toBe(true);
+		// Rejection is not proof of no effect; do not retry or replay the prompt.
 	});
 
 	it("allows a queued prompt to start when manual compaction ends", async () => {
@@ -959,16 +1125,41 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
-	it("cancels in-progress manual compaction when abortCompaction is called", async () => {
-		const { harness, compactionStarted } = await createAbortableCompactionHarness();
+	it("cancels in-progress manual compaction without changing persisted history", async () => {
+		const { harness, compactionStarted } = await createAbortableCompactionHarness(true);
 		harnesses.push(harness);
+		const manager = harness.sessionManager;
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a persisted session");
+		const beforeBytes = readFileSync(file);
+		const header = structuredClone(manager.getHeader());
+		const entries = structuredClone(manager.getEntries());
+		const messages = structuredClone(harness.session.messages);
+		const leaf = manager.getLeafId();
+		const originalId = manager.getSessionId();
 
 		const compactPromise = harness.session.compact();
 		const compactExpectation = expect(compactPromise).rejects.toThrow("Compaction cancelled");
 		await compactionStarted;
 		harness.session.abortCompaction();
-
 		await compactExpectation;
+
+		expect(readFileSync(file)).toEqual(beforeBytes);
+		expect(manager.getHeader()).toEqual(header);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(manager.getLeafId()).toBe(leaf);
+		expect(manager.getSessionId()).toBe(originalId);
+		expect(manager.getSessionFile()).toBe(file);
+		expect(harness.session.sessionManager).toBe(manager);
+		expect(harness.session.messages).toEqual(messages);
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
+		expect(harness.eventsOfType("compaction_end")[0]).toMatchObject({
+			result: undefined,
+			aborted: true,
+			willRetry: false,
+		});
+		expect(harness.session.isIdle).toBe(true);
 	});
 
 	// Regression test for #8920.
