@@ -93,6 +93,20 @@ jobs:
           sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep &&
           sudo ln -s "$(command -v fdfind)" /usr/local/bin/fd
         } 2>&1 | tee "$RUNNER_TEMP/pi-emergency/evidence/system-dependencies.log"
+    - name: Produce separate exact Sense C6 Pi source2 cohort
+      run: |
+        umask 077
+        python3 -I -B scripts/produce-sense-c6-p.py "$RUNNER_TEMP/sense-c6-source2-P"
+    - name: Retain separate P result and partial evidence
+      if: always()
+      timeout-minutes: 5
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: sense-c6-source2-P-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/sense-c6-source2-P/evidence
+        include-hidden-files: true
+        if-no-files-found: error
+        retention-days: 7
     - name: dependencies
       timeout-minutes: 10
       run: |
