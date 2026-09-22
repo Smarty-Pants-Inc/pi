@@ -1,5 +1,5 @@
 {
-  "status": "COMPLETE_IMMUTABLE_PI_SOURCE_SELECTION_UNLANDED_PRODUCT_UNRUN_NOT_WHOLE_COHORT_CLEAN",
+  "status": "EXPLICIT_COMPLETE_COMPILER_REPAIR_SUCCESSOR_SOURCE_ONLY_UNCOMPILED",
   "baseCommit": "7924a9ea781d82240b5a35dcb6ddc09b43fb7f2a",
   "baseTree": "97e5db95dbc1aa49490450f930fee96b2af152a2",
   "membershipCounts": {
@@ -10470,11 +10470,11 @@
     {
       "path": "packages/coding-agent/src/core/ordinary-operational-audit.ts",
       "preimage": "1b8bbd8868a468e909d9ee6c024d0a42702d186997ad9150893a22583e7c3ff3",
-      "selected": "1f9ba0c73264e6f2a57538cb11dbb040a7fd8ffdd33cf0026bef610e3b1740b4",
-      "bytes": 49399,
+      "selected": "ca04a5b25b33d17502761c1d8ec32b401bc89e2f821753670540bc3da749fb7d",
+      "bytes": 49468,
       "mode": "0o644",
       "membership": "CHANGED",
-      "origin": "active-C6-source-2",
+      "origin": "reviewed-five-file-compiler-repair-1",
       "category": "production",
       "explicitC6Member": true
     },
@@ -10723,33 +10723,33 @@
     {
       "path": "packages/coding-agent/src/core/ordinary-sc085-source/outside-final-data.ts",
       "preimage": "08a1bd422ad7bdc25a4e351e664f52a2ea8c460fbe5849c4424540572f81806e",
-      "selected": "08a1bd422ad7bdc25a4e351e664f52a2ea8c460fbe5849c4424540572f81806e",
-      "bytes": 22426,
+      "selected": "c98a950b6945dc1c05f2742412798bf6ba4943c26724a3f9bb71ecbc27c1b12d",
+      "bytes": 22482,
       "mode": "0o644",
       "membership": "UNCHANGED",
-      "origin": "exact-private-7924",
+      "origin": "reviewed-five-file-compiler-repair-1",
       "category": "production",
       "explicitC6Member": false
     },
     {
       "path": "packages/coding-agent/src/core/ordinary-sc085-source/outside-final-pipe.ts",
       "preimage": "232e6705e92d11a13da7f96ece20666a4fdf41c63e1445268cd3682817bddce1",
-      "selected": "232e6705e92d11a13da7f96ece20666a4fdf41c63e1445268cd3682817bddce1",
-      "bytes": 5435,
+      "selected": "3f4e23c33074e6d5695f4744d40b52af728cc0fbd4839beb3280bf0f52ee3b21",
+      "bytes": 5614,
       "mode": "0o644",
       "membership": "UNCHANGED",
-      "origin": "exact-private-7924",
+      "origin": "reviewed-five-file-compiler-repair-1",
       "category": "production",
       "explicitC6Member": false
     },
     {
       "path": "packages/coding-agent/src/core/ordinary-sc085-source/outside-final.ts",
       "preimage": "3b30efd474dea3101328ca1a339b0a4510ce1da0d09838cb41a5ed59c64b73fb",
-      "selected": "3b30efd474dea3101328ca1a339b0a4510ce1da0d09838cb41a5ed59c64b73fb",
-      "bytes": 44880,
+      "selected": "52895b9c95155a58b500753577e5d29bbcd4bf4fff5e1252eaf2de07e253a963",
+      "bytes": 44954,
       "mode": "0o644",
       "membership": "UNCHANGED",
-      "origin": "exact-private-7924",
+      "origin": "reviewed-five-file-compiler-repair-1",
       "category": "production",
       "explicitC6Member": false
     },
@@ -10910,11 +10910,11 @@
     {
       "path": "packages/coding-agent/src/core/owner-h-meter.ts",
       "preimage": null,
-      "selected": "a89be5a08a56071b6f90df4f3edfb5d15551d5c5627078c0c62e200880b26536",
-      "bytes": 10785,
+      "selected": "4a4ad5f4b40c6a89d08172a2af21d80ce88c113b1b08f8b180019dcdd09e6a75",
+      "bytes": 10838,
       "mode": "0o644",
       "membership": "NEW",
-      "origin": "active-C6-source-2",
+      "origin": "reviewed-five-file-compiler-repair-1",
       "category": "production",
       "explicitC6Member": true
     },
@@ -20264,7 +20264,7 @@
       "selected": "94f782e6b120d8ed31749972fa5c2ec5783bea2718174e64f95ccefd9e1bb116"
     }
   ],
-  "patchSha256": "277480727c0a289fec899f7b30538a3dab1b86649717a7aab78f336859f65fd8",
+  "patchSha256": null,
   "outputHashes": "UNBOUND",
   "productChecks": "UNRUN",
   "cliPacketIncluded": false,
@@ -20273,5 +20273,17 @@
     "resultSha256": "d99820e392a2bc6f6cf6fcbb86aa45d374908d7a05b6233f6b119894c9f765e5",
     "reason": "WITHDRAWN: git archive attribute conversion; not exact Git blob preimages"
   },
-  "baseExtraction": "raw git cat-file --batch; every blob object ID verified; canonical Git modes"
+  "baseExtraction": "raw git cat-file --batch; every blob object ID verified; canonical Git modes",
+  "compilerRepair": {
+    "predecessorSourceSha256": "784931cb0a323868c435603a6c82309c1b74e4bdfad2c5158f149580a9a8a941",
+    "predecessorArchiveSha256": "6d0bd9e20b603b094429ed74707552a5741c4cf624bee4f0039d49c521c5255a",
+    "repairSourceSha256": "e3aa956ada9532f33894c640f9fd957418bab28034d39ea7c9323d9a80e78d23",
+    "reviewSha256": "2c12a134022cc4ea6478291d79776d585a5304f7d8b63f7b5121ad56b428da17",
+    "deltaPatchSha256": "b90fc79758d9191d732f737c7991b6ab52546704d7a0856fd0264de8c449e1ee",
+    "changedFiles": 5,
+    "unchangedFiles": 1834,
+    "originalFailedRun": 35703589926,
+    "originalFailedJob": 106667095511
+  },
+  "patchDisposition": "Historical base patch is not a patch for this successor. Select this full archive once; reviewed predecessor delta retained separately."
 }
