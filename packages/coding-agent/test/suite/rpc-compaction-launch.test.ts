@@ -10,15 +10,20 @@ const io = vi.hoisted(() => ({
 	receive: undefined as ((line: string) => void) | undefined,
 }));
 vi.mock("../../src/core/output-guard.ts", () => ({
-	flushRawStdout: vi.fn(async () => {}), takeOverStdout: vi.fn(),
+	flushRawStdout: vi.fn(async () => {}),
+	takeOverStdout: vi.fn(),
 	waitForRawStdoutBackpressure: vi.fn(async () => {}),
-	writeRawStdout: (line: string) => { io.lines.push(line); },
+	writeRawStdout: (line: string) => {
+		io.lines.push(line);
+	},
 }));
 vi.mock("../../src/modes/interactive/theme/theme.ts", () => ({ theme: {} }));
 vi.mock("../../src/modes/rpc/jsonl.ts", () => ({
 	attachJsonlLineReader: (_stream: NodeJS.ReadableStream, receive: (line: string) => void) => {
 		io.receive = receive;
-		return () => { io.receive = undefined; };
+		return () => {
+			io.receive = undefined;
+		};
 	},
 	serializeJsonLine: (value: unknown) => `${JSON.stringify(value)}\n`,
 }));
@@ -34,8 +39,8 @@ describe("RPC launch compaction provenance (faux, no process/model probe)", () =
 		{ args: ["--no-auto-compaction=true"], enabled: false, selected: false },
 	])("keeps native selection distinct from settings: %j", async ({ args, enabled, selected }) => {
 		const h = await createHarness({ settings: { compaction: { enabled } } });
-		const signals = process.platform === "win32" ? ["SIGTERM"] as const : ["SIGTERM", "SIGHUP"] as const;
-		const previous = new Map(signals.map(signal => [signal, process.listeners(signal) as NodeListener[]]));
+		const signals = process.platform === "win32" ? (["SIGTERM"] as const) : (["SIGTERM", "SIGHUP"] as const);
+		const previous = new Map(signals.map((signal) => [signal, process.listeners(signal) as NodeListener[]]));
 		const inputListeners = process.stdin.listeners("end") as NodeListener[];
 		io.lines = [];
 		io.receive = undefined;
@@ -47,17 +52,23 @@ describe("RPC launch compaction provenance (faux, no process/model probe)", () =
 				applied = true;
 			}
 			const runtime = {
-				session: h.session, setRebindSession: vi.fn(), dispose: vi.fn(async () => {}),
+				session: h.session,
+				setRebindSession: vi.fn(),
+				dispose: vi.fn(async () => {}),
 			} as unknown as AgentSessionRuntime;
 			const options = { autoCompactionDisabledForProcess: applied };
 			// Exercise default invocation separately; a global false cannot supply provenance.
 			void (applied ? runRpcMode(runtime, options) : runRpcMode(runtime));
 			options.autoCompactionDisabledForProcess = false;
-			await vi.waitFor(() => expect(io.receive).toBeDefined());
+			const receive = await vi.waitFor(() => {
+				expect(io.receive).toBeDefined();
+				if (!io.receive) throw new Error("RPC_LINE_HANDLER_REQUIRED");
+				return io.receive;
+			});
 			// Extra command DATA must not be a setter for launch provenance.
-			io.receive?.(JSON.stringify({ id: "state", type: "get_state", autoCompactionDisabledForProcess: true }));
-			await vi.waitFor(() => expect(io.lines.some(line => line.includes('"id":"state"'))).toBe(true));
-			const response = io.lines.map(line => JSON.parse(line) as RpcResponse).find(value => value.id === "state");
+			receive(JSON.stringify({ id: "state", type: "get_state", autoCompactionDisabledForProcess: true }));
+			await vi.waitFor(() => expect(io.lines.some((line) => line.includes('"id":"state"'))).toBe(true));
+			const response = io.lines.map((line) => JSON.parse(line) as RpcResponse).find((value) => value.id === "state");
 			expect(response?.success).toBe(true);
 			if (!response?.success || response.command !== "get_state") throw new Error("STATE_REQUIRED");
 			expectTypeOf<RpcSessionState["autoCompactionDisabledForProcess"]>().toEqualTypeOf<boolean>();
@@ -67,9 +78,11 @@ describe("RPC launch compaction provenance (faux, no process/model probe)", () =
 			if (selected) {
 				// Provenance is not an immutable policy: the client must check BOTH fields.
 				h.settingsManager.applyOverrides({ compaction: { enabled: true } });
-				io.receive?.(JSON.stringify({ id: "changed", type: "get_state" }));
-				await vi.waitFor(() => expect(io.lines.some(line => line.includes('"id":"changed"'))).toBe(true));
-				const changed = io.lines.map(line => JSON.parse(line) as RpcResponse).find(value => value.id === "changed");
+				receive(JSON.stringify({ id: "changed", type: "get_state" }));
+				await vi.waitFor(() => expect(io.lines.some((line) => line.includes('"id":"changed"'))).toBe(true));
+				const changed = io.lines
+					.map((line) => JSON.parse(line) as RpcResponse)
+					.find((value) => value.id === "changed");
 				if (!changed?.success || changed.command !== "get_state") throw new Error("STATE_REQUIRED");
 				expect(changed.data.autoCompactionDisabledForProcess).toBe(true);
 				expect(changed.data.autoCompactionEnabled).toBe(true);
