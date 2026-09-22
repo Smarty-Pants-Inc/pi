@@ -1,6 +1,11 @@
 """Light source-DATA checks only. No npm, compiler, model hydration or P run."""
 import importlib.util
 import json
+import os
+import sys
+import stat
+import tarfile
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -52,6 +57,7 @@ class Projection(unittest.TestCase):
             with self.subTest(code=code, body=body), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 def mock_run(*args, **kwargs):
+                    self.assertEqual(kwargs["umask"], 0o022)
                     kwargs["stdout"].write(body)
                     return SimpleNamespace(returncode=code)
                 with patch.object(producer, "FILE_LIMIT", 4), patch.object(producer.subprocess, "run", mock_run):
@@ -64,6 +70,47 @@ class Projection(unittest.TestCase):
                 self.assertEqual(result["returncode"], code)
                 self.assertEqual(result["success"], success)
                 self.assertEqual((root / "MOCK.log").read_bytes(), body)
+
+    def test_child_creation_modes_without_parent_mask_or_archive_normalization(self):
+        # Standard-library child only, no supplier/compiler/package command.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = os.umask(0o077)
+            try:
+                producer.phase("mode-probe", 10, [sys.executable, "-I", "-B", "-c",
+                    "from pathlib import Path; import os; p=Path('emitted'); p.write_bytes(b'DATA'); "
+                    "os.chmod(p, p.stat().st_mode | 0o111)"], root, {}, root)
+                self.assertEqual((root / "emitted").stat().st_mode & 0o777, 0o755)
+                self.assertEqual((root / "mode-probe.log").stat().st_mode & 0o777, 0o600)
+                self.assertEqual((root / "mode-probe.json").stat().st_mode & 0o777, 0o600)
+                actual = os.umask(0o077)
+                self.assertEqual(actual, 0o077)
+            finally:
+                os.umask(previous)
+
+    def test_package_member_guards_remain_fail_closed(self):
+        cases = [("package/dist/api.js", tarfile.REGTYPE, 0o600),
+                 ("package/dist/cli.js", tarfile.REGTYPE, 0o711),
+                 ("package/../api.js", tarfile.REGTYPE, 0o644),
+                 ("package//api.js", tarfile.REGTYPE, 0o644),
+                 ("package/api.js", tarfile.SYMTYPE, 0o644),
+                 ("package/api.js", tarfile.LNKTYPE, 0o644),
+                 ("package/api.js", tarfile.DIRTYPE, 0o755)]
+        for name, kind, mode in cases:
+            with self.subTest(name=name, kind=kind, mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "tarballs").mkdir()
+                (root / "pack-results.json").write_text(json.dumps([{"name": str(i)} for i in range(10)]))
+                for index in range(10):
+                    with tarfile.open(root / "tarballs" / f"{index}.tgz", "w:gz") as archive:
+                        member = tarfile.TarInfo(name)
+                        member.mode, member.type = mode, kind
+                        if kind in (tarfile.SYMTYPE, tarfile.LNKTYPE): member.linkname = "foreign"
+                        member.size = 1 if kind == tarfile.REGTYPE else 0
+                        archive.addfile(member, io.BytesIO(b"X") if member.size else None)
+                with self.assertRaisesRegex(ValueError, "unsafe package member"):
+                    producer.package_manifest(root, root / "source")
+                self.assertFalse((root / "PI-C6-SOURCE2-MEMBERS.json").exists())
 
     def test_evidence_quota_is_failure_not_partial_success(self):
         with tempfile.TemporaryDirectory() as directory:

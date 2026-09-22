@@ -125,12 +125,13 @@ def phase(name, seconds, argv, source, env, evidence):
     started = time.time()
     with (evidence / (name + ".log")).open("xb") as log:
         result = subprocess.run(["/usr/bin/timeout", "--signal=TERM", "--kill-after=5s", str(seconds - 5) + "s", *argv],
-                                cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT, preexec_fn=limits)
+                                cwd=source, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                preexec_fn=limits, umask=0o022)
     record = {"phase": name, "argv": argv, "deadlineSeconds": seconds, "commandTimeoutSeconds": seconds - 5, "killGraceSeconds": 5,
               "started": started, "finished": time.time(), "returncode": result.returncode,
               "signal": -result.returncode if result.returncode < 0 else None,
               "log": file_record(evidence / (name + ".log")),
-              "signalScope": "timeout-wrapper status; inner child signal is not inferred",
+              "childUmask": "0022", "signalScope": "timeout-wrapper status; inner child signal is not inferred",
               "success": result.returncode == 0 and (evidence / (name + ".log")).stat().st_size < FILE_LIMIT}
     save(evidence / (name + ".json"), record)
     quota(evidence)
