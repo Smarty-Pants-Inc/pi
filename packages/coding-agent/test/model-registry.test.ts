@@ -9,6 +9,7 @@ import type {
 	OpenAICompletionsCompat,
 } from "@earendil-works/pi-ai/compat";
 import { getApiProvider, getModels, getSupportedThinkingLevels } from "@earendil-works/pi-ai/compat";
+import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ModelsJsonProvider } from "../src/core/model-config.ts";
@@ -692,6 +693,24 @@ describe("ModelRegistry", () => {
 	});
 
 	describe("modelOverrides (per-model customization)", () => {
+		beforeEach(() => {
+			// Pi PR #25: control catalog inputs, not override results; live catalogs can retire these IDs.
+			const providers = builtinProviderCatalog.builtinProviders();
+			const openrouter = providers.find((provider) => provider.id === "openrouter");
+			if (!openrouter) throw new Error("OpenRouter provider required for model override tests");
+			vi.spyOn(openrouter, "getModels").mockReturnValue(
+				["anthropic/claude-sonnet-4", "anthropic/claude-opus-4"].map((id) => ({
+					...openAiModel,
+					id,
+					name: id,
+					provider: "openrouter",
+					baseUrl: "https://openrouter.ai/api/v1",
+					cost: { ...openAiModel.cost, output: 1 },
+				})),
+			);
+			vi.spyOn(builtinProviderCatalog, "builtinProviders").mockReturnValue(providers);
+		});
+
 		test("model override applies to a single built-in model", async () => {
 			writeRawModelsJson({
 				openrouter: {

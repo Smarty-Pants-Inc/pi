@@ -99,7 +99,12 @@ export type {
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
+export async function runRpcMode(
+	runtimeHost: AgentSessionRuntime,
+	options: { readonly autoCompactionDisabledForProcess?: boolean } = {},
+): Promise<never> {
+	// Launch provenance, not an inference from effective or persisted settings.
+	const autoCompactionDisabledForProcess = options.autoCompactionDisabledForProcess === true;
 	takeOverStdout();
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
@@ -587,6 +592,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					sessionId: session.sessionId,
 					sessionName: session.sessionName,
 					autoCompactionEnabled: session.autoCompactionEnabled,
+					autoCompactionDisabledForProcess,
 					messageCount: session.messages.length,
 					pendingMessageCount: session.pendingMessageCount,
 				};
