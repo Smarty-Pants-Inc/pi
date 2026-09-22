@@ -2,6 +2,34 @@ import { describe, expect, test } from "vitest";
 import { normalizeSessionName, parseArgs } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
+	describe("--no-auto-compaction", () => {
+		test("recognizes the explicit switch without consuming a prompt or forwarding an extension flag", () => {
+			const result = parseArgs(["--mode", "rpc", "--no-auto-compaction", "continue"]);
+			expect(result.noAutoCompaction).toBe(true);
+			expect(result.mode).toBe("rpc");
+			expect(result.messages).toEqual(["continue"]);
+			expect(result.unknownFlags.size).toBe(0);
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("does not change the default", () => {
+			expect(parseArgs([]).noAutoCompaction).toBeUndefined();
+			expect(parseArgs(["--mode", "rpc"]).noAutoCompaction).toBeUndefined();
+		});
+
+		test("does not mistake an unknown equals option for the native selection", () => {
+			const result = parseArgs(["--no-auto-compaction=true"]);
+			expect(result.noAutoCompaction).toBeUndefined();
+			expect(result.unknownFlags.get("no-auto-compaction")).toBe("true");
+		});
+
+		test("preserves the option terminator", () => {
+			const result = parseArgs(["--", "--no-auto-compaction"]);
+			expect(result.noAutoCompaction).toBeUndefined();
+			expect(result.messages).toEqual(["--no-auto-compaction"]);
+		});
+	});
+
 	describe("--version flag", () => {
 		test("parses --version flag", () => {
 			const result = parseArgs(["--version"]);
