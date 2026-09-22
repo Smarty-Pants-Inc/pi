@@ -795,6 +795,7 @@ export async function main(args: string[], options?: MainOptions) {
 	const resolvedSkillPaths = resolveCliPaths(cwd, parsed.skills);
 	const resolvedPromptTemplatePaths = resolveCliPaths(cwd, parsed.promptTemplates);
 	const resolvedThemePaths = resolveCliPaths(cwd, parsed.themes);
+	let autoCompactionDisabledForProcess = false;
 	const createRuntime: CreateAgentSessionRuntimeFactory = async ({
 		cwd,
 		agentDir,
@@ -860,6 +861,12 @@ export async function main(args: string[], options?: MainOptions) {
 			},
 		});
 		const { settingsManager, modelRuntime, resourceLoader } = services;
+		// Resource loading can reload settings. Apply only after it completes,
+		// before constructing any session that can run prompt preflight.
+		if (parsed.noAutoCompaction) {
+			settingsManager.applyOverrides({ compaction: { enabled: false } });
+			autoCompactionDisabledForProcess = true;
+		}
 		const diagnostics: AgentSessionRuntimeDiagnostic[] = [
 			...projectTrustDiagnostics,
 			...services.diagnostics,
@@ -914,6 +921,11 @@ export async function main(args: string[], options?: MainOptions) {
 		const cliThinkingOverride = parsed.thinking !== undefined || cliThinkingFromModel;
 		if (created.session.model && cliThinkingOverride) {
 			created.session.setThinkingLevel(created.session.thinkingLevel);
+			// Saving CLI thinking recalculates merged settings; restore only this
+			// launch override. Do not change the settings writer or its semantics.
+			if (parsed.noAutoCompaction) {
+				settingsManager.applyOverrides({ compaction: { enabled: false } });
+			}
 		}
 
 		return {
@@ -1014,7 +1026,7 @@ export async function main(args: string[], options?: MainOptions) {
 
 	if (appMode === "rpc") {
 		printTimings();
-		await runRpcMode(runtime);
+		await runRpcMode(runtime, { autoCompactionDisabledForProcess });
 	} else if (appMode === "interactive") {
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,

@@ -118,6 +118,8 @@ export interface RpcSessionState {
 	sessionId: string;
 	sessionName?: string;
 	autoCompactionEnabled: boolean;
+	/** Explicit CLI launch selection applied in memory; independent of the effective setting. */
+	readonly autoCompactionDisabledForProcess: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
 }
