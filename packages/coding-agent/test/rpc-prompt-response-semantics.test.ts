@@ -579,10 +579,11 @@ describe("RPC prompt response semantics", () => {
 
 		try {
 			lineHandler(JSON.stringify({ id: "entry-id", type: "prompt", message: "Check message entry IDs" }));
-			await vi.waitFor(() => expect(observedEntryIds).toHaveLength(2));
+			// v0.87 persists the initial SYSTEM transcript message before the user prompt.
+			await vi.waitFor(() => expect(observedEntryIds).toHaveLength(3));
 			await vi.waitFor(() => expect(session.isStreaming).toBe(false));
 			await session.sendCustomMessage({ customType: "test", content: "Custom message", display: true });
-			await vi.waitFor(() => expect(observedEntryIds).toHaveLength(3));
+			await vi.waitFor(() => expect(observedEntryIds).toHaveLength(4));
 
 			for (const { entryId, historyId } of observedEntryIds) {
 				expect(typeof entryId).toBe("string");
@@ -605,9 +606,13 @@ describe("RPC prompt response semantics", () => {
 		try {
 			await session.prompt("Persist without RPC capture");
 
-			expect(messages).toHaveLength(2);
-			expect(sessionManager.getEntries()).toHaveLength(2);
-			expect(messages.map((message) => session.takeMessageEntryId(message))).toEqual([undefined, undefined]);
+			expect(messages.map((message) => message.role)).toEqual(["system", "user", "assistant"]);
+			expect(sessionManager.getEntries()).toHaveLength(3);
+			expect(messages.map((message) => session.takeMessageEntryId(message))).toEqual([
+				undefined,
+				undefined,
+				undefined,
+			]);
 		} finally {
 			unsubscribe();
 			await cleanup();
@@ -735,15 +740,19 @@ describe("RPC prompt response semantics", () => {
 			sessionManager.appendMessage({ role: "user", content: `history ${index}`, timestamp: index });
 		}
 		const getEntries = vi.spyOn(sessionManager, "getEntries");
+		// v0.87 builds the canonical request and compaction context from the session projection.
+		const buildSessionProjection = vi.spyOn(sessionManager, "buildSessionProjection");
 
 		try {
 			lineHandler(JSON.stringify({ id: "long-history", type: "prompt", message: "Live message IDs" }));
 			await vi.waitFor(() => {
 				const messageEnds = parseOutputLines(rpcIo.outputLines).filter((event) => event.type === "message_end");
-				expect(messageEnds).toHaveLength(2);
+				expect(messageEnds).toHaveLength(3);
 			});
-			expect(getEntries).not.toHaveBeenCalled();
+			// Entry IDs come from live persistence, not an additional history scan.
+			expect(getEntries).toHaveBeenCalledTimes(buildSessionProjection.mock.calls.length);
 		} finally {
+			buildSessionProjection.mockRestore();
 			getEntries.mockRestore();
 			await cleanup();
 		}

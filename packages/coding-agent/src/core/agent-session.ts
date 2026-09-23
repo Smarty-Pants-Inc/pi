@@ -350,6 +350,11 @@ function startCompactionDeadline(controller: AbortController): ReturnType<typeof
 	}, COMPACTION_TIMEOUT_MS);
 }
 
+/** Explicit cancellation aborts the signal. Deadline expiry and error text alone are failures. */
+function isCompactionCancelled(signal: AbortSignal): boolean {
+	return signal.aborted && !(signal.reason instanceof DOMException && signal.reason.name === "TimeoutError");
+}
+
 // ============================================================================
 // AgentSession Class
 // ============================================================================
@@ -3167,10 +3172,7 @@ export class AgentSession {
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
 			const message = error instanceof Error ? error.message : "compaction failed";
-			const aborted =
-				cancelledByExtension ||
-				message === "Compaction cancelled" ||
-				(error instanceof Error && error.name === "AbortError");
+			const aborted = cancelledByExtension || isCompactionCancelled(signal);
 			const errorMessage = aborted
 				? undefined
 				: reason === "overflow"
