@@ -6,20 +6,39 @@ import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { ResponsesEvidence } from "@earendil-works/pi-ai/api/responses-evidence";
 import {
+	beginOrdinaryClockOperation,
+	commitOrdinaryClockOperation,
+	failOrdinaryClockOperation,
+} from "./ordinary-clock.ts";
+import type { NativeClockSample, OriginalClockObservation } from "./ordinary-clock-evidence.ts";
+import {
 	createOwnedProviderExchange,
 	type OwnedCountRequest,
 	type OwnedProviderExchange,
 } from "./ordinary-provider-transport.ts";
 import type { NativeResourceObservation } from "./ordinary-resource-inspection.ts";
+import {
+	type NativeHMeterBinding,
+	OriginalHMeter,
+	type OriginalHMeterBorrow,
+	type OriginalHMeterSelection,
+} from "./owner-h-meter.ts";
 import { OWNER_NATIVE_ABI, type OwnerHostProfile, ownerProfileDigest, parseOwnerHostProfile } from "./owner-profile.ts";
 import type { SessionHeader } from "./session-manager.ts";
 
 const moduleRequire = createRequire(import.meta.url);
 const constructionKey = Symbol("native-owner-construction");
+let preparedClockModule: { profilePath: string; profileDigest: string; native: NativeOwnerBinding } | undefined;
 // ponytail: an uncertain close reply cannot be retried or silently garbage-collected.
 // Retain failed bootstrap custody; an explicit native recovery protocol would be needed to release it.
 const quarantinedHosts = new Set<OwnerHost>();
 const terminalWrites = new AsyncLocalStorage<{ journal: OwnedJournal; active: boolean }>();
+
+/** Internal phase selection only; the journal still validates original custody. */
+export function isOwnedTerminalWrite(journal: OwnedJournal): boolean {
+	const scope = terminalWrites.getStore();
+	return scope?.journal === journal && scope.active && journal.isTerminalSealed();
+}
 const ownerHosts = new WeakMap<
 	OwnerHost,
 	{
@@ -27,8 +46,26 @@ const ownerHosts = new WeakMap<
 		handle: NativeHost;
 		profile: OwnerHostProfile;
 		digest: string;
+		hMeter?: OriginalHMeter;
+		hMeterReceiving?: boolean;
 	}
 >();
+
+function hMeterBinding(native: NativeOwnerBinding): NativeHMeterBinding {
+	const port = native as NativeOwnerBinding & Partial<NativeHMeterBinding>;
+	if (port.hMeterAbi !== 1) throw new Error("OWNER_H_NATIVE_ABI");
+	for (const name of [
+		"startOriginalHMeter",
+		"pollOriginalHMeter",
+		"cancelOriginalHMeter",
+		"acceptOriginalHMeter",
+		"borrowOriginalHMeter",
+		"returnOriginalHMeter",
+		"finishOriginalHMeter",
+	] as const)
+		if (typeof port[name] !== "function") throw new Error("OWNER_H_NATIVE_ABI");
+	return port as NativeOwnerBinding & NativeHMeterBinding;
+}
 
 /** Private native handles. Persisted strings cannot reconstruct them. */
 type NativeHost = object;
@@ -36,6 +73,7 @@ type NativeLease = object;
 type NativeLaunch = object;
 type NativeOperation = object;
 type NativeAdmission = object;
+const launchHandles = new WeakMap<object, NativeLaunch>();
 
 export type OwnedEffectKind = "process" | "read" | "write" | "worker" | "provider";
 export interface OwnedProviderScope {
@@ -82,7 +120,7 @@ export interface OwnerAllocationClaim {
 }
 
 export type OwnedEffectRequest =
-	| { readonly kind: "process" | "worker" }
+	| { readonly kind: "process" | "worker"; readonly timeoutMs?: number }
 	| { readonly kind: "read" | "write"; readonly root: number }
 	| ({
 			readonly kind: "provider";
@@ -144,6 +182,7 @@ export interface OwnedProcessPoll {
 	signal: number;
 	error: number;
 	drained: boolean;
+	sampleExpired: boolean;
 }
 
 /** Current native counters, not a reservation, clock qualification or grant. */
@@ -159,8 +198,82 @@ export interface NativePermissionObservation {
 	readonly remainingMs: number;
 }
 
+interface NativeLifecycleReceipt<T> {
+	readonly ready: Promise<void>;
+	remaining(): number;
+	complete(): { readonly next: NativeLifecycleReceipt<T> | null; readonly value: T };
+}
+
+interface NativeCompletionObservation {
+	current?: OriginalClockObservation;
+}
+
+type NativeLifecycleQueue = <T>(
+	start: () => NativeLifecycleReceipt<T>,
+	observation?: NativeCompletionObservation,
+) => Promise<T>;
+
+async function settleNativeLifecycle<T>(
+	receipt: NativeLifecycleReceipt<T>,
+	cancel: () => void,
+	observation?: NativeCompletionObservation,
+): Promise<T> {
+	for (;;) {
+		const timer = new AbortController();
+		const deadline = delay(receipt.remaining(), undefined, { signal: timer.signal }).then(() => {
+			const failure = new Error("OWNER_LIFECYCLE_NOT_SETTLED");
+			try {
+				cancel(); // Atomic cancellation only; the native call and references remain retained.
+			} catch (cleanup) {
+				throw new AggregateError([failure, cleanup], "OWNER_LIFECYCLE_UNKNOWN", { cause: failure });
+			}
+			throw failure;
+		});
+		try {
+			await Promise.race([receipt.ready, deadline]);
+		} finally {
+			timer.abort();
+		}
+		// Readiness is not retirement. This original native completion checks
+		// generation, actual outcome and the same deadline before acknowledging.
+		let completed = false;
+		let result: ReturnType<NativeLifecycleReceipt<T>["complete"]> | undefined;
+		try {
+			const ticket = observation ? beginOrdinaryClockOperation("native-operation-completion") : undefined;
+			completed = true;
+			result = receipt.complete();
+			if (ticket) observation!.current = commitOrdinaryClockOperation(ticket);
+		} catch (cause) {
+			let error = cause;
+			if (observation) {
+				try {
+					failOrdinaryClockOperation(cause);
+				} catch (first) {
+					error = first;
+				}
+			}
+			// A clock before-edge failure must not replay persistence. Finish only
+			// this retained native receipt, then preserve the observer failure.
+			if (!completed) {
+				completed = true;
+				try {
+					receipt.complete();
+				} catch (cleanup) {
+					throw new AggregateError([error, cleanup], "OWNER_LIFECYCLE_RECEIPT_FAILED", { cause: error });
+				}
+			}
+			throw error;
+		}
+		const { next, value } = result!;
+		if (!next) return value;
+		receipt = next;
+	}
+}
+
 interface NativeOwnerBinding {
 	abi: number;
+	clockAbi?: number;
+	readClockSample?(): NativeClockSample;
 	permissionAbi?: number;
 	inspectPermission?(lease: NativeLease): NativePermissionObservation;
 	resourceAbi?: number;
@@ -189,17 +302,26 @@ interface NativeOwnerBinding {
 	receiveCredential(lease: NativeLease): Buffer;
 	checkCredential(lease: NativeLease): void;
 	check(lease: NativeLease): void;
-	seal(lease: NativeLease): void;
-	quarantine(lease: NativeLease): void;
+	seal(lease: NativeLease): NativeLifecycleReceipt<void>;
+	quarantine(lease: NativeLease): NativeLifecycleReceipt<void> | undefined;
+	cancelLifecycle(lease: NativeLease): void;
+	beginClose(lease: NativeLease): void;
 	readJournal(lease: NativeLease, name: string): Buffer;
 	commitJournal(lease: NativeLease, name: string, previous: Buffer, next: Buffer): number;
 	commitTerminalJournal(lease: NativeLease, name: string, previous: Buffer, next: Buffer): number;
-	prepareLaunch(lease: NativeLease, request: OwnedProcessRequest): NativeLaunch;
+	commitTerminalJournalAsync(
+		lease: NativeLease,
+		name: string,
+		previous: Buffer,
+		next: Buffer,
+	): NativeLifecycleReceipt<number>;
+	prepareLaunch(lease: NativeLease, request: OwnedProcessRequest, timeoutMs: number): NativeLaunch;
 	dispatchLaunch(launch: NativeLaunch): number;
-	stopLaunch(launch: NativeLaunch): void;
-	pollLaunch(launch: NativeLaunch): OwnedProcessPoll;
+	requestStopLaunch(launch: NativeLaunch): void;
+	stopLaunch(launch: NativeLaunch): NativeLifecycleReceipt<void>;
+	pollLaunch(launch: NativeLaunch): NativeLifecycleReceipt<OwnedProcessPoll>;
 	writeLaunchStdin(launch: NativeLaunch, bytes: Buffer): number;
-	retireLaunch(launch: NativeLaunch): void;
+	retireLaunch(launch: NativeLaunch): NativeLifecycleReceipt<void>;
 	beginOperation(lease: NativeLease, request: OwnedEffectRequest): NativeOperation;
 	checkOperation(operation: NativeOperation): void;
 	connectProvider(
@@ -231,8 +353,9 @@ interface NativeOwnerBinding {
 		files: readonly OwnedTreeFile[],
 	): string;
 	removeSnapshot(operation: NativeOperation, relativePath: string): void;
-	completeOperation(operation: NativeOperation, failed: boolean): void;
-	releaseOwner(lease: NativeLease): void;
+	associateLaunch(operation: NativeOperation, launch: NativeLaunch): void;
+	completeOperation(operation: NativeOperation, failed: boolean): NativeLifecycleReceipt<void>;
+	releaseOwner(lease: NativeLease): NativeLifecycleReceipt<void>;
 }
 
 function binding(value: unknown): asserts value is NativeOwnerBinding {
@@ -250,6 +373,8 @@ function binding(value: unknown): asserts value is NativeOwnerBinding {
 		"check",
 		"seal",
 		"quarantine",
+		"cancelLifecycle",
+		"beginClose",
 		"claimAllocation",
 		"spendAutomaticTurn",
 		"stopAutomaticTurns",
@@ -258,9 +383,11 @@ function binding(value: unknown): asserts value is NativeOwnerBinding {
 		"readJournal",
 		"commitJournal",
 		"commitTerminalJournal",
+		"commitTerminalJournalAsync",
 		"prepareLaunch",
 		"dispatchLaunch",
 		"stopLaunch",
+		"requestStopLaunch",
 		"pollLaunch",
 		"writeLaunchStdin",
 		"retireLaunch",
@@ -269,6 +396,7 @@ function binding(value: unknown): asserts value is NativeOwnerBinding {
 		"readFile",
 		"writeFile",
 		"completeOperation",
+		"associateLaunch",
 		"releaseOwner",
 		"listDirectories",
 		"readTree",
@@ -346,16 +474,98 @@ export function openReleaseFile(path: string, maxBytes: number, directory?: numb
 	}
 }
 
+/** Private pre-A artifact receiving, NOT Host validation or permission. The
+ * caller binds the original clock once; normal Host loading rechecks all custody
+ * and must receive the very same module/profile. No native effect is started. */
+export function receiveOriginalClockSource(profileRef: { path: string; sha256: string }) {
+	if (
+		preparedClockModule ||
+		process.platform !== "linux" ||
+		!isAbsolute(profileRef.path) ||
+		normalize(profileRef.path) !== profileRef.path ||
+		/[\u0000-\u001f\u007f@]/.test(profileRef.path)
+	)
+		throw new Error("OWNER_CLOCK_PREPARATION");
+	const files: number[] = [];
+	let failure: { cause: unknown } | undefined;
+	try {
+		const held = openReleaseFile(profileRef.path, 65536);
+		files.push(held.fd);
+		if (ownerProfileDigest(held.bytes) !== profileRef.sha256) throw new Error("OWNER_CLOCK_PROFILE_PIN");
+		const profile = parseOwnerHostProfile(held.bytes);
+		const runtimeVersion = profile.runtime.kind === "bun" ? process.versions.bun : process.versions.node;
+		if (
+			profile.runtime.architecture !== process.arch ||
+			runtimeVersion !== profile.runtime.version ||
+			(profile.runtime.kind === "node" && process.versions.bun)
+		)
+			throw new Error("OWNER_RUNTIME_VERSION");
+		for (const artifact of [profile.artifacts.addon, profile.artifacts.runtime, ...profile.artifacts.closure]) {
+			const file = openReleaseFile(artifact.path, 268435456);
+			files.push(file.fd);
+			if (createHash("sha256").update(file.bytes).digest("hex") !== artifact.sha256)
+				throw new Error("OWNER_ARTIFACT_HASH");
+		}
+		const executable = openSync("/proc/self/exe", constants.O_RDONLY);
+		files.push(executable);
+		const running = fstatSync(executable),
+			runtime = fstatSync(files[2]);
+		if (running.dev !== runtime.dev || running.ino !== runtime.ino) throw new Error("OWNER_RUNTIME_ARTIFACT");
+		if (moduleRequire.cache[profile.artifacts.addon.path]) throw new Error("OWNER_CLOCK_ADDON_ALREADY_LOADED");
+		const native: unknown = moduleRequire(profile.artifacts.addon.path);
+		binding(native);
+		if (native.clockAbi !== 1 || typeof native.readClockSample !== "function")
+			throw new Error("OWNER_NATIVE_CLOCK_ABI");
+		// Check the named addon is still the exact held inode after module loading.
+		const rechecked = openReleaseFile(profile.artifacts.addon.path, 268435456);
+		files.push(rechecked.fd);
+		const named = fstatSync(rechecked.fd),
+			pinned = fstatSync(files[1]);
+		if (
+			named.dev !== pinned.dev ||
+			named.ino !== pinned.ino ||
+			createHash("sha256").update(rechecked.bytes).digest("hex") !== profile.artifacts.addon.sha256
+		)
+			throw new Error("OWNER_ARTIFACT_HASH");
+		Object.freeze(native);
+		preparedClockModule = { profilePath: profileRef.path, profileDigest: profileRef.sha256, native };
+		return Object.freeze({
+			implementation: Object.freeze({ ...profile.artifacts.addon }),
+		});
+	} catch (cause) {
+		failure = { cause };
+		throw cause;
+	} finally {
+		closeReleaseDescriptors(files, failure);
+	}
+}
+
+/** Fixed original native sample source. No caller can supply a read function. */
+export function readOriginalPreparedClockSample(): NativeClockSample {
+	const native = preparedClockModule?.native;
+	if (!native || native.clockAbi !== 1 || typeof native.readClockSample !== "function")
+		throw new Error("OWNER_CLOCK_NOT_PREPARED");
+	return native.readClockSample();
+}
+
 /** Internal views retain the real native obligation, not an outer abort race. */
 class OwnedOperation {
 	readonly #native: NativeOwnerBinding;
 	readonly #handle: NativeOperation;
+	readonly #lifecycle: NativeLifecycleQueue;
 
-	constructor(key: symbol, native: NativeOwnerBinding, handle: NativeOperation) {
+	constructor(key: symbol, native: NativeOwnerBinding, handle: NativeOperation, lifecycle: NativeLifecycleQueue) {
 		if (key !== constructionKey) throw new Error("OWNER_NATIVE_CONSTRUCTION");
 		this.#native = native;
 		this.#handle = handle;
+		this.#lifecycle = lifecycle;
 		Object.freeze(this);
+	}
+
+	bindProcess(process: object): void {
+		const launch = launchHandles.get(process);
+		if (!launch) throw new Error("OWNER_ORIGINAL_LAUNCH_REQUIRED");
+		this.#native.associateLaunch(this.#handle, launch);
 	}
 
 	check(): void {
@@ -410,36 +620,44 @@ class OwnedOperation {
 	removeSnapshot(relativePath: string): void {
 		this.#native.removeSnapshot(this.#handle, relativePath);
 	}
-	complete(failed: boolean): void {
-		this.#native.completeOperation(this.#handle, failed);
+	async complete(failed: boolean, observe = false): Promise<OriginalClockObservation | undefined> {
+		if (typeof observe !== "boolean") throw new Error("OWNER_COMPLETION_CALLBACK_UNSUPPORTED");
+		const observation: NativeCompletionObservation | undefined = observe ? {} : undefined;
+		await this.#lifecycle(() => this.#native.completeOperation(this.#handle, failed), observation);
+		return observation?.current;
 	}
 }
 
 class OwnedProcess {
 	readonly #native: NativeOwnerBinding;
 	readonly #handle: NativeLaunch;
+	readonly #lifecycle: NativeLifecycleQueue;
 
-	constructor(key: symbol, native: NativeOwnerBinding, handle: NativeLaunch) {
+	constructor(key: symbol, native: NativeOwnerBinding, handle: NativeLaunch, lifecycle: NativeLifecycleQueue) {
 		if (key !== constructionKey) throw new Error("OWNER_NATIVE_CONSTRUCTION");
 		this.#native = native;
 		this.#handle = handle;
+		this.#lifecycle = lifecycle;
+		launchHandles.set(this, handle);
 		Object.freeze(this);
 	}
 
 	dispatch(): number {
 		return this.#native.dispatchLaunch(this.#handle);
 	}
-	stop(): void {
-		this.#native.stopLaunch(this.#handle);
+	stop(): Promise<void> {
+		// Latch before queueing, including while an earlier read/fsync is stuck.
+		this.#native.requestStopLaunch(this.#handle);
+		return this.#lifecycle(() => this.#native.stopLaunch(this.#handle));
 	}
-	poll(): OwnedProcessPoll {
-		return this.#native.pollLaunch(this.#handle);
+	poll(): Promise<OwnedProcessPoll> {
+		return this.#lifecycle(() => this.#native.pollLaunch(this.#handle));
 	}
 	write(bytes: Buffer): number {
 		return this.#native.writeLaunchStdin(this.#handle, bytes);
 	}
-	retire(): void {
-		this.#native.retireLaunch(this.#handle);
+	retire(): Promise<void> {
+		return this.#lifecycle(() => this.#native.retireLaunch(this.#handle));
 	}
 }
 
@@ -476,11 +694,13 @@ export class OwnedJournal {
 	#previous: Buffer;
 	#loaded: boolean;
 	#quarantined = false;
+	#quarantineFailure?: { cause: unknown };
 	#sealed = false;
 	#released = false;
 	#releaseAttempted = false;
 	#activated = false;
 	#recoveryTask?: Promise<void>;
+	#lifecycleTail: Promise<unknown> = Promise.resolve();
 
 	private constructor(
 		key: symbol,
@@ -606,6 +826,10 @@ export class OwnedJournal {
 		return Buffer.from(this.#previous);
 	}
 
+	isTerminalSealed(): boolean {
+		return this.#sealed && !this.#quarantined && !this.#releaseAttempted && !this.#released;
+	}
+
 	assertWritable(): void {
 		const scope = terminalWrites.getStore();
 		if (scope?.journal === this && scope.active && this.#sealed && !this.#quarantined && !this.#releaseAttempted)
@@ -640,6 +864,30 @@ export class OwnedJournal {
 		return this.#commit(bytes, true);
 	}
 
+	async commitTerminalAsync(bytes: Buffer): Promise<{ bytes: number; sha256: string }> {
+		const scope = terminalWrites.getStore();
+		if (scope?.journal !== this || !scope.active || !this.#sealed || this.#quarantined || this.#releaseAttempted)
+			throw new Error("OWNER_TERMINAL_STATE");
+		const next = Buffer.from(bytes);
+		const previous = this.#previous;
+		if (
+			next.length > this.maxBytes ||
+			next.length < previous.length ||
+			!next.subarray(0, previous.length).equals(previous)
+		)
+			throw new Error("OWNER_JOURNAL_NOT_APPEND");
+		const count = await this.#lifecycle(() => {
+			if (!scope.active || this.#releaseAttempted) throw new Error("OWNER_TERMINAL_STATE");
+			return this.#native.commitTerminalJournalAsync(this.#lease, basename(this.file), previous, next);
+		});
+		if (count !== next.length) {
+			this.#quarantined = true;
+			throw new Error("OWNER_JOURNAL_RECEIPT");
+		}
+		this.#previous = next;
+		return { bytes: count, sha256: createHash("sha256").update(next).digest("hex") };
+	}
+
 	#commit(bytes: Buffer, terminal: boolean): { bytes: number; sha256: string } {
 		if (
 			bytes.length > this.maxBytes ||
@@ -672,6 +920,22 @@ export class OwnedJournal {
 		if (!received || this.#activated) throw new Error("OWNER_ADMISSION_ISSUER");
 		const handle = this.#native.issueAdmission(received.handle, this.#lease, policy);
 		return new OwnerAdmission(constructionKey, this, handle);
+	}
+
+	/** The core calls only AFTER original context/Source binding. Native checks
+	 * this exact allocated lease against the separately received H selection. */
+	acceptOriginalHMeter(): void {
+		this.assertActive();
+		const meter = ownerHosts.get(this.#host)?.hMeter;
+		if (!this.#activated || !meter) throw new Error("OWNER_H_ORIGINAL_HOST_REQUIRED");
+		meter.accept(this.#lease);
+	}
+
+	borrowOriginalHMeter(): OriginalHMeterBorrow {
+		this.assertActive();
+		const meter = ownerHosts.get(this.#host)?.hMeter;
+		if (!this.#activated || !meter) throw new Error("OWNER_H_ORIGINAL_HOST_REQUIRED");
+		return meter.borrow(this.#lease);
 	}
 
 	claimAllocation(allocation: OwnerAllocationClaim): void {
@@ -729,32 +993,74 @@ export class OwnedJournal {
 	beginOperation(request: OwnedEffectRequest): OwnedOperation {
 		this.assertActive();
 		if (!this.#activated) throw new Error("OWNER_NOT_ACTIVATED");
-		return new OwnedOperation(constructionKey, this.#native, this.#native.beginOperation(this.#lease, request));
+		return new OwnedOperation(
+			constructionKey,
+			this.#native,
+			this.#native.beginOperation(this.#lease, request),
+			(start, observation) => this.#lifecycle(start, observation),
+		);
 	}
 
-	prepareProcess(request: OwnedProcessRequest): OwnedProcess {
+	prepareProcess(request: OwnedProcessRequest, timeoutMs: number): OwnedProcess {
 		this.assertActive();
 		if (!this.#activated) throw new Error("OWNER_NOT_ACTIVATED");
-		return new OwnedProcess(constructionKey, this.#native, this.#native.prepareLaunch(this.#lease, request));
+		return new OwnedProcess(
+			constructionKey,
+			this.#native,
+			this.#native.prepareLaunch(this.#lease, request, timeoutMs),
+			(start) => this.#lifecycle(start),
+		);
 	}
 
-	seal(): void {
+	#lifecycle<T>(start: () => NativeLifecycleReceipt<T>, observation?: NativeCompletionObservation): Promise<T> {
+		const pending = this.#lifecycleTail.then(() => {
+			if (this.#quarantined || this.#released)
+				throw new Error("OWNER_LIFECYCLE_UNKNOWN", { cause: this.#quarantineFailure?.cause });
+			return settleNativeLifecycle(start(), () => this.#native.cancelLifecycle(this.#lease), observation);
+		});
+		// Keep rejection in the serialization chain: no later queued operation
+		// can revive the original generation after an unknown completion.
+		this.#lifecycleTail = pending;
+		void pending.catch((error: unknown) => {
+			this.#quarantineFailure ??= { cause: error };
+			this.#quarantined = true;
+		});
+		return pending;
+	}
+
+	seal(): Promise<void> {
 		if (this.#releaseAttempted) throw new Error("STALE_OWNER");
 		this.#sealed = true;
-		this.#native.seal(this.#lease);
+		this.#native.beginClose(this.#lease);
+		return this.#lifecycle(() => this.#native.seal(this.#lease));
 	}
 
 	quarantine(): void {
 		if (this.#releaseAttempted) throw new Error("STALE_OWNER");
 		this.#sealed = this.#quarantined = true;
-		this.#native.quarantine(this.#lease);
+		const pending = this.#native.quarantine(this.#lease);
+		if (pending) {
+			// Native retains uncertain custody. Observing readiness cannot reopen
+			// the owner, retry release or turn quarantine into clean retirement.
+			void settleNativeLifecycle(pending, () => this.#native.cancelLifecycle(this.#lease)).catch(
+				(error: unknown) => {
+					this.#quarantineFailure ??= { cause: error };
+				},
+			);
+		}
 	}
 
-	release(): void {
-		if (!this.#sealed || this.#quarantined || this.#releaseAttempted) throw new Error("OWNER_NOT_RETIRED");
+	cancelLifecycle(): void {
+		this.#quarantined = true;
+		this.#native.cancelLifecycle(this.#lease);
+	}
+
+	async release(): Promise<void> {
+		if (!this.#sealed || this.#quarantined || this.#releaseAttempted)
+			throw new Error("OWNER_NOT_RETIRED", { cause: this.#quarantineFailure?.cause });
 		this.#releaseAttempted = true;
 		try {
-			this.#native.releaseOwner(this.#lease);
+			await this.#lifecycle(() => this.#native.releaseOwner(this.#lease));
 			this.#released = true;
 		} catch (error) {
 			// A release reply may be lost after close consumed JA. Never write or
@@ -842,6 +1148,13 @@ export class OwnerHost {
 			}
 			const native: unknown = moduleRequire(profile.artifacts.addon.path);
 			binding(native);
+			if (
+				preparedClockModule &&
+				(preparedClockModule.profilePath !== profilePath ||
+					preparedClockModule.profileDigest !== digest ||
+					preparedClockModule.native !== native)
+			)
+				throw new Error("OWNER_CLOCK_HOST_REBOUND");
 			Object.freeze(native);
 			for (const path of [
 				join("/sys/fs/cgroup", profile.host.cgroup),
@@ -885,6 +1198,27 @@ export class OwnerHost {
 		return host!;
 	}
 
+	/** Reachable only from the original async core construction, never a path
+	 * reopen/getter or replacement for the effect cgroup root. */
+	async receiveOriginalHMeter(selection: OriginalHMeterSelection): Promise<void> {
+		const received = ownerHosts.get(this);
+		if (!received || received.hMeterReceiving) throw new Error("OWNER_H_ORIGINAL_HOST_ONCE");
+		received.hMeterReceiving = true;
+		received.hMeter = await OriginalHMeter.receive(hMeterBinding(received.native), received.handle, selection);
+	}
+
+	joinOriginalHMeter(): Promise<void> {
+		const received = ownerHosts.get(this);
+		if (!received) throw new Error("OWNER_NATIVE_HOST_REQUIRED");
+		return received.hMeter?.joinBorrow() ?? Promise.resolve();
+	}
+
+	finishOriginalHMeter(): void {
+		const received = ownerHosts.get(this);
+		if (!received) throw new Error("OWNER_NATIVE_HOST_REQUIRED");
+		received.hMeter?.finish();
+	}
+
 	/** The host control plane supplies the exact permissions, not a session UUID,
 	 * restored record, ambient owner, profile maximum or author-facing option. */
 	admit(journal: OwnedJournal, policy: OwnerAdmissionPolicy): OwnerAdmission {
@@ -895,7 +1229,16 @@ export class OwnerHost {
 	close(): void {
 		const received = ownerHosts.get(this);
 		if (!received) throw new Error("OWNER_NATIVE_HOST_REQUIRED");
+		received.hMeter?.cancelUnaccepted();
 		received.native.closeHost(received.handle);
 		ownerHosts.delete(this);
 	}
 }
+
+// Original operational bodies cannot be replaced through shared prototypes.
+Object.freeze(OwnedOperation.prototype);
+Object.freeze(OwnedOperation);
+Object.freeze(OwnedJournal.prototype);
+Object.freeze(OwnedJournal);
+Object.freeze(OwnerHost.prototype);
+Object.freeze(OwnerHost);

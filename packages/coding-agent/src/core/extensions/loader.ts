@@ -615,20 +615,56 @@ async function loadExtension(
 	}
 }
 
+const originalSenseEntries = new WeakMap<OrdinaryOwnerContext, object>();
+const originalSenseLoads = new WeakSet<OrdinaryOwnerContext>();
+const operationalCompositionSpecifier = "@smarty/sense/pi/operational-composition";
+
+/** Check original evaluated namespace identity, never its shape or a supplied verifier. */
+export function assertOriginalSenseEntry(context: OrdinaryOwnerContext, entry: object): void {
+	if (originalSenseEntries.get(context) !== entry) throw new Error("OWNER_SENSE_ORIGINAL_ENTRY_REQUIRED");
+	assertOrdinaryOwner(context);
+}
+
 /** Load only the descriptor-pinned Sense entry with original private ports. */
 export async function loadOwnedSenseExtension(context: OrdinaryOwnerContext): Promise<LoadExtensionsResult> {
 	assertOrdinaryOwner(context);
+	if (originalSenseLoads.has(context)) throw new Error("OWNER_SENSE_ORIGINAL_ENTRY_ONCE");
+	originalSenseLoads.add(context);
 	const extensionPath = context.decision.record.sense.path;
+	const nativeRequire = createRequire(extensionPath);
+	const compositionPath = nativeRequire.resolve(operationalCompositionSpecifier);
+	context.holdSenseCompositionModule(compositionPath);
+	// Native cache only: never fall back to another Jiti copy of the registry.
+	// Original C3 startup admission must cover this same canonical external graph.
+	const composition: unknown = nativeRequire(compositionPath);
+	context.checkSenseCompositionModule();
+	if (
+		!composition ||
+		typeof composition !== "object" ||
+		!("receiveOrdinaryOperationalCollector" in composition) ||
+		!("receiveOriginalOperationalCollector" in composition) ||
+		typeof composition.receiveOriginalOperationalCollector !== "function"
+	)
+		throw new Error("OWNER_SENSE_COMPOSITION_MODULE_IDENTITY");
 	const runtime = createOwnedExtensionRuntime(context.owner);
 	const eventBus = createEventBus();
 	const [createJitiImpl, virtualModules] = await context.within(() =>
 		Promise.all([getCreateJiti(), getVirtualModules()]),
 	);
 	context.assertActive();
+	// Same namespace object the extension virtual modules expose as the bundled ordinary entry.
+	const bundledOrdinary = virtualModules["@earendil-works/pi-coding-agent/ordinary"];
+	if (
+		!bundledOrdinary ||
+		typeof bundledOrdinary !== "object" ||
+		!("receiveOrdinaryOperationalCollector" in bundledOrdinary) ||
+		composition.receiveOrdinaryOperationalCollector !== bundledOrdinary.receiveOrdinaryOperationalCollector
+	)
+		throw new Error("OWNER_SENSE_COMPOSITION_MODULE_IDENTITY");
 	const loader = createJitiImpl(import.meta.url, {
 		fsCache: false,
 		moduleCache: false,
-		virtualModules,
+		virtualModules: { ...virtualModules, [operationalCompositionSpecifier]: composition },
 		tryNative: false,
 		alias: {},
 		nativeModules: [],
@@ -644,6 +680,14 @@ export async function loadOwnedSenseExtension(context: OrdinaryOwnerContext): Pr
 	);
 	context.assertActive();
 	if (!loaded || typeof loaded !== "object") throw new Error("OWNER_SENSE_ENTRY_REQUIRED");
+	context.checkSenseCompositionModule();
+	if (
+		!("receiveOriginalOperationalCollector" in loaded) ||
+		loaded.receiveOriginalOperationalCollector !== composition.receiveOriginalOperationalCollector
+	)
+		throw new Error("OWNER_SENSE_COMPOSITION_MODULE_IDENTITY");
+	if (originalSenseEntries.has(context)) throw new Error("OWNER_SENSE_ORIGINAL_ENTRY_ONCE");
+	originalSenseEntries.set(context, loaded);
 	const factory = createOrdinarySenseExtension(context, loaded as OrdinarySenseEntry);
 	const extension = await initializeExtension(
 		factory,

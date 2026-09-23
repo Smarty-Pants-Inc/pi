@@ -3,12 +3,20 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
+import {
+	assertOriginalCIClockQuery,
+	type OriginalCIClockQuery,
+	parseOriginalCIClock,
+	type ReceivedCIClock,
+} from "./ci-clock-receiving.ts";
 import type { RawRef } from "./fd-slot-expectation.ts";
 import type { IndependentlyAdmittedFdSlotPreflight } from "./fd-slot-preflight.ts";
+import { outsideFields, outsideRef } from "./outside-final-data.ts";
+import { canonicalPilotDecision } from "./references/sense/src/adapters/codex/pilot-canonical.ts";
 import type { SourceAdmissionPorts } from "./source-contracts.ts";
 
 // Exact proposed ORIGINAL controller overlay, not caller-selectable executable code.
-export const OPERATIONAL_CONTROLLER_SHA256 = "fdf74629e6a1da89ab9ba9c84c5824eb9b912ec1c2b668c2eb80e98b4505ae61";
+export const OPERATIONAL_CONTROLLER_SHA256 = "de9d62a9ea0e87c65f17c533f1007e697da400a9a5493cecd1baa96d2d624f80";
 export interface OperationalBinding {
 	version: 1;
 	namespace: "sense-operational-pi";
@@ -16,11 +24,37 @@ export interface OperationalBinding {
 	producer_contract: RawRef;
 	instruction: RawRef;
 	operational_run_id: string;
-	native: { decision: RawRef; receiving: RawRef; profile: RawRef };
+	native: { decision: RawRef; receiving: RawRef; profile: RawRef; compiledReceiving?: RawRef };
 	producers: Record<string, RawRef>;
 	allowed_operations: readonly string[];
 	fd_slot_bound: IndependentlyAdmittedFdSlotPreflight | null;
 	policy: RawRef;
+}
+/** Closed existing native selection. The optional fourth Ref is the original
+ * compiled producer's ordinary management result, NOT native owner receiving.
+ * Historical three-ref data does not admit the outside pre-import bootstrap. */
+export function assertOriginalCINativeBinding(
+	value: unknown,
+	compiledRequired = false,
+): asserts value is OperationalBinding["native"] {
+	assert(value && typeof value === "object" && !Array.isArray(value), "OPS_CI_NATIVE_BINDING");
+	const compiled = Object.hasOwn(value, "compiledReceiving");
+	outsideFields(value, compiled ? "decision receiving profile compiledReceiving" : "decision receiving profile");
+	for (const ref of Object.values(value)) outsideRef(ref);
+	assert(!compiledRequired || compiled, "OPS_OUTSIDE_COMPILED_CLOSURE_BOOTSTRAP_SOURCE_REQUIRED");
+}
+/** ORIGINAL CI canonical_digest uses Python's default ensure_ascii=True, not
+ * Pilot's UTF-8 raw-document encoding. Keep the existing restricted integer and
+ * Unicode-scalar domain; a different numeric domain requires a reviewed recipe. */
+export function canonicalOriginalCIData(value: unknown): Buffer {
+	// ponytail: reuse Pilot's code-point ordering and scalar validation. Escaping
+	// UTF-16 units also reproduces Python's paired-surrogate spelling for non-BMP.
+	const text = canonicalPilotDecision(value)
+		.toString("utf8")
+		.replace(/[\u007f-\uffff]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+	const bytes = Buffer.from(text, "ascii");
+	assert(bytes.length <= 65536, "OPS_CI_CANONICAL_BOUND");
+	return bytes;
 }
 export interface OriginalCISelection {
 	readonly controller: RawRef;
@@ -134,6 +168,12 @@ export function parseOriginalCIInitial(raw: Uint8Array): ReceivedCIInitial {
 export function receiveOriginalCIAuthorization(
 	selection: OriginalCISelection,
 	nativeReceiving: RawRef,
+	operation: Parameters<SourceAdmissionPorts["admission"]["check"]>[0],
+	query: OriginalCIClockQuery,
+): ReceivedCIClock;
+export function receiveOriginalCIAuthorization(
+	selection: OriginalCISelection,
+	nativeReceiving: RawRef,
 	operation: "preflight",
 	initial: true,
 ): ReceivedCIInitial;
@@ -146,8 +186,11 @@ export function receiveOriginalCIAuthorization(
 	selection: OriginalCISelection,
 	nativeReceiving: RawRef,
 	operation: Parameters<SourceAdmissionPorts["admission"]["check"]>[0],
-	initial = false,
-): ReceivedCIData | ReceivedCIInitial {
+	variant: boolean | OriginalCIClockQuery = false,
+): ReceivedCIData | ReceivedCIInitial | ReceivedCIClock {
+	const initial = variant === true;
+	const query = typeof variant === "object" ? variant : undefined;
+	if (query) assertOriginalCIClockQuery(query);
 	assert(!initial || operation === "preflight", "OPS_CI_INITIAL_OPERATION");
 	assert(
 		["preflight", "configure", "request", "burst", "refresh", "boundary"].includes(operation),
@@ -178,11 +221,11 @@ export function receiveOriginalCIAuthorization(
 	protectedPath();
 	const fd = openSync(selection.controller.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
 	const errors: unknown[] = [];
-	let received: ReceivedCIData | ReceivedCIInitial | undefined;
+	let received: ReceivedCIData | ReceivedCIInitial | ReceivedCIClock | undefined;
 	try {
 		const before = fstatSync(fd);
 		assert(
-			before.isFile() && before.nlink === 1 && !(before.mode & 0o222) && before.size <= 256 * 1024,
+			before.isFile() && before.nlink === 1 && !(before.mode & 0o222) && before.size <= 1024 * 1024,
 			"OPS_CI_CONTROLLER_FILE",
 		);
 		const check = () => {
@@ -216,7 +259,7 @@ export function receiveOriginalCIAuthorization(
 				operation,
 				nativeReceiving.path,
 				nativeReceiving.sha256,
-				...(initial ? ["initial"] : []),
+				...(initial ? ["initial"] : query ? ["clock", query.beforeNs, query.afterNs] : []),
 			],
 			{
 				env: { PATH: "/usr/bin:/bin", LANG: "C" },
@@ -226,7 +269,11 @@ export function receiveOriginalCIAuthorization(
 			},
 		);
 		check();
-		const projection = initial ? parseOriginalCIInitial(raw) : undefined;
+		const projection = initial
+			? parseOriginalCIInitial(raw)
+			: query
+				? parseOriginalCIClock(raw, query, operation, nativeReceiving)
+				: undefined;
 		const result = projection
 			? projection.authorization
 			: (JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)) as ReceivedCIData);
@@ -238,6 +285,7 @@ export function receiveOriginalCIAuthorization(
 				result.authorization.release_sha256 === selection.releaseSha256,
 			"OPS_CI_ORIGINAL_PROVENANCE",
 		);
+		assertOriginalCINativeBinding(result.authorization.operational_binding.native);
 		received = projection ?? result;
 	} catch (cause) {
 		errors.push(cause);

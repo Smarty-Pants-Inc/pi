@@ -1,12 +1,18 @@
 import type { AgentSession } from "./agent-session.ts";
+import { assertOriginalSenseEntry } from "./extensions/loader.ts";
 import type { ExtensionAPI, ExtensionFactory } from "./extensions/types.ts";
 import { createOrdinaryDefinitionPorts, type OrdinarySenseScope } from "./ordinary-definitions.ts";
 import { createOrdinaryExecutor } from "./ordinary-executor.ts";
 import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "./ordinary-owner-context.ts";
 import { createOrdinaryProviderIntegration } from "./ordinary-provider.ts";
 import type { consumeOrdinaryPairedInput } from "./ordinary-request-pair.ts";
+import {
+	attachOrdinarySenseComposition,
+	type OriginalOperationalCollector,
+	originalOperationalCollectorToken,
+} from "./ordinary-runtime.ts";
 import type { OrdinaryValidatedSetup, SetupRawRef } from "./ordinary-sc085-setup.ts";
-import type { SessionManager } from "./session-manager.ts";
+import { appendOwnedTerminalEntry, persistOwnedTerminalSession, type SessionManager } from "./session-manager.ts";
 import type { OwnedJournalView } from "./session-ownership.ts";
 
 // Structural types for the one deployment-pinned bundle, not package discovery
@@ -94,6 +100,12 @@ export interface OrdinaryOperationalHooks {
 	sc085SetupReceiver?(receive: (event: OrdinaryValidatedSetup) => Promise<SetupRawRef>): void;
 }
 
+const originalCoreOwners = new WeakMap<object, OrdinaryOwnerContext>();
+
+export function assertOriginalCoreOwner(context: OrdinaryOwnerContext, owner: object): void {
+	if (originalCoreOwners.get(owner) !== context) throw new Error("OWNER_SENSE_ORIGINAL_CORE_OWNER_REQUIRED");
+}
+
 interface CommonOwner {
 	scope: OrdinarySenseScope;
 	epoch: string;
@@ -117,8 +129,14 @@ export interface OrdinarySenseEntry {
 		journal: OwnedJournalView,
 		newLineage: boolean,
 	): string;
+	receiveOriginalOperationalCollector(
+		token: object,
+		recorder: unknown,
+		context: OrdinaryOwnerContext,
+	): Readonly<OriginalOperationalCollector>;
 	createOwnedPiSenseExtension(options: {
-		operational?: Readonly<OrdinaryOperationalHooks>;
+		ordinaryComposition?: object;
+		operationalCollector?: object;
 		owner: CommonOwner;
 		manager: SessionManager;
 		journal: OwnedJournalView;
@@ -167,6 +185,7 @@ export function createOrdinarySenseExtension(
 	context: OrdinaryOwnerContext,
 	entry: OrdinarySenseEntry,
 ): ExtensionFactory {
+	assertOriginalSenseEntry(context, entry);
 	assertOrdinaryOwner(context);
 	for (const member of [
 		entry.FileDefinitions,
@@ -208,14 +227,18 @@ export function createOrdinarySenseExtension(
 		epoch: context.owner.grant,
 		isCurrent: () => context.isCurrent(),
 	});
+	originalCoreOwners.set(owner, context);
+	const ordinaryComposition = attachOrdinarySenseComposition(context, entry, owner);
+	const operationalCollector = originalOperationalCollectorToken(context);
 	const definitions = createOrdinaryDefinitionPorts(context, scope);
 	const executor = createOrdinaryExecutor(context, scope, definitions);
 	const bridge = context.within(() =>
 		entry.createOwnedPiSenseExtension({
+			...(ordinaryComposition ? { ordinaryComposition } : {}),
 			owner,
 			manager,
 			journal,
-			operational: context.operational,
+			...(operationalCollector ? { operationalCollector } : {}),
 			core: {
 				definitions: new entry.FileDefinitions(definitions.options),
 				executor,
@@ -238,7 +261,12 @@ export function createOrdinarySenseExtension(
 				},
 				fault: () => context.owner.quarantine(),
 				wakeIntention: (event) => context.operationalAudit.wakeIntention(event),
-				exposure: (frame, receipt) => context.operationalAudit.exposure(frame, receipt),
+				...(!ordinaryComposition
+					? {
+							exposure: (frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt) =>
+								context.operationalAudit.exposure(frame, receipt),
+						}
+					: {}),
 			},
 			canSubmit: () => context.canSubmitNative(),
 			providerAcceptanceQualified: () => false,
@@ -251,6 +279,8 @@ export function createOrdinarySenseExtension(
 		bindSession: (session) => bridge.bindSession(session),
 		installProviderGuard: (session) => provider.install(session),
 		canSubmit: () => bridge.canSubmit(),
+		providerIdle: () => provider.isIdle(),
+		joinProvider: () => provider.join(),
 		async close() {
 			const results = await Promise.allSettled([
 				Promise.resolve().then(() => bridge.close()),
@@ -259,8 +289,8 @@ export function createOrdinarySenseExtension(
 			const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
 			if (errors.length) throw new AggregateError(errors, "OWNER_SENSE_CLOSE_FAILED", { cause: errors[0] });
 			const state = await executor.retained();
-			await context.owner.terminal(() => {
-				manager.appendCustomEntry("smarty-sense:ordinary-retention-v1", {
+			await context.owner.terminal(async () => {
+				await appendOwnedTerminalEntry(manager, "smarty-sense:ordinary-retention-v1", {
 					protocol: 1,
 					allocation: record.admission.allocation.id,
 					ownerEpoch: context.owner.grant,
@@ -269,7 +299,7 @@ export function createOrdinarySenseExtension(
 					snapshots: definitions.retained(),
 					state,
 				});
-				journal.flush(manager);
+				await persistOwnedTerminalSession(manager);
 			});
 		},
 	});
