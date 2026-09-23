@@ -37,6 +37,7 @@ import {
 	fuzzyFilter,
 	getCapabilities,
 	hyperlink,
+	linkifyUrls,
 	Markdown,
 	matchesKey,
 	Spacer,
@@ -3746,6 +3747,7 @@ export class InteractiveMode {
 		const last = children.length > 0 ? children[children.length - 1] : undefined;
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
+		message = linkifyUrls(message);
 		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
 			this.lastStatusText.setText(theme.fg("dim", message));
 			this.ui.requestRender();
@@ -4519,13 +4521,15 @@ export class InteractiveMode {
 
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
+		this.chatContainer.addChild(
+			new Text(theme.fg("error", `Error: ${linkifyUrls(errorMessage)}`), this.outputPad, 0),
+		);
 		this.ui.requestRender();
 	}
 
 	showWarning(warningMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
+		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${linkifyUrls(warningMessage)}`), 1, 0));
 		this.ui.requestRender();
 	}
 
