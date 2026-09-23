@@ -6,6 +6,7 @@ import type { AgentSession } from "./agent-session.ts";
 import type { CreateAgentSessionRuntimeFactory } from "./agent-session-runtime.ts";
 import type { AgentSessionServices } from "./agent-session-services.ts";
 import { OrdinaryAutomaticHold, type OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
+import { OriginalCompaction, type OriginalCompactionReceipt } from "./ordinary-compaction.ts";
 import { assertCountSemantics, type CountSemantics, parseCountSemantics } from "./ordinary-count-semantics.ts";
 import { receivePreparedCredential } from "./ordinary-credential-binding.ts";
 import { type NativeTuiAuditState, OrdinaryOperationalAudit } from "./ordinary-operational-audit.ts";
@@ -21,16 +22,25 @@ import {
 	recordOrdinaryPairedStream,
 } from "./ordinary-request-pair.ts";
 import { OrdinaryRequestProvenance } from "./ordinary-request-provenance.ts";
+import {
+	assertOriginalRuntimeFactory,
+	publishOrdinaryUsage,
+	receivedOrdinaryOperationalHooks,
+} from "./ordinary-runtime.ts";
 import { createOriginalSc085 } from "./ordinary-sc085.ts";
+import type { OrdinarySc085Setup } from "./ordinary-sc085-setup.ts";
 import {
 	bindSc085OriginalChild,
 	checkSc085Operation,
 	enterSc085OriginalReceiving,
 	guardSc085OriginalCallback,
+	qualifySc085OriginalStamp,
+	receiveSc085Compaction,
+	receiveSc085OriginalHMeter,
 	receiveSc085OriginalStorage,
 	type Sc085OriginalReceiving,
 } from "./ordinary-sc085-source/operational-admission.ts";
-import type { OrdinaryOperationalHooks } from "./ordinary-sense.ts";
+import type { OrdinaryCapture, OrdinaryOperationalHooks } from "./ordinary-sense.ts";
 import {
 	OrdinaryTokenBudget,
 	type TokenCountPlan,
@@ -49,6 +59,12 @@ const contexts = new WeakSet<OrdinaryOwnerContext>();
 const factories = new WeakMap<CreateAgentSessionRuntimeFactory, OrdinaryOwnerContext>();
 const serviceOwners = new WeakMap<AgentSessionServices, OrdinaryOwnerContext>();
 const inputs = new WeakMap<object, OrdinaryOwnerContext>();
+export let assertOriginalCompactionOwner: (
+	context: OrdinaryOwnerContext,
+	compaction: OriginalCompaction,
+	receiving: Sc085OriginalReceiving,
+	session: AgentSession,
+) => void;
 
 /** Private propagation, deliberately absent from public option shapes/exports. */
 export function bindOrdinaryOptions<T extends object>(options: T, owner: OrdinaryOwnerContext): T {
@@ -82,11 +98,24 @@ export interface OrdinarySenseBridge {
 	bindSession(session: AgentSession): void;
 	installProviderGuard(session: AgentSession): void;
 	canSubmit(): boolean;
+	providerIdle(): boolean;
+	joinProvider(): Promise<void>;
 	close(): Promise<void>;
 }
 
 /** Private original-owner handle. A parsed record or matching UUID cannot make one. */
 export class OrdinaryOwnerContext {
+	static {
+		assertOriginalCompactionOwner = (context, compaction, receiving, session) => {
+			if (
+				!contexts.has(context) ||
+				context.#compaction !== compaction ||
+				context.#sc085Receiving !== receiving ||
+				context.#session !== session
+			)
+				throw new Error("OPS_COMPACTION_ORIGINAL_RECEIVING_REQUIRED");
+		};
+	}
 	readonly owner: SessionOwnership;
 	readonly operationalAudit: OrdinaryOperationalAudit;
 	readonly requestProvenance = new OrdinaryRequestProvenance<TokenReservation>();
@@ -95,9 +124,11 @@ export class OrdinaryOwnerContext {
 	readonly profilePath: string;
 	readonly applicationPath: string;
 	readonly #files: number[];
+	readonly #senseEntryDescriptor: number | undefined;
+	#senseCompositionAttempted = false;
+	#senseCompositionModule?: { path: string; fd: number; sha256: string };
 	readonly #tokenBudget: OrdinaryTokenBudget;
 	readonly #countSemantics?: Readonly<CountSemantics>;
-	#usageSink?: (receipt: TokenSettlement) => void;
 	readonly #publishedUsage = new WeakSet<TokenSettlement>();
 	#stopped = false;
 	readonly #credential: ReturnType<typeof receivePreparedCredential>;
@@ -114,6 +145,7 @@ export class OrdinaryOwnerContext {
 	#session?: AgentSession;
 	#bindingSession = false;
 	#guardInstalled = false;
+	#guardStream?: AgentSession["agent"]["streamFunction"];
 	readonly #automaticHold = new OrdinaryAutomaticHold();
 	readonly #sc085Receiving?: Sc085OriginalReceiving;
 	#sc085?: ReturnType<typeof createOriginalSc085>;
@@ -123,6 +155,8 @@ export class OrdinaryOwnerContext {
 		requestWake(recheck: () => boolean, enroll?: OriginalAutomaticEnrollment): Promise<"started" | "suppressed">;
 	};
 	readonly #preparedFetches = new WeakSet<typeof globalThis.fetch>();
+	readonly #compaction: OriginalCompaction;
+	#compactionRetained?: { path: string; sha256: string };
 
 	constructor(
 		key: symbol,
@@ -136,11 +170,13 @@ export class OrdinaryOwnerContext {
 	) {
 		if (key !== constructionKey || ownershipOf(owner.manager) !== owner) throw new Error("OWNER_NATIVE_CONSTRUCTION");
 		this.owner = owner;
+		this.#compaction = new OriginalCompaction(owner.host.profile.storage.journalBytes);
 		this.#sc085Receiving = sc085;
 		this.decision = decision;
 		this.profilePath = profilePath;
 		this.applicationPath = applicationPath;
 		this.#files = files;
+		this.#senseEntryDescriptor = files.at(-1);
 		this.operationalAudit = new OrdinaryOperationalAudit(
 			{ ownerEpoch: owner.grant, sessionId: owner.sessionId, allocationId: decision.allocation.id },
 			Math.min(65536, owner.host.profile.limits.operationsPerOwner * 64),
@@ -212,7 +248,7 @@ export class OrdinaryOwnerContext {
 	 * could resolve it back to a replaced pathname before opening the source. */
 	readSenseEntry(): string {
 		this.assertActive();
-		const fd = this.#files.at(-1);
+		const fd = this.#senseEntryDescriptor;
 		if (fd === undefined) throw new Error("OWNER_SENSE_DESCRIPTOR");
 		const before = fstatSync(fd);
 		if (!before.isFile() || before.uid !== 0 || before.mode & 0o022 || before.size > 268_435_456)
@@ -236,6 +272,42 @@ export class OrdinaryOwnerContext {
 		}
 		this.assertActive();
 		return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+	}
+
+	/** Fixed loader only. A canonical external must be an exact original native
+	 * profile closure member, not merely a resolver result or matching filename. */
+	holdSenseCompositionModule(path: string): void {
+		this.assertActive();
+		if (this.#senseCompositionAttempted) throw new Error("OWNER_SENSE_COMPOSITION_MODULE_ONCE");
+		this.#senseCompositionAttempted = true;
+		const matches = this.owner.host.profile.artifacts.closure.filter((entry) => entry.path === path);
+		if (matches.length !== 1 || !path.endsWith(".mjs")) throw new Error("OWNER_SENSE_COMPOSITION_CLOSURE_REQUIRED");
+		const file = openReleaseFile(path, 268_435_456);
+		this.#files.push(file.fd);
+		this.#senseCompositionModule = { path, fd: file.fd, sha256: matches[0].sha256 };
+		if (createHash("sha256").update(file.bytes).digest("hex") !== matches[0].sha256)
+			throw new Error("OWNER_SENSE_COMPOSITION_MODULE_HASH");
+		this.assertActive();
+	}
+
+	checkSenseCompositionModule(): void {
+		this.assertActive();
+		const original = this.#senseCompositionModule;
+		if (!original) throw new Error("OWNER_SENSE_COMPOSITION_CLOSURE_REQUIRED");
+		const file = openReleaseFile(original.path, 268_435_456);
+		this.#files.push(file.fd);
+		const named = fstatSync(file.fd),
+			held = fstatSync(original.fd);
+		if (
+			named.dev !== held.dev ||
+			named.ino !== held.ino ||
+			named.size !== held.size ||
+			named.mtimeMs !== held.mtimeMs ||
+			named.ctimeMs !== held.ctimeMs ||
+			createHash("sha256").update(file.bytes).digest("hex") !== original.sha256
+		)
+			throw new Error("OWNER_SENSE_COMPOSITION_MODULE_CHANGED");
+		this.assertActive();
 	}
 
 	/** Private Stage B/action observation. Source must still authenticate the
@@ -327,11 +399,22 @@ export class OrdinaryOwnerContext {
 		);
 	}
 
-	/** Private host collector binding, not an admission or author-facing API. */
-	bindUsageSink(sink: (receipt: TokenSettlement) => void): void {
+	/** Original setup ledger only; neither matching scope nor a supplied check can
+	 * select another receiving, recorder or hook set. This is not a DATA mint. */
+	originalSetupReceiving(setup: OrdinarySc085Setup): Sc085OriginalReceiving {
+		if (!contexts.has(this)) throw new Error("OWNER_SC085_SETUP_ORIGINAL_OWNER_REQUIRED");
+		this.operationalAudit.assertOriginalSetup(setup);
+		if (!this.#sc085Receiving || this.#operational !== receivedOrdinaryOperationalHooks(this))
+			throw new Error("OWNER_SC085_SETUP_ORIGINAL_RECEIVING_REQUIRED");
 		this.assertActive();
-		if (this.#usageSink) throw new Error("OWNER_USAGE_SINK_BOUND");
-		this.#usageSink = sink;
+		return this.#sc085Receiving;
+	}
+
+	/** SAME recorder retained by original Sc085 receiving, not a supplied writer. */
+	originalOperationalRecorder() {
+		this.assertActive();
+		if (!this.#sc085Receiving) throw new Error("OWNER_SC085_RECEIVING_REQUIRED");
+		return receiveSc085OriginalStorage(this.#sc085Receiving, this);
 	}
 
 	reserveProviderTokens(requestId: string, payloadHash: string): TokenReservation {
@@ -355,7 +438,7 @@ export class OrdinaryOwnerContext {
 		// Do not retry an uncertain journal write or a throwing external sink.
 		this.#publishedUsage.add(receipt);
 		this.within(() => this.owner.manager.appendCustomEntry("smarty-sense:provider-usage-v1", receipt));
-		this.#usageSink?.(receipt);
+		publishOrdinaryUsage(this, receipt);
 		this.assertActive();
 	}
 
@@ -379,6 +462,13 @@ export class OrdinaryOwnerContext {
 		if (this.#admission || session.sessionManager !== this.owner.manager)
 			throw new Error("OWNER_SESSION_ADMISSION_BINDING");
 		const agent = session.agent;
+		// A prior imported transcript has no complete original observation ledger.
+		if (
+			session.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "message" || entry.type === "compaction" || entry.type === "branch_summary")
+		)
+			this.#compaction.invalidateHistory();
 		this.#admission = Object.freeze({ session, agent, requestWake });
 		this.#auditSubscriptions.push(
 			agent.observeLifecycle(
@@ -474,7 +564,8 @@ export class OrdinaryOwnerContext {
 			this.#admission?.session !== session ||
 			session.sessionManager !== this.owner.manager ||
 			session.agent !== this.#admission.agent ||
-			!this.#guardInstalled
+			!this.#guardInstalled ||
+			session.agent.streamFunction !== this.#guardStream
 		) {
 			throw new Error("OWNER_SESSION_START_BINDING");
 		}
@@ -488,6 +579,7 @@ export class OrdinaryOwnerContext {
 		this.#guardInstalled = true;
 		try {
 			this.#sense!.installProviderGuard(session);
+			this.#guardStream = session.agent.streamFunction;
 			this.assertActive();
 		} catch (error) {
 			this.#stopped = true;
@@ -508,6 +600,8 @@ export class OrdinaryOwnerContext {
 			bindSession: bridge.bindSession.bind(bridge),
 			installProviderGuard: bridge.installProviderGuard.bind(bridge),
 			canSubmit: bridge.canSubmit.bind(bridge),
+			providerIdle: bridge.providerIdle.bind(bridge),
+			joinProvider: bridge.joinProvider.bind(bridge),
 			close: bridge.close.bind(bridge),
 		});
 		this.assertActive();
@@ -537,6 +631,7 @@ export class OrdinaryOwnerContext {
 	}
 
 	assertSubmission(): void {
+		this.#compaction.assertProvider();
 		this.assertActive();
 		if (this.#session) this.assertSessionStart(this.#session);
 		if (!this.#session || this.#bindingSession || !this.#sense?.canSubmit())
@@ -544,6 +639,84 @@ export class OrdinaryOwnerContext {
 		// The bridge can reenter shutdown while answering. Its boolean cannot
 		// revive the original owner after that callback returns.
 		this.assertSessionStart(this.#session);
+	}
+
+	assertCompactionIdle(): void {
+		this.#compaction.assertIdle();
+	}
+
+	observeCompactionContext(capture: OrdinaryCapture | null): void {
+		this.#compaction.observe(capture);
+	}
+
+	assertCompactionRequest(value: unknown): void {
+		this.#compaction.assertRequest(value);
+	}
+
+	compactionReceipt() {
+		return this.#compaction.snapshot();
+	}
+
+	compactionEvidence() {
+		return {
+			receipt: this.#compaction.snapshot(),
+			lastRetained: this.#compactionRetained ? { ...this.#compactionRetained } : null,
+		};
+	}
+
+	/** Original context/receiving/session are DATA capabilities, never function suppliers. */
+	async compactOriginal(receiving: Sc085OriginalReceiving, signal: AbortSignal) {
+		if (!this.#session) throw new Error("OPS_COMPACTION_ORIGINAL_RECEIVING_REQUIRED");
+		assertOriginalCompactionOwner(this, this.#compaction, receiving, this.#session);
+		if (!this.#sense?.providerIdle()) throw new Error("OPS_COMPACTION_PROVIDER_NOT_IDLE");
+		const session = this.#session;
+		return this.within(() => this.#compaction.run(this, receiving, session, signal));
+	}
+
+	originalCompactionIdentity(receiving: Sc085OriginalReceiving, session: AgentSession) {
+		assertOriginalCompactionOwner(this, this.#compaction, receiving, session);
+		const selected = receiveSc085Compaction(receiving, this);
+		return {
+			ownerEpoch: this.owner.grant,
+			sessionId: this.owner.sessionId,
+			allocationId: this.decision.allocation.id,
+			method: selected.method,
+		};
+	}
+
+	checkOriginalCompaction(receiving: Sc085OriginalReceiving, session: AgentSession): void {
+		assertOriginalCompactionOwner(this, this.#compaction, receiving, session);
+		this.assertSessionStart(session);
+		this.assertCredentialBinding();
+		this.assertNativeTokenReservation();
+		checkSc085Operation(receiving, this, "boundary");
+	}
+
+	joinOriginalCompaction(receiving: Sc085OriginalReceiving, session: AgentSession): Promise<void> {
+		assertOriginalCompactionOwner(this, this.#compaction, receiving, session);
+		if (!this.#sense) throw new Error("OWNER_SENSE_BINDING_REQUIRED");
+		return this.#sense.joinProvider();
+	}
+
+	qualifyOriginalCompaction(receiving: Sc085OriginalReceiving, entryId: string) {
+		if (receiving !== this.#sc085Receiving) throw new Error("OPS_COMPACTION_ORIGINAL_RECEIVING_REQUIRED");
+		return qualifySc085OriginalStamp(receiving, this, { kind: "compaction", entryId }).raw;
+	}
+
+	retainOriginalCompaction(receiving: Sc085OriginalReceiving, value: OriginalCompactionReceipt): void {
+		if (receiving !== this.#sc085Receiving) throw new Error("OPS_COMPACTION_ORIGINAL_RECEIVING_REQUIRED");
+		const storage = receiveSc085OriginalStorage(receiving, this);
+		guardSc085OriginalCallback(receiving, () => {
+			const raw = storage.bytes(Buffer.from(`${JSON.stringify(value)}\n`));
+			const retained = storage.retained.get(raw.path);
+			if (
+				!retained ||
+				createHash("sha256").update(retained).digest("hex") !== raw.sha256 ||
+				Buffer.from(retained).toString("utf8") !== `${JSON.stringify(value)}\n`
+			)
+				throw new Error("OPS_COMPACTION_RECEIPT_RETENTION");
+			this.#compactionRetained = { ...raw };
+		});
 	}
 
 	fileTarget(path: string, writable: boolean): { root: number; relativePath: string } {
@@ -583,47 +756,34 @@ export class OrdinaryOwnerContext {
 		return this.#operational;
 	}
 
-	bindFactory(
-		factory: CreateAgentSessionRuntimeFactory,
-		operational?: OrdinaryOperationalHooks,
-	): CreateAgentSessionRuntimeFactory {
-		this.assertActive();
-		if (this.#runtimeFactory || factories.has(factory)) throw new Error("OWNER_RUNTIME_FACTORY");
-		let retained: Readonly<OrdinaryOperationalHooks> | undefined;
-		if (operational !== undefined) {
-			const { executor, opened, wakeIntention, sc085SetupReceiver } = operational;
-			if (
-				typeof executor !== "function" ||
-				typeof opened !== "function" ||
-				typeof wakeIntention !== "function" ||
-				(sc085SetupReceiver !== undefined && typeof sc085SetupReceiver !== "function")
-			) {
-				throw new Error("OWNER_OPERATIONAL_HOOKS");
-			}
-			retained = Object.freeze({
-				executor: executor.bind(operational),
-				opened: opened.bind(operational),
-				wakeIntention: wakeIntention.bind(operational),
-				...(sc085SetupReceiver ? { sc085SetupReceiver: sc085SetupReceiver.bind(operational) } : {}),
-			});
-		}
-		this.assertActive();
+	bindFactory(factory: CreateAgentSessionRuntimeFactory): CreateAgentSessionRuntimeFactory {
+		// biome-ignore lint/complexity/noArguments: Refuse extra callback arguments; rest parameters would change the public arity.
+		if (arguments.length !== 1) throw new Error("OWNER_OPERATIONAL_CALLBACKS_UNSUPPORTED");
+		assertOriginalRuntimeFactory(this, factory);
 		if (this.#runtimeFactory || factories.has(factory)) throw new Error("OWNER_RUNTIME_FACTORY");
 		this.#runtimeFactory = factory;
-		this.#operational = retained;
 		factories.set(factory, this);
-		if (this.#sc085Receiving) {
-			const receiving = this.#sc085Receiving;
-			if (!retained?.sc085SetupReceiver) throw new Error("OWNER_SC085_SETUP_REGISTRATION_REQUIRED");
-			const storage = receiveSc085OriginalStorage(receiving, this);
-			this.operationalAudit.registerValidatedSetupReceiver(
-				retained.sc085SetupReceiver,
-				{ get: (path) => guardSc085OriginalCallback(receiving, () => storage.retained.get(path)) },
-				(value) => guardSc085OriginalCallback(receiving, () => storage.record(value)),
-				() => checkSc085Operation(receiving, this, "boundary"),
-			);
-		} else if (retained?.sc085SetupReceiver) throw new Error("OWNER_SC085_RECEIVING_REQUIRED");
 		return factory;
+	}
+
+	/** No callable inputs: retrieve the exact source-owned record after the
+	 * canonical collector and original recorder/context have authenticated. */
+	finishOriginalOperationalHooks(): void {
+		this.assertActive();
+		if (!this.#runtimeFactory || this.#operational) throw new Error("OWNER_OPERATIONAL_HOOKS_ONCE");
+		const retained = receivedOrdinaryOperationalHooks(this);
+		if (
+			!Object.isFrozen(retained) ||
+			typeof retained.executor !== "function" ||
+			typeof retained.opened !== "function" ||
+			typeof retained.wakeIntention !== "function"
+		)
+			throw new Error("OWNER_OPERATIONAL_HOOKS");
+		this.#operational = retained;
+		if (this.#sc085Receiving) {
+			if (!retained.sc085SetupReceiver) throw new Error("OWNER_SC085_SETUP_REGISTRATION_REQUIRED");
+			this.operationalAudit.registerValidatedSetupReceiver(this);
+		} else if (retained.sc085SetupReceiver) throw new Error("OWNER_SC085_RECEIVING_REQUIRED");
 	}
 
 	bindServices(services: AgentSessionServices): void {
@@ -670,6 +830,15 @@ export class OrdinaryOwnerContext {
 		}
 	}
 
+	/** Private same-process port for the actual canonical Sense meter. No SDK
+	 * export, external FD adoption, callback enrollment or alternate owner. */
+	borrowOriginalHMeter() {
+		assertOrdinaryOwner(this);
+		if (!this.#sc085Receiving) throw new Error("OWNER_H_ORIGINAL_RECEIVING_REQUIRED");
+		checkSc085Operation(this.#sc085Receiving, this, "preflight");
+		return this.owner.borrowOriginalHMeter();
+	}
+
 	close(hooks: Parameters<SessionOwnership["close"]>[0] = {}): Promise<void> {
 		if (!contexts.has(this)) throw new Error("OWNER_NATIVE_CONSTRUCTION");
 		if (!this.#closing) {
@@ -693,6 +862,7 @@ export class OrdinaryOwnerContext {
 
 	async #close(hooks: NonNullable<Parameters<SessionOwnership["close"]>[0]>): Promise<void> {
 		const errors: unknown[] = [];
+		let hostJoined = false;
 		try {
 			await this.owner.close({
 				...hooks,
@@ -704,15 +874,30 @@ export class OrdinaryOwnerContext {
 						Promise.resolve().then(() => (hooks.stop ? hooks.stop() : this.#session?.abort())),
 					]);
 					const errors = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
-					if (errors.length) throw new AggregateError(errors, "OWNER_STOP_FAILED");
+					if (errors.length) throw new AggregateError(errors, "OWNER_STOP_FAILED", { cause: errors[0] });
+				},
+				settle: async () => {
+					const results = await Promise.allSettled([
+						Promise.resolve().then(() => hooks.settle?.()),
+						this.owner.host.joinOriginalHMeter(),
+					]);
+					const failures = results.flatMap((result) => (result.status === "rejected" ? [result.reason] : []));
+					if (failures.length === 1) throw failures[0];
+					if (failures.length)
+						throw new AggregateError(failures, "OWNER_H_METER_JOIN_FAILED", { cause: failures[0] });
 				},
 				persist: () => (hooks.persist ? hooks.persist() : this.#session?.dispose()),
 			});
+			// Native owner/holder drain already completed, and the actual Sense
+			// duplicate/pending join returned its branded borrow inside that SAME
+			// close budget. Only now may native send H_CLOSED once.
+			this.owner.host.finishOriginalHMeter();
+			hostJoined = true;
 		} catch (error) {
 			errors.push(error);
 		}
 		// Unknown native custody retains its deployment descriptors as well as H.
-		if (this.owner.phase === "closed")
+		if (this.owner.phase === "closed" && hostJoined)
 			for (const fd of this.#files.splice(0)) {
 				try {
 					closeSync(fd);
@@ -727,9 +912,13 @@ export class OrdinaryOwnerContext {
 		for (const unsubscribe of this.#auditSubscriptions.splice(0)) unsubscribe();
 		this.operationalAudit.close(errors.length === 0 && this.owner.phase === "closed");
 		if (errors.length === 1) throw errors[0];
-		if (errors.length) throw new AggregateError(errors, "OWNER_RECEIVING_CLOSE_FAILED");
+		if (errors.length) throw new AggregateError(errors, "OWNER_RECEIVING_CLOSE_FAILED", { cause: errors[0] });
 	}
 }
+
+// Original operation bodies cannot be substituted through public prototypes.
+Object.freeze(OrdinaryOwnerContext.prototype);
+Object.freeze(OrdinaryOwnerContext);
 
 export function assertOrdinaryOwner(context: OrdinaryOwnerContext): void {
 	if (!contexts.has(context)) throw new Error("OWNER_PROFILE_UNAVAILABLE: no received ordinary owner");
@@ -819,7 +1008,13 @@ export async function receiveOrdinaryOwner(
 			if (createHash("sha256").update(file.bytes).digest("hex") !== artifact.sha256)
 				throw new Error("OWNER_ARTIFACT_HASH");
 		}
+		const hReceiving = sc085 ? receiveSc085OriginalHMeter(sc085) : undefined;
 		host = OwnerHost.loadNative(profilePath);
+		if (hReceiving) {
+			if (hReceiving.receivingPath !== record.receiving.path) throw new Error("OWNER_H_ORIGINAL_RECEIVING_REQUIRED");
+			await host.receiveOriginalHMeter(hReceiving);
+			hReceiving.signal.throwIfAborted();
+		}
 		if (
 			ownerProfileDigest(Buffer.from(`${JSON.stringify(host.profile, null, 2)}\n`)) !== decision.record.profileSha256
 		) {
@@ -837,7 +1032,10 @@ export async function receiveOrdinaryOwner(
 			countSemantics,
 			sc085,
 		);
-		if (sc085) bindSc085OriginalChild(sc085, context);
+		if (sc085) {
+			bindSc085OriginalChild(sc085, context);
+			owner.acceptOriginalHMeter();
+		}
 		return context;
 	} catch (error) {
 		// Failed creation/admission can retain native custody. Never report a clean
@@ -873,7 +1071,7 @@ export async function receiveOrdinaryOwner(
 					errors.push(cleanup);
 				}
 			}
-		if (errors.length > 1) throw new AggregateError(errors, "OWNER_RECEIVING_FAILED");
+		if (errors.length > 1) throw new AggregateError(errors, "OWNER_RECEIVING_FAILED", { cause: error });
 		throw error;
 	}
 }

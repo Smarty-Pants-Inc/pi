@@ -1,15 +1,31 @@
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { isDeepStrictEqual } from "node:util";
-import { ordinaryClock } from "./ordinary-clock.ts";
+import {
+	beginOrdinaryClockOperation,
+	commitOrdinaryClockOperation,
+	failOrdinaryClockOperation,
+	finishOrdinaryClockOperation,
+	hasOriginalClockEvidence,
+	ordinaryClock,
+} from "./ordinary-clock.ts";
+import type { OriginalClockObservation, OriginalClockWitness } from "./ordinary-clock-evidence.ts";
 import type { OrdinaryExecutionRequest } from "./ordinary-executor.ts";
+import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "./ordinary-owner-context.ts";
 import { type NativeRequestSource, nonViewRequest, requestCost, requestDigest } from "./ordinary-request-evidence.ts";
+import {
+	assertOrdinaryExposureAudit,
+	publishOrdinaryExposure,
+	publishOrdinaryRequest,
+	receivedOrdinaryOperationalHooks,
+} from "./ordinary-runtime.ts";
 import {
 	type OrdinaryObservedRefresh,
 	OrdinarySc085Setup,
 	type OrdinaryValidatedSetup,
 	type SetupRawRef,
 } from "./ordinary-sc085-setup.ts";
+import { checkSc085Operation } from "./ordinary-sc085-source/operational-admission.ts";
 import type {
 	OrdinaryCapture,
 	OrdinaryExposureFrame,
@@ -29,11 +45,16 @@ export interface NativeAuditStamp {
 	/** Local observations are not a qualified mapping into the caller's Clock. */
 	clockId: string;
 	uncertaintyMs: null;
+	/** Separate direct parent-domain evidence, never a performance offset. */
+	parent?: OriginalClockWitness;
+	clockSequence?: string;
+	eventMeaning?: string;
 }
 /** Select retained originals, never a timestamp supplied by the host caller. */
 export type Sc085StampSelector =
 	| { kind: "request"; requestId: string; phase: "prepared" | "dispatch" | "settled" | "retired" }
 	| { kind: "exposure"; requestId: string }
+	| { kind: "compaction"; entryId: string }
 	| { kind: "window"; cursor: object; edge: "start" | "end" };
 
 export interface NativeSessionAuditState {
@@ -120,11 +141,21 @@ export class OrdinaryOperationalAudit {
 			wakePending: boolean | null;
 		}
 	>();
+	#exposureTransitionFailure?: { cause: unknown };
+	#pendingExposure?: { frame: OrdinaryExposureFrame; receipt: OrdinaryExposureReceipt; at: NativeAuditStamp };
+	#exposureTransitionActive = false;
 	#exposureBytes = 0;
 	#exposureLost = false;
 	readonly #notified = new Set<string>();
-	#requestSink?: (receipt: ReturnType<OrdinaryOperationalAudit["requests"]>[number]) => void;
-	#exposureSink?: (frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt) => void;
+	#exposureOperation?: {
+		ticket: object;
+		clockTicket: object;
+		frame: OrdinaryExposureFrame;
+		receipt: OrdinaryExposureReceipt;
+		originalFrame: OrdinaryExposureFrame;
+		originalReceipt: OrdinaryExposureReceipt;
+		phase: "before" | "committed" | "delivering" | "delivered" | "aborted";
+	};
 	#diagnosticSink?: OrdinaryDiagnosticSink;
 	#executionStarted = false;
 	#diagnosticFailure?: { cause: unknown };
@@ -201,15 +232,21 @@ export class OrdinaryOperationalAudit {
 		return this.#setup.begin(original);
 	}
 
-	/** Original runtime registration only, using the evidence custody retained by B.
-	 * No authority is created here; the owner supplies its own current check. */
-	registerValidatedSetupReceiver(
-		register: (receive: (event: OrdinaryValidatedSetup) => Promise<SetupRawRef>) => void,
-		retained: Pick<ReadonlyMap<string, Uint8Array>, "get">,
-		record: (value: unknown) => SetupRawRef,
-		checkCurrent: () => void,
-	): void {
-		checkCurrent();
+	/** Identity only, against this audit's private ledger; not a supplied verifier. */
+	assertOriginalSetup(setup: OrdinarySc085Setup): void {
+		if (this.#setup !== setup) throw new Error("OWNER_SC085_SETUP_ORIGINAL_LEDGER_REQUIRED");
+	}
+
+	/** Only the original owner is accepted. Registration uses its already-bound
+	 * canonical hook; callers cannot enroll register/read/write/check functions. */
+	registerValidatedSetupReceiver(context: OrdinaryOwnerContext): void {
+		// biome-ignore lint/complexity/noArguments: Refuse extra callback arguments; rest parameters would change the public arity.
+		if (arguments.length !== 1) throw new Error("OWNER_SC085_SETUP_CALLBACKS_UNSUPPORTED");
+		assertOrdinaryOwner(context);
+		const receiving = context.originalSetupReceiving(this.#setup);
+		const register = receivedOrdinaryOperationalHooks(context).sc085SetupReceiver;
+		if (!register) throw new Error("OWNER_SC085_SETUP_REGISTRATION_REQUIRED");
+		checkSc085Operation(receiving, context, "boundary");
 		if (
 			this.#setupReceiverRegistered ||
 			this.#closed ||
@@ -222,8 +259,8 @@ export class OrdinaryOperationalAudit {
 		}
 		this.#setupReceiverRegistered = true;
 		try {
-			register(async (event) => this.receiveValidatedSetup(event, retained, record, checkCurrent));
-			checkCurrent();
+			register(async (event) => this.#receiveValidatedSetup(event, context));
+			checkSc085Operation(receiving, context, "boundary");
 			if (this.#closed || this.#lost) throw new Error("OWNER_SC085_SETUP_AUDIT_LOST");
 		} catch (cause) {
 			this.#setupNotificationReceived = true;
@@ -233,19 +270,10 @@ export class OrdinaryOperationalAudit {
 
 	/** Private runtime receiving uses original retained custody, not arbitrary paths.
 	 * Matching this event proves association only, never source authority. */
-	receiveValidatedSetup(
-		event: OrdinaryValidatedSetup,
-		retained: Pick<ReadonlyMap<string, Uint8Array>, "get">,
-		record: (value: unknown) => SetupRawRef,
-		checkCurrent: () => void,
-	): SetupRawRef {
+	#receiveValidatedSetup(event: OrdinaryValidatedSetup, context: OrdinaryOwnerContext): SetupRawRef {
 		if (this.#setupNotificationReceived) throw new Error("OWNER_SC085_SETUP_DUPLICATE");
 		this.#setupNotificationReceived = true;
-		const current = () => {
-			checkCurrent();
-			if (this.#closed || this.#lost) throw new Error("OWNER_SC085_SETUP_AUDIT_LOST");
-		};
-		current();
+		this.checkOriginalSetup(context, this.#setup);
 		const candidates = this.requests().filter(
 			(row) => row.nativeAccepted && row.native && isDeepStrictEqual(row.native.receipt, event.baseline.native),
 		);
@@ -259,15 +287,21 @@ export class OrdinaryOperationalAudit {
 				finalBytes: row.finalBytes,
 				exposure: this.requestExposure(row.requestId),
 			},
-			retained,
-			record,
-			current,
+			context,
 		);
 	}
 
-	validateSc085Checkpoint(value: OrdinaryObservedRefresh, retained: ReadonlyMap<string, Uint8Array>) {
+	/** Fixed original current/audit check, shared with the private ledger. */
+	checkOriginalSetup(context: OrdinaryOwnerContext, setup: OrdinarySc085Setup): void {
+		assertOrdinaryOwner(context);
+		if (context.operationalAudit !== this) throw new Error("OWNER_SC085_SETUP_ORIGINAL_AUDIT_REQUIRED");
+		this.assertOriginalSetup(setup);
+		checkSc085Operation(context.originalSetupReceiving(setup), context, "boundary");
 		if (this.#closed || this.#lost) throw new Error("OWNER_SC085_SETUP_AUDIT_LOST");
-		return this.#setup.checkpoint(value, retained);
+	}
+
+	validateSc085Checkpoint(value: OrdinaryObservedRefresh, context: OrdinaryOwnerContext) {
+		return this.#setup.checkpoint(value, context);
 	}
 
 	validatedSetup() {
@@ -282,7 +316,19 @@ export class OrdinaryOperationalAudit {
 		return this.clock;
 	}
 
-	#stamp(): NativeAuditStamp {
+	#stamp(eventMeaning?: string): NativeAuditStamp {
+		if (eventMeaning && hasOriginalClockEvidence()) {
+			const ticket = beginOrdinaryClockOperation(eventMeaning);
+			const observed = commitOrdinaryClockOperation(ticket);
+			return {
+				...observed.local,
+				clockId: this.clockIdentity.id,
+				uncertaintyMs: null,
+				parent: observed.parent,
+				clockSequence: observed.sequence,
+				eventMeaning: observed.eventMeaning,
+			};
+		}
 		return {
 			monotonicMs: this.clock.monotonic(),
 			wallMs: this.clock.wallTime(),
@@ -299,13 +345,6 @@ export class OrdinaryOperationalAudit {
 			}
 			this.#captures.set(value, { ...value });
 		}
-	}
-
-	/** Arm the existing host recorder before invocation. Notification follows the
-	 * actual three-way join, not polling or an invoke Promise's completion. */
-	bindRequestSink(sink: (receipt: ReturnType<OrdinaryOperationalAudit["requests"]>[number]) => void): void {
-		if (this.#closed || this.#requestSink || this.#requests.size) throw new Error("OWNER_AUDIT_SINK_BOUND");
-		this.#requestSink = sink;
 	}
 
 	/** Host binds before Core/runtime creation; no default writer or author API. */
@@ -370,14 +409,128 @@ export class OrdinaryOperationalAudit {
 		};
 	}
 
-	/** Forward only the original validated Core callback. The Foundation adapter
-	 * retains/matches it; Pi does not implement a second common-exposure matcher. */
-	bindExposureSink(sink: (frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt) => void): void {
-		if (this.#closed || this.#exposureSink || this.#requests.size) throw new Error("OWNER_AUDIT_SINK_BOUND");
-		this.#exposureSink = sink;
+	/** Only the authenticated Core composition calls these fixed DATA operations.
+	 * Core owns the actual mutation; no transition supplier is accepted here. */
+	beginExposure(owner: object, frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt): object {
+		assertOrdinaryExposureAudit(owner, this);
+		try {
+			if (this.#exposureTransitionFailure) throw this.#exposureTransitionFailure.cause;
+			if (
+				this.#closed ||
+				this.#lost ||
+				this.#pendingExposure ||
+				this.#exposureTransitionActive ||
+				(this.#exposureOperation && this.#exposureOperation.phase !== "delivered") ||
+				frame.ownerEpoch !== this.#scope.ownerEpoch ||
+				receipt.ownerEpoch !== this.#scope.ownerEpoch ||
+				frame.scope.sessionId !== this.#scope.sessionId ||
+				receipt.scope.sessionId !== this.#scope.sessionId
+			)
+				throw new Error("OWNER_EXPOSURE_TRANSITION");
+			this.#exposureTransitionActive = true;
+			const originals = structuredClone({ frame, receipt });
+			const ticket = Object.freeze({});
+			const clockTicket = beginOrdinaryClockOperation("core-exposure-transition");
+			this.#exposureOperation = {
+				ticket,
+				clockTicket,
+				...originals,
+				originalFrame: frame,
+				originalReceipt: receipt,
+				phase: "before",
+			};
+			return ticket;
+		} catch (cause) {
+			return this.#failExposure(cause);
+		}
 	}
 
-	exposure(frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt): void {
+	commitExposure(owner: object, ticket: object): void {
+		assertOrdinaryExposureAudit(owner, this);
+		try {
+			if (this.#exposureTransitionFailure) throw this.#exposureTransitionFailure.cause;
+			const operation = this.#exposureOperation;
+			if (!operation || operation.ticket !== ticket || operation.phase !== "before" || this.#closed || this.#lost)
+				throw new Error("OWNER_EXPOSURE_TRANSITION_LOST");
+			const captured = commitOrdinaryClockOperation(operation.clockTicket);
+			if (
+				!isDeepStrictEqual(
+					{ frame: operation.frame, receipt: operation.receipt },
+					{ frame: operation.originalFrame, receipt: operation.originalReceipt },
+				)
+			)
+				throw new Error("OWNER_EXPOSURE_TRANSITION_CHANGED");
+			operation.phase = "committed";
+			this.#pendingExposure = {
+				frame: operation.frame,
+				receipt: operation.receipt,
+				at: {
+					...captured.local,
+					clockId: this.clockIdentity.id,
+					uncertaintyMs: null,
+					parent: captured.parent,
+					clockSequence: captured.sequence,
+					eventMeaning: captured.eventMeaning,
+				},
+			};
+			this.#exposureTransitionActive = false;
+		} catch (cause) {
+			this.#failExposure(cause);
+		}
+	}
+
+	#checkExposureFailure(): void {
+		if (this.#exposureTransitionFailure) throw this.#exposureTransitionFailure.cause;
+	}
+
+	deliverExposure(owner: object, ticket: object): void {
+		assertOrdinaryExposureAudit(owner, this);
+		try {
+			if (this.#exposureTransitionFailure) throw this.#exposureTransitionFailure.cause;
+			const operation = this.#exposureOperation;
+			if (!operation || operation.ticket !== ticket || operation.phase !== "committed" || this.#closed || this.#lost)
+				throw new Error("OWNER_EXPOSURE_DELIVERY_ONCE");
+			operation.phase = "delivering";
+			this.exposure(operation.frame, operation.receipt, owner);
+			this.#checkExposureFailure();
+			if ((operation.phase as string) !== "delivering" || this.#closed || this.#lost)
+				throw new Error("OWNER_EXPOSURE_DELIVERY_LOST");
+			operation.phase = "delivered";
+		} catch (cause) {
+			this.#failExposure(cause);
+		}
+	}
+
+	/** Validate before either the composition or clock failure latch is touched.
+	 * Closed/lost audit state cannot forbid cleanup of its own retained ticket. */
+	assertExposureAbort(owner: object, ticket: object): void {
+		assertOrdinaryExposureAudit(owner, this);
+		const operation = this.#exposureOperation;
+		if (!operation || operation.ticket !== ticket || operation.phase === "delivered")
+			throw new Error("OWNER_EXPOSURE_ABORT_TICKET");
+	}
+
+	abortExposure(owner: object, ticket: object, cause: unknown): never {
+		this.assertExposureAbort(owner, ticket);
+		const operation = this.#exposureOperation!;
+		if (operation.phase === "aborted") throw this.#exposureTransitionFailure!.cause;
+		operation.phase = "aborted";
+		this.#pendingExposure = undefined;
+		this.#exposureTransitionActive = false;
+		return this.#failExposure(cause);
+	}
+
+	#failExposure(cause: unknown): never {
+		this.#lost = true;
+		this.#exposureTransitionFailure ??= { cause };
+		return failOrdinaryClockOperation(this.#exposureTransitionFailure.cause);
+	}
+
+	exposure(frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt, owner?: object): void {
+		if (hasOriginalClockEvidence()) {
+			if (!owner) throw new Error("OWNER_EXPOSURE_ORIGINAL_OWNER_REQUIRED");
+			assertOrdinaryExposureAudit(owner, this);
+		}
 		if (this.#closed) {
 			this.#lost = true;
 			return;
@@ -393,7 +546,16 @@ export class OrdinaryOperationalAudit {
 				return;
 			}
 			const key = JSON.stringify([receipt.decisionId, receipt.attemptId]);
-			const retained = structuredClone({ frame, receipt, at: this.#stamp() });
+			const pending = this.#pendingExposure;
+			if (
+				hasOriginalClockEvidence() &&
+				(!pending ||
+					this.#exposureTransitionActive ||
+					!isDeepStrictEqual({ frame: pending.frame, receipt: pending.receipt }, { frame, receipt }))
+			)
+				throw new Error("OWNER_EXPOSURE_TRANSITION_MISSING");
+			this.#pendingExposure = undefined;
+			const retained = structuredClone({ frame, receipt, at: pending?.at ?? this.#stamp() });
 			const bytes = Buffer.byteLength(JSON.stringify(retained), "utf8");
 			if (
 				this.#exposures.has(key) ||
@@ -405,24 +567,26 @@ export class OrdinaryOperationalAudit {
 				this.#exposureBytes += bytes;
 				this.#exposures.set(key, retained);
 			}
-			this.#exposureSink?.(frame, receipt);
+			publishOrdinaryExposure(this, frame, receipt);
 			this.event("owner", "common-exposure-observed", receipt.requestId);
-		} catch {
+		} catch (cause) {
 			this.#lost = true;
+			throw cause;
 		}
 	}
 
 	#notify(): void {
-		if (!this.#requestSink || this.#lost) return;
+		if (this.#lost) return;
 		try {
 			for (const receipt of this.requests()) {
 				if (this.#lost) break;
 				if (!receipt.nativeAccepted || this.#notified.has(receipt.requestId)) continue;
 				this.#notified.add(receipt.requestId);
-				this.#requestSink(receipt);
+				publishOrdinaryRequest(this, receipt);
 			}
-		} catch {
+		} catch (cause) {
 			this.#lost = true;
+			throw cause;
 		}
 	}
 
@@ -574,7 +738,7 @@ export class OrdinaryOperationalAudit {
 			: 0;
 		this.#activeWindow = Object.freeze({});
 		this.#windowStart = this.#sequence;
-		this.#windowStartedAt = this.#stamp();
+		this.#windowStartedAt = this.#stamp("original-window-start");
 		this.#turnPeak = Number(this.#currentTurn !== null);
 		this.#events = [];
 		this.#initialNativeState = this.#nativeState;
@@ -597,7 +761,7 @@ export class OrdinaryOperationalAudit {
 			startSequence: this.#windowStart,
 			endSequence: this.#sequence,
 			startedAt: this.#windowStartedAt ? { ...this.#windowStartedAt } : null,
-			finishedAt: this.#stamp(),
+			finishedAt: this.#stamp("original-window-finish"),
 			clockIdentity: this.clockIdentity,
 			coreClockSupplied: this.#coreClockSupplied,
 			events: structuredClone(this.#events),
@@ -629,6 +793,30 @@ export class OrdinaryOperationalAudit {
 		};
 	}
 
+	finishPreparation(reservation: TokenReservation, ticket: object): void {
+		const original = this.#requests.get(reservation);
+		if (!original || original.preparedAt.parent) throw new Error("OWNER_AUDIT_ORIGINAL_PREPARATION");
+		const captured = finishOrdinaryClockOperation(ticket);
+		original.preparedAt = {
+			...original.preparedAt,
+			parent: captured.witness,
+			clockSequence: captured.sequence,
+			eventMeaning: captured.eventMeaning,
+		};
+	}
+
+	finishSettlement(reservation: TokenReservation, ticket: object): void {
+		const original = this.#requests.get(reservation);
+		if (!original?.settledAt || original.settledAt.parent) throw new Error("OWNER_AUDIT_ORIGINAL_SETTLEMENT");
+		const captured = finishOrdinaryClockOperation(ticket);
+		original.settledAt = {
+			...original.settledAt,
+			parent: captured.witness,
+			clockSequence: captured.sequence,
+			eventMeaning: captured.eventMeaning,
+		};
+	}
+
 	request(reservation: TokenReservation, bytes: Uint8Array): void {
 		if (
 			this.#closed ||
@@ -656,10 +844,20 @@ export class OrdinaryOperationalAudit {
 	}
 
 	/** Actual final native authorization boundary, before original socket bytes. */
-	dispatch(reservation: TokenReservation): void {
+	dispatch(reservation: TokenReservation, ticket?: object): void {
+		if (typeof ticket === "function") throw new Error("OWNER_DISPATCH_CALLBACK_UNSUPPORTED");
 		const request = this.#requests.get(reservation);
 		if (!request || request.dispatchAt) throw new Error("OWNER_AUDIT_DISPATCH");
 		request.dispatchAt = this.#stamp();
+		if (ticket) {
+			const observed = finishOrdinaryClockOperation(ticket);
+			request.dispatchAt = {
+				...request.dispatchAt,
+				parent: observed.witness,
+				clockSequence: observed.sequence,
+				eventMeaning: observed.eventMeaning,
+			};
+		} else if (hasOriginalClockEvidence()) throw new Error("OWNER_AUDIT_ORIGINAL_DISPATCH");
 		this.event("provider", "inference-dispatch-authorized", reservation.requestId);
 	}
 
@@ -679,11 +877,22 @@ export class OrdinaryOperationalAudit {
 		this.#notify();
 	}
 
-	retired(reservation: TokenReservation): void {
+	retired(reservation: TokenReservation, completion?: OriginalClockObservation): void {
 		const request = this.#requests.get(reservation);
 		if (!request || request.retired) throw new Error("OWNER_AUDIT_RETIREMENT");
+		if (hasOriginalClockEvidence() && (!completion || completion.eventMeaning !== "native-operation-completion"))
+			throw new Error("OWNER_AUDIT_ORIGINAL_COMPLETION");
 		request.retired = true;
-		request.retiredAt = this.#stamp();
+		request.retiredAt = completion
+			? {
+					...completion.local,
+					clockId: this.clockIdentity.id,
+					uncertaintyMs: null,
+					parent: structuredClone(completion.parent),
+					clockSequence: completion.sequence,
+					eventMeaning: completion.eventMeaning,
+				}
+			: this.#stamp();
 		this.event("provider", "inference-operation-retired", reservation.requestId);
 		this.#notify();
 	}
@@ -843,7 +1052,7 @@ export class OrdinaryOperationalAudit {
 		this.#cursors.set(cursor, {
 			window: this.#activeWindow,
 			sequence: this.#sequence,
-			at: this.#stamp(),
+			at: this.#stamp("original-window-cursor"),
 			runId: this.#currentRun,
 			turnId: this.#currentTurn,
 			nativeState: this.#nativeState ? Object.freeze({ ...this.#nativeState }) : null,
@@ -1061,8 +1270,12 @@ export class OrdinaryOperationalAudit {
 	/** Private Source binding resolves only this audit's original records. Raw
 	 * null uncertainty stays null; independent qualification must retain a
 	 * separate view referencing this sample and its received qualification. */
-	resolveSc085Stamp(selector: Sc085StampSelector) {
+	assertSc085ClockCoverage(): void {
 		if (this.#closed || this.#lost || !this.#coreClockSupplied) throw new Error("OWNER_SC085_CLOCK_COVERAGE");
+	}
+
+	resolveSc085Stamp(selector: Sc085StampSelector) {
+		this.assertSc085ClockCoverage();
 		let stamp: NativeAuditStamp | null;
 		switch (selector.kind) {
 			case "request": {
@@ -1152,6 +1365,7 @@ export class OrdinaryOperationalAudit {
 	}
 
 	close(retired = false): void {
+		if (this.#pendingExposure || this.#exposureTransitionActive) this.#lost = true;
 		if (this.#tui) this.tui(this.#tui.source, "owner-close");
 		if (
 			this.#tuiState &&
@@ -1167,3 +1381,7 @@ export class OrdinaryOperationalAudit {
 		this.#closed = true;
 	}
 }
+
+// Original operational bodies cannot be replaced through shared prototypes.
+Object.freeze(OrdinaryOperationalAudit.prototype);
+Object.freeze(OrdinaryOperationalAudit);

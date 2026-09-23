@@ -1,7 +1,14 @@
 import { createHash } from "node:crypto";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { type OperationalBinding, parseOriginalCIInitial } from "../src/core/ordinary-sc085-source/ci-authority.ts";
 import { verifyOperationalInitialRetention } from "../src/core/ordinary-sc085-source/operational-admission.ts";
+
+// MOCK: these placeholder records do not form an enforcement chain. That edge is
+// verified by its own decoder; here only its same-map call is checked.
+const enforcement = vi.hoisted(() => ({ verify: vi.fn() }));
+vi.mock("../src/core/ordinary-sc085-source/enforcement-retention.ts", () => ({
+	verifyOperationalEnforcementRetention: enforcement.verify,
+}));
 
 // Closed projection/retention DATA only. No controller, authority, native capture,
 // selected helper pin, release or physical graph is supplied by these fixtures.
@@ -93,6 +100,13 @@ test("exact >64KiB initial bytes and release.initial survive private receiving a
 	expect(value.projection.initial.bytes.length).toBeGreaterThan(65536);
 	expect(value.authorization).toEqual(packet.authorization);
 	expect(verifyOperationalInitialRetention(value.projection, f.binding, f.retained)).toEqual(packet.release.raw);
+	expect(enforcement.verify).toHaveBeenCalledOnce();
+	const [initial, release, binding, records, retained] = enforcement.verify.mock.calls[0];
+	expect(initial).toEqual(f.document);
+	expect(release).toMatchObject({ kind: "original-ci-operational-release", initial: packet.initial.raw });
+	expect(binding).toBe(f.binding);
+	expect([...records.values()]).toEqual(f.document.records.map((row) => row.raw));
+	expect(retained).toBe(f.retained);
 });
 
 test.each(["unknown-field", "wrong-kind", "base64-alias", "hash", "carrier", "wrapper"])(

@@ -228,7 +228,7 @@ export function createOrdinaryExecutor(
 					},
 				);
 				processJoined = true; // runProcess fulfills only after native subtree/pipe/effect retirement.
-				context.assertActive();
+				guard(); // Native completion cannot renew the original whole-sample interval.
 				if (outputLimited) outcome = "OUTPUT_LIMIT";
 				else if (result.code !== 0) outcome = "EXIT_NONZERO";
 				else {
@@ -282,6 +282,14 @@ export function createOrdinaryExecutor(
 				}
 			}
 			context.assertActive();
+			// Cleanup and diagnostic persistence are still part of this invocation.
+			// A delayed timer must not allow their late success to publish OK.
+			if (!Number.isFinite(remaining) || performance.now() - started >= remaining) {
+				timedOut = true;
+				stop.abort();
+				outcome = "TIMEOUT";
+				body = "";
+			}
 			const result: OrdinaryExecutionResult = {
 				outcome,
 				body,

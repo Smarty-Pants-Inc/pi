@@ -57,8 +57,8 @@ export interface OwnerArtifact {
 }
 
 export const OWNER_PROFILE_MAX_BYTES = 65_536;
-// Count admission/accounting must not load an older inference-only binding.
-export const OWNER_NATIVE_ABI = 2;
+// Retained asynchronous lifecycle receipts must not load a synchronous binding.
+export const OWNER_NATIVE_ABI = 3;
 
 function record(value: unknown, keys: readonly string[]): asserts value is Record<string, unknown> {
 	if (

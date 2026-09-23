@@ -131,6 +131,8 @@ export interface SourceAdmissionPorts {
 		retained: ReadonlyMap<string, Uint8Array>;
 		record(event: unknown): RawRef;
 		bytes(bytes: Uint8Array): RawRef;
+		/** Required by the private clock projection; absent ports cannot qualify it. */
+		retain?(ref: RawRef, bytes: Uint8Array): void;
 		close(): Promise<void>;
 	};
 	admission: {
