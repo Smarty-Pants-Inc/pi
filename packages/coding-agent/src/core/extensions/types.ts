@@ -822,6 +822,12 @@ export interface AgentBeforeSettleEvent extends BoundaryState {
 /** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */
 export interface AgentSettledEvent {
 	type: "agent_settled";
+	/**
+	 * How the run ended. `aborted`: the run was cancelled by a user abort (also during retry backoff or
+	 * `agent_before_settle`), an extension that cancelled compaction, or session shutdown. `error`: the run
+	 * ended on a provider, run, or compaction failure. Otherwise `completed`.
+	 */
+	outcome: AgentActivityOutcome;
 }
 
 export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
