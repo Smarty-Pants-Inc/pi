@@ -369,6 +369,8 @@ export class AgentSession {
 	private _unsubscribeAgent?: () => void;
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _isAgentRunActive = false;
+	/** Prompt preflights that may still start a run, oldest first. */
+	private readonly _promptPreflights = new Set<object>();
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -1813,6 +1815,7 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		const onInputTransferred = options?.onInputTransferred;
+		const preflightToken = {};
 		let messages: AgentMessage[] | undefined;
 
 		try {
@@ -1837,12 +1840,21 @@ export class AgentSession {
 				);
 			}
 
+			// An earlier prompt can still be in preflight, for example in pre-prompt compaction whose
+			// compaction_end flushes input queued during compaction. Queue behind it instead of
+			// racing it into the agent and failing with "Agent is already processing a prompt".
+			this._promptPreflights.add(preflightToken);
+			const mustQueue = () =>
+				this.isStreaming ||
+				(options?.streamingBehavior !== undefined &&
+					this._promptPreflights.values().next().value !== preflightToken);
+
 			// Emit input event for extension interception (before skill/template expansion)
 			const processedInput = await this._runInputHandlers(
 				text,
 				options?.images,
 				options?.source ?? "interactive",
-				this.isStreaming ? options?.streamingBehavior : undefined,
+				mustQueue() ? options?.streamingBehavior : undefined,
 			);
 			if (!processedInput) {
 				onInputTransferred?.();
@@ -1858,8 +1870,8 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
-			// If streaming, queue via steer() or followUp() based on option
-			if (this.isStreaming) {
+			// If streaming or behind another prompt, queue via steer() or followUp() based on option
+			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
 					throw new Error(
 						"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
@@ -1970,8 +1982,11 @@ export class AgentSession {
 			this._runSystemPromptOptions = result.systemPromptOptions;
 			if (updateMessage) messages.unshift(updateMessage);
 		} catch (error) {
+			this._promptPreflights.delete(preflightToken);
 			preflightResult?.(false);
 			throw error;
+		} finally {
+			if (!messages) this._promptPreflights.delete(preflightToken);
 		}
 
 		if (!messages) {
@@ -1980,6 +1995,8 @@ export class AgentSession {
 
 		preflightResult?.(true);
 		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
+		// The run is active synchronously, so later prompts now queue through isStreaming.
+		this._promptPreflights.delete(preflightToken);
 		releasePreflight?.();
 		await run;
 	}
