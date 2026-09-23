@@ -468,10 +468,16 @@ export class ModelRuntime implements Models {
 		providerId?: string,
 		options?: AuthOperationOptions,
 	): Promise<readonly ModelTypeMap[TType][]> {
+		// The ordinary owner may use only its one allowed chat model.
+		if (this.#ordinaryOwner)
+			return type === "chat"
+				? (this.getAvailable(providerId, options) as Promise<readonly ModelTypeMap[TType][]>)
+				: this.getAvailable(providerId, options).then(() => []);
 		return this.models.getAvailableOfType(type, providerId, options);
 	}
 
 	getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
+		if (this.#ordinaryOwner) return this.getAvailable(providerId, options);
 		return this.models.getAllAvailable(providerId, options);
 	}
 
