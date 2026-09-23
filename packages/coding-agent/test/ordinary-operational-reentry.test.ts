@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { expect, test, vi } from "vitest";
-import type { OriginalCISelection } from "../src/core/ordinary-sc085-source/ci-authority.ts";
 import {
 	createOperationalAdmission,
 	type HeldOperationalRecord,
@@ -11,7 +10,12 @@ const helper = vi.hoisted(() =>
 		throw new Error("unexpected CI helper invocation");
 	}),
 );
-vi.mock("../src/core/ordinary-sc085-source/ci-authority.ts", () => ({ receiveOriginalCIAuthorization: helper }));
+vi.mock("../src/core/ordinary-sc085-source/ci-authority.ts", () => ({
+	receiveOriginalCIAuthorization: helper,
+	assertOriginalCINativeBinding: vi.fn(),
+	canonicalOriginalCIData: vi.fn(),
+	OPERATIONAL_CONTROLLER_SHA256: "0".repeat(64),
+}));
 
 // Inert malformed data intentionally cannot reach CI or native admission. The
 // original held-file callback must refuse reentry BEFORE parsing or helper I/O.
@@ -43,7 +47,6 @@ test.each([false, true])(
 			},
 		};
 		supplier = createOperationalAdmission({
-			authority: {} as OriginalCISelection,
 			instruction: held,
 			producerContract: held,
 			profile: held,

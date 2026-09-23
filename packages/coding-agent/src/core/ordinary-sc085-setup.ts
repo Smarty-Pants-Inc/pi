@@ -3,6 +3,11 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import type { OrdinaryExecutionRequest, OrdinaryExecutionResult } from "./ordinary-executor.ts";
 import type { NativeAuditStamp } from "./ordinary-operational-audit.ts";
+import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "./ordinary-owner-context.ts";
+import {
+	guardSc085OriginalCallback,
+	receiveSc085OriginalStorage,
+} from "./ordinary-sc085-source/operational-admission.ts";
 import type { OrdinaryExposureFrame, OrdinaryExposureReceipt, OrdinaryProviderOutcome } from "./ordinary-sense.ts";
 
 export interface SetupRawRef {
@@ -71,6 +76,7 @@ export class OrdinarySc085Setup {
 	constructor(owner: OrdinaryValidatedSetup["owner"], maxBytes: number) {
 		this.#owner = Object.freeze({ ...owner });
 		this.#maxBytes = maxBytes;
+		Object.freeze(this);
 	}
 
 	/** Called after original native request validation, before process/state effects.
@@ -141,18 +147,18 @@ export class OrdinarySc085Setup {
 		};
 	}
 
-	/** Only the registered original-runtime receiver calls this with its original
-	 * retained custody/recorder. No namespace or executor facts are set from event. */
-	receive(
-		event: OrdinaryValidatedSetup,
-		original: OriginalSetupRequest,
-		retained: Pick<ReadonlyMap<string, Uint8Array>, "get">,
-		record: (value: unknown) => SetupRawRef,
-		checkCurrent: () => void,
-	): SetupRawRef {
+	/** The original context must own THIS private ledger. A new ledger with an
+	 * equal owner tuple cannot select custody or invoke a supplied callback. */
+	receive(event: OrdinaryValidatedSetup, original: OriginalSetupRequest, context: OrdinaryOwnerContext): SetupRawRef {
+		// biome-ignore lint/complexity/noArguments: Refuse extra callback arguments; rest parameters would change the public arity.
+		if (arguments.length !== 3) throw new Error("OWNER_SC085_SETUP_CALLBACKS_UNSUPPORTED");
+		assertOrdinaryOwner(context);
+		context.operationalAudit.assertOriginalSetup(this);
 		assert(!this.#used && !this.#lost, "OWNER_SC085_SETUP_UNAVAILABLE");
 		this.#used = true;
-		checkCurrent();
+		context.operationalAudit.checkOriginalSetup(context, this);
+		const receiving = context.originalSetupReceiving(this);
+		const storage = receiveSc085OriginalStorage(receiving, context);
 		const selected = structuredClone(event);
 		const exact = (value: object, names: string[]) => {
 			assert(isDeepStrictEqual(Object.keys(value).sort(), names.sort()), "OWNER_SC085_SETUP_KEYS");
@@ -173,7 +179,7 @@ export class OrdinarySc085Setup {
 					/^[a-f0-9]{64}$/.test(ref.sha256),
 				"OWNER_SC085_SETUP_REF",
 			);
-			const value = retained.get(ref.path);
+			const value = guardSc085OriginalCallback(receiving, () => storage.retained.get(ref.path));
 			assert(value && createHash("sha256").update(value).digest("hex") === ref.sha256, "OWNER_SC085_SETUP_RETAINED");
 			return Uint8Array.from(value);
 		};
@@ -285,7 +291,7 @@ export class OrdinarySc085Setup {
 			);
 			executions.push({ originalExecution: structuredClone(matches[0]), coreExecutionId: sample.executionId });
 		}
-		checkCurrent();
+		context.operationalAudit.checkOriginalSetup(context, this);
 		const receiptValue = {
 			kind: "ordinary-sc085-validated-setup/1",
 			owner: this.#owner,
@@ -295,14 +301,24 @@ export class OrdinarySc085Setup {
 			executionIdBasis: "core-refresh-correlation-not-native-authority",
 			originalExposure: structuredClone(original.exposure),
 		};
-		const raw = structuredClone(record(structuredClone(receiptValue)));
+		const raw = structuredClone(
+			guardSc085OriginalCallback(receiving, () => storage.record(structuredClone(receiptValue))),
+		);
 		assert(isDeepStrictEqual(json(raw), receiptValue), "OWNER_SC085_SETUP_RECORDED");
-		checkCurrent();
+		context.operationalAudit.checkOriginalSetup(context, this);
 		this.#joined = { raw, event: selected, originalRequestId: original.requestId };
 		return { ...raw };
 	}
 
-	checkpoint(value: OrdinaryObservedRefresh, retained: ReadonlyMap<string, Uint8Array>) {
+	checkpoint(value: OrdinaryObservedRefresh, context: OrdinaryOwnerContext) {
+		assertOrdinaryOwner(context);
+		context.operationalAudit.checkOriginalSetup(context, this);
+		const receiving = context.originalSetupReceiving(this);
+		const storage = receiveSc085OriginalStorage(receiving, context);
+		return guardSc085OriginalCallback(receiving, () => this.#checkpoint(value, storage.retained));
+	}
+
+	#checkpoint(value: OrdinaryObservedRefresh, retained: ReadonlyMap<string, Uint8Array>) {
 		assert(this.#joined && this.#latest.size > 0 && !this.#lost, "OWNER_SC085_CHECKPOINT_UNAVAILABLE");
 		const event = structuredClone(value),
 			settlement = event.settlement;
@@ -405,3 +421,7 @@ export class OrdinarySc085Setup {
 		return structuredClone(this.#joined);
 	}
 }
+
+// The private audit ledger must keep these original receiving/checkpoint bodies.
+Object.freeze(OrdinarySc085Setup.prototype);
+Object.freeze(OrdinarySc085Setup);

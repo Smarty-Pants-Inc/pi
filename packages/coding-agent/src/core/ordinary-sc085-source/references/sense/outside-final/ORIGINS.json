@@ -1,0 +1,30 @@
+{
+  "sourceCommit": "2468a4c3ccdc29d10fb75ee9ede76d20c7cef43b",
+  "sourceTree": "0ffa56593d5c557691be74ca6bfca44d0d2fc744",
+  "sourceFiles": {
+    "tests/ops/measurement.ts": {
+      "sha256": "3e06033cd958aea18cf8a810dc1b6c247f3a7b3096a8df1974c59f6fee82fcd3",
+      "bytes": 72205
+    },
+    "tests/pilot/operational-staging.ts": {
+      "sha256": "8031cd836da332088ce4e40030d884ebcc6686acd13f17f3f9fecc6ce1545d8f",
+      "bytes": 9613
+    }
+  },
+  "runtimeFunctions": [
+    "clockNs",
+    "receiveOriginalFinalGraphData",
+    "receiveOriginalTerminalData",
+    "receiveOperationalFinalGraphData",
+    "receiveOperationalTerminalData"
+  ],
+  "adaptations": [
+    "Only the named DATA functions, their direct declarations and comments are copied.",
+    "Imports use the same Node builtins and local measurement module.",
+    "Recorder retained-map type uses the existing Pi SourceAdmissionPorts structural boundary.",
+    "TerminalSourceAccounting.sourceBilling indexes an omitted measurement type upstream; its exact original field type is written inline.",
+    "Original supplier internal any types are retained; no predicate or failure condition is changed.",
+    "Biome formatting may change layout only; final postimage hashes are in the enclosing Pi packet."
+  ],
+  "status": "SOURCE_COMPOSITION_ONLY_NO_IMPORT_TEST_TYPECHECK_BUILD_OR_RUNTIME_QUALIFICATION"
+}

@@ -39,9 +39,59 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 import { materializeOwnedEntry, parseOwnedSessionEntries } from "./owned-session-entries.ts";
-import { OwnedJournal } from "./owner-effects.ts";
+import { isOwnedTerminalWrite, OwnedJournal } from "./owner-effects.ts";
 
 export const CURRENT_SESSION_VERSION = 3;
+
+const ownedTerminalPersistence = new WeakMap<SessionManager, () => Promise<void>>();
+type OwnedTerminalAppender = {
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage): Promise<string>;
+	appendCustomMessage<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+	): Promise<string>;
+	appendCustomEntry(type: string, data?: unknown): Promise<string>;
+};
+const ownedTerminalAppenders = new WeakMap<SessionManager, OwnedTerminalAppender>();
+
+/** Private owner lifecycle entry; not exported from the SDK or ordinary API. */
+export function persistOwnedTerminalSession(manager: SessionManager): Promise<void> {
+	const persist = ownedTerminalPersistence.get(manager);
+	if (!persist) throw new Error("OWNED_JOURNAL_REQUIRED");
+	return persist();
+}
+
+/** Private captured route used only by the original owner's terminal callbacks. */
+export function appendOwnedTerminalMessage(
+	manager: SessionManager,
+	message: Message | CustomMessage | BashExecutionMessage,
+): Promise<string> {
+	const append = ownedTerminalAppenders.get(manager)?.appendMessage;
+	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
+	return append(message);
+}
+
+/** Private captured route used only by the original owner's terminal callbacks. */
+export function appendOwnedTerminalCustomMessage<T = unknown>(
+	manager: SessionManager,
+	customType: string,
+	content: string | (TextContent | ImageContent)[],
+	display: boolean,
+	details?: T,
+): Promise<string> {
+	const append = ownedTerminalAppenders.get(manager)?.appendCustomMessage;
+	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
+	return append(customType, content, display, details);
+}
+
+/** Private captured route for non-message retained-session entries. */
+export function appendOwnedTerminalEntry(manager: SessionManager, type: string, data?: unknown): Promise<string> {
+	const append = ownedTerminalAppenders.get(manager)?.appendCustomEntry;
+	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
+	return append(type, data);
+}
 
 export interface SessionHeader {
 	type: "session";
@@ -1001,7 +1051,9 @@ export class SessionManager {
 	private leafId: string | null = null;
 	readonly #ownedJournal?: OwnedJournal;
 	private ownedBytes: Buffer = Buffer.alloc(0);
-
+	#ownedTerminalTail: Promise<void> = Promise.resolve();
+	#ownedTerminalPending = 0;
+	#terminalIndexFailure?: { error: unknown; entry: SessionEntry; bytes: Buffer; nativeWriteAccepted: true };
 	private constructor(
 		cwd: string,
 		sessionDir: string,
@@ -1016,6 +1068,13 @@ export class SessionManager {
 		this.persist = persist;
 		this.#ownedJournal = ownedJournal;
 		if (ownedJournal) {
+			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
+			ownedTerminalAppenders.set(this, {
+				appendMessage: (message) => this.#appendMessageOwnedTerminal(message),
+				appendCustomMessage: (customType, content, display, details) =>
+					this.#appendCustomMessageOwnedTerminal(customType, content, display, details),
+				appendCustomEntry: (type, data) => this.#appendCustomEntryOwnedTerminal(type, data),
+			});
 			ownedJournal.assertActive();
 			this.sessionFile = ownedJournal.file;
 			this.sessionId = ownedJournal.sessionId;
@@ -1243,6 +1302,7 @@ export class SessionManager {
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		if (this.#ownedTerminalPending) throw new Error("OWNER_TERMINAL_APPEND_BUSY");
 		if (this.#ownedJournal) {
 			this.#ownedJournal.assertWritable();
 			const admitted = materializeOwnedEntry(entry);
@@ -1265,6 +1325,128 @@ export class SessionManager {
 		this._persist(entry);
 	}
 
+	#enqueueOwnedTerminal<T>(operation: () => Promise<T>): Promise<T> {
+		this.#ownedTerminalPending++;
+		const run = this.#ownedTerminalTail.then(operation).finally(() => {
+			this.#ownedTerminalPending--;
+		});
+		// Observe, but do not recover the queue: an unknown write must not replay.
+		this.#ownedTerminalTail = run.then(() => undefined);
+		void this.#ownedTerminalTail.catch(() => {});
+		return run;
+	}
+
+	#appendMessageOwnedTerminal(message: Message | CustomMessage | BashExecutionMessage): Promise<string> {
+		if (this.#terminalIndexFailure)
+			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
+		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendMessage(message));
+		return this.#enqueueOwnedTerminal(async () => {
+			const entry: SessionMessageEntry = {
+				type: "message",
+				id: generateId(this.byId),
+				parentId: this.leafId,
+				timestamp: new Date().toISOString(),
+				message,
+			};
+			await this.#appendEntryOwnedTerminal(entry);
+			return entry.id;
+		});
+	}
+
+	#appendCustomMessageOwnedTerminal<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+	): Promise<string> {
+		if (this.#terminalIndexFailure)
+			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
+		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		if (!isOwnedTerminalWrite(this.#ownedJournal))
+			return Promise.resolve(this.appendCustomMessageEntry(customType, content, display, details));
+		return this.#enqueueOwnedTerminal(async () => {
+			const entry: CustomMessageEntry<T> = {
+				type: "custom_message",
+				customType,
+				content,
+				display,
+				details,
+				id: generateId(this.byId),
+				parentId: this.leafId,
+				timestamp: new Date().toISOString(),
+			};
+			await this.#appendEntryOwnedTerminal(entry);
+			return entry.id;
+		});
+	}
+
+	#appendCustomEntryOwnedTerminal(type: string, data?: unknown): Promise<string> {
+		if (this.#terminalIndexFailure)
+			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
+		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendCustomEntry(type, data));
+		return this.#enqueueOwnedTerminal(async () => {
+			const entry: CustomEntry = {
+				type: "custom",
+				customType: type,
+				data,
+				id: generateId(this.byId),
+				parentId: this.leafId,
+				timestamp: new Date().toISOString(),
+			};
+			await this.#appendEntryOwnedTerminal(entry);
+			return entry.id;
+		});
+	}
+
+	async #appendEntryOwnedTerminal(entry: SessionEntry): Promise<void> {
+		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		this.#ownedJournal.assertWritable();
+		const admitted = materializeOwnedEntry(entry);
+		const prefix = this.flushed ? this.ownedBytes : this.encodeOwnedEntries();
+		const bytes = Buffer.concat([prefix, Buffer.from(`${JSON.stringify(admitted)}\n`)]);
+		const selected = parseOwnedSessionEntries(bytes, this.sessionId);
+		const published = selected[selected.length - 1] as SessionEntry;
+		await this.#ownedJournal.commitTerminalAsync(bytes);
+		try {
+			this.#ownedJournal.assertWritable();
+			this.ownedBytes = bytes;
+			this.flushed = true;
+			this.fileEntries.push(published);
+			this.byId.set(published.id, published);
+			this.leafId = published.id;
+		} catch (error) {
+			this.#terminalIndexFailure ??= { error, entry: published, bytes, nativeWriteAccepted: true };
+			try {
+				this.#ownedJournal.quarantine();
+			} catch (cleanup) {
+				throw new AggregateError([error, cleanup], "OWNER_TERMINAL_INDEX_UNKNOWN", { cause: error });
+			}
+			throw error;
+		}
+	}
+
+	#persistOwnedTerminal(): Promise<void> {
+		if (this.#terminalIndexFailure)
+			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
+		const journal = this.#ownedJournal;
+		if (!journal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		return this.#enqueueOwnedTerminal(async () => {
+			journal.assertWritable();
+			if (!isOwnedTerminalWrite(journal)) throw new Error("OWNER_TERMINAL_STATE");
+			// Every successful owned append already published ownedBytes. Only an
+			// unflushed header needs a final write; never use the active-only reader.
+			if (!this.flushed) {
+				const bytes = this.encodeOwnedEntries();
+				await journal.commitTerminalAsync(bytes);
+				journal.assertWritable();
+				this.ownedBytes = bytes;
+				this.flushed = true;
+			}
+		});
+	}
+
 	private encodeOwnedEntries(): Buffer {
 		return Buffer.from(
 			`${this.fileEntries.map((entry) => JSON.stringify(materializeOwnedEntry(entry))).join("\n")}\n`,
@@ -1277,6 +1459,7 @@ export class SessionManager {
 
 	/** Durable owned acknowledgment, including header/control-only sessions. */
 	persistCurrent(): { sessionId: string; file: string; bytes: number; sha256: string } {
+		if (this.#ownedTerminalPending) throw new Error("OWNER_TERMINAL_APPEND_BUSY");
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		this.#ownedJournal.assertWritable();
 		const bytes = this.flushed ? this.ownedBytes : this.encodeOwnedEntries();
