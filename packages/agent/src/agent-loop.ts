@@ -5,9 +5,14 @@
 
 import {
 	type AssistantMessage,
-	type Context,
 	EventStream,
+	getCurrentTools,
+	getToolStateChanges,
+	normalizeContext,
+	type SystemMessage,
 	type ToolResultMessage,
+	type ToolStateChanges,
+	toToolDeclaration,
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
 import { getDefaultStreamFn } from "./stream-fn.ts";
@@ -23,7 +28,8 @@ import type {
 	StreamFn,
 } from "./types.ts";
 
-export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+/** sourceMessage identifies queued input when tool declaration normalization copies it. */
+export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
 
 /**
  * Start an agent loop with a new prompt message.
@@ -110,15 +116,8 @@ export async function runAgentLoop(
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
-	// continue() can pass a queue reservation. Iterate the live array after
-	// each awaited event; clear may invalidate the remaining prompts.
-	for (const prompt of prompts) {
-		await emit({ type: "message_start", message: prompt });
-		await emit({ type: "message_end", message: prompt });
-		currentContext.messages.push(prompt);
-		newMessages.push(prompt);
-	}
-	if (hadPrompts && newMessages.length === 0) {
+	const injectedPrompts = await appendPendingMessages(currentContext, newMessages, [prompts], emit, signal);
+	if (signal?.aborted || (hadPrompts && !injectedPrompts)) {
 		await emit({ type: "agent_end", messages: newMessages });
 		return newMessages;
 	}
@@ -173,6 +172,8 @@ async function runLoop(
 	let currentContext = initialContext;
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
+	let explicitContinuation = false;
+	let contextOnlyTurn = false;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 	let hasMoreToolCalls = true;
@@ -180,11 +181,13 @@ async function runLoop(
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		// Inner loop: process tool calls and steering messages
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
+		while (!signal?.aborted && (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn)) {
+			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
 					currentContext = nextTurnSnapshot.context ?? currentContext;
+					preparedMessages = nextTurnSnapshot.messages ?? [];
 					config = {
 						...config,
 						model: nextTurnSnapshot.model ?? config.model,
@@ -202,31 +205,61 @@ async function runLoop(
 				if (pendingMessages.length === 0) {
 					pendingMessages = (await config.getSteeringMessages?.()) || [];
 				}
-				if (!hasMoreToolCalls && pendingMessages.length === 0) break;
+				if (
+					signal?.aborted ||
+					(!hasMoreToolCalls && !contextOnlyTurn && preparedMessages.length === 0 && pendingMessages.length === 0)
+				)
+					break;
 				await emit({ type: "turn_start" });
 			}
 
-			// Iterate the live reservation before each message_start. Clearing it
-			// during preparation or an awaited event invalidates undelivered input.
-			let injectedMessages = false;
-			if (pendingMessages.length > 0) {
-				for (const message of pendingMessages) {
-					await emit({ type: "message_start", message });
-					await emit({ type: "message_end", message });
-					currentContext.messages.push(message);
-					newMessages.push(message);
-					injectedMessages = true;
-				}
-				pendingMessages = [];
+			const injectedMessages = await appendPendingMessages(
+				currentContext,
+				newMessages,
+				[preparedMessages, pendingMessages],
+				emit,
+				signal,
+			);
+			pendingMessages = [];
+			// Clearing queued input is not a context-only continuation decision.
+			if (signal?.aborted || (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages)) break;
+			contextOnlyTurn = false;
+
+			const requestUpdate = await config.prepareRequest?.(
+				{
+					context: currentContext,
+					model: config.model,
+					thinkingLevel: config.reasoning ?? "off",
+				},
+				signal,
+			);
+			if (requestUpdate) {
+				currentContext = requestUpdate.context ?? currentContext;
+				config = {
+					...config,
+					model: requestUpdate.model ?? config.model,
+					reasoning:
+						requestUpdate.thinkingLevel === undefined
+							? config.reasoning
+							: requestUpdate.thinkingLevel === "off"
+								? undefined
+								: requestUpdate.thinkingLevel,
+				};
 			}
-			// An awaited turn_start listener can clear the last reason to continue.
-			if (!hasMoreToolCalls && !injectedMessages) break;
+			if (signal?.aborted) break;
 
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
+				lastCompletedTurn = {
+					message,
+					toolResults: [],
+					context: currentContext,
+					newMessages,
+				};
+				await config.finishTurn?.(lastCompletedTurn, signal);
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -254,28 +287,42 @@ async function runLoop(
 				}
 			}
 
-			await emit({ type: "turn_end", message, toolResults });
-
 			lastCompletedTurn = {
 				message,
 				toolResults,
 				context: currentContext,
 				newMessages,
 			};
+			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
+			await emit({ type: "turn_end", message, toolResults });
 
-			if (await config.shouldStopAfterTurn?.(lastCompletedTurn)) {
+			if (decision?.action === "end") {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
 			}
 
+			explicitContinuation = decision?.action === "continue";
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
+			if (hasMoreToolCalls || pendingMessages.length > 0) {
+				explicitContinuation = false;
+			}
 		}
+
+		if (signal?.aborted) break;
 
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
 			// Set as pending so inner loop processes them
+			explicitContinuation = false;
 			pendingMessages = followUpMessages;
+			continue;
+		}
+
+		// No natural request was selected, so fulfill the continuation decision with one context-only turn.
+		if (explicitContinuation) {
+			explicitContinuation = false;
+			contextOnlyTurn = true;
 			continue;
 		}
 
@@ -284,6 +331,97 @@ async function runLoop(
 	}
 
 	await emit({ type: "agent_end", messages: newMessages });
+}
+
+type PendingMessage = {
+	message: AgentMessage;
+	source?: { batch: AgentMessage[]; index: number; message: AgentMessage };
+};
+
+async function appendPendingMessages(
+	context: AgentContext,
+	newMessages: AgentMessage[],
+	batches: AgentMessage[][],
+	emit: AgentEventSink,
+	signal?: AbortSignal,
+): Promise<boolean> {
+	let injected = false;
+	// The final pass reconciles tools if a pending system declaration was cleared
+	// during an awaited event. A synthetic declaration never counts as queued input.
+	for (const pending of [batches, []]) {
+		for (const { message, source } of declareToolChanges(context, pending)) {
+			if (signal?.aborted) return injected;
+			if (source && source.batch[source.index] !== source.message) continue;
+			await emit({ type: "message_start", message }, source?.message);
+			await emit({ type: "message_end", message });
+			context.messages.push(message);
+			newMessages.push(message);
+			if (source) injected = true;
+		}
+	}
+	return injected;
+}
+
+/**
+ * Declare tool loadout changes to the model.
+ *
+ * `context.tools` is what the runtime can execute; the transcript's system messages declare
+ * what the model may call. Before each request the difference becomes `toolsAdded` and
+ * `toolsRemoved` on a system message. When a pending system message exists, its tool fields
+ * are treated as intent and replaced with the delta between the committed transcript and
+ * the executable set, so replay always yields exactly `context.tools`. Otherwise a new
+ * system message is inserted before the first non-system pending message.
+ */
+function declareToolChanges(context: AgentContext, batches: AgentMessage[][]): PendingMessage[] {
+	// Keep each original reservation slot alongside its normalized message. The
+	// caller rechecks that slot immediately before transferring it at message_start.
+	const entries: PendingMessage[] = batches.flatMap((batch) =>
+		batch.map((message, index) => ({ message, source: { batch, index, message } })),
+	);
+	const pendingMessages = entries.map((entry) => entry.message);
+	let systemIndex = -1;
+	for (let i = pendingMessages.length - 1; i >= 0; i--) {
+		if (pendingMessages[i].role === "system") {
+			systemIndex = i;
+			break;
+		}
+	}
+	const pending = pendingMessages[systemIndex] as SystemMessage | undefined;
+	const baseline = pending
+		? pendingMessages.map((message, index) =>
+				index === systemIndex ? withToolChanges(pending, NO_CHANGES) : message,
+			)
+		: pendingMessages;
+	const changes = getToolStateChanges(
+		getCurrentTools([...context.messages, ...baseline]),
+		(context.tools ?? []).map(toToolDeclaration),
+	);
+	const unchanged = changes.toolsAdded.length === 0 && changes.toolsRemoved.length === 0;
+
+	if (pending) {
+		// Keep the caller's message object when it already declares no tool changes.
+		if (unchanged && !pending.toolsAdded?.length && !pending.toolsRemoved?.length) return entries;
+		return entries.map((entry, index) =>
+			index === systemIndex ? { ...entry, message: withToolChanges(pending, changes) } : entry,
+		);
+	}
+	if (unchanged) return entries;
+	const update = withToolChanges({ role: "system", content: "", timestamp: Date.now() }, changes);
+	const insertIndex = pendingMessages.findIndex((message) => message.role !== "system");
+	const index = insertIndex === -1 ? pendingMessages.length : insertIndex;
+	return [...entries.slice(0, index), { message: update }, ...entries.slice(index)];
+}
+
+const NO_CHANGES: ToolStateChanges = { toolsAdded: [], toolsRemoved: [] };
+
+/** Copy a system message with its tool fields replaced by `changes`; empty lists omit the field. */
+function withToolChanges(message: SystemMessage, { toolsAdded, toolsRemoved }: ToolStateChanges): SystemMessage {
+	const { toolsAdded: _added, toolsRemoved: _removed, ...rest } = message;
+	return {
+		...rest,
+		...(toolsAdded.length > 0 ? { toolsAdded } : {}),
+		...(toolsRemoved.length > 0 ? { toolsRemoved } : {}),
+	};
 }
 
 /**
@@ -306,12 +444,7 @@ async function streamAssistantResponse(
 	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
 	const llmMessages = await config.convertToLlm(messages);
 
-	// Build LLM context
-	const llmContext: Context = {
-		systemPrompt: context.systemPrompt,
-		messages: llmMessages,
-		tools: context.tools,
-	};
+	const llmContext = normalizeContext({ messages: llmMessages });
 
 	// Resolve API key (important for expiring tokens)
 	const resolvedApiKey =
@@ -805,7 +938,6 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 		content: finalized.result.content ?? [],
 		details: finalized.result.details,
 		usage: finalized.result.usage,
-		...(finalized.result.addedToolNames?.length ? { addedToolNames: finalized.result.addedToolNames } : {}),
 		isError: finalized.isError,
 		timestamp: Date.now(),
 	};

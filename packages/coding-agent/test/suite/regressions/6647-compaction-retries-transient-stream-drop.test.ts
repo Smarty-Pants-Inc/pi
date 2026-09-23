@@ -1,6 +1,7 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import { type AssistantMessage, createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { prepareCompaction } from "../../../src/core/compaction/index.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 /**
@@ -95,6 +96,13 @@ describe("#6647 compaction retries transient summarization failures", () => {
 			...fauxAssistantMessage("recovered summary"),
 			usage: createUsage(10),
 		};
+		expect(
+			prepareCompaction(harness.sessionManager.getBranch(), harness.settingsManager.getCompactionSettings(model)),
+		).toMatchObject({
+			isSplitTurn: true,
+			messagesToSummarize: [],
+			turnPrefixMessages: [expect.objectContaining({ role: "user" })],
+		});
 		const getCallCount = useScriptedStreamFn(harness, [error("terminated"), success]);
 		vi.useFakeTimers();
 		const compaction = harness.session.compact();
@@ -102,7 +110,7 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		const result = await compaction;
 
 		expect(result.summary).toContain("recovered summary");
-		expect(getCallCount()).toBe(2); // 1 initial + 1 compaction retry
+		expect(getCallCount()).toBe(2); // 1 prefix-summary attempt + 1 compaction retry
 		const starts = harness.eventsOfType("summarization_retry_scheduled");
 		const ends = harness.eventsOfType("summarization_retry_finished");
 		expect(starts).toHaveLength(1);

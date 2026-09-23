@@ -9,6 +9,7 @@ on:
     branches:
       - main
       - tmp-mergify/merge-queue/**
+      - goal2/pi-0.87.1-fabric
   workflow_dispatch:
     inputs:
       source_sha:

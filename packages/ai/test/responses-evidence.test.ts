@@ -7,6 +7,7 @@ import {
 	withResponsesEvidence,
 } from "../src/api/responses-evidence.ts";
 import type { Model } from "../src/types.ts";
+import { normalizeContext } from "../src/utils/transcript.ts";
 
 // Synthetic decoded events through the production observer, NOT native/provider proof.
 const response = (status = "completed", usage: unknown = { input_tokens: 7, output_tokens: 3, total_tokens: 10 }) => ({
@@ -44,22 +45,18 @@ describe("Responses native-event accounting", () => {
 			maxTokens: 128,
 		};
 		const receipts: Readonly<ResponsesEvidence>[] = [];
-		const result = await streamResponses(
-			model,
-			{ messages: [] },
-			{
-				apiKey: "synthetic-not-a-credential",
-				maxRetries: 0,
-				fetch: async () => {
-					const event = { type: "response.completed", sequence_number: 0, response: response() };
-					const http = new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
-						headers: { "content-type": "text/event-stream" },
-					});
-					observeResponsesEvidence(http, model.id, (receipt) => receipts.push(receipt));
-					return http;
-				},
+		const result = await streamResponses(model, normalizeContext({ messages: [] }), {
+			apiKey: "synthetic-not-a-credential",
+			maxRetries: 0,
+			fetch: async () => {
+				const event = { type: "response.completed", sequence_number: 0, response: response() };
+				const http = new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
+					headers: { "content-type": "text/event-stream" },
+				});
+				observeResponsesEvidence(http, model.id, (receipt) => receipts.push(receipt));
+				return http;
 			},
-		).result();
+		}).result();
 		expect(result.stopReason).toBe("stop");
 		expect(receipts).toHaveLength(1);
 		expect(receipts[0]).toMatchObject({

@@ -82,7 +82,7 @@ export function parseOwnedSessionEntries(bytes: Buffer, expectedSessionId: strin
 					typeof value.summary !== "string" ||
 					typeof value.tokensBefore !== "number" ||
 					typeof value.firstKeptEntryId !== "string" ||
-					!ids.has(value.firstKeptEntryId)
+					(value.firstKeptEntryId !== value.id && !ids.has(value.firstKeptEntryId))
 				)
 					throw new Error("OWNER_JOURNAL_COMPACTION");
 				break;
@@ -101,6 +101,23 @@ export function parseOwnedSessionEntries(bytes: Buffer, expectedSessionId: strin
 				)
 					throw new Error("OWNER_JOURNAL_CUSTOM_MESSAGE");
 				break;
+			case "context_edit": {
+				const target = entries.find((entry) => entry.id === value.targetId);
+				const replacement = value.replacement;
+				if (
+					!target ||
+					!(
+						target.type === "custom_message" ||
+						(target.type === "message" && ["user", "assistant", "toolResult"].includes(target.message.role))
+					) ||
+					(replacement !== null &&
+						(typeof replacement !== "object" ||
+							Array.isArray(replacement) ||
+							(typeof replacement.content !== "string" && !Array.isArray(replacement.content))))
+				)
+					throw new Error("OWNER_JOURNAL_CONTEXT_EDIT");
+				break;
+			}
 			case "label":
 				if (
 					typeof value.targetId !== "string" ||
