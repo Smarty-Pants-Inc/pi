@@ -21,6 +21,7 @@ import {
 	hyperlink,
 	imageFallback,
 	isImageLine,
+	linkifyUrls,
 	registerKittyImageMetadata,
 	renderImage,
 	resetCapabilitiesCache,
@@ -28,7 +29,7 @@ import {
 	setCapabilityOverrides,
 	setCellDimensions,
 } from "../src/terminal-image.ts";
-import { visibleWidth } from "../src/utils.ts";
+import { visibleWidth, wrapTextWithAnsi } from "../src/utils.ts";
 
 const ENV_KEYS = [
 	"TERM",
@@ -287,6 +288,17 @@ describe("detectCapabilities", () => {
 			assert.strictEqual(caps.hyperlinks, true);
 			assert.strictEqual(caps.images, null);
 		});
+	});
+
+	it("enables hyperlinks under Herdr", () => {
+		assert.deepStrictEqual(
+			withEnv({ TERM_PROGRAM: "herdr", COLORTERM: "truecolor" }, () => detectCapabilities()),
+			{ images: null, trueColor: true, hyperlinks: true },
+		);
+		assert.strictEqual(
+			withEnv({ TERM_PROGRAM: "herdr", PI_HYPERLINKS: "0" }, () => detectCapabilities()).hyperlinks,
+			false,
+		);
 	});
 
 	it("disables hyperlinks under tmux when the client does not forward them", () => {
@@ -616,6 +628,45 @@ describe("Kitty image cursor movement", () => {
 			);
 			assert.ok(lines[0].includes("..."), "expected ellipsis when truncating long fallback path");
 			assert.ok(lines[0].includes("~"), "expected home-shortened path in fallback");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+});
+
+describe("linkifyUrls", () => {
+	const url = "https://github.com/Smarty-Pants-Inc/pi/pull/35/files?diff=split#diff-0123456789abcdef";
+
+	it("returns text unchanged when hyperlinks are off", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: false });
+		try {
+			assert.strictEqual(linkifyUrls(`Opened ${url}.`), `Opened ${url}.`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("links URLs and leaves trailing punctuation outside the link", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+		try {
+			assert.strictEqual(
+				linkifyUrls(`Opened ${url}. See (${url})`),
+				`Opened ${hyperlink(url, url)}. See (${hyperlink(url, url)})`,
+			);
+			const linked = hyperlink("PR", url);
+			assert.strictEqual(linkifyUrls(`${linked} ${url}`), `${linked} ${url}`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("keeps the full target on every wrapped row", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+		try {
+			const rows = wrapTextWithAnsi(linkifyUrls(`Open ${url}`), 30);
+			const urlRows = rows.filter((row) => row.replace(/\x1b\]8;;[^\x1b]*\x1b\\/g, "").trim() !== "Open");
+			assert.ok(urlRows.length > 1);
+			for (const row of urlRows) assert.ok(row.includes(`\x1b]8;;${url}\x1b\\`), JSON.stringify(row));
 		} finally {
 			resetCapabilitiesCache();
 		}

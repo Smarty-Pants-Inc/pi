@@ -110,6 +110,7 @@ export {
 	type ImageProtocol,
 	type ImageRenderOptions,
 	imageFallback,
+	linkifyUrls,
 	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
