@@ -16,10 +16,26 @@ export function shortenPath(path: unknown): string {
 	return path;
 }
 
-export function linkPath(styledText: string, rawPath: string, cwd: string): string {
+/**
+ * OSC 8 file URL with this host's name, as the OSC 8 spec asks, so a terminal or Herdr link handler can tell
+ * local from remote files. The line goes in the fragment (`#42`), as kitty's hyperlinked grep does.
+ */
+export function fileLinkUrl(absolutePath: string, line?: number): string {
+	const fragment = line !== undefined && line > 0 ? `#${line}` : "";
+	return `file://${os.hostname()}${pathToFileURL(absolutePath).pathname}${fragment}`;
+}
+
+export function linkPath(styledText: string, rawPath: string, cwd: string, line?: number): string {
 	if (!getCapabilities().hyperlinks) return styledText;
-	const absolutePath = resolvePath(rawPath, cwd);
-	return hyperlink(styledText, pathToFileURL(absolutePath).href);
+	return hyperlink(styledText, fileLinkUrl(resolvePath(rawPath, cwd), line));
+}
+
+/** Link the path in each `path:line: text` or `path-line- text` row of grep output. Paths resolve against `baseDir`. */
+export function linkGrepOutputLine(line: string, baseDir: string): string {
+	const match = /^(.+?)(?::(\d+): |-(\d+)- )/.exec(line);
+	if (!match) return line;
+	const [, path, matchLine, contextLine] = match;
+	return linkPath(path, path, baseDir, Number(matchLine ?? contextLine)) + line.slice(path.length);
 }
 
 export function str(value: unknown): string | null {
@@ -76,10 +92,10 @@ export function renderToolPath(
 	rawPath: string | null,
 	theme: Theme,
 	cwd: string,
-	options?: { emptyFallback?: string },
+	options?: { emptyFallback?: string; line?: number },
 ): string {
 	if (rawPath === null) return invalidArgText(theme);
 	const value = rawPath || options?.emptyFallback;
 	if (!value) return theme.fg("toolOutput", "...");
-	return linkPath(theme.fg("accent", shortenPath(value)), value, cwd);
+	return linkPath(theme.fg("accent", shortenPath(value)), value, cwd, options?.line);
 }
