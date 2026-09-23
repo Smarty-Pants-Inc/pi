@@ -2,13 +2,15 @@ import { readFileSync } from "node:fs";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
-	type Context,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	fauxToolCall,
+	getCurrentSystemPrompt,
+	getCurrentTools,
 	type ImageContent,
 	type Model,
 	type SimpleStreamOptions,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -63,7 +65,7 @@ function createAssistant(
 function useSummaryStreamFn(
 	harness: Harness,
 	summary: string,
-	onRequest?: (context: Context, options: SimpleStreamOptions | undefined) => void,
+	onRequest?: (context: TranscriptContext, options: SimpleStreamOptions | undefined) => void,
 ): () => number {
 	let callCount = 0;
 	harness.session.agent.streamFunction = (model, context, options) => {
@@ -189,7 +191,57 @@ describe("AgentSession compaction characterization", () => {
 		expect(statsAfter.tokens.cacheRead).toBe(statsBefore.tokens.cacheRead + summaryUsage.cacheRead);
 		expect(statsAfter.tokens.cacheWrite).toBe(statsBefore.tokens.cacheWrite + summaryUsage.cacheWrite);
 		expect(statsAfter.cost).toBe(statsBefore.cost + summaryUsage.cost.total);
-		expect(harness.session.messages[0]?.role).toBe("compactionSummary");
+		expect(harness.session.messages[0]?.role).toBe("system");
+		expect(harness.session.messages[1]?.role).toBe("compactionSummary");
+	});
+
+	it("checkpoints the replayed system state and folds summarized and retained system patches into it", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("declared")]);
+		await harness.session.prompt("declare the prompt");
+		const declared = harness.session.messages[0];
+		if (declared?.role !== "system") throw new Error("expected declared system message");
+
+		harness.sessionManager.appendMessage({
+			role: "system",
+			content: "summarized instruction",
+			sections: { early: "<early>1</early>" },
+			toolsRemoved: [{ name: "bash" }],
+			timestamp: Date.now(),
+		});
+		const firstKeptEntryId = harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "kept before patch" }],
+			timestamp: Date.now(),
+		});
+		harness.sessionManager.appendMessage({
+			role: "system",
+			content: "retained instruction",
+			sections: { extra: "<extra>late</extra>" },
+			toolsRemoved: [{ name: "read" }],
+			timestamp: Date.now(),
+		});
+		harness.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "kept after patch" }],
+			timestamp: Date.now(),
+		});
+		harness.sessionManager.appendCompaction("compacted", firstKeptEntryId, 100);
+
+		const messages = harness.sessionManager.buildSessionContext().messages;
+		expect(messages.map((message) => message.role)).toEqual(["system", "compactionSummary", "user", "user"]);
+		const checkpoint = messages[0];
+		if (checkpoint?.role !== "system") throw new Error("expected checkpoint system message");
+		expect(checkpoint.content).toBe("summarized instruction\n\nretained instruction");
+		expect(checkpoint.sections).toEqual({
+			...declared.sections,
+			early: "<early>1</early>",
+			extra: "<extra>late</extra>",
+		});
+		expect(checkpoint.toolsAdded?.map((tool) => tool.name)).toEqual(
+			harness.session.getActiveToolNames().filter((name) => name !== "read" && name !== "bash"),
+		);
 	});
 
 	it("public compact preserves persisted history and continues on the same manager", async () => {
@@ -253,7 +305,8 @@ describe("AgentSession compaction characterization", () => {
 		expect(manager.getLeafId()).toBe(compactions[0]?.id);
 		expect(manager.getLabel(labelTarget)).toBe("retained label");
 		expect(harness.session.messages).toEqual(manager.buildSessionContext().messages);
-		expect(harness.session.messages[0]).toMatchObject({ role: "compactionSummary", summary: result.summary });
+		expect(harness.session.messages[0]?.role).toBe("system");
+		expect(harness.session.messages[1]).toMatchObject({ role: "compactionSummary", summary: result.summary });
 		expect(harness.session.getLastAssistantText()).toBe("second reply");
 		const compacted = structuredClone(manager.getEntries());
 		const controlId = manager.appendCustomEntry("control-fixture", { phase: "after-compaction" });
@@ -440,13 +493,12 @@ describe("AgentSession compaction characterization", () => {
 			streamSimple: () => createAssistantMessageEventStream(),
 		});
 		seedCompactableSession(harness);
-		harness.setResponses([
-			(_context, options) => {
-				expect(options?.apiKey).toBeUndefined();
-				expect(options?.headers).toEqual({ Authorization: "Bearer ambient-token" });
-				return fauxAssistantMessage("summary with bearer auth");
-			},
-		]);
+		const summaryResponse = (_context: TranscriptContext, options: SimpleStreamOptions | undefined) => {
+			expect(options?.apiKey).toBeUndefined();
+			expect(options?.headers).toEqual({ Authorization: "Bearer ambient-token" });
+			return fauxAssistantMessage("summary with bearer auth");
+		};
+		harness.setResponses([summaryResponse]);
 
 		const result = await harness.session.compact();
 
@@ -464,7 +516,7 @@ describe("AgentSession compaction characterization", () => {
 		harness.session.agent.sessionId = "active-routing-session";
 		harness.session.agent.transport = "websocket";
 
-		let requestContext: Context | undefined;
+		let requestContext: TranscriptContext | undefined;
 		let requestOptions: SimpleStreamOptions | undefined;
 		useSummaryStreamFn(harness, "standalone summary", (context, options) => {
 			requestContext = context;
@@ -474,9 +526,10 @@ describe("AgentSession compaction characterization", () => {
 		await harness.session.compact();
 
 		expect(transformContext).not.toHaveBeenCalled();
-		expect(requestContext?.systemPrompt).not.toBe(harness.session.agent.state.systemPrompt);
-		expect(requestContext?.tools).toBeUndefined();
-		expect(JSON.stringify(requestContext?.messages)).toContain("<conversation>");
+		expect(getCurrentSystemPrompt(requestContext?.messages ?? [])).not.toBe(harness.session.agent.state.systemPrompt);
+		expect(getCurrentTools(requestContext?.messages ?? [])).toEqual([]);
+		// Regression test for #9652: split-turn summaries use a clear Markdown conversation boundary.
+		expect(JSON.stringify(requestContext?.messages)).toContain("# Conversation\\n[User]: message to compact");
 		expect(requestOptions).toMatchObject({ cacheRetention: "none" });
 		expect(requestOptions?.sessionId).not.toBe("active-routing-session");
 		expect(requestOptions?.transport).toBeUndefined();
@@ -593,10 +646,11 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	// Regression coverage for #8133: model overrides must also apply between assistant turns.
+	// Regression coverage for #9740: an oversized trailing tool result must still produce a cut point.
 	it.each([false, true])(
-		"compacts after a tool result in the same run (model override: %s)",
+		"compacts after an oversized tool result in the same run (model override: %s)",
 		async (modelOverride) => {
-			const toolResult = `large-tool-result:${"x".repeat(6800)}`;
+			const toolResult = `large-tool-result:${"x".repeat(8000)}`;
 			const largeTool: AgentTool = {
 				name: "large_result",
 				label: "Large result",
@@ -654,8 +708,8 @@ describe("AgentSession compaction characterization", () => {
 			const agentStartsBefore = harness.eventsOfType("agent_start").length;
 			await harness.session.prompt("run the large tool");
 
-			expect(order).toEqual(["compaction", "provider"]);
-			expect(observedSettings).toEqual([{ enabled: true, reserveTokens: 400, keepRecentTokens: 1750 }]);
+			expect(order.slice(0, 2)).toEqual(["compaction", "provider"]);
+			expect(observedSettings[0]).toEqual({ enabled: true, reserveTokens: 400, keepRecentTokens: 1750 });
 			expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
 			expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
 				type: "compaction_start",
@@ -743,6 +797,7 @@ describe("AgentSession compaction characterization", () => {
 			const images: ImageContent[] = [{ type: "image", data: "synthetic-image", mimeType: "image/png" }];
 			let queueOwnedAtPreparation = false;
 			let recovering = false;
+			let requestedAfterFailure = false;
 			const largeTool: AgentTool = {
 				name: "large_result",
 				label: "Large result",
@@ -779,6 +834,17 @@ describe("AgentSession compaction characterization", () => {
 							await harness.session.steer(queuedTexts[2]);
 							return outcome === "aborted" ? { cancel: true } : undefined;
 						});
+						// smarty-dev#217: settlement hooks must not restart failed compaction.
+						pi.on("agent_before_settle", () => {
+							if (!queueOwnedAtPreparation || recovering || requestedAfterFailure) return;
+							requestedAfterFailure = true;
+							return {
+								entries: [
+									{ type: "custom_message", customType: "unsafe-retry", content: "retry", display: false },
+								],
+								continue: true,
+							};
+						});
 					},
 				],
 			});
@@ -802,6 +868,7 @@ describe("AgentSession compaction characterization", () => {
 			expect(queuedMessages.map(getMessageText)).toEqual(queuedTexts);
 			expect(queuedMessages[0]).toMatchObject({ content: [{ type: "text", text: queuedTexts[0] }, ...images] });
 			expect(queueOwnedAtPreparation).toBe(true);
+			expect(requestedAfterFailure).toBe(false);
 			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
 			expect(harness.session.getSteeringMessages()).toEqual(queuedTexts);
 			expect(getUserTexts(harness).filter((text) => queuedTexts.includes(text))).toEqual([]);
@@ -822,7 +889,7 @@ describe("AgentSession compaction characterization", () => {
 			expect((await harness.session.compact()).summary).toBe("recovered history");
 			expect(harness.faux.state.callCount).toBe(callsBeforeRecovery);
 			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
-			let recoveredRequest: Context["messages"] = [];
+			let recoveredRequest: TranscriptContext["messages"] = [];
 			harness.appendResponses([
 				(context) => {
 					recoveredRequest = structuredClone(context.messages);
@@ -854,7 +921,14 @@ describe("AgentSession compaction characterization", () => {
 		async (queue) => {
 			const clearedTexts = ["clear image", "clear second", "clear preparation arrival"];
 			const laterTexts = ["keep later first", "keep later second"];
-			const images: ImageContent[] = [{ type: "image", data: "synthetic-cleared-image", mimeType: "image/png" }];
+			// Valid PNG: explicit resubmission now runs v0.87 image normalization.
+			const images: ImageContent[] = [
+				{
+					type: "image",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
+					mimeType: "image/png",
+				},
+			];
 			let markPreparationStarted = () => {};
 			const preparationStarted = new Promise<void>((resolve) => {
 				markPreparationStarted = resolve;
@@ -891,7 +965,7 @@ describe("AgentSession compaction characterization", () => {
 			harness.session.setSteeringMode("all");
 			harness.session.setFollowUpMode("all");
 			const enqueue = vi.spyOn(harness.session.agent, queue);
-			let resumedRequest: Context["messages"] = [];
+			let resumedRequest: TranscriptContext["messages"] = [];
 			harness.setResponses([
 				fauxAssistantMessage("seed response"),
 				async () => {
@@ -1434,7 +1508,7 @@ describe("AgentSession compaction characterization", () => {
 			});
 			let releaseFirst = () => {};
 			let firstTimer: ReturnType<typeof setTimeout> | undefined;
-			const step = (_context: Context, options: SimpleStreamOptions | undefined) => {
+			const step = (_context: TranscriptContext, options: SimpleStreamOptions | undefined) => {
 				signals.push(options?.signal);
 				if (signals.length === 1 && phase !== "history") {
 					const response =

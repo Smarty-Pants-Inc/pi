@@ -315,7 +315,7 @@ export class AgentSessionRuntime {
 			const replacement = this.#captureOutgoing();
 			await options.setup(replacement.sessionManager);
 			this.#assertCurrent(replacement);
-			replacement.session.agent.state.messages = replacement.sessionManager.buildSessionContext().messages;
+			replacement.session.refreshContext();
 		}
 		await this.finishSessionReplacement(options?.withSession);
 		return { cancelled: false };

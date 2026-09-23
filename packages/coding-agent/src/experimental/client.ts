@@ -122,6 +122,8 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 		let response: AgentOperationResponse;
 		try {
 			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
+			// The operation response and transcript updates use independent protocol
+			// messages, so the response can arrive before its terminal event.
 			if (response.accepted) {
 				operationId = response.operationId;
 				if (!terminalRunIds.has(operationId)) await terminal;
