@@ -21,6 +21,7 @@ import {
 	hyperlink,
 	imageFallback,
 	isImageLine,
+	linkifyUrls,
 	registerKittyImageMetadata,
 	renderImage,
 	resetCapabilitiesCache,
@@ -28,7 +29,7 @@ import {
 	setCapabilityOverrides,
 	setCellDimensions,
 } from "../src/terminal-image.ts";
-import { visibleWidth } from "../src/utils.ts";
+import { visibleWidth, wrapTextWithAnsi } from "../src/utils.ts";
 
 const ENV_KEYS = [
 	"TERM",
@@ -44,6 +45,7 @@ const ENV_KEYS = [
 	"CMUX_WORKSPACE_ID",
 	"WARP_SESSION_ID",
 	"WARP_TERMINAL_SESSION_UUID",
+	"HERDR_ENV",
 	"PI_HYPERLINKS",
 	"PI_IMAGE_PROTOCOL",
 	"PI_TRUE_COLOR",
@@ -287,6 +289,29 @@ describe("detectCapabilities", () => {
 			assert.strictEqual(caps.hyperlinks, true);
 			assert.strictEqual(caps.images, null);
 		});
+	});
+
+	it("enables hyperlinks under Herdr", () => {
+		assert.deepStrictEqual(
+			withEnv({ TERM_PROGRAM: "herdr", COLORTERM: "truecolor" }, () => detectCapabilities()),
+			{ images: null, trueColor: true, hyperlinks: true },
+		);
+		assert.strictEqual(
+			withEnv({ TERM_PROGRAM: "herdr", PI_HYPERLINKS: "0" }, () => detectCapabilities()).hyperlinks,
+			false,
+		);
+	});
+
+	it("enables hyperlinks in Herdr 0.9.0 panes that set only HERDR_ENV", () => {
+		assert.deepStrictEqual(
+			withEnv({ HERDR_ENV: "1", TERM: "xterm-256color" }, () => detectCapabilities()),
+			{ images: null, trueColor: false, hyperlinks: true },
+		);
+		assert.strictEqual(withEnv({ HERDR_ENV: "1", PI_HYPERLINKS: "0" }, () => detectCapabilities()).hyperlinks, false);
+		const nested = withEnv({ HERDR_ENV: "1", TMUX: "/tmp/tmux-1000/default,1234,0" }, () =>
+			detectCapabilities(() => false),
+		);
+		assert.strictEqual(nested.hyperlinks, false);
 	});
 
 	it("disables hyperlinks under tmux when the client does not forward them", () => {
@@ -616,6 +641,57 @@ describe("Kitty image cursor movement", () => {
 			);
 			assert.ok(lines[0].includes("..."), "expected ellipsis when truncating long fallback path");
 			assert.ok(lines[0].includes("~"), "expected home-shortened path in fallback");
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+});
+
+describe("linkifyUrls", () => {
+	const url = "https://github.com/Smarty-Pants-Inc/pi/pull/35/files?diff=split#diff-0123456789abcdef";
+
+	it("returns text unchanged when hyperlinks are off", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: false });
+		try {
+			assert.strictEqual(linkifyUrls(`Opened ${url}.`), `Opened ${url}.`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("links URLs and leaves trailing punctuation outside the link", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+		try {
+			assert.strictEqual(
+				linkifyUrls(`Opened ${url}. See (${url})`),
+				`Opened ${hyperlink(url, url)}. See (${hyperlink(url, url)})`,
+			);
+			const linked = hyperlink("PR", url);
+			assert.strictEqual(linkifyUrls(`${linked} ${url}`), `${linked} ${url}`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("keeps balanced closing parentheses and stops at control characters", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+		try {
+			const wiki = "https://en.wikipedia.org/wiki/Herdr_(software)";
+			assert.strictEqual(linkifyUrls(`See ${wiki}.`), `See ${hyperlink(wiki, wiki)}.`);
+			assert.strictEqual(linkifyUrls(`(see ${wiki})`), `(see ${hyperlink(wiki, wiki)})`);
+			assert.strictEqual(linkifyUrls(`${url}\x07bell`), `${hyperlink(url, url)}\x07bell`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("keeps the full target on every wrapped row", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+		try {
+			const rows = wrapTextWithAnsi(linkifyUrls(`Open ${url}`), 30);
+			const urlRows = rows.filter((row) => row.replace(/\x1b\]8;;[^\x1b]*\x1b\\/g, "").trim() !== "Open");
+			assert.ok(urlRows.length > 1);
+			for (const row of urlRows) assert.ok(row.includes(`\x1b]8;;${url}\x1b\\`), JSON.stringify(row));
 		} finally {
 			resetCapabilitiesCache();
 		}
