@@ -6,7 +6,6 @@
  * definition, so the tool's public shape is unchanged.
  */
 
-import { statSync } from "node:fs";
 import { dirname } from "node:path";
 import { getCapabilities, Text } from "@earendil-works/pi-tui";
 import { keyHint } from "../../../modes/interactive/components/keybinding-hints.ts";
@@ -37,9 +36,9 @@ function formatGrepCall(
 	return text;
 }
 /** Grep prints paths relative to a searched directory, or the bare file name when the search path is a file. */
-function grepLinkBase(rawPath: string, cwd: string): string {
+function grepLinkBase(rawPath: string, cwd: string, searchIsFile: boolean | undefined): string {
 	const searchPath = resolveToCwd(rawPath || ".", cwd);
-	return statSync(searchPath, { throwIfNoEntry: false })?.isFile() ? dirname(searchPath) : searchPath;
+	return searchIsFile ? dirname(searchPath) : searchPath;
 }
 function formatGrepResult(
 	result: {
@@ -59,7 +58,10 @@ function formatGrepResult(
 		const maxLines = options.expanded ? lines.length : 15;
 		const displayLines = lines.slice(0, maxLines);
 		const remaining = lines.length - maxLines;
-		const linkBase = getCapabilities().hyperlinks && rawPath !== null ? grepLinkBase(rawPath, cwd) : undefined;
+		const linkBase =
+			getCapabilities().hyperlinks && rawPath !== null
+				? grepLinkBase(rawPath, cwd, result.details?.searchIsFile)
+				: undefined;
 		text += `\n${displayLines.map((line) => theme.fg("toolOutput", linkBase ? linkGrepOutputLine(line, linkBase) : line)).join("\n")}`;
 		if (remaining > 0) {
 			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;

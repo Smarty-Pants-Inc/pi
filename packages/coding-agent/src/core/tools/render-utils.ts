@@ -17,12 +17,22 @@ export function shortenPath(path: unknown): string {
 }
 
 /**
- * OSC 8 file URL with this host's name, as the OSC 8 spec asks, so a terminal or Herdr link handler can tell
- * local from remote files. The line goes in the fragment (`#42`), as kitty's hyperlinked grep does.
+ * OSC 8 file URL for a path. Herdr runs its link handlers on the Herdr server host, which may not be the
+ * client's host, so for Herdr the URL names this host (as the OSC 8 spec suggests) and puts the line in the
+ * fragment (`#42`, as kitty's hyperlinked grep does). Other terminals and Pi's own click-to-open get a plain
+ * `file:///path`, which every opener accepts; on Windows a host would turn the URL into a UNC path.
  */
-export function fileLinkUrl(absolutePath: string, line?: number): string {
-	const fragment = line !== undefined && line > 0 ? `#${line}` : "";
-	return `file://${os.hostname()}${pathToFileURL(absolutePath).pathname}${fragment}`;
+export function fileLinkUrl(
+	absolutePath: string,
+	line?: number,
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const url = pathToFileURL(absolutePath);
+	const herdr = env.TERM_PROGRAM === "herdr" || env.HERDR_ENV === "1";
+	if (!herdr || platform === "win32") return url.href;
+	const fragment = line !== undefined && Number.isInteger(line) && line > 0 ? `#${line}` : "";
+	return `file://${os.hostname()}${url.pathname}${fragment}`;
 }
 
 export function linkPath(styledText: string, rawPath: string, cwd: string, line?: number): string {
