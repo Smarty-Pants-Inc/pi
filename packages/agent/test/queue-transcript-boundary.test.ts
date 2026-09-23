@@ -102,7 +102,7 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 		expect(requests()).toBe(path === "initial" ? 1 : 2);
 	});
 
-	// Abort is excluded: like upstream, queued input still reaches the aborted run.
+	// Abort is covered below: like upstream, queued input still reaches the aborted run.
 	it.each(["clear", "fail"] as const)(
 		"does not manufacture a provider turn when preparation ends with %s",
 		async (action) => {
@@ -126,6 +126,44 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 			if (action === "fail") expect(agent.state.errorMessage).toBe("preparation failed");
 		},
 	);
+
+	// smarty-dev#244 (N1): abort must not leave queued input in the queue.
+	it("delivers input queued before an abort once, to the aborted run", async () => {
+		const signals: boolean[] = [];
+		const agent = new Agent({
+			initialState: { messages: [assistant] },
+			streamFn: (_model, _context, options) => {
+				const aborted = options?.signal?.aborted === true;
+				signals.push(aborted);
+				const stream = createAssistantMessageEventStream();
+				if (aborted) {
+					stream.push({ type: "error", reason: "aborted", error: { ...assistant, stopReason: "aborted" } });
+				} else {
+					stream.push({ type: "done", reason: "stop", message: { ...assistant } });
+				}
+				return stream;
+			},
+		});
+		const message: SystemMessage = { role: "system", content: "queued before abort", timestamp: 2 };
+		agent.finishTurn = () => {
+			if (signals.length === 1) agent[queue](message);
+		};
+		agent.prepareNextTurn = async () => {
+			await Promise.resolve();
+			agent.abort();
+			return undefined;
+		};
+
+		await agent.prompt("start");
+
+		expect(signals).toEqual([false, true]);
+		expect(
+			agent.state.messages.filter((value) => value.role === "system" && value.content === message.content),
+		).toHaveLength(1);
+		expect(agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(agent.hasQueuedMessages()).toBe(false);
+		expect(agent.state.isStreaming).toBe(false);
+	});
 });
 
 it("keeps explicit context-only continuation and its prepared transcript messages", async () => {
