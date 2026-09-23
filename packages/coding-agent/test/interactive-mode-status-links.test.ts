@@ -29,6 +29,26 @@ describe("InteractiveMode status links", () => {
 		},
 	);
 
+	test.each(["info", "warning", "error"] as const)("extension notify (%s) emits the URL as an OSC 8 link", (type) => {
+		initTheme("dark");
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+		const fakeThis = {
+			chatContainer: new Container(),
+			ui: { requestRender: vi.fn() },
+			outputPad: 1,
+			showStatus: Reflect.get(InteractiveMode.prototype, "showStatus"),
+			showWarning: Reflect.get(InteractiveMode.prototype, "showWarning"),
+			showError: Reflect.get(InteractiveMode.prototype, "showError"),
+		};
+		const notify = Reflect.get(InteractiveMode.prototype, "showExtensionNotify") as (
+			this: typeof fakeThis,
+			message: string,
+			type?: "info" | "warning" | "error",
+		) => void;
+		notify.call(fakeThis, `Open ${url}`, type);
+		expect(fakeThis.chatContainer.render(200).join("\n")).toContain(`${link}${url}\x1b]8;;\x1b\\`);
+	});
+
 	test("prints plain URLs when hyperlinks are off", () => {
 		expect(render("showStatus", false)).not.toContain("\x1b]8;");
 	});
