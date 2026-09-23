@@ -206,7 +206,7 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled" }
+	| { type: "agent_settled"; outcome: AgentActivityOutcome }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -999,14 +999,14 @@ export class AgentSession {
 		resolve();
 	}
 
-	private async _emitAgentSettled(): Promise<void> {
+	private async _emitAgentSettled(outcome: AgentActivityOutcome): Promise<void> {
 		this._cacheWarmer?.onAgentSettled();
 		this._isAgentRunActive = false;
 		this.#auditState("session_run_settled");
 		this._isEmittingAgentSettled = true;
 		try {
-			await this._extensionRunner.emit({ type: "agent_settled" });
-			this._emit({ type: "agent_settled" });
+			await this._extensionRunner.emit({ type: "agent_settled", outcome });
+			this._emit({ type: "agent_settled", outcome });
 		} finally {
 			this._isEmittingAgentSettled = false;
 		}
@@ -1704,9 +1704,12 @@ export class AgentSession {
 		};
 		this._stopAfterCompactionFailure = false;
 		this._agentRunAbortRequested = false;
+		this._abortDuringBeforeSettle = false;
+		this._lastActivityOutcome = "completed";
 		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
 		this.#auditState("session_run_start");
+		let runFailed = false;
 		try {
 			if (automaticEnrollment) await automaticEnrollment(() => dispatch());
 			else if (this.#ordinaryOwner)
@@ -1720,6 +1723,9 @@ export class AgentSession {
 				if (this.#ordinaryOwner) await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true));
 				else await dispatch(true);
 			}
+		} catch (error) {
+			runFailed = true;
+			throw error;
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			this._runSystemPromptOptions = undefined;
@@ -1740,7 +1746,13 @@ export class AgentSession {
 				persistenceFailure = { cause: error };
 			}
 			try {
-				await this._emitAgentSettled();
+				await this._emitAgentSettled(
+					this._agentRunAbortRequested || this._abortDuringBeforeSettle
+						? "aborted"
+						: runFailed
+							? "error"
+							: this._lastActivityOutcome,
+				);
 			} catch (notificationFailure) {
 				if (persistenceFailure)
 					// biome-ignore lint/correctness/noUnsafeFinally: Settlement persistence and notification failures must both reject; persistence stays the first cause.
@@ -1789,6 +1801,7 @@ export class AgentSession {
 		const compaction = await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
 			this._stopAfterCompactionFailure = true;
+			this._lastActivityOutcome = compaction === "aborted" ? "aborted" : "error";
 			return false;
 		}
 		if (compaction) return !this._agentRunAbortRequested;

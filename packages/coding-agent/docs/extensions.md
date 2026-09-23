@@ -65,6 +65,7 @@ Automatic retries, recovery, compaction, or queued work can continue afterward.
 
 `agent_before_settle` is the final actionable boundary: it can append entries and request one continuation.
 `agent_settled` is final and notification-only; use it when an integration needs to know Pi will not continue automatically.
+Its `outcome` is `aborted` when the user aborted the run, including during retry backoff or an `agent_before_settle` handler; `error` when the run ended on an error; otherwise `completed`.
 
 <a id="extensionapi-methods"></a>
 

@@ -822,6 +822,8 @@ export interface AgentBeforeSettleEvent extends BoundaryState {
 /** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */
 export interface AgentSettledEvent {
 	type: "agent_settled";
+	/** How the run ended: `aborted` after a user abort, `error` after a failure, otherwise `completed`. */
+	outcome: AgentActivityOutcome;
 }
 
 export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
