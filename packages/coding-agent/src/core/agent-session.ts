@@ -429,6 +429,8 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _stopAfterCompactionFailure = false;
+	/** Settlement outcome of the compaction that stopped the run; a later synthetic turn_end cannot replace it. */
+	private _compactionStopOutcome: AgentActivityOutcome | undefined;
 	private _overflowRecoveryAttempted = false;
 
 	// Branch summarization state
@@ -697,6 +699,7 @@ export class AgentSession {
 			// Stop this run rather than sending unchanged oversized context or
 			// turning a compaction timeout into an ordinary agent retry.
 			this._stopAfterCompactionFailure = true;
+			this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
 			this.agent.abort();
 			throw new Error(`Compaction ${outcome} before the next assistant turn`);
 		}
@@ -1703,6 +1706,7 @@ export class AgentSession {
 			await run;
 		};
 		this._stopAfterCompactionFailure = false;
+		this._compactionStopOutcome = undefined;
 		this._agentRunAbortRequested = false;
 		this._abortDuringBeforeSettle = false;
 		this._lastActivityOutcome = "completed";
@@ -1751,7 +1755,7 @@ export class AgentSession {
 						? "aborted"
 						: runFailed
 							? "error"
-							: this._lastActivityOutcome,
+							: (this._compactionStopOutcome ?? this._lastActivityOutcome),
 				);
 			} catch (notificationFailure) {
 				if (persistenceFailure)
@@ -1801,7 +1805,7 @@ export class AgentSession {
 		const compaction = await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
 			this._stopAfterCompactionFailure = true;
-			this._lastActivityOutcome = compaction === "aborted" ? "aborted" : "error";
+			this._compactionStopOutcome = compaction === "aborted" ? "aborted" : "error";
 			return false;
 		}
 		if (compaction) return !this._agentRunAbortRequested;
