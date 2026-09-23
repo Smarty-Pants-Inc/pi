@@ -86,7 +86,8 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 	}
 
 	// Herdr forwards OSC 8 targets, so a click on any wrapped row opens the full URL.
-	if (termProgram === "herdr") {
+	// Herdr 0.9.0 panes set only HERDR_ENV=1; later releases also set TERM_PROGRAM=herdr.
+	if (termProgram === "herdr" || process.env.HERDR_ENV === "1") {
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: true };
 	}
 
@@ -671,7 +672,18 @@ export function hyperlink(text: string, url: string): string {
 	return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
 }
 
-const URL_PATTERN = /https?:\/\/[^\s<>"'`\x1b]+/g;
+const URL_PATTERN = /https?:\/\/[^\s<>"'`\x00-\x1f\x7f]+/g;
+
+/** Drop trailing punctuation, but keep a closing parenthesis that the URL opened. */
+function trimUrl(match: string): string {
+	let url = match;
+	for (;;) {
+		const last = url.at(-1);
+		if (last && ".,;:!?'\"]".includes(last)) url = url.slice(0, -1);
+		else if (last === ")" && url.split(")").length > url.split("(").length) url = url.slice(0, -1);
+		else return url;
+	}
+}
 
 /**
  * Wrap http(s) URLs in plain text as OSC 8 hyperlinks when the terminal supports them.
@@ -681,7 +693,7 @@ const URL_PATTERN = /https?:\/\/[^\s<>"'`\x1b]+/g;
 export function linkifyUrls(text: string): string {
 	if (!getCapabilities().hyperlinks || text.includes("\x1b]8;")) return text;
 	return text.replace(URL_PATTERN, (match) => {
-		const url = match.replace(/[.,;:!?'")\]]+$/, "");
+		const url = trimUrl(match);
 		return hyperlink(url, url) + match.slice(url.length);
 	});
 }

@@ -45,6 +45,7 @@ const ENV_KEYS = [
 	"CMUX_WORKSPACE_ID",
 	"WARP_SESSION_ID",
 	"WARP_TERMINAL_SESSION_UUID",
+	"HERDR_ENV",
 	"PI_HYPERLINKS",
 	"PI_IMAGE_PROTOCOL",
 	"PI_TRUE_COLOR",
@@ -299,6 +300,18 @@ describe("detectCapabilities", () => {
 			withEnv({ TERM_PROGRAM: "herdr", PI_HYPERLINKS: "0" }, () => detectCapabilities()).hyperlinks,
 			false,
 		);
+	});
+
+	it("enables hyperlinks in Herdr 0.9.0 panes that set only HERDR_ENV", () => {
+		assert.deepStrictEqual(
+			withEnv({ HERDR_ENV: "1", TERM: "xterm-256color" }, () => detectCapabilities()),
+			{ images: null, trueColor: false, hyperlinks: true },
+		);
+		assert.strictEqual(withEnv({ HERDR_ENV: "1", PI_HYPERLINKS: "0" }, () => detectCapabilities()).hyperlinks, false);
+		const nested = withEnv({ HERDR_ENV: "1", TMUX: "/tmp/tmux-1000/default,1234,0" }, () =>
+			detectCapabilities(() => false),
+		);
+		assert.strictEqual(nested.hyperlinks, false);
 	});
 
 	it("disables hyperlinks under tmux when the client does not forward them", () => {
@@ -655,6 +668,18 @@ describe("linkifyUrls", () => {
 			);
 			const linked = hyperlink("PR", url);
 			assert.strictEqual(linkifyUrls(`${linked} ${url}`), `${linked} ${url}`);
+		} finally {
+			resetCapabilitiesCache();
+		}
+	});
+
+	it("keeps balanced closing parentheses and stops at control characters", () => {
+		setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+		try {
+			const wiki = "https://en.wikipedia.org/wiki/Herdr_(software)";
+			assert.strictEqual(linkifyUrls(`See ${wiki}.`), `See ${hyperlink(wiki, wiki)}.`);
+			assert.strictEqual(linkifyUrls(`(see ${wiki})`), `(see ${hyperlink(wiki, wiki)})`);
+			assert.strictEqual(linkifyUrls(`${url}\x07bell`), `${hyperlink(url, url)}\x07bell`);
 		} finally {
 			resetCapabilitiesCache();
 		}
