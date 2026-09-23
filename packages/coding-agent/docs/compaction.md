@@ -135,7 +135,7 @@ Why 20 minutes: a split compaction can require two serial summary requests. The 
 
 If compaction fails or is cancelled before a new prompt, `prompt()` rejects without appending or sending that prompt. The processed text and attachments stay in the existing steering queue, or the follow-up queue when requested. `preflightResult` receives `false`. Recover the queued input before resubmitting it to avoid duplicates. A failed between-turn compaction also stops continuation rather than sending unchanged oversized context.
 
-Interactive input queued during compaction is only submitted after a successful, non-aborted result. When compaction ran before a new prompt, that queued input joins the new prompt's run as steering or follow-up input instead of racing it. Failure and cancellation leave its text and steering/follow-up modes unchanged. These queues are in memory, not durable storage; process loss can still lose them.
+Interactive input queued during compaction is only submitted after a successful, non-aborted result. When compaction ran before a new prompt, that queued input joins the new prompt's run as steering or follow-up input instead of racing it. If the new prompt then fails before its run starts, the queued input starts its own run. Failure and cancellation leave its text and steering/follow-up modes unchanged. These queues are in memory, not durable storage; process loss can still lose them.
 
 The deadline aborts requests and stops Pi's waits. It cannot force an extension or provider that ignores its signal to stop remote work; their late promises remain observed, but their results do not restart compaction or publish a summary.
 
