@@ -19,8 +19,9 @@ export function shortenPath(path: unknown): string {
 /**
  * OSC 8 file URL for a path. Herdr runs its link handlers on the Herdr server host, which may not be the
  * client's host, so for Herdr the URL names this host (as the OSC 8 spec suggests) and puts the line in the
- * fragment (`#42`, as kitty's hyperlinked grep does). Other terminals and Pi's own click-to-open get a plain
- * `file:///path`, which every opener accepts; on Windows a host would turn the URL into a UNC path.
+ * fragment (`#42`, as kitty's hyperlinked grep does). Other terminals get a plain `file:///path`, which every
+ * opener accepts; on Windows a host would turn the URL into a UNC path. Pi's own fullscreen click-to-open
+ * turns this host's links back into `file:///path` (see `toLocalOpenTarget`).
  */
 export function fileLinkUrl(
 	absolutePath: string,

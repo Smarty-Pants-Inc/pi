@@ -9,6 +9,7 @@ import type { ToolRenderContext } from "../src/core/extensions/types.ts";
 import { fileLinkUrl } from "../src/core/tools/render-utils.ts";
 import { editRenderers, findRenderers, grepRenderers, readRenderers } from "../src/core/tools/renderers/index.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
+import { toLocalOpenTarget } from "../src/utils/open-browser.ts";
 
 const OSC8_URL = /\x1b\]8;;([^\x07\x1b]+)(?:\x07|\x1b\\)/g;
 const HERDR = { HERDR_ENV: "1", TERM_PROGRAM: "" };
@@ -169,5 +170,23 @@ describe("tool path links", () => {
 		expect(html).not.toContain("]8;");
 		expect(html).not.toContain("\x1b");
 		expect(html).not.toContain(hostname());
+		expect(ansiToHtml("\x1b]8;;file:///x\x07text\x1b]8;;\x07")).toBe("text");
+		expect(ansiToHtml("a ]8;;file:///x b")).toBe("a ]8;;file:///x b");
+	});
+
+	test("Pi's own opener gets this host's file links as plain file:///path", () => {
+		const herdrLink = fileLinkUrl("/tmp/a b#c.ts", 12, HERDR, "linux");
+		expect(toLocalOpenTarget(herdrLink)).toBe("file:///tmp/a%20b%23c.ts");
+		expect(toLocalOpenTarget(herdrLink.replace(hostname(), hostname().toUpperCase()))).toBe(
+			"file:///tmp/a%20b%23c.ts",
+		);
+		for (const target of [
+			"file:///tmp/a.ts",
+			"file://other-host/tmp/a.ts#3",
+			"https://example.test/#x",
+			"not a url",
+		]) {
+			expect(toLocalOpenTarget(target)).toBe(target);
+		}
 	});
 });
