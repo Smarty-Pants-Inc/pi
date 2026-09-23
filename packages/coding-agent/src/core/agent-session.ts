@@ -376,6 +376,8 @@ export class AgentSession {
 	private _isAgentRunActive = false;
 	/** Prompt preflights that may still start a run, oldest first. */
 	private readonly _promptPreflights = new Set<object>();
+	/** Input was queued behind a prompt preflight, not behind an active run. */
+	private _inputQueuedBehindPreflight = false;
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -1608,7 +1610,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(
-		messages: AgentMessage | AgentMessage[],
+		messages: AgentMessage | AgentMessage[] | undefined,
 		promptToken?: object,
 		automaticEnrollment?: OriginalAutomaticEnrollment,
 		onInputTransferred?: () => void,
@@ -1622,7 +1624,8 @@ export class AgentSession {
 			if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 			// No await or external callback may separate this check from dispatch.
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
-			const run = continuation ? agent.continue() : agent.prompt(messages);
+			// Without messages, the run starts from queued input.
+			const run = continuation || !messages ? agent.continue() : agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
 			} catch (cause) {
@@ -1638,6 +1641,7 @@ export class AgentSession {
 		};
 		this._stopAfterCompactionFailure = false;
 		this._agentRunAbortRequested = false;
+		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
 		this.#auditState("session_run_start");
 		try {
@@ -1887,6 +1891,7 @@ export class AgentSession {
 				} else {
 					await this._queueSteer(expandedText, currentImages);
 				}
+				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
 				preflightResult?.(true);
 				return;
@@ -1927,6 +1932,8 @@ export class AgentSession {
 					const behavior = options?.streamingBehavior ?? "steer";
 					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
 					else await this._queueSteer(expandedText, currentImages);
+					// Input already queued behind this prompt is retained with it.
+					this._inputQueuedBehindPreflight = false;
 					onInputTransferred?.();
 					throw new Error(
 						`Prompt not sent: compaction ${outcome === "aborted" ? "was cancelled" : "failed"}. ` +
@@ -1991,7 +1998,10 @@ export class AgentSession {
 			preflightResult?.(false);
 			throw error;
 		} finally {
-			if (!messages) this._promptPreflights.delete(preflightToken);
+			if (!messages) {
+				this._promptPreflights.delete(preflightToken);
+				this._runInputQueuedBehindPreflight();
+			}
 		}
 
 		if (!messages) {
@@ -2004,6 +2014,28 @@ export class AgentSession {
 		this._promptPreflights.delete(preflightToken);
 		releasePreflight?.();
 		await run;
+	}
+
+	/**
+	 * Start a run for input queued behind a prompt preflight when the last preflight ends
+	 * without a run, for example because it failed. Otherwise that input waits for the
+	 * next prompt.
+	 */
+	private _runInputQueuedBehindPreflight(): void {
+		if (!this._inputQueuedBehindPreflight || this._promptPreflights.size > 0 || !this.isIdle) return;
+		this._inputQueuedBehindPreflight = false;
+		// ponytail: Agent.continue() starts queued input only after an assistant message. Upstream
+		// rejects a queued continuation without transcript, so a failed first prompt still leaves its
+		// queued input for the next prompt. That failure is usually a missing model or auth, which the
+		// queued input would also hit. Revisit if another first-prompt failure strands input.
+		if (!this.agent.hasQueuedMessages() || this.agent.state.messages.at(-1)?.role !== "assistant") return;
+		void this._runAgentPrompt(undefined).catch((error: unknown) => {
+			this._extensionRunner.emitError({
+				extensionPath: "<queue>",
+				event: "prompt",
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 	}
 
 	/**
