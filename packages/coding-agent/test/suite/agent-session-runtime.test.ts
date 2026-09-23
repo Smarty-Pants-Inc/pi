@@ -191,13 +191,6 @@ describe("AgentSessionRuntime characterization", () => {
 
 		faux.setResponses([fauxAssistantMessage(fauxToolCall("block", {}), { stopReason: "toolUse" })]);
 		const outgoingSession = runtime.session;
-		const settledBeforeReplacement: boolean[] = [];
-		cleanups.push(
-			outgoingSession.subscribe((event) => {
-				if (event.type === "agent_settled") settledBeforeReplacement.push(runtime.session === outgoingSession);
-			}),
-		);
-		const callsBefore = faux.state.callCount;
 		const promptPromise = outgoingSession.prompt("start blocking tool");
 		await toolStartedPromise;
 
@@ -206,19 +199,18 @@ describe("AgentSessionRuntime characterization", () => {
 
 		expect(switchResult.cancelled).toBe(false);
 		expect(runtime.session.sessionFile).toBe(firstSessionFile);
-		expect(settledBeforeReplacement).toEqual([true]);
-		expect(faux.state.callCount).toBe(callsBefore + 1);
-		// Abort persists the interrupted tool result and settles before replacement,
-		// without starting another assistant request.
+		// The outgoing session settled before replacement: the interrupted tool
+		// call has a persisted tool result instead of dangling forever.
 		const outgoingEntries = SessionManager.open(outgoingSession.sessionFile!)
 			.getEntries()
 			.filter((entry) => entry.type === "message");
-		expect(outgoingEntries.map((entry) => entry.message.role)).toEqual(["system", "user", "assistant", "toolResult"]);
-		expect(outgoingEntries.at(-1)?.message).toMatchObject({
-			role: "toolResult",
-			toolName: "block",
-			content: [{ type: "text", text: "tool aborted" }],
-		});
+		expect(outgoingEntries.map((entry) => entry.message.role)).toEqual([
+			"system",
+			"user",
+			"assistant",
+			"toolResult",
+			"assistant",
+		]);
 	});
 
 	it("preserves an existing session when importing a file with the same name", async () => {

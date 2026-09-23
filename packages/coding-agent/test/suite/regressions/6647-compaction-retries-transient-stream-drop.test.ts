@@ -221,6 +221,7 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		expect(harness.eventsOfType("auto_retry_start")).toHaveLength(2);
 	});
 
+	// A provider-aborted summary without user cancellation is a failure (#9777).
 	it("does not persist a provider-aborted summary", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
@@ -229,7 +230,7 @@ describe("#6647 compaction retries transient summarization failures", () => {
 		await expect(harness.session.compact()).rejects.toThrow("Compaction cancelled");
 		expect(harness.faux.state.callCount).toBe(1);
 		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "compaction")).toBe(false);
-		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ aborted: true });
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ aborted: false });
 	});
 
 	it("aborts an in-flight retry backoff via abortCompaction", async () => {

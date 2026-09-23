@@ -116,8 +116,8 @@ export async function runAgentLoop(
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
-	const injectedPrompts = await appendPendingMessages(currentContext, newMessages, [prompts], emit, signal);
-	if (signal?.aborted || (hadPrompts && !injectedPrompts)) {
+	const injectedPrompts = await appendPendingMessages(currentContext, newMessages, [prompts], emit);
+	if (hadPrompts && !injectedPrompts) {
 		await emit({ type: "agent_end", messages: newMessages });
 		return newMessages;
 	}
@@ -181,7 +181,7 @@ async function runLoop(
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		// Inner loop: process tool calls and steering messages
-		while (!signal?.aborted && (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn)) {
+		while (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn) {
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
@@ -205,10 +205,7 @@ async function runLoop(
 				if (pendingMessages.length === 0) {
 					pendingMessages = (await config.getSteeringMessages?.()) || [];
 				}
-				if (
-					signal?.aborted ||
-					(!hasMoreToolCalls && !contextOnlyTurn && preparedMessages.length === 0 && pendingMessages.length === 0)
-				)
+				if (!hasMoreToolCalls && !contextOnlyTurn && preparedMessages.length === 0 && pendingMessages.length === 0)
 					break;
 				await emit({ type: "turn_start" });
 			}
@@ -218,11 +215,10 @@ async function runLoop(
 				newMessages,
 				[preparedMessages, pendingMessages],
 				emit,
-				signal,
 			);
 			pendingMessages = [];
 			// Clearing queued input is not a context-only continuation decision.
-			if (signal?.aborted || (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages)) break;
+			if (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages) break;
 			contextOnlyTurn = false;
 
 			const requestUpdate = await config.prepareRequest?.(
@@ -246,7 +242,6 @@ async function runLoop(
 								: requestUpdate.thinkingLevel,
 				};
 			}
-			if (signal?.aborted) break;
 
 			// Stream assistant response
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
@@ -308,8 +303,6 @@ async function runLoop(
 			}
 		}
 
-		if (signal?.aborted) break;
-
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
@@ -343,14 +336,12 @@ async function appendPendingMessages(
 	newMessages: AgentMessage[],
 	batches: AgentMessage[][],
 	emit: AgentEventSink,
-	signal?: AbortSignal,
 ): Promise<boolean> {
 	let injected = false;
 	// The final pass reconciles tools if a pending system declaration was cleared
 	// during an awaited event. A synthetic declaration never counts as queued input.
 	for (const pending of [batches, []]) {
 		for (const { message, source } of declareToolChanges(context, pending)) {
-			if (signal?.aborted) return injected;
 			if (source && source.batch[source.index] !== source.message) continue;
 			await emit({ type: "message_start", message }, source?.message);
 			await emit({ type: "message_end", message });

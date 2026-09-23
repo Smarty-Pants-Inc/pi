@@ -102,7 +102,8 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 		expect(requests()).toBe(path === "initial" ? 1 : 2);
 	});
 
-	it.each(["clear", "abort", "fail"] as const)(
+	// Abort is excluded: like upstream, queued input still reaches the aborted run.
+	it.each(["clear", "fail"] as const)(
 		"does not manufacture a provider turn when preparation ends with %s",
 		async (action) => {
 			const { agent, requests } = fixture();
@@ -113,7 +114,6 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 			agent.prepareNextTurn = async () => {
 				await Promise.resolve();
 				if (action === "clear") agent.clearAllQueues();
-				else if (action === "abort") agent.abort();
 				else throw new Error("preparation failed");
 				return undefined;
 			};

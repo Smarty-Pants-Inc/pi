@@ -200,7 +200,6 @@ describe("AgentSession concurrent prompt guard", () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 		let sawSteeringMessage = false;
-		let finishInitialResponse = () => {};
 		let lastInputSource: string | undefined;
 		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
 
@@ -235,14 +234,8 @@ describe("AgentSession concurrent prompt guard", () => {
 						return;
 					}
 
-					let completed = false;
-					finishInitialResponse = () => {
-						completed = true;
-						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("Initial response") });
-					};
 					stream.push({ type: "start", partial: createAssistantMessage("") });
 					const checkAbort = () => {
-						if (completed) return;
 						if (abortSignal?.aborted) {
 							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
 						} else {
@@ -305,9 +298,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(lastInputSource).toBe("extension");
 		expect(queueEvents.some((event) => event.steering.includes("Steer from extension"))).toBe(true);
 
-		// smarty-dev#217: v0.87 abort preserves queued work instead of starting another run.
-		finishInitialResponse();
-		await firstPrompt;
+		await session.abort();
+		await firstPrompt.catch(() => {});
 
 		expect(sawSteeringMessage).toBe(true);
 	});

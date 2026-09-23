@@ -119,7 +119,7 @@ Response:
 }
 ```
 
-To implement interactive Esc behavior, send `clear_queue` before `abort`, then restore the returned text in the client editor. `abort` stops the active run and retains queued messages; it does not start another run to deliver them.
+To implement interactive Esc behavior, send `clear_queue` before `abort`, then restore the returned text in the client editor. `abort` continues queued messages when they remain in the session.
 
 ### new_session
 
