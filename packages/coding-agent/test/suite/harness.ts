@@ -64,7 +64,6 @@ export interface HarnessOptions {
 	persistSession?: boolean;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
-	systemPrompt?: string;
 	tools?: AgentTool[];
 	initialActiveToolNames?: string[];
 	allowedToolNames?: string[];
@@ -133,6 +132,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 				api: registeredModel.api,
 				reasoning: registeredModel.reasoning,
 				input: registeredModel.input,
+				inputLimits: registeredModel.inputLimits,
 				cost: registeredModel.cost,
 				contextWindow: registeredModel.contextWindow,
 				maxTokens: registeredModel.maxTokens,
@@ -146,7 +146,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		streamFn: streamSimple,
 		initialState: {
 			model,
-			systemPrompt: options.systemPrompt ?? "You are a test assistant.",
+			systemPrompt: "",
 			tools: [],
 		},
 		convertToLlm,

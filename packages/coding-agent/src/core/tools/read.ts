@@ -1,5 +1,5 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import type { Api, ImageContent, Model, TextContent } from "@earendil-works/pi-ai";
+import type { Api, ImageContent, Model, ModelImageResizeOptions, TextContent } from "@earendil-works/pi-ai";
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
@@ -50,8 +50,10 @@ const defaultReadOperations: ReadOperations = {
 };
 
 export interface ReadToolOptions {
-	/** Whether to auto-resize images to 2000x2000 max. Default: true */
+	/** Whether to auto-resize images. Default: true */
 	autoResizeImages?: boolean;
+	/** Fallback resize profile when the execution context has no model metadata. */
+	resizeOptions?: ModelImageResizeOptions;
 	/** Custom operations for file reading. Default: local filesystem */
 	operations?: ReadOperations;
 }
@@ -70,6 +72,7 @@ export function createReadToolDefinition(
 	const owner = options && ordinaryOwnerOf(options);
 	if (owner && options?.operations) throw new Error("OWNER_TOOL_OPERATIONS");
 	const autoResizeImages = options?.autoResizeImages ?? true;
+	const fallbackResizeOptions = options?.resizeOptions;
 	const ops = options?.operations ?? defaultReadOperations;
 	return {
 		name: "read",
@@ -132,7 +135,10 @@ export function createReadToolDefinition(
 								// The read grant does not admit an image worker or decoder.
 								if (owner && (autoResizeImages || mimeType === "image/bmp"))
 									throw new Error("OWNER_IMAGE_PROCESSING_SCOPE");
-								const processed = await processImage(buffer, mimeType, { autoResizeImages });
+								const processed = await processImage(buffer, mimeType, {
+									autoResizeImages,
+									resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
+								});
 								owner?.assertActive();
 								if (!processed.ok) {
 									let textNote = `Read image file [${mimeType}]\n${processed.message}`;

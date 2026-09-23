@@ -1,6 +1,12 @@
 import { describe, expect, test } from "vitest";
 import { materializeOwnedEntry, parseOwnedSessionEntries } from "../src/core/owned-session-entries.ts";
-import type { CustomEntry, SessionHeader } from "../src/core/session-manager.ts";
+import type {
+	CompactionEntry,
+	ContextEditEntry,
+	CustomEntry,
+	SessionHeader,
+	SessionMessageEntry,
+} from "../src/core/session-manager.ts";
 
 const header: SessionHeader = {
 	type: "session",
@@ -130,6 +136,53 @@ describe("strict owned native open", () => {
 		expect(() => parseOwnedSessionEntries(journal({ ...custom(null), parentId: "missing" }), header.id)).toThrow(
 			"OWNER_JOURNAL_ENTRY",
 		);
+	});
+
+	// smarty-dev#217: retain the v0.87 journal forms without admitting dangling references.
+	test("accepts retain-none compaction using its own entry ID", () => {
+		const compaction: CompactionEntry = {
+			type: "compaction",
+			id: "e1",
+			parentId: null,
+			timestamp: header.timestamp,
+			summary: "all summarized",
+			firstKeptEntryId: "e1",
+			tokensBefore: 1,
+		};
+		expect(parseOwnedSessionEntries(journal(compaction), header.id)).toEqual([header, compaction]);
+	});
+
+	test("accepts context edits only for earlier editable entries and valid replacement shapes", () => {
+		const message: SessionMessageEntry = {
+			type: "message",
+			id: "e1",
+			parentId: null,
+			timestamp: header.timestamp,
+			message: { role: "user", content: "original", timestamp: 1 },
+		};
+		const edit: ContextEditEntry = {
+			type: "context_edit",
+			id: "e2",
+			parentId: "e1",
+			timestamp: header.timestamp,
+			targetId: "e1",
+			replacement: { content: "replacement" },
+		};
+		for (const replacement of [{ content: "replacement" }, { content: [] }, null]) {
+			const changed = { ...edit, replacement };
+			expect(parseOwnedSessionEntries(journal(message, changed), header.id)).toEqual([header, message, changed]);
+		}
+		expect(() => parseOwnedSessionEntries(journal(message, { ...edit, targetId: "missing" }), header.id)).toThrow(
+			"OWNER_JOURNAL_CONTEXT_EDIT",
+		);
+		expect(() => parseOwnedSessionEntries(journal(custom(null), edit), header.id)).toThrow(
+			"OWNER_JOURNAL_CONTEXT_EDIT",
+		);
+		for (const replacement of [undefined, 1, [], {}, { content: 1 }]) {
+			expect(() => parseOwnedSessionEntries(journal(message, { ...edit, replacement }), header.id)).toThrow(
+				"OWNER_JOURNAL_CONTEXT_EDIT",
+			);
+		}
 	});
 
 	test("refuses a second header and dangling compaction or label references", () => {
