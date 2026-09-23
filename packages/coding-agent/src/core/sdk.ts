@@ -423,6 +423,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			headers: response.headers,
 		});
 	};
+	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
+		data,
+		model,
+	) => {
+		const runner = extensionRunnerRef.current;
+		if (!runner?.hasHandlers("provider_stream_event")) return;
+		await runner.emit({
+			data,
+			type: "provider_stream_event",
+			provider: model.provider,
+			api: model.api,
+			model: model.id,
+		});
+	};
 
 	const agent = new Agent({
 		initialState: {
@@ -451,6 +465,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		},
 		onPayload: transformProviderPayload,
 		onResponse: handleProviderResponse,
+		onProviderStreamEvent: handleProviderStreamEvent,
 		sessionId: sessionManager.getSessionId(),
 		transformContext: async (messages, signal) => {
 			const selected = pairedContext?.select(messages, signal) ?? messages;

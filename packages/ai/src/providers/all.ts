@@ -1,7 +1,6 @@
-import { createImagesModels, type ImagesProvider, type MutableImagesModels } from "../images-models.ts";
-import { MODELS } from "../models.generated.ts";
+import { CLASSIFIER_MODELS, IMAGE_MODELS, MODELS } from "../models.generated.ts";
 import { type CreateModelsOptions, createModels, type MutableModels, type Provider } from "../models.ts";
-import type { Api, Model } from "../types.ts";
+import type { AnyModel, Api, ClassifierApi, ClassifierModel, ImageApi, ImageModel, Model } from "../types.ts";
 import { amazonBedrockProvider } from "./amazon-bedrock.ts";
 import { antLingProvider } from "./ant-ling.ts";
 import { anthropicProvider } from "./anthropic.ts";
@@ -31,12 +30,12 @@ import { openaiCodexProvider } from "./openai-codex.ts";
 import { opencodeProvider } from "./opencode.ts";
 import { opencodeGoProvider } from "./opencode-go.ts";
 import { openrouterProvider } from "./openrouter.ts";
-import { openrouterImagesProvider } from "./openrouter-images.ts";
 import { qwenTokenPlanProvider } from "./qwen-token-plan.ts";
 import { qwenTokenPlanCnProvider } from "./qwen-token-plan-cn.ts";
 import { qwenTokenPlanIndividualProvider } from "./qwen-token-plan-individual.ts";
 import { radiusProvider } from "./radius.ts";
 import { togetherProvider } from "./together.ts";
+import { typesafeProvider } from "./typesafe.ts";
 import { vercelAIGatewayProvider } from "./vercel-ai-gateway.ts";
 import { xaiProvider } from "./xai.ts";
 import { xiaomiProvider } from "./xiaomi.ts";
@@ -53,22 +52,59 @@ export { radiusProvider };
  * catalog entry. Kimi remains a typed optional provider when its catalog is omitted. */
 export type BuiltinProvider = keyof typeof MODELS | "kimi-coding";
 
-type OptionalBuiltinCatalog = Record<string, Model<"anthropic-messages">>;
-type BuiltinCatalog<TProvider extends BuiltinProvider> = TProvider extends keyof typeof MODELS
-	? (typeof MODELS)[TProvider]
-	: OptionalBuiltinCatalog;
-type BuiltinModelApi<
-	TProvider extends BuiltinProvider,
-	TModelId extends keyof BuiltinCatalog<TProvider>,
-> = BuiltinCatalog<TProvider>[TModelId] extends { api: infer TApi } ? (TApi extends Api ? TApi : never) : never;
+/** Generated catalog for a provider, or a typed fallback when its catalog is omitted (Kimi). */
+type BuiltinCatalog<TCatalogs, TProvider extends BuiltinProvider, TFallback> = TProvider extends keyof TCatalogs
+	? TCatalogs[TProvider]
+	: TFallback;
+type ChatCatalog<TProvider extends BuiltinProvider> = BuiltinCatalog<
+	typeof MODELS,
+	TProvider,
+	Record<string, Model<"anthropic-messages">>
+>;
+type ImageCatalog<TProvider extends BuiltinProvider> = BuiltinCatalog<
+	typeof IMAGE_MODELS,
+	TProvider,
+	Record<string, never>
+>;
+type ClassifierCatalog<TProvider extends BuiltinProvider> = BuiltinCatalog<
+	typeof CLASSIFIER_MODELS,
+	TProvider,
+	Record<string, never>
+>;
+type BuiltinChatModelId<TProvider extends BuiltinProvider> = keyof ChatCatalog<TProvider>;
+type BuiltinImageModelId<TProvider extends BuiltinProvider> = keyof ImageCatalog<TProvider>;
+type BuiltinClassifierModelId<TProvider extends BuiltinProvider> = keyof ClassifierCatalog<TProvider>;
+/** API ids of catalog entries. Built-in getters return `Model<Api>` shapes, not literal entry types. */
+type CatalogApi<TEntry> = TEntry extends { api: infer TApi extends string } ? TApi : never;
 
-/** Typed read of the generated built-in catalog. */
-export function getBuiltinModel<TProvider extends BuiltinProvider, TModelId extends keyof BuiltinCatalog<TProvider>>(
+/** Typed read of one generated built-in chat model. */
+export function getBuiltinModel<TProvider extends BuiltinProvider, TModelId extends BuiltinChatModelId<TProvider>>(
 	provider: TProvider,
 	modelId: TModelId,
-): Model<BuiltinModelApi<TProvider, TModelId>> {
-	const models = (MODELS as unknown as Partial<Record<BuiltinProvider, Record<string, Model<Api>>>>)[provider];
-	return models?.[modelId as string] as Model<BuiltinModelApi<TProvider, TModelId>>;
+): Model<CatalogApi<ChatCatalog<TProvider>[TModelId]>> {
+	return (MODELS as Record<string, Record<string, Model<Api>> | undefined>)[provider]?.[modelId as string] as Model<
+		CatalogApi<ChatCatalog<TProvider>[TModelId]>
+	>;
+}
+
+/** Typed read of one generated built-in image model. */
+export function getBuiltinImageModel<
+	TProvider extends BuiltinProvider,
+	TModelId extends BuiltinImageModelId<TProvider>,
+>(provider: TProvider, modelId: TModelId): ImageModel<CatalogApi<ImageCatalog<TProvider>[TModelId]>> {
+	return (IMAGE_MODELS as Record<string, Record<string, ImageModel<ImageApi>> | undefined>)[provider]?.[
+		modelId as string
+	] as ImageModel<CatalogApi<ImageCatalog<TProvider>[TModelId]>>;
+}
+
+/** Typed read of one generated built-in classifier model. */
+export function getBuiltinClassifierModel<
+	TProvider extends BuiltinProvider,
+	TModelId extends BuiltinClassifierModelId<TProvider>,
+>(provider: TProvider, modelId: TModelId): ClassifierModel<CatalogApi<ClassifierCatalog<TProvider>[TModelId]>> {
+	return (CLASSIFIER_MODELS as Record<string, Record<string, ClassifierModel<ClassifierApi>> | undefined>)[provider]?.[
+		modelId as string
+	] as ClassifierModel<CatalogApi<ClassifierCatalog<TProvider>[TModelId]>>;
 }
 
 export function getBuiltinProviders(): BuiltinProvider[] {
@@ -83,9 +119,33 @@ export function getBuiltinModelDataGeneratedAt(): number | undefined {
 
 export function getBuiltinModels<TProvider extends BuiltinProvider>(
 	provider: TProvider,
-): Model<BuiltinModelApi<TProvider, keyof BuiltinCatalog<TProvider>>>[] {
-	const models = (MODELS as unknown as Partial<Record<BuiltinProvider, Record<string, Model<Api>>>>)[provider];
-	return models ? (Object.values(models) as Model<BuiltinModelApi<TProvider, keyof BuiltinCatalog<TProvider>>>[]) : [];
+): Model<CatalogApi<ChatCatalog<TProvider>[BuiltinChatModelId<TProvider>]>>[] {
+	const models = (MODELS as Record<string, Record<string, Model<Api>> | undefined>)[provider];
+	return Object.values(models ?? {}) as Model<CatalogApi<ChatCatalog<TProvider>[BuiltinChatModelId<TProvider>]>>[];
+}
+
+export function getBuiltinImageModels<TProvider extends BuiltinProvider>(
+	provider: TProvider,
+): ImageModel<CatalogApi<ImageCatalog<TProvider>[BuiltinImageModelId<TProvider>]>>[] {
+	const models = (IMAGE_MODELS as Record<string, Record<string, ImageModel<ImageApi>> | undefined>)[provider];
+	return Object.values(models ?? {}) as ImageModel<
+		CatalogApi<ImageCatalog<TProvider>[BuiltinImageModelId<TProvider>]>
+	>[];
+}
+
+export function getBuiltinClassifierModels<TProvider extends BuiltinProvider>(
+	provider: TProvider,
+): ClassifierModel<CatalogApi<ClassifierCatalog<TProvider>[BuiltinClassifierModelId<TProvider>]>>[] {
+	const models = (CLASSIFIER_MODELS as Record<string, Record<string, ClassifierModel<ClassifierApi>> | undefined>)[
+		provider
+	];
+	return Object.values(models ?? {}) as ClassifierModel<
+		CatalogApi<ClassifierCatalog<TProvider>[BuiltinClassifierModelId<TProvider>]>
+	>[];
+}
+
+export function getAllBuiltinModels<TProvider extends BuiltinProvider>(provider: TProvider): AnyModel[] {
+	return [...getBuiltinModels(provider), ...getBuiltinImageModels(provider), ...getBuiltinClassifierModels(provider)];
 }
 
 /** All built-in providers, freshly constructed. */
@@ -124,6 +184,7 @@ export function builtinProviders(): Provider[] {
 		qwenTokenPlanIndividualProvider(),
 		radiusProvider(),
 		togetherProvider(),
+		typesafeProvider(),
 		vercelAIGatewayProvider(),
 		xaiProvider(),
 		xiaomiProvider(),
@@ -139,20 +200,6 @@ export function builtinProviders(): Provider[] {
 export function builtinModels(options?: CreateModelsOptions): MutableModels {
 	const models = createModels(options);
 	for (const provider of builtinProviders()) {
-		models.setProvider(provider);
-	}
-	return models;
-}
-
-/** All built-in image-generation providers, freshly constructed. */
-export function builtinImagesProviders(): ImagesProvider[] {
-	return [openrouterImagesProvider()];
-}
-
-/** An `ImagesModels` collection with every built-in image-generation provider registered. */
-export function builtinImagesModels(options?: CreateModelsOptions): MutableImagesModels {
-	const models = createImagesModels(options);
-	for (const provider of builtinImagesProviders()) {
 		models.setProvider(provider);
 	}
 	return models;
