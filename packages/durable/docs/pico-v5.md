@@ -2096,11 +2096,12 @@ benchmarks.
 
 ### 11.3 JSONL
 
-JSONL uses reclaimable sidecars without exposing them to the harness. Persistence
-alone does not provide the ownership boundary: any decoded indexes, materialized
-values, or caches retained in memory must be detached from commit arguments and
-must not be exposed directly by reads. A JSONL backend cannot simply add file
-appends around aliasing memory tables.
+JSONL depends on the portable `FileSystem` capability, not the broader
+`ExecutionEnv`. It uses reclaimable sidecars without exposing them to the
+harness. Persistence alone does not provide the ownership boundary: any decoded
+indexes, materialized values, or caches retained in memory must be detached from
+commit arguments and must not be exposed directly by reads. A JSONL backend
+cannot simply add file appends around aliasing memory tables.
 
 ```text
 main.jsonl       table writes, document records, and one marker per commit
@@ -2115,9 +2116,18 @@ Publication protocol:
 3. Publish in memory only after the marker write succeeds.
 
 Every commit uses this protocol; there is no standalone-sidecar fast path.
-Without `fsync`, it guarantees ordinary process-crash consistency, not survival
-of power, host, kernel, or filesystem failure. Durable mode flushes sidecars
-before the marker.
+JSONL creation accepts an `fsync` option that defaults to `false`. Without
+`fsync`, it guarantees ordinary process-crash consistency, not survival of
+power, host, kernel, or filesystem failure. With `fsync: true`, the backend
+appends all affected sidecar records, flushes each affected sidecar, and only
+then appends the main marker. Ordinary publication does not explicitly flush
+`main.jsonl`; an acknowledged tail commit may therefore still disappear, but a
+marker that survives should not overtake its sidecar data. A main-only commit has
+no sidecars to flush. Before destructive reclamation with `fsync: true`, the
+backend flushes `main.jsonl` once so the authorizing marker cannot disappear
+while its replacement or removal survives. If that flush fails, the committed
+state remains published and reclamation is deferred. A non-empty temporary
+replacement is also flushed before rename.
 
 Recovery:
 
@@ -2129,10 +2139,12 @@ Recovery:
   record unnecessary.
 - Any uncertain append failure poisons the open backend.
 
-Reclamation starts only after the authorizing base/retirement commits. It writes
-a temporary replacement, renames it, and invalidates cached file descriptors so
-future appends cannot target an unlinked inode. `main.jsonl` is not compacted in
-the initial implementation.
+Reclamation starts only after the authorizing base/retirement commits. When no
+sidecar records remain, it removes the sidecar directly. Otherwise, it writes a
+temporary replacement, renames it, and invalidates cached file descriptors so
+future appends cannot target an unlinked inode. Flushing `main.jsonl` to
+authorize reclamation does not compact it. `main.jsonl` is not compacted in the
+initial implementation.
 
 ## 12. API footguns
 

@@ -1,7 +1,9 @@
 import { dirname, join } from "node:path";
 import {
+	type AnyModel,
 	type Api,
 	type ApiStreamOptions,
+	type AssistantImages,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type AuthCheck,
@@ -9,6 +11,11 @@ import {
 	type AuthOperationOptions,
 	type AuthResult,
 	type AuthType,
+	type ClassifierApi,
+	type ClassifierContext,
+	type ClassifierModel,
+	type ClassifierOptions,
+	type ClassifierResult,
 	type Context,
 	type Credential,
 	type CredentialInfo,
@@ -17,18 +24,26 @@ import {
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
+	type ImageApi,
+	type ImageModel,
+	type ImagesContext,
+	type ImagesOptions,
 	lazyStream,
 	type Model,
 	type Models,
 	type ModelsApiStreamOptions,
+	type ModelsClassifierOptions,
 	type ModelsDeferredCancelOptions,
 	type ModelsDeferredFetchOptions,
 	ModelsError,
+	type ModelsImagesOptions,
 	type ModelsRefreshOptions,
 	type ModelsRefreshResult,
 	type ModelsRequestTransforms,
 	type ModelsSimpleStreamOptions,
 	type ModelsStore,
+	type ModelType,
+	type ModelTypeMap,
 	type MutableModels,
 	normalizeContext,
 	type Provider,
@@ -38,6 +53,13 @@ import {
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
+import {
+	assertChatModel,
+	assertClassifierModel,
+	assertImageModel,
+	classifierErrorResult,
+	imageErrorResult,
+} from "@earendil-works/pi-ai/utils/model-operations";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage, ReadOnlyAuthStorage } from "./auth-storage.ts";
@@ -425,6 +447,40 @@ export class ModelRuntime implements Models {
 		return this.models.getModel(providerId, modelId);
 	}
 
+	getModelsOfType<TType extends ModelType>(type: TType, providerId?: string): readonly ModelTypeMap[TType][] {
+		return this.models.getModelsOfType(type, providerId);
+	}
+
+	getModelOfType<TType extends ModelType>(
+		type: TType,
+		providerId: string,
+		modelId: string,
+	): ModelTypeMap[TType] | undefined {
+		return this.models.getModelOfType(type, providerId, modelId);
+	}
+
+	getAllModels(providerId?: string): readonly AnyModel[] {
+		return this.models.getAllModels(providerId);
+	}
+
+	getAvailableOfType<TType extends ModelType>(
+		type: TType,
+		providerId?: string,
+		options?: AuthOperationOptions,
+	): Promise<readonly ModelTypeMap[TType][]> {
+		// The ordinary owner may use only its one allowed chat model.
+		if (this.#ordinaryOwner)
+			return type === "chat"
+				? (this.getAvailable(providerId, options) as Promise<readonly ModelTypeMap[TType][]>)
+				: this.getAvailable(providerId, options).then(() => []);
+		return this.models.getAvailableOfType(type, providerId, options);
+	}
+
+	getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
+		if (this.#ordinaryOwner) return this.getAvailable(providerId, options);
+		return this.models.getAllAvailable(providerId, options);
+	}
+
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
 		if (this.#ordinaryOwner) {
 			this.#ordinaryOwner.assertCredentialBinding();
@@ -526,9 +582,9 @@ export class ModelRuntime implements Models {
 	}
 
 	getAuth(providerId: string, overrides?: ModelRuntimeAuthOverrides): Promise<AuthResult | undefined>;
-	getAuth(model: Model<Api>, overrides?: ModelRuntimeAuthOverrides): Promise<AuthResult | undefined>;
+	getAuth(model: AnyModel, overrides?: ModelRuntimeAuthOverrides): Promise<AuthResult | undefined>;
 	async getAuth(
-		providerOrModel: string | Model<Api>,
+		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
 		const owner = this.#ordinaryOwner;
@@ -658,13 +714,16 @@ export class ModelRuntime implements Models {
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 
-	private async prepareRequest<TOptions extends ProviderRequestOptions & ModelsRequestTransforms>(
-		model: Model<Api>,
+	private async prepareRequest<
+		TModel extends AnyModel,
+		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
+	>(
+		model: TModel,
 		options: TOptions | undefined,
 	): Promise<{
 		provider: Provider;
-		model: Model<Api>;
-		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
+		model: TModel;
+		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 	}> {
 		const owner = this.#ordinaryOwner;
 		owner?.assertCredentialBinding();
@@ -681,14 +740,14 @@ export class ModelRuntime implements Models {
 		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
-		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
+		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
 		if (transformHeaders) headers = await transformHeaders(headers ?? {});
 		const env =
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
-		const preparedModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
 		if (owner) {
 			owner.assertCredentialBinding();
 			owner.assertNativeTokenReservation();
@@ -697,23 +756,23 @@ export class ModelRuntime implements Models {
 			const allowed = owner.decision.record.provider;
 			if (
 				this.models.getProvider(model.provider) !== provider ||
-				preparedModel.provider !== allowed.provider ||
-				preparedModel.id !== allowed.model ||
-				preparedModel.api !== allowed.api ||
-				preparedModel.baseUrl !== allowed.baseUrl
+				requestModel.provider !== allowed.provider ||
+				requestModel.id !== allowed.model ||
+				requestModel.api !== allowed.api ||
+				requestModel.baseUrl !== allowed.baseUrl
 			) {
 				throw new Error("OWNER_PREPARED_PROVIDER_IDENTITY");
 			}
 		}
 		return {
 			provider,
-			model: preparedModel,
+			model: requestModel,
 			options: {
 				...providerOptions,
 				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
 				headers,
 				env,
-			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions,
+			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
 		};
 	}
 
@@ -724,16 +783,13 @@ export class ModelRuntime implements Models {
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
 		return lazyStream(model, async () => {
+			assertChatModel(model);
 			const prepared = await this.prepareRequest(
 				model,
 				options as (StreamOptions & ModelsRequestTransforms) | undefined,
 			);
 			this.#ordinaryOwner?.assertSubmission();
-			return prepared.provider.stream(
-				prepared.model as Model<TApi>,
-				transcript,
-				prepared.options as ApiStreamOptions<TApi>,
-			);
+			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
 		});
 	}
 
@@ -748,6 +804,7 @@ export class ModelRuntime implements Models {
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
 		return lazyStream(model, async () => {
+			assertChatModel(model);
 			const prepared = await this.prepareRequest(model, options);
 			this.#ordinaryOwner?.assertSubmission();
 			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
@@ -764,6 +821,7 @@ export class ModelRuntime implements Models {
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
+			assertChatModel(model);
 			const prepared = await this.prepareRequest(model, options);
 			if (!prepared.provider.fetchDeferred) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
@@ -785,11 +843,46 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredCancelOptions,
 	): Promise<void> {
+		assertChatModel(model);
 		const prepared = await this.prepareRequest(model, options);
 		if (!prepared.provider.cancelDeferred) {
 			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 		}
 		await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
+	}
+
+	async generateImages(
+		model: ImageModel<ImageApi>,
+		context: ImagesContext,
+		options?: ModelsImagesOptions,
+	): Promise<AssistantImages> {
+		try {
+			assertImageModel(model);
+			const prepared = await this.prepareRequest(model, options);
+			if (!prepared.provider.generateImages) {
+				throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
+			}
+			return await prepared.provider.generateImages(prepared.model, context, prepared.options as ImagesOptions);
+		} catch (error) {
+			return imageErrorResult(model, error, options?.signal?.aborted);
+		}
+	}
+
+	async classify(
+		model: ClassifierModel<ClassifierApi>,
+		context: ClassifierContext,
+		options?: ModelsClassifierOptions,
+	): Promise<ClassifierResult> {
+		try {
+			assertClassifierModel(model);
+			const prepared = await this.prepareRequest(model, options);
+			if (!prepared.provider.classify) {
+				throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
+			}
+			return await prepared.provider.classify(prepared.model, context, prepared.options as ClassifierOptions);
+		} catch (error) {
+			return classifierErrorResult(model, error, options?.signal?.aborted);
+		}
 	}
 
 	login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {
