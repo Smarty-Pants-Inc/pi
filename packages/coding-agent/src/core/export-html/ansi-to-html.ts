@@ -191,11 +191,15 @@ function applySgrCode(params: number[], style: TextStyle): void {
 
 // Match ANSI escape sequences: ESC[ followed by params and ending with 'm'
 const ANSI_REGEX = /\x1b\[([\d;]*)m/g;
+// OSC sequences (for example OSC 8 hyperlinks) terminated by BEL or ST. They have no HTML form here.
+const OSC_REGEX = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 
 /**
  * Convert ANSI-escaped text to HTML with inline styles.
  */
-export function ansiToHtml(text: string): string {
+export function ansiToHtml(ansiText: string): string {
+	// Terminal hyperlinks would show as raw "]8;;file://host/path" text and leak local paths in shared HTML.
+	const text = ansiText.replace(OSC_REGEX, "");
 	const style = createEmptyStyle();
 	let result = "";
 	let lastIndex = 0;
