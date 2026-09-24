@@ -1398,6 +1398,14 @@ export class AgentSession {
 		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
+	/**
+	 * Whether `agent_settled` handlers are running. Exactly then, `prompt()` and a triggered custom message are
+	 * deferred until the remaining handlers finish.
+	 */
+	get isSettling(): boolean {
+		return this._isEmittingAgentSettled;
+	}
+
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
 		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
@@ -3801,6 +3809,7 @@ export class AgentSession {
 				getModel: () => this.model,
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
+				isSettling: () => this.isSettling,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {

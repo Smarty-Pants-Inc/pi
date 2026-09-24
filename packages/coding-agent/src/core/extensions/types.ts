@@ -340,6 +340,12 @@ export interface ExtensionContext {
 	thinkingLevel?: ThinkingLevel;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
+	/**
+	 * Whether `agent_settled` handlers are running. `isIdle()` is already true then. Exactly while this is true,
+	 * `sendUserMessage()` and `sendMessage(..., { triggerTurn: true })` do not start a turn at once: the turn
+	 * starts after the remaining `agent_settled` handlers. It is false once those deferred turns begin.
+	 */
+	isSettling(): boolean;
 	/** Whether project-local trust is active for this context. */
 	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
@@ -1898,6 +1904,7 @@ export interface ExtensionContextActions {
 	getModel: () => Model<any> | undefined;
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;
+	isSettling: () => boolean;
 	isProjectTrusted: () => boolean;
 	getSignal: () => AbortSignal | undefined;
 	abort: () => void;
