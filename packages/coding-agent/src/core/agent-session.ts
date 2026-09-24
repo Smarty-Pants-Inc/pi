@@ -456,6 +456,7 @@ export class AgentSession {
 	private _abortDuringBeforeSettle = false;
 	private _isEmittingAgentSettled = false;
 	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
+	private _isRunningDeferredSettledActions = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -1016,9 +1017,11 @@ export class AgentSession {
 
 		const deferred = this._deferredSettledActions.splice(0);
 		if (deferred.length > 0) {
+			this._isRunningDeferredSettledActions = true;
 			try {
 				for (const action of deferred) await action();
 			} finally {
+				this._isRunningDeferredSettledActions = false;
 				this._resolveIdleWaitIfIdle();
 			}
 			return;
@@ -1396,6 +1399,15 @@ export class AgentSession {
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
 		return !this._isAgentRunActive && !this.isCompacting;
+	}
+
+	/** Whether `agent_settled` handlers, or the prompts and runs they deferred, are still in progress. */
+	get isSettling(): boolean {
+		return (
+			this._isEmittingAgentSettled ||
+			this._deferredSettledActions.length > 0 ||
+			this._isRunningDeferredSettledActions
+		);
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
@@ -3801,6 +3813,7 @@ export class AgentSession {
 				getModel: () => this.model,
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
+				isSettling: () => this.isSettling,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {

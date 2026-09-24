@@ -76,6 +76,7 @@ function setup(options: { activeTools?: string[]; selectChoice?: string; editorT
 		},
 		sessionManager: { getEntries: () => [] },
 		isIdle: () => false,
+		isSettling: () => false,
 		hasPendingMessages: () => false,
 	} as unknown as ExtensionContext;
 
