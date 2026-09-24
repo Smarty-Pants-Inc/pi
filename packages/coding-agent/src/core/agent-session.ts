@@ -456,7 +456,6 @@ export class AgentSession {
 	private _abortDuringBeforeSettle = false;
 	private _isEmittingAgentSettled = false;
 	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
-	private _isRunningDeferredSettledActions = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -1017,11 +1016,9 @@ export class AgentSession {
 
 		const deferred = this._deferredSettledActions.splice(0);
 		if (deferred.length > 0) {
-			this._isRunningDeferredSettledActions = true;
 			try {
 				for (const action of deferred) await action();
 			} finally {
-				this._isRunningDeferredSettledActions = false;
 				this._resolveIdleWaitIfIdle();
 			}
 			return;
@@ -1401,13 +1398,12 @@ export class AgentSession {
 		return !this._isAgentRunActive && !this.isCompacting;
 	}
 
-	/** Whether `agent_settled` handlers, or the prompts and runs they deferred, are still in progress. */
+	/**
+	 * Whether `agent_settled` handlers are running. Exactly then, `prompt()` and a triggered custom message are
+	 * deferred until the remaining handlers finish.
+	 */
 	get isSettling(): boolean {
-		return (
-			this._isEmittingAgentSettled ||
-			this._deferredSettledActions.length > 0 ||
-			this._isRunningDeferredSettledActions
-		);
+		return this._isEmittingAgentSettled;
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */

@@ -11,6 +11,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 	return { promise, resolve };
 }
 
+// isSettling() means "a turn requested now is deferred past the remaining agent_settled handlers".
 describe("ExtensionContext.isSettling", () => {
 	const harnesses: Harness[] = [];
 
@@ -40,7 +41,7 @@ describe("ExtensionContext.isSettling", () => {
 		expect(harness.session.isSettling).toBe(false);
 	});
 
-	it("is true in every agent_settled handler, including a held async one, until deferred actions complete", async () => {
+	it("is true in every agent_settled handler, including a held async one, while a triggered turn is deferred", async () => {
 		const held = deferred();
 		const release = deferred();
 		const observed: string[] = [];
@@ -52,7 +53,6 @@ describe("ExtensionContext.isSettling", () => {
 					pi.on("agent_settled", (_event, ctx) => {
 						settledCount++;
 						observed.push(`first:${settledCount}:idle=${ctx.isIdle()}:settling=${ctx.isSettling()}`);
-						// Deferred past the remaining handlers because agent_settled is still being emitted.
 						if (settledCount === 1)
 							pi.sendMessage({ customType: "wake", content: "wake", display: false }, { triggerTurn: true });
 					});
@@ -74,7 +74,7 @@ describe("ExtensionContext.isSettling", () => {
 		harness.setResponses([
 			fauxAssistantMessage("first"),
 			() => {
-				// The deferred run is itself a pending settled action.
+				// The deferred turn has begun, so a turn requested now would not be deferred.
 				deferredRunSettling.push(harness.session.isSettling);
 				return fauxAssistantMessage("after wake");
 			},
@@ -85,14 +85,14 @@ describe("ExtensionContext.isSettling", () => {
 		expect(harness.session.isIdle).toBe(true);
 		expect(harness.session.isSettling).toBe(true);
 		expect(heldContext?.isSettling()).toBe(true);
-		// The deferred turn has not started while the held handler runs.
+		// The triggered turn is deferred while the held handler runs.
 		expect(harness.faux.state.callCount).toBe(1);
 
 		release.resolve();
 		await prompt;
 
 		expect(harness.faux.state.callCount).toBe(2);
-		expect(deferredRunSettling).toEqual([true]);
+		expect(deferredRunSettling).toEqual([false]);
 		expect(observed).toEqual([
 			"first:1:idle=true:settling=true",
 			"held:1:settling=true",
@@ -102,6 +102,54 @@ describe("ExtensionContext.isSettling", () => {
 		]);
 		expect(harness.session.isSettling).toBe(false);
 		expect(heldContext?.isSettling()).toBe(false);
+	});
+
+	it("tracks deferral exactly across two deferred prompts and a nested deferral", async () => {
+		const observed: string[] = [];
+		let settledCount = 0;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", (_event, ctx) => {
+						settledCount++;
+						observed.push(`settled:${settledCount}:settling=${ctx.isSettling()}`);
+						// First settlement defers A and B; A's settlement defers the nested prompt C.
+						if (settledCount === 1) {
+							pi.sendUserMessage("A");
+							pi.sendUserMessage("B");
+						} else if (settledCount === 2) {
+							pi.sendUserMessage("C");
+						}
+					});
+					pi.on("before_agent_start", (event, ctx) => {
+						// A deferred prompt's pre-run handlers are outside agent_settled: a turn requested here is not deferred.
+						observed.push(`before:${event.prompt}:idle=${ctx.isIdle()}:settling=${ctx.isSettling()}`);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			fauxAssistantMessage("start done"),
+			fauxAssistantMessage("A done"),
+			fauxAssistantMessage("C done"),
+			fauxAssistantMessage("B done"),
+		]);
+
+		await harness.session.prompt("start");
+
+		expect(harness.faux.state.callCount).toBe(4);
+		expect(observed).toEqual([
+			"before:start:idle=true:settling=false",
+			"settled:1:settling=true",
+			"before:A:idle=true:settling=false",
+			"settled:2:settling=true",
+			"before:C:idle=true:settling=false",
+			"settled:3:settling=true",
+			"before:B:idle=true:settling=false",
+			"settled:4:settling=true",
+		]);
+		expect(harness.session.isSettling).toBe(false);
 		expect(harness.session.isIdle).toBe(true);
 	});
 });
