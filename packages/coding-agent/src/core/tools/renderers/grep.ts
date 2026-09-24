@@ -6,12 +6,14 @@
  * definition, so the tool's public shape is unchanged.
  */
 
-import { Text } from "@earendil-works/pi-tui";
+import { dirname } from "node:path";
+import { getCapabilities, Text } from "@earendil-works/pi-tui";
 import { keyHint } from "../../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/types.ts";
 import type { GrepToolDetails } from "../grep.ts";
-import { getTextOutput, invalidArgText, shortenPath, str } from "../render-utils.ts";
+import { resolveToCwd } from "../path-utils.ts";
+import { getTextOutput, invalidArgText, linkGrepOutputLine, shortenPath, str } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
 
 function formatGrepCall(
@@ -33,6 +35,11 @@ function formatGrepCall(
 	if (limit !== undefined) text += theme.fg("toolOutput", ` limit ${limit}`);
 	return text;
 }
+/** Grep prints paths relative to a searched directory, or the bare file name when the search path is a file. */
+function grepLinkBase(rawPath: string, cwd: string, searchIsFile: boolean | undefined): string {
+	const searchPath = resolveToCwd(rawPath || ".", cwd);
+	return searchIsFile ? dirname(searchPath) : searchPath;
+}
 function formatGrepResult(
 	result: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
@@ -41,6 +48,8 @@ function formatGrepResult(
 	options: ToolRenderResultOptions,
 	theme: Theme,
 	showImages: boolean,
+	rawPath: string | null,
+	cwd: string,
 ): string {
 	const output = getTextOutput(result, showImages).trim();
 	let text = "";
@@ -49,7 +58,11 @@ function formatGrepResult(
 		const maxLines = options.expanded ? lines.length : 15;
 		const displayLines = lines.slice(0, maxLines);
 		const remaining = lines.length - maxLines;
-		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+		const linkBase =
+			getCapabilities().hyperlinks && rawPath !== null
+				? grepLinkBase(rawPath, cwd, result.details?.searchIsFile)
+				: undefined;
+		text += `\n${displayLines.map((line) => theme.fg("toolOutput", linkBase ? linkGrepOutputLine(line, linkBase) : line)).join("\n")}`;
 		if (remaining > 0) {
 			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
 		}
@@ -76,7 +89,16 @@ export const grepRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 	},
 	renderResult(result, options, theme, context) {
 		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-		text.setText(formatGrepResult(result as any, options, theme, context.showImages));
+		text.setText(
+			formatGrepResult(
+				result as any,
+				options,
+				theme,
+				context.showImages,
+				context.isError ? null : str((context.args as { path?: unknown } | undefined)?.path),
+				context.cwd,
+			),
+		);
 		return text;
 	},
 };

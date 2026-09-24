@@ -44,6 +44,8 @@ export interface GrepToolDetails {
 	truncation?: TruncationResult;
 	matchLimitReached?: number;
 	linesTruncated?: boolean;
+	/** The search path was a file, so output rows name it by its base name. */
+	searchIsFile?: boolean;
 }
 
 /**
@@ -282,6 +284,7 @@ export function createGrepToolDefinition(
 							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
 							let output = truncation.content;
 							const details: GrepToolDetails = {};
+							if (!isDirectory) details.searchIsFile = true;
 							// Build actionable notices for truncation and match limits.
 							const notices: string[] = [];
 							if (matchLimitReached) {

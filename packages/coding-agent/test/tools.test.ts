@@ -837,6 +837,8 @@ describe("Coding Agent Tools", () => {
 
 			const output = getTextOutput(result);
 			expect(output).toContain("example.txt:2: match line");
+			// The renderer links base-name rows against the file's directory.
+			expect(result.details?.searchIsFile).toBe(true);
 		});
 
 		it("should respect global limit and include context lines", async () => {

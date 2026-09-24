@@ -16,10 +16,37 @@ export function shortenPath(path: unknown): string {
 	return path;
 }
 
-export function linkPath(styledText: string, rawPath: string, cwd: string): string {
+/**
+ * OSC 8 file URL for a path. Herdr runs its link handlers on the Herdr server host, which may not be the
+ * client's host, so for Herdr the URL names this host (as the OSC 8 spec suggests) and puts the line in the
+ * fragment (`#42`, as kitty's hyperlinked grep does). Other terminals get a plain `file:///path`, which every
+ * opener accepts; on Windows a host would turn the URL into a UNC path. Pi's own fullscreen click-to-open
+ * turns this host's links back into `file:///path` (see `toLocalOpenTarget`).
+ */
+export function fileLinkUrl(
+	absolutePath: string,
+	line?: number,
+	env: NodeJS.ProcessEnv = process.env,
+	platform: NodeJS.Platform = process.platform,
+): string {
+	const url = pathToFileURL(absolutePath);
+	const herdr = env.TERM_PROGRAM === "herdr" || env.HERDR_ENV === "1";
+	if (!herdr || platform === "win32") return url.href;
+	const fragment = line !== undefined && Number.isInteger(line) && line > 0 ? `#${line}` : "";
+	return `file://${os.hostname()}${url.pathname}${fragment}`;
+}
+
+export function linkPath(styledText: string, rawPath: string, cwd: string, line?: number): string {
 	if (!getCapabilities().hyperlinks) return styledText;
-	const absolutePath = resolvePath(rawPath, cwd);
-	return hyperlink(styledText, pathToFileURL(absolutePath).href);
+	return hyperlink(styledText, fileLinkUrl(resolvePath(rawPath, cwd), line));
+}
+
+/** Link the path in each `path:line: text` or `path-line- text` row of grep output. Paths resolve against `baseDir`. */
+export function linkGrepOutputLine(line: string, baseDir: string): string {
+	const match = /^(.+?)(?::(\d+): |-(\d+)- )/.exec(line);
+	if (!match) return line;
+	const [, path, matchLine, contextLine] = match;
+	return linkPath(path, path, baseDir, Number(matchLine ?? contextLine)) + line.slice(path.length);
 }
 
 export function str(value: unknown): string | null {
@@ -76,10 +103,10 @@ export function renderToolPath(
 	rawPath: string | null,
 	theme: Theme,
 	cwd: string,
-	options?: { emptyFallback?: string },
+	options?: { emptyFallback?: string; line?: number },
 ): string {
 	if (rawPath === null) return invalidArgText(theme);
 	const value = rawPath || options?.emptyFallback;
 	if (!value) return theme.fg("toolOutput", "...");
-	return linkPath(theme.fg("accent", shortenPath(value)), value, cwd);
+	return linkPath(theme.fg("accent", shortenPath(value)), value, cwd, options?.line);
 }
