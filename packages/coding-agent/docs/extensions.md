@@ -66,6 +66,7 @@ Automatic retries, recovery, compaction, or queued work can continue afterward.
 `agent_before_settle` is the final actionable boundary: it can append entries and request one continuation.
 `agent_settled` is final and notification-only; use it when an integration needs to know Pi will not continue automatically.
 Its `outcome` is `aborted` when the run was cancelled: by a user abort (also during retry backoff or an `agent_before_settle` handler), by an extension that cancelled compaction, or by session shutdown. An abort after the last turn but before settlement also reports `aborted`. The outcome is `error` when the run ended on a provider, run, or compaction failure; otherwise it is `completed`.
+`ctx.isIdle()` is already true inside `agent_settled` handlers. `ctx.isSettling()` is true exactly while `agent_settled` handlers run, including held async handlers. During that time, `pi.sendUserMessage()` and `pi.sendMessage(..., { triggerTurn: true })` do not start a turn at once: the turn starts after the remaining handlers. `ctx.isSettling()` is false once those deferred turns begin, including in a deferred prompt's `input` and `before_agent_start` handlers, where a requested turn is not deferred.
 
 <a id="extensionapi-methods"></a>
 
