@@ -58,6 +58,19 @@ export function parseHerdrOriginFrame(data: string): HerdrOriginFrame | undefine
 	return { type: "start", origin };
 }
 
+/** Origin after a lost frame boundary: API input from an unknown sender, never keyboard. */
+export const LOST_FRAME_INPUT_ORIGIN: InputOrigin = Object.freeze({ kind: "herdr-api", sender: "unknown" });
+
+/** True when `data` may be the start of a Herdr origin frame that is still arriving. */
+export function isPossibleHerdrOriginFrame(data: string): boolean {
+	return data.startsWith(HERDR_ORIGIN_PREFIX) || (data.length >= 2 && HERDR_ORIGIN_PREFIX.startsWith(data));
+}
+
+/** True for an unterminated end frame. */
+export function isIncompleteHerdrOriginEnd(data: string): boolean {
+	return data.startsWith(`${HERDR_ORIGIN_PREFIX};end`);
+}
+
 /** True for any herdr-origin frame, or a flushed fragment of one, that must never reach components. */
 export function isHerdrOriginSequence(data: string): boolean {
 	return data.startsWith(HERDR_ORIGIN_PREFIX) || (data.length > 2 && HERDR_ORIGIN_PREFIX.startsWith(data));

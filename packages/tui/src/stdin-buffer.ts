@@ -18,11 +18,14 @@
  */
 
 import { EventEmitter } from "events";
-import { HERDR_ORIGIN_PREFIX } from "./input-origin.ts";
+import { HERDR_ORIGIN_PREFIX, isPossibleHerdrOriginFrame } from "./input-origin.ts";
 
 const ESC = "\x1b";
 const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
+// Herdr writes a frame in one write, so its parts arrive together unless the host is slow.
+// Only Herdr emits the prefix, so a longer wait here does not hold keyboard input.
+const DEFAULT_FRAME_TIMEOUT_MS = 2000;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 
@@ -286,6 +289,10 @@ export type StdinBufferOptions = {
 	 * (default: 10ms). Increase for high-latency Alt+key input (SSH).
 	 */
 	escapeTimeout?: number;
+	/**
+	 * Maximum time to wait for the rest of a Herdr origin frame (default: 2000ms).
+	 */
+	frameTimeout?: number;
 };
 
 export type StdinBufferEventMap = {
@@ -302,6 +309,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private timeout: ReturnType<typeof setTimeout> | null = null;
 	private readonly timeoutMs: number;
 	private readonly escapeTimeoutMs: number;
+	private readonly frameTimeoutMs: number;
 	private pasteMode: boolean = false;
 	private pasteBuffer: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
@@ -310,6 +318,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		super();
 		this.timeoutMs = options.timeout ?? DEFAULT_SEQUENCE_TIMEOUT_MS;
 		this.escapeTimeoutMs = options.escapeTimeout ?? DEFAULT_ESCAPE_TIMEOUT_MS;
+		this.frameTimeoutMs = options.frameTimeout ?? DEFAULT_FRAME_TIMEOUT_MS;
 	}
 
 	public process(data: string | Buffer): void {
@@ -444,7 +453,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		if (this.buffer.length > 0) {
-			const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs;
+			const timeoutMs =
+				this.buffer === ESC
+					? this.escapeTimeoutMs
+					: isPossibleHerdrOriginFrame(this.buffer)
+						? this.frameTimeoutMs
+						: this.timeoutMs;
 			this.timeout = setTimeout(() => {
 				const flushed = this.flush();
 

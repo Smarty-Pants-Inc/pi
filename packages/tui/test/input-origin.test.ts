@@ -27,7 +27,7 @@ function setup(): Setup {
 	const terminal = new VirtualTerminal(80, 24);
 	const tui = new TuiMainScreen(terminal);
 	const editor = new Editor(tui, defaultEditorTheme);
-	const stdin = new StdinBuffer({ timeout: 5 });
+	const stdin = new StdinBuffer({ timeout: 5, frameTimeout: 40 });
 	stdin.on("data", (sequence) => terminal.sendInput(sequence));
 	stdin.on("paste", (content) => terminal.sendInput(paste(content)));
 	const submits: Setup["submits"] = [];
@@ -174,30 +174,64 @@ describe("Herdr input origin frames", () => {
 		assert.deepStrictEqual(s.submits, [
 			{ text: "z", origin: { kind: "herdr-api", sender: "unknown", pane: "%E0%A4%A" } },
 		]);
-		// A terminated frame without fields is dropped and changes nothing.
+		// A frame Pi cannot parse is dropped. Only Herdr emits the prefix, so it fails closed.
 		s.send("\x1b_herdr-origin\x1b\\q\r");
-		assert.deepStrictEqual(s.submits[1], { text: "q", origin: { kind: "keyboard" } });
+		assert.deepStrictEqual(s.submits[1], { text: "q", origin: { kind: "herdr-api", sender: "unknown" } });
 	});
 
-	it("drops a flushed unterminated frame and keeps later keyboard input", async () => {
+	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+	it("waits for a frame split by a delay longer than the key sequence timeout", async () => {
+		// Astra review of herdr#82: a genuine frame split across the 5 ms sequence timeout.
+		const s = setup();
+		s.send("\x1b_herdr-origin;v=1;kind=api;id=7;sender=lead;pane=p1;session=s1");
+		await sleep(20);
+		s.send(`\x1b\\hello\r${end("7")}`);
+		assert.deepStrictEqual(s.submits, [{ text: "hello", origin: API }]);
+		assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "keyboard" });
+		// A delayed end frame still closes the frame before later keyboard input.
+		s.send(`${start("v=1;id=8;sender=lead")}x\x1b_herdr-origin;end;id=8`);
+		await sleep(20);
+		s.send("\x1b\\");
+		s.send("\r");
+		s.send("k");
+		s.send("\r");
+		assert.deepStrictEqual(s.submits[2], { text: "k", origin: { kind: "keyboard" } });
+	});
+
+	it("fails closed when a frame start times out incomplete", async () => {
 		const s = setup();
 		const received: string[] = [];
 		const probe: Component = { render: () => [], invalidate() {}, handleInput: (d) => received.push(d) };
 		s.tui.setFocus(probe);
 		s.send("\x1b_herdr-origin;v=1;id=3;sender=lead");
-		await new Promise((resolve) => setTimeout(resolve, 30));
+		await sleep(80);
 		assert.deepStrictEqual(received, []);
-		assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "keyboard" });
+		// Its API input may still follow, so it is never attributed to the keyboard.
+		assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "herdr-api", sender: "unknown" });
 		s.tui.setFocus(s.editor);
+		s.send("hello");
+		s.send("\r");
+		assert.deepStrictEqual(s.submits, [{ text: "hello", origin: { kind: "herdr-api", sender: "unknown" } }]);
+		// The next end frame restores keyboard origin.
+		s.send(end("3"));
 		s.send("k");
 		s.send("\r");
-		assert.deepStrictEqual(s.submits, [{ text: "k", origin: { kind: "keyboard" } }]);
+		assert.deepStrictEqual(s.submits[1], { text: "k", origin: { kind: "keyboard" } });
 	});
 
-	it("drops a flushed fragment of the frame prefix", async () => {
+	it("closes the frame when an end frame times out incomplete", async () => {
+		const s = setup();
+		s.send(`${start("v=1;id=3;sender=lead")}x\x1b_herdr-origin;end;id=3`);
+		await sleep(80);
+		assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "keyboard" });
+	});
+
+	it("drops a flushed fragment of the frame prefix without leaking it", async () => {
 		const s = setup();
 		s.send("\x1b_herdr-or");
-		await new Promise((resolve) => setTimeout(resolve, 30));
+		await sleep(80);
 		assert.strictEqual(s.editor.getText(), "");
+		assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "herdr-api", sender: "unknown" });
 	});
 });

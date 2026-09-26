@@ -6,7 +6,9 @@ import { performance } from "node:perf_hooks";
 import {
 	type InputOrigin,
 	isHerdrOriginSequence,
+	isIncompleteHerdrOriginEnd,
 	KEYBOARD_INPUT_ORIGIN,
+	LOST_FRAME_INPUT_ORIGIN,
 	parseHerdrOriginFrame,
 } from "./input-origin.ts";
 import { isKeyRelease, matchesKey } from "./keys.ts";
@@ -1023,8 +1025,15 @@ export abstract class TuiBase extends Container implements TUI {
 			const frame = parseHerdrOriginFrame(data);
 			// A nested start keeps the outer origin. ponytail: an end closes the frame even if
 			// its id differs; an early close is safer than a frame left open on keyboard input.
-			if (frame?.type === "start" && this.inputOrigin.kind === "keyboard") this.inputOrigin = frame.origin;
-			else if (frame?.type === "end") this.inputOrigin = KEYBOARD_INPUT_ORIGIN;
+			if (frame?.type === "start") {
+				if (this.inputOrigin.kind === "keyboard") this.inputOrigin = frame.origin;
+			} else if (frame?.type === "end" || isIncompleteHerdrOriginEnd(data)) {
+				this.inputOrigin = KEYBOARD_INPUT_ORIGIN;
+			} else if (this.inputOrigin.kind === "keyboard") {
+				// A frame start that timed out incomplete: its API input may still follow.
+				// Fail closed until the next end frame; never fall back to keyboard.
+				this.inputOrigin = LOST_FRAME_INPUT_ORIGIN;
+			}
 			return;
 		}
 		if (this.consumeOsc11BackgroundResponse(data)) {
