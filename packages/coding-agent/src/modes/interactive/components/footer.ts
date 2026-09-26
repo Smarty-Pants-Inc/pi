@@ -47,8 +47,41 @@ export function formatCwdForFooter(cwd: string, home: string | undefined): strin
  * Footer component that shows pwd, token stats, and context usage.
  * Computes token/context stats from session, gets git branch and extension statuses from provider.
  */
+type SessionTotals = {
+	usageTotals: ReturnType<typeof createUsageTotals>;
+	latestCacheHitRate: number | undefined;
+	sessionName: string | undefined;
+};
+
+function computeSessionTotals(sessionManager: AgentSession["sessionManager"]): SessionTotals {
+	// Calculate cumulative usage from ALL session entries (not just post-compaction messages)
+	const usageTotals = createUsageTotals();
+	let latestCacheHitRate: number | undefined;
+
+	for (const entry of sessionManager.getEntries()) {
+		if (entry.type === "usage") {
+			addUsageToTotals(usageTotals, entry.usage);
+		} else if (entry.type === "message" && entry.message.role === "assistant") {
+			addUsageToTotals(usageTotals, entry.message.usage);
+
+			const latestPromptTokens =
+				entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
+			latestCacheHitRate =
+				latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
+		} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
+			addUsageToTotals(usageTotals, entry.message.usage);
+		} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
+			addUsageToTotals(usageTotals, entry.usage);
+		}
+	}
+	return { usageTotals, latestCacheHitRate, sessionName: sessionManager.getSessionName() };
+}
+
 export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
+	// The footer renders on every frame; the totals walk the whole session, so reuse them
+	// until the session changes.
+	private totalsCache: { sessionManager: object; revision: number; totals: SessionTotals } | undefined;
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
 
@@ -84,26 +117,14 @@ export class FooterComponent implements Component {
 	render(width: number): string[] {
 		const state = this.session.state;
 
-		// Calculate cumulative usage from ALL session entries (not just post-compaction messages)
-		const usageTotals = createUsageTotals();
-		let latestCacheHitRate: number | undefined;
-
-		for (const entry of this.session.sessionManager.getEntries()) {
-			if (entry.type === "usage") {
-				addUsageToTotals(usageTotals, entry.usage);
-			} else if (entry.type === "message" && entry.message.role === "assistant") {
-				addUsageToTotals(usageTotals, entry.message.usage);
-
-				const latestPromptTokens =
-					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
-				latestCacheHitRate =
-					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
-			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
-				addUsageToTotals(usageTotals, entry.message.usage);
-			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-				addUsageToTotals(usageTotals, entry.usage);
-			}
+		const sessionManager = this.session.sessionManager;
+		const revision = sessionManager.revision();
+		let cache = this.totalsCache;
+		if (cache?.sessionManager !== sessionManager || cache.revision !== revision) {
+			cache = { sessionManager, revision, totals: computeSessionTotals(sessionManager) };
+			this.totalsCache = cache;
 		}
+		const { usageTotals, latestCacheHitRate, sessionName } = cache.totals;
 
 		// Calculate context usage from session (handles compaction correctly).
 		// After compaction, tokens are unknown until the next LLM response.
@@ -122,7 +143,6 @@ export class FooterComponent implements Component {
 		}
 
 		// Add session name if set
-		const sessionName = this.session.sessionManager.getSessionName();
 		if (sessionName) {
 			pwd = `${pwd} • ${sessionName}`;
 		}
