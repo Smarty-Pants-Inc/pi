@@ -1,10 +1,11 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { ordinaryOwnerOf } from "../ordinary-owner-context.ts";
 import { currentSessionOwnership } from "../session-ownership.ts";
+import { writeFileAtomic } from "./atomic-write.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
 import { writeRenderers } from "./renderers/write.ts";
@@ -34,7 +35,7 @@ export interface WriteOperations {
 }
 
 const defaultWriteOperations: WriteOperations = {
-	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	writeFile: writeFileAtomic,
 	mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => {}),
 };
 
@@ -53,6 +54,8 @@ export function createWriteToolDefinition(
 	return {
 		name: "write",
 		label: "write",
+		// ponytail: see edit.ts; a bash call in the same message sees the written file (smarty-dev#977).
+		executionMode: "sequential",
 		description:
 			"Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
 		promptSnippet: writeToolSystemPromptContribution.snippet,
