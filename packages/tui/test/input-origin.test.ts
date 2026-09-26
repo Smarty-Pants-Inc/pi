@@ -23,7 +23,8 @@ type Setup = {
 const setups: Setup[] = [];
 
 // Mirrors ProcessTerminal: StdinBuffer splits stdin, then sequences and paste reach the TUI.
-const READY = `\uFDD0herdr-origin;ready;v=1;pid=${process.pid}\uFDD1`;
+const NONCE = claimHerdrInputOrigin();
+const READY = `\uFDD0herdr-origin;ready;v=1;nonce=${NONCE}\uFDD1`;
 
 /** A Pi whose claim Herdr admitted (it sent the ready frame), unless `ready` is false. */
 function setup({ ready = true }: { ready?: boolean } = {}): Setup {
@@ -96,11 +97,13 @@ describe("Herdr input origin frames", () => {
 		assert.deepStrictEqual(s.submits[1], { text: "c", origin: { kind: "keyboard" } });
 	});
 
-	it("ignores a ready frame addressed to another process", () => {
+	it("ignores a ready frame for another claim", () => {
 		// Security pass on pi#59: a helper's admitted claim must not make this Pi treat
 		// unframed input as typed.
 		const s = setup({ ready: false });
-		s.send(`\uFDD0herdr-origin;ready;v=1;pid=${process.pid + 1}\uFDD1`);
+		// Another run's nonce (for example, a process that had this pid before), and none.
+		s.send(`\uFDD0herdr-origin;ready;v=1;nonce=${"0".repeat(32)}\uFDD1`);
+		s.send(`\uFDD0herdr-origin;ready;v=1;pid=${process.pid}\uFDD1`);
 		s.send("\uFDD0herdr-origin;ready;v=1\uFDD1");
 		s.send("x");
 		s.send("\r");
@@ -283,11 +286,14 @@ describe("Herdr input origin frames", () => {
 		assert.deepStrictEqual(s.submits, [{ text: "xk", origin: { kind: "herdr-api", sender: "lead", id: "3" } }]);
 	});
 
-	it("claims to read origin frames only when a process terminal starts", () => {
-		assert.strictEqual(typeof HERDR_INPUT_ORIGIN_CLAIM, "symbol");
+	it("claims to read origin frames with a stable nonce for this run", () => {
 		assert.strictEqual(HERDR_INPUT_ORIGIN_CLAIM, Symbol.for("pi.herdrInputOrigin"));
-		claimHerdrInputOrigin();
-		assert.strictEqual((globalThis as Record<symbol, unknown>)[HERDR_INPUT_ORIGIN_CLAIM], "v1");
-		delete (globalThis as Record<symbol, unknown>)[HERDR_INPUT_ORIGIN_CLAIM];
+		const claim = (globalThis as Record<symbol, unknown>)[HERDR_INPUT_ORIGIN_CLAIM] as {
+			version: string;
+			nonce: string;
+		};
+		assert.strictEqual(claim.version, "v1");
+		assert.match(claim.nonce, /^[0-9a-f]{32}$/);
+		assert.strictEqual(claimHerdrInputOrigin(), claim.nonce);
 	});
 });

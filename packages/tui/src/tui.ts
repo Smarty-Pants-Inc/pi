@@ -4,6 +4,7 @@
 
 import { performance } from "node:perf_hooks";
 import {
+	herdrInputOriginNonce,
 	type InputOrigin,
 	isHerdrOriginSequence,
 	isIncompleteHerdrOriginEnd,
@@ -1034,7 +1035,8 @@ export abstract class TuiBase extends Container implements TUI {
 			if (frame?.type === "ready") {
 				// Only a ready frame for this process: another Pi's admitted claim says nothing
 				// about whether Herdr frames input for this one.
-				if (frame.pid === process.pid) this.herdrFramingReady = true;
+				const nonce = herdrInputOriginNonce();
+				if (nonce !== undefined && frame.nonce === nonce) this.herdrFramingReady = true;
 			} else if (frame?.type === "start") {
 				if (this.inputOrigin.kind === "keyboard" || this.inputOrigin === LOST_FRAME_INPUT_ORIGIN) {
 					this.inputOrigin = frame.origin;

@@ -4,8 +4,8 @@
  * Herdr wraps input that another agent sends into a pane through its API in origin frames:
  *   start: U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<s>[;pane=<p>][;session=<sid>] U+FDD1
  *   end:   U+FDD0 herdr-origin;end;id=<id> U+FDD1
- *   ready: U+FDD0 herdr-origin;ready;v=1;pid=<pid> U+FDD1 (Herdr admitted the claim of
- *          process <pid>; another process ignores it)
+ *   ready: U+FDD0 herdr-origin;ready;v=1;nonce=<nonce> U+FDD1 (Herdr admitted the claim
+ *          that carried <nonce>; any other reader ignores it)
  * Values are percent-encoded. Input between the frames is "herdr-api". Other input is
  * "keyboard" only after the ready frame; before it, it is "unknown". The author comes from the
  * frame, never from the text.
@@ -53,15 +53,31 @@ const TAG = "herdr-origin;";
  */
 export const HERDR_INPUT_ORIGIN_CLAIM = Symbol.for("pi.herdrInputOrigin");
 
-/** Claim, for this process, that it reads Herdr origin frames. */
-export function claimHerdrInputOrigin(): void {
-	(globalThis as Record<symbol, unknown>)[HERDR_INPUT_ORIGIN_CLAIM] = "v1";
+/**
+ * Claim, for this process, that it reads Herdr origin frames. The claim carries a random nonce
+ * for this run; Herdr echoes it in the ready frame, so only this run accepts that frame (not a
+ * later process that reuses the pid). Returns the nonce.
+ */
+export function claimHerdrInputOrigin(): string {
+	const globals = globalThis as Record<symbol, unknown>;
+	const existing = globals[HERDR_INPUT_ORIGIN_CLAIM] as { version?: unknown; nonce?: unknown } | undefined;
+	if (existing?.version === "v1" && typeof existing.nonce === "string") return existing.nonce;
+	const bytes = crypto.getRandomValues(new Uint8Array(16));
+	const nonce = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+	globals[HERDR_INPUT_ORIGIN_CLAIM] = { version: "v1", nonce };
+	return nonce;
+}
+
+/** This run's claim nonce, if it claimed. */
+export function herdrInputOriginNonce(): string | undefined {
+	const claim = (globalThis as Record<symbol, unknown>)[HERDR_INPUT_ORIGIN_CLAIM] as { nonce?: unknown } | undefined;
+	return typeof claim?.nonce === "string" ? claim.nonce : undefined;
 }
 
 export type HerdrOriginFrame =
 	| { type: "start"; origin: Extract<InputOrigin, { kind: "herdr-api" }> }
 	| { type: "end"; id?: string }
-	| { type: "ready"; pid?: number };
+	| { type: "ready"; nonce?: string };
 
 function decodeValue(value: string): string {
 	try {
@@ -98,10 +114,7 @@ export function parseHerdrOriginFrame(data: string): HerdrOriginFrame | undefine
 		if (eq > 0) fields.set(part.slice(0, eq), decodeValue(part.slice(eq + 1)));
 	}
 	if (parts[0] === "end") return { type: "end", id: fields.get("id") };
-	if (parts[0] === "ready") {
-		const pid = Number(fields.get("pid"));
-		return { type: "ready", pid: Number.isInteger(pid) ? pid : undefined };
-	}
+	if (parts[0] === "ready") return { type: "ready", nonce: fields.get("nonce") };
 
 	// Unknown `v` values are tolerated: the frame still marks API input with the fields we can read.
 	const origin: Extract<InputOrigin, { kind: "herdr-api" }> = {
