@@ -1,11 +1,12 @@
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { constants } from "fs";
-import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { splitBom } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { ordinaryOwnerOf } from "../ordinary-owner-context.ts";
 import { currentSessionOwnership } from "../session-ownership.ts";
+import { writeFileAtomic } from "./atomic-write.ts";
 import {
 	applyEditsToNormalizedContent,
 	detectLineEnding,
@@ -93,7 +94,7 @@ export interface EditOperations {
 
 const defaultEditOperations: EditOperations = {
 	readFile: (path) => fsReadFile(path),
-	writeFile: (path, content) => fsWriteFile(path, content, "utf-8"),
+	writeFile: writeFileAtomic,
 	access: (path) => fsAccess(path, constants.R_OK | constants.W_OK),
 };
 
@@ -152,6 +153,9 @@ export function createEditToolDefinition(
 	return {
 		name: "edit",
 		label: "edit",
+		// ponytail: a batch with a file change runs in order, so a bash call in the same
+		// message sees the finished file (smarty-dev#977). Costs parallelism for that batch only.
+		executionMode: "sequential",
 		description:
 			"Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
 		promptSnippet: editToolSystemPromptContribution.snippet,
