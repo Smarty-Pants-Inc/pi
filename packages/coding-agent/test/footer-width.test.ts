@@ -1,7 +1,9 @@
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
 import type { ReadonlyFooterDataProvider } from "../src/core/footer-data-provider.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
 import { FooterComponent, formatCwdForFooter } from "../src/modes/interactive/components/footer.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
@@ -77,6 +79,7 @@ function createSession(options: {
 			getEntries: () => entries,
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
+			revision: () => 0,
 		},
 		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
 		modelRuntime: {
@@ -248,5 +251,51 @@ describe("FooterComponent width handling", () => {
 
 		expect(stats).toContain("$1.234");
 		expect(stats).not.toContain("(sub)");
+	});
+});
+
+// Smarty-Pants-Inc/smarty-dev#1043: the footer renders on every frame.
+describe("FooterComponent session totals cache", () => {
+	beforeAll(() => {
+		initTheme(undefined, false);
+	});
+
+	it("walks the session once per session change, not once per frame", () => {
+		const sessionManager = SessionManager.inMemory();
+		const session = createSession({ sessionName: "" }) as unknown as { sessionManager: SessionManager };
+		session.sessionManager = sessionManager;
+		const entries = vi.spyOn(sessionManager, "getEntries");
+		const footer = new FooterComponent(session as unknown as AgentSession, createFooterData(1));
+		const usage = (input: number) => ({
+			input,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: input,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		const assistant = (input: number): AssistantMessage => ({
+			role: "assistant",
+			content: [],
+			api: "x",
+			provider: "test",
+			model: "test-model",
+			usage: usage(input),
+			stopReason: "stop",
+			timestamp: 1,
+		});
+
+		sessionManager.appendMessage(assistant(1000));
+		expect(stripAnsi(footer.render(120).join("\n"))).toContain("↑1.0k");
+		footer.render(120);
+		expect(entries.mock.calls.length).toBeGreaterThan(0);
+		const walks = entries.mock.calls.length;
+		footer.render(120);
+		expect(entries.mock.calls.length).toBe(walks);
+
+		sessionManager.appendMessage(assistant(2000));
+		expect(stripAnsi(footer.render(120).join("\n"))).toContain("↑3.0k");
+		sessionManager.appendSessionInfo("renamed");
+		expect(stripAnsi(footer.render(120).join("\n"))).toContain("renamed");
 	});
 });

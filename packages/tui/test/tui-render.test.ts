@@ -453,6 +453,51 @@ describe("TUI Kitty image cleanup", () => {
 		tui.stop();
 	});
 
+	// Smarty-Pants-Inc/smarty-dev#1043: line resets and Kitty scans are reused across frames.
+	it("handles an image that appears after text-only frames and is then removed", async () => {
+		const terminal = new LoggingVirtualTerminal(40, 10);
+		const tui: TUI = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		tui.addChild(component);
+
+		component.lines = ["top", "middle", "bottom"];
+		tui.start();
+		await terminal.waitForRender();
+		component.lines = ["top", "middle", "bottom!"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.deepStrictEqual(
+			terminal
+				.getViewport()
+				.slice(0, 3)
+				.map((line) => line.trimEnd()),
+			["top", "middle", "bottom!"],
+		);
+
+		const image = encodeKitty("AAAA", { columns: 2, rows: 1, imageId: 51, moveCursor: false });
+		component.lines = ["top", image, "bottom!"];
+		terminal.clearWrites();
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes(image), "new image line should be drawn");
+
+		// A full redraw must still know about the image drawn by the differential path.
+		component.lines = ["top", "middle", "bottom!"];
+		terminal.clearWrites();
+		tui.requestRender(true);
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes(deleteKittyImage(51)), "removed image should be deleted");
+		assert.deepStrictEqual(
+			terminal
+				.getViewport()
+				.slice(0, 3)
+				.map((line) => line.trimEnd()),
+			["top", "middle", "bottom!"],
+		);
+
+		tui.stop();
+	});
+
 	it("redraws image lines when an earlier reserved image row changes", async () => {
 		const terminal = new LoggingVirtualTerminal(40, 10);
 		const tui: TUI = new TuiMainScreen(terminal);

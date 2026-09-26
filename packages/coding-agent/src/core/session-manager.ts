@@ -1049,6 +1049,8 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	#revision = 0;
+	#revisionKey: { entries: FileEntry[]; length: number; leafId: string | null } | undefined;
 	readonly #ownedJournal?: OwnedJournal;
 	private ownedBytes: Buffer = Buffer.alloc(0);
 	#ownedTerminalTail: Promise<void> = Promise.resolve();
@@ -1683,6 +1685,27 @@ export class SessionManager {
 
 	getLeafId(): string | null {
 		return this.leafId;
+	}
+
+	/**
+	 * Cheap token that changes whenever the session content or leaf changes.
+	 * Use it to cache values derived from the session (for example, per-frame UI state).
+	 */
+	revision(): number {
+		// ponytail: entries are append-only (push) or the array is replaced, and the leaf is the
+		// only other input, so (array, length, leaf) identifies the state without hooks at every
+		// mutation site. Revisit if entries are ever mutated or removed in place.
+		const key = this.#revisionKey;
+		if (
+			!key ||
+			key.entries !== this.fileEntries ||
+			key.length !== this.fileEntries.length ||
+			key.leafId !== this.leafId
+		) {
+			this.#revisionKey = { entries: this.fileEntries, length: this.fileEntries.length, leafId: this.leafId };
+			this.#revision++;
+		}
+		return this.#revision;
 	}
 
 	getLeafEntry(): SessionEntry | undefined {

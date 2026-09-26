@@ -395,6 +395,7 @@ export class AgentSession {
 	readonly agent: Agent;
 	readonly #originalAgent: Agent;
 	readonly sessionManager: SessionManager;
+	#contextUsageCache: { revision: number; contextWindow: number; usage: ContextUsage } | undefined;
 	readonly settingsManager: SettingsManager;
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	#ordinaryPreflights = 0;
@@ -4586,6 +4587,17 @@ export class AgentSession {
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return undefined;
 
+		// The footer calls this on every frame, and the computation walks the whole session.
+		// The result depends only on the session state and the context window.
+		const revision = this.sessionManager.revision();
+		const cached = this.#contextUsageCache;
+		if (cached?.revision === revision && cached.contextWindow === contextWindow) return { ...cached.usage };
+		const usage = this.#computeContextUsage(contextWindow);
+		this.#contextUsageCache = { revision, contextWindow, usage };
+		return { ...usage };
+	}
+
+	#computeContextUsage(contextWindow: number): ContextUsage {
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.

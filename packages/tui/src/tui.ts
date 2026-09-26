@@ -1350,14 +1350,35 @@ export abstract class TuiBase extends Container implements TUI {
 		return result;
 	}
 
+	/** Whether the lines of the last applyLineResets() call included an image line. */
+	protected lastLinesHaveImages = false;
+	#lineResetInputs: string[] = [];
+	#lineResetOutputs: string[] = [];
+
 	protected applyLineResets(lines: string[]): string[] {
+		// Every frame passes every transcript line, and almost all are unchanged at the same
+		// index. Reusing the last frame's output skips the per-line scans and keeps unchanged
+		// output strings identical, so the differential compare is a reference check.
 		const reset = SEGMENT_RESET;
+		const previousInputs = this.#lineResetInputs;
+		const previousOutputs = this.#lineResetOutputs;
+		const inputs = lines.slice();
+		let hasImages = false;
 		for (let i = 0; i < lines.length; i++) {
 			const line = lines[i];
-			if (!isImageLine(line)) {
-				lines[i] = normalizeTerminalOutput(line) + reset;
+			let output: string;
+			if (previousInputs[i] === line) {
+				output = previousOutputs[i];
+			} else {
+				// An image line maps to itself; every other line gains the reset suffix.
+				output = isImageLine(line) ? line : normalizeTerminalOutput(line) + reset;
 			}
+			if (output === line) hasImages = true;
+			lines[i] = output;
 		}
+		this.#lineResetInputs = inputs;
+		this.#lineResetOutputs = lines.slice();
+		this.lastLinesHaveImages = hasImages;
 		return lines;
 	}
 
