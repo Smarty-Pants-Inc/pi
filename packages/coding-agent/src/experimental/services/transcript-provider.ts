@@ -52,12 +52,15 @@ export function createTranscriptService(
 
 	const onEvent = (event: HarnessEvent, context: Context): void => {
 		if (rebaseError !== undefined) throw rebaseError;
-		const forwarded = toLaneWatchEvent(event);
-		if (forwarded === undefined) return;
+		const lane = toLaneWatchEvent(event);
+		if (lane === undefined) return;
+		// Replicated state holds JSON values only: a tool result's `details: undefined` would throw (smarty-dev#890).
+		const forwarded = withoutUndefined(lane);
 		if (state.value.snapshot === null) throw new Error("Transcript service is not active");
 		let needsRebase = false;
 		state.change(context, (draft) => {
-			needsRebase = reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, event) === "rebase";
+			needsRebase =
+				reduceLaneSnapshot(draft.snapshot as unknown as LaneSnapshot, withoutUndefined(event)) === "rebase";
 			draft.event = forwarded;
 		});
 		if (needsRebase) scheduleRebase(context);
@@ -121,4 +124,15 @@ function toLaneWatchEvent(event: HarnessEvent): LaneWatchEvent | undefined {
 		default:
 			return event as LaneWatchEvent;
 	}
+}
+
+/** A copy without undefined object properties (and undefined array items as null), as JSON would store it. */
+function withoutUndefined<T>(value: T): T {
+	if (Array.isArray(value)) return value.map((item) => (item === undefined ? null : withoutUndefined(item))) as T;
+	if (value === null || typeof value !== "object") return value;
+	const copy: Record<string, unknown> = {};
+	for (const [key, item] of Object.entries(value)) {
+		if (item !== undefined) copy[key] = withoutUndefined(item);
+	}
+	return copy as T;
 }

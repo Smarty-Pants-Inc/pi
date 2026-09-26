@@ -83,6 +83,23 @@ describe("Transcript service", () => {
 			event: { type: "entry_added" },
 		});
 
+		// smarty-dev#890: a tool result with `details: undefined` still reaches subscribers.
+		await listener?.(
+			{
+				type: "tool_end",
+				lane: "main",
+				runId: "run-1",
+				toolCallId: "call-1",
+				toolName: "read",
+				result: { content: [{ type: "text", text: "file" }], details: undefined },
+				isError: false,
+				endedAt: 2,
+			} as unknown as HarnessEvent,
+			BACKGROUND_CONTEXT,
+		);
+		expect(states.at(-1)).toMatchObject({ event: { type: "tool_end", toolCallId: "call-1" } });
+		expect(states.at(-1)?.event).not.toHaveProperty("result.details");
+
 		const navigation: HarnessEvent = {
 			type: "navigation_end",
 			lane: "main",
