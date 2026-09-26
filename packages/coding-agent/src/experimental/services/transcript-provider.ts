@@ -130,9 +130,10 @@ function toLaneWatchEvent(event: HarnessEvent): LaneWatchEvent | undefined {
 function withoutUndefined<T>(value: T): T {
 	if (Array.isArray(value)) return value.map((item) => (item === undefined ? null : withoutUndefined(item))) as T;
 	if (value === null || typeof value !== "object") return value;
-	const copy: Record<string, unknown> = {};
-	for (const [key, item] of Object.entries(value)) {
-		if (item !== undefined) copy[key] = withoutUndefined(item);
-	}
-	return copy as T;
+	// Object.fromEntries defines own data properties, so an own `__proto__` key stays a key (pi#51 review).
+	return Object.fromEntries(
+		Object.entries(value)
+			.filter(([, item]) => item !== undefined)
+			.map(([key, item]) => [key, withoutUndefined(item)]),
+	) as T;
 }
