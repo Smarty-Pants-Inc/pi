@@ -93,11 +93,37 @@ describe("Herdr input origin frames", () => {
 		}
 	});
 
+	it("keeps the origin for every stdin split after an open sequence", () => {
+		// Astra review of herdr#82: one PTY write can arrive as several stdin chunks, so the
+		// frame prefix itself can be split right after an open CSI.
+		const frame = `${start("v=1;id=7;sender=lead;pane=p1;session=s1")}hello\r${end("7")}`;
+		for (const open of ["", "\x1b_", "\x1b[1;", "\x1bO", "\x1b", "\x1b[200~ab"]) {
+			const input = `${open}${frame}`;
+			for (let split = 1; split < input.length; split++) {
+				const s = setup();
+				s.send(input.slice(0, split));
+				s.send(input.slice(split));
+				const label = JSON.stringify({ open, split });
+				assert.strictEqual(s.submits.length, 1, label);
+				assert.deepStrictEqual(s.submits[0]!.origin, API, label);
+				assert.ok(s.submits[0]!.text.endsWith("hello"), `${label} ${JSON.stringify(s.submits[0])}`);
+				assert.ok(!s.submits[0]!.text.includes("herdr"), `${label} ${JSON.stringify(s.submits[0])}`);
+				assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "keyboard" }, label);
+			}
+		}
+	});
+
 	it("does not let a payload that leaves a sequence open absorb the end frame", () => {
-		for (const open of ["\x1b_", "\x1b[1;", "\x1b[200~ab"]) {
-			const s = setup();
-			s.send(`${start("v=1;id=7;sender=lead")}x${open}${end("7")}`);
-			assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "keyboard" }, JSON.stringify(open));
+		for (const open of ["\x1b_", "\x1b[1;", "\x1bO", "\x1b", "\x1b[200~ab"]) {
+			const input = `${start("v=1;id=7;sender=lead")}x${open}${end("7")}`;
+			for (let split = 1; split < input.length; split++) {
+				const s = setup();
+				s.send(input.slice(0, split));
+				s.send(input.slice(split));
+				const label = JSON.stringify({ open, split });
+				assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "keyboard" }, label);
+				assert.ok(!s.editor.getText().includes("herdr"), label);
+			}
 		}
 	});
 

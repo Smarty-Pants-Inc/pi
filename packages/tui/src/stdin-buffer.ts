@@ -220,6 +220,12 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				const status = isCompleteSequence(candidate);
 
 				if (status === "complete") {
+					// An ESC at the end of the buffer may start a Herdr origin frame whose next
+					// bytes are still in transit. Wait rather than let it end this sequence.
+					if (seqEnd > 1 && seqEnd === remaining.length && candidate.endsWith(ESC)) {
+						seqEnd++;
+						break;
+					}
 					// WezTerm with enable_kitty_keyboard sends the Escape key press as a
 					// raw '\x1b' byte (simple text path in encode_kitty, ignoring
 					// DISAMBIGUATE_ESCAPE_CODES) and the release as a full Kitty CSI-u
@@ -372,6 +378,28 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.emitDataSequence(result.remainder);
 			}
 			this.process(rest);
+			return;
+		}
+		// The same for a frame prefix that is still arriving: a sequence before it must not
+		// take its first bytes (for example CSI takes `_` as its final byte).
+		const tailIndex = this.buffer.lastIndexOf(ESC);
+		const tail = this.buffer.slice(tailIndex);
+		if (
+			startIndex === -1 &&
+			tailIndex > 0 &&
+			tail.length >= 2 &&
+			tail.length < HERDR_ORIGIN_PREFIX.length &&
+			HERDR_ORIGIN_PREFIX.startsWith(tail)
+		) {
+			const result = extractCompleteSequences(this.buffer.slice(0, tailIndex));
+			for (const sequence of result.sequences) {
+				this.emitDataSequence(sequence);
+			}
+			if (result.remainder.length > 0) {
+				this.emitDataSequence(result.remainder);
+			}
+			this.buffer = "";
+			this.process(tail);
 			return;
 		}
 
