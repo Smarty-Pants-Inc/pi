@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { claimHerdrInputOrigin } from "./input-origin.ts";
 import { setKittyProtocolActive } from "./keys.ts";
 import { isNativeModifierPressed } from "./native-modifiers.ts";
 import { getNativePlatformHelper } from "./native-platform.ts";
@@ -172,6 +173,8 @@ export class ProcessTerminal implements Terminal {
 	start(onInput: (data: string) => void, onResize: () => void): void {
 		this.inputHandler = onInput;
 		this.resizeHandler = onResize;
+		// This process now reads Herdr origin frames from stdin (see input-origin.ts).
+		claimHerdrInputOrigin();
 
 		// Save previous state and enable raw mode
 		this.wasRaw = process.stdin.isRaw || false;

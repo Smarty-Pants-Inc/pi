@@ -1,12 +1,16 @@
 /**
  * Input origin: who produced the input that reaches components.
  *
- * Herdr wraps input that another agent sends into a pane through its API in APC
- * origin frames:
- *   start: ESC _ herdr-origin;v=1;kind=api;id=<id>;sender=<s>[;pane=<p>][;session=<sid>] ST
- *   end:   ESC _ herdr-origin;end;id=<id> ST
- * ST is ESC \. Values are percent-encoded. Input between the frames is "herdr-api";
- * all other input is "keyboard". The author comes from the frame, never from the text.
+ * Herdr wraps input that another agent sends into a pane through its API in origin frames:
+ *   start: U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<s>[;pane=<p>][;session=<sid>] U+FDD1
+ *   end:   U+FDD0 herdr-origin;end;id=<id> U+FDD1
+ * Values are percent-encoded. Input between the frames is "herdr-api"; all other input is
+ * "keyboard". The author comes from the frame, never from the text.
+ *
+ * Herdr breaks U+FDD0 in all other input, so every U+FDD0 Pi reads starts a real frame. Stdin is
+ * decoded as UTF-8, so U+FDD0 always arrives whole: however the rest of a frame is split or
+ * delayed, Pi knows that a frame has started. Herdr sends frames only to a Pi that claims to
+ * read them (see HERDR_INPUT_ORIGIN_CLAIM).
  */
 
 export type InputOrigin =
@@ -15,7 +19,25 @@ export type InputOrigin =
 
 export const KEYBOARD_INPUT_ORIGIN: InputOrigin = Object.freeze({ kind: "keyboard" });
 
-export const HERDR_ORIGIN_PREFIX = "\x1b_herdr-origin";
+/** Origin after a lost frame boundary: API input from an unknown sender, never keyboard. */
+export const LOST_FRAME_INPUT_ORIGIN: InputOrigin = Object.freeze({ kind: "herdr-api", sender: "unknown" });
+
+/** Starts every frame. */
+export const HERDR_ORIGIN_MARKER = "\uFDD0";
+/** Ends a frame header. */
+export const HERDR_ORIGIN_HEADER_END = "\uFDD1";
+const TAG = "herdr-origin;";
+
+/**
+ * Global that Herdr's Pi integration reads to tell Herdr that this process reads origin frames.
+ * A global, not an environment variable, so child processes do not inherit the claim.
+ */
+export const HERDR_INPUT_ORIGIN_CLAIM = Symbol.for("pi.herdrInputOrigin");
+
+/** Claim, for this process, that it reads Herdr origin frames. */
+export function claimHerdrInputOrigin(): void {
+	(globalThis as Record<symbol, unknown>)[HERDR_INPUT_ORIGIN_CLAIM] = "v1";
+}
 
 export type HerdrOriginFrame =
 	| { type: "start"; origin: Extract<InputOrigin, { kind: "herdr-api" }> }
@@ -29,14 +51,25 @@ function decodeValue(value: string): string {
 	}
 }
 
+/** True for a frame, complete or not. It must never reach components. */
+export function isHerdrOriginSequence(data: string): boolean {
+	return data.startsWith(HERDR_ORIGIN_MARKER);
+}
+
+/** True for an end frame whose header did not complete. */
+export function isIncompleteHerdrOriginEnd(data: string): boolean {
+	return data.startsWith(`${HERDR_ORIGIN_MARKER}${TAG}end`);
+}
+
 /**
- * Parse a complete herdr-origin APC sequence. Returns undefined for anything else,
- * including unterminated or truncated frames.
+ * Parse a complete frame header. Returns undefined for anything else, including an unterminated
+ * or truncated header.
  */
 export function parseHerdrOriginFrame(data: string): HerdrOriginFrame | undefined {
-	if (!data.startsWith(`${HERDR_ORIGIN_PREFIX};`)) return undefined;
-	if (!data.endsWith("\x1b\\")) return undefined;
-	const body = data.slice(HERDR_ORIGIN_PREFIX.length + 1, -2);
+	const prefix = `${HERDR_ORIGIN_MARKER}${TAG}`;
+	if (!data.startsWith(prefix) || !data.endsWith(HERDR_ORIGIN_HEADER_END)) return undefined;
+	const body = data.slice(prefix.length, -HERDR_ORIGIN_HEADER_END.length);
+	if (body.includes(HERDR_ORIGIN_MARKER) || body.includes(HERDR_ORIGIN_HEADER_END)) return undefined;
 
 	const parts = body.split(";");
 	const fields = new Map<string, string>();
@@ -56,22 +89,4 @@ export function parseHerdrOriginFrame(data: string): HerdrOriginFrame | undefine
 		if (value !== undefined) origin[key] = value;
 	}
 	return { type: "start", origin };
-}
-
-/** Origin after a lost frame boundary: API input from an unknown sender, never keyboard. */
-export const LOST_FRAME_INPUT_ORIGIN: InputOrigin = Object.freeze({ kind: "herdr-api", sender: "unknown" });
-
-/** True when `data` may be the start of a Herdr origin frame that is still arriving. */
-export function isPossibleHerdrOriginFrame(data: string): boolean {
-	return data.startsWith(HERDR_ORIGIN_PREFIX) || (data.length >= 2 && HERDR_ORIGIN_PREFIX.startsWith(data));
-}
-
-/** True for an unterminated end frame. */
-export function isIncompleteHerdrOriginEnd(data: string): boolean {
-	return data.startsWith(`${HERDR_ORIGIN_PREFIX};end`);
-}
-
-/** True for any herdr-origin frame, or a flushed fragment of one, that must never reach components. */
-export function isHerdrOriginSequence(data: string): boolean {
-	return data.startsWith(HERDR_ORIGIN_PREFIX) || (data.length > 2 && HERDR_ORIGIN_PREFIX.startsWith(data));
 }

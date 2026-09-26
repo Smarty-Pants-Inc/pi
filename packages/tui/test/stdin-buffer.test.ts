@@ -269,12 +269,9 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["\x1b", "\x1b[27;1:3u"]);
 		});
 
-		it("should still emit ESC+ESC as a single sequence when not followed by a new escape", async () => {
-			// \x1b\x1b alone (no following CSI) stays as-is — e.g. ctrl+alt+[. A trailing ESC
-			// may start a Herdr origin frame, so the pair waits for the sequence timeout.
+		it("should still emit ESC+ESC as a single sequence when not followed by a new escape", () => {
+			// \x1b\x1b alone (no following CSI) stays as-is — e.g. ctrl+alt+[
 			processInput("\x1b\x1b");
-			assert.deepStrictEqual(emittedSequences, []);
-			await wait(60);
 			assert.deepStrictEqual(emittedSequences, ["\x1b\x1b"]);
 		});
 

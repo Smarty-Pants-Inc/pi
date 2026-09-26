@@ -18,26 +18,28 @@
  */
 
 import { EventEmitter } from "events";
-import { HERDR_ORIGIN_PREFIX, isPossibleHerdrOriginFrame } from "./input-origin.ts";
+import { HERDR_ORIGIN_HEADER_END, HERDR_ORIGIN_MARKER } from "./input-origin.ts";
 
 const ESC = "\x1b";
 const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
-// Herdr writes a frame in one write, so its parts arrive together unless the host is slow.
-// Only Herdr emits the prefix, so a longer wait here does not hold keyboard input.
-const DEFAULT_FRAME_TIMEOUT_MS = 2000;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+// Herdr writes each origin frame in one write, so its parts arrive together unless the host
+// stalls. Keyboard input cannot arrive inside a frame header, so waiting does not hold it.
+const DEFAULT_FRAME_TIMEOUT_MS = 2000;
+// A header longer than this has lost its end marker.
+const MAX_FRAME_HEADER_LENGTH = 8192;
 
 /**
  * End of paste content: the paste end marker, or a Herdr origin frame. Herdr emits the frame
- * prefix only in its own frames and breaks it in all other input, so the prefix is a sync
+ * marker only in its own frames and breaks it in all other input, so the marker is a sync
  * point: an unterminated paste before it cannot absorb the frame.
  */
 function findPasteEnd(buffer: string): { index: number; length: number } | undefined {
 	const end = buffer.indexOf(BRACKETED_PASTE_END);
-	const origin = buffer.indexOf(HERDR_ORIGIN_PREFIX);
-	if (origin !== -1 && (end === -1 || origin < end)) return { index: origin, length: 0 };
+	const marker = buffer.indexOf(HERDR_ORIGIN_MARKER);
+	if (marker !== -1 && (end === -1 || marker < end)) return { index: marker, length: 0 };
 	return end === -1 ? undefined : { index: end, length: BRACKETED_PASTE_END.length };
 }
 
@@ -223,12 +225,6 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 				const status = isCompleteSequence(candidate);
 
 				if (status === "complete") {
-					// An ESC at the end of the buffer may start a Herdr origin frame whose next
-					// bytes are still in transit. Wait rather than let it end this sequence.
-					if (seqEnd > 1 && seqEnd === remaining.length && candidate.endsWith(ESC)) {
-						seqEnd++;
-						break;
-					}
 					// WezTerm with enable_kitty_keyboard sends the Escape key press as a
 					// raw '\x1b' byte (simple text path in encode_kitty, ignoring
 					// DISAMBIGUATE_ESCAPE_CODES) and the release as a full Kitty CSI-u
@@ -290,7 +286,8 @@ export type StdinBufferOptions = {
 	 */
 	escapeTimeout?: number;
 	/**
-	 * Maximum time to wait for the rest of a Herdr origin frame (default: 2000ms).
+	 * Time to wait for the rest of a Herdr origin frame header before reporting it as
+	 * incomplete (default: 2000ms). The buffer keeps waiting for the header after that.
 	 */
 	frameTimeout?: number;
 };
@@ -312,6 +309,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private readonly frameTimeoutMs: number;
 	private pasteMode: boolean = false;
 	private pasteBuffer: string = "";
+	private frameHeaderReported = false;
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -372,14 +370,17 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		const startIndex = this.buffer.indexOf(BRACKETED_PASTE_START);
-		// A Herdr origin frame is a sync point (see findPasteEnd): an unterminated escape
-		// sequence before it is emitted as it is, so it cannot absorb the frame.
-		const originIndex = this.buffer.indexOf(HERDR_ORIGIN_PREFIX, 1);
-		if (originIndex !== -1 && (startIndex === -1 || originIndex < startIndex)) {
-			const before = this.buffer.slice(0, originIndex);
-			const rest = this.buffer.slice(originIndex);
+		const markerIndex = this.buffer.indexOf(HERDR_ORIGIN_MARKER);
+		if (markerIndex === 0) {
+			this.processFrameHeader();
+			return;
+		}
+		// The frame marker is a sync point (see findPasteEnd): an unterminated escape sequence
+		// before it is emitted as it is, so it cannot absorb the frame.
+		if (markerIndex > 0 && (startIndex === -1 || markerIndex < startIndex)) {
+			const result = extractCompleteSequences(this.buffer.slice(0, markerIndex));
+			const rest = this.buffer.slice(markerIndex);
 			this.buffer = "";
-			const result = extractCompleteSequences(before);
 			for (const sequence of result.sequences) {
 				this.emitDataSequence(sequence);
 			}
@@ -387,28 +388,6 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.emitDataSequence(result.remainder);
 			}
 			this.process(rest);
-			return;
-		}
-		// The same for a frame prefix that is still arriving: a sequence before it must not
-		// take its first bytes (for example CSI takes `_` as its final byte).
-		const tailIndex = this.buffer.lastIndexOf(ESC);
-		const tail = this.buffer.slice(tailIndex);
-		if (
-			startIndex === -1 &&
-			tailIndex > 0 &&
-			tail.length >= 2 &&
-			tail.length < HERDR_ORIGIN_PREFIX.length &&
-			HERDR_ORIGIN_PREFIX.startsWith(tail)
-		) {
-			const result = extractCompleteSequences(this.buffer.slice(0, tailIndex));
-			for (const sequence of result.sequences) {
-				this.emitDataSequence(sequence);
-			}
-			if (result.remainder.length > 0) {
-				this.emitDataSequence(result.remainder);
-			}
-			this.buffer = "";
-			this.process(tail);
 			return;
 		}
 
@@ -453,12 +432,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		if (this.buffer.length > 0) {
-			const timeoutMs =
-				this.buffer === ESC
-					? this.escapeTimeoutMs
-					: isPossibleHerdrOriginFrame(this.buffer)
-						? this.frameTimeoutMs
-						: this.timeoutMs;
+			const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs;
 			this.timeout = setTimeout(() => {
 				const flushed = this.flush();
 
@@ -466,6 +440,42 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 					this.emitDataSequence(sequence);
 				}
 			}, timeoutMs);
+		}
+	}
+
+	/**
+	 * The buffer starts with a Herdr origin frame marker. Emit the header once it is complete.
+	 * Until then, emit the partial header once after the frame timeout, so the receiver can fail
+	 * closed, and keep waiting for the rest.
+	 */
+	private processFrameHeader(): void {
+		const headerEnd = this.buffer.indexOf(HERDR_ORIGIN_HEADER_END);
+		const nextMarker = this.buffer.indexOf(HERDR_ORIGIN_MARKER, 1);
+		let headerLength: number | undefined;
+		if (headerEnd !== -1 && (nextMarker === -1 || headerEnd < nextMarker)) {
+			headerLength = headerEnd + HERDR_ORIGIN_HEADER_END.length;
+		} else if (nextMarker !== -1) {
+			headerLength = nextMarker; // Broken header: another frame starts.
+		} else if (this.buffer.length > MAX_FRAME_HEADER_LENGTH) {
+			headerLength = this.buffer.length; // Broken header: its end is lost.
+		}
+		if (headerLength !== undefined) {
+			const header = this.buffer.slice(0, headerLength);
+			const rest = this.buffer.slice(headerLength);
+			this.buffer = "";
+			this.frameHeaderReported = false;
+			this.emitDataSequence(header);
+			if (rest.length > 0) {
+				this.process(rest);
+			}
+			return;
+		}
+		if (!this.frameHeaderReported) {
+			this.timeout = setTimeout(() => {
+				this.timeout = null;
+				this.frameHeaderReported = true;
+				this.emitDataSequence(this.buffer);
+			}, this.frameTimeoutMs);
 		}
 	}
 
@@ -504,6 +514,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer = "";
 		this.pasteMode = false;
 		this.pasteBuffer = "";
+		this.frameHeaderReported = false;
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
 

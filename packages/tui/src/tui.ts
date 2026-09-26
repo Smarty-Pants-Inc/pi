@@ -1019,14 +1019,15 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private handleTerminalInput(data: string): void {
-		// Herdr origin frames never reach listeners or components. Paste content arrives
-		// wrapped in ESC[200~, so frame-like text inside a paste stays paste text.
+		// Herdr origin frames never reach listeners or components.
 		if (isHerdrOriginSequence(data)) {
 			const frame = parseHerdrOriginFrame(data);
 			// A nested start keeps the outer origin. ponytail: an end closes the frame even if
 			// its id differs; an early close is safer than a frame left open on keyboard input.
 			if (frame?.type === "start") {
-				if (this.inputOrigin.kind === "keyboard") this.inputOrigin = frame.origin;
+				if (this.inputOrigin.kind === "keyboard" || this.inputOrigin === LOST_FRAME_INPUT_ORIGIN) {
+					this.inputOrigin = frame.origin;
+				}
 			} else if (frame?.type === "end" || isIncompleteHerdrOriginEnd(data)) {
 				this.inputOrigin = KEYBOARD_INPUT_ORIGIN;
 			} else if (this.inputOrigin.kind === "keyboard") {
