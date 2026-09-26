@@ -181,8 +181,13 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						],
 						timestamp: m.timestamp,
 					};
+				case "user": {
+					if (m.origin === undefined) return m;
+					// Origin is session-log metadata; keep it out of provider requests.
+					const { origin: _origin, ...llmMessage } = m;
+					return llmMessage;
+				}
 				case "system":
-				case "user":
 				case "assistant":
 				case "toolResult":
 					return m;

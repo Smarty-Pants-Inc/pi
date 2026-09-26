@@ -47,6 +47,7 @@ export {
 export type { EditorComponent } from "./editor-component.ts";
 // Fuzzy matching
 export { type FuzzyMatch, fuzzyFilter, fuzzyMatch } from "./fuzzy.ts";
+export { type InputOrigin, KEYBOARD_INPUT_ORIGIN } from "./input-origin.ts";
 // Keybindings
 export {
 	getKeybindings,

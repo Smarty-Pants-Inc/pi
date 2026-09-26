@@ -1,4 +1,5 @@
 import type { AutocompleteProvider } from "./autocomplete.ts";
+import type { InputOrigin } from "./input-origin.ts";
 import type { Component } from "./tui.ts";
 
 /**
@@ -26,8 +27,8 @@ export interface EditorComponent extends Component {
 	// Callbacks (required)
 	// =========================================================================
 
-	/** Called when user submits (e.g., Enter key) */
-	onSubmit?: (text: string) => void;
+	/** Called when user submits (e.g., Enter key). `origin` says who produced the submitted text. */
+	onSubmit?: (text: string, origin?: InputOrigin) => void;
 
 	/** Called when text changes */
 	onChange?: (text: string) => void;
@@ -35,6 +36,9 @@ export interface EditorComponent extends Component {
 	// =========================================================================
 	// History support (optional)
 	// =========================================================================
+
+	/** Origin of the current content since the last submit or clear. */
+	getInputOrigin?(): InputOrigin;
 
 	/** Add text to history for up/down navigation */
 	addToHistory?(text: string): void;
