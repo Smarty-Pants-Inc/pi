@@ -272,6 +272,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		const cursorPos = this.extractCursorPosition(newLines, height);
 
 		newLines = this.applyLineResets(newLines);
+		// Most frames have no images; skip the per-line Kitty scans then.
+		const newHasImages = this.lastLinesHaveImages;
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
@@ -313,7 +315,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousViewportTop = Math.max(0, bufferLength - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousKittyImageIds = newHasImages ? this.collectKittyImageIds(newLines) : new Set();
 			this.previousWidth = width;
 			this.previousHeight = height;
 		};
@@ -381,7 +383,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			lastChanged = newLines.length - 1;
 		}
-		if (firstChanged !== -1) {
+		if (firstChanged !== -1 && (newHasImages || this.previousKittyImageIds.size > 0)) {
 			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
@@ -439,7 +441,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousKittyImageIds = newHasImages ? this.collectKittyImageIds(newLines) : new Set();
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
@@ -610,7 +612,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
-		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+		this.previousKittyImageIds = newHasImages ? this.collectKittyImageIds(newLines) : new Set();
 		this.previousWidth = width;
 		this.previousHeight = height;
 	}

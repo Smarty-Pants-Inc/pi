@@ -106,14 +106,16 @@ export class Box implements Component {
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const leftPad = " ".repeat(this.paddingX);
 
-		// Render all children
+		// Render all children. Compare their raw lines with the last render before padding them:
+		// the TUI renders every box on every frame, and unchanged children mostly return the same
+		// strings, so this is a reference compare instead of a copy and a text compare.
 		const childLines: string[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
 		for (const child of this.children) {
 			const lines = child.render(contentWidth);
 			mouseChildren.push({ component: child, height: lines.length });
 			for (const line of lines) {
-				childLines.push(leftPad + line);
+				childLines.push(line);
 			}
 		}
 		this.mouseLayout = { width: contentWidth, children: mouseChildren };
@@ -140,7 +142,7 @@ export class Box implements Component {
 
 		// Content
 		for (const line of childLines) {
-			result.push(this.applyBg(line, width));
+			result.push(this.applyBg(leftPad + line, width));
 		}
 
 		// Bottom padding
