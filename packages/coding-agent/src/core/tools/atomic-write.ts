@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { type FileHandle, lstat, open, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 function errorCode(error: unknown): unknown {
 	return typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
@@ -12,16 +12,18 @@ function errorCode(error: unknown): unknown {
  * then renames it over the target. A symlink stays a symlink; its real file gets the content.
  *
  * ponytail: rename gives the file a new inode, so hard links to it split and the owner
- * becomes the current user. Two cases keep the old in-place write: a dangling symlink,
- * and a directory where we may not create the temp file (EACCES/EPERM). Revisit if a
- * user needs either case atomic too.
+ * becomes the current user. Three cases keep the old in-place write: a target that is not
+ * a regular file (FIFO, socket, device), a dangling symlink, and a directory where we may
+ * not create the temp file (EACCES/EPERM). Revisit if a user needs these atomic too.
  */
 export async function writeFileAtomic(path: string, content: string): Promise<void> {
 	let target = resolve(path);
 	let mode: number | undefined;
 	try {
 		target = await realpath(target);
-		mode = (await stat(target)).mode & 0o7777;
+		const stats = await stat(target);
+		if (!stats.isFile()) return writeFile(target, content, "utf-8");
+		mode = stats.mode & 0o7777;
 	} catch (error) {
 		const code = errorCode(error);
 		if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
@@ -29,7 +31,8 @@ export async function writeFileAtomic(path: string, content: string): Promise<vo
 		if (link?.isSymbolicLink()) return writeFile(path, content, "utf-8");
 	}
 
-	const temp = join(dirname(target), `.${basename(target)}.${randomBytes(6).toString("hex")}.tmp`);
+	// Fixed-length name: a target name near the 255-byte limit must still get a temp file.
+	const temp = join(dirname(target), `.pi-${randomBytes(8).toString("hex")}.tmp`);
 	let handle: FileHandle;
 	try {
 		handle = await open(temp, "wx", mode ?? 0o666);

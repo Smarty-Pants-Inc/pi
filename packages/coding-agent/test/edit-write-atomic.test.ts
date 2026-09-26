@@ -11,6 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import * as fsPromises from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -212,6 +213,34 @@ describe("edit/write atomic and sequential (smarty-dev#977)", () => {
 		expect((await fsPromises.lstat(link)).isSymbolicLink()).toBe(true);
 		expect(readFileSync(real, "utf-8")).toBe("three\n");
 		expect(readdirSync(join(dir, "real"))).toEqual(["r.txt"]);
+	});
+
+	it("a non-regular target is written in place, not replaced (review F1)", async () => {
+		const socketPath = join(dir, "s.sock");
+		const link = join(dir, "s.link");
+		const server = createServer();
+		await new Promise<void>((r) => server.listen(socketPath, r));
+		symlinkSync(socketPath, link);
+		try {
+			// fs.writeFile rejects a socket; the old write did the same.
+			await expect(createWriteTool(dir).execute("w", { path: socketPath, content: "x" })).rejects.toThrow();
+			await expect(createWriteTool(dir).execute("w", { path: link, content: "x" })).rejects.toThrow();
+			expect((await fsPromises.lstat(socketPath)).isSocket()).toBe(true);
+			expect((await fsPromises.lstat(link)).isSymbolicLink()).toBe(true);
+			expect(readdirSync(dir).sort()).toEqual(["s.link", "s.sock"]);
+		} finally {
+			await new Promise<void>((r) => server.close(() => r()));
+		}
+	});
+
+	it("a filename near the 255-byte limit still works (review F2)", async () => {
+		const name = `${"n".repeat(250)}.txt`;
+		const file = join(dir, name);
+		writeFileSync(file, "a\n");
+		await createEditTool(dir).execute("e", { path: file, edits: [{ oldText: "a", newText: "b" }] });
+		await createWriteTool(dir).execute("w", { path: file, content: "c\n" });
+		expect(readFileSync(file, "utf-8")).toBe("c\n");
+		expect(readdirSync(dir)).toEqual([name]);
 	});
 
 	it("a failing write leaves the original intact and no temp file", async () => {
