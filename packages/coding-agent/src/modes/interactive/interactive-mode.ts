@@ -21,6 +21,7 @@ import type {
 	AutocompleteItem,
 	AutocompleteProvider,
 	EditorComponent,
+	InputOrigin,
 	Keybinding,
 	KeyId,
 	MarkdownTheme,
@@ -242,7 +243,11 @@ class ExpandableText extends Text implements Expandable {
 type CompactionQueuedMessage = {
 	text: string;
 	mode: "steer" | "followUp";
+	origin?: InputOrigin;
 };
+
+/** Editor submission waiting for the main loop. */
+type UserInput = { text: string; origin?: InputOrigin };
 
 type CompactionCostNotice = {
 	type: "compaction_cost";
@@ -443,8 +448,8 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string) => void;
-	private pendingUserInputs: string[] = [];
+	private onInputCallback?: (input: UserInput) => void;
+	private pendingUserInputs: UserInput[] = [];
 	private userInputInFlight = false;
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -1208,7 +1213,7 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				const prompt = this.session.prompt(userInput);
+				const prompt = this.session.prompt(userInput.text, { origin: userInput.origin });
 				// Original session preflight owns the input before TUI staging clears.
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-transferred");
@@ -3123,7 +3128,7 @@ export class InteractiveMode {
 	}
 
 	private setupEditorSubmitHandler(): void {
-		this.defaultEditor.onSubmit = async (text: string) => {
+		this.defaultEditor.onSubmit = async (text: string, origin?: InputOrigin) => {
 			text = text.trim();
 			if (!text) return;
 
@@ -3294,7 +3299,7 @@ export class InteractiveMode {
 					this.editor.setText("");
 					await this.session.prompt(text);
 				} else {
-					this.queueCompactionMessage(text, "steer");
+					this.queueCompactionMessage(text, "steer", origin);
 				}
 				return;
 			}
@@ -3304,7 +3309,7 @@ export class InteractiveMode {
 			if (this.session.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.session.prompt(text, { streamingBehavior: "steer", origin });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3315,9 +3320,9 @@ export class InteractiveMode {
 			this.flushPendingBashComponents();
 
 			if (this.onInputCallback) {
-				this.onInputCallback(text);
+				this.onInputCallback({ text, origin });
 			} else {
-				this.pendingUserInputs.push(text);
+				this.pendingUserInputs.push({ text, origin });
 				this.stagingAudit?.("input-enqueued");
 			}
 			this.editor.addToHistory?.(text);
@@ -4143,7 +4148,7 @@ export class InteractiveMode {
 		);
 	}
 
-	async getUserInput(): Promise<string> {
+	async getUserInput(): Promise<UserInput> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
 			this.userInputInFlight = true;
@@ -4152,11 +4157,11 @@ export class InteractiveMode {
 		}
 
 		return new Promise((resolve) => {
-			this.onInputCallback = (text: string) => {
+			this.onInputCallback = (input: UserInput) => {
 				this.onInputCallback = undefined;
 				this.userInputInFlight = true;
 				this.stagingAudit?.("input-delivered");
-				resolve(text);
+				resolve(input);
 			};
 		});
 	}
@@ -4372,6 +4377,7 @@ export class InteractiveMode {
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
 		if (!text) return;
+		const origin = this.editor.getInputOrigin?.();
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
@@ -4380,7 +4386,7 @@ export class InteractiveMode {
 				this.editor.setText("");
 				await this.session.prompt(text);
 			} else {
-				this.queueCompactionMessage(text, "followUp");
+				this.queueCompactionMessage(text, "followUp", origin);
 			}
 			return;
 		}
@@ -4390,14 +4396,14 @@ export class InteractiveMode {
 		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.session.prompt(text, { streamingBehavior: "followUp", origin });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
 		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
 		else if (this.editor.onSubmit) {
 			this.editor.setText("");
-			this.editor.onSubmit(text);
+			this.editor.onSubmit(text, origin);
 		}
 	}
 
@@ -4659,8 +4665,8 @@ export class InteractiveMode {
 		return allQueued.length;
 	}
 
-	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
+	private queueCompactionMessage(text: string, mode: "steer" | "followUp", origin?: InputOrigin): void {
+		this.compactionQueuedMessages.push({ text, mode, origin });
 		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
@@ -4727,9 +4733,9 @@ export class InteractiveMode {
 							},
 						});
 					} else if (message.mode === "followUp") {
-						await session.followUp(message.text);
+						await session.followUp(message.text, undefined, { origin: message.origin });
 					} else {
-						await session.steer(message.text);
+						await session.steer(message.text, undefined, { origin: message.origin });
 					}
 					pending.delete(message);
 				}
@@ -4770,6 +4776,7 @@ export class InteractiveMode {
 			let firstTransferred = false;
 			const started = session.prompt(firstPrompt.text, {
 				streamingBehavior: firstPrompt.mode,
+				origin: firstPrompt.origin,
 				onInputTransferred: () => {
 					firstTransferred = true;
 				},
@@ -4797,9 +4804,9 @@ export class InteractiveMode {
 						},
 					});
 				} else if (message.mode === "followUp") {
-					await session.followUp(message.text);
+					await session.followUp(message.text, undefined, { origin: message.origin });
 				} else {
-					await session.steer(message.text);
+					await session.steer(message.text, undefined, { origin: message.origin });
 				}
 				pending.delete(message);
 			}

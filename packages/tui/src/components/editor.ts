@@ -1,4 +1,5 @@
 import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.ts";
+import { type InputOrigin, KEYBOARD_INPUT_ORIGIN } from "../input-origin.ts";
 import { getKeybindings } from "../keybindings.ts";
 import { decodePrintableKey, matchesKey } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
@@ -364,7 +365,10 @@ export class Editor implements Component, Focusable {
 	// Undo support
 	private undoStack = new UndoStack<EditorSnapshot>();
 
-	public onSubmit?: (text: string) => void;
+	// Most recent framed (non-keyboard) input since the last submit or clear.
+	private inputOrigin: InputOrigin = KEYBOARD_INPUT_ORIGIN;
+
+	public onSubmit?: (text: string, origin?: InputOrigin) => void;
 	public onChange?: (text: string) => void;
 	public disableSubmit: boolean = false;
 
@@ -690,7 +694,17 @@ export class Editor implements Component, Focusable {
 		return { handled: true, focus: true };
 	}
 
+	/**
+	 * Origin of the current content: framed input dispatched now, else the most recent framed
+	 * input since the last submit or clear, else keyboard.
+	 */
+	getInputOrigin(): InputOrigin {
+		const current = this.tui.currentInputOrigin;
+		return current && current.kind !== "keyboard" ? current : this.inputOrigin;
+	}
+
 	handleInput(data: string): void {
+		this.inputOrigin = this.getInputOrigin();
 		const kb = getKeybindings();
 
 		// Handle character jump mode (awaiting next character to jump to)
@@ -1114,6 +1128,7 @@ export class Editor implements Component, Focusable {
 		this.lastAction = null;
 		this.exitHistoryBrowsing();
 		const normalized = this.normalizeText(text);
+		if (normalized === "") this.inputOrigin = KEYBOARD_INPUT_ORIGIN;
 		// Push undo snapshot if content differs (makes programmatic changes undoable)
 		if (this.getText() !== normalized) {
 			this.pushUndoSnapshot();
@@ -1361,6 +1376,8 @@ export class Editor implements Component, Focusable {
 	private submitValue(): void {
 		this.cancelAutocomplete();
 		const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
+		const origin = this.getInputOrigin();
+		this.inputOrigin = KEYBOARD_INPUT_ORIGIN;
 
 		this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
 		this.pastes.clear();
@@ -1371,7 +1388,7 @@ export class Editor implements Component, Focusable {
 		this.lastAction = null;
 
 		if (this.onChange) this.onChange("");
-		if (this.onSubmit) this.onSubmit(result);
+		if (this.onSubmit) this.onSubmit(result, origin);
 	}
 
 	private handleBackspace(): void {

@@ -3,6 +3,12 @@
  */
 
 import { performance } from "node:perf_hooks";
+import {
+	type InputOrigin,
+	isHerdrOriginSequence,
+	KEYBOARD_INPUT_ORIGIN,
+	parseHerdrOriginFrame,
+} from "./input-origin.ts";
 import { isKeyRelease, matchesKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
 import {
@@ -428,6 +434,8 @@ export interface TUI extends Component {
 	terminal: Terminal;
 	onDebug?: () => void;
 	readonly fullRedraws: number;
+	/** Origin of the input being dispatched: "herdr-api" inside a Herdr origin frame, else "keyboard". */
+	readonly currentInputOrigin: InputOrigin;
 	addChild(component: Component): void;
 	removeChild(component: Component): void;
 	clear(): void;
@@ -467,6 +475,7 @@ export abstract class TuiBase extends Container implements TUI {
 	public terminal: Terminal;
 	private focusedComponent: Component | null = null;
 	private inputListeners = new Set<TuiInputListener>();
+	private inputOrigin: InputOrigin = KEYBOARD_INPUT_ORIGIN;
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
@@ -1003,7 +1012,21 @@ export abstract class TuiBase extends Container implements TUI {
 		}, delay);
 	}
 
+	get currentInputOrigin(): InputOrigin {
+		return this.inputOrigin;
+	}
+
 	private handleTerminalInput(data: string): void {
+		// Herdr origin frames never reach listeners or components. Paste content arrives
+		// wrapped in ESC[200~, so frame-like text inside a paste stays paste text.
+		if (isHerdrOriginSequence(data)) {
+			const frame = parseHerdrOriginFrame(data);
+			// A nested start keeps the outer origin. ponytail: an end closes the frame even if
+			// its id differs; an early close is safer than a frame left open on keyboard input.
+			if (frame?.type === "start" && this.inputOrigin.kind === "keyboard") this.inputOrigin = frame.origin;
+			else if (frame?.type === "end") this.inputOrigin = KEYBOARD_INPUT_ORIGIN;
+			return;
+		}
 		if (this.consumeOsc11BackgroundResponse(data)) {
 			return;
 		}
