@@ -138,17 +138,19 @@ export function createOwnedProviderExchange(
 			agent.createConnection = () => {
 				if (created || !tcp) throw new Error("OWNER_PROVIDER_SOCKET_REPLAY");
 				created = true;
-				tls = connectTls({
+				// A local const keeps the narrowing under bun-types' node:tls declarations (smarty-dev#890).
+				const secure = connectTls({
 					socket: tcp,
 					host: hostname,
 					servername: isIP(hostname) ? undefined : hostname,
 					rejectUnauthorized: true,
 					ALPNProtocols: ["http/1.1"],
 				});
-				closes.push(new Promise<void>((resolve) => tls!.once("close", () => resolve())));
-				tls.on("error", fail);
-				tls.once("secureConnect", tlsReady);
-				return tls;
+				tls = secure;
+				closes.push(new Promise<void>((resolve) => secure.once("close", () => resolve())));
+				secure.on("error", fail);
+				secure.once("secureConnect", tlsReady);
+				return secure;
 			};
 			const headers = Object.fromEntries(initialHeaders);
 			delete headers.host;
