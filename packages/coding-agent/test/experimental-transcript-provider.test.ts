@@ -105,7 +105,15 @@ describe("Transcript service", () => {
 		const details = JSON.parse('{"__proto__":{"marker":"kept"},"other":1}') as Record<string, unknown>;
 		(details as Record<string, unknown>).gone = undefined;
 		await listener?.(
-			{ type: "tool_start", lane: "main", runId: "run-1", turnId: "turn-1", toolCallId: "call-2", toolName: "read", args: {} } as unknown as HarnessEvent,
+			{
+				type: "tool_start",
+				lane: "main",
+				runId: "run-1",
+				turnId: "turn-1",
+				toolCallId: "call-2",
+				toolName: "read",
+				args: {},
+			} as unknown as HarnessEvent,
 			BACKGROUND_CONTEXT,
 		);
 		await listener?.(
@@ -127,8 +135,11 @@ describe("Transcript service", () => {
 		expect(published && Object.hasOwn(published, "__proto__")).toBe(true);
 		expect(published && Object.getPrototypeOf(published)).toBe(Object.prototype);
 		expect(published).not.toHaveProperty("gone");
-		const settled = (states.at(-1)?.snapshot?.operation as { runningTools?: { toolCallId: string; result?: { details?: object } }[] })
-			?.runningTools?.find((tool) => tool.toolCallId === "call-2")?.result?.details;
+		const settled = (
+			states.at(-1)?.snapshot?.operation as {
+				runningTools?: { toolCallId: string; result?: { details?: object } }[];
+			}
+		)?.runningTools?.find((tool) => tool.toolCallId === "call-2")?.result?.details;
 		expect(settled && Object.hasOwn(settled, "__proto__")).toBe(true);
 
 		const navigation: HarnessEvent = {
