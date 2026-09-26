@@ -23,7 +23,10 @@ type Setup = {
 const setups: Setup[] = [];
 
 // Mirrors ProcessTerminal: StdinBuffer splits stdin, then sequences and paste reach the TUI.
-function setup(): Setup {
+const READY = "\uFDD0herdr-origin;ready;v=1\uFDD1";
+
+/** A Pi whose claim Herdr admitted (it sent the ready frame), unless `ready` is false. */
+function setup({ ready = true }: { ready?: boolean } = {}): Setup {
 	const terminal = new VirtualTerminal(80, 24);
 	const tui = new TuiMainScreen(terminal);
 	const editor = new Editor(tui, defaultEditorTheme);
@@ -35,6 +38,7 @@ function setup(): Setup {
 	tui.setFocus(editor);
 	tui.start();
 	const result = { tui, editor, stdin, submits, send: (data: string) => stdin.process(data) };
+	if (ready) result.send(READY);
 	setups.push(result);
 	return result;
 }
@@ -76,6 +80,63 @@ describe("Herdr input origin frames", () => {
 		s.send("i");
 		s.send("\r");
 		assert.deepStrictEqual(s.submits, [{ text: "hi", origin: { kind: "keyboard" } }]);
+	});
+
+	it("records unframed input as unknown until Herdr sends the ready frame", () => {
+		// Security pass on pi#59: before Herdr admits the claim, its API input arrives unframed.
+		const s = setup({ ready: false });
+		s.send("a");
+		s.send(READY);
+		s.send("b");
+		s.send("\r");
+		// "a" came before the ready frame, so the message stays unknown.
+		assert.deepStrictEqual(s.submits, [{ text: "ab", origin: { kind: "unknown" } }]);
+		s.send("c");
+		s.send("\r");
+		assert.deepStrictEqual(s.submits[1], { text: "c", origin: { kind: "keyboard" } });
+	});
+
+	it("records text that Pi restores or inserts itself as unknown", () => {
+		// Security pass on pi#59: history, undo, restored drafts and clipboard insertion carry no
+		// trustworthy origin, so they must not become keyboard input.
+		const restorers: [string, (s: Setup) => void][] = [
+			["setText", (s) => s.editor.setText("restored")],
+			["insertTextAtCursor", (s) => s.editor.insertTextAtCursor("clip")],
+			[
+				"undo",
+				(s) => {
+					s.send(`${start("v=1;id=7;sender=lead")}${paste("api")}${end("7")}`);
+					s.editor.setText("");
+					s.send("\x1f"); // ctrl+_ undo
+				},
+			],
+			[
+				"history",
+				(s) => {
+					s.editor.addToHistory("from history");
+					s.send("\x1b[A");
+				},
+			],
+		];
+		for (const [name, restore] of restorers) {
+			const s = setup();
+			restore(s);
+			s.send("x");
+			s.send("\r");
+			assert.strictEqual(s.submits.length, 1, name);
+			assert.notDeepStrictEqual(
+				s.submits[0]!.origin,
+				{ kind: "keyboard" },
+				`${name} ${JSON.stringify(s.submits[0])}`,
+			);
+		}
+	});
+
+	it("keeps a restored origin when the caller knows it", () => {
+		const s = setup();
+		s.editor.setText("again", API);
+		s.send("\r");
+		assert.deepStrictEqual(s.submits, [{ text: "again", origin: API }]);
 	});
 
 	it("attributes mixed input to the API when a frame changed the content", () => {

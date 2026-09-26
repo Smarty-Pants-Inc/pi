@@ -533,6 +533,7 @@ export interface SystemMessage {
 /** Who produced a user message typed into the interactive editor. Not sent to providers. */
 export type UserMessageOrigin =
 	| { kind: "keyboard" }
+	| { kind: "unknown" }
 	| { kind: "herdr-api"; sender: string; pane?: string; session?: string; id?: string };
 
 export interface UserMessage {

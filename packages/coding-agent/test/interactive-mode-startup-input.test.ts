@@ -48,12 +48,12 @@ type FollowUpContext = {
 };
 
 type StartupSubmitContext = {
-	editor: { setText: (text: string) => void };
+	editor: { setText: (text: string, origin?: InputOrigin) => void };
 	showStatus: (message: string) => void;
 };
 
 type InteractiveModePrivate = {
-	handleStartupSubmit(this: StartupSubmitContext, text: string): void;
+	handleStartupSubmit(this: StartupSubmitContext, text: string, origin?: InputOrigin): void;
 	setupEditorSubmitHandler(this: SubmitContext): void;
 	getUserInput(this: InputContext): Promise<UserInput>;
 	handleFollowUp(this: FollowUpContext): Promise<void>;
@@ -90,9 +90,10 @@ describe("InteractiveMode startup input", () => {
 			showStatus: vi.fn(),
 		};
 
-		interactiveModePrototype.handleStartupSubmit.call(context, "early prompt");
+		interactiveModePrototype.handleStartupSubmit.call(context, "early prompt", { kind: "herdr-api", sender: "lead" });
 
-		expect(context.editor.setText).toHaveBeenCalledWith("early prompt");
+		// The restored draft keeps its origin (security pass on pi#59).
+		expect(context.editor.setText).toHaveBeenCalledWith("early prompt", { kind: "herdr-api", sender: "lead" });
 		expect(context.showStatus).toHaveBeenCalledWith("Startup is still in progress");
 	});
 
@@ -150,6 +151,8 @@ describe("InteractiveMode input origin", () => {
 		tui.setFocus(editor);
 		tui.start();
 		try {
+			// Herdr admitted this Pi's claim.
+			terminal.sendInput("\uFDD0herdr-origin;ready;v=1\uFDD1");
 			terminal.sendInput("a");
 			terminal.sendInput("\uFDD0herdr-origin;v=1;kind=api;id=7;sender=lead;pane=p1;session=s1\uFDD1");
 			terminal.sendInput("\x1b[200~b\x1b[201~");

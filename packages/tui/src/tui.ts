@@ -10,6 +10,7 @@ import {
 	KEYBOARD_INPUT_ORIGIN,
 	LOST_FRAME_INPUT_ORIGIN,
 	parseHerdrOriginFrame,
+	UNKNOWN_INPUT_ORIGIN,
 } from "./input-origin.ts";
 import { isKeyRelease, matchesKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
@@ -436,7 +437,10 @@ export interface TUI extends Component {
 	terminal: Terminal;
 	onDebug?: () => void;
 	readonly fullRedraws: number;
-	/** Origin of the input being dispatched: "herdr-api" inside a Herdr origin frame, else "keyboard". */
+	/**
+	 * Origin of the input being dispatched: "herdr-api" inside a Herdr origin frame; else
+	 * "keyboard" once Herdr sent its ready frame, "unknown" before.
+	 */
 	readonly currentInputOrigin: InputOrigin;
 	addChild(component: Component): void;
 	removeChild(component: Component): void;
@@ -478,6 +482,8 @@ export abstract class TuiBase extends Container implements TUI {
 	private focusedComponent: Component | null = null;
 	private inputListeners = new Set<TuiInputListener>();
 	private inputOrigin: InputOrigin = KEYBOARD_INPUT_ORIGIN;
+	// Herdr sent the ready frame: it frames API input, so unframed input is typed.
+	private herdrFramingReady = false;
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
@@ -1015,6 +1021,7 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	get currentInputOrigin(): InputOrigin {
+		if (this.inputOrigin.kind === "keyboard" && !this.herdrFramingReady) return UNKNOWN_INPUT_ORIGIN;
 		return this.inputOrigin;
 	}
 
@@ -1024,7 +1031,9 @@ export abstract class TuiBase extends Container implements TUI {
 			const frame = parseHerdrOriginFrame(data);
 			// A nested start keeps the outer origin. ponytail: an end closes the frame even if
 			// its id differs; an early close is safer than a frame left open on keyboard input.
-			if (frame?.type === "start") {
+			if (frame?.type === "ready") {
+				this.herdrFramingReady = true;
+			} else if (frame?.type === "start") {
 				if (this.inputOrigin.kind === "keyboard" || this.inputOrigin === LOST_FRAME_INPUT_ORIGIN) {
 					this.inputOrigin = frame.origin;
 				}

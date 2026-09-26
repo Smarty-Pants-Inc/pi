@@ -18,7 +18,8 @@ export interface EditorComponent extends Component {
 	getText(): string;
 
 	/** Set the text content */
-	setText(text: string): void;
+	/** Replace the content; non-empty text without `origin` has unknown origin. */
+	setText(text: string, origin?: InputOrigin): void;
 
 	/** Handle raw terminal input (key presses, paste sequences, etc.) */
 	handleInput(data: string): void;
@@ -48,7 +49,7 @@ export interface EditorComponent extends Component {
 	// =========================================================================
 
 	/** Insert text at current cursor position */
-	insertTextAtCursor?(text: string): void;
+	insertTextAtCursor?(text: string, origin?: InputOrigin): void;
 
 	/**
 	 * Get text with any markers expanded (e.g., paste markers).

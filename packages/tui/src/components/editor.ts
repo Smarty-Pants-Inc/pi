@@ -1,5 +1,5 @@
 import type { AutocompleteProvider, AutocompleteSuggestions } from "../autocomplete.ts";
-import { type InputOrigin, KEYBOARD_INPUT_ORIGIN } from "../input-origin.ts";
+import { type InputOrigin, KEYBOARD_INPUT_ORIGIN, mergeInputOrigin, UNKNOWN_INPUT_ORIGIN } from "../input-origin.ts";
 import { getKeybindings } from "../keybindings.ts";
 import { decodePrintableKey, matchesKey } from "../keys.ts";
 import { KillRing } from "../kill-ring.ts";
@@ -455,6 +455,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	private navigateHistory(direction: 1 | -1): void {
+		this.markRestoredContent();
 		this.lastAction = null;
 		if (this.history.length === 0) return;
 
@@ -700,7 +701,12 @@ export class Editor implements Component, Focusable {
 	 */
 	getInputOrigin(): InputOrigin {
 		const current = this.tui.currentInputOrigin;
-		return current && current.kind !== "keyboard" ? current : this.inputOrigin;
+		return current ? mergeInputOrigin(this.inputOrigin, current) : this.inputOrigin;
+	}
+
+	/** Content that Pi restores or inserts itself has an origin Pi cannot establish. */
+	private markRestoredContent(origin: InputOrigin = UNKNOWN_INPUT_ORIGIN): void {
+		this.inputOrigin = mergeInputOrigin(this.inputOrigin, origin);
 	}
 
 	handleInput(data: string): void {
@@ -1123,12 +1129,18 @@ export class Editor implements Component, Focusable {
 		return { line: this.state.cursorLine, col: this.state.cursorCol };
 	}
 
-	setText(text: string): void {
+	/**
+	 * Replace the content. Non-empty text counts as `origin`, or as unknown origin when the
+	 * caller does not know it; clearing resets the origin.
+	 */
+	setText(text: string, origin?: InputOrigin): void {
 		this.cancelAutocomplete();
 		this.lastAction = null;
 		this.exitHistoryBrowsing();
 		const normalized = this.normalizeText(text);
 		if (normalized === "") this.inputOrigin = KEYBOARD_INPUT_ORIGIN;
+		else if (origin) this.inputOrigin = origin;
+		else this.markRestoredContent();
 		// Push undo snapshot if content differs (makes programmatic changes undoable)
 		if (this.getText() !== normalized) {
 			this.pushUndoSnapshot();
@@ -1143,8 +1155,9 @@ export class Editor implements Component, Focusable {
 	 * Used for programmatic insertion (e.g., clipboard image markers).
 	 * This is atomic for undo - single undo restores entire pre-insert state.
 	 */
-	insertTextAtCursor(text: string): void {
+	insertTextAtCursor(text: string, origin?: InputOrigin): void {
 		if (!text) return;
+		this.markRestoredContent(origin);
 		this.cancelAutocomplete();
 		this.pushUndoSnapshot();
 		this.lastAction = null;
@@ -2010,6 +2023,7 @@ export class Editor implements Component, Focusable {
 	 * Yank (paste) the most recent kill ring entry at cursor position.
 	 */
 	private yank(): void {
+		this.markRestoredContent();
 		if (this.killRing.length === 0) return;
 
 		this.pushUndoSnapshot();
@@ -2025,6 +2039,7 @@ export class Editor implements Component, Focusable {
 	 * Replaces the last yanked text with the previous entry in the ring.
 	 */
 	private yankPop(): void {
+		this.markRestoredContent();
 		// Only works if we just yanked and have more than one entry
 		if (this.lastAction !== "yank" || this.killRing.length <= 1) return;
 
@@ -2132,6 +2147,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	private undo(): void {
+		this.markRestoredContent();
 		this.exitHistoryBrowsing();
 		const snapshot = this.undoStack.pop();
 		if (!snapshot) return;

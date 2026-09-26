@@ -967,7 +967,7 @@ export class InteractiveMode {
 		// Accept text while startup completes, but only enable interrupt, exit, and submission feedback.
 		this.defaultEditor.onAction("app.clear", () => this.handleCtrlC());
 		this.defaultEditor.onCtrlD = () => this.handleCtrlD();
-		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
+		this.defaultEditor.onSubmit = (text, origin) => this.handleStartupSubmit(text, origin);
 		this.ui.setFocus(this.editor);
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
@@ -2814,6 +2814,7 @@ export class InteractiveMode {
 
 		// Save text from current editor before switching
 		const currentText = this.editor.getText();
+		const currentOrigin = this.editor.getInputOrigin?.();
 
 		this.disposeActiveSelector();
 		this.editorContainer.clear();
@@ -2826,8 +2827,8 @@ export class InteractiveMode {
 			newEditor.onSubmit = this.defaultEditor.onSubmit;
 			newEditor.onChange = this.defaultEditor.onChange;
 
-			// Copy text from previous editor
-			newEditor.setText(currentText);
+			// Copy text and its origin from previous editor
+			newEditor.setText(currentText, currentOrigin);
 
 			// Copy appearance settings if supported
 			if (newEditor.borderColor !== undefined) {
@@ -2869,8 +2870,8 @@ export class InteractiveMode {
 
 			this.editor = newEditor;
 		} else {
-			// Restore default editor with text from custom editor
-			this.defaultEditor.setText(currentText);
+			// Restore default editor with text and origin from custom editor
+			this.defaultEditor.setText(currentText, currentOrigin);
 			this.editor = this.defaultEditor;
 		}
 
@@ -2914,12 +2915,13 @@ export class InteractiveMode {
 		},
 	): Promise<T> {
 		const savedText = this.editor.getText();
+		const savedOrigin = this.editor.getInputOrigin?.();
 		const isOverlay = options?.overlay ?? false;
 
 		const restoreEditor = () => {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
-			this.editor.setText(savedText);
+			this.editor.setText(savedText, savedOrigin);
 			this.ui.setFocus(this.editor);
 			this.ui.requestRender();
 		};
@@ -3122,8 +3124,8 @@ export class InteractiveMode {
 		}
 	}
 
-	private handleStartupSubmit(text: string): void {
-		this.editor.setText(text);
+	private handleStartupSubmit(text: string, origin?: InputOrigin): void {
+		this.editor.setText(text, origin);
 		this.showStatus("Startup is still in progress");
 	}
 
@@ -3281,7 +3283,7 @@ export class InteractiveMode {
 				if (command) {
 					if (this.session.isBashRunning) {
 						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
-						this.editor.setText(text);
+						this.editor.setText(text, origin);
 						return;
 					}
 					this.editor.addToHistory?.(text);
