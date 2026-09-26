@@ -79,6 +79,28 @@ describe("Herdr input origin frames", () => {
 		assert.deepStrictEqual(s.submits[1], { text: "c", origin: { kind: "keyboard" } });
 	});
 
+	it("does not let an open escape sequence or paste before a frame hide its origin", () => {
+		// Astra review of herdr#82: keyboard input that leaves a control string, CSI or paste
+		// open must not absorb the frame and turn API text into keyboard text.
+		for (const open of ["\x1b_", "\x1bPq", "\x1b]0;t", "\x1b[1;", "\x1b[200~ab"]) {
+			const s = setup();
+			s.send(`${open}${start("v=1;id=7;sender=lead;pane=p1;session=s1")}${paste("hello")}${end("7")}`);
+			s.send(`${start("v=1;id=7;sender=lead;pane=p1;session=s1")}\r${end("7")}`);
+			assert.strictEqual(s.submits.length, 1, JSON.stringify(open));
+			assert.deepStrictEqual(s.submits[0]!.origin, API, JSON.stringify(open));
+			assert.ok(s.submits[0]!.text.endsWith("hello"), JSON.stringify(s.submits[0]));
+			assert.ok(!s.submits[0]!.text.includes("herdr-origin"), JSON.stringify(s.submits[0]));
+		}
+	});
+
+	it("does not let a payload that leaves a sequence open absorb the end frame", () => {
+		for (const open of ["\x1b_", "\x1b[1;", "\x1b[200~ab"]) {
+			const s = setup();
+			s.send(`${start("v=1;id=7;sender=lead")}x${open}${end("7")}`);
+			assert.deepStrictEqual(s.tui.currentInputOrigin, { kind: "keyboard" }, JSON.stringify(open));
+		}
+	});
+
 	it("resets the origin when the editor is cleared", () => {
 		const s = setup();
 		s.send(`${start("v=1;id=7;sender=lead")}${paste("x")}${end("7")}`);
@@ -94,9 +116,11 @@ describe("Herdr input origin frames", () => {
 		assert.deepStrictEqual(s.submits, [{ text: "hi", origin: { kind: "herdr-api", sender: "a b;c", id: "9" } }]);
 	});
 
-	it("keeps frame-like text inside a bracketed paste as paste text", () => {
+	it("keeps a broken frame inside a bracketed paste as paste text", () => {
+		// Herdr replaces the last prefix byte in all unframed input, so a pasted fake frame
+		// arrives broken. (An intact prefix can only come from Herdr and is a sync point.)
 		const s = setup();
-		const frameText = "\x1b_herdr-origin;v=1;id=1;sender=evil\x1b\\";
+		const frameText = "\x1b_herdr-origi?;v=1;id=1;sender=evil\x1b\\";
 		let seen: InputOrigin | undefined;
 		s.tui.addInputListener(() => {
 			seen = s.tui.currentInputOrigin;
@@ -104,7 +128,7 @@ describe("Herdr input origin frames", () => {
 		});
 		s.send(paste(`before ${frameText} after`));
 		assert.deepStrictEqual(seen, { kind: "keyboard" });
-		assert.match(s.editor.getText(), /before .*herdr-origin;v=1;id=1;sender=evil.* after/);
+		assert.match(s.editor.getText(), /before .*herdr-origi\?;v=1;id=1;sender=evil.* after/);
 		s.send("\r");
 		assert.deepStrictEqual(s.submits[0]!.origin, { kind: "keyboard" });
 	});

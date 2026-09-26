@@ -18,12 +18,25 @@
  */
 
 import { EventEmitter } from "events";
+import { HERDR_ORIGIN_PREFIX } from "./input-origin.ts";
 
 const ESC = "\x1b";
 const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+
+/**
+ * End of paste content: the paste end marker, or a Herdr origin frame. Herdr emits the frame
+ * prefix only in its own frames and breaks it in all other input, so the prefix is a sync
+ * point: an unterminated paste before it cannot absorb the frame.
+ */
+function findPasteEnd(buffer: string): { index: number; length: number } | undefined {
+	const end = buffer.indexOf(BRACKETED_PASTE_END);
+	const origin = buffer.indexOf(HERDR_ORIGIN_PREFIX);
+	if (origin !== -1 && (end === -1 || origin < end)) return { index: origin, length: 0 };
+	return end === -1 ? undefined : { index: end, length: BRACKETED_PASTE_END.length };
+}
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -325,10 +338,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.pasteBuffer += this.buffer;
 			this.buffer = "";
 
-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
-			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
+			const pasteEnd = findPasteEnd(this.pasteBuffer);
+			if (pasteEnd) {
+				const pastedContent = this.pasteBuffer.slice(0, pasteEnd.index);
+				const remaining = this.pasteBuffer.slice(pasteEnd.index + pasteEnd.length);
 
 				this.pasteMode = false;
 				this.pasteBuffer = "";
@@ -344,6 +357,24 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		const startIndex = this.buffer.indexOf(BRACKETED_PASTE_START);
+		// A Herdr origin frame is a sync point (see findPasteEnd): an unterminated escape
+		// sequence before it is emitted as it is, so it cannot absorb the frame.
+		const originIndex = this.buffer.indexOf(HERDR_ORIGIN_PREFIX, 1);
+		if (originIndex !== -1 && (startIndex === -1 || originIndex < startIndex)) {
+			const before = this.buffer.slice(0, originIndex);
+			const rest = this.buffer.slice(originIndex);
+			this.buffer = "";
+			const result = extractCompleteSequences(before);
+			for (const sequence of result.sequences) {
+				this.emitDataSequence(sequence);
+			}
+			if (result.remainder.length > 0) {
+				this.emitDataSequence(result.remainder);
+			}
+			this.process(rest);
+			return;
+		}
+
 		if (startIndex !== -1) {
 			if (startIndex > 0) {
 				const beforePaste = this.buffer.slice(0, startIndex);
@@ -359,10 +390,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.pasteBuffer = this.buffer;
 			this.buffer = "";
 
-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
-			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
+			const pasteEnd = findPasteEnd(this.pasteBuffer);
+			if (pasteEnd) {
+				const pastedContent = this.pasteBuffer.slice(0, pasteEnd.index);
+				const remaining = this.pasteBuffer.slice(pasteEnd.index + pasteEnd.length);
 
 				this.pasteMode = false;
 				this.pasteBuffer = "";
