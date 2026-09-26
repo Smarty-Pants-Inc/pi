@@ -151,9 +151,9 @@ describe("InteractiveMode input origin", () => {
 		tui.start();
 		try {
 			terminal.sendInput("a");
-			terminal.sendInput("\x1b_herdr-origin;v=1;kind=api;id=7;sender=lead;pane=p1;session=s1\x1b\\");
+			terminal.sendInput("\uFDD0herdr-origin;v=1;kind=api;id=7;sender=lead;pane=p1;session=s1\uFDD1");
 			terminal.sendInput("\x1b[200~b\x1b[201~");
-			terminal.sendInput("\x1b_herdr-origin;end;id=7\x1b\\");
+			terminal.sendInput("\uFDD0herdr-origin;end;id=7\uFDD1");
 			terminal.sendInput("\r");
 			await vi.waitFor(() => expect(context.pendingUserInputs).toEqual([{ text: "ab", origin: API }]));
 
