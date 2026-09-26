@@ -82,19 +82,22 @@ function rebuildBashResultRenderComponent(
 		} else {
 			component.addChild({
 				render: (width: number) => {
+					// Every frame renders every tool result in the transcript, so return the same
+					// lines until the width changes or invalidate() runs (for example, on a theme change).
 					if (state.cachedLines === undefined || state.cachedWidth !== width) {
 						const preview = truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width);
-						state.cachedLines = preview.visualLines;
 						state.cachedSkipped = preview.skippedCount;
 						state.cachedWidth = width;
+						if (preview.skippedCount > 0) {
+							const hint =
+								theme.fg("muted", `... (${preview.skippedCount} earlier lines,`) +
+								` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
+							state.cachedLines = ["", truncateToWidth(hint, width, "..."), ...preview.visualLines];
+						} else {
+							state.cachedLines = ["", ...preview.visualLines];
+						}
 					}
-					if (state.cachedSkipped && state.cachedSkipped > 0) {
-						const hint =
-							theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
-							` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-						return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
-					}
-					return ["", ...(state.cachedLines ?? [])];
+					return state.cachedLines;
 				},
 				invalidate: () => {
 					state.cachedWidth = undefined;

@@ -6,7 +6,7 @@ import {
 	type ToolResultMessage,
 	type Usage,
 } from "@earendil-works/pi-ai/compat";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -312,5 +312,76 @@ describe("AgentSession.getSessionStats", () => {
 		} finally {
 			session.dispose();
 		}
+	});
+});
+
+// Smarty-Pants-Inc/smarty-dev#1043: the footer calls getContextUsage() on every frame.
+describe("AgentSession.getContextUsage cache", () => {
+	it("reuses the result until the session, leaf or context window changes", async () => {
+		const { session, sessionManager } = await createSession();
+		const projections = vi.spyOn(sessionManager, "buildSessionProjection");
+
+		try {
+			sessionManager.appendMessage(createUserMessage("hello", 1));
+			const firstAssistantId = sessionManager.appendMessage(createAssistantMessage("hi", 200, 2));
+
+			expect(session.getContextUsage()?.tokens).toBe(200);
+			expect(session.getContextUsage()?.tokens).toBe(200);
+			expect(projections).toHaveBeenCalledTimes(1);
+
+			// Append: recomputed.
+			sessionManager.appendMessage(createUserMessage("more", 3));
+			sessionManager.appendMessage(createAssistantMessage("more", 500, 4));
+			expect(session.getContextUsage()?.tokens).toBe(500);
+			expect(projections).toHaveBeenCalledTimes(2);
+
+			// Leaf move to an earlier entry: recomputed.
+			sessionManager.branch(firstAssistantId);
+			expect(session.getContextUsage()?.tokens).toBe(200);
+			expect(projections).toHaveBeenCalledTimes(3);
+
+			// Model with another context window: recomputed.
+			session.agent.state.model = { ...model, contextWindow: 1000 };
+			expect(session.getContextUsage()).toEqual({ tokens: 200, contextWindow: 1000, percent: 20 });
+			expect(projections).toHaveBeenCalledTimes(4);
+
+			// Callers get their own copy.
+			const usage = session.getContextUsage()!;
+			usage.tokens = 0;
+			expect(session.getContextUsage()?.tokens).toBe(200);
+			expect(projections).toHaveBeenCalledTimes(4);
+		} finally {
+			session.dispose();
+		}
+	});
+});
+
+describe("SessionManager.revision", () => {
+	it("changes on append, branch, leaf reset and session replacement, and not otherwise", () => {
+		const sessionManager = SessionManager.inMemory();
+		const r0 = sessionManager.revision();
+		expect(sessionManager.revision()).toBe(r0);
+
+		const userId = sessionManager.appendMessage(createUserMessage("hello", 1));
+		const r1 = sessionManager.revision();
+		expect(r1).not.toBe(r0);
+		sessionManager.getEntries();
+		sessionManager.buildSessionProjection();
+		expect(sessionManager.revision()).toBe(r1);
+
+		sessionManager.appendMessage(createAssistantMessage("hi", 200, 2));
+		const r2 = sessionManager.revision();
+		expect(r2).not.toBe(r1);
+
+		sessionManager.branch(userId);
+		const r3 = sessionManager.revision();
+		expect(r3).not.toBe(r2);
+
+		sessionManager.resetLeaf();
+		const r4 = sessionManager.revision();
+		expect(r4).not.toBe(r3);
+
+		sessionManager.newSession();
+		expect(sessionManager.revision()).not.toBe(r4);
 	});
 });
