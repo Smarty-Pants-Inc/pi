@@ -123,7 +123,8 @@ jobs:
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/public-model-data.log"
-        npm run hydrate:model-data
+        # The model data is the committed snapshot (smarty-dev#1034): CI reads no models.dev.
+        # A catalog change arrives as a refresh PR; check:model-data verifies its manifest's sha256s.
         npm --prefix packages/ai run check:model-data
         git diff --exit-code HEAD --
         cp -a packages/ai/src/providers/data "$EVIDENCE_DIR/model-data"
@@ -334,7 +335,8 @@ jobs:
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/public-model-data.log"
-        npm run hydrate:model-data
+        # The model data is the committed snapshot (smarty-dev#1034): CI reads no models.dev.
+        # A catalog change arrives as a refresh PR; check:model-data verifies its manifest's sha256s.
         npm --prefix packages/ai run check:model-data
         git diff --exit-code HEAD --
         cp -a packages/ai/src/providers/data "$EVIDENCE_DIR/model-data"
