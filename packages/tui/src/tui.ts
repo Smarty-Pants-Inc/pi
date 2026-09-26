@@ -1032,7 +1032,9 @@ export abstract class TuiBase extends Container implements TUI {
 			// A nested start keeps the outer origin. ponytail: an end closes the frame even if
 			// its id differs; an early close is safer than a frame left open on keyboard input.
 			if (frame?.type === "ready") {
-				this.herdrFramingReady = true;
+				// Only a ready frame for this process: another Pi's admitted claim says nothing
+				// about whether Herdr frames input for this one.
+				if (frame.pid === process.pid) this.herdrFramingReady = true;
 			} else if (frame?.type === "start") {
 				if (this.inputOrigin.kind === "keyboard" || this.inputOrigin === LOST_FRAME_INPUT_ORIGIN) {
 					this.inputOrigin = frame.origin;

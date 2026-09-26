@@ -4,7 +4,8 @@
  * Herdr wraps input that another agent sends into a pane through its API in origin frames:
  *   start: U+FDD0 herdr-origin;v=1;kind=api;id=<id>;sender=<s>[;pane=<p>][;session=<sid>] U+FDD1
  *   end:   U+FDD0 herdr-origin;end;id=<id> U+FDD1
- *   ready: U+FDD0 herdr-origin;ready;v=1 U+FDD1 (Herdr admitted this Pi's claim)
+ *   ready: U+FDD0 herdr-origin;ready;v=1;pid=<pid> U+FDD1 (Herdr admitted the claim of
+ *          process <pid>; another process ignores it)
  * Values are percent-encoded. Input between the frames is "herdr-api". Other input is
  * "keyboard" only after the ready frame; before it, it is "unknown". The author comes from the
  * frame, never from the text.
@@ -60,7 +61,7 @@ export function claimHerdrInputOrigin(): void {
 export type HerdrOriginFrame =
 	| { type: "start"; origin: Extract<InputOrigin, { kind: "herdr-api" }> }
 	| { type: "end"; id?: string }
-	| { type: "ready" };
+	| { type: "ready"; pid?: number };
 
 function decodeValue(value: string): string {
 	try {
@@ -97,7 +98,10 @@ export function parseHerdrOriginFrame(data: string): HerdrOriginFrame | undefine
 		if (eq > 0) fields.set(part.slice(0, eq), decodeValue(part.slice(eq + 1)));
 	}
 	if (parts[0] === "end") return { type: "end", id: fields.get("id") };
-	if (parts[0] === "ready") return { type: "ready" };
+	if (parts[0] === "ready") {
+		const pid = Number(fields.get("pid"));
+		return { type: "ready", pid: Number.isInteger(pid) ? pid : undefined };
+	}
 
 	// Unknown `v` values are tolerated: the frame still marks API input with the fields we can read.
 	const origin: Extract<InputOrigin, { kind: "herdr-api" }> = {

@@ -50,6 +50,7 @@ import {
 	type TUI,
 	TuiAltScreen,
 	TuiMainScreen,
+	UNKNOWN_INPUT_ORIGIN,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import chalk from "chalk";
@@ -3089,6 +3090,9 @@ export class InteractiveMode {
 			const text = await readClipboardText();
 			if (!text || this.renderer.getFocusedComponent() !== target) return;
 			handleInput.call(target, `\x1b[200~${text}\x1b[201~`);
+			// The paste was requested before the clipboard read; whoever requested it is not
+			// the input being dispatched now, so the pasted text has unknown origin.
+			if (target === this.editor) this.editor.addInputOrigin?.(UNKNOWN_INPUT_ORIGIN);
 			this.ui.requestRender();
 		} catch {
 			// Silently ignore clipboard errors (may not have permission, etc.)

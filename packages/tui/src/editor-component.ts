@@ -41,6 +41,9 @@ export interface EditorComponent extends Component {
 	/** Origin of the current content since the last submit or clear. */
 	getInputOrigin?(): InputOrigin;
 
+	/** Adds an origin to the current content, for content inserted outside `handleInput`. */
+	addInputOrigin?(origin: InputOrigin): void;
+
 	/** Add text to history for up/down navigation */
 	addToHistory?(text: string): void;
 

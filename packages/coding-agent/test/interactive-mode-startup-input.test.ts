@@ -152,7 +152,7 @@ describe("InteractiveMode input origin", () => {
 		tui.start();
 		try {
 			// Herdr admitted this Pi's claim.
-			terminal.sendInput("\uFDD0herdr-origin;ready;v=1\uFDD1");
+			terminal.sendInput(`\uFDD0herdr-origin;ready;v=1;pid=${process.pid}\uFDD1`);
 			terminal.sendInput("a");
 			terminal.sendInput("\uFDD0herdr-origin;v=1;kind=api;id=7;sender=lead;pane=p1;session=s1\uFDD1");
 			terminal.sendInput("\x1b[200~b\x1b[201~");

@@ -709,6 +709,11 @@ export class Editor implements Component, Focusable {
 		this.inputOrigin = mergeInputOrigin(this.inputOrigin, origin);
 	}
 
+	/** Adds an origin to the current content, for content inserted outside `handleInput`. */
+	addInputOrigin(origin: InputOrigin): void {
+		this.markRestoredContent(origin);
+	}
+
 	handleInput(data: string): void {
 		this.inputOrigin = this.getInputOrigin();
 		const kb = getKeybindings();

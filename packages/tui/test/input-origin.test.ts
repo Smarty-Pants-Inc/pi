@@ -23,7 +23,7 @@ type Setup = {
 const setups: Setup[] = [];
 
 // Mirrors ProcessTerminal: StdinBuffer splits stdin, then sequences and paste reach the TUI.
-const READY = "\uFDD0herdr-origin;ready;v=1\uFDD1";
+const READY = `\uFDD0herdr-origin;ready;v=1;pid=${process.pid}\uFDD1`;
 
 /** A Pi whose claim Herdr admitted (it sent the ready frame), unless `ready` is false. */
 function setup({ ready = true }: { ready?: boolean } = {}): Setup {
@@ -94,6 +94,25 @@ describe("Herdr input origin frames", () => {
 		s.send("c");
 		s.send("\r");
 		assert.deepStrictEqual(s.submits[1], { text: "c", origin: { kind: "keyboard" } });
+	});
+
+	it("ignores a ready frame addressed to another process", () => {
+		// Security pass on pi#59: a helper's admitted claim must not make this Pi treat
+		// unframed input as typed.
+		const s = setup({ ready: false });
+		s.send(`\uFDD0herdr-origin;ready;v=1;pid=${process.pid + 1}\uFDD1`);
+		s.send("\uFDD0herdr-origin;ready;v=1\uFDD1");
+		s.send("x");
+		s.send("\r");
+		assert.deepStrictEqual(s.submits, [{ text: "x", origin: { kind: "unknown" } }]);
+	});
+
+	it("marks content added outside handleInput with the given origin", () => {
+		const s = setup();
+		s.send("a");
+		s.editor.addInputOrigin({ kind: "unknown" });
+		s.send("\r");
+		assert.deepStrictEqual(s.submits, [{ text: "a", origin: { kind: "unknown" } }]);
 	});
 
 	it("records text that Pi restores or inserts itself as unknown", () => {
