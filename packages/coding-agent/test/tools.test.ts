@@ -432,6 +432,40 @@ describe("Coding Agent Tools", () => {
 			expect(readFileSync(testFile, "utf-8")).toBe(originalContent);
 		});
 
+		// smarty-dev#1528 (K13): report every non-matching edit at once, each with its nearest match.
+		it("should report all non-matching edits with their nearest matches", async () => {
+			const testFile = join(testDir, "edit-all-missing.txt");
+			const originalContent = "function alpha() {\n\treturn 1;\n}\n\nfunction beta() {\n\treturn 2;\n}\n";
+			writeFileSync(testFile, originalContent);
+
+			const error = await editTool
+				.execute("test-call-all-missing", {
+					path: testFile,
+					edits: [
+						{ oldText: "function alpah() {\n", newText: "function a() {\n" },
+						{ oldText: "\treturn 1;\n", newText: "\treturn 10;\n" },
+						{ oldText: "function beta(x) {\n\treturn 2;", newText: "function b() {\n\treturn 2;" },
+						{ oldText: "zzzzzzzz qqqqqqq", newText: "x" },
+					],
+				})
+				.then(
+					() => undefined,
+					(err: unknown) => err,
+				);
+
+			expect(error).toBeInstanceOf(Error);
+			const message = (error as Error).message;
+			expect(message).toContain("Could not find edits[0], edits[2], edits[3]");
+			expect(message).toContain("(3 of 4 edits)");
+			expect(message).toContain("- edits[0]: nearest match at line 1:\n    1| function alpha() {");
+			expect(message).toContain(
+				"- edits[2]: nearest match at line 5:\n    5| function beta() {\n    6| \treturn 2;",
+			);
+			expect(message).toContain("- edits[3]: no similar text found.");
+			expect(message).not.toContain("edits[1]:");
+			expect(readFileSync(testFile, "utf-8")).toBe(originalContent);
+		});
+
 		it("should include EACCES for read-only files", async () => {
 			const testFile = join(testDir, "edit-readonly.txt");
 			writeFileSync(testFile, "hello\n");

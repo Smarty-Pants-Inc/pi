@@ -1,4 +1,5 @@
 import { type ToolResultMessage, validateToolArguments } from "@earendil-works/pi-ai";
+import { formatAvailableToolNames } from "../../tool-not-found.ts";
 import type { AgentToolCall, AgentToolResult } from "../../types.ts";
 import { type Context, withAbortSignal } from "../context.ts";
 import type { JsonValue } from "../session/types.ts";
@@ -81,7 +82,10 @@ export function prepareToolCall<TContext extends object | undefined>(
 ): PreparedToolCall<TContext> | ImmediateToolOutcome {
 	const tool = tools.find((candidate) => candidate.name === call.name);
 	if (!tool) {
-		return immediateError(call, `Tool ${JSON.stringify(call.name)} is unavailable`);
+		return immediateError(
+			call,
+			`Tool ${JSON.stringify(call.name)} is unavailable. ${formatAvailableToolNames(tools.map((candidate) => candidate.name))}`,
+		);
 	}
 
 	try {

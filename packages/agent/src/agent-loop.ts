@@ -16,6 +16,7 @@ import {
 	validateToolArguments,
 } from "@earendil-works/pi-ai";
 import { getDefaultStreamFn } from "./stream-fn.ts";
+import { formatAvailableToolNames } from "./tool-not-found.ts";
 import type {
 	AgentContext,
 	AgentEvent,
@@ -753,7 +754,9 @@ async function prepareToolCall(
 	if (!tool) {
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			result: createErrorToolResult(
+				`Tool ${toolCall.name} not found. ${formatAvailableToolNames((currentContext.tools ?? []).map((t) => t.name))}`,
+			),
 			isError: true,
 		};
 	}

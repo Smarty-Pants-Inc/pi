@@ -95,7 +95,9 @@ describe("tool execution primitives", () => {
 		]);
 		const invalid = prepareToolCall(call({}), [tool()]);
 
-		expect(isImmediate(unknown) ? text(unknown.result) : "").toBe('Tool "echo" is unavailable');
+		expect(isImmediate(unknown) ? text(unknown.result) : "").toBe(
+			'Tool "echo" is unavailable. No tools are available in this session.',
+		);
 		expect(isImmediate(unknown) ? unknown.result.details : null).toBeUndefined();
 		expect(isImmediate(preparationFailure) ? text(preparationFailure.result) : "").toBe("cannot prepare");
 		expect(isImmediate(invalid) ? text(invalid.result) : "").toContain('Validation failed for tool "echo"');

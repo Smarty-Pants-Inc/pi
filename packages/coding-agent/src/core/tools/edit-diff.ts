@@ -250,14 +250,93 @@ function countOccurrences(content: string, oldText: string): number {
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
-	if (totalEdits === 1) {
+const NEAREST_MATCH_MAX_LINES = 3;
+const NEAREST_MATCH_MAX_LINE_LENGTH = 120;
+const NEAREST_MATCH_MAX_SCORED_LINES = 20;
+const NEAREST_MATCH_MAX_COMPARISONS = 2_000_000;
+const NEAREST_MATCH_MIN_SCORE = 0.4;
+
+function bigrams(line: string): Set<string> {
+	const result = new Set<string>();
+	for (let i = 0; i < line.length - 1; i++) result.add(line.slice(i, i + 2));
+	return result;
+}
+
+/** Dice coefficient over character bigrams of two trimmed lines (1 = identical). */
+function lineSimilarity(a: string, b: string, aBigrams: Set<string>, bBigrams: Set<string>): number {
+	if (a === b) return 1;
+	if (aBigrams.size === 0 || bBigrams.size === 0) return 0;
+	let shared = 0;
+	for (const bigram of aBigrams) if (bBigrams.has(bigram)) shared++;
+	return (2 * shared) / (aBigrams.size + bBigrams.size);
+}
+
+/**
+ * Locate the block of content most similar to oldText, line by line, and render it as a short
+ * numbered snippet so the model can see what the file actually contains there.
+ */
+function describeNearestMatch(content: string, oldText: string): string {
+	const contentLines = content.split("\n");
+	const targetLines = oldText
+		.split("\n")
+		.map((line) => normalizeForFuzzyMatch(line).trim())
+		.slice(0, NEAREST_MATCH_MAX_SCORED_LINES);
+	while (targetLines.length > 1 && targetLines[targetLines.length - 1] === "") targetLines.pop();
+	const scoredCount = Math.max(
+		1,
+		Math.min(targetLines.length, Math.floor(NEAREST_MATCH_MAX_COMPARISONS / Math.max(contentLines.length, 1))),
+	);
+	const scored = targetLines.slice(0, scoredCount);
+	if (scored.every((line) => line === "")) return "no similar text found.";
+
+	const normalizedContent = contentLines.map((line) => normalizeForFuzzyMatch(line).trim());
+	const contentBigrams = normalizedContent.map(bigrams);
+	const targetBigrams = scored.map(bigrams);
+	let bestStart = -1;
+	let bestScore = 0;
+	for (let start = 0; start < contentLines.length; start++) {
+		let total = 0;
+		let weight = 0;
+		for (let j = 0; j < scored.length; j++) {
+			// Blank target lines carry no signal; skip them.
+			if (scored[j] === "") continue;
+			weight++;
+			const index = start + j;
+			if (index >= contentLines.length) continue;
+			total += lineSimilarity(scored[j], normalizedContent[index], targetBigrams[j], contentBigrams[index]);
+		}
+		const score = total / weight;
+		if (score > bestScore) {
+			bestScore = score;
+			bestStart = start;
+		}
+	}
+	if (bestStart === -1 || bestScore < NEAREST_MATCH_MIN_SCORE) return "no similar text found.";
+
+	const snippetLength = Math.min(targetLines.length, NEAREST_MATCH_MAX_LINES, contentLines.length - bestStart);
+	const snippet = contentLines.slice(bestStart, bestStart + snippetLength).map((line, offset) => {
+		const text =
+			line.length > NEAREST_MATCH_MAX_LINE_LENGTH ? `${line.slice(0, NEAREST_MATCH_MAX_LINE_LENGTH)}...` : line;
+		return `    ${bestStart + offset + 1}| ${text}`;
+	});
+	return `nearest match at line ${bestStart + 1}:\n${snippet.join("\n")}`;
+}
+
+function getNotFoundError(path: string, content: string, edits: Edit[], missingIndexes: number[]): Error {
+	if (edits.length === 1) {
+		const nearest = describeNearestMatch(content, edits[0].oldText);
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.\n` +
+				`${nearest[0].toUpperCase()}${nearest.slice(1)}`,
 		);
 	}
+	const details = missingIndexes.map(
+		(index) => `- edits[${index}]: ${describeNearestMatch(content, edits[index].oldText)}`,
+	);
+	const which = missingIndexes.map((index) => `edits[${index}]`).join(", ");
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+		`Could not find ${which} in ${path} (${missingIndexes.length} of ${edits.length} edits). ` +
+			`The oldText must match exactly including all whitespace and newlines. No edits were applied.\n${details.join("\n")}`,
 	);
 }
 
@@ -317,12 +396,17 @@ export function applyEditsToNormalizedContent(
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
 	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
 
+	const missingIndexes = initialMatches.flatMap((match, index) => (match.found ? [] : [index]));
+	if (missingIndexes.length > 0) {
+		throw getNotFoundError(path, normalizedContent, normalizedEdits, missingIndexes);
+	}
+
 	const matchedEdits: MatchedEdit[] = [];
 	for (let i = 0; i < normalizedEdits.length; i++) {
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			throw getNotFoundError(path, normalizedContent, normalizedEdits, [i]);
 		}
 
 		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);

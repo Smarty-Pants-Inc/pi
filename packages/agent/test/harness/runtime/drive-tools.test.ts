@@ -599,7 +599,7 @@ describe("durable tool batch", () => {
 		expect(missingEntry?.type === "message" ? missingEntry.message : undefined).toMatchObject({
 			role: "toolResult",
 			isError: true,
-			content: [{ type: "text", text: 'Tool "missing" is unavailable' }],
+			content: [{ type: "text", text: 'Tool "missing" is unavailable. No tools are available in this session.' }],
 		});
 		expect(
 			missingEntry?.type === "message" && missingEntry.message.role === "toolResult"
@@ -614,7 +614,10 @@ describe("durable tool batch", () => {
 			args: { value: "missing" },
 		});
 		expect(missingEnds[0]).toMatchObject({
-			result: { content: [{ type: "text", text: 'Tool "missing" is unavailable' }], details: undefined },
+			result: {
+				content: [{ type: "text", text: 'Tool "missing" is unavailable. No tools are available in this session.' }],
+				details: undefined,
+			},
 			isError: true,
 		});
 	});

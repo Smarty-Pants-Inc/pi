@@ -10,6 +10,7 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { agentLoop, agentLoopContinue, runAgentLoop } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
+import { formatAvailableToolNames } from "../src/tool-not-found.ts";
 import type { AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool } from "../src/types.ts";
 
 // Mock stream for testing - mimics MockAssistantStream
@@ -403,6 +404,57 @@ describe("agentLoop with AgentMessage", () => {
 		const messages = await stream.result();
 		const toolResult = messages.find((message) => message.role === "toolResult");
 		expect(toolResult?.role === "toolResult" ? toolResult.usage : undefined).toEqual(patchedToolUsage);
+	});
+
+	// smarty-dev#1528 (K05): unknown tool errors list the valid tool names so the model can retry.
+	it("lists the valid tool names when the model calls an unknown tool", async () => {
+		const makeTool = (name: string): AgentTool => ({
+			name,
+			label: name,
+			description: name,
+			parameters: Type.Object({}),
+			async execute() {
+				return { content: [{ type: "text", text: "ok" }], details: undefined };
+			},
+		});
+		const context: AgentContext = {
+			messages: [],
+			tools: [makeTool("write"), makeTool("read"), makeTool("edit")],
+		};
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = new MockAssistantStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex === 0
+						? createAssistantMessage([{ type: "toolCall", id: "tool-1", name: "Read", arguments: {} }], "toolUse")
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+				callIndex++;
+			});
+			return stream;
+		};
+
+		const stream = agentLoop([createUserMessage("read")], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// drain
+		}
+		const messages = await stream.result();
+		const toolResult = messages.find((message) => message.role === "toolResult");
+		expect(toolResult?.role === "toolResult" ? toolResult.isError : undefined).toBe(true);
+		expect(toolResult?.role === "toolResult" ? toolResult.content : undefined).toEqual([
+			{ type: "text", text: "Tool Read not found. Available tools: edit, read, write" },
+		]);
+	});
+
+	it("caps the listed tool names", () => {
+		const names = Array.from({ length: 45 }, (_, i) => `tool${String(i).padStart(2, "0")}`);
+		const message = formatAvailableToolNames(names.reverse());
+		expect(message.startsWith("Available tools: tool00, tool01,")).toBe(true);
+		expect(message).toContain("tool39, ... (5 more)");
+		expect(message).not.toContain("tool40");
 	});
 
 	it("should not execute tool calls from a length-truncated assistant message", async () => {
