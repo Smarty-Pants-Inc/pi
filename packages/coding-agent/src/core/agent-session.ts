@@ -388,18 +388,6 @@ function isCompactionCancelled(signal: AbortSignal): boolean {
 // AgentSession Class
 // ============================================================================
 
-/**
- * Host behaviors that an extension can detect at runtime through
- * `import { HOST_CAPABILITIES } from "@earendil-works/pi-coding-agent"`.
- */
-export const HOST_CAPABILITIES = Object.freeze({
-	/**
-	 * `sendMessage(..., { triggerTurn: true })` while a prompt is in preflight (input handlers,
-	 * `before_agent_start`) queues behind that prompt instead of starting a competing run.
-	 */
-	triggeredMessageQueuesBehindPreflight: true,
-});
-
 export class AgentSession {
 	static {
 		runOriginalSessionCompaction = (session, attempt) => session.#compactOriginal(attempt);

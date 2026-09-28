@@ -70,8 +70,10 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 		};
 	};
 
-	it("declares the capability", () => {
+	it("declares the capability, and gives it to an extension through pi.hostCapabilities", async () => {
 		expect(HOST_CAPABILITIES.triggeredMessageQueuesBehindPreflight).toBe(true);
+		const { api } = await withGatedInput();
+		expect(api().hostCapabilities.triggeredMessageQueuesBehindPreflight).toBe(true);
 	});
 
 	it("queues behind the prompt: the prompt runs, then the message, with no competing run", async () => {

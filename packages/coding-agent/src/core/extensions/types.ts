@@ -59,6 +59,7 @@ import type { CompactionPreparation, CompactionResult } from "../compaction/inde
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
+import type { HostCapabilities } from "../host-capabilities.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { CustomMessage } from "../messages.ts";
 import type { ModelRegistry } from "../model-registry.ts";
@@ -1375,6 +1376,9 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/** Behaviors of the Pi that runs this extension (see HOST_CAPABILITIES). */
+	readonly hostCapabilities: HostCapabilities;
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
