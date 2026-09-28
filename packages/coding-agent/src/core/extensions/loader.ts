@@ -14,6 +14,7 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../
 import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import { createExecCommand, type ExecOptions, execCommand, type OwnedExecScope } from "../exec.ts";
+import { HOST_CAPABILITIES } from "../host-capabilities.ts";
 import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "../ordinary-owner-context.ts";
 import { createOrdinarySenseExtension, type OrdinarySenseEntry } from "../ordinary-sense.ts";
 import { readPiManifest } from "../pi-manifest.ts";
@@ -375,6 +376,8 @@ function createExtensionAPI(
 			if (!extension.flags.has(name)) return undefined;
 			return runtime.flagValues.has(name) ? runtime.flagValues.get(name) : pendingFlagValues.get(name);
 		},
+
+		hostCapabilities: HOST_CAPABILITIES,
 
 		// Action methods - delegate to shared runtime
 		sendMessage(message, options): void {
