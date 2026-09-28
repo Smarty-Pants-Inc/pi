@@ -261,6 +261,48 @@ function getNotFoundError(path: string, editIndex: number, totalEdits: number): 
 	);
 }
 
+function bigrams(text: string): Set<string> {
+	const set = new Set<string>();
+	for (let i = 0; i < text.length - 1; i++) set.add(text.slice(i, i + 2));
+	return set;
+}
+
+/** Nearest line to the first non-blank line of oldText (Dice similarity on character bigrams). */
+export function findNearestLine(content: string, oldText: string): { line: number; excerpt: string } | undefined {
+	const needle = oldText
+		.split("\n")
+		.find((line) => line.trim().length > 0)
+		?.trim();
+	if (!needle) return undefined;
+	const needleGrams = bigrams(needle);
+	let best: { line: number; excerpt: string; score: number } | undefined;
+	content.split("\n").forEach((text, index) => {
+		const trimmed = text.trim();
+		if (!trimmed) return;
+		const grams = bigrams(trimmed);
+		let shared = 0;
+		for (const gram of grams) if (needleGrams.has(gram)) shared++;
+		const score = (2 * shared) / (grams.size + needleGrams.size || 1);
+		if (!best || score > best.score) best = { line: index + 1, excerpt: trimmed, score };
+	});
+	if (!best || best.score === 0) return undefined;
+	const excerpt = best.excerpt.length > 80 ? `${best.excerpt.slice(0, 77)}...` : best.excerpt;
+	return { line: best.line, excerpt };
+}
+
+function getAllNotFoundError(path: string, content: string, edits: Edit[], missing: number[]): Error {
+	const lines = missing.map((i) => {
+		const nearest = findNearestLine(content, edits[i].oldText);
+		const hint = nearest
+			? `nearest match at line ${nearest.line}: ${JSON.stringify(nearest.excerpt)}`
+			: "no similar line";
+		return `- edits[${i}]: ${hint}`;
+	});
+	return new Error(
+		`Could not find ${missing.length} of ${edits.length} edits in ${path}. Each oldText must match exactly including all whitespace and newlines. No edits were applied.\n${lines.join("\n")}`,
+	);
+}
+
 function getDuplicateError(path: string, editIndex: number, totalEdits: number, occurrences: number): Error {
 	if (totalEdits === 1) {
 		return new Error(
@@ -316,6 +358,12 @@ export function applyEditsToNormalizedContent(
 	const initialMatches = normalizedEdits.map((edit) => fuzzyFindText(normalizedContent, edit.oldText));
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
 	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
+
+	// Report every non-matching edit at once, each with its nearest line (smarty-dev#1528 K13).
+	const missing = initialMatches.flatMap((match, i) => (match.found ? [] : [i]));
+	if (missing.length > 0 && normalizedEdits.length > 1) {
+		throw getAllNotFoundError(path, normalizedContent, normalizedEdits, missing);
+	}
 
 	const matchedEdits: MatchedEdit[] = [];
 	for (let i = 0; i < normalizedEdits.length; i++) {
