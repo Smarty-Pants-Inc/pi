@@ -216,4 +216,24 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 		expect(getAssistantTexts(harness)).toEqual(["took the wake", "next"]);
 		expect(customTypes(harness)).toEqual(["wake"]);
 	});
+
+	// pi#74 review F4: clearQueue clears a held triggered message too.
+	it.each([true, false])("clearQueue drops a held message (input consumed: %s)", async (consume) => {
+		const { harness, entered, release, api, arm } = await withGatedInput(consume);
+		harness.setResponses([fauxAssistantMessage("answered the user"), fauxAssistantMessage("must not run")]);
+		arm();
+		const prompt = harness.session.prompt("the user's prompt");
+		await entered.promise;
+		api().sendMessage(
+			{ customType: "wake", content: "wake", display: false },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+		harness.session.clearQueue();
+		release.resolve();
+		await prompt;
+		await new Promise((r) => setTimeout(r, 200));
+		expect(customTypes(harness)).toEqual([]);
+		expect(getAssistantTexts(harness)).toEqual(consume ? [] : ["answered the user"]);
+		expect(harness.faux.state.callCount).toBe(consume ? 0 : 1);
+	});
 });

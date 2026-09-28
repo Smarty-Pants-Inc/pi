@@ -2060,8 +2060,10 @@ export class AgentSession {
 					const behavior = options?.streamingBehavior ?? "steer";
 					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
 					else await this._queueSteer(expandedText, currentImages);
-					// Input already queued behind this prompt is retained with it.
+					// Input already queued behind this prompt is retained with it, and so are
+					// triggered messages held during this preflight: the stop holds for them too.
 					this._inputQueuedBehindPreflight = false;
+					this._queueTriggeredBehindPreflight();
 					onInputTransferred?.();
 					throw new Error(
 						`Prompt not sent: compaction ${outcome === "aborted" ? "was cancelled" : "failed"}. ` +
@@ -2566,6 +2568,7 @@ export class AgentSession {
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
+		this._triggeredBehindPreflight.splice(0);
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
