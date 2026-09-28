@@ -423,6 +423,8 @@ export class AgentSession {
 	private readonly _promptPreflights = new Set<object>();
 	/** Input was queued behind a prompt preflight, not behind an active run. */
 	private _inputQueuedBehindPreflight = false;
+	/** Triggered custom messages sent during a prompt preflight, oldest first. */
+	private readonly _triggeredBehindPreflight: Array<{ message: CustomMessage; deliverAs?: "steer" | "followUp" }> = [];
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
 	private _resolveIdleWait: (() => void) | undefined;
@@ -2126,6 +2128,7 @@ export class AgentSession {
 		} finally {
 			if (!messages) {
 				this._promptPreflights.delete(preflightToken);
+				this._runTriggeredBehindPreflight();
 				this._runInputQueuedBehindPreflight();
 			}
 		}
@@ -2135,11 +2138,41 @@ export class AgentSession {
 		}
 
 		preflightResult?.(true);
+		// Triggered messages held during this preflight join its run, in the queue they asked for.
+		this._queueTriggeredBehindPreflight();
 		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
 		// The run is active synchronously, so later prompts now queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
 		releasePreflight?.();
 		await run;
+	}
+
+	private _queueTriggeredBehindPreflight(): void {
+		for (const { message, deliverAs } of this._triggeredBehindPreflight.splice(0)) {
+			if (deliverAs === "followUp") this.agent.followUp(message);
+			else this.agent.steer(message);
+		}
+	}
+
+	/**
+	 * When the last preflight ends without a run (its input was consumed, or it failed), start the
+	 * run that the held triggered messages asked for. Unlike queued input, this needs no earlier
+	 * assistant message: the messages are the run's input, as they would have been without the wait.
+	 */
+	private _runTriggeredBehindPreflight(): void {
+		if (this._promptPreflights.size > 0 || this._triggeredBehindPreflight.length === 0) return;
+		if (!this.isIdle) {
+			this._queueTriggeredBehindPreflight();
+			return;
+		}
+		const messages = this._triggeredBehindPreflight.splice(0).map(({ message }) => message);
+		void this._runAgentPrompt(messages).catch((error: unknown) => {
+			this._extensionRunner.emitError({
+				extensionPath: "<queue>",
+				event: "sendMessage",
+				error: error instanceof Error ? error.message : String(error),
+			});
+		});
 	}
 
 	/**
@@ -2390,11 +2423,9 @@ export class AgentSession {
 			if (this._promptPreflights.size > 0) {
 				// A prompt is in preflight (input handlers, before_agent_start). The session still
 				// reports idle, but a run started now makes that prompt fail with "Agent is already
-				// processing". Queue behind it, as _prompt queues input behind an earlier preflight:
-				// the prompt's run delivers the message, or the last preflight starts a run for it.
-				if (options.deliverAs === "followUp") this.agent.followUp(appMessage);
-				else this.agent.steer(appMessage);
-				this._inputQueuedBehindPreflight = true;
+				// processing". Hold the message: the prompt's run takes it, or, when the last
+				// preflight ends without a run, the message starts its own run as it would have.
+				this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
 				return;
 			}
 			await this._runAgentPrompt(appMessage);

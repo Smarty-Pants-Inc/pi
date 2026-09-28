@@ -26,7 +26,7 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
 	});
 
-	const withGatedInput = async (consume = false) => {
+	const withGatedInput = async (consume = false, hook: "input" | "before_agent_start" = "input") => {
 		const entered = deferred();
 		const release = deferred();
 		let api: ExtensionAPI | undefined;
@@ -35,14 +35,23 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 			extensionFactories: [
 				(pi) => {
 					// Registered first: this input handler runs before any other extension's.
-					pi.on("input", async (_event, ctx) => {
-						if (!gate) return undefined;
+					const hold = async (ctx: { isIdle(): boolean }): Promise<boolean> => {
+						if (!gate) return false;
 						gate = false;
 						expect(ctx.isIdle()).toBe(true);
 						entered.resolve();
 						await release.promise;
-						return consume ? { action: "handled" as const } : undefined;
-					});
+						return true;
+					};
+					if (hook === "input") {
+						pi.on("input", async (_event, ctx) =>
+							(await hold(ctx)) && consume ? { action: "handled" as const } : undefined,
+						);
+					} else {
+						pi.on("before_agent_start", async (_event, ctx) => {
+							await hold(ctx);
+						});
+					}
 				},
 				(pi) => {
 					api = pi;
@@ -132,5 +141,79 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 			await new Promise((r) => setTimeout(r, 20));
 		expect(harness.faux.state.callCount).toBe(1);
 		expect(getAssistantTexts(harness)).toEqual(["took the wake"]);
+	});
+
+	it("queues behind a prompt held in before_agent_start", async () => {
+		const { harness, entered, release, api, arm } = await withGatedInput(false, "before_agent_start");
+		harness.setResponses([fauxAssistantMessage("answered the user"), fauxAssistantMessage("took the wake")]);
+		arm();
+		const prompt = harness.session.prompt("the user's prompt");
+		await entered.promise;
+		api().sendMessage(
+			{ customType: "wake", content: "wake", display: false },
+			{ triggerTurn: true, deliverAs: "followUp" },
+		);
+		expect(harness.faux.state.callCount).toBe(0);
+		release.resolve();
+		await expect(prompt).resolves.toBeUndefined();
+		expect(getAssistantTexts(harness)).toEqual(["answered the user", "took the wake"]);
+		expect(customTypes(harness)).toEqual(["wake"]);
+	});
+
+	const waitForAssistants = async (harness: Harness, count: number) => {
+		const deadline = Date.now() + 5_000;
+		while (getAssistantTexts(harness).length < count && Date.now() < deadline)
+			await new Promise((r) => setTimeout(r, 20));
+	};
+
+	// Review F1 on pi#74: with no assistant message yet, the message must still get its own run.
+	it.each(["steer", "followUp"] as const)(
+		"starts the run a %s asked for when a fresh session's first input is consumed",
+		async (deliverAs) => {
+			const { harness, entered, release, api, arm } = await withGatedInput(true);
+			harness.setResponses([fauxAssistantMessage("took the wake")]);
+			arm();
+			const prompt = harness.session.prompt("consumed by the input handler");
+			await entered.promise;
+			api().sendMessage({ customType: "wake", content: "wake", display: false }, { triggerTurn: true, deliverAs });
+			release.resolve();
+			await prompt;
+			await waitForAssistants(harness, 1);
+			expect(getAssistantTexts(harness)).toEqual(["took the wake"]);
+			expect(customTypes(harness)).toEqual(["wake"]);
+			expect(harness.faux.state.callCount).toBe(1);
+		},
+	);
+
+	it("starts the run when the transcript ends with a custom message that started no turn", async () => {
+		const { harness, entered, release, api, arm } = await withGatedInput(true);
+		harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("took the wake")]);
+		await harness.session.prompt("first");
+		api().sendMessage({ customType: "note", content: "note", display: false });
+		expect(harness.session.messages.at(-1)?.role).toBe("custom");
+		arm();
+		const prompt = harness.session.prompt("consumed by the input handler");
+		await entered.promise;
+		api().sendMessage({ customType: "wake", content: "wake", display: false }, { triggerTurn: true });
+		release.resolve();
+		await prompt;
+		await waitForAssistants(harness, 2);
+		expect(getAssistantTexts(harness)).toEqual(["first", "took the wake"]);
+		expect(customTypes(harness)).toEqual(["note", "wake"]);
+	});
+
+	it("does not run the held message twice when the consumed input came before a real prompt", async () => {
+		const { harness, entered, release, api, arm } = await withGatedInput(true);
+		harness.setResponses([fauxAssistantMessage("took the wake"), fauxAssistantMessage("next")]);
+		arm();
+		const prompt = harness.session.prompt("consumed");
+		await entered.promise;
+		api().sendMessage({ customType: "wake", content: "wake", display: false }, { triggerTurn: true });
+		release.resolve();
+		await prompt;
+		await waitForAssistants(harness, 1);
+		await harness.session.prompt("next");
+		expect(getAssistantTexts(harness)).toEqual(["took the wake", "next"]);
+		expect(customTypes(harness)).toEqual(["wake"]);
 	});
 });
