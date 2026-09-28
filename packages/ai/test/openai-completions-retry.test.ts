@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
 import type { Model } from "../src/types.ts";
+import { isRetryableAssistantError } from "../src/utils/retry.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const mockState = vi.hoisted(() => ({
@@ -136,5 +137,38 @@ describe("openai-completions provider retries", () => {
 		expect(result.errorMessage).toContain("Server requested 277403s retry delay (max: 1s)");
 		expect(result.errorMessage).toContain("rate limited");
 		expect(mockState.requestOptions).toEqual([expect.objectContaining({ maxRetries: 0 })]);
+	});
+
+	// smarty-dev#1723: the Node gateway's plan-limit 429. The message with and without the credit URL, so the
+	// "billing" text pattern cannot be what stops the retry.
+	it.each([
+		"Your 5-hour limit is used up. More at 14:32Z, or add credit: https://billing.smartypants.ai/checkout",
+		"Your 5-hour limit is used up. More at 14:32Z.",
+	])("does not retry the smarty_limit 429 and shows its message as-is: %s", async (message) => {
+		// The body the gateway sends; the openai SDK puts `body.error` in `error.error`.
+		const body = {
+			error: {
+				type: "smarty_limit",
+				code: "smarty_limit",
+				message,
+				window: "5h",
+				throttled: false,
+				resets_at: "2026-09-28T14:32:00Z",
+			},
+		};
+		mockState.requestErrors = [
+			Object.assign(new Error(`429 ${message}`), {
+				status: 429,
+				headers: new Headers({ "retry-after": "1" }),
+				error: body.error,
+			}),
+		];
+
+		const result = await consume({ maxRetries: 2 });
+
+		expect(mockState.requestOptions).toHaveLength(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe(message);
+		expect(isRetryableAssistantError(result)).toBe(false);
 	});
 });

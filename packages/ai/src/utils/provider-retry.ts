@@ -1,3 +1,5 @@
+import { smartyLimitMessage } from "./error-body.ts";
+
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
 interface ProviderRetryOptions {
@@ -21,6 +23,7 @@ function isProviderError(error: unknown): error is ProviderError {
 
 /** Mirrors the pinned OpenAI/Anthropic SDK retry policy; review when either SDK is upgraded. */
 function isRetryableProviderError(error: ProviderError): boolean {
+	if (smartyLimitMessage(error) !== undefined) return false;
 	const shouldRetry = error.headers?.get("x-should-retry");
 	if (shouldRetry === "true") return true;
 	if (shouldRetry === "false") return false;
