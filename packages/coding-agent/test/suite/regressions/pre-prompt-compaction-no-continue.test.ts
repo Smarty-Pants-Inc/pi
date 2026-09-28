@@ -136,4 +136,53 @@ describe("pre-prompt compaction regression", () => {
 			aborted: outcome === "aborted",
 		});
 	});
+
+	// pi#74 review F3: a triggered custom message held during this preflight must not restart work
+	// after the compaction stop, and must not carry the retained input into a run.
+	it.each(["failed", "aborted"] as const)(
+		"keeps a triggered message held before %s compaction queued, with no new run",
+		async (outcome) => {
+			const harness = await createHarness({
+				models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+				settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("input", () => {
+							pi.sendMessage({ customType: "wake", content: "wake", display: false }, { triggerTurn: true });
+							return undefined;
+						});
+						if (outcome === "aborted") pi.on("session_before_compact", () => ({ cancel: true }));
+					},
+				],
+			});
+			harnesses.push(harness);
+			const now = Date.now();
+			const model = harness.getModel();
+			harness.sessionManager.appendMessage({ role: "user", content: "previous prompt", timestamp: now - 1000 });
+			harness.sessionManager.appendMessage({
+				...fauxAssistantMessage("previous response", { timestamp: now - 500 }),
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: createUsage(101),
+			});
+			harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" }),
+				fauxAssistantMessage("must not run"),
+			]);
+			const runPrompt = vi.spyOn(harness.session.agent, "prompt");
+
+			await expect(harness.session.prompt("pending input")).rejects.toThrow("Input is retained in the steer queue");
+			await new Promise((resolve) => setTimeout(resolve, 100));
+
+			expect(runPrompt).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(outcome === "failed" ? 1 : 0);
+			expect(getUserTexts(harness)).not.toContain("pending input");
+			expect(harness.session.messages.some((message) => message.role === "custom")).toBe(false);
+			expect(harness.session.getSteeringMessages()).toEqual(["pending input"]);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+			expect(harness.session.isIdle).toBe(true);
+		},
+	);
 });
