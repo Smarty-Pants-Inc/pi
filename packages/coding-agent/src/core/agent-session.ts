@@ -2135,9 +2135,11 @@ export class AgentSession {
 		preflightResult?.(true);
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
-		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
-		// The run is active synchronously, so later prompts now queue through isStreaming.
+		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
+		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
+		// run active synchronously, so later prompts still queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
+		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
 		releasePreflight?.();
 		await run;
 	}

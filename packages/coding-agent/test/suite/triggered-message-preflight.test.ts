@@ -255,4 +255,22 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 		seen.push(harness.session.isPromptPending);
 		expect(seen).toEqual([true, false]);
 	});
+
+	it("reports the prompt as started in the first agent_start handler", async () => {
+		const atStart: Array<{ idle: boolean; pending: boolean }> = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					// Registered first: the first handler to see the run start.
+					pi.on("agent_start", (_event, ctx) => {
+						atStart.push({ idle: ctx.isIdle(), pending: ctx.isPromptPending() });
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("answered")]);
+		await harness.session.prompt("the user's prompt");
+		expect(atStart).toEqual([{ idle: false, pending: false }]);
+	});
 });
