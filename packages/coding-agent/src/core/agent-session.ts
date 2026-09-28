@@ -388,6 +388,18 @@ function isCompactionCancelled(signal: AbortSignal): boolean {
 // AgentSession Class
 // ============================================================================
 
+/**
+ * Host behaviors that an extension can detect at runtime through
+ * `import { HOST_CAPABILITIES } from "@earendil-works/pi-coding-agent"`.
+ */
+export const HOST_CAPABILITIES = Object.freeze({
+	/**
+	 * `sendMessage(..., { triggerTurn: true })` while a prompt is in preflight (input handlers,
+	 * `before_agent_start`) queues behind that prompt instead of starting a competing run.
+	 */
+	triggeredMessageQueuesBehindPreflight: true,
+});
+
 export class AgentSession {
 	static {
 		runOriginalSessionCompaction = (session, attempt) => session.#compactOriginal(attempt);
@@ -2341,6 +2353,7 @@ export class AgentSession {
 	 * - Streaming: queues message, processed when loop pulls from queue
 	 * - Streaming + triggerTurn false: appended to state/session once the current turn ends
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
+	 * - Not streaming + triggerTurn during a prompt's preflight: queued behind that prompt (see HOST_CAPABILITIES)
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
 	 * @param message Custom message with customType, content, display, details
@@ -2372,6 +2385,16 @@ export class AgentSession {
 		} else if (options?.triggerTurn) {
 			if (this._isEmittingAgentSettled) {
 				this._deferredSettledActions.push(async () => await this._runAgentPrompt(appMessage));
+				return;
+			}
+			if (this._promptPreflights.size > 0) {
+				// A prompt is in preflight (input handlers, before_agent_start). The session still
+				// reports idle, but a run started now makes that prompt fail with "Agent is already
+				// processing". Queue behind it, as _prompt queues input behind an earlier preflight:
+				// the prompt's run delivers the message, or the last preflight starts a run for it.
+				if (options.deliverAs === "followUp") this.agent.followUp(appMessage);
+				else this.agent.steer(appMessage);
+				this._inputQueuedBehindPreflight = true;
 				return;
 			}
 			await this._runAgentPrompt(appMessage);
