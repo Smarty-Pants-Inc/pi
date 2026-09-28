@@ -2197,6 +2197,7 @@ export class InteractiveMode {
 			thinkingLevel: this.session.thinkingLevel,
 			isIdle: () => this.session.isIdle,
 			isSettling: () => this.session.isSettling,
+			isPromptPending: () => this.session.isPromptPending,
 			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 			signal: this.session.agent.signal,
 			abort: () => {

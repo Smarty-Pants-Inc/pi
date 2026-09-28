@@ -9,6 +9,8 @@ export const HOST_CAPABILITIES = Object.freeze({
 	 * `before_agent_start`) waits for that prompt instead of starting a competing run.
 	 */
 	triggeredMessageQueuesBehindPreflight: true as boolean,
+	/** `ctx.isPromptPending()` reports a prompt in preflight, while `ctx.isIdle()` is still true. */
+	promptPendingVisible: true as boolean,
 });
 
 export type HostCapabilities = typeof HOST_CAPABILITIES;

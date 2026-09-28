@@ -363,6 +363,7 @@ export class ExtensionRunner {
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
 	private isIdleFn: () => boolean = () => true;
 	private isSettlingFn: () => boolean = () => false;
+	private isPromptPendingFn: () => boolean = () => false;
 	private isProjectTrustedFn: () => boolean = () => true;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
 	private waitForIdleFn: () => Promise<void> = async () => {};
@@ -430,6 +431,7 @@ export class ExtensionRunner {
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
 		this.isSettlingFn = contextActions.isSettling;
+		this.isPromptPendingFn = contextActions.isPromptPending ?? (() => false);
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
 		this.getSignalFn = contextActions.getSignal;
 		this.abortFn = contextActions.abort;
@@ -856,6 +858,10 @@ export class ExtensionRunner {
 			isSettling: () => {
 				runner.assertActive();
 				return runner.isSettlingFn();
+			},
+			isPromptPending: () => {
+				runner.assertActive();
+				return runner.isPromptPendingFn();
 			},
 			isProjectTrusted: () => {
 				runner.assertActive();

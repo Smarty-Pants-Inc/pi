@@ -1409,6 +1409,11 @@ export class AgentSession {
 		return this._isEmittingAgentSettled;
 	}
 
+	/** Whether a prompt is in preflight (input handlers, `before_agent_start`) and its run has not started. */
+	get isPromptPending(): boolean {
+		return this._promptPreflights.size > 0;
+	}
+
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
 		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
@@ -3856,6 +3861,7 @@ export class AgentSession {
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
 				isSettling: () => this.isSettling,
+				isPromptPending: () => this.isPromptPending,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {
