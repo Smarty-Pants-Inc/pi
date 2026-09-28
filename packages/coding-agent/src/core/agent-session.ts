@@ -1409,6 +1409,11 @@ export class AgentSession {
 		return this._isEmittingAgentSettled;
 	}
 
+	/** Whether a prompt is in preflight (input handlers, `before_agent_start`) and its run has not started. */
+	get isPromptPending(): boolean {
+		return this._promptPreflights.size > 0;
+	}
+
 	/** Current effective system prompt, including changes not yet sent to the model. */
 	get systemPrompt(): string {
 		return buildSystemPrompt(this._runSystemPromptOptions ?? this._baseSystemPromptOptions);
@@ -2130,9 +2135,11 @@ export class AgentSession {
 		preflightResult?.(true);
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
-		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
-		// The run is active synchronously, so later prompts now queue through isStreaming.
+		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
+		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
+		// run active synchronously, so later prompts still queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
+		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
 		releasePreflight?.();
 		await run;
 	}
@@ -3856,6 +3863,7 @@ export class AgentSession {
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
 				isSettling: () => this.isSettling,
+				isPromptPending: () => this.isPromptPending,
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {

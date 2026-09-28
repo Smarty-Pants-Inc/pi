@@ -35,10 +35,11 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 			extensionFactories: [
 				(pi) => {
 					// Registered first: this input handler runs before any other extension's.
-					const hold = async (ctx: { isIdle(): boolean }): Promise<boolean> => {
+					const hold = async (ctx: { isIdle(): boolean; isPromptPending(): boolean }): Promise<boolean> => {
 						if (!gate) return false;
 						gate = false;
 						expect(ctx.isIdle()).toBe(true);
+						expect(ctx.isPromptPending()).toBe(true);
 						entered.resolve();
 						await release.promise;
 						return true;
@@ -74,6 +75,7 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 		expect(HOST_CAPABILITIES.triggeredMessageQueuesBehindPreflight).toBe(true);
 		const { api } = await withGatedInput();
 		expect(api().hostCapabilities.triggeredMessageQueuesBehindPreflight).toBe(true);
+		expect(api().hostCapabilities.promptPendingVisible).toBe(true);
 	});
 
 	it("queues behind the prompt: the prompt runs, then the message, with no competing run", async () => {
@@ -237,5 +239,38 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 		expect(customTypes(harness)).toEqual([]);
 		expect(getAssistantTexts(harness)).toEqual(consume ? [] : ["answered the user"]);
 		expect(harness.faux.state.callCount).toBe(consume ? 0 : 1);
+	});
+
+	it("reports a prompt in preflight through isPromptPending, and not before or after it", async () => {
+		const seen: boolean[] = [];
+		const { harness, entered, release, arm } = await withGatedInput(false, "before_agent_start");
+		harness.setResponses([fauxAssistantMessage("answered")]);
+		expect(harness.session.isPromptPending).toBe(false);
+		arm();
+		const prompt = harness.session.prompt("the user's prompt");
+		await entered.promise;
+		seen.push(harness.session.isPromptPending);
+		release.resolve();
+		await prompt;
+		seen.push(harness.session.isPromptPending);
+		expect(seen).toEqual([true, false]);
+	});
+
+	it("reports the prompt as started in the first agent_start handler", async () => {
+		const atStart: Array<{ idle: boolean; pending: boolean }> = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					// Registered first: the first handler to see the run start.
+					pi.on("agent_start", (_event, ctx) => {
+						atStart.push({ idle: ctx.isIdle(), pending: ctx.isPromptPending() });
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("answered")]);
+		await harness.session.prompt("the user's prompt");
+		expect(atStart).toEqual([{ idle: false, pending: false }]);
 	});
 });
