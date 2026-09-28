@@ -22,6 +22,7 @@
 
 ### Fixed
 
+- Fixed OpenAI-compatible providers retrying the Smarty Node gateway's plan-limit 429: a parsed error body with `code` or `type` `smarty_limit` is now final at both the provider and agent retry levels, and its `message` is shown as-is ([smarty-dev#1723](https://github.com/Smarty-Pants-Inc/smarty-dev/issues/1723)).
 - Fixed 1-hour Anthropic cache writes reported by Vercel AI Gateway in streaming deltas being priced at the 5-minute rate ([#9210](https://github.com/earendil-works/pi/issues/9210)).
 
 ## [0.87.1] - 2026-09-22

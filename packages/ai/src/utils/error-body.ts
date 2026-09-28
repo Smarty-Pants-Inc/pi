@@ -134,6 +134,22 @@ export function formatProviderError(norm: NormalizedProviderError, prefix?: stri
 	return prefix !== undefined ? `${prefix} (${norm.status}): ${norm.body}` : `${norm.status}: ${norm.body}`;
 }
 
+/** Diagnostic type marking a provider plan/usage limit refusal; the agent must not retry it. */
+export const PROVIDER_LIMIT_DIAGNOSTIC = "provider_limit";
+
+/**
+ * The Smarty Node gateway's plan-limit refusal: a 429 whose parsed body (`openai` SDK `error.error`) has
+ * `code` or `type` `smarty_limit`. Returns the gateway's message to show as-is, or undefined for any other error.
+ * It is final until the window resets, so neither the provider nor the agent retries it.
+ */
+export function smartyLimitMessage(error: unknown): string | undefined {
+	const body = (error as { error?: unknown } | null | undefined)?.error;
+	if (typeof body !== "object" || body === null) return undefined;
+	const { code, type, message } = body as Record<string, unknown>;
+	if (code !== "smarty_limit" && type !== "smarty_limit") return undefined;
+	return typeof message === "string" && message.length > 0 ? message : "smarty_limit";
+}
+
 export function truncateErrorText(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;
