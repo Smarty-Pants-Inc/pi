@@ -347,6 +347,12 @@ export interface ExtensionContext {
 	 * starts after the remaining `agent_settled` handlers. It is false once those deferred turns begin.
 	 */
 	isSettling(): boolean;
+	/**
+	 * Whether a prompt is in preflight: its input handlers or `before_agent_start` are running and
+	 * its run has not started. `isIdle()` is still true then. An extension that starts a turn by
+	 * itself (a timer, an outside event) can wait until this is false.
+	 */
+	isPromptPending(): boolean;
 	/** Whether project-local trust is active for this context. */
 	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
@@ -1909,6 +1915,8 @@ export interface ExtensionContextActions {
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;
 	isSettling: () => boolean;
+	/** Optional: hosts without prompt preflights report false. */
+	isPromptPending?: () => boolean;
 	isProjectTrusted: () => boolean;
 	getSignal: () => AbortSignal | undefined;
 	abort: () => void;
