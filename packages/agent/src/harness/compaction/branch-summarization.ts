@@ -157,11 +157,15 @@ export function prepareBranchEntries(entries: Entry[], tokenBudget: number = 0):
 			}
 		}
 	}
+	// Messages the walk visits, newest first. File ops are extracted oldest first after the walk so
+	// the recency order (and the cap in computeFileLists) follows the session, not the walk.
+	const visited: AgentMessage[] = [];
+
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
-		extractFileOpsFromMessage(message, fileOps);
+		visited.push(message);
 
 		const tokens = estimateTokens(message);
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
@@ -177,6 +181,7 @@ export function prepareBranchEntries(entries: Entry[], tokenBudget: number = 0):
 		messages.unshift(message);
 		totalTokens += tokens;
 	}
+	for (let i = visited.length - 1; i >= 0; i--) extractFileOpsFromMessage(visited[i], fileOps);
 
 	return { messages, fileOps, totalTokens };
 }
@@ -288,8 +293,9 @@ export async function generateBranchSummaryWithRequest(
 
 	let summary = contentText(response.content);
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	const fileLists = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = fileLists;
+	summary += formatFileOperations(fileLists);
 
 	return ok({
 		summary: summary || "No summary generated",
