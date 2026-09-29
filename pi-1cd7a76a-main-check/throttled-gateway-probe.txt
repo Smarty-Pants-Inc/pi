@@ -1,0 +1,7 @@
+01:18:31.985Z curl POST 127.0.0.1:18403/v1/chat/completions X-Smarty-Member: devlead-main-throttled (33 s after the primer, well past the 10 s window)
+HTTP/1.1 429 Too Many Requests
+retry-after: 2586494
+x-smarty-trace: refused-013855c2a4006eb9
+{"error":{"type":"smarty_limit","code":"smarty_limit","message":"Your plan's allowance for this period is used up. More at 2026-10-28 23:46Z, or add credit: https://billing.smartypants.ai/checkout","window":"period","throttled":false,"resets_at":"2026-10-28T23:46:46.000Z"}}
+usage line: {"time":"2026-09-29T01:18:32.005Z","node":"test-org-2","member":"devlead-main-throttled","model":"nemotron-3-super","path":"/v1/chat/completions","credential":null,"trace":"refused-013855c2a4006eb9","status":429,"prompt_tokens":null,"completion_tokens":null,"end":"refused","refused":"limit","window":"period"}
+01:19:5xZ: /tmp/tmp.YUsWcNlPbo (both usage logs) no longer exists; 18403/18405 not listening; port file already had line 4 'done' (not written by this lane).

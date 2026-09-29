@@ -1,0 +1,1 @@
+{"time":"2026-09-29T01:17:31.757Z","node":"test-org-3","member":"devlead-main-plain","model":"nemotron-3-super","path":"/v1/chat/completions","credential":null,"trace":"refused-c889ddfa8028cb84","status":429,"prompt_tokens":null,"completion_tokens":null,"end":"refused","refused":"limit","window":"too_large"}

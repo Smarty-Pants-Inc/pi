@@ -1,0 +1,9 @@
+2026-09-29T01:17:57.698Z binary /home/paul/.local/share/smarty-dev/pi-runtime/releases/1cd7a76af2cdaab66d68ec9378e9898bff362dac/node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+2026-09-29T01:17:57.701Z primer POST start (curl, X-Smarty-Member: devlead-main-throttled)
+2026-09-29T01:17:58.000Z START pi --provider smartygw --model nemotron-3-super --no-session --no-tools --print 'Reply with only OK.'
+2026-09-29T01:17:58.056Z primer HTTP/1.1 200 OK
+2026-09-29T01:17:58.056Z primer body: {"id":"gen-1790644677-0R4TbK7lTySVrDeJaPDX","error":{"message":"Upstream error from Nvidia: Service temporarily overloaded","code":503,"metadata":{"error_type":"provider_overloaded"}}}
+2026-09-29T01:17:58.641Z ERR Your plan's allowance for this period is used up. More at 2026-10-28 23:46Z, or add credit: https://billing.smartypants.ai/checkout
+2026-09-29T01:17:58.663Z OUT exit=1
+2026-09-29T01:17:58.670Z pi exited; watching usage log 20 s
+2026-09-29T01:18:18.672Z END

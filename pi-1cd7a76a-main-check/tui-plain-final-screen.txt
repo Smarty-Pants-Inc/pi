@@ -1,0 +1,28 @@
+
+ pi v0.87.1
+ escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
+ Press ctrl+o to show full startup help and loaded resources.
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+[Skills]
+  herdr, mergify-config, mergify-merge-protections, no-mistakes, omp-upstream-merge, remote-agent,
+smarty-dev2
+
+
+ Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys
+ on` to ~/.tmux.conf and restart tmux.
+
+
+ Reply with only OK.
+
+
+ Error: One request to this model can cost up to $0.0224, more than your $0.0100 limit. Add credit
+ to use it: https://billing.smartypants.ai/checkout
+ If this looks like a pi bug, /bug sends a report to the developers.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+~/.local/state/dev-lead-posts/pi-1cd7a76a-check.R3mdZY/prof-plain
+1.5%/32k (auto)                                                                     nemotron-3-super

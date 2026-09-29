@@ -1,0 +1,6 @@
+2026-09-29T01:17:31.087Z binary /home/paul/.local/share/smarty-dev/pi-runtime/releases/1cd7a76af2cdaab66d68ec9378e9898bff362dac/node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+2026-09-29T01:17:31.088Z START pi --provider smartygw --model nemotron-3-super --no-session --no-tools --print 'Reply with only OK.'
+2026-09-29T01:17:31.765Z ERR One request to this model can cost up to $0.0224, more than your $0.0100 limit. Add credit to use it: https://billing.smartypants.ai/checkout
+2026-09-29T01:17:31.783Z OUT exit=1
+2026-09-29T01:17:31.791Z pi exited; watching usage log 20 s
+2026-09-29T01:17:51.794Z END
