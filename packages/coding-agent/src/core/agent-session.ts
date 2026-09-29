@@ -1839,7 +1839,11 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
-		const compaction = await this._checkCompaction(message, true, toolResults);
+		// An error on the one-shot throttle retry is final: no overflow compaction-and-retry either.
+		const compaction =
+			throttleWaitUsed && message.stopReason === "error"
+				? false
+				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
 			this._stopAfterCompactionFailure = true;
 			this._compactionStopOutcome = compaction === "aborted" ? "aborted" : "error";

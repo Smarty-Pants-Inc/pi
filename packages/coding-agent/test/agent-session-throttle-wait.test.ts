@@ -85,6 +85,14 @@ function limit(retryAfterSeconds?: number): AssistantMessage {
 
 const ok = () => assistant({ content: [{ type: "text", text: "OK" }] });
 const serverError = () => assistant({ stopReason: "error", errorMessage: "500 internal server error" });
+/** A context-overflow error from the session's own model, which would normally start overflow compaction. */
+const overflow = () =>
+	assistant({
+		provider: "anthropic",
+		model: "claude-sonnet-4-5",
+		stopReason: "error",
+		errorMessage: "prompt is too long",
+	});
 
 describe("AgentSession throttled limit wait", () => {
 	let session: AgentSession | undefined;
@@ -123,7 +131,10 @@ describe("AgentSession throttled limit wait", () => {
 			},
 		});
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
+		settingsManager.applyOverrides({
+			retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 },
+			compaction: { enabled: true },
+		});
 		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 		session = new AgentSession({
@@ -167,6 +178,33 @@ describe("AgentSession throttled limit wait", () => {
 		await session.prompt("Reply with only OK.");
 		expect(requests.count).toBe(2);
 		expect(last(session)).toMatchObject({ stopReason: "error", errorMessage: "500 internal server error" });
+	});
+
+	// pi#83 review round 2: a context overflow on the retry must not compact and continue.
+	it("a context-overflow error on the retry is final: no compaction, no further request", async () => {
+		const { session, requests, events } = await createSession([() => limit(10), overflow, ok]);
+		const compact = vi
+			.spyOn(session as unknown as { _runAutoCompaction: () => Promise<boolean> }, "_runAutoCompaction")
+			.mockResolvedValue(false);
+		const compactions: string[] = [];
+		session.subscribe((event) => {
+			if (event.type === "compaction_start") compactions.push(event.reason);
+		});
+		await session.prompt("Reply with only OK.");
+		expect(requests.count).toBe(2);
+		expect(compact).not.toHaveBeenCalled();
+		expect(compactions).toEqual([]);
+		expect(events).toEqual([`wait:10000:${LIMIT}`, "end:false"]);
+		expect(last(session)).toMatchObject({ stopReason: "error", errorMessage: "prompt is too long" });
+	});
+
+	it("control: the same overflow without a throttle retry does start overflow compaction", async () => {
+		const { session } = await createSession([overflow, ok]);
+		const compact = vi
+			.spyOn(session as unknown as { _runAutoCompaction: () => Promise<boolean> }, "_runAutoCompaction")
+			.mockResolvedValue(false);
+		await session.prompt("Reply with only OK.");
+		expect(compact).toHaveBeenCalledWith("overflow", true);
 	});
 
 	it("a limit without a wait (throttled:false, Retry-After missing or over 30 s) is final after 1 request", async () => {
