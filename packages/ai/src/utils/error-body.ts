@@ -150,6 +150,22 @@ export function smartyLimitMessage(error: unknown): string | undefined {
 	return typeof message === "string" && message.length > 0 ? message : "smarty_limit";
 }
 
+/**
+ * A throttled `smarty_limit` (`throttled: true`: the org already has a request in flight) with an integer
+ * `Retry-After` of at most 30 seconds. Returns those seconds, or undefined for any other error, including
+ * period and size limits (`throttled: false`) and a missing, longer or non-integer `Retry-After`.
+ * The agent waits that long and retries once; this is not a retry the provider or the generic retry loop makes.
+ */
+export function smartyThrottleRetryAfterSeconds(error: unknown): number | undefined {
+	if (smartyLimitMessage(error) === undefined) return undefined;
+	const { error: body, headers } = error as { error: { throttled?: unknown }; headers?: unknown };
+	if (body.throttled !== true || !(headers instanceof Headers)) return undefined;
+	const retryAfter = headers.get("retry-after")?.trim();
+	if (!retryAfter || !/^\d+$/.test(retryAfter)) return undefined;
+	const seconds = Number(retryAfter);
+	return seconds <= 30 ? seconds : undefined;
+}
+
 export function truncateErrorText(text: string, maxChars: number): string {
 	if (text.length <= maxChars) return text;
 	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;

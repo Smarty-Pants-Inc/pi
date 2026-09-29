@@ -48,6 +48,7 @@ import {
 	type RetryCallbacks,
 	resetApiProviders,
 	streamSimple,
+	throttledLimitWait,
 } from "@earendil-works/pi-ai/compat";
 import { getThemeByName, theme } from "../modes/interactive/theme/theme.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
@@ -224,7 +225,15 @@ export type AgentSessionEvent =
 			willRetry: boolean;
 			errorMessage?: string;
 	  }
-	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
+	| {
+			type: "auto_retry_start";
+			attempt: number;
+			maxAttempts: number;
+			delayMs: number;
+			errorMessage: string;
+			/** Set for the one-shot wait on a throttled provider limit: show `Waiting Ns: <waitMessage>`. */
+			waitMessage?: string;
+	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| {
 			type: "summarization_retry_scheduled";
@@ -442,6 +451,8 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
+	private _throttleWaitUsed = false;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -1115,6 +1126,7 @@ export class AgentSession {
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
+				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
 				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
 					this._emit({
 						type: "auto_retry_end",
@@ -1140,18 +1152,14 @@ export class AgentSession {
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		if (this._agentRunAbortRequested) return false;
+		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
+		if (!message || this._throttleWaitUsed) return false;
+		if (throttledLimitWait(message)) return true;
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
 			return false;
 		}
-
-		for (let i = event.messages.length - 1; i >= 0; i--) {
-			const message = event.messages[i];
-			if (message.role === "assistant") {
-				return this._isRetryableError(message as AssistantMessage);
-			}
-		}
-		return false;
+		return this._isRetryableError(message);
 	}
 
 	private _findPersistedMessageEntryId(message: AgentMessage): string | undefined {
@@ -1799,7 +1807,20 @@ export class AgentSession {
 		}
 		if (!message) return this.agent.hasQueuedMessages();
 
-		if (this._isRetryableError(message) && (await this._prepareRetry(message))) {
+		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
+		const throttleWaitUsed = this._throttleWaitUsed;
+		this._throttleWaitUsed = false;
+		const throttleWait = throttleWaitUsed ? undefined : throttledLimitWait(message);
+		let retrying: boolean;
+		if (throttleWait) {
+			this._retryAttempt++;
+			const { delayMs, waitMessage } = throttleWait;
+			retrying = await this._waitAndRetry(message, delayMs, this._retryAttempt, waitMessage);
+			this._throttleWaitUsed = retrying;
+		} else {
+			retrying = !throttleWaitUsed && this._isRetryableError(message) && (await this._prepareRetry(message));
+		}
+		if (retrying) {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
 			return !this._agentRunAbortRequested;
 		}
@@ -4164,14 +4185,26 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = retryDelayMs(settings, this._retryAttempt);
+		return this._waitAndRetry(message, retryDelayMs(settings, this._retryAttempt), settings.maxRetries);
+	}
 
+	/**
+	 * Announce the retry, omit the failed attempt from model context and wait (abortable).
+	 * @returns true if the caller should continue the agent, false if the wait was cancelled
+	 */
+	private async _waitAndRetry(
+		message: AssistantMessage,
+		delayMs: number,
+		maxAttempts: number,
+		waitMessage?: string,
+	): Promise<boolean> {
 		this._emit({
 			type: "auto_retry_start",
 			attempt: this._retryAttempt,
-			maxAttempts: settings.maxRetries,
+			maxAttempts,
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
+			...(waitMessage !== undefined ? { waitMessage } : {}),
 		});
 
 		// Keep the failed attempt in raw history while durably omitting it from model projection.
