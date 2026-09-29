@@ -110,6 +110,23 @@ describe("provider retry classification", () => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 	});
 
+	// smarty-dev#1856: CLIProxyAPI gateway restart.
+	it.each([
+		"connect ECONNREFUSED 127.0.0.1:8317",
+		"read ECONNRESET",
+		"400 unknown provider for model gpt-5",
+	])("matches local gateway restart failures: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each([
+		"400 invalid request",
+		"insufficient_quota",
+		"insufficient_quota: 400 unknown provider for model gpt-5",
+	])("keeps non-transient errors non-retryable: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
 	it("matches OpenAI Responses streams that end before terminal events", () => {
 		expect(
 			isRetryableAssistantError(

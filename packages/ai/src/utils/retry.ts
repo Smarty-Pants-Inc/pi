@@ -61,6 +61,12 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"ENOTFOUND",
 	"EAI_AGAIN",
 	"upstream.?connect",
+	// A local gateway (CLIProxyAPI) mid-restart refuses or drops the socket (smarty-dev#1856).
+	"ECONNREFUSED",
+	"ECONNRESET",
+	// CLIProxyAPI answers 400 while it reloads models after a restart (smarty-dev#1856).
+	// ponytail: a truly unknown model now retries the normal budget (~14 s) before it fails.
+	"unknown provider for model",
 	"reset before headers",
 	"socket hang up",
 	"socket connection was closed",
