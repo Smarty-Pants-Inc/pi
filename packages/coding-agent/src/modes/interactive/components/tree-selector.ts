@@ -112,6 +112,11 @@ class TreeList implements Component {
 	private filterMode: FilterMode = "default";
 	private searchQuery = "";
 	private toolCallMap: Map<string, ToolCallInfo> = new Map();
+	/**
+	 * Per-entry content facts, derived once per selector. Older session entries read their content
+	 * from the session file (smarty-dev#2177), so filter and search keys must not re-read it.
+	 */
+	private contentInfo: Map<object, { hasText: boolean; preview: string }> = new Map();
 	private multipleRoots = false;
 	private showLabelTimestamps = false;
 	private activePathIds: Set<string> = new Set();
@@ -255,6 +260,7 @@ class TreeList implements Component {
 			const entry = node.entry;
 			if (entry.type === "message" && entry.message.role === "assistant") {
 				const content = (entry.message as { content?: unknown }).content;
+				this.getContentInfo(entry.message, content);
 				if (Array.isArray(content)) {
 					for (const block of content) {
 						if (typeof block === "object" && block !== null && "type" in block && block.type === "toolCall") {
@@ -345,7 +351,7 @@ class TreeList implements Component {
 			// Always show current leaf so active position is visible
 			if (entry.type === "message" && entry.message.role === "assistant" && !isCurrentLeaf) {
 				const msg = entry.message as { stopReason?: string; content?: unknown };
-				const hasText = this.hasTextContent(msg.content);
+				const hasText = this.getContentInfo(msg).hasText;
 				const isErrorOrAborted = msg.stopReason && msg.stopReason !== "stop" && msg.stopReason !== "toolUse";
 				// Only hide if no text AND not an error/aborted message
 				if (!hasText && !isErrorOrAborted) {
@@ -571,8 +577,9 @@ class TreeList implements Component {
 			case "message": {
 				const msg = entry.message;
 				parts.push(msg.role);
-				if ("content" in msg && msg.content) {
-					parts.push(this.extractContent(msg.content));
+				if ("content" in msg) {
+					const preview = this.getContentInfo(msg).preview;
+					if (preview) parts.push(preview);
 				}
 				if (msg.role === "bashExecution") {
 					const bashMsg = msg as { command?: string };
@@ -782,11 +789,11 @@ class TreeList implements Component {
 				const role = msg.role;
 				if (role === "user") {
 					const msgWithContent = msg as { content?: unknown };
-					const content = normalize(this.extractContent(msgWithContent.content));
+					const content = normalize(this.getContentInfo(msgWithContent).preview);
 					result = theme.fg("accent", "user: ") + content;
 				} else if (role === "assistant") {
 					const msgWithContent = msg as { content?: unknown; stopReason?: string; errorMessage?: string };
-					const textContent = normalize(this.extractContent(msgWithContent.content));
+					const textContent = normalize(this.getContentInfo(msgWithContent).preview);
 					if (textContent) {
 						result = theme.fg("success", "assistant: ") + textContent;
 					} else if (msgWithContent.stopReason === "aborted") {
@@ -882,6 +889,20 @@ class TreeList implements Component {
 
 		const year = date.getFullYear().toString().slice(-2);
 		return `${year}/${month}/${day} ${time}`;
+	}
+
+	/**
+	 * Content facts of a message, keyed by the message object. Reads `content` only on the first
+	 * call; pass it when the caller already has it.
+	 */
+	private getContentInfo(message: { content?: unknown }, content?: unknown): { hasText: boolean; preview: string } {
+		let info = this.contentInfo.get(message);
+		if (!info) {
+			const value = content ?? message.content;
+			info = { hasText: this.hasTextContent(value), preview: this.extractContent(value) };
+			this.contentInfo.set(message, info);
+		}
+		return info;
 	}
 
 	private extractContent(content: unknown): string {
