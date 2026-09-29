@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -153,5 +153,25 @@ describe("lazy session entries", () => {
 		writeFileSync(file, `${readFileSync(file, "utf8").split("\n").slice(0, 1).join("\n")}\n`);
 
 		expect(() => JSON.stringify(cold)).toThrow(/Session file changed on disk/);
+	});
+
+	it("keeps appending when the session file is deleted while Pi runs", () => {
+		const { file } = writeLargeSession();
+		const session = SessionManager.open(file);
+		rmSync(file);
+		const id = session.appendMessage({ role: "user", content: big("after delete"), timestamp: 1 });
+		expect(readFileSync(file, "utf8")).toContain(id);
+	});
+
+	it("keeps a symlinked session file a symlink when it is rewritten", () => {
+		const { file } = writeLargeSession();
+		const real = join(dir, "real.jsonl");
+		renameSync(file, real);
+		symlinkSync(real, file);
+		const session = SessionManager.open(file);
+		// createBranchedSession rewrites a new file; migration rewrites in place. Force an in-place rewrite:
+		(session as unknown as { _rewriteFile(): void })._rewriteFile();
+		expect(lstatSync(file).isSymbolicLink()).toBe(true);
+		expect(JSON.stringify(session.getEntries())).toBe(JSON.stringify(eagerEntries(real)));
 	});
 });

@@ -21,6 +21,7 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	realpathSync,
 	renameSync,
 	type Stats,
 	statSync,
@@ -1233,14 +1234,16 @@ export class SessionManager {
 		if (!this.persist || !this.sessionFile) return;
 		// Cold entries read from the current file while the new one is written, so write a
 		// temporary file and rename it over the old one.
-		const temporary = `${this.sessionFile}.${process.pid}.tmp`;
+		// Write next to the real path so a symlinked session file stays a symlink.
+		const target = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
+		const temporary = `${target}.${process.pid}.tmp`;
 		const fd = openSync(temporary, "w");
 		try {
 			this.#writeEntries(fd, this.sessionFile);
 		} finally {
 			closeSync(fd);
 		}
-		renameSync(temporary, this.sessionFile);
+		renameSync(temporary, target);
 	}
 
 	/**
@@ -1262,7 +1265,7 @@ export class SessionManager {
 			}
 			const rebound = toColdEntry(JSON.parse(line) as SessionEntry, location);
 			this.fileEntries[i] = rebound;
-			this.byId.set(rebound.id, rebound);
+			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
 		}
 		this.#revisionKey = undefined;
 	}
@@ -1270,7 +1273,8 @@ export class SessionManager {
 	/** Append one entry line and record its byte range. */
 	#appendLine(file: string, entry: SessionEntry): void {
 		const line = JSON.stringify(entry);
-		const offset = statSync(file).size;
+		// The file can be deleted while Pi runs; appendFileSync then recreates it.
+		const offset = existsSync(file) ? statSync(file).size : 0;
 		appendFileSync(file, `${line}\n`);
 		setEntryLocation(entry, { file, offset, length: Buffer.byteLength(line) });
 	}
@@ -1297,7 +1301,8 @@ export class SessionManager {
 			const next = hot.has(entry.id) ? toHotEntry(entry) : isColdEntry(entry) ? entry : toColdEntry(entry, location);
 			if (next === entry) continue;
 			this.fileEntries[i] = next;
-			this.byId.set(next.id, next);
+			// With duplicate ids, byId keeps the later entry (as _buildIndex does); only replace that one.
+			if (this.byId.get(next.id) === entry) this.byId.set(next.id, next);
 			changed = true;
 		}
 		if (changed) this.#revisionKey = undefined;

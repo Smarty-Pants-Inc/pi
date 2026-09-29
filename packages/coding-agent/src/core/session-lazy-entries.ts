@@ -31,6 +31,8 @@ type Json = Record<string, unknown>;
 
 const locations = new WeakMap<object, EntryLocation>();
 const coldEntries = new WeakSet<object>();
+/** Entries already checked that have no large field; they stay resident as they are. */
+const smallEntries = new WeakSet<object>();
 let lastRead: { location: EntryLocation; value: Json } | undefined;
 
 export function setEntryLocation(entry: object, location: EntryLocation): void {
@@ -49,7 +51,14 @@ export function isColdEntry(entry: object): boolean {
 function readEntryLine(location: EntryLocation, id: unknown): Json {
 	if (lastRead?.location === location) return lastRead.value;
 	const buffer = Buffer.allocUnsafe(location.length);
-	const fd = openSync(location.file, "r");
+	let fd: number;
+	try {
+		fd = openSync(location.file, "r");
+	} catch (error) {
+		throw new Error(`Session file changed on disk: cannot read entry ${String(id)} from ${location.file}`, {
+			cause: error,
+		});
+	}
 	try {
 		let read = 0;
 		while (read < location.length) {
@@ -99,6 +108,10 @@ function defineLazy(target: Json, key: string, read: () => unknown): void {
  * role, usage and model stay resident.
  */
 export function toColdEntry<T extends object>(entry: T, location: EntryLocation): T {
+	if (smallEntries.has(entry)) {
+		setEntryLocation(entry, location);
+		return entry;
+	}
 	const source = entry as Json;
 	const id = source.id;
 	const copy: Json = {};
@@ -128,7 +141,10 @@ export function toColdEntry<T extends object>(entry: T, location: EntryLocation)
 		}
 	}
 	setEntryLocation(entry, location);
-	if (!cold) return entry;
+	if (!cold) {
+		smallEntries.add(entry);
+		return entry;
+	}
 	setEntryLocation(copy, location);
 	coldEntries.add(copy);
 	return copy as T;
