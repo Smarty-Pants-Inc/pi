@@ -1,0 +1,28 @@
+
+ Pi can explain its own features and look up its docs. Ask it how to use or extend Pi.
+
+[Skills]
+  herdr, mergify-config, mergify-merge-protections, no-mistakes, omp-upstream-merge, remote-agent,
+smarty-dev2
+
+
+ Warning: tmux extended-keys is off. Modified Enter keys may not work. Add `set -g extended-keys
+ on` to ~/.tmux.conf and restart tmux.
+
+
+ Reply with only OK.
+
+
+ Error: Your 5-hour limit is used up, so Flash models now run one request at a time, 10 seconds
+ apart. Add credit for full speed: https://billing.smartypants.ai/checkout
+ If this looks like a pi bug, /bug sends a report to the developers.
+
+ We need to respond with only "OK".
+
+ OK
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+~/.local/state/dev-lead-posts/pi83-prof.MIdLFl
+↑451 ↓13 1.5%/32k (auto)                                                            nemotron-3-super

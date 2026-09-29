@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# usage: setup-profile.sh <profile_dir> <port> <model>  -- temp Pi agent dir: Node-gateway compat, member header, no key.
+set -eu
+mkdir -p "$1/agent"
+cat > "$1/agent/models.json" <<J
+{"providers":{"smartygw":{"baseUrl":"http://127.0.0.1:$2/v1","api":"openai-completions","apiKey":"node-gateway",
+ "compat":{"maxTokensField":"max_tokens","supportsStore":false,"supportsDeveloperRole":false,"supportsReasoningEffort":false,"supportsUsageInStreaming":true},
+ "headers":{"X-Smarty-Member":"dev-lead-pi83"},
+ "models":[{"id":"$3","name":"Flash (net-lead temp gateway, test-org-2)","reasoning":false,"input":["text"],"contextWindow":32000,"maxTokens":256,
+ "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0}}]}}}
+J

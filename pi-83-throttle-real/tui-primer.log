@@ -1,0 +1,3 @@
+2026-09-29T00:45:14.450Z primer POST start (curl, X-Smarty-Member: dev-lead-pi83)
+2026-09-29T00:45:15.181Z primer HTTP/1.1 200 OK
+2026-09-29T00:45:15.181Z primer body: {"id":"gen-1790642714-uEiMJTdQYBWRVjCfqBm1","error":{"message":"Upstream error from Nvidia: Service temporarily overloaded","code":503,"metadata":{"error_type":"provider_overloaded"}}}

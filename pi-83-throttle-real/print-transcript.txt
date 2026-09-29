@@ -1,0 +1,8 @@
+2026-09-29T00:44:39.280Z head 7f99b2658e0f79597b6d87ec4d9c1866e88158a0
+2026-09-29T00:44:39.286Z primer POST start (curl, X-Smarty-Member: dev-lead-pi83)
+2026-09-29T00:44:39.584Z START pi --provider smartygw --model nemotron-3-super --no-session --no-tools --print 'Reply with only OK.'
+2026-09-29T00:44:39.889Z primer HTTP/1.1 200 OK
+2026-09-29T00:44:39.889Z primer body: {"id":"gen-1790642679-JQ1RwrHFRVXIt1cFIiaT","object":"chat.completion","created":1790642679,"model":"nvidia/nemotron-3-super-120b-a12b:free","provider":"Nvidia","system_fingerprint":null,"service_tier":null,"choices":[{"index":0,"logprobs":null,"finish_reason":"length","native_finish_reason":"length
+2026-09-29T00:44:40.230Z ERR Waiting 10s: Your 5-hour limit is used up, so Flash models now run one request at a time, 10 seconds apart. Add credit for full speed: https://billing.smartypants.ai/checkout
+2026-09-29T00:44:50.825Z OUT OK
+2026-09-29T00:44:51.354Z END
