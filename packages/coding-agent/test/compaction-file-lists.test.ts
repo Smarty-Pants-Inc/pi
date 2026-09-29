@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { describe, expect, it } from "vitest";
+import { prepareBranchEntries } from "../src/core/compaction/branch-summarization.ts";
 import {
 	computeFileLists,
 	createFileOps,
@@ -7,6 +8,7 @@ import {
 	formatFileOperations,
 	MAX_SUMMARY_FILES,
 } from "../src/core/compaction/utils.ts";
+import type { SessionEntry } from "../src/core/session-manager.ts";
 
 function toolCalls(calls: Array<[string, string]>): AgentMessage {
 	return {
@@ -75,5 +77,21 @@ describe("compaction file lists", () => {
 		expect(formatFileOperations(computeFileLists(fileOps))).toBe(
 			"\n\n<read-files>\na.ts\nb.ts\n</read-files>\n\n<modified-files>\nc.ts\n</modified-files>",
 		);
+	});
+
+	it("branch summaries keep the files touched last in the branch", () => {
+		// The branch walk runs newest to oldest; recency must still follow session order.
+		const entries: SessionEntry[] = Array.from({ length: 60 }, (_, i) => ({
+			type: "message",
+			id: `e${i}`,
+			parentId: i === 0 ? null : `e${i - 1}`,
+			timestamp: new Date(1_000 + i).toISOString(),
+			message: toolCalls([["read", `f${i + 1}.ts`]]),
+		}));
+		const lists = computeFileLists(prepareBranchEntries(entries).fileOps);
+		expect(lists.readFiles.at(-1)).toBe("f60.ts");
+		expect(lists.readFiles).toContain("f51.ts");
+		expect(lists.readFiles).not.toContain("f10.ts");
+		expect(lists.omittedReadFiles).toBe(10);
 	});
 });
