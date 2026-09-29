@@ -1101,8 +1101,9 @@ export async function compact(
 
 	signal?.throwIfAborted();
 	// Compute file lists and append to summary
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	const fileLists = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = fileLists;
+	summary += formatFileOperations(fileLists);
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");

@@ -808,8 +808,9 @@ export async function compactWithRequest(
 		summaryUsage = summaryResult.value.usage;
 	}
 
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	const fileLists = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = fileLists;
+	summary += formatFileOperations(fileLists);
 	const details: CompactionDetails = { readFiles, modifiedFiles };
 
 	return ok({ summary, tokensBefore, usage: summaryUsage, retainedTail, details });
