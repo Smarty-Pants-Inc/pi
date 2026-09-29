@@ -288,8 +288,9 @@ export async function generateBranchSummaryWithRequest(
 
 	let summary = contentText(response.content);
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	const fileLists = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = fileLists;
+	summary += formatFileOperations(fileLists);
 
 	return ok({
 		summary: summary || "No summary generated",
