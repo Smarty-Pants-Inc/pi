@@ -1,0 +1,2 @@
+2026-09-29T00:22:44.296Z request 1 POST /v1/chat/completions +9.06s -> 429 retry-after=8
+2026-09-29T00:22:52.323Z request 2 POST /v1/chat/completions +17.08s -> 200
