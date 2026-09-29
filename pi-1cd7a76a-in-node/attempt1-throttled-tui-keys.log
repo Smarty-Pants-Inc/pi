@@ -1,0 +1,5 @@
+2026-09-29T01:32:33.828Z pane run: pi --model node-gateway/nemotron-3-super
+2026-09-29T01:32:42.144Z primer: pane wC:p3 run: pi --model node-gateway/nemotron-3-super --print 'Say hi.'
+2026-09-29T01:32:52.855Z primer usage line seen: 
+2026-09-29T01:32:52.857Z Enter (prompt 'Reply with only OK.')
+2026-09-29T01:33:25.230Z ctrl+d (exit pi)

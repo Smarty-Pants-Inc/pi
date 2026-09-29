@@ -1,0 +1,17 @@
+ github.com
+ Warning: Failed to download ripgrep: fetch failed: getaddrinfo
+ EAI_AGAIN github.com
+
+
+ Reply with only OK.
+
+
+ We need to reply with only "OK".
+
+ OK
+
+───────────────────────────────────────────────────────────────────────
+
+───────────────────────────────────────────────────────────────────────
+~
+↑1.6k ↓13 1.3%/131k (auto)                             nemotron-3-super

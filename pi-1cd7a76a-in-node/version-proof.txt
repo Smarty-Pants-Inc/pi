@@ -1,0 +1,34 @@
+# 2026-09-29T01:27:26.129Z inside test-org's Node (Herdr pane wC:p1, workspace created with: herdr.sh test-org workspace create --label devlead-pinode --env SMARTY_MEMBER=devlead-pinode)
+uid=999(test-org) gid=987(test-org) groups=987(test-org)
+SM=devlead-pinode
+/var/lib/smarty-org-sandbox/test-org/hostd/current/bin/pi
+/var/lib/smarty-org-sandbox/test-org/hostd/0173ffeffb1d-ed8fb9831a1e-k2a00c061dd9e/deploy/node/pi
+0.87.1
+cat: /var/lib/smarty-org-sandbox/test-org/hostd/0173ffeffb1d-ed8fb9831a1e-k2a00c061dd9e/deploy/node/../../pi/RELEASE: No such file or directory
+VERDONE
+test-org@dev1:~$
+# fleet side: /var/lib/smarty-org-sandbox/test-org/pi/RELEASE
+1cd7a76af2cdaab66d68ec9378e9898bff362dac node=41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c runtime=cbfcaa14ed4170bcd82522d85c734299cadd2a20c4d9b1576e2538bcb7ede599
+# diff -rq fleet release 1cd7a76af2cd…/node/node_modules/@earendil-works vs Node's /var/lib/smarty-org-sandbox/test-org/pi/runtime/node_modules/@earendil-works
+(no differences)
+# sha256
+b845ad682af25875a6e7bcfb347d16334d54ea08e2e84d5c79f59281ed317ef2  /var/lib/smarty-org-sandbox/test-org/pi/runtime/node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js
+b845ad682af25875a6e7bcfb347d16334d54ea08e2e84d5c79f59281ed317ef2  /home/paul/.local/share/smarty-dev/pi-runtime/releases/1cd7a76af2cdaab66d68ec9378e9898bff362dac/node/node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js
+# Node's bin/pi
+#!/bin/sh
+# Pi in a Node's Herdr pane (smarty-dev#1471): the Pi runtime in the Node's inbox, with the release's model provider
+# (packages/node-gateway/pi/models.json: the Node's gateway on loopback, member from SMARTY_MEMBER) and Pi's state in
+# the Node's home. Panes find it as INBOX/hostd/current/bin/pi (install.sh puts that directory first on every child's PATH).
+set -eu
+inbox=$(readlink -f "$0"); inbox=${inbox%/hostd/*}
+[ -d "$inbox/pi/runtime" ] || { echo "pi: no Pi runtime in $inbox/pi (its Node env file sets no PI_RELEASE)" >&2; exit 125; }
+export PI_CODING_AGENT_DIR="${PI_CODING_AGENT_DIR:-$HOME/.local/share/smarty-dev/pi-agent}"
+mkdir -p "$PI_CODING_AGENT_DIR"
+models=$inbox/hostd/current/packages/node-gateway/pi/models.json
+cmp -s "$models" "$PI_CODING_AGENT_DIR/models.json" || cp "$models" "$PI_CODING_AGENT_DIR/models.json"
+exec "$inbox/pi/bin/node" "$inbox/pi/runtime/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" "$@"
+1cd7a76af2cdaab66d68ec9378e9898bff362dac node=41a74efb34cbde5c7632cdac0cf8bd1a14d0b8d73dc1e82755014d9a9ce70f5c runtime=cbfcaa14ed4170bcd82522d85c734299cadd2a20c4d9b1576e2538bcb7ede599
+b845ad682af25875a6e7bcfb347d16334d54ea08e2e84d5c79f59281ed317ef2  /var/lib/smarty-org-sandbox/test-org/pi/runtime/node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js
+3
+VER2
+test-org@dev1:~$

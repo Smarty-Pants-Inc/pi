@@ -1,0 +1,8 @@
+01:31:30.071Z START primer pi --print 'Say hi.'
+01:31:32.042Z PRIMER hi
+01:31:32.068Z START pi --model node-gateway/nemotron-3-super --print 'Reply with only OK.'
+01:31:32.773Z ERR Waiting 8s: Your 5-hour limit is used up, so Flash models now run one request at a time, 10 seconds apart. Add credit for full speed: https://billing.smartypants.ai/checkout
+01:31:41.589Z OUT OK
+exit=0
+01:31:42.116Z END
+test-org@dev1:~$

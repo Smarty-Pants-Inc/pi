@@ -1,0 +1,17 @@
+ request at a time, 10 seconds apart. Add credit for full speed:
+ https://billing.smartypants.ai/checkout
+ If this looks like a pi bug, /bug sends a report to the developers.
+
+ Okay, the user wants me to reply with only "OK". I need to make sure
+ I don't add anything else. Just output the string "OK" and nothing
+ more. Let me check the instructions again. The user says: "Reply with
+ only OK." So I should respond exactly with that. No extra spaces, no
+ punctuation, just the two letters O and K. I'll do that now.
+
+ OK
+
+───────────────────────────────────────────────────────────────────────
+
+───────────────────────────────────────────────────────────────────────
+~
+↑1.6k ↓87 1.3%/131k (auto)                             nemotron-3-super

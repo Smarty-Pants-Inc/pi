@@ -1,0 +1,5 @@
+--- fleet-side usage log (gateway usage-test-org-4.jsonl), lines for member devlead-pinode in this run, copied in by dev-lead:
+01:34:18.637Z status 502 complete   trace 20260929013418-4f1b40b159bd0cd8-00000004
+01:34:18.880Z status 429 refused throttled  trace refused-0cec11be5f08b1c7
+{"time":"2026-09-29T01:34:28.946Z","node":"test-org-4","member":"devlead-pinode","model":"nemotron-3-super","path":"/v1/chat/completions","credential":null,"trace":null,"status":503,"prompt_tokens":null,"completion_tokens":null,"end":"complete"}
+test-org@dev1:~$

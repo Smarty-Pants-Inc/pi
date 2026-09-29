@@ -1,0 +1,3 @@
+test-org@dev1:~$ SMARTY_MEMBER=devlead-pinode pi --model node-gateway/nemotron-3-super --print 'Say hi.'
+502: {"code":503,"message":"Upstream error from Nvidia: Service temporarily overloaded","metadata":{"error_type":"provider_overloaded"}}
+test-org@dev1:~$

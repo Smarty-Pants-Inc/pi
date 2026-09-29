@@ -1,0 +1,5 @@
+2026-09-29T01:35:49.507Z pane run: pi --model node-gateway/nemotron-3-super
+2026-09-29T01:35:57.716Z primer: pane wC:p3 run: SMARTY_MEMBER=devlead-pinode pi --model node-gateway/nemotron-3-super --print 'Say hi.'
+2026-09-29T01:35:59.587Z primer usage line seen: "status":200
+2026-09-29T01:35:59.588Z Enter (prompt 'Reply with only OK.')
+2026-09-29T01:36:31.749Z ctrl+d (exit pi)

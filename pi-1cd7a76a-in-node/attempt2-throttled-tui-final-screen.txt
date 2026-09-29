@@ -1,0 +1,17 @@
+
+ Error: 503: {"message":"auth_unavailable: no auth available
+ (providers=openai-compatible-openrouter, model=nemotron-3-super; last
+ upstream error: 503: Upstream error from Nvidia: Service temporarily
+ overloaded)","type":"server_error","code":"internal_server_error"}
+
+ Error: Retry failed after 1 attempts: 503:
+ {"message":"auth_unavailable: no auth available
+ (providers=openai-compatible-openrouter, model=nemotron-3-super; last
+ upstream error: 503: Upstream error from Nvidia: Service temporarily
+ overloaded)","type":"server_error","code":"internal_server_error"}
+
+───────────────────────────────────────────────────────────────────────
+
+───────────────────────────────────────────────────────────────────────
+~
+1.1%/131k (auto)                                       nemotron-3-super
