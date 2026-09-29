@@ -229,6 +229,20 @@ export async function retryAssistantCall(
 }
 
 /**
+ * The one-shot wait a provider marked on a throttled limit (the Smarty gateway's `smarty_limit` with
+ * `throttled: true` and a `Retry-After` of at most 30 s): the delay and the status text to show while waiting.
+ * Independent of {@link isRetryableAssistantError}, which stays false for the same message.
+ */
+export function throttledLimitWait(message: AssistantMessage): { delayMs: number; waitMessage: string } | undefined {
+	if (message.stopReason !== "error") return undefined;
+	const details = message.diagnostics?.find((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)?.details;
+	const seconds = details?.retryAfterSeconds;
+	const waitMessage = details?.waitMessage;
+	if (typeof seconds !== "number" || typeof waitMessage !== "string") return undefined;
+	return { delayMs: seconds * 1000, waitMessage };
+}
+
+/**
  * Classifies whether a failed assistant message looks like a transient provider
  * or transport error, so callers can decide if the last assistant turn should be
  * restarted.

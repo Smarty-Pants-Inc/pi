@@ -41,6 +41,7 @@ import {
 	normalizeProviderError,
 	PROVIDER_LIMIT_DIAGNOSTIC,
 	smartyLimitMessage,
+	smartyThrottleRetryAfterSeconds,
 } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
@@ -719,12 +720,22 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			const limitMessage = smartyLimitMessage(error);
 			if (limitMessage !== undefined) {
-				// Show the gateway's limit message as-is, and mark it final so the agent does not retry.
+				// Show the gateway's limit message as-is, and mark it final so the generic retry does not retry it.
+				// A throttled limit with a short Retry-After carries the wait for the agent's one-shot retry.
 				output.errorMessage = limitMessage;
+				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
 				appendAssistantMessageDiagnostic(output, {
 					type: PROVIDER_LIMIT_DIAGNOSTIC,
 					timestamp: Date.now(),
-					details: { code: "smarty_limit" },
+					details:
+						retryAfterSeconds === undefined
+							? { code: "smarty_limit" }
+							: {
+									code: "smarty_limit",
+									retryAfterSeconds,
+									waitMessage:
+										limitMessage === "smarty_limit" ? "Flash runs one request at a time" : limitMessage,
+								},
 				});
 			} else {
 				output.errorMessage = formatProviderError(normalizeProviderError(error));

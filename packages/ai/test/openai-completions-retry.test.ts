@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
 import type { Model } from "../src/types.ts";
-import { isRetryableAssistantError } from "../src/utils/retry.ts";
+import { isRetryableAssistantError, throttledLimitWait } from "../src/utils/retry.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const mockState = vi.hoisted(() => ({
@@ -171,4 +171,39 @@ describe("openai-completions provider retries", () => {
 		expect(result.errorMessage).toBe(message);
 		expect(isRetryableAssistantError(result)).toBe(false);
 	});
+
+	// smarty-net#136: a throttled smarty_limit with a short Retry-After carries a one-shot wait for the agent.
+	// The provider itself still makes one request and the generic retry still refuses it.
+	it.each([
+		{ throttled: true, retryAfter: "10", message: "Flash runs one request at a time.", wait: 10_000 },
+		{ throttled: true, retryAfter: "10", message: "", wait: 10_000 },
+		{ throttled: true, retryAfter: "30", message: "busy", wait: 30_000 },
+		{ throttled: true, retryAfter: "31", message: "busy", wait: undefined },
+		{ throttled: true, retryAfter: undefined, message: "busy", wait: undefined },
+		{ throttled: true, retryAfter: "2.5", message: "busy", wait: undefined },
+		{ throttled: true, retryAfter: "Wed, 21 Oct 2026 07:28:00 GMT", message: "busy", wait: undefined },
+		{ throttled: false, retryAfter: "10", message: "Your 5-hour limit is used up.", wait: undefined },
+	])(
+		"marks the throttled smarty_limit wait only for a short integer Retry-After: %o",
+		async ({ throttled, retryAfter, message, wait }) => {
+			mockState.requestErrors = [
+				Object.assign(new Error(`429 ${message}`), {
+					status: 429,
+					headers: new Headers(retryAfter === undefined ? {} : { "retry-after": retryAfter }),
+					error: { type: "smarty_limit", code: "smarty_limit", message, throttled, window: "5h", resets_at: null },
+				}),
+			];
+
+			const result = await consume({ maxRetries: 2 });
+
+			expect(mockState.requestOptions).toHaveLength(1);
+			expect(result.errorMessage).toBe(message || "smarty_limit");
+			expect(isRetryableAssistantError(result)).toBe(false);
+			expect(throttledLimitWait(result)).toEqual(
+				wait === undefined
+					? undefined
+					: { delayMs: wait, waitMessage: message || "Flash runs one request at a time" },
+			);
+		},
+	);
 });
