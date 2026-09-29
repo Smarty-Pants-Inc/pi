@@ -21,6 +21,8 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	realpathSync,
+	renameSync,
 	type Stats,
 	statSync,
 	writeFileSync,
@@ -40,6 +42,18 @@ import {
 } from "./messages.ts";
 import { materializeOwnedEntry, parseOwnedSessionEntries } from "./owned-session-entries.ts";
 import { isOwnedTerminalWrite, OwnedJournal } from "./owner-effects.ts";
+import {
+	copyEntry,
+	getEntryLocation,
+	isColdEntry,
+	readSessionFileLines,
+	setEntryLocation,
+	toColdEntry,
+	toHotEntry,
+} from "./session-lazy-entries.ts";
+
+/** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
+const RECENT_RESIDENT_ENTRIES = 100;
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -678,38 +692,33 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 
 /** Exported for testing */
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	return readEntriesFromFile(filePath, false);
+}
+
+/**
+ * Parse a session file. With `cold`, entries keep only small fields in memory and read large
+ * fields back from the file by byte offset (see session-lazy-entries.ts).
+ */
+function readEntriesFromFile(filePath: string, cold: boolean): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
 
 	const entries: FileEntry[] = [];
-	let pending = "";
-	const fd = openSync(resolvedFilePath, "r");
-	try {
-		const decoder = new StringDecoder("utf8");
-		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
-
-		while (true) {
-			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
-			if (bytesRead === 0) break;
-
-			pending += decoder.write(buffer.subarray(0, bytesRead));
-			let lineStart = 0;
-			let newlineIndex = pending.indexOf("\n", lineStart);
-			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
-				lineStart = newlineIndex + 1;
-				newlineIndex = pending.indexOf("\n", lineStart);
+	const { missingFinalNewline } = readSessionFileLines(
+		resolvedFilePath,
+		(line, offset, length) => {
+			const entry = parseSessionEntryLine(line);
+			if (!entry) return;
+			const location = { file: resolvedFilePath, offset, length };
+			if (cold && entry.type !== "session") {
+				entries.push(toColdEntry(entry, location));
+			} else {
+				if (cold) setEntryLocation(entry, location);
+				entries.push(entry);
 			}
-			pending = pending.slice(lineStart);
-		}
-
-		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
-	} finally {
-		closeSync(fd);
-	}
+		},
+		SESSION_READ_BUFFER_SIZE,
+	);
 
 	// Validate session header before repairing the file.
 	if (entries.length === 0) return entries;
@@ -718,7 +727,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		return [];
 	}
 
-	if (pending) appendFileSync(resolvedFilePath, "\n");
+	if (missingFinalNewline) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -1123,7 +1132,7 @@ export class SessionManager {
 		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+			const entries = preloadedFileEntries ?? readEntriesFromFile(this.sessionFile, true);
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1141,6 +1150,7 @@ export class SessionManager {
 
 			this._loadEntries(entries);
 			this.flushed = true;
+			this.#releaseColdEntries();
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
@@ -1222,14 +1232,80 @@ export class SessionManager {
 			return;
 		}
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		// Cold entries read from the current file while the new one is written, so write a
+		// temporary file and rename it over the old one.
+		// Write next to the real path so a symlinked session file stays a symlink.
+		const target = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
+		const temporary = `${target}.${process.pid}.tmp`;
+		const fd = openSync(temporary, "w");
 		try {
-			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-			}
+			this.#writeEntries(fd, this.sessionFile);
 		} finally {
 			closeSync(fd);
 		}
+		renameSync(temporary, target);
+	}
+
+	/**
+	 * Write every entry to `fd` (a new file that becomes `file`) and record each entry's new byte
+	 * range. Cold entries are rebound to the new file one line at a time.
+	 */
+	#writeEntries(fd: number, file: string): void {
+		let offset = 0;
+		for (let i = 0; i < this.fileEntries.length; i++) {
+			const entry = this.fileEntries[i];
+			const line = JSON.stringify(entry);
+			const length = Buffer.byteLength(line);
+			writeFileSync(fd, `${line}\n`);
+			const location = { file, offset, length };
+			offset += length + 1;
+			if (!isColdEntry(entry)) {
+				setEntryLocation(entry, location);
+				continue;
+			}
+			const rebound = toColdEntry(JSON.parse(line) as SessionEntry, location);
+			this.fileEntries[i] = rebound;
+			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
+		}
+		this.#revisionKey = undefined;
+	}
+
+	/** Append one entry line and record its byte range. */
+	#appendLine(file: string, entry: SessionEntry): void {
+		const line = JSON.stringify(entry);
+		// The file can be deleted while Pi runs; appendFileSync then recreates it.
+		const offset = existsSync(file) ? statSync(file).size : 0;
+		appendFileSync(file, `${line}\n`);
+		setEntryLocation(entry, { file, offset, length: Buffer.byteLength(line) });
+	}
+
+	/**
+	 * Bound session memory (smarty-dev#2177): keep the current context and the most recent entries
+	 * resident; every other entry keeps only its small fields and reads large ones from the file.
+	 * Runs after load, compaction and leaf moves; entries appended between runs stay resident.
+	 */
+	#releaseColdEntries(): void {
+		if (this.#ownedJournal || !this.persist || !this.flushed) return;
+		const hot = new Set<string>();
+		for (const entry of buildContextEntries([], this.leafId, this.byId)) hot.add(entry.id);
+		for (let i = Math.max(0, this.fileEntries.length - RECENT_RESIDENT_ENTRIES); i < this.fileEntries.length; i++) {
+			const entry = this.fileEntries[i];
+			if (entry.type !== "session") hot.add(entry.id);
+		}
+		let changed = false;
+		for (let i = 0; i < this.fileEntries.length; i++) {
+			const entry = this.fileEntries[i];
+			if (entry.type === "session") continue;
+			const location = getEntryLocation(entry);
+			if (!location) continue;
+			const next = hot.has(entry.id) ? toHotEntry(entry) : isColdEntry(entry) ? entry : toColdEntry(entry, location);
+			if (next === entry) continue;
+			this.fileEntries[i] = next;
+			// With duplicate ids, byId keeps the later entry (as _buildIndex does); only replace that one.
+			if (this.byId.get(next.id) === entry) this.byId.set(next.id, next);
+			changed = true;
+		}
+		if (changed) this.#revisionKey = undefined;
 	}
 
 	isPersisted(): boolean {
@@ -1280,7 +1356,7 @@ export class SessionManager {
 		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
 		if (!hasAssistant) {
 			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+				this.#appendLine(this.sessionFile, entry);
 			} else {
 				// Mark as not flushed so when assistant arrives, all entries get written
 				this.flushed = false;
@@ -1291,15 +1367,13 @@ export class SessionManager {
 		if (!this.flushed) {
 			const fd = openSync(this.sessionFile, "wx");
 			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
+				this.#writeEntries(fd, this.sessionFile);
 			} finally {
 				closeSync(fd);
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this.#appendLine(this.sessionFile, entry);
 		}
 	}
 
@@ -1565,6 +1639,7 @@ export class SessionManager {
 			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
 		};
 		this._appendEntry(entry);
+		this.#releaseColdEntries();
 		return entry.id;
 	}
 
@@ -1880,6 +1955,7 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.#releaseColdEntries();
 	}
 
 	/**
@@ -1922,6 +1998,7 @@ export class SessionManager {
 			fromHook,
 		};
 		this._appendEntry(entry);
+		this.#releaseColdEntries();
 		return entry.id;
 	}
 
@@ -1980,17 +2057,17 @@ export class SessionManager {
 				replacementByLabelId.set(labelId, entry.id);
 			}
 			pendingLabelIds.length = 0;
+			// copyEntry keeps cold fields lazy, so a long path is not loaded into memory at once.
 			pathWithoutLabels.push(
 				entry.type === "compaction"
-					? {
-							...entry,
+					? copyEntry(entry, {
 							parentId: pathParentId,
 							firstKeptEntryId:
 								entry.firstKeptEntryId === entry.id
 									? entry.id
 									: (replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId),
-						}
-					: { ...entry, parentId: pathParentId },
+						})
+					: copyEntry(entry, { parentId: pathParentId }),
 			);
 			pathParentId = entry.id;
 		}
@@ -2051,6 +2128,7 @@ export class SessionManager {
 			if (hasAssistant) {
 				this._rewriteFile();
 				this.flushed = true;
+				this.#releaseColdEntries();
 			} else {
 				this.flushed = false;
 			}
@@ -2106,7 +2184,7 @@ export class SessionManager {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
+				preloadedFileEntries = readEntriesFromFile(resolvedPath, true);
 				const firstEntry = preloadedFileEntries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
 			}
@@ -2152,7 +2230,7 @@ export class SessionManager {
 	): SessionManager {
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
+		const sourceEntries = readEntriesFromFile(resolvedSourcePath, true);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
 		}
