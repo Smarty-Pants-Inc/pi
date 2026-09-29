@@ -1,0 +1,8 @@
+HTTP/1.1 429 Too Many Requests
+Content-Type: application/json;charset=utf-8
+retry-after: 3600
+x-smarty-trace: refused-7b2c8604ae4b8b83
+Date: Tue, 29 Sep 2026 01:02:20 GMT
+Content-Length: 265
+
+{"error":{"type":"smarty_limit","code":"smarty_limit","message":"One request to this model can cost up to $0.0224, more than your $0.0100 limit. Add credit to use it: https://billing.smartypants.ai/checkout","window":"too_large","throttled":false,"resets_at":null}}

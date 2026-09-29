@@ -1,0 +1,7 @@
+2026-09-29T01:05:36.528Z pi /home/paul/.local/share/smarty-dev/pi-runtime/releases/7dec1f63685be53a867c036a9d1544342a0990b4/node/node_modules/@earendil-works/pi-coding-agent/dist/cli.js
+2026-09-29T01:05:36.530Z START pi --provider smartygw --model nemotron-3-super --no-session --no-tools --print 'Reply with only OK.'
+2026-09-29T01:05:37.452Z ERR One request to this model can cost up to $0.0224, more than your $0.0100 limit. Add credit to use it: https://billing.smartypants.ai/checkout
+2026-09-29T01:05:37.483Z EXIT exit=1
+2026-09-29T01:05:37.992Z EXITED; waiting 20 s for any further devlead-pi1723 line
+2026-09-29T01:05:57.995Z END quiet window
+2026-09-29T01:05:57.998Z devlead-pi1723 usage lines this run: 1
