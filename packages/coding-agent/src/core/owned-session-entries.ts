@@ -1,7 +1,20 @@
-import { isJsonValue } from "@earendil-works/chord";
+import { isJsonValue, type JsonValue } from "@earendil-works/chord";
 import { type FileEntry, parseSessionEntries, type SessionEntry, type SessionHeader } from "./session-manager.ts";
 
 const absentFields = new Set(["parentSession", "details", "usage", "fromHook", "data", "label", "name"]);
+
+/** Owned journals retain their depth bound even when Chord accepts deeper JSON trees. */
+function isOwnedJsonValue(value: unknown): value is JsonValue {
+	const withinDepth = (candidate: unknown, depth: number): boolean => {
+		if (depth > 512) return false;
+		if (candidate === null || typeof candidate !== "object") return true;
+		// Inspect descriptors, never getters or toJSON. Cycles also reach the finite bound.
+		return Object.values(Object.getOwnPropertyDescriptors(candidate)).every(
+			(property) => !("value" in property) || withinDepth(property.value, depth + 1),
+		);
+	};
+	return withinDepth(value, 0) && isJsonValue(value);
+}
 
 /** Native optional fields may be absent; arbitrary nested non-JSON is rejected. */
 export function materializeOwnedEntry<T extends FileEntry>(entry: T): T {
@@ -16,7 +29,7 @@ export function materializeOwnedEntry<T extends FileEntry>(entry: T): T {
 		if (property.value === undefined && absentFields.has(key)) continue;
 		Object.defineProperty(normalized, key, { value: property.value, enumerable: true });
 	}
-	if (!isJsonValue(normalized)) throw new Error("OWNER_ENTRY_NOT_JSON");
+	if (!isOwnedJsonValue(normalized)) throw new Error("OWNER_ENTRY_NOT_JSON");
 	return JSON.parse(JSON.stringify(normalized)) as T;
 }
 
@@ -31,7 +44,7 @@ export function parseOwnedSessionEntries(bytes: Buffer, expectedSessionId: strin
 	if (values.some((entry, index) => JSON.stringify(entry) !== lines[index])) throw new Error("OWNER_JOURNAL_ENCODING");
 	const header = values[0];
 	if (
-		!isJsonValue(header) ||
+		!isOwnedJsonValue(header) ||
 		header === null ||
 		Array.isArray(header) ||
 		typeof header !== "object" ||
@@ -48,7 +61,7 @@ export function parseOwnedSessionEntries(bytes: Buffer, expectedSessionId: strin
 	const ids = new Set<string>();
 	for (const value of values.slice(1)) {
 		if (
-			!isJsonValue(value) ||
+			!isOwnedJsonValue(value) ||
 			value === null ||
 			Array.isArray(value) ||
 			typeof value !== "object" ||

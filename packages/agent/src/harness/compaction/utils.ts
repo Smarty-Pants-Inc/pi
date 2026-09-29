@@ -20,8 +20,12 @@ export function createFileOps(): FileOperations {
 	};
 }
 
-/** Add file operations from assistant tool calls to an accumulator. */
+/** Add file operations from native assistant calls or nested calls recorded on tool results. */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
+	if (message.role === "toolResult") {
+		for (const call of message.nestedCalls?.calls ?? []) addFileOp(call.name, call.arguments, fileOps);
+		return;
+	}
 	if (message.role !== "assistant") return;
 	if (!("content" in message) || !Array.isArray(message.content)) return;
 
@@ -30,24 +34,24 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 		if (!("type" in block) || block.type !== "toolCall") continue;
 		if (!("arguments" in block) || !("name" in block)) continue;
 
-		const args = block.arguments as Record<string, unknown> | undefined;
-		if (!args) continue;
-
-		const path = typeof args.path === "string" ? args.path : undefined;
-		if (!path) continue;
-
-		const set =
-			block.name === "read"
-				? fileOps.read
-				: block.name === "write"
-					? fileOps.written
-					: block.name === "edit"
-						? fileOps.edited
-						: undefined;
-		// Delete first so each set stays ordered from least to most recently used.
-		set?.delete(path);
-		set?.add(path);
+		addFileOp(block.name, block.arguments as Record<string, unknown> | undefined, fileOps);
 	}
+}
+
+function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
+	const path = typeof args?.path === "string" ? args.path : undefined;
+	if (!path) return;
+	const set =
+		toolName === "read"
+			? fileOps.read
+			: toolName === "write"
+				? fileOps.written
+				: toolName === "edit"
+					? fileOps.edited
+					: undefined;
+	// Delete first so native and nested calls keep least-to-most-recent ordering (pi#88).
+	set?.delete(path);
+	set?.add(path);
 }
 
 /**

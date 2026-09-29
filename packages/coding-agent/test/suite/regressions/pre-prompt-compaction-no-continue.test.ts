@@ -106,6 +106,7 @@ describe("pre-prompt compaction regression", () => {
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 		const queue = vi.spyOn(harness.session.agent, "followUp");
 		const preflight = vi.fn();
+		const transferred = vi.fn();
 		const images: ImageContent[] = [{ type: "image", data: "synthetic-image", mimeType: "image/png" }];
 
 		await expect(
@@ -113,10 +114,13 @@ describe("pre-prompt compaction regression", () => {
 				images,
 				streamingBehavior: "followUp",
 				preflightResult: preflight,
+				onInputTransferred: transferred,
 			}),
 		).rejects.toThrow("Input is retained in the followUp queue");
 
-		expect(preflight).toHaveBeenCalledExactlyOnceWith(false);
+		// smarty-dev#2241: rejection reports no accepted disposition, but retained input is transferred.
+		expect(preflight).not.toHaveBeenCalled();
+		expect(transferred).toHaveBeenCalledExactlyOnceWith();
 		expect(harness.sessionManager.getEntries()).toEqual(before);
 		expect(getUserTexts(harness)).not.toContain("processed:pending input");
 		expect(harness.session.getFollowUpMessages()).toEqual(["processed:pending input"]);

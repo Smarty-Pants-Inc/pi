@@ -90,6 +90,7 @@ describe("owned native materialization", () => {
 		expect(called).toBe(0);
 	});
 
+	// smarty-dev#2241: upstream Chord removed its depth cap; the owned journal must retain it.
 	test("rejects cycles and excessive depth", () => {
 		const cycle: Record<string, unknown> = {};
 		cycle.self = cycle;
@@ -97,6 +98,25 @@ describe("owned native materialization", () => {
 		let deep: unknown = null;
 		for (let i = 0; i < 600; i++) deep = { child: deep };
 		expect(() => materializeOwnedEntry(custom(deep))).toThrow("OWNER_ENTRY_NOT_JSON");
+	});
+
+	test.each(["object", "array"])("keeps the exact depth boundary for %s data on write and open", (kind) => {
+		let data: unknown = null;
+		for (let i = 0; i < 511; i++) data = kind === "array" ? [data] : { child: data };
+		const allowed = custom(data);
+		// The entry is depth zero, data starts at one, and the terminal null is at 512.
+		expect(materializeOwnedEntry(allowed)).toEqual(allowed);
+		expect(parseOwnedSessionEntries(journal(allowed), header.id)).toEqual([header, allowed]);
+		const excessive = custom(kind === "array" ? [data] : { child: data });
+		expect(() => materializeOwnedEntry(excessive)).toThrow("OWNER_ENTRY_NOT_JSON");
+		expect(() => parseOwnedSessionEntries(journal(excessive), header.id)).toThrow("OWNER_JOURNAL_ENTRY");
+	});
+
+	test("accepts shared acyclic data without treating breadth as depth", () => {
+		const shared = { child: [null] };
+		const entry = custom(Array.from({ length: 600 }, () => shared));
+		expect(materializeOwnedEntry(entry)).toEqual(entry);
+		expect(parseOwnedSessionEntries(journal(entry), header.id)).toEqual([header, entry]);
 	});
 });
 

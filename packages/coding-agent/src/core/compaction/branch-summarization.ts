@@ -215,13 +215,17 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		}
 	}
 
-	// Messages the walk visits, newest first. File ops are extracted oldest first after the walk so
-	// the recency order (and the cap in computeFileLists) follows the session, not the walk.
+	// Messages the walk visits, newest first. Tool results contribute nested file calls, not
+	// summary text or token cost. Extract oldest first so the cap follows session recency.
 	const visited: AgentMessage[] = [];
 
 	// Second pass: walk from newest to oldest, adding messages until token budget
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
+		if (entry.type === "message" && entry.message.role === "toolResult") {
+			visited.push(entry.message);
+			continue;
+		}
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
 		visited.push(message);
