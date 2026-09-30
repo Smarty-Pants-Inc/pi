@@ -29,6 +29,16 @@ import type {
 	StreamFn,
 } from "./types.ts";
 
+/** @internal Completion custody for a tool whose accepted update delivery fails.
+ * Called after its callback and accepted updates drain, instead of normal after-hooks/events.
+ * Symbol metadata survives tool projection copies without changing tool declarations.
+ */
+export const TOOL_CALL_EXCEPTIONAL_COMPLETION = Symbol("toolCallExceptionalCompletion");
+
+type ExceptionalCompletionTool = AgentTool & {
+	[TOOL_CALL_EXCEPTIONAL_COMPLETION]?: (toolCallId: string) => void;
+};
+
 /** sourceMessage identifies queued input when tool declaration normalization copies it. */
 export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
 
@@ -946,7 +956,12 @@ async function executePreparedToolCall(
 	await Promise.all(updateEvents);
 	// Asynchronous event-pipeline failures propagate only after the drain. A
 	// synchronous sink throw still follows ordinary callback-error normalization.
-	if (updateFailure) throw updateFailure.error;
+	if (updateFailure) {
+		// Retire this invocation before batch failure handling joins siblings that
+		// may need its admission. Its callback owns child draining; updates join above.
+		(prepared.tool as ExceptionalCompletionTool)[TOOL_CALL_EXCEPTIONAL_COMPLETION]?.(prepared.toolCall.id);
+		throw updateFailure.error;
+	}
 	if ("outcome" in execution) return execution.outcome;
 	return {
 		result: createErrorToolResult(

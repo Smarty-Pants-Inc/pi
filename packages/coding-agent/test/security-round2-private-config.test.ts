@@ -88,7 +88,7 @@ describe("private MCP config public paths", () => {
 		expect(
 			addMcpServerConfig(path, "managed", {
 				...http,
-				headers: { Authorization: "$FAKE_TOKEN", "X-Team": "core" },
+				headers: { Authorization: "$FAKE_TOKEN", "X-Team": "$TEAM" },
 				oauth: { clientSecret: "!exit 2241" },
 			}),
 		).toBe(false);
@@ -197,11 +197,11 @@ describe("private MCP config public paths", () => {
 				...http,
 				headers: {
 					Authorization: reference,
-					"X-Team": "core",
+					"X-Team": "$TEAM",
 					"Content-Type": "application/json",
 					Accept: "application/json",
-					"X-Token-Count": "12",
-					"X-Credential-Format": "opaque",
+					"X-Token-Count": "$TOKEN_COUNT",
+					"X-Credential-Format": "$CREDENTIAL_FORMAT",
 				},
 				// #2241: the Authorization scheme is not part of a client-secret reference.
 				oauth: { clientSecret: reference.startsWith("Bearer ") ? env : reference },
@@ -228,7 +228,7 @@ describe("private MCP config public paths", () => {
 				"--bearer-token-env-var",
 				"FAKE_TOKEN",
 				"--header",
-				"X-Team=core",
+				"X-Team=$TEAM",
 				"--oauth-client-secret",
 				"!exit 2241",
 			],

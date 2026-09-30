@@ -66,24 +66,37 @@ interface McpConfigState {
 	errors: string[];
 }
 
+// Only these setting/value pairs are known harmless. Unknown names or arbitrary values in
+// supported credential channels remain candidates, rather than being guessed nonsecret.
+const HARMLESS_ENV_VALUES = new Map<string, readonly string[]>([
+	["NODE_ENV", ["development", "production", "test"]],
+	["LOG_LEVEL", ["trace", "debug", "info", "warn", "error", "fatal", "silent"]],
+	["NO_COLOR", ["0", "1", "true", "false"]],
+	["FORCE_COLOR", ["0", "1", "2", "3", "true", "false"]],
+]);
+const HARMLESS_HEADER_VALUES = new Map<string, readonly string[]>([
+	["accept", ["application/json", "text/event-stream", "application/json, text/event-stream"]],
+	["content-type", ["application/json", "application/json; charset=utf-8"]],
+]);
+
 function getLiteralCredentialFields(config: unknown): string[] {
 	if (!isRecord(config)) return [];
-	const headers = isRecord(config.headers) ? config.headers : {};
 	const fields: [string, string][] = [];
-	for (const [header, value] of Object.entries(headers)) {
-		if (
-			typeof value === "string" &&
-			/^(authorization|proxy-authorization|cookie|(?:.*[-_])?(?:api[-_]?key|token|secret|credentials?))$/i.test(
-				header,
-			)
-		) {
-			fields.push([`headers.${header}`, value]);
+	for (const [key, value] of Object.entries(isRecord(config.env) ? config.env : {})) {
+		if (typeof value === "string" && !HARMLESS_ENV_VALUES.get(key)?.includes(value)) {
+			fields.push([`env.${key}`, value]);
 		}
+	}
+	for (const [header, value] of Object.entries(isRecord(config.headers) ? config.headers : {})) {
+		if (typeof value !== "string") continue;
+		const name = header.toLowerCase();
+		if (HARMLESS_HEADER_VALUES.get(name)?.includes(value)) continue;
+		fields.push([`headers.${header}`, value]);
 	}
 	if (isRecord(config.oauth) && typeof config.oauth.clientSecret === "string") {
 		fields.push(["oauth.clientSecret", config.oauth.clientSecret]);
 	}
-	return fields
+	const literalFields = fields
 		.filter(([field, value]) => {
 			// A reference anywhere in a template does not exclude a literal credential elsewhere.
 			// Keys, clientSecret and Cookie require a whole reference; do not parse mixed cookies.
@@ -95,11 +108,19 @@ function getLiteralCredentialFields(config: unknown): string[] {
 			return scheme === undefined || getConfigValueEnvVarName(value.slice(scheme.length)) === undefined;
 		})
 		.map(([field]) => field);
+	// URLs are passed through without config-value resolution: userinfo is always literal,
+	// even when it looks like an environment or command reference. Do not infer query semantics.
+	if (typeof config.url === "string" && URL.canParse(config.url)) {
+		const url = new URL(config.url);
+		if (url.username !== "") literalFields.push("url.username");
+		if (url.password !== "") literalFields.push("url.password");
+	}
+	return literalFields;
 }
 
 /** Redacted advice only; literal project credentials remain supported in private files. Never resolve values here. */
 export function getMcpProjectConfigWarnings(entry: McpServerEntry): string[] {
-	if (entry.scope !== "project" || !("url" in entry.config)) return [];
+	if (entry.scope !== "project") return [];
 	return getLiteralCredentialFields(entry.config).map(
 		(field) =>
 			`${entry.source}: warning: project MCP server "${entry.name}" has a literal credential in ${field}; use an environment variable reference or !command instead.`,
@@ -174,7 +195,7 @@ export interface McpServerConfigPatch {
  */
 export function updateMcpServerConfig(path: string, name: string, patch: McpServerConfigPatch): void {
 	editMcpServers(path, (servers) => {
-		const server = servers?.[name];
+		const server = servers && Object.hasOwn(servers, name) ? servers[name] : undefined;
 		if (!isRecord(server)) throw new Error(`${path} does not define MCP server "${name}"`);
 		if (patch.enabled !== undefined) {
 			if (patch.enabled) delete server.enabled;
@@ -196,8 +217,9 @@ export function addMcpServerConfig(path: string, name: string, config: McpServer
 	let replaced = false;
 	editMcpServers(path, (servers, parsed) => {
 		const target = servers ?? {};
-		replaced = target[name] !== undefined;
-		target[name] = config;
+		replaced = Object.hasOwn(target, name);
+		// Server names may be object prototype names; persist them as ordinary own entries.
+		Object.defineProperty(target, name, { value: config, writable: true, enumerable: true, configurable: true });
 		parsed.mcpServers = target;
 		return true;
 	});
@@ -209,7 +231,7 @@ export function removeMcpServerConfig(path: string, name: string): boolean {
 	if (!existsSync(path)) return false;
 	let removed = false;
 	editMcpServers(path, (servers) => {
-		if (!servers || servers[name] === undefined) return false;
+		if (!servers || !Object.hasOwn(servers, name)) return false;
 		delete servers[name];
 		removed = true;
 		return true;

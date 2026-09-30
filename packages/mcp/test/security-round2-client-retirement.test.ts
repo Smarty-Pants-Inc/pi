@@ -230,8 +230,16 @@ describe("McpClient incoming cancellation custody", () => {
 					{ jsonrpc: "2.0", id: 7, method: "ping" },
 				);
 				expect(signals.size).toBe(3);
-				await (mode === "client" ? client.close() : transport.close());
+				let completed = false;
+				const closing = (mode === "client" ? client.close() : transport.close()).then(() => {
+					completed = true;
+				});
+				if (mode === "transport") await within(closing);
+				else await delay(0);
 				expect([...signals.values()].map((signal) => signal.aborted)).toEqual([true, true, true]);
+				if (mode === "client") expect(completed).toBe(false);
+				gate.resolve();
+				await within(closing);
 			} finally {
 				gate.resolve();
 			}
@@ -313,6 +321,7 @@ describe("shared public client and HTTP close completion", () => {
 			});
 		};
 		client.setRequestHandler("fixture/held", async (_params, context) => {
+			// smarty-dev#2241: callback-local shutdown cannot join its own held cleanup.
 			context.signal.addEventListener("abort", () => observe(client.close()), { once: true });
 			await handlerGate.promise;
 			return {};
@@ -330,11 +339,15 @@ describe("shared public client and HTTP close completion", () => {
 			await delay(0);
 			expect(closeCallbacks).toBe(1);
 			expect(joins).toHaveLength(4);
-			expect(completions).toBe(0);
-			expect(joins.every((join) => join === first)).toBe(true);
+			expect(completions).toBe(1);
+			expect(joins[0]).not.toBe(first);
+			expect(joins.slice(1).every((join) => join === first)).toBe(true);
 			expect(deletes).toHaveLength(1);
 			expect(client.connectionState).toBe("closed");
 			releaseDelete();
+			await delay(0);
+			expect(completions).toBe(1);
+			handlerGate.resolve();
 			await within(Promise.all(joins));
 			expect(completions).toBe(4);
 			expect(client.close()).toBe(first);

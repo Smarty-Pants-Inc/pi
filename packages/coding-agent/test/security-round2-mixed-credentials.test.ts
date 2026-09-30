@@ -291,9 +291,9 @@ describe("mixed MCP credential persistence and warnings", () => {
 				"--header",
 				"Accept=application/json",
 				"--header",
-				"X-Token-Count=12",
+				"X-Token-Count=$TOKEN_COUNT",
 				"--header",
-				"X-Team=core",
+				"X-Team=$TEAM",
 			],
 			paths,
 		);

@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { CallToolResult } from "./protocol/content.ts";
 import {
 	isJsonRpcId,
@@ -185,6 +186,9 @@ export class McpClient {
 	private pending = new Map<JsonRpcId, PendingRequest>();
 	private progressRequests = new Map<JsonRpcId, JsonRpcId>();
 	private incoming = new Map<JsonRpcId, AbortController>();
+	/** Retain accepted callback cleanup independently of the visible request IDs. */
+	private readonly incomingPromises = new Map<AbortController, Promise<void>>();
+	private readonly requestInvocation = new AsyncLocalStorage<AbortController>();
 	private requestHandlers = new Map<string, RequestHandler>();
 	private notificationListeners = new Map<string, Set<NotificationListener>>();
 	private errorListeners = new Set<ErrorListener>();
@@ -458,12 +462,23 @@ export class McpClient {
 		);
 	}
 
+	/**
+	 * External callers join transport retirement and all accepted request callbacks.
+	 * An active callback only requests retirement: joining itself would deadlock.
+	 */
 	close(): Promise<void> {
 		if (!this.closing) {
 			// Publish the completion before abort/close callbacks can re-enter close().
 			const closing = Promise.withResolvers<void>();
 			this.closing = closing.promise;
-			void this.closeTransport().then(closing.resolve, closing.reject);
+			// Transport/onClose callbacks are not part of the initiating request's custody.
+			void this.requestInvocation.exit(() => this.closeTransport()).then(closing.resolve, closing.reject);
+		}
+		const invocation = this.requestInvocation.getStore();
+		if (invocation && this.incomingPromises.has(invocation)) {
+			// Keep failure observable to external joins, even if only this callback requested close.
+			void this.closing.catch(() => {});
+			return Promise.resolve();
 		}
 		return this.closing;
 	}
@@ -472,8 +487,18 @@ export class McpClient {
 		const transport = this.transport;
 		this.transport = undefined;
 		this.disposeTransportListeners();
-		this.markClosed(new McpConnectionClosedError());
-		await transport?.close();
+		let retired: PromiseSettledResult<void>;
+		try {
+			this.markClosed(new McpConnectionClosedError());
+		} finally {
+			// Observer failure cannot release transport or accepted callback custody early.
+			[retired] = await Promise.allSettled([
+				Promise.resolve().then(() => transport?.close()),
+				...this.incomingPromises.values(),
+			]);
+		}
+		// A thrown observer failure propagates after finally; otherwise share transport failure.
+		if (retired.status === "rejected") throw retired.reason;
 	}
 
 	private async requestInternal(
@@ -595,9 +620,14 @@ export class McpClient {
 			return;
 		}
 		const controller = new AbortController();
+		const completion = Promise.withResolvers<void>();
 		this.incoming.set(message.id, controller);
+		// Install ownership before invoking user code, which can synchronously close this client.
+		this.incomingPromises.set(controller, completion.promise);
 		try {
-			const result = await handler(message.params, { signal: controller.signal });
+			const result = await this.requestInvocation.run(controller, () =>
+				handler(message.params, { signal: controller.signal }),
+			);
 			await transport.send({ jsonrpc: "2.0", id: message.id, result: result ?? {} });
 		} catch (error) {
 			const responseError =
@@ -609,6 +639,8 @@ export class McpClient {
 				.catch((sendError) => this.emitError(sendError));
 		} finally {
 			if (this.incoming.get(message.id) === controller) this.incoming.delete(message.id);
+			this.incomingPromises.delete(controller);
+			completion.resolve();
 		}
 	}
 
@@ -638,7 +670,9 @@ export class McpClient {
 	}
 
 	private handleCancelled(params: unknown): void {
-		if (isObject(params) && isJsonRpcId(params.requestId)) this.incoming.get(params.requestId)?.abort(params.reason);
+		if (!isObject(params) || !isJsonRpcId(params.requestId)) return;
+		const controller = this.incoming.get(params.requestId);
+		if (controller) this.requestInvocation.run(controller, () => controller.abort(params.reason));
 	}
 
 	private armTimeout(id: JsonRpcId, entry: PendingRequest): void {
@@ -681,7 +715,9 @@ export class McpClient {
 	}
 
 	private handleTransportClose(): void {
-		this.markClosed(new McpConnectionClosedError());
+		// A transport drop may occur synchronously inside a request handler. Its observers
+		// must receive the full join; markClosed still restores custody for each abort listener.
+		this.requestInvocation.exit(() => this.markClosed(new McpConnectionClosedError()));
 	}
 
 	/** Idempotent: rejects in-flight requests, aborts server requests we are serving, and flips the state. */
@@ -689,7 +725,10 @@ export class McpClient {
 		const wasClosed = this.state === "closed";
 		this.state = "closed";
 		this.rejectPending(error);
-		for (const controller of this.incoming.values()) controller.abort(error);
+		// Abort listeners execute in the aborting caller's context; restore their callback custody.
+		for (const controller of this.incoming.values()) {
+			this.requestInvocation.run(controller, () => controller.abort(error));
+		}
 		this.incoming.clear();
 		if (wasClosed) return;
 		for (const listener of [...this.closeListeners]) {

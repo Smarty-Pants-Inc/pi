@@ -30,6 +30,7 @@ import {
 	type PrepareNextTurnContext,
 	runToolCall,
 	type ThinkingLevel,
+	TOOL_CALL_EXCEPTIONAL_COMPLETION,
 } from "@earendil-works/pi-agent-core";
 import { contentText, getCurrentSystemMessage, type RetryPolicy, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
@@ -4358,7 +4359,18 @@ export class AgentSession {
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
 			toolRegistry.set(tool.name, tool);
 		}
-		this._toolRegistry = toolRegistry;
+		// Also attach custody to bare registry tools: SDK request hooks can replace
+		// the native projection. Normal admission still retires at tool_execution_end.
+		this._toolRegistry = new Map(
+			[...toolRegistry].map(([name, tool]) => [
+				name,
+				{
+					...tool,
+					[TOOL_CALL_EXCEPTIONAL_COMPLETION]: (toolCallId: string) =>
+						this._getNestedToolCallRunner().finishParent(toolCallId),
+				},
+			]),
+		);
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]

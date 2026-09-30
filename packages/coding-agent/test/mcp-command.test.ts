@@ -105,7 +105,7 @@ describe("pi mcp", () => {
 				"--bearer-token-env-var",
 				"DOCS_TOKEN",
 				"--header",
-				"X-Team=core",
+				"X-Team=$TEAM",
 				"--exposure",
 				"direct",
 			],
@@ -119,7 +119,7 @@ describe("pi mcp", () => {
 				docs: {
 					url: "https://example.com/mcp",
 					// biome-ignore lint/suspicious/noTemplateCurlyInString: literal config value reference
-					headers: { "X-Team": "core", Authorization: "Bearer ${DOCS_TOKEN}" },
+					headers: { "X-Team": "$TEAM", Authorization: "Bearer ${DOCS_TOKEN}" },
 					exposure: "direct",
 				},
 			},

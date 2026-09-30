@@ -140,7 +140,7 @@ function toolPatternRegExp(pattern: string): RegExp {
 /** Exposure of one tool of a server: its `toolExposure` entry, else the server's `exposure`. */
 export function getMcpToolExposure(config: McpServerConfig, toolName: string): McpExposure {
 	const overrides = config.toolExposure ?? {};
-	const exact = overrides[toolName];
+	const exact = Object.hasOwn(overrides, toolName) ? overrides[toolName] : undefined;
 	if (exact !== undefined) return exact;
 	for (const [pattern, exposure] of Object.entries(overrides)) {
 		if (pattern.includes("*") && toolPatternRegExp(pattern).test(toolName)) return exposure;

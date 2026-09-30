@@ -22,6 +22,7 @@ import {
 	type McpServerEntry,
 	removeMcpServerConfig,
 } from "./config.ts";
+import { describeTransport } from "./describe-transport.ts";
 import {
 	createDefaultTransport,
 	McpOAuthCredentialStore,
@@ -105,11 +106,6 @@ interface ServerReport {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-function describeTransport(entry: McpServerEntry): string {
-	const { config } = entry;
-	return "url" in config ? config.url : [config.command, ...(config.args ?? [])].join(" ");
 }
 
 function createConnection(entry: McpServerEntry, options: McpCommandOptions, credentials: McpOAuthCredentialStore) {
@@ -266,7 +262,12 @@ function parsePairs(option: string, pairs: string[] | undefined, error: (line: s
 			error(`--${option} expects KEY=VALUE, got "${pair}".`);
 			return undefined;
 		}
-		record[pair.slice(0, separator)] = pair.slice(separator + 1);
+		Object.defineProperty(record, pair.slice(0, separator), {
+			value: pair.slice(separator + 1),
+			writable: true,
+			enumerable: true,
+			configurable: true,
+		});
 	}
 	return record;
 }
@@ -490,7 +491,8 @@ async function list(
 		if (report.state === "needs-auth") log(`  sign in with: ${APP_NAME} mcp login ${report.name}`);
 		if (report.tools.length > 0) {
 			const tools = report.tools.map((tool) => {
-				const exposure = report.toolExposure?.[tool];
+				const exposure =
+					report.toolExposure && Object.hasOwn(report.toolExposure, tool) ? report.toolExposure[tool] : undefined;
 				return exposure ? `${tool} [${exposure}]` : tool;
 			});
 			log(`  tools: ${tools.join(", ")}`);

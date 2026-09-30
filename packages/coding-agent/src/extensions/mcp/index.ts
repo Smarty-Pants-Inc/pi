@@ -51,6 +51,7 @@ import {
 	type McpServerEntry,
 	updateMcpServerConfig,
 } from "./config.ts";
+import { describeTransport } from "./describe-transport.ts";
 import type { McpOAuthCredentialStore, McpSignInPrompt } from "./oauth.ts";
 import { createMcpResourceToolDefinitions } from "./resources.ts";
 import { loadMcpRuntime } from "./runtime.lazy.ts";
@@ -162,12 +163,6 @@ function attentionRank(server: McpServer): number {
 		default:
 			return 3;
 	}
-}
-
-function describeTransport(entry: McpServerEntry): string {
-	const { config } = entry;
-	if ("url" in config) return config.url;
-	return [config.command, ...(config.args ?? [])].join(" ");
 }
 
 const MCP_USAGE = "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp reconnect [server]";
