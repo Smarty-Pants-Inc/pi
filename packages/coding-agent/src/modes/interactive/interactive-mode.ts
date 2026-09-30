@@ -63,7 +63,13 @@ import {
 	getDocsPath,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	captureHostTurnReceipt,
+	type PromptOptions,
+	parseSkillBlock,
+} from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
@@ -239,8 +245,12 @@ class ExpandableText extends Text implements Expandable {
 	}
 }
 
-type CompactionQueuedMessage = {
+type ReceivedHostInput = {
 	text: string;
+	receipt: PromptOptions;
+};
+
+type CompactionQueuedMessage = ReceivedHostInput & {
 	mode: "steer" | "followUp";
 };
 
@@ -443,8 +453,9 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string) => void;
-	private pendingUserInputs: string[] = [];
+	private onInputCallback?: (input: ReceivedHostInput) => void;
+	private pendingUserInputs: ReceivedHostInput[] = [];
+	private userInputReceipt?: PromptOptions;
 	private userInputInFlight = false;
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -1208,7 +1219,8 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				const prompt = this.session.prompt(userInput);
+				const prompt = this.session.prompt(userInput, this.userInputReceipt);
+				this.userInputReceipt = undefined;
 				// Original session preflight owns the input before TUI staging clears.
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-transferred");
@@ -3288,14 +3300,16 @@ export class InteractiveMode {
 				}
 			}
 
+			const receipt = captureHostTurnReceipt(this.session, text, "interactive");
+
 			// Queue input during compaction (extension commands execute immediately)
 			if (this.session.isCompacting) {
 				if (this.isExtensionCommand(text)) {
 					this.editor.addToHistory?.(text);
 					this.editor.setText("");
-					await this.session.prompt(text);
+					await this.session.prompt(text, receipt);
 				} else {
-					this.queueCompactionMessage(text, "steer");
+					this.queueCompactionMessage(text, "steer", receipt);
 				}
 				return;
 			}
@@ -3305,7 +3319,7 @@ export class InteractiveMode {
 			if (this.session.isStreaming) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
+				await this.session.prompt(text, { ...receipt, streamingBehavior: "steer" });
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				return;
@@ -3316,9 +3330,9 @@ export class InteractiveMode {
 			this.flushPendingBashComponents();
 
 			if (this.onInputCallback) {
-				this.onInputCallback(text);
+				this.onInputCallback({ text, receipt });
 			} else {
-				this.pendingUserInputs.push(text);
+				this.pendingUserInputs.push({ text, receipt });
 				this.stagingAudit?.("input-enqueued");
 			}
 			this.editor.addToHistory?.(text);
@@ -4149,15 +4163,17 @@ export class InteractiveMode {
 		if (queuedInput !== undefined) {
 			this.userInputInFlight = true;
 			this.stagingAudit?.("input-dequeued");
-			return queuedInput;
+			this.userInputReceipt = queuedInput.receipt;
+			return queuedInput.text;
 		}
 
 		return new Promise((resolve) => {
-			this.onInputCallback = (text: string) => {
+			this.onInputCallback = (input) => {
 				this.onInputCallback = undefined;
 				this.userInputInFlight = true;
 				this.stagingAudit?.("input-delivered");
-				resolve(text);
+				this.userInputReceipt = input.receipt;
+				resolve(input.text);
 			};
 		});
 	}
@@ -4379,7 +4395,7 @@ export class InteractiveMode {
 			if (this.isExtensionCommand(text)) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text);
+				await this.session.prompt(text, captureHostTurnReceipt(this.session, text, "interactive"));
 			} else {
 				this.queueCompactionMessage(text, "followUp");
 			}
@@ -4391,7 +4407,10 @@ export class InteractiveMode {
 		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await this.session.prompt(text, {
+				...captureHostTurnReceipt(this.session, text, "interactive"),
+				streamingBehavior: "followUp",
+			});
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
@@ -4660,8 +4679,12 @@ export class InteractiveMode {
 		return allQueued.length;
 	}
 
-	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
+	private queueCompactionMessage(
+		text: string,
+		mode: "steer" | "followUp",
+		receipt = captureHostTurnReceipt(this.session, text, "interactive"),
+	): void {
+		this.compactionQueuedMessages.push({ text, mode, receipt });
 		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
@@ -4723,14 +4746,15 @@ export class InteractiveMode {
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.text)) {
 						await session.prompt(message.text, {
+							...message.receipt,
 							onInputTransferred: () => {
 								pending.delete(message);
 							},
 						});
 					} else if (message.mode === "followUp") {
-						await session.followUp(message.text);
+						await session.followUp(message.text, undefined, message.receipt);
 					} else {
-						await session.steer(message.text);
+						await session.steer(message.text, undefined, message.receipt);
 					}
 					pending.delete(message);
 				}
@@ -4744,6 +4768,7 @@ export class InteractiveMode {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
 					await session.prompt(message.text, {
+						...message.receipt,
 						onInputTransferred: () => {
 							pending.delete(message);
 						},
@@ -4760,6 +4785,7 @@ export class InteractiveMode {
 
 			for (const message of preCommands) {
 				await session.prompt(message.text, {
+					...message.receipt,
 					onInputTransferred: () => {
 						pending.delete(message);
 					},
@@ -4770,6 +4796,7 @@ export class InteractiveMode {
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
 			let firstTransferred = false;
 			const started = session.prompt(firstPrompt.text, {
+				...firstPrompt.receipt,
 				streamingBehavior: firstPrompt.mode,
 				onInputTransferred: () => {
 					firstTransferred = true;
@@ -4793,14 +4820,15 @@ export class InteractiveMode {
 			for (const message of rest) {
 				if (this.isExtensionCommand(message.text)) {
 					await session.prompt(message.text, {
+						...message.receipt,
 						onInputTransferred: () => {
 							pending.delete(message);
 						},
 					});
 				} else if (message.mode === "followUp") {
-					await session.followUp(message.text);
+					await session.followUp(message.text, undefined, message.receipt);
 				} else {
-					await session.steer(message.text);
+					await session.steer(message.text, undefined, message.receipt);
 				}
 				pending.delete(message);
 			}

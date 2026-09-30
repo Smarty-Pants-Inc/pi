@@ -24,6 +24,7 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
+import { finalizeExtensionTurnProvenanceCaller } from "../turn-provenance.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartEvent,
@@ -393,6 +394,8 @@ export class ExtensionRunner {
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
 	) {
+		// Custom resource loaders also finish source assignment before constructing the runner.
+		for (const extension of extensions) finalizeExtensionTurnProvenanceCaller(extension);
 		this.extensions = extensions;
 		this.runtime = runtime;
 		this.uiContext = noOpUIContext;
@@ -1325,6 +1328,8 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
+		// Host-only receipt notification; never exposed to extension handlers.
+		onMessageReceived?: () => void,
 	): Promise<BeforeAgentStartCombinedResult> {
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
@@ -1354,7 +1359,11 @@ export class ExtensionRunner {
 
 					if (handlerResult) {
 						const result = handlerResult as BeforeAgentStartEventResult;
-						if (result.message) messages.push(result.message);
+						if (result.message) {
+							// Notify for each occurrence, even when handlers reuse the same frozen object.
+							onMessageReceived?.();
+							messages.push(result.message);
+						}
 						if (result.systemPrompt !== undefined) {
 							currentOptions.forceSystemPrompt = result.systemPrompt;
 						}

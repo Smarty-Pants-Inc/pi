@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
+import type { PromptOptions } from "../src/core/agent-session.ts";
+import * as sessionModule from "../src/core/agent-session.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+
+type ReceivedInput = { text: string; receipt: PromptOptions };
 
 type SubmitContext = {
 	defaultEditor: { onSubmit?: (text: string) => void };
@@ -14,13 +18,14 @@ type SubmitContext = {
 		prompt: (text: string, options?: unknown) => Promise<void>;
 	};
 	flushPendingBashComponents: () => void;
-	onInputCallback?: (text: string) => void;
-	pendingUserInputs: string[];
+	onInputCallback?: (input: ReceivedInput) => void;
+	pendingUserInputs: ReceivedInput[];
 };
 
 type InputContext = {
-	onInputCallback?: (text: string) => void;
-	pendingUserInputs: string[];
+	userInputReceipt?: PromptOptions;
+	onInputCallback?: (input: ReceivedInput) => void;
+	pendingUserInputs: ReceivedInput[];
 };
 
 type StartupSubmitContext = {
@@ -69,21 +74,26 @@ describe("InteractiveMode startup input", () => {
 
 	it("queues a normal prompt submitted before the input callback is installed", async () => {
 		const context = createSubmitContext();
+		const receipt: PromptOptions = { source: "interactive" };
+		const capture = vi.spyOn(sessionModule, "captureHostTurnReceipt").mockReturnValue(receipt);
 		interactiveModePrototype.setupEditorSubmitHandler.call(context);
 
 		await context.defaultEditor.onSubmit?.(" early prompt ");
 
-		expect(context.pendingUserInputs).toEqual(["early prompt"]);
+		expect(context.pendingUserInputs).toEqual([{ text: "early prompt", receipt }]);
+		expect(capture).toHaveBeenCalledWith(context.session, "early prompt", "interactive");
+		capture.mockRestore();
 		expect(context.flushPendingBashComponents).toHaveBeenCalledTimes(1);
 		expect(context.editor.addToHistory).toHaveBeenCalledWith("early prompt");
 	});
 
 	it("returns queued startup input before installing a new input callback", async () => {
 		const context: InputContext = {
-			pendingUserInputs: ["queued prompt"],
+			pendingUserInputs: [{ text: "queued prompt", receipt: { source: "interactive" } }],
 		};
 
 		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("queued prompt");
+		expect(context.userInputReceipt).toEqual({ source: "interactive" });
 		expect(context.onInputCallback).toBeUndefined();
 		expect(context.pendingUserInputs).toEqual([]);
 	});

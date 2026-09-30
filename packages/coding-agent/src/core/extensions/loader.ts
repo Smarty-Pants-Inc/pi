@@ -21,6 +21,7 @@ import { readPiManifest } from "../pi-manifest.ts";
 import { currentSessionOwnership, ownershipOf, type SessionOwnership } from "../session-ownership.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
+import { getExtensionTurnProvenanceCaller } from "../turn-provenance.ts";
 import type {
 	EntryRenderer,
 	Extension,
@@ -383,12 +384,12 @@ function createExtensionAPI(
 		// The harness names the caller here, so an extension cannot pass another extension's identity.
 		sendMessage(message, options): void {
 			assertActive();
-			runtime.sendMessage(message, options, extension);
+			runtime.sendMessage(message, options, getExtensionTurnProvenanceCaller(extension));
 		},
 
 		sendUserMessage(content, options): void {
 			assertActive();
-			runtime.sendUserMessage(content, options, extension);
+			runtime.sendUserMessage(content, options, getExtensionTurnProvenanceCaller(extension));
 		},
 
 		appendEntry(customType: string, data?: unknown): void {
@@ -423,7 +424,7 @@ function createExtensionAPI(
 
 		getAllTools() {
 			assertActive();
-			return runtime.getAllTools();
+			return runtime.getAllTools().map((tool) => ({ ...tool, sourceInfo: { ...tool.sourceInfo } }));
 		},
 
 		setActiveTools(toolNames: string[]): void {
@@ -433,7 +434,10 @@ function createExtensionAPI(
 
 		getCommands() {
 			assertActive();
-			return runtime.getCommands();
+			return runtime.getCommands().map((command) => ({
+				...command,
+				sourceInfo: command.sourceInfo ? { ...command.sourceInfo } : undefined,
+			}));
 		},
 
 		setModel(model) {
@@ -891,24 +895,26 @@ export async function discoverAndLoadExtensions(
 	const resolvedAgentDir = resolvePath(agentDir);
 	const allPaths: string[] = [];
 	const seen = new Set<string>();
+	const automaticScopes = new Map<string, "project" | "user">();
 
-	const addPaths = (paths: string[]) => {
+	const addPaths = (paths: string[], scope?: "project" | "user") => {
 		for (const p of paths) {
 			const resolved = path.resolve(p);
 			if (!seen.has(resolved)) {
 				seen.add(resolved);
 				allPaths.push(p);
+				if (scope) automaticScopes.set(resolved, scope);
 			}
 		}
 	};
 
 	// 1. Project-local extensions: cwd/${CONFIG_DIR_NAME}/extensions/
 	const localExtDir = path.join(resolvedCwd, CONFIG_DIR_NAME, "extensions");
-	addPaths(discoverExtensionsInDir(localExtDir));
+	addPaths(discoverExtensionsInDir(localExtDir), "project");
 
 	// 2. Global extensions: agentDir/extensions/
 	const globalExtDir = path.join(resolvedAgentDir, "extensions");
-	addPaths(discoverExtensionsInDir(globalExtDir));
+	addPaths(discoverExtensionsInDir(globalExtDir), "user");
 
 	// 3. Explicitly configured paths
 	for (const p of configuredPaths) {
@@ -928,5 +934,15 @@ export async function discoverAndLoadExtensions(
 		addPaths([resolved]);
 	}
 
-	return loadExtensions(allPaths, resolvedCwd, eventBus);
+	const result = await loadExtensions(allPaths, resolvedCwd, eventBus);
+	for (const extension of result.extensions) {
+		const scope = automaticScopes.get(extension.resolvedPath);
+		if (!scope) continue;
+		// First occurrence wins: explicit duplicates cannot promote automatic project discovery.
+		// Leave finalization to the host, after any further authoritative metadata assignment.
+		extension.sourceInfo = { ...extension.sourceInfo, scope };
+		for (const command of extension.commands.values()) command.sourceInfo = { ...extension.sourceInfo };
+		for (const tool of extension.tools.values()) tool.sourceInfo = { ...extension.sourceInfo };
+	}
+	return result;
 }

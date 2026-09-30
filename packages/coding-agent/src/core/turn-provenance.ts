@@ -76,7 +76,27 @@ export interface TurnProvenanceTrust {
 /** The calling extension, as the loader knows it (never supplied by the extension). */
 export interface TurnProvenanceCaller {
 	readonly resolvedPath: string;
-	readonly sourceInfo: SourceInfo;
+	readonly sourceInfo: Readonly<SourceInfo>;
+}
+
+// Admission descriptors are private, not the mutable metadata exposed by resource inspection.
+const extensionCallers = new WeakMap<TurnProvenanceCaller, TurnProvenanceCaller>();
+
+/** Host-only: finalize once, after the resource loader has assigned authoritative source metadata. */
+export function finalizeExtensionTurnProvenanceCaller(extension: TurnProvenanceCaller): void {
+	if (extensionCallers.has(extension)) return;
+	extensionCallers.set(
+		extension,
+		Object.freeze({
+			resolvedPath: extension.resolvedPath,
+			sourceInfo: Object.freeze({ ...extension.sourceInfo }),
+		}),
+	);
+}
+
+/** Host-only: an unfinalized extension has no admission identity and its claims fail closed. */
+export function getExtensionTurnProvenanceCaller(extension: TurnProvenanceCaller): TurnProvenanceCaller | undefined {
+	return extensionCallers.get(extension);
 }
 
 /** Herdr's answer for one submitted input: an attached client, signed in as `principal`. */

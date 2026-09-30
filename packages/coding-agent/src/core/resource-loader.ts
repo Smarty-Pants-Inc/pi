@@ -26,6 +26,7 @@ import type { Skill } from "./skills.ts";
 import { loadSkills } from "./skills.ts";
 import { createSourceInfo, type SourceInfo } from "./source-info.ts";
 import { resetTimings } from "./timings.ts";
+import { finalizeExtensionTurnProvenanceCaller } from "./turn-provenance.ts";
 
 export interface ResourceExtensionPaths {
 	skillPaths?: Array<{ path: string; metadata: PathMetadata }>;
@@ -490,12 +491,22 @@ export class DefaultResourceLoader implements ResourceLoader {
 		// Add CLI paths metadata
 		for (const r of cliExtensionPaths.extensions) {
 			if (!metadataByPath.has(r.path)) {
-				metadataByPath.set(r.path, { source: "cli", scope: "temporary", origin: "top-level" });
+				metadataByPath.set(
+					r.path,
+					r.metadata.origin === "package"
+						? r.metadata
+						: { ...r.metadata, source: "cli", scope: "temporary", origin: "top-level" },
+				);
 			}
 		}
 		for (const r of cliExtensionPaths.skills) {
 			if (!metadataByPath.has(r.path)) {
-				metadataByPath.set(r.path, { source: "cli", scope: "temporary", origin: "top-level" });
+				metadataByPath.set(
+					r.path,
+					r.metadata.origin === "package"
+						? r.metadata
+						: { ...r.metadata, source: "cli", scope: "temporary", origin: "top-level" },
+				);
 			}
 		}
 
@@ -813,11 +824,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 			extension.sourceInfo =
 				this.findSourceInfoForPath(extension.path, undefined, metadataByPath) ??
 				this.getDefaultSourceInfoForPath(extension.path);
+			finalizeExtensionTurnProvenanceCaller(extension);
 			for (const command of extension.commands.values()) {
-				command.sourceInfo = extension.sourceInfo;
+				command.sourceInfo = { ...extension.sourceInfo };
 			}
 			for (const tool of extension.tools.values()) {
-				tool.sourceInfo = extension.sourceInfo;
+				tool.sourceInfo = { ...extension.sourceInfo };
 			}
 		}
 	}

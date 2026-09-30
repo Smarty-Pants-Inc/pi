@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import { captureHostTurnReceipt, type PromptOptions } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -512,6 +513,9 @@ export async function runRpcMode(
 		}
 	};
 
+	// Harness-owned metadata is separate from parsed JSON; caller-supplied provenance is never read.
+	const commandReceipts = new WeakMap<RpcCommand, PromptOptions>();
+
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
 		const id = command.id;
@@ -527,6 +531,7 @@ export async function runRpcMode(
 				let preflightSucceeded = false;
 				void session
 					.prompt(command.message, {
+						...commandReceipts.get(command),
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
@@ -549,12 +554,12 @@ export async function runRpcMode(
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images, { source: "rpc" });
+				await session.steer(command.message, command.images, commandReceipts.get(command));
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images, { source: "rpc" });
+				await session.followUp(command.message, command.images, commandReceipts.get(command));
 				return success(id, "follow_up");
 			}
 
@@ -1182,6 +1187,9 @@ export async function runRpcMode(
 		}
 
 		const command = parsed as RpcCommand;
+		if (command?.type === "prompt" || command?.type === "steer" || command?.type === "follow_up") {
+			commandReceipts.set(command, captureHostTurnReceipt(session, command.message, "rpc"));
+		}
 
 		// Once bound, incoming commands may unblock pending startup work.
 		// Startup byte/count limits above still apply until that work settles.

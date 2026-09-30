@@ -150,9 +150,13 @@ import {
 } from "./turn-provenance.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 
-/** Module-private key: only this module can hand a resolved extension provenance to prompt(). */
+/** Module-private key: only harness code can retain resolved provenance across queue handoffs. */
 const RESOLVED_PROVENANCE = Symbol("resolvedTurnProvenance");
 type InternalPromptOptions = PromptOptions & { [RESOLVED_PROVENANCE]?: TurnProvenance };
+
+/** Harness-only host admission, deliberately absent from the package public index.
+ * The returned options retain the session's attested first receipt under a private symbol. */
+export let captureHostTurnReceipt: (session: AgentSession, text: string, source: InputSource) => PromptOptions;
 
 const appendOriginalCompaction = SessionManager.prototype.appendCompaction;
 const originalCompactionSessions = new WeakMap<
@@ -786,6 +790,7 @@ export class AgentSession {
 			const entryId = this._findPersistedMessageEntryId(result);
 			return entryId ? [entryId] : [];
 		});
+		const draftProvenance = new WeakMap<SessionBoundaryDraft, TurnProvenance>();
 		const boundary = await this._extensionRunner.emitBoundary(
 			{
 				type: "turn_end",
@@ -796,9 +801,9 @@ export class AgentSession {
 				toolResultEntryIds,
 				outcome: this._lastActivityOutcome,
 			},
-			(entries) => this._buildBoundaryContext(entries, "turn_end"),
+			(entries) => this._buildBoundaryContext(entries, "turn_end", draftProvenance),
 		);
-		this._commitBoundaryDrafts(boundary.entries);
+		this._commitBoundaryDrafts(boundary.entries, draftProvenance);
 		if (boundary.continue && !this._buildBoundaryContext([], "turn_end").canContinue) {
 			this._reportInvalidBoundaryContinuation("turn_end");
 			return false;
@@ -881,7 +886,11 @@ export class AgentSession {
 		this.agent.state.messages = projection.messages;
 	}
 
-	private _applyBoundaryDrafts(manager: SessionManager, drafts: SessionBoundaryDraft[]): SessionEntry[] {
+	private _applyBoundaryDrafts(
+		manager: SessionManager,
+		drafts: SessionBoundaryDraft[],
+		draftProvenance: WeakMap<SessionBoundaryDraft, TurnProvenance>,
+	): SessionEntry[] {
 		const appended: SessionEntry[] = [];
 		for (const draft of drafts) {
 			let entryId: string;
@@ -895,6 +904,7 @@ export class AgentSession {
 						draft.content,
 						draft.display,
 						draft.details,
+						draftProvenance.get(draft),
 					);
 					break;
 				case "context_edit":
@@ -922,11 +932,14 @@ export class AgentSession {
 		return appended;
 	}
 
-	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
+	private _createBoundaryPreviewManager(
+		drafts: SessionBoundaryDraft[],
+		draftProvenance: WeakMap<SessionBoundaryDraft, TurnProvenance>,
+	): SessionManager {
 		const header = this.sessionManager.getHeader();
 		if (!header) throw new Error("Session header is missing");
 		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
-		this._applyBoundaryDrafts(manager, drafts);
+		this._applyBoundaryDrafts(manager, drafts, draftProvenance);
 		return manager;
 	}
 
@@ -937,8 +950,16 @@ export class AgentSession {
 	private _buildBoundaryContext(
 		drafts: SessionBoundaryDraft[],
 		boundary: "turn_end" | "agent_before_settle",
+		draftProvenance = new WeakMap<SessionBoundaryDraft, TurnProvenance>(),
 	): BoundaryContextPreview {
-		const projection = this._createBoundaryPreviewManager(drafts).buildSessionProjection();
+		// The runner calls this immediately after each hook result. Stamp new drafts once,
+		// ignoring returned claims, and retain the record through previews and final append.
+		for (const draft of drafts) {
+			if (draft.type === "custom_message" && !draftProvenance.has(draft)) {
+				draftProvenance.set(draft, resolveExtensionTurnProvenance(undefined, undefined, undefined));
+			}
+		}
+		const projection = this._createBoundaryPreviewManager(drafts, draftProvenance).buildSessionProjection();
 		const pendingMessages = this._getPendingBoundaryMessages();
 		const llmMessages = convertToLlm(projection.messages);
 		const finalRole = llmMessages[llmMessages.length - 1]?.role;
@@ -959,8 +980,11 @@ export class AgentSession {
 		};
 	}
 
-	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[]): void {
-		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts);
+	private _commitBoundaryDrafts(
+		drafts: SessionBoundaryDraft[],
+		draftProvenance: WeakMap<SessionBoundaryDraft, TurnProvenance>,
+	): void {
+		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts, draftProvenance);
 		this._refreshFinalizedContext();
 		for (const entry of appended) this._emit({ type: "entry_appended", entry });
 	}
@@ -1884,11 +1908,12 @@ export class AgentSession {
 		this._isBeforeSettle = true;
 		this._abortDuringBeforeSettle = false;
 		try {
+			const draftProvenance = new WeakMap<SessionBoundaryDraft, TurnProvenance>();
 			const result = await this._extensionRunner.emitBoundary(
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
-				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
+				(entries) => this._buildBoundaryContext(entries, "agent_before_settle", draftProvenance),
 			);
-			this._commitBoundaryDrafts(result.entries);
+			this._commitBoundaryDrafts(result.entries, draftProvenance);
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
 			if (this._abortDuringBeforeSettle) return false;
@@ -2125,11 +2150,20 @@ export class AgentSession {
 			// Emit before_agent_start before normalizing images so extension-driven model
 			// selection determines the resize profile used for the request and history.
 			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+			const hookReceipts: TurnProvenance[] = [];
 			const result = await this._extensionRunner.emitBeforeAgentStart(
 				expandedText,
 				currentImages,
 				this._baseSystemPromptOptions,
+				() => {
+					// Hook results are not claims. Stamp each receipt before the next handler can await.
+					hookReceipts.push(resolveExtensionTurnProvenance(undefined, undefined, undefined));
+				},
 			);
+			const hookMessages = result.messages.map((message, index) => ({
+				message,
+				provenance: hookReceipts[index],
+			}));
 			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 			// which updates the live loadout instead. An explicit edit wins; otherwise the live
 			// loadout is authoritative, so a setActiveTools() call is not undone here.
@@ -2156,8 +2190,8 @@ export class AgentSession {
 			}
 			this._pendingNextTurnMessages = [];
 
-			for (const msg of result.messages) {
-				messages.push({
+			for (const { message: msg, provenance: hookProvenance } of hookMessages) {
+				const message: CustomMessage = {
 					role: "custom",
 					customType: msg.customType,
 					// Untyped extensions can pass null/missing content; normalize at ingestion.
@@ -2165,7 +2199,9 @@ export class AgentSession {
 					display: msg.display,
 					details: msg.details,
 					timestamp: Date.now(),
-				});
+				};
+				this.#turnProvenance.set(message, hookProvenance);
+				messages.push(message);
 			}
 			const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
 			this._runSystemPromptOptions = result.systemPromptOptions;
@@ -2308,11 +2344,21 @@ export class AgentSession {
 		}
 	}
 
+	static {
+		captureHostTurnReceipt = (session, text, source) => {
+			const options: InternalPromptOptions = {
+				source,
+				[RESOLVED_PROVENANCE]: session._turnProvenanceFor(text, { source }),
+			};
+			return options;
+		};
+	}
+
 	/**
-	 * The harness-written provenance of a prompt, steer or follow-up, stamped at receipt. Only
-	 * sendUserMessage() supplies resolved extension provenance; prompt() retains the record under the same
-	 * module-private key before deferral. Host input is `terminal`, unless it came from the interactive editor
-	 * and herdr attests an attached client.
+	 * The harness-written provenance of a prompt, steer or follow-up, stamped at receipt.
+	 * Extension delivery and host admission retain the record under the same module-private key
+	 * before staging or deferral. Host input is `terminal`, unless it came from the interactive
+	 * editor and herdr attests an attached client.
 	 */
 	private _turnProvenanceFor(text: string, options: InternalPromptOptions | undefined): TurnProvenance {
 		const resolved = options?.[RESOLVED_PROVENANCE];
@@ -2325,9 +2371,9 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
-		source: InputSource,
+		options: { source?: InputSource } | undefined,
 	): Promise<void> {
-		const provenance = this._turnProvenanceFor(text, { source });
+		const provenance = this._turnProvenanceFor(text, options);
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
 		if (this.#ordinaryOwner) {
@@ -2335,7 +2381,7 @@ export class AgentSession {
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source, provenance);
+			await this._prepareQueuedInput(text, images, behavior, options?.source ?? "interactive", provenance);
 		} finally {
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
@@ -2383,7 +2429,7 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+		await this._queueUserInput(text, images, "steer", options);
 	}
 
 	/**
@@ -2395,7 +2441,7 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		await this._queueUserInput(text, images, "followUp", options);
 	}
 
 	/**
