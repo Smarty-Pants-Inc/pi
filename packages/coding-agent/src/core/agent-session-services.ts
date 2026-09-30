@@ -137,6 +137,47 @@ function applyExtensionFlagValues(
 }
 
 /**
+ * @internal Install loader registrations in dependency order before model selection.
+ * Services consume failures as diagnostics; direct SDK callers retain them for runner reporting.
+ * Ordinary-owner callers must not enter this extensible bootstrap.
+ */
+export async function bootstrapExtensionModels(
+	modelRuntime: ModelRuntime,
+	resourceLoader: ResourceLoader,
+	diagnostics?: AgentSessionRuntimeDiagnostic[],
+): Promise<ReadonlySet<string>> {
+	const runtime = resourceLoader.getExtensions().runtime;
+	const installedProviderIds = new Set<string>();
+	const register = <T extends { extensionPath: string }>(registrations: T[], apply: (registration: T) => void): T[] =>
+		registrations.filter((registration) => {
+			try {
+				apply(registration);
+				return false;
+			} catch (error) {
+				if (!diagnostics) return true;
+				const message = error instanceof Error ? error.message : String(error);
+				diagnostics.push({ type: "error", message: `Extension "${registration.extensionPath}" error: ${message}` });
+				return false;
+			}
+		});
+	runtime.pendingProviderRegistrations = register(runtime.pendingProviderRegistrations, ({ name, config }) => {
+		modelRuntime.registerProvider(name, config);
+		installedProviderIds.add(name);
+	});
+	runtime.pendingNativeProviderRegistrations = register(runtime.pendingNativeProviderRegistrations, ({ provider }) => {
+		modelRuntime.registerNativeProvider(provider);
+		installedProviderIds.add(provider.id);
+	});
+	runtime.pendingVirtualModelRegistrations = register(runtime.pendingVirtualModelRegistrations, ({ definition }) =>
+		modelRuntime.registerVirtualModel(definition),
+	);
+	// Native registration and auth checks update availability asynchronously. Join the final
+	// offline pass before restore instead of relying on provisional registration snapshots.
+	await modelRuntime.refresh({ allowNetwork: false });
+	return installedProviderIds;
+}
+
+/**
  * Create cwd-bound runtime services.
  *
  * Returns services plus diagnostics. It does not create an AgentSession.
@@ -179,44 +220,7 @@ export async function createAgentSessionServices(
 	if (!owner) await resourceLoader.reload(options.resourceLoaderReloadOptions);
 
 	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
-	const extensionsResult = resourceLoader.getExtensions();
-	for (const { name, config, extensionPath } of extensionsResult.runtime.pendingProviderRegistrations) {
-		try {
-			modelRuntime.registerProvider(name, config);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
-		}
-	}
-	extensionsResult.runtime.pendingProviderRegistrations = [];
-	for (const { provider, extensionPath } of extensionsResult.runtime.pendingNativeProviderRegistrations) {
-		try {
-			modelRuntime.registerNativeProvider(provider);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
-		}
-	}
-	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
-	for (const { definition, extensionPath } of extensionsResult.runtime.pendingVirtualModelRegistrations) {
-		try {
-			modelRuntime.registerVirtualModel(definition);
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			diagnostics.push({
-				type: "error",
-				message: `Extension "${extensionPath}" error: ${message}`,
-			});
-		}
-	}
-	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
-	if (!owner) await modelRuntime.refresh({ allowNetwork: false });
+	if (!owner) await bootstrapExtensionModels(modelRuntime, resourceLoader, diagnostics);
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
 	const services: AgentSessionServices = {

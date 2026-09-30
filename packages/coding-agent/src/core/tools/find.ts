@@ -75,6 +75,7 @@ export function createFindToolDefinition(
 	return {
 		name: "find",
 		label: "find",
+		executionKind: "effect",
 		description: `Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to ${DEFAULT_LIMIT} results or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first).`,
 		promptSnippet: findToolSystemPromptContribution.snippet,
 		parameters: findSchema,
@@ -100,10 +101,8 @@ export function createFindToolDefinition(
 					stopChild = undefined;
 					fn();
 				};
-				const onAbort = () => {
-					stopChild?.();
-					settle(() => reject(new Error("Operation aborted")));
-				};
+				// #2241: request termination, but join the accepted backend/child before retirement.
+				const onAbort = () => stopChild?.();
 				signal?.addEventListener("abort", onAbort, { once: true });
 
 				(async () => {
@@ -114,12 +113,13 @@ export function createFindToolDefinition(
 
 						// If custom operations provide glob(), use that instead of fd.
 						if (customOps?.glob) {
-							if (!(await ops.exists(searchPath))) {
-								settle(() => reject(new Error(`Path not found: ${searchPath}`)));
-								return;
-							}
+							const exists = await ops.exists(searchPath);
 							if (signal?.aborted) {
 								settle(() => reject(new Error("Operation aborted")));
+								return;
+							}
+							if (!exists) {
+								settle(() => reject(new Error(`Path not found: ${searchPath}`)));
 								return;
 							}
 							const results = await ops.glob(pattern, searchPath, {
@@ -187,7 +187,12 @@ export function createFindToolDefinition(
 						// https://github.com/earendil-works/pi/issues/5960
 						let insideGitRepo = false;
 						for (let current = searchPath; ; ) {
-							if (await pathExists(path.join(current, ".git"))) {
+							const exists = await pathExists(path.join(current, ".git"));
+							if (signal?.aborted) {
+								settle(() => reject(new Error("Operation aborted")));
+								return;
+							}
+							if (exists) {
 								insideGitRepo = true;
 								break;
 							}
@@ -217,6 +222,7 @@ export function createFindToolDefinition(
 						const rl = createInterface({ input: child.stdout });
 						let stderr = "";
 						const lines: string[] = [];
+						let childError: Error | undefined;
 
 						stopChild = () => {
 							if (!child.killed) {
@@ -233,18 +239,21 @@ export function createFindToolDefinition(
 						});
 
 						rl.on("line", (line) => {
-							lines.push(line);
+							if (!signal?.aborted) lines.push(line);
 						});
 
 						child.on("error", (error) => {
-							cleanup();
-							settle(() => reject(new Error(`Failed to run fd: ${error.message}`)));
+							childError = new Error(`Failed to run fd: ${error.message}`);
 						});
 
 						child.on("close", (code) => {
 							cleanup();
 							if (signal?.aborted) {
 								settle(() => reject(new Error("Operation aborted")));
+								return;
+							}
+							if (childError) {
+								settle(() => reject(childError));
 								return;
 							}
 							const output = lines.join("\n");

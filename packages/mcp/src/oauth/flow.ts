@@ -13,11 +13,13 @@ import {
 	selectResource,
 } from "./discovery.ts";
 import {
+	isOAuthNetworkBoundaryError,
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
 	OAuthInsecureEndpointError,
 	OAuthRegistrationError,
 } from "./errors.ts";
+import { type OAuthNetworkOptions, oauthDiagnostic, withOAuthNetwork } from "./response.ts";
 import {
 	type AuthorizationServerMetadata,
 	type OAuthClientInformation,
@@ -40,6 +42,8 @@ export type AddClientAuthentication = (
 ) => void | Promise<void>;
 
 export interface OAuthClientProvider {
+	/** Owner cancellation for this provider/attempt; combined with per-call cancellation. */
+	readonly signal?: AbortSignal;
 	readonly redirectUrl: string | URL;
 	readonly clientMetadata: OAuthClientMetadata;
 	readonly clientMetadataUrl?: string;
@@ -57,7 +61,7 @@ export interface OAuthClientProvider {
 	discoveryState?(): OAuthDiscoveryState | undefined | Promise<OAuthDiscoveryState | undefined>;
 }
 
-export interface OAuthFlowOptions {
+export interface OAuthFlowOptions extends OAuthNetworkOptions {
 	serverUrl: string | URL;
 	authorizationCode?: string;
 	scope?: string;
@@ -74,7 +78,7 @@ export interface OAuthFlowOptions {
 export type OAuthFlowResult = "AUTHORIZED" | "REDIRECT";
 type ClientAuthMethod = "client_secret_basic" | "client_secret_post" | "none";
 
-export interface TokenRequestOptions {
+export interface TokenRequestOptions extends OAuthNetworkOptions {
 	metadata?: AuthorizationServerMetadata;
 	clientInformation: OAuthClientInformationMixed;
 	resource?: string;
@@ -178,36 +182,38 @@ async function tokenRequest(
 		);
 	}
 	// Token bodies contain grant credentials. Never resend them to a redirected endpoint.
-	const response = await (options.fetch ?? globalThis.fetch)(url, {
-		method: "POST",
-		headers,
-		body: params,
-		redirect: "manual",
+	return withOAuthNetwork(options, async (operation) => {
+		const response = await operation.fetch(url, {
+			method: "POST",
+			headers,
+			body: params,
+			redirect: "manual",
+		});
+		if (response.status >= 300 && response.status < 400) {
+			operation.discard(response);
+			throw new OAuthError("invalid_request", "OAuth token endpoint redirects are not allowed");
+		}
+		const text = await operation.text(response);
+		let value: unknown;
+		try {
+			value = JSON.parse(text);
+		} catch {}
+		// Servers may report OAuth errors with any status, so check the body before the status.
+		if (isObject(value) && typeof value.error === "string") {
+			throw new OAuthError(
+				value.error,
+				oauthDiagnostic(typeof value.error_description === "string" ? value.error_description : value.error),
+				typeof value.error_uri === "string" ? oauthDiagnostic(value.error_uri) : undefined,
+			);
+		}
+		if (!response.ok) throw new OAuthError("server_error", `HTTP ${response.status}: ${oauthDiagnostic(text)}`);
+		return parseOAuthTokens(value);
 	});
-	if (response.status >= 300 && response.status < 400) {
-		await response.body?.cancel();
-		throw new OAuthError("invalid_request", "OAuth token endpoint redirects are not allowed");
-	}
-	const text = await response.text();
-	let value: unknown;
-	try {
-		value = JSON.parse(text);
-	} catch {}
-	// Servers may report OAuth errors with any status, so check the body before the status.
-	if (isObject(value) && typeof value.error === "string") {
-		throw new OAuthError(
-			value.error,
-			typeof value.error_description === "string" ? value.error_description : value.error,
-			typeof value.error_uri === "string" ? value.error_uri : undefined,
-		);
-	}
-	if (!response.ok) throw new OAuthError("server_error", `HTTP ${response.status}: ${text}`);
-	return parseOAuthTokens(value);
 }
 
 export async function registerClient(
 	authorizationServerUrl: string | URL,
-	options: {
+	options: OAuthNetworkOptions & {
 		metadata?: AuthorizationServerMetadata;
 		clientMetadata: OAuthClientMetadata;
 		scope?: string;
@@ -217,16 +223,17 @@ export async function registerClient(
 	const endpoint = options.metadata?.registration_endpoint;
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
-	const response = await (options.fetch ?? globalThis.fetch)(
-		validateOAuthUrl(endpoint ?? new URL("/register", authorizationServerUrl)),
-		{
+	const url = validateOAuthUrl(endpoint ?? new URL("/register", authorizationServerUrl));
+	return withOAuthNetwork(options, async (operation) => {
+		const response = await operation.fetch(url, {
 			method: "POST",
 			headers: { Accept: "application/json", "content-type": "application/json" },
 			body: JSON.stringify({ ...options.clientMetadata, ...(options.scope ? { scope: options.scope } : {}) }),
-		},
-	);
-	if (!response.ok) throw new OAuthRegistrationError(response.status, await response.text());
-	return parseClientInformation(await response.json());
+		});
+		const text = await operation.text(response);
+		if (!response.ok) throw new OAuthRegistrationError(response.status, oauthDiagnostic(text));
+		return parseClientInformation(JSON.parse(text));
+	});
 }
 
 export async function exchangeAuthorizationCode(
@@ -267,6 +274,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 					? parseAuthorizationServerMetadata(cached.authorizationServerMetadata)
 					: await discoverAuthorizationServerMetadata(cached.authorizationServerUrl, {
 							fetch: options.fetch,
+							signal: options.signal,
+							networkTimeoutMs: options.networkTimeoutMs,
 							skipIssuerValidation: options.skipIssuerValidation,
 						}),
 				resourceMetadata: cached.resourceMetadata,
@@ -274,6 +283,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		: await discoverOAuthServerInfo(options.serverUrl, {
 				resourceMetadataUrl: options.resourceMetadataUrl,
 				fetch: options.fetch,
+				signal: options.signal,
+				networkTimeoutMs: options.networkTimeoutMs,
 				skipIssuerValidation: options.skipIssuerValidation,
 			});
 	await provider.saveDiscoveryState?.({
@@ -299,6 +310,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 				clientMetadata: provider.clientMetadata,
 				scope,
 				fetch: options.fetch,
+				signal: options.signal,
+				networkTimeoutMs: options.networkTimeoutMs,
 			});
 			await provider.saveClientInformation(client);
 		}
@@ -309,6 +322,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		resource,
 		addClientAuthentication: provider.addClientAuthentication,
 		fetch: options.fetch,
+		signal: options.signal,
+		networkTimeoutMs: options.networkTimeoutMs,
 	};
 	if (options.authorizationCode) {
 		const tokens = await exchangeAuthorizationCode(discovered.authorizationServerUrl, {
@@ -330,7 +345,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 			await provider.saveTokens(tokens);
 			return "AUTHORIZED";
 		} catch (error) {
-			if (error instanceof OAuthInsecureEndpointError) throw error;
+			if (error instanceof OAuthInsecureEndpointError || isOAuthNetworkBoundaryError(error)) throw error;
 			if (error instanceof OAuthError && error.code !== "server_error") throw error;
 		}
 	}
@@ -349,6 +364,14 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 }
 
 export async function authorizeMcp(provider: OAuthClientProvider, options: OAuthFlowOptions): Promise<OAuthFlowResult> {
+	options = {
+		...options,
+		signal: provider.signal
+			? options.signal
+				? AbortSignal.any([provider.signal, options.signal])
+				: provider.signal
+			: options.signal,
+	};
 	try {
 		return await runFlow(provider, options);
 	} catch (error) {
@@ -370,7 +393,7 @@ export async function authorizeMcp(provider: OAuthClientProvider, options: OAuth
  * one refresh, and a request whose token was already replaced is just retried: with rotating refresh
  * tokens, a second refresh with the old refresh token would fail and discard the new grant.
  */
-export function adaptOAuthProvider(provider: OAuthClientProvider): AuthProvider {
+export function adaptOAuthProvider(provider: OAuthClientProvider, options: OAuthNetworkOptions = {}): AuthProvider {
 	let inFlight: Promise<void> | undefined;
 	return {
 		token: async () => (await provider.tokens())?.access_token,
@@ -382,6 +405,7 @@ export function adaptOAuthProvider(provider: OAuthClientProvider): AuthProvider 
 				if (current !== undefined && current !== context.token) return;
 			}
 			inFlight ??= authorizeMcp(provider, {
+				...options,
 				serverUrl: context.serverUrl,
 				resourceMetadataUrl: challenge.resourceMetadataUrl,
 				scope: challenge.scope,

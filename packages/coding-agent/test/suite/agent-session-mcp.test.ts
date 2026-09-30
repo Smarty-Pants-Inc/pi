@@ -43,7 +43,12 @@ const SERVER_TOOLS = [
 ];
 
 /** Minimal MCP server over an in-memory transport. Records the tool calls it receives. */
-function createFakeServer(calls: string[], listTools: () => unknown[] = () => SERVER_TOOLS, resources = false) {
+function createFakeServer(
+	calls: string[],
+	listTools: () => unknown[] = () => SERVER_TOOLS,
+	resources = false,
+	discovery?: { entered: () => void; gate: Promise<void> },
+) {
 	const pair = createInMemoryTransportPair();
 	const respond = (request: JsonRpcRequest): unknown => {
 		switch (request.method) {
@@ -93,8 +98,12 @@ function createFakeServer(calls: string[], listTools: () => unknown[] = () => SE
 	pair.server.onMessage((message) => {
 		if (!("id" in message) || !("method" in message)) return;
 		const request = message as JsonRpcRequest;
-		queueMicrotask(() => {
-			void pair.server.send({ jsonrpc: "2.0", id: request.id, result: respond(request) });
+		queueMicrotask(async () => {
+			if (request.method === "tools/list" && discovery) {
+				discovery.entered();
+				await discovery.gate;
+			}
+			await pair.server.send({ jsonrpc: "2.0", id: request.id, result: respond(request) });
 		});
 	});
 	return pair;
@@ -171,8 +180,77 @@ describe("AgentSession MCP integration", () => {
 		return harness.session.getCallableToolNames();
 	}
 
+	// smarty-dev#2241: bounded first-prompt startup is not a readiness guarantee.
+	it("joins public MCP readiness after the startup wait expires during discovery", async () => {
+		const listed = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const calls: string[] = [];
+		const pair = createFakeServer(calls, undefined, false, { entered: listed.resolve, gate: release.promise });
+		const harness = await createHarness({
+			initialActiveToolNames: [],
+			extensionFactories: [
+				createCodemodeExtension(),
+				createMcpExtension({
+					loadConfig: () => ({
+						servers: [
+							{ name: "docs", source: "test", config: { url: "http://unused.invalid", exposure: "codemode" } },
+						],
+						errors: [],
+					}),
+					startupWaitMs: 0,
+					createTransport: () => {
+						void pair.server.start();
+						return pair.client;
+					},
+				}),
+			],
+		});
+		harnesses.push(harness);
+		try {
+			await harness.session.bindExtensions({});
+			await listed.promise;
+			harness.setResponses([
+				fauxAssistantMessage(
+					[fauxToolCall("codemode", { code: 'return await tools.mcp__docs__search({ query: "ready" });' })],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("done"),
+			]);
+			await harness.session.prompt("before discovery completes");
+			expect(harness.session.getActiveToolNames()).toEqual([]);
+			expect(getMessageText(toolResult(harness, "codemode"))).toBe(
+				"Tool codemode not found. No tools are available in this session.",
+			);
+			expect(calls).toEqual([]);
+		} finally {
+			release.resolve();
+			// The public status command joins startup, rather than racing its prompt deadline.
+			await harness.session.prompt("/mcp");
+		}
+		expect(harness.session.getActiveToolNames()).toEqual(["codemode"]);
+		expect(harness.session.getCallableToolNames()).toContain("mcp__docs__search");
+		harness.setResponses([
+			fauxAssistantMessage(
+				[
+					fauxToolCall("codemode", {
+						code: 'return (await tools.mcp__docs__search({ query: "ready" })).structuredContent;',
+					}),
+				],
+				{ stopReason: "toolUse" },
+			),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("after public readiness");
+		expect(toolResult(harness, "codemode").isError).toBe(false);
+		expect(getMessageText(toolResult(harness, "codemode"))).toContain('"ready guide"');
+		expect(declaredToolNames(harness)).toEqual(["codemode"]);
+		expect(calls).toEqual(['search:{"query":"ready"}']);
+	});
+
 	it("exposes codemode-only MCP tools through codemode and hides them from the model", async () => {
 		const { harness, calls } = await setup("codemode");
+		// Public /mcp completion joins discovery AND codemode activation, even on a loaded host.
+		await harness.session.prompt("/mcp");
 		const searchName = createMcpToolName("docs", "search");
 		// MCP tools resolve to their CallToolResult, errors included.
 		harness.setResponses([

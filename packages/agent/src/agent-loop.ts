@@ -634,9 +634,31 @@ async function executeToolCallsParallel(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	// Keep a sentinel object so undefined is also a retained first failure.
+	let pipelineFailure: { error: unknown } | undefined;
+	const recordPipelineFailure = (error: unknown) => {
+		pipelineFailure ??= { error };
+	};
+	// Observe every asynchronous sink rejection at the same boundary, before
+	// native entry unwinding or accepted-update draining can reorder failures.
+	// Invoke the sink synchronously: update sink throws remain callback errors,
+	// while synchronous native event failures are pipeline failures.
+	const emitBatchEvent: AgentEventSink = (event, sourceMessage) => {
+		let delivery: Promise<void> | void;
+		try {
+			delivery = emit(event, sourceMessage);
+		} catch (error) {
+			if (event.type !== "tool_execution_update") recordPipelineFailure(error);
+			throw error;
+		}
+		return Promise.resolve(delivery).catch((error: unknown) => {
+			recordPipelineFailure(error);
+			throw error;
+		});
+	};
 
 	for (const toolCall of toolCalls) {
-		await emit({
+		await emitBatchEvent({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
@@ -650,7 +672,7 @@ async function executeToolCallsParallel(
 				result: preparation.result,
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
-			await emitToolExecutionEnd(finalized, emit);
+			await emitToolExecutionEnd(finalized, emitBatchEvent);
 			finalizedCalls.push(finalized);
 			if (signal?.aborted) {
 				break;
@@ -665,10 +687,14 @@ async function executeToolCallsParallel(
 					result: createErrorToolResult("Operation aborted"),
 					isError: true,
 				} satisfies FinalizedToolCallOutcome;
-				await emitToolExecutionEnd(finalized, emit);
+				await emitToolExecutionEnd(finalized, emitBatchEvent);
 				return finalized;
 			}
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				preparation,
+				signal,
+				emitToolExecutionUpdate(toolCall, emitBatchEvent),
+			);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -677,7 +703,7 @@ async function executeToolCallsParallel(
 				config,
 				signal,
 			);
-			await emitToolExecutionEnd(finalized, emit);
+			await emitToolExecutionEnd(finalized, emitBatchEvent);
 			return finalized;
 		});
 		if (signal?.aborted) {
@@ -685,13 +711,26 @@ async function executeToolCallsParallel(
 		}
 	}
 
-	const orderedFinalizedCalls = await Promise.all(
-		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	const startedCalls = finalizedCalls.map((entry) =>
+		(typeof entry === "function" ? entry() : Promise.resolve(entry)).catch((error: unknown) => {
+			recordPipelineFailure(error);
+			throw error;
+		}),
 	);
+	let orderedFinalizedCalls: FinalizedToolCallOutcome[];
+	try {
+		orderedFinalizedCalls = await Promise.all(startedCalls);
+	} catch (error) {
+		// An event/pipeline failure must not retire the run while started siblings
+		// still own effects, accepted children, or hooks. Preserve the first observed
+		// pipeline failure, not whichever drained entry happens to reject first.
+		await Promise.allSettled(startedCalls);
+		throw pipelineFailure ? pipelineFailure.error : error;
+	}
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
+		await emitToolResultMessage(toolResultMessage, emitBatchEvent);
 		messages.push(toolResultMessage);
 	}
 
@@ -876,7 +915,9 @@ async function executePreparedToolCall(
 	onUpdate: ToolUpdateSink,
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
+	let updateFailure: { error: unknown } | undefined;
 	let acceptingUpdates = true;
+	let execution: { outcome: ExecutedToolCallOutcome } | { error: unknown };
 
 	try {
 		const result = await prepared.tool.execute(
@@ -885,22 +926,34 @@ async function executePreparedToolCall(
 			signal,
 			(partialResult) => {
 				if (!acceptingUpdates) return;
-				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+				// Observe rejections immediately, even while the callback is still running.
+				// These non-rejecting joins drain every accepted delivery and retain the
+				// first failure by arrival, including a rejection with undefined.
+				updateEvents.push(
+					Promise.resolve(onUpdate(partialResult)).catch((error: unknown) => {
+						updateFailure ??= { error };
+					}),
+				);
 			},
 		);
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return { result, isError: result.isError === true };
+		execution = { outcome: { result, isError: result.isError === true } };
 	} catch (error) {
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return {
-			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
-			isError: true,
-		};
+		execution = { error };
 	} finally {
 		acceptingUpdates = false;
 	}
+
+	await Promise.all(updateEvents);
+	// Asynchronous event-pipeline failures propagate only after the drain. A
+	// synchronous sink throw still follows ordinary callback-error normalization.
+	if (updateFailure) throw updateFailure.error;
+	if ("outcome" in execution) return execution.outcome;
+	return {
+		result: createErrorToolResult(
+			execution.error instanceof Error ? execution.error.message : String(execution.error),
+		),
+		isError: true,
+	};
 }
 
 async function finalizeExecutedToolCall(

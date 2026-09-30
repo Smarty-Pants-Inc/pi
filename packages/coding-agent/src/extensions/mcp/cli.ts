@@ -15,6 +15,7 @@ import { ProjectTrustStore } from "../../core/trust-manager.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import {
 	addMcpServerConfig,
+	getMcpProjectConfigWarnings,
 	getMcpToolExposure,
 	type LoadedMcpConfig,
 	loadMcpConfig,
@@ -194,7 +195,7 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 			: remove(rest, projectConfig, options, log, error);
 	}
 	const projectTrusted = new ProjectTrustStore(options.agentDir).get(options.cwd) === true;
-	const loaded = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted });
+	const loaded = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted, onWarning: error });
 	const untrustedNote =
 		!projectTrusted && existsSync(projectConfig)
 			? `${projectConfig} is ignored because the project is not trusted. Start ${APP_NAME} in the project to trust it.`
@@ -364,6 +365,7 @@ function add(
 		return 1;
 	}
 	log(`${replaced ? "Replaced" : "Added"} ${scope} MCP server "${name}" in ${path}.`);
+	for (const warning of getMcpProjectConfigWarnings({ name, config: validated, source: path, scope })) error(warning);
 	if (project && new ProjectTrustStore(options.agentDir).get(options.cwd) !== true) {
 		log(`The project is not trusted, so ${path} is ignored until you start ${APP_NAME} in the project and trust it.`);
 	}
@@ -406,9 +408,12 @@ function remove(
 		log(`Removed ${scope} MCP server "${name}" from ${path}.`);
 		return 0;
 	}
-	const other = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted: true }).servers.find(
-		(server) => server.name === name && server.scope !== scope,
-	);
+	const other = loadMcpConfig({
+		agentDir: options.agentDir,
+		cwd: options.cwd,
+		projectTrusted: true,
+		onWarning: error,
+	}).servers.find((server) => server.name === name && server.scope !== scope);
 	error(
 		`No ${scope} MCP server named "${name}" in ${path}.${other ? ` It is defined in ${other.source}${other.scope === "project" ? "; use --local" : "; omit --local"}.` : ""}`,
 	);

@@ -3,8 +3,7 @@
  * execute.lazy.ts so the sandbox runtime only loads when a script runs.
  */
 
-import { randomBytes } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool, AgentToolCallOutcome, AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -157,11 +156,15 @@ function formatError(result: Extract<CodemodeResult, { ok: false }>, calls: read
 
 /** Write the full text output to a temp file, like bash does for truncated output. */
 async function spillOutput(text: string): Promise<{ path: string } | { error: string }> {
-	const path = join(tmpdir(), `pi-codemode-${randomBytes(8).toString("hex")}.txt`);
+	let directory: string | undefined;
 	try {
-		await writeFile(path, text);
+		// mkdtemp creates a unique 0700 directory; never change the shared temp parent's mode.
+		directory = await mkdtemp(join(tmpdir(), "pi-codemode-"));
+		const path = join(directory, "output.txt");
+		await writeFile(path, text, { flag: "wx", mode: 0o600 });
 		return { path };
 	} catch (error) {
+		if (directory) await rm(directory, { recursive: true, force: true }).catch(() => {});
 		return { error: error instanceof Error ? error.message : String(error) };
 	}
 }

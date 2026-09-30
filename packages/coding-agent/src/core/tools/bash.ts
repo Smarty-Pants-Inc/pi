@@ -82,7 +82,8 @@ export interface BashOperations {
 	 * @param cwd Working directory
 	 * @param options Execution options
 	 * @returns Promise resolving to the exit code. Report signal terminations as 128 + signal number;
-	 * a null exit code is treated as a failed command.
+	 * a null exit code is treated as a failed command. Cancellation must not settle this
+	 * promise until accepted backend work and process termination have been joined.
 	 */
 	exec: (
 		command: string,
@@ -111,6 +112,8 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 				throw new Error(`Working directory does not exist: ${cwd}\nCannot execute ${shellName} commands.`);
 			}
 
+			// #2241: cancellation during the accepted cwd check must fence process creation.
+			if (signal?.aborted) throw new Error("aborted");
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
 			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
 				cwd,
@@ -255,6 +258,8 @@ export function createShellToolDefinition(
 	return {
 		name: config.name,
 		label: config.label,
+		// Fork-only effect admission also covers PowerShell through this shared factory (#2241).
+		executionKind: "effect",
 		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
@@ -268,6 +273,7 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
+			if (signal?.aborted) throw new Error("Command aborted");
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(
 				resolvedCommand,
@@ -323,7 +329,7 @@ export function createShellToolDefinition(
 			}
 
 			const handleData = (data: Buffer) => {
-				if (!acceptingOutput) return;
+				if (!acceptingOutput || signal?.aborted) return;
 				output.append(data);
 				scheduleOutputUpdate();
 			};
@@ -364,17 +370,21 @@ export function createShellToolDefinition(
 			try {
 				let exitCode: number | null;
 				try {
+					if (signal?.aborted) throw new Error("aborted");
 					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
 						onData: handleData,
 						signal,
 						timeout,
 						env: spawnContext.env,
 					});
+					// Custom backends may finish normally after cancellation; retain the join,
+					// but do not publish success or start another output read (#2241).
+					if (signal?.aborted) throw new Error("aborted");
 					exitCode = result.exitCode;
 				} catch (err) {
 					const snapshot = await finishOutput();
 					const { text } = formatOutput(snapshot, "");
-					if (err instanceof Error && err.message === "aborted") {
+					if (signal?.aborted || (err instanceof Error && err.message === "aborted")) {
 						throw new Error(appendStatus(text, "Command aborted"));
 					}
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
@@ -385,12 +395,14 @@ export function createShellToolDefinition(
 				}
 
 				const snapshot = await finishOutput();
+				if (signal?.aborted) throw new Error("Command aborted");
 				const { text: outputText, details } = formatOutput(snapshot);
 				if (exitCode === null) {
 					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
 				}
 				const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
 				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
+				if (signal?.aborted) throw new Error("Command aborted");
 				const structuredContent: BashToolOutput = {
 					output: fullOutput.content,
 					truncated: fullOutput.truncated,

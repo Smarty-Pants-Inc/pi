@@ -34,6 +34,11 @@ import type {
 	ExtensionFactory,
 	ToolDefinition,
 } from "../../core/extensions/types.ts";
+import {
+	isMcpServerRegistrationCurrent,
+	isSameMcpServerRegistration,
+	type RegisteredMcpServer,
+} from "../../core/mcp-servers.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import { CODEMODE_TOOL_NAME, isCodemodeTool } from "../codemode/tool.ts";
 import { isToolSearchTool, TOOL_SEARCH_TOOL_NAME } from "../tool-search/tool.ts";
@@ -82,10 +87,18 @@ const DEFAULT_STARTUP_WAIT_MS = 10_000;
 interface McpServer {
 	entry: McpServerEntry;
 	connection?: McpServerConnection;
-	/** For servers extensions registered: the config as registered, to detect re-registrations. */
-	registeredConfig?: string;
+	/** Identity of this enabled lifetime, including work before connection construction. */
+	creation?: McpConnectionOwner;
+	/** Registry-issued snapshot, retaining its synchronous lifetime authority across list copies. */
+	registration?: RegisteredMcpServer;
 	/** Result of the last `/mcp` action that failed, shown in the manager. */
 	message?: string;
+}
+
+interface McpConnectionOwner {
+	server: McpServer;
+	connection?: McpServerConnection;
+	settled: Promise<void>;
 }
 
 const EXPOSURE_DESCRIPTIONS: Record<Exclude<McpExposure, "hidden">, string> = {
@@ -197,14 +210,23 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			};
 		};
 
-		const connections = () => servers.flatMap((server) => (server.connection ? [server.connection] : []));
+		/** Own creation and retirement independently of the visible registry. */
+		const owners = new Set<McpConnectionOwner>();
 		const findServer = (name: string) => servers.find((server) => server.entry.name === name);
+		const isCurrentServer = (server: McpServer) =>
+			sessionActive &&
+			findServer(server.entry.name) === server &&
+			isEnabled(server) &&
+			(!server.registration || isMcpServerRegistrationCurrent(server.registration));
+		const isCurrentOwner = (owner: McpConnectionOwner) =>
+			isCurrentServer(owner.server) && owner.server.creation === owner;
 
 		/** Servers extensions registered, except names `mcp.json` defines, which take precedence. */
 		const registeredServers = (): { servers: McpServer[]; overridden: string[] } => {
 			const registered: McpServer[] = [];
 			const overriddenNames: string[] = [];
-			for (const { name, config, extensionPath } of pi.getMcpServers()) {
+			for (const registration of pi.getMcpServers()) {
+				const { name, config, extensionPath } = registration;
 				const configured = configuredEntries.find((entry) => entry.name === name);
 				if (configured) {
 					overriddenNames.push(`"${name}" registered by ${extensionPath} is overridden by ${configured.source}`);
@@ -212,7 +234,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				}
 				registered.push({
 					entry: { name, config, source: extensionPath, scope: "extension" },
-					registeredConfig: JSON.stringify(config),
+					registration,
 				});
 			}
 			return { servers: registered, overridden: overriddenNames };
@@ -237,7 +259,9 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 
 		const registerTools = (connection: McpServerConnection) => {
 			const server = connection.entry.name;
-			const entry = findServer(server)?.entry ?? connection.entry;
+			const currentServer = findServer(server);
+			if (!currentServer || !isCurrentServer(currentServer) || currentServer.connection !== connection) return;
+			const entry = currentServer.entry;
 			const namespaceName = `mcp__${server}`;
 			const namespace = {
 				name: namespaceName,
@@ -245,6 +269,9 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			};
 			const previous = serverTools.get(server) ?? new Set<string>();
 			const current = new Set<string>();
+			// Keep partial publication owned if a loadout callback retires authority mid-loop.
+			const published = new Set(previous);
+			serverTools.set(server, published);
 			const assignName = (tool: string, owner: string) => {
 				const name = createMcpToolName(server, tool, (candidate) => {
 					const existing = toolOwners.get(candidate);
@@ -255,6 +282,8 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				return name;
 			};
 			for (const tool of connection.tools) {
+				// registerTool refreshes extension loadouts, whose callbacks can mutate the registry.
+				if (!isCurrentServer(currentServer) || currentServer.connection !== connection) return;
 				const definition = createMcpToolDefinition({
 					server,
 					tool,
@@ -262,12 +291,18 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 					exposure: getMcpToolExposure(entry.config, tool.name),
 					namespace,
 					timeoutMs: connection.timeoutMs,
-					getClient: async () => connection,
+					getClient: async () => {
+						if (!isCurrentServer(currentServer) || currentServer.connection !== connection)
+							throw new Error(`MCP server "${server}" is no longer enabled`);
+						return connection;
+					},
 					readableResources: () => resourceServers().includes(connection),
 				});
 				definitions.set(definition.name, definition);
+				published.add(definition.name);
 				pi.registerTool(definition);
 			}
+			if (!isCurrentServer(currentServer) || currentServer.connection !== connection) return;
 			serverTools.set(server, current);
 			// Tools cannot be unregistered, so tools the server dropped are re-registered as hidden. When
 			// the server offers them again they are registered with their configured exposure above.
@@ -291,7 +326,8 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		/** Enabled servers with resources whose exposure is not `hidden`, which the resource tools reach. */
 		const serversWithResources = (): McpServer[] =>
 			servers.filter(
-				(server) => server.connection?.hasResources && isEnabled(server) && exposureOf(server.entry) !== "hidden",
+				(server) =>
+					server.connection?.hasResources && isCurrentServer(server) && exposureOf(server.entry) !== "hidden",
 			);
 		const resourceServers = (): McpServerConnection[] =>
 			serversWithResources().flatMap((server) => (server.connection ? [server.connection] : []));
@@ -327,8 +363,9 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		 */
 		const ensureDiscoveryActive = (ctx: ExtensionContext) => {
 			const exposures = new Set<McpExposure>();
-			for (const { connection, entry } of servers) {
-				if (connection?.state !== "connected") continue;
+			for (const server of servers) {
+				const { connection, entry } = server;
+				if (!isCurrentServer(server) || connection?.state !== "connected") continue;
 				// Resource tools share the server's exposure.
 				if (connection.hasResources) exposures.add(exposureOf(entry));
 				for (const tool of connection.tools) exposures.add(getMcpToolExposure(entry.config, tool.name));
@@ -384,21 +421,61 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			ensureDiscoveryActive(ctx);
 		};
 
-		/** Create the server's connection, loading the MCP runtime on first use. */
-		const createConnection = async (server: McpServer): Promise<McpServerConnection> => {
-			const runtime = await loadMcpRuntime();
-			const connection = new runtime.McpServerConnection({
-				entry: server.entry,
-				cwd: sessionCwd,
-				createTransport: options.createTransport ?? runtime.createDefaultTransport,
-				credentials: getCredentials(runtime),
-				log: getServerLog(runtime),
-				onTools: registerTools,
-				onChange: onConnectionChange,
-			});
-			server.connection = connection;
-			emitChange();
-			return connection;
+		/** Own the enabled lifetime synchronously, before deferred startup or runtime loading. */
+		const startConnection = (server: McpServer, deferred = false): Promise<void> => {
+			if (!isCurrentServer(server)) return Promise.resolve();
+			if (server.creation) return server.creation.settled;
+			const completion = Promise.withResolvers<void>();
+			const owner: McpConnectionOwner = { server, settled: completion.promise };
+			server.creation = owner;
+			owners.add(owner);
+			const opening = async () => {
+				try {
+					if (deferred) await new Promise<void>((resolve) => setImmediate(resolve));
+					if (!isCurrentOwner(owner)) return;
+					const runtime = await loadMcpRuntime();
+					if (!isCurrentOwner(owner)) return;
+					const connection = new runtime.McpServerConnection({
+						entry: server.entry,
+						cwd: sessionCwd,
+						isCurrent: () => isCurrentOwner(owner),
+						createTransport: options.createTransport ?? runtime.createDefaultTransport,
+						credentials: getCredentials(runtime),
+						log: getServerLog(runtime),
+						onTools: (connection) => {
+							if (isCurrentOwner(owner)) registerTools(connection);
+						},
+						onChange: (connection) => {
+							if (isCurrentOwner(owner)) onConnectionChange(connection);
+						},
+					});
+					owner.connection = connection;
+					server.connection = connection;
+					emitChange();
+					if (!isCurrentOwner(owner)) return;
+					await connection.getClient().catch(() => undefined);
+				} finally {
+					if (!isCurrentOwner(owner)) {
+						await owner.connection?.close();
+						owners.delete(owner);
+					}
+				}
+			};
+			void opening().then(completion.resolve, completion.reject);
+			return owner.settled;
+		};
+
+		/** Invalidate before closing, then join even work that has not constructed a connection. */
+		const retireServer = async (server: McpServer): Promise<void> => {
+			server.creation = undefined;
+			server.connection = undefined;
+			const retiring = [...owners].filter((owner) => owner.server === server);
+			await Promise.all(retiring.map((owner) => owner.connection?.close()));
+			await Promise.allSettled(retiring.map((owner) => owner.settled));
+			for (const owner of retiring) {
+				if (owner.connection) tokensAtSignIn.delete(owner.connection);
+				owners.delete(owner);
+			}
 		};
 
 		/**
@@ -487,15 +564,13 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const failed = saveConfig(server, { enabled });
 			if (failed) return failed;
 			if (!enabled) {
-				const connection = server.connection;
-				server.connection = undefined;
+				const retiring = retireServer(server);
 				hideTools(server.entry.name);
 				emitChange();
-				await connection?.close();
+				await retiring;
 				return undefined;
 			}
-			const connection = await createConnection(server);
-			await connection.getClient().catch(() => undefined);
+			await startConnection(server);
 			return undefined;
 		};
 
@@ -809,13 +884,8 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			}
 			// The MCP client loads only now, so sessions without servers never pay for it. Waiting one
 			// event loop turn lets the first render happen before loading and connecting.
-			pending = new Promise((resolve) => setImmediate(resolve))
-				.then(() => loadMcpRuntime())
-				.then(async () => {
-					if (current !== generation) return;
-					const started = await Promise.all(enabled.map((server) => createConnection(server)));
-					if (current !== generation) return;
-					await Promise.allSettled(started.map((connection) => connection.getClient()));
+			pending = Promise.all(enabled.map((server) => startConnection(server, true)))
+				.then(() => {
 					if (current !== generation) return;
 					ensureDiscoveryActive(ctx);
 					reportProblems(ctx);
@@ -859,28 +929,25 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const registered = registeredServers();
 			overridden = registered.overridden;
 			const next = new Map(registered.servers.map((server) => [server.entry.name, server]));
-			// Unregistered servers and re-registered ones with a new config are dropped; the latter come back below.
-			const removed = servers.filter(
-				(server) =>
-					server.entry.scope === "extension" &&
-					next.get(server.entry.name)?.registeredConfig !== server.registeredConfig,
-			);
+			// Every re-registration replaces authority, even with identical config or a different source.
+			const removed = servers.filter((server) => {
+				if (!server.registration) return false;
+				const replacement = next.get(server.entry.name)?.registration;
+				return !replacement || !isSameMcpServerRegistration(server.registration, replacement);
+			});
 			servers = servers.filter((server) => !removed.includes(server));
 			for (const server of removed) hideTools(server.entry.name);
 			const added = registered.servers.filter((server) => !findServer(server.entry.name));
 			servers.push(...added);
 			emitChange();
-			await Promise.all(removed.map((server) => server.connection?.close()));
+			const retiring = removed.map((server) => retireServer(server));
 			const connecting = added.filter(isEnabled);
-			if (current !== generation || connecting.length === 0) return;
+			// Admit every pending owner before this handler first yields to another registry change.
+			const started = connecting.map((server) => startConnection(server));
 			try {
-				const started = await Promise.all(connecting.map((server) => createConnection(server)));
-				if (current !== generation) {
-					await Promise.all(started.map((connection) => connection.close()));
-					return;
-				}
-				await Promise.allSettled(started.map((connection) => connection.getClient()));
+				await Promise.all([...retiring, ...started]);
 			} catch (error) {
+				if (current !== generation) return;
 				ctx.ui.notify(`MCP failed to load: ${errorMessage(error)}`, "error");
 				return;
 			}
@@ -892,10 +959,12 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		pi.on("session_shutdown", async () => {
 			sessionActive = false;
 			generation++;
-			const closing = connections();
+			const retiring = new Set([...servers, ...[...owners].map((owner) => owner.server)]);
 			servers = [];
 			emitChange();
-			await Promise.all(closing.map((connection) => connection.close()));
+			await Promise.all([...retiring].map((server) => retireServer(server)));
+			await pending;
+			tokensAtSignIn.clear();
 		});
 
 		pi.registerCommand("mcp", {

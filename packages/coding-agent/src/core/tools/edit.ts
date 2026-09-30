@@ -153,6 +153,7 @@ export function createEditToolDefinition(
 	return {
 		name: "edit",
 		label: "edit",
+		executionKind: "effect",
 		// ponytail: a batch with a file change runs in order, so a bash call in the same
 		// message sees the finished file (smarty-dev#977). Costs parallelism for that batch only.
 		executionMode: "sequential",

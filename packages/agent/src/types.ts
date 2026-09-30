@@ -498,6 +498,17 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * If omitted, the default execution mode applies.
 	 */
 	executionMode?: ToolExecutionMode;
+	/**
+	 * Fork-only executor metadata, never part of a model-facing tool declaration (#2241).
+	 * Honored by AgentSession's native/nested executor, not the standalone low-level agent loop.
+	 * `effect` opts a parallel callback into shared admission against unrelated sequential
+	 * effects. `orchestration` delegates effects through owned nested calls without holding
+	 * a parallel shared ticket. Use orchestration for callbacks that delegate or wait on
+	 * unrelated tool effects: effect callbacks must not do so while holding their ticket.
+	 * Sequential callbacks retain exclusive subtree admission.
+	 * Omitted: legacy writer-only admission; arbitrary undeclared readers may still overlap.
+	 */
+	executionKind?: "effect" | "orchestration";
 }
 
 /** Context snapshot passed into the low-level agent loop. */

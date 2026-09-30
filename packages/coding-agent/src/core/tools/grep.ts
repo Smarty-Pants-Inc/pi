@@ -77,6 +77,7 @@ export function createGrepToolDefinition(
 	return {
 		name: "grep",
 		label: "grep",
+		executionKind: "effect",
 		description: `Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to ${DEFAULT_LIMIT} matches or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). Long lines are truncated to ${GREP_MAX_LINE_LENGTH} chars.`,
 		promptSnippet: grepToolSystemPromptContribution.snippet,
 		parameters: grepSchema,
@@ -109,16 +110,27 @@ export function createGrepToolDefinition(
 					return;
 				}
 				let settled = false;
+				let stopChild: (() => void) | undefined;
+				// #2241: abort requests retirement, never detaches accepted I/O or termination.
+				const onAbort = () => stopChild?.();
+				signal?.addEventListener("abort", onAbort, { once: true });
+				const throwIfAborted = () => {
+					if (signal?.aborted) throw new Error("Operation aborted");
+				};
 				const settle = (fn: () => void) => {
 					if (!settled) {
 						settled = true;
-						fn();
+						signal?.removeEventListener("abort", onAbort);
+						stopChild = undefined;
+						if (signal?.aborted) reject(new Error("Operation aborted"));
+						else fn();
 					}
 				};
 
 				(async () => {
 					try {
 						const rgPath = await ensureTool("rg");
+						throwIfAborted();
 						if (!rgPath) {
 							settle(() => reject(new Error("ripgrep (rg) is not available and could not be downloaded")));
 							return;
@@ -134,6 +146,7 @@ export function createGrepToolDefinition(
 							return;
 						}
 
+						throwIfAborted();
 						const contextValue = context && context > 0 ? context : 0;
 						const effectiveLimit = Math.max(1, limit ?? DEFAULT_LIMIT);
 						const formatPath = (filePath: string): string => {
@@ -150,10 +163,13 @@ export function createGrepToolDefinition(
 						const getFileLines = async (filePath: string): Promise<string[]> => {
 							let lines = fileCache.get(filePath);
 							if (!lines) {
+								throwIfAborted();
 								try {
 									const content = await ops.readFile(filePath);
+									throwIfAborted();
 									lines = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
 								} catch {
+									throwIfAborted();
 									lines = [];
 								}
 								fileCache.set(filePath, lines);
@@ -173,25 +189,18 @@ export function createGrepToolDefinition(
 						let matchCount = 0;
 						let matchLimitReached = false;
 						let linesTruncated = false;
-						let aborted = false;
+						let childError: Error | undefined;
 						let killedDueToLimit = false;
 						const outputLines: string[] = [];
 
-						const cleanup = () => {
-							rl.close();
-							signal?.removeEventListener("abort", onAbort);
-						};
-						const stopChild = (dueToLimit = false) => {
+						const cleanup = () => rl.close();
+						const requestStop = (dueToLimit = false) => {
 							if (!child.killed) {
 								killedDueToLimit = dueToLimit;
 								child.kill();
 							}
 						};
-						const onAbort = () => {
-							aborted = true;
-							stopChild();
-						};
-						signal?.addEventListener("abort", onAbort, { once: true });
+						stopChild = requestStop;
 						child.stderr?.on("data", (chunk) => {
 							stderr += chunk.toString();
 						});
@@ -219,7 +228,7 @@ export function createGrepToolDefinition(
 						// Collect matches during streaming, then format them after rg exits.
 						const matches: Array<{ filePath: string; lineNumber: number; lineText?: string }> = [];
 						rl.on("line", (line) => {
-							if (!line.trim() || matchCount >= effectiveLimit) return;
+							if (signal?.aborted || !line.trim() || matchCount >= effectiveLimit) return;
 							let event: any;
 							try {
 								event = JSON.parse(line);
@@ -235,81 +244,86 @@ export function createGrepToolDefinition(
 									matches.push({ filePath, lineNumber, lineText });
 								if (matchCount >= effectiveLimit) {
 									matchLimitReached = true;
-									stopChild(true);
+									requestStop(true);
 								}
 							}
 						});
 
 						child.on("error", (error) => {
-							cleanup();
-							settle(() => reject(new Error(`Failed to run ripgrep: ${error.message}`)));
+							childError = new Error(`Failed to run ripgrep: ${error.message}`);
 						});
 						child.on("close", async (code) => {
 							cleanup();
-							if (aborted) {
-								settle(() => reject(new Error("Operation aborted")));
-								return;
-							}
-							if (!killedDueToLimit && code !== 0 && code !== 1) {
-								const errorMsg = stderr.trim() || `ripgrep exited with code ${code}`;
-								settle(() => reject(new Error(errorMsg)));
-								return;
-							}
-							if (matchCount === 0) {
-								settle(() =>
-									resolve({ content: [{ type: "text", text: "No matches found" }], details: undefined }),
-								);
-								return;
-							}
-
-							// Format matches after streaming finishes so custom readFile() backends can be async.
-							for (const match of matches) {
-								if (contextValue === 0 && match.lineText !== undefined) {
-									const relativePath = formatPath(match.filePath);
-									const sanitized = match.lineText
-										.replace(/\r\n/g, "\n")
-										.replace(/\r/g, "")
-										.replace(/\n$/, "");
-									const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
-									if (wasTruncated) linesTruncated = true;
-									outputLines.push(`${relativePath}:${match.lineNumber}: ${truncatedText}`);
-								} else {
-									const block = await formatBlock(match.filePath, match.lineNumber);
-									outputLines.push(...block);
+							stopChild = undefined;
+							try {
+								throwIfAborted();
+								if (childError) throw childError;
+								if (!killedDueToLimit && code !== 0 && code !== 1) {
+									const errorMsg = stderr.trim() || `ripgrep exited with code ${code}`;
+									settle(() => reject(new Error(errorMsg)));
+									return;
 								}
-							}
+								if (matchCount === 0) {
+									settle(() =>
+										resolve({ content: [{ type: "text", text: "No matches found" }], details: undefined }),
+									);
+									return;
+								}
 
-							const rawOutput = outputLines.join("\n");
-							// Apply byte truncation. There is no line limit here because the match limit already capped rows.
-							const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
-							let output = truncation.content;
-							const details: GrepToolDetails = {};
-							if (!isDirectory) details.searchIsFile = true;
-							// Build actionable notices for truncation and match limits.
-							const notices: string[] = [];
-							if (matchLimitReached) {
-								notices.push(
-									`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
+								// Format matches after streaming finishes so custom readFile() backends can be async.
+								for (const match of matches) {
+									throwIfAborted();
+									if (contextValue === 0 && match.lineText !== undefined) {
+										const relativePath = formatPath(match.filePath);
+										const sanitized = match.lineText
+											.replace(/\r\n/g, "\n")
+											.replace(/\r/g, "")
+											.replace(/\n$/, "");
+										const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
+										if (wasTruncated) linesTruncated = true;
+										outputLines.push(`${relativePath}:${match.lineNumber}: ${truncatedText}`);
+									} else {
+										const block = await formatBlock(match.filePath, match.lineNumber);
+										throwIfAborted();
+										outputLines.push(...block);
+									}
+								}
+
+								throwIfAborted();
+								const rawOutput = outputLines.join("\n");
+								// Apply byte truncation. There is no line limit here because the match limit already capped rows.
+								const truncation = truncateHead(rawOutput, { maxLines: Number.MAX_SAFE_INTEGER });
+								let output = truncation.content;
+								const details: GrepToolDetails = {};
+								if (!isDirectory) details.searchIsFile = true;
+								// Build actionable notices for truncation and match limits.
+								const notices: string[] = [];
+								if (matchLimitReached) {
+									notices.push(
+										`${effectiveLimit} matches limit reached. Use limit=${effectiveLimit * 2} for more, or refine pattern`,
+									);
+									details.matchLimitReached = effectiveLimit;
+								}
+								if (truncation.truncated) {
+									notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
+									details.truncation = truncation;
+								}
+								if (linesTruncated) {
+									notices.push(
+										`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`,
+									);
+									details.linesTruncated = true;
+								}
+								if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
+								settle(() =>
+									resolve({
+										content: [{ type: "text", text: output }],
+										details: Object.keys(details).length > 0 ? details : undefined,
+									}),
 								);
-								details.matchLimitReached = effectiveLimit;
+							} catch (error: unknown) {
+								settle(() => reject(error));
 							}
-							if (truncation.truncated) {
-								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-								details.truncation = truncation;
-							}
-							if (linesTruncated) {
-								notices.push(
-									`Some lines truncated to ${GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines`,
-								);
-								details.linesTruncated = true;
-							}
-							if (notices.length > 0) output += `\n\n[${notices.join(". ")}]`;
-							settle(() =>
-								resolve({
-									content: [{ type: "text", text: output }],
-									details: Object.keys(details).length > 0 ? details : undefined,
-								}),
-							);
 						});
 					} catch (err) {
 						settle(() => reject(err as Error));

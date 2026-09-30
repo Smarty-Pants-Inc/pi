@@ -203,6 +203,21 @@ export interface RegisteredMcpServer {
 	extensionPath: string;
 }
 
+// Lifetime metadata is internal, not part of the public server/config shape. list() copies share
+// this identity, but not mutable config data. Retirement precedes ordinary async notifications.
+const registrationLifetimes = new WeakMap<RegisteredMcpServer, { current: boolean }>();
+
+/** Whether a registry-issued snapshot still has authority to connect or execute. */
+export function isMcpServerRegistrationCurrent(server: RegisteredMcpServer): boolean {
+	return registrationLifetimes.get(server)?.current === true;
+}
+
+/** Compare registration lifetimes, never names, sources, or serialized configuration. */
+export function isSameMcpServerRegistration(left: RegisteredMcpServer, right: RegisteredMcpServer): boolean {
+	const lifetime = registrationLifetimes.get(left);
+	return lifetime !== undefined && lifetime === registrationLifetimes.get(right);
+}
+
 /** Servers registered by the extensions of one runtime. */
 export class McpServerRegistry {
 	private readonly servers = new Map<string, RegisteredMcpServer>();
@@ -210,13 +225,22 @@ export class McpServerRegistry {
 
 	/** Register or replace a server. The caller checks ownership. */
 	register(server: RegisteredMcpServer): void {
-		this.servers.set(server.name, server);
+		const previous = this.servers.get(server.name);
+		const lifetime = previous && registrationLifetimes.get(previous);
+		if (lifetime) lifetime.current = false;
+		// A new object is required even when a caller registers the same input object twice.
+		const registered = { ...server };
+		registrationLifetimes.set(registered, { current: true });
+		this.servers.set(server.name, registered);
 		this.changeListener?.();
 	}
 
 	/** Remove a server registered by `extensionPath`. Servers of other extensions are left alone. */
 	unregister(name: string, extensionPath: string): void {
-		if (this.servers.get(name)?.extensionPath !== extensionPath) return;
+		const server = this.servers.get(name);
+		if (!server || server.extensionPath !== extensionPath) return;
+		const lifetime = registrationLifetimes.get(server);
+		if (lifetime) lifetime.current = false;
 		this.servers.delete(name);
 		this.changeListener?.();
 	}
@@ -227,7 +251,12 @@ export class McpServerRegistry {
 
 	/** Copies of the registered servers, in registration order. */
 	list(): RegisteredMcpServer[] {
-		return [...this.servers.values()].map((server) => ({ ...server, config: structuredClone(server.config) }));
+		return [...this.servers.values()].map((server) => {
+			const copy = { ...server, config: structuredClone(server.config) };
+			const lifetime = registrationLifetimes.get(server);
+			if (lifetime) registrationLifetimes.set(copy, lifetime);
+			return copy;
+		});
 	}
 
 	/** Called after every change. The runner sets it when it binds, to emit `mcp_servers_change`. */

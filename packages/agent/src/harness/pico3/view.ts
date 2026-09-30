@@ -409,16 +409,17 @@ function syncOptional(target: object, key: string, next: unknown): void {
 		delete record[key];
 		return;
 	}
-	const current = record[key];
+	const current = Object.hasOwn(record, key) ? record[key] : undefined;
 	if (same(current, next)) return;
 	if (isRecord(current) && isRecord(next)) syncRecord(current, next);
 	else record[key] = structuredClone(next);
 }
 
 function syncRecord(target: Record<string, unknown>, next: Record<string, unknown>): void {
-	for (const key of Object.keys(target)) if (!(key in next)) delete target[key];
+	for (const key of Object.keys(target)) if (!Object.hasOwn(next, key)) delete target[key];
 	for (const [key, value] of Object.entries(next)) {
-		const current = target[key];
+		// Chord drafts expose inherited containers directly. Only own JSON data is a merge target.
+		const current = Object.hasOwn(target, key) ? target[key] : undefined;
 		if (same(current, value)) continue;
 		if (Array.isArray(current) && Array.isArray(value)) {
 			syncArray(current, value);
@@ -435,6 +436,7 @@ function syncRecord(target: Record<string, unknown>, next: Record<string, unknow
 function syncArray(target: unknown[], next: unknown[]): void {
 	let prefix = 0;
 	while (prefix < target.length && prefix < next.length) {
+		if (!Object.hasOwn(target, prefix) || !Object.hasOwn(next, prefix)) break;
 		if (same(target[prefix], next[prefix])) {
 			prefix++;
 			continue;
@@ -454,9 +456,15 @@ function syncArray(target: unknown[], next: unknown[]): void {
 }
 
 function sameArrayItem(current: Record<string, unknown>, next: Record<string, unknown>): boolean {
-	if (typeof current.id === "number" || typeof next.id === "number") return current.id === next.id;
-	if (typeof current.callId === "string" || typeof next.callId === "string") return current.callId === next.callId;
-	if (typeof current.type === "string" || typeof next.type === "string") return current.type === next.type;
+	for (const [key, type] of [
+		["id", "number"],
+		["callId", "string"],
+		["type", "string"],
+	] as const) {
+		const currentValue = Object.hasOwn(current, key) ? current[key] : undefined;
+		const nextValue = Object.hasOwn(next, key) ? next[key] : undefined;
+		if (typeof currentValue === type || typeof nextValue === type) return currentValue === nextValue;
+	}
 	return false;
 }
 

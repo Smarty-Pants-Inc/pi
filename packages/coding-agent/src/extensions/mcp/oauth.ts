@@ -12,6 +12,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { oauthErrorHtml, oauthSuccessHtml } from "@earendil-works/pi-ai/utils/oauth-page";
 import type { AuthProvider, McpFetch } from "@earendil-works/pi-mcp";
 import {
@@ -29,6 +30,7 @@ import {
 import lockfile from "proper-lockfile";
 import { APP_NAME, getAgentDir } from "../../config.ts";
 import { type AuthStorageBackend, FileAuthStorageBackend } from "../../core/auth-storage.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 
 const CALLBACK_HOST = "127.0.0.1";
 const CALLBACK_PATH = "/callback";
@@ -94,7 +96,13 @@ function mergeScopes(...scopes: (string | undefined)[]): string | undefined {
 	return merged.length > 0 ? merged.join(" ") : undefined;
 }
 
-type StoredState = McpOAuthState & { grantGeneration?: string; signedOut?: true };
+type StoredState = McpOAuthState & {
+	grantGeneration?: string;
+	grantRevision?: string;
+	signedOut?: true;
+	authorizationAttempt?: string;
+	authorizationState?: McpOAuthState;
+};
 type StoredStates = Record<string, StoredState>;
 const inProcessRefreshes = new WeakMap<AuthStorageBackend, Map<string, Promise<unknown>>>();
 
@@ -104,11 +112,24 @@ function parseStates(content: string | undefined): StoredStates {
 	return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? (parsed as StoredStates) : {};
 }
 
+function grantState(state: StoredState | undefined): McpOAuthState | undefined {
+	if (!state || state.signedOut) return undefined;
+	const value = structuredClone(state);
+	delete value.grantGeneration;
+	delete value.grantRevision;
+	delete value.signedOut;
+	delete value.authorizationAttempt;
+	delete value.authorizationState;
+	return value;
+}
+
 export interface McpOAuthServerStore extends McpOAuthStateStore {
-	/** Capture the current grant generation; logout invalidates all writes through this view. */
+	/** Capture the current grant revision; replacement or logout invalidates this view. */
 	forGrant(): McpOAuthStateStore;
-	/** Run `fn` while no other process refreshes or deletes the server's tokens. */
-	withRefreshLock<T>(fn: () => Promise<T>): Promise<T>;
+	/** Own client/state/verifier separately from the live grant; a newer sign-in supersedes this view. */
+	forAuthorization(): McpOAuthStateStore;
+	/** Run `fn` while no other process refreshes or deletes tokens; `signal` cancels only waiting for ownership. */
+	withRefreshLock<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T>;
 }
 
 /** Per-server OAuth state (client registration, tokens, pending PKCE verifier) in `mcp-auth.json`. */
@@ -128,32 +149,102 @@ export class McpOAuthCredentialStore {
 	forServer(serverUrl: string): McpOAuthServerStore {
 		const key = String(new URL(serverUrl));
 		const forGrant = (): McpOAuthStateStore => {
-			const generation = this.read()[key]?.grantGeneration;
+			const captured = this.read()[key];
+			const generation = captured?.grantGeneration;
+			let revision = captured?.grantRevision;
 			const check = (state: StoredState | undefined) => {
-				if (state?.grantGeneration !== generation) throw new McpOAuthAuthorizationRequiredError();
+				if (state?.grantGeneration !== generation || state?.grantRevision !== revision)
+					throw new McpOAuthAuthorizationRequiredError();
 			};
 			return {
 				load: () => {
 					const state = this.read()[key];
 					check(state);
-					return state?.signedOut ? undefined : state;
+					return grantState(state);
 				},
-				save: (state) =>
+				save: (state, options) =>
 					this.write((states) => {
-						check(states[key]);
-						states[key] = { ...state, grantGeneration: generation };
-						delete states[key].signedOut;
+						const current = states[key];
+						check(current);
+						// Invalidation and client replacement also retire authority over the old grant.
+						if (
+							options?.replaceGrant ||
+							JSON.stringify(current?.tokens) !== JSON.stringify(state.tokens) ||
+							JSON.stringify(current?.clientInformation) !== JSON.stringify(state.clientInformation)
+						)
+							revision = randomUUID();
+						states[key] = {
+							...state,
+							grantGeneration: generation,
+							grantRevision: revision,
+							authorizationAttempt: current?.authorizationAttempt,
+							authorizationState: current?.authorizationState,
+						};
 					}),
+			};
+		};
+		const forAuthorization = (): McpOAuthStateStore => {
+			const attempt = randomUUID();
+			// Capture logout authority before any await, but claim the attempt only under the
+			// initial refresh lock. Merely starting login must not discard a rotated refresh token.
+			const generation = this.read()[key]?.grantGeneration;
+			let claimed = false;
+			let committedRevision: string | undefined;
+			let value: McpOAuthState | undefined;
+			const check = (state: StoredState | undefined) => {
+				if (
+					state?.grantGeneration !== generation ||
+					(claimed && state?.authorizationAttempt !== attempt) ||
+					(committedRevision !== undefined && state?.grantRevision !== committedRevision)
+				)
+					throw new McpOAuthAuthorizationRequiredError();
+			};
+			return {
+				load: () => {
+					const current = this.read()[key];
+					check(current);
+					// Re-read the live grant after waiting for an ordinary refresh, then freeze
+					// this attempt's client/state/verifier at its first authorization write.
+					if (!claimed)
+						value = (!current?.tokens && current?.authorizationState) ||
+							grantState(current) || { serverUrl: key };
+					return structuredClone(value);
+				},
+				save: (state, options) => {
+					const revision = options?.replaceGrant ? randomUUID() : undefined;
+					this.write((states) => {
+						const current = states[key];
+						check(current);
+						if (options?.replaceGrant) {
+							// Do not take the refresh lock here: CAS fences a refresh already in flight,
+							// and logout must still be able to revoke an exchange awaiting its response.
+							states[key] = {
+								...state,
+								grantGeneration: generation,
+								grantRevision: revision,
+								authorizationAttempt: attempt,
+							};
+						} else {
+							states[key] = {
+								...current,
+								serverUrl: key,
+								authorizationAttempt: attempt,
+								authorizationState: structuredClone(state),
+							};
+						}
+					});
+					claimed = true;
+					if (revision) committedRevision = revision;
+					value = structuredClone(state);
+				},
 			};
 		};
 		return {
 			...forGrant(),
-			load: () => {
-				const state = this.read()[key];
-				return state?.signedOut ? undefined : state;
-			},
+			load: () => grantState(this.read()[key]),
 			forGrant,
-			withRefreshLock: (fn) => this.withRefreshLock(key, fn),
+			forAuthorization,
+			withRefreshLock: (fn, signal) => this.withRefreshLock(key, fn, signal),
 		};
 	}
 
@@ -161,31 +252,53 @@ export class McpOAuthCredentialStore {
 	 * A lock file per server. When the process exits, proper-lockfile removes the locks it holds; when
 	 * it is killed, the lock goes stale because it is no longer renewed, and the next process takes it over.
 	 */
-	private async withRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+	private async withRefreshLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		signal?.throwIfAborted();
 		if (!this.lockDir) {
-			const operation = (this.refreshes.get(key) ?? Promise.resolve()).catch(() => undefined).then(fn);
-			this.refreshes.set(key, operation);
-			try {
-				return await operation;
-			} finally {
-				if (this.refreshes.get(key) === operation) this.refreshes.delete(key);
-			}
+			const turn = (this.refreshes.get(key) ?? Promise.resolve()).catch(() => undefined);
+			const operation = raceWithAbortSignal(turn, signal).then(() => {
+				signal?.throwIfAborted();
+				return fn();
+			});
+			// Keep the queue slot behind its predecessor even if the caller rejects early.
+			const queued = turn.then(() => operation);
+			this.refreshes.set(key, queued);
+			const cleanup = () => {
+				if (this.refreshes.get(key) === queued) this.refreshes.delete(key);
+			};
+			void queued.then(cleanup, cleanup);
+			return operation;
 		}
 		mkdirSync(this.lockDir, { recursive: true, mode: 0o700 });
 		const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
-		const release = await lockfile.lock(join(this.lockDir, `mcp-auth-refresh-${hash}`), {
-			realpath: false,
-			stale: REFRESH_LOCK_STALE_MS,
-			retries: {
-				retries: REFRESH_LOCK_WAIT_MS / REFRESH_LOCK_RETRY_MS,
-				factor: 1,
-				minTimeout: REFRESH_LOCK_RETRY_MS,
-				maxTimeout: REFRESH_LOCK_RETRY_MS,
-			},
-			// The default throws from a timer. A lost lock at worst lets two refreshes overlap.
-			onCompromised: () => {},
-		});
+		const deadline = Date.now() + REFRESH_LOCK_WAIT_MS;
+		let release: () => Promise<void>;
+		while (true) {
+			signal?.throwIfAborted();
+			try {
+				release = await lockfile.lock(join(this.lockDir, `mcp-auth-refresh-${hash}`), {
+					realpath: false,
+					stale: REFRESH_LOCK_STALE_MS,
+					retries: 0,
+					// The default throws from a timer. A lost lock at worst lets two refreshes overlap.
+					onCompromised: () => {},
+				});
+				break;
+			} catch (error) {
+				signal?.throwIfAborted();
+				const remaining = deadline - Date.now();
+				if ((error as NodeJS.ErrnoException).code !== "ELOCKED" || remaining <= 0) throw error;
+				try {
+					await sleep(Math.min(REFRESH_LOCK_RETRY_MS, remaining), undefined, { signal });
+				} catch (error) {
+					signal?.throwIfAborted();
+					throw error;
+				}
+			}
+		}
 		try {
+			// Acquisition itself is not cancellable: release a concurrently acquired lock here.
+			signal?.throwIfAborted();
 			return await fn();
 		} finally {
 			await release().catch(() => undefined);
@@ -234,6 +347,7 @@ function createProvider(
 	settings: McpOAuthSettings,
 	redirectUrl: string,
 	onRedirect: (url: URL) => void,
+	signal?: AbortSignal,
 ): McpOAuthProvider {
 	return new McpOAuthProvider({
 		serverUrl,
@@ -243,6 +357,7 @@ function createProvider(
 		clientSecret: settings.clientSecret,
 		store,
 		onRedirect,
+		signal,
 	});
 }
 
@@ -292,8 +407,8 @@ export function createMcpAuthProvider(options: {
 					serverUrl,
 					resourceMetadataUrl: challenge?.resourceMetadataUrl,
 					scope: challenge?.scope,
-					fetch: (input, init) =>
-						fetch(input, { ...init, signal: AbortSignal.timeout(REFRESH_REQUEST_TIMEOUT_MS) }),
+					fetch,
+					networkTimeoutMs: REFRESH_REQUEST_TIMEOUT_MS,
 				});
 				if (result === "REDIRECT") throw new McpOAuthAuthorizationRequiredError();
 			})
@@ -365,16 +480,25 @@ async function waitForAuthorizationCode(
 	callback: OAuthCallbackServer,
 	state: string,
 	prompt: McpSignInPrompt,
+	signal?: AbortSignal,
 ): Promise<string> {
+	signal?.throwIfAborted();
 	const controller = new AbortController();
+	let rejectCancellation!: (reason: unknown) => void;
+	const cancelled = new Promise<never>((_resolve, reject) => {
+		rejectCancellation = reject;
+	});
+	const onAbort = () => rejectCancellation(signal?.reason ?? new McpSignInCancelledError());
+	signal?.addEventListener("abort", onAbort, { once: true });
 	const fromBrowser = callback.waitForCallback(state).then((result) => result.code);
 	const fromUser = prompt.promptForRedirectUrl(controller.signal).then((input) => {
 		if (!input?.trim()) throw new McpSignInCancelledError();
 		return codeFromRedirectUrl(input, state);
 	});
 	try {
-		return await Promise.race([fromBrowser, fromUser]);
+		return await Promise.race([fromBrowser, fromUser, cancelled]);
 	} finally {
+		signal?.removeEventListener("abort", onAbort);
 		// The losing side rejects once the prompt is aborted or the callback server closes.
 		controller.abort();
 		fromBrowser.catch(() => undefined);
@@ -411,14 +535,19 @@ async function listenForCallback(
  */
 export async function signInMcpServer(options: {
 	serverUrl: string;
-	store: McpOAuthStateStore & Partial<Pick<McpOAuthServerStore, "forGrant" | "withRefreshLock">>;
+	store: McpOAuthStateStore & Partial<Pick<McpOAuthServerStore, "forGrant" | "forAuthorization" | "withRefreshLock">>;
 	settings: McpOAuthSettings;
 	challenge?: OAuthChallenge;
 	prompt: McpSignInPrompt;
+	/** Cancels lock acquisition, network phases, and browser waiting; cleanup still joins the callback listener. */
+	signal?: AbortSignal;
+	/** Bounds each network operation, not time spent waiting for the user. */
+	networkTimeoutMs?: number;
 }): Promise<void> {
 	const { serverUrl, settings } = options;
+	options.signal?.throwIfAborted();
 	// Capture before the first await, including when no credentials have been stored yet.
-	const store = options.store.forGrant?.() ?? options.store;
+	const store = options.store.forAuthorization?.() ?? options.store.forGrant?.() ?? options.store;
 	const stored = await store.load();
 	const callbackOptions = callbackSettings(settings);
 	// Reuse the port of the registered redirect URI so the registered client stays valid.
@@ -428,12 +557,22 @@ export async function signInMcpServer(options: {
 	const callback = await listenForCallback(callbackOptions, preferredPort, callbackOptions.port !== undefined);
 	const redirectUrl = callbackOptions.fixedRedirectUrl ?? callback.redirectUrl;
 	try {
+		options.signal?.throwIfAborted();
 		let authorizationUrl: URL | undefined;
-		const provider = createProvider(serverUrl, store, settings, redirectUrl, (url) => {
-			authorizationUrl = url;
-		});
+		const provider = createProvider(
+			serverUrl,
+			store,
+			settings,
+			redirectUrl,
+			(url) => {
+				authorizationUrl = url;
+			},
+			options.signal,
+		);
 		const flow = {
 			serverUrl,
+			signal: options.signal,
+			networkTimeoutMs: options.networkTimeoutMs,
 			resourceMetadataUrl: options.challenge?.resourceMetadataUrl,
 			// A server asking for more scope gets it on top of the configured scope.
 			scope: mergeScopes(settings.scope, options.challenge?.scope),
@@ -441,6 +580,7 @@ export async function signInMcpServer(options: {
 		// A refresh keeps the granted scope; a server asking for more needs the browser flow.
 		const skipRefresh = options.challenge?.error === "insufficient_scope";
 		const authorize = async () => {
+			options.signal?.throwIfAborted();
 			// Read again under the refresh lock: another process may have rotated tokens while we bound the callback.
 			const current = await store.load();
 			if (current) {
@@ -457,13 +597,15 @@ export async function signInMcpServer(options: {
 			}
 			return authorizeMcp(provider, { ...flow, skipRefresh });
 		};
-		const result = options.store.withRefreshLock ? await options.store.withRefreshLock(authorize) : await authorize();
+		const result = options.store.withRefreshLock
+			? await options.store.withRefreshLock(authorize, options.signal)
+			: await authorize();
 		if (result === "AUTHORIZED") return;
 		if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
 
 		const state = await provider.state();
 		options.prompt.showAuthorizationUrl(authorizationUrl);
-		const code = await waitForAuthorizationCode(callback, state, options.prompt);
+		const code = await waitForAuthorizationCode(callback, state, options.prompt, options.signal);
 		await authorizeMcp(provider, { ...flow, authorizationCode: code });
 	} finally {
 		await callback.close();

@@ -44,7 +44,7 @@ export class McpServerLog {
 		const line = formatMcpLogMessage(server, params);
 		try {
 			if (this.size === undefined) {
-				mkdirSync(dirname(this.path), { recursive: true });
+				mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
 				this.size = this.currentSize();
 			}
 			if (this.size > MAX_LOG_BYTES) {
@@ -52,7 +52,8 @@ export class McpServerLog {
 				if (this.currentSize() > MAX_LOG_BYTES) renameSync(this.path, `${this.path}.1`);
 				this.size = this.currentSize();
 			}
-			appendFileSync(this.path, line);
+			// Creation modes leave intentionally managed existing permissions unchanged.
+			appendFileSync(this.path, line, { mode: 0o600 });
 			this.size += Buffer.byteLength(line);
 		} catch {
 			// Ignore: the log is best effort.

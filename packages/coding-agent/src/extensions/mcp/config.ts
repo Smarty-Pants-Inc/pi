@@ -22,10 +22,11 @@
  * with `codemode` or `codemode-deferred` exposure connects. A project value overrides the global one.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME } from "../../config.ts";
 import { type McpExposure, type McpServerConfig, validateMcpServerConfig } from "../../core/mcp-servers.ts";
+import { getConfigValueEnvVarName, isCommandConfigValue } from "../../core/resolve-config-value.ts";
 
 export type {
 	McpExposure,
@@ -65,7 +66,52 @@ interface McpConfigState {
 	errors: string[];
 }
 
-function readConfigFile(path: string, scope: "global" | "project", state: McpConfigState): void {
+function getLiteralCredentialFields(config: unknown): string[] {
+	if (!isRecord(config)) return [];
+	const headers = isRecord(config.headers) ? config.headers : {};
+	const fields: [string, string][] = [];
+	for (const [header, value] of Object.entries(headers)) {
+		if (
+			typeof value === "string" &&
+			/^(authorization|proxy-authorization|cookie|(?:.*[-_])?(?:api[-_]?key|token|secret|credentials?))$/i.test(
+				header,
+			)
+		) {
+			fields.push([`headers.${header}`, value]);
+		}
+	}
+	if (isRecord(config.oauth) && typeof config.oauth.clientSecret === "string") {
+		fields.push(["oauth.clientSecret", config.oauth.clientSecret]);
+	}
+	return fields
+		.filter(([field, value]) => {
+			// A reference anywhere in a template does not exclude a literal credential elsewhere.
+			// Keys, clientSecret and Cookie require a whole reference; do not parse mixed cookies.
+			if (isCommandConfigValue(value) || getConfigValueEnvVarName(value) !== undefined) return false;
+			// Authorization may also contain an HTTP auth-scheme token followed by a whole reference.
+			const scheme = /^headers\.(authorization|proxy-authorization)$/i.test(field)
+				? /^[A-Za-z0-9!#$%&'*+.^_`|~-]+[ \t]+/.exec(value)?.[0]
+				: undefined;
+			return scheme === undefined || getConfigValueEnvVarName(value.slice(scheme.length)) === undefined;
+		})
+		.map(([field]) => field);
+}
+
+/** Redacted advice only; literal project credentials remain supported in private files. Never resolve values here. */
+export function getMcpProjectConfigWarnings(entry: McpServerEntry): string[] {
+	if (entry.scope !== "project" || !("url" in entry.config)) return [];
+	return getLiteralCredentialFields(entry.config).map(
+		(field) =>
+			`${entry.source}: warning: project MCP server "${entry.name}" has a literal credential in ${field}; use an environment variable reference or !command instead.`,
+	);
+}
+
+function readConfigFile(
+	path: string,
+	scope: "global" | "project",
+	state: McpConfigState,
+	onWarning: (warning: string) => void,
+): void {
 	const { servers, errors } = state;
 	if (!existsSync(path)) return;
 	let parsed: unknown;
@@ -87,7 +133,9 @@ function readConfigFile(path: string, scope: "global" | "project", state: McpCon
 			errors.push(`${path}: ${config}`);
 			continue;
 		}
-		servers.set(name, { name, config, source: path, scope });
+		const entry = { name, config, source: path, scope };
+		for (const warning of getMcpProjectConfigWarnings(entry)) onWarning(warning);
+		servers.set(name, entry);
 	}
 }
 
@@ -95,10 +143,18 @@ function readConfigFile(path: string, scope: "global" | "project", state: McpCon
  * Load global and (when trusted) project MCP configuration. Disabled servers are included with
  * `enabled: false`, so they can be enabled again.
  */
-export function loadMcpConfig(options: { agentDir: string; cwd: string; projectTrusted: boolean }): LoadedMcpConfig {
+export function loadMcpConfig(options: {
+	agentDir: string;
+	cwd: string;
+	projectTrusted: boolean;
+	/** Defaults to console.warn, including session startup. Warnings do not invalidate entries. */
+	onWarning?: (warning: string) => void;
+}): LoadedMcpConfig {
 	const state: McpConfigState = { servers: new Map(), errors: [] };
-	readConfigFile(join(options.agentDir, "mcp.json"), "global", state);
-	if (options.projectTrusted) readConfigFile(join(options.cwd, CONFIG_DIR_NAME, "mcp.json"), "project", state);
+	const onWarning = options.onWarning ?? ((warning: string) => console.warn(warning));
+	readConfigFile(join(options.agentDir, "mcp.json"), "global", state, onWarning);
+	if (options.projectTrusted)
+		readConfigFile(join(options.cwd, CONFIG_DIR_NAME, "mcp.json"), "project", state, onWarning);
 	return {
 		servers: [...state.servers.values()],
 		...(state.autoEnableCodemode === undefined ? {} : { autoEnableCodemode: state.autoEnableCodemode }),
@@ -176,7 +232,22 @@ function editMcpServers(
 	}
 	const servers = isRecord(parsed.mcpServers) ? parsed.mcpServers : undefined;
 	if (!edit(servers, parsed)) return;
+	if (text !== undefined && (statSync(path).mode & 0o077) !== 0) {
+		for (const [name, config] of Object.entries(parsed.mcpServers ?? {})) {
+			const fields = getLiteralCredentialFields(config);
+			if (fields.length > 0) {
+				throw new Error(
+					`${path}: refusing to persist literal credentials for MCP server "${name}" in ${fields.join(", ")} because the file allows group/world access; use environment variable references or !command, or have the owner explicitly restrict the file to mode 0600.`,
+				);
+			}
+		}
+	}
 	const indent = (text && /^([ \t]+)\S/m.exec(text)?.[1]) || "  ";
-	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(parsed, null, indent)}\n`);
+	// Private defaults apply only to new paths; safe managed existing modes are left untouched.
+	mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+	// Exclusive creation refuses a file that appeared after the missing-file read.
+	writeFileSync(path, `${JSON.stringify(parsed, null, indent)}\n`, {
+		mode: 0o600,
+		flag: text === undefined ? "wx" : "w",
+	});
 }

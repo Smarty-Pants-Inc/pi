@@ -18,7 +18,9 @@ export {
 	OAuthError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
+	OAuthNetworkError,
 	OAuthRegistrationError,
+	OAuthResponseLimitError,
 } from "./errors.ts";
 export {
 	type AddClientAuthentication,
@@ -40,6 +42,7 @@ export {
 	type McpOAuthStateStore,
 	MemoryOAuthStateStore,
 } from "./provider.ts";
+export type { OAuthNetworkOptions } from "./response.ts";
 export type {
 	AuthorizationServerMetadata,
 	OAuthChallenge,

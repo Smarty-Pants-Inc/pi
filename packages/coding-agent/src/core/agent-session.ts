@@ -149,7 +149,11 @@ import {
 } from "./system-prompt.ts";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
-import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+import {
+	createToolDefinitionFromAgentTool,
+	scopeToolDefinition,
+	wrapToolWithCompletionOwner,
+} from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
 	findLatestResponse,
@@ -528,7 +532,7 @@ export class AgentSession {
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
-	/** Created on the first `ctx.executeTool()` call. */
+	/** Created on the first tool callback; owns native and nested child scopes. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
@@ -802,10 +806,14 @@ export class AgentSession {
 		args: unknown,
 		options: ExecuteToolOptions,
 	): Promise<AgentToolCallOutcome> {
+		return this._getNestedToolCallRunner().execute(parentToolCallId, name, args, options);
+	}
+
+	private _getNestedToolCallRunner(): NestedToolCallRunner {
 		this._nestedToolCalls ??= new NestedToolCallRunner({
 			getTools: () => this._getCallableTools(),
 			isSequential: () => this.agent.toolExecution === "sequential",
-			runToolCall: (toolCall, parentId, signal, onUpdate) => {
+			runToolCall: (toolCall, parentId, signal, onUpdate, admittedTools) => {
 				const assistantMessage = this._findLastAssistantMessage();
 				if (!assistantMessage) {
 					return Promise.resolve({
@@ -815,7 +823,7 @@ export class AgentSession {
 					});
 				}
 				return runToolCall(toolCall, {
-					tools: this._getCallableTools(),
+					tools: admittedTools,
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
 					// Read the public hooks at dispatch time, including SDK authorization/redaction wrappers.
@@ -832,7 +840,7 @@ export class AgentSession {
 				this._emit(event);
 			},
 		});
-		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+		return this._nestedToolCalls;
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -871,6 +879,18 @@ export class AgentSession {
 		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
 	}
 
+	/** Keep completion ownership on native dispatch, not on bare public registry execute calls. */
+	private _withNativeToolCompletion(context: AgentContext): AgentContext {
+		return {
+			...context,
+			tools: context.tools?.map((tool) =>
+				wrapToolWithCompletionOwner(tool, (toolCallId, run) =>
+					this._getNestedToolCallRunner().runWithParentCompletion(toolCallId, run),
+				),
+			),
+		};
+	}
+
 	private _installAgentRequestProjection(): void {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
@@ -901,7 +921,8 @@ export class AgentSession {
 			signal?.throwIfAborted();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
-			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+			if (!isVirtualModel(model))
+				return { ...previous, context: this._withNativeToolCompletion(context), model, thinkingLevel };
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
 			// failure rejects, which ends the run with an error response. Only messages the user wrote
@@ -939,7 +960,12 @@ export class AgentSession {
 				({ previous, context } = await prepare());
 			}
 			signal?.throwIfAborted();
-			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
+			return {
+				...previous,
+				context: this._withNativeToolCompletion(context),
+				model: route.model,
+				thinkingLevel: route.thinkingLevel,
+			};
 		};
 	}
 
@@ -1236,7 +1262,10 @@ export class AgentSession {
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
-	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+	private _handleAgentEvent = async (event: AgentEvent, signal: AbortSignal): Promise<void> => {
+		if (event.type === "tool_execution_start") {
+			this._getNestedToolCallRunner().startParent(event.toolCallId, signal);
+		}
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -1246,6 +1275,8 @@ export class AgentSession {
 				if (summary?.usage) {
 					message.usage = message.usage ? combineUsage(message.usage, summary.usage) : summary.usage;
 				}
+			} else if (event.type === "tool_execution_end") {
+				this._nestedToolCalls.finishParent(event.toolCallId);
 			} else if (event.type === "agent_end") {
 				this._nestedToolCalls.clear();
 			}
@@ -4295,12 +4326,27 @@ export class AgentSession {
 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
 		);
 		const runner = this._extensionRunner;
-		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
+		const scopeDefinition = (definition: ToolDefinition): ToolDefinition => {
+			const { executionMode, executionKind } = definition;
+			return scopeToolDefinition(definition, (toolCallId, signal, run) =>
+				this._getNestedToolCallRunner().runParent(
+					toolCallId,
+					signal,
+					this.agent.toolExecution === "sequential" || executionMode === "sequential",
+					executionKind,
+					run,
+				),
+			);
+		};
+		const wrappedExtensionTools = wrapRegisteredTools(
+			allCustomTools.map((tool) => ({ ...tool, definition: scopeDefinition(tool.definition) })),
+			runner,
+		);
 		const wrappedBuiltInTools = wrapRegisteredTools(
 			Array.from(this._baseToolDefinitions.values())
 				.filter((definition) => isAllowedTool(definition.name))
 				.map((definition) => ({
-					definition,
+					definition: scopeDefinition(definition),
 					sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${definition.name}`, {
 						source: "builtin",
 					}),

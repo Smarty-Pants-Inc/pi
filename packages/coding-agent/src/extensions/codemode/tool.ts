@@ -419,6 +419,8 @@ export function createCodemodeToolDefinition(
 	return {
 		name: CODEMODE_TOOL_NAME,
 		label: CODEMODE_TOOL_NAME,
+		// smarty-dev#2241 fork-only: scripts orchestrate owned effects, not shared leaf admission.
+		executionKind: "orchestration",
 		// Replaced with the declarations of the callable tools when the tool is activated.
 		description: createCodemodeDescription([], { models: options.models === true }),
 		promptSnippet: codemodeToolSystemPromptContribution.snippet,

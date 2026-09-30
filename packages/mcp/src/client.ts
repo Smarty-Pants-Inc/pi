@@ -36,7 +36,13 @@ import {
 import type { McpTransport } from "./transports/transport.ts";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
-const MAX_LIST_PAGES = 1_000;
+/** Bounds apply to each complete catalogue traversal, and to public single-page listings. */
+const MAX_CATALOGUE_PAGES = 100;
+const MAX_CATALOGUE_ITEMS = 10_000;
+/** UTF-8 JSON bytes of complete received results, including cursors and unknown metadata. */
+const MAX_CATALOGUE_BYTES = 16 * 1024 * 1024;
+const DEFAULT_CATALOGUE_TIMEOUT_MS = 60_000;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 type ClientState = "idle" | "connecting" | "connected" | "closed";
 type NotificationListener = (params: unknown) => void;
@@ -48,6 +54,8 @@ export interface McpClientOptions extends Implementation {
 	capabilities?: ClientCapabilities;
 	protocolVersion?: SupportedProtocolVersion;
 	requestTimeoutMs?: number;
+	/** Whole catalogue deadline, not renewed by pages or progress. Default: 60000; must be positive and finite. */
+	catalogueTimeoutMs?: number;
 	roots?: readonly Root[] | (() => readonly Root[] | Promise<readonly Root[]>);
 }
 
@@ -55,6 +63,19 @@ export interface McpRequestOptions {
 	signal?: AbortSignal;
 	timeoutMs?: number;
 	onProgress?: (progress: ProgressNotification) => void;
+}
+
+interface CatalogueBudget {
+	bytes: number;
+	items: number;
+	expiresAt: number;
+	timeoutMs: number;
+}
+
+function checkCatalogueDeadline(options: McpRequestOptions, budget: CatalogueBudget): void {
+	// Check elapsed time too: synchronous validation/serialization may delay the timer callback.
+	if (performance.now() >= budget.expiresAt) throw new McpTimeoutError(budget.timeoutMs);
+	if (options.signal?.aborted) throw new McpAbortError();
 }
 
 interface PendingRequest {
@@ -155,6 +176,7 @@ export class McpClient {
 	readonly options: Readonly<McpClientOptions>;
 	private state: ClientState = "idle";
 	private transport: McpTransport | undefined;
+	private closing: Promise<void> | undefined;
 	private nextRequestId = 1;
 	private serverInfoValue: Implementation | undefined;
 	private serverCapabilitiesValue: ServerCapabilities | undefined;
@@ -344,34 +366,86 @@ export class McpClient {
 		cursor: string | undefined,
 		options: McpRequestOptions,
 	): Promise<{ items: Record<string, unknown>[]; nextCursor?: string }> {
-		return validateListPage(
-			method,
-			key,
-			await this.request(method, cursor === undefined ? undefined : { cursor }, options),
-			isItem,
+		return this.withCatalogueDeadline(options, (catalogueOptions, budget) =>
+			this.listCataloguePage(method, key, isItem, cursor, catalogueOptions, budget),
 		);
 	}
 
-	/** Every item of a paginated list method. */
+	private async listCataloguePage(
+		method: string,
+		key: string,
+		isItem: (item: Record<string, unknown>) => boolean,
+		cursor: string | undefined,
+		options: McpRequestOptions,
+		budget: CatalogueBudget,
+	): Promise<{ items: Record<string, unknown>[]; nextCursor?: string }> {
+		checkCatalogueDeadline(options, budget);
+		const result = await this.request(method, cursor === undefined ? undefined : { cursor }, options);
+		checkCatalogueDeadline(options, budget);
+		const entries = isObject(result) ? result[key] : undefined;
+		if (Array.isArray(entries) && entries.length > MAX_CATALOGUE_ITEMS - budget.items) {
+			throw new Error(`MCP ${method} exceeded ${MAX_CATALOGUE_ITEMS} items`);
+		}
+		// Transports bound individual wire messages. Bound all decoded result data here before
+		// retaining items or normalizing resources; count metadata and cursors, not just items.
+		const serialized = JSON.stringify(result);
+		if (serialized === undefined) throw invalid(`Invalid MCP ${method} result`);
+		const bytes = Buffer.byteLength(serialized, "utf8");
+		if (bytes > MAX_CATALOGUE_BYTES - budget.bytes) {
+			throw new Error(`MCP ${method} exceeded ${MAX_CATALOGUE_BYTES} bytes`);
+		}
+		const page = validateListPage(method, key, result, isItem);
+		checkCatalogueDeadline(options, budget);
+		budget.bytes += bytes;
+		budget.items += page.items.length;
+		return page;
+	}
+
+	private async withCatalogueDeadline<Result>(
+		options: McpRequestOptions,
+		run: (options: McpRequestOptions, budget: CatalogueBudget) => Promise<Result>,
+	): Promise<Result> {
+		const timeoutMs = this.options.catalogueTimeoutMs ?? DEFAULT_CATALOGUE_TIMEOUT_MS;
+		if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMER_DELAY_MS) {
+			throw new Error(`MCP catalogueTimeoutMs must be positive and finite, at most ${MAX_TIMER_DELAY_MS}`);
+		}
+		const controller = new AbortController();
+		const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+		const budget: CatalogueBudget = { bytes: 0, items: 0, expiresAt: performance.now() + timeoutMs, timeoutMs };
+		const timer = setTimeout(() => controller.abort(new McpTimeoutError(timeoutMs)), timeoutMs);
+		try {
+			return await run({ ...options, signal }, budget);
+		} catch (error) {
+			// requestInternal preserves ordinary caller-abort semantics; translate only our deadline.
+			if (controller.signal.aborted) throw controller.signal.reason;
+			throw error;
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/** Every item of a paginated list method, within one shared budget and deadline. */
 	private async listAll(
 		method: string,
 		key: string,
 		isItem: (item: Record<string, unknown>) => boolean,
 		options: McpRequestOptions,
 	): Promise<Record<string, unknown>[]> {
-		const items: Record<string, unknown>[] = [];
-		const cursors = new Set<string>();
-		let cursor: string | undefined;
-		for (let pageNumber = 0; pageNumber < MAX_LIST_PAGES; pageNumber++) {
-			const page = await this.listPage(method, key, isItem, cursor, options);
-			items.push(...page.items);
-			if (page.nextCursor === undefined) return items;
-			if (cursors.has(page.nextCursor))
-				throw new Error(`MCP ${method} returned duplicate cursor: ${page.nextCursor}`);
-			cursors.add(page.nextCursor);
-			cursor = page.nextCursor;
-		}
-		throw new Error(`MCP ${method} exceeded ${MAX_LIST_PAGES} pages`);
+		return this.withCatalogueDeadline(options, async (catalogueOptions, budget) => {
+			const items: Record<string, unknown>[] = [];
+			const cursors = new Set<string>();
+			let cursor: string | undefined;
+			for (let pageNumber = 0; pageNumber < MAX_CATALOGUE_PAGES; pageNumber++) {
+				const page = await this.listCataloguePage(method, key, isItem, cursor, catalogueOptions, budget);
+				items.push(...page.items);
+				if (page.nextCursor === undefined) return items;
+				if (cursors.has(page.nextCursor))
+					throw new Error(`MCP ${method} returned duplicate cursor: ${page.nextCursor}`);
+				cursors.add(page.nextCursor);
+				cursor = page.nextCursor;
+			}
+			throw new Error(`MCP ${method} exceeded ${MAX_CATALOGUE_PAGES} pages`);
+		});
 	}
 
 	async callTool(
@@ -384,7 +458,17 @@ export class McpClient {
 		);
 	}
 
-	async close(): Promise<void> {
+	close(): Promise<void> {
+		if (!this.closing) {
+			// Publish the completion before abort/close callbacks can re-enter close().
+			const closing = Promise.withResolvers<void>();
+			this.closing = closing.promise;
+			void this.closeTransport().then(closing.resolve, closing.reject);
+		}
+		return this.closing;
+	}
+
+	private async closeTransport(): Promise<void> {
 		const transport = this.transport;
 		this.transport = undefined;
 		this.disposeTransportListeners();
@@ -488,7 +572,17 @@ export class McpClient {
 
 	private async handleRequest(message: JsonRpcRequest): Promise<void> {
 		const transport = this.transport;
-		if (!transport) return;
+		if (!transport || this.state === "closed") return;
+		if (this.incoming.has(message.id)) {
+			await transport
+				.send({
+					jsonrpc: "2.0",
+					id: message.id,
+					error: { code: JSON_RPC_ERROR_CODES.invalidRequest, message: "Duplicate active MCP request ID" },
+				})
+				.catch((error) => this.emitError(error));
+			return;
+		}
 		const handler = this.requestHandlers.get(message.method);
 		if (!handler) {
 			await transport
@@ -514,7 +608,7 @@ export class McpClient {
 				.send({ jsonrpc: "2.0", id: message.id, error: responseError })
 				.catch((sendError) => this.emitError(sendError));
 		} finally {
-			this.incoming.delete(message.id);
+			if (this.incoming.get(message.id) === controller) this.incoming.delete(message.id);
 		}
 	}
 

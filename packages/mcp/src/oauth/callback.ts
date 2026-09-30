@@ -32,6 +32,7 @@ function plainText(page: OAuthCallbackPage): string {
 export class OAuthCallbackServer {
 	readonly redirectUrl: string;
 	private server: Server;
+	private closing: Promise<void> | undefined;
 	private path: string;
 	private timeoutMs: number;
 	private renderPage: ((page: OAuthCallbackPage) => string) | undefined;
@@ -100,6 +101,7 @@ export class OAuthCallbackServer {
 	}
 
 	waitForCallback(state: string): Promise<OAuthCallback> {
+		if (this.closing) return Promise.reject(new Error("OAuth callback server closed"));
 		if (this.pending.has(state)) throw new Error("OAuth state is already pending");
 		return new Promise((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -110,15 +112,19 @@ export class OAuthCallbackServer {
 		});
 	}
 
-	async close(): Promise<void> {
+	close(): Promise<void> {
+		if (this.closing) return this.closing;
+		this.closing = new Promise<void>((resolve, reject) => {
+			// Stop accepting before retiring connections, including preconnections and incomplete requests.
+			this.server.close((error) => (error ? reject(error) : resolve()));
+			this.server.closeAllConnections();
+		});
 		for (const pending of this.pending.values()) {
 			clearTimeout(pending.timer);
 			pending.reject(new Error("OAuth callback server closed"));
 		}
 		this.pending.clear();
-		await new Promise<void>((resolve, reject) => {
-			this.server.close((error) => (error ? reject(error) : resolve()));
-		});
+		return this.closing;
 	}
 
 	private reply(response: ServerResponse, status: number, page: OAuthCallbackPage): void {

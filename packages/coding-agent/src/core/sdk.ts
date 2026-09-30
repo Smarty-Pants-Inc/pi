@@ -5,6 +5,7 @@ import { clampThinkingLevel, type Message, type Model, streamSimple } from "@ear
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
+import { bootstrapExtensionModels } from "./agent-session-services.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
 import { CacheWarmer } from "./cache-warmer.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
@@ -256,6 +257,17 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
+
+	// Restore only after queued provider prerequisites, virtual models and offline auth
+	// availability are installed. Ordinary owners use their separately received services.
+	if (!owner) {
+		const installedProviderIds = await bootstrapExtensionModels(modelRuntime, resourceLoader);
+		// Match runner registration precedence without normalizing intentionally custom SDK models
+		// when their provider was not changed by extension loading.
+		if (model && installedProviderIds.has(model.provider)) {
+			model = modelRuntime.getModel(model.provider, model.id) ?? model;
+		}
+	}
 
 	// Assistant messages name the physical model that answered, so a virtual selection is only in
 	// model_change entries.

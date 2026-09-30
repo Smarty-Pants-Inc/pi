@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Worker } from "node:worker_threads";
 import { toCodemodeIdentifier } from "../identifier.ts";
 import type {
@@ -12,6 +13,7 @@ import type {
 	CodemodeTool,
 } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
+import { MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "./prelude-source.ts";
 import {
 	CONTROL_WORDS,
 	type HostToWorkerMessage,
@@ -51,6 +53,19 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function validateStore(store: Iterable<readonly [string, string]>): void {
+	let total = 0;
+	for (const [key, json] of store) {
+		if (json.length > MAX_STORE_VALUE_CHARS) {
+			throw new RangeError(`store value exceeds ${MAX_STORE_VALUE_CHARS} characters of JSON`);
+		}
+		total += key.length + json.length;
+		if (total > MAX_STORE_TOTAL_CHARS) {
+			throw new RangeError(`store is full: stored values exceed ${MAX_STORE_TOTAL_CHARS} characters of JSON`);
+		}
+	}
+}
+
 function serializeStore(store: Readonly<Record<string, unknown>> | undefined): Record<string, string> {
 	const serialized: Record<string, string> = {};
 	for (const [key, value] of Object.entries(store ?? {})) {
@@ -59,13 +74,15 @@ function serializeStore(store: Readonly<Record<string, unknown>> | undefined): R
 			Object.defineProperty(serialized, key, { value: json, enumerable: true, configurable: true, writable: true });
 		}
 	}
+	validateStore(Object.entries(serialized));
 	return serialized;
 }
 
-function parseStoreWrites(json: string): CodemodeStoreWrites {
+function parseStoreWrites(json: string, snapshot: Readonly<Record<string, string>>): CodemodeStoreWrites {
 	const entries: unknown = JSON.parse(json);
 	if (!Array.isArray(entries)) throw new Error("Invalid store writes: expected an array");
 	const writes: CodemodeStoreWrites = { set: {}, delete: [] };
+	const serializedWrites = new Map<string, string>();
 	for (const entry of entries) {
 		if (
 			!Array.isArray(entry) ||
@@ -78,10 +95,26 @@ function parseStoreWrites(json: string): CodemodeStoreWrites {
 		const key: string = entry[0];
 		if (entry.length === 1) writes.delete.push(key);
 		else {
+			if (entry[1].length > MAX_STORE_VALUE_CHARS) {
+				throw new RangeError(`store value exceeds ${MAX_STORE_VALUE_CHARS} characters of JSON`);
+			}
 			const value: unknown = JSON.parse(entry[1]);
 			Object.defineProperty(writes.set, key, { value, enumerable: true, configurable: true, writable: true });
+			serializedWrites.set(key, entry[1]);
 		}
 	}
+	// Callers persist deletions first, then the returned set. Duplicate forged
+	// entries must not make quota accounting disagree with that public result.
+	const effective = new Map(Object.entries(snapshot));
+	for (const key of writes.delete) effective.delete(key);
+	for (const [key, value] of serializedWrites) effective.set(key, value);
+	validateStore(effective);
+	for (const [key, value] of Object.entries(writes.set)) {
+		// Count the JSON that will be serialized on the next run as well as the
+		// incoming text: compact numeric encodings can expand after parsing.
+		effective.set(key, JSON.stringify(value));
+	}
+	validateStore(effective);
 	return writes;
 }
 
@@ -91,12 +124,18 @@ function defaultWorkerUrl(): URL {
 }
 
 interface PendingCall {
+	execution: Execution;
+	active: boolean;
 	record: CodemodeCall | undefined;
 	startedAt: number;
 	controller: AbortController;
 	/** Includes execute() and its hooks/finally blocks, even after cancellation. */
 	promise: Promise<void>;
 }
+
+// One process-local context; each invocation identifies its exact execution.
+// Inherited asynchronous callbacks cease to be reentrant once it has settled.
+const hostInvocation = new AsyncLocalStorage<PendingCall>();
 
 interface ExecutionOptions {
 	code: string;
@@ -123,6 +162,7 @@ class Execution {
 	private readonly tools: ReadonlyMap<string, CodemodeTool>;
 	private readonly globals: ReadonlyMap<string, CodemodeTool>;
 	private readonly signal: AbortSignal | undefined;
+	private readonly store: Readonly<Record<string, string>>;
 	private readonly timer: NodeJS.Timeout | undefined;
 	private readonly output: CodemodeOutputItem[] = [];
 	private readonly calls: CodemodeCall[] = [];
@@ -138,6 +178,7 @@ class Execution {
 		this.tools = options.tools;
 		this.globals = options.globals;
 		this.signal = options.signal;
+		this.store = options.store;
 
 		if (Number.isFinite(options.timeoutMs)) {
 			this.timer = setTimeout(() => {
@@ -287,7 +328,7 @@ class Execution {
 			return;
 		}
 		const value: unknown = message.value === undefined ? undefined : JSON.parse(message.value);
-		const writes = parseStoreWrites(message.writes);
+		const writes = parseStoreWrites(message.writes, this.store);
 		this.finish(undefined, value, writes);
 	}
 
@@ -296,15 +337,22 @@ class Execution {
 			message.target === "tool" ? { name: message.name, status: "cancelled", durationMs: 0 } : undefined;
 		if (record) this.calls.push(record);
 		const pending: PendingCall = {
+			execution: this,
+			active: true,
 			record,
 			startedAt: performance.now(),
 			controller: new AbortController(),
 			promise: Promise.resolve(),
 		};
 		this.pending.set(message.id, pending);
-		pending.promise = this.invokeCall(message, pending).catch((error: unknown) => {
-			this.finish({ kind: "sandbox", message: `Host call failed: ${errorMessage(error)}` });
-		});
+		pending.promise = hostInvocation
+			.run(pending, () => this.invokeCall(message, pending))
+			.catch((error: unknown) => {
+				this.finish({ kind: "sandbox", message: `Host call failed: ${errorMessage(error)}` });
+			})
+			.finally(() => {
+				pending.active = false;
+			});
 	}
 
 	private async invokeCall(
@@ -350,7 +398,9 @@ class Execution {
 		this.signal?.removeEventListener("abort", this.onAbort);
 
 		const draining = [...this.pending.values()];
-		for (const pending of draining) pending.controller.abort();
+		// Abort listeners run in the aborting caller's context, not necessarily
+		// where they were registered. Their cleanup still belongs to this call.
+		for (const pending of draining) hostInvocation.run(pending, () => pending.controller.abort());
 
 		const result: CodemodeResult = error
 			? { ok: false, error, output: this.output, calls: this.calls }
@@ -452,9 +502,17 @@ export class CodemodeSandbox {
 		return execution.promise.finally(() => this.running.delete(execution));
 	}
 
-	/** Aborts in-flight executions (they resolve with `kind: "aborted"`) and rejects new ones. */
+	/**
+	 * Aborts in-flight executions and rejects new ones. External callers join
+	 * all host effects and hooks. Inside an active host callback (including
+	 * cancellation cleanup), this only requests retirement: joining that same
+	 * callback would deadlock. The execution and external closes still drain it.
+	 */
 	async close(): Promise<void> {
 		this.closed = true;
-		await Promise.all([...this.running].map((execution) => execution.abort("Sandbox closed")));
+		const invocation = hostInvocation.getStore();
+		const reentrant = invocation?.active === true && this.running.has(invocation.execution);
+		const draining = [...this.running].map((execution) => execution.abort("Sandbox closed"));
+		if (!reentrant) await Promise.all(draining);
 	}
 }

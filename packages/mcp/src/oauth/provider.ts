@@ -14,7 +14,8 @@ export interface McpOAuthState {
 
 export interface McpOAuthStateStore {
 	load(): McpOAuthState | undefined | Promise<McpOAuthState | undefined>;
-	save(state: McpOAuthState): void | Promise<void>;
+	/** `replaceGrant` marks a successful token exchange, not an intermediate authorization write. */
+	save(state: McpOAuthState, options?: { replaceGrant?: boolean }): void | Promise<void>;
 }
 
 export interface McpOAuthProviderOptions {
@@ -24,6 +25,8 @@ export interface McpOAuthProviderOptions {
 	clientId?: string;
 	clientSecret?: string;
 	store?: McpOAuthStateStore;
+	/** Cancellation owned by the authorization attempt, including its network operations. */
+	signal?: AbortSignal;
 	onRedirect(url: URL): void | Promise<void>;
 }
 
@@ -43,6 +46,7 @@ export class MemoryOAuthStateStore implements McpOAuthStateStore {
 export class McpOAuthProvider implements OAuthClientProvider {
 	readonly redirectUrl: string;
 	readonly clientMetadata: OAuthClientMetadata;
+	readonly signal: AbortSignal | undefined;
 	private serverUrl: string;
 	private configuredClient: OAuthClientInformationMixed | undefined;
 	private store: McpOAuthStateStore;
@@ -50,6 +54,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
 	private writes: Promise<void> = Promise.resolve();
 
 	constructor(options: McpOAuthProviderOptions) {
+		this.signal = options.signal;
 		this.serverUrl = String(new URL(options.serverUrl));
 		this.redirectUrl = String(options.redirectUrl);
 		this.clientMetadata = {
@@ -90,12 +95,15 @@ export class McpOAuthProvider implements OAuthClientProvider {
 
 	async saveTokens(tokens: OAuthTokens): Promise<void> {
 		const expiresAt = tokens.expires_in === undefined ? undefined : Date.now() + tokens.expires_in * 1000;
-		await this.update((value) => {
-			const next: McpOAuthState = { ...value, tokens };
-			if (expiresAt === undefined) delete next.tokensExpireAt;
-			else next.tokensExpireAt = expiresAt;
-			return next;
-		});
+		await this.update(
+			(value) => {
+				const next: McpOAuthState = { ...value, tokens };
+				if (expiresAt === undefined) delete next.tokensExpireAt;
+				else next.tokensExpireAt = expiresAt;
+				return next;
+			},
+			{ replaceGrant: true },
+		);
 	}
 
 	async redirectToAuthorization(url: URL): Promise<void> {
@@ -140,9 +148,12 @@ export class McpOAuthProvider implements OAuthClientProvider {
 		return this.own(await this.store.load());
 	}
 
-	private async update(update: (state: McpOAuthState) => McpOAuthState): Promise<void> {
+	private async update(
+		update: (state: McpOAuthState) => McpOAuthState,
+		options?: { replaceGrant?: boolean },
+	): Promise<void> {
 		this.writes = this.writes.then(async () => {
-			await this.store.save(update(this.own(await this.store.load())));
+			await this.store.save(update(this.own(await this.store.load())), options);
 		});
 		await this.writes;
 	}

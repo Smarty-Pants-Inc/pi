@@ -631,6 +631,19 @@ export interface ToolDefinition<TParams extends TSchema = TSchema, TDetails = un
 	 */
 	executionMode?: ToolExecutionMode;
 
+	/**
+	 * Fork-only executor metadata, excluded from model schemas/declarations (#2241).
+	 * `effect`: shared admission for a parallel leaf callback through its completion hooks,
+	 * exclusive for sequential execution. Native admission begins at execute, not preparation
+	 * or before-hooks. `orchestration`: parallel parents delegate effects through ctx.executeTool()
+	 * without their own shared ticket; sequential parents retain an exclusive subtree ticket.
+	 * Use effect tools for direct filesystem/process/network work, not callbacks that delegate
+	 * or wait on unrelated tool effects while holding their ticket.
+	 * Omitted preserves legacy writer-only scheduling, including undeclared composites;
+	 * undeclared readers are not covered by the cross-branch shared-admission guarantee.
+	 */
+	executionKind?: AgentTool["executionKind"];
+
 	/** Execute the tool. */
 	execute(
 		toolCallId: string,

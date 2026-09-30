@@ -182,6 +182,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	private stderrTail: string | undefined;
 	private readonly cwd: string;
 	private readonly createTransport: McpTransportFactory;
+	/** Registration authority may retire before the async registry receiver runs. */
+	private readonly isCurrent: () => boolean;
 	private readonly authProvider: McpAuthProvider | undefined;
 	private readonly onTools: (connection: McpServerConnection) => void;
 	private readonly onChange: ((connection: McpServerConnection) => void) | undefined;
@@ -191,6 +193,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		entry: McpServerEntry;
 		cwd: string;
 		createTransport: McpTransportFactory;
+		/** Synchronous authority check for a registered server's exact enabled lifetime. */
+		isCurrent?: () => boolean;
 		credentials: McpOAuthCredentialStore;
 		onTools: (connection: McpServerConnection) => void;
 		/** Called when `state`, `error`, or `tools` change. */
@@ -201,6 +205,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		this.entry = options.entry;
 		this.cwd = options.cwd;
 		this.createTransport = options.createTransport;
+		this.isCurrent = options.isCurrent ?? (() => true);
 		this.onTools = options.onTools;
 		this.onChange = options.onChange;
 		this.log = options.log;
@@ -245,8 +250,13 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		};
 	}
 
+	private assertCurrent(): void {
+		if (!this.isCurrent()) throw new Error(`MCP server "${this.entry.name}" is no longer enabled`);
+	}
+
 	getClient(): Promise<McpClient> {
 		if (this.closed) return Promise.reject(new Error(`MCP server "${this.entry.name}" is shut down`));
+		if (!this.isCurrent()) return Promise.reject(new Error(`MCP server "${this.entry.name}" is no longer enabled`));
 		if (this.client?.connectionState === "connected") return Promise.resolve(this.client);
 		this.opening ??= this.open().finally(() => {
 			this.opening = undefined;
@@ -289,6 +299,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	private async withClient<T>(run: (client: McpClient) => Promise<T>, readOnly = false): Promise<T> {
 		for (let attempt = 1; ; attempt++) {
 			const client = await this.getClient();
+			// getClient() yields even for a connected client; mutation may have retired it meanwhile.
+			this.assertCurrent();
 			try {
 				return await run(client);
 			} catch (error) {
@@ -382,17 +394,18 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 				return await this.connectOnce();
 			} catch (error) {
 				const delayMs = retries[attempt];
-				if (this.closed || delayMs === undefined || !isTransientError(error)) {
+				if (this.closed || !this.isCurrent() || delayMs === undefined || !isTransientError(error)) {
 					throw this.connectFailed(error);
 				}
 				await delay(delayMs, undefined, { signal: this.shutdown.signal }).catch(() => undefined);
-				if (this.closed) throw this.connectFailed(error);
+				if (this.closed || !this.isCurrent()) throw this.connectFailed(error);
 			}
 		}
 	}
 
 	private async connectOnce(): Promise<McpClient> {
 		if (this.closed) throw new Error("shut down while connecting");
+		this.assertCurrent();
 		const client = new McpClient({
 			name: "pi",
 			version: VERSION,
@@ -404,9 +417,12 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		if (log) client.onNotification("notifications/message", (params) => log.write(this.entry.name, params));
 		let transport: McpTransport | undefined;
 		try {
+			this.assertCurrent();
 			transport = this.createTransport(this.entry, this.cwd, this.authProvider);
+			this.assertCurrent();
 			await client.connect(transport);
 			if (this.closed) throw new Error("shut down while connecting");
+			this.assertCurrent();
 			client.onNotification("notifications/tools/list_changed", () => {
 				void this.refreshTools(client);
 			});
@@ -422,6 +438,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 				hasResources ? fetchResources(client) : { resources: [], resourceTemplates: [] },
 			]);
 			if (this.closed) throw new Error("shut down while connecting");
+			this.assertCurrent();
 			if (client.connectionState !== "connected") throw new Error("connection closed during setup");
 			this.client = client;
 			this.tools = tools;
@@ -434,8 +451,11 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			this.onTools(this);
 			this.changed();
 			if (this.closed) throw new Error("shut down while connecting");
+			this.assertCurrent();
 			return client;
 		} catch (error) {
+			// A reentrant factory can retire registration before connect() owns the transport.
+			if (client.connectionState === "idle") await transport?.close();
 			await this.dropClient(client);
 			if (transport instanceof StdioTransport) {
 				this.stderrTail = transport.stderr.trim().slice(-STDERR_TAIL_CHARS) || undefined;
@@ -466,21 +486,23 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private async refreshTools(client: McpClient): Promise<void> {
+		if (!this.isCurrent()) return;
 		try {
 			const tools = await client.listTools();
-			if (this.client !== client || this.closed) return;
+			if (this.client !== client || this.closed || !this.isCurrent()) return;
 			this.tools = tools;
 			this.onTools(this);
 		} catch (error) {
-			if (this.client !== client || this.closed) return;
+			if (this.client !== client || this.closed || !this.isCurrent()) return;
 			this.error = `Failed to refresh tools: ${errorMessage(error)}`;
 		}
 		this.changed();
 	}
 
 	private async refreshResources(client: McpClient): Promise<void> {
+		if (!this.isCurrent()) return;
 		const { resources, resourceTemplates } = await fetchResources(client);
-		if (this.client !== client || this.closed) return;
+		if (this.client !== client || this.closed || !this.isCurrent()) return;
 		this.resources = resources;
 		this.resourceTemplates = resourceTemplates;
 		this.onTools(this);

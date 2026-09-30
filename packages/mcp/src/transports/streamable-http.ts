@@ -239,6 +239,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	private controller = new AbortController();
 	private started = false;
 	private closed = false;
+	private closing: Promise<void> | undefined;
 	private sessionIdValue: string | undefined;
 	private protocolVersion: string | undefined;
 	private getStreamStarted = false;
@@ -309,8 +310,17 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		throw new McpHttpError(response.status, `Unsupported MCP response content type: ${type ?? "missing"}`);
 	}
 
-	async close(): Promise<void> {
-		if (this.closed) return;
+	close(): Promise<void> {
+		if (!this.closing) {
+			// Concurrent and reentrant callers share the DELETE/stream-retirement completion.
+			const closing = Promise.withResolvers<void>();
+			this.closing = closing.promise;
+			void this.closeSession().then(closing.resolve, closing.reject);
+		}
+		return this.closing;
+	}
+
+	private async closeSession(): Promise<void> {
 		this.closed = true;
 		this.controller.abort();
 		if (this.started && this.sessionIdValue) {

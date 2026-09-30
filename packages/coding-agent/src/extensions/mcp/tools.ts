@@ -10,8 +10,8 @@
  * errors (`isError`) are error results for the model, but scripts still resolve to the result.
  */
 
-import { createHash, randomBytes } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -62,10 +62,16 @@ export interface McpToolDetails {
 export type McpOutputSaver = (data: string | Uint8Array, extension: string) => Promise<string>;
 
 export async function saveToTempFile(data: string | Uint8Array, extension: string): Promise<string> {
-	const path = join(tmpdir(), `pi-mcp-${randomBytes(8).toString("hex")}${extension}`);
-	// Results can carry private data, so only the user may read the file.
-	await writeFile(path, data, { mode: 0o600 });
-	return path;
+	// Results can carry private data. mkdtemp creates a unique, user-only 0700 directory.
+	const directory = await mkdtemp(join(tmpdir(), "pi-mcp-"));
+	try {
+		const path = join(directory, `output${extension}`);
+		await writeFile(path, data, { flag: "wx", mode: 0o600 });
+		return path;
+	} catch (error) {
+		await rm(directory, { recursive: true, force: true }).catch(() => {});
+		throw error;
+	}
 }
 
 export interface McpToolCaller {

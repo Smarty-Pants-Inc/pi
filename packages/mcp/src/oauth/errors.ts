@@ -1,3 +1,29 @@
+/** A network deadline/cancellation must not be treated as a discovery miss or a refresh failure. */
+export class OAuthNetworkError extends Error {
+	constructor(message: string, cause?: unknown) {
+		super(message, { cause });
+		this.name = "OAuthNetworkError";
+	}
+}
+
+export class OAuthResponseLimitError extends Error {
+	readonly body: string;
+
+	constructor(maxBytes: number, body = "") {
+		super(`OAuth response exceeds ${maxBytes} received bytes`);
+		this.name = "OAuthResponseLimitError";
+		this.body = body;
+	}
+}
+
+export function isOAuthNetworkBoundaryError(error: unknown): boolean {
+	return (
+		error instanceof OAuthNetworkError ||
+		error instanceof OAuthResponseLimitError ||
+		(error instanceof Error && ["AbortError", "TimeoutError"].includes(error.name))
+	);
+}
+
 export class OAuthError extends Error {
 	readonly code: string;
 	readonly errorUri: string | undefined;

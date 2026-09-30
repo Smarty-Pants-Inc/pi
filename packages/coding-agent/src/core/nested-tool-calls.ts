@@ -5,9 +5,12 @@
  * `parentToolCallId`, and records the calls and their usage on the model-issued call's tool result
  * message.
  *
- * Nothing here runs until a tool calls `ctx.executeTool()`.
+ * Fork-only: AgentSession also scopes native callbacks so accepted unawaited children join
+ * before publication. Explicit effect metadata enables shared admission; undeclared parallel
+ * callbacks keep legacy scheduling (#2241).
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
 	AgentTool,
 	AgentToolCall,
@@ -138,6 +141,7 @@ export interface NestedToolCallHost {
 		parentToolCallId: string,
 		signal: AbortSignal | undefined,
 		onUpdate: (partialResult: AgentToolResult<unknown>) => Promise<void>,
+		admittedTools: readonly AgentTool[],
 	): Promise<AgentToolCallOutcome>;
 	emit(event: NestedToolExecutionEvent): Promise<void>;
 }
@@ -147,19 +151,23 @@ interface CallScope {
 	recorder: NestedCallRecorder;
 	nextId: number;
 	queue: CallQueue;
-	writers: readonly WriterLease[];
+	ancestors: readonly EffectLease[];
+	releaseEffect?: () => void;
+	accepting: boolean;
+	signal?: AbortSignal;
 }
 
-interface WriterLease {
-	ancestors: readonly WriterLease[];
+interface EffectLease {
+	ancestors: readonly EffectLease[];
+	exclusive: boolean;
 }
 
-/** Only sequential calls hold global leases; parallel composites never block writer admission. */
-class SequentialCallQueue {
-	private readonly active = new Set<WriterLease>();
-	private readonly waiting: { lease: WriterLease; admit: () => void }[] = [];
+/** Fork-only: opt-in effect leaves share admission; undeclared/orchestration parents take only exclusive tickets. */
+class EffectCallQueue {
+	private readonly active = new Set<EffectLease>();
+	private readonly waiting: { lease: EffectLease; admit: () => void }[] = [];
 
-	async acquire(lease: WriterLease, signal?: AbortSignal): Promise<() => void> {
+	async acquire(lease: EffectLease, signal?: AbortSignal): Promise<() => void> {
 		if (signal?.aborted) return () => {};
 		const admitted = Promise.withResolvers<void>();
 		const waiter = { lease, admit: admitted.resolve };
@@ -184,16 +192,31 @@ class SequentialCallQueue {
 		};
 	}
 
+	private conflicts(active: EffectLease, candidate: EffectLease): boolean {
+		return !candidate.ancestors.includes(active) && (active.exclusive || candidate.exclusive);
+	}
+
 	private admit(): void {
+		const blocked: EffectLease[] = [];
 		for (let index = 0; index < this.waiting.length; ) {
 			const waiter = this.waiting[index];
-			if ([...this.active].every((active) => waiter.lease.ancestors.includes(active))) {
+			const active = [...this.active];
+			if (
+				active.every((lease) => !this.conflicts(lease, waiter.lease)) &&
+				blocked.every(
+					(earlier) =>
+						(!earlier.exclusive && !waiter.lease.exclusive) ||
+						// A blocked unrelated waiter cannot precede the descendant needed
+						// to release its blocker. A common exclusive ancestor that already
+						// admits both cousins is not itself such a blocker.
+						active.some((lease) => waiter.lease.ancestors.includes(lease) && this.conflicts(lease, earlier)),
+				)
+			) {
 				this.waiting.splice(index, 1);
 				this.active.add(waiter.lease);
 				waiter.admit();
 			} else {
-				// A waiting unrelated writer cannot precede a descendant needed by
-				// its blocking ancestor. Otherwise the first eligible writer wins.
+				blocked.push(waiter.lease);
 				index++;
 			}
 		}
@@ -250,7 +273,91 @@ export class NestedToolCallRunner {
 	/** Scopes by the id of the calling tool call. */
 	private readonly scopes = new Map<string, CallScope>();
 	private readonly rootQueue = new CallQueue();
-	private readonly sequentialQueue = new SequentialCallQueue();
+	private readonly effectQueue = new EffectCallQueue();
+	private readonly nativeCompletions = new Map<string, { signal: AbortSignal; claimed: boolean }>();
+	private readonly completionOwner = new AsyncLocalStorage<{
+		toolCallId: string;
+		active: boolean;
+		claimed: boolean;
+	}>();
+
+	/** Native events reserve completion ownership, never effect admission. This also
+	 * covers SDK request hooks that replace the session's tool-context projection. */
+	startParent(toolCallId: string, signal: AbortSignal): void {
+		this.nativeCompletions.set(toolCallId, { signal, claimed: false });
+	}
+
+	/** Only native dispatch owns completion after the callback, through its public after-hooks. */
+	runWithParentCompletion<T>(toolCallId: string, run: () => Promise<T>): Promise<T> {
+		const owner = { toolCallId, active: true, claimed: false };
+		return this.completionOwner.run(owner, async () => {
+			try {
+				return await run();
+			} finally {
+				// Deferred bare calls can inherit async context, but not this invocation's authority.
+				owner.active = false;
+			}
+		});
+	}
+
+	/** Own native callbacks too. Nested calls already have a scope and admission ticket. */
+	async runParent<T>(
+		toolCallId: string,
+		signal: AbortSignal | undefined,
+		exclusive: boolean,
+		executionKind: AgentTool["executionKind"],
+		run: (isAccepting: () => boolean) => Promise<T>,
+	): Promise<T> {
+		let scope = this.scopes.get(toolCallId);
+		let pipelineOwned = !!scope;
+		const owner = this.completionOwner.getStore();
+		if (!scope && owner?.active && !owner.claimed && owner.toolCallId === toolCallId) {
+			owner.claimed = true;
+			pipelineOwned = true;
+		}
+		const nativeCompletion = this.nativeCompletions.get(toolCallId);
+		if (!scope && nativeCompletion && !nativeCompletion.claimed && nativeCompletion.signal === signal) {
+			nativeCompletion.claimed = true;
+			pipelineOwned = true;
+		}
+		if (!scope) {
+			const lease: EffectLease | undefined =
+				exclusive || executionKind === "effect" ? { ancestors: [], exclusive } : undefined;
+			scope = {
+				recorder: new NestedCallRecorder(),
+				nextId: 1,
+				queue: new CallQueue(),
+				ancestors: lease ? [lease] : [],
+				accepting: true,
+				signal,
+			};
+			this.scopes.set(toolCallId, scope);
+			if (lease) scope.releaseEffect = await this.effectQueue.acquire(lease, signal);
+		}
+		const owned = scope;
+		try {
+			signal?.throwIfAborted();
+			return await run(() => owned.accepting);
+		} finally {
+			// Close admission before joining. Descendants keep their own live scopes.
+			owned.accepting = false;
+			await owned.queue.drain();
+			// Native/nested pipelines release after their public after-hooks. A bare
+			// registry invocation has no completion event: its callback/child join owns release.
+			if (!pipelineOwned) {
+				owned.releaseEffect?.();
+				if (this.scopes.get(toolCallId) === owned) this.scopes.delete(toolCallId);
+			}
+		}
+	}
+
+	/** Native after-hooks have finished; nested calls release in execute's finally. */
+	finishParent(toolCallId: string): void {
+		this.nativeCompletions.delete(toolCallId);
+		const scope = this.scopes.get(toolCallId);
+		scope?.releaseEffect?.();
+		if (scope) scope.releaseEffect = undefined;
+	}
 
 	constructor(host: NestedToolCallHost) {
 		this.host = host;
@@ -268,7 +375,13 @@ export class NestedToolCallRunner {
 	): Promise<AgentToolCallOutcome> {
 		let scope = this.scopes.get(callerId);
 		if (!scope) {
-			scope = { recorder: new NestedCallRecorder(), nextId: 1, queue: this.rootQueue, writers: [] };
+			scope = {
+				recorder: new NestedCallRecorder(),
+				nextId: 1,
+				queue: this.rootQueue,
+				ancestors: [],
+				accepting: true,
+			};
 			this.scopes.set(callerId, scope);
 		}
 		const toolCall: AgentToolCall = {
@@ -277,14 +390,30 @@ export class NestedToolCallRunner {
 			name,
 			arguments: (args ?? {}) as AgentToolCall["arguments"],
 		};
+		if (!scope.accepting) {
+			return {
+				toolCall,
+				result: { content: [{ type: "text", text: "Calling tool has retired" }], details: {} },
+				isError: true,
+			};
+		}
+		const signal = scope.signal
+			? options.signal && options.signal !== scope.signal
+				? AbortSignal.any([scope.signal, options.signal])
+				: scope.signal
+			: options.signal;
 		const record = scope.recorder.start(toolCall);
-		const exclusive =
-			this.host.isSequential() ||
-			this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential";
+		// Bind dispatch to this admitted registry snapshot. Start observers and hooks
+		// may replace registrations, but cannot change this call's execution contract.
+		const admittedTools = this.host.getTools().slice();
+		const tool = admittedTools.find((tool) => tool.name === name);
+		const exclusive = this.host.isSequential() || tool?.executionMode === "sequential";
+		// Fork-only opt-in: omitted metadata preserves legacy parallel composite scheduling.
+		const effectAdmission = exclusive || tool?.executionKind === "effect";
 		// Reserve before the first await so a parent joins even unawaited accepted children.
-		const admission = scope.queue.acquire(exclusive, options.signal);
+		const admission = scope.queue.acquire(exclusive, signal);
 		let release: (() => void) | undefined;
-		let releaseWriter: (() => void) | undefined;
+		let childScope: CallScope | undefined;
 		try {
 			await this.host.emit({
 				type: "tool_execution_start",
@@ -294,32 +423,43 @@ export class NestedToolCallRunner {
 				parentToolCallId: callerId,
 			});
 			release = await admission;
-			const writer: WriterLease = { ancestors: scope.writers };
-			// Acquire only after local admission: a writer waiting behind a parallel
-			// sibling must not block that sibling's awaited sequential descendants.
-			if (exclusive) releaseWriter = await this.sequentialQueue.acquire(writer, options.signal);
+			const lease: EffectLease = { ancestors: scope.ancestors, exclusive };
+			// Local admission precedes global admission so an awaiting sibling does not
+			// block the descendants needed to release its local barrier.
+			const releaseEffect = effectAdmission ? await this.effectQueue.acquire(lease, signal) : undefined;
+			childScope = {
+				recorder: scope.recorder,
+				nextId: 1,
+				queue: new CallQueue(),
+				ancestors: effectAdmission ? [...scope.ancestors, lease] : scope.ancestors,
+				releaseEffect,
+				accepting: true,
+				signal,
+			};
+			this.scopes.set(toolCall.id, childScope);
 			let outcome: AgentToolCallOutcome;
-			if (!options.signal?.aborted) {
-				const children = new CallQueue();
-				this.scopes.set(toolCall.id, {
-					recorder: scope.recorder,
-					nextId: 1,
-					queue: children,
-					writers: exclusive ? [...scope.writers, writer] : scope.writers,
-				});
+			if (!signal?.aborted) {
+				const children = childScope.queue;
 				try {
-					outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
-						options.onUpdate?.(partialResult);
-						await this.host.emit({
-							type: "tool_execution_update",
-							toolCallId: toolCall.id,
-							toolName: name,
-							args: toolCall.arguments,
-							partialResult,
-							parentToolCallId: callerId,
-						});
-					});
+					outcome = await this.host.runToolCall(
+						toolCall,
+						callerId,
+						signal,
+						async (partialResult) => {
+							options.onUpdate?.(partialResult);
+							await this.host.emit({
+								type: "tool_execution_update",
+								toolCallId: toolCall.id,
+								toolName: name,
+								args: toolCall.arguments,
+								partialResult,
+								parentToolCallId: callerId,
+							});
+						},
+						admittedTools,
+					);
 				} finally {
+					childScope.accepting = false;
 					await children.drain();
 				}
 			} else {
@@ -344,20 +484,28 @@ export class NestedToolCallRunner {
 			return outcome;
 		} finally {
 			this.scopes.delete(toolCall.id);
-			releaseWriter?.();
+			childScope?.releaseEffect?.();
 			(release ?? (await admission))();
 		}
 	}
 
 	/** Remove and return the record of the nested calls a model-issued call made. */
 	takeRecord(toolCallId: string): NestedCallSummary | undefined {
+		this.nativeCompletions.delete(toolCallId);
 		const scope = this.scopes.get(toolCallId);
 		this.scopes.delete(toolCallId);
 		if (!scope) return undefined;
+		scope.accepting = false;
+		scope.releaseEffect?.();
 		return { calls: scope.recorder.snapshot(), usage: scope.recorder.totalUsage };
 	}
 
 	clear(): void {
+		this.nativeCompletions.clear();
+		for (const scope of this.scopes.values()) {
+			scope.accepting = false;
+			scope.releaseEffect?.();
+		}
 		this.scopes.clear();
 	}
 }

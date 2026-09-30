@@ -54,6 +54,7 @@ export function createWriteToolDefinition(
 	return {
 		name: "write",
 		label: "write",
+		executionKind: "effect",
 		// ponytail: see edit.ts; a bash call in the same message sees the written file (smarty-dev#977).
 		executionMode: "sequential",
 		description:
