@@ -1,0 +1,4 @@
+Semantic extract, not raw provider/RPC output. Original inspect log SHA256: f90ce693624fbf0015431ea95a0cc2eeaa9984c0209ddde547e62d09d3e5bf5b
+Actual fabric_exec result: value=42; model=gpt-6.1-sol; provider=cliproxyapi.
+Guard: deliberate command refused before shell execution; no bypass attempted.
+Seven recorded initial RPC command dispositions successful (get_state, prompt, prompt, prompt, compact, prompt, prompt). Raw envelopes, IDs and message payloads omitted.

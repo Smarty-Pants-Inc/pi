@@ -1,0 +1,133 @@
+{
+  "baseHead": "8c14be9775e59147c8f1e1c906a36b547c281fd4",
+  "blockingIDs": 22,
+  "additionalLogHardening": true,
+  "checks": [
+    {
+      "id": "F15",
+      "severity": "P1",
+      "check": "Actual watched generation across separate commits treats reserved own keys as data, no inherited merge targets/deletions."
+    },
+    {
+      "id": "F16",
+      "severity": "P1",
+      "check": "Actual CodeMode spill under022 creates private0700 directory/exclusive0600 file; full content accessible only through intended owner path."
+    },
+    {
+      "id": "F17",
+      "severity": "P1",
+      "check": "Fresh global/project0700+0600, redacted literal-project warning and unsafe existing secret-mode refusal including mixed Cookie literal+env and clientSecret literal+env templates; whole references and supported Authorization scheme+reference controls retained without resolution/execution."
+    },
+    {
+      "id": "F13",
+      "severity": "P1",
+      "check": "Synchronous core registry lifetime mutation invalidates construction/connect/publication/captured tool execution even while an earlier async change observer blocks MCP receiver; same-name/config unregister-readd has distinct lifetime/source. Shutdown joins old and pending owners; healthy replacement/unrelated servers remain usable."
+    },
+    {
+      "id": "A11",
+      "severity": "P2",
+      "check": "Sequential child excludes built-in and explicitly annotated effect cousins in both arrival orders including exclusive ancestor. Optional executionKind effect/orchestration; absent retains legacy writer-only admission with no shared wait. Legacy composite waiting for a cousin writer before its first child completes; undeclared readers retain legacy overlap. Effect leaves must not delegate/wait unrelated tools. Native admission begins execute through completion hooks, not model-loop prepare hooks. External fleet annotation follow-up remains separate and pending."
+    },
+    {
+      "id": "F18",
+      "severity": "P2",
+      "check": "Model-issued native tool result/idle/abort joins its accepted unawaited nested children and hooks, rejects postretirement admission."
+    },
+    {
+      "id": "F19",
+      "severity": "P2",
+      "check": "Host enforces store pervalue+effective aggregate quotas on snapshots/writes/replacements/deletions/repeated runs outside mutable guest."
+    },
+    {
+      "id": "F20",
+      "severity": "P2",
+      "check": "Duplicate active incoming IDs rejected before callback; identity cleanup/cancel/close retains original callback ownership."
+    },
+    {
+      "id": "F21",
+      "severity": "P2",
+      "check": "Discovery/register/token successes/errors have received-byte bounds and cancellable network headers/body deadlines; normal human auth wait preserved."
+    },
+    {
+      "id": "F22",
+      "severity": "P2",
+      "check": "Separate OS processes sharing real FileAuthStorageBackend and refresh lock: superseded browser and old refresh success/invalid_grant cannot overwrite/invalidate newer grant; preserved grant remains usable for tools/call and rotating refresh. Logout fences and ordinary cross-process stale-token refresh remain."
+    },
+    {
+      "id": "F23",
+      "severity": "P2",
+      "check": "Catalogue item/byte/page retention bounded before append; whole-operation deadline not progress/page renewed; unrelated requests continue."
+    },
+    {
+      "id": "F24",
+      "severity": "P2",
+      "check": "Awaited reentrant close settles/rejects selfjoin and initiates retirement; external close still joins callback effects."
+    },
+    {
+      "id": "F25",
+      "severity": "P2",
+      "check": "Callback successful/cancel cleanup retires raw preconnections/incomplete requests and joins shutdown."
+    },
+    {
+      "id": "F26",
+      "severity": "P2",
+      "check": "Concurrent/reentrant MCP client and HTTP close await same retirement including descendant/DELETE."
+    },
+    {
+      "id": "Astra8",
+      "severity": "P2",
+      "check": "Actual createAgentSession fresh runtime flushes queued provider/native-provider prerequisites then virtual registrations and offline availability before restore, including virtual selection under an existing physical provider needing queued auth reference. Successful same-provider registrations refresh explicit same-identity model snapshots; absent, unrelated or failed registrations preserve custom explicit models. Next faux prompt proves URL and routing; ordinary-owner exclusion/physical and removed-router controls remain."
+    },
+    {
+      "id": "Astra9",
+      "severity": "P2",
+      "check": "Cold tokenization cancel either caller settles independently; live counterpart and warm/retry cache remain correct."
+    },
+    {
+      "id": "OAUTH-R1",
+      "severity": "P2",
+      "check": "Caller abort during file-lock acquisition or in-process queue promptly retires bound sign-in callback/spare sockets, skips queued authorization writes, never abandons a later acquired lock or cancels the active holder; ordinary waiting rereads rotated tokens."
+    },
+    {
+      "id": "OAUTH-R2",
+      "severity": "P2",
+      "check": "Both backend entry points initialize under the existing storage lock, including successful exclusive-open-before-first-write interleaving; B cannot commit during A bootstrap, later complete grant/revisions survive. Preserve stale-absence, wx0600/EEXIST, managed modes, cancellation/compromise checks and release-on-error controls."
+    },
+    {
+      "id": "R2-ASTRA-1",
+      "severity": "P2",
+      "check": "Native parallel event/pipeline failure joins all started siblings AND every accepted update-delivery promise before propagation and idle/settled/abort completion, including one rejected update plus another held event. Retain the first failure observed at a common original event-delivery promise boundary (Error or undefined; native-end/update adjacent releases in both source and arrival orders), prompt rejection observation, synchronous update normalization, gated writes/hooks, and normal sequential/direct-call controls."
+    },
+    {
+      "id": "R2-ASTRA-2",
+      "severity": "P2",
+      "check": "Annotated built-in reader cancellation joins accepted backend IO/process retirement before effect lease release and fences further operations; live cousin writer cannot overlap canceled-but-unsettled read/ls. Unstarted canceled calls remain prompt."
+    },
+    {
+      "id": "R2-ASTRA-3",
+      "severity": "P2",
+      "check": "Nested start-observer dynamic replacement cannot dispatch a different callable/effect contract than admission owns: pin instance or safely re-admit replacement. Current public hooks and normal dynamic replacement remain supported."
+    },
+    {
+      "id": "R2-ASTRA-4",
+      "severity": "P2",
+      "check": "Direct session-wrapped execute owns and releases its lease after callback/children join without native events; subsequent direct writer and next faux-native prompt complete. Native pipeline lease still covers completion hooks."
+    },
+    {
+      "id": "inventory-log",
+      "severity": "hardening",
+      "check": "New rotating MCP logs/files/directories private; safe existing managed modes/best-effort behavior retained."
+    }
+  ],
+  "gates": {
+    "source": "PASS 65/65 committed blobs on bfc93f278218534d72803f779093b2e5c875f1f1; product clean, all writers released",
+    "targetsBeforeAndFixed": "PASS retained released before/control receipts; final common-observer narrow Astra PASS. Historical d073 Forge ci/check/build/fullsuite/consumer PASS does not clear latest loop",
+    "rootCheck": "PASS exact bfc93 rootcheck,1796 files,no fixes,exit0",
+    "fullSuite": "PASS exact bfc93 Forge ./test.sh,7411 Vitest passed/912 intentional skips,25 scripts passed,1182 TUI dot passes,exit0",
+    "realPi": "PENDING actual CLI and Dev1 fleet proof on immutable bfc93 archive",
+    "independentAudit": "pending",
+    "namedSecurity": "PENDING exact-newhead pass; full delayed old8c comment5904824438 reconciled to F16/F17/F21/F23/log already repaired",
+    "landedInstalled": "pending"
+  },
+  "note": "Selected semantic acceptance metadata only; private host/session/owner fields omitted. Gates are retained producer states, not fresh acceptance."
+}

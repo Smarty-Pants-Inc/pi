@@ -1,0 +1,52 @@
+{
+  "proofOf": "Smarty-Pants-Inc/pi#92",
+  "host": "dev1 (ryzen1)",
+  "runner": "fabric-v2",
+  "source": "bfc93f278218534d72803f779093b2e5c875f1f1",
+  "tracked_clean_packages": "0",
+  "archive": {
+    "path": ".local/round2-artifact/dist.tar.gz",
+    "sha256": "065633d867a3e4acceaebc52522402a7e611ff409a470996123721f2d03cf392"
+  },
+  "scripts": {
+    "prepare-proof.mjs": "6c83f617b1eb6659eb83f55d07195e9956ac8eef3d721dc5cddecfe3ed56e543",
+    "seed-proof.mjs": "5c4cdf349cdc36c99cd07ac70b269a086267003a70adfafb16844036a6337d28",
+    "run-proof.mjs": "8c4317beb4c5b971a565a6a122f77b533c02e975a5412fbf83ffc43760fd7126",
+    "inspect-proof.mjs": "96c4ea24fd627cf2c386140f1b5db64e5cd5bbd67f2d739b74c43617839e5b5e",
+    "proof-observer.ts": "8445ddd55ce3b624561ac43b7549b847339b3dd0bb36283fe85d5f73aa8b96c0"
+  },
+  "runner_script": {
+    "fv2-run.sh": "9f526d429a5cb0c1c06560b75f40baa2bf8869ff55beecfd40d4c507e6fa05da"
+  },
+  "profile_settings_sha256": "0352a7eb80b444abc7a0de679c8023ca34ea93727120a6bcbbeae11aba20ca3e",
+  "profile_models_sha256": "4d1dd0a9f915584b96c8a62e021a51486cea3db9922d1059e29ba1c253fc8f65",
+  "production_settings_sha256": "88d5ab55859c662dfee4d06761bc998ac7c22dbee3e784eb0e348cbcff2e556d",
+  "cli_sha256": "8189b66abc4f9f431dbb70941dcba690d76d040de1fbfff212886be35a53639d",
+  "artifacts": {
+    "after-compaction-event.json": "585c1793aca07b969e59b2cfe7eed050d59f939814967362efe58853619955c2",
+    "after-resume.json": "9cf416726842d506d7eda656940eec03c2d4faa06547f00c665740f187922062",
+    "before-live-proof.json": "6b4bbfb82f20a236264e847b8f56817d88e5b3af6fed3a96bc712fe7755f2638",
+    "before-resume.json": "32f0f93803539e73a704513fe4dbdfd11d12119ab90252e3f9f6aa7b7de5d4ea",
+    "compaction-events.jsonl": "5f1a135a95517b1fa2a7996a2a528a555c5fe58fa2cfbc1e9695d8bf54964358",
+    "initial-rpc.jsonl": "373600fad539603b7f1654fba0b42705ef3cab69f2e207d07a4569931d284cf6",
+    "observations.jsonl": "fa58163e81d69b97abdaabd843ad29a478c03fcf4867c044c90fc4940c5cb4fc",
+    "result.json": "17161fb8f19b89637b87d86174ca35d91d98bafd13c2d9a7052aecdddc67a674",
+    "resumed-rpc.jsonl": "0d5aaf0ae70d2a0cf1e792d1f13f9c9df147aec598f255faf3e36ec4a5995295",
+    "seed.json": "8a866e44defdaf0b3c7139afe805147a720c6f25e27edaa8553013352007fb37",
+    "startup.json": "bf4975218c4f0a4cc1985818e6453d726ef7d3458f82c01bc891481af419307f",
+    "tool-results.jsonl": "8962cd8003fc1d0afbd70d4b6b233c625f356a24a1aa3f46a598432241088af2"
+  },
+  "progress": [
+    "2026-09-30T06:09:44Z npm ci",
+    "2026-09-30T06:09:52Z extract dist",
+    "2026-09-30T06:09:53Z START prepare",
+    "2026-09-30T06:09:53Z END prepare 0",
+    "2026-09-30T06:09:53Z START seed",
+    "2026-09-30T06:09:53Z END seed 0",
+    "2026-09-30T06:09:53Z START run",
+    "2026-09-30T06:10:32Z END run 0",
+    "2026-09-30T06:10:32Z START inspect",
+    "2026-09-30T06:10:32Z END inspect 0",
+    "2026-09-30T06:10:32Z FLEET_PROOF_DONE rc=0"
+  ]
+}

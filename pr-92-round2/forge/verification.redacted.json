@@ -1,0 +1,120 @@
+{
+  "head": "bfc93f278218534d72803f779093b2e5c875f1f1",
+  "host": "forge",
+  "start": "2026-09-30T05:59:24Z",
+  "end": "2026-09-30T06:01:30Z",
+  "scriptSha256": "39231e6260dbd975b8f83de44be2161e85ab57446aff0b79775888ff82bb37f7",
+  "staticToolsBin": "<STATIC_TOOLS_BIN>",
+  "phases": {
+    "ci": 0,
+    "check": 0,
+    "build": 0,
+    "tests": 0,
+    "consumer": 0,
+    "all": 0
+  },
+  "vitest": [
+    {
+      "passed": 980,
+      "skipped": 1
+    },
+    {
+      "passed": 1278,
+      "skipped": 860
+    },
+    {
+      "passed": 345,
+      "skipped": 0
+    },
+    {
+      "passed": 27,
+      "skipped": 0
+    },
+    {
+      "passed": 107,
+      "skipped": 0
+    },
+    {
+      "passed": 3658,
+      "skipped": 50
+    },
+    {
+      "passed": 514,
+      "skipped": 1
+    },
+    {
+      "passed": 55,
+      "skipped": 0
+    },
+    {
+      "passed": 150,
+      "skipped": 0
+    },
+    {
+      "passed": 133,
+      "skipped": 0
+    },
+    {
+      "passed": 44,
+      "skipped": 0
+    },
+    {
+      "passed": 15,
+      "skipped": 0
+    },
+    {
+      "passed": 105,
+      "skipped": 0
+    }
+  ],
+  "vitestPassed": 7411,
+  "vitestSkipped": 912,
+  "nodeTestSummaries": [
+    {
+      "tests": 25,
+      "suites": 0,
+      "passed": 25,
+      "failed": 0,
+      "cancelled": 0,
+      "skipped": 0
+    }
+  ],
+  "tuiDotReporter": {
+    "passed": 1182,
+    "phaseExit": 0
+  },
+  "failureLines": [],
+  "rawArchive": {
+    "path": ".local/ryzen3-bfc9-logs.tgz",
+    "sha256": "9470f14334d0fbeca25d19f3317f6746cca6db22dfd25292e7faecc3ac339753"
+  },
+  "logs": [
+    {
+      "path": ".local/ryzen3-bfc9.Rkfceb/run.out",
+      "sha256": "4af1191532a65d6bd357c335db353623241b14f3740c9baa1ca8f53332007a8c"
+    },
+    {
+      "path": ".local/ryzen3-bfc9.Rkfceb/ryzen3-final/ci.log",
+      "sha256": "a81a20203b6d108ef912befbc5fd58ce04cd347c4489fc9a8ff47f8e28e0feef"
+    },
+    {
+      "path": ".local/ryzen3-bfc9.Rkfceb/ryzen3-final/check.log",
+      "sha256": "073e09fd37bea687b4ed98508ea90c345f775754e4e481d4ec9bc70ae856c791"
+    },
+    {
+      "path": ".local/ryzen3-bfc9.Rkfceb/ryzen3-final/build.log",
+      "sha256": "65c4b0ed32ca3d77e96266fb91ae98b345e9a3b16db15f4f2160868807bd4bcf"
+    },
+    {
+      "path": ".local/ryzen3-bfc9.Rkfceb/ryzen3-final/tests.log",
+      "sha256": "8bef12053e71906b18d7505eedfb2790ba3dc833a3364afb428dff35ceba411a"
+    },
+    {
+      "path": ".local/ryzen3-bfc9.Rkfceb/ryzen3-final/consumer.log",
+      "sha256": "5c13645cc9ccafc1d96eb5c5ee5176b6e620e4424a57d09759cad8ade1acde48"
+    }
+  ],
+  "sourceDiffs": "both empty",
+  "consumer": "actual packed SDK and bundled/unbundled CLI passed",
+  "remaining": "CLI/fleet/independent audit pending, named review/security/CI/install separate"
+}

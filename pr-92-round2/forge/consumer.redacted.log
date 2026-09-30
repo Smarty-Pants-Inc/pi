@@ -1,0 +1,22 @@
+
+> pi-monorepo@0.0.3 check:package-install
+> node scripts/coding-agent-consumer.mjs
+
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/tarballs
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/consumer/smoke-sdk.mjs
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/consumer/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --version
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-package-consumer-LQFJHR/consumer/node_modules/@earendil-works/pi-coding-agent/dist/cli.js --version
+Coding-agent SDK and CLI consumer smoke tests passed (<NODE_24.18.0>).

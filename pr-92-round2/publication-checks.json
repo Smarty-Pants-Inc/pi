@@ -1,0 +1,15 @@
+{
+  "head": "bfc93f278218534d72803f779093b2e5c875f1f1",
+  "finalizedUTC": "2026-09-30T06:40:45.121835+00:00",
+  "status": "RELEASED_FOR_LEAD_PUBLICATION_READY_FOR_RE_REVIEW_ONLY",
+  "independentAudit": "ACCEPTANCE_AUDIT: PASS \u2014 READY-FOR-RE-REVIEW ONLY",
+  "independentAuditOriginalSHA256": "ebb1ac60ba223069ee0c9b9aa7b3badc688ea92c9386069109791beea79c41b7",
+  "committedAndWorktreeSourcesMatched": 65,
+  "textFilesScanned": 33,
+  "credentialAndPrivateAbsolutePathPatternFindings": [],
+  "rawFleetRpcOrProfilePublished": false,
+  "privateOriginPublished": false,
+  "sourceOrArtifactBytesChanged": false,
+  "originalVisualsUnchanged": true,
+  "namedReviewSecurityCiLandingInstallation": "NOT CLEARED"
+}

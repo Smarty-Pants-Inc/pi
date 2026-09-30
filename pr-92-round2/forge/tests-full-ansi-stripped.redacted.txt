@@ -1,0 +1,413 @@
+Running tests without API keys in isolated home: <FORGE_TMP_ROOT>/pi-test.bQcMXy/home
+
+> pi-monorepo@0.0.3 test
+> npm run test:scripts && npm run test --workspaces --if-present
+
+
+> pi-monorepo@0.0.3 test:scripts
+> node --test scripts/*.test.mjs scripts/*.test.ts
+
+✔ rejects undeclared imports even when the workspace package exists (99.811111ms)
+✔ accepts runtime declarations, builtins, self imports, relative imports, and erased types (92.407434ms)
+✔ rejects dev-only dependencies, side-effect imports, mixed exports, and literal runtime loads (96.875479ms)
+✔ allows imported JSON assets outside the TypeScript include pattern (92.046525ms)
+✔ permits dev-only dependencies in sources excluded from the published build (89.464889ms)
+✔ rejects excluded code reachable through export * from "./experimental/server"; (91.712947ms)
+✔ rejects excluded code reachable through import type { Options } from "./experimental/server"; (85.181832ms)
+✔ ignores tests, declarations, and private packages (88.399234ms)
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH] --version
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH] --version
+Coding-agent SDK and CLI consumer smoke tests passed (<NODE_24.18.0>).
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+$ <NODE_24.18.0> <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm pack --ignore-scripts --json --pack-destination <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+✔ installs only coding-agent directly and uses overrides only for declared runtime dependencies (1141.219707ms)
+✔ requires the ordinary export and rejects changed public or loader function identities (1093.141555ms)
+✔ fails when the SDK imports an undeclared server despite a working CLI (1038.39674ms)
+✔ fails if a development-only dependency is added back to the published dependency tree (998.09736ms)
+✔ builds revision scoped storage keys (0.641718ms)
+✔ orders Pi versions with semver precedence (0.443694ms)
+✔ selects the newest catalog a Pi version supports (0.178045ms)
+✔ redirects Pi user agents to an explicit catalog version (0.656234ms)
+✔ serves explicit and unversioned catalog requests without redirecting (0.150423ms)
+✔ rejects invalid catalog request parameters (0.117731ms)
+✔ validates stored indexes and drops publication metadata (0.262063ms)
+✔ publishes explicit per-type and total model counts (67.464142ms)
+✔ compares stable release versions numerically (1.268065ms)
+✔ does not regress an existing newer release marker (0.506754ms)
+✔ retries a lost conditional update and preserves a racing newer marker (0.163768ms)
+✔ creates a missing marker with an if-none-match condition (0.126378ms)
+✔ synchronizes private dependencies without touching registry aliases, generated manifests, or published lockstep (59.387869ms)
+ℹ tests 25
+ℹ suites 0
+ℹ pass 25
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4313.005113
+
+> @earendil-works/pi-agent-core@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/agent
+
+················································································-····································································································································································································································································································································································································································································································································································································································································································································································································································································································································
+
+ Test Files  86 passed (86)
+      Tests  980 passed | 1 skipped (981)
+   Start at  05:59:52
+   Duration  6.60s (transform 24.57s, setup 0ms, import 47.60s, tests 15.73s, environment 7ms)
+
+
+> @earendil-works/pi-ai@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/ai
+
+················································································································································································································································································································································---···································································-·······················------···········--·········································----------------------------------------------------------------------------··········-·································································································----------------------------------------------·········-···································-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------···································································································································································································································································································································································································--------··································································----···----------------------------··········-·············-······················-----------························----------·······---························--·-·························································-·----·············-········--········----------------------------------------------------------------------------------------------------------·····
+
+ Test Files  137 passed | 26 skipped (163)
+      Tests  1278 passed | 860 skipped (2138)
+   Start at  05:59:59
+   Duration  4.48s (transform 32.91s, setup 0ms, import 98.85s, tests 7.65s, environment 12ms)
+
+
+> @earendil-works/chord@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/chord
+
+ ✓ test/context.test.ts (5 tests) 5ms
+ ✓ test/boundary.test.ts (1 test) 8ms
+ ✓ test/delta-clone.test.ts (4 tests) 6ms
+ ✓ test/state-value.test.ts (3 tests) 7ms
+ ✓ test/delta-apply-immutable.test.ts (7 tests) 40ms
+ ✓ test/json.test.ts (5 tests) 6ms
+ ✓ test/service-wire.test.ts (8 tests) 12ms
+ ✓ test/state.test.ts (19 tests) 14ms
+ ✓ test/facet-loader.test.ts (9 tests) 13ms
+ ✓ test/facets.test.ts (14 tests) 23ms
+ ✓ test/delta.test.ts (41 tests) 103ms
+ ✓ test/state-diff.test.ts (28 tests) 103ms
+ ✓ test/state-draft.test.ts (9 tests) 106ms
+ ✓ test/service-delivery.test.ts (14 tests) 34ms
+ ✓ test/delta-diff.test.ts (29 tests) 117ms
+ ✓ test/services.test.ts (23 tests) 76ms
+ ✓ test/bundle.test.ts (5 tests) 124ms
+ ✓ test/delta-tracker/tracker.test.ts (67 tests) 626ms
+ ✓ test/state-delivery.test.ts (39 tests) 680ms
+ ✓ test/state-fuzz.test.ts (1 test) 972ms
+   ✓ converges across randomized prepared revisions  971ms
+ ✓ test/delta-tracker/retention.test.ts (14 tests) 2259ms
+     ✓ validates same-job-folded-ops-cleanup retention semantics  431ms
+
+ Test Files  21 passed (21)
+      Tests  345 passed (345)
+   Start at  06:00:04
+   Duration  2.51s (transform 2.88s, setup 0ms, import 4.00s, tests 5.33s, environment 1ms)
+
+
+> @earendil-works/pi-client@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/client
+
+···························
+
+ Test Files  3 passed (3)
+      Tests  27 passed (27)
+   Start at  06:00:07
+   Duration  997ms (transform 714ms, setup 0ms, import 1.21s, tests 408ms, environment 0ms)
+
+
+> @earendil-works/pi-codemode@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/codemode
+
+···········································································································
+
+ Test Files  5 passed (5)
+      Tests  107 passed (107)
+   Start at  06:00:08
+   Duration  8.14s (transform 1.68s, setup 0ms, import 2.45s, tests 12.00s, environment 0ms)
+
+
+> @earendil-works/pi-coding-agent@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/coding-agent
+
+·····················································································································································································································································································································································································································--··································································································································································································································Installing ./packages/local-package...
+Installing <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+Removing <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+··················································Updating npm:fake-package...
+··················································································Installing <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+····································································································································································································································································································································································································································································································································································································································································································------------------·····················································································································································································································································································································································································································································································--------····························································································From <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+   6b13385..9ea74c6  main       -> origin/main
+·······HEAD is now at 9ea74c6 Second commit
+···········································From <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+   6b13385..c0e2de3  main       -> origin/main
+····HEAD is now at c0e2de3 v3
+·····From <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+ + c0e2de3...3b925d2 main       -> origin/main  (forced update)
+HEAD is now at 3b925d2 Rewrite B
+···············From <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+ * tag               v2         -> FETCH_HEAD
+··············HEAD is now at 9ea74c6 Second commit
+From <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+ * tag               v2         -> FETCH_HEAD
+HEAD is now at 9ea74c6 Second commit
+······························································································································································----------····························································································································································································································································································································································································································································-························································································································································································-----···························································································done
+·····················································································································································································---······--······································································································································································································································································Launching external editor: <NODE_24.18.0> <FORGE_SOURCE_ROOT>/packages/coding-agent/test/fixtures/fake-external-editor.mjs <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH]
+Pi will resume when the editor exits.
+·····Launching external editor: <NODE_24.18.0> <FORGE_SOURCE_ROOT>/packages/coding-agent/test/fixtures/fake-external-editor.mjs <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH] --fail
+Pi will resume when the editor exits.
+Launching external editor: <NODE_24.18.0> <FORGE_SOURCE_ROOT>/packages/coding-agent/test/fixtures/fake-external-editor.mjs <FORGE_TMP_ROOT>/pi-test.bQcMXy[DISPOSABLE_TEST_PATH] --empty
+Pi will resume when the editor exits.
+···································································································································································-············································································
+
+ Test Files  381 passed | 6 skipped (387)
+      Tests  3658 passed | 50 skipped (3708)
+   Start at  06:00:16
+   Duration  46.30s (transform 82.99s, setup 0ms, import 547.82s, tests 186.78s, environment 33ms)
+
+
+> @earendil-works/pi-durable@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/durable
+
+ ✓ test/types.test.ts (2 tests) 3ms
+ ✓ test/storage-runtime-boundary.test.ts (4 tests) 15ms
+ ✓ test/env-adaptive-publisher.test.ts (4 tests) 7ms
+ ✓ test/env-output-capture.test.ts (23 tests) 15ms
+ ✓ test/env-truncate.test.ts (13 tests) 135ms
+ ✓ test/sqlite-facade.test.ts (4 tests) 9ms
+ ✓ test/sqlite-migrations.test.ts (4 tests) 15ms
+ ✓ test/security-storage-upgrade.test.ts (4 tests) 21ms
+ ✓ test/memory-storage.test.ts (23 tests) 30ms
+ ✓ test/env-node.test.ts (47 tests | 1 skipped) 278ms
+ ✓ test/sqlite-storage.test.ts (55 tests) 333ms
+ ✓ test/session-definitions.test.ts (2 tests) 4ms
+ ✓ test/harness-registry.test.ts (12 tests) 11ms
+ ✓ test/harness-context.test.ts (6 tests) 18ms
+ ✓ test/security-document-migration.test.ts (3 tests) 29ms
+ ✓ test/harness-prompt.test.ts (7 tests) 24ms
+ ✓ test/harness-inspect.test.ts (2 tests) 20ms
+ ✓ test/session-tables.test.ts (12 tests) 30ms
+ ✓ test/session-states.test.ts (10 tests) 36ms
+ ✓ test/harness-conversations.test.ts (14 tests) 50ms
+ ✓ test/session-documents.test.ts (27 tests) 53ms
+ ✓ test/session-forks.test.ts (14 tests) 55ms
+ ✓ test/session-watches.test.ts (21 tests) 62ms
+ ✓ test/harness-submissions.test.ts (10 tests) 52ms
+ ✓ test/session-checkpoints-migrations.test.ts (20 tests) 73ms
+ ✓ test/jsonl-storage.test.ts (85 tests) 419ms
+ ✓ test/harness-tasks-recovery.test.ts (22 tests) 99ms
+ ✓ test/harness-tasks.test.ts (34 tests) 113ms
+ ✓ test/harness-generation-recovery.test.ts (7 tests) 238ms
+ ✓ test/security-generation-prototype.test.ts (3 tests) 645ms
+ ✓ test/env-node-spill.test.ts (1 test) 1221ms
+     ✓ keeps inherited stdio open past the exit grace period while a spill write is pending  1219ms
+ ✓ test/harness-generation.test.ts (20 tests) 775ms
+     ✓ faults a run task, settling its inputs and discarding the committed partial  303ms
+
+ Test Files  32 passed (32)
+      Tests  514 passed | 1 skipped (515)
+   Start at  06:01:03
+   Duration  1.76s (transform 11.16s, setup 0ms, import 18.90s, tests 4.89s, environment 3ms)
+
+
+> @earendil-works/pi-evals@0.99.1 test
+> vitest run --config vitest.test.config.ts
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/evals
+
+ ✓ test/plan.test.ts (4 tests) 4ms
+ ✓ test/comparison.test.ts (4 tests) 11ms
+ ✓ test/report.test.ts (14 tests) 22ms
+ ✓ test/acme-server.test.ts (10 tests) 43ms
+ ✓ test/harness.test.ts (15 tests) 7ms
+ ✓ test/configured-runtime.test.ts (8 tests) 244ms
+
+ Test Files  6 passed (6)
+      Tests  55 passed (55)
+   Start at  06:01:05
+   Duration  2.82s (transform 3.63s, setup 0ms, import 5.20s, tests 331ms, environment 0ms)
+
+
+> @earendil-works/pi-mcp@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/mcp
+
+······················································································································································
+
+ Test Files  13 passed (13)
+      Tests  150 passed (150)
+   Start at  06:01:08
+   Duration  2.74s (transform 1.01s, setup 0ms, import 1.63s, tests 10.33s, environment 1ms)
+
+
+> @earendil-works/pi-protocol@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/protocol
+
+·····································································································································
+
+ Test Files  3 passed (3)
+      Tests  133 passed (133)
+   Start at  06:01:11
+   Duration  535ms (transform 439ms, setup 0ms, import 888ms, tests 193ms, environment 0ms)
+
+
+> @earendil-works/pi-server@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/server
+
+············································
+
+ Test Files  6 passed (6)
+      Tests  44 passed (44)
+   Start at  06:01:12
+   Duration  990ms (transform 2.14s, setup 0ms, import 3.73s, tests 395ms, environment 0ms)
+
+
+> @earendil-works/pi-telemetry@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/telemetry
+
+ ✓ test/telemetry.test.ts (5 tests) 5ms
+ ✓ test/conformance.test.ts (10 tests) 5ms
+
+ Test Files  2 passed (2)
+      Tests  15 passed (15)
+   Start at  06:01:13
+   Duration  145ms (transform 68ms, setup 0ms, import 91ms, tests 10ms, environment 0ms)
+
+
+> @earendil-works/pi-tui@0.99.1 test
+> node --test --test-reporter=dot --test-reporter-destination=stdout test/*.test.ts
+
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+..
+
+> @earendil-works/pi-session-backend-sqlite-node@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 <FORGE_SOURCE_ROOT>/packages/session-backends/sqlite-node
+
+·········································································································
+
+ Test Files  6 passed (6)
+      Tests  105 passed (105)
+   Start at  06:01:18
+   Duration  866ms (transform 2.23s, setup 0ms, import 3.78s, tests 384ms, environment 0ms)
+
+npm notice
+npm notice New major version of npm available! 11.16.0 -> 12.1.0
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.1.0
+npm notice To update run: npm install -g npm@12.1.0
+npm notice

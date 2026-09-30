@@ -1,0 +1,33 @@
+{
+  "extensionsLoaded": [
+    "pi-fabric",
+    "better-compaction",
+    "inbox",
+    "gateway",
+    "guard"
+  ],
+  "fabricExec": {
+    "value": 42,
+    "actualModel": "cliproxyapi/gpt-6.1-sol"
+  },
+  "compaction": {
+    "fromExtension": true,
+    "configuredFallback": "sync-compaction/gpt-6.1-sol (same approved Sol endpoint)"
+  },
+  "lazyResume": {
+    "identicalContext": true,
+    "contextSHA256": "bc12627aed8362b2130fea285ff9ed3834cea88f4af245bc10132423e002fc6f",
+    "contextBytes": 46604,
+    "coldEntries": 511
+  },
+  "codemode": {
+    "registered": true,
+    "activeByDefault": false
+  },
+  "processPolicy": {
+    "onePiAtATime": true,
+    "nice": 19
+  },
+  "scratchRoot": "<FLEET_PROOF_ROOT>",
+  "betterCompactionDebug": "session_before_compact.fallback-success"
+}

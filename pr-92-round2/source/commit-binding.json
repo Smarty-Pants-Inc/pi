@@ -1,0 +1,280 @@
+{
+  "schema": "pi-round2-commit-binding/1",
+  "at": "2026-09-30T05:53:27.800Z",
+  "head": "bfc93f278218534d72803f779093b2e5c875f1f1",
+  "branch": "sync/upstream-v0.99.1",
+  "baseHead": "8c14be9775e59147c8f1e1c906a36b547c281fd4",
+  "files": [
+    {
+      "path": "packages/agent/src/agent-loop.ts",
+      "sha256": "5acd01b7e3a069e3ce57cb6acf98f50c5c8d40c3005b30aca77319b8b18fddd2"
+    },
+    {
+      "path": "packages/agent/src/harness/pico3/view.ts",
+      "sha256": "a79e2e63d47b25b3852006c5e4c1fe7b6bd88911a41453382893d26ebc86d311"
+    },
+    {
+      "path": "packages/agent/src/types.ts",
+      "sha256": "fda3e11616a31e710c6d47f463e2a58bf9321d68fe44436b403f9956a2f31f8e"
+    },
+    {
+      "path": "packages/agent/test/harness/pico3/security-round2-owned-watch.test.ts",
+      "sha256": "a5f77cb7f80c02c21e6c49fe0c113cd532b3118baf33aa8571394473e45bad94"
+    },
+    {
+      "path": "packages/ai/src/api/llama-cpp-classify.ts",
+      "sha256": "8ba611ea0147ca914a6a65b8557467a01bd848ca5b27a10cb835ffa88701acae"
+    },
+    {
+      "path": "packages/ai/test/security-round2-classifier-cancellation.test.ts",
+      "sha256": "6d5f24f165d71aa50a54839cfcbd8f437dec457f90a067791f48a0ab9ae6b9ed"
+    },
+    {
+      "path": "packages/codemode/src/runtime/host.ts",
+      "sha256": "0526aa526eb708f58e5ac75a6b3e6fb55d41a66864a2502c6d20289cd0fbcb99"
+    },
+    {
+      "path": "packages/codemode/test/security-round2-store-close.test.ts",
+      "sha256": "5a8bb792245dc84c94a6f9f34be66a6f97b57ac782006fceda290f7e4d291fbe"
+    },
+    {
+      "path": "packages/coding-agent/src/core/agent-session-services.ts",
+      "sha256": "7896d4f54a520716cb27488e555855a81bea83a0ecacd133313b4363470b16e3"
+    },
+    {
+      "path": "packages/coding-agent/src/core/agent-session.ts",
+      "sha256": "d47f12b8cf8b67cdc0096217bfa10c5d185c083b6ec3375a0e6fa23bed0bbe09"
+    },
+    {
+      "path": "packages/coding-agent/src/core/auth-storage.ts",
+      "sha256": "10b493d8b09823c8e4b0faef0c5d12edb2b33a4867fd9ed03e518d2b2a81586f"
+    },
+    {
+      "path": "packages/coding-agent/src/core/extensions/types.ts",
+      "sha256": "aa2773cf218ba0b28e8959bce3636864e0c1cbbc1c15a44b6f28aad018232b11"
+    },
+    {
+      "path": "packages/coding-agent/src/core/mcp-servers.ts",
+      "sha256": "b93d2ca5c1fc5dfeba75ddf0a5bbd109f6fa20b1e45ded360f9dbf573d04f7bd"
+    },
+    {
+      "path": "packages/coding-agent/src/core/nested-tool-calls.ts",
+      "sha256": "d5b7bfc88b227399422a03c37f5c4b00933c10928b4aa5672590f74aa624ba90"
+    },
+    {
+      "path": "packages/coding-agent/src/core/sdk.ts",
+      "sha256": "5a30c28db7b729e3102fbfaec44452d1901347b25a957a6f2d3eb7651d08759d"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/bash.ts",
+      "sha256": "b5500f1607524daa6a1f76eeac08c58f43f2a7cc4a60f3828c2285c27ec9511d"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/edit.ts",
+      "sha256": "224746e017143c86678e750cf7f9521220334f30cd18cd49bb554ee8d1187db5"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/find.ts",
+      "sha256": "7b376d6b8fec8774406e8721943d0733ef4985a94b37db739a69d51f35244509"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/grep.ts",
+      "sha256": "9d7826de82ac3c2be9730796a88e62994d5765ea5daa9e49f712f8abb3fe5cca"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/ls.ts",
+      "sha256": "56797f08cea00f2090401f51f434cc18b398dbc4b2f27bd51f49f40c66b99653"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/read.ts",
+      "sha256": "17124f79c633f90f2043ef4a19e033253ed4d8d75205213abf1a6fe0896a6bfd"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/tool-definition-wrapper.ts",
+      "sha256": "177cc7fb378c26497ac5dc24cded4266019c1860fdf6f18b528c8bd36e67b3ac"
+    },
+    {
+      "path": "packages/coding-agent/src/core/tools/write.ts",
+      "sha256": "7e0343a11600a6f45eca315373ea42eed78765a17356ac6e871c6eb5256085ac"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/codemode/execute.ts",
+      "sha256": "aae17dc2e22376e68a4b2fda1ecd02edfb8bde2aa88df098cec87ab4359df097"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/codemode/tool.ts",
+      "sha256": "537d0f24f4fce14ed714188d7a7ae085e08bc1926ce7a1fa4f74cc6ffd980fc9"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/mcp/cli.ts",
+      "sha256": "66087d5e0e81b8d378472b97e8d93409997543f7cf0297d16c252ed095eae596"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/mcp/config.ts",
+      "sha256": "223d83e538e0831ed39d9b63143a9c72054650b210d3c27d82d5dfc131815515"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/mcp/index.ts",
+      "sha256": "bd70724bb7bcc86a4ae9a067b8abd818abd8e34aa22f8bb8477096299ba9d3f0"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/mcp/log.ts",
+      "sha256": "021cd26951728288c34d705c03d7e72ac8958ecfce8e5951f91ad43d55a33754"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/mcp/oauth.ts",
+      "sha256": "743f5fe373b9524e74bc898a8f57b4b21b2edbdac6ebd9858d283f83e45800c4"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/mcp/runtime.ts",
+      "sha256": "9cfeeda38ec8dcfd0b6214ff6c8d00bc7d262d7cc12c2b0bdcf0fa3f6620380e"
+    },
+    {
+      "path": "packages/coding-agent/src/extensions/mcp/tools.ts",
+      "sha256": "5e1506ac8adb3997b8f56c480c343daea3176bd087ea1210879e7a0008289d1a"
+    },
+    {
+      "path": "packages/coding-agent/test/fixtures/security-round2-auth-bootstrap-process.ts",
+      "sha256": "c3f069f0e16921eba9a5170cc750f4e4628e32a516e1e68fa495bb08a75f1d85"
+    },
+    {
+      "path": "packages/coding-agent/test/fixtures/security-round2-oauth-process.ts",
+      "sha256": "3d70cb5c707143c075f341256d280a4bf77870ac7820daeb62487550d152f925"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-auth-bootstrap.test.ts",
+      "sha256": "fb46f7c2750726f32751c1b9cd65b0f1e0aa9ade34d6d4beed8971979dc92834"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-mcp-log.test.ts",
+      "sha256": "046fa8700438fcfe4f564616b75652bd6333b3f3d4a4d06eea28601e1fd134f1"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-mixed-credentials.test.ts",
+      "sha256": "9fd91fadfea156dc2a055255a0a736158bc58ac00c04d74a0aca4e36defc634b"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-oauth-lifecycle.test.ts",
+      "sha256": "bf28e73dfab382c6b3723aee33a5c1f9437e5b6659043db1b84d8f929f254d3d"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-oauth-lock-cancellation.test.ts",
+      "sha256": "474648d66e4df4d7acb31f94b50c5f58abe9780fa6e40896dbf0073ad7699a13"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-oauth-processes.test.ts",
+      "sha256": "9ee89e17965daad7d91238cd5932d52dad2bdcd4e6c8be635a8ff4ee4518b6ad"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-oauth-revision.test.ts",
+      "sha256": "18233438ad231452ebb9f98bdf054da72dc17cde1aeb375b7453f44fbcaa7b7f"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-private-config.test.ts",
+      "sha256": "875357efbd71cef210179c00249cebbdc2729e8cd6d7bde792871aedfeb4e0ee"
+    },
+    {
+      "path": "packages/coding-agent/test/security-round2-private-output.test.ts",
+      "sha256": "a014a0cc10115557e9f81a19a1030a268baacbf6c7294c0b1c90554a2fff2e05"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/agent-session-mcp.test.ts",
+      "sha256": "a6dd0ae32dcf048e13f96b91489b10f92306b1132f0485985908a6ac416ae45f"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-admission-ownership.test.ts",
+      "sha256": "9a79a90d009d1111c74fead85a71c8d79662cabe23bb66a07a85de1c8a0df405"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-mcp-registry.test.ts",
+      "sha256": "a535ea8516ba99a67cc8084f29e037da1f327571c54845661d8891834fcffb4e"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-native-failure-join.test.ts",
+      "sha256": "7e7c43208a5ccdc80de57b225308eed5c8c745012f3e2ec98a2e7e94270bd5a1"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-nested-custody.test.ts",
+      "sha256": "478326c01259d549a6f91a46d16b0d0dbbbc985ffc706fa02b2e59a2d8e2c359"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-provider-bootstrap.test.ts",
+      "sha256": "97c6ed55e85c7e6c5c86a6a457b6c022d79d1e1b7666f96796807e7ff9d26afd"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-reader-cancel-join.test.ts",
+      "sha256": "76ed1405cdceeec5e1289bdc1211d750d57d0feb8a2a778aa4865dc2041bc15a"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-registry-mutation-fence.test.ts",
+      "sha256": "e3ca71094cbb562bdc401a0f2bf3bb4087709d02f4fe3d4d9315e8ed30b0e78b"
+    },
+    {
+      "path": "packages/coding-agent/test/suite/security-round2-virtual-resume.test.ts",
+      "sha256": "88ea16cc27a9c0e6daadf38fc7ba512dfc91f3c9833a0d7a771f790e2b94bbde"
+    },
+    {
+      "path": "packages/mcp/src/client.ts",
+      "sha256": "ba6a9701f787166712a03ea18014e00721d8b10be221fa5d981e4278738864b4"
+    },
+    {
+      "path": "packages/mcp/src/oauth/callback.ts",
+      "sha256": "86dca8a228c4ab90cfe2854cecf3b5b0a439af2d7be6171c6f937e6a1cf3853b"
+    },
+    {
+      "path": "packages/mcp/src/oauth/discovery.ts",
+      "sha256": "7baee90053a843941f9407882f414294e3d8c9ba010f09c4c258023032dae5f1"
+    },
+    {
+      "path": "packages/mcp/src/oauth/errors.ts",
+      "sha256": "d88491b80c1a80bb50f08a9391e64d99f361001cab415b09edd3a08aae2828f1"
+    },
+    {
+      "path": "packages/mcp/src/oauth/flow.ts",
+      "sha256": "b12df466b0684523c2aee2113eefaf656dc30e6c8e9e4bb8c6a07f3634f4d8dc"
+    },
+    {
+      "path": "packages/mcp/src/oauth/index.ts",
+      "sha256": "6d471c83afb50fb28d41a33e204e52a67352875bae35d6834de4a32ff1ccb306"
+    },
+    {
+      "path": "packages/mcp/src/oauth/provider.ts",
+      "sha256": "0d780be54db47c6e5c6e13b87631fe36142f8006debe6441679689ce282f7a2a"
+    },
+    {
+      "path": "packages/mcp/src/oauth/response.ts",
+      "sha256": "38f58796630f3402b5af6c4ef77ffb7e6deea8b64eeb0466a91d0bca0ddda762"
+    },
+    {
+      "path": "packages/mcp/src/transports/streamable-http.ts",
+      "sha256": "941939f797934d69895d255aa48470cbe0cf336df9a4ca75bf0e243d20a2be09"
+    },
+    {
+      "path": "packages/mcp/test/security-round2-callback-retirement.test.ts",
+      "sha256": "84429790b7cf55babdfccef526ca4124f337309ba2faadbf294d5c8cf90fa8c5"
+    },
+    {
+      "path": "packages/mcp/test/security-round2-catalogue-bounds.test.ts",
+      "sha256": "fb6af87cc9a9266d520e80fffd84680d369f0026428e94cc88e78f3d32317156"
+    },
+    {
+      "path": "packages/mcp/test/security-round2-client-retirement.test.ts",
+      "sha256": "74add4916a22d516d8d0df1fd94b79753ff234c3902f777c6ce2cdcbecfe73a1"
+    },
+    {
+      "path": "packages/mcp/test/security-round2-oauth-bounds.test.ts",
+      "sha256": "5feea99bd9d6557c74d65a49a0c9396d9e7056c80559216a70d797e1b9f89e0e"
+    }
+  ],
+  "checks": {
+    "root": "PASS common-precommit,1796 files,no fixes",
+    "build": "PASS changed agent and coding-agent; other sources unchanged",
+    "scopedAstra": "PASS common-observer final adversarial, release hashes bound",
+    "fullSuite": "PASS exact-head Forge ./test.sh,7411 Vitest/25 scripts/1182 TUI,912 intentional skips",
+    "audit": "pending",
+    "consumer": "PASS packed SDK/bundled and unbundled CLI",
+    "remoteCheckBuild": "PASS exact-head clean ci/rootcheck/full offlinebuild; source diffs empty"
+  },
+  "push": "not pushed; lead fetches for verification",
+  "supersedesUnpublished": "d07351589d30bfc28ac973db8de6da41e0d0d3ae"
+}

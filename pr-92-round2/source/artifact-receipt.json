@@ -1,0 +1,12 @@
+{
+  "head": "bfc93f278218534d72803f779093b2e5c875f1f1",
+  "manifestSha256": "d9b80a6cf2473207daf18a79226876b3025f75bb568f647fdb6d496f00bde214",
+  "archive": ".local/round2-artifact/dist.tar.gz",
+  "sha256": "065633d867a3e4acceaebc52522402a7e611ff409a470996123721f2d03cf392",
+  "sourceFiles": 65,
+  "distFiles": 3351,
+  "finalProofRelease": true,
+  "readiness": false,
+  "fullVerification": "PASS exact-head Forge",
+  "scopedAstra": "PASS common-observer only"
+}

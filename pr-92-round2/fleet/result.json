@@ -1,0 +1,51 @@
+{
+  "extensionsLoaded": [
+    "pi-fabric",
+    "better-compaction",
+    "inbox",
+    "gateway",
+    "guard"
+  ],
+  "fabricExec": {
+    "value": 42,
+    "actualModel": "cliproxyapi/gpt-6.1-sol"
+  },
+  "compaction": {
+    "fromExtension": true,
+    "configuredFallback": "sync-compaction/gpt-6.1-sol (same approved Sol endpoint)"
+  },
+  "lazyResume": {
+    "identicalContext": true,
+    "contextSHA256": "bc12627aed8362b2130fea285ff9ed3834cea88f4af245bc10132423e002fc6f",
+    "contextBytes": 46604,
+    "coldEntries": 511
+  },
+  "codemode": {
+    "registered": true,
+    "activeByDefault": false
+  },
+  "processPolicy": {
+    "onePiAtATime": true,
+    "nice": 19
+  },
+  "betterCompactionDebug": "session_before_compact.fallback-success",
+  "guard": {
+    "refusedBeforeShellExecution": true,
+    "message": "Scratch sync proof guard: deliberate command refused."
+  },
+  "head": "bfc93f278218534d72803f779093b2e5c875f1f1",
+  "sourceTarSHA256": "065633d867a3e4acceaebc52522402a7e611ff409a470996123721f2d03cf392",
+  "cliSHA256": "8189b66abc4f9f431dbb70941dcba690d76d040de1fbfff212886be35a53639d",
+  "gate": "Released fleet proof PASS; terminal independent ACCEPTANCE_AUDIT: PASS \u2014 READY-FOR-RE-REVIEW ONLY. Named review/security/CI, landing and installation remain required.",
+  "freshProfileReleaseIDs": {
+    "gateway": "f6929d12204b864c17b71ccd0c7a295f4f1e1641",
+    "fabric": "a39d9b01a4e24bb0025f4b7217d2d72e6172d46b",
+    "betterCompaction": "e9b8bef33b4d69b5179437728938e1e2d4cdfc11",
+    "inbox": "128ffe01740ff1f681f2c99d9ea11f3c58e4c00d"
+  },
+  "parentVerifiedArtifactAndScriptEntries": 17,
+  "parentRunnerMatched": true,
+  "packagerRehashedArtifactEntries": 12,
+  "parentVerificationOriginalSHA256": "c1621d1621b050a789ba0cf4bac78b5f274943aded7bac2aaebed59355de445f",
+  "independentAuditOriginalSHA256": "ebb1ac60ba223069ee0c9b9aa7b3badc688ea92c9386069109791beea79c41b7"
+}

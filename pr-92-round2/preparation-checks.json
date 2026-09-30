@@ -1,0 +1,34 @@
+{
+  "sourceHashesMatched": 65,
+  "committedBlobHashesMatched": 65,
+  "distHashesMatched": 3351,
+  "forgeOriginalLogHashesMatched": 5,
+  "retainedVitestPassed": 7411,
+  "retainedVitestSkipped": 912,
+  "retainedScriptPassed": 25,
+  "retainedTuiDots": 1182,
+  "retainedPhaseExits": {
+    "ci": 0,
+    "check": 0,
+    "build": 0,
+    "tests": 0,
+    "consumer": 0,
+    "all": 0
+  },
+  "productDiffs": "both empty in producer receipt",
+  "textFilesScanned": 30,
+  "credentialAndPrivatePathPatternFindings": [],
+  "visuals": "15 released artifacts copied unchanged; sheet, final and all 12 frames read; visible disposable fixture paths retained by explicit user authorization; no rendering/edits",
+  "notIndependentAcceptance": true,
+  "noPublication": true,
+  "scanScope": "All current public-folder text bytes; final inventories and result mechanically reviewed and contain only filenames, SHA256 and these non-secret summaries.",
+  "fleet": {
+    "release": "explicit parent RELEASE",
+    "parentVerifiedEntries": 17,
+    "packagerRehashedArtifacts": 12,
+    "rawRpcCopied": false,
+    "productionProfileCopied": false,
+    "freshGateway": "f6929d12204b864c17b71ccd0c7a295f4f1e1641"
+  },
+  "status": "PREPARATION_ONLY_BLOCKED_AUDIT_AND_PUBLIC_LINKS"
+}

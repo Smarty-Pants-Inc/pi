@@ -1,0 +1,67 @@
+{
+  "realPtyBytes": true,
+  "browser": "153.0.8010.12",
+  "cols": 132,
+  "rows": 42,
+  "idleGapCapSeconds": 1,
+  "frames": [
+    {
+      "index": 1,
+      "note": "User sets permissive umask; disposable fake-only profile"
+    },
+    {
+      "index": 2,
+      "note": "Native CLI adds global fake HTTP server"
+    },
+    {
+      "index": 3,
+      "note": "Native CLI adds private project literal credential"
+    },
+    {
+      "index": 4,
+      "note": "Native stat on newly created managed directories and files"
+    },
+    {
+      "index": 5,
+      "note": "Prepare isolated trusted project, empty auth/settings/packages/extensions"
+    },
+    {
+      "index": 6,
+      "note": "Actual CLI list: redacted literal warning and expected loopback failure"
+    },
+    {
+      "index": 7,
+      "note": "Record original content SHA before unsafe-mode experiment"
+    },
+    {
+      "index": 8,
+      "note": "User changes isolated managed project file to mode 644"
+    },
+    {
+      "index": 9,
+      "note": "Actual CLI must refuse persisting retained literal credential"
+    },
+    {
+      "index": 10,
+      "note": "Native SHA verification: original project content unchanged"
+    },
+    {
+      "index": 11,
+      "note": "Native mode after refusal remains 644"
+    },
+    {
+      "index": 12,
+      "note": "Final actual list retains redacted project warning and original server"
+    }
+  ],
+  "contactSheetSteps": [
+    2,
+    3,
+    4,
+    6,
+    8,
+    9,
+    10,
+    12
+  ]
+}

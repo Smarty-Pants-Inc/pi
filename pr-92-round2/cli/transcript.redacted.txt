@@ -1,0 +1,69 @@
+$ umask 022; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+
+EXIT_CODE=0
+$ pi mcp add fake-global --url http://127.0.0.1:9/mcp --header Authorization=FAKE; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+Added global MCP server "fake-global" in <FAKE_PROOF_ROOT>/agent/mcp.json.
+Check it with: pi mcp list
+
+EXIT_CODE=0
+$ pi mcp add -l fake-private --url http://127.0.0.1:9/mcp --header Authorization=FAKE; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+Added project MCP server "fake-private" in <FAKE_PROOF_ROOT>/project/.pi/mcp.json.
+<FAKE_PROOF_ROOT>/project/.pi/mcp.json: warning: project MCP server "fake-private" has a literal credential in headers.Authorization; use an environment variable reference or !command instead.
+The project is not trusted, so <FAKE_PROOF_ROOT>/project/.pi/mcp.json is ignored until you start pi in the project and trust it.
+Check it with: pi mcp list
+
+EXIT_CODE=0
+$ stat -c '%a %n' ../agent ../agent/mcp.json .pi .pi/mcp.json; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+700 ../agent
+600 ../agent/mcp.json
+700 .pi
+600 .pi/mcp.json
+
+EXIT_CODE=0
+$ python3 ../setup-profile.py; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+Isolated fixture only: trusted disposable project; empty auth/settings/packages/extensions; no real credentials.
+
+EXIT_CODE=0
+$ pi mcp list; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+<FAKE_PROOF_ROOT>/project/.pi/mcp.json: warning: project MCP server "fake-private" has a literal credential in headers.Authorization; use an environment variable reference or !command instead.
+fake-global: failed (codemode, global)
+  http://127.0.0.1:9/mcp
+  fetch failed
+fake-private: failed (codemode, project)
+  http://127.0.0.1:9/mcp
+  fetch failed
+
+EXIT_CODE=1
+$ sha256sum .pi/mcp.json | tee ../artifacts/original-content.sha256; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+8aae90339aa5256b5d927e970a5c9cadd7c5144ad83eb6a1208c159e0faea2c3  .pi/mcp.json
+
+EXIT_CODE=0
+$ chmod 644 .pi/mcp.json; stat -c '%a %n' .pi/mcp.json; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+644 .pi/mcp.json
+
+EXIT_CODE=0
+$ pi mcp add -l fake-second --url http://127.0.0.1:9/mcp; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+Could not update <FAKE_PROOF_ROOT>/project/.pi/mcp.json: <FAKE_PROOF_ROOT>/project/.pi/mcp.json: refusing to persist literal credentials for MCP server "fake-private" in headers.Authorization because the file allows group/world access; use environment variable references or !command, or have the owner explicitly restrict the file to mode 0600.
+
+EXIT_CODE=1
+$ sha256sum -c ../artifacts/original-content.sha256; sha256sum .pi/mcp.json; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+.pi/mcp.json: OK
+8aae90339aa5256b5d927e970a5c9cadd7c5144ad83eb6a1208c159e0faea2c3  .pi/mcp.json
+
+EXIT_CODE=0
+$ stat -c '%a %n' .pi/mcp.json; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+644 .pi/mcp.json
+
+EXIT_CODE=0
+$ pi mcp list; rc=$?; printf '\nEXIT_CODE=%s\n' "$rc"
+<FAKE_PROOF_ROOT>/project/.pi/mcp.json: warning: project MCP server "fake-private" has a literal credential in headers.Authorization; use an environment variable reference or !command instead.
+fake-global: failed (codemode, global)
+  http://127.0.0.1:9/mcp
+  fetch failed
+fake-private: failed (codemode, project)
+  http://127.0.0.1:9/mcp
+  fetch failed
+
+EXIT_CODE=1
+$ exit
+exit

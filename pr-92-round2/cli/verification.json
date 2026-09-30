@@ -1,0 +1,113 @@
+{
+  "checks": [
+    {
+      "check": "no fake literal in output: User sets permissive umask; disposable fake-only profile",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Native CLI adds global fake HTTP server",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Native CLI adds private project literal credential",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Native stat on newly created managed directories and files",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Prepare isolated trusted project, empty auth/settings/packages/extensions",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Actual CLI list: redacted literal warning and expected loopback failure",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Record original content SHA before unsafe-mode experiment",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: User changes isolated managed project file to mode 644",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Actual CLI must refuse persisting retained literal credential",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Native SHA verification: original project content unchanged",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Native mode after refusal remains 644",
+      "pass": true
+    },
+    {
+      "check": "no fake literal in output: Final actual list retains redacted project warning and original server",
+      "pass": true
+    },
+    {
+      "check": "12 ordered typed steps; shell exit zero",
+      "pass": true
+    },
+    {
+      "check": "native CLI exit codes add/add/list/refusal/final-list = 0/0/1/1/1",
+      "pass": true
+    },
+    {
+      "check": "native initial managed dirs 700 and files 600",
+      "pass": true
+    },
+    {
+      "check": "redacted literal project warning at step 3",
+      "pass": true
+    },
+    {
+      "check": "redacted literal project warning at step 6",
+      "pass": true
+    },
+    {
+      "check": "redacted literal project warning at step 12",
+      "pass": true
+    },
+    {
+      "check": "unsafe managed-file refusal names retained literal credential field without value",
+      "pass": true
+    },
+    {
+      "check": "original project content SHA unchanged; retained fake fixture, no second server",
+      "pass": true
+    },
+    {
+      "check": "post-refusal file stays deliberately changed mode 644",
+      "pass": true
+    },
+    {
+      "check": "CLI/source artifact unchanged: packages/coding-agent/dist/cli.js",
+      "pass": true
+    },
+    {
+      "check": "CLI/source artifact unchanged: packages/coding-agent/dist/extensions/mcp/cli.js",
+      "pass": true
+    },
+    {
+      "check": "CLI/source artifact unchanged: packages/coding-agent/dist/extensions/mcp/config.js",
+      "pass": true
+    },
+    {
+      "check": "CLI/source artifact unchanged: packages/coding-agent/src/extensions/mcp/cli.ts",
+      "pass": true
+    },
+    {
+      "check": "CLI/source artifact unchanged: packages/coding-agent/src/extensions/mcp/config.ts",
+      "pass": true
+    }
+  ],
+  "pass": true,
+  "projectContentBeforeSHA256": "8aae90339aa5256b5d927e970a5c9cadd7c5144ad83eb6a1208c159e0faea2c3",
+  "projectContentAfterSHA256": "8aae90339aa5256b5d927e970a5c9cadd7c5144ad83eb6a1208c159e0faea2c3",
+  "fakeOnly": true,
+  "notIndependentAcceptanceOrSecurityClearance": true
+}

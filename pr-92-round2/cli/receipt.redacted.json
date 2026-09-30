@@ -1,0 +1,148 @@
+{
+  "realShellPty": true,
+  "shell": "/usr/bin/bash --noprofile --norc -i",
+  "cli": "<SOURCE_ROOT>/packages/coding-agent/dist/cli.js",
+  "shellExit": 0,
+  "hashes": {
+    "packages/coding-agent/dist/cli.js": "8189b66abc4f9f431dbb70941dcba690d76d040de1fbfff212886be35a53639d",
+    "packages/coding-agent/dist/extensions/mcp/cli.js": "7775ba77361440092a4ebfda92a233a7a15b422bd747621f2964a0cee0b461b8",
+    "packages/coding-agent/dist/extensions/mcp/config.js": "1cc0b68d9ecff60f7dc7310a951df911333b243f27f8a5e53a7de7457508c183",
+    "packages/coding-agent/src/extensions/mcp/cli.ts": "66087d5e0e81b8d378472b97e8d93409997543f7cf0297d16c252ed095eae596",
+    "packages/coding-agent/src/extensions/mcp/config.ts": "223d83e538e0831ed39d9b63143a9c72054650b210d3c27d82d5dfc131815515"
+  },
+  "seconds": 22.84406083000067,
+  "environment": {
+    "HOME": "<FAKE_PROOF_ROOT>/home",
+    "PATH": "<FAKE_PROOF_ROOT>/bin:/usr/local/bin:/usr/bin:/bin",
+    "TERM": "xterm-256color",
+    "LANG": "C.UTF-8",
+    "TMPDIR": "<FAKE_PROOF_ROOT>/tmp",
+    "PI_CODING_AGENT_DIR": "<FAKE_PROOF_ROOT>/agent",
+    "PS1": "$ ",
+    "PS2": "> ",
+    "HISTFILE": "/dev/null",
+    "CLI": "<SOURCE_ROOT>/packages/coding-agent/dist/cli.js"
+  },
+  "steps": [
+    {
+      "event": "step",
+      "note": "User sets permissive umask; disposable fake-only profile",
+      "command": "umask 022",
+      "start": 0.5002851659955923,
+      "t": 1.9022022229983122,
+      "exit": 0,
+      "rawStart": 10,
+      "rawEnd": 95
+    },
+    {
+      "event": "step",
+      "note": "Native CLI adds global fake HTTP server",
+      "command": "pi mcp add fake-global --url http://127.0.0.1:9/mcp --header Authorization=FAKE",
+      "start": 1.902215857997362,
+      "t": 3.849359927997284,
+      "exit": 0,
+      "rawStart": 95,
+      "rawEnd": 406
+    },
+    {
+      "event": "step",
+      "note": "Native CLI adds private project literal credential",
+      "command": "pi mcp add -l fake-private --url http://127.0.0.1:9/mcp --header Authorization=FAKE",
+      "start": 3.849366830996587,
+      "t": 5.804353970997909,
+      "exit": 0,
+      "rawStart": 406,
+      "rawEnd": 1157
+    },
+    {
+      "event": "step",
+      "note": "Native stat on newly created managed directories and files",
+      "command": "stat -c '%a %n' ../agent ../agent/mcp.json .pi .pi/mcp.json",
+      "start": 5.8043641799959005,
+      "t": 7.308493635995546,
+      "exit": 0,
+      "rawStart": 1157,
+      "rawEnd": 1356
+    },
+    {
+      "event": "step",
+      "note": "Prepare isolated trusted project, empty auth/settings/packages/extensions",
+      "command": "python3 ../setup-profile.py",
+      "start": 7.308497343001363,
+      "t": 8.7469181330016,
+      "exit": 0,
+      "rawStart": 1356,
+      "rawEnd": 1573
+    },
+    {
+      "event": "step",
+      "note": "Actual CLI list: redacted literal warning and expected loopback failure",
+      "command": "pi mcp list",
+      "start": 8.746923672995763,
+      "t": 11.856507792996126,
+      "exit": 1,
+      "rawStart": 1573,
+      "rawEnd": 2072
+    },
+    {
+      "event": "step",
+      "note": "Record original content SHA before unsafe-mode experiment",
+      "command": "sha256sum .pi/mcp.json | tee ../artifacts/original-content.sha256",
+      "start": 11.856514254999638,
+      "t": 13.373330115995486,
+      "exit": 0,
+      "rawStart": 2072,
+      "rawEnd": 2293
+    },
+    {
+      "event": "step",
+      "note": "User changes isolated managed project file to mode 644",
+      "command": "chmod 644 .pi/mcp.json; stat -c '%a %n' .pi/mcp.json",
+      "start": 13.373336017000838,
+      "t": 14.863499942999624,
+      "exit": 0,
+      "rawStart": 2293,
+      "rawEnd": 2439
+    },
+    {
+      "event": "step",
+      "note": "Actual CLI must refuse persisting retained literal credential",
+      "command": "pi mcp add -l fake-second --url http://127.0.0.1:9/mcp",
+      "start": 14.863504791996093,
+      "t": 16.758499513998686,
+      "exit": 1,
+      "rawStart": 2439,
+      "rawEnd": 3020
+    },
+    {
+      "event": "step",
+      "note": "Native SHA verification: original project content unchanged",
+      "command": "sha256sum -c ../artifacts/original-content.sha256; sha256sum .pi/mcp.json",
+      "start": 16.75850527399598,
+      "t": 18.29177643299772,
+      "exit": 0,
+      "rawStart": 3020,
+      "rawEnd": 3267
+    },
+    {
+      "event": "step",
+      "note": "Native mode after refusal remains 644",
+      "command": "stat -c '%a %n' .pi/mcp.json",
+      "start": 18.291781843996432,
+      "t": 19.732306029996835,
+      "exit": 0,
+      "rawStart": 3267,
+      "rawEnd": 3389
+    },
+    {
+      "event": "step",
+      "note": "Final actual list retains redacted project warning and original server",
+      "command": "pi mcp list",
+      "start": 19.732310447994678,
+      "t": 22.841939830999763,
+      "exit": 1,
+      "rawStart": 3389,
+      "rawEnd": 3888
+    }
+  ]
+}
