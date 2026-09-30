@@ -170,6 +170,70 @@ describe("turn provenance", () => {
 		]);
 	});
 
+	// pi#95 R1 / smarty-dev#2636: host prompts must be stamped before agent_settled defers them.
+	it("keeps first-receipt times for two host prompts deferred by a held settlement handler", async () => {
+		let held = () => {};
+		const entered = new Promise<void>((resolve) => {
+			held = resolve;
+		});
+		let release = () => {};
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let settlements = 0;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async () => {
+						if (++settlements !== 1) return;
+						held();
+						await gate;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			vi.setSystemTime(new Date("2026-09-30T19:00:00.000Z"));
+			harness.setResponses([
+				fauxAssistantMessage("start done"),
+				() => {
+					vi.setSystemTime(new Date("2026-09-30T19:00:04.000Z"));
+					return fauxAssistantMessage("A done");
+				},
+				fauxAssistantMessage("B done"),
+			]);
+			const run = harness.session.prompt("start");
+			await entered;
+			vi.setSystemTime(new Date("2026-09-30T19:00:01.000Z"));
+			await harness.session.prompt("A");
+			vi.setSystemTime(new Date("2026-09-30T19:00:02.000Z"));
+			await harness.session.prompt("B", { source: "rpc" });
+			expect(turns(harness)).toHaveLength(1);
+			vi.setSystemTime(new Date("2026-09-30T19:00:03.000Z"));
+			const releasedAt = new Date().toISOString();
+			release();
+			await run;
+
+			const records = turns(harness)
+				.slice(1)
+				.map((entry) => getTurnProvenance(entry)!);
+			expect(records.map((record) => record.receivedAt)).toEqual([
+				"2026-09-30T19:00:01.000Z",
+				"2026-09-30T19:00:02.000Z",
+			]);
+			for (const record of records) {
+				expect(record.receivedAt < releasedAt).toBe(true);
+				expect(record.channel).toBe("terminal");
+			}
+			expect(new Set(records.map((record) => record.turnId)).size).toBe(2);
+		} finally {
+			release();
+			vi.useRealTimers();
+		}
+	});
+
 	it("records the trusted voice extension's claim with the call's principal", async () => {
 		const { harness, api } = await withExtensions(["voice"], { settings: TRUST });
 		harnesses.push(harness);
@@ -342,7 +406,20 @@ describe("turn provenance", () => {
 		const goodId = append(good);
 		const oldUser = manager.appendMessage({ role: "user", content: FORGED, timestamp: 1 });
 		const oldCustom = manager.appendCustomMessageEntry("pi-fabric-agent-message", FORGED, true, { from: ORG });
+		// pi#95 R1 / smarty-dev#2636: malformed stamps cannot yield principal attribution.
+		const voice = { ...good, channel: "voice", principal: { id: "paul", binding: "voice-call" } };
 		const bad = [
+			...["not-a-uuid", "3f1c2a7e000040008000000000000000", ` ${good.turnId}`].map((turnId) => ({
+				...voice,
+				turnId,
+			})),
+			...[
+				"09/30/2026",
+				"Wed, 30 Sep 2026 00:00:00 GMT",
+				"2026-09-30T00:00:00.000+00:00",
+				"2026-09-30T00:00:00.000",
+				"2026-02-30T00:00:00.000Z",
+			].map((receivedAt) => ({ ...voice, receivedAt })),
 			{ ...good, v: 2 },
 			{ ...good, v: undefined },
 			{ ...good, channel: "admin" },
@@ -360,8 +437,9 @@ describe("turn provenance", () => {
 		const assistantId = manager.appendMessage(fauxAssistantMessage("hi"));
 
 		expect(getTurnProvenance(manager.getEntry(goodId)!)).toEqual(good);
+		expect(getTurnProvenance(manager.getEntry(append(voice))!)).toEqual(voice);
 		for (const id of [oldUser, oldCustom, ...bad, assistantId]) {
-			expect(getTurnProvenance(manager.getEntry(id)!)).toBeUndefined();
+			expect.soft(getTurnProvenance(manager.getEntry(id)!)).toBeUndefined();
 		}
 	});
 

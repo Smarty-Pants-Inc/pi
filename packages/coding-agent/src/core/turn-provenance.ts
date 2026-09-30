@@ -99,6 +99,8 @@ export interface InputAttestationReader {
 export const herdrAttestationReader: InputAttestationReader = Object.freeze({ attest: () => null });
 
 const MAX_FIELD_LENGTH = 200;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 const SENDER_KINDS = new Set<unknown>(["main", "actor", "agent", "remote"]);
 const VERIFIED = new Set<unknown>(["mesh", "bridge"]);
 const FABRIC_VIA = new Set<unknown>(["steer", "followUp", "actor", "replay"]);
@@ -214,9 +216,17 @@ export function getTurnProvenance(entry: SessionEntry): TurnProvenance | undefin
 	else if (entry.type === "custom_message") record = entry.provenance;
 	else return undefined;
 	if (!isObject(record) || record.v !== TURN_PROVENANCE_VERSION) return undefined;
-	if (!field(record.turnId) || typeof record.receivedAt !== "string" || Number.isNaN(Date.parse(record.receivedAt))) {
+	if (
+		typeof record.turnId !== "string" ||
+		!UUID.test(record.turnId) ||
+		typeof record.receivedAt !== "string" ||
+		!ISO_UTC.test(record.receivedAt)
+	) {
 		return undefined;
 	}
+	// Require the writer's canonical UTC format and reject dates that Date.parse normalizes (e.g. February 30).
+	const receivedAt = Date.parse(record.receivedAt);
+	if (!Number.isFinite(receivedAt) || new Date(receivedAt).toISOString() !== record.receivedAt) return undefined;
 	const principal = isObject(record.principal) && field(record.principal.id) ? record.principal.binding : undefined;
 	const hasSenderOrVia = record.sender !== undefined || record.via !== undefined;
 	let readable: boolean;

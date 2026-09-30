@@ -1955,11 +1955,16 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		// Stamp at receipt, not when a held settlement handler or owned preflight lets us dispatch.
+		const promptOptions: InternalPromptOptions = {
+			...options,
+			[RESOLVED_PROVENANCE]: this._turnProvenanceFor(text, options),
+		};
 		if (this._isEmittingAgentSettled) {
-			this._deferredSettledActions.push(async () => await this.prompt(text, options));
+			this._deferredSettledActions.push(async () => await this.prompt(text, promptOptions));
 			return;
 		}
-		if (!this.#ordinaryOwner) return this._prompt(text, options);
+		if (!this.#ordinaryOwner) return this._prompt(text, promptOptions);
 		this.#ordinaryOwner.assertSessionStart(this);
 		this.#ordinaryOwner.assertCompactionIdle();
 		this.#ordinaryPreflights++;
@@ -1973,7 +1978,9 @@ export class AgentSession {
 			}
 		};
 		try {
-			await this.#ordinaryOwner.requestProvenance.prompt((token) => this._prompt(text, options, release, token));
+			await this.#ordinaryOwner.requestProvenance.prompt((token) =>
+				this._prompt(text, promptOptions, release, token),
+			);
 		} finally {
 			release();
 		}
@@ -2303,8 +2310,9 @@ export class AgentSession {
 
 	/**
 	 * The harness-written provenance of a prompt, steer or follow-up, stamped at receipt. Only
-	 * sendUserMessage() supplies a resolved extension provenance (under a module-private key). All other
-	 * input is `terminal`, unless it came from the interactive editor and herdr attests an attached client.
+	 * sendUserMessage() supplies resolved extension provenance; prompt() retains the record under the same
+	 * module-private key before deferral. Host input is `terminal`, unless it came from the interactive editor
+	 * and herdr attests an attached client.
 	 */
 	private _turnProvenanceFor(text: string, options: InternalPromptOptions | undefined): TurnProvenance {
 		const resolved = options?.[RESOLVED_PROVENANCE];
