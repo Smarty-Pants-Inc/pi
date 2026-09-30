@@ -2,6 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
@@ -940,6 +941,7 @@ export class ExtensionRunner {
 	async emitBoundary(
 		baseEvent: BoundaryBaseEvent,
 		buildContext: (entries: SessionBoundaryDraft[]) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
+		getPendingMessages?: () => AgentMessage[],
 	): Promise<BoundaryDispatchResult> {
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
@@ -949,6 +951,17 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
+				const revision = this.sessionManager.revision();
+				const pendingMessages = getPendingMessages?.();
+				const hadEntries = entries.length > 0;
+				let previousEntries: SessionBoundaryDraft[] | undefined;
+				if (hadEntries) {
+					try {
+						previousEntries = structuredClone(entries);
+					} catch {
+						// Uncloneable extension data must still follow the usual preview validation.
+					}
+				}
 				const event = {
 					...baseEvent,
 					entries,
@@ -966,6 +979,22 @@ export class ExtensionRunner {
 						error: err instanceof Error ? err.message : String(err),
 						stack: err instanceof Error ? err.stack : undefined,
 					});
+				}
+
+				// Observers need no new preview. Preserve in-place draft edits, canonical appends
+				// and queue changes, including mutations made before a handler throws.
+				const unchangedEntries = previousEntries
+					? isDeepStrictEqual(previousEntries, entries)
+					: !hadEntries && entries.length === 0;
+				const nextPendingMessages = getPendingMessages?.();
+				if (
+					valid &&
+					unchangedEntries &&
+					revision === this.sessionManager.revision() &&
+					pendingMessages?.length === nextPendingMessages?.length &&
+					(pendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
+				) {
+					continue;
 				}
 
 				try {

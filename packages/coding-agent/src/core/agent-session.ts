@@ -778,8 +778,9 @@ export class AgentSession {
 				outcome: this._lastActivityOutcome,
 			},
 			(entries) => this._buildBoundaryContext(entries, "turn_end"),
+			() => this._getPendingBoundaryMessages(),
 		);
-		this._commitBoundaryDrafts(boundary.entries);
+		if (boundary.entries.length > 0) this._commitBoundaryDrafts(boundary.entries);
 		if (boundary.continue && !this._buildBoundaryContext([], "turn_end").canContinue) {
 			this._reportInvalidBoundaryContinuation("turn_end");
 			return false;
@@ -919,7 +920,10 @@ export class AgentSession {
 		drafts: SessionBoundaryDraft[],
 		boundary: "turn_end" | "agent_before_settle",
 	): BoundaryContextPreview {
-		const projection = this._createBoundaryPreviewManager(drafts).buildSessionProjection();
+		const projection =
+			drafts.length === 0
+				? this.sessionManager.buildSessionProjection()
+				: this._createBoundaryPreviewManager(drafts).buildSessionProjection();
 		const pendingMessages = this._getPendingBoundaryMessages();
 		const llmMessages = convertToLlm(projection.messages);
 		const finalRole = llmMessages[llmMessages.length - 1]?.role;
@@ -1864,8 +1868,9 @@ export class AgentSession {
 			const result = await this._extensionRunner.emitBoundary(
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
 				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
+				() => this._getPendingBoundaryMessages(),
 			);
-			this._commitBoundaryDrafts(result.entries);
+			if (result.entries.length > 0) this._commitBoundaryDrafts(result.entries);
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
 			if (this._abortDuringBeforeSettle) return false;
