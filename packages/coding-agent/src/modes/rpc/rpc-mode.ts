@@ -530,6 +530,7 @@ export async function runRpcMode(
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
+						origin: command.origin,
 						preflightResult: (didSucceed) => {
 							if (didSucceed) {
 								preflightSucceeded = true;
@@ -549,12 +550,12 @@ export async function runRpcMode(
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images, { source: "rpc" });
+				await session.steer(command.message, command.images, { source: "rpc", origin: command.origin });
 				return success(id, "steer");
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images, { source: "rpc" });
+				await session.followUp(command.message, command.images, { source: "rpc", origin: command.origin });
 				return success(id, "follow_up");
 			}
 

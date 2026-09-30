@@ -139,7 +139,18 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+import {
+	resolveExtensionTurnProvenance,
+	resolveHostTurnProvenance,
+	type TurnOriginClaim,
+	type TurnProvenance,
+	type TurnProvenanceCaller,
+} from "./turn-provenance.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+
+/** Module-private key: only this module can hand a resolved extension provenance to prompt(). */
+const RESOLVED_PROVENANCE = Symbol("resolvedTurnProvenance");
+type InternalPromptOptions = PromptOptions & { [RESOLVED_PROVENANCE]?: TurnProvenance };
 
 const appendOriginalCompaction = SessionManager.prototype.appendCompaction;
 const originalCompactionSessions = new WeakMap<
@@ -319,6 +330,11 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
+	/**
+	 * Mark the turn as sent by an agent (for example a Fabric process worker's spawner). Only kind "agent"
+	 * is accepted here; a voice claim throws. Without it, host input is recorded as keyboard.
+	 */
+	origin?: TurnOriginClaim;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
 	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
@@ -432,6 +448,8 @@ export class AgentSession {
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
+	/** Harness-written origin per queued turn message, persisted with its entry (smarty-dev#2264). */
+	readonly #turnProvenance = new WeakMap<AgentMessage, TurnProvenance>();
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
 	private _pendingCustomMessages: CustomMessage[] = [];
 	/** FIFO entry IDs keyed by live message objects for the active capture epoch. */
@@ -1076,6 +1094,8 @@ export class AgentSession {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
+			// Set only for messages this session created from an input path; never from message content.
+			const provenance = this.#turnProvenance.get(event.message);
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -1086,12 +1106,14 @@ export class AgentSession {
 							event.message.content,
 							event.message.display,
 							event.message.details,
+							provenance,
 						)
 					: this.sessionManager.appendCustomMessageEntry(
 							event.message.customType,
 							event.message.content,
 							event.message.display,
 							event.message.details,
+							provenance,
 						);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
@@ -1106,8 +1128,8 @@ export class AgentSession {
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.#ordinaryOwner
-					? await appendOwnedTerminalMessage(this.sessionManager, event.message)
-					: this.sessionManager.appendMessage(event.message);
+					? await appendOwnedTerminalMessage(this.sessionManager, event.message, provenance)
+					: this.sessionManager.appendMessage(event.message, provenance);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1969,6 +1991,7 @@ export class AgentSession {
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			const provenance = this._turnProvenanceFor(options);
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
@@ -2028,9 +2051,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, provenance);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, currentImages, provenance);
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
@@ -2076,8 +2099,8 @@ export class AgentSession {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
-					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
-					else await this._queueSteer(expandedText, currentImages);
+					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, provenance);
+					else await this._queueSteer(expandedText, currentImages, provenance);
 					// Input already queued behind this prompt is retained with it, and so are
 					// triggered messages held during this preflight: the stop holds for them too.
 					this._inputQueuedBehindPreflight = false;
@@ -2115,11 +2138,9 @@ export class AgentSession {
 			messages = [];
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
 			userContent.push(...normalized.images);
-			messages.push({
-				role: "user",
-				content: userContent,
-				timestamp: Date.now(),
-			});
+			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
+			this.#turnProvenance.set(userMessage, provenance);
+			messages.push(userMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -2279,12 +2300,36 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * The harness-written origin of a prompt, steer or follow-up. Only sendUserMessage() supplies a
+	 * resolved extension provenance (under a module-private key). Otherwise the source decides: host
+	 * input is keyboard unless the host marks it agent-sent; message text is never read.
+	 */
+	private _turnProvenanceFor(options: InternalPromptOptions | undefined): TurnProvenance {
+		const resolved = options?.[RESOLVED_PROVENANCE];
+		if (resolved) return resolved;
+		const source = options?.source ?? "interactive";
+		if (source === "extension") {
+			// No caller identity on this path, so any claim is refused.
+			return resolveExtensionTurnProvenance(
+				options?.origin,
+				undefined,
+				this.settingsManager.getTurnProvenanceTrust(),
+			);
+		}
+		// via is the mode the host bound; an SDK host without bindings reads as "print".
+		return resolveHostTurnProvenance(options?.origin, source === "rpc" ? "rpc" : this._extensionMode);
+	}
+
 	private async _queueUserInput(
 		text: string,
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		origin: TurnOriginClaim | undefined,
 	): Promise<void> {
+		// Resolve before any queueing work so a refused claim fails the call.
+		const provenance = this._turnProvenanceFor({ source, origin });
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
 		if (this.#ordinaryOwner) {
@@ -2292,7 +2337,7 @@ export class AgentSession {
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source);
+			await this._prepareQueuedInput(text, images, behavior, source, provenance);
 		} finally {
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
@@ -2306,6 +2351,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		provenance: TurnProvenance,
 	): Promise<void> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2323,9 +2369,9 @@ export class AgentSession {
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images);
+			await this._queueSteer(expandedText, processedInput.images, provenance);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images);
+			await this._queueFollowUp(expandedText, processedInput.images, provenance);
 		}
 	}
 
@@ -2335,11 +2381,15 @@ export class AgentSession {
 	 * before the next LLM call.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
-	 * @param options Input source; defaults to interactive
+	 * @param options Input source (defaults to interactive) and optional agent origin (see PromptOptions.origin)
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+	async steer(
+		text: string,
+		images?: ImageContent[],
+		options?: { source?: InputSource; origin?: TurnOriginClaim },
+	): Promise<void> {
+		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive", options?.origin);
 	}
 
 	/**
@@ -2347,17 +2397,25 @@ export class AgentSession {
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
-	 * @param options Input source; defaults to interactive
+	 * @param options Input source (defaults to interactive) and optional agent origin (see PromptOptions.origin)
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+	async followUp(
+		text: string,
+		images?: ImageContent[],
+		options?: { source?: InputSource; origin?: TurnOriginClaim },
+	): Promise<void> {
+		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive", options?.origin);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(
+		text: string,
+		images: ImageContent[] | undefined,
+		provenance: TurnProvenance,
+	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
@@ -2365,17 +2423,19 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this.#turnProvenance.set(message, provenance);
+		this.agent.steer(message);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images: ImageContent[] | undefined,
+		provenance: TurnProvenance,
+	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
@@ -2383,7 +2443,9 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this.#turnProvenance.set(message, provenance);
+		this.agent.followUp(message);
 	}
 
 	/**
@@ -2417,7 +2479,18 @@ export class AgentSession {
 	 */
 	async sendCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; origin?: TurnOriginClaim },
+	): Promise<void> {
+		// No caller identity on this path, so any origin claim is refused.
+		return this._sendCustomMessage(message, options, undefined);
+	}
+
+	private async _sendCustomMessage<T = unknown>(
+		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
+		options:
+			| { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; origin?: TurnOriginClaim }
+			| undefined,
+		caller: TurnProvenanceCaller | undefined,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
@@ -2429,6 +2502,10 @@ export class AgentSession {
 			details: message.details,
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
+		this.#turnProvenance.set(
+			appMessage,
+			resolveExtensionTurnProvenance(options?.origin, caller, this.settingsManager.getTurnProvenanceTrust()),
+		);
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
@@ -2468,6 +2545,7 @@ export class AgentSession {
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
+			this.#turnProvenance.get(appMessage),
 		);
 		this._recordMessageEntryId(appMessage, entryId);
 		this._entryIdsByMessage.set(appMessage, entryId);
@@ -2497,6 +2575,7 @@ export class AgentSession {
 					message.content,
 					message.display,
 					message.details,
+					this.#turnProvenance.get(message),
 				);
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
@@ -2548,7 +2627,18 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean; origin?: TurnOriginClaim },
+	): Promise<void> {
+		// No caller identity on this path, so any origin claim is refused.
+		return this._sendUserMessage(content, options, undefined);
+	}
+
+	private async _sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options:
+			| { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean; origin?: TurnOriginClaim }
+			| undefined,
+		caller: TurnProvenanceCaller | undefined,
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
@@ -2570,12 +2660,18 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		await this.prompt(text, {
+		const promptOptions: InternalPromptOptions = {
 			expandPromptTemplates: options?.expandPromptTemplates ?? false,
 			streamingBehavior: options?.deliverAs,
 			images,
 			source: "extension",
-		});
+			[RESOLVED_PROVENANCE]: resolveExtensionTurnProvenance(
+				options?.origin,
+				caller,
+				this.settingsManager.getTurnProvenanceTrust(),
+			),
+		};
+		await this.prompt(text, promptOptions);
 	}
 
 	/**
@@ -3840,8 +3936,8 @@ export class AgentSession {
 
 		runner.bindCore(
 			{
-				sendMessage: (message, options) => {
-					this.sendCustomMessage(message, options).catch((err) => {
+				sendMessage: (message, options, caller) => {
+					this._sendCustomMessage(message, options, caller).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
 							event: "send_message",
@@ -3849,8 +3945,8 @@ export class AgentSession {
 						});
 					});
 				},
-				sendUserMessage: (content, options) => {
-					this.sendUserMessage(content, options).catch((err) => {
+				sendUserMessage: (content, options, caller) => {
+					this._sendUserMessage(content, options, caller).catch((err) => {
 						runner.emitError({
 							extensionPath: "<runtime>",
 							event: "send_user_message",

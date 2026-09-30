@@ -12,6 +12,7 @@ import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
+import type { TurnOriginClaim } from "../../core/turn-provenance.ts";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -32,9 +33,17 @@ export interface RpcBranchEntriesPage {
 
 export type RpcCommand =
 	// Prompting
-	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
-	| { id?: string; type: "steer"; message: string; images?: ImageContent[] }
-	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[] }
+	| {
+			id?: string;
+			type: "prompt";
+			message: string;
+			images?: ImageContent[];
+			streamingBehavior?: "steer" | "followUp";
+			/** Agent-sent turn (kind "agent" only); omitted means keyboard. */
+			origin?: TurnOriginClaim;
+	  }
+	| { id?: string; type: "steer"; message: string; images?: ImageContent[]; origin?: TurnOriginClaim }
+	| { id?: string; type: "follow_up"; message: string; images?: ImageContent[]; origin?: TurnOriginClaim }
 	| { id?: string; type: "abort" }
 	| { id?: string; type: "clear_queue" }
 	| { id?: string; type: "new_session"; parentSession?: string }

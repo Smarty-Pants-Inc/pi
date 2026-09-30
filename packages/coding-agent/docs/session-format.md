@@ -87,10 +87,25 @@ A message in the conversation. The `message` field contains an `AgentMessage`. S
 Sessions created before system messages existed have no leading system message; the first request declares the current prompt as a later system message, which replays the same way.
 
 ```json
-{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello","timestamp":1733234401000}}
+{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello","timestamp":1733234401000},"provenance":{"kind":"keyboard","via":"tui"}}
 {"type":"message","id":"b2c3d4e5","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{...},"stopReason":"stop","timestamp":1733234402000}}
 {"type":"message","id":"c3d4e5f6","parentId":"b2c3d4e5","timestamp":"2024-12-03T14:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_123","toolName":"bash","content":[{"type":"text","text":"output"}],"isError":false,"timestamp":1733234403000}}
 ```
+
+#### Turn provenance
+
+User message entries and custom message entries carry `provenance`: the origin of the turn, written by Pi from the input path that delivered it and the identity of the calling extension. Message text never sets it.
+
+| Field | Meaning |
+|---|---|
+| `kind` | `keyboard` (host input: editor, print, JSON or RPC prompt), `voice` (trusted voice extension), `agent` (agent-injected, with `sender`), `extension` (any other extension) |
+| `via` | `tui`, `print`, `json`, `rpc` (host input) or `extension` |
+| `extension` | Calling extension: package source, or resolved path |
+| `principal` | `voice` only: the call's principal `{id, name?, kind?}` |
+| `sender` | `agent` only: the sending agent `{id, name?, kind?}` |
+| `rejectedClaim` | A `voice` or `agent` claim Pi refused because the caller is not trusted for it |
+
+A host (SDK, RPC client) may mark input as `agent` with a sender; it cannot claim `voice`. Entries written before this field have no `provenance`; `getTurnProvenance(entry)` returns `{kind: "unknown"}` for them and for unreadable records. Nothing is inferred from the text.
 
 ### ModelChangeEntry
 
@@ -181,6 +196,7 @@ Fields:
 - `content`: String or `(TextContent | ImageContent)[]` (same as UserMessage)
 - `display`: `true` = show in TUI with distinct styling, `false` = hidden
 - `details`: Optional extension-specific metadata (not sent to LLM)
+- `provenance`: Harness-written origin; see [Turn provenance](#turn-provenance)
 
 ### LabelEntry
 

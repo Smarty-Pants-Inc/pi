@@ -41,6 +41,12 @@ Response:
 
 The `images` field is optional. Each image uses `ImageContent` format: `{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}`.
 
+**Origin**: a prompt is recorded as `keyboard` input (see [Turn provenance](session-format.md#turn-provenance)). A client that relays another agent's message marks it with `origin`; `prompt`, `steer` and `follow_up` accept it. Only kind `"agent"` is accepted; any other kind is rejected.
+
+```json
+{"type": "prompt", "message": "Run the tests", "origin": {"kind": "agent", "sender": {"id": "agent-7", "name": "lead", "kind": "main"}}}
+```
+
 ### steer
 
 Queue a steering message while the agent is running. It is delivered after the current assistant turn finishes executing its tool calls, before the next LLM call. Skill commands and prompt templates are expanded. Extension commands are not allowed (use `prompt` instead).

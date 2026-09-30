@@ -383,6 +383,16 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+export {
+	getTurnProvenance,
+	type TurnOriginClaim,
+	type TurnParty,
+	type TurnProvenance,
+	type TurnProvenanceTrust,
+	type TurnVia,
+	UNKNOWN_TURN_PROVENANCE,
+	type UnknownTurnProvenance,
+} from "./core/turn-provenance.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 export type { RpcAgentSessionEvent, RpcMessageEndEvent } from "./modes/index.ts";

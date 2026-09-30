@@ -380,14 +380,15 @@ function createExtensionAPI(
 		hostCapabilities: HOST_CAPABILITIES,
 
 		// Action methods - delegate to shared runtime
+		// The harness names the caller here, so an extension cannot pass another extension's identity.
 		sendMessage(message, options): void {
 			assertActive();
-			runtime.sendMessage(message, options);
+			runtime.sendMessage(message, options, extension);
 		},
 
 		sendUserMessage(content, options): void {
 			assertActive();
-			runtime.sendUserMessage(content, options);
+			runtime.sendUserMessage(content, options, extension);
 		},
 
 		appendEntry(customType: string, data?: unknown): void {

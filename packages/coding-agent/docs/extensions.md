@@ -165,6 +165,19 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
+### Turn origin
+
+Pi records who sent each turn in the entry's `provenance` field (see [Session Format](session-format.md#turn-provenance)). A message sent with `pi.sendUserMessage()` or `pi.sendMessage()` is recorded as `extension`, with the harness-supplied identity of the calling extension. An extension that speaks for a person or an agent passes a claim:
+
+```typescript
+// A voice extension, with the principal from its trusted call state:
+pi.sendMessage(message, { triggerTurn: true, origin: { kind: "voice", principal: { id: "paul", name: "Paul" } } });
+// A message bus, with the sending agent:
+pi.sendUserMessage(text, { deliverAs: "steer", origin: { kind: "agent", sender: { id, name, kind } } });
+```
+
+Pi accepts the claim only when global settings trust the calling extension for that kind (`turnProvenance.voiceExtensions` or `turnProvenance.agentExtensions`, matched against the package source or the resolved path; see [Settings](settings.md#sessions-and-context)). Project-scoped extensions and `withSession` contexts are never trusted. A refused claim is recorded as `extension` with `rejectedClaim`. Read the record with `getTurnProvenance(entry)`.
+
 <a id="state-management"></a>
 <a id="persist-state"></a>
 
