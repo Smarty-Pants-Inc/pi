@@ -692,10 +692,7 @@ export class AgentSession {
 		};
 	}
 
-	private async _compactBeforeNextAssistantResponse(
-		context: AgentContext,
-		overflowOnly = false,
-	): Promise<AgentContext> {
+	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		this.#ordinaryOwner?.assertNativeTokenReservation();
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
@@ -703,16 +700,11 @@ export class AgentSession {
 		if (!model || model.contextWindow <= 0) return { ...context, messages: projection.messages };
 		const tokens = estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens;
 		const overflow = tokens > model.contextWindow;
-		if (overflow && !settings.enabled) {
-			throw new Error(
-				`Context exceeds window: estimated ${tokens} tokens, window ${model.contextWindow}; auto-compaction is disabled.`,
-			);
-		}
-		if (overflowOnly ? !overflow : !shouldCompact(tokens, model.contextWindow, settings)) {
+		if (!shouldCompact(tokens, model.contextWindow, settings)) {
 			return { ...context, messages: projection.messages };
 		}
 
-		const outcome = await this._runAutoCompaction(overflowOnly ? "overflow" : "threshold", false);
+		const outcome = await this._runAutoCompaction("threshold", false);
 		if (outcome === "failed" || outcome === "aborted") {
 			// Stop this run rather than sending unchanged oversized context or
 			// turning a compaction timeout into an ordinary agent retry.
@@ -723,39 +715,59 @@ export class AgentSession {
 				`${overflow ? "Context exceeds window: " : ""}Compaction ${outcome} before the next assistant turn`,
 			);
 		}
-		const compacted = this.sessionManager.buildSessionProjection();
-		const remaining = estimateProjectedContextTokens(compacted, this.sessionManager.getBranch()).tokens;
-		if (remaining > model.contextWindow) {
-			throw new Error(
-				`Context exceeds window: estimated ${remaining} tokens, window ${model.contextWindow}; compaction could not reduce the input enough.`,
-			);
-		}
-		return { ...context, messages: compacted.messages };
+		// Raw projection estimates drive proactive compaction, not hard admission:
+		// request preparation, context transforms and conversion can deliberately omit it.
+		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
 	}
 
 	private _installAgentRequestProjection(): void {
 		let requestModel = this.agent.state.model;
+		let canReproject = true;
 		const previousConvertToLlm = this.agent.convertToLlm;
 		this.agent.convertToLlm = async (messages) => {
-			const converted = await previousConvertToLlm(messages);
-			// Check final provider messages, including extension transforms, forced prompts
-			// and summary/bash formatting added by conversion, against the prepared model.
-			assertContextFitsWindow(converted, requestModel);
+			let converted = await previousConvertToLlm(messages);
+			// Admission is after model selection, context transforms and conversion. Raw
+			// transcript size (including !! output) is not the provider-visible input.
+			try {
+				assertContextFitsWindow(converted, requestModel);
+			} catch (error) {
+				if (!canReproject || !this.settingsManager.getCompactionSettings(requestModel).enabled) throw error;
+				this.#ordinaryOwner?.assertNativeTokenReservation();
+				const revision = this.sessionManager.revision();
+				const outcome = await this._runAutoCompaction("overflow", false);
+				if (outcome === "failed" || outcome === "aborted") {
+					this._stopAfterCompactionFailure = true;
+					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
+					this.agent.abort();
+					throw new Error(`Context exceeds window: Compaction ${outcome} before the next assistant turn`);
+				}
+				if (this.sessionManager.revision() === revision) throw error;
+				const compacted = this.sessionManager.buildSessionProjection().messages;
+				const transformed = this.agent.transformContext
+					? await this.agent.transformContext(compacted, this.agent.signal)
+					: compacted;
+				converted = await previousConvertToLlm(transformed);
+				assertContextFitsWindow(converted, requestModel);
+			}
 			return converted;
 		};
 		const previousPrepareRequest = this.agent.prepareRequest;
+		const snapshotMessages = (messages: AgentMessage[]): string | undefined => {
+			try {
+				return JSON.stringify(messages);
+			} catch {
+				// SDK-only metadata may not serialize. It must not block a fitting request.
+				return undefined;
+			}
+		};
 		this.agent.prepareRequest = async (request, signal) => {
-			// prepareNextTurn skips the first request. Check the full persisted input here,
-			// including new prompts and queued messages, without waiting for a provider error.
-			const canonicalContext = await this._compactBeforeNextAssistantResponse(
-				{
-					...request.context,
-					messages: this.sessionManager.buildSessionProjection().messages,
-					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
-					tools: this.agent.state.tools.slice(),
-				},
-				true,
-			);
+			const canonicalContext = {
+				...request.context,
+				messages: this.sessionManager.buildSessionProjection().messages,
+				// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
+				tools: this.agent.state.tools.slice(),
+			};
+			const canonicalMessages = previousPrepareRequest ? snapshotMessages(canonicalContext.messages) : undefined;
 			const previous = await previousPrepareRequest?.(
 				{
 					...request,
@@ -766,6 +778,13 @@ export class AgentSession {
 				signal,
 			);
 			requestModel = previous?.model ?? this.agent.state.model;
+			// ponytail: preparation is opaque. If it replaces or mutates input, refuse
+			// overflow rather than discard that input or replay a side-effectful hook.
+			// Snapshot only when a hook exists; identity alone misses in-place edits.
+			canReproject =
+				(previous?.context === undefined || previous.context === canonicalContext) &&
+				(!previousPrepareRequest ||
+					(canonicalMessages !== undefined && canonicalMessages === snapshotMessages(canonicalContext.messages)));
 			return {
 				...previous,
 				context: previous?.context ?? canonicalContext,
@@ -2193,6 +2212,10 @@ export class AgentSession {
 			return;
 		}
 
+		// A switch can also begin during before_agent_start or image normalization.
+		// Keep this prompt's admission token until its run can start, so triggered
+		// messages still queue behind it instead of acquiring a competing run.
+		while (this._modelSwitchCompactionPending) await this.waitForIdle();
 		preflightResult?.(true);
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
@@ -2480,8 +2503,15 @@ export class AgentSession {
 				this.agent.steer(appMessage);
 			}
 		} else if (options?.triggerTurn) {
+			// Waiting releases admission. Re-enter the public dispatch so a prompt or
+			// earlier triggered message that acquired the run owns settlement; preserve
+			// this message's requested queue rather than starting another run owner.
+			if (this._modelSwitchCompactionPending) {
+				while (this._modelSwitchCompactionPending) await this.waitForIdle();
+				return this.sendCustomMessage(appMessage, options);
+			}
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this._runAgentPrompt(appMessage));
+				this._deferredSettledActions.push(async () => await this.sendCustomMessage(appMessage, options));
 				return;
 			}
 			if (this._promptPreflights.size > 0) {
