@@ -1114,6 +1114,7 @@ export class ModelRuntime implements Models {
 		},
 	): Promise<ModelRoute> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
+		options.signal?.throwIfAborted();
 		const name = `Virtual model ${model.provider}/${model.id}`;
 		const virtual = this.virtualModels.get(model.provider)?.get(model.id);
 		if (!virtual) throw new Error(`${name} is not registered.`);
@@ -1129,6 +1130,7 @@ export class ModelRuntime implements Models {
 			failed: failedModel && failed && { model: failedModel, thinkingLevel: failed.thinkingLevel, message: failed },
 			messages,
 		});
+		options.signal?.throwIfAborted();
 		const target = this.getPhysicalModel(route.model.provider, route.model.id);
 		const routed = `${name} routed to ${route.model.provider}/${route.model.id}`;
 		if (!target) throw new Error(`${routed}, which is not a physical model.`);

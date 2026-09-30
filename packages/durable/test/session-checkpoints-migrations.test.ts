@@ -405,7 +405,11 @@ describe("Session document migrations", () => {
 			content: { kind: "base", version: 3, value: { count: 4 } },
 		});
 		expect(checkpoints).toBe(0);
-		expect(documentChanges(publications.at(-1)!)).toHaveLength(0);
+		// smarty-dev#2241, A13: a persisted version base publishes even without a further edit.
+		expect(documentChanges(publications.at(-1)!)).toEqual([
+			expect.objectContaining({ version: 3, value: { count: 4 }, ops: [] }),
+		]);
+		expect(documentChanges(publications.at(-1)!)[0]!.value).toBe(snapshot);
 		expect(await session.snapshot(Current, context)).toBe(snapshot);
 
 		await session.commit(async (tx) => {

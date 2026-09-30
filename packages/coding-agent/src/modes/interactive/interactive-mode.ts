@@ -473,7 +473,7 @@ export class InteractiveMode {
 	// Status line tracking (for mutating immediately-sequential status updates)
 	private lastStatusSpacer: Spacer | undefined = undefined;
 	private lastStatusText: ThemedText | undefined = undefined;
-	private lastStatusMessage = "";
+	private lastStatusState: { message: string } | undefined = undefined;
 	private managedToolStatusStarted = false;
 
 	// Streaming message tracking
@@ -3772,20 +3772,27 @@ export class InteractiveMode {
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
 		message = linkifyUrls(message);
-		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
-			this.lastStatusMessage = message;
+		if (
+			last &&
+			secondLast &&
+			last === this.lastStatusText &&
+			secondLast === this.lastStatusSpacer &&
+			this.lastStatusState
+		) {
+			this.lastStatusState.message = message;
 			this.lastStatusText.invalidate();
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		this.lastStatusMessage = message;
-		const text = new ThemedText(() => theme.fg("dim", this.lastStatusMessage), 1, 0);
+		const state = { message };
+		const text = new ThemedText(() => theme.fg("dim", state.message), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
 		this.lastStatusText = text;
+		this.lastStatusState = state;
 		this.ui.requestRender();
 	}
 

@@ -287,7 +287,8 @@ type JsonContainer = Record<string, JsonValue> | JsonValue[];
  */
 function assignJson(target: JsonContainer, key: string | number, value: JsonValue): void {
 	const slots = target as Record<string | number, JsonValue>;
-	const current = slots[key];
+	// Inherited containers (notably Object.prototype via __proto__) are outside the draft's custody.
+	const current = Object.hasOwn(slots, key) ? slots[key] : undefined;
 	if (isRecord(current) && isRecord(value)) {
 		for (const name of Object.keys(current)) if (!Object.hasOwn(value, name)) delete current[name];
 		for (const [name, child] of Object.entries(value)) assignJson(current, name, child);

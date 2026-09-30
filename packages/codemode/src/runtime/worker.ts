@@ -13,14 +13,35 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
-import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
+import {
+	INTERRUPT_INDEX,
+	isHostToWorkerMessage,
+	MAX_CALLS,
+	MAX_MESSAGE_BYTES,
+	MAX_OUTPUT_BYTES,
+	MAX_OUTPUT_ITEMS,
+	MAX_OUTSTANDING_BYTES,
+	MAX_OUTSTANDING_MESSAGES,
+	MAX_PENDING_CALLS,
+	messageBytes,
+	QUEUED_BYTES_INDEX,
+	QUEUED_ITEMS_INDEX,
+	RESPONSE_BYTES_INDEX,
+	RESPONSE_ITEMS_INDEX,
+	type WorkerData,
+	type WorkerToHostMessage,
+} from "./protocol.ts";
 
 function post(message: WorkerToHostMessage): void {
 	parentPort?.postMessage(message);
 }
 
+let crashed = false;
 function crash(error: unknown): void {
-	post({ type: "crash", message: error instanceof Error ? `${error.name}: ${error.message}` : String(error) });
+	if (crashed) return;
+	crashed = true;
+	const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+	post({ type: "crash", message: message.slice(0, 1024) });
 }
 
 /**
@@ -57,44 +78,104 @@ async function main(data: WorkerData): Promise<void> {
 		// Without a guard, deep recursion overflows the wasm stack and traps instead of throwing a
 		// catchable RangeError.
 		maxStackSize: MAX_STACK_SIZE,
-		interruptHandler: () => Atomics.load(interrupt, 0) !== 0,
+		interruptHandler: () => Atomics.load(interrupt, INTERRUPT_INDEX) !== 0,
 		wasi: discardOutput,
 	});
 
-	// Called from the prelude with primitives only.
+	let outputBytes = 0;
+	let outputItems = 0;
+	let callCount = 0;
+	const pendingCalls = new Set<number>();
+	const fail = (error: unknown): void => {
+		// Native retirement cannot be bypassed by catching a guest exception or
+		// replacing its serializer/prototypes. Send just one emergency report.
+		crash(error);
+		Atomics.store(interrupt, INTERRUPT_INDEX, 1);
+	};
+	const readString = (handle: JSValueHandle | undefined): string => {
+		if (!handle?.isString) throw new Error("Invalid bridge string");
+		// Check primitive length before copying out of wasm. UTF-8 accounting
+		// below then checks actual bytes before queueing/accumulation.
+		if (handle.length > MAX_MESSAGE_BYTES) throw new Error("Message byte budget exceeded");
+		return handle.toString();
+	};
+	const send = (message: WorkerToHostMessage): void => {
+		if (crashed || Atomics.load(interrupt, INTERRUPT_INDEX) !== 0) return;
+		const bytes = messageBytes(message);
+		if (bytes > MAX_MESSAGE_BYTES) throw new Error("Message byte budget exceeded");
+		const items = Atomics.add(interrupt, QUEUED_ITEMS_INDEX, 1) + 1;
+		const queuedBytes = Atomics.add(interrupt, QUEUED_BYTES_INDEX, bytes) + bytes;
+		if (items > MAX_OUTSTANDING_MESSAGES || queuedBytes > MAX_OUTSTANDING_BYTES) {
+			Atomics.sub(interrupt, QUEUED_ITEMS_INDEX, 1);
+			Atomics.sub(interrupt, QUEUED_BYTES_INDEX, bytes);
+			throw new Error("Outstanding message budget exceeded");
+		}
+		post(message);
+	};
+
+	// The native bridge validates even though the prelude normally passes
+	// primitives: guest intrinsics remain mutable and are not a trust boundary.
 	const bridge = vm.newFunction("bridge", (kind, a, b, c) => {
-		switch (kind.toString()) {
-			case "call":
-			case "global":
-				post({
-					type: "call",
-					id: a.toNumber(),
-					target: kind.toString() === "call" ? "tool" : "global",
-					name: b.toString(),
-					args: c === undefined || c.isUndefined ? undefined : c.toString(),
-				});
-				break;
-			case "output":
-				post({
-					type: "output",
-					item:
-						a.toString() === "image"
-							? { type: "image", data: b.toString(), mimeType: c.toString() }
-							: { type: "text", text: b.toString() },
-				});
-				break;
-			case "done":
-				if (a.toBoolean()) {
-					post({
-						type: "done",
-						ok: true,
-						value: b === undefined || b.isUndefined ? undefined : b.toString(),
-						writes: c.toString(),
+		if (crashed || Atomics.load(interrupt, INTERRUPT_INDEX) !== 0) return vm.undefined;
+		try {
+			const target = readString(kind);
+			switch (target) {
+				case "call":
+				case "global": {
+					if (!a?.isNumber) throw new Error("Invalid bridge call id");
+					const id = a.toNumber();
+					if (
+						!Number.isSafeInteger(id) ||
+						id <= 0 ||
+						pendingCalls.has(id) ||
+						pendingCalls.size >= MAX_PENDING_CALLS ||
+						callCount >= MAX_CALLS
+					) {
+						throw new Error("Host call budget exceeded or invalid call id");
+					}
+					pendingCalls.add(id);
+					callCount++;
+					send({
+						type: "call",
+						id,
+						target: target === "call" ? "tool" : "global",
+						name: readString(b),
+						args: c === undefined || c.isUndefined ? undefined : readString(c),
 					});
-				} else {
-					post({ type: "done", ok: false, error: b.toString() });
+					break;
 				}
-				break;
+				case "output": {
+					if (outputItems >= MAX_OUTPUT_ITEMS) throw new Error("Output item budget exceeded");
+					const item =
+						readString(a) === "image"
+							? { type: "image" as const, data: readString(b), mimeType: readString(c) }
+							: { type: "text" as const, text: readString(b) };
+					const message: WorkerToHostMessage = { type: "output", item };
+					const bytes = messageBytes(message);
+					if (outputBytes + bytes > MAX_OUTPUT_BYTES) throw new Error("Output byte budget exceeded");
+					outputBytes += bytes;
+					outputItems++;
+					send(message);
+					break;
+				}
+				case "done":
+					if (!a.isBool) throw new Error("Invalid bridge completion");
+					if (a.toBoolean()) {
+						send({
+							type: "done",
+							ok: true,
+							value: b === undefined || b.isUndefined ? undefined : readString(b),
+							writes: readString(c),
+						});
+					} else {
+						send({ type: "done", ok: false, error: readString(b) });
+					}
+					break;
+				default:
+					throw new Error("Invalid bridge message kind");
+			}
+		} catch (error) {
+			fail(error);
 		}
 		return vm.undefined;
 	});
@@ -122,8 +203,11 @@ async function main(data: WorkerData): Promise<void> {
 	};
 
 	parentPort?.on("message", (message: unknown) => {
-		if (!isHostToWorkerMessage(message)) return;
+		if (!isHostToWorkerMessage(message) || crashed) return;
 		try {
+			Atomics.sub(interrupt, RESPONSE_ITEMS_INDEX, 1);
+			Atomics.sub(interrupt, RESPONSE_BYTES_INDEX, messageBytes(message));
+			pendingCalls.delete(message.id);
 			vm.withScope(() => {
 				vm.callFunction(
 					settle,
@@ -135,7 +219,7 @@ async function main(data: WorkerData): Promise<void> {
 			});
 			drain();
 		} catch (error) {
-			crash(error);
+			fail(error);
 		}
 	});
 
@@ -146,7 +230,7 @@ async function main(data: WorkerData): Promise<void> {
 		fn = vm.evalCode(`(async (tools, console) => {${data.code}\n})`, "codemode.js");
 	} catch (error) {
 		if (!(error instanceof JSException)) throw error;
-		post({ type: "done", ok: false, error: describeException(error) });
+		send({ type: "done", ok: false, error: describeException(error) });
 		return;
 	}
 	vm.callFunction(run, api, fn).dispose();

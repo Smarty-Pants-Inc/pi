@@ -6,6 +6,7 @@
 
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
 import {
 	type AuthProvider,
@@ -48,6 +49,8 @@ const DEFAULT_TIMEOUT_SECONDS = 60;
 const STDERR_TAIL_CHARS = 2_000;
 /** Delays between attempts to connect to an HTTP server that failed with a transient error. */
 const CONNECT_RETRY_DELAYS_MS = [250, 1_000];
+/** Superseded sessions may finish other requests, but cannot retain a GET stream indefinitely. */
+const RETIRING_CLIENT_GRACE_MS = 60_000;
 
 /**
  * `disconnected`: the connection dropped (for example the stdio server exited); the next call
@@ -169,6 +172,11 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	challenge: OAuthChallenge | undefined;
 	private client: McpClient | undefined;
 	private opening: Promise<McpClient> | undefined;
+	/** Own clients before setup starts, and until transport cleanup has settled. */
+	private readonly clients = new Map<McpClient, Promise<void> | undefined>();
+	private readonly retiring = new Map<McpClient, ReturnType<typeof setTimeout>>();
+	private readonly shutdown = new AbortController();
+	private closing: Promise<void> | undefined;
 	private closed = false;
 	/** Stderr of the last stdio server that failed to connect. */
 	private stderrTail: string | undefined;
@@ -285,14 +293,18 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 				return await run(client);
 			} catch (error) {
 				if (readOnly && attempt === 1 && error instanceof McpHttpError && isTransientError(error)) {
-					await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_DELAYS_MS[0]));
+					await delay(CONNECT_RETRY_DELAYS_MS[0], undefined, { signal: this.shutdown.signal }).catch(
+						() => undefined,
+					);
 					continue;
 				}
 				if (error instanceof McpSessionExpiredError && attempt === 1) {
 					// The server no longer knows the session (restart, deploy), so it did not run the request.
-					// Retry once on a new session. The old client is detached but not closed: closing would
-					// fail its other in-flight calls, which instead get the same 404 and retry the same way.
+					// Retry once on a new session. Keep the old client owned during a bounded grace period:
+					// other calls can finish, or receive their own 404 and retry without being discarded.
+					if (this.closed) throw error;
 					if (this.client === client) this.client = undefined;
+					this.retireClient(client);
 					continue;
 				}
 				if (!this.needsSignIn(error)) throw error;
@@ -306,14 +318,14 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	/** Connect again with fresh credentials, for example after signing in. */
 	async reconnect(): Promise<void> {
 		await this.opening?.catch(() => undefined);
-		if (this.client) await this.dropClient(this.client);
+		await Promise.all([...this.clients.keys()].map((client) => this.dropClient(client)));
 		await this.getClient();
 	}
 
 	/** Disconnect after the stored credentials were removed. */
 	async signOut(): Promise<void> {
 		await this.opening?.catch(() => undefined);
-		if (this.client) await this.dropClient(this.client);
+		await Promise.all([...this.clients.keys()].map((client) => this.dropClient(client)));
 		if (!this.closed) this.markNeedsAuth();
 	}
 
@@ -326,6 +338,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private markNeedsAuth(): void {
+		if (this.closed) return;
 		this.state = "needs-auth";
 		this.error = undefined;
 		this.changed();
@@ -335,9 +348,28 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		this.onChange?.(this);
 	}
 
-	private async dropClient(client: McpClient): Promise<void> {
+	private retireClient(client: McpClient): void {
+		// ponytail: grace also covers pending requests made through the public raw getClient() path.
+		if (!this.clients.has(client) || this.clients.get(client) || this.retiring.has(client)) return;
+		const timer = setTimeout(() => {
+			void this.dropClient(client);
+		}, RETIRING_CLIENT_GRACE_MS);
+		timer.unref();
+		this.retiring.set(client, timer);
+	}
+
+	private dropClient(client: McpClient): Promise<void> {
 		if (this.client === client) this.client = undefined;
-		await client.close().catch(() => undefined);
+		clearTimeout(this.retiring.get(client));
+		this.retiring.delete(client);
+		const closing = this.clients.get(client);
+		if (closing) return closing;
+		const cleanup = client
+			.close()
+			.catch(() => undefined)
+			.finally(() => this.clients.delete(client));
+		this.clients.set(client, cleanup);
+		return cleanup;
 	}
 
 	private async open(): Promise<McpClient> {
@@ -349,29 +381,32 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			try {
 				return await this.connectOnce();
 			} catch (error) {
-				const delay = retries[attempt];
-				if (this.closed || delay === undefined || !isTransientError(error)) {
+				const delayMs = retries[attempt];
+				if (this.closed || delayMs === undefined || !isTransientError(error)) {
 					throw this.connectFailed(error);
 				}
-				await new Promise((resolve) => setTimeout(resolve, delay));
+				await delay(delayMs, undefined, { signal: this.shutdown.signal }).catch(() => undefined);
 				if (this.closed) throw this.connectFailed(error);
 			}
 		}
 	}
 
 	private async connectOnce(): Promise<McpClient> {
+		if (this.closed) throw new Error("shut down while connecting");
 		const client = new McpClient({
 			name: "pi",
 			version: VERSION,
 			requestTimeoutMs: this.timeoutMs,
 			roots: [{ uri: pathToFileURL(this.cwd).href, name: basename(this.cwd) }],
 		});
+		this.clients.set(client, undefined);
 		const log = this.log;
 		if (log) client.onNotification("notifications/message", (params) => log.write(this.entry.name, params));
 		let transport: McpTransport | undefined;
 		try {
 			transport = this.createTransport(this.entry, this.cwd, this.authProvider);
 			await client.connect(transport);
+			if (this.closed) throw new Error("shut down while connecting");
 			client.onNotification("notifications/tools/list_changed", () => {
 				void this.refreshTools(client);
 			});
@@ -398,9 +433,10 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			this.error = undefined;
 			this.onTools(this);
 			this.changed();
+			if (this.closed) throw new Error("shut down while connecting");
 			return client;
 		} catch (error) {
-			await client.close().catch(() => undefined);
+			await this.dropClient(client);
 			if (transport instanceof StdioTransport) {
 				this.stderrTail = transport.stderr.trim().slice(-STDERR_TAIL_CHARS) || undefined;
 			}
@@ -422,7 +458,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	/** The transport dropped. The next call reconnects; until then the status shows why. */
 	private handleClientClose(client: McpClient, stdio: StdioTransport | undefined): void {
 		if (this.client !== client || this.closed) return;
-		this.client = undefined;
+		void this.dropClient(client);
 		this.state = "disconnected";
 		const stderr = stdio?.stderr.trim().slice(-STDERR_TAIL_CHARS);
 		this.error = stderr ? `Connection closed\n${stderr}` : "Connection closed";
@@ -436,6 +472,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			this.tools = tools;
 			this.onTools(this);
 		} catch (error) {
+			if (this.client !== client || this.closed) return;
 			this.error = `Failed to refresh tools: ${errorMessage(error)}`;
 		}
 		this.changed();
@@ -450,13 +487,25 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		this.changed();
 	}
 
-	async close(): Promise<void> {
+	close(): Promise<void> {
+		if (!this.closing) {
+			// Record the join before callbacks can re-enter close().
+			const closing = Promise.withResolvers<void>();
+			this.closing = closing.promise;
+			void this.closeOwnedClients().then(closing.resolve, closing.reject);
+		}
+		return this.closing;
+	}
+
+	private async closeOwnedClients(): Promise<void> {
 		this.closed = true;
+		this.shutdown.abort();
 		this.state = "closed";
 		this.changed();
-		const client = this.client;
 		this.client = undefined;
-		await client?.close().catch(() => undefined);
+		// Close first to interrupt initialization and discovery, then join their catch/cleanup path.
+		await Promise.all([...this.clients.keys()].map((client) => this.dropClient(client)));
+		await this.opening?.catch(() => undefined);
 		// A refresh the server already answered may have rotated the refresh token; exiting before the
 		// new tokens are saved would lose the grant.
 		await this.authProvider?.settled();

@@ -958,7 +958,7 @@ function planDocument(document: DocumentEntry): DocumentPlan | undefined {
 	}
 }
 
-/** Whether adoption publishes the plan: every creation, copy, and retirement, and a loaded incarnation that changed. */
+/** Publish every persisted document change, including a version base with no draft operations. */
 function publishes(plan: DocumentPlan): boolean {
-	return plan.retire || plan.change?.loaded === undefined || plan.change.prepared.ops.length > 0;
+	return plan.retire || plan.content !== undefined;
 }

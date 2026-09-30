@@ -717,10 +717,11 @@ export class AgentSession {
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
-	private async _beforeToolCall(
-		{ toolCall, args }: BeforeToolCallContext,
-		parentToolCallId?: string,
-	): Promise<BeforeToolCallResult | undefined> {
+	private async _beforeToolCall({
+		toolCall,
+		args,
+		parentToolCallId,
+	}: BeforeToolCallContext): Promise<BeforeToolCallResult | undefined> {
 		const runner = this._extensionRunner;
 		if (!runner.hasHandlers("tool_call")) {
 			return undefined;
@@ -743,10 +744,13 @@ export class AgentSession {
 	}
 
 	/** `tool_result` handlers and image normalization. `parentToolCallId` is set for calls another tool made. */
-	private async _afterToolCall(
-		{ toolCall, args, result, isError }: AfterToolCallContext,
-		parentToolCallId?: string,
-	): Promise<AfterToolCallResult | undefined> {
+	private async _afterToolCall({
+		toolCall,
+		args,
+		result,
+		isError,
+		parentToolCallId,
+	}: AfterToolCallContext): Promise<AfterToolCallResult | undefined> {
 		const runner = this._extensionRunner;
 		const hookResult = runner.hasHandlers("tool_result")
 			? await runner.emitToolResult({
@@ -814,8 +818,11 @@ export class AgentSession {
 					tools: this._getCallableTools(),
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
-					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
-					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					// Read the public hooks at dispatch time, including SDK authorization/redaction wrappers.
+					beforeToolCall: async (context, callSignal) =>
+						this.agent.beforeToolCall?.({ ...context, parentToolCallId: parentId }, callSignal),
+					afterToolCall: async (context, callSignal) =>
+						this.agent.afterToolCall?.({ ...context, parentToolCallId: parentId }, callSignal),
 					signal,
 					onUpdate,
 				});
@@ -838,7 +845,11 @@ export class AgentSession {
 		);
 	}
 
-	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+	private async _compactBeforeNextAssistantResponse(
+		context: AgentContext,
+		signal?: AbortSignal,
+	): Promise<AgentContext> {
+		signal?.throwIfAborted();
 		this.#ordinaryOwner?.assertNativeTokenReservation();
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
@@ -847,7 +858,7 @@ export class AgentSession {
 			return { ...context, messages: projection.messages };
 		}
 
-		const outcome = await this._runAutoCompaction("threshold", false);
+		const outcome = await this._runAutoCompaction("threshold", false, signal);
 		if (outcome === "failed" || outcome === "aborted") {
 			// Stop this run rather than sending unchanged oversized context or
 			// turning a compaction timeout into an ordinary agent retry.
@@ -856,12 +867,14 @@ export class AgentSession {
 			this.agent.abort();
 			throw new Error(`Compaction ${outcome} before the next assistant turn`);
 		}
+		signal?.throwIfAborted();
 		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
 	}
 
 	private _installAgentRequestProjection(): void {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
+			signal?.throwIfAborted();
 			const failed = this._failedResponse;
 			this._failedResponse = undefined;
 			const prepare = async () => {
@@ -881,9 +894,11 @@ export class AgentSession {
 					},
 					signal,
 				);
+				signal?.throwIfAborted();
 				return { previous, context: previous?.context ?? canonicalContext, projection };
 			};
 			let { previous, context, projection } = await prepare();
+			signal?.throwIfAborted();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
@@ -901,6 +916,8 @@ export class AgentSession {
 				failed,
 				state,
 			});
+			// Routers may return a fallback after cancellation; it must not publish state or start compaction.
+			signal?.throwIfAborted();
 			if (route.state !== undefined && route.state !== state) {
 				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
 				const entry = this.sessionManager.getEntry(
@@ -909,9 +926,10 @@ export class AgentSession {
 				if (entry) this._emit({ type: "entry_appended", entry });
 			}
 			// The route stands: the router already decided this request. The state entry does not change
-			// the projection.
+			// the projection. State listeners may have cancelled this run.
+			signal?.throwIfAborted();
 			if (this._exceedsCompactionThreshold(route.model, projection)) {
-				const outcome = await this._runAutoCompaction("threshold", false);
+				const outcome = await this._runAutoCompaction("threshold", false, signal);
 				if (outcome === "failed" || outcome === "aborted") {
 					this._stopAfterCompactionFailure = true;
 					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
@@ -920,6 +938,7 @@ export class AgentSession {
 				}
 				({ previous, context } = await prepare());
 			}
+			signal?.throwIfAborted();
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}
@@ -983,8 +1002,10 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-			const context = await this._compactBeforeNextAssistantResponse(turn.context);
+			const context = await this._compactBeforeNextAssistantResponse(turn.context, signal);
+			signal?.throwIfAborted();
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
+			signal?.throwIfAborted();
 			const nextContext = previousSnapshot?.context ?? context;
 			const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
 			const options = normalizeBuildSystemPromptOptions({
@@ -3766,14 +3787,19 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns A continuation decision, or an explicit failed/aborted outcome.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<CompactionOutcome> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		originatingSignal: AbortSignal | undefined = originalAgentSignal.call(this.#originalAgent),
+	): Promise<CompactionOutcome> {
+		if (originatingSignal?.aborted) return "aborted";
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		if (this.isCompacting) return "failed";
 		const controller = new AbortController();
 		this._autoCompactionAbortController = controller;
 		this.#auditState("auto_compaction_preparing");
-		const signal = controller.signal;
+		const signal = originatingSignal ? AbortSignal.any([controller.signal, originatingSignal]) : controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let started = false;
 		let fromExtension = false;

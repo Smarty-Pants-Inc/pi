@@ -63,7 +63,23 @@ export class OAuthCallbackServer {
 		const redirectHost = options.redirectHost ?? host;
 		const path = options.path ?? "/callback";
 		let instance: OAuthCallbackServer | undefined;
-		const server = createServer((request, response) => instance?.handle(request.url ?? "/", response));
+		const server = createServer((request, response) => {
+			try {
+				instance?.handle(request.url ?? "/", response);
+			} catch {
+				// Do not consume pending state or invoke a custom renderer for malformed requests.
+				try {
+					if (response.headersSent) response.destroy();
+					else {
+						response
+							.writeHead(400, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" })
+							.end("Invalid OAuth callback request.");
+					}
+				} catch {
+					response.destroy();
+				}
+			}
+		});
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(options.port ?? 0, host, () => {

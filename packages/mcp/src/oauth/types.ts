@@ -5,6 +5,7 @@
  */
 
 import { isObject } from "../protocol/jsonrpc.ts";
+import { OAuthInsecureEndpointError } from "./errors.ts";
 
 export interface OAuthProtectedResourceMetadata {
 	resource: string;
@@ -111,10 +112,19 @@ function optionalStrings(value: unknown, name: string): string[] | undefined {
 	return [...value];
 }
 
+/** OAuth metadata and endpoints are web URLs; HTTP is reserved for explicit loopback development. */
+export function validateOAuthUrl(value: string | URL): URL {
+	const url = new URL(value);
+	const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+	if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
+		throw new OAuthInsecureEndpointError(url.href);
+	}
+	return url;
+}
+
 function safeUrl(value: unknown, name: string): string {
 	const text = requiredString(value, name);
-	const url = new URL(text);
-	if (["javascript:", "data:", "vbscript:"].includes(url.protocol)) throw new Error(`Invalid ${name}`);
+	validateOAuthUrl(text);
 	return text;
 }
 

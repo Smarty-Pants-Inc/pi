@@ -9,7 +9,7 @@
  * Credentials live in `<agent-dir>/mcp-auth.json`, keyed by server URL.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { oauthErrorHtml, oauthSuccessHtml } from "@earendil-works/pi-ai/utils/oauth-page";
@@ -94,7 +94,9 @@ function mergeScopes(...scopes: (string | undefined)[]): string | undefined {
 	return merged.length > 0 ? merged.join(" ") : undefined;
 }
 
-type StoredStates = Record<string, McpOAuthState>;
+type StoredState = McpOAuthState & { grantGeneration?: string; signedOut?: true };
+type StoredStates = Record<string, StoredState>;
+const inProcessRefreshes = new WeakMap<AuthStorageBackend, Map<string, Promise<unknown>>>();
 
 function parseStates(content: string | undefined): StoredStates {
 	if (!content?.trim()) return {};
@@ -103,7 +105,9 @@ function parseStates(content: string | undefined): StoredStates {
 }
 
 export interface McpOAuthServerStore extends McpOAuthStateStore {
-	/** Run `fn` while no other process refreshes the server's tokens. */
+	/** Capture the current grant generation; logout invalidates all writes through this view. */
+	forGrant(): McpOAuthStateStore;
+	/** Run `fn` while no other process refreshes or deletes the server's tokens. */
 	withRefreshLock<T>(fn: () => Promise<T>): Promise<T>;
 }
 
@@ -112,20 +116,43 @@ export class McpOAuthCredentialStore {
 	private readonly backend: AuthStorageBackend;
 	/** Directory for the refresh lock files. Without one, refreshes are only serialized in this process. */
 	private readonly lockDir: string | undefined;
+	private readonly refreshes: Map<string, Promise<unknown>>;
 
 	constructor(backend?: AuthStorageBackend, lockDir?: string) {
 		this.backend = backend ?? new FileAuthStorageBackend(join(getAgentDir(), "mcp-auth.json"));
 		this.lockDir = backend ? lockDir : getAgentDir();
+		this.refreshes = inProcessRefreshes.get(this.backend) ?? new Map();
+		inProcessRefreshes.set(this.backend, this.refreshes);
 	}
 
 	forServer(serverUrl: string): McpOAuthServerStore {
 		const key = String(new URL(serverUrl));
+		const forGrant = (): McpOAuthStateStore => {
+			const generation = this.read()[key]?.grantGeneration;
+			const check = (state: StoredState | undefined) => {
+				if (state?.grantGeneration !== generation) throw new McpOAuthAuthorizationRequiredError();
+			};
+			return {
+				load: () => {
+					const state = this.read()[key];
+					check(state);
+					return state?.signedOut ? undefined : state;
+				},
+				save: (state) =>
+					this.write((states) => {
+						check(states[key]);
+						states[key] = { ...state, grantGeneration: generation };
+						delete states[key].signedOut;
+					}),
+			};
+		};
 		return {
-			load: () => this.read()[key],
-			save: (state) =>
-				this.write((states) => {
-					states[key] = state;
-				}),
+			...forGrant(),
+			load: () => {
+				const state = this.read()[key];
+				return state?.signedOut ? undefined : state;
+			},
+			forGrant,
 			withRefreshLock: (fn) => this.withRefreshLock(key, fn),
 		};
 	}
@@ -135,7 +162,15 @@ export class McpOAuthCredentialStore {
 	 * it is killed, the lock goes stale because it is no longer renewed, and the next process takes it over.
 	 */
 	private async withRefreshLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-		if (!this.lockDir) return fn();
+		if (!this.lockDir) {
+			const operation = (this.refreshes.get(key) ?? Promise.resolve()).catch(() => undefined).then(fn);
+			this.refreshes.set(key, operation);
+			try {
+				return await operation;
+			} finally {
+				if (this.refreshes.get(key) === operation) this.refreshes.delete(key);
+			}
+		}
 		mkdirSync(this.lockDir, { recursive: true, mode: 0o700 });
 		const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
 		const release = await lockfile.lock(join(this.lockDir, `mcp-auth-refresh-${hash}`), {
@@ -162,14 +197,18 @@ export class McpOAuthCredentialStore {
 		return this.read()[String(new URL(serverUrl))]?.tokens;
 	}
 
-	/** Returns whether credentials were stored for the server. */
-	remove(serverUrl: string): boolean {
+	/** Resolves after any refresh finishes and its grant is deleted. Pending sign-ins stay revoked. */
+	async remove(serverUrl: string): Promise<boolean> {
 		const key = String(new URL(serverUrl));
-		if (!(key in this.read())) return false;
-		this.write((states) => {
-			delete states[key];
+		return this.withRefreshLock(key, async () => {
+			let removed = false;
+			this.write((states) => {
+				removed = states[key] !== undefined && !states[key].signedOut;
+				// Keep only a generation tombstone: a late sign-in or lost refresh lock cannot recreate the grant.
+				states[key] = { serverUrl: key, grantGeneration: randomUUID(), signedOut: true };
+			});
+			return removed;
 		});
-		return true;
 	}
 
 	private read(): StoredStates {
@@ -238,7 +277,8 @@ export function createMcpAuthProvider(options: {
 	const refresh = (staleToken: string | undefined, fetch: McpFetch = globalThis.fetch, challenge?: OAuthChallenge) => {
 		refreshing ??= store
 			.withRefreshLock(async () => {
-				const state = await store.load();
+				const grant = store.forGrant();
+				const state = await grant.load();
 				if (state?.tokens?.access_token !== staleToken) return;
 				if (!state?.tokens?.refresh_token) throw new McpOAuthAuthorizationRequiredError();
 				const settings = options.settings();
@@ -246,7 +286,7 @@ export function createMcpAuthProvider(options: {
 					callbackSettings(settings).fixedRedirectUrl ??
 					registeredRedirectUrls(state.clientInformation)[0] ??
 					FALLBACK_REDIRECT_URL;
-				const provider = createProvider(serverUrl, store, settings, redirectUrl, () => {});
+				const provider = createProvider(serverUrl, grant, settings, redirectUrl, () => {});
 				// Refreshes the tokens, or reports that a new sign-in is needed.
 				const result = await authorizeMcp(provider, {
 					serverUrl,
@@ -371,12 +411,14 @@ async function listenForCallback(
  */
 export async function signInMcpServer(options: {
 	serverUrl: string;
-	store: McpOAuthStateStore;
+	store: McpOAuthStateStore & Partial<Pick<McpOAuthServerStore, "forGrant" | "withRefreshLock">>;
 	settings: McpOAuthSettings;
 	challenge?: OAuthChallenge;
 	prompt: McpSignInPrompt;
 }): Promise<void> {
-	const { serverUrl, store, settings } = options;
+	const { serverUrl, settings } = options;
+	// Capture before the first await, including when no credentials have been stored yet.
+	const store = options.store.forGrant?.() ?? options.store;
 	const stored = await store.load();
 	const callbackOptions = callbackSettings(settings);
 	// Reuse the port of the registered redirect URI so the registered client stays valid.
@@ -386,19 +428,6 @@ export async function signInMcpServer(options: {
 	const callback = await listenForCallback(callbackOptions, preferredPort, callbackOptions.port !== undefined);
 	const redirectUrl = callbackOptions.fixedRedirectUrl ?? callback.redirectUrl;
 	try {
-		if (stored) {
-			const next: McpOAuthState = { ...stored };
-			// Every sign-in gets a fresh `state` parameter.
-			delete next.oauthState;
-			// A registered client cannot use another redirect URI, and its tokens belong to it.
-			if (!settings.clientId && !registeredRedirectUrls(stored.clientInformation).includes(redirectUrl)) {
-				delete next.clientInformation;
-				delete next.tokens;
-				delete next.tokensExpireAt;
-			}
-			await store.save(next);
-		}
-
 		let authorizationUrl: URL | undefined;
 		const provider = createProvider(serverUrl, store, settings, redirectUrl, (url) => {
 			authorizationUrl = url;
@@ -411,7 +440,25 @@ export async function signInMcpServer(options: {
 		};
 		// A refresh keeps the granted scope; a server asking for more needs the browser flow.
 		const skipRefresh = options.challenge?.error === "insufficient_scope";
-		if ((await authorizeMcp(provider, { ...flow, skipRefresh })) === "AUTHORIZED") return;
+		const authorize = async () => {
+			// Read again under the refresh lock: another process may have rotated tokens while we bound the callback.
+			const current = await store.load();
+			if (current) {
+				const next: McpOAuthState = { ...current };
+				// Every sign-in gets a fresh `state` parameter.
+				delete next.oauthState;
+				// A registered client cannot use another redirect URI, and its tokens belong to it.
+				if (!settings.clientId && !registeredRedirectUrls(current.clientInformation).includes(redirectUrl)) {
+					delete next.clientInformation;
+					delete next.tokens;
+					delete next.tokensExpireAt;
+				}
+				await store.save(next);
+			}
+			return authorizeMcp(provider, { ...flow, skipRefresh });
+		};
+		const result = options.store.withRefreshLock ? await options.store.withRefreshLock(authorize) : await authorize();
+		if (result === "AUTHORIZED") return;
 		if (!authorizationUrl) throw new Error("OAuth flow did not produce an authorization URL");
 
 		const state = await provider.state();

@@ -9,8 +9,10 @@ function isOwnedJsonValue(value: unknown): value is JsonValue {
 		if (depth > 512) return false;
 		if (candidate === null || typeof candidate !== "object") return true;
 		// Inspect descriptors, never getters or toJSON. Cycles also reach the finite bound.
-		return Object.values(Object.getOwnPropertyDescriptors(candidate)).every(
-			(property) => !("value" in property) || withinDepth(property.value, depth + 1),
+		return Object.entries(Object.getOwnPropertyDescriptors(candidate)).every(
+			([key, property]) =>
+				(Array.isArray(candidate) && key === "length") ||
+				("value" in property && withinDepth(property.value, depth + 1)),
 		);
 	};
 	return withinDepth(value, 0) && isJsonValue(value);

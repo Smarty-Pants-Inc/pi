@@ -463,6 +463,8 @@ export class SessionImpl implements Session {
 		unsubscribeCommit = this.subscribeCommits((publication, context) => {
 			for (const change of publication.changes) {
 				if (change.type !== "document" || change.record.id !== loaded.record.id) continue;
+				// A migration-only base resets older shapes, but already-current observers have no new frame.
+				if (change.value !== null && change.version === observed.version && change.ops.length === 0) continue;
 				// A document state's frames carry no caller cancellation; a watch observes its own cancellation.
 				const frameContext = observer instanceof SessionDocumentSource ? withoutAbortSignal(context) : context;
 				observer.advance(change.value, observedOperations(observed, change), frameContext);

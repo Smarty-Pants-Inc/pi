@@ -217,23 +217,30 @@ function isToolModifier(entry: unknown): boolean {
 }
 
 /**
- * Merge `defaultTools` of two settings layers. A list with plain tool names replaces the inherited
- * one; a list of only `+name`/`-name` entries is appended, so it modifies the inherited selection.
+ * Merge `defaultTools` of two settings layers. An empty list or one with plain tool names replaces
+ * the inherited selection; a nonempty modifier-only list changes that selection.
  */
 function mergeDefaultTools(base: string[] | undefined, overrides: string[] | undefined): string[] | undefined {
 	if (overrides === undefined) return base;
 	// Settings files are not validated; a malformed value replaces instead of throwing here.
-	if (!Array.isArray(base) || !Array.isArray(overrides) || !overrides.every(isToolModifier)) return overrides;
-	return [...base, ...overrides];
+	if (
+		!Array.isArray(base) ||
+		!Array.isArray(overrides) ||
+		overrides.length === 0 ||
+		!overrides.every(isToolModifier)
+	) {
+		return overrides;
+	}
+	return resolveDefaultTools(overrides, resolveDefaultTools(base));
 }
 
 /**
- * Resolve a merged `defaultTools` list: plain names replace `DEFAULT_TOOL_NAMES`, then `+name` adds
- * and `-name` removes a tool, in list order.
+ * Resolve a `defaultTools` list: plain names or an empty list replace the inherited selection,
+ * then `+name` adds and `-name` removes a tool, in list order.
  */
-function resolveDefaultTools(entries: string[]): string[] {
+function resolveDefaultTools(entries: string[], inherited: readonly string[] = DEFAULT_TOOL_NAMES): string[] {
 	const plain = entries.filter((entry) => !isToolModifier(entry));
-	const tools = plain.length > 0 || entries.length === 0 ? plain : [...DEFAULT_TOOL_NAMES];
+	const tools = plain.length > 0 || entries.length === 0 ? plain : [...inherited];
 	for (const entry of entries) {
 		if (!isToolModifier(entry)) continue;
 		const name = entry.slice(1);

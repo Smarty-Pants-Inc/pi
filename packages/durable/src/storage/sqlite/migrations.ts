@@ -19,12 +19,8 @@ const INITIAL_SCHEMA: readonly string[] = [
 	) STRICT`,
 	`CREATE TABLE conversations (
 		id INTEGER PRIMARY KEY,
-		owner_conversation_id INTEGER,
-		owner_task_id INTEGER,
 		record TEXT NOT NULL CHECK (json_valid(record))
 	) STRICT`,
-	"CREATE INDEX conversations_by_owner_conversation ON conversations (owner_conversation_id, id)",
-	"CREATE INDEX conversations_by_owner_task ON conversations (owner_task_id, id)",
 	`CREATE TABLE entries (
 		id INTEGER PRIMARY KEY,
 		conversation_id INTEGER NOT NULL,
@@ -52,12 +48,9 @@ const INITIAL_SCHEMA: readonly string[] = [
 		id INTEGER PRIMARY KEY,
 		conversation_id INTEGER NOT NULL,
 		request_id TEXT,
-		status TEXT NOT NULL CHECK (status IN ('queued', 'placed', 'done', 'unanswered')),
 		record TEXT NOT NULL CHECK (json_valid(record))
 	) STRICT`,
 	"CREATE INDEX submissions_by_request ON submissions (conversation_id, request_id)",
-	"CREATE INDEX submissions_by_conversation ON submissions (conversation_id, id)",
-	"CREATE INDEX submissions_by_status ON submissions (status, id)",
 	`CREATE TABLE documents (
 		id INTEGER PRIMARY KEY,
 		kind TEXT NOT NULL,
@@ -84,8 +77,27 @@ const INITIAL_SCHEMA: readonly string[] = [
 	"CREATE INDEX document_revisions_by_kind ON document_revisions (document_id, kind, seq DESC)",
 ];
 
-/** Immutable, ordered schema history. Append new migrations after the initial schema ships. */
-export const SQLITE_MIGRATIONS: readonly SqliteMigration[] = [{ version: 1, statements: INITIAL_SCHEMA }];
+const OWNER_AND_SUBMISSION_INDEXES: readonly string[] = [
+	"ALTER TABLE conversations ADD COLUMN owner_conversation_id INTEGER",
+	"ALTER TABLE conversations ADD COLUMN owner_task_id INTEGER",
+	`UPDATE conversations SET
+		owner_conversation_id = json_extract(record, '$.owner.conversationId'),
+		owner_task_id = json_extract(record, '$.owner.taskId')`,
+	"CREATE INDEX conversations_by_owner_conversation ON conversations (owner_conversation_id, id)",
+	"CREATE INDEX conversations_by_owner_task ON conversations (owner_task_id, id)",
+	// SQLite requires a non-null default when adding a NOT NULL column to a populated table.
+	`ALTER TABLE submissions ADD COLUMN status TEXT NOT NULL DEFAULT 'queued'
+		CHECK (status IN ('queued', 'placed', 'done', 'unanswered'))`,
+	"UPDATE submissions SET status = json_extract(record, '$.status')",
+	"CREATE INDEX submissions_by_conversation ON submissions (conversation_id, id)",
+	"CREATE INDEX submissions_by_status ON submissions (status, id)",
+];
+
+/** Immutable, ordered schema history. Append new migrations; never edit released ones. */
+export const SQLITE_MIGRATIONS: readonly SqliteMigration[] = [
+	{ version: 1, statements: INITIAL_SCHEMA },
+	{ version: 2, statements: OWNER_AND_SUBMISSION_INDEXES },
+];
 
 export const CURRENT_SQLITE_SCHEMA_VERSION = SQLITE_MIGRATIONS.at(-1)?.version ?? 0;
 

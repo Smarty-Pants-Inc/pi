@@ -65,7 +65,10 @@ export async function startOAuthCallbackServer<T>(
 	let claimed = false;
 	let settled = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	const onAbort = () => finish({ error: new Error("Login cancelled") });
+	const onAbort = () => {
+		finish({ error: new Error("Login cancelled") });
+		server.close();
+	};
 	const finish = (result: { value: T | undefined } | { error: Error }): void => {
 		if (settled) return;
 		settled = true;
@@ -112,7 +115,15 @@ export async function startOAuthCallbackServer<T>(
 				sendPage(response, 502, oauthErrorHtml(`${providerName} sign-in failed.`, failure.message));
 				finish({ error: failure });
 			}
-		})();
+		})().catch(() => {
+			// Invalid request targets must not reject the HTTP listener or consume the sign-in.
+			try {
+				if (response.headersSent) response.destroy();
+				else sendPage(response, 400, oauthErrorHtml("Invalid OAuth callback request."));
+			} catch {
+				response.destroy();
+			}
+		});
 	});
 
 	await new Promise<void>((resolve, reject) => {
@@ -130,6 +141,11 @@ export async function startOAuthCallbackServer<T>(
 
 	server.on("error", (error) => finish({ error }));
 	signal?.addEventListener("abort", onAbort, { once: true });
+	// An abort during the awaited bind is not replayed when the listener is registered.
+	if (signal?.aborted) {
+		onAbort();
+		throw new Error("Login cancelled");
+	}
 	if (options.timeoutMs !== undefined) {
 		timer = setTimeout(() => finish({ error: new Error(`${providerName} sign-in timed out`) }), options.timeoutMs);
 	}

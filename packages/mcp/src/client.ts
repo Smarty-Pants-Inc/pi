@@ -63,6 +63,7 @@ interface PendingRequest {
 	timeoutMs: number;
 	timer: ReturnType<typeof setTimeout> | undefined;
 	signal: AbortSignal | undefined;
+	controller: AbortController;
 	onAbort: () => void;
 	cancellable: boolean;
 	onProgress: ((progress: ProgressNotification) => void) | undefined;
@@ -418,6 +419,7 @@ export class McpClient {
 				timeoutMs: options.timeoutMs ?? this.options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
 				timer: undefined,
 				signal: options.signal,
+				controller: new AbortController(),
 				// The spec forbids cancelling `initialize`.
 				onAbort: () =>
 					this.cancelPending(
@@ -434,7 +436,7 @@ export class McpClient {
 			if (progressToken !== undefined) this.progressRequests.set(progressToken, id);
 			options.signal?.addEventListener("abort", entry.onAbort, { once: true });
 			this.armTimeout(id, entry);
-			transport.send(message).catch((error) => this.cancelPending(id, error, false));
+			transport.send(message, entry.controller.signal).catch((error) => this.cancelPending(id, error, false));
 		});
 	}
 
@@ -574,6 +576,7 @@ export class McpClient {
 		if (entry.timer) clearTimeout(entry.timer);
 		if (entry.progressToken !== undefined) this.progressRequests.delete(entry.progressToken);
 		entry.signal?.removeEventListener("abort", entry.onAbort);
+		entry.controller.abort();
 	}
 
 	private rejectPending(error: unknown): void {

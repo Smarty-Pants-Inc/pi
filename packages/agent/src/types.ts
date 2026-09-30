@@ -105,6 +105,8 @@ export interface AfterToolCallResult {
 
 /** Context passed to `beforeToolCall`. */
 export interface BeforeToolCallContext {
+	/** The calling tool's id for nested calls; absent for model-issued calls. */
+	parentToolCallId?: string;
 	/** The assistant message that requested the tool call. */
 	assistantMessage: AssistantMessage;
 	/** The raw tool call block from `assistantMessage.content`. */
@@ -117,6 +119,8 @@ export interface BeforeToolCallContext {
 
 /** Context passed to `afterToolCall`. */
 export interface AfterToolCallContext {
+	/** The calling tool's id for nested calls; absent for model-issued calls. */
+	parentToolCallId?: string;
 	/** The assistant message that requested the tool call. */
 	assistantMessage: AssistantMessage;
 	/** The raw tool call block from `assistantMessage.content`. */

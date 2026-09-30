@@ -196,9 +196,11 @@ describe("AgentSession concurrent prompt guard", () => {
 		await firstPrompt.catch(() => {});
 	});
 
+	// #2241 F10: queued input continues after normal completion, not after cancellation fences stop dispatch.
 	it("should queue extension-origin steering messages while streaming", async () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
+		let finishFirstResponse = () => {};
 		let sawSteeringMessage = false;
 		let lastInputSource: string | undefined;
 		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
@@ -234,8 +236,14 @@ describe("AgentSession concurrent prompt guard", () => {
 						return;
 					}
 
+					let finished = false;
+					finishFirstResponse = () => {
+						finished = true;
+						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("First response") });
+					};
 					stream.push({ type: "start", partial: createAssistantMessage("") });
 					const checkAbort = () => {
+						if (finished) return;
 						if (abortSignal?.aborted) {
 							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
 						} else {
@@ -298,8 +306,8 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(lastInputSource).toBe("extension");
 		expect(queueEvents.some((event) => event.steering.includes("Steer from extension"))).toBe(true);
 
-		await session.abort();
-		await firstPrompt.catch(() => {});
+		finishFirstResponse();
+		await firstPrompt;
 
 		expect(sawSteeringMessage).toBe(true);
 	});

@@ -97,11 +97,11 @@ describe("AgentSession tool orchestration", () => {
 			(message): message is ToolResultMessage => message.role === "toolResult",
 		);
 		if (!result) throw new Error("No tool result");
-		// smarty-dev#2241: retain the full fork diagnostic and the nested self-call refusal.
+		// smarty-dev#2241 N1: retain the nested self-call refusal and list the actual callable set.
 		expect(result.content).toEqual([
 			{
 				type: "text",
-				text: "helped | echo: hi | Tool run_tools not found. Available tools in this session: echo, run_tools",
+				text: "helped | echo: hi | Tool run_tools not found. Available tools in this session: echo, helper",
 			},
 		]);
 		const parent = result.toolCallId;

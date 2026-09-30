@@ -146,8 +146,96 @@ export interface NestedToolCallHost {
 interface CallScope {
 	recorder: NestedCallRecorder;
 	nextId: number;
-	/** Set inside a call that holds the exclusive queue, so its own nested calls do not wait on it. */
-	holdsQueue: boolean;
+	queue: CallQueue;
+	writers: readonly WriterLease[];
+}
+
+interface WriterLease {
+	ancestors: readonly WriterLease[];
+}
+
+/** Only sequential calls hold global leases; parallel composites never block writer admission. */
+class SequentialCallQueue {
+	private readonly active = new Set<WriterLease>();
+	private readonly waiting: { lease: WriterLease; admit: () => void }[] = [];
+
+	async acquire(lease: WriterLease, signal?: AbortSignal): Promise<() => void> {
+		if (signal?.aborted) return () => {};
+		const admitted = Promise.withResolvers<void>();
+		const waiter = { lease, admit: admitted.resolve };
+		const onAbort = () => {
+			const index = this.waiting.indexOf(waiter);
+			if (index < 0) return;
+			this.waiting.splice(index, 1);
+			admitted.resolve();
+			this.admit();
+		};
+		this.waiting.push(waiter);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		this.admit();
+		try {
+			await admitted.promise;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+		return () => {
+			this.active.delete(lease);
+			this.admit();
+		};
+	}
+
+	private admit(): void {
+		for (let index = 0; index < this.waiting.length; ) {
+			const waiter = this.waiting[index];
+			if ([...this.active].every((active) => waiter.lease.ancestors.includes(active))) {
+				this.waiting.splice(index, 1);
+				this.active.add(waiter.lease);
+				waiter.admit();
+			} else {
+				// A waiting unrelated writer cannot precede a descendant needed by
+				// its blocking ancestor. Otherwise the first eligible writer wins.
+				index++;
+			}
+		}
+	}
+}
+
+/** Arrival-ordered shared/exclusive admission for one set of siblings. */
+class CallQueue {
+	private tail: Promise<void> = Promise.resolve();
+	private exclusiveTail: Promise<void> = Promise.resolve();
+
+	async acquire(exclusive: boolean, signal?: AbortSignal): Promise<() => void> {
+		const previous = exclusive ? this.tail : this.exclusiveTail;
+		const done = Promise.withResolvers<void>();
+		// Even a cancelled waiter retains the previous barrier. Releasing its ticket
+		// early must not let later calls pass an active exclusive predecessor.
+		const completed = previous.then(() => done.promise);
+		if (exclusive) {
+			this.tail = completed;
+			this.exclusiveTail = completed;
+		} else {
+			this.tail = Promise.all([this.tail, completed]).then(() => {});
+		}
+
+		const aborted = Promise.withResolvers<void>();
+		const onAbort = () => aborted.resolve();
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			if (!signal?.aborted) await Promise.race([previous, aborted.promise]);
+			return done.resolve;
+		} finally {
+			signal?.removeEventListener("abort", onAbort);
+		}
+	}
+
+	async drain(): Promise<void> {
+		let tail: Promise<void>;
+		do {
+			tail = this.tail;
+			await tail;
+		} while (tail !== this.tail);
+	}
 }
 
 function textOf(result: AgentToolResult<unknown>): string {
@@ -161,8 +249,8 @@ export class NestedToolCallRunner {
 	private readonly host: NestedToolCallHost;
 	/** Scopes by the id of the calling tool call. */
 	private readonly scopes = new Map<string, CallScope>();
-	/** Serializes nested calls that must not run concurrently. */
-	private queueTail: Promise<void> = Promise.resolve();
+	private readonly rootQueue = new CallQueue();
+	private readonly sequentialQueue = new SequentialCallQueue();
 
 	constructor(host: NestedToolCallHost) {
 		this.host = host;
@@ -180,7 +268,7 @@ export class NestedToolCallRunner {
 	): Promise<AgentToolCallOutcome> {
 		let scope = this.scopes.get(callerId);
 		if (!scope) {
-			scope = { recorder: new NestedCallRecorder(), nextId: 1, holdsQueue: false };
+			scope = { recorder: new NestedCallRecorder(), nextId: 1, queue: this.rootQueue, writers: [] };
 			this.scopes.set(callerId, scope);
 		}
 		const toolCall: AgentToolCall = {
@@ -190,61 +278,75 @@ export class NestedToolCallRunner {
 			arguments: (args ?? {}) as AgentToolCall["arguments"],
 		};
 		const record = scope.recorder.start(toolCall);
-		await this.host.emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: name,
-			args: toolCall.arguments,
-			parentToolCallId: callerId,
-		});
-
 		const exclusive =
-			!scope.holdsQueue &&
-			(this.host.isSequential() ||
-				this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential");
+			this.host.isSequential() ||
+			this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential";
+		// Reserve before the first await so a parent joins even unawaited accepted children.
+		const admission = scope.queue.acquire(exclusive, options.signal);
 		let release: (() => void) | undefined;
-		if (exclusive) {
-			const previous = this.queueTail;
-			this.queueTail = new Promise((resolve) => {
-				release = resolve;
-			});
-			await previous;
-		}
-		this.scopes.set(toolCall.id, {
-			recorder: scope.recorder,
-			nextId: 1,
-			holdsQueue: scope.holdsQueue || exclusive,
-		});
-		let outcome: AgentToolCallOutcome;
+		let releaseWriter: (() => void) | undefined;
 		try {
-			outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
-				options.onUpdate?.(partialResult);
-				await this.host.emit({
-					type: "tool_execution_update",
-					toolCallId: toolCall.id,
-					toolName: name,
-					args: toolCall.arguments,
-					partialResult,
-					parentToolCallId: callerId,
-				});
+			await this.host.emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: name,
+				args: toolCall.arguments,
+				parentToolCallId: callerId,
 			});
+			release = await admission;
+			const writer: WriterLease = { ancestors: scope.writers };
+			// Acquire only after local admission: a writer waiting behind a parallel
+			// sibling must not block that sibling's awaited sequential descendants.
+			if (exclusive) releaseWriter = await this.sequentialQueue.acquire(writer, options.signal);
+			let outcome: AgentToolCallOutcome;
+			if (!options.signal?.aborted) {
+				const children = new CallQueue();
+				this.scopes.set(toolCall.id, {
+					recorder: scope.recorder,
+					nextId: 1,
+					queue: children,
+					writers: exclusive ? [...scope.writers, writer] : scope.writers,
+				});
+				try {
+					outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
+						options.onUpdate?.(partialResult);
+						await this.host.emit({
+							type: "tool_execution_update",
+							toolCallId: toolCall.id,
+							toolName: name,
+							args: toolCall.arguments,
+							partialResult,
+							parentToolCallId: callerId,
+						});
+					});
+				} finally {
+					await children.drain();
+				}
+			} else {
+				outcome = {
+					toolCall,
+					result: { content: [{ type: "text", text: "Operation aborted" }], details: {} },
+					isError: true,
+				};
+			}
+
+			scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
+			// Nested results are not persisted, so their usage is only counted through the recorder.
+			if (outcome.result.usage) scope.recorder.addUsage(outcome.result.usage);
+			await this.host.emit({
+				type: "tool_execution_end",
+				toolCallId: toolCall.id,
+				toolName: name,
+				result: outcome.result,
+				isError: outcome.isError,
+				parentToolCallId: callerId,
+			});
+			return outcome;
 		} finally {
 			this.scopes.delete(toolCall.id);
-			release?.();
+			releaseWriter?.();
+			(release ?? (await admission))();
 		}
-
-		scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
-		// Nested results are not persisted, so their usage is only counted through the recorder.
-		if (outcome.result.usage) scope.recorder.addUsage(outcome.result.usage);
-		await this.host.emit({
-			type: "tool_execution_end",
-			toolCallId: toolCall.id,
-			toolName: name,
-			result: outcome.result,
-			isError: outcome.isError,
-			parentToolCallId: callerId,
-		});
-		return outcome;
 	}
 
 	/** Remove and return the record of the nested calls a model-issued call made. */

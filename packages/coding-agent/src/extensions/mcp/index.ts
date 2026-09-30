@@ -466,7 +466,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const connection = server.connection;
 			const url = connection?.oauthUrl;
 			if (!connection || !url) return false;
-			const removed = getCredentials(await loadMcpRuntime()).remove(url);
+			const removed = await getCredentials(await loadMcpRuntime()).remove(url);
 			await connection.signOut();
 			return removed;
 		};

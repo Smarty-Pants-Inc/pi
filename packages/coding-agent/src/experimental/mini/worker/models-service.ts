@@ -6,7 +6,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { getAgentDir } from "../../../config.ts";
 import type { ModelRuntime } from "../../../core/model-runtime.ts";
+import { SettingsManager } from "../../../core/settings-manager.ts";
 import { refreshModelCatalogs } from "../../../modes/interactive/model-catalog-refresh.ts";
 import type {
 	AuthPromptRequest,
@@ -56,14 +58,40 @@ export class ModelsService implements ModelsServiceApi {
 	/** Prompts and notices travel to the presentation as events; answers come back via `authReply`. */
 	async login(providerId: string, authType: ProviderAccount["authType"]): Promise<CommandResult> {
 		try {
-			await this.#runtime.login(providerId, authType, {
-				prompt: (prompt) => {
-					const { signal, ...request } = prompt;
-					return this.#ask(request, signal);
-				},
-				notify: (notice) => this.#publish({ type: "notice", notice }),
-			});
-			return { ok: true };
+			// The worker uses the same agent directory as ModelRuntime, never the presentation's identity.
+			const settings = SettingsManager.create(process.cwd(), getAgentDir(), { projectTrusted: false });
+			let identityUsed = false;
+			let result: CommandResult = { ok: true };
+			try {
+				await this.#runtime.login(
+					providerId,
+					authType,
+					{
+						prompt: (prompt) => {
+							const { signal, ...request } = prompt;
+							return this.#ask(request, signal);
+						},
+						notify: (notice) => this.#publish({ type: "notice", notice }),
+					},
+					{
+						getDeviceId: () => {
+							identityUsed = true;
+							const [error] = settings.drainErrors();
+							if (error) throw error.error;
+							return settings.getOrCreateDeviceId();
+						},
+					},
+				);
+			} catch (error) {
+				result = { ok: false, error: message(error) };
+			}
+			if (identityUsed) {
+				// Persist even if browser login is cancelled, so the next attempt keeps this host ID.
+				await settings.flush();
+				const [error] = settings.drainErrors();
+				if (error) throw error.error;
+			}
+			return result;
 		} catch (error) {
 			return { ok: false, error: message(error) };
 		} finally {

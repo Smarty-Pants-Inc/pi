@@ -13,8 +13,22 @@ import type {
 } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
 import {
+	CONTROL_WORDS,
 	type HostToWorkerMessage,
+	INTERRUPT_INDEX,
 	isWorkerToHostMessage,
+	MAX_CALLS,
+	MAX_MESSAGE_BYTES,
+	MAX_OUTPUT_BYTES,
+	MAX_OUTPUT_ITEMS,
+	MAX_OUTSTANDING_BYTES,
+	MAX_OUTSTANDING_MESSAGES,
+	MAX_PENDING_CALLS,
+	messageBytes,
+	QUEUED_BYTES_INDEX,
+	QUEUED_ITEMS_INDEX,
+	RESPONSE_BYTES_INDEX,
+	RESPONSE_ITEMS_INDEX,
 	type WorkerData,
 	type WorkerToHostMessage,
 } from "./protocol.ts";
@@ -41,16 +55,32 @@ function serializeStore(store: Readonly<Record<string, unknown>> | undefined): R
 	const serialized: Record<string, string> = {};
 	for (const [key, value] of Object.entries(store ?? {})) {
 		const json = JSON.stringify(value);
-		if (json !== undefined) serialized[key] = json;
+		if (json !== undefined) {
+			Object.defineProperty(serialized, key, { value: json, enumerable: true, configurable: true, writable: true });
+		}
 	}
 	return serialized;
 }
 
 function parseStoreWrites(json: string): CodemodeStoreWrites {
+	const entries: unknown = JSON.parse(json);
+	if (!Array.isArray(entries)) throw new Error("Invalid store writes: expected an array");
 	const writes: CodemodeStoreWrites = { set: {}, delete: [] };
-	for (const [key, value] of JSON.parse(json) as [string, string?][]) {
-		if (value === undefined) writes.delete.push(key);
-		else writes.set[key] = JSON.parse(value);
+	for (const entry of entries) {
+		if (
+			!Array.isArray(entry) ||
+			(entry.length !== 1 && entry.length !== 2) ||
+			typeof entry[0] !== "string" ||
+			(entry.length === 2 && typeof entry[1] !== "string")
+		) {
+			throw new Error("Invalid store write entry");
+		}
+		const key: string = entry[0];
+		if (entry.length === 1) writes.delete.push(key);
+		else {
+			const value: unknown = JSON.parse(entry[1]);
+			Object.defineProperty(writes.set, key, { value, enumerable: true, configurable: true, writable: true });
+		}
 	}
 	return writes;
 }
@@ -64,6 +94,8 @@ interface PendingCall {
 	record: CodemodeCall | undefined;
 	startedAt: number;
 	controller: AbortController;
+	/** Includes execute() and its hooks/finally blocks, even after cancellation. */
+	promise: Promise<void>;
 }
 
 interface ExecutionOptions {
@@ -87,7 +119,7 @@ class Execution {
 	readonly promise: Promise<CodemodeResult>;
 	private resolveResult!: (result: CodemodeResult) => void;
 	private worker: Worker | undefined;
-	private readonly interrupt = new SharedArrayBuffer(4);
+	private readonly interrupt = new SharedArrayBuffer(CONTROL_WORDS * Int32Array.BYTES_PER_ELEMENT);
 	private readonly tools: ReadonlyMap<string, CodemodeTool>;
 	private readonly globals: ReadonlyMap<string, CodemodeTool>;
 	private readonly signal: AbortSignal | undefined;
@@ -96,6 +128,8 @@ class Execution {
 	private readonly calls: CodemodeCall[] = [];
 	private readonly pending = new Map<number, PendingCall>();
 	private finished = false;
+	private outputBytes = 0;
+	private callCount = 0;
 
 	constructor(options: ExecutionOptions) {
 		this.promise = new Promise<CodemodeResult>((resolve) => {
@@ -177,44 +211,116 @@ class Execution {
 	};
 
 	private post(message: HostToWorkerMessage): void {
+		const bytes = messageBytes(message);
+		if (bytes > MAX_MESSAGE_BYTES) throw new Error("Host response byte budget exceeded");
+		const control = new Int32Array(this.interrupt);
+		const items = Atomics.add(control, RESPONSE_ITEMS_INDEX, 1) + 1;
+		const queuedBytes = Atomics.add(control, RESPONSE_BYTES_INDEX, bytes) + bytes;
+		if (items > MAX_OUTSTANDING_MESSAGES || queuedBytes > MAX_OUTSTANDING_BYTES) {
+			Atomics.sub(control, RESPONSE_ITEMS_INDEX, 1);
+			Atomics.sub(control, RESPONSE_BYTES_INDEX, bytes);
+			throw new Error("Outstanding host response budget exceeded");
+		}
 		this.worker?.postMessage(message);
 	}
 
 	private handleMessage(message: unknown): void {
-		if (this.finished || !isWorkerToHostMessage(message)) return;
-		switch (message.type) {
-			case "output":
-				this.output.push(message.item);
-				break;
-			case "call":
-				void this.handleCall(message);
-				break;
-			case "done":
-				this.handleDone(message);
-				break;
-			case "crash":
-				this.finish({ kind: "sandbox", message: message.message });
-				break;
+		if (this.finished) return;
+		try {
+			if (!isWorkerToHostMessage(message)) throw new Error("Invalid worker message");
+			const bytes = messageBytes(message);
+			const control = new Int32Array(this.interrupt);
+			// Crash reports use an emergency, single terminal message, not queue credit.
+			if (message.type !== "crash") {
+				Atomics.sub(control, QUEUED_ITEMS_INDEX, 1);
+				Atomics.sub(control, QUEUED_BYTES_INDEX, bytes);
+			}
+			if (bytes > MAX_MESSAGE_BYTES) throw new Error("Message byte budget exceeded");
+			switch (message.type) {
+				case "output":
+					if (this.output.length >= MAX_OUTPUT_ITEMS || this.outputBytes + bytes > MAX_OUTPUT_BYTES) {
+						throw new Error("Output budget exceeded");
+					}
+					this.outputBytes += bytes;
+					this.output.push(message.item);
+					break;
+				case "call":
+					if (
+						this.callCount >= MAX_CALLS ||
+						this.pending.size >= MAX_PENDING_CALLS ||
+						this.pending.has(message.id)
+					) {
+						throw new Error("Host call budget exceeded or duplicate call id");
+					}
+					this.callCount++;
+					this.handleCall(message);
+					break;
+				case "done":
+					this.handleDone(message);
+					break;
+				case "crash":
+					this.finish({ kind: "sandbox", message: message.message });
+					break;
+			}
+		} catch (error) {
+			this.finish({ kind: "sandbox", message: `Invalid sandbox completion or message: ${errorMessage(error)}` });
 		}
 	}
 
 	private handleDone(message: Extract<WorkerToHostMessage, { type: "done" }>): void {
+		// Validate all guest-controlled JSON before setting terminal state. Guest
+		// JSON.stringify can still invoke a poisoned toJSON/prototype method.
 		if (!message.ok) {
-			const parsed = JSON.parse(message.error) as Omit<CodemodeError, "kind">;
-			this.finish({ kind: "script", ...parsed });
+			const parsed: unknown = JSON.parse(message.error);
+			if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+				throw new Error("Invalid script error");
+			}
+			const { name, message: text, stack } = parsed as Record<string, unknown>;
+			if (
+				typeof text !== "string" ||
+				(name !== undefined && typeof name !== "string") ||
+				(stack !== undefined && typeof stack !== "string")
+			) {
+				throw new Error("Invalid script error fields");
+			}
+			this.finish({ kind: "script", name, message: text, stack });
 			return;
 		}
-		this.finish(undefined, message.value === undefined ? undefined : JSON.parse(message.value), message.writes);
+		const value: unknown = message.value === undefined ? undefined : JSON.parse(message.value);
+		const writes = parseStoreWrites(message.writes);
+		this.finish(undefined, value, writes);
 	}
 
-	private async handleCall(message: Extract<WorkerToHostMessage, { type: "call" }>): Promise<void> {
+	private handleCall(message: Extract<WorkerToHostMessage, { type: "call" }>): void {
+		const record: CodemodeCall | undefined =
+			message.target === "tool" ? { name: message.name, status: "cancelled", durationMs: 0 } : undefined;
+		if (record) this.calls.push(record);
+		const pending: PendingCall = {
+			record,
+			startedAt: performance.now(),
+			controller: new AbortController(),
+			promise: Promise.resolve(),
+		};
+		this.pending.set(message.id, pending);
+		pending.promise = this.invokeCall(message, pending).catch((error: unknown) => {
+			this.finish({ kind: "sandbox", message: `Host call failed: ${errorMessage(error)}` });
+		});
+	}
+
+	private async invokeCall(
+		message: Extract<WorkerToHostMessage, { type: "call" }>,
+		pending: PendingCall,
+	): Promise<void> {
+		// Retain the promise before invoking host code, which can itself abort
+		// the execution synchronously. No effects start after retirement.
+		await Promise.resolve();
+		if (this.finished) {
+			this.pending.delete(message.id);
+			return;
+		}
 		const { id, name } = message;
 		const isTool = message.target === "tool";
-		const record: CodemodeCall | undefined = isTool ? { name, status: "cancelled", durationMs: 0 } : undefined;
-		if (record) this.calls.push(record);
-		const pending: PendingCall = { record, startedAt: performance.now(), controller: new AbortController() };
-		this.pending.set(id, pending);
-
+		const { record } = pending;
 		let status: CodemodeCallStatus;
 		let reply: HostToWorkerMessage;
 		try {
@@ -229,28 +335,22 @@ class Execution {
 			status = "error";
 		}
 
-		// Already cancelled by finish(): the record keeps "cancelled" and the
-		// worker is gone or going.
-		if (!this.pending.delete(id)) return;
+		this.pending.delete(id);
 		if (record) {
-			record.status = status;
+			record.status = this.finished ? "cancelled" : status;
 			record.durationMs = performance.now() - pending.startedAt;
 		}
-		this.post(reply);
+		if (!this.finished) this.post(reply);
 	}
 
-	private finish(error: CodemodeError | undefined, value?: unknown, writes?: string): void {
+	private finish(error: CodemodeError | undefined, value?: unknown, writes?: CodemodeStoreWrites): void {
 		if (this.finished) return;
 		this.finished = true;
 		clearTimeout(this.timer);
 		this.signal?.removeEventListener("abort", this.onAbort);
 
-		const now = performance.now();
-		for (const pending of this.pending.values()) {
-			if (pending.record) pending.record.durationMs = now - pending.startedAt;
-			pending.controller.abort();
-		}
-		this.pending.clear();
+		const draining = [...this.pending.values()];
+		for (const pending of draining) pending.controller.abort();
 
 		const result: CodemodeResult = error
 			? { ok: false, error, output: this.output, calls: this.calls }
@@ -259,17 +359,16 @@ class Execution {
 					value,
 					output: this.output,
 					calls: this.calls,
-					storeWrites: writes === undefined ? { set: {}, delete: [] } : parseStoreWrites(writes),
+					storeWrites: writes ?? { set: {}, delete: [] },
 				};
-		if (!this.worker) {
+		Atomics.store(new Int32Array(this.interrupt), INTERRUPT_INDEX, 1);
+		// Aborting a tool does not join its I/O or hooks (atomic writes may still
+		// rename). Keep draining ownership, including close(), until all settle.
+		const terminated = this.worker?.terminate();
+		void Promise.allSettled([terminated, ...draining.map((pending) => pending.promise)]).then(() => {
+			this.pending.clear();
 			this.resolveResult(result);
-			return;
-		}
-		Atomics.store(new Int32Array(this.interrupt), 0, 1);
-		this.worker
-			.terminate()
-			.catch(() => undefined)
-			.then(() => this.resolveResult(result));
+		});
 	}
 }
 

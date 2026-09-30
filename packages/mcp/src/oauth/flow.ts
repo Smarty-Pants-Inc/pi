@@ -26,8 +26,10 @@ import {
 	type OAuthClientMetadata,
 	type OAuthDiscoveryState,
 	type OAuthTokens,
+	parseAuthorizationServerMetadata,
 	parseClientInformation,
 	parseOAuthTokens,
+	validateOAuthUrl,
 } from "./types.ts";
 
 export type AddClientAuthentication = (
@@ -78,16 +80,6 @@ export interface TokenRequestOptions {
 	resource?: string;
 	addClientAuthentication?: AddClientAuthentication;
 	fetch?: McpFetch;
-}
-
-function loopback(hostname: string): boolean {
-	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
-}
-
-function secureEndpoint(value: string | URL): URL {
-	const url = new URL(value);
-	if (url.protocol !== "https:" && !loopback(url.hostname)) throw new OAuthInsecureEndpointError(url.href);
-	return url;
 }
 
 function selectClientAuthMethod(information: OAuthClientInformationMixed, supported: string[]): ClientAuthMethod {
@@ -150,7 +142,7 @@ export async function startAuthorization(
 	if (metadata?.code_challenge_methods_supported && !metadata.code_challenge_methods_supported.includes("S256")) {
 		throw new Error("Authorization server does not support PKCE S256");
 	}
-	const url = new URL(metadata?.authorization_endpoint ?? new URL("/authorize", authorizationServerUrl));
+	const url = validateOAuthUrl(metadata?.authorization_endpoint ?? new URL("/authorize", authorizationServerUrl));
 	const { verifier, challenge } = await pkce();
 	url.searchParams.set("response_type", "code");
 	url.searchParams.set("client_id", options.clientInformation.client_id);
@@ -169,7 +161,7 @@ async function tokenRequest(
 	options: TokenRequestOptions,
 	params: URLSearchParams,
 ): Promise<OAuthTokens> {
-	const url = secureEndpoint(options.metadata?.token_endpoint ?? new URL("/token", authorizationServerUrl));
+	const url = validateOAuthUrl(options.metadata?.token_endpoint ?? new URL("/token", authorizationServerUrl));
 	const headers = new Headers({ Accept: "application/json", "content-type": "application/x-www-form-urlencoded" });
 	if (options.resource) params.set("resource", options.resource);
 	if (options.addClientAuthentication) {
@@ -185,7 +177,17 @@ async function tokenRequest(
 			params,
 		);
 	}
-	const response = await (options.fetch ?? globalThis.fetch)(url, { method: "POST", headers, body: params });
+	// Token bodies contain grant credentials. Never resend them to a redirected endpoint.
+	const response = await (options.fetch ?? globalThis.fetch)(url, {
+		method: "POST",
+		headers,
+		body: params,
+		redirect: "manual",
+	});
+	if (response.status >= 300 && response.status < 400) {
+		await response.body?.cancel();
+		throw new OAuthError("invalid_request", "OAuth token endpoint redirects are not allowed");
+	}
 	const text = await response.text();
 	let value: unknown;
 	try {
@@ -216,7 +218,7 @@ export async function registerClient(
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
 	const response = await (options.fetch ?? globalThis.fetch)(
-		new URL(endpoint ?? new URL("/register", authorizationServerUrl)),
+		validateOAuthUrl(endpoint ?? new URL("/register", authorizationServerUrl)),
 		{
 			method: "POST",
 			headers: { Accept: "application/json", "content-type": "application/json" },
@@ -257,15 +259,16 @@ export async function refreshAuthorization(
 
 async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions): Promise<OAuthFlowResult> {
 	const cached = await provider.discoveryState?.();
+	if (cached?.authorizationServerUrl) validateOAuthUrl(cached.authorizationServerUrl);
 	const discovered = cached?.authorizationServerUrl
 		? {
 				authorizationServerUrl: cached.authorizationServerUrl,
-				authorizationServerMetadata:
-					cached.authorizationServerMetadata ??
-					(await discoverAuthorizationServerMetadata(cached.authorizationServerUrl, {
-						fetch: options.fetch,
-						skipIssuerValidation: options.skipIssuerValidation,
-					})),
+				authorizationServerMetadata: cached.authorizationServerMetadata
+					? parseAuthorizationServerMetadata(cached.authorizationServerMetadata)
+					: await discoverAuthorizationServerMetadata(cached.authorizationServerUrl, {
+							fetch: options.fetch,
+							skipIssuerValidation: options.skipIssuerValidation,
+						}),
 				resourceMetadata: cached.resourceMetadata,
 			}
 		: await discoverOAuthServerInfo(options.serverUrl, {

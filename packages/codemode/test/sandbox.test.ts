@@ -470,7 +470,9 @@ describe("limits and lifetime", () => {
 				execute: (_args, { signal }) => {
 					toolSignal = signal;
 					called();
-					return new Promise(() => {});
+					return new Promise((_resolve, reject) => {
+						signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+					});
 				},
 			},
 		]);
@@ -494,6 +496,87 @@ describe("limits and lifetime", () => {
 
 		await sandbox.close();
 		expect(await promise).toMatchObject({ ok: false, error: { kind: "aborted", message: "Sandbox closed" } });
+	});
+
+	// #2241 F4: abort/close must retain a finite uncooperative host invocation,
+	// including its cleanup hook, rather than report idle with effects pending.
+	it("keeps cancelled execution and close pending until host effects and hooks join", async () => {
+		let entered!: () => void;
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let releaseHost!: () => void;
+		const hostGate = new Promise<void>((resolve) => {
+			releaseHost = resolve;
+		});
+		let hookEntered!: () => void;
+		const hookStarted = new Promise<void>((resolve) => {
+			hookEntered = resolve;
+		});
+		let releaseHook!: () => void;
+		const hookGate = new Promise<void>((resolve) => {
+			releaseHook = resolve;
+		});
+		const controller = new AbortController();
+		const recorder: string[] = [];
+		let effects = 0;
+		let aborted = 0;
+		const sandbox = createSandbox([
+			{
+				name: "gated",
+				execute: async (_args, { signal }) => {
+					signal.addEventListener(
+						"abort",
+						() => {
+							aborted++;
+						},
+						{ once: true },
+					);
+					entered();
+					await hostGate;
+					effects++;
+					hookEntered();
+					await hookGate;
+					recorder.push("joined");
+				},
+			},
+		]);
+		let settled = false;
+		const execution = sandbox.execute("await tools.gated()", { signal: controller.signal }).then((result) => {
+			settled = true;
+			return result;
+		});
+		let closed = false;
+		let closing: Promise<void> | undefined;
+		try {
+			await started;
+			controller.abort();
+			closing = sandbox.close().then(() => {
+				closed = true;
+			});
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect([settled, closed, effects, aborted]).toEqual([false, false, 0, 1]);
+			expect(recorder).toEqual([]);
+			releaseHost();
+			await hookStarted;
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect([settled, closed, effects, aborted]).toEqual([false, false, 1, 1]);
+			expect(recorder).toEqual([]);
+			releaseHook();
+			expect(await execution).toMatchObject({
+				ok: false,
+				error: { kind: "aborted" },
+				calls: [{ status: "cancelled" }],
+			});
+			await closing;
+			expect([settled, closed, effects, aborted]).toEqual([true, true, 1, 1]);
+			expect(recorder).toEqual(["joined"]);
+		} finally {
+			releaseHost();
+			releaseHook();
+			await sandbox.close();
+			await execution;
+		}
 	});
 
 	it("rejects execute after close", async () => {

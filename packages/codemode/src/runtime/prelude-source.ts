@@ -295,13 +295,15 @@ export const PRELUDE_SOURCE: string = `(function (bridge, toolsJson, globalsJson
 				promise,
 				(value) => {
 					let json;
+					let writesJson;
 					try {
 						json = serialize(value);
+						writesJson = serializeWrites();
 					} catch (error) {
 						done(false, describeError(error));
 						return;
 					}
-					done(true, json, serializeWrites());
+					done(true, json, writesJson);
 				},
 				(error) => {
 					done(false, describeError(error));

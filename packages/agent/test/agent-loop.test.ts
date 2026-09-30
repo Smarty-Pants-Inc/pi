@@ -2159,7 +2159,7 @@ describe("runToolCall", () => {
 		// smarty-dev#2241: keep the fork's complete unknown-tool diagnostic on the upstream path.
 		expect(await runToolCall(call("d", "missing", {}), options)).toMatchObject({
 			result: {
-				content: [{ type: "text", text: "Tool missing not found. No tools are available in this session." }],
+				content: [{ type: "text", text: "Tool missing not found. Available tools in this session: echo, failing" }],
 			},
 			isError: true,
 		});

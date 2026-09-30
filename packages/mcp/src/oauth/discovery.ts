@@ -6,7 +6,7 @@
 
 import type { McpFetch } from "../auth-provider.ts";
 import { LATEST_PROTOCOL_VERSION } from "../protocol/types.ts";
-import { OAuthIssuerMismatchError } from "./errors.ts";
+import { OAuthInsecureEndpointError, OAuthIssuerMismatchError } from "./errors.ts";
 import {
 	type AuthorizationServerMetadata,
 	type OAuthChallenge,
@@ -14,6 +14,7 @@ import {
 	type OAuthServerInfo,
 	parseAuthorizationServerMetadata,
 	parseProtectedResourceMetadata,
+	validateOAuthUrl,
 } from "./types.ts";
 
 function discard(response: Response | undefined): void {
@@ -55,7 +56,7 @@ export function parseWwwAuthenticate(header: string | null): OAuthChallenge {
 }
 
 async function fetchMetadata(url: URL, fetch: McpFetch, protocolVersion: string): Promise<Response> {
-	return fetch(url, {
+	return fetch(validateOAuthUrl(url), {
 		headers: { Accept: "application/json", "MCP-Protocol-Version": protocolVersion },
 	});
 }
@@ -88,7 +89,7 @@ export async function discoverProtectedResourceMetadata(
 export function buildAuthorizationServerDiscoveryUrls(
 	authorizationServerUrl: string | URL,
 ): { url: URL; type: "oauth" | "oidc" }[] {
-	const issuer = new URL(authorizationServerUrl);
+	const issuer = validateOAuthUrl(authorizationServerUrl);
 	const path = pathSuffix(issuer.pathname);
 	const urls: { url: URL; type: "oauth" | "oidc" }[] = [
 		{ url: new URL(`/.well-known/oauth-authorization-server${path}`, issuer.origin), type: "oauth" },
@@ -137,7 +138,7 @@ export async function discoverOAuthServerInfo(
 			fetch: options.fetch,
 		});
 	} catch (error) {
-		if (error instanceof TypeError) throw error;
+		if (error instanceof TypeError || error instanceof OAuthInsecureEndpointError) throw error;
 	}
 	const authorizationServerUrl = resourceMetadata?.authorization_servers?.[0] ?? String(new URL("/", serverUrl));
 	return {
