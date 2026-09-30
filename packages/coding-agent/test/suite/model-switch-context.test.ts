@@ -1,6 +1,10 @@
 import { fauxAssistantMessage, type Model, normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { completeSummarization, estimateProjectedContextTokens } from "../../src/core/compaction/compaction.ts";
+import {
+	completeSummarization,
+	estimateProjectedContextTokens,
+	estimateTokens,
+} from "../../src/core/compaction/compaction.ts";
 import type { ExtensionAPI } from "../../src/index.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { createHarness, type Harness, type HarnessOptions } from "./harness.ts";
@@ -26,8 +30,8 @@ describe("model switch context admission (#2742)", () => {
 		return h;
 	}
 
-	function seed(h: Harness, tokens = 230_000): void {
-		h.sessionManager.appendMessage({ role: "user", content: "history to summarize", timestamp: Date.now() - 2000 });
+	function seed(h: Harness, tokens = 230_000, history = "history to summarize"): void {
+		h.sessionManager.appendMessage({ role: "user", content: history, timestamp: Date.now() - 2000 });
 		h.sessionManager.appendMessage({
 			...fauxAssistantMessage("old response", { timestamp: Date.now() - 1000 }),
 			api: h.getModel().api,
@@ -159,6 +163,67 @@ describe("model switch context admission (#2742)", () => {
 		await h.session.setModel(h.getModel("sol")!);
 		expect(h.session.model?.id).toBe("sol");
 		expect(h.eventsOfType("compaction_end")[0]?.result?.summary).toContain("large history summarized");
+	});
+
+	it.each([151, 259])(
+		"summarizes real history at %s percent of Sol's window on Opus before switching",
+		async (percent) => {
+			const h = await setup();
+			const target = h.getModel("sol")!;
+			const tokens = (percent * target.contextWindow) / 100;
+			seed(h, tokens, "x".repeat(tokens * 4));
+			h.setResponses([
+				(context, _options, _state, model) => {
+					expect(model.id).toBe("opus");
+					expect(h.session.model?.id).toBe("opus");
+					const summaryInput = context.messages.reduce((total, message) => total + estimateTokens(message), 0);
+					expect(summaryInput).toBeGreaterThan(target.contextWindow);
+					expect(summaryInput).toBeLessThan(model.contextWindow);
+					return fauxAssistantMessage("large history summarized safely on Opus");
+				},
+			]);
+			await h.session.setModel(target);
+			expect(h.session.model?.id).toBe("sol");
+			expect(h.faux.state.callCount).toBe(1);
+			expect(
+				estimateProjectedContextTokens(h.sessionManager.buildSessionProjection(), h.sessionManager.getBranch())
+					.tokens,
+			).toBeLessThan(0.8 * target.contextWindow);
+		},
+	);
+
+	it.each([151, 259])(
+		"refuses %s percent context with compact-first guidance if automatic compaction is disabled",
+		async (percent) => {
+			const h = await setup();
+			const target = h.getModel("sol")!;
+			const tokens = (percent * target.contextWindow) / 100;
+			seed(h, tokens, "x".repeat(tokens * 4));
+			h.session.setAutoCompactionEnabled(false);
+			await expect(h.session.setModel(target, { persist: true })).rejects.toThrow(
+				/compact with the current model first/i,
+			);
+			expect(h.session.model?.id).toBe("opus");
+			expect(h.settingsManager.getDefaultModel()).toBeUndefined();
+			expect(h.sessionManager.getEntries().filter((entry) => entry.type === "model_change")).toEqual([]);
+			expect(h.faux.state.callCount).toBe(0);
+		},
+	);
+
+	it.each([151, 259])("blocks the compaction request itself at %s percent of the smaller window", async (percent) => {
+		const h = await setup();
+		const model = h.getModel("sol")!;
+		const tokens = (percent * model.contextWindow) / 100;
+		await expect(
+			completeSummarization(
+				model,
+				normalizeContext({
+					messages: [{ role: "user", content: "x".repeat(tokens * 4), timestamp: Date.now() }],
+				}),
+				{},
+			),
+		).rejects.toThrow(/context exceeds window/i);
+		expect(h.faux.state.callCount).toBe(0);
 	});
 
 	it("compacts when refreshed metadata shrinks the same model's window", async () => {
