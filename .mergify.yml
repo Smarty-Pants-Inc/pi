@@ -41,6 +41,9 @@ commands_restrictions:
       - or:
           - sender-permission >= write
           - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
   # The stuck-work check's R4 posts one `@mergifyio refresh` per head as the write App (smarty-dev#868,
   # #983); without this Mergify answers "Command disallowed".
   refresh:
@@ -48,3 +51,6 @@ commands_restrictions:
       - or:
           - sender-permission >= write
           - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
