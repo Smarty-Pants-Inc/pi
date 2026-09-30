@@ -46,7 +46,7 @@ Available built-in tools are `read`, `bash`, `powershell`, `edit`, `write`, `gre
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `sessionDir` | string | Agent session directory | Session storage directory. Relative paths resolve from the working directory. `PI_CODING_AGENT_SESSION_DIR` and `--session-dir` override this setting. |
-| `turnOrigin` | `{voiceExtensions?: string[], fabricExtensions?: string[]}` | none | Extensions trusted to claim a `voice` or `fabric` turn channel, by package source (for example `git:github.com/Smarty-Pants-Inc/smarty-voice`) or resolved path. An item ending in `/` matches every source or path under that directory, such as a release root. Global settings only; project settings are ignored. See [Turn origin](session-format.md#turn-origin). |
+| `turnProvenance` | `{voiceExtensions?: string[], fabricExtensions?: string[]}` | none | Extensions trusted to claim a `voice` or `fabric` turn channel, by resolved path or package source. An item ending in `/` matches every source or path under that directory, such as a release root. Global settings only; project settings are ignored. See [Turn provenance](session-format.md#turn-provenance). |
 
 ### Compaction
 

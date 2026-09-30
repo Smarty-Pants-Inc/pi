@@ -11,6 +11,8 @@ export const HOST_CAPABILITIES = Object.freeze({
 	triggeredMessageQueuesBehindPreflight: true as boolean,
 	/** `ctx.isPromptPending()` reports a prompt in preflight, while `ctx.isIdle()` is still true. */
 	promptPendingVisible: true as boolean,
+	/** `sendMessage`/`sendUserMessage` accept a `provenance` claim of this version (smarty-dev#2636); absent on older Pi. */
+	turnProvenance: 1 as number,
 });
 
 export type HostCapabilities = typeof HOST_CAPABILITIES;

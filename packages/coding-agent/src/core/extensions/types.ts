@@ -95,7 +95,7 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
-import type { TurnOriginCaller, TurnOriginClaim } from "../turn-origin.ts";
+import type { TurnProvenanceCaller, TurnProvenanceClaim } from "../turn-provenance.ts";
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions, NormalizedBuildSystemPromptOptions } from "../system-prompt.ts";
@@ -1521,24 +1521,28 @@ export interface ExtensionAPI {
 
 	/**
 	 * Send a custom message to the session.
-	 * `origin` claims a voice or fabric channel for the entry's origin; see sendUserMessage.
+	 * `provenance` claims a voice or fabric channel for the entry; see sendUserMessage.
 	 */
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; origin?: TurnOriginClaim },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+			provenance?: TurnProvenanceClaim;
+		},
 	): void;
 
 	/**
 	 * Send a user message to the agent. Always triggers a turn.
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
 	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
-	 * `origin` claims a voice turn (with the call's principal) or a Fabric turn (with its sender). Pi records
-	 * the claim only when global settings `turnOrigin` trust this extension for that channel; otherwise the
-	 * turn is recorded with channel `unknown`.
+	 * `provenance` claims a voice turn (with the call's principal) or a Fabric turn (with its verified sender).
+	 * Pi records the claim only when global settings `turnProvenance` trust this extension for that channel and
+	 * the claim is well formed; otherwise the turn is still delivered and recorded as `terminal`.
 	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean; origin?: TurnOriginClaim },
+		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean; provenance?: TurnProvenanceClaim },
 	): void;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
@@ -1829,15 +1833,15 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 /** `caller` is the calling extension, supplied by the loader, never by the extension. */
 export type SendMessageHandler = <T = unknown>(
 	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; origin?: TurnOriginClaim },
-	caller?: TurnOriginCaller,
+	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; provenance?: TurnProvenanceClaim },
+	caller?: TurnProvenanceCaller,
 ) => void;
 
 /** `caller` is the calling extension, supplied by the loader, never by the extension. */
 export type SendUserMessageHandler = (
 	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean; origin?: TurnOriginClaim },
-	caller?: TurnOriginCaller,
+	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean; provenance?: TurnProvenanceClaim },
+	caller?: TurnProvenanceCaller,
 ) => void;
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;

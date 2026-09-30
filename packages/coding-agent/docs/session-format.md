@@ -87,25 +87,26 @@ A message in the conversation. The `message` field contains an `AgentMessage`. S
 Sessions created before system messages existed have no leading system message; the first request declares the current prompt as a later system message, which replays the same way.
 
 ```json
-{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello","timestamp":1733234401000},"origin":{"channel":"keyboard","turnId":"a1b2c3d4","receivedAt":"2024-12-03T14:00:01.000Z","principal":{"id":"paul","binding":"launch"},"via":"interactive"}}
+{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello","timestamp":1733234401000},"provenance":{"v":1,"turnId":"5b0c6f1e-2d4a-4c1b-9e7f-3a8d2c1b0e9f","receivedAt":"2024-12-03T14:00:01.000Z","channel":"terminal"}}
 {"type":"message","id":"b2c3d4e5","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{...},"stopReason":"stop","timestamp":1733234402000}}
 {"type":"message","id":"c3d4e5f6","parentId":"b2c3d4e5","timestamp":"2024-12-03T14:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_123","toolName":"bash","content":[{"type":"text","text":"output"}],"isError":false,"timestamp":1733234403000}}
 ```
 
-#### Turn origin
+#### Turn provenance
 
-User message entries and custom message entries carry `origin`: who sent the turn, written by Pi at receipt from the input path that delivered it, the identity of the calling extension and the launch binding. Message text never sets it.
+User message entries and custom message entries carry `provenance`: who sent the turn. Pi writes it once, at first receipt, from the input path that delivered it, the loader's identity of the calling extension, and the terminal host's input attestation. Message text never sets it, and compaction, reload, fork, branch and export copy it unchanged.
 
 | Field | Meaning |
 |---|---|
-| `channel` | `keyboard` (host input: editor, print, JSON or RPC prompt), `voice` (trusted voice extension), `fabric` (Fabric-injected, with `sender`), `unknown` (any other extension, or a refused claim) |
-| `turnId` | The entry id |
-| `receivedAt` | ISO time at which Pi received the turn |
-| `principal` | `{id, binding}`. `keyboard` on the interactive editor only, from `PI_LAUNCH_PRINCIPAL` (`binding: "launch"`); `voice` from the trusted voice extension (`binding: "voice-call"`). Absent when nothing binds one |
-| `sender` | `fabric` only: the sender `{id, kind, name?}` |
-| `via` | Entry point: `interactive`, `print`, `json`, `rpc`, or `extension:<package source or resolved path>` |
+| `v` | `1` |
+| `turnId` | UUID Pi generated for the turn |
+| `receivedAt` | ISO time of the first receipt in Pi |
+| `channel` | `keyboard`: editor input that herdr attests an attached client submitted. `terminal`: any other host input (editor without attestation, print, JSON, RPC, SDK) and every refused claim. `voice`: the trusted voice extension. `fabric`: Fabric, through the extension API |
+| `principal` | `keyboard`: `{id, binding: "herdr-client"}`. `voice`: `{id, binding: "voice-call"}`. Absent otherwise |
+| `sender` | `fabric` only: `{id, kind: "main" \| "actor" \| "agent" \| "remote", name?, verified: "mesh" \| "bridge"}` |
+| `via` | `fabric` only, optional: `steer`, `followUp`, `actor` or `replay` |
 
-A host (SDK, RPC client) may mark input as `fabric` with a sender; it cannot claim `voice`. RPC and print input never carry the launch principal. Entries written before this field have no `origin`; `getTurnOrigin(entry)` returns `{channel: "unknown"}` for them and for unreadable records (including a `turnId` that is not the entry's id). Nothing is inferred from the text.
+Host input cannot claim a channel. Until herdr can attest input (smarty-dev#2637), `keyboard` never appears. `getTurnProvenance(entry)` returns the record, or `undefined` (UNKNOWN) for entries written before this field, a `v` other than `1`, and any record that breaks the rules above. Nothing is inferred from the text.
 
 ### ModelChangeEntry
 
@@ -196,7 +197,7 @@ Fields:
 - `content`: String or `(TextContent | ImageContent)[]` (same as UserMessage)
 - `display`: `true` = show in TUI with distinct styling, `false` = hidden
 - `details`: Optional extension-specific metadata (not sent to LLM)
-- `origin`: Harness-written origin; see [Turn origin](#turn-origin)
+- `provenance`: Harness-written provenance; see [Turn provenance](#turn-provenance)
 
 ### LabelEntry
 

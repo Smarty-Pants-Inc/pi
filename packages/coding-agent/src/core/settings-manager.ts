@@ -9,7 +9,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
-import type { TurnOriginTrust } from "./turn-origin.ts";
+import type { TurnProvenanceTrust } from "./turn-provenance.ts";
 
 export interface CompactionModelOverride {
 	reserveTokens?: number;
@@ -110,8 +110,8 @@ export type PackageSource =
 
 export interface Settings {
 	lastChangelogVersion?: string;
-	/** Extensions trusted to claim voice or fabric turn origins. Read from global settings only. */
-	turnOrigin?: TurnOriginTrust;
+	/** Extensions trusted to claim voice or fabric turn provenance. Read from global settings only. */
+	turnProvenance?: TurnProvenanceTrust;
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: ThinkingLevel;
@@ -515,8 +515,8 @@ export class SettingsManager {
 	}
 
 	/** Global settings only: a project must not grant an extension the right to speak for a principal. */
-	getTurnOriginTrust(): TurnOriginTrust | undefined {
-		return this.globalSettings.turnOrigin;
+	getTurnProvenanceTrust(): TurnProvenanceTrust | undefined {
+		return this.globalSettings.turnProvenance;
 	}
 
 	setProjectTrusted(trusted: boolean): void {

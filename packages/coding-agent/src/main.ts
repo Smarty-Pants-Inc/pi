@@ -68,7 +68,6 @@ import { collectSettingsDiagnostics, deduplicateDiagnostics } from "./core/setti
 import { SettingsManager } from "./core/settings-manager.ts";
 import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
-import { LAUNCH_PRINCIPAL_ENV } from "./core/turn-origin.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
@@ -572,9 +571,6 @@ export interface MainOptions {
 }
 
 export async function main(args: string[], options?: MainOptions) {
-	// turn-origin.ts read the launch principal when it loaded. Child processes (bash tools, Fabric
-	// workers, nested Pi) must not inherit a principal binding meant for this interactive session.
-	delete process.env[LAUNCH_PRINCIPAL_ENV];
 	const parsed = parseArgs(args);
 	// Receive before migrations, resource discovery, trust hooks or model fallback.
 	// Unsupported owned invocations never fall through to the unowned bootstrap.

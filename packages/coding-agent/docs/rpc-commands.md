@@ -41,12 +41,6 @@ Response:
 
 The `images` field is optional. Each image uses `ImageContent` format: `{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}`.
 
-**Origin**: a prompt is recorded as `keyboard` input without a principal (see [Turn origin](session-format.md#turn-origin)). A client that relays a Fabric message marks it with `origin`; `prompt`, `steer` and `follow_up` accept it. Only channel `"fabric"` is accepted, with `sender.id` and `sender.kind`; any other channel is rejected.
-
-```json
-{"type": "prompt", "message": "Run the tests", "origin": {"channel": "fabric", "sender": {"id": "session:agent-7", "kind": "main", "name": "lead"}}}
-```
-
 ### steer
 
 Queue a steering message while the agent is running. It is delivered after the current assistant turn finishes executing its tool calls, before the next LLM call. Skill commands and prompt templates are expanded. Extension commands are not allowed (use `prompt` instead).

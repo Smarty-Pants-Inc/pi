@@ -165,18 +165,22 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
-### Turn origin
+### Turn provenance
 
-Pi records who sent each turn in the entry's `origin` field (see [Session Format](session-format.md#turn-origin)). A message sent with `pi.sendUserMessage()` or `pi.sendMessage()` is recorded with channel `unknown` and `via: "extension:<identity>"`, the harness-supplied identity of the calling extension. An extension that speaks for a principal or relays Fabric passes a claim:
+Pi records who sent each turn in the entry's `provenance` field (see [Session Format](session-format.md#turn-provenance)). A message sent with `pi.sendUserMessage()` or `pi.sendMessage()` is recorded as `terminal`. The voice extension and Fabric pass a claim; Pi writes `turnId` and `receivedAt`:
 
 ```typescript
-// A voice extension, with the principal from its trusted call state:
-pi.sendMessage(message, { triggerTurn: true, origin: { channel: "voice", principal: { id: "paul" } } });
-// Fabric, with the mesh-verified sender:
-pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true, origin: { channel: "fabric", sender: { id, kind, name } } });
+// The voice extension, with the principal from the call's binding:
+pi.sendMessage(message, { triggerTurn: true, provenance: { v: 1, channel: "voice", principal: { id: "paul" } } });
+// Fabric, with the verified sender:
+pi.sendMessage(message, {
+	deliverAs: "steer",
+	triggerTurn: true,
+	provenance: { v: 1, channel: "fabric", sender: { id, kind: "main", name, verified: "mesh" }, via: "steer" },
+});
 ```
 
-Pi accepts the claim only when global settings trust the calling extension for that channel (`turnOrigin.voiceExtensions` or `turnOrigin.fabricExtensions`, matched against the package source or the resolved path; see [Settings](settings.md#sessions-and-context)). Project-scoped extensions and `withSession` contexts are never trusted. A refused claim is recorded as `unknown`; the message is still delivered. Read the record with `getTurnOrigin(entry)`.
+Pi accepts a claim only when it is well formed and global settings trust the calling extension for that channel (`turnProvenance.voiceExtensions` or `turnProvenance.fabricExtensions`, matched against the resolved path or package source; see [Settings](settings.md#sessions-and-context)). Project-scoped extensions and `withSession` contexts are never trusted, and no extension can claim `keyboard`. A refused claim is recorded as `terminal` with no principal; the message is still delivered. Read the record with `getTurnProvenance(entry)`. Detect support with `pi.hostCapabilities.turnProvenance === 1`; an older Pi ignores the option.
 
 <a id="state-management"></a>
 <a id="persist-state"></a>

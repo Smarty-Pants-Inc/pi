@@ -384,17 +384,19 @@ export {
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
 export {
-	getTurnOrigin,
-	LAUNCH_PRINCIPAL_ENV,
+	getTurnProvenance,
+	type HerdrInputAttestation,
+	type InputAttestationReader,
+	TURN_PROVENANCE_VERSION,
 	type TurnChannel,
-	type TurnOrigin,
-	type TurnOriginClaim,
-	type TurnOriginTrust,
+	type TurnFabricVia,
 	type TurnPrincipal,
+	type TurnProvenance,
+	type TurnProvenanceClaim,
+	type TurnProvenanceTrust,
 	type TurnSender,
-	UNKNOWN_TURN_ORIGIN,
-	type UnknownTurnOrigin,
-} from "./core/turn-origin.ts";
+	type TurnSenderKind,
+} from "./core/turn-provenance.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
 export type { RpcAgentSessionEvent, RpcMessageEndEvent } from "./modes/index.ts";
