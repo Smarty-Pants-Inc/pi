@@ -60,7 +60,8 @@ export type TurnOriginClaim = { kind: "voice"; principal: TurnParty } | { kind: 
 /**
  * Trusted callers per claim kind. Read from global settings only: a project's settings must not grant
  * an extension the right to speak for a principal. Each item matches a package source
- * (for example `git:github.com/Smarty-Pants-Inc/smarty-voice`) or an extension's resolved path.
+ * (for example `git:github.com/Smarty-Pants-Inc/smarty-voice`) or an extension's resolved path exactly;
+ * an item ending in `/` matches every source or path under that directory (for example a release root).
  */
 export interface TurnProvenanceTrust {
 	voiceExtensions?: string[];
@@ -128,7 +129,12 @@ export function resolveExtensionTurnProvenance(
 		// A project-scoped extension comes from the checked-out repository, not from the user.
 		caller.sourceInfo.scope !== "project" &&
 		Array.isArray(allowed) &&
-		(allowed.includes(extensionIdentity(caller)) || allowed.includes(caller.resolvedPath));
+		[extensionIdentity(caller), caller.resolvedPath].some((id) =>
+			allowed.some(
+				(item) =>
+					typeof item === "string" && item !== "" && (item.endsWith("/") ? id.startsWith(item) : id === item),
+			),
+		);
 	const who =
 		kind === "voice"
 			? party((claim as { principal?: unknown }).principal)

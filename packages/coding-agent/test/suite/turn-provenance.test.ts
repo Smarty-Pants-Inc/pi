@@ -204,6 +204,28 @@ describe("turn provenance", () => {
 			}),
 		).toMatchObject({ kind: "extension", rejectedClaim: "voice" });
 
+		const release = (dir: string) => ({
+			resolvedPath: `${dir}/index.ts`,
+			sourceInfo: createSyntheticSourceInfo(`${dir}/index.ts`, { source: dir, scope: "user", origin: "package" }),
+		});
+		const claim = { kind: "agent", sender: ORG } as const;
+		const releases = { agentExtensions: ["/opt/fabric/releases/"] };
+		expect(resolveExtensionTurnProvenance(claim, release("/opt/fabric/releases/abc"), releases)).toEqual({
+			kind: "agent",
+			via: "extension",
+			extension: "/opt/fabric/releases/abc",
+			sender: ORG,
+		});
+		expect(resolveExtensionTurnProvenance(claim, release("/opt/fabric/releases-evil/abc"), releases)).toMatchObject({
+			kind: "extension",
+			rejectedClaim: "agent",
+		});
+		expect(
+			resolveExtensionTurnProvenance(claim, release("/opt/fabric/releases/abc"), {
+				agentExtensions: ["/opt/fabric/releases"],
+			}),
+		).toMatchObject({ kind: "extension", rejectedClaim: "agent" });
+
 		const storage = new InMemorySettingsStorage();
 		storage.withLock("project", () => JSON.stringify(TRUST));
 		const settings = SettingsManager.fromStorage(storage);
