@@ -27,6 +27,8 @@ describe("issue #7829 invalid settings warning", () => {
 			const context = {
 				init: vi.fn(async () => {}),
 				options: { startupDiagnostics },
+				// pi#95 R3: this run-only fixture has no constructor-admitted CLI inputs.
+				initialInputs: [],
 				chatContainer,
 				outputPad: 1,
 				ui: { requestRender: vi.fn() },

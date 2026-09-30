@@ -51,12 +51,75 @@ import {
 	toColdEntry,
 	toHotEntry,
 } from "./session-lazy-entries.ts";
-import type { TurnProvenance } from "./turn-provenance.ts";
+import { registerSessionTurnAppender } from "./session-turn-capability.ts";
+import { resolveExtensionTurnProvenance, type TurnProvenance } from "./turn-provenance.ts";
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
 const RECENT_RESIDENT_ENTRIES = 100;
 
 export const CURRENT_SESSION_VERSION = 3;
+
+/** Detach inspection results without materializing large cold fields during tree walks. */
+function detachedSessionView<T>(value: T, seen = new WeakMap<object, object>(), key = ""): T {
+	if (value === null || typeof value !== "object") return value;
+	// Serialize a toJSON subtree before traversing children: its serializer may move them to new keys.
+	if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
+		return JSON.parse(JSON.stringify({ [key]: value }))[key] as T;
+	}
+	const previous = seen.get(value);
+	if (previous) return previous as T;
+	if (Array.isArray(value)) {
+		const result: unknown[] = [];
+		seen.set(value, result);
+		for (const [index, item] of value.entries()) result.push(detachedSessionView(item, seen, String(index)));
+		return result as T;
+	}
+	if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
+		// Preserve JSON metadata (Buffer, URL, Date, custom toJSON), including its property-key argument.
+		return JSON.parse(JSON.stringify({ [key]: value }))[key] as T;
+	}
+	// Preserve byte locations and cold markers, not aliases to resident values or lazy read caches.
+	const result = isColdEntry(value)
+		? copyEntry(value, {})
+		: (Object.create(Object.getPrototypeOf(value)) as T & object);
+	seen.set(value, result);
+	for (const key of Object.keys(value)) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
+		if (descriptor.get) {
+			const read = descriptor.get;
+			Object.defineProperty(result, key, {
+				enumerable: true,
+				configurable: true,
+				get() {
+					const detached = detachedSessionView(read.call(value), undefined, key);
+					Object.defineProperty(this, key, {
+						value: detached,
+						writable: true,
+						enumerable: true,
+						configurable: true,
+					});
+					return detached;
+				},
+				set(replacement: unknown) {
+					Object.defineProperty(this, key, {
+						value: replacement,
+						writable: true,
+						enumerable: true,
+						configurable: true,
+					});
+				},
+			});
+		} else {
+			Object.defineProperty(result, key, {
+				value: detachedSessionView(descriptor.value, seen, key),
+				writable: true,
+				enumerable: true,
+				configurable: true,
+			});
+		}
+	}
+	return Object.isFrozen(value) ? Object.freeze(result) : result;
+}
 
 const ownedTerminalPersistence = new WeakMap<SessionManager, () => Promise<void>>();
 type OwnedTerminalAppender = {
@@ -1086,6 +1149,11 @@ export class SessionManager {
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
 		this.#ownedJournal = ownedJournal;
+		registerSessionTurnAppender(this, {
+			message: (message, provenance) => this.#appendHarnessMessage(message, provenance),
+			custom: (customType, content, display, details, provenance) =>
+				this.#appendHarnessCustomMessage(customType, content, display, details, provenance),
+		});
 		if (ownedJournal) {
 			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
 			ownedTerminalAppenders.set(this, {
@@ -1354,7 +1422,7 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	_persist(entry: SessionEntry): void {
+	#persistEntry(entry: SessionEntry): void {
 		if (this.#ownedJournal) {
 			this.persistCurrent();
 			return;
@@ -1403,10 +1471,12 @@ export class SessionManager {
 			this.leafId = published.id;
 			return;
 		}
-		this.fileEntries.push(entry);
-		this.byId.set(entry.id, entry);
-		this.leafId = entry.id;
-		this._persist(entry);
+		// Never retain caller-owned nested values (including a harness receipt record).
+		const admitted = detachedSessionView(entry);
+		this.fileEntries.push(admitted);
+		this.byId.set(admitted.id, admitted);
+		this.leafId = admitted.id;
+		this.#persistEntry(admitted);
 	}
 
 	#enqueueOwnedTerminal<T>(operation: () => Promise<T>): Promise<T> {
@@ -1427,7 +1497,8 @@ export class SessionManager {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendMessage(message, provenance));
+		if (!isOwnedTerminalWrite(this.#ownedJournal))
+			return Promise.resolve(this.#appendHarnessMessage(message, provenance));
 		return this.#enqueueOwnedTerminal(async () => {
 			const entry: SessionMessageEntry = {
 				type: "message",
@@ -1453,7 +1524,7 @@ export class SessionManager {
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		if (!isOwnedTerminalWrite(this.#ownedJournal))
-			return Promise.resolve(this.appendCustomMessageEntry(customType, content, display, details, provenance));
+			return Promise.resolve(this.#appendHarnessCustomMessage(customType, content, display, details, provenance));
 		return this.#enqueueOwnedTerminal(async () => {
 			const entry: CustomMessageEntry<T> = {
 				type: "custom_message",
@@ -1544,7 +1615,7 @@ export class SessionManager {
 	}
 
 	private ownedView<T>(value: T): T {
-		return this.#ownedJournal ? structuredClone(value) : value;
+		return this.#ownedJournal ? structuredClone(value) : detachedSessionView(value);
 	}
 
 	/** Durable owned acknowledgment, including header/control-only sessions. */
@@ -1571,7 +1642,16 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage, provenance?: TurnProvenance): string {
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		return this.#appendHarnessMessage(
+			message,
+			message.role === "user" || message.role === "custom"
+				? resolveExtensionTurnProvenance(undefined, undefined, undefined)
+				: undefined,
+		);
+	}
+
+	#appendHarnessMessage(message: Message | CustomMessage | BashExecutionMessage, provenance?: TurnProvenance): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
@@ -1709,6 +1789,21 @@ export class SessionManager {
 	 * @returns Entry id
 	 */
 	appendCustomMessageEntry<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+	): string {
+		return this.#appendHarnessCustomMessage(
+			customType,
+			content,
+			display,
+			details,
+			resolveExtensionTurnProvenance(undefined, undefined, undefined),
+		);
+	}
+
+	#appendHarnessCustomMessage<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
@@ -1903,7 +1998,7 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get all session entries (excludes header). Returns a shallow copy.
+	 * Get all session entries (excludes header). Returns detached, laziness-preserving snapshots.
 	 * The session is append-only: use appendXXX() to add entries, branch() to
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
@@ -1912,7 +2007,7 @@ export class SessionManager {
 	}
 
 	/**
-	 * Get the session as a tree structure. Returns a shallow defensive copy of all entries.
+	 * Get the session as a tree structure. Returns detached snapshots of all entries.
 	 * A well-formed session has exactly one root (first entry with parentId === null).
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
@@ -2137,7 +2232,7 @@ export class SessionManager {
 			this._buildIndex();
 
 			// Only write the file now if it contains an assistant message.
-			// Otherwise defer to _persist(), which creates the file on the
+			// Otherwise defer to #persistEntry(), which creates the file on the
 			// first assistant response, matching the newSession() contract
 			// and avoiding the duplicate-header bug when _persist()'s
 			// no-assistant guard later resets flushed to false.

@@ -154,7 +154,6 @@ describe("hook-generated turn provenance", () => {
 			});
 			harnesses.push(harness);
 			vi.useFakeTimers({ toFake: ["Date"] });
-			const append = vi.spyOn(harness.sessionManager, "appendCustomMessageEntry");
 			harness.setResponses([fauxAssistantMessage("done")]);
 			const prompt = harness.session.prompt("input");
 			await entered;
@@ -168,10 +167,8 @@ describe("hook-generated turn provenance", () => {
 				expect(records[0]).not.toBe(records[1]);
 				expect(records[0].turnId).not.toBe(records[1].turnId);
 			}
-			expect(append).toHaveBeenCalledTimes(records.length);
 			for (let index = 0; index < records.length; index++) {
 				expect(Object.isFrozen(records[index])).toBe(true);
-				expect(append.mock.calls[index][4]).toBe(records[index]);
 				expect(entries[index].content).toBe(TEXT);
 				expect(entries[index].details).toEqual({ provenance: FORGED });
 			}
@@ -243,8 +240,9 @@ describe("hook-generated turn provenance", () => {
 			expect(records[0].turnId).not.toBe(records[1].turnId);
 			expect(previews).toHaveLength(4);
 			for (let index = 0; index < records.length; index++) {
-				expect(previews[index * 2]).toBe(records[index]);
-				expect(previews[index * 2 + 1]).toBe(records[index]);
+				// pi#95 R3: inspection snapshots are detached; the retained receipt values must be identical.
+				expect(previews[index * 2]).toEqual(records[index]);
+				expect(previews[index * 2 + 1]).toEqual(records[index]);
 				expect(Object.isFrozen(records[index])).toBe(true);
 			}
 			const appended = harness

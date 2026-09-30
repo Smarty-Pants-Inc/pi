@@ -126,6 +126,7 @@ import {
 	type SessionEntry,
 	SessionManager,
 } from "./session-manager.ts";
+import { appendHarnessCustomMessage, appendHarnessMessage } from "./session-turn-capability.ts";
 import type { CacheWarmingMode, SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -899,7 +900,8 @@ export class AgentSession {
 					entryId = manager.appendCustomEntry(draft.customType, draft.data);
 					break;
 				case "custom_message":
-					entryId = manager.appendCustomMessageEntry(
+					entryId = appendHarnessCustomMessage(
+						manager,
 						draft.customType,
 						draft.content,
 						draft.display,
@@ -952,8 +954,9 @@ export class AgentSession {
 		boundary: "turn_end" | "agent_before_settle",
 		draftProvenance = new WeakMap<SessionBoundaryDraft, TurnProvenance>(),
 	): BoundaryContextPreview {
-		// The runner calls this immediately after each hook result. Stamp new drafts once,
-		// ignoring returned claims, and retain the record through previews and final append.
+		// The runner supplies distinct host snapshots for new occurrences immediately
+		// after each hook result, retaining admitted snapshots at most once. Stamp each
+		// occurrence once, ignoring claims, through previews and final append.
 		for (const draft of drafts) {
 			if (draft.type === "custom_message" && !draftProvenance.has(draft)) {
 				draftProvenance.set(draft, resolveExtensionTurnProvenance(undefined, undefined, undefined));
@@ -1133,7 +1136,8 @@ export class AgentSession {
 							event.message.details,
 							provenance,
 						)
-					: this.sessionManager.appendCustomMessageEntry(
+					: appendHarnessCustomMessage(
+							this.sessionManager,
 							event.message.customType,
 							event.message.content,
 							event.message.display,
@@ -1154,7 +1158,7 @@ export class AgentSession {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.#ordinaryOwner
 					? await appendOwnedTerminalMessage(this.sessionManager, event.message, provenance)
-					: this.sessionManager.appendMessage(event.message, provenance);
+					: appendHarnessMessage(this.sessionManager, event.message, provenance);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -2580,7 +2584,8 @@ export class AgentSession {
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
-		const entryId = this.sessionManager.appendCustomMessageEntry(
+		const entryId = appendHarnessCustomMessage(
+			this.sessionManager,
 			appMessage.customType,
 			appMessage.content,
 			appMessage.display,

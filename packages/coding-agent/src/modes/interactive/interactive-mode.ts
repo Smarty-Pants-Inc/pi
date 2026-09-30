@@ -558,6 +558,7 @@ export class InteractiveMode {
 	private customHeader: (Component & { dispose?(): void }) | undefined = undefined;
 
 	private options: InteractiveModeOptions;
+	private readonly initialInputs: ReceivedHostInput[];
 	private readonly onRightClickPaste = (): void => {
 		void this.handleRightClickPaste();
 	};
@@ -585,6 +586,16 @@ export class InteractiveMode {
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
 		this.options = { ...options, tuiMode };
+		// CLI inputs arrive together, before startup or any preceding model run.
+		// Capture via the non-editor host path so they cannot request keyboard attestation,
+		// while retaining the interactive input-event source on dispatch.
+		this.initialInputs = [
+			...(options.initialMessage ? [{ text: options.initialMessage, images: options.initialImages }] : []),
+			...(options.initialMessages ?? []).map((text) => ({ text, images: undefined })),
+		].map(({ text, images }) => ({
+			text,
+			receipt: { ...captureHostTurnReceipt(this.session, text, "rpc"), source: "interactive", images },
+		}));
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			if (this.compactionQueueTransfers > 0) throw new Error("OWNER_TUI_TRANSFER_PENDING");
@@ -1152,14 +1163,7 @@ export class InteractiveMode {
 		}
 
 		// Show startup warnings
-		const {
-			migratedProviders,
-			startupDiagnostics,
-			modelFallbackMessage,
-			initialMessage,
-			initialImages,
-			initialMessages,
-		} = this.options;
+		const { migratedProviders, startupDiagnostics, modelFallbackMessage } = this.options;
 
 		for (const diagnostic of startupDiagnostics ?? []) {
 			if (diagnostic.type === "error") {
@@ -1194,24 +1198,13 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
-		// Process initial messages
-		if (initialMessage) {
+		// Process initial messages with their original host-admission receipts.
+		for (const input of this.initialInputs) {
 			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
+				await this.session.prompt(input.text, input.receipt);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
-			}
-		}
-
-		if (initialMessages) {
-			for (const message of initialMessages) {
-				try {
-					await this.session.prompt(message);
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
-				}
 			}
 		}
 

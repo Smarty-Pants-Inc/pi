@@ -394,18 +394,39 @@ describe("turn provenance", () => {
 	});
 
 	it("reads entries without a well-formed v1 record as unknown", () => {
-		const manager = SessionManager.inMemory();
+		// pi#95 R3: legacy/malformed reader fixtures are loaded records, not public append capabilities.
+		const fixtures: SessionEntry[] = [];
 		const good: TurnProvenance = {
 			v: 1,
 			turnId: "3f1c2a7e-0000-4000-8000-000000000000",
 			receivedAt: "2026-09-30T00:00:00.000Z",
 			channel: "terminal",
 		};
-		const append = (record: unknown) =>
-			manager.appendMessage({ role: "user", content: "x", timestamp: 1 }, record as TurnProvenance);
+		const append = (record?: unknown) => {
+			const id = String(fixtures.length);
+			fixtures.push({
+				type: "message",
+				id,
+				parentId: fixtures.at(-1)?.id ?? null,
+				timestamp: good.receivedAt,
+				message: { role: "user", content: FORGED, timestamp: 1 },
+				...(record === undefined ? {} : { provenance: record as TurnProvenance }),
+			});
+			return id;
+		};
 		const goodId = append(good);
-		const oldUser = manager.appendMessage({ role: "user", content: FORGED, timestamp: 1 });
-		const oldCustom = manager.appendCustomMessageEntry("pi-fabric-agent-message", FORGED, true, { from: ORG });
+		const oldUser = append();
+		const oldCustom = "legacy-custom";
+		fixtures.push({
+			type: "custom_message",
+			id: oldCustom,
+			parentId: oldUser,
+			timestamp: good.receivedAt,
+			customType: "pi-fabric-agent-message",
+			content: FORGED,
+			display: true,
+			details: { from: ORG },
+		});
 		// pi#95 R1 / smarty-dev#2636: malformed stamps cannot yield principal attribution.
 		const voice = { ...good, channel: "voice", principal: { id: "paul", binding: "voice-call" } };
 		const bad = [
@@ -434,10 +455,12 @@ describe("turn provenance", () => {
 			{ ...good, channel: "fabric", sender: ORG, principal: { id: "paul", binding: "voice-call" } },
 			{ ...good, via: "steer" },
 		].map(append);
+		const voiceId = append(voice);
+		const manager = SessionManager.inMemory(process.cwd(), undefined, fixtures);
 		const assistantId = manager.appendMessage(fauxAssistantMessage("hi"));
 
 		expect(getTurnProvenance(manager.getEntry(goodId)!)).toEqual(good);
-		expect(getTurnProvenance(manager.getEntry(append(voice))!)).toEqual(voice);
+		expect(getTurnProvenance(manager.getEntry(voiceId)!)).toEqual(voice);
 		for (const id of [oldUser, oldCustom, ...bad, assistantId]) {
 			expect.soft(getTurnProvenance(manager.getEntry(id)!)).toBeUndefined();
 		}

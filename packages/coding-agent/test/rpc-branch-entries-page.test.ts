@@ -1,3 +1,5 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { RpcClient } from "../src/modes/rpc/rpc-client.ts";
@@ -106,6 +108,25 @@ async function requestBranchEntriesPage(
 	lineHandler(JSON.stringify({ id, type: "get_branch_entries_page", ...request }));
 	await vi.waitFor(() => expect(getResponse(id).success).toBe(true));
 	return getResponse(id).data as PageData;
+}
+
+// pi#95: read APIs return detached entries; load malformed historical data instead.
+function loadHistoricalParentCycle(harness: Harness, entryId: string, parentId: string): void {
+	const entries = harness.sessionManager.getEntries();
+	expect(entries.some((entry) => entry.id === entryId)).toBe(true);
+	const file = join(harness.tempDir, "historical-parent-cycle.jsonl");
+	writeFileSync(
+		file,
+		`${[
+			harness.sessionManager.getHeader(),
+			...entries.map((entry) => (entry.id === entryId ? { ...entry, parentId } : entry)),
+		]
+			.map((entry) => JSON.stringify(entry))
+			.join("\n")}\n`,
+	);
+	// Call after RPC binding: the in-memory manager skips cold-entry context traversal.
+	expect(harness.sessionManager.isPersisted()).toBe(false);
+	harness.sessionManager.setSessionFile(file);
 }
 
 async function startRpcMode(harness: Harness): Promise<{
@@ -447,13 +468,9 @@ describe("get_branch_entries_page", () => {
 	it("rejects a self-parent cycle while building an initial page", async () => {
 		const harness = await createHarness();
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "self", timestamp: 1 });
-		const leaf = harness.sessionManager.getEntry(leafId);
-		if (!leaf) {
-			throw new Error("Expected the page leaf");
-		}
-		leaf.parentId = leafId;
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
+			loadHistoricalParentCycle(harness, leafId, leafId);
 			lineHandler(JSON.stringify({ id: "self-cycle", type: "get_branch_entries_page", limit: 1, leafId }));
 			await vi.waitFor(() => expect(rpcIo.outputLines).toHaveLength(1));
 			expect(getResponse("self-cycle")).toMatchObject({
@@ -469,13 +486,9 @@ describe("get_branch_entries_page", () => {
 		const harness = await createHarness();
 		const rootId = harness.sessionManager.appendMessage({ role: "user", content: "root", timestamp: 1 });
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "leaf", timestamp: 2 });
-		const root = harness.sessionManager.getEntry(rootId);
-		if (!root) {
-			throw new Error("Expected the page root");
-		}
-		root.parentId = leafId;
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
+			loadHistoricalParentCycle(harness, rootId, leafId);
 			lineHandler(JSON.stringify({ id: "initial-cycle", type: "get_branch_entries_page", limit: 3, leafId }));
 			await vi.waitFor(() => expect(rpcIo.outputLines).toHaveLength(1));
 			expect(getResponse("initial-cycle")).toMatchObject({
@@ -491,13 +504,9 @@ describe("get_branch_entries_page", () => {
 		const harness = await createHarness();
 		const aId = harness.sessionManager.appendMessage({ role: "user", content: "A", timestamp: 1 });
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "B", timestamp: 2 });
-		const a = harness.sessionManager.getEntry(aId);
-		if (!a) {
-			throw new Error("Expected cycle entry A");
-		}
-		a.parentId = leafId;
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
+			loadHistoricalParentCycle(harness, aId, leafId);
 			const firstPage = await requestBranchEntriesPage(lineHandler, "cycle-first", { limit: 1, leafId });
 			expect(firstPage.entries.map((entry) => entry.id)).toEqual([leafId]);
 			if (!firstPage.nextCursor) {
@@ -537,13 +546,9 @@ describe("get_branch_entries_page", () => {
 		const rootId = harness.sessionManager.appendMessage({ role: "user", content: "root", timestamp: 1 });
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "leaf", timestamp: 2 });
 		const cursorId = harness.sessionManager.appendMessage({ role: "user", content: "cursor", timestamp: 3 });
-		const root = harness.sessionManager.getEntry(rootId);
-		if (!root) {
-			throw new Error("Expected the page root");
-		}
-		root.parentId = leafId;
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
+			loadHistoricalParentCycle(harness, rootId, leafId);
 			lineHandler(
 				JSON.stringify({
 					id: "ancestry-cycle",

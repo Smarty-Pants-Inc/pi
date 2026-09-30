@@ -952,6 +952,9 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
+				// The host snapshots each newly returned occurrence. A retained snapshot can
+				// carry its receipt forward only once, even if a handler duplicates it.
+				const retainedOccurrences = new Set(entries);
 				const event = {
 					...baseEvent,
 					entries,
@@ -972,6 +975,7 @@ export class ExtensionRunner {
 				}
 
 				try {
+					entries = entries.map((draft) => (retainedOccurrences.delete(draft) ? draft : { ...draft }));
 					context = await buildContext(entries);
 					valid = true;
 				} catch (err) {

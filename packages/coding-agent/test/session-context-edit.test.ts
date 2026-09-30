@@ -5,7 +5,7 @@ import {
 	estimateProjectedContextTokens,
 	prepareCompaction,
 } from "../src/core/compaction/index.ts";
-import { SessionManager } from "../src/core/session-manager.ts";
+import { type FileEntry, SessionManager } from "../src/core/session-manager.ts";
 
 function assistant(text: string): AssistantMessage {
 	return {
@@ -53,7 +53,14 @@ describe("session context edits", () => {
 
 		expect(session.getBranch().filter((entry) => entry.type === "message")).toHaveLength(3);
 		expect(session.buildSessionProjection().messages.map((message) => message.role)).toEqual(["user"]);
-		expect((session.getEntry(resultId) as { message: ToolResultMessage }).message).toBe(result);
+		// pi#95: inspection snapshots preserve values, not canonical identity.
+		const snapshot = (session.getEntry(resultId) as { message: ToolResultMessage }).message;
+		expect(snapshot).toEqual(result);
+		expect(snapshot).not.toBe(result);
+		const content = snapshot.content[0];
+		if (content.type !== "text") throw new Error("expected text content");
+		content.text = "changed snapshot";
+		expect((session.getEntry(resultId) as { message: ToolResultMessage }).message).toEqual(result);
 	});
 
 	it("replaces only content and lets the latest edit win", () => {
@@ -103,12 +110,27 @@ describe("session context edits", () => {
 	});
 
 	it("normalizes imported string replacements while projecting array-only roles", () => {
-		const session = SessionManager.inMemory();
-		const assistantId = session.appendMessage(assistant("original"));
-		const editId = session.appendContextEdit(assistantId, null);
-		const edit = session.getEntry(editId);
-		if (edit?.type !== "context_edit") throw new Error("expected context edit");
-		edit.replacement = { content: "imported replacement" };
+		// pi#95: seed historical records at load, never through detached inspection snapshots.
+		const timestamp = new Date().toISOString();
+		const entries: FileEntry[] = [
+			{
+				type: "message",
+				id: "assistant",
+				parentId: null,
+				timestamp,
+				message: assistant("original"),
+			},
+			{
+				type: "context_edit",
+				id: "edit",
+				parentId: "assistant",
+				timestamp,
+				targetId: "assistant",
+				replacement: { content: "imported replacement" },
+			},
+		];
+		const session = SessionManager.inMemory(undefined, undefined, entries);
+		expect(session.getEntry("edit")).toMatchObject({ replacement: { content: "imported replacement" } });
 
 		expect(session.buildSessionProjection().messages[0]).toMatchObject({
 			role: "assistant",
