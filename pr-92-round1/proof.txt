@@ -1,0 +1,158 @@
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                                          gpt-6.1-sol • low0.0%/272k                                                            (cliproxyapi) gpt-6.1-sol • low Thinking level: low                                                                                
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                            (cliproxyapi) gpt-6.1-sol • low────────────────────────────────────────────────────────────────────────────────────────────────────
+ $ printf 'INTERVENING_REAL_TOOL_OUTPUT\n'                                                          
+
+ ⠋ Running... (escape/ctrl+c to cancel)                                                             
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                            (cliproxyapi) gpt-6.1-sol • low                                                                                                    
+ INTERVENING_REAL_TOOL_OUTPUT                                                                       
+                                                                                                    
+
+ ⠋ Running... (escape/ctrl+c to cancel)                                                             
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                            (cliproxyapi) gpt-6.1-sol • low────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                            (cliproxyapi) gpt-6.1-sol • low
+
+ Thinking level: medium                                                                             
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                         (cliproxyapi) gpt-6.1-sol • medium Thinking level: high                                                                               
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                           (cliproxyapi) gpt-6.1-sol • high────────────────────────────────────────────────────────────────────────────────────────────────────
+>                                                                                                   
+
+→ Auto-compact                      false
+  Auto-resize images                true
+  Block images                      false
+  Skill commands                    true
+  Show hardware cursor              false
+  Editor padding                    0
+  Output padding                    1
+  Autocomplete max items            5
+  Clear on shrink                   false
+  Terminal progress                 false
+  (1/32)
+
+  Automatically compact context when it gets too large
+
+  Type to search · Enter/Space to change · Esc to cancel
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                           (cliproxyapi) gpt-6.1-sol • high> theme                                                                                             
+
+→ Theme                             dark
+  Default thinking level per model  none
+
+  Color theme for the interface
+
+  Type to search · Enter/Space to change · Esc to cancel
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                           (cliproxyapi) gpt-6.1-sol • high
+
+
+
+
+
+
+
+
+Theme                                                                                               
+
+Select a theme, or choose automatic to follow terminal appearance.                                  
+
+    system     Theme created from your terminal's colors
+    automatic  Use separate themes for light and dark terminal appearance
+→ ✓ dark
+    light
+
+  Enter to select · Esc to go back                                                                  
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                           (cliproxyapi) gpt-6.1-sol • high────────────────────────────────────────────────────────────────────────────────────────────────────
+ $ printf 'INTERVENING_REAL_TOOL_OUTPUT\n'                                                          
+                                                                                                    
+ INTERVENING_REAL_TOOL_OUTPUT                                                                       
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Thinking level: high                                                                               
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Theme                                                                                               
+
+Select a theme, or choose automatic to follow terminal appearance.                                  
+
+    system     Theme created from your terminal's colors
+    automatic  Use separate themes for light and dark terminal appearance
+  ✓ dark
+→   light
+
+  Enter to select · Esc to go back                                                                  
+────────────────────────────────────────────────────────────────────────────────────────────────────> theme                                                                                             
+
+→ Theme                             light
+  Default thinking level per model  none
+
+  Color theme for the interface
+
+  Type to search · Enter/Space to change · Esc to cancel
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                           (cliproxyapi) gpt-6.1-sol • high
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                           (cliproxyapi) gpt-6.1-sol • high
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ $ printf 'AFTER_THEME_REAL_TOOL_OUTPUT\n'                                                          
+                                                                                                    
+ AFTER_THEME_REAL_TOOL_OUTPUT                                                                       
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+                                                                                                    
+────────────────────────────────────────────────────────────────────────────────────────────────────
+/home/paul/smarty/smarty-pants/worktrees/pi/upstream-sync-0991/.local/tui-proof/workspace (sync/u...
+0.0%/272k                                                           (cliproxyapi) gpt-6.1-sol • high 

@@ -1,0 +1,26 @@
+{
+  "scope": "ready-for-re-review, not security clearance/landed/installed",
+  "checks": {
+    "tests": 0,
+    "hydrate": 0,
+    "n1_orchestration": 0,
+    "check": 0,
+    "install": 0
+  },
+  "vitest_passed": 7073,
+  "vitest_intentional_skipped": 912,
+  "scripts_passed": 25,
+  "tui_passed": 1182,
+  "repair_files": 56,
+  "manifest_sha256": "5172d546add3c7550b57bcf75695b339b704fe14248f32dec65dbedc2b34c073",
+  "tests_log_sha256": "6f0f59919462336f4de8284aa4847a64dd56942a97a782236d528e8116341e1f",
+  "tty": {
+    "passed": true,
+    "actualPtyBytes": true,
+    "historyRetainedAfterThemeChange": true,
+    "adjacentCoalescing": true,
+    "videoSHA256": "e31a9b4c446a5414ed3a2d6aabbdac06da807eec2db605cf5289a809a70f80a8"
+  },
+  "head": "8c14be9775e59147c8f1e1c906a36b547c281fd4",
+  "independentAudit": "ACCEPTANCE_AUDIT: PASS \u2014 READY-FOR-RE-REVIEW ONLY, all26"
+}

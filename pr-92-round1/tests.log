@@ -1,0 +1,413 @@
+Running tests without API keys in isolated home: /tmp/pi-test.VnARMX/home
+
+> pi-monorepo@0.0.3 test
+> npm run test:scripts && npm run test --workspaces --if-present
+
+
+> pi-monorepo@0.0.3 test:scripts
+> node --test scripts/*.test.mjs scripts/*.test.ts
+
+✔ rejects undeclared imports even when the workspace package exists (93.144056ms)
+✔ accepts runtime declarations, builtins, self imports, relative imports, and erased types (91.046152ms)
+✔ rejects dev-only dependencies, side-effect imports, mixed exports, and literal runtime loads (94.8948ms)
+✔ allows imported JSON assets outside the TypeScript include pattern (85.545695ms)
+✔ permits dev-only dependencies in sources excluded from the published build (86.638588ms)
+✔ rejects excluded code reachable through export * from "./experimental/server"; (84.984956ms)
+✔ rejects excluded code reachable through import type { Options } from "./experimental/server"; (83.593484ms)
+✔ ignores tests, declarations, and private packages (85.916889ms)
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/tarballs
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+$ /opt/node-v24.18.0-linux-x64/bin/node /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/consumer/smoke-sdk.mjs
+$ /opt/node-v24.18.0-linux-x64/bin/node /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/consumer/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js --version
+$ /opt/node-v24.18.0-linux-x64/bin/node /tmp/pi-test.VnARMX/tmp/pi-consumer-test-2B2iNP/consumer/node_modules/@earendil-works/pi-coding-agent/dist/cli.js --version
+Coding-agent SDK and CLI consumer smoke tests passed (/opt/node-v24.18.0-linux-x64/bin/node).
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/tarballs
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+$ /opt/node-v24.18.0-linux-x64/bin/node /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/consumer/smoke-sdk.mjs
+$ /opt/node-v24.18.0-linux-x64/bin/node /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/consumer/smoke-sdk.mjs
+$ /opt/node-v24.18.0-linux-x64/bin/node /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ggn8FO/consumer/smoke-sdk.mjs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ibwglg/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ibwglg/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ibwglg/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ibwglg/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ibwglg/tarballs
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+$ /opt/node-v24.18.0-linux-x64/bin/node /tmp/pi-test.VnARMX/tmp/pi-consumer-test-Ibwglg/consumer/smoke-sdk.mjs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-HZtWva/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-HZtWva/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-HZtWva/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-HZtWva/tarballs
+$ npm pack --ignore-scripts --json --pack-destination /tmp/pi-test.VnARMX/tmp/pi-consumer-test-HZtWva/tarballs
+$ npm install --ignore-scripts --omit=dev --no-audit --no-fund
+✔ installs only coding-agent directly and uses overrides only for declared runtime dependencies (1111.252177ms)
+✔ requires the ordinary export and rejects changed public or loader function identities (1040.706156ms)
+✔ fails when the SDK imports an undeclared server despite a working CLI (959.637636ms)
+✔ fails if a development-only dependency is added back to the published dependency tree (939.148165ms)
+✔ builds revision scoped storage keys (0.584954ms)
+✔ orders Pi versions with semver precedence (0.57774ms)
+✔ selects the newest catalog a Pi version supports (0.305552ms)
+✔ redirects Pi user agents to an explicit catalog version (0.858746ms)
+✔ serves explicit and unversioned catalog requests without redirecting (0.15474ms)
+✔ rejects invalid catalog request parameters (0.132568ms)
+✔ validates stored indexes and drops publication metadata (0.285484ms)
+✔ publishes explicit per-type and total model counts (64.955696ms)
+✔ compares stable release versions numerically (1.258334ms)
+✔ does not regress an existing newer release marker (0.501208ms)
+✔ retries a lost conditional update and preserves a racing newer marker (0.155841ms)
+✔ creates a missing marker with an if-none-match condition (0.109825ms)
+✔ synchronizes private dependencies without touching registry aliases, generated manifests, or published lockstep (57.024371ms)
+ℹ tests 25
+ℹ suites 0
+ℹ pass 25
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 4094.125318
+
+> @earendil-works/pi-agent-core@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/agent
+
+················································································-·································································································································································································································································································································································································································································································································································································································································································································································································································································································································
+
+ Test Files  85 passed (85)
+      Tests  977 passed | 1 skipped (978)
+   Start at  00:44:14
+   Duration  6.54s (transform 23.26s, setup 0ms, import 43.67s, tests 15.38s, environment 6ms)
+
+
+> @earendil-works/pi-ai@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/ai
+
+··················································································································································································································································································································································---·················································-······--···········--·················------------------------------------------------------------------------------------------------------------------------------·························································-······································-·························································································································--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------····-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------····················································································································································································································································································································································································--------···········································································--------------···············-······················-------------------·······-----------·······················----------·····---····················--······-···························-·······················-·······-··---·················------------------------------------------------------------------------------------------------------------·············
+
+ Test Files  136 passed | 26 skipped (162)
+      Tests  1275 passed | 860 skipped (2135)
+   Start at  00:44:21
+   Duration  4.05s (transform 26.89s, setup 0ms, import 86.02s, tests 6.86s, environment 12ms)
+
+
+> @earendil-works/chord@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/chord
+
+ ✓ test/context.test.ts (5 tests) 5ms
+ ✓ test/boundary.test.ts (1 test) 8ms
+ ✓ test/delta-clone.test.ts (4 tests) 6ms
+ ✓ test/state-value.test.ts (3 tests) 6ms
+ ✓ test/delta-apply-immutable.test.ts (7 tests) 38ms
+ ✓ test/json.test.ts (5 tests) 5ms
+ ✓ test/service-wire.test.ts (8 tests) 12ms
+ ✓ test/state.test.ts (19 tests) 14ms
+ ✓ test/facet-loader.test.ts (9 tests) 12ms
+ ✓ test/facets.test.ts (14 tests) 20ms
+ ✓ test/service-delivery.test.ts (14 tests) 32ms
+ ✓ test/state-diff.test.ts (28 tests) 100ms
+ ✓ test/delta.test.ts (41 tests) 99ms
+ ✓ test/state-draft.test.ts (9 tests) 112ms
+ ✓ test/delta-diff.test.ts (29 tests) 112ms
+ ✓ test/services.test.ts (23 tests) 75ms
+ ✓ test/bundle.test.ts (5 tests) 153ms
+ ✓ test/delta-tracker/tracker.test.ts (67 tests) 617ms
+ ✓ test/state-delivery.test.ts (39 tests) 675ms
+ ✓ test/state-fuzz.test.ts (1 test) 908ms
+   ✓ converges across randomized prepared revisions  907ms
+ ✓ test/delta-tracker/retention.test.ts (14 tests) 2185ms
+     ✓ validates same-job-folded-ops-cleanup retention semantics  405ms
+
+ Test Files  21 passed (21)
+      Tests  345 passed (345)
+   Start at  00:44:25
+   Duration  2.43s (transform 2.74s, setup 0ms, import 3.76s, tests 5.19s, environment 2ms)
+
+
+> @earendil-works/pi-client@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/client
+
+···························
+
+ Test Files  3 passed (3)
+      Tests  27 passed (27)
+   Start at  00:44:28
+   Duration  971ms (transform 694ms, setup 0ms, import 1.18s, tests 407ms, environment 0ms)
+
+
+> @earendil-works/pi-codemode@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/codemode
+
+························································································
+
+ Test Files  4 passed (4)
+      Tests  88 passed (88)
+   Start at  00:44:29
+   Duration  7.75s (transform 1.49s, setup 0ms, import 2.08s, tests 8.50s, environment 0ms)
+
+
+> @earendil-works/pi-coding-agent@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/coding-agent
+
+·······················································································································································································································································································································································································································································································································································································--·······································································································································································Installing ./packages/local-package...
+Installing /tmp/pi-test.VnARMX/tmp/pi-package-commands-1790729081671-69l2ujpprqs/local-package/...
+Removing /tmp/pi-test.VnARMX/tmp/pi-package-commands-1790729081671-69l2ujpprqs/local-package/...
+···········································Updating npm:fake-package...
+························································································Installing /tmp/pi-test.VnARMX/tmp/pi-package-commands-1790729081765-v8fv6x3mv1/local-package...
+··································································································································································································································································································································································································------------------···················································································································································································································································································································································································From /tmp/pi-test.VnARMX/tmp/git-update-test-1790729083880-f6aoojbxka/remote
+   360ff6a..ee99a3e  main       -> origin/main
+HEAD is now at ee99a3e Second commit
+··························From /tmp/pi-test.VnARMX/tmp/git-update-test-1790729083998-wo5tldytje8/remote
+   f45770a..615963c  main       -> origin/main
+····························································HEAD is now at 615963c v3
+··········From /tmp/pi-test.VnARMX/tmp/git-update-test-1790729083998-wo5tldytje8/remote
+ + 615963c...bceb65f main       -> origin/main  (forced update)
+HEAD is now at bceb65f Rewrite B
+·······································From /tmp/pi-test.VnARMX/tmp/git-update-test-1790729084198-o0qdfrrf4i/remote
+ * tag               v2         -> FETCH_HEAD
+HEAD is now at 82c42ab Second commit
+·······From /tmp/pi-test.VnARMX/tmp/git-update-test-1790729084198-o0qdfrrf4i/remote
+ * tag               v2         -> FETCH_HEAD
+·HEAD is now at 82c42ab Second commit
+······--------······································································································----------···········································································································································································································································································································································································································································································································································································································-·······················································································································································-----·············································································································done
+················································································································································································---············--···················································································································································································································································································Launching external editor: /opt/node-v24.18.0-linux-x64/bin/node /home/batch/jobs/20260930T004346Z-500710/packages/coding-agent/test/fixtures/fake-external-editor.mjs /tmp/pi-test.VnARMX/tmp/pi-external-editor-test-IHMBwF/capture.json
+Pi will resume when the editor exits.
+·Launching external editor: /opt/node-v24.18.0-linux-x64/bin/node /home/batch/jobs/20260930T004346Z-500710/packages/coding-agent/test/fixtures/fake-external-editor.mjs /tmp/pi-test.VnARMX/tmp/pi-external-editor-test-9mBGmG/capture.json --fail
+Pi will resume when the editor exits.
+Launching external editor: /opt/node-v24.18.0-linux-x64/bin/node /home/batch/jobs/20260930T004346Z-500710/packages/coding-agent/test/fixtures/fake-external-editor.mjs /tmp/pi-test.VnARMX/tmp/pi-external-editor-test-G5bM6V/capture.json --empty
+Pi will resume when the editor exits.
+·································································································································································-··········································································
+
+ Test Files  364 passed | 6 skipped (370)
+      Tests  3419 passed | 50 skipped (3469)
+   Start at  00:44:37
+   Duration  41.82s (transform 70.66s, setup 0ms, import 441.61s, tests 136.04s, environment 30ms)
+
+
+> @earendil-works/pi-durable@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/durable
+
+ ✓ test/storage-runtime-boundary.test.ts (4 tests) 10ms
+ ✓ test/types.test.ts (2 tests) 2ms
+ ✓ test/env-adaptive-publisher.test.ts (4 tests) 6ms
+ ✓ test/env-output-capture.test.ts (23 tests) 15ms
+ ✓ test/env-truncate.test.ts (13 tests) 120ms
+ ✓ test/sqlite-facade.test.ts (4 tests) 8ms
+ ✓ test/memory-storage.test.ts (23 tests) 22ms
+ ✓ test/sqlite-migrations.test.ts (4 tests) 151ms
+ ✓ test/security-storage-upgrade.test.ts (4 tests) 168ms
+ ✓ test/env-node.test.ts (47 tests | 1 skipped) 378ms
+ ✓ test/harness-registry.test.ts (12 tests) 8ms
+ ✓ test/session-definitions.test.ts (2 tests) 4ms
+ ✓ test/harness-context.test.ts (6 tests) 15ms
+ ✓ test/harness-prompt.test.ts (7 tests) 16ms
+ ✓ test/security-document-migration.test.ts (3 tests) 25ms
+ ✓ test/harness-inspect.test.ts (2 tests) 17ms
+ ✓ test/session-tables.test.ts (12 tests) 28ms
+ ✓ test/session-states.test.ts (10 tests) 33ms
+ ✓ test/session-documents.test.ts (27 tests) 45ms
+ ✓ test/session-forks.test.ts (14 tests) 46ms
+ ✓ test/session-watches.test.ts (21 tests) 51ms
+ ✓ test/harness-conversations.test.ts (14 tests) 51ms
+ ✓ test/session-checkpoints-migrations.test.ts (20 tests) 64ms
+ ✓ test/harness-submissions.test.ts (10 tests) 62ms
+ ✓ test/harness-tasks.test.ts (34 tests) 105ms
+ ✓ test/jsonl-storage.test.ts (85 tests) 413ms
+ ✓ test/harness-tasks-recovery.test.ts (22 tests) 200ms
+ ✓ test/harness-generation-recovery.test.ts (7 tests) 379ms
+ ✓ test/security-generation-prototype.test.ts (3 tests) 641ms
+ ✓ test/harness-generation.test.ts (20 tests) 765ms
+     ✓ faults a run task, settling its inputs and discarding the committed partial  302ms
+ ✓ test/env-node-spill.test.ts (1 test) 1214ms
+     ✓ keeps inherited stdio open past the exit grace period while a spill write is pending  1212ms
+ ✓ test/sqlite-storage.test.ts (55 tests) 1529ms
+
+ Test Files  32 passed (32)
+      Tests  514 passed | 1 skipped (515)
+   Start at  00:45:19
+   Duration  2.07s (transform 8.94s, setup 0ms, import 15.82s, tests 6.59s, environment 3ms)
+
+
+> @earendil-works/pi-evals@0.99.1 test
+> vitest run --config vitest.test.config.ts
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/evals
+
+ ✓ test/plan.test.ts (4 tests) 4ms
+ ✓ test/comparison.test.ts (4 tests) 9ms
+ ✓ test/report.test.ts (14 tests) 23ms
+ ✓ test/acme-server.test.ts (10 tests) 41ms
+ ✓ test/harness.test.ts (15 tests) 5ms
+ ✓ test/configured-runtime.test.ts (8 tests) 231ms
+
+ Test Files  6 passed (6)
+      Tests  55 passed (55)
+   Start at  00:45:21
+   Duration  2.60s (transform 3.35s, setup 0ms, import 4.76s, tests 313ms, environment 0ms)
+
+
+> @earendil-works/pi-mcp@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/mcp
+
+············································································
+
+ Test Files  9 passed (9)
+      Tests  76 passed (76)
+   Start at  00:45:24
+   Duration  1.83s (transform 498ms, setup 0ms, import 837ms, tests 3.88s, environment 1ms)
+
+
+> @earendil-works/pi-protocol@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/protocol
+
+·····································································································································
+
+ Test Files  3 passed (3)
+      Tests  133 passed (133)
+   Start at  00:45:26
+   Duration  465ms (transform 347ms, setup 0ms, import 753ms, tests 178ms, environment 0ms)
+
+
+> @earendil-works/pi-server@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/server
+
+············································
+
+ Test Files  6 passed (6)
+      Tests  44 passed (44)
+   Start at  00:45:27
+   Duration  908ms (transform 1.92s, setup 0ms, import 3.34s, tests 384ms, environment 0ms)
+
+
+> @earendil-works/pi-telemetry@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/telemetry
+
+ ✓ test/telemetry.test.ts (5 tests) 4ms
+ ✓ test/conformance.test.ts (10 tests) 5ms
+
+ Test Files  2 passed (2)
+      Tests  15 passed (15)
+   Start at  00:45:28
+   Duration  128ms (transform 55ms, setup 0ms, import 76ms, tests 9ms, environment 0ms)
+
+
+> @earendil-works/pi-tui@0.99.1 test
+> node --test --test-reporter=dot --test-reporter-destination=stdout test/*.test.ts
+
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+....................
+..
+
+> @earendil-works/pi-session-backend-sqlite-node@0.99.1 test
+> vitest --run
+
+
+ RUN  v4.1.11 /home/batch/jobs/20260930T004346Z-500710/packages/session-backends/sqlite-node
+
+·········································································································
+
+ Test Files  6 passed (6)
+      Tests  105 passed (105)
+   Start at  00:45:33
+   Duration  3.20s (transform 2.08s, setup 0ms, import 3.41s, tests 4.79s, environment 0ms)
+
+npm notice
+npm notice New major version of npm available! 11.16.0 -> 12.1.0
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v12.1.0
+npm notice To update run: npm install -g npm@12.1.0
+npm notice

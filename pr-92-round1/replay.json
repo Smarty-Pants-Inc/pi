@@ -1,0 +1,73 @@
+{
+  "realPtyBytes": true,
+  "cols": 100,
+  "rows": 42,
+  "steps": [
+    {
+      "event": "step",
+      "note": "first status: thinking low",
+      "t": 12.022261806007009
+    },
+    {
+      "event": "step",
+      "note": "intervening real shell input",
+      "t": 14.022447680006735
+    },
+    {
+      "event": "step",
+      "note": "second status: thinking medium",
+      "t": 15.022878070012666
+    },
+    {
+      "event": "step",
+      "note": "adjacent status coalesces to high",
+      "t": 16.023381927981973
+    },
+    {
+      "event": "step",
+      "note": "open actual settings",
+      "t": 17.023890617012512
+    },
+    {
+      "event": "step",
+      "note": "filter actual settings to theme",
+      "t": 18.02458047500113
+    },
+    {
+      "event": "step",
+      "note": "open theme submenu",
+      "t": 19.024937590002082
+    },
+    {
+      "event": "step",
+      "note": "preview light theme",
+      "t": 20.025424088991713
+    },
+    {
+      "event": "step",
+      "note": "commit selected theme",
+      "t": 21.025940123014152
+    },
+    {
+      "event": "step",
+      "note": "close settings; invalidate real history",
+      "t": 23.026369964005426
+    },
+    {
+      "event": "step",
+      "note": "tool after theme change",
+      "t": 25.02675872098189
+    },
+    {
+      "event": "step",
+      "note": "exit first interrupt",
+      "t": 25.327681289985776
+    },
+    {
+      "event": "step",
+      "note": "exit second interrupt",
+      "t": 25.510451246984303
+    }
+  ],
+  "seconds": 25.447898109967355
+}
