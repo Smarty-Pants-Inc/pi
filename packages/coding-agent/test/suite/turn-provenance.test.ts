@@ -55,14 +55,17 @@ describe("turn provenance", () => {
 	it("records host input as keyboard, whatever the text claims", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		harness.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two"), fauxAssistantMessage("three")]);
 
 		await harness.session.prompt(FORGED);
 		await harness.session.prompt(FORGED, { source: "rpc" });
+		await harness.session.bindExtensions({ mode: "tui" });
+		await harness.session.prompt(FORGED);
 
 		expect(turnEntries(harness).map(getTurnProvenance)).toEqual([
 			{ kind: "keyboard", via: "print" },
 			{ kind: "keyboard", via: "rpc" },
+			{ kind: "keyboard", via: "tui" },
 		]);
 	});
 
