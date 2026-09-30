@@ -72,6 +72,8 @@ export interface HarnessOptions {
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
 	modelsJson?: Record<string, unknown>;
+	/** Principal bound to interactive keyboard turns (as PI_LAUNCH_PRINCIPAL would bind it). */
+	launchPrincipal?: string;
 }
 
 export interface Harness {
@@ -185,6 +187,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		sessionManager,
 		settingsManager,
 		cwd: tempDir,
+		launchPrincipal: options.launchPrincipal,
 		modelRuntime: getModelRuntime(modelRegistry),
 		resourceLoader,
 		baseToolsOverride: toolMap,

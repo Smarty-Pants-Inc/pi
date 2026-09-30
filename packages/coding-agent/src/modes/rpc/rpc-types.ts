@@ -12,7 +12,7 @@ import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
-import type { TurnOriginClaim } from "../../core/turn-provenance.ts";
+import type { TurnOriginClaim } from "../../core/turn-origin.ts";
 
 // ============================================================================
 // RPC Commands (stdin)
@@ -39,7 +39,7 @@ export type RpcCommand =
 			message: string;
 			images?: ImageContent[];
 			streamingBehavior?: "steer" | "followUp";
-			/** Agent-sent turn (kind "agent" only); omitted means keyboard. */
+			/** Fabric-sent turn (channel "fabric" only); omitted means keyboard. */
 			origin?: TurnOriginClaim;
 	  }
 	| { id?: string; type: "steer"; message: string; images?: ImageContent[]; origin?: TurnOriginClaim }

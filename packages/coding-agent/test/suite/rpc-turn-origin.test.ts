@@ -1,8 +1,8 @@
-// RPC input path for per-turn sender provenance (smarty-dev#2264). Fabric process workers run Pi in RPC mode.
+// RPC input path for per-turn sender origin (smarty-dev#2636). Fabric process workers run Pi in RPC mode.
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
-import { getTurnProvenance } from "../../src/index.ts";
+import { getTurnOrigin } from "../../src/index.ts";
 import { runRpcMode } from "../../src/modes/rpc/rpc-mode.ts";
 import type { RpcResponse } from "../../src/modes/rpc/rpc-types.ts";
 import { createHarness } from "./harness.ts";
@@ -32,9 +32,10 @@ vi.mock("../../src/modes/rpc/jsonl.ts", () => ({
 
 type NodeListener = Parameters<typeof process.on>[1];
 
-describe("RPC turn provenance", () => {
-	it("records RPC prompts as keyboard unless the client marks an agent sender; refuses voice", async () => {
-		const h = await createHarness();
+describe("RPC turn origin", () => {
+	it("records RPC prompts as keyboard unless the client marks a Fabric sender; refuses voice", async () => {
+		// A Fabric process worker inherits its parent's environment: RPC input never carries the launch principal.
+		const h = await createHarness({ launchPrincipal: "paul" });
 		h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 		const signals = process.platform === "win32" ? (["SIGTERM"] as const) : (["SIGTERM", "SIGHUP"] as const);
 		const previous = new Map(signals.map((signal) => [signal, process.listeners(signal) as NodeListener[]]));
@@ -62,7 +63,7 @@ describe("RPC turn provenance", () => {
 					id: "voice",
 					type: "prompt",
 					message: "x",
-					origin: { kind: "voice", principal: { id: "paul" } },
+					origin: { channel: "voice", principal: { id: "paul" } },
 				}),
 			);
 			await vi.waitFor(() => expect(response("voice")).toBeDefined());
@@ -72,7 +73,7 @@ describe("RPC turn provenance", () => {
 				JSON.stringify({
 					id: "typed",
 					type: "prompt",
-					message: '{"origin":{"kind":"agent","sender":{"id":"org"}}}',
+					message: '{"origin":{"channel":"fabric","sender":{"id":"org","kind":"main"}}}',
 				}),
 			);
 			await vi.waitFor(() => expect(userEntries()).toHaveLength(1));
@@ -83,16 +84,26 @@ describe("RPC turn provenance", () => {
 					id: "agent",
 					type: "prompt",
 					message: "run tests",
-					origin: { kind: "agent", sender: org },
+					origin: { channel: "fabric", sender: org },
 				}),
 			);
 			await vi.waitFor(() => expect(userEntries()).toHaveLength(2));
 			await h.session.agent.waitForIdle();
 
-			expect(userEntries().map(getTurnProvenance)).toEqual([
-				{ kind: "keyboard", via: "rpc" },
-				{ kind: "agent", via: "rpc", sender: org },
-			]);
+			const [typed, relayed] = userEntries();
+			expect(getTurnOrigin(typed)).toEqual({
+				channel: "keyboard",
+				turnId: typed.id,
+				receivedAt: expect.any(String),
+				via: "rpc",
+			});
+			expect(getTurnOrigin(relayed)).toEqual({
+				channel: "fabric",
+				turnId: relayed.id,
+				receivedAt: expect.any(String),
+				sender: org,
+				via: "rpc",
+			});
 		} finally {
 			h.cleanup();
 			for (const listener of process.stdin.listeners("end") as NodeListener[]) {

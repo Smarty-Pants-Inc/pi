@@ -51,7 +51,7 @@ import {
 	toColdEntry,
 	toHotEntry,
 } from "./session-lazy-entries.ts";
-import type { TurnProvenance } from "./turn-provenance.ts";
+import { stampTurnOrigin, type TurnOrigin, type TurnOriginDraft } from "./turn-origin.ts";
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
 const RECENT_RESIDENT_ENTRIES = 100;
@@ -60,13 +60,13 @@ export const CURRENT_SESSION_VERSION = 3;
 
 const ownedTerminalPersistence = new WeakMap<SessionManager, () => Promise<void>>();
 type OwnedTerminalAppender = {
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage, provenance?: TurnProvenance): Promise<string>;
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage, origin?: TurnOriginDraft): Promise<string>;
 	appendCustomMessage<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
-		provenance?: TurnProvenance,
+		origin?: TurnOriginDraft,
 	): Promise<string>;
 	appendCustomEntry(type: string, data?: unknown): Promise<string>;
 };
@@ -83,11 +83,11 @@ export function persistOwnedTerminalSession(manager: SessionManager): Promise<vo
 export function appendOwnedTerminalMessage(
 	manager: SessionManager,
 	message: Message | CustomMessage | BashExecutionMessage,
-	provenance?: TurnProvenance,
+	origin?: TurnOriginDraft,
 ): Promise<string> {
 	const append = ownedTerminalAppenders.get(manager)?.appendMessage;
 	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(message, provenance);
+	return append(message, origin);
 }
 
 /** Private captured route used only by the original owner's terminal callbacks. */
@@ -97,11 +97,11 @@ export function appendOwnedTerminalCustomMessage<T = unknown>(
 	content: string | (TextContent | ImageContent)[],
 	display: boolean,
 	details?: T,
-	provenance?: TurnProvenance,
+	origin?: TurnOriginDraft,
 ): Promise<string> {
 	const append = ownedTerminalAppenders.get(manager)?.appendCustomMessage;
 	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(customType, content, display, details, provenance);
+	return append(customType, content, display, details, origin);
 }
 
 /** Private captured route for non-message retained-session entries. */
@@ -135,8 +135,8 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
-	/** User messages only: harness-written origin. Absent on older entries; read with getTurnProvenance(). */
-	provenance?: TurnProvenance;
+	/** User messages only: harness-written origin. Absent on older entries; read with getTurnOrigin(). */
+	origin?: TurnOrigin;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -235,8 +235,8 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
-	/** Harness-written origin of the calling extension. Absent on older entries; read with getTurnProvenance(). */
-	provenance?: TurnProvenance;
+	/** Harness-written origin. Absent on older entries; read with getTurnOrigin(). */
+	origin?: TurnOrigin;
 }
 
 /** Content that an append-only context edit may replace without changing message metadata. */
@@ -1089,9 +1089,9 @@ export class SessionManager {
 		if (ownedJournal) {
 			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
 			ownedTerminalAppenders.set(this, {
-				appendMessage: (message, provenance) => this.#appendMessageOwnedTerminal(message, provenance),
-				appendCustomMessage: (customType, content, display, details, provenance) =>
-					this.#appendCustomMessageOwnedTerminal(customType, content, display, details, provenance),
+				appendMessage: (message, origin) => this.#appendMessageOwnedTerminal(message, origin),
+				appendCustomMessage: (customType, content, display, details, origin) =>
+					this.#appendCustomMessageOwnedTerminal(customType, content, display, details, origin),
 				appendCustomEntry: (type, data) => this.#appendCustomEntryOwnedTerminal(type, data),
 			});
 			ownedJournal.assertActive();
@@ -1422,20 +1422,21 @@ export class SessionManager {
 
 	#appendMessageOwnedTerminal(
 		message: Message | CustomMessage | BashExecutionMessage,
-		provenance?: TurnProvenance,
+		origin?: TurnOriginDraft,
 	): Promise<string> {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendMessage(message, provenance));
+		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendMessage(message, origin));
 		return this.#enqueueOwnedTerminal(async () => {
+			const id = generateId(this.byId);
 			const entry: SessionMessageEntry = {
 				type: "message",
-				id: generateId(this.byId),
+				id,
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
 				message,
-				...(provenance ? { provenance } : {}),
+				...(origin ? { origin: stampTurnOrigin(origin, id) } : {}),
 			};
 			await this.#appendEntryOwnedTerminal(entry);
 			return entry.id;
@@ -1447,24 +1448,25 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
-		provenance?: TurnProvenance,
+		origin?: TurnOriginDraft,
 	): Promise<string> {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		if (!isOwnedTerminalWrite(this.#ownedJournal))
-			return Promise.resolve(this.appendCustomMessageEntry(customType, content, display, details, provenance));
+			return Promise.resolve(this.appendCustomMessageEntry(customType, content, display, details, origin));
 		return this.#enqueueOwnedTerminal(async () => {
+			const id = generateId(this.byId);
 			const entry: CustomMessageEntry<T> = {
 				type: "custom_message",
 				customType,
 				content,
 				display,
 				details,
-				id: generateId(this.byId),
+				id,
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
-				...(provenance ? { provenance } : {}),
+				...(origin ? { origin: stampTurnOrigin(origin, id) } : {}),
 			};
 			await this.#appendEntryOwnedTerminal(entry);
 			return entry.id;
@@ -1571,14 +1573,15 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage, provenance?: TurnProvenance): string {
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage, origin?: TurnOriginDraft): string {
+		const id = generateId(this.byId);
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.byId),
+			id,
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
-			...(provenance ? { provenance } : {}),
+			...(origin ? { origin: stampTurnOrigin(origin, id) } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1713,18 +1716,19 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
-		provenance?: TurnProvenance,
+		origin?: TurnOriginDraft,
 	): string {
+		const id = generateId(this.byId);
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType,
 			content,
 			display,
 			details,
-			id: generateId(this.byId),
+			id,
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
-			...(provenance ? { provenance } : {}),
+			...(origin ? { origin: stampTurnOrigin(origin, id) } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;

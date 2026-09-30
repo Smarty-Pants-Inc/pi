@@ -140,17 +140,18 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import {
-	resolveExtensionTurnProvenance,
-	resolveHostTurnProvenance,
+	launchPrincipal,
+	resolveExtensionTurnOrigin,
+	resolveHostTurnOrigin,
+	type TurnOriginCaller,
 	type TurnOriginClaim,
-	type TurnProvenance,
-	type TurnProvenanceCaller,
-} from "./turn-provenance.ts";
+	type TurnOriginDraft,
+} from "./turn-origin.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 
-/** Module-private key: only this module can hand a resolved extension provenance to prompt(). */
-const RESOLVED_PROVENANCE = Symbol("resolvedTurnProvenance");
-type InternalPromptOptions = PromptOptions & { [RESOLVED_PROVENANCE]?: TurnProvenance };
+/** Module-private key: only this module can hand a resolved extension origin to prompt(). */
+const RESOLVED_ORIGIN = Symbol("resolvedTurnOrigin");
+type InternalPromptOptions = PromptOptions & { [RESOLVED_ORIGIN]?: TurnOriginDraft };
 
 const appendOriginalCompaction = SessionManager.prototype.appendCompaction;
 const originalCompactionSessions = new WeakMap<
@@ -280,6 +281,8 @@ export interface AgentSessionConfig {
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	cwd: string;
+	/** Principal bound to interactive keyboard turns. Defaults to PI_LAUNCH_PRINCIPAL as read at startup. */
+	launchPrincipal?: string;
 	/** Models to cycle through with Ctrl+P (from --models flag) */
 	scopedModels?: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 	/** Resource loader for extensions, skills, prompts, themes, context files, and system prompt */
@@ -331,7 +334,7 @@ export interface PromptOptions {
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
 	/**
-	 * Mark the turn as sent by an agent (for example a Fabric process worker's spawner). Only kind "agent"
+	 * Mark the turn as Fabric-sent (for example a Fabric process worker's spawner). Only channel "fabric"
 	 * is accepted here; a voice claim throws. Without it, host input is recorded as keyboard.
 	 */
 	origin?: TurnOriginClaim;
@@ -448,8 +451,10 @@ export class AgentSession {
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
-	/** Harness-written origin per queued turn message, persisted with its entry (smarty-dev#2264). */
-	readonly #turnProvenance = new WeakMap<AgentMessage, TurnProvenance>();
+	/** Harness-written origin per queued turn message, persisted with its entry (smarty-dev#2636). */
+	readonly #turnOrigin = new WeakMap<AgentMessage, TurnOriginDraft>();
+	/** Principal bound at launch (PI_LAUNCH_PRINCIPAL), stamped on interactive keyboard turns. */
+	readonly #launchPrincipal: string | undefined;
 	/** Context-only custom messages queued during a run, flushed once the current turn's tool results are in. */
 	private _pendingCustomMessages: CustomMessage[] = [];
 	/** FIFO entry IDs keyed by live message objects for the active capture epoch. */
@@ -521,6 +526,7 @@ export class AgentSession {
 	private _runSystemPromptOptions?: NormalizedBuildSystemPromptOptions;
 
 	constructor(config: AgentSessionConfig) {
+		this.#launchPrincipal = config.launchPrincipal ?? launchPrincipal();
 		const owner = ordinaryOwnerOf(config);
 		const sessionManager = config.sessionManager;
 		assertOrdinaryRuntime(sessionManager, owner);
@@ -1095,7 +1101,7 @@ export class AgentSession {
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
 			// Set only for messages this session created from an input path; never from message content.
-			const provenance = this.#turnProvenance.get(event.message);
+			const origin = this.#turnOrigin.get(event.message);
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -1106,14 +1112,14 @@ export class AgentSession {
 							event.message.content,
 							event.message.display,
 							event.message.details,
-							provenance,
+							origin,
 						)
 					: this.sessionManager.appendCustomMessageEntry(
 							event.message.customType,
 							event.message.content,
 							event.message.display,
 							event.message.details,
-							provenance,
+							origin,
 						);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
@@ -1128,8 +1134,8 @@ export class AgentSession {
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.#ordinaryOwner
-					? await appendOwnedTerminalMessage(this.sessionManager, event.message, provenance)
-					: this.sessionManager.appendMessage(event.message, provenance);
+					? await appendOwnedTerminalMessage(this.sessionManager, event.message, origin)
+					: this.sessionManager.appendMessage(event.message, origin);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1991,7 +1997,7 @@ export class AgentSession {
 		let messages: AgentMessage[] | undefined;
 
 		try {
-			const provenance = this._turnProvenanceFor(options);
+			const origin = this._turnOriginFor(options);
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
@@ -2051,9 +2057,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages, provenance);
+					await this._queueFollowUp(expandedText, currentImages, origin);
 				} else {
-					await this._queueSteer(expandedText, currentImages, provenance);
+					await this._queueSteer(expandedText, currentImages, origin);
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
@@ -2099,8 +2105,8 @@ export class AgentSession {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
-					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, provenance);
-					else await this._queueSteer(expandedText, currentImages, provenance);
+					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, origin);
+					else await this._queueSteer(expandedText, currentImages, origin);
 					// Input already queued behind this prompt is retained with it, and so are
 					// triggered messages held during this preflight: the stop holds for them too.
 					this._inputQueuedBehindPreflight = false;
@@ -2139,7 +2145,7 @@ export class AgentSession {
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
 			userContent.push(...normalized.images);
 			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
-			this.#turnProvenance.set(userMessage, provenance);
+			this.#turnOrigin.set(userMessage, origin);
 			messages.push(userMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
@@ -2301,24 +2307,23 @@ export class AgentSession {
 	}
 
 	/**
-	 * The harness-written origin of a prompt, steer or follow-up. Only sendUserMessage() supplies a
-	 * resolved extension provenance (under a module-private key). Otherwise the source decides: host
-	 * input is keyboard unless the host marks it agent-sent; message text is never read.
+	 * The harness-written origin of a prompt, steer or follow-up, taken at receipt. Only sendUserMessage()
+	 * supplies a resolved extension origin (under a module-private key). Otherwise the source decides: host
+	 * input is keyboard unless the host marks it Fabric-sent; message text is never read.
 	 */
-	private _turnProvenanceFor(options: InternalPromptOptions | undefined): TurnProvenance {
-		const resolved = options?.[RESOLVED_PROVENANCE];
+	private _turnOriginFor(options: InternalPromptOptions | undefined): TurnOriginDraft {
+		const resolved = options?.[RESOLVED_ORIGIN];
 		if (resolved) return resolved;
+		const receivedAt = new Date().toISOString();
 		const source = options?.source ?? "interactive";
 		if (source === "extension") {
 			// No caller identity on this path, so any claim is refused.
-			return resolveExtensionTurnProvenance(
-				options?.origin,
-				undefined,
-				this.settingsManager.getTurnProvenanceTrust(),
-			);
+			return resolveExtensionTurnOrigin(options?.origin, undefined, undefined, receivedAt);
 		}
 		// via is the mode the host bound; an SDK host without bindings reads as "print".
-		return resolveHostTurnProvenance(options?.origin, source === "rpc" ? "rpc" : this._extensionMode);
+		const mode = this._extensionMode;
+		const via = source === "rpc" || mode === "rpc" ? "rpc" : mode === "tui" ? "interactive" : mode;
+		return resolveHostTurnOrigin(options?.origin, via, this.#launchPrincipal, receivedAt);
 	}
 
 	private async _queueUserInput(
@@ -2329,7 +2334,7 @@ export class AgentSession {
 		origin: TurnOriginClaim | undefined,
 	): Promise<void> {
 		// Resolve before any queueing work so a refused claim fails the call.
-		const provenance = this._turnProvenanceFor({ source, origin });
+		const turnOrigin = this._turnOriginFor({ source, origin });
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
 		if (this.#ordinaryOwner) {
@@ -2337,7 +2342,7 @@ export class AgentSession {
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source, provenance);
+			await this._prepareQueuedInput(text, images, behavior, source, turnOrigin);
 		} finally {
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
@@ -2351,7 +2356,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
-		provenance: TurnProvenance,
+		origin: TurnOriginDraft,
 	): Promise<void> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2369,9 +2374,9 @@ export class AgentSession {
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images, provenance);
+			await this._queueSteer(expandedText, processedInput.images, origin);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images, provenance);
+			await this._queueFollowUp(expandedText, processedInput.images, origin);
 		}
 	}
 
@@ -2411,11 +2416,7 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(
-		text: string,
-		images: ImageContent[] | undefined,
-		provenance: TurnProvenance,
-	): Promise<void> {
+	private async _queueSteer(text: string, images: ImageContent[] | undefined, origin: TurnOriginDraft): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
@@ -2424,7 +2425,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#turnProvenance.set(message, provenance);
+		this.#turnOrigin.set(message, origin);
 		this.agent.steer(message);
 	}
 
@@ -2434,7 +2435,7 @@ export class AgentSession {
 	private async _queueFollowUp(
 		text: string,
 		images: ImageContent[] | undefined,
-		provenance: TurnProvenance,
+		origin: TurnOriginDraft,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
@@ -2444,7 +2445,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#turnProvenance.set(message, provenance);
+		this.#turnOrigin.set(message, origin);
 		this.agent.followUp(message);
 	}
 
@@ -2490,7 +2491,7 @@ export class AgentSession {
 		options:
 			| { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn"; origin?: TurnOriginClaim }
 			| undefined,
-		caller: TurnProvenanceCaller | undefined,
+		caller: TurnOriginCaller | undefined,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
@@ -2502,9 +2503,14 @@ export class AgentSession {
 			details: message.details,
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
-		this.#turnProvenance.set(
+		this.#turnOrigin.set(
 			appMessage,
-			resolveExtensionTurnProvenance(options?.origin, caller, this.settingsManager.getTurnProvenanceTrust()),
+			resolveExtensionTurnOrigin(
+				options?.origin,
+				caller,
+				this.settingsManager.getTurnOriginTrust(),
+				new Date().toISOString(),
+			),
 		);
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
@@ -2545,7 +2551,7 @@ export class AgentSession {
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
-			this.#turnProvenance.get(appMessage),
+			this.#turnOrigin.get(appMessage),
 		);
 		this._recordMessageEntryId(appMessage, entryId);
 		this._entryIdsByMessage.set(appMessage, entryId);
@@ -2575,7 +2581,7 @@ export class AgentSession {
 					message.content,
 					message.display,
 					message.details,
-					this.#turnProvenance.get(message),
+					this.#turnOrigin.get(message),
 				);
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
@@ -2638,7 +2644,7 @@ export class AgentSession {
 		options:
 			| { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean; origin?: TurnOriginClaim }
 			| undefined,
-		caller: TurnProvenanceCaller | undefined,
+		caller: TurnOriginCaller | undefined,
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
@@ -2665,10 +2671,11 @@ export class AgentSession {
 			streamingBehavior: options?.deliverAs,
 			images,
 			source: "extension",
-			[RESOLVED_PROVENANCE]: resolveExtensionTurnProvenance(
+			[RESOLVED_ORIGIN]: resolveExtensionTurnOrigin(
 				options?.origin,
 				caller,
-				this.settingsManager.getTurnProvenanceTrust(),
+				this.settingsManager.getTurnOriginTrust(),
+				new Date().toISOString(),
 			),
 		};
 		await this.prompt(text, promptOptions);
