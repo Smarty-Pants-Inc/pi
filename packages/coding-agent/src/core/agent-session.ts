@@ -61,6 +61,7 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
+	assertContextFitsWindow,
 	type CompactionPreparation,
 	type CompactionResult,
 	calculateContextTokens,
@@ -444,6 +445,7 @@ export class AgentSession {
 	/** Settlement outcome of the compaction that stopped the run; a later synthetic turn_end cannot replace it. */
 	private _compactionStopOutcome: AgentActivityOutcome | undefined;
 	private _overflowRecoveryAttempted = false;
+	private _modelSwitchCompactionPending = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -535,9 +537,9 @@ export class AgentSession {
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
-		this._installAgentRequestProjection();
 		this._installAgentBoundaryHooks();
 		this._installAgentForcedPromptProjection();
+		this._installAgentRequestProjection();
 
 		this._buildRuntime({
 			activeToolNames: this._initialActiveToolNames,
@@ -690,45 +692,70 @@ export class AgentSession {
 		};
 	}
 
-	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+	private async _compactBeforeNextAssistantResponse(
+		context: AgentContext,
+		overflowOnly = false,
+	): Promise<AgentContext> {
 		this.#ordinaryOwner?.assertNativeTokenReservation();
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		const projection = this.sessionManager.buildSessionProjection();
-
-		if (
-			!model ||
-			model.contextWindow <= 0 ||
-			!shouldCompact(
-				estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
-				model.contextWindow,
-				settings,
-			)
-		) {
+		if (!model || model.contextWindow <= 0) return { ...context, messages: projection.messages };
+		const tokens = estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens;
+		const overflow = tokens > model.contextWindow;
+		if (overflow && !settings.enabled) {
+			throw new Error(
+				`Context exceeds window: estimated ${tokens} tokens, window ${model.contextWindow}; auto-compaction is disabled.`,
+			);
+		}
+		if (overflowOnly ? !overflow : !shouldCompact(tokens, model.contextWindow, settings)) {
 			return { ...context, messages: projection.messages };
 		}
 
-		const outcome = await this._runAutoCompaction("threshold", false);
+		const outcome = await this._runAutoCompaction(overflowOnly ? "overflow" : "threshold", false);
 		if (outcome === "failed" || outcome === "aborted") {
 			// Stop this run rather than sending unchanged oversized context or
 			// turning a compaction timeout into an ordinary agent retry.
 			this._stopAfterCompactionFailure = true;
 			this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
 			this.agent.abort();
-			throw new Error(`Compaction ${outcome} before the next assistant turn`);
+			throw new Error(
+				`${overflow ? "Context exceeds window: " : ""}Compaction ${outcome} before the next assistant turn`,
+			);
 		}
-		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
+		const compacted = this.sessionManager.buildSessionProjection();
+		const remaining = estimateProjectedContextTokens(compacted, this.sessionManager.getBranch()).tokens;
+		if (remaining > model.contextWindow) {
+			throw new Error(
+				`Context exceeds window: estimated ${remaining} tokens, window ${model.contextWindow}; compaction could not reduce the input enough.`,
+			);
+		}
+		return { ...context, messages: compacted.messages };
 	}
 
 	private _installAgentRequestProjection(): void {
+		let requestModel = this.agent.state.model;
+		const previousConvertToLlm = this.agent.convertToLlm;
+		this.agent.convertToLlm = async (messages) => {
+			const converted = await previousConvertToLlm(messages);
+			// Check final provider messages, including extension transforms, forced prompts
+			// and summary/bash formatting added by conversion, against the prepared model.
+			assertContextFitsWindow(converted, requestModel);
+			return converted;
+		};
 		const previousPrepareRequest = this.agent.prepareRequest;
 		this.agent.prepareRequest = async (request, signal) => {
-			const canonicalContext = {
-				...request.context,
-				messages: this.sessionManager.buildSessionProjection().messages,
-				// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
-				tools: this.agent.state.tools.slice(),
-			};
+			// prepareNextTurn skips the first request. Check the full persisted input here,
+			// including new prompts and queued messages, without waiting for a provider error.
+			const canonicalContext = await this._compactBeforeNextAssistantResponse(
+				{
+					...request.context,
+					messages: this.sessionManager.buildSessionProjection().messages,
+					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
+					tools: this.agent.state.tools.slice(),
+				},
+				true,
+			);
 			const previous = await previousPrepareRequest?.(
 				{
 					...request,
@@ -738,10 +765,11 @@ export class AgentSession {
 				},
 				signal,
 			);
+			requestModel = previous?.model ?? this.agent.state.model;
 			return {
 				...previous,
 				context: previous?.context ?? canonicalContext,
-				model: previous?.model ?? this.agent.state.model,
+				model: requestModel,
 				thinkingLevel: previous?.thinkingLevel ?? this.agent.state.thinkingLevel,
 			};
 		};
@@ -1406,7 +1434,7 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive && !this.isCompacting;
+		return !this._isAgentRunActive && !this.isCompacting && !this._modelSwitchCompactionPending;
 	}
 
 	/**
@@ -1705,6 +1733,8 @@ export class AgentSession {
 		onInputTransferred?: () => void,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
+		// A prompt admitted before the switch may still be finishing async input hooks.
+		while (this._modelSwitchCompactionPending) await this.waitForIdle();
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 		const dispatch = async (continuation = false) => {
@@ -1981,6 +2011,9 @@ export class AgentSession {
 				}
 			}
 
+			if (this._modelSwitchCompactionPending && !options?.streamingBehavior) {
+				throw new Error("Model switch compaction is in progress; wait before submitting input.");
+			}
 			if (
 				this._compactionAbortController !== undefined ||
 				(this._autoCompactionAbortController !== undefined && !this.isStreaming)
@@ -1996,6 +2029,7 @@ export class AgentSession {
 			this._promptPreflights.add(preflightToken);
 			const mustQueue = () =>
 				this.isStreaming ||
+				this._modelSwitchCompactionPending ||
 				(options?.streamingBehavior !== undefined &&
 					this._promptPreflights.values().next().value !== preflightToken);
 
@@ -2020,6 +2054,8 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
+			// Preserve an already-admitted prompt if a switch began while its input hook ran.
+			while (this._modelSwitchCompactionPending) await this.waitForIdle();
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
 			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
@@ -2203,7 +2239,13 @@ export class AgentSession {
 	 * next prompt.
 	 */
 	private _runInputQueuedBehindPreflight(): void {
-		if (!this._inputQueuedBehindPreflight || this._promptPreflights.size > 0 || !this.isIdle) return;
+		if (
+			this._modelSwitchCompactionPending ||
+			!this._inputQueuedBehindPreflight ||
+			this._promptPreflights.size > 0 ||
+			!this.isIdle
+		)
+			return;
 		this._inputQueuedBehindPreflight = false;
 		// ponytail: Agent.continue() starts queued input only after an assistant message. Upstream
 		// rejects a queued continuation without transcript, so a failed first prompt still leaves its
@@ -2653,8 +2695,58 @@ export class AgentSession {
 		});
 	}
 
+	private async _compactForModelSwitch(model: Model<any>, commit: () => void): Promise<void> {
+		if (this._modelSwitchCompactionPending)
+			throw new Error("Model switch refused: another model switch compaction is in progress.");
+		if (
+			(modelsAreEqual(this.model, model) && this.model?.contextWindow === model.contextWindow) ||
+			model.contextWindow <= 0
+		) {
+			commit();
+			return;
+		}
+		const tokens = estimateProjectedContextTokens(
+			this.sessionManager.buildSessionProjection(),
+			this.sessionManager.getBranch(),
+		).tokens;
+		if (tokens <= 0.8 * model.contextWindow) {
+			commit();
+			return;
+		}
+		const refusal = `Model switch refused: estimated context ${tokens} tokens exceeds 80% of ${model.provider}/${model.id}'s ${model.contextWindow}-token window.`;
+		if (this.isStreaming || this.isCompacting)
+			throw new Error(`${refusal} Wait for the current operation, then compact and retry.`);
+		if (!this.autoCompactionEnabled)
+			throw new Error(`${refusal} Auto-compaction is disabled; compact with the current model first.`);
+
+		// ponytail: summarize with the old model while its larger window still fits;
+		// do not persist a target that cannot safely accept the compacted context.
+		this._modelSwitchCompactionPending = true;
+		try {
+			const outcome = await this._runAutoCompaction("threshold", false);
+			if (outcome === "failed" || outcome === "aborted") throw new Error(`Compaction ${outcome}.`);
+			const remaining = estimateProjectedContextTokens(
+				this.sessionManager.buildSessionProjection(),
+				this.sessionManager.getBranch(),
+			).tokens;
+			if (remaining > 0.8 * model.contextWindow)
+				throw new Error("Compaction could not reduce context below 80% of the target window.");
+			// No await between the final admission check and model/transcript commit.
+			commit();
+		} catch (error) {
+			throw new Error(
+				`${refusal} ${error instanceof Error ? error.message : String(error)} Current model unchanged.`,
+				{ cause: error },
+			);
+		} finally {
+			this._modelSwitchCompactionPending = false;
+			this._resolveIdleWaitIfIdle();
+		}
+	}
+
 	/**
 	 * Set model directly.
+	 * Compacts above 80% of the target window before committing the switch.
 	 * Validates that auth is configured and saves to the session transcript.
 	 * Persists to global defaults only when options.persist is true.
 	 * @throws Error if no auth is configured for the model
@@ -2665,20 +2757,21 @@ export class AgentSession {
 		}
 
 		const previousModel = this.model;
-		const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
-		this.agent.state.model = model;
-		this.sessionManager.appendModelChange(model.provider, model.id);
-		if (options.persist) {
-			this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
-			this._addPersistedDefaultToNonEmptyScope(model);
-		}
+		await this._compactForModelSwitch(model, () => {
+			const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
+			this.agent.state.model = model;
+			this.sessionManager.appendModelChange(model.provider, model.id);
+			if (options.persist) {
+				this.settingsManager.setDefaultModelAndProvider(model.provider, model.id);
+				this._addPersistedDefaultToNonEmptyScope(model);
+			}
 
-		// Apply thinking level for the new model.
-		// Per-model thinking level overrides take priority over the global default.
-		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+			// Model persistence does not implicitly rewrite the global thinking default.
+			this.setThinkingLevel(thinkingLevel);
+		});
 
 		await this._emitModelSelect(model, previousModel, "set");
+		this._runInputQueuedBehindPreflight();
 	}
 
 	private _addPersistedDefaultToNonEmptyScope(model: Model<any>): void {
@@ -2732,22 +2825,20 @@ export class AgentSession {
 		const next = scopedModels[nextIndex];
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(next.model, next.thinkingLevel);
 
-		// Apply model
-		this.agent.state.model = next.model;
-		this.sessionManager.appendModelChange(next.model.provider, next.model.id);
-		if (options.persist) {
-			this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
-			this._addPersistedDefaultToNonEmptyScope(next.model);
-		}
+		await this._compactForModelSwitch(next.model, () => {
+			this.agent.state.model = next.model;
+			this.sessionManager.appendModelChange(next.model.provider, next.model.id);
+			if (options.persist) {
+				this.settingsManager.setDefaultModelAndProvider(next.model.provider, next.model.id);
+				this._addPersistedDefaultToNonEmptyScope(next.model);
+			}
 
-		// Apply thinking level for the new model.
-		// - Explicit scoped model thinking level overrides defaults
-		// - Per-model thinking level overrides take priority over the global default
-		// setThinkingLevel clamps to model capabilities.
-		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+			// Scoped/per-model thinking overrides are clamped without changing global defaults.
+			this.setThinkingLevel(thinkingLevel);
+		});
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
+		this._runInputQueuedBehindPreflight();
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
@@ -2768,18 +2859,20 @@ export class AgentSession {
 		const nextModel = availableModels[nextIndex];
 
 		const thinkingLevel = this._getThinkingLevelForModelSwitch(nextModel);
-		this.agent.state.model = nextModel;
-		this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
-		if (options.persist) {
-			this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
-			this._addPersistedDefaultToNonEmptyScope(nextModel);
-		}
+		await this._compactForModelSwitch(nextModel, () => {
+			this.agent.state.model = nextModel;
+			this.sessionManager.appendModelChange(nextModel.provider, nextModel.id);
+			if (options.persist) {
+				this.settingsManager.setDefaultModelAndProvider(nextModel.provider, nextModel.id);
+				this._addPersistedDefaultToNonEmptyScope(nextModel);
+			}
 
-		// Apply thinking level for the new model.
-		// Model persistence does not implicitly rewrite the global thinking default.
-		this.setThinkingLevel(thinkingLevel);
+			// Model persistence does not implicitly rewrite the global thinking default.
+			this.setThinkingLevel(thinkingLevel);
+		});
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
+		this._runInputQueuedBehindPreflight();
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}

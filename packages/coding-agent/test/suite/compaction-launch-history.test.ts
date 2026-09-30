@@ -12,7 +12,8 @@ import { createHarness, getMessageText } from "./harness.ts";
 // paid/model probe, native owner, manual compact call or Fabric hook substitute.
 describe("memory-only launch compaction override", () => {
 	it.each(["stop", "error", "aborted"] as const)(
-		"prompts past retained %s usage without a preflight summarizer or history rewrite",
+		// #2742: disabling compaction must not disable the local window bound.
+		"fails fast past retained %s usage without a preflight summarizer or history rewrite",
 		async (stopReason) => {
 			const h = await createHarness({ models: [{ id: "faux-1", contextWindow: 4096, maxTokens: 256 }] });
 			let session: AgentSession | undefined;
@@ -92,7 +93,13 @@ describe("memory-only launch compaction override", () => {
 				]);
 				await session.prompt("CURRENT ACTIVATION PROMPT");
 				await settings.flush();
-				expect(requests).toBe(1);
+				expect(requests).toBe(0);
+				expect(h.faux.state.callCount).toBe(0);
+				expect(session.messages.at(-1)).toMatchObject({
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: expect.stringMatching(/context exceeds window/i),
+				});
 				expect(
 					events.filter(
 						(event) => event.type === "compaction_start" || event.type === "summarization_retry_attempt_start",

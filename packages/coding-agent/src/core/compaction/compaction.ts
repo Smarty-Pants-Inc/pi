@@ -291,6 +291,24 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 	return contextTokens > contextWindow - settings.reserveTokens;
 }
 
+/** Final size-only check after request transforms; stale provider usage is not an input bound. */
+export function assertContextFitsWindow(
+	messages: AgentMessage[],
+	model: Pick<Model<string>, "contextWindow"> | undefined,
+): void {
+	if (!model || model.contextWindow <= 0) return;
+	const system = getCurrentSystemMessage(messages);
+	let tokens = system ? estimateTokens(system) : 0;
+	for (const message of messages) {
+		if (message.role !== "system") tokens += estimateTokens(message);
+	}
+	if (tokens > model.contextWindow) {
+		throw new Error(
+			`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}. Compact or reduce input before retrying.`,
+		);
+	}
+}
+
 // ============================================================================
 // Cut point detection
 // ============================================================================
@@ -646,6 +664,7 @@ export async function completeSummarization(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<AssistantMessage> {
+	assertContextFitsWindow(context.messages, model);
 	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
 	// callers without a session ID, including branch summaries, receive a fresh routing ID.
 	const requestOptions: SimpleStreamOptions = {
