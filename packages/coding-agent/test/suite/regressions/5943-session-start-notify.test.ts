@@ -11,6 +11,7 @@ function createUiContext(
 	onNotify: (message: string, type: "info" | "warning" | "error" | undefined) => void,
 ): ExtensionUIContext {
 	return {
+		holdState: () => undefined,
 		select: async () => undefined,
 		confirm: async () => false,
 		input: async () => undefined,
