@@ -481,6 +481,8 @@ export class AgentSession {
 	private _isBeforeSettle = false;
 	private _abortDuringBeforeSettle = false;
 	private _isEmittingAgentSettled = false;
+	/** Settlement descendants await acceptance, never delivery that requires their handler to return. */
+	private readonly _agentSettledScope = new AsyncLocalStorage<{ active: boolean }>();
 	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
 
 	private _resourceLoader: ResourceLoader;
@@ -1095,10 +1097,15 @@ export class AgentSession {
 		this._isAgentRunActive = false;
 		this.#auditState("session_run_settled");
 		this._isEmittingAgentSettled = true;
+		const scope = { active: true };
 		try {
-			await this._extensionRunner.emit({ type: "agent_settled", outcome });
-			this._emit({ type: "agent_settled", outcome });
+			await this._agentSettledScope.run(scope, async () => {
+				await this._extensionRunner.emit({ type: "agent_settled", outcome });
+				this._emit({ type: "agent_settled", outcome });
+			});
 		} finally {
+			// Detached descendants of a finished handler are external delivery waiters again.
+			scope.active = false;
 			this._isEmittingAgentSettled = false;
 		}
 
@@ -2556,9 +2563,10 @@ export class AgentSession {
 			// earlier triggered message that acquired the run owns settlement; preserve
 			// this message's requested queue rather than starting another run owner.
 			if (this._modelSwitchCompactionPending) {
-				if (this._compactionHookScope.getStore()) {
-					// The switch awaits this hook. Accept now and let successful switch
-					// cleanup dispatch, or let an admitted prompt take the requested queue.
+				if (this._compactionHookScope.getStore() || this._agentSettledScope.getStore()?.active) {
+					// A compaction or enclosing settlement handler must not await dispatch
+					// that needs that handler to return. Accept into the existing held queue:
+					// success drains after settlement; refusal/abort retains without a run.
 					this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
 					return;
 				}
@@ -2778,6 +2786,8 @@ export class AgentSession {
 		this.#ordinaryOwner?.stopAutomatic();
 		if (this._isAgentRunActive) this._agentRunAbortRequested = true;
 		this._retainModelSwitchDispatches();
+		// Accepted hook/settlement input is retained too, even if the switch already committed.
+		this._queueTriggeredBehindPreflight();
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();

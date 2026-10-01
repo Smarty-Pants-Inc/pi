@@ -439,6 +439,227 @@ it.each(["deliver", "abort", "clear"] as const)(
 	},
 );
 
+// Refs Smarty-Pants-Inc/pi#97, Astra round 5 P1: the enclosing handler actually awaits its send.
+it.each(
+	(
+		[
+			["steer", "deliver"],
+			["followUp", "deliver"],
+			["steer", "cancelled"],
+			["followUp", "cancelled"],
+			["steer", "insufficient"],
+			["followUp", "insufficient"],
+			["steer", "abort"],
+			["followUp", "abort"],
+			["steer", "abort after commit"],
+			["followUp", "abort after commit"],
+		] as const
+	).flatMap(([deliverAs, disposition]) => [
+		[deliverAs, disposition, false] as const,
+		[deliverAs, disposition, true] as const,
+	]),
+)(
+	"accepts an awaited settled %s switch trigger without deadlock (%s, external: %s)",
+	async (deliverAs, disposition, withExternal) => {
+		const handlerStarted = gate(),
+			handlerRelease = gate(),
+			sendReturned = gate(),
+			handlerEndRelease = gate(),
+			compactStarted = gate(),
+			compactRelease = gate(),
+			responseStarted = gate(),
+			responseRelease = gate();
+		let h!: Harness;
+		let handled = false;
+		let handlerReturned = false;
+		let mainReturned = false;
+		let idleNotified = false;
+		let idlePersisted: number | undefined;
+		let externalReturned = false;
+		h = await createHarness({
+			models: [
+				{ id: "opus", contextWindow: 100_000 },
+				{ id: "sol", contextWindow: 16_000 },
+			],
+			settings: {
+				compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 1000 },
+				retry: { enabled: false },
+			},
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", async () => {
+						if (handled) return;
+						handled = true;
+						handlerStarted.release();
+						await handlerRelease.promise;
+						await h.session.sendCustomMessage(
+							{ customType: "settled", content: "awaited settled input", display: true, details: { deliverAs } },
+							{ triggerTurn: true, deliverAs },
+						);
+						sendReturned.release();
+						await handlerEndRelease.promise;
+						handlerReturned = true;
+					});
+					pi.on("session_before_compact", async (event) => {
+						compactStarted.release();
+						await compactRelease.promise;
+						if (disposition === "cancelled") return { cancel: true };
+						return {
+							compaction: {
+								summary: disposition === "insufficient" ? "x".repeat(80_000) : "small summary",
+								firstKeptEntryId: event.preparation.firstKeptEntryId,
+								tokensBefore: event.preparation.tokensBefore,
+							},
+						};
+					});
+				},
+			],
+		});
+		h.sessionManager.appendMessage({ role: "user", content: "x".repeat(60_000), timestamp: Date.now() - 2000 });
+		h.sessionManager.appendMessage({ ...fauxAssistantMessage("old"), timestamp: Date.now() - 1000 });
+		h.session.refreshContext();
+		h.setResponses([
+			fauxAssistantMessage("initial"),
+			async () => {
+				responseStarted.release();
+				await responseRelease.promise;
+				return fauxAssistantMessage("delivered");
+			},
+			fauxAssistantMessage("followUp delivered"),
+		]);
+		const main = h.session.prompt("initial input").then(() => {
+			mainReturned = true;
+		});
+		// Observe even a broken implementation's detached rejection during test cleanup.
+		void main.catch(() => {});
+		await handlerStarted.promise;
+		const switching = h.session.setModel(h.getModel("sol")!).catch((error: unknown) => error);
+		await compactStarted.promise;
+		// Same settlement, different async origin: this caller must still await delivery.
+		const external = withExternal
+			? h.session
+					.sendCustomMessage(
+						{ customType: "external", content: "external input", display: true },
+						{ triggerTurn: true },
+					)
+					.then(() => {
+						externalReturned = true;
+					})
+			: undefined;
+		void external?.catch(() => {});
+		const idle = h.session.waitForIdle().then(() => {
+			idleNotified = true;
+			idlePersisted = h.sessionManager.getEntries().filter((entry) => entry.type === "custom_message").length;
+		});
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			handlerRelease.release();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			let aborted = disposition === "abort" ? h.session.abort() : undefined;
+			if (disposition !== "abort") compactRelease.release();
+			const result = await switching;
+			if (disposition === "deliver" || disposition === "abort after commit") expect(result).toBeUndefined();
+			else expect(result).toBeInstanceOf(Error);
+			const accepted = await Promise.race([
+				sendReturned.promise.then(() => true),
+				new Promise<boolean>((resolve) => {
+					timer = setTimeout(() => resolve(false), 1000);
+				}),
+			]);
+			expect(accepted, "settlement handler must await acceptance, not its own deferred delivery").toBe(true);
+			expect(handlerReturned).toBe(false);
+			expect(mainReturned).toBe(false);
+			expect(externalReturned).toBe(false);
+			if (disposition === "abort after commit") {
+				aborted = h.session.abort();
+				const abortReturned = await Promise.race([
+					aborted.then(() => true),
+					new Promise<boolean>((resolve) => {
+						clearTimeout(timer);
+						timer = setTimeout(() => resolve(false), 1000);
+					}),
+				]);
+				expect(abortReturned, "abort must retain accepted input without awaiting the held settlement handler").toBe(
+					true,
+				);
+			}
+			if (disposition === "deliver") expect(idleNotified).toBe(false);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(h.faux.state.callCount).toBe(1);
+			expect(handlerReturned).toBe(false);
+			if (disposition === "deliver") {
+				expect(idleNotified).toBe(false);
+				expect(externalReturned).toBe(false);
+			}
+			handlerEndRelease.release();
+			if (disposition === "deliver") {
+				await responseStarted.promise;
+				expect(handlerReturned).toBe(true);
+				expect(idleNotified).toBe(false);
+				expect(externalReturned).toBe(false);
+				expect(h.session.isIdle).toBe(false);
+				responseRelease.release();
+			} else {
+				await aborted;
+			}
+			await Promise.all([main, external, idle]);
+			expect(handlerReturned).toBe(true);
+			expect(mainReturned).toBe(true);
+			expect(h.session.isSettling).toBe(false);
+			expect(h.session.isIdle).toBe(true);
+			expect(h.session.model?.id).toBe(
+				disposition === "deliver" || disposition === "abort after commit" ? "sol" : "opus",
+			);
+			expect(idlePersisted).toBe(disposition === "deliver" ? (withExternal ? 2 : 1) : 0);
+			if (disposition === "deliver") {
+				expect(h.session.getLastAssistantText()).toBe(withExternal ? "followUp delivered" : "delivered");
+			}
+			if (disposition !== "deliver") {
+				expect(h.faux.state.callCount).toBe(1);
+				expect(h.eventsOfType("agent_settled")).toHaveLength(1);
+				// peekQueuedMessages previews one selected queue item, not the whole retained backlog.
+				expect(h.session.agent.peekQueuedMessages()).toMatchObject([
+					withExternal
+						? { customType: "external", content: "external input" }
+						: { customType: "settled", content: "awaited settled input", details: { deliverAs } },
+				]);
+				expect(h.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toHaveLength(0);
+				compactRelease.release();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(h.faux.state.callCount).toBe(1);
+			}
+			// A following explicit prompt remains usable and recovers retained input exactly once.
+			h.session.setAutoCompactionEnabled(false);
+			h.setResponses([fauxAssistantMessage("next response"), fauxAssistantMessage("recovered followUp")]);
+			await h.session.prompt("next explicit input");
+			expect(["next response", "recovered followUp"]).toContain(h.session.getLastAssistantText());
+			expect(h.eventsOfType("agent_settled").every((event) => event.outcome === "completed")).toBe(true);
+			expect(h.session.agent.hasQueuedMessages()).toBe(false);
+			for (const customType of withExternal ? ["settled", "external"] : ["settled"]) {
+				expect(
+					h.sessionManager
+						.getEntries()
+						.filter((entry) => entry.type === "custom_message" && entry.customType === customType),
+				).toHaveLength(1);
+			}
+			expect(h.sessionManager.getEntries().filter((entry) => entry.type === "custom_message")).toMatchObject([
+				...(withExternal ? [{ customType: "external", content: "external input" }] : []),
+				{ customType: "settled", content: "awaited settled input", details: { deliverAs } },
+			]);
+		} finally {
+			clearTimeout(timer);
+			handlerRelease.release();
+			handlerEndRelease.release();
+			compactRelease.release();
+			responseRelease.release();
+			h.session.abortCompaction();
+			await switching;
+			// Do not await circularly blocked main/external promises when exercising RED.
+			h.cleanup();
+		}
+	},
+);
+
 // Refs Smarty-Pants-Inc/pi#97: every preflight drain must respect enclosing settlement hooks.
 it("defers consumed-preflight trigger dispatch until enclosing settled model-select returns", async () => {
 	const inputStarted = gate(),
