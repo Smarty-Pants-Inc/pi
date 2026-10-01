@@ -74,28 +74,40 @@ describe("pi mcp", () => {
 		expect((await run(["frobnicate"], servers)).exitCode).toBe(1);
 	});
 
-	it("adds stdio servers and passes options after the command through", async () => {
-		const added = await run(
-			["add", "--env", "A=1", "--env", "B=x=y", "files", "--", "npx", "-y", "server", "--root", "."],
-			undefined,
-		);
-		expect(added.exitCode).toBe(0);
-		expect(added.output).toContain('Added global MCP server "files"');
-		expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
-			mcpServers: {
-				files: { command: "npx", args: ["-y", "server", "--root", "."], env: { A: "1", B: "x=y" } },
-			},
-		});
+	it.skipIf(process.platform === "win32")(
+		"adds stdio servers and passes options after the command through",
+		async () => {
+			// pi#92: literal env values require an already-private destination; no implicit chmod.
+			const dir = mkdtempSync(join(tmpdir(), "pi-mcp-command-private-"));
+			dirs.push(dir);
+			writeFileSync(join(dir, "mcp.json"), "{}", { mode: 0o600 });
+			const added = await run(
+				["add", "--env", "A=1", "--env", "B=x=y", "files", "--", "npx", "-y", "server", "--root", "."],
+				undefined,
+				dir,
+			);
+			expect(added.exitCode).toBe(0);
+			expect(added.output).toContain('Added global MCP server "files"');
+			expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
+				mcpServers: {
+					files: { command: "npx", args: ["-y", "server", "--root", "."], env: { A: "1", B: "x=y" } },
+				},
+			});
 
-		// Without `--`, options after the command belong to the command too.
-		const replaced = await run(["add", "files", "node", "server.js", "--port", "1"], undefined, added.agentDir);
-		expect(replaced.output).toContain('Replaced global MCP server "files"');
-		expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
-			mcpServers: { files: { command: "node", args: ["server.js", "--port", "1"] } },
-		});
-	});
+			// Without `--`, options after the command belong to the command too.
+			const replaced = await run(["add", "files", "node", "server.js", "--port", "1"], undefined, added.agentDir);
+			expect(replaced.output).toContain('Replaced global MCP server "files"');
+			expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
+				mcpServers: { files: { command: "node", args: ["server.js", "--port", "1"] } },
+			});
+		},
+	);
 
-	it("adds HTTP servers and keeps other content of the file", async () => {
+	it.skipIf(process.platform === "win32")("adds HTTP servers and keeps other content of the file", async () => {
+		// pi#92: literal custom headers require an already-private destination.
+		const dir = mkdtempSync(join(tmpdir(), "pi-mcp-command-private-"));
+		dirs.push(dir);
+		writeFileSync(join(dir, "mcp.json"), "{}", { mode: 0o600 });
 		const { exitCode, output, agentDir } = await run(
 			[
 				"add",
@@ -110,6 +122,7 @@ describe("pi mcp", () => {
 				"direct",
 			],
 			{ fixture: servers.fixture },
+			dir,
 		);
 		expect(exitCode).toBe(0);
 		expect(output).not.toContain("mcp login");

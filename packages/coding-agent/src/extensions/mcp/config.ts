@@ -22,10 +22,21 @@
  * with `codemode` or `codemode-deferred` exposure connects. A project value overrides the global one.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	closeSync,
+	constants,
+	existsSync,
+	fstatSync,
+	ftruncateSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME } from "../../config.ts";
 import { type McpExposure, type McpServerConfig, validateMcpServerConfig } from "../../core/mcp-servers.ts";
+import { getConfigValueEnvVarName } from "../../core/resolve-config-value.ts";
 
 export type {
 	McpExposure,
@@ -161,6 +172,83 @@ export function removeMcpServerConfig(path: string, name: string): boolean {
 	return removed;
 }
 
+/** Refusal to persist literal MCP credentials without a verified private destination. */
+export class McpCredentialPersistenceError extends Error {
+	constructor() {
+		super(
+			"MCP_LITERAL_CREDENTIAL_REFUSED: Cannot write literal MCP credentials to a non-private config file. Use an env-var reference or the private credential store.",
+		);
+		this.name = "McpCredentialPersistenceError";
+	}
+}
+
+function hasLiteralMcpCredentials(document: unknown): boolean {
+	if (!isRecord(document) || !isRecord(document.mcpServers)) return false;
+	for (const server of Object.values(document.mcpServers)) {
+		if (!isRecord(server)) continue;
+		// Any custom header or child environment variable can carry credentials. Do not rely on
+		// names, or exempt a literal merely because another part of the value references an env var.
+		for (const field of ["headers", "env"] as const) {
+			if (!isRecord(server[field])) continue;
+			for (const value of Object.values(server[field])) {
+				if (typeof value !== "string" || value === "") continue;
+				const reference = field === "headers" ? value.replace(/^(?:Bearer|Basic)\s+/i, "") : value;
+				if (getConfigValueEnvVarName(reference) === undefined) return true;
+			}
+		}
+		if (
+			isRecord(server.oauth) &&
+			typeof server.oauth.clientSecret === "string" &&
+			server.oauth.clientSecret !== "" &&
+			getConfigValueEnvVarName(server.oauth.clientSecret) === undefined
+		) {
+			return true;
+		}
+		if (typeof server.url !== "string") continue;
+		// URLs are not config-value templates at the transport receiver. Even reference-looking
+		// userinfo and auth query values remain literal; malformed retained URLs fail closed too.
+		if (!URL.canParse(server.url)) return true;
+		const url = new URL(server.url);
+		if (url.username || url.password) return true;
+		for (const [name, value] of url.searchParams) {
+			const key = name.toLowerCase().replace(/[^a-z0-9]/g, "");
+			if (
+				value !== "" &&
+				(/token|secret|password|credential|signature|apikey|accesskey/.test(key) ||
+					/^(?:x|proxy|http|client|api|oauth)?(?:key|auth|authorization|bearer|sig|passwd|pwd|jwt|session|sessionid|code)$/.test(
+						key,
+					))
+			) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/** No creation, chmod, credential resolution, or migration: only an already-private file qualifies. */
+function writePrivateMcpConfig(path: string, text: string): void {
+	if (process.platform === "win32" || !process.getuid) throw new McpCredentialPersistenceError();
+	let fd: number;
+	try {
+		fd = openSync(path, constants.O_RDWR | constants.O_NOFOLLOW);
+	} catch {
+		throw new McpCredentialPersistenceError();
+	}
+	try {
+		const stat = fstatSync(fd);
+		if (!stat.isFile() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0 || stat.nlink !== 1) {
+			throw new McpCredentialPersistenceError();
+		}
+		// Check the opened file, not a path stat followed by a second open that could name a
+		// different, non-private destination. Refusal happens before truncation or any write.
+		ftruncateSync(fd, 0);
+		writeFileSync(fd, text);
+	} finally {
+		closeSync(fd);
+	}
+}
+
 /**
  * Read an `mcp.json` (an empty config when missing), let `edit` change its `mcpServers`, and write
  * it back with its indentation when `edit` returns true. Other content is kept.
@@ -177,6 +265,12 @@ function editMcpServers(
 	const servers = isRecord(parsed.mcpServers) ? parsed.mcpServers : undefined;
 	if (!edit(servers, parsed)) return;
 	const indent = (text && /^([ \t]+)\S/m.exec(text)?.[1]) || "  ";
+	const candidate = `${JSON.stringify(parsed, null, indent)}\n`;
+	// Inspect exactly the bytes to be persisted, including unchanged servers and toJSON output.
+	if (hasLiteralMcpCredentials(JSON.parse(candidate))) {
+		writePrivateMcpConfig(path, candidate);
+		return;
+	}
 	mkdirSync(dirname(path), { recursive: true });
-	writeFileSync(path, `${JSON.stringify(parsed, null, indent)}\n`);
+	writeFileSync(path, candidate);
 }
