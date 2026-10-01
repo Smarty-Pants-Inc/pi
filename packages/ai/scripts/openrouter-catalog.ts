@@ -26,8 +26,11 @@ export interface OpenRouterCatalog {
 	classifiers: ClassifierModel<"typesafe-system-one">[];
 }
 
-function roundCost(value: number): number {
-	return Number(value.toFixed(6));
+function pricePerMillion(value: string | undefined): number {
+	const rate = Number(value ?? "0") * 1_000_000;
+	// Negative sentinel prices (e.g. routers) and invalid rates are unknown.
+	// Represent them as a zero estimate, as with missing pricing, not a credit.
+	return Number.isFinite(rate) && rate > 0 ? Number(rate.toFixed(6)) : 0;
 }
 
 function modalities(values: string[] | undefined): ("text" | "image")[] {
@@ -39,10 +42,10 @@ function modalities(values: string[] | undefined): ("text" | "image")[] {
 function cost(model: OpenRouterModelListItem): ModelCost {
 	// Convert pricing from $/token to $/million tokens
 	return {
-		input: roundCost(parseFloat(model.pricing?.prompt || "0") * 1_000_000),
-		output: roundCost(parseFloat(model.pricing?.completion || "0") * 1_000_000),
-		cacheRead: roundCost(parseFloat(model.pricing?.input_cache_read || "0") * 1_000_000),
-		cacheWrite: roundCost(parseFloat(model.pricing?.input_cache_write || "0") * 1_000_000),
+		input: pricePerMillion(model.pricing?.prompt),
+		output: pricePerMillion(model.pricing?.completion),
+		cacheRead: pricePerMillion(model.pricing?.input_cache_read),
+		cacheWrite: pricePerMillion(model.pricing?.input_cache_write),
 	};
 }
 
