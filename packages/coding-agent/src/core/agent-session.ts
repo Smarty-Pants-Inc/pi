@@ -110,6 +110,8 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { HOST_CAPABILITIES } from "./host-capabilities.ts";
+import { InputAdmissionError } from "./input-admission.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -386,6 +388,11 @@ const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, bas
 // a skipped check or successful compaction with nothing queued.
 type CompactionOutcome = boolean | "failed" | "aborted";
 
+interface InputAdmission {
+	controller: AbortController;
+	release(): void;
+}
+
 function startCompactionDeadline(controller: AbortController): ReturnType<typeof setTimeout> {
 	return setTimeout(() => {
 		controller.abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
@@ -413,6 +420,11 @@ export class AgentSession {
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	#ordinaryPreflights = 0;
 	#pendingModeInput?: () => boolean;
+	readonly capabilities = HOST_CAPABILITIES;
+	private readonly _inputAdmissions = new Set<InputAdmission>();
+	private readonly _inputAdmissionScope = new AsyncLocalStorage<InputAdmission>();
+	private _inputFence: object | undefined;
+	private _inputsDisposed = false;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -1429,6 +1441,11 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		if (this._inputsDisposed) return;
+		this._assertInputsDrained();
+		if (!this.isIdle || this.isSettling)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "abort and settle the active operation before disposal");
+		this._inputsDisposed = true;
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
 		try {
 			this.abortRetry();
@@ -1495,6 +1512,7 @@ export class AgentSession {
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
 		return (
+			this._inputAdmissions.size === 0 &&
 			!this._isAgentRunActive &&
 			!this.isCompacting &&
 			!this._modelSwitchCompactionPending &&
@@ -1513,7 +1531,7 @@ export class AgentSession {
 
 	/** Whether a prompt is in preflight (input handlers, `before_agent_start`) and its run has not started. */
 	get isPromptPending(): boolean {
-		return this._promptPreflights.size > 0;
+		return this._inputAdmissions.size > 0 || this._promptPreflights.size > 0;
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
@@ -1800,10 +1818,11 @@ export class AgentSession {
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
-		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 		const dispatch = async (continuation = false) => {
+			if (!continuation) this._checkInputAdmission();
 			this.#ordinaryOwner?.assertCompactionIdle();
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
@@ -1811,9 +1830,12 @@ export class AgentSession {
 			// No await or external callback may separate this check from dispatch.
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
+			// No yield between ending admission and the original synchronous run entry.
+			if (!continuation) this._inputAdmissionScope.getStore()?.release();
 			const run = continuation || !messages ? agent.continue() : agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
+				if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 			} catch (cause) {
 				// A failing observer must not detach the already-started original run.
 				try {
@@ -1981,6 +2003,112 @@ export class AgentSession {
 		}
 	}
 
+	/** Inputs awaiting native handoff, including every extension input handler. */
+	get inputAdmissionCount(): number {
+		return this._inputAdmissions.size;
+	}
+
+	get isDisposed(): boolean {
+		return this._inputsDisposed;
+	}
+
+	get inputsFenced(): boolean {
+		return this._inputFence !== undefined || this._inputsDisposed;
+	}
+
+	private _assertInputsOpen(): void {
+		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "input was not accepted");
+		if (this._inputFence)
+			throw new InputAdmissionError(
+				"INPUT_ADMISSION_FENCED",
+				"input was not accepted; retry against the current session",
+			);
+	}
+
+	private _assertInputsDrained(): void {
+		if (
+			this._inputAdmissions.size > 0 ||
+			this.isSettling ||
+			this.#pendingModeInput?.() ||
+			this.agent.hasQueuedMessages() ||
+			this._steeringMessages.length > 0 ||
+			this._followUpMessages.length > 0 ||
+			this._triggeredBehindPreflight.length > 0 ||
+			this._modelSwitchDispatches.size > 0 ||
+			this._deferredSettledActions.length > 0
+		)
+			throw new InputAdmissionError(
+				"INPUT_ADMISSION_BUSY",
+				"settle admitted input or recover queued input before replacement/disposal",
+			);
+	}
+
+	/**
+	 * Close input admission synchronously, before any lifecycle hook can yield.
+	 * Refuses immediately (bounded, no implicit replay) when input is still owned by
+	 * preflight, the mode, or queues. On success keep the returned release function
+	 * until replacement finishes, or call it when replacement is cancelled/failed.
+	 * Disposal stays permanently closed even after release.
+	 */
+	async fenceInputs(options?: { rejectQueuedInput?: (messages: AgentMessage[]) => void }): Promise<() => void> {
+		this._assertInputsOpen();
+		const fence = {};
+		this._inputFence = fence;
+		try {
+			if (options?.rejectQueuedInput) {
+				// Orderly shutdown may reject input instead of refusing disposal. Admission is
+				// already closed before abort yields, including input from extension handlers.
+				await this.abort();
+				const messages = this.agent.getQueuedMessages();
+				if (messages.length > 0) {
+					options.rejectQueuedInput(messages);
+					this.clearQueue();
+				}
+			}
+			this._assertInputsDrained();
+		} catch (error) {
+			this._inputFence = undefined;
+			throw error;
+		}
+		return () => {
+			if (this._inputFence === fence) this._inputFence = undefined;
+		};
+	}
+
+	private _admitInput(): InputAdmission {
+		this._assertInputsOpen();
+		const admission: InputAdmission = {
+			controller: new AbortController(),
+			release: () => {
+				if (!this._inputAdmissions.delete(admission)) return;
+				this._inputAdmissionScope.exit(() => this._runInputQueuedBehindPreflight());
+				this._resolveIdleWaitIfIdle();
+			},
+		};
+		this._inputAdmissions.add(admission);
+		return admission;
+	}
+
+	private async _withInputAdmission(admission: InputAdmission, operation: () => Promise<void>): Promise<void> {
+		try {
+			await this._inputAdmissionScope.run(admission, operation);
+		} finally {
+			admission.release();
+		}
+	}
+
+	private _checkInputAdmission(): void {
+		this._inputAdmissionScope.getStore()?.controller.signal.throwIfAborted();
+		this._assertInputsOpen();
+	}
+
+	private async _awaitInput<T>(operation: Promise<T>): Promise<T> {
+		const admission = this._inputAdmissionScope.getStore();
+		const result = await raceWithAbortSignal(operation, admission?.controller.signal);
+		if (!admission || this._inputAdmissions.has(admission)) this._checkInputAdmission();
+		return result;
+	}
+
 	private async _runInputHandlers(
 		text: string,
 		images: ImageContent[] | undefined,
@@ -1991,7 +2119,9 @@ export class AgentSession {
 			return { text, images };
 		}
 
-		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		const inputResult = await this._awaitInput(
+			this._extensionRunner.emitInput(text, images, source, streamingBehavior),
+		);
 		if (inputResult.action === "handled") {
 			return undefined;
 		}
@@ -2033,8 +2163,40 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, () => this._promptAdmitted(text, options, admission));
+	}
+
+	private async _promptAdmitted(
+		text: string,
+		options: PromptOptions | undefined,
+		admission: InputAdmission,
+	): Promise<void> {
+		this._checkInputAdmission();
+		const originalTransfer = options?.onInputTransferred;
+		options = {
+			...options,
+			onInputTransferred: () => {
+				if (this._inputAdmissions.has(admission)) this._checkInputAdmission();
+				admission.release();
+				originalTransfer?.();
+			},
+		};
 		if (this._isEmittingAgentSettled) {
-			this._deferredSettledActions.push(async () => await this.prompt(text, options));
+			// Scheduling is not acceptance. Keep the result and admission pending until the
+			// deferred action runs, or reject cancellation without waiting for held handlers.
+			await this._awaitInput(
+				new Promise<void>((resolve, reject) => {
+					this._deferredSettledActions.push(async () => {
+						try {
+							await this._withInputAdmission(admission, () => this._promptAdmitted(text, options, admission));
+							resolve();
+						} catch (error) {
+							reject(error);
+						}
+					});
+				}),
+			);
 			return;
 		}
 		if (!this.#ordinaryOwner) return this._prompt(text, options);
@@ -2051,7 +2213,9 @@ export class AgentSession {
 			}
 		};
 		try {
-			await this.#ordinaryOwner.requestProvenance.prompt((token) => this._prompt(text, options, release, token));
+			await this._awaitInput(
+				this.#ordinaryOwner.requestProvenance.prompt((token) => this._prompt(text, options, release, token)),
+			);
 		} finally {
 			release();
 		}
@@ -2126,7 +2290,7 @@ export class AgentSession {
 			}
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
-			while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+			while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
 			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
@@ -2161,7 +2325,7 @@ export class AgentSession {
 
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				(await this._awaitInput(this._modelRuntime.checkAuth(this.model.provider))) !== undefined;
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -2178,7 +2342,7 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				const outcome = await this._checkCompaction(lastAssistant, false);
+				const outcome = await this._awaitInput(this._checkCompaction(lastAssistant, false));
 				if (outcome === "failed" || outcome === "aborted") {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
@@ -2201,10 +2365,8 @@ export class AgentSession {
 			// Emit before_agent_start before normalizing images so extension-driven model
 			// selection determines the resize profile used for the request and history.
 			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-			const result = await this._extensionRunner.emitBeforeAgentStart(
-				expandedText,
-				currentImages,
-				this._baseSystemPromptOptions,
+			const result = await this._awaitInput(
+				this._extensionRunner.emitBeforeAgentStart(expandedText, currentImages, this._baseSystemPromptOptions),
 			);
 			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 			// which updates the live loadout instead. An explicit edit wins; otherwise the live
@@ -2214,7 +2376,7 @@ export class AgentSession {
 				result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
 			if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
-			const normalized = await this._normalizePromptImages(currentImages);
+			const normalized = await this._awaitInput(this._normalizePromptImages(currentImages));
 			const userText =
 				normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
@@ -2267,15 +2429,18 @@ export class AgentSession {
 		// A switch can also begin during before_agent_start or image normalization.
 		// Keep this prompt's admission token until its run can start, so triggered
 		// messages still queue behind it instead of acquiring a competing run.
-		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
-		preflightResult?.(true);
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
+		this._checkInputAdmission();
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
 		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
 		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
 		// run active synchronously, so later prompts still queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
-		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
+		const run = this._runAgentPrompt(messages, promptToken, undefined, () => {
+			onInputTransferred?.();
+			preflightResult?.(true);
+		});
 		releasePreflight?.();
 		await run;
 	}
@@ -2367,6 +2532,9 @@ export class AgentSession {
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
 
+		// Commands own their input once dispatched; they may replace their session.
+		this._checkInputAdmission();
+		this._inputAdmissionScope.getStore()?.release();
 		try {
 			await command.handler(args, ctx);
 			return true;
@@ -2472,7 +2640,10 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, () =>
+			this._queueUserInput(text, images, "steer", options?.source ?? "interactive"),
+		);
 	}
 
 	/**
@@ -2484,16 +2655,19 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, () =>
+			this._queueUserInput(text, images, "followUp", options?.source ?? "interactive"),
+		);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -2503,20 +2677,24 @@ export class AgentSession {
 			content,
 			timestamp: Date.now(),
 		});
+		this._inputAdmissionScope.getStore()?.release();
+		this._emitQueueUpdate();
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
 		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+		this._inputAdmissionScope.getStore()?.release();
+		this._emitQueueUpdate();
 	}
 
 	/**
@@ -2552,6 +2730,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this._assertInputsOpen();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
 			role: "custom" as const,
@@ -2584,7 +2763,7 @@ export class AgentSession {
 				}
 				this._modelSwitchDispatches.set(appMessage, options.deliverAs);
 				try {
-					while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+					while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 					const dispatch = async () => {
 						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
 						if (!this._modelSwitchDispatches.has(appMessage)) return;
@@ -2725,31 +2904,38 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void> {
-		// Normalize content to text string + optional images
-		let text: string;
-		let images: ImageContent[] | undefined;
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, async () => {
+			// Normalize content to text string + optional images
+			let text: string;
+			let images: ImageContent[] | undefined;
 
-		if (typeof content === "string") {
-			text = content;
-		} else {
-			const textParts: string[] = [];
-			images = [];
-			for (const part of content) {
-				if (part.type === "text") {
-					textParts.push(part.text);
-				} else {
-					images.push(part);
+			if (typeof content === "string") {
+				text = content;
+			} else {
+				const textParts: string[] = [];
+				images = [];
+				for (const part of content) {
+					if (part.type === "text") {
+						textParts.push(part.text);
+					} else {
+						images.push(part);
+					}
 				}
+				text = textParts.join("\n");
+				if (images.length === 0) images = undefined;
 			}
-			text = textParts.join("\n");
-			if (images.length === 0) images = undefined;
-		}
 
-		await this.prompt(text, {
-			expandPromptTemplates: options?.expandPromptTemplates ?? false,
-			streamingBehavior: options?.deliverAs,
-			images,
-			source: "extension",
+			await this._promptAdmitted(
+				text,
+				{
+					expandPromptTemplates: options?.expandPromptTemplates ?? false,
+					streamingBehavior: options?.deliverAs,
+					images,
+					source: "extension",
+				},
+				admission,
+			);
 		});
 	}
 
@@ -2773,7 +2959,7 @@ export class AgentSession {
 
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
-		return this._steeringMessages.length + this._followUpMessages.length;
+		return this._inputAdmissions.size + this._steeringMessages.length + this._followUpMessages.length;
 	}
 
 	/** Get pending steering messages (read-only) */
@@ -2794,6 +2980,9 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		for (const admission of this._inputAdmissions) {
+			admission.controller.abort(new InputAdmissionError("INPUT_ADMISSION_ABORTED", "input was not transferred"));
+		}
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_ABORTED"));
 		this.#ordinaryOwner?.stopAutomatic();
 		if (this._isAgentRunActive) this._agentRunAbortRequested = true;

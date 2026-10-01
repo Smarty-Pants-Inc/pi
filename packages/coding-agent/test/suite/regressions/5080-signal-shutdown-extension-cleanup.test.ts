@@ -19,7 +19,8 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 type ShutdownThis = {
 	isShuttingDown: boolean;
 	unregisterSignalHandlers: () => void;
-	runtimeHost: { dispose: () => Promise<void> };
+	runtimeHost: { dispose: (options?: { beforeShutdown?: () => Promise<void> }) => Promise<void> };
+	handleInputAdmissionError: (error: unknown) => boolean;
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
 	themeController: { disableAutoSync: () => void };
 	stop: () => void;
@@ -69,9 +70,12 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
+		handleInputAdmissionError: () => false,
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {
-			dispose: vi.fn(async () => {
+			dispose: vi.fn(async (options) => {
+				// smarty-dev#3048: runtime fences before invoking terminal teardown.
+				await options?.beforeShutdown?.();
 				order.push("dispose");
 			}),
 		},

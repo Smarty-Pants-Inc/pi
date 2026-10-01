@@ -103,6 +103,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await runtimeHost.session.bindExtensions({});
 
 		cleanups.push(async () => {
+			// smarty-dev#3048: test teardown explicitly recovers retained input before disposal.
+			runtimeHost.session.clearQueue();
 			await runtimeHost.dispose();
 			faux.unregister();
 			if (existsSync(tempDir)) {

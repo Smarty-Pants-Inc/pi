@@ -171,6 +171,10 @@ class PendingMessageQueue {
 		return first ? [first] : [];
 	}
 
+	snapshot(): AgentMessage[] {
+		return this.messages.slice();
+	}
+
 	get size(): number {
 		return this.messages.length;
 	}
@@ -408,6 +412,11 @@ export class Agent {
 	peekQueuedMessages(): AgentMessage[] {
 		const steering = this.steeringQueue.peek();
 		return steering.length > 0 ? steering : this.followUpQueue.peek();
+	}
+
+	/** Snapshot every undelivered message in both queues, independent of delivery mode. */
+	getQueuedMessages(): AgentMessage[] {
+		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()];
 	}
 
 	/** Active abort signal for the current run, if any. */

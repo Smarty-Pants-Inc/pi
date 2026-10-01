@@ -118,6 +118,8 @@ function hookBoundary() {
 		abort: async () => {
 			hook("abort");
 		},
+		// smarty-dev#3048: this inert fixture tests identity, not admission behavior.
+		fenceInputs: async () => () => {},
 		dispose,
 	} as unknown as AgentSession;
 	const runtime = new AgentSessionRuntime(

@@ -218,6 +218,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		},
 		tempDir,
 		cleanup() {
+			// smarty-dev#3048: test teardown deliberately recovers undelivered input.
+			session.clearQueue();
 			session.dispose();
 			fauxProvider.unregister();
 			if (existsSync(tempDir)) {

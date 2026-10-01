@@ -20,6 +20,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponseBody,
 	RpcFatalErrorResponse,
+	RpcInputRejectedEvent,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -80,6 +81,7 @@ export type RpcMessageEndEvent = Extract<JsonAgentSessionEvent, { type: "message
 export type RpcAgentSessionEvent =
 	| Exclude<JsonAgentSessionEvent, { type: "message_end" }>
 	| RpcExtensionUIRequest
+	| RpcInputRejectedEvent
 	| RpcMessageEndEvent;
 
 export type RpcEventListener = (event: RpcAgentSessionEvent) => void;
@@ -90,6 +92,7 @@ export type RpcEventListener = (event: RpcAgentSessionEvent) => void;
 
 export class RpcClient {
 	private process: ChildProcess | null = null;
+	private processClosed: Promise<void> | null = null;
 	private stopReadingStdout: (() => void) | null = null;
 	private eventListeners: RpcEventListener[] = [];
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
@@ -132,6 +135,7 @@ export class RpcClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.process = childProcess;
+		this.processClosed = new Promise<void>((resolve) => childProcess.once("close", () => resolve()));
 
 		// Collect stderr for debugging
 		childProcess.stderr?.on("data", (data) => {
@@ -139,7 +143,7 @@ export class RpcClient {
 			process.stderr.write(data);
 		});
 
-		childProcess.once("exit", (code, signal) => {
+		childProcess.once("close", (code, signal) => {
 			if (this.process !== childProcess) return;
 			const error = this.exitError ?? this.createProcessExitError(code, signal);
 			this.exitError = error;
@@ -184,24 +188,21 @@ export class RpcClient {
 	async stop(): Promise<void> {
 		if (!this.process) return;
 
+		// `exit` may precede the final stdout data. Keep authoritative receipts readable
+		// until `close`, including when the child has already exited before stop().
+		const childProcess = this.process;
+		if (childProcess.exitCode === null && childProcess.signalCode === null) childProcess.kill("SIGTERM");
+		const timeout = setTimeout(() => childProcess.kill("SIGKILL"), 1000);
+		try {
+			await this.processClosed;
+		} finally {
+			clearTimeout(timeout);
+		}
+
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
-		this.process.kill("SIGTERM");
-
-		// Wait for process to exit
-		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => {
-				this.process?.kill("SIGKILL");
-				resolve();
-			}, 1000);
-
-			this.process?.on("exit", () => {
-				clearTimeout(timeout);
-				resolve();
-			});
-		});
-
 		this.process = null;
+		this.processClosed = null;
 		this.pendingRequests.clear();
 	}
 
@@ -657,6 +658,10 @@ export class RpcClient {
 			this.pendingRequests.set(id, {
 				resolve: (response) => {
 					clearTimeout(timeout);
+					if (!response.success) {
+						reject(new Error(response.error));
+						return;
+					}
 					resolve(response);
 				},
 				reject: (error) => {

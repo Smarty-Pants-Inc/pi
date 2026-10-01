@@ -113,6 +113,9 @@ async function createRuntimeHost(options: {
 	rebind: () => Promise<void>;
 	cleanup: () => Promise<void>;
 }> {
+	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
+	const previousSignals = signals.map((signal) => ({ signal, listeners: process.listeners(signal) }));
+	const previousEnd = process.stdin.listeners("end");
 	const tempDir = join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 
@@ -196,11 +199,22 @@ async function createRuntimeHost(options: {
 			await rebindSession();
 		},
 		cleanup: async () => {
+			// Remove only listeners installed by this test's RPC host.
+			for (const { signal, listeners } of previousSignals) {
+				for (const listener of process.listeners(signal)) {
+					if (!listeners.includes(listener)) process.off(signal, listener);
+				}
+			}
+			for (const listener of process.stdin.listeners("end") as Array<Parameters<typeof process.on>[1]>) {
+				if (!previousEnd.includes(listener)) process.stdin.off("end", listener);
+			}
 			try {
 				await session.abort();
 			} catch {
 				// ignore test cleanup failures
 			}
+			// smarty-dev#3048: queued input must be explicitly recovered, never silently dropped by dispose.
+			session.clearQueue();
 			session.dispose();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true });

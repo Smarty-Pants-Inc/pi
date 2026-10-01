@@ -1,3 +1,4 @@
+import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +26,41 @@ afterEach(() => {
 });
 
 describe("RpcClient child process failures", () => {
+	// smarty-dev#3048: the client must read authoritative shutdown receipts before detaching stdout.
+	test("stop drains the complete attachment-bearing rejection receipt before child close", async () => {
+		const attachment = "x".repeat(2 * 1024 * 1024);
+		const receipt = {
+			type: "input_rejected",
+			reason: "shutdown",
+			sessionId: "outgoing",
+			error: "INPUT_ADMISSION_SHUTDOWN",
+			messages: [
+				{ role: "user", content: [{ type: "image", data: attachment, mimeType: "image/png" }], timestamp: 0 },
+			],
+		};
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+process.on("SIGTERM", () => {
+	process.stdout.write(JSON.stringify(${JSON.stringify(receipt)}) + "\\n", () => process.exit(0));
+});
+process.stdin.resume();
+`),
+		});
+		const events: unknown[] = [];
+		client.onEvent((event) => events.push(event));
+		let closed: Promise<void> | undefined;
+		try {
+			await client.start();
+			const child = Reflect.get(client, "process") as ChildProcess;
+			closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+			await client.stop();
+			expect(events).toHaveLength(1);
+			expect(events).toEqual([receipt]);
+		} finally {
+			await client.stop();
+			await closed;
+		}
+	});
 	test("rejects an in-flight request when the child process exits", async () => {
 		const client = new RpcClient({
 			cliPath: writeChildScript(`

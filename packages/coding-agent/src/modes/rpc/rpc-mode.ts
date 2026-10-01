@@ -19,6 +19,7 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import { InputAdmissionError } from "../../core/input-admission.ts";
 import {
 	flushRawStdout,
 	takeOverStdout,
@@ -34,6 +35,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcFatalErrorResponse,
+	RpcInputRejectedEvent,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -511,7 +513,7 @@ export async function runRpcMode(
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+				void shutdown(signal === "SIGHUP" ? 129 : 143);
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -521,6 +523,12 @@ export async function runRpcMode(
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
 		const id = command.id;
+		if (
+			shutdownPromise &&
+			["prompt", "steer", "follow_up", "new_session", "switch_session", "fork", "clone"].includes(command.type)
+		) {
+			throw new InputAdmissionError("INPUT_ADMISSION_FENCED", "shutdown is in progress; input was not accepted");
+		}
 
 		switch (command.type) {
 			// =================================================================
@@ -588,6 +596,11 @@ export async function runRpcMode(
 
 			case "get_state": {
 				const state: RpcSessionState = {
+					capabilities: session.capabilities,
+					inputAdmissionCount: session.inputAdmissionCount,
+					inputsFenced: session.inputsFenced,
+					isIdle: session.isIdle,
+					isPromptPending: session.isPromptPending,
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,
@@ -1057,21 +1070,30 @@ export async function runRpcMode(
 		cancelPendingExtensionRequests();
 	};
 
-	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+	function shutdown(exitCode = 0): Promise<never> {
 		if (shutdownPromise) return shutdownPromise;
 		shutdownPromise = (async (): Promise<never> => {
 			for (const cleanup of signalCleanupHandlers) {
 				cleanup();
 			}
+			// Native shutdown fencing precedes abort, including extension-originated input.
+			await runtimeHost.dispose({
+				rejectQueuedInput: (messages) =>
+					output({
+						type: "input_rejected",
+						reason: "shutdown",
+						sessionId: session.sessionId,
+						error: "INPUT_ADMISSION_SHUTDOWN: queued input was not delivered",
+						messages,
+					} satisfies RpcInputRejectedEvent),
+			});
 			session.stopMessageEntryIdCapture();
 			unsubscribe?.();
 			unsubscribeBackpressure?.();
-			await runtimeHost.dispose();
 			detachInput();
 			process.stdin.pause();
-			if (signal !== "SIGTERM") {
-				await flushRawStdout();
-			}
+			// Authoritative rejections must reach the controller even on SIGTERM.
+			await flushRawStdout();
 			return process.exit(exitCode);
 		})();
 		return shutdownPromise;
