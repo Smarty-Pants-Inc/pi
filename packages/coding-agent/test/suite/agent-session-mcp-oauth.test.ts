@@ -164,6 +164,7 @@ describe("AgentSession MCP OAuth", () => {
 		const { harness, server, backend } = await setup("follow");
 		const agentDir = mkdtempSync(join(tmpdir(), "pi-mcp-login-"));
 		cleanups.push(() => rmSync(agentDir, { recursive: true, force: true }));
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
 		writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: { issues: { url: server.url } } }));
 
 		// The agent runs `pi mcp login issues` through bash; the user approves in the browser.

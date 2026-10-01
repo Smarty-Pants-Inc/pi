@@ -11,6 +11,8 @@ import { createInterface } from "node:readline/promises";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME } from "../../config.ts";
 import { validateMcpServerConfig } from "../../core/mcp-servers.ts";
+import { resolveBuiltinExtension } from "../../core/package-manager.ts";
+import { SettingsManager } from "../../core/settings-manager.ts";
 import { ProjectTrustStore } from "../../core/trust-manager.ts";
 import { openBrowser } from "../../utils/open-browser.ts";
 import {
@@ -181,6 +183,12 @@ function parseOptions(
 export async function runMcpCommand(args: string[], options: McpCommandOptions): Promise<number> {
 	const log = options.log ?? ((line: string) => console.log(line));
 	const error = options.error ?? ((line: string) => console.error(line));
+	const projectTrusted = new ProjectTrustStore(options.agentDir).get(options.cwd) === true;
+	const settingsManager = SettingsManager.create(options.cwd, options.agentDir, { projectTrusted });
+	if (!resolveBuiltinExtension("mcp", settingsManager, options.cwd, options.agentDir).enabled) {
+		error('MCP is disabled. Explicitly enable it with "extensions": ["+builtin:mcp"] in settings.json.');
+		return 1;
+	}
 	const [command, ...rest] = args;
 	if (command === undefined || command === "help" || args.includes("--help") || args.includes("-h")) {
 		log(HELP);
@@ -193,7 +201,6 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 			? add(rest, projectConfig, options, log, error)
 			: remove(rest, projectConfig, options, log, error);
 	}
-	const projectTrusted = new ProjectTrustStore(options.agentDir).get(options.cwd) === true;
 	const loaded = loadMcpConfig({ agentDir: options.agentDir, cwd: options.cwd, projectTrusted });
 	const untrustedNote =
 		!projectTrusted && existsSync(projectConfig)

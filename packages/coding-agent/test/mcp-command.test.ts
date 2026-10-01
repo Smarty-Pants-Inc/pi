@@ -16,6 +16,7 @@ describe("pi mcp", () => {
 	async function run(args: string[], servers: Record<string, unknown> | undefined, dir?: string) {
 		const agentDir = dir ?? mkdtempSync(join(tmpdir(), "pi-mcp-command-"));
 		if (!dir) dirs.push(agentDir);
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
 		if (servers) writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: servers }));
 		const output: string[] = [];
 		const exitCode = await runMcpCommand(args, {

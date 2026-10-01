@@ -715,13 +715,13 @@ function getOverridePatterns(entries: string[]): string[] {
 	return entries.filter((pattern) => pattern.startsWith("!") || pattern.startsWith("+") || pattern.startsWith("-"));
 }
 
-function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string): boolean {
+function isEnabledByOverrides(filePath: string, patterns: string[], baseDir: string, defaultEnabled = true): boolean {
 	const overrides = getOverridePatterns(patterns);
 	const excludes = overrides.filter((pattern) => pattern.startsWith("!")).map((pattern) => pattern.slice(1));
 	const forceIncludes = overrides.filter((pattern) => pattern.startsWith("+")).map((pattern) => pattern.slice(1));
 	const forceExcludes = overrides.filter((pattern) => pattern.startsWith("-")).map((pattern) => pattern.slice(1));
 
-	let enabled = true;
+	let enabled = defaultEnabled;
 	if (excludes.length > 0 && matchesAnyPattern(filePath, excludes, baseDir)) {
 		enabled = false;
 	}
@@ -807,6 +807,32 @@ function applyAutoloadDisabledPatterns(allPaths: string[], patterns: string[], b
 		}
 	}
 	return result;
+}
+
+/** Resolve built-in opt-in using the existing extensions setting, including trusted project overrides. */
+export function resolveBuiltinExtension(
+	name: string,
+	settingsManager: SettingsManager,
+	cwd: string,
+	agentDir: string,
+): { enabled: boolean; scope: "user" | "project" } {
+	const path = `${BUILTIN_PATH_PREFIX}${name}`;
+	const projectEnabled = applyAutoloadDisabledPatterns(
+		[path],
+		getOverridePatterns(settingsManager.getProjectSettings().extensions ?? []),
+		join(cwd, CONFIG_DIR_NAME),
+	).get(path);
+	return {
+		enabled:
+			projectEnabled ??
+			isEnabledByOverrides(
+				path,
+				settingsManager.getGlobalSettings().extensions ?? [],
+				agentDir,
+				name !== "codemode" && name !== "mcp",
+			),
+		scope: projectEnabled === undefined ? "user" : "project",
+	};
 }
 
 export class DefaultPackageManager implements PackageManager {
@@ -968,21 +994,12 @@ export class DefaultPackageManager implements PackageManager {
 
 		this.addAutoDiscoveredResources(accumulator, globalSettings, projectSettings, globalBaseDir, projectBaseDir);
 
-		// Built-in extensions are enabled unless the user `extensions` setting excludes them, for example
-		// with `-builtin:mcp`. A matching `+`, `-`, or `!` entry in the project setting overrides that.
+		// Codemode and MCP require explicit opt-in; other built-ins retain their defaults.
+		// The same extension settings policy gates the standalone MCP command.
 		for (const name of this.builtinExtensions) {
 			const path = `${BUILTIN_PATH_PREFIX}${name}`;
-			const projectEnabled = applyAutoloadDisabledPatterns(
-				[path],
-				getOverridePatterns(projectSettings.extensions ?? []),
-				projectBaseDir,
-			).get(path);
-			this.addResource(
-				accumulator.extensions,
-				path,
-				{ source: "builtin", scope: projectEnabled === undefined ? "user" : "project", origin: "top-level" },
-				projectEnabled ?? isEnabledByOverrides(path, globalSettings.extensions ?? [], globalBaseDir),
-			);
+			const { enabled, scope } = resolveBuiltinExtension(name, this.settingsManager, this.cwd, this.agentDir);
+			this.addResource(accumulator.extensions, path, { source: "builtin", scope, origin: "top-level" }, enabled);
 		}
 
 		return this.toResolvedPaths(accumulator);

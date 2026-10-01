@@ -135,7 +135,7 @@ describe("DefaultPackageManager", () => {
 				(await pm.resolve()).extensions.map((r) => [r.path, r.enabled, r.metadata.source, r.metadata.scope]);
 
 			expect(await builtins()).toEqual([
-				["builtin:mcp", true, "builtin", "user"],
+				["builtin:mcp", false, "builtin", "user"],
 				["builtin:llama.cpp", true, "builtin", "user"],
 			]);
 

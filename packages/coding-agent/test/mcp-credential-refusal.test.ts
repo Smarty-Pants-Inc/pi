@@ -107,6 +107,7 @@ describe("MCP literal credential persistence refusal", () => {
 		const agentDir = join(root, "agent");
 		mkdirSync(cwd);
 		mkdirSync(agentDir);
+		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
 		const path = scope === "global" ? join(agentDir, "mcp.json") : join(cwd, ".pi", "mcp.json");
 		if (mode !== undefined) {
 			mkdirSync(dirname(path), { recursive: true });
