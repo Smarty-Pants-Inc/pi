@@ -28,6 +28,7 @@ interface BugReportContext {
 	editorContainer: Container;
 	editor: EditorComponent;
 	keybindings: KeybindingsManager;
+	beginExternalEditorHold?: () => () => void;
 	showStatus: (message: string) => void;
 	showError: (message: string) => void;
 }
@@ -245,7 +246,7 @@ function input(
 			initialValue,
 			(value) => finish(value),
 			() => finish(null),
-			{ description },
+			{ description, onExternalEditorOpen: context.beginExternalEditorHold },
 			context.session.settingsManager.getExternalEditorCommand(),
 		);
 		showOverlay(context, component);

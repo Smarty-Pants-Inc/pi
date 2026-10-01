@@ -233,7 +233,12 @@ export async function runRpcMode(
 				},
 				cancel: () => resolveDefault(false),
 			});
-			output({ type: "extension_ui_request", id, ...request, timeout } as RpcExtensionUIRequest);
+			try {
+				output({ type: "extension_ui_request", id, ...request, timeout } as RpcExtensionUIRequest);
+			} catch (error) {
+				cleanup();
+				throw error;
+			}
 		});
 	}
 
@@ -241,6 +246,7 @@ export async function runRpcMode(
 	 * Create an extension UI context that uses the RPC protocol.
 	 */
 	const createExtensionUIContext = (): ExtensionUIContext => ({
+		holdState: () => (pendingExtensionRequests.size > 0 ? "dialog" : undefined),
 		select: (title, options, opts) =>
 			createDialogPromise(opts, undefined, { method: "select", title, options }, (r) =>
 				"cancelled" in r && r.cancelled ? undefined : "value" in r ? r.value : undefined,
