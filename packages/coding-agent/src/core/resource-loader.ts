@@ -644,7 +644,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 	}
 
 	private resolveExtensionLoadPath(path: string): string {
-		return resolvePath(path, this.cwd, { normalizeUnicodeSpaces: true });
+		return resolvePath(path, this.cwd);
 	}
 
 	private async loadFinalExtensionSet(

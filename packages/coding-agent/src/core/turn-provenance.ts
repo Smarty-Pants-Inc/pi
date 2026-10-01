@@ -7,10 +7,11 @@
  * Message text never sets it, and nothing rewrites it later.
  */
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
+import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, sep } from "node:path";
-import { canonicalizePath, isLocalPath, normalizePath, resolvePath } from "../utils/paths.ts";
+import { isLocalPath, normalizePath, resolvePath } from "../utils/paths.ts";
+import { isExtensionModuleCurrent, type LoadedModuleIdentity } from "./extensions/module-identity.ts";
 import type { SessionEntry } from "./session-manager.ts";
 import type { SourceInfo } from "./source-info.ts";
 
@@ -86,6 +87,17 @@ export interface TurnProvenanceCaller {
 
 // Admission descriptors are private, not the mutable metadata exposed by resource inspection.
 const extensionCallers = new WeakMap<TurnProvenanceCaller, TurnProvenanceCaller>();
+const loadedModules = new WeakMap<TurnProvenanceCaller, LoadedModuleIdentity>();
+
+/** Host-only: bind the evaluated module before its factory can change the filesystem. */
+export function bindExtensionTurnProvenanceModule(
+	extension: TurnProvenanceCaller,
+	identity: LoadedModuleIdentity,
+): void {
+	if (loadedModules.has(extension) || extensionCallers.has(extension))
+		throw new Error("Extension identity already bound");
+	loadedModules.set(extension, identity);
+}
 
 /** Host-only: finalize once, after the resource loader has assigned authoritative source metadata. */
 export function finalizeExtensionTurnProvenanceCaller(
@@ -94,20 +106,36 @@ export function finalizeExtensionTurnProvenanceCaller(
 ): void {
 	if (extensionCallers.has(extension)) return;
 	const sourceInfo = { ...extension.sourceInfo };
+	const loaded = loadedModules.get(extension);
+	const resolvedPath =
+		loaded?.path ??
+		(extension.resolvedPath.startsWith("<")
+			? extension.resolvedPath
+			: (existingIdentity(extension.resolvedPath) ?? ""));
 	if (sourceInfo.origin === "package" && isLocalPath(sourceInfo.source)) {
-		// Keep the configured spelling for inspection, never for attribution. The default loader knows
-		// the package's scope base; a custom loader without one can only use an absolute source or file.
-		sourceInfo.source = localPackageBaseDir
-			? normalizeIdentity(sourceInfo.source, localPackageBaseDir)
-			: extensionIdentity(extension);
+		// A local file grant names only the evaluated file. A package-directory grant also requires
+		// that file to be inside the real package root, never a manifest/symlink escape.
+		const source = existingIdentity(sourceInfo.source, localPackageBaseDir);
+		let packageRoot: string | undefined;
+		if (loaded && source && (localPackageBaseDir || isAbsolute(normalizePath(sourceInfo.source)))) {
+			try {
+				if (
+					statSync(source).isDirectory() &&
+					loaded.path.startsWith(source.endsWith(sep) ? source : `${source}${sep}`)
+				)
+					packageRoot = source;
+			} catch {
+				// Missing package metadata cannot add an alternate grant.
+			}
+		}
+		sourceInfo.source = packageRoot ?? resolvedPath;
 	}
-	extensionCallers.set(
-		extension,
-		Object.freeze({
-			resolvedPath: normalizeIdentity(extension.resolvedPath),
-			sourceInfo: Object.freeze(sourceInfo),
-		}),
-	);
+	const caller = Object.freeze({
+		resolvedPath,
+		sourceInfo: Object.freeze(sourceInfo),
+	});
+	if (loaded) loadedModules.set(caller, loaded);
+	extensionCallers.set(extension, caller);
 }
 
 /** Host-only: an unfinalized extension has no admission identity and its claims fail closed. */
@@ -170,13 +198,6 @@ function stamp(fields: Omit<TurnProvenance, "v" | "turnId" | "receivedAt">, rece
 	return Object.freeze({ v: 1, turnId: randomUUID(), receivedAt, ...fields });
 }
 
-function normalizeIdentity(identity: string, baseDir?: string): string {
-	if (identity.startsWith("<") || !isLocalPath(identity)) return identity;
-	// Let realpath restore filesystem spelling, not blanket case-folding: even Windows can have
-	// case-sensitive directories, whose distinct files must not share attribution authority.
-	return canonicalizePath(resolvePath(identity, baseDir, { trim: true, homeDir: process.env.HOME || homedir() }));
-}
-
 function samePath(left: string, right: string): boolean {
 	if (left === right) return true;
 	if (left.toLowerCase() !== right.toLowerCase()) return false;
@@ -191,24 +212,36 @@ function samePath(left: string, right: string): boolean {
 	}
 }
 
-/** Package identity or resolved file, never an unresolved local package spelling. */
+function existingIdentity(identity: string, baseDir?: string): string | undefined {
+	try {
+		// An allowlist is an identity, not CLI input: trimming/folding can name a different existing object.
+		return realpathSync(resolvePath(identity, baseDir, { homeDir: process.env.HOME || homedir() }));
+	} catch {
+		return undefined;
+	}
+}
+
+/** Captured package identity or evaluated file; never re-resolve a saved caller pathname. */
 export function extensionIdentity(caller: TurnProvenanceCaller): string {
 	if (caller.sourceInfo.origin === "package") {
 		const source = caller.sourceInfo.source;
 		if (!isLocalPath(source)) return source;
-		if (isAbsolute(normalizePath(source))) return normalizeIdentity(source);
+		if (isAbsolute(normalizePath(source))) return source;
 	}
-	return normalizeIdentity(caller.resolvedPath);
+	return caller.resolvedPath;
 }
 
 function trusts(allowed: unknown, caller: TurnProvenanceCaller): boolean {
 	// A project-scoped extension comes from the checked-out repository, not from the user.
 	if (caller.sourceInfo.scope === "project" || !Array.isArray(allowed)) return false;
-	return [extensionIdentity(caller), normalizeIdentity(caller.resolvedPath)].some((id) =>
+	const loaded = loadedModules.get(caller);
+	if (loaded && !isExtensionModuleCurrent(loaded)) return false;
+	return [extensionIdentity(caller), caller.resolvedPath].some((id) =>
 		allowed.some((item) => {
 			if (typeof item !== "string" || item.trim() === "") return false;
 			if (!isLocalPath(item) || item.startsWith("<")) return id === item;
-			const path = normalizeIdentity(item);
+			const path = existingIdentity(item);
+			if (!path) return false;
 			const directory = item.endsWith("/") || (process.platform === "win32" && item.endsWith("\\"));
 			if (!directory) return samePath(id, path);
 			if (id.startsWith(path.endsWith(sep) ? path : `${path}${sep}`)) return true;

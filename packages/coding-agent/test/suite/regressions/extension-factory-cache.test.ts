@@ -80,6 +80,32 @@ describe("extension factory cache", () => {
 		expect(first.runtime).not.toBe(second.runtime);
 	});
 
+	// pi#95 R6: cached code and captured filesystem identity must always describe the same load.
+	it("reevaluates changed content instead of giving a stale cached factory a fresh identity", async () => {
+		const { root, cwd } = fixture("changed-content");
+		const extensionPath = join(root, "counting.ts");
+		writeCountingExtension(extensionPath);
+		const first = await loadExtensionsCached([extensionPath], cwd);
+		expect(first.errors).toEqual([]);
+		writeFileSync(
+			extensionPath,
+			`
+			const state = (globalThis.__extensionFactoryCacheTest ??= {});
+			state.moduleLoads = (state.moduleLoads ?? 0) + 1;
+			export default function(pi) {
+				state.factoryRuns = (state.factoryRuns ?? 0) + 1;
+				pi.registerCommand("replacement", { handler: async () => {} });
+			}
+		`,
+		);
+		const second = await loadExtensionsCached([extensionPath], cwd);
+		expect(second.errors).toEqual([]);
+		expect(state().moduleLoads).toBe(2);
+		expect(state().factoryRuns).toBe(2);
+		expect(first.extensions[0].commands.has("replacement")).toBe(false);
+		expect(second.extensions[0].commands.has("replacement")).toBe(true);
+	});
+
 	it("does not cache direct loadExtensions calls", async () => {
 		const { root, cwd } = fixture("direct");
 		const extensionPath = join(root, "counting.ts");

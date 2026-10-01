@@ -21,7 +21,8 @@ import { readPiManifest } from "../pi-manifest.ts";
 import { currentSessionOwnership, ownershipOf, type SessionOwnership } from "../session-ownership.ts";
 import { createSyntheticSourceInfo } from "../source-info.ts";
 import { time } from "../timings.ts";
-import { getExtensionTurnProvenanceCaller } from "../turn-provenance.ts";
+import { bindExtensionTurnProvenanceModule, getExtensionTurnProvenanceCaller } from "../turn-provenance.ts";
+import { isExtensionModuleCurrent, type LoadedModuleIdentity, readExtensionModule } from "./module-identity.ts";
 import type {
 	EntryRenderer,
 	Extension,
@@ -130,7 +131,12 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 
 let extensionCacheCwd: string | undefined;
 let extensionCacheGeneration = 0;
-const extensionCache = new Map<string, ExtensionFactory>();
+interface LoadedExtensionModule {
+	factory: ExtensionFactory;
+	identity: LoadedModuleIdentity;
+}
+
+const extensionCache = new Map<string, LoadedExtensionModule>();
 
 interface ExtensionCacheToken {
 	cwd: string;
@@ -515,12 +521,13 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
 	if (isCurrentCacheToken(cacheToken)) {
-		const cachedFactory = extensionCache.get(extensionPath);
-		if (cachedFactory) {
-			return cachedFactory;
+		const cachedModule = extensionCache.get(extensionPath);
+		if (cachedModule && isExtensionModuleCurrent(cachedModule.identity)) {
+			return cachedModule;
 		}
 	}
 
+	const { identity, source } = readExtensionModule(extensionPath);
 	const createJitiImpl = await getCreateJiti();
 	// Compiled binaries and the bundled Node distribution use embedded modules.
 	// Source TypeScript reuses host modules and root tsconfig paths. Unbundled
@@ -530,20 +537,46 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		: isTypeScriptSourceRuntime
 			? { virtualModules: await getVirtualModules(), tsconfigPaths: true }
 			: { alias: getAliases() };
+	if (isTypeScriptSourceRuntime && !usesEmbeddedModules && /\.[cm]?js$/.test(identity.path)) {
+		// Native JS entries previously resolved installed dependencies before falling back to Jiti.
+		// Keep that resolution while evaluating captured entry bytes instead of reopening the entry.
+		const nativeRequire = createRequire(identity.path);
+		const virtualModules = { ...resolutionOptions.virtualModules };
+		const alias: Record<string, string> = {};
+		for (const specifier of Object.keys(virtualModules)) {
+			try {
+				const dependency = nativeRequire.resolve(specifier);
+				if (!/\.(?:[cm]?js|node)$/.test(dependency)) continue;
+				alias[specifier] = dependency;
+				delete virtualModules[specifier];
+			} catch {
+				// Missing compiled dependencies still use the host's source-runtime virtual modules.
+			}
+		}
+		resolutionOptions.virtualModules = virtualModules;
+		resolutionOptions.alias = alias;
+	}
 	const jiti = createJitiImpl(import.meta.url, {
+		fsCache: false,
 		moduleCache: false,
 		...resolutionOptions,
 	});
 
-	const module = await jiti.import(extensionPath, { default: true });
-	const factory = module as ExtensionFactory;
+	if (!isExtensionModuleCurrent(identity)) throw new Error(`Extension changed before evaluation: ${extensionPath}`);
+	// Evaluate the exact opened bytes, including JS/CJS/ESM entries. Native import would reopen the path.
+	const module = await jiti.evalModule(source, { filename: identity.path, async: true, forceTranspile: true });
+	const factory =
+		module && (typeof module === "object" || typeof module === "function") && "default" in module
+			? module.default
+			: module;
 	if (typeof factory !== "function") {
 		return undefined;
 	}
+	const loaded = { factory: factory as ExtensionFactory, identity };
 	if (isCurrentCacheToken(cacheToken)) {
-		extensionCache.set(extensionPath, factory);
+		extensionCache.set(extensionPath, loaded);
 	}
-	return factory;
+	return loaded;
 }
 
 /**
@@ -577,8 +610,10 @@ async function initializeExtension(
 	cwd: string,
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
+	identity?: LoadedModuleIdentity,
 ): Promise<Extension> {
 	const extension = createExtension(extensionPath, resolvedPath);
+	if (identity) bindExtensionTurnProvenanceModule(extension, identity);
 	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
 	const owner = runtimeOwners.get(runtime)?.owner;
 	try {
@@ -600,21 +635,30 @@ async function loadExtension(
 	runtime: ExtensionRuntime,
 	cacheToken?: ExtensionCacheToken,
 ): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
+	// Resource paths have already been resolved. Unicode lookalikes are distinct filesystem names.
+	const resolvedPath = resolvePath(extensionPath, cwd);
 
 	try {
 		const owner = runtimeOwners.get(runtime)?.owner;
 		if (currentSessionOwnership() && !owner) throw new Error("OWNER_RUNTIME_OWNERSHIP");
-		const factory = await (owner
+		const loaded = await (owner
 			? owner.within(() => loadExtensionModule(resolvedPath, cacheToken))
 			: loadExtensionModule(resolvedPath, cacheToken));
 		owner?.assertActive();
 		time(`${extensionPath} module import`, "extensions");
-		if (!factory) {
+		if (!loaded) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
 		}
 
-		const extension = await initializeExtension(factory, extensionPath, resolvedPath, cwd, eventBus, runtime);
+		const extension = await initializeExtension(
+			loaded.factory,
+			extensionPath,
+			resolvedPath,
+			cwd,
+			eventBus,
+			runtime,
+			loaded.identity,
+		);
 
 		return { extension, error: null };
 	} catch (err) {

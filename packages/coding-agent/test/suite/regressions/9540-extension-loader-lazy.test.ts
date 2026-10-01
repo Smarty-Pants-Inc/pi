@@ -1,11 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
 	jitiModuleLoads: 0,
 	jitiStaticModuleLoads: 0,
 	virtualModulesLoads: 0,
 	createJiti: vi.fn((_id: unknown, _options: unknown) => ({
-		import: vi.fn(async () => () => {}),
+		evalModule: vi.fn(async () => ({ default: () => {} })),
 	})),
 }));
 
@@ -33,6 +36,11 @@ interface JitiOptionsProbe {
 	virtualModules?: Record<string, unknown>;
 }
 
+const directories: string[] = [];
+afterEach(() => {
+	while (directories.length) rmSync(directories.pop()!, { recursive: true, force: true });
+});
+
 describe("extension loader lazy imports", () => {
 	// Regression test for #9540.
 	it("defers ordinary jiti and its virtual modules until importing an extension", async () => {
@@ -40,7 +48,12 @@ describe("extension loader lazy imports", () => {
 		expect(state.jitiStaticModuleLoads).toBe(0);
 		expect(state.virtualModulesLoads).toBe(0);
 
-		const result = await loadExtensions(["/extension.ts"], "/");
+		// pi#95 R6: the lazy evaluator consumes a real opened file, not a synthetic pathname.
+		const root = mkdtempSync(join(tmpdir(), "pi-lazy-loader-"));
+		directories.push(root);
+		const file = join(root, "extension.ts");
+		writeFileSync(file, "export default function() {}");
+		const result = await loadExtensions([file], root);
 
 		expect(result.errors).toEqual([]);
 		expect(result.extensions).toHaveLength(1);

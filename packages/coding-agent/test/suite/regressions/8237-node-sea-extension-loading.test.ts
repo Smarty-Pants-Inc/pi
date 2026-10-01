@@ -1,4 +1,7 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => {
 	const originalGetBuiltinModule = Object.getOwnPropertyDescriptor(process, "getBuiltinModule");
@@ -12,7 +15,7 @@ const state = vi.hoisted(() => {
 		jitiModuleLoads: 0,
 		virtualModulesLoads: 0,
 		createJiti: vi.fn((_id: unknown, _options: unknown) => ({
-			import: vi.fn(async () => () => {}),
+			evalModule: vi.fn(async () => ({ default: () => {} })),
 		})),
 	};
 });
@@ -46,13 +49,23 @@ afterAll(() => {
 	}
 });
 
+const directories: string[] = [];
+afterEach(() => {
+	while (directories.length) rmSync(directories.pop()!, { recursive: true, force: true });
+});
+
 describe("Node SEA extension loading", () => {
 	// Regression test for #8237 and #9540.
 	it("loads jiti and bundled virtual modules only when importing an extension", async () => {
 		expect(state.jitiModuleLoads).toBe(0);
 		expect(state.virtualModulesLoads).toBe(0);
 
-		const result = await loadExtensions(["/extension.ts"], "/");
+		// pi#95 R6: SEA also evaluates the bytes from an opened real extension file.
+		const root = mkdtempSync(join(tmpdir(), "pi-sea-loader-"));
+		directories.push(root);
+		const file = join(root, "extension.ts");
+		writeFileSync(file, "export default function() {}");
+		const result = await loadExtensions([file], root);
 
 		expect(result.errors).toEqual([]);
 		expect(state.jitiModuleLoads).toBe(1);

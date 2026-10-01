@@ -1,5 +1,6 @@
 // Per-turn sender provenance v1 (smarty-dev#2636 comment 5913265017; smarty-dev#2264, smarty-knowledge-3#623).
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
@@ -64,8 +65,10 @@ async function withExtensions(names: string[], options: HarnessOptions = {}) {
 
 describe("turn provenance", () => {
 	const harnesses: Harness[] = [];
+	const directories: string[] = [];
 	afterEach(() => {
 		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+		while (directories.length > 0) rmSync(directories.pop()!, { recursive: true, force: true });
 	});
 
 	it("records host input as terminal with no principal, whatever the text claims", async () => {
@@ -315,11 +318,16 @@ describe("turn provenance", () => {
 	});
 
 	it("validates the Fabric claim shape and refuses it as terminal", () => {
+		// pi#95 R6: directory grants must resolve successfully, even in claim-shape controls.
+		const root = mkdtempSync(join(tmpdir(), "pi-provenance-shape-"));
+		directories.push(root);
+		const file = join(root, "index.ts");
+		writeFileSync(file, "export default function() {}");
 		const caller = {
-			resolvedPath: "/opt/fabric/releases/abc/index.ts",
-			sourceInfo: createSyntheticSourceInfo("/opt/fabric/releases/abc/index.ts", { source: "local", scope: "user" }),
+			resolvedPath: file,
+			sourceInfo: createSyntheticSourceInfo(file, { source: "local", scope: "user" }),
 		};
-		const trust = { fabricExtensions: ["/opt/fabric/releases/"] };
+		const trust = { fabricExtensions: [`${root}/`] };
 		const resolve = (claim: unknown) => {
 			const { channel, sender, via } = resolveExtensionTurnProvenance(claim, caller, trust);
 			return JSON.parse(JSON.stringify({ channel, sender, via }));
@@ -366,12 +374,22 @@ describe("turn provenance", () => {
 			resolveExtensionTurnProvenance(VOICE_PAUL, project, { voiceExtensions: [project.resolvedPath] }).channel,
 		).toBe("terminal");
 
-		const release = (dir: string) => ({
-			resolvedPath: `${dir}/index.ts`,
-			sourceInfo: createSyntheticSourceInfo(`${dir}/index.ts`, { source: "local", scope: "user", baseDir: dir }),
-		});
-		const voice = { voiceExtensions: ["/home/u/.local/share/smarty-dev/smarty-voice/releases/"] };
-		const root = "/home/u/.local/share/smarty-dev/smarty-voice";
+		// pi#95 R6: a missing allowlisted directory must not fall back to a lexical prefix grant.
+		const root = mkdtempSync(join(tmpdir(), "pi-provenance-release-"));
+		directories.push(root);
+		const release = (dir: string) => {
+			mkdirSync(dir, { recursive: true });
+			writeFileSync(join(dir, "index.ts"), "export default function() {}");
+			return {
+				resolvedPath: join(dir, "index.ts"),
+				sourceInfo: createSyntheticSourceInfo(join(dir, "index.ts"), {
+					source: "local",
+					scope: "user",
+					baseDir: dir,
+				}),
+			};
+		};
+		const voice = { voiceExtensions: [`${root}/releases/`] };
 		expect(resolveExtensionTurnProvenance(VOICE_PAUL, release(`${root}/releases/ff93`), voice)).toMatchObject({
 			channel: "voice",
 			principal: { id: "paul", binding: "voice-call" },
@@ -385,6 +403,11 @@ describe("turn provenance", () => {
 			}).channel,
 		).toBe("terminal");
 		expect(resolveExtensionTurnProvenance(VOICE_PAUL, undefined, voice).channel).toBe("terminal");
+		const missing = release(`${root}/missing/release`);
+		rmSync(join(root, "missing"), { recursive: true });
+		expect(
+			resolveExtensionTurnProvenance(VOICE_PAUL, missing, { voiceExtensions: [`${root}/missing/`] }).channel,
+		).toBe("terminal");
 
 		const storage = new InMemorySettingsStorage();
 		storage.withLock("project", () => JSON.stringify(TRUST));
