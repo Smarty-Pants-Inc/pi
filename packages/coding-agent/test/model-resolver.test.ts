@@ -720,6 +720,20 @@ describe("default model selection", () => {
 		expect(defaultModelPerProvider["ant-ling"]).toBe("Ring-2.6-1T");
 	});
 
+	// Regression for Smarty-Pants-Inc/pi#100: prefer Kimi K3, not Together's first catalog entry.
+	test("findInitialModel selects Together's supported default", async () => {
+		const authStorage = AuthStorage.inMemory({ together: { type: "api_key", key: "test-key" } });
+		const modelRuntime = getModelRuntime(await createModelRegistry(authStorage));
+		const result = await findInitialModel({
+			scopedModels: [],
+			isContinuing: false,
+			modelRuntime,
+		});
+		expect(defaultModelPerProvider.together).toBe("moonshotai/Kimi-K3");
+		expect(result.model?.provider).toBe("together");
+		expect(result.model?.id).toBe("moonshotai/Kimi-K3");
+	});
+
 	test("built-in chat providers have defaults in their generated catalogs", () => {
 		for (const provider of getBuiltinProviders()) {
 			const chatModels = getBuiltinModels(provider);
