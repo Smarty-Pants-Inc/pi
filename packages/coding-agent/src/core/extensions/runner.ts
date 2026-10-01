@@ -946,14 +946,16 @@ export class ExtensionRunner {
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
 		let shouldContinue = false;
+		// Record the state represented by the preview before the builder can yield.
+		let previewRevision = this.sessionManager.revision();
+		let previewPendingMessages = getPendingMessages?.().slice();
 		let context = await buildContext(entries);
 		let valid = true;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
-				const revision = this.sessionManager.revision();
-				const pendingMessages = getPendingMessages?.();
-				const hadEntries = entries.length > 0;
+				// A failed proposal remains visible so a later handler can replace it.
+				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
 				if (hadEntries) {
 					try {
@@ -981,23 +983,27 @@ export class ExtensionRunner {
 					});
 				}
 
-				// Observers need no new preview. Preserve in-place draft edits, canonical appends
-				// and queue changes, including mutations made before a handler throws.
-				const unchangedEntries = previousEntries
-					? isDeepStrictEqual(previousEntries, entries)
-					: !hadEntries && entries.length === 0;
-				const nextPendingMessages = getPendingMessages?.();
-				if (
-					valid &&
-					unchangedEntries &&
-					revision === this.sessionManager.revision() &&
-					pendingMessages?.length === nextPendingMessages?.length &&
-					(pendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
-				) {
-					continue;
-				}
-
 				try {
+					if (!Array.isArray(entries)) throw new Error("Boundary entries must be an array");
+					// Observers need no new preview. Preserve in-place draft edits, canonical appends
+					// and queue changes, including mutations made before a handler throws.
+					const unchangedEntries = previousEntries
+						? isDeepStrictEqual(previousEntries, entries)
+						: !hadEntries && entries.length === 0;
+					const nextRevision = this.sessionManager.revision();
+					const nextPendingMessages = getPendingMessages?.();
+					if (
+						valid &&
+						unchangedEntries &&
+						previewRevision === nextRevision &&
+						previewPendingMessages?.length === nextPendingMessages?.length &&
+						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
+					) {
+						continue;
+					}
+
+					previewRevision = nextRevision;
+					previewPendingMessages = nextPendingMessages?.slice();
 					context = await buildContext(entries);
 					valid = true;
 				} catch (err) {

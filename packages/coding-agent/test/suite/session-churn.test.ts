@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { BoundaryContextPreview } from "../../src/core/extensions/types.ts";
+import type { BoundaryContextPreview, SessionBoundaryDraft } from "../../src/core/extensions/types.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 type BoundaryInternals = {
@@ -124,6 +124,100 @@ describe("session boundary allocation churn", () => {
 		expect(build).toHaveBeenCalledTimes(3);
 		expect(observations).toEqual([1, 1]);
 	});
+
+	// smarty-dev#2177 / pi#94: state can change while an asynchronous preview builder awaits.
+	it.each([1, 2])("refreshes a preview captured before an await in build %i", async (pausedBuild) => {
+		const pending: AgentMessage[] = [];
+		const observations: BoundaryContextPreview[] = [];
+		let capturePreview!: () => void;
+		let releasePreview!: () => void;
+		const captured = new Promise<void>((resolve) => {
+			capturePreview = resolve;
+		});
+		const release = new Promise<void>((resolve) => {
+			releasePreview = resolve;
+		});
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					if (pausedBuild === 2) {
+						pi.on("agent_before_settle", () => ({
+							entries: [{ type: "custom", customType: "draft" }],
+						}));
+					}
+					pi.on("agent_before_settle", () => undefined);
+					pi.on("agent_before_settle", (event) => {
+						observations.push(event.context);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		let builds = 0;
+		const build = vi.fn(async () => {
+			const preview = {
+				...emptyPreview(),
+				contextEntries: harness.sessionManager.buildSessionProjection().entries,
+				pendingMessages: pending.slice(),
+				canContinue: pending.length > 0,
+			};
+			if (++builds === pausedBuild) {
+				capturePreview();
+				await release;
+			}
+			return preview;
+		});
+		const dispatch = harness.session.extensionRunner.emitBoundary(
+			{ type: "agent_before_settle", outcome: "completed" },
+			build,
+			() => pending,
+		);
+		await captured;
+		const entryId = harness.sessionManager.appendCustomEntry("arrived-during-build");
+		pending.push({ role: "user", content: "queued-during-build", timestamp: 1 });
+		releasePreview();
+		const result = await dispatch;
+		expect(observations).toHaveLength(1);
+		expect(observations[0].contextEntries.at(-1)?.sourceEntry.id).toBe(entryId);
+		expect(observations[0].pendingMessages).toEqual(pending);
+		expect(observations[0].canContinue).toBe(true);
+		expect(result.context).toBe(observations[0]);
+		expect(build).toHaveBeenCalledTimes(pausedBuild + 1);
+	});
+
+	// smarty-dev#2177 / pi#94: JavaScript extensions can return non-array proposals.
+	it.each([null, {}, "malformed"])(
+		"isolates malformed entries %j and lets a later handler repair",
+		async (malformed) => {
+			const errors: string[] = [];
+			let repaired = false;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("agent_before_settle", () => ({ entries: malformed as unknown as SessionBoundaryDraft[] }));
+						pi.on("agent_before_settle", (event) => {
+							repaired = true;
+							expect(event.entries).toBe(malformed);
+							return { entries: [] };
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.session.extensionRunner.onError((error) => errors.push(error.error));
+			const build = vi.fn((entries: SessionBoundaryDraft[]) => {
+				if (!Array.isArray(entries)) throw new Error("Boundary entries must be an array");
+				return emptyPreview();
+			});
+			const result = await harness.session.extensionRunner.emitBoundary(
+				{ type: "agent_before_settle", outcome: "completed" },
+				build,
+			);
+			expect(repaired).toBe(true);
+			expect(errors).toEqual(["Invalid boundary entries: Boundary entries must be an array"]);
+			expect(result).toMatchObject({ valid: true, entries: [], continue: false });
+		},
+	);
 
 	it("preserves mutations before exceptions and repairs invalid proposals", async () => {
 		const errors: string[] = [];
