@@ -116,12 +116,28 @@ export function finalizeExtensionTurnProvenanceCaller(
 			: (existingIdentity(extension.resolvedPath) ?? ""));
 	const git = sourceInfo.origin === "package" ? parseGitUrl(sourceInfo.source) : null;
 	if (git) {
-		// Git caches share a checkout across refs. A requested source is not authority unless
-		// the evaluated module belongs to that checkout and HEAD matches the resolved ref.
+		// Git caches share a checkout across refs and endpoints (e.g. different ports).
+		// Require its recorded clone endpoint as well as the evaluated module and resolved ref.
 		let verified = false;
 		try {
 			const root = sourceInfo.baseDir && existingIdentity(sourceInfo.baseDir);
 			if (loaded && root && loaded.path.startsWith(`${root}${sep}`) && statSync(join(root, ".git")).isDirectory()) {
+				// Read the URL recorded by clone, not `remote get-url`, which applies insteadOf rewrites.
+				const origin = spawnProcessSync("git", ["config", "--local", "--null", "--get-all", "remote.origin.url"], {
+					cwd: root,
+					encoding: "utf8",
+					stdio: "pipe",
+					timeout: 10_000,
+				});
+				// Exactly one NUL-terminated value, including empty values in the ambiguity check.
+				const urls = origin.stdout?.split("\0");
+				const endpoint = urls?.length === 2 && urls[1] === "" ? normalizeGitEndpoint(urls[0]) : undefined;
+				const originVerified =
+					origin.status === 0 &&
+					!origin.error &&
+					!origin.stderr?.trim() &&
+					endpoint !== undefined &&
+					endpoint === normalizeGitEndpoint(git.repo);
 				const commits = ["HEAD", git.ref ?? "origin/HEAD"].map((ref) => {
 					const result = spawnProcessSync(
 						"git",
@@ -141,10 +157,10 @@ export function finalizeExtensionTurnProvenanceCaller(
 						? commit
 						: undefined;
 				});
-				verified = commits[0] !== undefined && commits[0] === commits[1];
+				verified = originVerified && commits[0] !== undefined && commits[0] === commits[1];
 			}
 		} catch {
-			// An absent checkout/ref or unavailable Git cannot establish a source grant.
+			// An absent/mismatched endpoint, checkout/ref or unavailable Git cannot establish a source grant.
 		}
 		if (!verified) sourceInfo.source = resolvedPath;
 	}
@@ -172,6 +188,19 @@ export function finalizeExtensionTurnProvenanceCaller(
 	});
 	if (loaded) loadedModules.set(caller, loaded);
 	extensionCallers.set(extension, caller);
+}
+
+// Preserve protocol, credentials, port and the complete repository path. Do not collapse endpoints
+// using the cache's host/path parser or strip .git: distinct servers may serve distinct paths.
+function normalizeGitEndpoint(endpoint: string | undefined): string | undefined {
+	if (!endpoint || /\s/.test(endpoint)) return undefined;
+	if (/^git@[^:]+:[^/].+/.test(endpoint)) return endpoint;
+	try {
+		const url = new URL(endpoint);
+		return ["https:", "http:", "ssh:", "git:"].includes(url.protocol) && url.hostname ? url.href : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 /** Host-only: an unfinalized extension has no admission identity and its claims fail closed. */
