@@ -74,6 +74,7 @@ export function getToolResult(harness: Harness, toolName: string): ToolResultMes
 /** An extension UI context that does nothing, with `overrides` applied. */
 export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {}): ExtensionUIContext {
 	return {
+		holdState: () => undefined,
 		select: async () => undefined,
 		confirm: async () => false,
 		input: async () => undefined,

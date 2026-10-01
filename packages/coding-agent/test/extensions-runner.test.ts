@@ -20,7 +20,6 @@ import type {
 	ExtensionActions,
 	ExtensionContextActions,
 	ExtensionFactory,
-	ExtensionUIContext,
 	ProviderConfig,
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
@@ -28,6 +27,7 @@ import type { ModelRegistry } from "../src/core/model-registry.ts";
 import type { ScopedModel } from "../src/core/model-resolver.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { buildSystemPrompt } from "../src/core/system-prompt.ts";
+import { createTestUiContext } from "./suite/harness.ts";
 
 describe("ExtensionRunner", () => {
 	let tempDir: string;
@@ -581,22 +581,24 @@ describe("ExtensionRunner", () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
 			runner.bindCore(extensionActions, extensionContextActions);
-			runner.setUIContext({} as ExtensionUIContext, "rpc");
+			runner.setUIContext(createTestUiContext(), "rpc");
 
 			const ctx = runner.createContext();
 			expect(ctx.mode).toBe("rpc");
 			expect(ctx.hasUI).toBe(true);
+			expect(ctx.ui.holdState()).toBeUndefined();
 		});
 
 		it("exposes tui mode with hasUI true when a TUI UI context is provided", async () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
 			runner.bindCore(extensionActions, extensionContextActions);
-			runner.setUIContext({} as ExtensionUIContext, "tui");
+			runner.setUIContext(createTestUiContext(), "tui");
 
 			const ctx = runner.createContext();
 			expect(ctx.mode).toBe("tui");
 			expect(ctx.hasUI).toBe(true);
+			expect(ctx.ui.holdState()).toBeUndefined();
 		});
 	});
 
