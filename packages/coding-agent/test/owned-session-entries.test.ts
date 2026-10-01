@@ -90,6 +90,7 @@ describe("owned native materialization", () => {
 		expect(called).toBe(0);
 	});
 
+	// pi#107: owned entries keep a bounded graph even when chord accepts deep JSON.
 	test("rejects cycles and excessive depth", () => {
 		const cycle: Record<string, unknown> = {};
 		cycle.self = cycle;
@@ -97,6 +98,14 @@ describe("owned native materialization", () => {
 		let deep: unknown = null;
 		for (let i = 0; i < 600; i++) deep = { child: deep };
 		expect(() => materializeOwnedEntry(custom(deep))).toThrow("OWNER_ENTRY_NOT_JSON");
+	});
+	// pi#107: test both container kinds at the owned-entry depth boundary.
+	test.each(["object", "array"] as const)("bounds nested %s depth without rejecting fitting entries", (kind) => {
+		let data: unknown = null;
+		for (let i = 0; i < 511; i++) data = kind === "object" ? { child: data } : [data];
+		expect(materializeOwnedEntry(custom(data))).toEqual(custom(data));
+		data = kind === "object" ? { child: data } : [data];
+		expect(() => materializeOwnedEntry(custom(data))).toThrow("OWNER_ENTRY_NOT_JSON");
 	});
 });
 

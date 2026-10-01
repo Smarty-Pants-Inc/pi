@@ -3,6 +3,17 @@ import { type FileEntry, parseSessionEntries, type SessionEntry, type SessionHea
 
 const absentFields = new Set(["parentSession", "details", "usage", "fromHook", "data", "label", "name"]);
 
+// Bound traversal before strict JSON validation and serialization, including cycles.
+function isWithinOwnedEntryDepth(value: unknown, depth = 0): boolean {
+	if (depth > 512) return false;
+	if (value === null || typeof value !== "object") return true;
+	for (const key of Reflect.ownKeys(value)) {
+		const property = Object.getOwnPropertyDescriptor(value, key);
+		if (property && "value" in property && !isWithinOwnedEntryDepth(property.value, depth + 1)) return false;
+	}
+	return true;
+}
+
 /** Native optional fields may be absent; arbitrary nested non-JSON is rejected. */
 export function materializeOwnedEntry<T extends FileEntry>(entry: T): T {
 	if (Object.getPrototypeOf(entry) !== Object.prototype && Object.getPrototypeOf(entry) !== null) {
@@ -16,7 +27,7 @@ export function materializeOwnedEntry<T extends FileEntry>(entry: T): T {
 		if (property.value === undefined && absentFields.has(key)) continue;
 		Object.defineProperty(normalized, key, { value: property.value, enumerable: true });
 	}
-	if (!isJsonValue(normalized)) throw new Error("OWNER_ENTRY_NOT_JSON");
+	if (!isWithinOwnedEntryDepth(normalized) || !isJsonValue(normalized)) throw new Error("OWNER_ENTRY_NOT_JSON");
 	return JSON.parse(JSON.stringify(normalized)) as T;
 }
 
