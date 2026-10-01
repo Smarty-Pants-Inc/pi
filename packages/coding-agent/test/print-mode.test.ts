@@ -1,5 +1,6 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { resolveHostTurnProvenance } from "../src/core/turn-provenance.ts";
 import type { SessionShutdownEvent } from "../src/index.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
 
@@ -18,6 +19,7 @@ type FakeSession = {
 	bindExtensions: ReturnType<typeof vi.fn>;
 	subscribe: ReturnType<typeof vi.fn>;
 	prompt: ReturnType<typeof vi.fn>;
+	_turnProvenanceFor: ReturnType<typeof vi.fn>;
 	reload: ReturnType<typeof vi.fn>;
 };
 
@@ -71,6 +73,7 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		bindExtensions: vi.fn(async () => {}),
 		subscribe: vi.fn(() => () => {}),
 		prompt: vi.fn(async () => {}),
+		_turnProvenanceFor: vi.fn((text: string) => resolveHostTurnProvenance(text, false, { attest: () => null })),
 		reload: vi.fn(async () => {}),
 	};
 
@@ -103,7 +106,10 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(session.prompt).toHaveBeenCalledWith("Say done", { images });
+		expect(session.prompt).toHaveBeenCalledWith(
+			"Say done",
+			expect.objectContaining({ images, source: "interactive" }),
+		);
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
@@ -118,7 +124,7 @@ describe("runPrintMode", () => {
 		});
 
 		expect(exitCode).toBe(0);
-		expect(session.prompt).toHaveBeenCalledWith("hello");
+		expect(session.prompt).toHaveBeenCalledWith("hello", expect.objectContaining({ source: "interactive" }));
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});

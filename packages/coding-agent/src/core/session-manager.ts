@@ -59,46 +59,60 @@ const RECENT_RESIDENT_ENTRIES = 100;
 
 export const CURRENT_SESSION_VERSION = 3;
 
-/** Detach inspection results without materializing large cold fields during tree walks. */
-function detachedSessionView<T>(value: T, seen = new WeakMap<object, object>(), key = ""): T {
-	if (value === null || typeof value !== "object") return value;
-	// Serialize a toJSON subtree before traversing children: its serializer may move them to new keys.
-	if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
-		return JSON.parse(JSON.stringify({ [key]: value }))[key] as T;
+/** Detach values, preserving only storage-owned cold fields during inspection/tree walks. */
+function detachedSessionView<T>(
+	value: T,
+	seen = new WeakMap<object, object>(),
+	key = "",
+	lazyFields: "cold" | "message" | false = "cold",
+): T {
+	// Cold message children are unmarked; caller admission disables laziness for the entire subtree.
+	if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+	// Capture once, as native JSON does. The wrapper preserves this/key and lets JSON traverse
+	// relocated children without invoking the serializer result's root toJSON a second time.
+	const serializer = (value as { toJSON?: unknown }).toJSON;
+	if (typeof serializer === "function") {
+		return JSON.parse(JSON.stringify({ [key]: { toJSON: () => serializer.call(value, key) } }))[key] as T;
 	}
+	// Ordinary functions are omitted by JSON; never retain a caller function that can gain toJSON later.
+	if (typeof value === "function") return undefined as T;
 	const previous = seen.get(value);
 	if (previous) return previous as T;
 	if (Array.isArray(value)) {
 		const result: unknown[] = [];
 		seen.set(value, result);
-		for (const [index, item] of value.entries()) result.push(detachedSessionView(item, seen, String(index)));
+		for (const [index, item] of value.entries())
+			result.push(detachedSessionView(item, seen, String(index), lazyFields === false ? false : "cold"));
 		return result as T;
 	}
 	if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
-		// Preserve JSON metadata (Buffer, URL, Date, custom toJSON), including its property-key argument.
-		return JSON.parse(JSON.stringify({ [key]: value }))[key] as T;
+		// Skip a second root toJSON lookup after the captured non-callable serializer.
+		return JSON.parse(JSON.stringify({ [key]: { toJSON: () => value } }))[key] as T;
 	}
 	// Preserve byte locations and cold markers, not aliases to resident values or lazy read caches.
-	const result = isColdEntry(value)
-		? copyEntry(value, {})
-		: (Object.create(Object.getPrototypeOf(value)) as T & object);
+	const cold = lazyFields !== false && isColdEntry(value);
+	const result = cold ? copyEntry(value, {}) : (Object.create(Object.getPrototypeOf(value)) as T & object);
 	seen.set(value, result);
 	for (const key of Object.keys(value)) {
 		const descriptor = Object.getOwnPropertyDescriptor(value, key)!;
-		if (descriptor.get) {
+		if (descriptor.get && (cold || lazyFields === "message")) {
 			const read = descriptor.get;
+			let cached: { value: unknown } | undefined;
 			Object.defineProperty(result, key, {
 				enumerable: true,
 				configurable: true,
 				get() {
-					const detached = detachedSessionView(read.call(value), undefined, key);
-					Object.defineProperty(this, key, {
-						value: detached,
-						writable: true,
-						enumerable: true,
-						configurable: true,
-					});
-					return detached;
+					cached ??= { value: detachedSessionView(read.call(value), undefined, key, false) };
+					// Frozen/sealed snapshots keep their accessor and its private detached cache.
+					if (Object.getOwnPropertyDescriptor(this, key)?.configurable) {
+						Object.defineProperty(this, key, {
+							value: cached.value,
+							writable: true,
+							enumerable: true,
+							configurable: true,
+						});
+					}
+					return cached.value;
 				},
 				set(replacement: unknown) {
 					Object.defineProperty(this, key, {
@@ -111,7 +125,12 @@ function detachedSessionView<T>(value: T, seen = new WeakMap<object, object>(), 
 			});
 		} else {
 			Object.defineProperty(result, key, {
-				value: detachedSessionView(descriptor.value, seen, key),
+				value: detachedSessionView(
+					descriptor.get ? (key === "toJSON" ? serializer : descriptor.get.call(value)) : descriptor.value,
+					seen,
+					key,
+					lazyFields === false ? false : cold && key === "message" ? "message" : "cold",
+				),
 				writable: true,
 				enumerable: true,
 				configurable: true,
@@ -1264,6 +1283,9 @@ export class SessionManager {
 	}
 
 	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
+		// In-memory preload is host-controlled JSON history, not a new turn admission.
+		// Snapshot caller getters and nested values before migration, indexing, or revision caching.
+		if (!this.persist) entries = JSON.parse(JSON.stringify(entries)) as FileEntry[];
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 
 		if (header) {
@@ -1471,8 +1493,9 @@ export class SessionManager {
 			this.leafId = published.id;
 			return;
 		}
+		// Materialize caller getters/serializers before publication; only storage-owned views may stay lazy.
 		// Never retain caller-owned nested values (including a harness receipt record).
-		const admitted = detachedSessionView(entry);
+		const admitted = detachedSessionView(entry, undefined, "", false);
 		this.fileEntries.push(admitted);
 		this.byId.set(admitted.id, admitted);
 		this.leafId = admitted.id;
@@ -1643,6 +1666,8 @@ export class SessionManager {
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		// Choose the receipt from the same eager snapshot that will be admitted, not caller getters.
+		message = detachedSessionView(message, undefined, "message", false);
 		return this.#appendHarnessMessage(
 			message,
 			message.role === "user" || message.role === "custom"
@@ -2097,7 +2122,6 @@ export class SessionManager {
 		}
 		this.#ownedJournal?.assertActive();
 		const fromId = this.leafId ?? "root";
-		if (!this.#ownedJournal) this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),

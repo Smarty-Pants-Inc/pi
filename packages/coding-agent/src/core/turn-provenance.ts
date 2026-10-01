@@ -232,7 +232,8 @@ export function resolveHostTurnProvenance(
  */
 export function getTurnProvenance(entry: SessionEntry): TurnProvenance | undefined {
 	let record: unknown;
-	if (entry.type === "message" && entry.message.role === "user") record = entry.provenance;
+	if (entry.type === "message" && (entry.message.role === "user" || entry.message.role === "custom"))
+		record = entry.provenance;
 	else if (entry.type === "custom_message") record = entry.provenance;
 	else return undefined;
 	if (!isObject(record) || record.v !== TURN_PROVENANCE_VERSION) return undefined;

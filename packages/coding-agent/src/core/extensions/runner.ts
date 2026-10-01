@@ -1363,10 +1363,12 @@ export class ExtensionRunner {
 
 					if (handlerResult) {
 						const result = handlerResult as BeforeAgentStartEventResult;
-						if (result.message) {
+						// Read accessors once, before admitting a receipt, to keep messages and receipts aligned.
+						const message = result.message;
+						if (message) {
 							// Notify for each occurrence, even when handlers reuse the same frozen object.
 							onMessageReceived?.();
-							messages.push(result.message);
+							messages.push(message);
 						}
 						if (result.systemPrompt !== undefined) {
 							currentOptions.forceSystemPrompt = result.systemPrompt;

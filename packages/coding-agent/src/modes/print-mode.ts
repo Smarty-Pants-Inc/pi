@@ -7,6 +7,7 @@
  */
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
+import { captureHostTurnReceipt } from "../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
@@ -34,6 +35,15 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
 	let session = runtimeHost.session;
+	// All CLI inputs arrive together, before startup or any preceding model run.
+	// Use the non-editor receipt path while retaining the existing input-event source.
+	const inputs = [
+		...(initialMessage ? [{ text: initialMessage, images: initialImages }] : []),
+		...messages.map((text) => ({ text, images: undefined })),
+	].map(({ text, images }) => ({
+		text,
+		receipt: { ...captureHostTurnReceipt(session, text, "rpc"), source: "interactive" as const, images },
+	}));
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
 	let disposed = false;
@@ -130,12 +140,8 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		await rebindSession();
 
-		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
-		}
-
-		for (const message of messages) {
-			await session.prompt(message);
+		for (const input of inputs) {
+			await session.prompt(input.text, input.receipt);
 		}
 
 		if (mode === "text") {
