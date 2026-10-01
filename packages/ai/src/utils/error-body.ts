@@ -135,7 +135,7 @@ export function formatProviderError(norm: NormalizedProviderError, prefix?: stri
 }
 
 /** Diagnostic type marking a provider plan/usage limit refusal; the agent must not retry it. */
-export const PROVIDER_LIMIT_DIAGNOSTIC = "provider_limit";
+export { PROVIDER_LIMIT_DIAGNOSTIC } from "./retry.ts";
 
 /**
  * The Smarty Node gateway's plan-limit refusal: a 429 whose parsed body (`openai` SDK `error.error`) has

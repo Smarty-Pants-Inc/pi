@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -14,6 +14,57 @@ afterEach(() => {
 });
 
 describe("strict model generation", () => {
+	// Refs smarty-dev#3155: replay the pinned snapshot without network or credentials.
+	it("replays offline data with upstream corrections and without fetching catalogs", () => {
+		const fixtureRoot = mkdtempSync(join(tmpdir(), "pi-generate-offline-"));
+		temporaryRoots.push(fixtureRoot);
+		const isolatedPackageRoot = join(fixtureRoot, "package");
+		mkdirSync(isolatedPackageRoot);
+		for (const entry of ["package.json", "scripts", "src"]) {
+			cpSync(join(packageRoot, entry), join(isolatedPackageRoot, entry), { recursive: true });
+		}
+		const dataDir = join(packageRoot, "src/providers/data");
+		const models = readdirSync(dataDir)
+			.filter((name) => name.endsWith(".json") && !name.startsWith("."))
+			.flatMap((name) => {
+				const data = JSON.parse(readFileSync(join(dataDir, name), "utf8")) as Record<
+					string,
+					Record<string, unknown>
+				>;
+				return Object.values(data).flatMap((catalog) => Object.values(catalog));
+			});
+		const inputPath = join(fixtureRoot, "models.json");
+		writeFileSync(inputPath, JSON.stringify(models));
+		const preloadPath = join(fixtureRoot, "no-fetch.mjs");
+		writeFileSync(preloadPath, 'globalThis.fetch = () => { throw new Error("NETWORK_FORBIDDEN"); };\n');
+		const generatedPath = join(isolatedPackageRoot, "src/models.generated.ts");
+		const generatedBefore = readFileSync(generatedPath, "utf8");
+		const result = spawnSync(
+			process.execPath,
+			[
+				"--import",
+				pathToFileURL(preloadPath).href,
+				"scripts/generate-models.ts",
+				"--strict",
+				"--data-only",
+				"--offline-data",
+				inputPath,
+			],
+			{ cwd: isolatedPackageRoot, encoding: "utf8", timeout: 20_000 },
+		);
+		expect(result.error).toBeUndefined();
+		expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+		expect(`${result.stdout}\n${result.stderr}`).not.toContain("NETWORK_FORBIDDEN");
+		expect(readFileSync(generatedPath, "utf8")).toBe(generatedBefore);
+		const codex = JSON.parse(
+			readFileSync(join(isolatedPackageRoot, "src/providers/data/openai-codex.json"), "utf8"),
+		) as Record<string, Record<string, { id: string }>>;
+		expect(
+			Object.values(codex)
+				.flatMap((catalog) => Object.values(catalog))
+				.some((model) => model.id === "gpt-6.1-sol"),
+		).toBe(true);
+	});
 	it("omits Kimi while retaining other providers", () => {
 		const models = [
 			{ provider: "kimi-coding", id: "k3" },
