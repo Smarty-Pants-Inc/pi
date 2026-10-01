@@ -615,7 +615,8 @@ describe("AgentSession compaction characterization", () => {
 
 	it("compacts and resumes after a length stop below the desired output limit", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			// #2742: the initial input must fit; this test exercises output truncation recovery.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -941,8 +942,9 @@ describe("AgentSession compaction characterization", () => {
 			});
 			let pauseNextPreparation = false;
 			const harness = await createHarness({
-				models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
-				settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 1 } },
+				// #2742: trigger threshold compaction without requiring an over-window request.
+				models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+				settings: { compaction: { enabled: true, reserveTokens: 8_000, keepRecentTokens: 1 } },
 				extensionFactories: [
 					(pi) => {
 						pi.on("session_before_compact", async (event) => {
@@ -1325,7 +1327,8 @@ describe("AgentSession compaction characterization", () => {
 	it("compacts successful overflow responses without retrying", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
-			models: [{ id: "faux-1", contextWindow: 1, maxTokens: 100 }],
+			// #2742: a valid input can still produce provider-reported silent overflow.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -1340,9 +1343,12 @@ describe("AgentSession compaction characterization", () => {
 			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("completed answer")]);
+		seedCompactableSession(harness);
+		const completed = harness.session.messages.at(-1) as AssistantMessage;
+		completed.usage = createUsage(10_001);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await expect(harness.session.prompt("hello")).resolves.toBeUndefined();
+		await expect(sessionInternals._checkCompaction(completed)).resolves.toBe(false);
 
 		const compactionEnd = harness.eventsOfType("compaction_end").at(-1);
 		expect(compactionEnd).toMatchObject({
@@ -1350,7 +1356,7 @@ describe("AgentSession compaction characterization", () => {
 			aborted: false,
 			willRetry: false,
 		});
-		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {
