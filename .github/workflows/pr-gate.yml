@@ -23,6 +23,15 @@ jobs:
             const defaultBranch = context.payload.repository.default_branch;
             const isBotAuthor = prAuthor.endsWith('[bot]');
 
+            // ponytail: only an actor with write access can push a branch to this repository, so the
+            // contributor gate applies to pull requests from forks. This keeps every org write App
+            // (and any future one) from being auto-closed without listing each bot (smarty-dev#2177).
+            const headRepo = context.payload.pull_request.head.repo;
+            if (headRepo && headRepo.full_name === context.payload.repository.full_name) {
+              console.log(`Skipping same-repository PR from ${prAuthor}`);
+              return;
+            }
+
             if (TRUSTED_BOT_AUTHORS.has(prAuthor)) {
               console.log(`Skipping trusted bot: ${prAuthor}`);
               return;
