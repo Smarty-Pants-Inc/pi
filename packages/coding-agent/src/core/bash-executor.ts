@@ -158,5 +158,10 @@ export async function executeBashWithOperations(
 		}
 	}
 	if (tempFileError) throw tempFileError;
+	// An abort can arrive while the full-output stream is being flushed.
+	if (options?.signal?.aborted) {
+		bashResult.cancelled = true;
+		bashResult.exitCode = undefined;
+	}
 	return bashResult;
 }
