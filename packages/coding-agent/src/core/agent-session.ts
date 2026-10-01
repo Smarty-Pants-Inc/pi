@@ -835,6 +835,7 @@ export class AgentSession {
 			const entryId = this._findPersistedMessageEntryId(result);
 			return entryId ? [entryId] : [];
 		});
+		const revision = this.sessionManager.revision();
 		const boundary = await this._extensionRunner.emitBoundary(
 			{
 				type: "turn_end",
@@ -846,8 +847,11 @@ export class AgentSession {
 				outcome: this._lastActivityOutcome,
 			},
 			(entries) => this._buildBoundaryContext(entries, "turn_end"),
+			() => this._getPendingBoundaryMessages(),
 		);
-		this._commitBoundaryDrafts(boundary.entries);
+		if (boundary.entries.length > 0) this._commitBoundaryDrafts(boundary.entries);
+		// Carry captured-manager changes into agent state even if continuation is requested later.
+		else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
 		if (boundary.continue && !this._buildBoundaryContext([], "turn_end").canContinue) {
 			this._reportInvalidBoundaryContinuation("turn_end");
 			return false;
@@ -987,7 +991,10 @@ export class AgentSession {
 		drafts: SessionBoundaryDraft[],
 		boundary: "turn_end" | "agent_before_settle",
 	): BoundaryContextPreview {
-		const projection = this._createBoundaryPreviewManager(drafts).buildSessionProjection();
+		const projection =
+			drafts.length === 0
+				? this.sessionManager.buildSessionProjection()
+				: this._createBoundaryPreviewManager(drafts).buildSessionProjection();
 		const pendingMessages = this._getPendingBoundaryMessages();
 		const llmMessages = convertToLlm(projection.messages);
 		const finalRole = llmMessages[llmMessages.length - 1]?.role;
@@ -1950,11 +1957,16 @@ export class AgentSession {
 		this._isBeforeSettle = true;
 		this._abortDuringBeforeSettle = false;
 		try {
+			const revision = this.sessionManager.revision();
 			const result = await this._extensionRunner.emitBoundary(
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
 				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
+				() => this._getPendingBoundaryMessages(),
 			);
-			this._commitBoundaryDrafts(result.entries);
+			if (result.entries.length > 0) this._commitBoundaryDrafts(result.entries);
+			// Captured SDK managers can append context without proposing any drafts.
+			// Agent.continue() checks agent state before request preparation can refresh it.
+			else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
 			if (this._abortDuringBeforeSettle) return false;

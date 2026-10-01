@@ -749,8 +749,9 @@ describe("RPC prompt response semantics", () => {
 				const messageEnds = parseOutputLines(rpcIo.outputLines).filter((event) => event.type === "message_end");
 				expect(messageEnds).toHaveLength(3);
 			});
-			// Entry IDs come from live persistence, not an additional history scan.
-			expect(getEntries).toHaveBeenCalledTimes(buildSessionProjection.mock.calls.length);
+			// smarty-dev#2177: neither live IDs nor canonical projections scan the full entry array.
+			expect(buildSessionProjection).toHaveBeenCalled();
+			expect(getEntries).not.toHaveBeenCalled();
 		} finally {
 			buildSessionProjection.mockRestore();
 			getEntries.mockRestore();
