@@ -142,6 +142,14 @@ export type EditorFactory = (tui: TUI, theme: EditorTheme, keybindings: Keybindi
  * Each mode (interactive, RPC, print) provides its own implementation.
  */
 export interface ExtensionUIContext {
+	/**
+	 * Synchronous host-wide UI hold query. Undefined means no hold; otherwise returns one active reason.
+	 * TUI includes native/extension dialogs, custom interactions (including pending factories), and external editors.
+	 * RPC reports dialog while a request awaits a client response; print/JSON report undefined.
+	 * Persistent widgets, headers, footers, and the main editor are not holds. This is a snapshot, not a lock.
+	 */
+	holdState(): "dialog" | "custom" | "editor" | undefined;
+
 	/** Show a selector and return the user's choice. */
 	select(title: string, options: string[], opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
 
