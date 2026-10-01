@@ -26,7 +26,14 @@ import {
 	type PrepareNextTurnContext,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, getCurrentSystemMessage, type RetryPolicy, retryDelayMs } from "@earendil-works/pi-ai";
+import {
+	contentText,
+	getCurrentSystemMessage,
+	hasAssistantOutput,
+	isPrematureStreamError,
+	type RetryPolicy,
+	retryDelayMs,
+} from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -239,6 +246,7 @@ export type AgentSessionEvent =
 			waitMessage?: string;
 	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "auto_retry_fallback"; fromModel: string; toModel: string; attempt: number; errorMessage: string }
 	| {
 			type: "summarization_retry_scheduled";
 			attempt: number;
@@ -463,6 +471,9 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryFallbackUsed = false;
+	// Sticky per assistant request: providers may discard partial content on error.
+	private _assistantOutputObserved = false;
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
 
@@ -1130,6 +1141,17 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start" && event.message.role === "assistant") {
+			this._assistantOutputObserved = hasAssistantOutput(event.message);
+		} else if (event.type === "message_update" && event.message.role === "assistant") {
+			const update = event.assistantMessageEvent;
+			this._assistantOutputObserved ||=
+				hasAssistantOutput(event.message) ||
+				update.type.startsWith("toolcall_") ||
+				("delta" in update && update.delta.length > 0) ||
+				("content" in update && update.content.length > 0);
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1242,12 +1264,12 @@ export class AgentSession {
 		if (this._agentRunAbortRequested) return false;
 		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
 		if (!message || this._throttleWaitUsed) return false;
+		if (this._assistantOutputObserved || hasAssistantOutput(message)) return false;
 		if (throttledLimitWait(message)) return true;
-		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
-			return false;
-		}
-		return this._isRetryableError(message);
+		const settings = this._getRetrySettings(message);
+		if (!settings.enabled || !this._isRetryableError(message)) return false;
+		if (this._retryFallbackUsed && this._retryAttempt > 0) return false;
+		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
 
 	private _findPersistedMessageEntryId(message: AgentMessage): string | undefined {
@@ -1832,6 +1854,7 @@ export class AgentSession {
 		this._lastActivityOutcome = "completed";
 		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
+		this._retryFallbackUsed = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -1906,7 +1929,10 @@ export class AgentSession {
 		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
 		const throttleWaitUsed = this._throttleWaitUsed;
 		this._throttleWaitUsed = false;
-		const throttleWait = throttleWaitUsed ? undefined : throttledLimitWait(message);
+		const throttleWait =
+			throttleWaitUsed || this._assistantOutputObserved || hasAssistantOutput(message)
+				? undefined
+				: throttledLimitWait(message);
 		let retrying: boolean;
 		if (throttleWait) {
 			this._retryAttempt++;
@@ -4387,6 +4413,8 @@ export class AgentSession {
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
+		// Never restart a request once output or a tool call has been streamed.
+		if (this._assistantOutputObserved) return false;
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
 		return isRetryableAssistantError(message);
@@ -4443,8 +4471,8 @@ export class AgentSession {
 	 * @returns true if the caller should continue the agent, false otherwise
 	 */
 	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
-		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled) {
+		const settings = this._getRetrySettings(message);
+		if (!settings.enabled || (this._retryFallbackUsed && this._retryAttempt > 0)) {
 			return false;
 		}
 
@@ -4453,10 +4481,75 @@ export class AgentSession {
 		if (this._retryAttempt > settings.maxRetries) {
 			// Preserve the completed attempt count so post-run handling can emit the final failure.
 			this._retryAttempt--;
-			return false;
+			try {
+				return await this._prepareRetryFallback(message);
+			} catch (error) {
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this._retryAttempt,
+					finalError: error instanceof Error ? error.message : String(error),
+				});
+				this._retryAttempt = 0;
+				throw error;
+			}
 		}
 
 		return this._waitAndRetry(message, retryDelayMs(settings, this._retryAttempt), settings.maxRetries);
+	}
+
+	private _getRetrySettings(message: AssistantMessage): RetryPolicy {
+		const settings = this.settingsManager.getRetrySettings();
+		// A dropped stream gets at most two retries, even with a larger ordinary retry budget.
+		return isPrematureStreamError(message) ? { ...settings, maxRetries: Math.min(2, settings.maxRetries) } : settings;
+	}
+
+	private _getRetryFallbackModel(): Model<string> | undefined {
+		const reference = this.settingsManager.getRetryFallbackModel();
+		// Sealed owner runtimes authorize one provider identity; alternates require fresh receiving.
+		if (!reference || this._retryFallbackUsed || this.#ordinaryOwner) return undefined;
+		const slash = reference.indexOf("/");
+		if (slash <= 0) return undefined;
+		const model = this._modelRuntime.getModel(reference.slice(0, slash), reference.slice(slash + 1));
+		if (!model || modelsAreEqual(model, this.model) || !this._modelRuntime.hasConfiguredAuth(model.provider))
+			return undefined;
+		return model;
+	}
+
+	private async _prepareRetryFallback(message: AssistantMessage): Promise<boolean> {
+		if (this.#ordinaryOwner && this.settingsManager.getRetryFallbackModel()) {
+			throw new Error(
+				"Retry fallback refused: owned runtime pins provider identity; a fresh owner allocation is required.",
+			);
+		}
+		const model = this._getRetryFallbackModel();
+		const previousModel = this.model;
+		if (!model || !previousModel || this._agentRunAbortRequested) return false;
+		const event = {
+			type: "auto_retry_fallback",
+			fromModel: `${previousModel.provider}/${previousModel.id}`,
+			toModel: `${model.provider}/${model.id}`,
+			attempt: this._retryAttempt,
+			errorMessage: message.errorMessage || "Unknown error",
+		} as const;
+		// Reuse context admission and thinking-level clamping, but do not change global defaults
+		// or drain queued input during this post-run recovery. Oversized targets are refused.
+		await this._compactForModelSwitch(model, () => {
+			if (this._agentRunAbortRequested) return;
+			this._omitRecoveryAttempt(message);
+			this.agent.state.model = model;
+			this.sessionManager.appendModelChange(model.provider, model.id);
+			this.setThinkingLevel(this._getThinkingLevelForModelSwitch(model));
+			this._retryFallbackUsed = true;
+			const entryId = this.sessionManager.appendCustomEntry(event.type, event);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+			this._emit(event);
+		});
+		if (!this._retryFallbackUsed) return false;
+		await this._emitModelSelect(model, previousModel, "set");
+		// Retain the exhausted retry count: the alternate gets one attempt, not a fresh budget.
+		return !this._agentRunAbortRequested;
 	}
 
 	/**

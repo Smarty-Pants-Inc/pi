@@ -11,6 +11,7 @@ import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
+import { writeRetryNotice } from "./retry-notice.ts";
 
 /**
  * Options for print mode.
@@ -106,10 +107,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
+			writeRetryNotice(event);
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
-			} else if (event.type === "auto_retry_start" && event.waitMessage !== undefined) {
-				console.error(`Waiting ${Math.ceil(event.delayMs / 1000)}s: ${event.waitMessage}`);
 			}
 		});
 		unsubscribeBackpressure =

@@ -28,6 +28,7 @@ import {
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
+import { writeRetryNotice } from "../retry-notice.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
 	RpcCommand,
@@ -467,6 +468,7 @@ export async function runRpcMode(
 
 		session.startMessageEntryIdCapture();
 		unsubscribe = session.subscribe((event) => {
+			writeRetryNotice(event);
 			const eventSession = session;
 			const writeEvent = (entryId?: string) => {
 				writeRawStdout(
