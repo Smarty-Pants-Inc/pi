@@ -9,7 +9,9 @@
 import { randomUUID } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, sep } from "node:path";
+import { dirname, isAbsolute, join, sep } from "node:path";
+import { spawnProcessSync } from "../utils/child-process.ts";
+import { parseGitUrl } from "../utils/git.ts";
 import { isLocalPath, normalizePath, resolvePath } from "../utils/paths.ts";
 import { isExtensionModuleCurrent, type LoadedModuleIdentity } from "./extensions/module-identity.ts";
 import type { SessionEntry } from "./session-manager.ts";
@@ -112,6 +114,40 @@ export function finalizeExtensionTurnProvenanceCaller(
 		(extension.resolvedPath.startsWith("<")
 			? extension.resolvedPath
 			: (existingIdentity(extension.resolvedPath) ?? ""));
+	const git = sourceInfo.origin === "package" ? parseGitUrl(sourceInfo.source) : null;
+	if (git) {
+		// Git caches share a checkout across refs. A requested source is not authority unless
+		// the evaluated module belongs to that checkout and HEAD matches the resolved ref.
+		let verified = false;
+		try {
+			const root = sourceInfo.baseDir && existingIdentity(sourceInfo.baseDir);
+			if (loaded && root && loaded.path.startsWith(`${root}${sep}`) && statSync(join(root, ".git")).isDirectory()) {
+				const commits = ["HEAD", git.ref ?? "origin/HEAD"].map((ref) => {
+					const result = spawnProcessSync(
+						"git",
+						["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`],
+						{
+							cwd: root,
+							encoding: "utf8",
+							stdio: "pipe",
+							timeout: 10_000,
+						},
+					);
+					const commit = result.stdout?.trim();
+					return result.status === 0 &&
+						!result.error &&
+						!result.stderr?.trim() &&
+						/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit ?? "")
+						? commit
+						: undefined;
+				});
+				verified = commits[0] !== undefined && commits[0] === commits[1];
+			}
+		} catch {
+			// An absent checkout/ref or unavailable Git cannot establish a source grant.
+		}
+		if (!verified) sourceInfo.source = resolvedPath;
+	}
 	if (sourceInfo.origin === "package" && isLocalPath(sourceInfo.source)) {
 		// A local file grant names only the evaluated file. A package-directory grant also requires
 		// that file to be inside the real package root, never a manifest/symlink escape.
