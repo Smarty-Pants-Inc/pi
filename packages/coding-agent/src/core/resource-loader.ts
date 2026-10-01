@@ -824,7 +824,13 @@ export class DefaultResourceLoader implements ResourceLoader {
 			extension.sourceInfo =
 				this.findSourceInfoForPath(extension.path, undefined, metadataByPath) ??
 				this.getDefaultSourceInfoForPath(extension.path);
-			finalizeExtensionTurnProvenanceCaller(extension);
+			const packageBaseDir =
+				extension.sourceInfo.scope === "user"
+					? this.agentDir
+					: extension.sourceInfo.scope === "project"
+						? join(this.cwd, CONFIG_DIR_NAME)
+						: this.cwd;
+			finalizeExtensionTurnProvenanceCaller(extension, packageBaseDir);
 			for (const command of extension.commands.values()) {
 				command.sourceInfo = { ...extension.sourceInfo };
 			}

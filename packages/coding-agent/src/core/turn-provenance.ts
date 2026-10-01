@@ -7,6 +7,10 @@
  * Message text never sets it, and nothing rewrites it later.
  */
 import { randomUUID } from "node:crypto";
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, sep } from "node:path";
+import { canonicalizePath, isLocalPath, normalizePath, resolvePath } from "../utils/paths.ts";
 import type { SessionEntry } from "./session-manager.ts";
 import type { SourceInfo } from "./source-info.ts";
 
@@ -65,8 +69,9 @@ export type TurnProvenanceClaim =
 /**
  * Extensions trusted per claim channel. Read from global settings only: a project's settings must not grant
  * an extension the right to speak for a principal. Each item matches an extension's resolved path (or its
- * package source) exactly; an item ending in `/` matches everything under that directory, for example the
- * smarty-voice release root, whose release directories the installer names by commit and verifies.
+ * package source) exactly. Local paths are resolved and symlinks followed before matching; npm/git sources
+ * match exactly without filesystem normalization. An item ending in `/` matches everything under that
+ * directory, for example the smarty-voice release root, whose release directories the installer verifies.
  */
 export interface TurnProvenanceTrust {
 	voiceExtensions?: string[];
@@ -83,13 +88,24 @@ export interface TurnProvenanceCaller {
 const extensionCallers = new WeakMap<TurnProvenanceCaller, TurnProvenanceCaller>();
 
 /** Host-only: finalize once, after the resource loader has assigned authoritative source metadata. */
-export function finalizeExtensionTurnProvenanceCaller(extension: TurnProvenanceCaller): void {
+export function finalizeExtensionTurnProvenanceCaller(
+	extension: TurnProvenanceCaller,
+	localPackageBaseDir?: string,
+): void {
 	if (extensionCallers.has(extension)) return;
+	const sourceInfo = { ...extension.sourceInfo };
+	if (sourceInfo.origin === "package" && isLocalPath(sourceInfo.source)) {
+		// Keep the configured spelling for inspection, never for attribution. The default loader knows
+		// the package's scope base; a custom loader without one can only use an absolute source or file.
+		sourceInfo.source = localPackageBaseDir
+			? normalizeIdentity(sourceInfo.source, localPackageBaseDir)
+			: extensionIdentity(extension);
+	}
 	extensionCallers.set(
 		extension,
 		Object.freeze({
-			resolvedPath: extension.resolvedPath,
-			sourceInfo: Object.freeze({ ...extension.sourceInfo }),
+			resolvedPath: normalizeIdentity(extension.resolvedPath),
+			sourceInfo: Object.freeze(sourceInfo),
 		}),
 	);
 }
@@ -154,18 +170,55 @@ function stamp(fields: Omit<TurnProvenance, "v" | "turnId" | "receivedAt">, rece
 	return Object.freeze({ v: 1, turnId: randomUUID(), receivedAt, ...fields });
 }
 
-/** Identity of an extension for trust: its package source when installed as a package, else its resolved path. */
+function normalizeIdentity(identity: string, baseDir?: string): string {
+	if (identity.startsWith("<") || !isLocalPath(identity)) return identity;
+	// Let realpath restore filesystem spelling, not blanket case-folding: even Windows can have
+	// case-sensitive directories, whose distinct files must not share attribution authority.
+	return canonicalizePath(resolvePath(identity, baseDir, { trim: true, homeDir: process.env.HOME || homedir() }));
+}
+
+function samePath(left: string, right: string): boolean {
+	if (left === right) return true;
+	if (left.toLowerCase() !== right.toLowerCase()) return false;
+	// realpath need not correct case on case-insensitive volumes. Accept a case alias only when
+	// the filesystem confirms it is the same object, not a distinct case-sensitive file/directory.
+	try {
+		const a = statSync(left, { bigint: true });
+		const b = statSync(right, { bigint: true });
+		return a.ino !== 0n && a.dev === b.dev && a.ino === b.ino;
+	} catch {
+		return false;
+	}
+}
+
+/** Package identity or resolved file, never an unresolved local package spelling. */
 export function extensionIdentity(caller: TurnProvenanceCaller): string {
-	return caller.sourceInfo.origin === "package" ? caller.sourceInfo.source : caller.resolvedPath;
+	if (caller.sourceInfo.origin === "package") {
+		const source = caller.sourceInfo.source;
+		if (!isLocalPath(source)) return source;
+		if (isAbsolute(normalizePath(source))) return normalizeIdentity(source);
+	}
+	return normalizeIdentity(caller.resolvedPath);
 }
 
 function trusts(allowed: unknown, caller: TurnProvenanceCaller): boolean {
 	// A project-scoped extension comes from the checked-out repository, not from the user.
 	if (caller.sourceInfo.scope === "project" || !Array.isArray(allowed)) return false;
-	return [extensionIdentity(caller), caller.resolvedPath].some((id) =>
-		allowed.some(
-			(item) => typeof item === "string" && item !== "" && (item.endsWith("/") ? id.startsWith(item) : id === item),
-		),
+	return [extensionIdentity(caller), normalizeIdentity(caller.resolvedPath)].some((id) =>
+		allowed.some((item) => {
+			if (typeof item !== "string" || item.trim() === "") return false;
+			if (!isLocalPath(item) || item.startsWith("<")) return id === item;
+			const path = normalizeIdentity(item);
+			const directory = item.endsWith("/") || (process.platform === "win32" && item.endsWith("\\"));
+			if (!directory) return samePath(id, path);
+			if (id.startsWith(path.endsWith(sep) ? path : `${path}${sep}`)) return true;
+			if (!isLocalPath(id) || id.startsWith("<")) return false;
+			// Match directory case aliases at an actual ancestor, keeping sibling prefixes out.
+			for (let parent = dirname(id); ; parent = dirname(parent)) {
+				if (samePath(parent, path)) return true;
+				if (parent === dirname(parent)) return false;
+			}
+		}),
 	);
 }
 
