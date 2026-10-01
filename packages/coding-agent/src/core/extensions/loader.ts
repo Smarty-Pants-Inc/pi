@@ -3,8 +3,9 @@
  *
  */
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import { createRequire } from "node:module";
+import { builtinModules, createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Provider } from "@earendil-works/pi-ai";
@@ -556,10 +557,91 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		resolutionOptions.virtualModules = virtualModules;
 		resolutionOptions.alias = alias;
 	}
+	// Keep evaluation-time identities for every transformed implementation, not just the entry.
+	// Native/unobserved dependency implementations may still load, but cannot establish a Git grant.
+	const modules = new Map<string, LoadedModuleIdentity>([[identity.path, identity]]);
+	const imports = new Set<string>();
+	const hostModules = new Set(Object.keys(resolutionOptions.virtualModules ?? {}));
+	let unverifiable = false;
+	const observerId = `pi:module-identity/${randomUUID()}`;
+	const observeImport = (specifier: unknown, resolve: () => string) => {
+		if (typeof specifier !== "string") {
+			unverifiable = true;
+			return;
+		}
+		if (hostModules.has(specifier)) return;
+		if (specifier === "node:module" || specifier === "module") unverifiable = true;
+		if (specifier.startsWith("node:") || builtinModules.includes(specifier)) return;
+		try {
+			const resolved = resolve();
+			imports.add(fs.realpathSync(resolved.startsWith("file:") ? fileURLToPath(resolved) : resolved));
+		} catch {
+			unverifiable = true;
+		}
+	};
 	const jiti = createJitiImpl(import.meta.url, {
 		fsCache: false,
 		moduleCache: false,
 		...resolutionOptions,
+		virtualModules: { ...resolutionOptions.virtualModules, [observerId]: observeImport },
+		// A native module cache is not evidence of the bytes evaluated in this load.
+		tryNative: false,
+	});
+	// Wrap this instance's installed transformer, preserving its lazy/static runtime selection.
+	const transform = jiti.options.transform!;
+	jiti.options.transform = (options) => {
+		try {
+			if (!options.filename) throw new Error("Missing implementation filename");
+			const captured =
+				options.filename === identity.path ? { identity, source } : readExtensionModule(options.filename);
+			if (captured.source !== options.source) throw new Error("Implementation changed before evaluation");
+			modules.set(captured.identity.path, captured.identity);
+		} catch {
+			unverifiable = true;
+		}
+		// Reuse Jiti's installed transformer. The prelude observes actual requires/imports,
+		// including deferred imports, without guessing dependencies from source text.
+		const transformed = transform(options);
+		return {
+			...transformed,
+			code: `{
+				const observe = require(${JSON.stringify(observerId)});
+				const originalRequire = require;
+				const originalImport = jitiImport;
+				require = Object.assign(function(id) {
+					observe(id, () => originalRequire.resolve(id));
+					return originalRequire(id);
+				}, originalRequire);
+				jitiImport = function(id, ...args) {
+					observe(id, () => jitiESMResolve(id));
+					return originalImport(id, ...args);
+				};
+				require.import = jitiImport;
+				// Introspection remains usable, but exposing evaluator controls cannot manufacture
+				// private evaluated-byte evidence. This revocation is irreversible for this load.
+				for (const key of ["options", "transform", "evalModule", "cache", "extensions"]) {
+					Object.defineProperty(require, key, {
+						configurable: true,
+						get() { observe(undefined); return originalRequire[key]; },
+						set(value) { observe(undefined); originalRequire[key] = value; }
+					});
+				}
+				module.require = require;
+			}\n${transformed.code.replace(/^#!/, "//")}`,
+		};
+	};
+	const implementation = Object.freeze({
+		isCurrent: () => [...modules.values()].every(isExtensionModuleCurrent),
+		isGitCurrent: (root: string, endpoint: string, commit: string) =>
+			!unverifiable &&
+			[...imports].every((file) => modules.has(file)) &&
+			[...modules.values()].every(
+				(module) =>
+					module.git?.root === root &&
+					module.git.endpoint === endpoint &&
+					module.git.commit === commit &&
+					isExtensionModuleCurrent(module),
+			),
 	});
 
 	if (!isExtensionModuleCurrent(identity)) throw new Error(`Extension changed before evaluation: ${extensionPath}`);
@@ -572,7 +654,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 	if (typeof factory !== "function") {
 		return undefined;
 	}
-	const loaded = { factory: factory as ExtensionFactory, identity };
+	const loaded = { factory: factory as ExtensionFactory, identity: Object.freeze({ ...identity, implementation }) };
 	if (isCurrentCacheToken(cacheToken)) {
 		extensionCache.set(extensionPath, loaded);
 	}

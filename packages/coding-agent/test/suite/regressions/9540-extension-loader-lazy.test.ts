@@ -1,13 +1,15 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { JitiOptions } from "jiti";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
 	jitiModuleLoads: 0,
 	jitiStaticModuleLoads: 0,
 	virtualModulesLoads: 0,
-	createJiti: vi.fn((_id: unknown, _options: unknown) => ({
+	createJiti: vi.fn((_id: unknown, options: JitiOptions) => ({
+		options: { ...options, transform: (input: { source: string }) => ({ code: input.source }) },
 		evalModule: vi.fn(async () => ({ default: () => {} })),
 	})),
 }));
@@ -63,7 +65,8 @@ describe("extension loader lazy imports", () => {
 		expect(state.createJiti).toHaveBeenCalledOnce();
 
 		const options = state.createJiti.mock.calls[0][1] as JitiOptionsProbe;
-		expect(options.tryNative).toBeUndefined();
+		// pi#95 security R5: never treat a native module cache as evaluated-byte evidence.
+		expect(options.tryNative).toBe(false);
 		expect(options.tsconfigPaths).toBe(true);
 		expect(options.alias).toBeUndefined();
 		expect(options.virtualModules).toBeDefined();

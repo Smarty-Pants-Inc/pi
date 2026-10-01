@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { JitiOptions } from "jiti";
 import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => {
@@ -14,7 +15,8 @@ const state = vi.hoisted(() => {
 		originalGetBuiltinModule,
 		jitiModuleLoads: 0,
 		virtualModulesLoads: 0,
-		createJiti: vi.fn((_id: unknown, _options: unknown) => ({
+		createJiti: vi.fn((_id: unknown, options: JitiOptions) => ({
+			options: { ...options, transform: (input: { source: string }) => ({ code: input.source }) },
 			evalModule: vi.fn(async () => ({ default: () => {} })),
 		})),
 	};
@@ -40,6 +42,7 @@ import { loadExtensions } from "../../../src/core/extensions/loader.ts";
 interface JitiOptionsProbe {
 	alias?: unknown;
 	tryNative?: boolean;
+	tsconfigPaths?: boolean;
 	virtualModules?: Record<string, unknown>;
 }
 
@@ -74,9 +77,10 @@ describe("Node SEA extension loading", () => {
 		expect(state.createJiti).toHaveBeenCalledOnce();
 
 		const options = state.createJiti.mock.calls[0][1] as JitiOptionsProbe;
-		// Source TypeScript also uses virtual modules, so tryNative: false is what
-		// proves the compiled-binary branch took precedence over the source branch.
+		// Both runtimes now disable native-first loading. SEA still uses the static loader
+		// and embedded modules, without the source runtime's tsconfig path resolution.
 		expect(options.tryNative).toBe(false);
+		expect(options.tsconfigPaths).toBeUndefined();
 		expect(options.alias).toBeUndefined();
 		expect(options.virtualModules?.typebox).toBeDefined();
 		expect(options.virtualModules?.["@earendil-works/pi-coding-agent"]).toBeDefined();

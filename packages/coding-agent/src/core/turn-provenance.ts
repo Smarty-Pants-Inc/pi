@@ -13,7 +13,11 @@ import { dirname, isAbsolute, join, sep } from "node:path";
 import { spawnProcessSync } from "../utils/child-process.ts";
 import { parseGitUrl } from "../utils/git.ts";
 import { isLocalPath, normalizePath, resolvePath } from "../utils/paths.ts";
-import { isExtensionModuleCurrent, type LoadedModuleIdentity } from "./extensions/module-identity.ts";
+import {
+	isExtensionModuleCurrent,
+	type LoadedModuleIdentity,
+	normalizeGitEndpoint,
+} from "./extensions/module-identity.ts";
 import type { SessionEntry } from "./session-manager.ts";
 import type { SourceInfo } from "./source-info.ts";
 
@@ -73,8 +77,10 @@ export type TurnProvenanceClaim =
  * Extensions trusted per claim channel. Read from global settings only: a project's settings must not grant
  * an extension the right to speak for a principal. Each item matches an extension's resolved path (or its
  * package source) exactly. Local paths are resolved and symlinks followed before matching; npm/git sources
- * match exactly without filesystem normalization. An item ending in `/` matches everything under that
- * directory, for example the smarty-voice release root, whose release directories the installer verifies.
+ * match exactly without filesystem normalization. Git source grants additionally require the recorded
+ * endpoint/ref and tracked blobs of the evaluated implementation graph. Native/unverifiable dependencies
+ * refuse the source grant, not loading or explicit file-path trust. An item ending in `/` matches everything
+ * under that directory, for example the smarty-voice release root, whose release directories the installer verifies.
  */
 export interface TurnProvenanceTrust {
 	voiceExtensions?: string[];
@@ -121,7 +127,13 @@ export function finalizeExtensionTurnProvenanceCaller(
 		let verified = false;
 		try {
 			const root = sourceInfo.baseDir && existingIdentity(sourceInfo.baseDir);
-			if (loaded && root && loaded.path.startsWith(`${root}${sep}`) && statSync(join(root, ".git")).isDirectory()) {
+			if (
+				loaded?.git &&
+				root &&
+				loaded.git.root === root &&
+				loaded.path.startsWith(`${root}${sep}`) &&
+				statSync(join(root, ".git")).isDirectory()
+			) {
 				// Read the URL recorded by clone, not `remote get-url`, which applies insteadOf rewrites.
 				const origin = spawnProcessSync("git", ["config", "--local", "--null", "--get-all", "remote.origin.url"], {
 					cwd: root,
@@ -157,7 +169,13 @@ export function finalizeExtensionTurnProvenanceCaller(
 						? commit
 						: undefined;
 				});
-				verified = originVerified && commits[0] !== undefined && commits[0] === commits[1];
+				verified =
+					originVerified &&
+					commits[0] !== undefined &&
+					commits[0] === commits[1] &&
+					loaded.git.endpoint === endpoint &&
+					loaded.git.commit === commits[0] &&
+					loaded.implementation?.isGitCurrent(root, endpoint!, commits[0]) === true;
 			}
 		} catch {
 			// An absent/mismatched endpoint, checkout/ref or unavailable Git cannot establish a source grant.
@@ -188,19 +206,6 @@ export function finalizeExtensionTurnProvenanceCaller(
 	});
 	if (loaded) loadedModules.set(caller, loaded);
 	extensionCallers.set(extension, caller);
-}
-
-// Preserve protocol, credentials, port and the complete repository path. Do not collapse endpoints
-// using the cache's host/path parser or strip .git: distinct servers may serve distinct paths.
-function normalizeGitEndpoint(endpoint: string | undefined): string | undefined {
-	if (!endpoint || /\s/.test(endpoint)) return undefined;
-	if (/^git@[^:]+:[^/].+/.test(endpoint)) return endpoint;
-	try {
-		const url = new URL(endpoint);
-		return ["https:", "http:", "ssh:", "git:"].includes(url.protocol) && url.hostname ? url.href : undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 /** Host-only: an unfinalized extension has no admission identity and its claims fail closed. */
@@ -301,22 +306,30 @@ function trusts(allowed: unknown, caller: TurnProvenanceCaller): boolean {
 	if (caller.sourceInfo.scope === "project" || !Array.isArray(allowed)) return false;
 	const loaded = loadedModules.get(caller);
 	if (loaded && !isExtensionModuleCurrent(loaded)) return false;
-	return [extensionIdentity(caller), caller.resolvedPath].some((id) =>
-		allowed.some((item) => {
-			if (typeof item !== "string" || item.trim() === "") return false;
-			if (!isLocalPath(item) || item.startsWith("<")) return id === item;
-			const path = existingIdentity(item);
-			if (!path) return false;
-			const directory = item.endsWith("/") || (process.platform === "win32" && item.endsWith("\\"));
-			if (!directory) return samePath(id, path);
-			if (id.startsWith(path.endsWith(sep) ? path : `${path}${sep}`)) return true;
-			if (!isLocalPath(id) || id.startsWith("<")) return false;
-			// Match directory case aliases at an actual ancestor, keeping sibling prefixes out.
-			for (let parent = dirname(id); ; parent = dirname(parent)) {
-				if (samePath(parent, path)) return true;
-				if (parent === dirname(parent)) return false;
-			}
-		}),
+	// Deferred imports can enlarge the evaluated graph after finalization. Never retain a source
+	// grant when those new implementation bytes are untracked, native/unobserved or from another revision.
+	const source = extensionIdentity(caller);
+	const sourceCurrent =
+		!parseGitUrl(source) ||
+		(loaded?.git && loaded.implementation?.isGitCurrent(loaded.git.root, loaded.git.endpoint, loaded.git.commit));
+	return [source, caller.resolvedPath].some(
+		(id) =>
+			(id !== source || sourceCurrent) &&
+			allowed.some((item) => {
+				if (typeof item !== "string" || item.trim() === "") return false;
+				if (!isLocalPath(item) || item.startsWith("<")) return id === item;
+				const path = existingIdentity(item);
+				if (!path) return false;
+				const directory = item.endsWith("/") || (process.platform === "win32" && item.endsWith("\\"));
+				if (!directory) return samePath(id, path);
+				if (id.startsWith(path.endsWith(sep) ? path : `${path}${sep}`)) return true;
+				if (!isLocalPath(id) || id.startsWith("<")) return false;
+				// Match directory case aliases at an actual ancestor, keeping sibling prefixes out.
+				for (let parent = dirname(id); ; parent = dirname(parent)) {
+					if (samePath(parent, path)) return true;
+					if (parent === dirname(parent)) return false;
+				}
+			}),
 	);
 }
 
