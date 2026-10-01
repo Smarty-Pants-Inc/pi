@@ -25,6 +25,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
@@ -544,6 +545,8 @@ export class AgentSession {
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	/** Created on the first `ctx.executeTool()` call. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
+	/** Retains parent attribution when SDK hosts wrap the public tool hooks. */
+	private readonly _nestedToolCallParents = new WeakMap<AgentToolCall, string>();
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -726,8 +729,10 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
-		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.beforeToolCall = (context) =>
+			this._beforeToolCall(context, this._nestedToolCallParents.get(context.toolCall));
+		this.agent.afterToolCall = (context) =>
+			this._afterToolCall(context, this._nestedToolCallParents.get(context.toolCall));
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -824,12 +829,13 @@ export class AgentSession {
 						isError: true,
 					});
 				}
+				this._nestedToolCallParents.set(toolCall, parentId);
 				return runToolCall(toolCall, {
 					tools: this._getCallableTools(),
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
-					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
-					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					beforeToolCall: async (context, signal) => this.agent.beforeToolCall?.(context, signal),
+					afterToolCall: async (context, signal) => this.agent.afterToolCall?.(context, signal),
 					signal,
 					onUpdate,
 				});
