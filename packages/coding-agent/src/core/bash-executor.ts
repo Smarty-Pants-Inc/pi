@@ -10,6 +10,7 @@ import { randomBytes } from "node:crypto";
 import { createWriteStream, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import { stripAnsi } from "../utils/ansi.ts";
 import { sanitizeBinaryOutput } from "../utils/shell.ts";
 import type { BashOperations } from "./tools/bash.ts";
@@ -59,6 +60,7 @@ export async function executeBashWithOperations(
 
 	let tempFilePath: string | undefined;
 	let tempFileStream: WriteStream | undefined;
+	let tempFileCompletion: Promise<Error | undefined> | undefined;
 	let totalBytes = 0;
 
 	const ensureTempFile = () => {
@@ -67,7 +69,12 @@ export async function executeBashWithOperations(
 		}
 		const id = randomBytes(8).toString("hex");
 		tempFilePath = join(tmpdir(), `pi-bash-${id}.log`);
-		tempFileStream = createWriteStream(tempFilePath);
+		tempFileStream = createWriteStream(tempFilePath, { flags: "wx", mode: 0o600 });
+		// Capture even early open errors, then report them after execution has been joined.
+		tempFileCompletion = finished(tempFileStream).then(
+			() => undefined,
+			(error: Error) => error,
+		);
 		for (const chunk of outputChunks) {
 			tempFileStream.write(chunk);
 		}
@@ -104,6 +111,8 @@ export async function executeBashWithOperations(
 		}
 	};
 
+	let bashResult: BashResult;
+	let tempFileError: Error | undefined;
 	try {
 		const result = await operations.exec(command, cwd, {
 			onData,
@@ -115,12 +124,9 @@ export async function executeBashWithOperations(
 		if (truncationResult.truncated) {
 			ensureTempFile();
 		}
-		if (tempFileStream) {
-			tempFileStream.end();
-		}
 		const cancelled = options?.signal?.aborted ?? false;
 
-		return {
+		bashResult = {
 			output: truncationResult.truncated ? truncationResult.content : fullOutput,
 			exitCode: cancelled ? undefined : (result.exitCode ?? undefined),
 			cancelled,
@@ -135,22 +141,22 @@ export async function executeBashWithOperations(
 			if (truncationResult.truncated) {
 				ensureTempFile();
 			}
-			if (tempFileStream) {
-				tempFileStream.end();
-			}
-			return {
+			bashResult = {
 				output: truncationResult.truncated ? truncationResult.content : fullOutput,
 				exitCode: undefined,
 				cancelled: true,
 				truncated: truncationResult.truncated,
 				fullOutputPath: tempFilePath,
 			};
+		} else {
+			throw err;
 		}
-
+	} finally {
 		if (tempFileStream) {
 			tempFileStream.end();
+			tempFileError = await tempFileCompletion;
 		}
-
-		throw err;
 	}
+	if (tempFileError) throw tempFileError;
+	return bashResult;
 }
