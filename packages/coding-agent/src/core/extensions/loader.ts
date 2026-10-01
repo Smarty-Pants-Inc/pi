@@ -588,6 +588,10 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		tryNative: false,
 	});
 	// Wrap this instance's installed transformer, preserving its lazy/static runtime selection.
+	type ProgramPath = {
+		node: { directives: unknown[] };
+		unshiftContainer(key: "body", node: unknown): void;
+	};
 	const transform = jiti.options.transform!;
 	jiti.options.transform = (options) => {
 		try {
@@ -601,10 +605,27 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		}
 		// Reuse Jiti's installed transformer. The prelude observes actual requires/imports,
 		// including deferred imports, without guessing dependencies from source text.
-		const transformed = transform(options);
-		return {
-			...transformed,
-			code: `{
+		const transformed = transform({
+			...options,
+			babel: {
+				...options.babel,
+				plugins: [
+					...(options.babel?.plugins ?? []),
+					({ template }: { template: { statement: { ast(source: string): unknown } } }) => {
+						let directives: unknown[] = [];
+						return {
+							visitor: {
+								Program(program: ProgramPath) {
+									directives = [...program.node.directives];
+								},
+							},
+							post(file: { path: ProgramPath }) {
+								// PR #95: retain source directives, not generated strictness in sloppy CJS.
+								// Insert after Babel's import hoisting, so every import is still observed.
+								file.path.node.directives = directives;
+								file.path.unshiftContainer(
+									"body",
+									template.statement.ast(`{
 				const observe = require(${JSON.stringify(observerId)});
 				const originalRequire = require;
 				const originalImport = jitiImport;
@@ -627,8 +648,15 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 					});
 				}
 				module.require = require;
-			}\n${transformed.code.replace(/^#!/, "//")}`,
-		};
+			}`),
+								);
+							},
+						};
+					},
+				],
+			},
+		});
+		return { ...transformed, code: transformed.code.replace(/^#!/, "//") };
 	};
 	const implementation = Object.freeze({
 		isCurrent: () => [...modules.values()].every(isExtensionModuleCurrent),

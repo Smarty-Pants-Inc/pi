@@ -10,6 +10,7 @@ import { randomUUID } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, sep } from "node:path";
+import { validRange } from "semver";
 import { spawnProcessSync } from "../utils/child-process.ts";
 import { parseGitUrl } from "../utils/git.ts";
 import { isLocalPath, normalizePath, resolvePath } from "../utils/paths.ts";
@@ -78,9 +79,11 @@ export type TurnProvenanceClaim =
  * an extension the right to speak for a principal. Each item matches an extension's resolved path (or its
  * package source) exactly. Local paths are resolved and symlinks followed before matching; npm/git sources
  * match exactly without filesystem normalization. Git source grants additionally require the recorded
- * endpoint/ref and tracked blobs of the evaluated implementation graph. Native/unverifiable dependencies
- * refuse the source grant, not loading or explicit file-path trust. An item ending in `/` matches everything
- * under that directory, for example the smarty-voice release root, whose release directories the installer verifies.
+ * endpoint/ref and tracked blobs of the evaluated implementation graph. Npm dist-tags (including implicit
+ * latest) cannot establish source grants: name-keyed caches do not attest the selected tag's artifact.
+ * Native/unverifiable dependencies refuse the source grant, not loading or explicit file-path trust.
+ * An item ending in `/` matches everything under that directory, for example the smarty-voice release root,
+ * whose release directories the installer verifies.
  */
 export interface TurnProvenanceTrust {
 	voiceExtensions?: string[];
@@ -120,6 +123,14 @@ export function finalizeExtensionTurnProvenanceCaller(
 		(extension.resolvedPath.startsWith("<")
 			? extension.resolvedPath
 			: (existingIdentity(extension.resolvedPath) ?? ""));
+	if (sourceInfo.origin === "package" && sourceInfo.source.startsWith("npm:")) {
+		const spec = sourceInfo.source.slice(4).trim();
+		// Match the package manager's npm spec parser, including scoped names and malformed selectors.
+		const version = spec.match(/^(@?[^@]+(?:\/[^@]+)?)(?:@(.+))?$/)?.[2];
+		// ponytail: refuse unverifiable tag authority, not loading. A shared name-keyed cache
+		// may contain another tag's artifact; only semver requests are checked by the resolver.
+		if (!version || !validRange(version)) sourceInfo.source = resolvedPath;
+	}
 	const git = sourceInfo.origin === "package" ? parseGitUrl(sourceInfo.source) : null;
 	if (git) {
 		// Git caches share a checkout across refs and endpoints (e.g. different ports).
