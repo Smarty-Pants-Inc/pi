@@ -452,6 +452,8 @@ export class AgentSession {
 	/** Admission waiters must wake before accepted triggers finish, unlike true-idle waiters. */
 	private _modelSwitchAdmissionWait: Promise<void> = Promise.resolve();
 	private _resolveModelSwitchAdmissionWait: (() => void) | undefined;
+	/** External admission waiters remain pending until dispatch or explicit retention takes ownership. */
+	private readonly _modelSwitchDispatches = new Map<CustomMessage, "steer" | "followUp" | undefined>();
 	/** Compaction hooks may await message acceptance, but must not await their enclosing switch. */
 	private readonly _compactionHookScope = new AsyncLocalStorage<boolean>();
 
@@ -1482,6 +1484,7 @@ export class AgentSession {
 			!this._isAgentRunActive &&
 			!this.isCompacting &&
 			!this._modelSwitchCompactionPending &&
+			this._modelSwitchDispatches.size === 0 &&
 			this._triggeredBehindPreflight.length === 0
 		);
 	}
@@ -2559,8 +2562,36 @@ export class AgentSession {
 					this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
 					return;
 				}
-				while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
-				return this.sendCustomMessage(appMessage, options);
+				this._modelSwitchDispatches.set(appMessage, options.deliverAs);
+				try {
+					while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+					const dispatch = async () => {
+						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
+						if (!this._modelSwitchDispatches.has(appMessage)) return;
+						const delivery = this.sendCustomMessage(appMessage, options);
+						// Re-entry synchronously transfers ownership to a run, held queue, or another switch.
+						this._modelSwitchDispatches.delete(appMessage);
+						await delivery;
+					};
+					if (this._isEmittingAgentSettled) {
+						// External callers can await delivery; unlike hooks, they do not own this settlement.
+						await new Promise<void>((resolve, reject) => {
+							this._deferredSettledActions.push(async () => {
+								try {
+									await dispatch();
+									resolve();
+								} catch (error) {
+									reject(error);
+									throw error;
+								}
+							});
+						});
+					} else await dispatch();
+				} finally {
+					this._modelSwitchDispatches.delete(appMessage);
+					this._resolveIdleWaitIfIdle();
+				}
+				return;
 			}
 			if (this._isEmittingAgentSettled) {
 				this._deferredSettledActions.push(async () => await this.sendCustomMessage(appMessage, options));
@@ -2713,6 +2744,7 @@ export class AgentSession {
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this._triggeredBehindPreflight.splice(0);
+		this._modelSwitchDispatches.clear();
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		this._resolveIdleWaitIfIdle();
@@ -2745,11 +2777,13 @@ export class AgentSession {
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_ABORTED"));
 		this.#ordinaryOwner?.stopAutomatic();
 		if (this._isAgentRunActive) this._agentRunAbortRequested = true;
+		this._retainModelSwitchDispatches();
 		this.abortRetry();
 		this.abortCompaction();
 		this.abortBranchSummary();
 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
 		this.#originalAgent.abort();
+		this._resolveIdleWaitIfIdle();
 		await this.waitForIdle();
 	}
 
@@ -2776,6 +2810,14 @@ export class AgentSession {
 			previousModel,
 			source,
 		});
+	}
+
+	private _retainModelSwitchDispatches(): void {
+		for (const [message, deliverAs] of this._modelSwitchDispatches) {
+			if (deliverAs === "followUp") this.agent.followUp(message);
+			else this.agent.steer(message);
+		}
+		this._modelSwitchDispatches.clear();
 	}
 
 	private async _compactForModelSwitch(model: Model<any>, commit: () => void): Promise<void> {
@@ -2830,7 +2872,10 @@ export class AgentSession {
 			this._modelSwitchCompactionPending = false;
 			// A refused/cancelled switch retains input without starting a continuation.
 			// Transfer even while a preflight is pending: its later cleanup must not launch these.
-			if (!committed) this._queueTriggeredBehindPreflight();
+			if (!committed) {
+				this._retainModelSwitchDispatches();
+				this._queueTriggeredBehindPreflight();
+			}
 			this._resolveModelSwitchAdmissionWait?.();
 			this._resolveModelSwitchAdmissionWait = undefined;
 			this._resolveIdleWaitIfIdle();
