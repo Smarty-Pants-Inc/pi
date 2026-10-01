@@ -421,7 +421,7 @@ export class AgentSession {
 	private readonly _promptPreflights = new Set<object>();
 	/** Input was queued behind a prompt preflight, not behind an active run. */
 	private _inputQueuedBehindPreflight = false;
-	/** Triggered custom messages sent during a prompt preflight, oldest first. */
+	/** Triggered custom messages held behind prompt preflight or switch completion hooks, oldest first. */
 	private readonly _triggeredBehindPreflight: Array<{ message: CustomMessage; deliverAs?: "steer" | "followUp" }> = [];
 	private _agentRunAbortRequested = false;
 	private _idleWaitPromise: Promise<void> | undefined;
@@ -446,6 +446,11 @@ export class AgentSession {
 	private _compactionStopOutcome: AgentActivityOutcome | undefined;
 	private _overflowRecoveryAttempted = false;
 	private _modelSwitchCompactionPending = false;
+	/** Admission waiters must wake before accepted triggers finish, unlike true-idle waiters. */
+	private _modelSwitchAdmissionWait: Promise<void> = Promise.resolve();
+	private _resolveModelSwitchAdmissionWait: (() => void) | undefined;
+	/** Completion hooks may await message acceptance, but must not await their enclosing switch. */
+	private _isEmittingSessionCompact = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -723,6 +728,7 @@ export class AgentSession {
 	private _installAgentRequestProjection(): void {
 		let requestModel = this.agent.state.model;
 		let canReproject = true;
+		let canonicalMessages: string | undefined;
 		const previousConvertToLlm = this.agent.convertToLlm;
 		this.agent.convertToLlm = async (messages) => {
 			let converted = await previousConvertToLlm(messages);
@@ -731,7 +737,17 @@ export class AgentSession {
 			try {
 				assertContextFitsWindow(converted, requestModel);
 			} catch (error) {
-				if (!canReproject || !this.settingsManager.getCompactionSettings(requestModel).enabled) throw error;
+				// Only the known stateless converter and unchanged canonical input can be
+				// rebuilt safely. Context hooks and SDK converters may consume one-shot
+				// input; replaying them after compaction can silently lose that input.
+				if (
+					!canReproject ||
+					previousConvertToLlm !== convertToLlm ||
+					canonicalMessages === undefined ||
+					canonicalMessages !== snapshotMessages(messages) ||
+					!this.settingsManager.getCompactionSettings(requestModel).enabled
+				)
+					throw error;
 				this.#ordinaryOwner?.assertNativeTokenReservation();
 				const revision = this.sessionManager.revision();
 				const outcome = await this._runAutoCompaction("overflow", false);
@@ -743,10 +759,9 @@ export class AgentSession {
 				}
 				if (this.sessionManager.revision() === revision) throw error;
 				const compacted = this.sessionManager.buildSessionProjection().messages;
-				const transformed = this.agent.transformContext
-					? await this.agent.transformContext(compacted, this.agent.signal)
-					: compacted;
-				converted = await previousConvertToLlm(transformed);
+				// Do not rerun request hooks. The admitted input was canonical and the
+				// built-in converter is stateless, so convert the new projection directly.
+				converted = convertToLlm(compacted);
 				assertContextFitsWindow(converted, requestModel);
 			}
 			return converted;
@@ -767,7 +782,7 @@ export class AgentSession {
 				// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 				tools: this.agent.state.tools.slice(),
 			};
-			const canonicalMessages = previousPrepareRequest ? snapshotMessages(canonicalContext.messages) : undefined;
+			canonicalMessages = snapshotMessages(canonicalContext.messages);
 			const previous = await previousPrepareRequest?.(
 				{
 					...request,
@@ -778,13 +793,12 @@ export class AgentSession {
 				signal,
 			);
 			requestModel = previous?.model ?? this.agent.state.model;
-			// ponytail: preparation is opaque. If it replaces or mutates input, refuse
-			// overflow rather than discard that input or replay a side-effectful hook.
-			// Snapshot only when a hook exists; identity alone misses in-place edits.
+			// Snapshot before preparation and context transforms. Identity alone misses
+			// in-place edits, and opaque input is safe only when the final request fits.
 			canReproject =
 				(previous?.context === undefined || previous.context === canonicalContext) &&
-				(!previousPrepareRequest ||
-					(canonicalMessages !== undefined && canonicalMessages === snapshotMessages(canonicalContext.messages)));
+				canonicalMessages !== undefined &&
+				canonicalMessages === snapshotMessages(canonicalContext.messages);
 			return {
 				...previous,
 				context: previous?.context ?? canonicalContext,
@@ -1453,7 +1467,12 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
-		return !this._isAgentRunActive && !this.isCompacting && !this._modelSwitchCompactionPending;
+		return (
+			!this._isAgentRunActive &&
+			!this.isCompacting &&
+			!this._modelSwitchCompactionPending &&
+			this._triggeredBehindPreflight.length === 0
+		);
 	}
 
 	/**
@@ -1753,7 +1772,7 @@ export class AgentSession {
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
-		while (this._modelSwitchCompactionPending) await this.waitForIdle();
+		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 		const dispatch = async (continuation = false) => {
@@ -2074,7 +2093,7 @@ export class AgentSession {
 			}
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
-			while (this._modelSwitchCompactionPending) await this.waitForIdle();
+			while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
 			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
@@ -2215,7 +2234,7 @@ export class AgentSession {
 		// A switch can also begin during before_agent_start or image normalization.
 		// Keep this prompt's admission token until its run can start, so triggered
 		// messages still queue behind it instead of acquiring a competing run.
-		while (this._modelSwitchCompactionPending) await this.waitForIdle();
+		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 		preflightResult?.(true);
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
@@ -2241,8 +2260,20 @@ export class AgentSession {
 	 * assistant message: the messages are the run's input, as they would have been without the wait.
 	 */
 	private _runTriggeredBehindPreflight(): void {
-		if (this._promptPreflights.size > 0 || this._triggeredBehindPreflight.length === 0) return;
-		if (!this.isIdle) {
+		// Keep ownership here while a switch is pending: its compaction caller discards
+		// the usual continuation decision, so moving these into agent queues would strand them.
+		if (
+			this._modelSwitchCompactionPending ||
+			this._promptPreflights.size > 0 ||
+			this._triggeredBehindPreflight.length === 0
+		)
+			return;
+		if (this._isEmittingAgentSettled) {
+			this._deferredSettledActions.push(async () => this._runTriggeredBehindPreflight());
+			return;
+		}
+		// Held triggers themselves make the session non-idle; only an existing operation owns them.
+		if (this.isStreaming || this.isCompacting) {
 			this._queueTriggeredBehindPreflight();
 			return;
 		}
@@ -2269,6 +2300,10 @@ export class AgentSession {
 			!this.isIdle
 		)
 			return;
+		if (this._isEmittingAgentSettled) {
+			this._deferredSettledActions.push(async () => this._runInputQueuedBehindPreflight());
+			return;
+		}
 		this._inputQueuedBehindPreflight = false;
 		// ponytail: Agent.continue() starts queued input only after an assistant message. Upstream
 		// rejects a queued continuation without transcript, so a failed first prompt still leaves its
@@ -2507,7 +2542,13 @@ export class AgentSession {
 			// earlier triggered message that acquired the run owns settlement; preserve
 			// this message's requested queue rather than starting another run owner.
 			if (this._modelSwitchCompactionPending) {
-				while (this._modelSwitchCompactionPending) await this.waitForIdle();
+				if (this._isEmittingSessionCompact) {
+					// The switch awaits this hook. Accept now and let successful switch
+					// cleanup dispatch, or let an admitted prompt take the requested queue.
+					this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
+					return;
+				}
+				while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 				return this.sendCustomMessage(appMessage, options);
 			}
 			if (this._isEmittingAgentSettled) {
@@ -2663,6 +2704,7 @@ export class AgentSession {
 		this._triggeredBehindPreflight.splice(0);
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
+		this._resolveIdleWaitIfIdle();
 		return { steering, followUp };
 	}
 
@@ -2752,6 +2794,10 @@ export class AgentSession {
 		// ponytail: summarize with the old model while its larger window still fits;
 		// do not persist a target that cannot safely accept the compacted context.
 		this._modelSwitchCompactionPending = true;
+		this._modelSwitchAdmissionWait = new Promise((resolve) => {
+			this._resolveModelSwitchAdmissionWait = resolve;
+		});
+		let committed = false;
 		try {
 			const outcome = await this._runAutoCompaction("threshold", false);
 			if (outcome === "failed" || outcome === "aborted") throw new Error(`Compaction ${outcome}.`);
@@ -2763,6 +2809,7 @@ export class AgentSession {
 				throw new Error("Compaction could not reduce context below 80% of the target window.");
 			// No await between the final admission check and model/transcript commit.
 			commit();
+			committed = true;
 		} catch (error) {
 			throw new Error(
 				`${refusal} ${error instanceof Error ? error.message : String(error)} Current model unchanged.`,
@@ -2770,8 +2817,23 @@ export class AgentSession {
 			);
 		} finally {
 			this._modelSwitchCompactionPending = false;
+			// A refused/cancelled switch retains input without starting a continuation.
+			// Transfer even while a preflight is pending: its later cleanup must not launch these.
+			if (!committed) this._queueTriggeredBehindPreflight();
+			this._resolveModelSwitchAdmissionWait?.();
+			this._resolveModelSwitchAdmissionWait = undefined;
 			this._resolveIdleWaitIfIdle();
 		}
+	}
+
+	/** Successful switches drain only after any enclosing settlement notifications finish. */
+	private _drainPreflightQueuesAfterModelSwitch(): void {
+		if (this._isEmittingAgentSettled) {
+			this._deferredSettledActions.push(async () => this._drainPreflightQueuesAfterModelSwitch());
+			return;
+		}
+		this._runTriggeredBehindPreflight();
+		this._runInputQueuedBehindPreflight();
 	}
 
 	/**
@@ -2801,7 +2863,7 @@ export class AgentSession {
 		});
 
 		await this._emitModelSelect(model, previousModel, "set");
-		this._runInputQueuedBehindPreflight();
+		this._drainPreflightQueuesAfterModelSwitch();
 	}
 
 	private _addPersistedDefaultToNonEmptyScope(model: Model<any>): void {
@@ -2868,7 +2930,7 @@ export class AgentSession {
 		});
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
-		this._runInputQueuedBehindPreflight();
+		this._drainPreflightQueuesAfterModelSwitch();
 
 		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
 	}
@@ -2902,7 +2964,7 @@ export class AgentSession {
 		});
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
-		this._runInputQueuedBehindPreflight();
+		this._drainPreflightQueuesAfterModelSwitch();
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
 	}
@@ -3722,16 +3784,21 @@ export class AgentSession {
 			const savedCompactionEntry = this.sessionManager.getEntry(compactionId) as CompactionEntry | undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				await raceWithAbortSignal(
-					this._extensionRunner.emit({
-						type: "session_compact",
-						compactionEntry: savedCompactionEntry,
-						fromExtension,
-						reason,
-						willRetry,
-					}),
-					signal,
-				);
+				this._isEmittingSessionCompact = true;
+				try {
+					await raceWithAbortSignal(
+						this._extensionRunner.emit({
+							type: "session_compact",
+							compactionEntry: savedCompactionEntry,
+							fromExtension,
+							reason,
+							willRetry,
+						}),
+						signal,
+					);
+				} finally {
+					this._isEmittingSessionCompact = false;
+				}
 			}
 
 			const result: CompactionResult = {
