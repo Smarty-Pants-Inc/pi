@@ -87,7 +87,8 @@ describe("pi#95 cached Git endpoint attribution", () => {
 					"file-grant",
 				] as const) {
 					const matched = phase.startsWith("matched");
-					const admitted = matched || phase === "normalized-origin" || phase === "file-grant";
+					// PR #95 R8: matching endpoints still load, but only explicit file trust admits a claim.
+					const admitted = phase === "file-grant";
 					const index = phase === "a" || phase === "matched-a" || phase === "normalized-origin" ? 0 : 1;
 					const profile = matched ? join(root, phase) : agentDir;
 					mkdirSync(profile, { recursive: true });

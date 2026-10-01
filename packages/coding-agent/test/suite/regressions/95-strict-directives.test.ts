@@ -26,6 +26,8 @@ describe("PR #95 extension directive prologues", () => {
 			strict: true,
 		},
 		{ name: "strict TypeScript", extension: "ts", prefix: '"use strict";\n', strict: true },
+		{ name: "strict ES module", extension: "mjs", prefix: '"use strict";\n', strict: true, esm: true },
+		{ name: "strict TypeScript ES module", extension: "ts", prefix: '"use strict";\n', strict: true, esm: true },
 		{ name: "sloppy CJS", extension: "cjs", prefix: "", strict: false },
 		{ name: "escaped non-strict directive", extension: "cjs", prefix: '"use\\x20strict";\n', strict: false },
 		{ name: "parenthesized non-directive", extension: "cjs", prefix: '("use strict");\n', strict: false },
@@ -38,7 +40,7 @@ describe("PR #95 extension directive prologues", () => {
 			dependent: true,
 		},
 		{ name: "sloppy dependent TypeScript helper", extension: "ts", prefix: "", strict: false, dependent: true },
-	])("$name preserves unbound function this", async ({ extension, prefix, strict, dependent }) => {
+	])("$name preserves unbound function this", async ({ extension, prefix, strict, dependent, esm }) => {
 		const root = mkdtempSync(join(tmpdir(), "pi-95-directives-"));
 		directories.push(root);
 		const entry = join(root, `extension.${extension}`);
@@ -48,7 +50,7 @@ describe("PR #95 extension directive prologues", () => {
 			`${prefix}
 function unboundThis() { return this; }
 const moduleStrict = unboundThis() === undefined;
-module.exports = function(pi) {
+${esm ? "export default" : "module.exports ="} function(pi) {
 	const factoryStrict = unboundThis() === undefined;
 	pi.on("before_agent_start", () => ({
 		message: {

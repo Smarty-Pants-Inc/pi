@@ -49,7 +49,7 @@ describe("pi#95 cached npm tag attribution", () => {
 						const spec = args[1];
 						const dir = path.join(args[args.indexOf("--prefix") + 1], "node_modules", ${JSON.stringify(name)});
 						fs.mkdirSync(dir, { recursive: true });
-						fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: ${JSON.stringify(name)}, version: "1.0.0", pi: { extensions: ["index.ts"] } }));
+						fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: ${JSON.stringify(name)}, version: spec.endsWith("@approved") ? "2.0.0" : "1.0.0", pi: { extensions: ["index.ts"] } }));
 						fs.writeFileSync(path.join(dir, "index.ts"), 'export default function(pi) { pi.events.emit("loaded-api", { api: pi, marker: ' + JSON.stringify(spec) + ' }); }');
 						fs.appendFileSync(${JSON.stringify(installs)}, JSON.stringify(spec) + "\\n");
 					} else { throw new Error("Unexpected fixture npm command: " + args); }
@@ -67,7 +67,10 @@ describe("pi#95 cached npm tag attribution", () => {
 						"file-trust",
 						"version",
 						"range",
+						"fresh-approved",
 					] as const) {
+						const profile = phase === "fresh-approved" ? join(root, "fresh-agent") : agentDir;
+						mkdirSync(profile, { recursive: true });
 						vi.stubEnv("PI_OFFLINE", phase === "offline" ? "1" : "0");
 						const version =
 							phase === "version"
@@ -93,14 +96,14 @@ describe("pi#95 cached npm tag attribution", () => {
 									? source
 									: `npm:${name}@approved`;
 						writeFileSync(
-							join(agentDir, "settings.json"),
+							join(profile, "settings.json"),
 							JSON.stringify({
 								npmCommand: [process.execPath, npm],
 								...(ingress === "global-packages" ? { packages: [source] } : {}),
 								turnProvenance: { voiceExtensions: [allowed], fabricExtensions: [allowed] },
 							}),
 						);
-						const settings = SettingsManager.create(cwd, agentDir);
+						const settings = SettingsManager.create(cwd, profile);
 						let api!: ExtensionAPI;
 						let marker: string | undefined;
 						const eventBus = createEventBus();
@@ -109,7 +112,7 @@ describe("pi#95 cached npm tag attribution", () => {
 						});
 						const loader = new DefaultResourceLoader({
 							cwd,
-							agentDir,
+							agentDir: profile,
 							settingsManager: settings,
 							eventBus,
 							noContextFiles: true,
@@ -119,9 +122,10 @@ describe("pi#95 cached npm tag attribution", () => {
 						expect(loader.getExtensions().errors).toEqual([]);
 						expect(loader.getExtensions().extensions).toHaveLength(1);
 						installedFile = loader.getExtensions().extensions[0].resolvedPath;
-						expect(marker).toBe(`${name}@unapproved`);
+						expect(marker).toBe(`${name}@${phase === "fresh-approved" ? "approved" : "unapproved"}`);
 						expect(readFileSync(installs, "utf8").trim().split("\n")).toEqual([
 							JSON.stringify(`${name}@unapproved`),
+							...(phase === "fresh-approved" ? [JSON.stringify(`${name}@approved`)] : []),
 						]);
 						const harness = await createHarness({
 							persistSession: true,
@@ -141,7 +145,8 @@ describe("pi#95 cached npm tag attribution", () => {
 						await harness.session.agent.waitForIdle();
 						const entries = harness.sessionManager.getEntries().filter((entry) => getTurnProvenance(entry));
 						const records = entries.map(getTurnProvenance);
-						const trusted = phase === "file-trust" || phase === "version" || phase === "range";
+						// PR #95 R8: even checked semver selectors do not attest complete implementation coverage.
+						const trusted = phase === "file-trust";
 						const channels = trusted ? [claim.channel, claim.channel] : ["terminal", "terminal"];
 						expect(entries.map((entry) => entry.type)).toEqual(["custom_message", "message"]);
 						expect

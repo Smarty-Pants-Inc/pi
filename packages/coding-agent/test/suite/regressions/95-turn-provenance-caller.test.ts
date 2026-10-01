@@ -56,7 +56,13 @@ async function fixture(scope: SourceInfo["scope"], trusted: boolean) {
 	for (const tool of extension.tools.values()) tool.sourceInfo = sourceInfo;
 	const harness = await createHarness({
 		resourceLoader: createTestResourceLoader({ extensionsResult: result }),
-		settings: { turnProvenance: { voiceExtensions: [TRUSTED], fabricExtensions: [TRUSTED] } },
+		// PR #95 R8: source-string grants are deliberately refused; explicit host caller paths remain valid.
+		settings: {
+			turnProvenance: {
+				voiceExtensions: [trusted ? extension.resolvedPath : TRUSTED],
+				fabricExtensions: [trusted ? extension.resolvedPath : TRUSTED],
+			},
+		},
 	});
 	harnesses.push(harness);
 	await harness.session.bindExtensions({});
@@ -102,7 +108,7 @@ describe("pi#95 immutable caller admission", () => {
 			}
 		}
 		for (const claim of claims) {
-			it(`keeps legitimate ${claim.channel} package trust after ${kind} metadata mutation`, async () => {
+			it(`keeps legitimate ${claim.channel} explicit caller trust after ${kind} metadata mutation`, async () => {
 				const { api, harness, original, extension } = await fixture("user", true);
 				Object.assign(inspect(api, kind), { scope: "project", source: "untrusted", origin: "top-level" });
 				expect(await deliver(api, harness, claim)).toEqual([claim.channel, claim.channel]);

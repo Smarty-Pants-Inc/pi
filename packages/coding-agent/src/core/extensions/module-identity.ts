@@ -30,8 +30,20 @@ function revision(stats: BigIntStats): string {
 
 // Preserve protocol, credentials, port and complete path, rather than cache host/path identifiers.
 export function normalizeGitEndpoint(endpoint: string | undefined): string | undefined {
-	if (!endpoint || /\s/.test(endpoint)) return undefined;
+	if (!endpoint || /[\s\p{Cc}]/u.test(endpoint)) return undefined;
 	if (/^git@[^:]+:[^/].+/.test(endpoint)) return endpoint;
+	if (/^ssh:/i.test(endpoint)) {
+		const path = /^ssh:\/\/[^/?#\\]+(\/[^?#]*)$/i.exec(endpoint)?.[1];
+		// ponytail: refuse ambiguous authority, not Git loading. SSH transports can resolve raw
+		// symlink/../ paths differently from WHATWG URLs. Do not guess percent-decoding rules
+		// (including repeated/alternate encodings), or merge literal paths with URL-encoded ones.
+		if (
+			!path ||
+			!/^[/A-Za-z0-9._~!$&'()*+,;=:@-]+$/.test(path) ||
+			path.split("/").some((part) => part === "." || part === "..")
+		)
+			return undefined;
+	}
 	try {
 		const url = new URL(endpoint);
 		return ["https:", "http:", "ssh:", "git:"].includes(url.protocol) && url.hostname ? url.href : undefined;

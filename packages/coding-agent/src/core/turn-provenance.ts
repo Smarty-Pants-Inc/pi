@@ -77,11 +77,10 @@ export type TurnProvenanceClaim =
 /**
  * Extensions trusted per claim channel. Read from global settings only: a project's settings must not grant
  * an extension the right to speak for a principal. Each item matches an extension's resolved path (or its
- * package source) exactly. Local paths are resolved and symlinks followed before matching; npm/git sources
- * match exactly without filesystem normalization. Git source grants additionally require the recorded
- * endpoint/ref and tracked blobs of the evaluated implementation graph. Npm dist-tags (including implicit
- * latest) cannot establish source grants: name-keyed caches do not attest the selected tag's artifact.
- * Native/unverifiable dependencies refuse the source grant, not loading or explicit file-path trust.
+ * local package path) exactly. Local paths are resolved and symlinks followed before matching. Git/npm
+ * source strings never grant authority: artifact association and a complete implementation graph cannot
+ * currently be attested, including native loading outside Jiti. Ordinary loading and explicit file/directory
+ * trust remain available. Restore Git/npm grants only with artifact + complete implementation attestation.
  * An item ending in `/` matches everything under that directory, for example the smarty-voice release root,
  * whose release directories the installer verifies.
  */
@@ -99,6 +98,8 @@ export interface TurnProvenanceCaller {
 // Admission descriptors are private, not the mutable metadata exposed by resource inspection.
 const extensionCallers = new WeakMap<TurnProvenanceCaller, TurnProvenanceCaller>();
 const loadedModules = new WeakMap<TurnProvenanceCaller, LoadedModuleIdentity>();
+const packageSources = new WeakMap<TurnProvenanceCaller, string>();
+const reportedSourceRefusals = new WeakSet<TurnProvenanceCaller>();
 
 /** Host-only: bind the evaluated module before its factory can change the filesystem. */
 export function bindExtensionTurnProvenanceModule(
@@ -216,6 +217,11 @@ export function finalizeExtensionTurnProvenanceCaller(
 		sourceInfo: Object.freeze(sourceInfo),
 	});
 	if (loaded) loadedModules.set(caller, loaded);
+	if (
+		extension.sourceInfo.origin === "package" &&
+		(!isLocalPath(extension.sourceInfo.source) || parseGitUrl(extension.sourceInfo.source))
+	)
+		packageSources.set(caller, extension.sourceInfo.source);
 	extensionCallers.set(extension, caller);
 }
 
@@ -315,14 +321,20 @@ export function extensionIdentity(caller: TurnProvenanceCaller): string {
 function trusts(allowed: unknown, caller: TurnProvenanceCaller): boolean {
 	// A project-scoped extension comes from the checked-out repository, not from the user.
 	if (caller.sourceInfo.scope === "project" || !Array.isArray(allowed)) return false;
+	const packageSource = packageSources.get(caller);
+	if (packageSource && allowed.includes(packageSource) && !reportedSourceRefusals.has(caller)) {
+		reportedSourceRefusals.add(caller);
+		process.stderr.write(
+			`Turn provenance: refused Git/npm source grant ${JSON.stringify(packageSource)}; trust its installed file/directory path (e.g. ${JSON.stringify(caller.resolvedPath)}) instead.\n`,
+		);
+	}
 	const loaded = loadedModules.get(caller);
 	if (loaded && !isExtensionModuleCurrent(loaded)) return false;
-	// Deferred imports can enlarge the evaluated graph after finalization. Never retain a source
-	// grant when those new implementation bytes are untracked, native/unobserved or from another revision.
 	const source = extensionIdentity(caller);
-	const sourceCurrent =
-		!parseGitUrl(source) ||
-		(loaded?.git && loaded.implementation?.isGitCurrent(loaded.git.root, loaded.git.endpoint, loaded.git.commit));
+	// ponytail: an observed Jiti graph is not proof of complete implementation coverage. Native
+	// acquisition can bypass it without changing loading. Restore remote grants only with artifact
+	// + complete implementation attestation; explicit evaluated-file/directory trust is separate.
+	const sourceCurrent = source === caller.resolvedPath || isAbsolute(source);
 	return [source, caller.resolvedPath].some(
 		(id) =>
 			(id !== source || sourceCurrent) &&

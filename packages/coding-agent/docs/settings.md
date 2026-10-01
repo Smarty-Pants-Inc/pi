@@ -46,7 +46,11 @@ Available built-in tools are `read`, `bash`, `powershell`, `edit`, `write`, `gre
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `sessionDir` | string | Agent session directory | Session storage directory. Relative paths resolve from the working directory. `PI_CODING_AGENT_SESSION_DIR` and `--session-dir` override this setting. |
-| `turnProvenance` | `{voiceExtensions?: string[], fabricExtensions?: string[]}` | none | Extensions trusted to claim a `voice` or `fabric` turn channel, by resolved path or package source. An item ending in `/` matches every source or path under that directory, such as a release root. Global settings only; project settings are ignored. See [Turn provenance](session-format.md#turn-provenance). |
+| `turnProvenance` | `{voiceExtensions?: string[], fabricExtensions?: string[]}` | none | Extensions trusted to claim a `voice` or `fabric` turn channel, by resolved file or local package directory path. An item ending in `/` matches paths under that directory, such as a release root. Git/npm source selectors do not grant authority, including exact refs and versions. Global settings only; project settings are ignored. See [Turn provenance](session-format.md#turn-provenance). |
+
+A refused Git/npm source grant prints a one-line diagnostic to stderr naming the package and the remedy: trust its installed file/directory path instead. Ordinary package loading is unchanged. Explicit release-directory grants remain supported. Restore Git/npm grants only with artifact + complete implementation attestation.
+
+See [Turn provenance](session-format.md#turn-provenance) for the stored record.
 
 ### Compaction
 

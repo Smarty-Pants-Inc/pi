@@ -180,7 +180,9 @@ pi.sendMessage(message, {
 });
 ```
 
-Pi accepts a claim only when it is well formed and global settings trust the calling extension for that channel (`turnProvenance.voiceExtensions` or `turnProvenance.fabricExtensions`, matched against the resolved path or package source; see [Settings](settings.md#sessions-and-context)). Project-scoped extensions and `withSession` contexts are never trusted, and no extension can claim `keyboard`. A refused claim is recorded as `terminal` with no principal; the message is still delivered. Read the record with `getTurnProvenance(entry)`. Detect support with `pi.hostCapabilities.turnProvenance === 1`; an older Pi ignores the option.
+Pi accepts a claim only when it is well formed and global settings trust the calling extension for that channel (`turnProvenance.voiceExtensions` or `turnProvenance.fabricExtensions`, matched against the resolved file or local package directory path; see [Settings](settings.md#sessions-and-context)). Project-scoped extensions and `withSession` contexts are never trusted, and no extension can claim `keyboard`. A refused claim is recorded as `terminal` with no principal; the message is still delivered. Read the record with `getTurnProvenance(entry)`. Detect support with `pi.hostCapabilities.turnProvenance === 1`; an older Pi ignores the option.
+
+Git/npm source-string grants do not confer authority, even for matching refs or semver versions. Native loading can bypass the observed module graph, and source selectors alone do not attest installed artifacts. A refused source grant prints a one-line stderr diagnostic naming the package and asking you to trust its installed file/directory path. Ordinary loading and explicit file/directory grants, including versioned release directories, still work. Restore Git/npm grants only with artifact + complete implementation attestation.
 
 <a id="state-management"></a>
 <a id="persist-state"></a>

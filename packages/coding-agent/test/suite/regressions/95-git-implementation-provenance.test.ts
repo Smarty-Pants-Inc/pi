@@ -2,7 +2,7 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -26,6 +26,7 @@ afterEach(() => {
 	while (harnesses.length) harnesses.pop()?.cleanup();
 	while (directories.length) rmSync(directories.pop()!, { recursive: true, force: true });
 	vi.unstubAllEnvs();
+	vi.restoreAllMocks();
 	clearExtensionCache();
 });
 function git(cwd: string, ...args: string[]): string {
@@ -178,7 +179,7 @@ describe("pi#95 Git implementation authority", () => {
 				loader.getExtensions().extensions.find((extension) => extension.path.endsWith("child/index.ts"))?.sourceInfo
 					.source,
 			).toBe(outer);
-			await receipt(harness, apis.get("outer")!, claim, true, "tracked outer");
+			await receipt(harness, apis.get("outer")!, claim, false, "tracked outer source grant deliberately refused");
 			await receipt(harness, apis.get("child")!, claim, false, "nested child");
 		}, 30_000);
 
@@ -237,8 +238,8 @@ describe("pi#95 Git implementation authority", () => {
 				loaded.harness,
 				loaded.apis.get("entry")!,
 				claim,
-				true,
-				"tracked entry before deferred evaluation",
+				false,
+				"tracked entry before deferred evaluation: source grant deliberately refused",
 			);
 			let marker: unknown;
 			loaded.eventBus.on("helper-loaded", (value) => {
@@ -295,6 +296,101 @@ describe("pi#95 Git implementation authority", () => {
 			const explicit = await load(cwd, agentDir);
 			await receipt(explicit.harness, explicit.apis.get("native")!, claim, true, "explicit native file grant");
 		}, 30_000);
+
+		// PR #95 R8: global builtin acquisition bypasses the Jiti observer and retains native helper A.
+		it(`global native acquisition: ${claim.channel} refuses A cached under a fresh B API`, async () => {
+			const { root, cwd, agentDir } = fixture();
+			const url = "git://127.0.0.1:19418/fixture/global-native";
+			const { repo, bare } = repository(
+				root,
+				"repo",
+				url,
+				"extensions/index.ts",
+				`const nativeRequire = process.getBuiltinModule("module").createRequire(import.meta.url);
+				export default nativeRequire("../lib/factory.cjs");`,
+				0,
+			);
+			mkdirSync(join(repo, "lib"));
+			writeFileSync(
+				join(repo, "lib/factory.cjs"),
+				`module.exports = ${factory("native-A").replace("export default ", "")};`,
+			);
+			git(repo, "add", "lib/factory.cjs");
+			git(repo, "commit", "-m", "native implementation A");
+			git(repo, "branch", "revision-a");
+			writeFileSync(
+				join(repo, "lib/factory.cjs"),
+				`module.exports = ${factory("native-B").replace("export default ", "")};`,
+			);
+			git(repo, "add", "lib/factory.cjs");
+			git(repo, "commit", "-m", "native implementation B");
+			const b = git(repo, "rev-parse", "HEAD");
+			git(repo, "push", bare, "approved", "revision-a");
+			vi.stubEnv("GIT_CONFIG_COUNT", "1");
+			const sourceA = `git:${url}@revision-a`;
+			const sourceB = `git:${url}@${b}`;
+			configure(agentDir, sourceB);
+			const settings = SettingsManager.create(cwd, agentDir);
+			const manager = new DefaultPackageManager({ cwd, agentDir, settingsManager: settings });
+			await manager.installAndPersist(sourceA);
+			const installed = manager.getInstalledPath(sourceA, "user")!;
+			const first = await load(cwd, agentDir);
+			expect([...first.apis.keys()]).toEqual(["native-A"]);
+			await receipt(first.harness, first.apis.get("native-A")!, claim, false, "untrusted native A");
+			await manager.installAndPersist(sourceB);
+			expect(git(installed, "rev-parse", "HEAD")).toBe(b);
+			expect(readFileSync(join(installed, "lib/factory.cjs"), "utf8")).toContain("native-B");
+			const stderr = vi.spyOn(process.stderr, "write");
+			const second = await load(cwd, agentDir);
+			expect([...second.apis.keys()]).toEqual(["native-A"]);
+			await receipt(second.harness, second.apis.get("native-A")!, claim, false, "cached native A with fresh B API");
+			const entry = join(installed, "extensions/index.ts");
+			const diagnostics = stderr.mock.calls
+				.map(([text]) => String(text))
+				.filter((text) => text.startsWith("Turn provenance:"));
+			expect(diagnostics).toHaveLength(1);
+			expect(diagnostics[0]).toContain(JSON.stringify(sourceB));
+			expect(diagnostics[0]).toContain("trust its installed file/directory path");
+			expect(diagnostics[0]).toContain(JSON.stringify(entry));
+			expect(diagnostics[0].trimEnd().split("\n")).toHaveLength(1);
+			configure(agentDir, entry);
+			SettingsManager.create(cwd, agentDir).setPackages([sourceB]);
+			const explicit = await load(cwd, agentDir);
+			expect([...explicit.apis.keys()]).toEqual(["native-A"]);
+			await receipt(explicit.harness, explicit.apis.get("native-A")!, claim, true, "explicit evaluated entry trust");
+		}, 30_000);
+
+		// PR #95 R8: the fleet's explicit release-directory installs remain authorized, including native loading.
+		it(`explicit release-directory install: ${claim.channel} remains authorized without source-string grants`, async () => {
+			const { root, cwd, agentDir } = fixture();
+			const releases = join(root, "releases", "fabric");
+			const release = join(releases, "2026-10-01");
+			mkdirSync(join(release, "extensions"), { recursive: true });
+			mkdirSync(join(release, "lib"));
+			writeFileSync(join(release, "package.json"), JSON.stringify({ pi: { extensions: ["extensions/index.ts"] } }));
+			writeFileSync(
+				join(release, "extensions/index.ts"),
+				`const nativeRequire = process.getBuiltinModule("module").createRequire(import.meta.url); export default nativeRequire("../lib/factory.cjs");`,
+			);
+			writeFileSync(
+				join(release, "lib/factory.cjs"),
+				`module.exports = ${factory("native-release").replace("export default ", "")};`,
+			);
+			configure(agentDir, `${releases}/`);
+			const settings = SettingsManager.create(cwd, agentDir);
+			const manager = new DefaultPackageManager({ cwd, agentDir, settingsManager: settings });
+			await manager.installAndPersist(release);
+			expect(settings.getGlobalSettings().packages).toEqual([relative(agentDir, release)]);
+			const loaded = await load(cwd, agentDir);
+			expect([...loaded.apis.keys()]).toEqual(["native-release"]);
+			await receipt(
+				loaded.harness,
+				loaded.apis.get("native-release")!,
+				claim,
+				true,
+				"explicit release-directory grant",
+			);
+		});
 
 		it(`evaluator introspection: ${claim.channel} cannot manufacture native dependency evidence`, async () => {
 			const { root, cwd, agentDir } = fixture();
@@ -392,10 +488,13 @@ describe("pi#95 Git implementation authority", () => {
 				second.harness,
 				[...second.apis.values()][0],
 				claim,
-				[...second.apis.keys()][0] === "B",
-				"new loader B grant",
+				false,
+				"new loader B source grant deliberately refused",
 			);
+			// PR #95 R8: explicit evaluated-file trust, not a matching Git selector, authorizes B.
 			// Matching B uses the same cached implementation; changing its imported bytes revokes authority.
+			configure(agentDir, entry);
+			SettingsManager.create(cwd, agentDir).setPackages([sourceB]);
 			const positive = await load(cwd, agentDir);
 			expect([...positive.apis.keys()]).toEqual(["B"]);
 			await receipt(positive.harness, positive.apis.get("B")!, claim, true, "matching tracked B");

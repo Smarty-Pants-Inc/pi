@@ -145,7 +145,8 @@ describe("pi#95 cached Git ref attribution", () => {
 					await harness.session.agent.waitForIdle();
 					const entries = harness.sessionManager.getEntries().filter((entry) => getTurnProvenance(entry));
 					const records = entries.map(getTurnProvenance);
-					const channels = matched ? [claim.channel, claim.channel] : ["terminal", "terminal"];
+					// PR #95 R8: even a matching revision cannot attest unobserved native implementation.
+					const channels = ["terminal", "terminal"];
 					expect(entries.map((entry) => entry.type)).toEqual(["custom_message", "message"]);
 					expect
 						.soft(
@@ -154,15 +155,8 @@ describe("pi#95 cached Git ref attribution", () => {
 						)
 						.toEqual(channels);
 					for (const record of records) {
-						if (!matched) {
-							expect.soft(record?.principal, phase).toBeUndefined();
-							expect.soft(record?.sender, phase).toBeUndefined();
-						} else if (claim.channel === "voice") {
-							expect(record?.principal).toEqual({ id: "paul", binding: "voice-call" });
-						} else {
-							expect(record?.sender).toEqual(claim.sender);
-							expect(record?.via).toBe("steer");
-						}
+						expect.soft(record?.principal, phase).toBeUndefined();
+						expect.soft(record?.sender, phase).toBeUndefined();
 					}
 					expect(records[0]?.turnId).not.toBe(records[1]?.turnId);
 					const file = harness.sessionManager.getSessionFile()!;
