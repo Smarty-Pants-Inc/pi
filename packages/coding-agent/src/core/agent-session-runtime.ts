@@ -11,6 +11,7 @@ import type {
 	SessionStartEvent,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { InputAdmissionError } from "./input-admission.ts";
 import {
 	assertOrdinaryRuntime,
 	bindOrdinaryOptions,
@@ -95,6 +96,8 @@ export class AgentSessionRuntime {
 	readonly #owner?: OrdinaryOwnerContext;
 	#ownerDisposal?: Promise<void>;
 	private _disposed = false;
+	private lifecycleActive = false;
+	private releaseReceivingInputs?: () => void;
 
 	constructor(
 		_session: AgentSession,
@@ -121,6 +124,32 @@ export class AgentSessionRuntime {
 
 	get session(): AgentSession {
 		return this._session;
+	}
+
+	get inputsFenced(): boolean {
+		return this.lifecycleActive || this.session.inputsFenced;
+	}
+
+	private async fenceLifecycle(
+		outgoing: OutgoingSession,
+		rejectQueuedInput?: (messages: AgentMessage[]) => void,
+	): Promise<() => void> {
+		if (this.lifecycleActive)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
+		if (this._disposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "runtime is disposed");
+		this.lifecycleActive = true;
+		try {
+			const release = await outgoing.session.fenceInputs({ rejectQueuedInput });
+			return () => {
+				this.releaseReceivingInputs?.();
+				this.releaseReceivingInputs = undefined;
+				release();
+				this.lifecycleActive = false;
+			};
+		} catch (error) {
+			this.lifecycleActive = false;
+			throw error;
+		}
 	}
 
 	get cwd(): string {
@@ -235,6 +264,7 @@ export class AgentSessionRuntime {
 		const { session, services, diagnostics, modelFallbackMessage } = await this.createRuntime(Object.freeze(options));
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(session.sessionManager);
+		this.releaseReceivingInputs = await session.fenceInputs();
 		this._session = session;
 		this._services = services;
 		this._diagnostics = diagnostics;
@@ -244,11 +274,11 @@ export class AgentSessionRuntime {
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
 		const outgoing = this.#captureOutgoing();
 		if (this.rebindSession) {
-			await this.rebindSession(outgoing.session);
+			await outgoing.session.withFencedInput(() => this.rebindSession!(outgoing.session));
 			this.#assertCurrent(outgoing);
 		}
 		if (withSession) {
-			await withSession(outgoing.session.createReplacedSessionContext());
+			await outgoing.session.withFencedInput(() => withSession(outgoing.session.createReplacedSessionContext()));
 			this.#assertCurrent(outgoing);
 		}
 	}
@@ -262,7 +292,7 @@ export class AgentSessionRuntime {
 		},
 	): Promise<{ cancelled: boolean }> {
 		const outgoing = this.#captureOutgoing();
-		const releaseInputs = await outgoing.session.fenceInputs();
+		const releaseInputs = await this.fenceLifecycle(outgoing);
 		try {
 			const beforeResult = await this.emitBeforeSwitch(outgoing, "resume", sessionPath);
 			this.#assertCurrent(outgoing);
@@ -295,7 +325,7 @@ export class AgentSessionRuntime {
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }> {
 		const outgoing = this.#captureOutgoing();
-		const releaseInputs = await outgoing.session.fenceInputs();
+		const releaseInputs = await this.fenceLifecycle(outgoing);
 		try {
 			const beforeResult = await this.emitBeforeSwitch(outgoing, "new");
 			this.#assertCurrent(outgoing);
@@ -338,7 +368,7 @@ export class AgentSessionRuntime {
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const outgoing = this.#captureOutgoing();
-		const releaseInputs = await outgoing.session.fenceInputs();
+		const releaseInputs = await this.fenceLifecycle(outgoing);
 		try {
 			const position = options?.position ?? "before";
 			const beforeResult = await this.emitBeforeFork(outgoing, entryId, { position });
@@ -438,7 +468,7 @@ export class AgentSessionRuntime {
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const outgoing = this.#captureOutgoing();
-		const releaseInputs = await outgoing.session.fenceInputs();
+		const releaseInputs = await this.fenceLifecycle(outgoing);
 		try {
 			const resolvedPath = resolvePath(inputPath);
 			if (!existsSync(resolvedPath)) {
@@ -491,10 +521,12 @@ export class AgentSessionRuntime {
 		beforeShutdown?: () => Promise<void>;
 		rejectQueuedInput?: (messages: AgentMessage[]) => void;
 	}): Promise<void> {
-		if (this._disposed || this.session.isDisposed) return;
 		if (this.#ownerDisposal) return this.#ownerDisposal;
+		if (this.lifecycleActive)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
+		if (this._disposed || this.session.isDisposed) return;
 		const outgoing = this.#captureOutgoing(true);
-		const releaseInputs = await outgoing.session.fenceInputs({ rejectQueuedInput: options?.rejectQueuedInput });
+		const releaseInputs = await this.fenceLifecycle(outgoing, options?.rejectQueuedInput);
 		try {
 			// Host terminal teardown may await, but it must happen only after admission closes.
 			await options?.beforeShutdown?.();

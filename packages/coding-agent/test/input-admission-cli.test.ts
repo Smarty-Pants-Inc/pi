@@ -6,7 +6,20 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type RecordLine = Record<string, unknown>;
 const cli = process.env.PI_ADMISSION_CLI ?? resolve("dist/bundle/cli.js");
-const fixture = `export default function(pi) {
+const fixture = `import { createFauxCore, fauxAssistantMessage } from ${JSON.stringify(resolve("../ai/dist/providers/faux.js"))};
+export default function(pi) {
+  const faux = createFauxCore({ provider: "admission-faux" });
+  faux.setResponses([fauxAssistantMessage("offline answer")]);
+  // Synthetic in-memory auth is never read from a credential store or sent over a network.
+  pi.registerProvider(faux.provider, { baseUrl: faux.getModel().baseUrl, apiKey: "offline-faux-test-only", api: faux.api, streamSimple: faux.streamSimple, models: faux.models });
+  pi.on("session_start", async (_event, ctx) => {
+    if (process.env.PI_ADMISSION_STARTUP) await ctx.ui.confirm("startup-held", "release startup", { timeout: 10000 });
+    if (process.env.PI_ADMISSION_STARTUP_CHAIN) await ctx.ui.confirm("startup-next", "next dialog", { timeout: 10000 });
+    await pi.setModel(faux.getModel());
+  });
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (process.env.PI_ADMISSION_SETTLEMENT) { ctx.ui.notify("settlement-nondialog-held"); await new Promise((resolve) => setTimeout(resolve, 60000)); }
+  });
   let holdSwitch = false, holdShutdown = false;
   pi.registerCommand("hold-switch", { handler: async () => { holdSwitch = true; } });
   pi.registerCommand("hold-shutdown", { handler: async () => { holdShutdown = true; } });
@@ -16,6 +29,7 @@ const fixture = `export default function(pi) {
       console.error(JSON.stringify({ proof: "print-input", admission: pi.hostCapabilities.inputAdmission, idle: ctx.isIdle(), pending: ctx.isPromptPending() }));
       return { action: "handled" };
     }
+    if (event.text.startsWith("nondialog:")) { ctx.ui.notify("input-nondialog-held"); await new Promise((resolve) => setTimeout(resolve, 60000)); }
     if (event.text.startsWith("hold:")) await ctx.ui.confirm("input-held", event.text, { timeout: 10000 });
     if (event.text.includes("handled")) return { action: "handled" };
     return { action: "transform", text: "transformed:" + event.text, images: event.images };
@@ -34,6 +48,7 @@ interface ChildProof {
 	send(command: RecordLine): void;
 	response(id: string): Promise<RecordLine>;
 	dialog(title: string): Promise<RecordLine>;
+	marker(message: string): Promise<RecordLine>;
 	release(request: RecordLine): void;
 	exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 	target: string;
@@ -81,6 +96,9 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 				TMPDIR: temp,
 				PI_CODING_AGENT_DIR: agentDir,
 				PI_OFFLINE: "1",
+				PI_ADMISSION_STARTUP: label.includes("startup") ? "1" : "",
+				PI_ADMISSION_STARTUP_CHAIN: label === "startup-signal-refusal" ? "1" : "",
+				PI_ADMISSION_SETTLEMENT: label.includes("settlement") ? "1" : "",
 				PI_NO_LOCAL_LLM: "1",
 				AWS_EC2_METADATA_DISABLED: "true",
 			},
@@ -147,6 +165,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			send,
 			response: (id) => wait((record) => record.type === "response" && record.id === id),
 			dialog: (title) => wait((record) => record.type === "extension_ui_request" && record.title === title),
+			marker: (message) => wait((record) => record.type === "extension_ui_request" && record.message === message),
 			release: (request) => send({ type: "extension_ui_response", id: request.id, confirmed: true }),
 			exited,
 			target,
@@ -306,6 +325,79 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			}),
 		]);
 	});
+
+	// smarty-dev#3048, PR #110 F1: EOF must close admission before joining command work.
+	it.each(["live", "startup"] as const)("EOF aborts non-dialog input during %s draining", async (phase) => {
+		const p = await launch(`eof-nondialog-${phase}`);
+		const image = { type: "image", data: "eof-attachment", mimeType: "image/png" };
+		const queue = () =>
+			p.send({ id: "earlier-queue", type: "steer", message: "earlier-undelivered", images: [image] });
+		if (phase === "startup") {
+			const dialog = await p.dialog("startup-held");
+			queue();
+			p.send({ id: "held", type: "follow_up", message: "nondialog:held" });
+			p.release(dialog);
+		} else {
+			queue();
+			expect(await p.response("earlier-queue")).toMatchObject({ success: true });
+			p.send({ id: "held", type: "steer", message: "nondialog:held" });
+		}
+		await p.marker("input-nondialog-held");
+		expect(await p.response("earlier-queue")).toMatchObject({ success: true });
+		p.child.stdin.end();
+		expect(
+			await Promise.race([p.exited, new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 1500))]),
+		).toEqual({ code: 0, signal: null });
+		expect(p.records.filter((record) => record.id === "held" && record.type === "response")).toEqual([
+			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_ABORTED") }),
+		]);
+		expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
+			expect.objectContaining({
+				messages: [
+					expect.objectContaining({ content: [{ type: "text", text: "transformed:earlier-undelivered" }, image] }),
+				],
+			}),
+		]);
+	});
+
+	// smarty-dev#3048, PR #110 F5: mode-owned startup backlog needs correlated refusals.
+	it("SIGTERM refuses startup commands exactly once before flush and exit", async () => {
+		const p = await launch("startup-signal-refusal");
+		await p.dialog("startup-held");
+		p.send({ id: "startup-held-input", type: "follow_up", message: "handled:startup" });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		p.child.kill("SIGTERM");
+		expect(await p.exited).toEqual({ code: 143, signal: null });
+		expect(p.records.filter((record) => record.id === "startup-held-input" && record.type === "response")).toEqual([
+			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
+		]);
+	});
+
+	// smarty-dev#3048, PR #110 F2/S1: never rely on a kill to escape settlement.
+	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
+		"%s cancels a non-dialog settlement and flushes attachment receipts",
+		async (ending) => {
+			const p = await launch(`settlement-${ending}`);
+			p.send({ id: "run", type: "prompt", message: "start" });
+			await p.marker("settlement-nondialog-held");
+			const image = { type: "image", data: "attachment", mimeType: "image/png" };
+			p.send({ id: "queue", type: "steer", message: "undelivered", images: [image] });
+			expect(await p.response("queue")).toMatchObject({ success: true });
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(await p.exited).toEqual({
+				code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129,
+				signal: null,
+			});
+			expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
+				expect.objectContaining({
+					messages: [
+						expect.objectContaining({ content: [{ type: "text", text: "transformed:undelivered" }, image] }),
+					],
+				}),
+			]);
+		},
+	);
 
 	it("print mode uses the same native admission contract before handled short-circuit", async () => {
 		const p = await launch("print", "print");

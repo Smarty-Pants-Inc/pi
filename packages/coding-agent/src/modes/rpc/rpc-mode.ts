@@ -186,7 +186,8 @@ export async function runRpcMode(
 		request: Record<string, unknown>,
 		parseResponse: (response: RpcExtensionUIResponse) => T,
 	): Promise<T> {
-		if (inputEnded || opts?.signal?.aborted) return Promise.resolve(defaultValue);
+		if (inputEnded || (!extensionBindingsComplete && shutdownPromise) || opts?.signal?.aborted)
+			return Promise.resolve(defaultValue);
 
 		const configuredTimeout = opts?.timeout;
 		const timeout =
@@ -539,7 +540,7 @@ export async function runRpcMode(
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
 				let preflightSucceeded = false;
-				void session
+				const promptWork = session
 					.prompt(command.message, {
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
@@ -559,6 +560,7 @@ export async function runRpcMode(
 					.finally(() => {
 						void checkShutdownRequested();
 					});
+				trackWork(promptWork, pendingPromptWork);
 				return undefined;
 			}
 
@@ -1037,13 +1039,14 @@ export async function runRpcMode(
 	// Read input before session_start handlers can await extension UI. Ordinary
 	// commands wait for the initial bind, while UI responses resolve immediately.
 	let extensionBindingsComplete = false;
+	let initialBindingWork: Promise<void> | undefined;
 	let drainingStartupCommands = false;
-	let startupDrainComplete = false;
 	let startupFatal = false;
 	let startupInputCount = 0;
 	let startupInputBytes = 0;
 	let startupCommands: RpcCommand[] = [];
 	const pendingCommandWork = new Set<Promise<void>>();
+	const pendingPromptWork = new Set<Promise<void>>();
 
 	const cancelPendingExtensionRequests = () => {
 		for (const pending of [...pendingExtensionRequests.values()]) {
@@ -1073,20 +1076,41 @@ export async function runRpcMode(
 	function shutdown(exitCode = 0): Promise<never> {
 		if (shutdownPromise) return shutdownPromise;
 		shutdownPromise = (async (): Promise<never> => {
-			for (const cleanup of signalCleanupHandlers) {
-				cleanup();
+			// Mode-owned commands have not reached native admission. Refuse them exactly once.
+			for (const command of startupCommands.splice(0)) {
+				output(error(command.id, command.type, "INPUT_ADMISSION_SHUTDOWN: startup command was not accepted"));
 			}
-			// Native shutdown fencing precedes abort, including extension-originated input.
-			await runtimeHost.dispose({
-				rejectQueuedInput: (messages) =>
-					output({
-						type: "input_rejected",
-						reason: "shutdown",
-						sessionId: session.sessionId,
-						error: "INPUT_ADMISSION_SHUTDOWN: queued input was not delivered",
-						messages,
-					} satisfies RpcInputRejectedEvent),
-			});
+			cancelPendingExtensionRequests();
+			// Native fencing/abort must precede joining command work (including at EOF).
+			try {
+				await runtimeHost.dispose({
+					beforeShutdown: async () => {
+						// Keep initial bind and already-started non-input command responses intact,
+						// but only join them after native admission/settlement cancellation.
+						await initialBindingWork;
+						await waitForPendingCommandWork(true);
+					},
+					rejectQueuedInput: (messages) =>
+						output({
+							type: "input_rejected",
+							reason: "shutdown",
+							sessionId: session.sessionId,
+							error: "INPUT_ADMISSION_SHUTDOWN: queued input was not delivered",
+							messages,
+						} satisfies RpcInputRejectedEvent),
+				});
+				await waitForPendingCommandWork(true);
+			} catch (cause) {
+				output({
+					type: "response",
+					command: "parse",
+					success: false,
+					fatal: true,
+					error: `RPC shutdown failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+				} satisfies RpcFatalErrorResponse);
+				exitCode = 1;
+			}
+			for (const cleanup of signalCleanupHandlers) cleanup();
 			session.stopMessageEntryIdCapture();
 			unsubscribe?.();
 			unsubscribeBackpressure?.();
@@ -1111,7 +1135,7 @@ export async function runRpcMode(
 				output(response);
 				await waitForRawStdoutBackpressure();
 			}
-			await checkShutdownRequested();
+			void checkShutdownRequested();
 		} catch (commandError: unknown) {
 			output(
 				error(
@@ -1124,19 +1148,22 @@ export async function runRpcMode(
 		}
 	};
 
-	const trackCommandInput = (command: RpcCommand): Promise<void> => {
-		const work = handleCommandInput(command);
-		pendingCommandWork.add(work);
+	const trackWork = (work: Promise<void>, pending = pendingCommandWork): Promise<void> => {
+		pending.add(work);
 		void work.then(
-			() => pendingCommandWork.delete(work),
-			() => pendingCommandWork.delete(work),
+			() => pending.delete(work),
+			() => pending.delete(work),
 		);
 		return work;
 	};
 
-	const waitForPendingCommandWork = async (): Promise<void> => {
-		while (pendingCommandWork.size > 0) {
-			await Promise.allSettled(pendingCommandWork);
+	const trackCommandInput = (command: RpcCommand): Promise<void> => trackWork(handleCommandInput(command));
+
+	const waitForPendingCommandWork = async (includePrompts = false): Promise<void> => {
+		// Startup draining waits for command responses, not complete agent runs.
+		// Shutdown also joins aborted prompt work so its correlated refusals are flushed.
+		while (pendingCommandWork.size > 0 || (includePrompts && pendingPromptWork.size > 0)) {
+			await Promise.allSettled([...pendingCommandWork, ...(includePrompts ? pendingPromptWork : [])]);
 		}
 	};
 
@@ -1210,6 +1237,16 @@ export async function runRpcMode(
 		}
 
 		const command = parsed as RpcCommand;
+		if (shutdownPromise) {
+			output(
+				error(
+					command.id,
+					command.type,
+					"INPUT_ADMISSION_FENCED: shutdown is in progress; command was not accepted",
+				),
+			);
+			return;
+		}
 
 		// Once bound, incoming commands may unblock pending startup work.
 		// Startup byte/count limits above still apply until that work settles.
@@ -1224,9 +1261,7 @@ export async function runRpcMode(
 	const onInputEnd = () => {
 		inputEnded = true;
 		cancelPendingExtensionRequests();
-		if (startupDrainComplete) {
-			void waitForPendingCommandWork().then(() => shutdown());
-		}
+		if (extensionBindingsComplete) void shutdown();
 	};
 
 	detachInput = (() => {
@@ -1251,7 +1286,9 @@ export async function runRpcMode(
 	})();
 
 	registerSignalHandlers();
-	await rebindSession();
+	initialBindingWork = rebindSession();
+	await initialBindingWork;
+	if (shutdownPromise) return shutdownPromise;
 	if (startupFatal) return shutdown(1);
 
 	extensionBindingsComplete = true;
@@ -1266,12 +1303,14 @@ export async function runRpcMode(
 			}
 			await Promise.resolve();
 		}
+		// EOF during initial binding still dispatches the already-received backlog.
+		// Fence/abort before joining its potentially held native input.
+		if (inputEnded) return shutdown();
 		await waitForPendingCommandWork();
 		if (startupCommands.length === 0) break;
 	}
 	if (startupFatal) return shutdown(1);
 	drainingStartupCommands = false;
-	startupDrainComplete = true;
 	startupInputCount = 0;
 	startupInputBytes = 0;
 	if (inputEnded) {

@@ -1218,9 +1218,11 @@ export class InteractiveMode {
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
+				if (error instanceof InputAdmissionError) this.restoreRejectedInput(userInput);
 			} finally {
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-settled");
+				await this.checkShutdownRequested();
 			}
 		}
 	}
@@ -2009,9 +2011,7 @@ export class InteractiveMode {
 			},
 			shutdownHandler: () => {
 				this.shutdownRequested = true;
-				if (this.session.isIdle) {
-					void this.shutdown();
-				}
+				void this.checkShutdownRequested();
 			},
 			onError: (error) => {
 				this.showExtensionError(error.extensionPath, error.error, error.stack);
@@ -3190,7 +3190,7 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
-			if (this.session.inputsFenced) {
+			if (this.runtimeHost.inputsFenced) {
 				this.editor.setText(text);
 				this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
 				return;
@@ -3359,9 +3359,7 @@ export class InteractiveMode {
 			// Queue input during compaction (extension commands execute immediately)
 			if (this.session.isCompacting) {
 				if (this.isExtensionCommand(text)) {
-					this.editor.addToHistory?.(text);
-					this.editor.setText("");
-					await this.session.prompt(text);
+					await this.submitEditorPrompt(text);
 				} else {
 					this.queueCompactionMessage(text, "steer");
 				}
@@ -3371,17 +3369,7 @@ export class InteractiveMode {
 			// If streaming, use prompt() with steer behavior
 			// This handles extension commands (execute immediately), prompt template expansion, and queueing
 			if (this.session.isStreaming) {
-				this.editor.addToHistory?.(text);
-				this.editor.setText("");
-				try {
-					await this.session.prompt(text, { streamingBehavior: "steer" });
-				} catch (error) {
-					if (!this.handleInputAdmissionError(error)) throw error;
-					this.editor.setText(text);
-					return;
-				}
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
+				await this.submitEditorPrompt(text, "steer");
 				return;
 			}
 
@@ -3662,7 +3650,10 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
-				await this.checkShutdownRequested();
+				// Public settlement notification still runs inside the native settlement scope.
+				setImmediate(() => {
+					void this.checkShutdownRequested();
+				});
 				break;
 
 			case "compaction_start": {
@@ -4313,7 +4304,6 @@ export class InteractiveMode {
 			if (!this.handleInputAdmissionError(error)) throw error;
 			// Admission refusal precedes terminal teardown: the old session remains usable.
 			this.isShuttingDown = false;
-			this.shutdownRequested = false;
 		}
 	}
 
@@ -4365,7 +4355,8 @@ export class InteractiveMode {
 	 * Check if shutdown was requested and perform shutdown if so.
 	 */
 	private async checkShutdownRequested(): Promise<void> {
-		if (!this.shutdownRequested) return;
+		if (!this.shutdownRequested || !this.session.isIdle || this.session.isSettling || this.runtimeHost.inputsFenced)
+			return;
 		await this.shutdown();
 	}
 
@@ -4453,16 +4444,40 @@ export class InteractiveMode {
 		}
 	}
 
+	private async submitEditorPrompt(text: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+		this.editor.addToHistory?.(text);
+		this.editor.setText("");
+		try {
+			await this.session.prompt(text, { streamingBehavior });
+		} catch (error) {
+			if (!this.handleInputAdmissionError(error)) throw error;
+			this.restoreRejectedInput(text);
+		} finally {
+			await this.checkShutdownRequested();
+		}
+		this.updatePendingMessagesDisplay();
+		this.ui.requestRender();
+	}
+
+	private restoreRejectedInput(text: string): void {
+		// A rejected submission is independent of drafts typed since it was cleared.
+		const draft = this.editor.getText();
+		this.editor.setText(draft ? `${draft}\n${text}` : text);
+		this.ui.requestRender();
+	}
+
 	private async handleFollowUp(): Promise<void> {
 		const text = (this.editor.getExpandedText?.() ?? this.editor.getText()).trim();
 		if (!text) return;
+		if (this.runtimeHost.inputsFenced) {
+			this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
+			return;
+		}
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
 			if (this.isExtensionCommand(text)) {
-				this.editor.addToHistory?.(text);
-				this.editor.setText("");
-				await this.session.prompt(text);
+				await this.submitEditorPrompt(text);
 			} else {
 				this.queueCompactionMessage(text, "followUp");
 			}
@@ -4472,16 +4487,12 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
-			this.editor.addToHistory?.(text);
-			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
-			this.updatePendingMessagesDisplay();
-			this.ui.requestRender();
+			await this.submitEditorPrompt(text, "followUp");
 		}
 		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
 		else if (this.editor.onSubmit) {
 			this.editor.setText("");
-			this.editor.onSubmit(text);
+			await this.editor.onSubmit(text);
 		}
 	}
 

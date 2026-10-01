@@ -483,17 +483,123 @@ describe("native input admission v1", () => {
 		expect(h.session.inputAdmissionCount).toBe(0);
 	});
 
+	// smarty-dev#3048, PR #110 F2/S1: shutdown cancels non-dialog settlement, not just input.
+	it("orderly shutdown cancels and joins held settlement before returning attached queues", async () => {
+		const entered = gate();
+		const held = gate();
+		const h = await setup([
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					entered.release();
+					await held.promise;
+				});
+			},
+		]);
+		h.setResponses([fauxAssistantMessage("done")]);
+		const runtime = await runtimeFor(h);
+		const run = h.session.prompt("start");
+		await entered.promise;
+		const image: ImageContent = { type: "image", data: "attachment", mimeType: "image/png" };
+		await h.session.steer("undelivered", [image]);
+		const receipt = vi.fn();
+		await runtime.dispose({ rejectQueuedInput: receipt });
+		await run;
+		expect(h.session.isDisposed).toBe(true);
+		expect(h.session.isSettling).toBe(false);
+		expect(receipt).toHaveBeenCalledWith([
+			expect.objectContaining({ content: [{ type: "text", text: "undelivered" }, image] }),
+		]);
+		held.release();
+	});
+
+	// smarty-dev#3048, PR #110 F3/S2: ownership covers factory, setup, rebind and callbacks.
+	it.each(["factory", "setup", "rebind", "withSession"] as const)(
+		"refuses overlapping lifecycle and external receiving input during %s",
+		async (phase) => {
+			const h = await setup();
+			const runtime = await runtimeFor(h);
+			const entered = gate();
+			const held = gate();
+			const hold = async () => {
+				entered.release();
+				await held.promise;
+			};
+			if (phase === "factory") {
+				const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+				Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+					await hold();
+					return factory(options);
+				});
+			}
+			if (phase === "rebind") runtime.setRebindSession(hold);
+			const first = runtime.newSession({
+				setup: phase === "setup" ? hold : undefined,
+				withSession:
+					phase === "withSession"
+						? async (ctx) => {
+								await ctx.sendUserMessage("callback-owned", { deliverAs: "followUp" });
+								await hold();
+							}
+						: undefined,
+			});
+			await entered.promise;
+			const receiving = runtime.session;
+			await expect(runtime.dispose()).rejects.toThrow("INPUT_ADMISSION_BUSY");
+			await expect(runtime.newSession()).rejects.toThrow("INPUT_ADMISSION_BUSY");
+			if (phase !== "factory")
+				await expect(receiving.followUp("external early")).rejects.toThrow("INPUT_ADMISSION_FENCED");
+			held.release();
+			await first;
+			expect(runtime.session.isDisposed).toBe(false);
+			expect(runtime.session.inputsFenced).toBe(false);
+			if (phase === "withSession")
+				expect(runtime.session.messages).toContainEqual(
+					expect.objectContaining({ role: "user", content: [{ type: "text", text: "callback-owned" }] }),
+				);
+			await runtime.session.followUp("ready input");
+			expect(runtime.session.getFollowUpMessages()).toContain("ready input");
+		},
+	);
+
 	function createMode(h: Harness, runtime: AgentSessionRuntime) {
 		const recover = Reflect.get(InteractiveMode.prototype, "handleInputAdmissionError") as (
 			this: unknown,
 			error: unknown,
 		) => boolean;
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
+		let editorText = "";
+		const submitEditorPrompt = Reflect.get(InteractiveMode.prototype, "submitEditorPrompt") as (
+			this: unknown,
+			text: string,
+			behavior?: "steer" | "followUp",
+		) => Promise<void>;
+		const restoreRejectedInput = Reflect.get(InteractiveMode.prototype, "restoreRejectedInput") as (
+			this: unknown,
+			text: string,
+		) => void;
+		const checkShutdownRequested = Reflect.get(InteractiveMode.prototype, "checkShutdownRequested") as (
+			this: unknown,
+		) => Promise<void>;
 		return {
 			session: h.session,
 			runtimeHost: runtime,
 			defaultEditor,
-			editor: { setText: vi.fn(), addToHistory: vi.fn() },
+			editor: {
+				setText: vi.fn((text: string) => {
+					editorText = text;
+				}),
+				getText: () => editorText,
+				addToHistory: vi.fn(),
+			},
+			submitEditorPrompt(text: string, behavior?: "steer" | "followUp") {
+				return submitEditorPrompt.call(this, text, behavior);
+			},
+			restoreRejectedInput(text: string) {
+				restoreRejectedInput.call(this, text);
+			},
+			checkShutdownRequested() {
+				return checkShutdownRequested.call(this);
+			},
 			pendingUserInputs: [] as string[],
 			showError: vi.fn(),
 			clearStatusIndicator: vi.fn(),
@@ -567,6 +673,63 @@ describe("native input admission v1", () => {
 		expect(mode.showError).toHaveBeenCalledWith(expect.stringContaining("INPUT_ADMISSION_FENCED"));
 		expect(mode.pendingUserInputs).toEqual([]);
 		expect(h.session.inputAdmissionCount).toBe(0);
+		release();
+	});
+
+	// smarty-dev#3048, PR #110 F6: rejection cannot overwrite a newer draft.
+	it.each(["steer", "followUp"] as const)(
+		"TUI %s recovery keeps both newer draft and rejected submission",
+		async (behavior) => {
+			const runStarted = gate(),
+				runHeld = gate(),
+				inputStarted = gate(),
+				inputHeld = gate();
+			const h = await setup([
+				(pi) => {
+					pi.on("agent_start", async () => {
+						runStarted.release();
+						await runHeld.promise;
+					});
+					pi.on("input", async (event) => {
+						if (event.text === "submission-A") {
+							inputStarted.release();
+							await inputHeld.promise;
+						}
+					});
+				},
+			]);
+			h.setResponses([fauxAssistantMessage("done")]);
+			const runtime = await runtimeFor(h);
+			const mode = createMode(h, runtime);
+			const install = Reflect.get(InteractiveMode.prototype, "setupEditorSubmitHandler") as (this: unknown) => void;
+			const follow = Reflect.get(InteractiveMode.prototype, "handleFollowUp") as (this: unknown) => Promise<void>;
+			install.call(mode);
+			const run = h.session.prompt("start");
+			await runStarted.promise;
+			mode.editor.setText("submission-A");
+			const submit = behavior === "steer" ? mode.defaultEditor.onSubmit!("submission-A") : follow.call(mode);
+			await inputStarted.promise;
+			mode.editor.setText("newer-draft-B");
+			const abort = h.session.abort();
+			await submit;
+			expect(mode.editor.getText()).toBe("newer-draft-B\nsubmission-A");
+			runHeld.release();
+			await abort;
+			await run;
+		},
+	);
+
+	// smarty-dev#3048, PR #110 F6: Alt+Enter must share Enter's fence policy.
+	it("TUI Alt+Enter keeps editor text during a replacement fence", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		const mode = createMode(h, runtime);
+		mode.editor.setText("late-follow-up");
+		const release = await h.session.fenceInputs();
+		const follow = Reflect.get(InteractiveMode.prototype, "handleFollowUp") as (this: unknown) => Promise<void>;
+		await follow.call(mode);
+		expect(mode.editor.getText()).toBe("late-follow-up");
+		expect(mode.showError).toHaveBeenCalledWith(expect.stringContaining("INPUT_ADMISSION_FENCED"));
 		release();
 	});
 

@@ -118,6 +118,7 @@ type InteractiveBashContext = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> | void };
 	editor: { addToHistory?: (text: string) => void };
 	session: Harness["session"];
+	runtimeHost: AgentSessionRuntime;
 	sessionManager: Harness["sessionManager"];
 	ui: { requestRender(): void };
 	chatContainer: { addChild(component: unknown): void };
@@ -240,6 +241,7 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			defaultEditor: {},
 			editor: { addToHistory: vi.fn() },
 			session: harness.session,
+			runtimeHost: createRuntimeHost(harness),
 			sessionManager: harness.sessionManager,
 			ui: { requestRender: vi.fn() },
 			chatContainer: { addChild: vi.fn() },

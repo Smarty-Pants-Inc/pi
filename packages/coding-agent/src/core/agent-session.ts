@@ -424,6 +424,9 @@ export class AgentSession {
 	private readonly _inputAdmissions = new Set<InputAdmission>();
 	private readonly _inputAdmissionScope = new AsyncLocalStorage<InputAdmission>();
 	private _inputFence: object | undefined;
+	private readonly _inputFenceScope = new AsyncLocalStorage<{ fence: object; active: boolean }>();
+	private _settlementCancellation = new AbortController();
+	private _settlementCompletion?: Promise<void>;
 	private _inputsDisposed = false;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
@@ -1117,27 +1120,32 @@ export class AgentSession {
 		this.#auditState("session_run_settled");
 		this._isEmittingAgentSettled = true;
 		const scope = { active: true };
+		const cancellation = this._settlementCancellation;
+		let completed!: () => void;
+		this._settlementCompletion = new Promise<void>((resolve) => {
+			completed = resolve;
+		});
 		try {
-			await this._agentSettledScope.run(scope, async () => {
-				await this._extensionRunner.emit({ type: "agent_settled", outcome });
-				this._emit({ type: "agent_settled", outcome });
-			});
+			try {
+				await raceWithAbortSignal(
+					this._agentSettledScope.run(scope, () => this._extensionRunner.emit({ type: "agent_settled", outcome })),
+					cancellation.signal,
+				);
+			} catch (error) {
+				if (!cancellation.signal.aborted) throw error;
+			}
+			this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome }));
 		} finally {
-			// Detached descendants of a finished handler are external delivery waiters again.
+			// Detached descendants of finished/cancelled handlers cannot own delivery.
 			scope.active = false;
 			this._isEmittingAgentSettled = false;
-		}
-
-		const deferred = this._deferredSettledActions.splice(0);
-		if (deferred.length > 0) {
 			try {
-				for (const action of deferred) await action();
+				for (const action of this._deferredSettledActions.splice(0)) await action();
 			} finally {
 				this._resolveIdleWaitIfIdle();
+				completed();
 			}
-			return;
 		}
-		this._resolveIdleWaitIfIdle();
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -2018,7 +2026,8 @@ export class AgentSession {
 
 	private _assertInputsOpen(): void {
 		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "input was not accepted");
-		if (this._inputFence)
+		const scope = this._inputFenceScope.getStore();
+		if (this._inputFence && !(scope?.active && scope.fence === this._inputFence))
 			throw new InputAdmissionError(
 				"INPUT_ADMISSION_FENCED",
 				"input was not accepted; retry against the current session",
@@ -2058,7 +2067,14 @@ export class AgentSession {
 			if (options?.rejectQueuedInput) {
 				// Orderly shutdown may reject input instead of refusing disposal. Admission is
 				// already closed before abort yields, including input from extension handlers.
+				// Cancel the wait, observe the abandoned hook, and join native settlement.
+				// Arbitrary extension promises cannot be forced to resolve. The fence prevents
+				// their late descendants from admitting input into the retiring session.
+				this._settlementCancellation.abort(
+					new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
+				);
 				await this.abort();
+				await this._settlementCompletion;
 				const messages = this.agent.getQueuedMessages();
 				if (messages.length > 0) {
 					options.rejectQueuedInput(messages);
@@ -2068,11 +2084,27 @@ export class AgentSession {
 			this._assertInputsDrained();
 		} catch (error) {
 			this._inputFence = undefined;
+			this._settlementCancellation = new AbortController();
 			throw error;
 		}
 		return () => {
-			if (this._inputFence === fence) this._inputFence = undefined;
+			if (this._inputFence === fence) {
+				this._inputFence = undefined;
+				if (!this._inputsDisposed) this._settlementCancellation = new AbortController();
+			}
 		};
+	}
+
+	/** @internal Allow only awaited lifecycle callbacks to submit to their fenced receiving session. */
+	async withFencedInput<T>(operation: () => Promise<T>): Promise<T> {
+		const fence = this._inputFence;
+		if (!fence) return operation();
+		const scope = { fence, active: true };
+		try {
+			return await this._inputFenceScope.run(scope, operation);
+		} finally {
+			scope.active = false;
+		}
 	}
 
 	private _admitInput(): InputAdmission {

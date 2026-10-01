@@ -680,7 +680,8 @@ describe("RPC startup extension UI", () => {
 		let startupInputSent = false;
 		let resolveBash!: (result: BashResult) => void;
 		let shutdownAfterBashResponse = false;
-		const dispose = vi.fn(async () => {
+		const dispose = vi.fn(async (options?: Parameters<AgentSessionRuntime["dispose"]>[0]) => {
+			await options?.beforeShutdown?.();
 			shutdownAfterBashResponse = rpcIo.outputLines.some((line) => {
 				const record = JSON.parse(line) as Record<string, unknown>;
 				return record.type === "response" && record.id === "slow-startup-bash" && record.success === true;
@@ -741,7 +742,8 @@ describe("RPC startup extension UI", () => {
 					expect.objectContaining({ id: "startup-state", type: "response", success: true }),
 				);
 			});
-			expect(dispose).not.toHaveBeenCalled();
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(exit).not.toHaveBeenCalled();
 
 			resolveBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
 			await vi.waitFor(() => {
@@ -766,7 +768,8 @@ describe("RPC startup extension UI", () => {
 		let resolveStartupBash!: (result: BashResult) => void;
 		let resolveLateBash!: (result: BashResult) => void;
 		let shutdownAfterLateResponse = false;
-		const dispose = vi.fn(async () => {
+		const dispose = vi.fn(async (options?: Parameters<AgentSessionRuntime["dispose"]>[0]) => {
+			await options?.beforeShutdown?.();
 			shutdownAfterLateResponse = rpcIo.outputLines.some((line) => {
 				const record = JSON.parse(line) as Record<string, unknown>;
 				return record.type === "response" && record.id === "late-bash" && record.success === true;
@@ -849,7 +852,8 @@ describe("RPC startup extension UI", () => {
 				expect(lateCommandSent).toBe(true);
 				expect(executeBash).toHaveBeenCalledTimes(2);
 			});
-			expect(dispose).not.toHaveBeenCalled();
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(exit).not.toHaveBeenCalled();
 
 			resolveLateBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
 			await vi.waitFor(() => {
