@@ -48,6 +48,30 @@ describe("model switch review regressions (#97)", () => {
 		expect(h.session.getLastAssistantText()).toBe("short request accepted");
 	});
 
+	// Refs Smarty-Pants-Inc/pi#97, Astra round 3: !! output is not switch input.
+	it.each([false, true])("switches past excluded bash output (auto: %s)", async (enabled) => {
+		const h = await setup({ settings: { compaction: { enabled }, retry: { enabled: false } } });
+		h.session.recordBashResult(
+			"large diagnostic",
+			{ output: "x".repeat(80_000), exitCode: 0, cancelled: false, truncated: false },
+			{ excludeFromContext: true },
+		);
+		await h.session.setModel(h.getModel("sol")!);
+		expect(h.session.model?.id).toBe("sol");
+		expect(h.eventsOfType("compaction_start")).toHaveLength(0);
+		expect(h.faux.state.callCount).toBe(0);
+		expect(h.session.messages).toMatchObject([{ role: "bashExecution", excludeFromContext: true }]);
+		h.setResponses([
+			(context, _options, _state, model) => {
+				expect(model.id).toBe("sol");
+				expect(JSON.stringify(context.messages)).not.toContain("large diagnostic");
+				return fauxAssistantMessage("fitting switch accepted");
+			},
+		]);
+		await h.session.prompt("short input");
+		expect(h.faux.state.callCount).toBe(1);
+	});
+
 	it.each([false, true])("admits a shrinking context transform (auto: %s)", async (enabled) => {
 		const h = await setup({
 			settings: { compaction: { enabled }, retry: { enabled: false } },

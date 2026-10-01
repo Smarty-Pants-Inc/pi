@@ -375,6 +375,8 @@ export function estimateTokens(message: AgentMessage): number {
 			return Math.ceil(chars / 4);
 		}
 		case "bashExecution": {
+			// !! output remains in history but is intrinsically absent from model context.
+			if (message.excludeFromContext) return 0;
 			chars = message.command.length + message.output.length;
 			return Math.ceil(chars / 4);
 		}

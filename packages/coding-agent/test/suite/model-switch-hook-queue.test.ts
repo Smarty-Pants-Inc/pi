@@ -190,6 +190,96 @@ describe("model switch hook queue ownership (#97)", () => {
 			expectPersisted(h, "hook");
 		},
 	);
+	// Refs Smarty-Pants-Inc/pi#97, Astra round 3: preparation/failure hooks also await SDK dispatch.
+	it.each([
+		["steer", "success"],
+		["followUp", "success"],
+		["steer", "cancel"],
+		["followUp", "cancel"],
+		["steer", "summary failure"],
+		["followUp", "summary failure"],
+	] as const)("accepts awaited SDK %s dispatch in preparation and failure hooks (%s)", async (deliverAs, outcome) => {
+		let h!: Harness;
+		const returned: string[] = [];
+		h = await setup([
+			(pi) => {
+				pi.on("session_before_compact", async (event) => {
+					if (outcome === "success")
+						await h.session.sendCustomMessage(
+							{ customType: "preparation", content: "preparation trigger", display: true },
+							{ triggerTurn: true, deliverAs },
+						);
+					expect(h.session.model?.id).toBe("opus");
+					expect(h.faux.state.callCount).toBe(0);
+					returned.push("preparation");
+					if (outcome === "cancel") return { cancel: true };
+					if (outcome === "summary failure") return;
+					return {
+						compaction: {
+							summary: "small summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					};
+				});
+				pi.on("session_compact_failed", async (event) => {
+					expect(event.aborted).toBe(outcome === "cancel");
+					await h.session.sendCustomMessage(
+						{ customType: "failure", content: "failure trigger", display: true },
+						{ triggerTurn: true, deliverAs },
+					);
+					expect(h.session.model?.id).toBe("opus");
+					expect(h.faux.state.callCount).toBe(outcome === "summary failure" ? 1 : 0);
+					returned.push("failure");
+				});
+			},
+		]);
+		h.setResponses([
+			outcome === "summary failure"
+				? { ...fauxAssistantMessage(""), stopReason: "error", errorMessage: "invalid summary" }
+				: fauxAssistantMessage("preparation delivered"),
+		]);
+		const switching = h.session.setModel(h.getModel("sol")!).then(
+			() => "success",
+			(error: unknown) => error,
+		);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let result: unknown;
+		try {
+			result = await Promise.race([
+				switching,
+				new Promise<string>((resolve) => {
+					timer = setTimeout(() => resolve("deadlocked"), 1000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+			if (result === "deadlocked") h.session.abortCompaction();
+			await switching;
+			await h.session.waitForIdle();
+		}
+		expect(result, `${outcome} must not wait on its enclosing switch`).not.toBe("deadlocked");
+		if (outcome === "success") {
+			expect(result).toBe("success");
+			expect(returned).toEqual(["preparation"]);
+			expect(h.session.model?.id).toBe("sol");
+			expect(h.session.getLastAssistantText()).toBe("preparation delivered");
+			expect(h.faux.state.callCount).toBe(1);
+		} else {
+			expect(result).toBeInstanceOf(Error);
+			expect(String(result)).toContain("Current model unchanged");
+			expect(returned).toEqual(["preparation", "failure"]);
+			expect(h.session.model?.id).toBe("opus");
+			expect(h.eventsOfType("agent_settled")).toHaveLength(0);
+			expect(h.session.agent.peekQueuedMessages()).toMatchObject([{ role: "custom", customType: "failure" }]);
+			h.session.setAutoCompactionEnabled(false);
+			h.setResponses([fauxAssistantMessage("recovered"), fauxAssistantMessage("followUp recovered")]);
+			await h.session.prompt("explicit recovery");
+			expectPersisted(h, "failure");
+		}
+		if (outcome === "success") expectPersisted(h, "preparation");
+	});
+
 	it.each(["steer", "followUp"] as const)(
 		"keeps an admitted input as the owner of a %s hook trigger",
 		async (deliverAs) => {

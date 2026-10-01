@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
@@ -91,9 +92,11 @@ import {
 	type MessageStartEvent,
 	type MessageUpdateEvent,
 	type ReplacedSessionContext,
+	type SessionBeforeCompactEvent,
 	type SessionBeforeCompactResult,
 	type SessionBeforeTreeResult,
 	type SessionBoundaryDraft,
+	type SessionCompactEvent,
 	type SessionCompactFailedEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
@@ -449,8 +452,8 @@ export class AgentSession {
 	/** Admission waiters must wake before accepted triggers finish, unlike true-idle waiters. */
 	private _modelSwitchAdmissionWait: Promise<void> = Promise.resolve();
 	private _resolveModelSwitchAdmissionWait: (() => void) | undefined;
-	/** Completion hooks may await message acceptance, but must not await their enclosing switch. */
-	private _isEmittingSessionCompact = false;
+	/** Compaction hooks may await message acceptance, but must not await their enclosing switch. */
+	private readonly _compactionHookScope = new AsyncLocalStorage<boolean>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1042,6 +1045,14 @@ export class AgentSession {
 		});
 	}
 
+	private async _emitCompactionHook(
+		event: SessionBeforeCompactEvent | SessionCompactEvent | SessionCompactFailedEvent,
+		signal?: AbortSignal,
+	): Promise<SessionBeforeCompactResult | undefined> {
+		// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
+		return this._compactionHookScope.run(true, () => raceWithAbortSignal(this._extensionRunner.emit(event), signal));
+	}
+
 	private async _emitSessionCompactFailed(
 		event: Omit<SessionCompactFailedEvent, "type">,
 		signal?: AbortSignal,
@@ -1049,7 +1060,7 @@ export class AgentSession {
 	): Promise<void> {
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
 			try {
-				await raceWithAbortSignal(this._extensionRunner.emit({ type: "session_compact_failed", ...event }), signal);
+				await this._emitCompactionHook({ type: "session_compact_failed", ...event }, signal);
 			} catch (error) {
 				// A terminal notification cannot extend an expired compaction or
 				// replace its failed/aborted outcome. Its promise stays observed.
@@ -2542,7 +2553,7 @@ export class AgentSession {
 			// earlier triggered message that acquired the run owns settlement; preserve
 			// this message's requested queue rather than starting another run owner.
 			if (this._modelSwitchCompactionPending) {
-				if (this._isEmittingSessionCompact) {
+				if (this._compactionHookScope.getStore()) {
 					// The switch awaits this hook. Accept now and let successful switch
 					// cleanup dispatch, or let an admitted prompt take the requested queue.
 					this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
@@ -3214,8 +3225,8 @@ export class AgentSession {
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (!attempt && this._extensionRunner.hasHandlers("session_before_compact")) {
-				const result = (await raceWithAbortSignal(
-					this._extensionRunner.emit({
+				const result = (await this._emitCompactionHook(
+					{
 						type: "session_before_compact",
 						preparation,
 						branchEntries: pathEntries,
@@ -3223,7 +3234,7 @@ export class AgentSession {
 						reason: "manual",
 						willRetry: false,
 						signal,
-					}),
+					},
 					signal,
 				)) as SessionBeforeCompactResult | undefined;
 
@@ -3320,14 +3331,14 @@ export class AgentSession {
 				| undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				await raceWithAbortSignal(
-					this._extensionRunner.emit({
+				await this._emitCompactionHook(
+					{
 						type: "session_compact",
 						compactionEntry: savedCompactionEntry,
 						fromExtension,
 						reason: "manual",
 						willRetry: false,
-					}),
+					},
 					signal,
 				);
 			}
@@ -3710,8 +3721,8 @@ export class AgentSession {
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
-				const extensionResult = (await raceWithAbortSignal(
-					this._extensionRunner.emit({
+				const extensionResult = (await this._emitCompactionHook(
+					{
 						type: "session_before_compact",
 						preparation,
 						branchEntries: pathEntries,
@@ -3719,7 +3730,7 @@ export class AgentSession {
 						reason,
 						willRetry,
 						signal,
-					}),
+					},
 					signal,
 				)) as SessionBeforeCompactResult | undefined;
 
@@ -3784,21 +3795,16 @@ export class AgentSession {
 			const savedCompactionEntry = this.sessionManager.getEntry(compactionId) as CompactionEntry | undefined;
 
 			if (this._extensionRunner && savedCompactionEntry) {
-				this._isEmittingSessionCompact = true;
-				try {
-					await raceWithAbortSignal(
-						this._extensionRunner.emit({
-							type: "session_compact",
-							compactionEntry: savedCompactionEntry,
-							fromExtension,
-							reason,
-							willRetry,
-						}),
-						signal,
-					);
-				} finally {
-					this._isEmittingSessionCompact = false;
-				}
+				await this._emitCompactionHook(
+					{
+						type: "session_compact",
+						compactionEntry: savedCompactionEntry,
+						fromExtension,
+						reason,
+						willRetry,
+					},
+					signal,
+				);
 			}
 
 			const result: CompactionResult = {
