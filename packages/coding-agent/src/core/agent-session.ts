@@ -767,6 +767,7 @@ export class AgentSession {
 			const entryId = this._findPersistedMessageEntryId(result);
 			return entryId ? [entryId] : [];
 		});
+		const revision = this.sessionManager.revision();
 		const boundary = await this._extensionRunner.emitBoundary(
 			{
 				type: "turn_end",
@@ -781,6 +782,8 @@ export class AgentSession {
 			() => this._getPendingBoundaryMessages(),
 		);
 		if (boundary.entries.length > 0) this._commitBoundaryDrafts(boundary.entries);
+		// Carry captured-manager changes into agent state even if continuation is requested later.
+		else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
 		if (boundary.continue && !this._buildBoundaryContext([], "turn_end").canContinue) {
 			this._reportInvalidBoundaryContinuation("turn_end");
 			return false;

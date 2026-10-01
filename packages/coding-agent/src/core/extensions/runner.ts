@@ -267,15 +267,47 @@ function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["t
 	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
 }
 
-function snapshotBoundaryContext(context: BoundaryContextPreview): BoundaryContextPreview {
-	// Copy array membership once per build, not once per observer. Handlers may
-	// reorder, truncate or replace these mutable views without changing session state.
+function snapshotBoundaryContext(context: BoundaryContextPreview) {
+	// Snapshot only projection-local views once per build. Canonical messages and
+	// their payloads stay shared; cloning full history would restore allocation churn.
+	const canonicalMessages = new Set<AgentMessage>();
+	const sharedContent = new Set<unknown>();
+	for (const { sourceEntry } of context.contextEntries) {
+		if (sourceEntry.type === "message") {
+			canonicalMessages.add(sourceEntry.message);
+			if ("content" in sourceEntry.message) sharedContent.add(sourceEntry.message.content);
+		} else if (sourceEntry.type === "custom_message") {
+			sharedContent.add(sourceEntry.content);
+		} else if (sourceEntry.type === "context_edit") {
+			sharedContent.add(sourceEntry.replacement?.content);
+		} else if (sourceEntry.type === "compaction" && sourceEntry.systemMessage) {
+			canonicalMessages.add(sourceEntry.systemMessage);
+			sharedContent.add(sourceEntry.systemMessage.content);
+		}
+	}
+	const localMessages = new Map<AgentMessage, object>();
+	for (const messages of [context.contextMessages, context.llmMessages]) {
+		for (const message of messages) {
+			if (canonicalMessages.has(message) || localMessages.has(message)) continue;
+			localMessages.set(message, {
+				...message,
+				...("content" in message && !sharedContent.has(message.content)
+					? { content: structuredClone(message.content) }
+					: {}),
+			});
+		}
+	}
 	return {
 		contextEntries: context.contextEntries.slice(),
 		contextMessages: context.contextMessages.slice(),
 		llmMessages: context.llmMessages.slice(),
 		pendingMessages: context.pendingMessages.slice(),
 		canContinue: context.canContinue,
+		contributions: context.contextEntries.map((entry) => ({
+			sourceEntry: entry.sourceEntry,
+			messages: entry.messages.slice(),
+		})),
+		localMessages: Array.from(localMessages),
 	};
 }
 
@@ -1015,6 +1047,13 @@ export class ExtensionRunner {
 								context[key].length === contextSnapshot[key].length &&
 								contextSnapshot[key].every((item, index) => item === context[key][index]),
 						) &&
+						contextSnapshot.contributions.every(
+							(entry, index) =>
+								entry.sourceEntry === context.contextEntries[index].sourceEntry &&
+								Array.isArray(context.contextEntries[index].messages) &&
+								sameMessages(entry.messages, context.contextEntries[index].messages),
+						) &&
+						contextSnapshot.localMessages.every(([message, snapshot]) => isDeepStrictEqual(message, snapshot)) &&
 						previewRevision === nextRevision &&
 						previewPendingMessages?.length === nextPendingMessages?.length &&
 						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
