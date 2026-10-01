@@ -25,7 +25,9 @@ jobs:
   # Keep the public GitHub Release publication last. Binary assets are staged in
   # a draft release first; cleanup removes the draft if later publishing fails.
   build:
-    runs-on: ubuntu-latest
+    # Forge disposable VM: 2 vCPU / 8 GB; cross-compilation stays serial.
+    timeout-minutes: 120
+    runs-on: smarty-linux-x64
     permissions:
       contents: read
     env:
@@ -37,6 +39,16 @@ jobs:
         with:
           ref: ${{ env.SOURCE_REF }}
           persist-credentials: false
+
+      - name: Install Forge build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl git python3 build-essential pkg-config zip unzip software-properties-common
+          # create-source-archive.sh needs modern git archive --mtime support.
+          sudo add-apt-repository --yes ppa:git-core/ppa
+          sudo apt-get update
+          sudo apt-get install -y git
+          git --version
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
@@ -129,20 +141,26 @@ jobs:
           retention-days: 14
 
   smoke-test-binaries:
+    timeout-minutes: 15
     runs-on: ${{ matrix.runner }}
     needs: build
     strategy:
       fail-fast: false
       matrix:
         runner:
-          - ubuntu-latest
+          - smarty-linux-x64
+          # hosted-exception: pending Paul's decision on smarty-dev#1246
           - macos-latest
+          # hosted-exception: pending Paul's decision on smarty-dev#1246
           - windows-latest
     permissions:
       actions: read
     env:
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
       - name: Download binary archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -200,7 +218,8 @@ jobs:
           "${{ steps.binary.outputs.binary }}" --version
 
   stage-github-release:
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    runs-on: smarty-linux-x64
     needs:
       - build
       - smoke-test-binaries
@@ -211,6 +230,10 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
       - name: Download GitHub release payload
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -294,7 +317,8 @@ jobs:
           fi
 
   publish-npm:
-    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    runs-on: smarty-linux-x64
     needs: stage-github-release
     environment: npm-publish
     permissions:
@@ -320,7 +344,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
+          sudo apt-get install -y git python3 build-essential pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
           sudo ln -s $(which fdfind) /usr/local/bin/fd
 
       - name: Install dependencies
@@ -347,7 +371,8 @@ jobs:
         run: node scripts/publish.mjs
 
   announce-pi-dev-release:
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    runs-on: smarty-linux-x64
     needs: publish-npm
     environment: pi-model-upload
     concurrency:
@@ -375,8 +400,11 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Verify AWS CLI
-        run: aws --version
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli
+          aws --version
 
       - name: Announce verified release on pi.dev
         run: |
@@ -388,7 +416,8 @@ jobs:
             --installer-package-lock packages/coding-agent/install-lock/package-lock.json
 
   publish-github-release:
-    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    runs-on: smarty-linux-x64
     needs:
       - stage-github-release
       - publish-npm
@@ -399,6 +428,10 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
       - name: Publish staged GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -418,7 +451,8 @@ jobs:
           gh release edit "${RELEASE_TAG}" --draft=false
 
   cleanup-draft-github-release:
-    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    runs-on: smarty-linux-x64
     needs:
       - build
       - stage-github-release
@@ -432,6 +466,10 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
+      - name: Install GitHub CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gh
       - name: Delete draft GitHub Release after failure
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
