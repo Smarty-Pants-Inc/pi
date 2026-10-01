@@ -25,6 +25,7 @@ jobs:
   # Keep the public GitHub Release publication last. Binary assets are staged in
   # a draft release first; cleanup removes the draft if later publishing fails.
   build:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # Forge disposable VM: 2 vCPU / 8 GB; cross-compilation stays serial.
     timeout-minutes: 120
     runs-on: smarty-linux-x64
@@ -141,6 +142,7 @@ jobs:
           retention-days: 14
 
   smoke-test-binaries:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
     runs-on: ${{ matrix.runner }}
     needs: build
@@ -218,6 +220,7 @@ jobs:
           "${{ steps.binary.outputs.binary }}" --version
 
   stage-github-release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
     runs-on: smarty-linux-x64
     needs:
@@ -317,6 +320,7 @@ jobs:
           fi
 
   publish-npm:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 150
     runs-on: smarty-linux-x64
     needs: stage-github-release
@@ -371,6 +375,7 @@ jobs:
         run: node scripts/publish.mjs
 
   announce-pi-dev-release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
     runs-on: smarty-linux-x64
     needs: publish-npm
@@ -416,6 +421,7 @@ jobs:
             --installer-package-lock packages/coding-agent/install-lock/package-lock.json
 
   publish-github-release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 10
     runs-on: smarty-linux-x64
     needs:
@@ -459,7 +465,7 @@ jobs:
       - publish-npm
       - announce-pi-dev-release
       - publish-github-release
-    if: ${{ always() && needs.stage-github-release.result != 'skipped' && (needs.stage-github-release.result != 'success' || needs.publish-npm.result != 'success' || needs.announce-pi-dev-release.result != 'success' || needs.publish-github-release.result != 'success') }}
+    if: ${{ (always() && needs.stage-github-release.result != 'skipped' && (needs.stage-github-release.result != 'success' || needs.publish-npm.result != 'success' || needs.announce-pi-dev-release.result != 'success' || needs.publish-github-release.result != 'success')) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     permissions:
       contents: write
     env:
