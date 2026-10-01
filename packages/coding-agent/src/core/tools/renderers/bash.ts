@@ -20,13 +20,11 @@ export const BASH_UPDATE_THROTTLE_MS = 100;
 type BashResultRenderState = {
 	cachedWidth: number | undefined;
 	cachedLines: string[] | undefined;
-	cachedSkipped: number | undefined;
 };
 class BashResultRenderComponent extends Container {
 	state: BashResultRenderState = {
 		cachedWidth: undefined,
 		cachedLines: undefined,
-		cachedSkipped: undefined,
 	};
 }
 function formatDuration(ms: number): string {
@@ -82,11 +80,9 @@ function rebuildBashResultRenderComponent(
 		} else {
 			component.addChild({
 				render: (width: number) => {
-					// Every frame renders every tool result in the transcript, so return the same
-					// lines until the width changes or invalidate() runs (for example, on a theme change).
+					// Cache the complete output: this renders on every frame for every bash result in the transcript.
 					if (state.cachedLines === undefined || state.cachedWidth !== width) {
 						const preview = truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width);
-						state.cachedSkipped = preview.skippedCount;
 						state.cachedWidth = width;
 						if (preview.skippedCount > 0) {
 							const hint =
@@ -102,7 +98,6 @@ function rebuildBashResultRenderComponent(
 				invalidate: () => {
 					state.cachedWidth = undefined;
 					state.cachedLines = undefined;
-					state.cachedSkipped = undefined;
 				},
 			});
 		}
