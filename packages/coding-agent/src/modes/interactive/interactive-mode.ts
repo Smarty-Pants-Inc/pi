@@ -2592,8 +2592,10 @@ export class InteractiveMode {
 		return {
 			holdState: () =>
 				this.uiHolds.values().next().value?.reason ??
-				// Every native/extension dialog replaces the main editor here, including auth, /share, and /bug.
-				(this.editorContainer.children.some((child) => child !== this.editor) ? "dialog" : undefined),
+				// Dialogs replace the main editor; renderer-owned interactions (e.g. fullscreen search) use overlays.
+				(this.ui.hasOverlay() || this.editorContainer.children.some((child) => child !== this.editor)
+					? "dialog"
+					: undefined),
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
 			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),

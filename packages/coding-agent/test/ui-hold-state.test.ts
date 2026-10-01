@@ -28,7 +28,7 @@ type Mode = {
 
 const modes: Mode[] = [];
 
-function createMode(): Mode {
+function createMode(tuiMode: "regular" | "fullscreen" = "regular"): Mode {
 	const editor = Object.assign(new Text("", 0, 0), {
 		getText: () => "draft",
 		setText: vi.fn(),
@@ -38,7 +38,7 @@ function createMode(): Mode {
 	editorContainer.addChild(editor);
 	const mode = Object.assign(Object.create(InteractiveMode.prototype), {
 		ui: createInteractiveTui({
-			tuiMode: "regular",
+			tuiMode,
 			showHardwareCursor: false,
 			logDirectory: tmpdir(),
 			terminal: new VirtualTerminal(),
@@ -92,6 +92,38 @@ describe("host UI hold state (smarty-dev#2440, smarty-code#870)", () => {
 			harness.cleanup();
 		}
 	});
+
+	// smarty-dev#2440 / pi#105: native fullscreen search must be visible to extension consumers.
+	it.each(["\x1b", "\x1b[102;6u"])(
+		"tracks fullscreen search through an extension context (close=%j)",
+		async (close) => {
+			const mode = createMode("fullscreen");
+			const terminal = mode.ui.terminal as VirtualTerminal;
+			mode.ui.addChild(mode.editorContainer);
+			mode.ui.setFocus(mode.editor);
+			mode.ui.start();
+			const harness = await createHarness();
+			try {
+				await harness.session.bindExtensions({ uiContext: mode.createExtensionUIContext(), mode: "tui" });
+				const first = harness.session.extensionRunner.createContext();
+				const second = harness.session.extensionRunner.createContext();
+				expect(first.ui.holdState()).toBeUndefined(); // The ordinary main editor (even with a draft) is not a hold.
+				terminal.sendInput("\x1b[102;6u"); // Default native fullscreen search action (Ctrl+Shift+F).
+				expect(mode.ui.hasOverlay()).toBe(true);
+				expect(first.ui.holdState()).toBe("dialog");
+				expect(second.ui.holdState()).toBe("dialog");
+				terminal.sendInput("transcript query");
+				expect(first.ui.holdState()).toBe("dialog");
+				expect(mode.editor.handleInput).not.toHaveBeenCalled();
+				terminal.sendInput(close);
+				expect(mode.ui.hasOverlay()).toBe(false);
+				expect(first.ui.holdState()).toBeUndefined();
+				expect(second.ui.holdState()).toBeUndefined();
+			} finally {
+				harness.cleanup();
+			}
+		},
+	);
 
 	it.each(["close", "cancel", "error"])("tracks a native dialog through %s", (exit) => {
 		const mode = createMode();
