@@ -1865,12 +1865,16 @@ export class AgentSession {
 		this._isBeforeSettle = true;
 		this._abortDuringBeforeSettle = false;
 		try {
+			const revision = this.sessionManager.revision();
 			const result = await this._extensionRunner.emitBoundary(
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
 				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
 				() => this._getPendingBoundaryMessages(),
 			);
 			if (result.entries.length > 0) this._commitBoundaryDrafts(result.entries);
+			// Captured SDK managers can append context without proposing any drafts.
+			// Agent.continue() checks agent state before request preparation can refresh it.
+			else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
 			this._flushPendingCustomMessages();
 			const finalContext = this._buildBoundaryContext([], "agent_before_settle");
 			if (this._abortDuringBeforeSettle) return false;

@@ -2,6 +2,7 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BoundaryContextPreview, SessionBoundaryDraft } from "../../src/core/extensions/types.ts";
+import { convertToLlm } from "../../src/core/messages.ts";
 import { createHarness, type Harness } from "./harness.ts";
 
 type BoundaryInternals = {
@@ -62,6 +63,112 @@ describe("session boundary allocation churn", () => {
 			JSON.stringify(harness.sessionManager.buildSessionProjection().messages),
 		);
 		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+	});
+
+	// smarty-dev#2177 / pi#94: a captured SDK manager can append context without boundary drafts.
+	it.each(["user", "custom"] as const)(
+		"continues after a captured manager appends canonical %s context",
+		async (role) => {
+			let requested = false;
+			const requests: AgentMessage[][] = [];
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("agent_before_settle", () => {
+							if (requested) return;
+							requested = true;
+							if (role === "user") {
+								harness.sessionManager.appendMessage({ role, content: "canonical continuation", timestamp: 1 });
+							} else {
+								harness.sessionManager.appendCustomMessageEntry("canonical", "canonical continuation", false);
+							}
+							return { continue: true };
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const internals = harness.session as unknown as BoundaryInternals;
+			const commits = vi.spyOn(internals, "_commitBoundaryDrafts");
+			harness.setResponses([
+				fauxAssistantMessage("first"),
+				(context) => {
+					requests.push(context.messages);
+					return fauxAssistantMessage("second");
+				},
+			]);
+			await harness.session.prompt("start");
+			expect(requests).toHaveLength(1);
+			expect(requests[0].map((message) => message.role)).toEqual(["system", "user", "assistant", "user"]);
+			expect(JSON.stringify(requests[0].at(-1))).toContain("canonical continuation");
+			expect(harness.session.getLastAssistantText()).toBe("second");
+			expect(harness.eventsOfType("agent_start")).toHaveLength(2);
+			expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+			expect(commits).not.toHaveBeenCalled();
+		},
+	);
+
+	// smarty-dev#2177 / pi#94: mutable preview arrays must not leak local inspection edits downstream.
+	it.each(
+		(["contextEntries", "contextMessages", "llmMessages", "pendingMessages"] as const).flatMap((key) =>
+			[false, true].map((throws) => ({ key, throws })),
+		),
+	)("restores $key after a mutating handler (throws: $throws)", async ({ key, throws }) => {
+		const errors: string[] = [];
+		const observations: BoundaryContextPreview[] = [];
+		let canonical!: BoundaryContextPreview;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						switch (key) {
+							case "llmMessages":
+								event.context.llmMessages.reverse();
+								break;
+							case "contextEntries":
+								event.context.contextEntries.length = 0;
+								break;
+							case "contextMessages":
+								event.context.contextMessages.splice(0, 1);
+								break;
+							case "pendingMessages":
+								event.context.pendingMessages = [];
+								break;
+						}
+						if (throws) throw new Error("failed after preview mutation");
+					});
+					pi.on("agent_before_settle", (event) => {
+						observations.push(event.context);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.extensionRunner.onError((error) => errors.push(error.error));
+		harness.sessionManager.appendMessage({ role: "system", content: "system", timestamp: 1 });
+		harness.sessionManager.appendMessage({ role: "user", content: "user", timestamp: 2 });
+		harness.sessionManager.appendMessage(fauxAssistantMessage("assistant"));
+		const build = vi.fn(() => {
+			const projection = harness.sessionManager.buildSessionProjection();
+			const preview = {
+				contextEntries: projection.entries,
+				contextMessages: projection.messages,
+				llmMessages: convertToLlm(projection.messages),
+				pendingMessages: [{ role: "user", content: "pending", timestamp: 3 } as AgentMessage],
+				canContinue: true,
+			};
+			canonical = structuredClone(preview);
+			return preview;
+		});
+		const result = await harness.session.extensionRunner.emitBoundary(
+			{ type: "agent_before_settle", outcome: "completed" },
+			build,
+		);
+		expect(observations).toEqual([canonical]);
+		expect(observations[0].llmMessages.map((message) => message.role)).toEqual(["system", "user", "assistant"]);
+		expect(result.context).toEqual(canonical);
+		expect(build).toHaveBeenCalledTimes(2);
+		expect(errors).toEqual(throws ? ["failed after preview mutation"] : []);
 	});
 
 	it("rebuilds for nested in-place draft mutations but not nonempty observers", async () => {

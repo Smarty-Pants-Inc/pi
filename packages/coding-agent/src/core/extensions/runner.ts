@@ -267,6 +267,18 @@ function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["t
 	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
 }
 
+function snapshotBoundaryContext(context: BoundaryContextPreview): BoundaryContextPreview {
+	// Copy array membership once per build, not once per observer. Handlers may
+	// reorder, truncate or replace these mutable views without changing session state.
+	return {
+		contextEntries: context.contextEntries.slice(),
+		contextMessages: context.contextMessages.slice(),
+		llmMessages: context.llmMessages.slice(),
+		pendingMessages: context.pendingMessages.slice(),
+		canContinue: context.canContinue,
+	};
+}
+
 function sameMessages(left: AgentMessage[], right: AgentMessage[]): boolean {
 	return left.length === right.length && left.every((message, index) => message === right[index]);
 }
@@ -950,6 +962,7 @@ export class ExtensionRunner {
 		let previewRevision = this.sessionManager.revision();
 		let previewPendingMessages = getPendingMessages?.().slice();
 		let context = await buildContext(entries);
+		let contextSnapshot = snapshotBoundaryContext(context);
 		let valid = true;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
@@ -995,6 +1008,13 @@ export class ExtensionRunner {
 					if (
 						valid &&
 						unchangedEntries &&
+						context.canContinue === contextSnapshot.canContinue &&
+						(["contextEntries", "contextMessages", "llmMessages", "pendingMessages"] as const).every(
+							(key) =>
+								Array.isArray(context[key]) &&
+								context[key].length === contextSnapshot[key].length &&
+								contextSnapshot[key].every((item, index) => item === context[key][index]),
+						) &&
 						previewRevision === nextRevision &&
 						previewPendingMessages?.length === nextPendingMessages?.length &&
 						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
@@ -1005,6 +1025,7 @@ export class ExtensionRunner {
 					previewRevision = nextRevision;
 					previewPendingMessages = nextPendingMessages?.slice();
 					context = await buildContext(entries);
+					contextSnapshot = snapshotBoundaryContext(context);
 					valid = true;
 				} catch (err) {
 					valid = false;
