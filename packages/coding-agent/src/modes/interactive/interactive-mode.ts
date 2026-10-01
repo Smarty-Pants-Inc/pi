@@ -444,6 +444,7 @@ export class InteractiveMode {
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
 	private fdPath: string | undefined;
 	private editorContainer: Container;
+	private uiHolds = new Set<{ reason: "custom" | "editor"; cancel?: () => void }>();
 	private activeSelectorToken?: object;
 	private activeSelectorDispose?: () => void;
 	private footer: FooterComponent;
@@ -2399,6 +2400,7 @@ export class InteractiveMode {
 	}
 
 	private resetExtensionUI(): void {
+		this.cancelUIHolds();
 		if (this.extensionSelector) {
 			this.hideExtensionSelector();
 		}
@@ -2579,8 +2581,26 @@ export class InteractiveMode {
 		};
 	}
 
+	private beginUIHold(reason: "custom" | "editor", cancel?: () => void): () => void {
+		const hold = { reason, cancel };
+		this.uiHolds.add(hold);
+		return () => {
+			this.uiHolds.delete(hold);
+		};
+	}
+
+	private cancelUIHolds(): void {
+		for (const hold of [...this.uiHolds]) hold.cancel?.();
+	}
+
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
+			holdState: () =>
+				this.uiHolds.values().next().value?.reason ??
+				// Dialogs replace the main editor; renderer-owned interactions (e.g. fullscreen search) use overlays.
+				(this.ui.hasOverlay() || this.editorContainer.children.some((child) => child !== this.editor)
+					? "dialog"
+					: undefined),
 			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
 			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
@@ -2641,7 +2661,8 @@ export class InteractiveMode {
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
+		let cleanup = () => {};
+		return new Promise<string | undefined>((resolve) => {
 			if (opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
@@ -2652,6 +2673,7 @@ export class InteractiveMode {
 				resolve(undefined);
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+			cleanup = () => opts?.signal?.removeEventListener("abort", onAbort);
 
 			this.extensionSelector = new ExtensionSelectorComponent(
 				title,
@@ -2674,6 +2696,10 @@ export class InteractiveMode {
 			this.editorContainer.addChild(this.extensionSelector);
 			this.ui.setFocus(this.extensionSelector);
 			this.ui.requestRender();
+		}).catch((error) => {
+			cleanup();
+			this.hideExtensionSelector();
+			throw error;
 		});
 	}
 
@@ -2717,7 +2743,8 @@ export class InteractiveMode {
 		placeholder?: string,
 		opts?: ExtensionUIDialogOptions,
 	): Promise<string | undefined> {
-		return new Promise((resolve) => {
+		let cleanup = () => {};
+		return new Promise<string | undefined>((resolve) => {
 			if (opts?.signal?.aborted) {
 				resolve(undefined);
 				return;
@@ -2728,6 +2755,7 @@ export class InteractiveMode {
 				resolve(undefined);
 			};
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
+			cleanup = () => opts?.signal?.removeEventListener("abort", onAbort);
 
 			this.extensionInput = new ExtensionInputComponent(
 				title,
@@ -2750,6 +2778,10 @@ export class InteractiveMode {
 			this.editorContainer.addChild(this.extensionInput);
 			this.ui.setFocus(this.extensionInput);
 			this.ui.requestRender();
+		}).catch((error) => {
+			cleanup();
+			this.hideExtensionInput();
+			throw error;
 		});
 	}
 
@@ -2769,7 +2801,7 @@ export class InteractiveMode {
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
 	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
-		return new Promise((resolve) => {
+		return new Promise<string | undefined>((resolve) => {
 			this.extensionEditor = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
@@ -2783,7 +2815,7 @@ export class InteractiveMode {
 					this.hideExtensionEditor();
 					resolve(undefined);
 				},
-				undefined,
+				{ onExternalEditorOpen: () => this.beginUIHold("editor") },
 				this.settingsManager.getExternalEditorCommand(),
 			);
 
@@ -2792,6 +2824,9 @@ export class InteractiveMode {
 			this.editorContainer.addChild(this.extensionEditor);
 			this.ui.setFocus(this.extensionEditor);
 			this.ui.requestRender();
+		}).catch((error) => {
+			this.hideExtensionEditor();
+			throw error;
 		});
 	}
 
@@ -2916,7 +2951,6 @@ export class InteractiveMode {
 	): Promise<T> {
 		const savedText = this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
-
 		const restoreEditor = () => {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
@@ -2925,58 +2959,78 @@ export class InteractiveMode {
 			this.ui.requestRender();
 		};
 
-		return new Promise((resolve, reject) => {
-			let component: Component & { dispose?(): void };
+		return new Promise<T>((resolve, reject) => {
+			let component: (Component & { dispose?(): void }) | undefined;
+			let handle: OverlayHandle | undefined;
 			let closed = false;
-
-			const close = (result: T) => {
-				if (closed) return;
-				closed = true;
-				if (isOverlay) this.ui.hideOverlay();
-				else restoreEditor();
-				// Note: both branches above already call requestRender
-				resolve(result);
+			let mounted = false;
+			const dispose = (target = component) => {
 				try {
-					component?.dispose?.();
+					target?.dispose?.();
 				} catch {
 					/* ignore dispose errors */
 				}
 			};
-
-			Promise.resolve(factory(this.ui, theme, this.keybindings, close))
-				.then((c) => {
-					if (closed) return;
-					component = c;
-					if (isOverlay) {
-						// Resolve overlay options - can be static or dynamic function
-						const resolveOptions = (): OverlayOptions | undefined => {
-							if (options?.overlayOptions) {
-								const opts =
-									typeof options.overlayOptions === "function"
-										? options.overlayOptions()
-										: options.overlayOptions;
-								return opts;
-							}
-							// Fallback: use component's width property if available
-							const w = (component as { width?: number }).width;
-							return w ? { width: w } : undefined;
-						};
-						const handle = this.ui.showOverlay(component, resolveOptions());
-						// Expose handle to caller for visibility control
-						options?.onHandle?.(handle);
-					} else {
-						this.disposeActiveSelector();
-						this.editorContainer.clear();
-						this.editorContainer.addChild(component);
-						this.ui.setFocus(component);
-						this.ui.requestRender();
-					}
-				})
-				.catch((err) => {
-					if (closed) return;
-					if (!isOverlay) restoreEditor();
-					reject(err);
-				});
+			const cleanup = () => {
+				if (closed) return;
+				closed = true;
+				try {
+					if (isOverlay) handle?.hide();
+					else if (mounted) restoreEditor();
+				} finally {
+					dispose();
+					release();
+				}
+			};
+			const close = (result: T) => {
+				if (closed) return;
+				try {
+					cleanup();
+					resolve(result);
+				} catch (error) {
+					reject(error);
+				}
+			};
+			const fail = (error: unknown) => {
+				if (closed) return;
+				try {
+					cleanup();
+				} catch {
+					// Preserve the original failure; cleanup's finally already released the hold.
+				}
+				reject(error);
+			};
+			// Reload/session reset dismisses the interaction even if its async factory has not returned yet.
+			const release = this.beginUIHold("custom", () => close(undefined as T));
+			try {
+				Promise.resolve(factory(this.ui, theme, this.keybindings, close))
+					.then((c) => {
+						if (closed) {
+							dispose(c);
+							return;
+						}
+						component = c;
+						if (isOverlay) {
+							const overlayOptions =
+								typeof options?.overlayOptions === "function"
+									? options.overlayOptions()
+									: options?.overlayOptions;
+							const width = (component as { width?: number }).width;
+							handle = this.ui.showOverlay(component, overlayOptions ?? (width ? { width } : undefined));
+							options?.onHandle?.(handle);
+						} else {
+							this.disposeActiveSelector();
+							mounted = true;
+							this.editorContainer.clear();
+							this.editorContainer.addChild(component);
+							this.ui.setFocus(component);
+							this.ui.requestRender();
+						}
+					})
+					.catch(fail);
+			} catch (error) {
+				fail(error);
+			}
 		});
 	}
 
@@ -4510,8 +4564,9 @@ export class InteractiveMode {
 		}
 		const editorCmd = this.settingsManager.getExternalEditorCommand();
 		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
-		this.ui.stop();
+		const release = this.beginUIHold("editor");
 		try {
+			this.ui.stop();
 			const result = await editInExternalEditor({
 				command: editorCmd,
 				content,
@@ -4520,8 +4575,12 @@ export class InteractiveMode {
 				this.editor.setText(result.content);
 			}
 		} finally {
-			this.ui.start();
-			this.ui.requestRender(true);
+			try {
+				this.ui.start();
+				this.ui.requestRender(true);
+			} finally {
+				release();
+			}
 		}
 	}
 
@@ -4865,23 +4924,31 @@ export class InteractiveMode {
 		const token = {};
 		let dispose: (() => void) | undefined;
 		const done = () => {
-			dispose?.();
-			if (this.activeSelectorToken !== token) return;
+			if (this.activeSelectorToken !== token) {
+				dispose?.();
+				return;
+			}
 			this.activeSelectorToken = undefined;
 			this.activeSelectorDispose = undefined;
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
 			this.ui.setFocus(this.editor);
+			dispose?.();
 		};
 		const created = create(done);
 		dispose = created.dispose;
 		this.disposeActiveSelector();
 		this.activeSelectorToken = token;
 		this.activeSelectorDispose = dispose;
-		this.editorContainer.clear();
-		this.editorContainer.addChild(created.component);
-		this.ui.setFocus(created.focus);
-		this.ui.requestRender();
+		try {
+			this.editorContainer.clear();
+			this.editorContainer.addChild(created.component);
+			this.ui.setFocus(created.focus);
+			this.ui.requestRender();
+		} catch (error) {
+			done();
+			throw error;
+		}
 	}
 
 	private showSettingsSelector(): void {
@@ -6519,6 +6586,7 @@ export class InteractiveMode {
 				editorContainer: this.editorContainer,
 				editor: this.editor,
 				keybindings: this.keybindings,
+				beginExternalEditorHold: () => this.beginUIHold("editor"),
 				showStatus: (message) => this.showStatus(message),
 				showError: (message) => this.showError(message),
 			},
@@ -6990,6 +7058,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.cancelUIHolds();
 		this.stagingAudit?.("detached");
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {

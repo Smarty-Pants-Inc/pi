@@ -2,6 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
@@ -267,6 +268,50 @@ function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["t
 	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
 }
 
+function snapshotBoundaryContext(context: BoundaryContextPreview) {
+	// Snapshot only projection-local views once per build. Canonical messages and
+	// their payloads stay shared; cloning full history would restore allocation churn.
+	const canonicalMessages = new Set<AgentMessage>();
+	const sharedContent = new Set<unknown>();
+	for (const { sourceEntry } of context.contextEntries) {
+		if (sourceEntry.type === "message") {
+			canonicalMessages.add(sourceEntry.message);
+			if ("content" in sourceEntry.message) sharedContent.add(sourceEntry.message.content);
+		} else if (sourceEntry.type === "custom_message") {
+			sharedContent.add(sourceEntry.content);
+		} else if (sourceEntry.type === "context_edit") {
+			sharedContent.add(sourceEntry.replacement?.content);
+		} else if (sourceEntry.type === "compaction" && sourceEntry.systemMessage) {
+			canonicalMessages.add(sourceEntry.systemMessage);
+			sharedContent.add(sourceEntry.systemMessage.content);
+		}
+	}
+	const localMessages = new Map<AgentMessage, object>();
+	for (const messages of [context.contextMessages, context.llmMessages]) {
+		for (const message of messages) {
+			if (canonicalMessages.has(message) || localMessages.has(message)) continue;
+			localMessages.set(message, {
+				...message,
+				...("content" in message && !sharedContent.has(message.content)
+					? { content: structuredClone(message.content) }
+					: {}),
+			});
+		}
+	}
+	return {
+		contextEntries: context.contextEntries.slice(),
+		contextMessages: context.contextMessages.slice(),
+		llmMessages: context.llmMessages.slice(),
+		pendingMessages: context.pendingMessages.slice(),
+		canContinue: context.canContinue,
+		contributions: context.contextEntries.map((entry) => ({
+			sourceEntry: entry.sourceEntry,
+			messages: entry.messages.slice(),
+		})),
+		localMessages: Array.from(localMessages),
+	};
+}
+
 function sameMessages(left: AgentMessage[], right: AgentMessage[]): boolean {
 	return left.length === right.length && left.every((message, index) => message === right[index]);
 }
@@ -319,6 +364,7 @@ export async function emitProjectTrustEvent(
 }
 
 const noOpUIContext: ExtensionUIContext = {
+	holdState: () => undefined,
 	select: async () => undefined,
 	confirm: async () => false,
 	input: async () => undefined,
@@ -943,18 +989,33 @@ export class ExtensionRunner {
 	async emitBoundary(
 		baseEvent: BoundaryBaseEvent,
 		buildContext: (entries: SessionBoundaryDraft[]) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
+		getPendingMessages?: () => AgentMessage[],
 	): Promise<BoundaryDispatchResult> {
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
 		let shouldContinue = false;
+		// Record the state represented by the preview before the builder can yield.
+		let previewRevision = this.sessionManager.revision();
+		let previewPendingMessages = getPendingMessages?.().slice();
 		let context = await buildContext(entries);
+		let contextSnapshot = snapshotBoundaryContext(context);
 		let valid = true;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
 				// The host snapshots each newly returned occurrence. A retained snapshot can
 				// carry its receipt forward only once, even if a handler duplicates it.
-				const retainedOccurrences = new Set(entries);
+				const retainedOccurrences = new Set(Array.isArray(entries) ? entries : []);
+				// A failed proposal remains visible so a later handler can replace it.
+				const hadEntries = Array.isArray(entries) && entries.length > 0;
+				let previousEntries: SessionBoundaryDraft[] | undefined;
+				if (hadEntries) {
+					try {
+						previousEntries = structuredClone(entries);
+					} catch {
+						// Uncloneable extension data must still follow the usual preview validation.
+					}
+				}
 				const event = {
 					...baseEvent,
 					entries,
@@ -975,8 +1036,49 @@ export class ExtensionRunner {
 				}
 
 				try {
-					entries = entries.map((draft) => (retainedOccurrences.delete(draft) ? draft : { ...draft }));
+					if (!Array.isArray(entries)) throw new Error("Boundary entries must be an array");
+					let newOccurrences = false;
+					entries = entries.map((draft) => {
+						if (retainedOccurrences.delete(draft)) return draft;
+						newOccurrences = true;
+						return { ...draft };
+					});
+					// Observers need no new preview. Preserve in-place draft edits, canonical appends
+					// and queue changes, including mutations made before a handler throws. A new
+					// occurrence needs a receipt even when its content equals a previous draft.
+					const unchangedEntries =
+						!newOccurrences &&
+						(previousEntries ? isDeepStrictEqual(previousEntries, entries) : !hadEntries && entries.length === 0);
+					const nextRevision = this.sessionManager.revision();
+					const nextPendingMessages = getPendingMessages?.();
+					if (
+						valid &&
+						unchangedEntries &&
+						context.canContinue === contextSnapshot.canContinue &&
+						(["contextEntries", "contextMessages", "llmMessages", "pendingMessages"] as const).every(
+							(key) =>
+								Array.isArray(context[key]) &&
+								context[key].length === contextSnapshot[key].length &&
+								contextSnapshot[key].every((item, index) => item === context[key][index]),
+						) &&
+						contextSnapshot.contributions.every(
+							(entry, index) =>
+								entry.sourceEntry === context.contextEntries[index].sourceEntry &&
+								Array.isArray(context.contextEntries[index].messages) &&
+								sameMessages(entry.messages, context.contextEntries[index].messages),
+						) &&
+						contextSnapshot.localMessages.every(([message, snapshot]) => isDeepStrictEqual(message, snapshot)) &&
+						previewRevision === nextRevision &&
+						previewPendingMessages?.length === nextPendingMessages?.length &&
+						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
+					) {
+						continue;
+					}
+
+					previewRevision = nextRevision;
+					previewPendingMessages = nextPendingMessages?.slice();
 					context = await buildContext(entries);
+					contextSnapshot = snapshotBoundaryContext(context);
 					valid = true;
 				} catch (err) {
 					valid = false;

@@ -75,6 +75,7 @@ export interface HarnessOptions {
 	modelsJson?: Record<string, unknown>;
 	/** Stands in for herdr's input attestation (smarty-dev#2637). */
 	inputAttestation?: InputAttestationReader;
+	prepareRequest?: Agent["prepareRequest"];
 }
 
 export interface Harness {
@@ -153,6 +154,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			tools: [],
 		},
 		convertToLlm,
+		prepareRequest: options.prepareRequest,
 		onPayload: async (payload) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {

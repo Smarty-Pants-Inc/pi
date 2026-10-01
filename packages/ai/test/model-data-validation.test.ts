@@ -115,6 +115,15 @@ describe("generated model data validation", () => {
 		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow(expectedMessage);
 	});
 
+	// Regression for Smarty-Pants-Inc/pi#100: hydration must not publish negative prices.
+	it.each(["input", "output", "cacheRead", "cacheWrite"])("rejects negative cost.%s", (field) => {
+		const fixture = createFixture();
+		const model = fixture.values["chat:model-a"] as Record<string, unknown>;
+		(model.cost as Record<string, unknown>)[field] = -1_000_000;
+		writeFixtureData(fixture.dataDir, fixture.structure, fixture.values);
+		expect(() => validateModelDataDirectory(fixture.structure, fixture.dataDir)).toThrow(`invalid cost.${field}`);
+	});
+
 	it("rejects a model without a known type", () => {
 		const fixture = createFixture();
 		const model = fixture.values["chat:model-a"] as Record<string, unknown>;

@@ -46,9 +46,10 @@ describe("automatic compaction cancellation regressions", () => {
 	// Regression test for #9340.
 	it("does not start post-run auto-compaction after abort", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 200, maxTokens: 50 }],
+			// #2742: preserve the 150-token trigger, but let the request fit before testing abort.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 50 }],
 			settings: {
-				compaction: { enabled: true, reserveTokens: 50, keepRecentTokens: 1 },
+				compaction: { enabled: true, reserveTokens: 9_850, keepRecentTokens: 1 },
 				retry: { enabled: false },
 			},
 			extensionFactories: [

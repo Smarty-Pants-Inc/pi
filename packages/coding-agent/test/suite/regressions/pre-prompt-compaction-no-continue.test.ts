@@ -25,7 +25,8 @@ describe("pre-prompt compaction regression", () => {
 
 	it("compacts length-stop overflow before a new prompt without continuing from an assistant message", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			// #2742: the retained output selects length recovery; the next input must fit.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -75,7 +76,8 @@ describe("pre-prompt compaction regression", () => {
 
 	it.each(["failed", "aborted"] as const)("retains unsent input after %s compaction", async (outcome) => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			// #2742: the summary request fits even though prior usage selects overflow recovery.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -97,7 +99,7 @@ describe("pre-prompt compaction regression", () => {
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
-			usage: createUsage(101),
+			usage: createUsage(10_001),
 		});
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 		const before = structuredClone(harness.sessionManager.getEntries());
@@ -143,7 +145,8 @@ describe("pre-prompt compaction regression", () => {
 		"keeps a triggered message held before %s compaction queued, with no new run",
 		async (outcome) => {
 			const harness = await createHarness({
-				models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+				// #2742: let the summary provider fail instead of failing local summary admission.
+				models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 				settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 				extensionFactories: [
 					(pi) => {
@@ -164,7 +167,7 @@ describe("pre-prompt compaction regression", () => {
 				api: model.api,
 				provider: model.provider,
 				model: model.id,
-				usage: createUsage(101),
+				usage: createUsage(10_001),
 			});
 			harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 			harness.setResponses([

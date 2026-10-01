@@ -572,9 +572,12 @@ function buildSessionPath(
 	return path;
 }
 
-function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
-	let thinkingLevel = "off";
-	let model: { provider: string; modelId: string } | null = null;
+function getSessionContextSettings(
+	path: SessionEntry[],
+	previous?: Pick<SessionContext, "thinkingLevel" | "model">,
+): Pick<SessionContext, "thinkingLevel" | "model"> {
+	let thinkingLevel = previous?.thinkingLevel ?? "off";
+	let model = previous?.model ?? null;
 
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
@@ -635,7 +638,10 @@ export function buildContextEntries(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionEntry[] {
-	const path = buildSessionPath(entries, leafId, byId);
+	return buildContextEntriesFromPath(buildSessionPath(entries, leafId, byId));
+}
+
+function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -704,7 +710,14 @@ export function buildSessionProjection(
 ): SessionProjection {
 	const path = buildSessionPath(entries, leafId, byId);
 	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const contextEntries = buildContextEntries(entries, leafId, byId);
+	return projectSessionContext(buildContextEntriesFromPath(path), thinkingLevel, model);
+}
+
+function projectSessionContext(
+	contextEntries: SessionEntry[],
+	thinkingLevel: string,
+	model: SessionContext["model"],
+): SessionProjection {
 	const edits = new Map<string, ContextEditEntry>();
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
@@ -1149,6 +1162,13 @@ export class SessionManager {
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
 	#revision = 0;
+	#branchProjection?: {
+		revision: number;
+		path: SessionEntry[];
+		contextEntries: SessionEntry[];
+		thinkingLevel: string;
+		model: SessionContext["model"];
+	};
 	#revisionKey: { entries: FileEntry[]; length: number; leafId: string | null } | undefined;
 	readonly #ownedJournal?: OwnedJournal;
 	private ownedBytes: Buffer = Buffer.alloc(0);
@@ -1269,6 +1289,7 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 		};
 		this.fileEntries = [header];
+		this.#branchProjection = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1304,6 +1325,7 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.#branchProjection = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1366,6 +1388,7 @@ export class SessionManager {
 			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
 		}
 		this.#revisionKey = undefined;
+		this.#branchProjection = undefined;
 	}
 
 	/** Append one entry line and record its byte range. */
@@ -1403,7 +1426,10 @@ export class SessionManager {
 			if (this.byId.get(next.id) === entry) this.byId.set(next.id, next);
 			changed = true;
 		}
-		if (changed) this.#revisionKey = undefined;
+		if (changed) {
+			this.#revisionKey = undefined;
+			this.#branchProjection = undefined;
+		}
 	}
 
 	isPersisted(): boolean {
@@ -1499,6 +1525,7 @@ export class SessionManager {
 		this.fileEntries.push(admitted);
 		this.byId.set(admitted.id, admitted);
 		this.leafId = admitted.id;
+		this.extendBranchProjection(admitted);
 		this.#persistEntry(admitted);
 	}
 
@@ -1982,6 +2009,9 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		if (fromId === undefined || fromId === this.leafId) {
+			return this.ownedView(this.getBranchProjection().path.slice());
+		}
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
 		let current = startId ? this.byId.get(startId) : undefined;
@@ -1998,7 +2028,46 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return this.ownedView(buildContextEntries(this.getEntries(), this.leafId, this.byId));
+		return this.ownedView(this.getBranchProjection().contextEntries.slice());
+	}
+
+	/** Ordinary appends extend the cached branch instead of walking old history again. */
+	private extendBranchProjection(entry: SessionEntry): void {
+		const cache = this.#branchProjection;
+		const key = this.#revisionKey;
+		if (
+			!cache ||
+			cache.revision !== this.#revision ||
+			key?.entries !== this.fileEntries ||
+			key.length !== this.fileEntries.length - 1 ||
+			key.leafId !== entry.parentId
+		) {
+			this.#branchProjection = undefined;
+			return;
+		}
+		cache.path.push(entry);
+		if (entry.type === "compaction") {
+			cache.contextEntries = buildContextEntriesFromPath(cache.path);
+		} else if (cache.contextEntries !== cache.path) {
+			cache.contextEntries.push(entry);
+		}
+		Object.assign(cache, getSessionContextSettings([entry], cache));
+		cache.revision = this.revision();
+	}
+
+	/** Cache only the current branch selection, not mutable projected messages or past revisions. */
+	private getBranchProjection() {
+		const revision = this.revision();
+		if (this.#branchProjection?.revision !== revision) {
+			const path = buildSessionPath([], this.leafId, this.byId);
+			this.#branchProjection = {
+				revision,
+				path,
+				contextEntries: buildContextEntriesFromPath(path),
+				...getSessionContextSettings(path),
+			};
+		}
+		return this.#branchProjection;
 	}
 
 	/**
@@ -2006,7 +2075,8 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		return this.ownedView(buildSessionProjection(this.getEntries(), this.leafId, this.byId));
+		const { contextEntries, thinkingLevel, model } = this.getBranchProjection();
+		return this.ownedView(projectSessionContext(contextEntries, thinkingLevel, model ? { ...model } : null));
 	}
 
 	buildSessionContext(): SessionContext {
@@ -2092,6 +2162,7 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.#branchProjection = undefined;
 		this.#releaseColdEntries();
 	}
 
@@ -2103,6 +2174,7 @@ export class SessionManager {
 	resetLeaf(): void {
 		this.#ownedJournal?.assertActive();
 		this.leafId = null;
+		this.#branchProjection = undefined;
 	}
 
 	/**

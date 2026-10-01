@@ -218,6 +218,8 @@ Interactive mode provides the complete terminal UI.
 RPC can forward supported dialogs and notifications through the [RPC Extension UI protocol](rpc-extension-ui.md), but not custom terminal components; JSON and print modes have no UI.
 Guard terminal-only behavior with `ctx.mode === "tui"` and use `ctx.hasUI` for interactions supported by interactive and RPC clients.
 
+`ctx.ui.holdState(): "dialog" | "custom" | "editor" | undefined` synchronously reports one active host-wide UI hold, or `undefined` when none is active. In TUI mode it includes native and extension dialogs, `custom()` interactions (including async factories and hidden overlays until completion), and external editors. RPC reports `"dialog"` while a supported UI request awaits a client response; print/JSON report `undefined`. Persistent widgets, headers, footers, and the main editor are not holds. Use this cheap snapshot alongside `ctx.isPromptPending()` and agent-idle checks before automatic reloads; it does not reserve the UI or guarantee that a later reload is safe.
+
 Keep tool and event behavior independent from rendering so non-interactive modes remain functional.
 
 <a id="error-handling"></a>
