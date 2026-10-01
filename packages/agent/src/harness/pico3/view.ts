@@ -409,17 +409,19 @@ function syncOptional(target: object, key: string, next: unknown): void {
 		delete record[key];
 		return;
 	}
-	const current = record[key];
-	if (same(current, next)) return;
+	const own = Object.hasOwn(record, key);
+	const current = own ? record[key] : undefined;
+	if (own && same(current, next)) return;
 	if (isRecord(current) && isRecord(next)) syncRecord(current, next);
 	else record[key] = structuredClone(next);
 }
 
 function syncRecord(target: Record<string, unknown>, next: Record<string, unknown>): void {
-	for (const key of Object.keys(target)) if (!(key in next)) delete target[key];
+	for (const key of Object.keys(target)) if (!Object.hasOwn(next, key)) delete target[key];
 	for (const [key, value] of Object.entries(next)) {
-		const current = target[key];
-		if (same(current, value)) continue;
+		const own = Object.hasOwn(target, key);
+		const current = own ? target[key] : undefined;
+		if (own && same(current, value)) continue;
 		if (Array.isArray(current) && Array.isArray(value)) {
 			syncArray(current, value);
 			continue;
@@ -454,9 +456,17 @@ function syncArray(target: unknown[], next: unknown[]): void {
 }
 
 function sameArrayItem(current: Record<string, unknown>, next: Record<string, unknown>): boolean {
-	if (typeof current.id === "number" || typeof next.id === "number") return current.id === next.id;
-	if (typeof current.callId === "string" || typeof next.callId === "string") return current.callId === next.callId;
-	if (typeof current.type === "string" || typeof next.type === "string") return current.type === next.type;
+	for (const [key, type] of [
+		["id", "number"],
+		["callId", "string"],
+		["type", "string"],
+	]) {
+		const currentOwn = Object.hasOwn(current, key);
+		const nextOwn = Object.hasOwn(next, key);
+		if ((currentOwn && typeof current[key] === type) || (nextOwn && typeof next[key] === type)) {
+			return currentOwn && nextOwn && current[key] === next[key];
+		}
+	}
 	return false;
 }
 
