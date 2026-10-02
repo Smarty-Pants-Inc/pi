@@ -589,7 +589,6 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 	});
 	// Wrap this instance's installed transformer, preserving its lazy/static runtime selection.
 	type ProgramPath = {
-		node: { directives: unknown[] };
 		unshiftContainer(key: "body", node: unknown): void;
 	};
 	const transform = jiti.options.transform!;
@@ -609,20 +608,16 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 			...options,
 			babel: {
 				...options.babel,
+				// Jiti parses every source as a module by default, including sloppy CommonJS.
+				// Infer ESM from syntax, but explicit ESM suffixes are modules even without imports.
+				sourceType: /\.(?:mjs|mts)$/.test(options.filename ?? "") ? "module" : "unambiguous",
 				plugins: [
 					...(options.babel?.plugins ?? []),
 					({ template }: { template: { statement: { ast(source: string): unknown } } }) => {
-						let directives: unknown[] = [];
 						return {
-							visitor: {
-								Program(program: ProgramPath) {
-									directives = [...program.node.directives];
-								},
-							},
 							post(file: { path: ProgramPath }) {
-								// PR #95: retain source directives, not generated strictness in sloppy CJS.
+								// Keep Babel's module strictness and the source's own directives.
 								// Insert after Babel's import hoisting, so every import is still observed.
-								file.path.node.directives = directives;
 								file.path.unshiftContainer(
 									"body",
 									template.statement.ast(`{

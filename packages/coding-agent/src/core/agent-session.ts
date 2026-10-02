@@ -2718,10 +2718,10 @@ export class AgentSession {
 					const dispatch = async () => {
 						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
 						if (!this._modelSwitchDispatches.has(appMessage)) return;
-						const delivery = this._deliverCustomMessage(appMessage, options);
-						// Re-entry synchronously transfers ownership to a run, held queue, or another switch.
+						// Consume this ticket before re-entry can install another switch's ticket
+						// for the same admitted message. Its object and first receipt stay unchanged.
 						this._modelSwitchDispatches.delete(appMessage);
-						await delivery;
+						await this._deliverCustomMessage(appMessage, options);
 					};
 					if (this._isEmittingAgentSettled) {
 						// External callers can await delivery; unlike hooks, they do not own this settlement.

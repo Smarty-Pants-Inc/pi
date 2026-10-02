@@ -349,7 +349,8 @@ describe("pi#95 Git implementation authority", () => {
 				.map(([text]) => String(text))
 				.filter((text) => text.startsWith("Turn provenance:"));
 			expect(diagnostics).toHaveLength(1);
-			expect(diagnostics[0]).toContain(JSON.stringify(sourceB));
+			// PR #95 R10: diagnostics name the installed entry, never the original package URL.
+			expect(diagnostics[0]).not.toContain(sourceB);
 			expect(diagnostics[0]).toContain("trust its installed file/directory path");
 			expect(diagnostics[0]).toContain(JSON.stringify(entry));
 			expect(diagnostics[0].trimEnd().split("\n")).toHaveLength(1);

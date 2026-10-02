@@ -325,7 +325,7 @@ function trusts(allowed: unknown, caller: TurnProvenanceCaller): boolean {
 	if (packageSource && allowed.includes(packageSource) && !reportedSourceRefusals.has(caller)) {
 		reportedSourceRefusals.add(caller);
 		process.stderr.write(
-			`Turn provenance: refused Git/npm source grant ${JSON.stringify(packageSource)}; trust its installed file/directory path (e.g. ${JSON.stringify(caller.resolvedPath)}) instead.\n`,
+			`Turn provenance: refused Git/npm source grant for installed extension ${JSON.stringify(caller.resolvedPath)}; trust its installed file/directory path instead.\n`,
 		);
 	}
 	const loaded = loadedModules.get(caller);
