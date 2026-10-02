@@ -43,6 +43,7 @@ export interface RetrySettings {
 	maxRetries?: number; // default: 3
 	baseDelayMs?: number; // default: 2000 (exponential backoff: 2s, 4s, 8s)
 	maxAgentDelayMs?: number; // default: 60000
+	quotaDelayMs?: number; // default: 5000 (one-shot pre-output quota refusal retry)
 	provider?: ProviderRetrySettings;
 	/** Exact provider/modelId used once after agent retries are exhausted. Off by default. */
 	fallbackModel?: string;
@@ -938,6 +939,10 @@ export class SettingsManager {
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
 			maxAgentDelayMs: this.settings.retry?.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
 		};
+	}
+
+	getQuotaRetryDelayMs(): number {
+		return parseTimeoutSetting(this.settings.retry?.quotaDelayMs, "retry.quotaDelayMs") ?? 5000;
 	}
 
 	getRetryFallbackModel(): string | undefined {

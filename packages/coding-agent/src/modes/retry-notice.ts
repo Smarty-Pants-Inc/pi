@@ -4,9 +4,11 @@ import type { AgentSessionEvent } from "../core/agent-session.ts";
 export function writeRetryNotice(event: AgentSessionEvent): void {
 	if (event.type === "auto_retry_start") {
 		console.error(
-			event.waitMessage !== undefined
-				? `Waiting ${Math.ceil(event.delayMs / 1000)}s: ${event.waitMessage}`
-				: `Retrying (${event.attempt}/${event.maxAttempts}) in ${event.delayMs}ms: ${event.errorMessage}`,
+			event.retryReason === "quota"
+				? `quota refusal; retrying once in ${Math.ceil(event.delayMs / 1000)}s`
+				: event.waitMessage !== undefined
+					? `Waiting ${Math.ceil(event.delayMs / 1000)}s: ${event.waitMessage}`
+					: `Retrying (${event.attempt}/${event.maxAttempts}) in ${event.delayMs}ms: ${event.errorMessage}`,
 		);
 	} else if (event.type === "auto_retry_fallback") {
 		console.error(

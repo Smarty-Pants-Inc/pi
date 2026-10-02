@@ -3720,7 +3720,14 @@ export class InteractiveMode {
 					this.session.abortRetry();
 				};
 				this.showStatusIndicator(
-					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs, event.waitMessage),
+					new RetryStatusIndicator(
+						this.ui,
+						event.attempt,
+						event.maxAttempts,
+						event.delayMs,
+						event.waitMessage,
+						event.retryReason,
+					),
 				);
 				this.ui.requestRender();
 				break;

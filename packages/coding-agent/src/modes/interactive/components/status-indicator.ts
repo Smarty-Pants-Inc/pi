@@ -52,12 +52,21 @@ export class RetryStatusIndicator extends StatusIndicator {
 	private countdown: CountdownTimer | undefined;
 
 	/** `waitMessage` marks the one-shot wait on a throttled provider limit: `Waiting Ns: <waitMessage>`. */
-	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number, waitMessage?: string) {
+	constructor(
+		ui: TUI,
+		attempt: number,
+		maxAttempts: number,
+		delayMs: number,
+		waitMessage?: string,
+		retryReason?: "quota",
+	) {
 		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
 		const retryMessage = (seconds: number) =>
-			waitMessage !== undefined
-				? `Waiting ${seconds}s: ${waitMessage} ${cancelHint}`
-				: `Retrying (${attempt}/${maxAttempts}) in ${seconds}s... ${cancelHint}`;
+			retryReason === "quota"
+				? `quota refusal; retrying once in ${seconds}s ${cancelHint}`
+				: waitMessage !== undefined
+					? `Waiting ${seconds}s: ${waitMessage} ${cancelHint}`
+					: `Retrying (${attempt}/${maxAttempts}) in ${seconds}s... ${cancelHint}`;
 		super(
 			"retry",
 			ui,

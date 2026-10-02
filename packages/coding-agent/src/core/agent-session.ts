@@ -31,6 +31,7 @@ import {
 	getCurrentSystemMessage,
 	hasAssistantOutput,
 	isPrematureStreamError,
+	isQuotaRefusal,
 	type RetryPolicy,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
@@ -244,6 +245,8 @@ export type AgentSessionEvent =
 			errorMessage: string;
 			/** Set for the one-shot wait on a throttled provider limit: show `Waiting Ns: <waitMessage>`. */
 			waitMessage?: string;
+			/** One-shot quota recovery uses a distinct stderr/interactive notice. */
+			retryReason?: "quota";
 	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
 	| { type: "auto_retry_fallback"; fromModel: string; toModel: string; attempt: number; errorMessage: string }
@@ -478,6 +481,8 @@ export class AgentSession {
 	private _assistantOutputObserved = false;
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
+	/** A quota refusal gets one gateway reselection; that attempt's next error is final. */
+	private _quotaRetryInFlight = false;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -1240,7 +1245,10 @@ export class AgentSession {
 
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
-				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
+				if (assistantMsg.stopReason !== "error") {
+					this._throttleWaitUsed = false;
+					this._quotaRetryInFlight = false;
+				}
 				const fallbackSucceeded =
 					this._retryFallbackInFlight &&
 					(assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse");
@@ -1274,9 +1282,9 @@ export class AgentSession {
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		if (this._agentRunAbortRequested) return false;
 		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
-		if (!message || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
+		if (!message || this._throttleWaitUsed || this._retryFallbackInFlight || this._quotaRetryInFlight) return false;
 		if (this._assistantOutputObserved || hasAssistantOutput(message)) return false;
-		if (throttledLimitWait(message)) return true;
+		if (throttledLimitWait(message) || this._canRetryQuota(message)) return true;
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || !this._isRetryableError(message)) return false;
 		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
@@ -1866,6 +1874,7 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		this._retryFallbackUsed = false;
 		this._retryFallbackInFlight = false;
+		this._quotaRetryInFlight = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -1940,9 +1949,14 @@ export class AgentSession {
 		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
 		const throttleWaitUsed = this._throttleWaitUsed;
 		const fallbackAttempt = this._retryFallbackInFlight;
+		const quotaAttempt = this._quotaRetryInFlight;
 		this._throttleWaitUsed = false;
 		const throttleWait =
-			fallbackAttempt || throttleWaitUsed || this._assistantOutputObserved || hasAssistantOutput(message)
+			fallbackAttempt ||
+			quotaAttempt ||
+			throttleWaitUsed ||
+			this._assistantOutputObserved ||
+			hasAssistantOutput(message)
 				? undefined
 				: throttledLimitWait(message);
 		let retrying: boolean;
@@ -1951,8 +1965,18 @@ export class AgentSession {
 			const { delayMs, waitMessage } = throttleWait;
 			retrying = await this._waitAndRetry(message, delayMs, this._retryAttempt, waitMessage);
 			this._throttleWaitUsed = retrying;
+		} else if (!throttleWaitUsed && this._canRetryQuota(message)) {
+			const settings = this.settingsManager.getRetrySettings();
+			const delayMs = retryDelayMs({ ...settings, baseDelayMs: this.settingsManager.getQuotaRetryDelayMs() }, 1);
+			this._retryAttempt++;
+			this._quotaRetryInFlight = true;
+			retrying = await this._waitAndRetry(message, delayMs, this._retryAttempt, undefined, "quota");
 		} else {
-			retrying = !throttleWaitUsed && this._isRetryableError(message) && (await this._prepareRetry(message));
+			retrying =
+				!throttleWaitUsed &&
+				!quotaAttempt &&
+				this._isRetryableError(message) &&
+				(await this._prepareRetry(message));
 		}
 		if (retrying) {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
@@ -1974,9 +1998,9 @@ export class AgentSession {
 			this._retryFallbackInFlight = false;
 		}
 
-		// The one-shot alternate and failed throttle retry cannot recover through compaction either.
+		// One-shot alternate, quota, and throttle retries cannot recover through compaction either.
 		const compaction =
-			fallbackAttempt || (throttleWaitUsed && message.stopReason === "error")
+			fallbackAttempt || ((throttleWaitUsed || quotaAttempt) && message.stopReason === "error")
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -4421,10 +4445,21 @@ export class AgentSession {
 	// Auto-Retry
 	// =========================================================================
 
-	/**
-	 * Check if an error is retryable (overloaded, rate limit, server errors).
-	 * Context overflow errors are NOT retryable (handled by compaction instead).
-	 */
+	/** A quota retry cannot extend another one-shot recovery or replay streamed output. */
+	private _canRetryQuota(message: AssistantMessage): boolean {
+		const settings = this.settingsManager.getRetrySettings();
+		return (
+			settings.enabled &&
+			settings.maxRetries > 0 &&
+			!this._quotaRetryInFlight &&
+			!this._retryFallbackInFlight &&
+			!this._throttleWaitUsed &&
+			!this._assistantOutputObserved &&
+			isQuotaRefusal(message)
+		);
+	}
+
+	/** Context overflow errors are handled by compaction, not transient retries. */
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Never restart a request once output or a tool call has been streamed.
 		if (this._assistantOutputObserved) return false;
@@ -4472,6 +4507,7 @@ export class AgentSession {
 		const attempt = this._retryAttempt;
 		this._retryAttempt = 0;
 		this._retryFallbackInFlight = false;
+		this._quotaRetryInFlight = false;
 		this._emit({
 			type: "auto_retry_end",
 			success: false,
@@ -4576,6 +4612,7 @@ export class AgentSession {
 		delayMs: number,
 		maxAttempts: number,
 		waitMessage?: string,
+		retryReason?: "quota",
 	): Promise<boolean> {
 		this._emit({
 			type: "auto_retry_start",
@@ -4584,6 +4621,7 @@ export class AgentSession {
 			delayMs,
 			errorMessage: message.errorMessage || "Unknown error",
 			...(waitMessage !== undefined ? { waitMessage } : {}),
+			...(retryReason !== undefined ? { retryReason } : {}),
 		});
 
 		// Keep the failed attempt in raw history while durably omitting it from model projection.

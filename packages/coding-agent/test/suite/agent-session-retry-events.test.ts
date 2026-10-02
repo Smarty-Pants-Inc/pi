@@ -105,28 +105,37 @@ describe("AgentSession retry and event characterization", () => {
 				expect(harness.session.pendingMessageCount).toBe(0);
 			});
 
+			// smarty-dev#3200: quota prefixes get only one retry, not the capacity retry budget.
 			it.each([
 				{ enabled: false, maxRetries: 2, prefix: "" },
 				{ enabled: true, maxRetries: 0, prefix: "" },
 				{ enabled: true, maxRetries: 2, prefix: "insufficient_quota: " },
 				{ enabled: true, maxRetries: 2, prefix: "billing: " },
-			])("does not retry with $enabled/$maxRetries/$prefix", async ({ enabled, maxRetries, prefix }) => {
-				const harness = await createHarness({ settings: { retry: { enabled, maxRetries, baseDelayMs: 1 } } });
-				harnesses.push(harness);
-				harness.setResponses([
-					fauxAssistantMessage("", { stopReason: "error", errorMessage: prefix + errorMessage }),
-				]);
+			])(
+				"honors disabled retries or one-shot quota recovery with $enabled/$maxRetries/$prefix",
+				async ({ enabled, maxRetries, prefix }) => {
+					const harness = await createHarness({
+						settings: { retry: { enabled, maxRetries, baseDelayMs: 1, quotaDelayMs: 1 } },
+					});
+					harnesses.push(harness);
+					const quotaRefusal = prefix.length > 0;
+					harness.setResponses(
+						Array.from({ length: quotaRefusal ? 2 : 1 }, () =>
+							fauxAssistantMessage("", { stopReason: "error", errorMessage: prefix + errorMessage }),
+						),
+					);
 
-				await harness.session.prompt("test");
+					await harness.session.prompt("test");
 
-				expect(harness.faux.state.callCount).toBe(1);
-				expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
-				expect(harness.eventsOfType("auto_retry_end")).toEqual([]);
-				expect(harness.session.messages.at(-1)).toMatchObject({
-					stopReason: "error",
-					errorMessage: prefix + errorMessage,
-				});
-			});
+					expect(harness.faux.state.callCount).toBe(quotaRefusal ? 2 : 1);
+					expect(harness.eventsOfType("auto_retry_start")).toHaveLength(quotaRefusal ? 1 : 0);
+					expect(harness.eventsOfType("auto_retry_end")).toHaveLength(quotaRefusal ? 1 : 0);
+					expect(harness.session.messages.at(-1)).toMatchObject({
+						stopReason: "error",
+						errorMessage: prefix + errorMessage,
+					});
+				},
+			);
 
 			it("cancels held retry backoff without another attempt", async () => {
 				const harness = await createHarness({

@@ -5,7 +5,16 @@ function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
 	return new RegExp(patterns.join("|"), "i");
 }
 
-const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+const QUOTA_REFUSAL_ERROR_PATTERNS = [
+	// Generic quota/budget/billing exhaustion, including OpenAI's quota error code.
+	"insufficient_quota",
+	"out of budget",
+	"quota exceeded",
+	"billing",
+] as const;
+const QUOTA_REFUSAL_ERROR_PATTERN = buildProviderErrorPattern(QUOTA_REFUSAL_ERROR_PATTERNS);
+
+const NON_RETRYABLE_PLAN_LIMIT_ERROR_PATTERNS = [
 	// OpenCode Go/free-tier limits returned as 429 JSON error types by OpenCode's
 	// Zen API. These are subscription/account limits, not transient throttles.
 	"GoUsageLimitError",
@@ -15,13 +24,12 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	// usage after rolling/weekly/monthly limits are reached.
 	"Monthly usage limit reached",
 	"available balance",
-
-	// Generic quota/budget/billing exhaustion. `insufficient_quota` is OpenAI's
-	// quota/billing error code; the other strings cover common gateway wording.
-	"insufficient_quota",
-	"out of budget",
-	"quota exceeded",
-	"billing",
+] as const;
+const NON_RETRYABLE_PLAN_LIMIT_ERROR_PATTERN = buildProviderErrorPattern(NON_RETRYABLE_PLAN_LIMIT_ERROR_PATTERNS);
+const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+	...NON_RETRYABLE_PLAN_LIMIT_ERROR_PATTERNS,
+	// Quota stays non-transient. AgentSession can separately allow one gateway reselection.
+	...QUOTA_REFUSAL_ERROR_PATTERNS,
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
@@ -117,6 +125,19 @@ export function hasAssistantOutput(message: AssistantMessage): boolean {
 		message.content.some((block) =>
 			block.type === "thinking" ? block.thinking.length > 0 : block.type === "text" ? block.text.length > 0 : true,
 		)
+	);
+}
+
+/**
+ * A quota refusal eligible for a separate one-shot agent retry, never a generic transient retry.
+ * Marked plan limits remain final, and any assistant output prevents replay.
+ */
+export function isQuotaRefusal(message: AssistantMessage): boolean {
+	if (message.stopReason !== "error" || !message.errorMessage || hasAssistantOutput(message)) return false;
+	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)) return false;
+	return (
+		!NON_RETRYABLE_PLAN_LIMIT_ERROR_PATTERN.test(message.errorMessage) &&
+		QUOTA_REFUSAL_ERROR_PATTERN.test(message.errorMessage)
 	);
 }
 

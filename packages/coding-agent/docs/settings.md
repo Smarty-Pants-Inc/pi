@@ -109,6 +109,7 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts. Premature stream endings are capped at `2`. |
 | `retry.baseDelayMs` | number | `2000` | Initial exponential-backoff delay in milliseconds. |
 | `retry.maxAgentDelayMs` | number | `60000` | Maximum agent-level retry delay in milliseconds. |
+| `retry.quotaDelayMs` | number | `5000` | Delay before the single pre-output quota-refusal retry, capped by `retry.maxAgentDelayMs`. |
 | `retry.fallbackModel` | string | None (off) | Exact `provider/modelId` of the configured alternate model to try once after transient agent retries are exhausted. |
 | `retry.provider.timeoutMs` | number | `httpIdleTimeoutMs` | Provider request timeout in milliseconds. |
 | `retry.provider.maxRetries` | number | `0` | Provider-level retry attempts. |
@@ -117,6 +118,8 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 Agent retries and fallback only restart requests with no output: nonempty text or reasoning, any tool-call block (including a partial call), or reported output tokens prevent recovery. Empty reasoning blocks and encrypted reasoning signatures alone do not count as output. Pi also remembers streamed deltas if a provider discards partial content in its final error.
 
 Premature stream endings use at most two retries with the configured exponential backoff (by default 2s, then 4s). Lower `retry.maxRetries` values still apply, and `retry.enabled: false` disables both retry and fallback. Other transient failures keep their ordinary retry budget.
+
+A quota/billing refusal (including `insufficient_quota`) before any output gets exactly one retry on the same configured model, allowing a gateway to reselect its upstream account or model. Pi announces `quota refusal; retrying once in 5s` before waiting. Configure the delay with `retry.quotaDelayMs`; the wait is abortable. The retry's next error is final and retains the provider's error, without further retry, fallback, or compaction recovery. This one-shot allowance is separate from transient retries, but `retry.enabled: false` or `retry.maxRetries: 0` disables it. Explicitly marked provider plan limits, authentication failures, and invalid requests remain final. Provider-level and summarization retries do not retry quota refusals.
 
 Set `retry.fallbackModel` only to an explicitly chosen family alternate, for example `"cliproxyapi/your-alternate-model-id"`. Pi does not infer a family or select an alternate automatically. The alternate must exist in the model registry, have configured authentication, differ from the current model, and fit the current context. It gets one attempt, not a fresh retry budget. Unknown or unavailable alternates do not switch models. Global startup defaults are unchanged; the switched model remains selected in the session. The sealed `--owner-host-profile` interactive runtime pins a single provider identity and refuses fallback; changing that identity requires a fresh owner allocation. Ordinary print/JSON/RPC invocations do not use that sealed runtime.
 

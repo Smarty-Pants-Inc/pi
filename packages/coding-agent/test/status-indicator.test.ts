@@ -95,6 +95,22 @@ describe("status indicators", () => {
 		}
 	});
 
+	// smarty-dev#3200: interactive quota recovery is visible throughout its abortable countdown.
+	it("shows the one-shot quota notice and countdown", () => {
+		initTheme("dark");
+		vi.useFakeTimers();
+		const tui = { requestRender: vi.fn() } as unknown as TUI;
+		const indicator = new RetryStatusIndicator(tui, 1, 1, 5000, undefined, "quota");
+		try {
+			expect(stripAnsi(indicator.render(120)[1]!)).toContain("quota refusal; retrying once in 5s");
+			expect(stripAnsi(indicator.render(120)[1]!)).toContain("to cancel");
+			vi.advanceTimersByTime(1000);
+			expect(stripAnsi(indicator.render(120)[1]!)).toContain("quota refusal; retrying once in 4s");
+		} finally {
+			indicator.dispose();
+		}
+	});
+
 	it("disposes retry countdown updates", () => {
 		initTheme("dark");
 		vi.useFakeTimers();
