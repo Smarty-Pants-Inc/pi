@@ -468,6 +468,8 @@ export class AgentSessionRuntime {
 	async dispose(): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		const outgoing = this.#captureOutgoing(true);
+		// Stop held extension dispatch before owner close or native idle joins.
+		outgoing.session.cancelForShutdown();
 		if (this.#owner) {
 			// Publish the shared task before invoking close callbacks. Sealed-owner
 			// terminal persistence checks identity, not active-owner permission.
@@ -502,6 +504,8 @@ export class AgentSessionRuntime {
 			}
 			return this.#ownerDisposal;
 		}
+		await outgoing.session.abort();
+		this.#assertCurrent(outgoing);
 		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
 			type: "session_shutdown",
 			reason: "quit",

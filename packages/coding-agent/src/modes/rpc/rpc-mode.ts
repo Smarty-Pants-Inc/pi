@@ -511,7 +511,7 @@ export async function runRpcMode(
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+				void shutdown(signal === "SIGHUP" ? 129 : 143);
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -1057,9 +1057,14 @@ export async function runRpcMode(
 		cancelPendingExtensionRequests();
 	};
 
-	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+	function shutdown(exitCode = 0): Promise<never> {
 		if (shutdownPromise) return shutdownPromise;
 		shutdownPromise = (async (): Promise<never> => {
+			// Cancel before joining commands or the run; retain subscriptions for final events.
+			session.cancelForShutdown();
+			cancelPendingExtensionRequests();
+			await session.abort();
+			await waitForPendingCommandWork();
 			for (const cleanup of signalCleanupHandlers) {
 				cleanup();
 			}
@@ -1069,9 +1074,7 @@ export async function runRpcMode(
 			await runtimeHost.dispose();
 			detachInput();
 			process.stdin.pause();
-			if (signal !== "SIGTERM") {
-				await flushRawStdout();
-			}
+			await flushRawStdout();
 			return process.exit(exitCode);
 		})();
 		return shutdownPromise;
@@ -1089,7 +1092,7 @@ export async function runRpcMode(
 				output(response);
 				await waitForRawStdoutBackpressure();
 			}
-			await checkShutdownRequested();
+			void checkShutdownRequested();
 		} catch (commandError: unknown) {
 			output(
 				error(
@@ -1203,7 +1206,7 @@ export async function runRpcMode(
 		inputEnded = true;
 		cancelPendingExtensionRequests();
 		if (startupDrainComplete) {
-			void waitForPendingCommandWork().then(() => shutdown());
+			void shutdown();
 		}
 	};
 
@@ -1229,7 +1232,12 @@ export async function runRpcMode(
 	})();
 
 	registerSignalHandlers();
-	await rebindSession();
+	try {
+		await rebindSession();
+	} catch (cause) {
+		if (!shutdownPromise) throw cause;
+	}
+	if (shutdownPromise) return shutdownPromise;
 	if (startupFatal) return shutdown(1);
 
 	extensionBindingsComplete = true;
