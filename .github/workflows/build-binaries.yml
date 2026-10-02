@@ -149,9 +149,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # No hosted exceptions are approved (smarty-dev#1246).
+        # macOS/Windows hosted entries: scripts/ci/hosted-runner-allowlist.txt (smarty-dev#1246).
         runner:
           - smarty-linux-x64
+          - macos-latest
+          - windows-latest
     permissions:
       actions: read
     env:
@@ -402,10 +404,21 @@ jobs:
         with:
           node-version: '22'
 
+      # Ubuntu 24.04 has no awscli package; install the pinned official AWS CLI v2
+      # (2.37.8 supports s3api put-object --if-match/--if-none-match).
       - name: Install AWS CLI
+        env:
+          AWS_CLI_VERSION: 2.37.8
+          AWS_CLI_SHA256: 6a2f98fee0901ff623ff9abb5c80f4d67c40e5c0ac5e2ad7afa2ba756a7d5088
         run: |
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y awscli
+          sudo apt-get install -y ca-certificates curl unzip
+          archive="$RUNNER_TEMP/awscli.zip"
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-${AWS_CLI_VERSION}.zip" -o "$archive"
+          printf '%s  %s\n' "$AWS_CLI_SHA256" "$archive" | sha256sum --check
+          unzip -q "$archive" -d "$RUNNER_TEMP/awscli"
+          sudo "$RUNNER_TEMP/awscli/aws/install" --update
           aws --version
 
       - name: Announce verified release on pi.dev
