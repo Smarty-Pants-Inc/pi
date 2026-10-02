@@ -28,7 +28,7 @@ export default function(pi) {
     const timer = setInterval(() => { if (existsSync(join(dir, "release-" + name))) { clearInterval(timer); resolve(); } }, 20);
   });
   const faux = createFauxCore({ provider: "tui-admission-faux" });
-  faux.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage("offline terminal answer")));
+  faux.setResponses(process.env.PI_PROOF_CASE === "r4-images-retry" ? [fauxAssistantMessage("offline seed answer with enough content to compact"), fauxAssistantMessage("", { stopReason: "error", errorMessage: "context length exceeded" }), fauxAssistantMessage("offline retry answer")] : Array.from({ length: 8 }, () => fauxAssistantMessage("offline terminal answer")));
   // Synthetic in-memory auth is never read from a credential store or sent over a network.
   pi.registerProvider(faux.provider, { baseUrl: faux.getModel().baseUrl, apiKey: "offline-faux-test-only", api: faux.api, streamSimple: faux.streamSimple, models: faux.models });
   pi.on("session_start", async (_event, ctx) => {
@@ -37,11 +37,25 @@ export default function(pi) {
     await pi.setModel(faux.getModel());
     ctx.ui.setStatus("proof", "OFFLINE_PROOF_READY"); mark("ready");
   });
+  let round4RunHeld = false, savedImages = [];
+  pi.registerShortcut("ctrl+shift+c", { handler: ctx => { ctx.compact({ onError: error => { writeFileSync(join(dir, "compact-error"), String(error)); } }); } });
+  pi.registerShortcut("ctrl+shift+s", { handler: ctx => { savedImages = ctx.ui.getEditorText().match(/\\[recovered image [^\\]]+\\]/g) ?? []; ctx.ui.setEditorText("first-image\\n" + savedImages[0]); mark("split-images"); } });
+  pi.registerShortcut("ctrl+shift+t", { handler: ctx => { ctx.ui.setEditorText("tail-image\\n" + savedImages[1]); mark("tail-image-ready"); } });
+  pi.registerShortcut("ctrl+shift+j", { handler: () => { pi.sendUserMessage("shutdown-handled"); } });
+  pi.on("session_before_compact", async (event, ctx) => {
+    if (!process.env.PI_PROOF_CASE.startsWith("r4-")) return;
+    if (process.env.PI_PROOF_CASE === "r4-compact-shutdown") { mark("compact-shutdown-requested"); ctx.shutdown(); return { cancel: true }; }
+    ctx.ui.setStatus("proof", "R4_COMPACTION_HELD"); mark("compaction-held"); await hold("compaction");
+    return { compaction: { summary: "offline compacted context", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
+  });
   pi.on("agent_start", async (_event, ctx) => {
-    if (process.env.PI_PROOF_CASE.startsWith("recovery")) { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
+    if (process.env.PI_PROOF_CASE.startsWith("recovery") || round4RunHeld) { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
     if (process.env.PI_PROOF_CASE === "run-shutdown") ctx.shutdown();
   });
   pi.on("input", async (event, ctx) => {
+    if (event.text === "run-held" && process.env.PI_PROOF_CASE.startsWith("r4-")) round4RunHeld = true;
+    if (event.text === "r4-flush-held") { ctx.ui.setStatus("proof", "R4_FLUSH_INPUT_HELD"); mark("flushed-held"); await hold("flushed"); }
+    if (event.text.includes("first-image") || event.text.includes("tail-image")) { writeFileSync(join(dir, event.text.includes("first-image") ? "first-image-proof" : "tail-image-proof"), JSON.stringify({ text: event.text, images: event.images ?? null })); return { action: "handled" }; }
     if (event.text === "held-A") { ctx.ui.setStatus("proof", "INPUT_HELD_A"); mark("input-held"); await hold("input"); }
     if (event.text.includes("large-paste-tail") || (event.text.includes("held-A") && event.text !== "held-A")) { writeFileSync(join(dir, "paste-submitted"), event.text); return { action: "handled" }; }
     if (event.text === "queue-image") { mark("image-created"); return { action: "transform", text: "attached-original", images: [{ type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=", mimeType: "image/png" }] }; }
@@ -110,7 +124,7 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 	});
 	afterEach(async () => {
 		for (const p of proofs.splice(0)) {
-			for (const gate of ["input", "run", "switch", "shortcut", "cleanup", "settlement"])
+			for (const gate of ["input", "run", "switch", "shortcut", "cleanup", "settlement", "compaction", "flushed"])
 				writeFileSync(join(p.dir, `release-${gate}`), "release");
 			if (!existsSync(join(p.dir, "exit"))) {
 				p.keys("C-c");
@@ -128,7 +142,14 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 			}
 			p.frame("final");
 			if (evidence) {
-				for (const file of ["shortcut-result", "paste-submitted", "image-recovered", "exit"]) {
+				for (const file of [
+					"shortcut-result",
+					"paste-submitted",
+					"image-recovered",
+					"first-image-proof",
+					"tail-image-proof",
+					"exit",
+				]) {
 					if (existsSync(join(p.dir, file)))
 						writeFileSync(join(evidence, `tui-${p.name}-${file}.proof`), readFileSync(join(p.dir, file)));
 				}
@@ -141,6 +162,11 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 	async function launch(label: string, scenario: string): Promise<TerminalProof> {
 		const dir = mkdtempSync(join(tmpdir(), "pi-admission-tui-"));
 		mkdirSync(join(dir, "agent"));
+		if (scenario.startsWith("r4-"))
+			writeFileSync(
+				join(dir, "agent", "settings.json"),
+				JSON.stringify({ compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 1 } }),
+			);
 		writeFileSync(join(dir, "proof.mjs"), fixture);
 		const name = `${prefix}-${label}`;
 		tmux("new-session", "-d", "-s", name, "-x", "140", "-y", "50", "-c", dir);
@@ -434,6 +460,109 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 		]);
 		p.frame("image-resubmitted");
 	});
+	// smarty-dev#3048 / PR #110 R3-4: terminal teardown preserves unsent collapsed paste bytes.
+	it.each(["SIGTERM", "SIGHUP"] as const)("round4 %s returns exact idle collapsed draft", async (signal) => {
+		const p = await launch(`idle-paste-${signal}`, "idle");
+		const paste = `${"unsent-large-paste ".repeat(90)}large-paste-tail`;
+		p.text(`\x1b[200~${paste}\x1b[201~`);
+		await vi.waitFor(() => expect(editorFrame(p.frame("collapsed-unsent-paste"))).toContain("[paste #"));
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), signal);
+		expect(await p.exit()).toBe(0);
+		p.frame("paste-receipt");
+		await vi.waitFor(() => {
+			const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+			const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
+			expect(json).toBeDefined();
+			expect(JSON.parse(json!).text).toBe(paste);
+		});
+	});
+	// smarty-dev#3048 / PR #110 R3-5: a detached compaction prompt must restore before terminal receipt.
+	it.each(["SIGTERM", "SIGHUP"] as const)("round4 %s recovers held compaction flush input", async (signal) => {
+		const p = await launch(`compaction-flush-${signal}`, "r4-flush-signal");
+		p.submit("seed");
+		await p.mark("settled");
+		p.text("\x1b[67;6u");
+		await p.mark("compaction-held");
+		p.submit("r4-flush-held");
+		await vi.waitFor(() => expect(p.frame("compaction-staged")).toContain("Steering: r4-flush-held"));
+		writeFileSync(join(p.dir, "release-compaction"), "release");
+		await p.mark("flushed-held");
+		p.frame("flush-admission-held");
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), signal);
+		expect(await p.exit()).toBe(0);
+		p.frame("flush-recovered");
+		await vi.waitFor(() => {
+			const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+			const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
+			expect(json).toBeDefined();
+			expect(JSON.parse(json!).text).toBe("r4-flush-held");
+		});
+	});
+	// smarty-dev#3048 / PR #110 R3-6 (security R3-S6): original image ownership across every compaction branch.
+	it.each(["manual", "retry"] as const)(
+		"round4 %s compaction preserves first and tail recovered images",
+		async (kind) => {
+			const p = await launch(`images-${kind}`, `r4-images-${kind}`);
+			p.submit("seed");
+			await p.mark("settled");
+			p.submit("run-held");
+			await p.mark("run-held");
+			for (let index = 0; index < 2; index++) {
+				p.text("queue-image");
+				p.keys("M-Enter");
+				await vi.waitFor(() =>
+					expect(p.frame(`image-queued-${index}`).split("attached-original").length).toBeGreaterThan(index + 1),
+				);
+			}
+			p.keys("M-Up");
+			await vi.waitFor(() => expect(editorFrame(p.frame("images-dequeued"))).toContain("[recovered image"));
+			p.text("\x1b[83;6u");
+			await p.mark("split-images");
+			if (kind === "manual") p.text("\x1b[67;6u");
+			writeFileSync(join(p.dir, "release-run"), "release");
+			await p.mark("compaction-held");
+			p.keys("Enter");
+			p.text("\x1b[84;6u");
+			await p.mark("tail-image-ready");
+			p.keys("M-Enter");
+			await vi.waitFor(() => expect(p.frame("image-compaction-staging")).toContain("Follow-up: tail-image"));
+			writeFileSync(join(p.dir, "release-compaction"), "release");
+			await p.mark("first-image-proof");
+			await p.mark("tail-image-proof");
+			for (const slot of ["first", "tail"]) {
+				const proof = JSON.parse(readFileSync(join(p.dir, `${slot}-image-proof`), "utf8"));
+				expect(proof.text).not.toContain("[recovered image");
+				expect(proof.images).toEqual([
+					{
+						type: "image",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+						mimeType: "image/png",
+					},
+				]);
+			}
+			p.frame("image-compaction-transferred");
+		},
+	);
+	// smarty-dev#3048 / PR #110 R3-7: extension-origin no-run completion must retry the latched shutdown.
+	it.each(["extension-input", "compact"] as const)(
+		"round4 no-run %s shutdown exits without another key",
+		async (kind) => {
+			const p = await launch(`no-run-${kind}`, kind === "compact" ? "r4-compact-shutdown" : "idle");
+			if (kind === "compact") {
+				p.submit("seed");
+				await p.mark("settled");
+				p.submit("/compact");
+				await p.mark("compact-shutdown-requested");
+			} else {
+				p.text("\x1b[74;6u");
+				await p.mark("admission-shutdown");
+			}
+			p.frame("no-run-shutdown-requested");
+			expect(await p.exit()).toBe(0);
+			p.frame("no-run-exited");
+		},
+	);
+
 	it.each(["run-shutdown", "admission-shutdown"] as const)(
 		"extension-requested %s exits the real interactive loop",
 		async (scenario) => {

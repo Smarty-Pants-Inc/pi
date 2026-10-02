@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
@@ -1002,14 +1003,17 @@ export class ExtensionRunner {
 		baseEvent: BoundaryBaseEvent,
 		buildContext: (entries: SessionBoundaryDraft[]) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
 		getPendingMessages?: () => AgentMessage[],
+		signal?: AbortSignal,
 	): Promise<BoundaryDispatchResult> {
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
 		let shouldContinue = false;
 		// Record the state represented by the preview before the builder can yield.
 		let previewRevision = this.sessionManager.revision();
 		let previewPendingMessages = getPendingMessages?.().slice();
-		let context = await buildContext(entries);
+		let context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
+		signal?.throwIfAborted();
 		let contextSnapshot = snapshotBoundaryContext(context);
 		let valid = true;
 
@@ -1032,10 +1036,14 @@ export class ExtensionRunner {
 					context,
 				} as TurnEndEvent | AgentBeforeSettleEvent;
 				try {
-					const handlerResult = (await handler(event, ctx)) as BoundaryResult | undefined;
+					const handlerResult = (await raceWithAbortSignal(Promise.resolve(handler(event, ctx)), signal)) as
+						| BoundaryResult
+						| undefined;
+					signal?.throwIfAborted();
 					if (handlerResult?.entries !== undefined) entries = handlerResult.entries;
 					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
 				} catch (err) {
+					signal?.throwIfAborted();
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1079,10 +1087,12 @@ export class ExtensionRunner {
 
 					previewRevision = nextRevision;
 					previewPendingMessages = nextPendingMessages?.slice();
-					context = await buildContext(entries);
+					context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
+					signal?.throwIfAborted();
 					contextSnapshot = snapshotBoundaryContext(context);
 					valid = true;
 				} catch (err) {
+					signal?.throwIfAborted();
 					valid = false;
 					this.emitError({
 						extensionPath: ext.path,

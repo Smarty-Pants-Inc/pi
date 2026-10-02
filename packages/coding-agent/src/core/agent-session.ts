@@ -858,19 +858,27 @@ export class AgentSession {
 			return entryId ? [entryId] : [];
 		});
 		const revision = this.sessionManager.revision();
-		const boundary = await this._extensionRunner.emitBoundary(
-			{
-				type: "turn_end",
-				turnIndex: this._turnIndex,
-				message,
-				toolResults,
-				messageEntryId,
-				toolResultEntryIds,
-				outcome: this._lastActivityOutcome,
-			},
-			(entries) => this._buildBoundaryContext(entries, "turn_end"),
-			() => this._getPendingBoundaryMessages(),
-		);
+		let boundary: Awaited<ReturnType<ExtensionRunner["emitBoundary"]>>;
+		try {
+			boundary = await this._extensionRunner.emitBoundary(
+				{
+					type: "turn_end",
+					turnIndex: this._turnIndex,
+					message,
+					toolResults,
+					messageEntryId,
+					toolResultEntryIds,
+					outcome: this._lastActivityOutcome,
+				},
+				(entries) => this._buildBoundaryContext(entries, "turn_end"),
+				() => this._getPendingBoundaryMessages(),
+				this._shutdownCancellation.signal,
+			);
+		} catch (error) {
+			if (this._shutdownCancellation.signal.aborted) return false;
+			throw error;
+		}
+		if (this._shutdownCancellation.signal.aborted) return false;
 		if (boundary.entries.length > 0) this._commitBoundaryDrafts(boundary.entries);
 		// Carry captured-manager changes into agent state even if continuation is requested later.
 		else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
@@ -886,6 +894,8 @@ export class AgentSession {
 		this.agent.finishTurn = async (turn, signal) => {
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
+			// Terminal cancellation ends the low-level loop before it can drain undelivered queues.
+			if (this._shutdownCancellation.signal.aborted) return { action: "end" };
 			const previousDecision = await previousFinishTurn?.(turn, signal);
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
@@ -1162,19 +1172,18 @@ export class AgentSession {
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
+			// Empty text is valid for image-only queued input. Delivery is not truthiness.
+			// Check steering queue first
+			const steeringIndex = this._steeringMessages.indexOf(messageText);
+			if (steeringIndex !== -1) {
+				this._steeringMessages.splice(steeringIndex, 1);
+				this._emitQueueUpdate();
+			} else {
+				// Check follow-up queue
+				const followUpIndex = this._followUpMessages.indexOf(messageText);
+				if (followUpIndex !== -1) {
+					this._followUpMessages.splice(followUpIndex, 1);
 					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
 				}
 			}
 		}
@@ -2006,7 +2015,9 @@ export class AgentSession {
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
 				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
 				() => this._getPendingBoundaryMessages(),
+				this._shutdownCancellation.signal,
 			);
+			if (this._shutdownCancellation.signal.aborted) return false;
 			if (result.entries.length > 0) this._commitBoundaryDrafts(result.entries);
 			// Captured SDK managers can append context without proposing any drafts.
 			// Agent.continue() checks agent state before request preparation can refresh it.
@@ -2020,6 +2031,9 @@ export class AgentSession {
 				return false;
 			}
 			return shouldContinue;
+		} catch (error) {
+			if (this._shutdownCancellation.signal.aborted) return false;
+			throw error;
 		} finally {
 			this._isBeforeSettle = false;
 		}
@@ -2102,13 +2116,26 @@ export class AgentSession {
 			this._inputFence = undefined;
 			// Only the cancellation owner may replace its controller. A BUSY refusal
 			// must leave the still-running settlement's controller attached.
-			if (this._settlementCancellation.signal.aborted) this._settlementCancellation = new AbortController();
+			if (
+				this._settlementCancellation.signal.aborted &&
+				!this.isSettling &&
+				!this._shutdownCancellation.signal.aborted
+			)
+				this._settlementCancellation = new AbortController();
 			throw error;
 		}
 		return () => {
 			if (this._inputFence === fence) {
 				this._inputFence = undefined;
-				if (!this._inputsDisposed) this._settlementCancellation = new AbortController();
+				// A settlement may have started while this successfully acquired fence was held.
+				// Its live controller remains the cancellation owner until that settlement finishes.
+				if (
+					!this._inputsDisposed &&
+					this._settlementCancellation.signal.aborted &&
+					!this.isSettling &&
+					!this._shutdownCancellation.signal.aborted
+				)
+					this._settlementCancellation = new AbortController();
 			}
 		};
 	}
@@ -4804,6 +4831,7 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
+		this._assertInputsOpen();
 		this._shutdownCancellation.signal.throwIfAborted();
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
@@ -4839,6 +4867,8 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		if (this._inputsDisposed)
+			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash result was not recorded");
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,

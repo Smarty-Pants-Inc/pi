@@ -426,6 +426,9 @@ export async function runRpcMode(
 	runtimeHost.setRebindSession(async (receiving) => {
 		await rebindSession(receiving);
 	});
+	runtimeHost.setLifecycleCompleteHandler(() => {
+		void checkShutdownRequested().catch(() => requestShutdown(1));
+	});
 
 	const rebindSession = async (receiving = runtimeHost.session): Promise<void> => {
 		session.stopMessageEntryIdCapture();
@@ -466,6 +469,10 @@ export async function runRpcMode(
 			},
 			shutdownHandler: () => {
 				shutdownRequested = true;
+				void boundSession
+					.waitForIdle()
+					.then(() => checkShutdownRequested())
+					.catch(() => requestShutdown(1));
 			},
 			onError: (err) => {
 				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
@@ -545,21 +552,24 @@ export async function runRpcMode(
 			case "prompt": {
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
-				let preflightSucceeded = false;
-				const promptWork = session
-					.prompt(command.message, {
+				let responseSent = false;
+				const promptWork = raceWithAbortSignal(
+					session.prompt(command.message, {
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
 						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								preflightSucceeded = true;
+							if (didSucceed && !responseSent && !commandShutdown.signal.aborted) {
+								responseSent = true;
 								output(success(id, "prompt"));
 							}
 						},
-					})
+					}),
+					commandShutdown.signal,
+				)
 					.catch((e: unknown) => {
-						if (!preflightSucceeded) {
+						if (!responseSent) {
+							responseSent = true; // A terminal refusal also consumes the one response slot.
 							output(error(id, "prompt", e instanceof Error ? e.message : String(e)));
 						}
 					})
@@ -729,6 +739,13 @@ export async function runRpcMode(
 					}),
 					session.shutdownSignal,
 				);
+
+				// The non-dialog hook can outlive ordinary replacement. Revalidate its captured custody
+				// before either execution or persistence, without switching work to the receiving session.
+				if (session !== runtimeHost.session || session.isDisposed)
+					throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash was not executed or recorded");
+				if (session.inputsFenced) throw new InputAdmissionError("INPUT_ADMISSION_FENCED", "bash was not accepted");
+				session.shutdownSignal.throwIfAborted();
 
 				if (eventResult?.result) {
 					session.recordBashResult(command.command, eventResult.result, {
@@ -1066,12 +1083,11 @@ export async function runRpcMode(
 			fatal: true,
 			error: "RPC startup command queue limit exceeded",
 		} satisfies RpcFatalErrorResponse);
-		startupCommands = [];
-		startupInputCount = 0;
-		startupInputBytes = 0;
+		// Keep correlated backlog refusals for shutdown; overflow must cancel binding now.
 		detachInput();
 		process.stdin.pause();
 		cancelPendingExtensionRequests();
+		requestShutdown(1);
 	};
 
 	function shutdown(exitCode = 0): Promise<never> {
@@ -1145,7 +1161,18 @@ export async function runRpcMode(
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested || !session.isIdle) return;
+		if (
+			!shutdownRequested ||
+			!extensionBindingsComplete ||
+			!session.isIdle ||
+			session.isSettling ||
+			runtimeHost.inputsFenced
+		)
+			return;
+		// Extension-requested shutdown is graceful: publish accepted command responses
+		// before disposal. Terminal EOF/signals call shutdown directly and cancel first.
+		await waitForPendingCommandWork(true);
+		if (!session.isIdle || session.isSettling || runtimeHost.inputsFenced) return;
 		await shutdown();
 	}
 
@@ -1363,6 +1390,7 @@ export async function runRpcMode(
 		requestShutdown();
 	}
 
+	await checkShutdownRequested();
 	// Keep process alive forever
 	return new Promise(() => {});
 }

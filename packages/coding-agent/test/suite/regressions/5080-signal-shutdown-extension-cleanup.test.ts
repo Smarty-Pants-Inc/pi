@@ -21,6 +21,7 @@ type ShutdownThis = {
 	terminalShutdownRequested: boolean;
 	pendingUserInputs: string[];
 	compactionQueuedMessages: { text: string }[];
+	compactionQueueWork: Set<Promise<void>>;
 	cancelUIHolds: () => void;
 	disposeActiveSelector: () => void;
 	editor: { getText: () => string };
@@ -80,6 +81,7 @@ function createContext(order: string[], sessionManager = createSessionManager())
 		terminalShutdownRequested: false,
 		pendingUserInputs: [],
 		compactionQueuedMessages: [],
+		compactionQueueWork: new Set<Promise<void>>(),
 		cancelUIHolds: vi.fn(),
 		disposeActiveSelector: vi.fn(),
 		editor: { getText: () => "" },

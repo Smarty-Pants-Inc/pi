@@ -183,6 +183,7 @@ async function createRuntimeHost(options: {
 		switchSession: vi.fn(async () => ({ cancelled: true })),
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
+		setLifecycleCompleteHandler: vi.fn(),
 		setRebindSession: (callback: () => Promise<void>) => {
 			rebindSession = callback;
 		},
@@ -487,7 +488,8 @@ describe("RPC prompt response semantics", () => {
 			targetId = sessionManager.appendMessage({ role: "user", content: "history", timestamp: Date.now() });
 			sessionManager.appendMessage(createAssistantMessage("prior answer"));
 			session.agent.state.messages = sessionManager.buildSessionContext().messages;
-			vi.mocked(runtimeHost.dispose).mockImplementation(async () => {
+			vi.mocked(runtimeHost.dispose).mockImplementation(async (options) => {
+				await options?.beforeShutdown?.();
 				expect(session.isIdle).toBe(true);
 				order.push("dispose");
 			});

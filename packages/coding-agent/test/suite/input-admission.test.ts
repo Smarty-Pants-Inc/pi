@@ -7,7 +7,7 @@ import {
 	type AgentSessionServices,
 	type CreateAgentSessionRuntimeFactory,
 } from "../../src/core/agent-session-runtime.ts";
-import type { ExtensionFactory } from "../../src/core/extensions/index.ts";
+import type { BoundaryResult, ExtensionFactory } from "../../src/core/extensions/index.ts";
 import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
@@ -724,6 +724,124 @@ describe("native input admission v1", () => {
 		await run;
 		expect(runtime.session.inputAdmissionCount).toBe(0);
 	});
+	// smarty-dev#3048 / PR #110 R3-2 (security R3-S2): cancellation rejects late proposals and continuation.
+	it.each(["turn_end", "agent_before_settle"] as const)(
+		"terminal cancellation discards late %s drafts and later handlers",
+		async (boundary) => {
+			const entered = gate(),
+				held = gate(),
+				finished = gate();
+			const later = vi.fn();
+			const h = await setup([
+				(pi) => {
+					const handler = async (): Promise<BoundaryResult> => {
+						entered.release();
+						await held.promise;
+						finished.release();
+						return {
+							entries: [
+								{
+									type: "custom_message",
+									customType: "late-boundary",
+									content: "must not commit",
+									display: false,
+								},
+							],
+							continue: true,
+						};
+					};
+					if (boundary === "turn_end") {
+						pi.on("turn_end", handler);
+						pi.on("turn_end", later);
+					} else {
+						pi.on("agent_before_settle", handler);
+						pi.on("agent_before_settle", later);
+					}
+				},
+			]);
+			h.setResponses([fauxAssistantMessage("done")]);
+			const runtime = await runtimeFor(h);
+			const run = h.session.prompt("first");
+			await entered.promise;
+			const image: ImageContent = { type: "image", data: "original-boundary-queue", mimeType: "image/png" };
+			await h.session.followUp("undelivered", [image]);
+			const receipt = vi.fn();
+			const disposal = runtime.dispose({ terminal: true, rejectQueuedInput: receipt });
+			const result = await Promise.race([
+				disposal.then(() => "disposed"),
+				new Promise((resolve) => setTimeout(() => resolve("hung"), 150)),
+			]);
+			held.release();
+			await finished.promise;
+			await disposal;
+			await run;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(result).toBe("disposed");
+			expect(receipt.mock.calls[0]?.[0]).toEqual([
+				expect.objectContaining({ content: [{ type: "text", text: "undelivered" }, image] }),
+			]);
+			expect(h.sessionManager.getEntries().some((entry) => JSON.stringify(entry).includes("late-boundary"))).toBe(
+				false,
+			);
+			expect(later).not.toHaveBeenCalled();
+			expect(getUserTexts(h)).toEqual(["first"]);
+		},
+	);
+
+	// smarty-dev#3048 / PR #110 R3-9 (security R3-S1): a live settlement retains its controller across release.
+	it.each([true, false])(
+		"successful replacement fence preserves settlement cancellation (cancel: %s)",
+		async (cancel) => {
+			const runEntered = gate(),
+				runHeld = gate(),
+				switchEntered = gate(),
+				switchHeld = gate(),
+				settlementEntered = gate(),
+				settlementHeld = gate();
+			const h = await setup([
+				(pi) => {
+					pi.on("agent_start", async () => {
+						runEntered.release();
+						await runHeld.promise;
+					});
+					pi.on("session_before_switch", async () => {
+						switchEntered.release();
+						await switchHeld.promise;
+						return { cancel };
+					});
+					pi.on("agent_settled", async () => {
+						settlementEntered.release();
+						await settlementHeld.promise;
+					});
+				},
+			]);
+			h.setResponses([fauxAssistantMessage("done")]);
+			const runtime = await runtimeFor(h);
+			const run = h.session.prompt("first");
+			await runEntered.promise;
+			const replacement = runtime.newSession().then(
+				(value) => value,
+				(error: unknown) => error,
+			);
+			await switchEntered.promise;
+			runHeld.release();
+			await settlementEntered.promise;
+			switchHeld.release();
+			expect(await replacement).toMatchObject(
+				cancel ? { cancelled: true } : { message: expect.stringContaining("INPUT_ADMISSION_BUSY") },
+			);
+			const disposal = runtime.dispose({ terminal: true, rejectQueuedInput: () => {} });
+			const result = await Promise.race([
+				disposal.then(() => "disposed"),
+				new Promise((resolve) => setTimeout(() => resolve("hung"), 150)),
+			]);
+			settlementHeld.release();
+			await disposal;
+			await run;
+			expect(result).toBe("disposed");
+		},
+	);
+
 	function createMode(h: Harness, runtime: AgentSessionRuntime) {
 		const recover = Reflect.get(InteractiveMode.prototype, "handleInputAdmissionError") as (
 			this: unknown,
@@ -750,6 +868,10 @@ describe("native input admission v1", () => {
 		) => Promise<void>;
 		return {
 			recoveredImages: new Map<string, ImageContent>(),
+			prepareRecoveredInput: Reflect.get(InteractiveMode.prototype, "prepareRecoveredInput") as (
+				text: string,
+				images?: ImageContent[],
+			) => { text: string; images: ImageContent[] | undefined; transferred: () => void },
 			promptWithRecoveredImages(text: string, options?: PromptOptions) {
 				return promptWithRecoveredImages.call(this, text, options);
 			},

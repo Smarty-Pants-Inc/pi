@@ -83,6 +83,7 @@ function createRuntimeHost(harness: Harness): AgentSessionRuntime {
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
 		setRebindSession: vi.fn(),
+		setLifecycleCompleteHandler: vi.fn(),
 	} as unknown as AgentSessionRuntime;
 }
 
@@ -299,6 +300,7 @@ describe("RPC startup extension UI", () => {
 				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 				dispose,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 			} as unknown as AgentSessionRuntime);
 
 			await vi.waitFor(() => {
@@ -423,8 +425,17 @@ describe("RPC startup extension UI", () => {
 			const responses = rpcIo.outputLines
 				.map((line) => JSON.parse(line) as Record<string, unknown>)
 				.filter((record) => record.type === "response");
-			expect(responses).toHaveLength(1);
-			expect(responses[0]).toEqual(
+			expect(responses).toHaveLength(256);
+			expect(responses.filter((record) => record.id !== undefined)).toEqual(
+				Array.from({ length: 255 }, (_, index) =>
+					expect.objectContaining({
+						id: `startup-${index}`,
+						success: false,
+						error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN"),
+					}),
+				),
+			);
+			expect(responses.find((record) => record.fatal === true)).toEqual(
 				expect.objectContaining({
 					command: "parse",
 					error: "RPC startup command queue limit exceeded",
@@ -448,7 +459,8 @@ describe("RPC startup extension UI", () => {
 		let sessionStartComplete = false;
 		let shutdownAfterSessionStart: boolean | undefined;
 		let overflowSent = false;
-		const dispose = vi.fn(async () => {
+		const dispose = vi.fn(async (options?: Parameters<AgentSessionRuntime["dispose"]>[0]) => {
+			await options?.beforeShutdown?.();
 			shutdownAfterSessionStart = sessionStartComplete;
 		});
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -490,6 +502,7 @@ describe("RPC startup extension UI", () => {
 				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 				dispose,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 			} as unknown as AgentSessionRuntime);
 
 			await vi.waitFor(() => {
@@ -536,7 +549,8 @@ describe("RPC startup extension UI", () => {
 			let sessionStartComplete = false;
 			let oversizedRecordSent = false;
 			let shutdownAfterSessionStart: boolean | undefined;
-			const dispose = vi.fn(async () => {
+			const dispose = vi.fn(async (options?: Parameters<AgentSessionRuntime["dispose"]>[0]) => {
+				await options?.beforeShutdown?.();
 				shutdownAfterSessionStart = sessionStartComplete;
 			});
 			const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -577,6 +591,7 @@ describe("RPC startup extension UI", () => {
 					fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 					dispose,
 					setRebindSession: vi.fn(),
+					setLifecycleCompleteHandler: vi.fn(),
 				} as unknown as AgentSessionRuntime);
 
 				await vi.waitFor(() => {
@@ -733,6 +748,7 @@ describe("RPC startup extension UI", () => {
 				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 				dispose,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 			} as unknown as AgentSessionRuntime);
 
 			await vi.waitFor(() => {
@@ -840,6 +856,7 @@ describe("RPC startup extension UI", () => {
 				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 				dispose,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 			} as unknown as AgentSessionRuntime);
 
 			await vi.waitFor(() => {
@@ -876,7 +893,8 @@ describe("RPC startup extension UI", () => {
 		let sessionStartComplete = false;
 		let shutdownAfterSessionStart: boolean | undefined;
 		let inputEnded = false;
-		const dispose = vi.fn(async () => {
+		const dispose = vi.fn(async (options?: Parameters<AgentSessionRuntime["dispose"]>[0]) => {
+			await options?.beforeShutdown?.();
 			shutdownAfterSessionStart = sessionStartComplete;
 		});
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -920,6 +938,7 @@ describe("RPC startup extension UI", () => {
 				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 				dispose,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 			} as unknown as AgentSessionRuntime);
 
 			await vi.waitFor(() => {
@@ -943,7 +962,8 @@ describe("RPC startup extension UI", () => {
 		let sessionStartComplete = false;
 		let shutdownAfterSessionStart: boolean | undefined;
 		let inputEnded = false;
-		const dispose = vi.fn(async () => {
+		const dispose = vi.fn(async (options?: Parameters<AgentSessionRuntime["dispose"]>[0]) => {
+			await options?.beforeShutdown?.();
 			shutdownAfterSessionStart = sessionStartComplete;
 		});
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -987,6 +1007,7 @@ describe("RPC startup extension UI", () => {
 				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 				dispose,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 			} as unknown as AgentSessionRuntime);
 
 			await vi.waitFor(() => {

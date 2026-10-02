@@ -81,6 +81,7 @@ function createRuntimeHost(harness: Harness): AgentSessionRuntime {
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
 		setRebindSession: vi.fn(),
+		setLifecycleCompleteHandler: vi.fn(),
 	} as unknown as AgentSessionRuntime;
 }
 

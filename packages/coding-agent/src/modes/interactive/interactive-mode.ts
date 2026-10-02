@@ -519,6 +519,7 @@ export class InteractiveMode {
 	// Messages queued while compaction is running
 	private compactionQueuedMessages: CompactionQueuedMessage[] = [];
 	private compactionQueueTransfers = 0;
+	private readonly compactionQueueWork = new Set<Promise<void>>();
 
 	// Shutdown state
 	private shutdownRequested = false;
@@ -2029,7 +2030,13 @@ export class InteractiveMode {
 			},
 			shutdownHandler: () => {
 				this.shutdownRequested = true;
-				void this.checkShutdownRequested();
+				// Native idle completion includes extension-origin handled input and cancelled compaction.
+				void session
+					.waitForIdle()
+					.then(() => this.checkShutdownRequested())
+					.catch((cause: unknown) =>
+						this.uncaughtCrash(cause instanceof Error ? cause : new Error(String(cause))),
+					);
 			},
 			onError: (error) => {
 				this.showExtensionError(error.extensionPath, error.error, error.stack);
@@ -2834,7 +2841,7 @@ export class InteractiveMode {
 		this.editorComponentFactory = factory;
 
 		// Save text from current editor before switching
-		const currentText = this.editor.getText();
+		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
 
 		this.disposeActiveSelector();
 		this.editorContainer.clear();
@@ -2891,7 +2898,7 @@ export class InteractiveMode {
 			this.editor = newEditor;
 		} else {
 			// Restore default editor with text from custom editor
-			this.defaultEditor.setText(currentText);
+			if (this.editor !== this.defaultEditor) this.defaultEditor.setText(currentText);
 			this.editor = this.defaultEditor;
 		}
 
@@ -2934,7 +2941,7 @@ export class InteractiveMode {
 			onHandle?: (handle: OverlayHandle) => void;
 		},
 	): Promise<T> {
-		const savedText = this.editor.getText();
+		const savedText = this.editor.getExpandedText?.() ?? this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
 		const restoreEditor = () => {
 			this.editorContainer.clear();
@@ -4248,6 +4255,10 @@ export class InteractiveMode {
 				this.disposeActiveSelector();
 				await this.runtimeHost.dispose({
 					terminal: true,
+					beforeShutdown: async () => {
+						// Cancellation releases native admission first; each transfer catch owns recovery.
+						while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
+					},
 					rejectQueuedInput: (messages) => {
 						const recovered = this.recoveryText(messages);
 						if (recovered) this.restoreRejectedInput(recovered);
@@ -4276,6 +4287,10 @@ export class InteractiveMode {
 				this.disposeActiveSelector();
 				await this.runtimeHost.dispose({
 					terminal: true,
+					beforeShutdown: async () => {
+						// Cancellation releases native admission first; each transfer catch owns recovery.
+						while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
+					},
 					rejectQueuedInput: (messages) => {
 						const recovered = this.recoveryText(messages);
 						if (recovered) this.restoreRejectedInput(recovered);
@@ -4483,8 +4498,11 @@ export class InteractiveMode {
 		return text.join("\n");
 	}
 
-	private promptWithRecoveredImages(text: string, options?: PromptOptions): Promise<void> {
-		const images = [...(options?.images ?? [])];
+	private prepareRecoveredInput(
+		text: string,
+		originalImages?: ImageContent[],
+	): { text: string; images: ImageContent[] | undefined; transferred: () => void } {
+		const images = [...(originalImages ?? [])];
 		const markers: string[] = [];
 		for (const [marker, image] of this.recoveredImages) {
 			if (!text.includes(marker)) continue;
@@ -4492,14 +4510,32 @@ export class InteractiveMode {
 			images.push(image);
 			markers.push(marker);
 		}
-		return this.session.prompt(text, {
-			...options,
+		return {
+			text,
 			images: images.length ? images : undefined,
-			onInputTransferred: () => {
+			transferred: () => {
 				for (const marker of markers) this.recoveredImages.delete(marker);
+			},
+		};
+	}
+
+	private promptWithRecoveredImages(text: string, options?: PromptOptions, session = this.session): Promise<void> {
+		const input = this.prepareRecoveredInput(text, options?.images);
+		return session.prompt(input.text, {
+			...options,
+			images: input.images,
+			onInputTransferred: () => {
+				input.transferred();
 				options?.onInputTransferred?.();
 			},
 		});
+	}
+
+	private async queueWithRecoveredImages(message: CompactionQueuedMessage, session: AgentSession): Promise<void> {
+		const input = this.prepareRecoveredInput(message.text);
+		if (message.mode === "followUp") await session.followUp(input.text, input.images);
+		else await session.steer(input.text, input.images);
+		input.transferred();
 	}
 
 	private async submitEditorPrompt(text: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
@@ -4841,7 +4877,17 @@ export class InteractiveMode {
 		return !!extensionRunner.getCommand(commandName);
 	}
 
-	private async flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
+	private flushCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
+		const work = this.transferCompactionQueue(options);
+		this.compactionQueueWork.add(work);
+		void work.then(
+			() => this.compactionQueueWork.delete(work),
+			() => this.compactionQueueWork.delete(work),
+		);
+		return work;
+	}
+
+	private async transferCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
 		if (this.compactionQueuedMessages.length === 0) {
 			return;
 		}
@@ -4857,6 +4903,11 @@ export class InteractiveMode {
 				restored.add(message);
 				return true;
 			});
+			if (this.terminalShutdownRequested) {
+				for (const message of retained) this.restoreRejectedInput(message.text);
+				this.stagingAudit?.("compaction-terminal-recovered");
+				return;
+			}
 			const restoring = new Set([
 				...retained,
 				...this.compactionQueuedMessages.filter((message) => restored.has(message)),
@@ -4884,15 +4935,17 @@ export class InteractiveMode {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.text)) {
-						await session.prompt(message.text, {
-							onInputTransferred: () => {
-								pending.delete(message);
+						await this.promptWithRecoveredImages(
+							message.text,
+							{
+								onInputTransferred: () => {
+									pending.delete(message);
+								},
 							},
-						});
-					} else if (message.mode === "followUp") {
-						await session.followUp(message.text);
+							session,
+						);
 					} else {
-						await session.steer(message.text);
+						await this.queueWithRecoveredImages(message, session);
 					}
 					pending.delete(message);
 				}
@@ -4905,11 +4958,15 @@ export class InteractiveMode {
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await session.prompt(message.text, {
-						onInputTransferred: () => {
-							pending.delete(message);
+					await this.promptWithRecoveredImages(
+						message.text,
+						{
+							onInputTransferred: () => {
+								pending.delete(message);
+							},
 						},
-					});
+						session,
+					);
 					pending.delete(message);
 				}
 				return;
@@ -4921,22 +4978,30 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await session.prompt(message.text, {
-					onInputTransferred: () => {
-						pending.delete(message);
+				await this.promptWithRecoveredImages(
+					message.text,
+					{
+						onInputTransferred: () => {
+							pending.delete(message);
+						},
 					},
-				});
+					session,
+				);
 				pending.delete(message);
 			}
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
 			let firstTransferred = false;
-			const started = session.prompt(firstPrompt.text, {
-				streamingBehavior: firstPrompt.mode,
-				onInputTransferred: () => {
-					firstTransferred = true;
+			const started = this.promptWithRecoveredImages(
+				firstPrompt.text,
+				{
+					streamingBehavior: firstPrompt.mode,
+					onInputTransferred: () => {
+						firstTransferred = true;
+					},
 				},
-			});
+				session,
+			);
 			// This promise alone owns restoration of its input, even if a later transfer fails.
 			pending.delete(firstPrompt);
 			const promptPromise = started
@@ -4946,7 +5011,9 @@ export class InteractiveMode {
 				.finally(() => {
 					this.compactionQueueTransfers--;
 					this.stagingAudit?.("compaction-prompt-settled");
+					this.compactionQueueWork.delete(promptPromise);
 				});
+			this.compactionQueueWork.add(promptPromise);
 			// The detached prompt can restore staging after this flush returns.
 			this.compactionQueueTransfers++;
 			this.stagingAudit?.("compaction-prompt-pending");
@@ -4954,15 +5021,17 @@ export class InteractiveMode {
 			// Queue remaining messages
 			for (const message of rest) {
 				if (this.isExtensionCommand(message.text)) {
-					await session.prompt(message.text, {
-						onInputTransferred: () => {
-							pending.delete(message);
+					await this.promptWithRecoveredImages(
+						message.text,
+						{
+							onInputTransferred: () => {
+								pending.delete(message);
+							},
 						},
-					});
-				} else if (message.mode === "followUp") {
-					await session.followUp(message.text);
+						session,
+					);
 				} else {
-					await session.steer(message.text);
+					await this.queueWithRecoveredImages(message, session);
 				}
 				pending.delete(message);
 			}

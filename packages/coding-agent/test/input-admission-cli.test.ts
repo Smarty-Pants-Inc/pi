@@ -9,7 +9,13 @@ const cli = process.env.PI_ADMISSION_CLI ?? resolve("dist/bundle/cli.js");
 const fixture = `import { createFauxCore, fauxAssistantMessage } from ${JSON.stringify(resolve("../ai/dist/providers/faux.js"))};
 export default function(pi) {
   const faux = createFauxCore({ provider: "admission-faux" });
-  faux.setResponses([fauxAssistantMessage("offline answer")]);
+  faux.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage("offline answer")));
+  const round4 = process.env.PI_ROUND4_CASE;
+  const held = async (name, ctx) => { ctx.ui.notify(name + "-held"); await new Promise(resolve => setTimeout(resolve, 60000)); };
+  pi.on("agent_start", async (_event, ctx) => { if (round4?.includes("fence-release")) await ctx.ui.confirm("run-release", "release run", { timeout: 10000 }); });
+  for (const boundary of ["turn_end", "agent_before_settle"]) pi.on(boundary, async (_event, ctx) => { if (round4?.includes(boundary)) await held(boundary, ctx); });
+  pi.on("user_bash", async (_event, ctx) => { if (round4?.includes("retired-bash")) { await ctx.ui.confirm("bash-held", "release bash", { timeout: 10000 }); if (round4.endsWith("true")) return { result: { output: "retired-handled-result", exitCode: 0, cancelled: false, truncated: false } }; } });
+  pi.registerCommand("self-replace", { handler: async (_args, ctx) => { await ctx.newSession(); } });
   // Synthetic in-memory auth is never read from a credential store or sent over a network.
   pi.registerProvider(faux.provider, { baseUrl: faux.getModel().baseUrl, apiKey: "offline-faux-test-only", api: faux.api, streamSimple: faux.streamSimple, models: faux.models });
   pi.on("session_start", async (_event, ctx) => {
@@ -21,9 +27,10 @@ export default function(pi) {
     if (process.env.PI_ADMISSION_STARTUP) await ctx.ui.confirm("startup-held", "release startup", { timeout: 10000 });
     if (process.env.PI_ADMISSION_STARTUP_CHAIN) await ctx.ui.confirm("startup-next", "next dialog", { timeout: 10000 });
     await pi.setModel(faux.getModel());
+    if (round4 === "binding-shutdown") { ctx.shutdown(); ctx.ui.notify("binding-shutdown-requested"); }
   });
   pi.on("agent_settled", async (_event, ctx) => {
-    if (process.env.PI_ADMISSION_SETTLEMENT) { ctx.ui.notify("settlement-nondialog-held"); await new Promise((resolve) => setTimeout(resolve, 60000)); }
+    if (process.env.PI_ADMISSION_SETTLEMENT || round4?.includes("fence-release")) { ctx.ui.notify("settlement-nondialog-held"); await new Promise((resolve) => setTimeout(resolve, 60000)); }
   });
   let holdSwitch = false, holdShutdown = false;
   pi.registerCommand("hold-switch", { handler: async () => { holdSwitch = true; } });
@@ -31,6 +38,7 @@ export default function(pi) {
   pi.registerCommand("hold-shutdown", { handler: async () => { holdShutdown = true; } });
   pi.registerCommand("quit-test", { handler: async (_args, ctx) => { ctx.shutdown(); } });
   pi.on("input", async (event, ctx) => {
+    if (event.text === "" || event.text === "image-only-transform") return { action: "transform", text: "", images: event.images };
     if (event.text.startsWith("print:")) {
       console.error(JSON.stringify({ proof: "print-input", admission: pi.hostCapabilities.inputAdmission, idle: ctx.isIdle(), pending: ctx.isPromptPending() }));
       return { action: "handled" };
@@ -41,6 +49,7 @@ export default function(pi) {
     return { action: "transform", text: "transformed:" + event.text, images: event.images };
   });
   pi.on("session_before_switch", async (_event, ctx) => {
+    if (round4?.includes("fence-release")) { await ctx.ui.confirm("switch-release", "release switch", { timeout: 10000 }); return { cancel: !round4.includes("failed") }; }
     if (holdSwitch && process.env.PI_ADMISSION_NONCOOPERATIVE_SWITCH) { ctx.ui.notify("switch-nondialog-held"); await new Promise(resolve => setTimeout(resolve, 60000)); }
     else if (holdSwitch) await ctx.ui.confirm("switch-held", "release switch", { timeout: 10000 });
   });
@@ -103,6 +112,8 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 				TMPDIR: temp,
 				PI_CODING_AGENT_DIR: agentDir,
 				PI_OFFLINE: "1",
+				PI_PACKAGE_DIR: resolve("."),
+				PI_ROUND4_CASE: label,
 				PI_ADMISSION_STARTUP: label.includes("startup") ? "1" : "",
 				PI_ADMISSION_BIND_ONCE: label === "single-rebind" ? "1" : "",
 				PI_ADMISSION_NONCOOPERATIVE_START: label.includes("noncooperative-start") ? "1" : "",
@@ -568,6 +579,163 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
 	});
+	// smarty-dev#3048 / PR #110 R3-1 (security R3-S3): terminal ownership spans replacement.
+	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
+		"round4 %s cancels a retired dispatched command exactly once",
+		async (ending) => {
+			const p = await launch(`retired-command-${ending}`);
+			p.send({ id: "held-command", type: "prompt", message: "/nondialog-command" });
+			await p.marker("command-nondialog-held");
+			p.send({ id: "replace", type: "new_session" });
+			expect(await p.response("replace")).toMatchObject({ success: true, data: { cancelled: false } });
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
+			expect(p.records.filter((record) => record.id === "held-command")).toEqual([
+				expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
+			]);
+		},
+	);
+	it("round4 a command can still replace its own session", async () => {
+		const p = await launch("self-replace");
+		p.send({ id: "self", type: "prompt", message: "/self-replace" });
+		expect(await p.response("self")).toMatchObject({ success: true });
+	});
+	// smarty-dev#3048 / PR #110 R3-2 (security R3-S2): both native boundaries must cancel.
+	it.each([
+		["turn_end", "EOF"],
+		["turn_end", "SIGTERM"],
+		["turn_end", "SIGHUP"],
+		["agent_before_settle", "EOF"],
+		["agent_before_settle", "SIGTERM"],
+		["agent_before_settle", "SIGHUP"],
+	] as const)(
+		"round4 terminal cancellation releases %s under %s and returns original queued attachments",
+		async (boundary, ending) => {
+			const p = await launch(`${boundary}-${ending}`);
+			p.send({ id: "run", type: "prompt", message: "run" });
+			expect(await p.response("run")).toMatchObject({ success: true });
+			await p.marker(`${boundary}-held`);
+			const image = { type: "image", mimeType: "image/png", data: "original-queued-bytes" };
+			p.send({ id: "queued", type: "follow_up", message: "boundary-queue", images: [image] });
+			expect(await p.response("queued")).toMatchObject({ success: true });
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
+			expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
+				expect.objectContaining({
+					messages: [
+						expect.objectContaining({
+							content: [{ type: "text", text: "transformed:boundary-queue" }, image],
+						}),
+					],
+				}),
+			]);
+		},
+	);
+	// smarty-dev#3048 / PR #110 R3-9 (security R3-S1): successful acquisition cannot orphan settlement.
+	it.each([
+		["cancelled", "EOF"],
+		["cancelled", "SIGTERM"],
+		["cancelled", "SIGHUP"],
+		["failed", "EOF"],
+		["failed", "SIGTERM"],
+		["failed", "SIGHUP"],
+	] as const)(
+		"round4 %s replacement preserves overlapping settlement cancellation under %s",
+		async (result, ending) => {
+			const p = await launch(`fence-release-${result}-${ending}`);
+			p.send({ id: "run", type: "prompt", message: "run" });
+			const runGate = await p.dialog("run-release");
+			p.send({ id: "replace", type: "new_session" });
+			const switchGate = await p.dialog("switch-release");
+			p.release(runGate);
+			await p.marker("settlement-nondialog-held");
+			p.release(switchGate);
+			expect(await p.response("replace")).toMatchObject(
+				result === "cancelled"
+					? { success: true, data: { cancelled: true } }
+					: { success: false, error: expect.stringContaining("INPUT_ADMISSION_BUSY") },
+			);
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
+		},
+	);
+	// smarty-dev#3048 / PR #110 R3-3 (security R3-S5): overflow itself initiates terminal cancellation.
+	it("round4 startup overflow cancels a non-dialog binding before EOF", async () => {
+		const p = await launch("noncooperative-start-overflow");
+		await p.marker("binding-nondialog-held");
+		for (let index = 0; index < 257; index++) p.send({ id: `backlog-${index}`, type: "get_state" });
+		p.child.stdin.end();
+		expect(await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))])).toEqual(
+			{ code: 1, signal: null },
+		);
+		expect(p.records.filter((record) => record.fatal)).toEqual([
+			expect.objectContaining({ error: "RPC startup command queue limit exceeded" }),
+		]);
+		for (let index = 0; index < 256; index++)
+			expect(p.records.filter((record) => record.id === `backlog-${index}`)).toEqual([
+				expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
+			]);
+	});
+	// smarty-dev#3048 / PR #110 R3-10 (security R3-S4): no executable or handled result under retired custody.
+	it.each([false, true])("round4 held bash hook is refused after replacement (handled: %s)", async (handled) => {
+		const p = await launch(`retired-bash-${handled}`);
+		const sentinel = resolve(p.target, "..", "bash-started");
+		p.send({ id: "bash", type: "bash", command: `echo retired-bash-started > ${JSON.stringify(sentinel)}` });
+		const gate = await p.dialog("bash-held");
+		p.send({ id: "replace", type: "new_session" });
+		expect(await p.response("replace")).toMatchObject({ success: true, data: { cancelled: false } });
+		p.release(gate);
+		expect(await p.response("bash")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("INPUT_ADMISSION_DISPOSED"),
+		});
+		expect(p.records.some((record) => record.type === "bash_execution_update")).toBe(false);
+		expect(existsSync(sentinel)).toBe(false);
+		p.send({ id: "messages", type: "get_messages" });
+		expect((await p.response("messages")).data).toEqual({ messages: [] });
+	});
+	// smarty-dev#3048 / PR #110 R3-8: delivery of empty-text attachments clears native bookkeeping.
+	it.each([
+		["steer", ""],
+		["follow_up", ""],
+		["steer", "image-only-transform"],
+		["follow_up", "image-only-transform"],
+	] as const)("round4 consumed image-only %s from %s permits replacement and clean EOF", async (type, message) => {
+		const p = await launch(`image-only-${type}`);
+		p.send({
+			id: "image",
+			type,
+			message,
+			images: [{ type: "image", mimeType: "image/png", data: "original-queued-bytes" }],
+		});
+		expect(await p.response("image")).toMatchObject({ success: true });
+		p.send({ id: "run", type: "prompt", message: "run" });
+		await vi.waitFor(() => expect(p.records.some((record) => record.type === "agent_settled")).toBe(true));
+		p.send({ id: "state", type: "get_state" });
+		expect((await p.response("state")).data).toMatchObject({ pendingMessageCount: 0 });
+		p.send({ id: "replace", type: "new_session" });
+		expect(await p.response("replace")).toMatchObject({ success: true, data: { cancelled: false } });
+		p.child.stdin.end();
+		expect(await p.exited).toEqual({ code: 0, signal: null });
+	});
+	// smarty-dev#3048 / PR #110 R3-7: initial binding shutdown needs no incoming command.
+	it("round4 binding-requested shutdown exits with stdin still open", async () => {
+		const p = await launch("binding-shutdown");
+		await p.marker("binding-shutdown-requested");
+		expect(await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))])).toEqual(
+			{ code: 0, signal: null },
+		);
+	});
+
 	it("print mode uses the same native admission contract before handled short-circuit", async () => {
 		const p = await launch("print", "print");
 		expect(await p.exited).toEqual({ code: 0, signal: null });
