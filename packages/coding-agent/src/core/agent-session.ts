@@ -388,8 +388,14 @@ const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, bas
 // a skipped check or successful compaction with nothing queued.
 type CompactionOutcome = boolean | "failed" | "aborted";
 
+interface InputFenceScope {
+	fence: object;
+	active: boolean;
+}
+
 interface InputAdmission {
 	controller: AbortController;
+	fenceScope: InputFenceScope | undefined;
 	release(): void;
 }
 
@@ -424,7 +430,8 @@ export class AgentSession {
 	private readonly _inputAdmissions = new Set<InputAdmission>();
 	private readonly _inputAdmissionScope = new AsyncLocalStorage<InputAdmission>();
 	private _inputFence: object | undefined;
-	private readonly _inputFenceScope = new AsyncLocalStorage<{ fence: object; active: boolean }>();
+	private readonly _inputFenceScope = new AsyncLocalStorage<InputFenceScope | undefined>();
+	private readonly _shutdownCancellation = new AbortController();
 	private _settlementCancellation = new AbortController();
 	private _settlementCompletion?: Promise<void>;
 	private _inputsDisposed = false;
@@ -1173,7 +1180,14 @@ export class AgentSession {
 		}
 
 		// Emit to extensions first, then notify public listeners.
-		await this._emitExtensionEvent(event);
+		if (!this._shutdownCancellation.signal.aborted) {
+			try {
+				await raceWithAbortSignal(this._emitExtensionEvent(event), this._shutdownCancellation.signal);
+			} catch (error) {
+				if (!this._shutdownCancellation.signal.aborted) throw error;
+			}
+		}
+		// Cancellation releases extension waits, not final event publication/persistence.
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
@@ -2060,6 +2074,7 @@ export class AgentSession {
 	 * Disposal stays permanently closed even after release.
 	 */
 	async fenceInputs(options?: { rejectQueuedInput?: (messages: AgentMessage[]) => void }): Promise<() => void> {
+		if (!options?.rejectQueuedInput) this._shutdownCancellation.signal.throwIfAborted();
 		this._assertInputsOpen();
 		const fence = {};
 		this._inputFence = fence;
@@ -2073,6 +2088,7 @@ export class AgentSession {
 				this._settlementCancellation.abort(
 					new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
 				);
+				this.abortBash();
 				await this.abort();
 				await this._settlementCompletion;
 				const messages = this.agent.getQueuedMessages();
@@ -2084,7 +2100,9 @@ export class AgentSession {
 			this._assertInputsDrained();
 		} catch (error) {
 			this._inputFence = undefined;
-			this._settlementCancellation = new AbortController();
+			// Only the cancellation owner may replace its controller. A BUSY refusal
+			// must leave the still-running settlement's controller attached.
+			if (this._settlementCancellation.signal.aborted) this._settlementCancellation = new AbortController();
 			throw error;
 		}
 		return () => {
@@ -2096,12 +2114,12 @@ export class AgentSession {
 	}
 
 	/** @internal Allow only awaited lifecycle callbacks to submit to their fenced receiving session. */
-	async withFencedInput<T>(operation: () => Promise<T>): Promise<T> {
+	async withFencedInput<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
 		const fence = this._inputFence;
 		if (!fence) return operation();
 		const scope = { fence, active: true };
 		try {
-			return await this._inputFenceScope.run(scope, operation);
+			return await raceWithAbortSignal(this._inputFenceScope.run(scope, operation), signal);
 		} finally {
 			scope.active = false;
 		}
@@ -2109,8 +2127,10 @@ export class AgentSession {
 
 	private _admitInput(): InputAdmission {
 		this._assertInputsOpen();
+		this._shutdownCancellation.signal.throwIfAborted();
 		const admission: InputAdmission = {
 			controller: new AbortController(),
+			fenceScope: this._inputFenceScope.getStore(),
 			release: () => {
 				if (!this._inputAdmissions.delete(admission)) return;
 				this._inputAdmissionScope.exit(() => this._runInputQueuedBehindPreflight());
@@ -2123,7 +2143,9 @@ export class AgentSession {
 
 	private async _withInputAdmission(admission: InputAdmission, operation: () => Promise<void>): Promise<void> {
 		try {
-			await this._inputAdmissionScope.run(admission, operation);
+			await this._inputFenceScope.run(admission.fenceScope, () =>
+				this._inputAdmissionScope.run(admission, operation),
+			);
 		} finally {
 			admission.release();
 		}
@@ -2568,9 +2590,10 @@ export class AgentSession {
 		this._checkInputAdmission();
 		this._inputAdmissionScope.getStore()?.release();
 		try {
-			await command.handler(args, ctx);
+			await raceWithAbortSignal(command.handler(args, ctx), this._shutdownCancellation.signal);
 			return true;
 		} catch (err) {
+			if (this._shutdownCancellation.signal.aborted) throw err;
 			// Emit error via extension runner
 			this._extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
@@ -3008,9 +3031,23 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	/**
-	 * Abort current operation and wait for agent to become idle.
-	 */
+	/** @internal Permanently retire process-owned work before a terminal shutdown join. */
+	cancelForShutdown(): void {
+		this._shutdownCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "operation cancelled for shutdown"),
+		);
+		this._settlementCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
+		);
+		this.abortBash();
+	}
+
+	/** @internal Cancellation for host-owned startup, command and lifecycle work. */
+	get shutdownSignal(): AbortSignal {
+		return this._shutdownCancellation.signal;
+	}
+
+	/** Abort current operation and wait for agent to become idle. */
 	async abort(): Promise<void> {
 		for (const admission of this._inputAdmissions) {
 			admission.controller.abort(new InputAdmissionError("INPUT_ADMISSION_ABORTED", "input was not transferred"));
@@ -4194,6 +4231,7 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertSessionStart(this);
 		if (bindings.hasPendingInput !== undefined) this.#pendingModeInput = bindings.hasPendingInput;
 		if (bindings.uiContext !== undefined) {
@@ -4216,8 +4254,11 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
-		await this._extensionRunner.emit(this._sessionStartEvent);
-		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		await raceWithAbortSignal(this._extensionRunner.emit(this._sessionStartEvent), this._shutdownCancellation.signal);
+		await raceWithAbortSignal(
+			this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup"),
+			this._shutdownCancellation.signal,
+		);
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -4230,6 +4271,7 @@ export class AgentSession {
 			reason,
 		);
 
+		this._shutdownCancellation.signal.throwIfAborted();
 		if (skillPaths.length === 0 && promptPaths.length === 0 && themePaths.length === 0) {
 			return;
 		}
@@ -4762,6 +4804,7 @@ export class AgentSession {
 		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
 	): Promise<BashResult> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
+		this._shutdownCancellation.signal.throwIfAborted();
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
 

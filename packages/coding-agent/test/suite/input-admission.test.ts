@@ -1,7 +1,7 @@
 import { Agent } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, type ImageContent, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { AgentSession } from "../../src/core/agent-session.ts";
+import { AgentSession, type PromptOptions } from "../../src/core/agent-session.ts";
 import {
 	AgentSessionRuntime,
 	type AgentSessionServices,
@@ -506,7 +506,7 @@ describe("native input admission v1", () => {
 		await run;
 		expect(h.session.isDisposed).toBe(true);
 		expect(h.session.isSettling).toBe(false);
-		expect(receipt).toHaveBeenCalledWith([
+		expect(receipt.mock.calls[0]?.[0]).toEqual([
 			expect.objectContaining({ content: [{ type: "text", text: "undelivered" }, image] }),
 		]);
 		held.release();
@@ -561,6 +561,169 @@ describe("native input admission v1", () => {
 		},
 	);
 
+	// smarty-dev#3048, PR #110 S4: terminal cancellation never publishes a late factory or leaves a receiving fence live.
+	it.each(["factory", "publication", "setup", "rebind", "withSession"] as const)(
+		"terminal shutdown cancels held %s and retires its receiving session",
+		async (phase) => {
+			const h = await setup();
+			const runtime = await runtimeFor(h);
+			const entered = gate(),
+				held = gate(),
+				finished = gate();
+			const hold = async () => {
+				entered.release();
+				await held.promise;
+			};
+			const receipts: Array<{ messages: ReturnType<Agent["getQueuedMessages"]>; owner: AgentSession }> = [];
+			let receiving: AgentSession | undefined;
+			const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+			Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+				if (phase === "factory") await hold();
+				const result = await factory(options);
+				receiving = result.session;
+				if (phase === "factory")
+					await result.session.followUp("unpublished", [
+						{ type: "image", data: "late-original", mimeType: "image/png" },
+					]);
+				if (phase === "publication") {
+					const fence = result.session.fenceInputs.bind(result.session);
+					let first = true;
+					result.session.fenceInputs = async (fenceOptions) => {
+						const release = await fence(fenceOptions);
+						if (first) {
+							first = false;
+							entered.release();
+							await held.promise;
+						}
+						return release;
+					};
+				}
+				finished.release();
+				return result;
+			});
+			if (phase === "rebind") runtime.setRebindSession(hold);
+			const replacement = runtime
+				.newSession({
+					setup: phase === "setup" ? hold : undefined,
+					withSession: phase === "withSession" ? hold : undefined,
+				})
+				.then(
+					() => "completed",
+					(error: unknown) => error,
+				);
+			await entered.promise;
+			const shutdown = runtime
+				.dispose({ terminal: true, rejectQueuedInput: (messages, owner) => receipts.push({ messages, owner }) })
+				.then(
+					() => "disposed",
+					(error: unknown) => error,
+				);
+			// Publication fencing is native bounded work; release the artificial fence wait, not the extension holds.
+			if (phase === "publication") held.release();
+			const result = await Promise.race([
+				shutdown,
+				new Promise((resolve) => setTimeout(() => resolve("hung"), 150)),
+			]);
+			held.release();
+			await finished.promise;
+			await replacement;
+			await vi.waitFor(() => expect(receiving?.isDisposed).toBe(true));
+			expect(result).toBe("disposed");
+			expect(runtime.inputsFenced).toBe(true);
+			if (phase === "factory") {
+				expect(runtime.session).toBe(h.session);
+				expect(receipts).toEqual([
+					{
+						owner: receiving,
+						messages: [
+							expect.objectContaining({
+								content: [
+									{ type: "text", text: "unpublished" },
+									{ type: "image", data: "late-original", mimeType: "image/png" },
+								],
+							}),
+						],
+					},
+				]);
+			}
+			await expect(receiving!.followUp("late")).rejects.toThrow("INPUT_ADMISSION_DISPOSED");
+		},
+	);
+
+	// smarty-dev#3048, PR #110 R2-1: a BUSY refusal cannot orphan the running settlement's controller.
+	it("busy replacement still permits shutdown to cancel the original settlement", async () => {
+		const entered = gate(),
+			held = gate();
+		const h = await setup([
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					entered.release();
+					await held.promise;
+				});
+			},
+		]);
+		h.setResponses([fauxAssistantMessage("done")]);
+		const runtime = await runtimeFor(h);
+		const run = h.session.prompt("first");
+		await entered.promise;
+		await expect(runtime.newSession()).rejects.toThrow("INPUT_ADMISSION_BUSY");
+		await h.session.followUp("attached", [{ type: "image", data: "original", mimeType: "image/png" }]);
+		const receipt = vi.fn();
+		const disposal = runtime.dispose({ rejectQueuedInput: receipt });
+		const outcome = await Promise.race([
+			disposal.then(() => "disposed"),
+			new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 150)),
+		]);
+		held.release();
+		await disposal;
+		await run;
+		expect(outcome).toBe("disposed");
+		expect(receipt.mock.calls[0]?.[1]).toBe(h.session);
+		expect(receipt.mock.calls[0]?.[0]).toEqual([
+			expect.objectContaining({
+				content: [
+					{ type: "text", text: "attached" },
+					{ type: "image", data: "original", mimeType: "image/png" },
+				],
+			}),
+		]);
+	});
+
+	// smarty-dev#3048, PR #110 R2-5: the deferred submitter owns permission, not the draining run.
+	it("awaited withSession input preserves its live permission across rebind settlement", async () => {
+		const entered = gate(),
+			held = gate();
+		const h = await setup();
+		h.setResponses([fauxAssistantMessage("first")]);
+		const runtime = await runtimeFor(h, [
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					entered.release();
+					await held.promise;
+				});
+				pi.on("input", (event) => (event.text === "second" ? { action: "handled" } : undefined));
+			},
+		]);
+		let run: Promise<void> | undefined;
+		runtime.setRebindSession(async (session) => {
+			run = session.prompt("first");
+			await entered.promise;
+		});
+		const callbackEntered = gate();
+		const replacement = runtime.newSession({
+			withSession: async (ctx) => {
+				const input = ctx.sendUserMessage("second");
+				callbackEntered.release();
+				await input;
+			},
+		});
+		await callbackEntered.promise;
+		await expect(runtime.session.prompt("external")).rejects.toThrow("INPUT_ADMISSION_FENCED");
+		held.release();
+		await expect(replacement).resolves.toEqual({ cancelled: false });
+		await run;
+		expect(runtime.session.inputAdmissionCount).toBe(0);
+	});
 	function createMode(h: Harness, runtime: AgentSessionRuntime) {
 		const recover = Reflect.get(InteractiveMode.prototype, "handleInputAdmissionError") as (
 			this: unknown,
@@ -580,7 +743,16 @@ describe("native input admission v1", () => {
 		const checkShutdownRequested = Reflect.get(InteractiveMode.prototype, "checkShutdownRequested") as (
 			this: unknown,
 		) => Promise<void>;
+		const promptWithRecoveredImages = Reflect.get(InteractiveMode.prototype, "promptWithRecoveredImages") as (
+			this: unknown,
+			text: string,
+			options?: PromptOptions,
+		) => Promise<void>;
 		return {
+			recoveredImages: new Map<string, ImageContent>(),
+			promptWithRecoveredImages(text: string, options?: PromptOptions) {
+				return promptWithRecoveredImages.call(this, text, options);
+			},
 			session: h.session,
 			runtimeHost: runtime,
 			defaultEditor,

@@ -61,6 +61,54 @@ process.stdin.resume();
 			await closed;
 		}
 	});
+	// smarty-dev#3048, PR #110 R2-6/S7: exit is not close when a descendant holds the pipe.
+	test("bounds incomplete drainage and rejects pending work after an exited leader", async () => {
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+import { spawn } from "node:child_process";
+process.stdin.once("data", () => {
+  const descendant = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: ["ignore", process.stdout, process.stderr] });
+  process.stdout.write(JSON.stringify({ type: "descendant", pid: descendant.pid }) + "\\n", () => process.exit(43));
+});
+process.stdin.resume();
+`),
+		});
+		let descendant: number | undefined;
+		client.onEvent((event) => {
+			if ("pid" in event && typeof event.pid === "number") descendant = event.pid;
+		});
+		try {
+			await client.start();
+			const request = client.getCommands().then(
+				() => "success",
+				(error: unknown) => String(error),
+			);
+			const outcome = await Promise.race([
+				request,
+				new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2000)),
+			]);
+			const stopped = client.stop().then(
+				() => "stopped",
+				(error: unknown) => String(error),
+			);
+			const stopOutcome = await Promise.race([
+				stopped,
+				new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2500)),
+			]);
+			// Close the descendant before assertions so the red run cannot leak it.
+			if (descendant) process.kill(descendant, "SIGKILL");
+			await stopped;
+			expect(outcome).toContain("Agent process exited");
+			expect(stopOutcome).toContain("incomplete output drainage");
+		} finally {
+			if (descendant) {
+				try {
+					process.kill(descendant, "SIGKILL");
+				} catch {}
+			}
+			await client.stop().catch(() => {});
+		}
+	});
 	test("rejects an in-flight request when the child process exits", async () => {
 		const client = new RpcClient({
 			cliPath: writeChildScript(`

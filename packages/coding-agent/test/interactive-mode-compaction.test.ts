@@ -393,7 +393,8 @@ describe("InteractiveMode compaction events", () => {
 		const ui = {
 			clearAllQueues: () => ({ steering: [], followUp: [] }),
 			updatePendingMessagesDisplay: vi.fn(),
-			session: { abort },
+			session: { abort, agent: { getQueuedMessages: () => [] } },
+			recoveryText: () => "",
 		};
 		const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor") as (
 			this: typeof ui,

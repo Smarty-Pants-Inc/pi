@@ -1,6 +1,7 @@
 import { constants, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, parse, resolve } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -87,6 +88,7 @@ interface OutgoingSession {
  */
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
+	private lifecycleCompleteHandler?: () => void;
 	private beforeSessionInvalidate?: () => void;
 	private _session: AgentSession;
 	private _services: AgentSessionServices;
@@ -97,6 +99,10 @@ export class AgentSessionRuntime {
 	#ownerDisposal?: Promise<void>;
 	private _disposed = false;
 	private lifecycleActive = false;
+	private lifecycleCompletion?: Promise<void>;
+	private completeLifecycle?: () => void;
+	private readonly terminalCancellation = new AbortController();
+	private terminalRejection?: (messages: AgentMessage[], session: AgentSession) => void;
 	private releaseReceivingInputs?: () => void;
 
 	constructor(
@@ -127,27 +133,38 @@ export class AgentSessionRuntime {
 	}
 
 	get inputsFenced(): boolean {
-		return this.lifecycleActive || this.session.inputsFenced;
+		return this.terminalCancellation.signal.aborted || this.lifecycleActive || this.session.inputsFenced;
 	}
 
 	private async fenceLifecycle(
 		outgoing: OutgoingSession,
-		rejectQueuedInput?: (messages: AgentMessage[]) => void,
+		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void,
 	): Promise<() => void> {
 		if (this.lifecycleActive)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
 		if (this._disposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "runtime is disposed");
+		if (!rejectQueuedInput) this.terminalCancellation.signal.throwIfAborted();
 		this.lifecycleActive = true;
+		this.lifecycleCompletion = new Promise<void>((resolve) => {
+			this.completeLifecycle = resolve;
+		});
 		try {
-			const release = await outgoing.session.fenceInputs({ rejectQueuedInput });
+			const release = await outgoing.session.fenceInputs({
+				rejectQueuedInput: rejectQueuedInput
+					? (messages) => rejectQueuedInput(messages, outgoing.session)
+					: undefined,
+			});
 			return () => {
 				this.releaseReceivingInputs?.();
 				this.releaseReceivingInputs = undefined;
 				release();
 				this.lifecycleActive = false;
+				this.completeLifecycle?.();
+				queueMicrotask(() => this.lifecycleCompleteHandler?.());
 			};
 		} catch (error) {
 			this.lifecycleActive = false;
+			this.completeLifecycle?.();
 			throw error;
 		}
 	}
@@ -162,6 +179,11 @@ export class AgentSessionRuntime {
 
 	get modelFallbackMessage(): string | undefined {
 		return this._modelFallbackMessage;
+	}
+
+	/** @internal Recheck mode-owned deferred work only after lifecycle fences release. */
+	setLifecycleCompleteHandler(handler?: () => void): void {
+		this.lifecycleCompleteHandler = handler;
 	}
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
@@ -196,7 +218,8 @@ export class AgentSessionRuntime {
 		}
 	}
 
-	#assertCurrent(outgoing: OutgoingSession): void {
+	#assertCurrent(outgoing: OutgoingSession, allowTerminal = false): void {
+		if (!allowTerminal) this.terminalCancellation.signal.throwIfAborted();
 		this.#assertIdentity(outgoing);
 		assertOrdinaryRuntime(outgoing.sessionManager, this.#owner, this.createRuntime);
 	}
@@ -211,11 +234,14 @@ export class AgentSessionRuntime {
 			return { cancelled: false };
 		}
 
-		const result = await runner.emit({
-			type: "session_before_switch",
-			reason,
-			targetSessionFile,
-		});
+		const result = await raceWithAbortSignal(
+			runner.emit({
+				type: "session_before_switch",
+				reason,
+				targetSessionFile,
+			}),
+			this.terminalCancellation.signal,
+		);
 		return { cancelled: result?.cancel === true };
 	}
 
@@ -229,11 +255,14 @@ export class AgentSessionRuntime {
 			return { cancelled: false };
 		}
 
-		const result = await runner.emit({
-			type: "session_before_fork",
-			entryId,
-			...options,
-		});
+		const result = await raceWithAbortSignal(
+			runner.emit({
+				type: "session_before_fork",
+				entryId,
+				...options,
+			}),
+			this.terminalCancellation.signal,
+		);
 		return { cancelled: result?.cancel === true };
 	}
 
@@ -247,24 +276,65 @@ export class AgentSessionRuntime {
 		this.#assertCurrent(outgoing);
 		await outgoing.session.abort();
 		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason,
-			targetSessionFile,
-		});
+		await raceWithAbortSignal(
+			emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+				type: "session_shutdown",
+				reason,
+				targetSessionFile,
+			}),
+			this.terminalCancellation.signal,
+		);
 		this.#assertCurrent(outgoing);
 		this.beforeSessionInvalidate?.();
 		this.#assertCurrent(outgoing);
 		outgoing.session.dispose();
 	}
 
+	private async retireUnpublishedSession(session: AgentSession): Promise<void> {
+		session.cancelForShutdown();
+		const release = await session.fenceInputs({
+			rejectQueuedInput: (messages) => {
+				if (!this.terminalRejection)
+					throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "unpublished input requires a rejection receipt");
+				this.terminalRejection(messages, session);
+			},
+		});
+		try {
+			session.dispose();
+		} finally {
+			release();
+		}
+	}
 	async #replace(outgoing: OutgoingSession, options: Parameters<CreateAgentSessionRuntimeFactory>[0]): Promise<void> {
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(options.sessionManager);
-		const { session, services, diagnostics, modelFallbackMessage } = await this.createRuntime(Object.freeze(options));
-		this.#assertCurrent(outgoing);
-		assertUnownedSessionManager(session.sessionManager);
-		this.releaseReceivingInputs = await session.fenceInputs();
+		const construction = this.createRuntime(Object.freeze(options));
+		// A non-cooperative factory may finish after cancellation. Never publish it;
+		// observe its result and retire the unpublished session instead.
+		const receiving = construction.then(async (result) => {
+			if (this.terminalCancellation.signal.aborted) {
+				await this.retireUnpublishedSession(result.session);
+				this.terminalCancellation.signal.throwIfAborted();
+			}
+			return result;
+		});
+		const { session, services, diagnostics, modelFallbackMessage } = await raceWithAbortSignal(
+			receiving,
+			this.terminalCancellation.signal,
+		);
+		try {
+			this.#assertCurrent(outgoing);
+			assertUnownedSessionManager(session.sessionManager);
+			this.releaseReceivingInputs = await session.fenceInputs();
+			this.terminalCancellation.signal.throwIfAborted();
+		} catch (error) {
+			if (this.terminalCancellation.signal.aborted) {
+				this.releaseReceivingInputs?.();
+				this.releaseReceivingInputs = undefined;
+				await this.retireUnpublishedSession(session);
+			}
+			throw error;
+		}
 		this._session = session;
 		this._services = services;
 		this._diagnostics = diagnostics;
@@ -274,11 +344,17 @@ export class AgentSessionRuntime {
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
 		const outgoing = this.#captureOutgoing();
 		if (this.rebindSession) {
-			await outgoing.session.withFencedInput(() => this.rebindSession!(outgoing.session));
+			await outgoing.session.withFencedInput(
+				() => this.rebindSession!(outgoing.session),
+				this.terminalCancellation.signal,
+			);
 			this.#assertCurrent(outgoing);
 		}
 		if (withSession) {
-			await outgoing.session.withFencedInput(() => withSession(outgoing.session.createReplacedSessionContext()));
+			await outgoing.session.withFencedInput(
+				() => withSession(outgoing.session.createReplacedSessionContext()),
+				this.terminalCancellation.signal,
+			);
 			this.#assertCurrent(outgoing);
 		}
 	}
@@ -352,7 +428,7 @@ export class AgentSessionRuntime {
 			});
 			if (options?.setup) {
 				const replacement = this.#captureOutgoing();
-				await options.setup(replacement.sessionManager);
+				await raceWithAbortSignal(options.setup(replacement.sessionManager), this.terminalCancellation.signal);
 				this.#assertCurrent(replacement);
 				replacement.session.refreshContext();
 			}
@@ -517,10 +593,42 @@ export class AgentSessionRuntime {
 		}
 	}
 
+	private async waitForShutdownHook(cleanup: Promise<unknown>): Promise<void> {
+		const deadline = new AbortController();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const beginDeadline = () => {
+			timer = setTimeout(
+				() =>
+					deadline.abort(new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "shutdown hook deadline exceeded")),
+				1000,
+			);
+		};
+		const signal = this.terminalCancellation.signal;
+		if (signal.aborted) beginDeadline();
+		else signal.addEventListener("abort", beginDeadline, { once: true });
+		try {
+			await raceWithAbortSignal(cleanup, deadline.signal);
+		} catch (error) {
+			if (!deadline.signal.aborted) throw error;
+		} finally {
+			signal.removeEventListener("abort", beginDeadline);
+			clearTimeout(timer);
+		}
+	}
 	async dispose(options?: {
+		/** Terminal owner shutdown, distinct from an ordinary recoverable disposal refusal. */
+		terminal?: boolean;
 		beforeShutdown?: () => Promise<void>;
-		rejectQueuedInput?: (messages: AgentMessage[]) => void;
+		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
 	}): Promise<void> {
+		if (options?.terminal) {
+			this.terminalRejection = options.rejectQueuedInput;
+			this.terminalCancellation.abort(
+				new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
+			);
+			this.session.cancelForShutdown();
+			if (this.lifecycleActive) await this.lifecycleCompletion;
+		}
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		if (this.lifecycleActive)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
@@ -548,10 +656,12 @@ export class AgentSessionRuntime {
 							},
 							persist: async () => {
 								this.#assertIdentity(outgoing);
-								await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-									type: "session_shutdown",
-									reason: "quit",
-								});
+								await this.waitForShutdownHook(
+									emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+										type: "session_shutdown",
+										reason: "quit",
+									}),
+								);
 								this.#assertIdentity(outgoing);
 								this.beforeSessionInvalidate?.();
 								this.#assertIdentity(outgoing);
@@ -566,14 +676,15 @@ export class AgentSessionRuntime {
 				return await this.#ownerDisposal;
 			}
 			await outgoing.session.abort();
-			this.#assertCurrent(outgoing);
-			await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+			this.#assertCurrent(outgoing, true);
+			const cleanup = emitSessionShutdownEvent(outgoing.session.extensionRunner, {
 				type: "session_shutdown",
 				reason: "quit",
 			});
-			this.#assertCurrent(outgoing);
+			await this.waitForShutdownHook(cleanup);
+			this.#assertCurrent(outgoing, true);
 			this.beforeSessionInvalidate?.();
-			this.#assertCurrent(outgoing);
+			this.#assertCurrent(outgoing, true);
 			outgoing.session.dispose();
 			this._disposed = true;
 		} finally {

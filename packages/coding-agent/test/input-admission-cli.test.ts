@@ -13,6 +13,11 @@ export default function(pi) {
   // Synthetic in-memory auth is never read from a credential store or sent over a network.
   pi.registerProvider(faux.provider, { baseUrl: faux.getModel().baseUrl, apiKey: "offline-faux-test-only", api: faux.api, streamSimple: faux.streamSimple, models: faux.models });
   pi.on("session_start", async (_event, ctx) => {
+    const start = Number(process.env.PI_START_COUNT || 0) + 1; process.env.PI_START_COUNT = String(start);
+    ctx.ui.notify("binding-" + start);
+    if (process.env.PI_ADMISSION_BIND_ONCE && start === 2) await ctx.ui.confirm("receiving-held", "release receiving", { timeout: 10000 });
+    if (process.env.PI_ADMISSION_BIND_ONCE && start === 3) await ctx.ui.confirm("duplicate-held", "duplicate receiving", { timeout: 10000 });
+    if (process.env.PI_ADMISSION_NONCOOPERATIVE_START || (process.env.PI_ADMISSION_RECEIVING && start === 2)) { ctx.ui.notify("binding-nondialog-held"); await new Promise(resolve => setTimeout(resolve, 60000)); }
     if (process.env.PI_ADMISSION_STARTUP) await ctx.ui.confirm("startup-held", "release startup", { timeout: 10000 });
     if (process.env.PI_ADMISSION_STARTUP_CHAIN) await ctx.ui.confirm("startup-next", "next dialog", { timeout: 10000 });
     await pi.setModel(faux.getModel());
@@ -22,6 +27,7 @@ export default function(pi) {
   });
   let holdSwitch = false, holdShutdown = false;
   pi.registerCommand("hold-switch", { handler: async () => { holdSwitch = true; } });
+  pi.registerCommand("nondialog-command", { handler: async (_args, ctx) => { ctx.ui.notify("command-nondialog-held"); await new Promise(resolve => setTimeout(resolve, 60000)); } });
   pi.registerCommand("hold-shutdown", { handler: async () => { holdShutdown = true; } });
   pi.registerCommand("quit-test", { handler: async (_args, ctx) => { ctx.shutdown(); } });
   pi.on("input", async (event, ctx) => {
@@ -35,7 +41,8 @@ export default function(pi) {
     return { action: "transform", text: "transformed:" + event.text, images: event.images };
   });
   pi.on("session_before_switch", async (_event, ctx) => {
-    if (holdSwitch) await ctx.ui.confirm("switch-held", "release switch", { timeout: 10000 });
+    if (holdSwitch && process.env.PI_ADMISSION_NONCOOPERATIVE_SWITCH) { ctx.ui.notify("switch-nondialog-held"); await new Promise(resolve => setTimeout(resolve, 60000)); }
+    else if (holdSwitch) await ctx.ui.confirm("switch-held", "release switch", { timeout: 10000 });
   });
   pi.on("session_shutdown", async (_event, ctx) => {
     if (holdShutdown) await ctx.ui.confirm("shutdown-held", "release shutdown", { timeout: 10000 });
@@ -97,6 +104,10 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 				PI_CODING_AGENT_DIR: agentDir,
 				PI_OFFLINE: "1",
 				PI_ADMISSION_STARTUP: label.includes("startup") ? "1" : "",
+				PI_ADMISSION_BIND_ONCE: label === "single-rebind" ? "1" : "",
+				PI_ADMISSION_NONCOOPERATIVE_START: label.includes("noncooperative-start") ? "1" : "",
+				PI_ADMISSION_NONCOOPERATIVE_SWITCH: label.includes("noncooperative-switch") ? "1" : "",
+				PI_ADMISSION_RECEIVING: label.includes("noncooperative-receiving") ? "1" : "",
 				PI_ADMISSION_STARTUP_CHAIN: label === "startup-signal-refusal" ? "1" : "",
 				PI_ADMISSION_SETTLEMENT: label.includes("settlement") ? "1" : "",
 				PI_NO_LOCAL_LLM: "1",
@@ -129,7 +140,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			child.once("error", failed);
 			child.once("close", (code, signal) => done({ code, signal }));
 		});
-		const proofName = `${++sequence}-${label}`;
+		const proofName = `${process.env.PI_PROOF_PREFIX ?? "green"}-${++sequence}-${label}`;
 		cleanups.push(async () => {
 			child.stdin.end();
 			const timeout = setTimeout(() => {
@@ -399,6 +410,164 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		},
 	);
 
+	// smarty-dev#3048, PR #110 R2-1: a refusal must not swap the settlement cancellation owner.
+	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
+		"%s after BUSY replacement cancels held settlement",
+		async (ending) => {
+			const p = await launch(`busy-settlement-${ending}`);
+			p.send({ id: "run", type: "prompt", message: "start" });
+			await p.marker("settlement-nondialog-held");
+			p.send({ id: "refused", type: "new_session" });
+			expect(await p.response("refused")).toMatchObject({
+				success: false,
+				error: expect.stringContaining("INPUT_ADMISSION_BUSY"),
+			});
+			const image = { type: "image", data: "attachment", mimeType: "image/png" };
+			p.send({ id: "queue", type: "follow_up", message: "undelivered", images: [image] });
+			await p.response("queue");
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
+			expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
+				expect.objectContaining({
+					messages: [
+						expect.objectContaining({ content: [{ type: "text", text: "transformed:undelivered" }, image] }),
+					],
+				}),
+			]);
+		},
+	);
+
+	// smarty-dev#3048, PR #110 R2-2/S6: real commands initialize one receiving event owner.
+	it("RPC receiving initialization occurs once and remains fenced until ready", async () => {
+		const p = await launch("single-rebind");
+		await p.marker("binding-1");
+		p.send({ id: "new", type: "new_session" });
+		const held = await p.dialog("receiving-held");
+		p.send({ id: "early", type: "prompt", message: "handled:early" });
+		expect(await p.response("early")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("INPUT_ADMISSION_FENCED"),
+		});
+		p.release(held);
+		expect(
+			await Promise.race([p.response("new"), new Promise((resolve) => setTimeout(() => resolve("hung"), 1500))]),
+		).toMatchObject({ success: true });
+		expect(p.records.filter((record) => record.message === "binding-3")).toEqual([]);
+		p.send({ id: "run", type: "prompt", message: "ready" });
+		await p.response("run");
+		await vi.waitFor(() => expect(p.records.filter((record) => record.type === "agent_settled")).toHaveLength(1));
+		for (const role of ["user", "assistant"]) {
+			expect(
+				p.records.filter(
+					(record) =>
+						record.type === "message_end" &&
+						typeof record.message === "object" &&
+						record.message !== null &&
+						"role" in record.message &&
+						record.message.role === role,
+				),
+			).toHaveLength(1);
+		}
+	});
+
+	// smarty-dev#3048, PR #110 S1/S4: terminal cancellation precedes joining owned operations.
+	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
+		"%s cancels noncooperative startup and refuses correlated backlog",
+		async (ending) => {
+			const p = await launch(`noncooperative-start-${ending}`);
+			await p.marker("binding-nondialog-held");
+			p.send({ id: "queued", type: "steer", message: "unaccepted" });
+			await new Promise((resolve) => setTimeout(resolve, 50));
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
+			expect(p.records.filter((record) => record.id === "queued")).toEqual([
+				expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
+			]);
+		},
+	);
+	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
+		"%s cancels a dispatched non-dialog command with one failure response",
+		async (ending) => {
+			const p = await launch(`noncooperative-command-${ending}`);
+			p.send({ id: "held-command", type: "prompt", message: "/nondialog-command" });
+			await p.marker("command-nondialog-held");
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
+			expect(p.records.filter((record) => record.id === "held-command")).toEqual([
+				expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
+			]);
+		},
+	);
+	it("EOF aborts active bash before joining its correlated result", async () => {
+		const p = await launch("active-bash");
+		p.send({ id: "bash", type: "bash", command: "echo owned-bash-started; sleep 3; echo must-not-run" });
+		await vi.waitFor(() =>
+			expect(
+				p.records.some(
+					(record) =>
+						record.type === "bash_execution_update" && String(record.delta).includes("owned-bash-started"),
+				),
+			).toBe(true),
+		);
+		p.child.stdin.end();
+		expect(await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))])).toEqual(
+			{ code: 0, signal: null },
+		);
+		expect(p.records.filter((record) => record.id === "bash" && record.type === "response")).toEqual([
+			expect.objectContaining({ success: true, data: expect.objectContaining({ cancelled: true }) }),
+		]);
+		expect(p.records.some((record) => String(record.delta).includes("must-not-run"))).toBe(false);
+	});
+	it.each([
+		["EOF", "switch"],
+		["EOF", "receiving"],
+		["SIGTERM", "switch"],
+		["SIGTERM", "receiving"],
+		["SIGHUP", "switch"],
+		["SIGHUP", "receiving"],
+	] as const)("%s cancels held non-dialog %s lifecycle with a correlated disposition", async (ending, phase) => {
+		const p = await launch(`noncooperative-${phase}-${ending}`);
+		if (phase === "switch") {
+			p.send({ id: "arm", type: "prompt", message: "/hold-switch" });
+			await p.response("arm");
+		}
+		p.send({ id: "replace", type: "new_session" });
+		await p.marker(phase === "switch" ? "switch-nondialog-held" : "binding-nondialog-held");
+		if (ending === "EOF") p.child.stdin.end();
+		else p.child.kill(ending);
+		expect(await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))])).toEqual(
+			{ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null },
+		);
+		expect(p.records.filter((record) => record.id === "replace")).toEqual([
+			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
+		]);
+		expect(p.records.some((record) => record.fatal)).toBe(false);
+	});
+	// smarty-dev#3048, PR #110 S5: malformed envelopes cannot poison the startup refusal loop.
+	it("valid and malformed startup records preserve shutdown accounting", async () => {
+		const p = await launch("startup-malformed");
+		await p.dialog("startup-held");
+		p.child.stdin.write('null\n[]\n{"type":17}\n{"id":17,"type":"steer"}\n');
+		p.send({ id: "valid", type: "follow_up", message: "unaccepted" });
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		p.child.kill("SIGTERM");
+		expect(await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))])).toEqual(
+			{ code: 143, signal: null },
+		);
+		expect(p.records.filter((record) => record.command === "parse" && record.success === false)).toHaveLength(4);
+		expect(p.records.filter((record) => record.id === "valid")).toEqual([
+			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
+		]);
+	});
 	it("print mode uses the same native admission contract before handled short-circuit", async () => {
 		const p = await launch("print", "print");
 		expect(await p.exited).toEqual({ code: 0, signal: null });

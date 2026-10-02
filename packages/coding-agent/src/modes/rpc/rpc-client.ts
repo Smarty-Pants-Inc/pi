@@ -93,6 +93,7 @@ export type RpcEventListener = (event: RpcAgentSessionEvent) => void;
 export class RpcClient {
 	private process: ChildProcess | null = null;
 	private processClosed: Promise<void> | null = null;
+	private drainError: Error | null = null;
 	private stopReadingStdout: (() => void) | null = null;
 	private eventListeners: RpcEventListener[] = [];
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
@@ -115,6 +116,7 @@ export class RpcClient {
 		}
 
 		this.exitError = null;
+		this.drainError = null;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -135,7 +137,29 @@ export class RpcClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.process = childProcess;
-		this.processClosed = new Promise<void>((resolve) => childProcess.once("close", () => resolve()));
+		let drainDeadline: NodeJS.Timeout | undefined;
+		let resolveClosed: () => void = () => {};
+		this.processClosed = new Promise<void>((resolve) => {
+			resolveClosed = resolve;
+			childProcess.once("close", () => {
+				clearTimeout(drainDeadline);
+				resolve();
+			});
+		});
+		childProcess.once("exit", (code, signal) => {
+			if (this.process !== childProcess) return;
+			// Exit is known immediately, but already-written response bytes may still
+			// resolve requests. Bound that final drain even if a descendant owns a pipe.
+			this.exitError ??= this.createProcessExitError(code, signal);
+			drainDeadline = setTimeout(() => {
+				if (this.process !== childProcess) return;
+				this.drainError = new Error(`Agent process exited with incomplete output drainage. Stderr: ${this.stderr}`);
+				this.rejectPendingRequests(this.exitError!);
+				childProcess.stdout?.destroy();
+				childProcess.stderr?.destroy();
+				resolveClosed();
+			}, 1000);
+		});
 
 		// Collect stderr for debugging
 		childProcess.stderr?.on("data", (data) => {
@@ -192,7 +216,9 @@ export class RpcClient {
 		// until `close`, including when the child has already exited before stop().
 		const childProcess = this.process;
 		if (childProcess.exitCode === null && childProcess.signalCode === null) childProcess.kill("SIGTERM");
-		const timeout = setTimeout(() => childProcess.kill("SIGKILL"), 1000);
+		const timeout = setTimeout(() => {
+			if (childProcess.exitCode === null && childProcess.signalCode === null) childProcess.kill("SIGKILL");
+		}, 1000);
 		try {
 			await this.processClosed;
 		} finally {
@@ -203,7 +229,8 @@ export class RpcClient {
 		this.stopReadingStdout = null;
 		this.process = null;
 		this.processClosed = null;
-		this.pendingRequests.clear();
+		this.rejectPendingRequests(this.exitError ?? new Error("RPC client stopped"));
+		if (this.drainError) throw this.drainError;
 	}
 
 	/**

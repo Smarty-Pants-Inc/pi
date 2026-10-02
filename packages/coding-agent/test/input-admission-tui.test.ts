@@ -2,11 +2,11 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, it, vi } from "vitest";
 
 const cli = process.env.PI_ADMISSION_CLI ?? resolve("dist/bundle/cli.js");
 const fauxPath = resolve("../ai/dist/providers/faux.js");
-const socket = `pi-admission-${process.pid}`;
+const socket = join(tmpdir(), `pi-admission-${process.pid}.socket`);
 const evidence = process.env.TASK_OUT;
 const prefix = process.env.PI_PROOF_PREFIX ?? "green";
 const tmuxAvailable = (() => {
@@ -32,15 +32,20 @@ export default function(pi) {
   // Synthetic in-memory auth is never read from a credential store or sent over a network.
   pi.registerProvider(faux.provider, { baseUrl: faux.getModel().baseUrl, apiKey: "offline-faux-test-only", api: faux.api, streamSimple: faux.streamSimple, models: faux.models });
   pi.on("session_start", async (_event, ctx) => {
+    const count = Number(process.env.PI_START_COUNT || 0) + 1; process.env.PI_START_COUNT = String(count); mark("start-" + count);
+    if (count === 2 && process.env.PI_PROOF_CASE === "replacement-shutdown") { mark("replacement-shutdown"); ctx.shutdown(); }
     await pi.setModel(faux.getModel());
     ctx.ui.setStatus("proof", "OFFLINE_PROOF_READY"); mark("ready");
   });
   pi.on("agent_start", async (_event, ctx) => {
-    if (process.env.PI_PROOF_CASE === "recovery") { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
+    if (process.env.PI_PROOF_CASE.startsWith("recovery")) { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
     if (process.env.PI_PROOF_CASE === "run-shutdown") ctx.shutdown();
   });
   pi.on("input", async (event, ctx) => {
     if (event.text === "held-A") { ctx.ui.setStatus("proof", "INPUT_HELD_A"); mark("input-held"); await hold("input"); }
+    if (event.text.includes("large-paste-tail") || (event.text.includes("held-A") && event.text !== "held-A")) { writeFileSync(join(dir, "paste-submitted"), event.text); return { action: "handled" }; }
+    if (event.text === "queue-image") { mark("image-created"); return { action: "transform", text: "attached-original", images: [{ type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=", mimeType: "image/png" }] }; }
+    if (event.text.includes("attached-original")) { writeFileSync(join(dir, "image-recovered"), JSON.stringify(event.images ?? null)); return { action: "handled" }; }
     if (event.text === "shutdown-handled") {
       ctx.ui.notify("ADMISSION_SHUTDOWN_REQUESTED"); mark("admission-shutdown"); ctx.shutdown(); return { action: "handled" };
     }
@@ -50,16 +55,26 @@ export default function(pi) {
     ctx.ui.notify("REPLACEMENT_RESULT_CANCELLED=" + result.cancelled); mark("replacement-finished");
   } });
   pi.on("session_before_switch", async (_event, ctx) => {
+    if (["shortcut-stale", "replacement-shutdown"].includes(process.env.PI_PROOF_CASE)) return;
     ctx.ui.setStatus("proof", "REPLACEMENT_FENCE_HELD"); mark("switch-held"); await hold("switch"); return { cancel: true };
   });
-  pi.on("agent_settled", (_event, ctx) => { ctx.ui.setStatus("proof", "AGENT_SETTLED"); mark("settled"); });
+  pi.registerShortcut("ctrl+shift+h", { handler: async (ctx) => {
+    const savedNotify = ctx.ui.notify; mark("shortcut-held"); await hold("shortcut");
+    const rejected = [];
+    for (const [name, action] of [["abort", () => ctx.abort()], ["compact", () => ctx.compact()], ["ui", () => savedNotify("STALE_UI_MUTATED_RECEIVING")]]) {
+      try { action(); } catch { rejected.push(name); }
+    }
+    writeFileSync(join(dir, "shortcut-result"), JSON.stringify(rejected));
+  } });
+  pi.on("session_shutdown", async (_event, ctx) => { if (process.env.PI_PROOF_CASE === "shutdown-upgrade") { mark("cleanup-held"); await hold("cleanup"); } });
+  pi.on("agent_settled", async (_event, ctx) => { ctx.ui.setStatus("proof", "AGENT_SETTLED"); mark("settled"); if (process.env.PI_PROOF_CASE === "busy-settlement") { mark("settlement-held"); await hold("settlement"); } });
 }`;
 
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 function tmux(...args: string[]): string {
-	return execFileSync("tmux", ["-L", socket, ...args], { encoding: "utf8" });
+	return execFileSync("tmux", ["-S", socket, ...args], { encoding: "utf8" });
 }
 
 function editorFrame(frame: string): string {
@@ -86,9 +101,17 @@ interface TerminalProof {
 // smarty-dev#3048, PR #110 F4/F6/F8: actual bin + PTY + keyboard dispatch, not prototype mocks.
 describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive admission", () => {
 	const proofs: TerminalProof[] = [];
+	afterAll(() => {
+		// This file owns the private socket and every pane on its server.
+		try {
+			tmux("kill-server");
+		} catch {}
+		rmSync(socket, { force: true });
+	});
 	afterEach(async () => {
 		for (const p of proofs.splice(0)) {
-			for (const gate of ["input", "run", "switch"]) writeFileSync(join(p.dir, `release-${gate}`), "release");
+			for (const gate of ["input", "run", "switch", "shortcut", "cleanup", "settlement"])
+				writeFileSync(join(p.dir, `release-${gate}`), "release");
 			if (!existsSync(join(p.dir, "exit"))) {
 				p.keys("C-c");
 				await new Promise((done) => setTimeout(done, 600));
@@ -104,6 +127,12 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 				}
 			}
 			p.frame("final");
+			if (evidence) {
+				for (const file of ["shortcut-result", "paste-submitted", "image-recovered", "exit"]) {
+					if (existsSync(join(p.dir, file)))
+						writeFileSync(join(evidence, `tui-${p.name}-${file}.proof`), readFileSync(join(p.dir, file)));
+				}
+			}
 			tmux("kill-session", "-t", p.name);
 			rmSync(p.dir, { recursive: true, force: true });
 		}
@@ -116,7 +145,7 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 		const name = `${prefix}-${label}`;
 		tmux("new-session", "-d", "-s", name, "-x", "140", "-y", "50", "-c", dir);
 		tmux("set-option", "-s", "extended-keys", "on");
-		if (evidence) tmux("pipe-pane", "-t", name, "-o", `cat > ${shellQuote(join(evidence, `tui-${name}.ansi.log`))}`);
+		tmux("pipe-pane", "-t", name, "-o", `cat > ${shellQuote(join(evidence ?? dir, `tui-${name}.ansi.log`))}`);
 		const args = [
 			cli,
 			"--offline",
@@ -128,6 +157,7 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 			"-e",
 			join(dir, "proof.mjs"),
 		];
+		if (scenario === "initial-shutdown") args.push("shutdown-handled");
 		const env = {
 			PATH: process.env.PATH ?? "/usr/bin:/bin",
 			TERM: "tmux-256color",
@@ -243,6 +273,167 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 		await p.mark("settled");
 	});
 
+	// smarty-dev#3048, PR #110 S2: old shortcuts cannot retarget a receiving session or saved UI.
+	it("held shortcut rejects abort, compact and captured UI after replacement", async () => {
+		const p = await launch("shortcut-stale", "shortcut-stale");
+		p.text("[104;6u");
+		await p.mark("shortcut-held");
+		p.submit("/new");
+		await p.mark("start-2");
+		await vi.waitFor(() => expect(p.frame("receiving")).toContain("New session started"));
+		p.submit("held-A");
+		await p.mark("input-held");
+		writeFileSync(join(p.dir, "release-shortcut"), "release");
+		await p.mark("shortcut-result");
+		expect(JSON.parse(readFileSync(join(p.dir, "shortcut-result"), "utf8"))).toEqual(["abort", "compact", "ui"]);
+		expect(p.frame("stale-rejected")).not.toContain("STALE_UI_MUTATED_RECEIVING");
+		p.keys("Escape");
+		writeFileSync(join(p.dir, "release-input"), "release");
+	});
+
+	// smarty-dev#3048, PR #110 S3: real signals must latch terminal shutdown during busy ownership.
+	it.each([
+		["SIGTERM", "admission"],
+		["SIGHUP", "admission"],
+		["SIGTERM", "replacement"],
+		["SIGHUP", "replacement"],
+	] as const)("%s terminates held %s without swallowing the request", async (signal, phase) => {
+		const p = await launch(`signal-${signal}-${phase}`, "signal");
+		p.submit(phase === "admission" ? "held-A" : "/new");
+		await p.mark(phase === "admission" ? "input-held" : "switch-held");
+		p.frame("signal-pending");
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), signal);
+		expect(await p.exit()).toBe(0);
+		p.frame("signal-exited");
+	});
+
+	// smarty-dev#3048, PR #110 R2-1/S3: BUSY replacement must retain the active settlement cancellation owner.
+	it("SIGTERM after BUSY replacement cancels the original settlement", async () => {
+		const p = await launch("busy-settlement", "busy-settlement");
+		p.submit("settlement-run");
+		await p.mark("settlement-held");
+		p.submit("/new");
+		await vi.waitFor(() => expect(p.frame("settlement-busy")).toContain("INPUT_ADMISSION_BUSY"));
+		p.text("newer-settlement-draft");
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
+		expect(await p.exit()).toBe(0);
+		expect(p.frame("settlement-cancelled")).toContain("newer-settlement-draft");
+	});
+	// smarty-dev#3048, PR #110 S3/S11: terminal rejection preserves acknowledged queued image data and newer draft.
+	it("SIGTERM returns complete queued attachments and the editor draft", async () => {
+		const p = await launch("signal-queued-image", "recovery-signal-queues");
+		p.submit("run-held");
+		await p.mark("run-held");
+		p.text("queue-image");
+		p.keys("M-Enter");
+		await p.mark("image-created");
+		await vi.waitFor(() => expect(p.frame("image-queued")).toContain("attached-original"));
+		p.text("newer-signal-draft");
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
+		expect(await p.exit()).toBe(0);
+		const frame = p.frame("queued-image-rejected");
+		expect(frame).toContain("newer-signal-draft");
+		{
+			let receipt: { text: string; images: unknown[] } | undefined;
+			await vi.waitFor(() => {
+				const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+				const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
+				expect(json).toBeDefined();
+				receipt = JSON.parse(json!) as { text: string; images: unknown[] };
+			});
+			expect(receipt?.text).toContain("attached-original");
+			expect(receipt?.text).toContain("newer-signal-draft");
+			expect(receipt?.images).toEqual([
+				{
+					type: "image",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+					mimeType: "image/png",
+				},
+			]);
+			if (evidence) writeFileSync(join(evidence, `tui-${p.name}-recovery.proof.json`), JSON.stringify(receipt));
+		}
+	});
+	// smarty-dev#3048, PR #110 S3: a signal upgrades an ordinary quit already awaiting teardown.
+	it("SIGTERM upgrades an in-progress ordinary shutdown", async () => {
+		const p = await launch("shutdown-upgrade", "shutdown-upgrade");
+		p.submit("/quit");
+		await p.mark("cleanup-held");
+		p.frame("cleanup-pending");
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
+		expect(await p.exit()).toBe(0);
+		p.frame("cleanup-cancelled");
+	});
+	// smarty-dev#3048, PR #110 R2-3/S10/S8: idle Escape and collapsed bracketed paste must be lossless.
+	it.each(["Enter", "M-Enter", "streaming"] as const)(
+		"%s admission Escape preserves a newer large paste",
+		async (key) => {
+			const p = await launch(`paste-${key}`, key === "streaming" ? "recovery-paste" : "idle");
+			if (key === "streaming") {
+				p.submit("run-held");
+				await p.mark("run-held");
+			}
+			p.text("held-A");
+			p.keys(key === "streaming" ? "Enter" : key);
+			await p.mark("input-held");
+			const paste = `${"large-paste-body ".repeat(90)}large-paste-tail`;
+			p.text(`\x1b[200~${paste}\x1b[201~`);
+			await vi.waitFor(() => expect(editorFrame(p.frame("collapsed-paste"))).toContain("[paste #"));
+			p.keys("Escape");
+			await vi.waitFor(() => {
+				const frame = p.frame("paste-recovered");
+				expect(frame).toContain("INPUT_ADMISSION_ABORTED");
+				expect(editorFrame(frame)).toContain("held-A");
+			});
+			writeFileSync(join(p.dir, "release-input"), "release");
+			if (key === "streaming") {
+				writeFileSync(join(p.dir, "release-run"), "release");
+				await p.mark("settled");
+			}
+			p.keys("Enter");
+			await p.mark("paste-submitted");
+			expect(readFileSync(join(p.dir, "paste-submitted"), "utf8")).toBe(`${paste}\nheld-A`);
+			p.frame("paste-resubmitted");
+		},
+	);
+
+	// smarty-dev#3048, PR #110 R2-4/S9: no later run or keyboard prompt may be needed to exit.
+	it.each(["replacement-shutdown", "initial-shutdown"] as const)(
+		"deferred %s exits without starting a run",
+		async (scenario) => {
+			const p = await launch(scenario, scenario);
+			if (scenario === "replacement-shutdown") {
+				p.submit("/new");
+				await p.mark("replacement-shutdown");
+			} else await p.mark("admission-shutdown");
+			p.frame("deferred-shutdown");
+			expect(await p.exit()).toBe(0);
+			p.frame("deferred-exited");
+		},
+	);
+
+	// smarty-dev#3048, PR #110 S11: acknowledged image recovery cannot rely on rerunning a transform.
+	it("Escape recovers the original queued image and resubmits it intact", async () => {
+		const p = await launch("queued-image", "recovery");
+		p.submit("run-held");
+		await p.mark("run-held");
+		p.submit("queue-image");
+		await p.mark("image-created");
+		await vi.waitFor(() => expect(p.frame("image-queued")).toContain("attached-original"));
+		p.keys("Escape");
+		await vi.waitFor(() => expect(editorFrame(p.frame("image-recovered"))).toContain("attached-original"));
+		writeFileSync(join(p.dir, "release-run"), "release");
+		await p.mark("settled");
+		p.keys("Enter");
+		await p.mark("image-recovered");
+		expect(JSON.parse(readFileSync(join(p.dir, "image-recovered"), "utf8"))).toEqual([
+			{
+				type: "image",
+				data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+				mimeType: "image/png",
+			},
+		]);
+		p.frame("image-resubmitted");
+	});
 	it.each(["run-shutdown", "admission-shutdown"] as const)(
 		"extension-requested %s exits the real interactive loop",
 		async (scenario) => {

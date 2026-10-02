@@ -63,7 +63,12 @@ import {
 	getDocsPath,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type PromptOptions,
+	parseSkillBlock,
+} from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
@@ -80,7 +85,6 @@ import type {
 	AutocompleteProviderFactory,
 	EditorFactory,
 	ExtensionCommandContext,
-	ExtensionContext,
 	ExtensionRunner,
 	ExtensionUIContext,
 	ExtensionUIDialogOptions,
@@ -103,6 +107,7 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
 import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
+import { flushRawStdout } from "../../core/output-guard.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -517,6 +522,9 @@ export class InteractiveMode {
 
 	// Shutdown state
 	private shutdownRequested = false;
+	private terminalShutdownRequested = false;
+	/** Visible recovery markers own the original image content, independent of input transforms. */
+	private readonly recoveredImages = new Map<string, ImageContent>();
 
 	/** The `/bug` hint is shown at most once per session so error output stays readable. */
 	private bugReportHintShown = false;
@@ -580,6 +588,11 @@ export class InteractiveMode {
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			if (this.compactionQueueTransfers > 0) throw new Error("OWNER_TUI_TRANSFER_PENDING");
 			this.resetExtensionUI();
+		});
+		this.runtimeHost.setLifecycleCompleteHandler(() => {
+			void this.checkShutdownRequested().catch((cause: unknown) =>
+				this.uncaughtCrash(cause instanceof Error ? cause : new Error(String(cause))),
+			);
 		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
@@ -1192,6 +1205,8 @@ export class InteractiveMode {
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
+			} finally {
+				await this.checkShutdownRequested();
 			}
 		}
 
@@ -1202,6 +1217,8 @@ export class InteractiveMode {
 				} catch (error: unknown) {
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					this.showError(errorMessage);
+				} finally {
+					await this.checkShutdownRequested();
 				}
 			}
 		}
@@ -1210,7 +1227,7 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				const prompt = this.session.prompt(userInput);
+				const prompt = this.promptWithRecoveredImages(userInput);
 				// Original session preflight owns the input before TUI staging clears.
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-transferred");
@@ -1950,11 +1967,12 @@ export class InteractiveMode {
 			uiContext,
 			mode: "tui",
 			hasPendingInput: () =>
-				this.session !== session ||
-				this.pendingUserInputs.length > 0 ||
-				this.userInputInFlight ||
-				this.compactionQueuedMessages.length > 0 ||
-				this.compactionQueueTransfers > 0,
+				!this.terminalShutdownRequested &&
+				(this.session !== session ||
+					this.pendingUserInputs.length > 0 ||
+					this.userInputInFlight ||
+					this.compactionQueuedMessages.length > 0 ||
+					this.compactionQueueTransfers > 0),
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			},
@@ -2192,45 +2210,6 @@ export class InteractiveMode {
 	 */
 	private setupExtensionShortcuts(extensionRunner: ExtensionRunner): void {
 		const shortcuts = extensionRunner.getShortcuts(this.keybindings.getEffectiveConfig());
-		if (shortcuts.size === 0) return;
-
-		// Create a context for shortcut handlers
-		const createContext = (): ExtensionContext => ({
-			ui: this.createExtensionUIContext(),
-			mode: "tui",
-			hasUI: true,
-			cwd: this.sessionManager.getCwd(),
-			sessionManager: this.sessionManager,
-			modelRegistry: extensionRunner.getModelRegistry(),
-			model: this.session.model,
-			scopedModels: this.session.scopedModels,
-			thinkingLevel: this.session.thinkingLevel,
-			isIdle: () => this.session.isIdle,
-			isSettling: () => this.session.isSettling,
-			isPromptPending: () => this.session.isPromptPending,
-			isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
-			signal: this.session.agent.signal,
-			abort: () => {
-				this.restoreQueuedMessagesToEditor({ abort: true });
-			},
-			hasPendingMessages: () => this.session.pendingMessageCount > 0,
-			shutdown: () => {
-				this.shutdownRequested = true;
-			},
-			getContextUsage: () => this.session.getContextUsage(),
-			compact: (options) => {
-				void (async () => {
-					try {
-						const result = await this.session.compact(options?.customInstructions);
-						options?.onComplete?.(result);
-					} catch (error) {
-						const err = error instanceof Error ? error : new Error(String(error));
-						options?.onError?.(err);
-					}
-				})();
-			},
-			getSystemPrompt: () => this.session.systemPrompt,
-		});
 
 		// Set up the extension shortcut handler on the default editor
 		this.defaultEditor.onExtensionShortcut = (data: string) => {
@@ -2238,9 +2217,11 @@ export class InteractiveMode {
 				// Cast to KeyId - extension shortcuts use the same format
 				if (matchesKey(data, shortcutStr as KeyId)) {
 					// Run handler async, don't block input
-					Promise.resolve(shortcut.handler(createContext())).catch((err) => {
-						this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
-					});
+					Promise.resolve()
+						.then(() => shortcut.handler(extensionRunner.createContext()))
+						.catch((err) => {
+							this.showError(`Shortcut handler error: ${err instanceof Error ? err.message : String(err)}`);
+						});
 					return true;
 				}
 			}
@@ -3067,7 +3048,7 @@ export class InteractiveMode {
 		// Set up handlers on defaultEditor - they use this.editor for text access
 		// so they work correctly regardless of which editor is active
 		this.defaultEditor.onEscape = () => {
-			if (this.session.isStreaming) {
+			if (this.session.isStreaming || this.session.inputAdmissionCount > 0) {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			} else if (this.session.isBashRunning) {
 				this.session.abortBash();
@@ -3190,7 +3171,7 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
-			if (this.runtimeHost.inputsFenced) {
+			if (this.runtimeHost.inputsFenced || this.terminalShutdownRequested) {
 				this.editor.setText(text);
 				this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
 				return;
@@ -4259,7 +4240,22 @@ export class InteractiveMode {
 	private isShuttingDown = false;
 
 	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
-		if (this.isShuttingDown) return;
+		const upgrade = options?.fromSignal && !this.terminalShutdownRequested;
+		if (options?.fromSignal) this.terminalShutdownRequested = true;
+		if (this.isShuttingDown) {
+			if (upgrade) {
+				this.cancelUIHolds();
+				this.disposeActiveSelector();
+				await this.runtimeHost.dispose({
+					terminal: true,
+					rejectQueuedInput: (messages) => {
+						const recovered = this.recoveryText(messages);
+						if (recovered) this.restoreRejectedInput(recovered);
+					},
+				});
+			}
+			return;
+		}
 		this.isShuttingDown = true;
 		try {
 			// Keep signal handlers registered until terminal cleanup has completed.
@@ -4274,33 +4270,53 @@ export class InteractiveMode {
 				// terminal. If the terminal is gone, the restore writes below emit EIO,
 				// which the stdout/stderr error handler turns into emergencyTerminalExit;
 				// the render loop is already idle, so this cannot hot-spin (see #4144).
-				await this.runtimeHost.dispose();
+				for (const text of this.pendingUserInputs.splice(0)) this.restoreRejectedInput(text);
+				for (const message of this.compactionQueuedMessages.splice(0)) this.restoreRejectedInput(message.text);
+				this.cancelUIHolds();
+				this.disposeActiveSelector();
+				await this.runtimeHost.dispose({
+					terminal: true,
+					rejectQueuedInput: (messages) => {
+						const recovered = this.recoveryText(messages);
+						if (recovered) this.restoreRejectedInput(recovered);
+					},
+				});
 				this.themeController.disableAutoSync();
 				await this.ui.terminal.drainInput(1000);
 				this.stop();
-				process.exit(0);
+			} else {
+				// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
+				// TUI before emitting shutdown events so extension UI cleanup cannot repaint
+				// the final frame while the process is exiting.
+				// Drain any in-flight Kitty key release events before stopping.
+				// This prevents escape sequences from leaking to the parent shell over slow SSH.
+				await this.runtimeHost.dispose({
+					beforeShutdown: async () => {
+						this.themeController.disableAutoSync();
+						await this.ui.terminal.drainInput(1000);
+						this.stop();
+					},
+				});
 			}
-
-			// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
-			// TUI before emitting shutdown events so extension UI cleanup cannot repaint
-			// the final frame while the process is exiting.
-			// Drain any in-flight Kitty key release events before stopping.
-			// This prevents escape sequences from leaking to the parent shell over slow SSH.
-			await this.runtimeHost.dispose({
-				beforeShutdown: async () => {
-					this.themeController.disableAutoSync();
-					await this.ui.terminal.drainInput(1000);
-					this.stop();
-				},
-			});
-
-			const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
-			if (resumeCommand) {
-				process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+			if (this.terminalShutdownRequested) {
+				const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
+				if (draft.trim()) {
+					const images = [...this.recoveredImages]
+						.filter(([marker]) => draft.includes(marker))
+						.map(([, image]) => image);
+					process.stdout.write(
+						`INPUT_ADMISSION_SHUTDOWN: recovered draft ${JSON.stringify({ text: draft, images })}\n`,
+					);
+					await flushRawStdout();
+				}
+			} else {
+				const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
+				if (resumeCommand) process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
 			}
 
 			process.exit(0);
 		} catch (error) {
+			if (this.terminalShutdownRequested) throw error;
 			if (!this.handleInputAdmissionError(error)) throw error;
 			// Admission refusal precedes terminal teardown: the old session remains usable.
 			this.isShuttingDown = false;
@@ -4375,7 +4391,9 @@ export class InteractiveMode {
 				// surfaces as an EIO on the restore writes, which the stdout/stderr
 				// error handler converts into emergencyTerminalExit (see #4144, #5080).
 				killTrackedDetachedChildren();
-				void this.shutdown({ fromSignal: true });
+				void this.shutdown({ fromSignal: true }).catch((cause: unknown) =>
+					this.uncaughtCrash(cause instanceof Error ? cause : new Error(String(cause))),
+				);
 			};
 			process.prependListener(signal, handler);
 			this.signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -4444,11 +4462,51 @@ export class InteractiveMode {
 		}
 	}
 
+	private recoveryText(messages: AgentMessage[], imagesOnly = false): string {
+		const text: string[] = [];
+		for (const message of messages) {
+			if (message.role !== "user") continue;
+			if (typeof message.content === "string") {
+				if (!imagesOnly) text.push(message.content);
+				continue;
+			}
+			for (const part of message.content) {
+				if (part.type === "text") {
+					if (!imagesOnly) text.push(part.text);
+				} else if (part.type === "image") {
+					const marker = `[recovered image ${crypto.randomUUID()} ${part.mimeType}]`;
+					this.recoveredImages.set(marker, { ...part });
+					text.push(marker);
+				}
+			}
+		}
+		return text.join("\n");
+	}
+
+	private promptWithRecoveredImages(text: string, options?: PromptOptions): Promise<void> {
+		const images = [...(options?.images ?? [])];
+		const markers: string[] = [];
+		for (const [marker, image] of this.recoveredImages) {
+			if (!text.includes(marker)) continue;
+			text = text.replaceAll(marker, "");
+			images.push(image);
+			markers.push(marker);
+		}
+		return this.session.prompt(text, {
+			...options,
+			images: images.length ? images : undefined,
+			onInputTransferred: () => {
+				for (const marker of markers) this.recoveredImages.delete(marker);
+				options?.onInputTransferred?.();
+			},
+		});
+	}
+
 	private async submitEditorPrompt(text: string, streamingBehavior?: "steer" | "followUp"): Promise<void> {
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
 		try {
-			await this.session.prompt(text, { streamingBehavior });
+			await this.promptWithRecoveredImages(text, { streamingBehavior });
 		} catch (error) {
 			if (!this.handleInputAdmissionError(error)) throw error;
 			this.restoreRejectedInput(text);
@@ -4461,7 +4519,7 @@ export class InteractiveMode {
 
 	private restoreRejectedInput(text: string): void {
 		// A rejected submission is independent of drafts typed since it was cleared.
-		const draft = this.editor.getText();
+		const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
 		this.editor.setText(draft ? `${draft}\n${text}` : text);
 		this.ui.requestRender();
 	}
@@ -4739,8 +4797,13 @@ export class InteractiveMode {
 	}
 
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
+		// Snapshot complete content before clearQueue destroys the native queues.
+		const messages = this.session.agent.getQueuedMessages();
 		const { steering, followUp } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
+		const count = allQueued.length;
+		const imageText = this.recoveryText(messages, true);
+		if (imageText) allQueued.push(imageText);
 		if (allQueued.length === 0) {
 			this.updatePendingMessagesDisplay();
 			if (options?.abort) {
@@ -4749,14 +4812,14 @@ export class InteractiveMode {
 			return 0;
 		}
 		const queuedText = allQueued.join("\n\n");
-		const currentText = options?.currentText ?? this.editor.getText();
+		const currentText = options?.currentText ?? this.editor.getExpandedText?.() ?? this.editor.getText();
 		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
 		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
 			void this.session.abort();
 		}
-		return allQueued.length;
+		return count;
 	}
 
 	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
@@ -6912,6 +6975,8 @@ export class InteractiveMode {
 		} catch (error: unknown) {
 			if (this.handleInputAdmissionError(error)) return;
 			await this.handleFatalRuntimeError("Failed to create session", error);
+		} finally {
+			await this.checkShutdownRequested();
 		}
 	}
 
@@ -7098,6 +7163,8 @@ export class InteractiveMode {
 			this.stopInteractiveTui(fullscreenExitOutput);
 			this.isInitialized = false;
 		}
-		this.unregisterSignalHandlers();
+		// Ordinary quit stops the terminal before asynchronous session cleanup. Keep
+		// signal ownership until exit so SIGTERM/SIGHUP can still upgrade that wait.
+		if (!this.isShuttingDown) this.unregisterSignalHandlers();
 	}
 }
