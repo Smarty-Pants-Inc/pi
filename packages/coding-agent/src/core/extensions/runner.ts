@@ -256,9 +256,10 @@ export type ShutdownHandler = () => void;
 export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
+		await extensionRunner.emit(event, signal);
 		return true;
 	}
 	return false;

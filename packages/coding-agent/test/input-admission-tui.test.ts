@@ -39,7 +39,26 @@ export default function(pi) {
   });
   let round4RunHeld = false, savedImages = [];
   pi.registerShortcut("ctrl+shift+m", { handler: async ctx => {
-    await ctx.ui.custom(() => { mark("custom-mounted"); return { render: () => ["CUSTOM_MOUNTED"], invalidate() {} }; });
+    await ctx.ui.custom((_ui, _theme, _keys, done) => {
+      mark("custom-mounted"); let aborted = false;
+      const timer = process.env.PI_PROOF_CASE.startsWith("r2-custom") ? setInterval(() => {
+        if (!aborted && existsSync(join(dir, "abort-mounted"))) {
+          aborted = true; ctx.abort();
+          setTimeout(() => { writeFileSync(join(dir, "mounted-recovery"), JSON.stringify({ text: ctx.ui.getEditorText() })); mark("recovered-mounted"); }, 50);
+        }
+        if (existsSync(join(dir, "close-custom"))) done();
+      }, 20) : undefined;
+      return { render: () => ["CUSTOM_MOUNTED"], invalidate() {}, dispose() { clearInterval(timer); } };
+    });
+  } });
+  pi.on("session_before_fork", async () => {
+    if (!process.env.PI_PROOF_CASE.startsWith("r2-replacement")) return;
+    mark("fork-held"); await hold("fork");
+  });
+  pi.registerCommand("fork-held", { handler: async (_args, ctx) => {
+    await new Promise(resolve => setImmediate(resolve));
+    const target = ctx.sessionManager.getBranch().find(entry => entry.type === "message" && entry.message.role === "user");
+    await ctx.fork(target.id); mark("extension-fork-finished");
   } });
   pi.registerCommand("replace-bash", { handler: async (_args, ctx) => { await new Promise(resolve => setImmediate(resolve)); const result = await ctx.switchSession(join(dir, "target.jsonl")); if (!result.cancelled) mark("bash-replaced"); } });
   pi.on("user_bash", async () => {
@@ -62,7 +81,7 @@ export default function(pi) {
     return { compaction: { summary: "offline compacted context", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
   });
   pi.on("agent_start", async (_event, ctx) => {
-    if (process.env.PI_PROOF_CASE.startsWith("recovery") || round4RunHeld) { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
+    if (process.env.PI_PROOF_CASE.startsWith("recovery") || process.env.PI_PROOF_CASE.startsWith("r2-custom") || round4RunHeld) { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
     if (process.env.PI_PROOF_CASE === "run-shutdown") ctx.shutdown();
   });
   pi.on("input", async (event, ctx) => {
@@ -148,6 +167,7 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 				"flushed",
 				"bash",
 				"editor",
+				"fork",
 			])
 				writeFileSync(join(p.dir, `release-${gate}`), "release");
 			if (!existsSync(join(p.dir, "exit"))) {
@@ -208,7 +228,7 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 				JSON.stringify({ externalEditor: `${process.execPath} ${join(dir, "external.mjs")}` }),
 			);
 		}
-		if (scenario.startsWith("r1-bash") || scenario === "r1-import") {
+		if (scenario.startsWith("r1-bash") || scenario === "r1-import" || scenario.startsWith("r2-replacement")) {
 			const built = process.env.PI_R1_DIST ?? resolve("dist");
 			writeFileSync(
 				join(dir, "native-tui.mjs"),
@@ -262,7 +282,7 @@ await new InteractiveMode(host).run();
 			PI_PROOF_CASE: scenario,
 			PI_PACKAGE_DIR: resolve("."),
 		};
-		if (scenario.startsWith("r1-bash") || scenario === "r1-import")
+		if (scenario.startsWith("r1-bash") || scenario === "r1-import" || scenario.startsWith("r2-replacement"))
 			args.splice(0, args.length, join(dir, "native-tui.mjs"));
 		const command = `set +m; env -i ${Object.entries(env)
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
@@ -317,6 +337,92 @@ await new InteractiveMode(host).run();
 		p.frame("ready");
 		return p;
 	}
+
+	// smarty-dev#3048 / pi#117 R2-S3: recovery finishes while non-overlay custom UI is still mounted.
+	it.each(["normal", "SIGTERM", "SIGHUP"] as const)(
+		"R2-S3: %s dismissal preserves already-recovered original images",
+		async (ending) => {
+			const p = await launch(`r2-custom-${ending}`, `r2-custom-${ending}`);
+			p.submit("run-held");
+			await p.mark("run-held");
+			p.text("queue-image");
+			p.keys("M-Enter");
+			await p.mark("image-created");
+			await vi.waitFor(() => expect(p.frame("r2-original-queued")).toContain("attached-original"));
+			p.text("\x1b[77;6u");
+			await p.mark("custom-mounted");
+			await vi.waitFor(() => expect(p.frame("r2-custom-mounted")).toContain("CUSTOM_MOUNTED"));
+			writeFileSync(join(p.dir, "abort-mounted"), "abort");
+			await p.mark("recovered-mounted");
+			const recovered = JSON.parse(readFileSync(join(p.dir, "mounted-recovery"), "utf8"));
+			expect(recovered.text).toContain("attached-original");
+			expect(recovered.text).toContain("[recovered image");
+			expect(p.frame("r2-recovery-before-dismissal")).toContain("CUSTOM_MOUNTED");
+			if (ending === "normal") {
+				writeFileSync(join(p.dir, "release-run"), "release");
+				await p.mark("settled");
+				writeFileSync(join(p.dir, "close-custom"), "close");
+				await vi.waitFor(() => expect(editorFrame(p.frame("r2-custom-dismissed"))).toContain("attached-original"));
+				p.keys("Enter");
+				await p.mark("image-recovered");
+				expect(JSON.parse(readFileSync(join(p.dir, "image-recovered"), "utf8"))).toEqual([
+					{
+						type: "image",
+						mimeType: "image/png",
+						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+					},
+				]);
+			} else {
+				process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), ending);
+				expect(await p.exit()).toBe(0);
+				await vi.waitFor(() => {
+					const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+					const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
+					expect(json).toBeDefined();
+					const receipt = JSON.parse(json!);
+					expect(receipt.text).toBe(recovered.text);
+					expect(receipt.images).toEqual([
+						{
+							type: "image",
+							mimeType: "image/png",
+							data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+						},
+					]);
+				});
+			}
+		},
+	);
+
+	// smarty-dev#3048 / pi#117 R2-S4: successful replacement must not erase fenced submissions.
+	it.each(["clone", "fork", "extension"] as const)(
+		"R2-S4: successful held %s keeps newer fenced draft",
+		async (kind) => {
+			const p = await launch(`r2-${kind}`, `r2-replacement-${kind}`);
+			p.submit("historical-seed");
+			await p.mark("settled");
+			p.submit(kind === "extension" ? "/fork-held" : `/${kind}`);
+			if (kind === "fork") {
+				await vi.waitFor(() => expect(p.frame("r2-fork-selector")).toContain("Fork from Message"));
+				p.keys("Enter");
+			}
+			await p.mark("fork-held");
+			p.submit("newer-fenced-draft");
+			await vi.waitFor(() => {
+				const frame = p.frame("r2-replacement-fenced");
+				expect(frame).toContain("INPUT_ADMISSION_FENCED");
+				expect(editorFrame(frame)).toContain("newer-fenced-draft");
+			});
+			writeFileSync(join(p.dir, "release-fork"), "release");
+			await p.mark("start-2");
+			if (kind === "extension") await p.mark("extension-fork-finished");
+			await vi.waitFor(() =>
+				expect(p.frame("r2-replacement-complete")).toContain(
+					kind === "clone" ? "Cloned to new session" : "Forked to new session",
+				),
+			);
+			expect(editorFrame(p.frame("r2-newer-draft-retained"))).toContain("newer-fenced-draft");
+		},
+	);
 
 	// pi#117 R1-4: custom cleanup must precede transfer of compaction staging into recovery.
 	it("R1-4: signal with mounted custom interaction preserves staged original image recovery", async () => {
@@ -553,6 +659,10 @@ await new InteractiveMode(host).run();
 		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
 		expect(await p.exit()).toBe(0);
 		p.frame("cleanup-cancelled");
+		await vi.waitFor(() => {
+			const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+			expect(raw).toContain("session_shutdown cleanup incomplete: deadline exceeded 1000 ms");
+		});
 	});
 	// smarty-dev#3048, PR #110 R2-3/S10/S8: idle Escape and collapsed bracketed paste must be lossless.
 	it.each(["Enter", "M-Enter", "streaming"] as const)(

@@ -2359,6 +2359,12 @@ export class AgentSession {
 			},
 		};
 		if (this._isEmittingAgentSettled) {
+			if (this._agentSettledScope.getStore()?.active) {
+				throw new InputAdmissionError(
+					"INPUT_ADMISSION_BUSY",
+					"SDK input cannot await its own agent_settled handler; submit after settlement",
+				);
+			}
 			// Scheduling is not acceptance. Keep the result and admission pending until the
 			// deferred action runs, or reject cancellation without waiting for held handlers.
 			await this._awaitInput(
@@ -4553,13 +4559,16 @@ export class AgentSession {
 					});
 				},
 				sendUserMessage: (content, options) => {
-					this.sendUserMessage(content, options).catch((err) => {
-						runner.emitError({
-							extensionPath: "<runtime>",
-							event: "send_user_message",
-							error: err instanceof Error ? err.message : String(err),
+					// The extension API returns void: retain admission, but do not treat it as an awaited SDK self-join.
+					this._agentSettledScope
+						.exit(() => this.sendUserMessage(content, options))
+						.catch((err) => {
+							runner.emitError({
+								extensionPath: "<runtime>",
+								event: "send_user_message",
+								error: err instanceof Error ? err.message : String(err),
+							});
 						});
-					});
 				},
 				appendEntry: (customType, data) => {
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);

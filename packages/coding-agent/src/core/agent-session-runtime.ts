@@ -602,7 +602,7 @@ export class AgentSessionRuntime {
 		}
 	}
 
-	private async waitForShutdownHook(cleanup: Promise<unknown>): Promise<void> {
+	private async waitForShutdownHook(session: AgentSession): Promise<void> {
 		const deadline = new AbortController();
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const beginDeadline = () => {
@@ -616,9 +616,24 @@ export class AgentSessionRuntime {
 		if (signal.aborted) beginDeadline();
 		else signal.addEventListener("abort", beginDeadline, { once: true });
 		try {
-			await raceWithAbortSignal(cleanup, deadline.signal);
+			await emitSessionShutdownEvent(
+				session.extensionRunner,
+				{ type: "session_shutdown", reason: "quit" },
+				deadline.signal,
+			);
 		} catch (error) {
 			if (!deadline.signal.aborted) throw error;
+			const message = "INPUT_ADMISSION_SHUTDOWN: session_shutdown cleanup incomplete: deadline exceeded 1000 ms";
+			this._diagnostics.push({ type: "warning", message });
+			try {
+				session.extensionRunner.emitError({
+					extensionPath: "<runtime>",
+					event: "session_shutdown",
+					error: message,
+				});
+			} catch {
+				// A host reporter cannot skip mandatory invalidation. SDK callers retain the diagnostic.
+			}
 		} finally {
 			signal.removeEventListener("abort", beginDeadline);
 			clearTimeout(timer);
@@ -674,12 +689,7 @@ export class AgentSessionRuntime {
 							},
 							persist: async () => {
 								this.#assertIdentity(outgoing);
-								await this.waitForShutdownHook(
-									emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-										type: "session_shutdown",
-										reason: "quit",
-									}),
-								);
+								await this.waitForShutdownHook(outgoing.session);
 								this.#assertIdentity(outgoing);
 								this.beforeSessionInvalidate?.();
 								this.#assertIdentity(outgoing);
@@ -695,11 +705,7 @@ export class AgentSessionRuntime {
 			}
 			await outgoing.session.abort();
 			this.#assertCurrent(outgoing, true);
-			const cleanup = emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-				type: "session_shutdown",
-				reason: "quit",
-			});
-			await this.waitForShutdownHook(cleanup);
+			await this.waitForShutdownHook(outgoing.session);
 			this.#assertCurrent(outgoing, true);
 			this.beforeSessionInvalidate?.();
 			this.#assertCurrent(outgoing, true);

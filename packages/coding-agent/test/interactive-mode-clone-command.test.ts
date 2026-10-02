@@ -42,7 +42,8 @@ describe("InteractiveMode /clone", () => {
 
 		expect(fork).toHaveBeenCalledWith("leaf-123", { position: "at" });
 		expect(renderCurrentSessionState).not.toHaveBeenCalled();
-		expect(setText).toHaveBeenCalledWith("");
+		// smarty-dev#3048 / pi#117 R2-S4: submission already cleared; a late continuation must not clear again.
+		expect(setText).not.toHaveBeenCalled();
 		expect(showStatus).toHaveBeenCalledWith("Cloned to new session");
 		expect(showError).not.toHaveBeenCalled();
 		expect(requestRender).not.toHaveBeenCalled();

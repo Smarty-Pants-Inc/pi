@@ -435,6 +435,7 @@ export class InteractiveMode {
 	private statusContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
+	private editorRevision = 0;
 	private editorComponentFactory: EditorFactory | undefined;
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
@@ -2012,10 +2013,11 @@ export class InteractiveMode {
 					}
 				},
 				fork: async (entryId, options) => {
+					const editorRevision = this.editorRevision;
 					try {
 						const result = await this.runtimeHost.fork(entryId, options);
 						if (!result.cancelled) {
-							this.editor.setText(result.selectedText ?? "");
+							if (this.editorRevision === editorRevision) this.editor.setText(result.selectedText ?? "");
 							this.showStatus("Forked to new session");
 						}
 						return { cancelled: result.cancelled };
@@ -2063,7 +2065,12 @@ export class InteractiveMode {
 					);
 			},
 			onError: (error) => {
-				this.showExtensionError(error.extensionPath, error.error, error.stack);
+				if (this.isShuttingDown && error.event === "session_shutdown") {
+					// Cleanup may have already stopped rendering; report incomplete shutdown outside the final frame.
+					console.error(error.error);
+				} else {
+					this.showExtensionError(error.extensionPath, error.error, error.stack);
+				}
 			},
 		});
 
@@ -2974,12 +2981,10 @@ export class InteractiveMode {
 			onHandle?: (handle: OverlayHandle) => void;
 		},
 	): Promise<T> {
-		const savedText = this.editor.getExpandedText?.() ?? this.editor.getText();
 		const isOverlay = options?.overlay ?? false;
 		const restoreEditor = () => {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.editor);
-			this.editor.setText(savedText);
 			this.ui.setFocus(this.editor);
 			this.ui.requestRender();
 		};
@@ -3141,6 +3146,7 @@ export class InteractiveMode {
 		this.defaultEditor.onAction("app.session.resume", () => this.showSessionSelector());
 
 		this.defaultEditor.onChange = (text: string) => {
+			this.editorRevision++;
 			const wasBashMode = this.isBashMode;
 			this.isBashMode = text.trimStart().startsWith("!");
 			if (wasBashMode !== this.isBashMode) {
@@ -5783,6 +5789,7 @@ export class InteractiveMode {
 				userMessages.map((m) => ({ id: m.entryId, text: m.text })),
 				async (entryId) => {
 					done();
+					const editorRevision = this.editorRevision;
 					try {
 						const result = await this.runtimeHost.fork(entryId);
 						if (result.cancelled) {
@@ -5790,7 +5797,7 @@ export class InteractiveMode {
 							return;
 						}
 
-						this.editor.setText(result.selectedText ?? "");
+						if (this.editorRevision === editorRevision) this.editor.setText(result.selectedText ?? "");
 						this.showStatus("Forked to new session");
 					} catch (error: unknown) {
 						this.showError(error instanceof Error ? error.message : String(error));
@@ -5820,7 +5827,6 @@ export class InteractiveMode {
 				return;
 			}
 
-			this.editor.setText("");
 			this.showStatus("Cloned to new session");
 		} catch (error: unknown) {
 			this.showError(error instanceof Error ? error.message : String(error));

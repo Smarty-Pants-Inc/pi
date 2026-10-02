@@ -746,7 +746,10 @@ export async function runRpcMode(
 				// The non-dialog hook can outlive ordinary replacement. Revalidate its captured custody
 				// before either execution or persistence, without switching work to the receiving session.
 				if (session !== runtimeHost.session || session.isDisposed)
-					throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash was not executed or recorded");
+					throw new InputAdmissionError(
+						"INPUT_ADMISSION_DISPOSED",
+						"bash cancelled after session replacement or disposal; not executed or recorded",
+					);
 				if (session.inputsFenced) throw new InputAdmissionError("INPUT_ADMISSION_FENCED", "bash was not accepted");
 				session.shutdownSignal.throwIfAborted();
 
@@ -1261,7 +1264,6 @@ export async function runRpcMode(
 		void work.then(finished, finished);
 		return work;
 	};
-
 
 	const waitForPendingCommandWork = async (includePrompts = false): Promise<void> => {
 		// Startup draining waits for command responses, not complete agent runs.

@@ -339,7 +339,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.child.kill("SIGTERM");
 		expect(await p.exited).toEqual({ code: 143, signal: null });
 		expect(p.records.filter((record) => record.id === "held" && record.type === "response")).toEqual([
-			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_ABORTED") }),
+			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
 	});
 
@@ -400,7 +400,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			await Promise.race([p.exited, new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 1500))]),
 		).toEqual({ code: 0, signal: null });
 		expect(p.records.filter((record) => record.id === "held" && record.type === "response")).toEqual([
-			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_ABORTED") }),
+			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
 		expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
 			expect.objectContaining({
@@ -563,7 +563,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			{ code: 0, signal: null },
 		);
 		expect(p.records.filter((record) => record.id === "bash" && record.type === "response")).toEqual([
-			expect.objectContaining({ success: true, data: expect.objectContaining({ cancelled: true }) }),
+			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
 		expect(p.records.some((record) => String(record.delta).includes("must-not-run"))).toBe(false);
 	});
