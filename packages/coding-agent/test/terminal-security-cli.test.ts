@@ -171,9 +171,11 @@ else {
   await host.session.bindExtensions({});
   const published = [];
   host.session.subscribe(event => { if (event.type === "message_end") published.push(JSON.stringify(event.message)); });
-  const run = host.session.prompt("offline prompt");
+  const run = host.session.prompt("offline prompt").catch(error => {
+    if (error !== host.session.shutdownSignal.reason) throw error;
+  });
   process.stdin.once("data", async () => {
-    await host.dispose(); await run;
+    await host.dispose({ terminal: true, rejectQueuedInput: messages => { if (messages.length) throw new Error("unexpected queued alias input"); } }); await run;
     const manager = host.session.sessionManager;
     const before = JSON.stringify(manager.getEntries());
     const agentBefore = JSON.stringify(host.session.messages);
@@ -605,7 +607,7 @@ describe.skipIf(!existsSync(cli))("terminal security process regressions", () =>
 			const responses = p.records.filter((record) => record.id === "replace");
 			expect(responses).toHaveLength(1);
 			expect(responses[0].success).toBe(false);
-			expect(responses[0].error).toMatch(/cancel/i);
+			expect(responses[0].error).toMatch(/cancel|INPUT_ADMISSION_ABORTED/i);
 			expect(existsSync(join(p.dir, "cleanup-done"))).toBe(true);
 		},
 	);

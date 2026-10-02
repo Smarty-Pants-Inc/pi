@@ -20,6 +20,7 @@ import type {
 	ExtensionWidgetOptions,
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
+import { InputAdmissionError } from "../../core/input-admission.ts";
 import {
 	flushRawStdout,
 	takeOverStdout,
@@ -37,6 +38,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcFatalErrorResponse,
+	RpcInputRejectedEvent,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -196,7 +198,8 @@ export async function runRpcMode(
 		request: Record<string, unknown>,
 		parseResponse: (response: RpcExtensionUIResponse) => T,
 	): Promise<T> {
-		if (inputEnded || opts?.signal?.aborted) return Promise.resolve(defaultValue);
+		if (inputEnded || (!extensionBindingsComplete && shutdownPromise) || opts?.signal?.aborted)
+			return Promise.resolve(defaultValue);
 
 		const configuredTimeout = opts?.timeout;
 		const timeout =
@@ -429,32 +432,36 @@ export async function runRpcMode(
 		},
 	});
 
-	runtimeHost.setRebindSession(async () => {
-		await rebindSession();
+	runtimeHost.setRebindSession(async (receiving) => {
+		await rebindSession(receiving);
+	});
+	runtimeHost.setLifecycleCompleteHandler(() => {
+		void checkShutdownRequested().catch(() => requestShutdown(1));
 	});
 
-	const rebindSession = async (): Promise<void> => {
+	const rebindSession = async (receiving = runtimeHost.session): Promise<void> => {
 		session.stopMessageEntryIdCapture();
 		unsubscribe?.();
 		unsubscribe = undefined;
 		unsubscribeBackpressure?.();
 		unsubscribeBackpressure = undefined;
 
-		session = runtimeHost.session;
-		session.stopMessageEntryIdCapture();
+		session = receiving;
+		const boundSession = receiving;
+		boundSession.stopMessageEntryIdCapture();
 		issuedBranchPageCursors.clear();
-		await session.bindExtensions({
+		await boundSession.bindExtensions({
 			uiContext: createExtensionUIContext(),
 			mode: "rpc",
 			commandContextActions: {
-				waitForIdle: () => session.waitForIdle(),
+				waitForIdle: () => boundSession.waitForIdle(),
 				newSession: async (options) => runtimeHost.newSession(options),
 				fork: async (entryId, forkOptions) => {
 					const result = await runtimeHost.fork(entryId, forkOptions);
 					return { cancelled: result.cancelled };
 				},
 				navigateTree: async (targetId, options) => {
-					const result = await session.navigateTree(targetId, {
+					const result = await boundSession.navigateTree(targetId, {
 						summarize: options?.summarize,
 						customInstructions: options?.customInstructions,
 						replaceInstructions: options?.replaceInstructions,
@@ -466,27 +473,32 @@ export async function runRpcMode(
 					return runtimeHost.switchSession(sessionPath, options);
 				},
 				reload: async () => {
-					await session.reload();
+					await boundSession.reload();
 				},
 			},
 			shutdownHandler: () => {
 				shutdownRequested = true;
+				void boundSession
+					.waitForIdle()
+					.then(() => checkShutdownRequested())
+					.catch(() => requestShutdown(1));
 			},
 			onError: (err) => {
 				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
 			},
 		});
 
-		session.startMessageEntryIdCapture();
-		unsubscribe = session.subscribe((event) => {
+		if (runtimeHost.session !== boundSession || boundSession.shutdownSignal.aborted) return;
+		boundSession.startMessageEntryIdCapture();
+		unsubscribe = boundSession.subscribe((event) => {
 			writeRetryNotice(event);
-			const eventSession = session;
+			const eventSession = boundSession;
 			const writeEvent = (entryId?: string) => {
 				writeRawStdout(
 					serializeJsonLine(entryId !== undefined ? { ...toJsonEvent(event), entryId } : toJsonEvent(event)),
 				);
 				if (event.type === "agent_settled") {
-					void checkShutdownRequested();
+					void checkShutdownRequested().catch(() => requestShutdown(1));
 				}
 			};
 			const emitEvent = (entryId?: string) => {
@@ -510,7 +522,7 @@ export async function runRpcMode(
 			deferOutput(() => writeEvent(eventSession.takeMessageEntryId(message)));
 			return;
 		});
-		unsubscribeBackpressure = session.agent.subscribe(async () => {
+		unsubscribeBackpressure = boundSession.agent.subscribe(async () => {
 			await waitForOutputBackpressure();
 		});
 	};
@@ -524,7 +536,7 @@ export async function runRpcMode(
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143);
+				requestShutdown(signal === "SIGHUP" ? 129 : 143);
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -545,6 +557,12 @@ export async function runRpcMode(
 			}
 		};
 		assertCommandSession();
+		if (
+			shutdownPromise &&
+			["prompt", "steer", "follow_up", "new_session", "switch_session", "fork", "clone"].includes(command.type)
+		) {
+			throw new InputAdmissionError("INPUT_ADMISSION_FENCED", "shutdown is in progress; input was not accepted");
+		}
 
 		switch (command.type) {
 			// =================================================================
@@ -587,9 +605,7 @@ export async function runRpcMode(
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const result = await runtimeHost.newSession(options);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
+
 				return success(id, "new_session", result);
 			}
 
@@ -599,6 +615,11 @@ export async function runRpcMode(
 
 			case "get_state": {
 				const state: RpcSessionState = {
+					capabilities: session.capabilities,
+					inputAdmissionCount: session.inputAdmissionCount,
+					inputsFenced: runtimeHost.inputsFenced,
+					isIdle: session.isIdle,
+					isPromptPending: session.isPromptPending,
 					model: session.model,
 					thinkingLevel: session.thinkingLevel,
 					isStreaming: session.isStreaming,
@@ -712,12 +733,22 @@ export async function runRpcMode(
 			// =================================================================
 
 			case "bash": {
-				const eventResult = await session.extensionRunner.emitUserBash({
-					type: "user_bash",
-					command: command.command,
-					excludeFromContext: command.excludeFromContext ?? false,
-					cwd: session.sessionManager.getCwd(),
-				});
+				const eventResult = await raceWithAbortSignal(
+					session.extensionRunner.emitUserBash({
+						type: "user_bash",
+						command: command.command,
+						excludeFromContext: command.excludeFromContext ?? false,
+						cwd: session.sessionManager.getCwd(),
+					}),
+					session.shutdownSignal,
+				);
+
+				// The non-dialog hook can outlive ordinary replacement. Revalidate its captured custody
+				// before either execution or persistence, without switching work to the receiving session.
+				if (session !== runtimeHost.session || session.isDisposed)
+					throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash was not executed or recorded");
+				if (session.inputsFenced) throw new InputAdmissionError("INPUT_ADMISSION_FENCED", "bash was not accepted");
+				session.shutdownSignal.throwIfAborted();
 
 				assertCommandSession();
 				if (eventResult?.result) {
@@ -757,17 +788,13 @@ export async function runRpcMode(
 
 			case "switch_session": {
 				const result = await runtimeHost.switchSession(command.sessionPath);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
+
 				return success(id, "switch_session", result);
 			}
 
 			case "fork": {
 				const result = await runtimeHost.fork(command.entryId);
-				if (!result.cancelled) {
-					await rebindSession();
-				}
+
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
@@ -777,9 +804,7 @@ export async function runRpcMode(
 					return error(id, "clone", "Cannot clone session: no current entry selected");
 				}
 				const result = await runtimeHost.fork(leafId, { position: "at" });
-				if (!result.cancelled) {
-					await rebindSession();
-				}
+
 				return success(id, "clone", { cancelled: result.cancelled });
 			}
 
@@ -1037,8 +1062,9 @@ export async function runRpcMode(
 	// Read input before session_start handlers can await extension UI. Ordinary
 	// commands wait for the initial bind, while UI responses resolve immediately.
 	let extensionBindingsComplete = false;
+	let initialBindingWork: Promise<void> | undefined;
 	let drainingStartupCommands = false;
-	let startupBinding: Promise<void> | undefined;
+
 	let startupFatal = false;
 	let startupInputCount = 0;
 	let startupInputBytes = 0;
@@ -1065,7 +1091,11 @@ export async function runRpcMode(
 			fatal: true,
 			error: "RPC startup command queue limit exceeded",
 		} satisfies RpcFatalErrorResponse);
-		void shutdown(1);
+		// Keep correlated backlog refusals for shutdown; overflow must cancel binding now.
+		detachInput();
+		process.stdin.pause();
+		cancelPendingExtensionRequests();
+		requestShutdown(1);
 	};
 
 	function shutdown(exitCode = 0): Promise<never> {
@@ -1076,33 +1106,70 @@ export async function runRpcMode(
 				owner.cancelForShutdown();
 			}
 			transportCancellation.abort(session.shutdownSignal.reason);
-			detachInput();
-			process.stdin.pause();
-			cancelPendingExtensionRequests();
-			for (const command of startupCommands.splice(0)) {
-				output(error(command?.id, command?.type ?? "parse", "Operation cancelled for terminal shutdown"));
+			if (inputEnded || startupFatal) {
+				detachInput();
+				process.stdin.pause();
 			}
+			// Protect backlog refusal too: malformed records must never bypass cleanup.
 			try {
-				await startupBinding;
-			} catch (cause) {
-				if (cause !== session.shutdownSignal.reason) {
-					console.error("RPC startup failed:", cause);
-					exitCode = 1;
+				for (const command of startupCommands.splice(0)) {
+					output(
+						error(
+							command.id,
+							command.type,
+							"INPUT_ADMISSION_SHUTDOWN: startup command cancelled before acceptance",
+						),
+					);
 				}
-			}
-			await session.abort();
-			const commandDeadline = AbortSignal.timeout(TERMINAL_COMMAND_JOIN_MS);
-			try {
-				await raceWithAbortSignal(
-					Promise.allSettled([...pendingCommandWork, ...pendingOperations.keys()]),
-					commandDeadline,
-				);
+				cancelPendingExtensionRequests();
+				// Terminal cancellation/join also covers an active lifecycle transition.
+				await runtimeHost.dispose({
+					terminal: true,
+					beforeShutdown: async () => {
+						// Keep initial bind and already-started non-input command responses intact,
+						// but only join them after native admission/settlement cancellation.
+						try {
+							await initialBindingWork;
+						} catch (cause) {
+							if (cause !== session.shutdownSignal.reason) {
+								console.error("RPC startup failed:", cause);
+								exitCode = 1;
+							}
+						}
+						await session.abort();
+						const commandDeadline = AbortSignal.timeout(TERMINAL_COMMAND_JOIN_MS);
+						try {
+							await raceWithAbortSignal(
+								Promise.allSettled([...pendingCommandWork, ...pendingOperations.keys()]),
+								commandDeadline,
+							);
+						} catch (cause) {
+							if (cause !== commandDeadline.reason) throw cause;
+							console.error(
+								`RPC command shutdown incomplete: ${pendingOperations.size} operation(s) exceeded ${TERMINAL_COMMAND_JOIN_MS} ms`,
+							);
+							if (exitCode === 0) exitCode = 1;
+						}
+					},
+					rejectQueuedInput: (messages, owner) =>
+						output({
+							type: "input_rejected",
+							reason: "shutdown",
+							sessionId: owner.sessionId,
+							error: "INPUT_ADMISSION_SHUTDOWN: queued input was not delivered",
+							messages,
+						} satisfies RpcInputRejectedEvent),
+				});
+				await waitForPendingCommandWork(true);
 			} catch (cause) {
-				if (cause !== commandDeadline.reason) throw cause;
-				console.error(
-					`RPC command shutdown incomplete: ${pendingOperations.size} operation(s) exceeded ${TERMINAL_COMMAND_JOIN_MS} ms`,
-				);
-				if (exitCode === 0) exitCode = 1;
+				output({
+					type: "response",
+					command: "parse",
+					success: false,
+					fatal: true,
+					error: `RPC shutdown failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+				} satisfies RpcFatalErrorResponse);
+				exitCode = 1;
 			}
 			for (const cleanup of signalCleanupHandlers) {
 				cleanup();
@@ -1110,7 +1177,6 @@ export async function runRpcMode(
 			session.stopMessageEntryIdCapture();
 			unsubscribe?.();
 			unsubscribeBackpressure?.();
-			await runtimeHost.dispose();
 			detachInput();
 			process.stdin.pause();
 			// Journal persistence above is independent of delivery to a stalled reader.
@@ -1128,11 +1194,25 @@ export async function runRpcMode(
 		return shutdownPromise;
 	}
 
+	function requestShutdown(exitCode = 0): void {
+		void shutdown(exitCode).catch((cause: unknown) => {
+			console.error("RPC terminal shutdown failed", cause);
+			process.exit(1);
+		});
+	}
+
 	async function checkShutdownRequested(): Promise<void> {
-		// An extension command can request quit before its preflight response.
-		// Internal quit waits for current-session dispositions, not abandoned retired commands.
-		// EOF and signals cancel all transport-owned waits immediately.
-		if (!shutdownRequested || !session.isIdle || [...pendingPromptWork.values()].includes(session)) return;
+		if (
+			!shutdownRequested ||
+			!extensionBindingsComplete ||
+			!session.isIdle ||
+			session.isSettling ||
+			runtimeHost.inputsFenced ||
+			pendingPromptWork.size > 0
+		)
+			return;
+		await waitForPendingCommandWork(true);
+		if (!session.isIdle || session.isSettling || runtimeHost.inputsFenced || pendingPromptWork.size > 0) return;
 		await shutdown();
 	}
 
@@ -1175,20 +1255,23 @@ export async function runRpcMode(
 		const finished = () => {
 			pendingCommandWork.delete(work);
 			pendingPromptWork.delete(work);
-			void checkShutdownRequested();
+			void checkShutdownRequested().catch(() => requestShutdown(1));
 		};
 		void work.then(finished, finished);
 		return work;
 	};
 
-	const waitForPendingCommandWork = async (): Promise<void> => {
-		while (pendingCommandWork.size > 0) {
-			await Promise.allSettled(pendingCommandWork);
+
+	const waitForPendingCommandWork = async (includePrompts = false): Promise<void> => {
+		// Startup draining waits for command responses, not complete agent runs.
+		// Shutdown also joins aborted prompt work so its correlated refusals are flushed.
+		while (pendingCommandWork.size > 0 || (includePrompts && pendingPromptWork.size > 0)) {
+			await Promise.allSettled([...pendingCommandWork, ...(includePrompts ? pendingPromptWork.keys() : [])]);
 		}
 	};
 
 	const handleInputLine = async (line: string, rawFramedByteLength?: number) => {
-		if (startupFatal || shutdownPromise) return;
+		if (startupFatal) return;
 
 		const isStartupInput = !extensionBindingsComplete || drainingStartupCommands;
 		let inputBytes = 0;
@@ -1256,7 +1339,36 @@ export async function runRpcMode(
 			return;
 		}
 
+		if (
+			typeof parsed !== "object" ||
+			parsed === null ||
+			Array.isArray(parsed) ||
+			!("type" in parsed) ||
+			typeof parsed.type !== "string" ||
+			parsed.type.length === 0 ||
+			("id" in parsed && typeof parsed.id !== "string")
+		) {
+			output(
+				error(
+					undefined,
+					"parse",
+					"Invalid command envelope: expected an object with string type and optional string id",
+				),
+			);
+			await waitForOutputBackpressure();
+			return;
+		}
 		const command = parsed as RpcCommand;
+		if (shutdownPromise) {
+			output(
+				error(
+					command.id,
+					command.type,
+					"INPUT_ADMISSION_FENCED: shutdown is in progress; command was not accepted",
+				),
+			);
+			return;
+		}
 
 		// Once bound, incoming commands may unblock pending startup work.
 		// Startup byte/count limits above still apply until that work settles.
@@ -1271,14 +1383,14 @@ export async function runRpcMode(
 	const onInputEnd = () => {
 		inputEnded = true;
 		cancelPendingExtensionRequests();
-		void shutdown(startupFatal ? 1 : 0);
+		requestShutdown(startupFatal ? 1 : 0);
 	};
 
 	detachInput = (() => {
 		const detachJsonl = attachJsonlLineReader(
 			process.stdin,
 			(line, rawFramedByteLength) => {
-				void handleInputLine(line, rawFramedByteLength);
+				void handleInputLine(line, rawFramedByteLength).catch(() => requestShutdown(1));
 			},
 			{
 				getMaxBufferedBytes: () =>
@@ -1297,9 +1409,9 @@ export async function runRpcMode(
 
 	registerSignalHandlers();
 	// Publish the join before hooks can synchronously close input or overflow it.
-	startupBinding = Promise.resolve().then(rebindSession);
+	initialBindingWork = Promise.resolve().then(() => rebindSession());
 	try {
-		await startupBinding;
+		await initialBindingWork;
 	} catch (cause) {
 		if (!shutdownPromise) throw cause;
 	}
@@ -1318,7 +1430,9 @@ export async function runRpcMode(
 			}
 			await Promise.resolve();
 		}
-		await waitForPendingCommandWork();
+		// EOF fences native work before joining potentially held startup input.
+		if (inputEnded) return shutdown();
+		await waitForPendingCommandWork(true);
 		if (startupCommands.length === 0) break;
 	}
 	if (startupFatal) return shutdown(1);
@@ -1326,9 +1440,10 @@ export async function runRpcMode(
 	startupInputCount = 0;
 	startupInputBytes = 0;
 	if (inputEnded) {
-		void shutdown();
+		requestShutdown();
 	}
 
+	await checkShutdownRequested();
 	// Keep process alive forever
 	return new Promise(() => {});
 }

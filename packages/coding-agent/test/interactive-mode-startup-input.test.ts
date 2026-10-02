@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type SubmitContext = {
+	runtimeHost: { inputsFenced: boolean };
 	defaultEditor: { onSubmit?: (text: string) => void };
 	editor: {
 		addToHistory?: (text: string) => void;
@@ -38,6 +39,8 @@ const interactiveModePrototype = InteractiveMode.prototype as unknown as Interac
 
 function createSubmitContext(): SubmitContext {
 	return {
+		// smarty-dev#3048, PR #110 R2-7: match the native runtime admission contract.
+		runtimeHost: { inputsFenced: false },
 		defaultEditor: {},
 		editor: {
 			addToHistory: vi.fn(),

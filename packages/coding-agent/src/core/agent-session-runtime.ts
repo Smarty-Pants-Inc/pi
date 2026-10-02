@@ -1,5 +1,7 @@
 import { constants, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, parse, resolve } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -10,6 +12,7 @@ import type {
 	SessionStartEvent,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { InputAdmissionError } from "./input-admission.ts";
 import {
 	assertOrdinaryRuntime,
 	bindOrdinaryOptions,
@@ -85,6 +88,7 @@ interface OutgoingSession {
  */
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
+	private lifecycleCompleteHandler?: () => void;
 	private beforeSessionInvalidate?: () => void;
 	private _session: AgentSession;
 	private _services: AgentSessionServices;
@@ -93,6 +97,13 @@ export class AgentSessionRuntime {
 	private _modelFallbackMessage?: string;
 	readonly #owner?: OrdinaryOwnerContext;
 	#ownerDisposal?: Promise<void>;
+	private _disposed = false;
+	private lifecycleActive = false;
+	private lifecycleCompletion?: Promise<void>;
+	private completeLifecycle?: () => void;
+	private readonly terminalCancellation = new AbortController();
+	private terminalRejection?: (messages: AgentMessage[], session: AgentSession) => void;
+	private releaseReceivingInputs?: () => void;
 
 	constructor(
 		_session: AgentSession,
@@ -121,6 +132,43 @@ export class AgentSessionRuntime {
 		return this._session;
 	}
 
+	get inputsFenced(): boolean {
+		return this.terminalCancellation.signal.aborted || this.lifecycleActive || this.session.inputsFenced;
+	}
+
+	private async fenceLifecycle(
+		outgoing: OutgoingSession,
+		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void,
+	): Promise<() => void> {
+		if (this.lifecycleActive)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
+		if (this._disposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "runtime is disposed");
+		if (!rejectQueuedInput) this.terminalCancellation.signal.throwIfAborted();
+		this.lifecycleActive = true;
+		this.lifecycleCompletion = new Promise<void>((resolve) => {
+			this.completeLifecycle = resolve;
+		});
+		try {
+			const release = await outgoing.session.fenceInputs({
+				rejectQueuedInput: rejectQueuedInput
+					? (messages) => rejectQueuedInput(messages, outgoing.session)
+					: undefined,
+			});
+			return () => {
+				this.releaseReceivingInputs?.();
+				this.releaseReceivingInputs = undefined;
+				release();
+				this.lifecycleActive = false;
+				this.completeLifecycle?.();
+				queueMicrotask(() => this.lifecycleCompleteHandler?.());
+			};
+		} catch (error) {
+			this.lifecycleActive = false;
+			this.completeLifecycle?.();
+			throw error;
+		}
+	}
+
 	get cwd(): string {
 		return this._services.cwd;
 	}
@@ -131,6 +179,11 @@ export class AgentSessionRuntime {
 
 	get modelFallbackMessage(): string | undefined {
 		return this._modelFallbackMessage;
+	}
+
+	/** @internal Recheck mode-owned deferred work only after lifecycle fences release. */
+	setLifecycleCompleteHandler(handler?: () => void): void {
+		this.lifecycleCompleteHandler = handler;
 	}
 
 	setRebindSession(rebindSession?: (session: AgentSession) => Promise<void>): void {
@@ -166,7 +219,8 @@ export class AgentSessionRuntime {
 		}
 	}
 
-	#assertCurrent(outgoing: OutgoingSession): void {
+	#assertCurrent(outgoing: OutgoingSession, allowTerminal = false): void {
+		if (!allowTerminal) this.terminalCancellation.signal.throwIfAborted();
 		this.#assertIdentity(outgoing);
 		assertOrdinaryRuntime(outgoing.sessionManager, this.#owner, this.createRuntime);
 	}
@@ -182,11 +236,14 @@ export class AgentSessionRuntime {
 			return { cancelled: false };
 		}
 
-		const result = await runner.emit({
-			type: "session_before_switch",
-			reason,
-			targetSessionFile,
-		});
+		const result = await raceWithAbortSignal(
+			runner.emit({
+				type: "session_before_switch",
+				reason,
+				targetSessionFile,
+			}),
+			this.terminalCancellation.signal,
+		);
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		return { cancelled: result?.cancel === true };
 	}
@@ -202,11 +259,14 @@ export class AgentSessionRuntime {
 			return { cancelled: false };
 		}
 
-		const result = await runner.emit({
-			type: "session_before_fork",
-			entryId,
-			...options,
-		});
+		const result = await raceWithAbortSignal(
+			runner.emit({
+				type: "session_before_fork",
+				entryId,
+				...options,
+			}),
+			this.terminalCancellation.signal,
+		);
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		return { cancelled: result?.cancel === true };
 	}
@@ -223,25 +283,67 @@ export class AgentSessionRuntime {
 		await outgoing.session.abort();
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason,
-			targetSessionFile,
-		});
+		await raceWithAbortSignal(
+			emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+				type: "session_shutdown",
+				reason,
+				targetSessionFile,
+			}),
+			this.terminalCancellation.signal,
+		);
 		this.#assertCurrent(outgoing);
 		this.beforeSessionInvalidate?.();
 		this.#assertCurrent(outgoing);
 		outgoing.session.dispose();
 	}
 
+	private async retireUnpublishedSession(session: AgentSession): Promise<void> {
+		session.cancelForShutdown();
+		const release = await session.fenceInputs({
+			rejectQueuedInput: (messages) => {
+				if (!this.terminalRejection)
+					throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "unpublished input requires a rejection receipt");
+				this.terminalRejection(messages, session);
+			},
+		});
+		try {
+			session.dispose();
+		} finally {
+			release();
+		}
+	}
 	async #replace(outgoing: OutgoingSession, options: Parameters<CreateAgentSessionRuntimeFactory>[0]): Promise<void> {
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(options.sessionManager);
-		const { session, services, diagnostics, modelFallbackMessage } = await this.createRuntime(Object.freeze(options));
-		outgoing.session.shutdownSignal?.throwIfAborted();
-		this.#assertCurrent(outgoing);
-		assertUnownedSessionManager(session.sessionManager);
+		const construction = this.createRuntime(Object.freeze(options));
+		// A non-cooperative factory may finish after cancellation. Never publish it;
+		// observe its result and retire the unpublished session instead.
+		const receiving = construction.then(async (result) => {
+			if (this.terminalCancellation.signal.aborted) {
+				await this.retireUnpublishedSession(result.session);
+				this.terminalCancellation.signal.throwIfAborted();
+			}
+			return result;
+		});
+		const { session, services, diagnostics, modelFallbackMessage } = await raceWithAbortSignal(
+			receiving,
+			this.terminalCancellation.signal,
+		);
+		try {
+			outgoing.session.shutdownSignal?.throwIfAborted();
+			this.#assertCurrent(outgoing);
+			assertUnownedSessionManager(session.sessionManager);
+			this.releaseReceivingInputs = await session.fenceInputs();
+			this.terminalCancellation.signal.throwIfAborted();
+		} catch (error) {
+			if (this.terminalCancellation.signal.aborted) {
+				this.releaseReceivingInputs?.();
+				this.releaseReceivingInputs = undefined;
+				await this.retireUnpublishedSession(session);
+			}
+			throw error;
+		}
 		this._session = session;
 		this._services = services;
 		this._diagnostics = diagnostics;
@@ -251,11 +353,17 @@ export class AgentSessionRuntime {
 	private async finishSessionReplacement(withSession?: (ctx: ReplacedSessionContext) => Promise<void>): Promise<void> {
 		const outgoing = this.#captureOutgoing();
 		if (this.rebindSession) {
-			await this.rebindSession(outgoing.session);
+			await outgoing.session.withFencedInput(
+				() => this.rebindSession!(outgoing.session),
+				this.terminalCancellation.signal,
+			);
 			this.#assertCurrent(outgoing);
 		}
 		if (withSession) {
-			await withSession(outgoing.session.createReplacedSessionContext());
+			await outgoing.session.withFencedInput(
+				() => withSession(outgoing.session.createReplacedSessionContext()),
+				this.terminalCancellation.signal,
+			);
 			this.#assertCurrent(outgoing);
 		}
 	}
@@ -269,26 +377,31 @@ export class AgentSessionRuntime {
 		},
 	): Promise<{ cancelled: boolean }> {
 		const outgoing = this.#captureOutgoing();
-		const beforeResult = await this.emitBeforeSwitch(outgoing, "resume", sessionPath);
-		this.#assertCurrent(outgoing);
-		if (beforeResult.cancelled) {
-			return beforeResult;
-		}
+		const releaseInputs = await this.fenceLifecycle(outgoing);
+		try {
+			const beforeResult = await this.emitBeforeSwitch(outgoing, "resume", sessionPath);
+			this.#assertCurrent(outgoing);
+			if (beforeResult.cancelled) {
+				return beforeResult;
+			}
 
-		const previousSessionFile = outgoing.session.sessionFile;
-		const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
-		this.#assertCurrent(outgoing);
-		await this.#replace(outgoing, {
-			cwd: sessionManager.getCwd(),
-			agentDir: this.services.agentDir,
-			sessionManager,
-			sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-			projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
-		});
-		await this.finishSessionReplacement(options?.withSession);
-		return { cancelled: false };
+			const previousSessionFile = outgoing.session.sessionFile;
+			const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
+			assertSessionCwdExists(sessionManager, this.cwd);
+			await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
+			this.#assertCurrent(outgoing);
+			await this.#replace(outgoing, {
+				cwd: sessionManager.getCwd(),
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+			});
+			await this.finishSessionReplacement(options?.withSession);
+			return { cancelled: false };
+		} finally {
+			releaseInputs();
+		}
 	}
 
 	async newSession(options?: {
@@ -297,37 +410,42 @@ export class AgentSessionRuntime {
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
 	}): Promise<{ cancelled: boolean }> {
 		const outgoing = this.#captureOutgoing();
-		const beforeResult = await this.emitBeforeSwitch(outgoing, "new");
-		this.#assertCurrent(outgoing);
-		if (beforeResult.cancelled) {
-			return beforeResult;
-		}
+		const releaseInputs = await this.fenceLifecycle(outgoing);
+		try {
+			const beforeResult = await this.emitBeforeSwitch(outgoing, "new");
+			this.#assertCurrent(outgoing);
+			if (beforeResult.cancelled) {
+				return beforeResult;
+			}
 
-		const previousSessionFile = outgoing.session.sessionFile;
-		const sessionDir = outgoing.sessionManager.getSessionDir();
-		const sessionManager = outgoing.sessionManager.isPersisted()
-			? SessionManager.create(this.cwd, sessionDir)
-			: SessionManager.inMemory(this.cwd);
-		if (options?.parentSession) {
-			sessionManager.newSession({ parentSession: options.parentSession });
-		}
+			const previousSessionFile = outgoing.session.sessionFile;
+			const sessionDir = outgoing.sessionManager.getSessionDir();
+			const sessionManager = outgoing.sessionManager.isPersisted()
+				? SessionManager.create(this.cwd, sessionDir)
+				: SessionManager.inMemory(this.cwd);
+			if (options?.parentSession) {
+				sessionManager.newSession({ parentSession: options.parentSession });
+			}
 
-		await this.teardownCurrent(outgoing, "new", sessionManager.getSessionFile());
-		this.#assertCurrent(outgoing);
-		await this.#replace(outgoing, {
-			cwd: this.cwd,
-			agentDir: this.services.agentDir,
-			sessionManager,
-			sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
-		});
-		if (options?.setup) {
-			const replacement = this.#captureOutgoing();
-			await options.setup(replacement.sessionManager);
-			this.#assertCurrent(replacement);
-			replacement.session.refreshContext();
+			await this.teardownCurrent(outgoing, "new", sessionManager.getSessionFile());
+			this.#assertCurrent(outgoing);
+			await this.#replace(outgoing, {
+				cwd: this.cwd,
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+			});
+			if (options?.setup) {
+				const replacement = this.#captureOutgoing();
+				await raceWithAbortSignal(options.setup(replacement.sessionManager), this.terminalCancellation.signal);
+				this.#assertCurrent(replacement);
+				replacement.session.refreshContext();
+			}
+			await this.finishSessionReplacement(options?.withSession);
+			return { cancelled: false };
+		} finally {
+			releaseInputs();
 		}
-		await this.finishSessionReplacement(options?.withSession);
-		return { cancelled: false };
 	}
 
 	async fork(
@@ -335,44 +453,68 @@ export class AgentSessionRuntime {
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
 		const outgoing = this.#captureOutgoing();
-		const position = options?.position ?? "before";
-		const beforeResult = await this.emitBeforeFork(outgoing, entryId, { position });
-		this.#assertCurrent(outgoing);
-		if (beforeResult.cancelled) {
-			return { cancelled: true };
-		}
-		let targetLeafId: string | null;
-		let selectedText: string | undefined;
+		const releaseInputs = await this.fenceLifecycle(outgoing);
+		try {
+			const position = options?.position ?? "before";
+			const beforeResult = await this.emitBeforeFork(outgoing, entryId, { position });
+			this.#assertCurrent(outgoing);
+			if (beforeResult.cancelled) {
+				return { cancelled: true };
+			}
+			let targetLeafId: string | null;
+			let selectedText: string | undefined;
 
-		const selectedEntry = outgoing.sessionManager.getEntry(entryId);
-		if (!selectedEntry) {
-			throw new Error("Invalid entry ID for forking");
-		}
-
-		if (position === "at") {
-			targetLeafId = selectedEntry.id;
-		} else {
-			if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+			const selectedEntry = outgoing.sessionManager.getEntry(entryId);
+			if (!selectedEntry) {
 				throw new Error("Invalid entry ID for forking");
 			}
-			targetLeafId = selectedEntry.parentId;
-			selectedText = extractUserMessageText(selectedEntry.message.content);
-		}
 
-		const previousSessionFile = outgoing.session.sessionFile;
-		if (outgoing.sessionManager.isPersisted()) {
-			const currentSessionFile = outgoing.session.sessionFile;
-			if (!currentSessionFile) {
-				throw new Error("Persisted session is missing a session file");
+			if (position === "at") {
+				targetLeafId = selectedEntry.id;
+			} else {
+				if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+					throw new Error("Invalid entry ID for forking");
+				}
+				targetLeafId = selectedEntry.parentId;
+				selectedText = extractUserMessageText(selectedEntry.message.content);
 			}
-			const sessionDir = outgoing.sessionManager.getSessionDir();
-			if (!targetLeafId) {
-				const sessionManager = SessionManager.create(this.cwd, sessionDir);
-				sessionManager.newSession({ parentSession: currentSessionFile });
+
+			const previousSessionFile = outgoing.session.sessionFile;
+			if (outgoing.sessionManager.isPersisted()) {
+				const currentSessionFile = outgoing.session.sessionFile;
+				if (!currentSessionFile) {
+					throw new Error("Persisted session is missing a session file");
+				}
+				const sessionDir = outgoing.sessionManager.getSessionDir();
+				if (!targetLeafId) {
+					const sessionManager = SessionManager.create(this.cwd, sessionDir);
+					sessionManager.newSession({ parentSession: currentSessionFile });
+					await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
+					this.#assertCurrent(outgoing);
+					await this.#replace(outgoing, {
+						cwd: this.cwd,
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+					});
+					await this.finishSessionReplacement(options?.withSession);
+					return { cancelled: false, selectedText };
+				}
+
+				if (!existsSync(currentSessionFile)) {
+					throw new Error(
+						"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
+					);
+				}
+				const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
+				const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
+				if (!forkedSessionPath) {
+					throw new Error("Failed to create forked session");
+				}
 				await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
 				this.#assertCurrent(outgoing);
 				await this.#replace(outgoing, {
-					cwd: this.cwd,
+					cwd: sessionManager.getCwd(),
 					agentDir: this.services.agentDir,
 					sessionManager,
 					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
@@ -381,44 +523,25 @@ export class AgentSessionRuntime {
 				return { cancelled: false, selectedText };
 			}
 
-			if (!existsSync(currentSessionFile)) {
-				throw new Error(
-					"This session has not been saved yet. Wait for the first assistant response before cloning or forking it.",
-				);
-			}
-			const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
-			const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
-			if (!forkedSessionPath) {
-				throw new Error("Failed to create forked session");
-			}
+			const sessionManager = outgoing.sessionManager;
 			await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
+			if (!targetLeafId) {
+				sessionManager.newSession({ parentSession: previousSessionFile });
+			} else {
+				sessionManager.createBranchedSession(targetLeafId);
+			}
 			await this.#replace(outgoing, {
-				cwd: sessionManager.getCwd(),
+				cwd: this.cwd,
 				agentDir: this.services.agentDir,
 				sessionManager,
 				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
 			});
 			await this.finishSessionReplacement(options?.withSession);
 			return { cancelled: false, selectedText };
+		} finally {
+			releaseInputs();
 		}
-
-		const sessionManager = outgoing.sessionManager;
-		await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
-		this.#assertCurrent(outgoing);
-		if (!targetLeafId) {
-			sessionManager.newSession({ parentSession: previousSessionFile });
-		} else {
-			sessionManager.createBranchedSession(targetLeafId);
-		}
-		await this.#replace(outgoing, {
-			cwd: this.cwd,
-			agentDir: this.services.agentDir,
-			sessionManager,
-			sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-		});
-		await this.finishSessionReplacement(options?.withSession);
-		return { cancelled: false, selectedText };
 	}
 
 	/**
@@ -430,99 +553,152 @@ export class AgentSessionRuntime {
 	 */
 	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const outgoing = this.#captureOutgoing();
-		const resolvedPath = resolvePath(inputPath);
-		if (!existsSync(resolvedPath)) {
-			throw new SessionImportFileNotFoundError(resolvedPath);
-		}
-
-		const sessionDir = outgoing.sessionManager.getSessionDir();
-		if (!existsSync(sessionDir)) {
-			mkdirSync(sessionDir, { recursive: true });
-		}
-
-		let destinationPath = join(sessionDir, basename(resolvedPath));
-		const sourceAlreadyStored = resolve(destinationPath) === resolvedPath;
-		if (!sourceAlreadyStored) {
-			const { name, ext } = parse(destinationPath);
-			let suffix = 1;
-			while (existsSync(destinationPath)) {
-				destinationPath = join(sessionDir, `${name}-${suffix++}${ext}`);
+		const releaseInputs = await this.fenceLifecycle(outgoing);
+		try {
+			const resolvedPath = resolvePath(inputPath);
+			if (!existsSync(resolvedPath)) {
+				throw new SessionImportFileNotFoundError(resolvedPath);
 			}
-		}
-		const beforeResult = await this.emitBeforeSwitch(outgoing, "resume", destinationPath);
-		this.#assertCurrent(outgoing);
-		if (beforeResult.cancelled) {
-			return beforeResult;
-		}
 
-		const previousSessionFile = outgoing.session.sessionFile;
-		if (!sourceAlreadyStored) {
-			copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
-		}
+			const sessionDir = outgoing.sessionManager.getSessionDir();
+			if (!existsSync(sessionDir)) {
+				mkdirSync(sessionDir, { recursive: true });
+			}
 
-		const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
-		assertSessionCwdExists(sessionManager, this.cwd);
-		await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
-		this.#assertCurrent(outgoing);
-		await this.#replace(outgoing, {
-			cwd: sessionManager.getCwd(),
-			agentDir: this.services.agentDir,
-			sessionManager,
-			sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-		});
-		await this.finishSessionReplacement();
-		return { cancelled: false };
+			let destinationPath = join(sessionDir, basename(resolvedPath));
+			const sourceAlreadyStored = resolve(destinationPath) === resolvedPath;
+			if (!sourceAlreadyStored) {
+				const { name, ext } = parse(destinationPath);
+				let suffix = 1;
+				while (existsSync(destinationPath)) {
+					destinationPath = join(sessionDir, `${name}-${suffix++}${ext}`);
+				}
+			}
+			const beforeResult = await this.emitBeforeSwitch(outgoing, "resume", destinationPath);
+			this.#assertCurrent(outgoing);
+			if (beforeResult.cancelled) {
+				return beforeResult;
+			}
+
+			const previousSessionFile = outgoing.session.sessionFile;
+			if (!sourceAlreadyStored) {
+				copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
+			}
+
+			const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
+			assertSessionCwdExists(sessionManager, this.cwd);
+			await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
+			this.#assertCurrent(outgoing);
+			await this.#replace(outgoing, {
+				cwd: sessionManager.getCwd(),
+				agentDir: this.services.agentDir,
+				sessionManager,
+				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+			});
+			await this.finishSessionReplacement();
+			return { cancelled: false };
+		} finally {
+			releaseInputs();
+		}
 	}
 
-	async dispose(): Promise<void> {
-		if (this.#ownerDisposal) return this.#ownerDisposal;
-		const outgoing = this.#captureOutgoing(true);
-		// Stop held extension dispatch before owner close or native idle joins.
-		outgoing.session.cancelForShutdown();
-		if (this.#owner) {
-			// Publish the shared task before invoking close callbacks. Sealed-owner
-			// terminal persistence checks identity, not active-owner permission.
-			let resolve!: () => void;
-			let reject!: (cause: unknown) => void;
-			this.#ownerDisposal = new Promise<void>((done, failed) => {
-				resolve = done;
-				reject = failed;
-			});
-			try {
-				void this.#owner
-					.close({
-						stop: () => {
-							this.#assertIdentity(outgoing);
-							return outgoing.session.abort();
-						},
-						persist: async () => {
-							this.#assertIdentity(outgoing);
-							await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-								type: "session_shutdown",
-								reason: "quit",
-							});
-							this.#assertIdentity(outgoing);
-							this.beforeSessionInvalidate?.();
-							this.#assertIdentity(outgoing);
-							outgoing.session.dispose();
-						},
-					})
-					.then(resolve, reject);
-			} catch (cause) {
-				reject(cause);
-			}
-			return this.#ownerDisposal;
+	private async waitForShutdownHook(cleanup: Promise<unknown>): Promise<void> {
+		const deadline = new AbortController();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const beginDeadline = () => {
+			timer = setTimeout(
+				() =>
+					deadline.abort(new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "shutdown hook deadline exceeded")),
+				1000,
+			);
+		};
+		const signal = this.terminalCancellation.signal;
+		if (signal.aborted) beginDeadline();
+		else signal.addEventListener("abort", beginDeadline, { once: true });
+		try {
+			await raceWithAbortSignal(cleanup, deadline.signal);
+		} catch (error) {
+			if (!deadline.signal.aborted) throw error;
+		} finally {
+			signal.removeEventListener("abort", beginDeadline);
+			clearTimeout(timer);
 		}
-		await outgoing.session.abort();
-		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.#assertCurrent(outgoing);
-		this.beforeSessionInvalidate?.();
-		this.#assertCurrent(outgoing);
-		outgoing.session.dispose();
+	}
+	async dispose(options?: {
+		/** Terminal owner shutdown, distinct from an ordinary recoverable disposal refusal. */
+		terminal?: boolean;
+		beforeShutdown?: () => Promise<void>;
+		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
+	}): Promise<void> {
+		if (options?.terminal) {
+			this.terminalRejection = options.rejectQueuedInput;
+			this.terminalCancellation.abort(
+				new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
+			);
+			this.session.cancelForShutdown();
+			if (this.lifecycleActive) await this.lifecycleCompletion;
+		}
+		if (this.#ownerDisposal) return this.#ownerDisposal;
+		if (this.lifecycleActive)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
+		if (this._disposed || this.session.isDisposed) return;
+		const outgoing = this.#captureOutgoing(true);
+		const releaseInputs = await this.fenceLifecycle(outgoing, options?.rejectQueuedInput);
+		try {
+			// Host terminal teardown may await, but it must happen only after admission closes.
+			await options?.beforeShutdown?.();
+			if (this.#owner) {
+				// Publish the shared task before invoking close callbacks. Sealed-owner
+				// terminal persistence checks identity, not active-owner permission.
+				let resolve!: () => void;
+				let reject!: (cause: unknown) => void;
+				this.#ownerDisposal = new Promise<void>((done, failed) => {
+					resolve = done;
+					reject = failed;
+				});
+				try {
+					void this.#owner
+						.close({
+							stop: () => {
+								this.#assertIdentity(outgoing);
+								return outgoing.session.abort();
+							},
+							persist: async () => {
+								this.#assertIdentity(outgoing);
+								await this.waitForShutdownHook(
+									emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+										type: "session_shutdown",
+										reason: "quit",
+									}),
+								);
+								this.#assertIdentity(outgoing);
+								this.beforeSessionInvalidate?.();
+								this.#assertIdentity(outgoing);
+								outgoing.session.dispose();
+								this._disposed = true;
+							},
+						})
+						.then(resolve, reject);
+				} catch (cause) {
+					reject(cause);
+				}
+				return await this.#ownerDisposal;
+			}
+			await outgoing.session.abort();
+			this.#assertCurrent(outgoing, true);
+			const cleanup = emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+				type: "session_shutdown",
+				reason: "quit",
+			});
+			await this.waitForShutdownHook(cleanup);
+			this.#assertCurrent(outgoing, true);
+			this.beforeSessionInvalidate?.();
+			this.#assertCurrent(outgoing, true);
+			outgoing.session.dispose();
+			this._disposed = true;
+		} finally {
+			releaseInputs();
+		}
 	}
 }
 

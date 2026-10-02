@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
+import { fauxAssistantMessage, type ImageContent, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	type CreateAgentSessionRuntimeFactory,
@@ -103,6 +103,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		await runtimeHost.session.bindExtensions({});
 
 		cleanups.push(async () => {
+			// smarty-dev#3048: test teardown explicitly recovers retained input before disposal.
+			runtimeHost.session.clearQueue();
 			await runtimeHost.dispose();
 			faux.unregister();
 			if (existsSync(tempDir)) {
@@ -222,6 +224,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				session,
 				compactionQueuedMessages: [input],
 				compactionQueueTransfers: 0,
+				compactionQueueWork: new Set<Promise<void>>(),
+				recoveredImages: new Map<string, ImageContent>(),
 				isExtensionCommand: () => false,
 				updatePendingMessagesDisplay: vi.fn(),
 				showError: vi.fn(),
@@ -233,6 +237,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 					return outcome;
 				});
 			const dispatch = vi.spyOn(session.agent, "prompt");
+			Object.setPrototypeOf(mode, InteractiveMode.prototype);
 			const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 				this: typeof mode,
 			) => Promise<void>;
@@ -259,6 +264,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			session,
 			compactionQueuedMessages: [{ text: "dispatched A", mode: "steer" as const }],
 			compactionQueueTransfers: 0,
+			compactionQueueWork: new Set<Promise<void>>(),
+			recoveredImages: new Map<string, ImageContent>(),
 			isExtensionCommand: () => false,
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
@@ -267,6 +274,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			.spyOn(session as unknown as { _handlePostAgentRun(): Promise<boolean> }, "_handlePostAgentRun")
 			.mockRejectedValue(cause);
 		const prompt = vi.spyOn(session, "prompt");
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof mode,
 		) => Promise<void>;
@@ -311,6 +319,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			session,
 			compactionQueuedMessages: [input],
 			compactionQueueTransfers: 0,
+			compactionQueueWork: new Set<Promise<void>>(),
+			recoveredImages: new Map<string, ImageContent>(),
 			isExtensionCommand: () => false,
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
@@ -321,6 +331,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			expect(session.agent.signal).toBeDefined();
 		};
 		const prompt = vi.spyOn(session, "prompt");
+		Object.setPrototypeOf(mode, InteractiveMode.prototype);
 		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof mode,
 		) => Promise<void>;

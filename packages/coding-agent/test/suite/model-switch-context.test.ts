@@ -613,18 +613,15 @@ describe("model switch context admission (#2742)", () => {
 		await inputStarted;
 		const firstSwitch = h.session.setModel(h.getModel("sol")!);
 		await firstStarted;
-		const secondSwitch = h.session.waitForIdle().then(() => {
+		// smarty-dev#3048: true-idle now includes input still held by the hook.
+		const secondSwitch = firstSwitch.then(() => {
 			// A fresh completed boundary makes a second compaction preparable.
 			seed(h, 100_000);
 			return h.session.cycleModel();
 		});
-		releaseInput();
-		// Let the admitted prompt join the first switch's existing idle waiters.
-		await Promise.resolve();
-		await Promise.resolve();
-		await Promise.resolve();
 		releaseFirst();
 		await secondStarted;
+		releaseInput();
 		releaseSecond();
 		await Promise.all([firstSwitch, secondSwitch]);
 		expect(await outcome).toBeUndefined();
