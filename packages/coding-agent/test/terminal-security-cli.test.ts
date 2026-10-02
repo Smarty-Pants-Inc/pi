@@ -146,7 +146,16 @@ if (scenario === "retired-export") host.session.exportToHtml = async () => {
   mark("held"); await new Promise(resolve => setTimeout(resolve, 60000)); mark("late-export"); return "late-export.html";
 };
 if (scenario === "pressure-command") { host.session.sessionManager.appendMessage(fauxAssistantMessage("offline seed")); host.session.refreshContext(); }
-if (scenario.startsWith("tui-")) await new InteractiveMode(host).run();
+if (scenario.startsWith("tui-")) {
+  const mode = new InteractiveMode(host);
+  await mode.init();
+  // B deliberately fences mode-owned submitted input. Exercise the supported native SDK
+  // command path after the real TUI has installed its production replacement actions.
+  if (scenario === "tui-replace") void host.session.prompt("/replace-held").catch(error => {
+    if (!host.session.shutdownSignal.aborted) throw error;
+  });
+  await mode.run();
+}
 else if (scenario === "print-pressure") { const code = await runPrintMode(host, { mode: "json", initialMessage: "offline prompt" }); process.exit(code); }
 else if (scenario.startsWith("tree-")) {
   const manager = host.session.sessionManager;
@@ -731,8 +740,11 @@ describe.skipIf(!existsSync(cli))("terminal security process regressions", () =>
 		if (native) {
 			await vi.waitFor(() => expect(existsSync(join(dir, "ready"))).toBe(true), { timeout: 10000 });
 			await new Promise((resolve) => setTimeout(resolve, 500));
-			tmux("send-keys", "-t", name, "-l", hook === "tui-replace" ? "/replace-held" : "/new");
-			tmux("send-keys", "-t", name, "Enter");
+			// Native SDK starts the registered command after TUI binding; /new still enters through the real editor.
+			if (hook === "tui-builtin") {
+				tmux("send-keys", "-t", name, "-l", "/new");
+				tmux("send-keys", "-t", name, "Enter");
+			}
 		}
 		await vi.waitFor(() => expect(existsSync(join(dir, "held"))).toBe(true), { timeout: 10000 });
 		process.kill(Number(readFileSync(join(dir, "pid"), "utf8")), signal as NodeJS.Signals);

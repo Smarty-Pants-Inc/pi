@@ -843,6 +843,10 @@ describe("native input admission v1", () => {
 	);
 
 	function createMode(h: Harness, runtime: AgentSessionRuntime) {
+		const terminalCancellation = Reflect.get(InteractiveMode.prototype, "isTerminalRuntimeCancellation") as (
+			this: unknown,
+			error: unknown,
+		) => boolean;
 		const recover = Reflect.get(InteractiveMode.prototype, "handleInputAdmissionError") as (
 			this: unknown,
 			error: unknown,
@@ -902,6 +906,9 @@ describe("native input admission v1", () => {
 			handleFatalRuntimeError: vi.fn(async () => {
 				throw new Error("unexpected fatal TUI error");
 			}),
+			isTerminalRuntimeCancellation(error: unknown): boolean {
+				return terminalCancellation.call(this, error);
+			},
 			handleInputAdmissionError(error: unknown): boolean {
 				return recover.call(this, error);
 			},
