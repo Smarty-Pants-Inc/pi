@@ -1,5 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -16,6 +17,9 @@ export default function(pi) {
   ]);
   const held = async (name, ctx) => { ctx.ui.notify(name + "-held"); await new Promise(resolve => setTimeout(resolve, 60000)); };
   pi.registerTool({ name: "probe", label: "probe", description: "offline probe", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [{ type: "text", text: "probe-ran" }], details: {} }) });
+  if (process.env.PI_NATIVE_API) pi.registerProvider("admission-native", { baseUrl: process.env.PI_NATIVE_URL, apiKey: "offline-native-test-only", api: process.env.PI_NATIVE_API, models: [{ id: "native", name: "native", reasoning: false, input: ["text", "image"], contextWindow: 32000, maxTokens: 1024, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } }] });
+  pi.on("provider_stream_event", async (event, ctx) => { if (process.env.PI_NATIVE_API) { await held("provider_stream_event", ctx); event.data.late = "must-not-normalize"; } });
+  pi.on("provider_stream_event", async (_event, ctx) => { if (process.env.PI_NATIVE_API) ctx.ui.notify("late-second-provider_stream_event-handler"); });
   pi.on("tool_call", async (_event, ctx) => { if (round4?.includes("tool_call")) { await held("tool_call", ctx); return { block: true, reason: "late-tool-call-result" }; } });
   pi.on("tool_call", async (_event, ctx) => { if (round4?.includes("tool_call")) ctx.ui.notify("late-second-tool_call-handler"); });
   pi.on("tool_result", async (_event, ctx) => { if (round4?.includes("tool_result")) { await held("tool_result", ctx); return { content: [{ type: "text", text: "late-tool-result" }] }; } });
@@ -36,7 +40,7 @@ export default function(pi) {
     if (process.env.PI_ADMISSION_NONCOOPERATIVE_START || (process.env.PI_ADMISSION_RECEIVING && start === 2)) { ctx.ui.notify("binding-nondialog-held"); await new Promise(resolve => setTimeout(resolve, 60000)); }
     if (process.env.PI_ADMISSION_STARTUP) await ctx.ui.confirm("startup-held", "release startup", { timeout: 10000 });
     if (process.env.PI_ADMISSION_STARTUP_CHAIN) await ctx.ui.confirm("startup-next", "next dialog", { timeout: 10000 });
-    await pi.setModel(faux.getModel());
+    await pi.setModel(process.env.PI_NATIVE_API ? ctx.modelRegistry.find("admission-native", "native") : faux.getModel());
     if (round4 === "binding-shutdown") { ctx.shutdown(); ctx.ui.notify("binding-shutdown-requested"); }
   });
   pi.on("agent_settled", async (_event, ctx) => {
@@ -90,7 +94,11 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		while (cleanups.length) await cleanups.pop()?.();
 	});
 
-	async function launch(label: string, mode: "rpc" | "print" = "rpc"): Promise<ChildProof> {
+	async function launch(
+		label: string,
+		mode: "rpc" | "print" = "rpc",
+		native?: { api: "anthropic-messages" | "openai-completions"; baseUrl: string },
+	): Promise<ChildProof> {
 		const temp = mkdtempSync(join(tmpdir(), "pi-admission-cli-"));
 		const extension = join(temp, "admission.mjs");
 		const agentDir = join(temp, "agent");
@@ -125,6 +133,8 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 				PI_OFFLINE: "1",
 				PI_PACKAGE_DIR: resolve("."),
 				PI_ROUND4_CASE: label,
+				PI_NATIVE_API: native?.api,
+				PI_NATIVE_URL: native?.baseUrl,
 				PI_ADMISSION_STARTUP: label.includes("startup") ? "1" : "",
 				PI_ADMISSION_BIND_ONCE: label === "single-rebind" ? "1" : "",
 				PI_ADMISSION_NONCOOPERATIVE_START: label.includes("noncooperative-start") ? "1" : "",
@@ -691,6 +701,81 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 					}),
 				}),
 			]);
+		},
+	);
+	// smarty-dev#3048 / PR #110 R6: built-in producer callbacks must release before joining the run.
+	it.each([
+		["anthropic-messages", "EOF"],
+		["anthropic-messages", "SIGTERM"],
+		["anthropic-messages", "SIGHUP"],
+		["openai-completions", "EOF"],
+		["openai-completions", "SIGTERM"],
+		["openai-completions", "SIGHUP"],
+	] as const)(
+		"round6 held native %s provider_stream_event exits under %s with ordered receipts",
+		async (api, ending) => {
+			const requests: string[] = [];
+			const server = createServer((request, response) => {
+				requests.push(request.url ?? "");
+				request.resume();
+				response.writeHead(200, { "Content-Type": "text/event-stream" });
+				if (api === "anthropic-messages") {
+					response.write(
+						`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "offline", type: "message", role: "assistant", model: "native", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })}\n\n`,
+					);
+				} else {
+					response.write(
+						`data: ${JSON.stringify({ id: "offline", object: "chat.completion.chunk", created: 1, model: "native", choices: [{ index: 0, delta: { role: "assistant", content: "must-not-normalize" }, finish_reason: null }] })}\n\n`,
+					);
+				}
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			cleanups.push(async () => {
+				server.closeAllConnections();
+				await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+			});
+			const address = server.address();
+			if (!address || typeof address === "string") throw new Error("Expected local SSE server address");
+			const p = await launch(`provider-stream-${api}-${ending}`, "rpc", {
+				api,
+				baseUrl: `http://127.0.0.1:${address.port}`,
+			});
+			p.send({ id: "run", type: "prompt", message: "run" });
+			expect(await p.response("run")).toMatchObject({ success: true });
+			await p.marker("provider_stream_event-held");
+			const image = { type: "image", mimeType: "image/png", data: "original-queued-bytes" };
+			p.send({ id: "queued", type: "follow_up", message: "provider-stream-queue", images: [image] });
+			expect(await p.response("queued")).toMatchObject({ success: true });
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
+			expect(requests.map((url) => url.split("?")[0])).toEqual([
+				api === "anthropic-messages" ? "/v1/messages" : "/chat/completions",
+			]);
+			expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
+				expect.objectContaining({
+					messages: [
+						expect.objectContaining({
+							content: [{ type: "text", text: "transformed:provider-stream-queue" }, image],
+						}),
+					],
+				}),
+			]);
+			for (const id of ["run", "queued"])
+				expect(p.records.filter((record) => record.type === "response" && record.id === id)).toHaveLength(1);
+			const aborted = p.records.findIndex(
+				(record) => record.type === "message_end" && (record.message as RecordLine)?.role === "assistant",
+			);
+			const ended = p.records.findIndex((record) => record.type === "agent_end");
+			const rejected = p.records.findIndex((record) => record.type === "input_rejected");
+			expect(aborted).toBeGreaterThan(-1);
+			expect((p.records[aborted].message as RecordLine).stopReason).toBe("aborted");
+			expect(ended).toBeGreaterThan(aborted);
+			expect(rejected).toBeGreaterThan(ended);
+			expect(JSON.stringify(p.records)).not.toContain("must-not-normalize");
+			expect(JSON.stringify(p.records)).not.toContain("late-second-provider_stream_event-handler");
 		},
 	);
 	// smarty-dev#3048 / PR #110 R5 (security R4-S1): cancelled input handlers cannot acquire fresh admission.

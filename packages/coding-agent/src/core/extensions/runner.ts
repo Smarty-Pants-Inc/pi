@@ -430,6 +430,7 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private shutdownSignal: AbortSignal | undefined;
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
 
@@ -439,6 +440,7 @@ export class ExtensionRunner {
 		cwd: string,
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
+		shutdownSignal?: AbortSignal,
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
@@ -446,6 +448,7 @@ export class ExtensionRunner {
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+		this.shutdownSignal = shutdownSignal;
 	}
 
 	bindCore(
@@ -999,12 +1002,34 @@ export class ExtensionRunner {
 		return context;
 	}
 
+	/** All native handler waits share terminal cancellation; cleanup has its own deadline. */
+	private dispatchSignal(event: ExtensionEvent["type"], signal?: AbortSignal): AbortSignal | undefined {
+		const shutdownSignal = event === "session_shutdown" ? undefined : this.shutdownSignal;
+		return signal && shutdownSignal && signal !== shutdownSignal
+			? AbortSignal.any([signal, shutdownSignal])
+			: (signal ?? shutdownSignal);
+	}
+
+	private async dispatchHandler(
+		handler: (event: ExtensionEvent, ctx: ExtensionContext) => unknown,
+		event: ExtensionEvent,
+		ctx: ExtensionContext,
+		signal: AbortSignal | undefined,
+	): Promise<unknown> {
+		signal?.throwIfAborted();
+		const result = await raceWithAbortSignal(Promise.resolve(handler(event, ctx)), signal);
+		// A settled promise can win its race just before abort. Never apply that result.
+		signal?.throwIfAborted();
+		return result;
+	}
+
 	async emitBoundary(
 		baseEvent: BoundaryBaseEvent,
 		buildContext: (entries: SessionBoundaryDraft[]) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
 		getPendingMessages?: () => AgentMessage[],
 		signal?: AbortSignal,
 	): Promise<BoundaryDispatchResult> {
+		signal = this.dispatchSignal(baseEvent.type, signal);
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
@@ -1036,7 +1061,7 @@ export class ExtensionRunner {
 					context,
 				} as TurnEndEvent | AgentBeforeSettleEvent;
 				try {
-					const handlerResult = (await raceWithAbortSignal(Promise.resolve(handler(event, ctx)), signal)) as
+					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
 						| BoundaryResult
 						| undefined;
 					signal?.throwIfAborted();
@@ -1118,14 +1143,24 @@ export class ExtensionRunner {
 		);
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+	emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		const dispatch = this.emitEvent(event);
+		// Observer-only emitters may be fire-and-forget. Still observe terminal rejection.
+		void dispatch.catch(() => {});
+		return dispatch;
+	}
+
+	private async emitEvent<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		const signal = this.dispatchSignal(event.type);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
 				try {
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
 						result = handlerResult as SessionBeforeEventResult;
@@ -1134,6 +1169,7 @@ export class ExtensionRunner {
 						}
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1151,15 +1187,21 @@ export class ExtensionRunner {
 
 	/** Returns the event's own action unless a handler overrides it; the last override wins. */
 	async emitCacheWarmingDecision(event: CacheWarmingDecisionEvent): Promise<CacheWarmingAction> {
+		const signal = this.dispatchSignal(event.type);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let action = event.action;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
 				try {
-					const result = (await handler(event, ctx)) as CacheWarmingDecisionEventResult | undefined;
+					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| CacheWarmingDecisionEventResult
+						| undefined;
+					signal?.throwIfAborted();
 					if (result?.action !== undefined) action = result.action;
 				} catch (err) {
+					signal?.throwIfAborted();
 					this.emitError({
 						extensionPath: ext.path,
 						event: event.type,
@@ -1174,6 +1216,8 @@ export class ExtensionRunner {
 	}
 
 	async emitMessageEnd(event: MessageEndEvent): Promise<AgentMessage | undefined> {
+		const signal = this.dispatchSignal(event.type);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let currentMessage = event.message;
 		let modified = false;
@@ -1182,7 +1226,10 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				try {
 					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
-					const handlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
+					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
+						| MessageEndEventResult
+						| undefined;
+					signal?.throwIfAborted();
 					if (!handlerResult?.message) continue;
 
 					if (handlerResult.message.role !== currentMessage.role) {
@@ -1197,6 +1244,7 @@ export class ExtensionRunner {
 					currentMessage = handlerResult.message;
 					modified = true;
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1213,6 +1261,7 @@ export class ExtensionRunner {
 	}
 
 	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
+		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = { ...event };
 		let modified = false;
@@ -1221,7 +1270,10 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				signal?.throwIfAborted();
 				try {
-					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
+						| ToolResultEventResult
+						| undefined;
+					signal?.throwIfAborted();
 					if (!handlerResult) continue;
 
 					if (handlerResult.content !== undefined) {
@@ -1241,6 +1293,7 @@ export class ExtensionRunner {
 						modified = true;
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1266,13 +1319,15 @@ export class ExtensionRunner {
 	}
 
 	async emitToolCall(event: ToolCallEvent, signal?: AbortSignal): Promise<ToolCallEventResult | undefined> {
+		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
 		let result: ToolCallEventResult | undefined;
 
 		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
 			for (const handler of handlers) {
 				signal?.throwIfAborted();
-				const handlerResult = await handler(event, ctx);
+				const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+				signal?.throwIfAborted();
 
 				if (handlerResult) {
 					result = handlerResult as ToolCallEventResult;
@@ -1287,12 +1342,15 @@ export class ExtensionRunner {
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
+		const signal = this.dispatchSignal(event.type);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "user_bash")) {
 			for (const handler of handlers) {
 				try {
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 					if (handlerResult === undefined) continue;
 					if (!isUserBashEventResult(handlerResult)) {
 						throw new Error(
@@ -1301,6 +1359,7 @@ export class ExtensionRunner {
 					}
 					return handlerResult;
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1323,6 +1382,8 @@ export class ExtensionRunner {
 	 * handlers then see the full transcript and their output is used as returned.
 	 */
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		const signal = this.dispatchSignal("context");
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
 
@@ -1332,7 +1393,10 @@ export class ExtensionRunner {
 					const visibleMessages = currentMessages.filter((message) => message.role !== "system");
 					const visibleSnapshot = visibleMessages.slice();
 					const event: ContextEvent = { type: "context", messages: visibleMessages };
-					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
+					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| ContextEventResult
+						| undefined;
+					signal?.throwIfAborted();
 
 					// Handlers may return a new list or edit event.messages in place.
 					const returned =
@@ -1341,6 +1405,7 @@ export class ExtensionRunner {
 					if (!returned) continue;
 					currentMessages = restoreSystemMessages(currentMessages, visibleSnapshot, returned);
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1358,7 +1423,10 @@ export class ExtensionRunner {
 				try {
 					const hadLeadingSystemMessage = currentMessages[0]?.role === "system";
 					const event: ContextWithSystemEvent = { type: "context_with_system", messages: currentMessages };
-					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
+					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| ContextEventResult
+						| undefined;
+					signal?.throwIfAborted();
 					currentMessages = handlerResult?.messages ?? currentMessages;
 					// Providers read the prompt and initial tools from the leading system message.
 					// Losing it is never intended; report it but honor the handler's output.
@@ -1370,6 +1438,7 @@ export class ExtensionRunner {
 						});
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1386,6 +1455,8 @@ export class ExtensionRunner {
 	}
 
 	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
+		const signal = this.dispatchSignal("before_provider_request");
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let currentPayload = payload;
 
@@ -1396,11 +1467,13 @@ export class ExtensionRunner {
 						type: "before_provider_request",
 						payload: currentPayload,
 					};
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 					if (handlerResult !== undefined) {
 						currentPayload = handlerResult;
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1417,6 +1490,8 @@ export class ExtensionRunner {
 	}
 
 	async emitBeforeProviderHeaders(headers: ProviderHeaders): Promise<ProviderHeaders> {
+		const signal = this.dispatchSignal("before_provider_headers");
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_provider_headers")) {
@@ -1427,8 +1502,10 @@ export class ExtensionRunner {
 						type: "before_provider_headers",
 						headers,
 					};
-					await handler(event, ctx);
+					await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1449,6 +1526,8 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
 	): Promise<BeforeAgentStartCombinedResult> {
+		const signal = this.dispatchSignal("before_agent_start");
+		signal?.throwIfAborted();
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
 		const ctx = Object.defineProperties(
@@ -1473,7 +1552,8 @@ export class ExtensionRunner {
 						},
 						systemPromptOptions: currentOptions,
 					};
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 
 					if (handlerResult) {
 						const result = handlerResult as BeforeAgentStartEventResult;
@@ -1483,6 +1563,7 @@ export class ExtensionRunner {
 						}
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1506,6 +1587,8 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
+		const signal = this.dispatchSignal("resources_discover");
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
@@ -1515,7 +1598,8 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				try {
 					const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 					const result = handlerResult as ResourcesDiscoverResult | undefined;
 
 					if (result?.skillPaths?.length) {
@@ -1528,6 +1612,7 @@ export class ExtensionRunner {
 						themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath: ext.path })));
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1551,6 +1636,7 @@ export class ExtensionRunner {
 		streamingBehavior?: "steer" | "followUp",
 		signal?: AbortSignal,
 	): Promise<InputEventResult> {
+		signal = this.dispatchSignal("input", signal);
 		const ctx = this.createContext();
 		let currentText = text;
 		let currentImages = images;
@@ -1567,13 +1653,15 @@ export class ExtensionRunner {
 						source,
 						streamingBehavior,
 					};
-					const result = (await handler(event, ctx)) as InputEventResult | undefined;
+					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as InputEventResult | undefined;
+					signal?.throwIfAborted();
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
 						currentImages = result.images ?? currentImages;
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					this.emitError({
 						extensionPath: ext.path,
 						event: "input",
