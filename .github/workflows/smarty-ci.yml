@@ -30,6 +30,9 @@ concurrency:
 jobs:
   smarty-ci:
     name: ${{ github.event_name == 'workflow_dispatch' && 'Pi full gate not requested' || 'smarty-ci' }}
+    # Same-repository PRs are write-authorized, including current/future org write Apps
+    # (smarty-dev#2177); admit them without contributor or bot-author allowlists.
+    # Fork source remains excluded from this runner; retired pr-gate.yml stays deleted.
     if: (github.event_name != 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: smarty-linux-x64
     # Forge disposable VMs: 2 vCPU / 8 GB, up to 7 VMs in the shared pool.

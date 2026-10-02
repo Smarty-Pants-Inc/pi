@@ -78,12 +78,7 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"websocket.?closed",
 	"websocket.?error",
 
-	// Premature stream endings from SDKs and transports. Anthropic can throw
-	// "stream ended without ..." and "Anthropic stream ended before message_stop"
-	// (#4433); Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
-	"ended without",
-	"stream ended before message_stop",
-	"stream ended before a terminal response event",
+	// Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
 	"http2 request did not get a response",
 
 	// Provider-requested retry delay cap failures should flow through the outer
@@ -99,6 +94,31 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	// gRPC based providers (e.g. NVIDIA NIM)
 	"ResourceExhausted",
 ]);
+
+const PREMATURE_STREAM_ERROR_PATTERN = buildProviderErrorPattern([
+	// Anthropic SDK/transport early endings (#4433), and Responses early EOF.
+	"ended without",
+	"stream ended before message_stop",
+	"stream ended before a terminal response event",
+	// CLIProxyAPI Responses streams (smarty-dev#3200).
+	"stream disconnected before completion",
+	"stream closed before response\\.completed",
+]);
+
+/** Whether a failed stream ended before its provider's completion event. */
+export function isPrematureStreamError(message: AssistantMessage): boolean {
+	return message.stopReason === "error" && PREMATURE_STREAM_ERROR_PATTERN.test(message.errorMessage ?? "");
+}
+
+/** Empty reasoning signatures are metadata, not output. Even a partial tool call is output. */
+export function hasAssistantOutput(message: AssistantMessage): boolean {
+	return (
+		message.usage.output > 0 ||
+		message.content.some((block) =>
+			block.type === "thinking" ? block.thinking.length > 0 : block.type === "text" ? block.text.length > 0 : true,
+		)
+	);
+}
 
 /**
  * Retry policy: bounded attempts with exponential backoff (`baseDelayMs * 2^(attempt-1)`).
@@ -258,10 +278,13 @@ export function throttledLimitWait(message: AssistantMessage): { delayMs: number
  * before restarting the assistant turn.
  */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
-	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	if (message.stopReason !== "error" || !message.errorMessage || hasAssistantOutput(message)) return false;
+	// An observer can fail after receiving generated output but before normalization records it.
+	// Retrying its transient-looking error would regenerate output, not repair the observer.
+	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;
 	// Providers mark a limit found in the parsed error body (e.g. the Smarty gateway's `smarty_limit`).
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)) return false;
 	const errorMessage = message.errorMessage;
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
-	return RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+	return isPrematureStreamError(message) || RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
 }

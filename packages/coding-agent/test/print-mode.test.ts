@@ -123,6 +123,38 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
 
+	// smarty-dev#3200 / PR #114 round 4: settlement is authoritative even with a tool-result tail or length stop.
+	it.each([false, true])("returns failure for settled error with tool-result tail: %s", async (toolTail) => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "truncated", stopReason: "length" }));
+		if (toolTail)
+			Object.assign(runtimeHost.session.state, {
+				messages: [
+					...runtimeHost.session.state.messages,
+					{
+						role: "toolResult",
+						toolCallId: "partial",
+						toolName: "read",
+						content: [{ type: "text", text: "not executed" }],
+						isError: true,
+						timestamp: 0,
+					},
+				],
+			});
+		runtimeHost.session.subscribe.mockImplementation((listener) => {
+			runtimeHost.session.prompt.mockImplementation(async () => {
+				listener({ type: "agent_settled", outcome: "error" });
+			});
+			return () => {};
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "test",
+		});
+		expect(exitCode).toBe(1);
+		expect(errorSpy).toHaveBeenCalledWith("Request error");
+	});
+
 	it("emits session_shutdown and returns non-zero on assistant error", async () => {
 		const runtimeHost = createRuntimeHost(
 			createAssistantMessage({ stopReason: "error", errorMessage: "provider failure" }),

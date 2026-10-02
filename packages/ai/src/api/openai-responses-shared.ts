@@ -1,5 +1,6 @@
 import type OpenAI from "openai";
 import type {
+	Response as OpenAIResponse,
 	Tool as OpenAITool,
 	ResponseCreateParamsStreaming,
 	ResponseInput,
@@ -30,6 +31,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -431,6 +433,41 @@ type ResponsesOutputSlot =
 
 type ToolCallOutputSlot = Extract<ResponsesOutputSlot, { type: "toolCall" }>;
 
+export function finalizeResponsesUsage<TApi extends Api>(
+	response: OpenAIResponse,
+	output: AssistantMessage,
+	model: Model<TApi>,
+	options?: OpenAIResponsesStreamOptions,
+): void {
+	if (response?.id) {
+		output.responseId = response.id;
+	}
+	if (response?.usage) {
+		const inputDetails = response.usage.input_tokens_details as
+			| { cached_tokens?: number; cache_write_tokens?: number }
+			| undefined;
+		const cachedTokens = inputDetails?.cached_tokens || 0;
+		const cacheWriteTokens = inputDetails?.cache_write_tokens || 0;
+		output.usage = {
+			// OpenAI includes cached and cache-write tokens in input_tokens, so subtract both.
+			input: Math.max(0, (response.usage.input_tokens || 0) - cachedTokens - cacheWriteTokens),
+			output: response.usage.output_tokens || 0,
+			cacheRead: cachedTokens,
+			cacheWrite: cacheWriteTokens,
+			reasoning: response.usage.output_tokens_details?.reasoning_tokens || 0,
+			totalTokens: response.usage.total_tokens || 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		};
+	}
+	calculateCost(model, output.usage);
+	if (options?.applyServiceTierPricing) {
+		const serviceTier = options.resolveServiceTier
+			? options.resolveServiceTier(response?.service_tier, options.serviceTier)
+			: (response?.service_tier ?? options.serviceTier);
+		options.applyServiceTierPricing(output.usage, serviceTier);
+	}
+}
+
 export async function processResponsesStream<TApi extends Api>(
 	openaiStream: AsyncIterable<ResponseStreamEvent>,
 	output: AssistantMessage,
@@ -555,33 +592,7 @@ export async function processResponsesStream<TApi extends Api>(
 	): void => {
 		sawTerminalResponseEvent = true;
 		backfillReasoningSignatures(response.output ?? []);
-		if (response?.id) {
-			output.responseId = response.id;
-		}
-		if (response?.usage) {
-			const inputDetails = response.usage.input_tokens_details as
-				| { cached_tokens?: number; cache_write_tokens?: number }
-				| undefined;
-			const cachedTokens = inputDetails?.cached_tokens || 0;
-			const cacheWriteTokens = inputDetails?.cache_write_tokens || 0;
-			output.usage = {
-				// OpenAI includes cached and cache-write tokens in input_tokens, so subtract both.
-				input: Math.max(0, (response.usage.input_tokens || 0) - cachedTokens - cacheWriteTokens),
-				output: response.usage.output_tokens || 0,
-				cacheRead: cachedTokens,
-				cacheWrite: cacheWriteTokens,
-				reasoning: response.usage.output_tokens_details?.reasoning_tokens || 0,
-				totalTokens: response.usage.total_tokens || 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			};
-		}
-		calculateCost(model, output.usage);
-		if (options?.applyServiceTierPricing) {
-			const serviceTier = options.resolveServiceTier
-				? options.resolveServiceTier(response?.service_tier, options.serviceTier)
-				: (response?.service_tier ?? options.serviceTier);
-			options.applyServiceTierPricing(output.usage, serviceTier);
-		}
+		finalizeResponsesUsage(response, output, model, options);
 		// Map status to stop reason. For incomplete responses, retain the provider's
 		// specific reason so max-output truncation and content filtering stay distinct.
 		const status = response?.status;
@@ -598,7 +609,24 @@ export async function processResponsesStream<TApi extends Api>(
 	};
 
 	for await (const event of openaiStream) {
-		await options?.onProviderStreamEvent?.(event, model);
+		try {
+			await options?.onProviderStreamEvent?.(event, model);
+		} catch (error) {
+			// Preserve observer origin even when it rejects before the first output is normalized.
+			appendAssistantMessageDiagnostic(
+				output,
+				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
+			);
+			// A rejecting observer must not erase provider-reported generation and permit replay.
+			if (
+				event.type === "response.failed" ||
+				event.type === "response.completed" ||
+				event.type === "response.incomplete"
+			) {
+				finalizeResponsesUsage(event.response, output, model, options);
+			}
+			throw error;
+		}
 		if (event.type === "response.created") {
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {
@@ -747,6 +775,7 @@ export async function processResponsesStream<TApi extends Api>(
 			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
+			finalizeResponsesUsage(event.response, output, model, options);
 			output.rawStopReason = event.response?.status;
 			const error = event.response?.error;
 			const details = event.response?.incomplete_details;
