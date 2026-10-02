@@ -25,6 +25,7 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
@@ -109,6 +110,14 @@ export async function runRpcMode(
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
+	const outputCancellation = new AbortController();
+	const waitForOutputBackpressure = async (): Promise<void> => {
+		try {
+			await raceWithAbortSignal(waitForRawStdoutBackpressure(), outputCancellation.signal);
+		} catch (cause) {
+			if (!outputCancellation.signal.aborted || cause !== outputCancellation.signal.reason) throw cause;
+		}
+	};
 
 	const pendingOutputWrites: Array<() => void> = [];
 	let outputFlushScheduled = false;
@@ -498,7 +507,7 @@ export async function runRpcMode(
 			return;
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
-			await waitForRawStdoutBackpressure();
+			await waitForOutputBackpressure();
 		});
 	};
 
@@ -531,7 +540,7 @@ export async function runRpcMode(
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
 				let preflightSucceeded = false;
-				void session
+				const promptWork = session
 					.prompt(command.message, {
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
@@ -547,10 +556,15 @@ export async function runRpcMode(
 						if (!preflightSucceeded) {
 							output(error(id, "prompt", e instanceof Error ? e.message : String(e)));
 						}
-					})
-					.finally(() => {
-						void checkShutdownRequested();
 					});
+				pendingCommandWork.add(promptWork);
+				pendingPromptWork.add(promptWork);
+				const finished = () => {
+					pendingCommandWork.delete(promptWork);
+					pendingPromptWork.delete(promptWork);
+					void checkShutdownRequested();
+				};
+				void promptWork.then(finished, finished);
 				return undefined;
 			}
 
@@ -1025,12 +1039,13 @@ export async function runRpcMode(
 	// commands wait for the initial bind, while UI responses resolve immediately.
 	let extensionBindingsComplete = false;
 	let drainingStartupCommands = false;
-	let startupDrainComplete = false;
+	let startupBinding: Promise<void> | undefined;
 	let startupFatal = false;
 	let startupInputCount = 0;
 	let startupInputBytes = 0;
 	let startupCommands: RpcCommand[] = [];
 	const pendingCommandWork = new Set<Promise<void>>();
+	const pendingPromptWork = new Set<Promise<void>>();
 
 	const cancelPendingExtensionRequests = () => {
 		for (const pending of [...pendingExtensionRequests.values()]) {
@@ -1049,12 +1064,7 @@ export async function runRpcMode(
 			fatal: true,
 			error: "RPC startup command queue limit exceeded",
 		} satisfies RpcFatalErrorResponse);
-		startupCommands = [];
-		startupInputCount = 0;
-		startupInputBytes = 0;
-		detachInput();
-		process.stdin.pause();
-		cancelPendingExtensionRequests();
+		void shutdown(1);
 	};
 
 	function shutdown(exitCode = 0): Promise<never> {
@@ -1062,7 +1072,21 @@ export async function runRpcMode(
 		shutdownPromise = (async (): Promise<never> => {
 			// Cancel before joining commands or the run; retain subscriptions for final events.
 			session.cancelForShutdown();
+			outputCancellation.abort(session.shutdownSignal.reason);
+			detachInput();
+			process.stdin.pause();
 			cancelPendingExtensionRequests();
+			for (const command of startupCommands.splice(0)) {
+				output(error(command?.id, command?.type ?? "parse", "Operation cancelled for terminal shutdown"));
+			}
+			try {
+				await startupBinding;
+			} catch (cause) {
+				if (cause !== session.shutdownSignal.reason) {
+					console.error("RPC startup failed:", cause);
+					exitCode = 1;
+				}
+			}
 			await session.abort();
 			await waitForPendingCommandWork();
 			for (const cleanup of signalCleanupHandlers) {
@@ -1074,14 +1098,25 @@ export async function runRpcMode(
 			await runtimeHost.dispose();
 			detachInput();
 			process.stdin.pause();
-			await flushRawStdout();
+			// Journal persistence above is independent of delivery to a stalled reader.
+			// Final drainage has its own budget, not the already-aborted terminal signal.
+			const drainage = AbortSignal.timeout(1000);
+			try {
+				await raceWithAbortSignal(flushRawStdout(), drainage);
+			} catch (cause) {
+				if (cause !== drainage.reason) throw cause;
+				console.error("RPC output delivery incomplete: terminal drainage exceeded 1000 ms");
+				if (exitCode === 0) exitCode = 1;
+			}
 			return process.exit(exitCode);
 		})();
 		return shutdownPromise;
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested || !session.isIdle) return;
+		// An extension command can request quit before its preflight response.
+		// Internal quit waits for that disposition; EOF and signals cancel immediately.
+		if (!shutdownRequested || !session.isIdle || pendingPromptWork.size > 0) return;
 		await shutdown();
 	}
 
@@ -1090,7 +1125,7 @@ export async function runRpcMode(
 			const response = await handleCommand(command);
 			if (response) {
 				output(response);
-				await waitForRawStdoutBackpressure();
+				await waitForOutputBackpressure();
 			}
 			void checkShutdownRequested();
 		} catch (commandError: unknown) {
@@ -1101,7 +1136,7 @@ export async function runRpcMode(
 					commandError instanceof Error ? commandError.message : String(commandError),
 				),
 			);
-			await waitForRawStdoutBackpressure();
+			await waitForOutputBackpressure();
 		}
 	};
 
@@ -1122,7 +1157,7 @@ export async function runRpcMode(
 	};
 
 	const handleInputLine = async (line: string, rawFramedByteLength?: number) => {
-		if (startupFatal) return;
+		if (startupFatal || shutdownPromise) return;
 
 		const isStartupInput = !extensionBindingsComplete || drainingStartupCommands;
 		let inputBytes = 0;
@@ -1159,7 +1194,7 @@ export async function runRpcMode(
 					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
 				),
 			);
-			await waitForRawStdoutBackpressure();
+			await waitForOutputBackpressure();
 			return;
 		}
 
@@ -1205,9 +1240,7 @@ export async function runRpcMode(
 	const onInputEnd = () => {
 		inputEnded = true;
 		cancelPendingExtensionRequests();
-		if (startupDrainComplete) {
-			void shutdown();
-		}
+		void shutdown(startupFatal ? 1 : 0);
 	};
 
 	detachInput = (() => {
@@ -1232,8 +1265,10 @@ export async function runRpcMode(
 	})();
 
 	registerSignalHandlers();
+	// Publish the join before hooks can synchronously close input or overflow it.
+	startupBinding = Promise.resolve().then(rebindSession);
 	try {
-		await rebindSession();
+		await startupBinding;
 	} catch (cause) {
 		if (!shutdownPromise) throw cause;
 	}
@@ -1242,12 +1277,12 @@ export async function runRpcMode(
 
 	extensionBindingsComplete = true;
 	drainingStartupCommands = true;
-	while (!startupFatal) {
-		while (!startupFatal && startupCommands.length > 0) {
+	while (!startupFatal && !shutdownPromise) {
+		while (!startupFatal && !shutdownPromise && startupCommands.length > 0) {
 			const commands = startupCommands;
 			startupCommands = [];
 			for (const command of commands) {
-				if (startupFatal) break;
+				if (startupFatal || shutdownPromise) break;
 				trackCommandInput(command);
 			}
 			await Promise.resolve();
@@ -1257,7 +1292,6 @@ export async function runRpcMode(
 	}
 	if (startupFatal) return shutdown(1);
 	drainingStartupCommands = false;
-	startupDrainComplete = true;
 	startupInputCount = 0;
 	startupInputBytes = 0;
 	if (inputEnded) {

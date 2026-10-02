@@ -486,6 +486,7 @@ export class AgentSession {
 	/** Settlement descendants await acceptance, never delivery that requires their handler to return. */
 	private readonly _agentSettledScope = new AsyncLocalStorage<{ active: boolean }>();
 	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
+	private readonly _settlementActionScope = new AsyncLocalStorage<{ active: boolean }>();
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -1151,7 +1152,16 @@ export class AgentSession {
 			scope.active = false;
 			this._isEmittingAgentSettled = false;
 			try {
-				for (const action of this._deferredSettledActions.splice(0)) await action();
+				for (const action of this._deferredSettledActions.splice(0)) {
+					const actionScope = { active: true };
+					try {
+						await this._settlementActionScope.run(actionScope, action).catch((error: unknown) => {
+							if (!this._shutdownCancellation.signal.aborted) throw error;
+						});
+					} finally {
+						actionScope.active = false;
+					}
+				}
 			} finally {
 				this._resolveIdleWaitIfIdle();
 				completed();
@@ -2075,9 +2085,30 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
 		if (this._isEmittingAgentSettled) {
-			this._deferredSettledActions.push(async () => await this.prompt(text, options));
-			return;
+			const completion = new Promise<void>((resolve, reject) => {
+				this._deferredSettledActions.push(async () => {
+					try {
+						await this.prompt(text, options);
+						resolve();
+					} catch (error) {
+						reject(error);
+					}
+				});
+			});
+			// A settlement handler can await acceptance, not its own deferred delivery.
+			if (this._agentSettledScope.getStore()?.active) {
+				void completion.catch((error: unknown) => {
+					this._extensionRunner.emitError({
+						extensionPath: "<settlement>",
+						event: "prompt",
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+				return;
+			}
+			return completion;
 		}
 		if (!this.#ordinaryOwner) return this._prompt(text, options);
 		this.#ordinaryOwner.assertSessionStart(this);
@@ -2335,6 +2366,7 @@ export class AgentSession {
 	 * assistant message: the messages are the run's input, as they would have been without the wait.
 	 */
 	private _runTriggeredBehindPreflight(): void {
+		if (this._shutdownCancellation.signal.aborted) return;
 		// Keep ownership here while a switch is pending: its compaction caller discards
 		// the usual continuation decision, so moving these into agent queues would strand them.
 		if (
@@ -2368,6 +2400,7 @@ export class AgentSession {
 	 * next prompt.
 	 */
 	private _runInputQueuedBehindPreflight(): void {
+		if (this._shutdownCancellation.signal.aborted) return;
 		if (
 			this._modelSwitchCompactionPending ||
 			!this._inputQueuedBehindPreflight ||
@@ -2410,9 +2443,12 @@ export class AgentSession {
 		const ctx = this._extensionRunner.createCommandContext();
 
 		try {
-			await command.handler(args, ctx);
+			this._shutdownCancellation.signal.throwIfAborted();
+			await raceWithAbortSignal(Promise.resolve(command.handler(args, ctx)), this._shutdownCancellation.signal);
+			this._shutdownCancellation.signal.throwIfAborted();
 			return true;
 		} catch (err) {
+			this._shutdownCancellation.signal.throwIfAborted();
 			// Emit error via extension runner
 			this._extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
@@ -2594,6 +2630,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
 			role: "custom" as const,
@@ -2860,7 +2897,11 @@ export class AgentSession {
 		this.#originalAgent.abort();
 		this._resolveIdleWaitIfIdle();
 		await this.waitForIdle();
-		if (this._shutdownCancellation.signal.aborted) await this._settlementCompletion;
+		// Deferred work must not join the settlement whose completion it owns.
+		// The external terminal join still waits until every deferred action returns.
+		if (this._shutdownCancellation.signal.aborted && !this._settlementActionScope.getStore()?.active) {
+			await this._settlementCompletion;
+		}
 	}
 
 	async waitForIdle(): Promise<void> {

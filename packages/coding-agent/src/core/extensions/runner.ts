@@ -1210,14 +1210,16 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "message_end")) {
 			for (const handler of handlers) {
 				try {
-					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
+					// A cancelled handler can outlive disposal. Neither its draft nor a
+					// returned replacement may alias finalized state, including nested content.
+					const draft = structuredClone(currentMessage);
+					const currentEvent: MessageEndEvent = { ...event, message: draft };
 					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
 						| MessageEndEventResult
 						| undefined;
 					signal?.throwIfAborted();
-					if (!handlerResult?.message) continue;
-
-					if (handlerResult.message.role !== currentMessage.role) {
+					const candidate = handlerResult?.message ?? draft;
+					if (candidate.role !== currentMessage.role) {
 						this.emitError({
 							extensionPath: ext.path,
 							event: "message_end",
@@ -1226,8 +1228,10 @@ export class ExtensionRunner {
 						continue;
 					}
 
-					currentMessage = handlerResult.message;
-					modified = true;
+					if (!isDeepStrictEqual(candidate, currentMessage)) {
+						currentMessage = structuredClone(candidate);
+						modified = true;
+					}
 				} catch (err) {
 					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);

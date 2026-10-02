@@ -423,7 +423,11 @@ describe("RPC startup extension UI", () => {
 			const responses = rpcIo.outputLines
 				.map((line) => JSON.parse(line) as Record<string, unknown>)
 				.filter((record) => record.type === "response");
-			expect(responses).toHaveLength(1);
+			// smarty-dev#3048 / PR #116 R1-S2: every buffered command gets a cancellation disposition.
+			expect(responses).toHaveLength(256);
+			expect(
+				responses.slice(1).every((record) => record.success === false && /cancel/i.test(String(record.error))),
+			).toBe(true);
 			expect(responses[0]).toEqual(
 				expect.objectContaining({
 					command: "parse",
@@ -674,17 +678,13 @@ describe("RPC startup extension UI", () => {
 		}
 	});
 
-	it("waits for concurrent startup command responses before EOF shutdown", async () => {
+	// smarty-dev#3048 / PR #116 R1-S2: EOF cancels binding, not waits for startup commands to execute.
+	it("cancels buffered startup commands before EOF shutdown", async () => {
 		const listenerSnapshot = takeListenerSnapshot();
-		let sessionStartComplete = false;
 		let startupInputSent = false;
-		let resolveBash!: (result: BashResult) => void;
-		let shutdownAfterBashResponse = false;
-		const dispose = vi.fn(async () => {
-			shutdownAfterBashResponse = rpcIo.outputLines.some((line) => {
-				const record = JSON.parse(line) as Record<string, unknown>;
-				return record.type === "response" && record.id === "slow-startup-bash" && record.success === true;
-			});
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
 		});
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
 		const harness = await createHarness({
@@ -692,65 +692,47 @@ describe("RPC startup extension UI", () => {
 				(pi) => {
 					pi.on("session_start", async (_event, ctx) => {
 						await ctx.ui.confirm("Confirm", "Continue?");
-						sessionStartComplete = true;
+						await held;
 					});
 				},
 			],
 		});
-		const pendingBash = new Promise<BashResult>((resolve) => {
-			resolveBash = resolve;
+		const executeBash = vi.spyOn(harness.session, "executeBash");
+		const dispose = vi.fn(async () => {
+			expect(harness.session.shutdownSignal.aborted).toBe(true);
 		});
-		const executeBash = vi.spyOn(harness.session, "executeBash").mockReturnValue(pendingBash);
-
 		rpcIo.onOutputLine = (line) => {
 			const request = JSON.parse(line) as Record<string, unknown>;
 			if (request.type !== "extension_ui_request" || startupInputSent) return;
-			const response = responseForUiRequest(request);
 			const lineHandler = rpcIo.lineHandler;
-			if (!response || !lineHandler) {
-				throw new Error("Expected an attached input handler for the startup dialog");
-			}
-
+			if (!lineHandler) throw new Error("Expected startup input handler");
 			startupInputSent = true;
-			lineHandler(JSON.stringify(response));
 			lineHandler(JSON.stringify({ id: "slow-startup-bash", type: "bash", command: "slow" }));
 			lineHandler(JSON.stringify({ id: "startup-state", type: "get_state" }));
 			const onInputEnd = (process.stdin.listeners("end") as NodeListener[]).find(
 				(listener) => !listenerSnapshot.stdinEnd.includes(listener),
 			);
-			if (!onInputEnd) {
-				throw new Error("Expected RPC mode to listen for stdin EOF");
-			}
+			if (!onInputEnd) throw new Error("Expected RPC EOF listener");
 			onInputEnd.call(process.stdin);
 		};
-
 		try {
-			void runRpcMode({
-				session: harness.session,
-				newSession: vi.fn(async () => ({ cancelled: true })),
-				switchSession: vi.fn(async () => ({ cancelled: true })),
-				fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
-				dispose,
-				setRebindSession: vi.fn(),
-			} as unknown as AgentSessionRuntime);
-
-			await vi.waitFor(() => {
-				expect(sessionStartComplete).toBe(true);
-				expect(executeBash).toHaveBeenCalledOnce();
-				expect(rpcIo.outputLines.map((line) => JSON.parse(line) as Record<string, unknown>)).toContainEqual(
-					expect.objectContaining({ id: "startup-state", type: "response", success: true }),
-				);
-			});
-			expect(dispose).not.toHaveBeenCalled();
-
-			resolveBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
+			const runtimeHost = createRuntimeHost(harness);
+			vi.spyOn(runtimeHost, "dispose").mockImplementation(dispose);
+			void runRpcMode(runtimeHost);
 			await vi.waitFor(() => {
 				expect(dispose).toHaveBeenCalledOnce();
 				expect(exit).toHaveBeenCalledWith(0);
 			});
-			expect(shutdownAfterBashResponse).toBe(true);
+			expect(executeBash).not.toHaveBeenCalled();
+			const responses = rpcIo.outputLines
+				.map((line) => JSON.parse(line) as Record<string, unknown>)
+				.filter((record) => record.type === "response");
+			expect(responses.map((record) => record.id)).toEqual(["slow-startup-bash", "startup-state"]);
+			expect(responses.every((record) => record.success === false && /cancel/i.test(String(record.error)))).toBe(
+				true,
+			);
 		} finally {
-			resolveBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });
+			release();
 			executeBash.mockRestore();
 			exit.mockRestore();
 			harness.cleanup();
@@ -937,10 +919,10 @@ describe("RPC startup extension UI", () => {
 		const dialogDefaults: Array<boolean | string | undefined> = [];
 		const uiMethods: string[] = [];
 		let sessionStartComplete = false;
-		let shutdownAfterSessionStart: boolean | undefined;
+		let shutdownSawCancellation: boolean | undefined;
 		let inputEnded = false;
 		const dispose = vi.fn(async () => {
-			shutdownAfterSessionStart = sessionStartComplete;
+			shutdownSawCancellation = harness.session.shutdownSignal.aborted;
 		});
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
 		const harness = await createHarness({
@@ -992,7 +974,7 @@ describe("RPC startup extension UI", () => {
 
 			expect(dialogDefaults).toEqual([false, undefined, undefined, undefined]);
 			expect(uiMethods).toEqual(["confirm", "select"]);
-			expect(shutdownAfterSessionStart).toBe(true);
+			expect(shutdownSawCancellation).toBe(true);
 			expect(exit).toHaveBeenCalledWith(0);
 		} finally {
 			exit.mockRestore();
