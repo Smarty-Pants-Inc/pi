@@ -46,6 +46,10 @@ jobs:
         ref: ${{ github.sha }}
         persist-credentials: false
       timeout-minutes: 5
+    - name: Reject unapproved hosted runners
+      run: bash scripts/ci/no-hosted-runners.sh
+    - name: Test hosted-runner guard
+      run: bash scripts/ci/test-no-hosted-runners.sh
     - name: Setup Node22
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:

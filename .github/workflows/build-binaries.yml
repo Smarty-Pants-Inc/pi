@@ -149,12 +149,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # No hosted exceptions are approved (smarty-dev#1246).
         runner:
           - smarty-linux-x64
-          # hosted-exception: pending Paul's decision on smarty-dev#1246
-          - macos-latest
-          # hosted-exception: pending Paul's decision on smarty-dev#1246
-          - windows-latest
     permissions:
       actions: read
     env:
