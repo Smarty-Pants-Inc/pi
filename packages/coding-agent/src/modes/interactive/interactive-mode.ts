@@ -3726,6 +3726,12 @@ export class InteractiveMode {
 				break;
 			}
 
+			case "auto_retry_fallback": {
+				this.showWarning(`Failed over from ${event.fromModel} to ${event.toModel} after ${event.attempt} retries`);
+				this.ui.requestRender();
+				break;
+			}
+
 			case "auto_retry_end": {
 				// Restore escape handler
 				if (this.retryEscapeHandler) {
