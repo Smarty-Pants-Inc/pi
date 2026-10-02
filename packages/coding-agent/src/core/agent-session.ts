@@ -2920,8 +2920,11 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		// Deferred delivery retains the submitting callback's revocable permission, not settlement's scope.
+		const fenceScope = this._inputFenceScope.getStore();
+		const inheritedAdmission = this._inputAdmissionScope.getStore();
 		// Covers direct append, streaming queues and next-turn delivery from cancelled input handlers.
-		this._inputAdmissionScope.getStore()?.controller.signal.throwIfAborted();
+		inheritedAdmission?.controller.signal.throwIfAborted();
 		this._assertInputsOpen();
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
@@ -2960,7 +2963,12 @@ export class AgentSession {
 					const dispatch = async () => {
 						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
 						if (!this._modelSwitchDispatches.has(appMessage)) return;
-						const delivery = this.sendCustomMessage(appMessage, options);
+						const delivery = this._inputFenceScope.run(fenceScope, () => {
+							const send = () => this.sendCustomMessage(appMessage, options);
+							return inheritedAdmission
+								? this._inputAdmissionScope.run(inheritedAdmission, send)
+								: this._inputAdmissionScope.exit(send);
+						});
 						// Re-entry synchronously transfers ownership to a run, held queue, or another switch.
 						this._modelSwitchDispatches.delete(appMessage);
 						await delivery;
@@ -2986,7 +2994,33 @@ export class AgentSession {
 				return;
 			}
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this.sendCustomMessage(appMessage, options));
+				const dispatch = () =>
+					this._inputFenceScope.run(fenceScope, () => {
+						const send = () => this.sendCustomMessage(appMessage, options);
+						return inheritedAdmission
+							? this._inputAdmissionScope.run(inheritedAdmission, send)
+							: this._inputAdmissionScope.exit(send);
+					});
+				if (this._agentSettledScope.getStore()?.active) {
+					// Only a handler owning settlement must schedule without joining itself.
+					this._deferredSettledActions.push(dispatch);
+					return;
+				}
+				await this._awaitInput(
+					raceWithAbortSignal(
+						new Promise<void>((resolve, reject) => {
+							this._deferredSettledActions.push(async () => {
+								try {
+									await dispatch();
+									resolve();
+								} catch (error) {
+									reject(error);
+								}
+							});
+						}),
+						this._shutdownCancellation.signal,
+					),
+				);
 				return;
 			}
 			if (this._promptPreflights.size > 0) {

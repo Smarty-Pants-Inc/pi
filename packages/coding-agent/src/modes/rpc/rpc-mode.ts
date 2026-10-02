@@ -1207,12 +1207,13 @@ export async function runRpcMode(
 			!extensionBindingsComplete ||
 			!session.isIdle ||
 			session.isSettling ||
-			runtimeHost.inputsFenced ||
-			pendingPromptWork.size > 0
+			runtimeHost.inputsFenced
 		)
 			return;
-		await waitForPendingCommandWork(true);
-		if (!session.isIdle || session.isSettling || runtimeHost.inputsFenced || pendingPromptWork.size > 0) return;
+		// Let completing commands publish their one response, but never join held
+		// dispatch before shutdown starts its cancellation and bounded command deadline.
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		if (!session.isIdle || session.isSettling || runtimeHost.inputsFenced) return;
 		await shutdown();
 	}
 

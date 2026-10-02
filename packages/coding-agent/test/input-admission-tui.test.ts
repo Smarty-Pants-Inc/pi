@@ -38,6 +38,19 @@ export default function(pi) {
     ctx.ui.setStatus("proof", "OFFLINE_PROOF_READY"); mark("ready");
   });
   let round4RunHeld = false, savedImages = [];
+  pi.registerShortcut("ctrl+shift+m", { handler: async ctx => {
+    await ctx.ui.custom(() => { mark("custom-mounted"); return { render: () => ["CUSTOM_MOUNTED"], invalidate() {} }; });
+  } });
+  pi.registerCommand("replace-bash", { handler: async (_args, ctx) => { await new Promise(resolve => setImmediate(resolve)); const result = await ctx.switchSession(join(dir, "target.jsonl")); if (!result.cancelled) mark("bash-replaced"); } });
+  pi.on("user_bash", async () => {
+    if (!process.env.PI_PROOF_CASE.startsWith("r1-bash")) return;
+    mark("bash-held"); await hold("bash"); mark("bash-released");
+    if (process.env.PI_PROOF_CASE.endsWith("handled")) return { result: { output: "retired-handled-result", exitCode: 0, cancelled: false, truncated: false } };
+  });
+  pi.on("session_shutdown", (event, ctx) => { if (event.reason === "quit" && process.env.PI_PROOF_CASE.startsWith("r1-bash")) writeFileSync(join(dir, "bash-history"), JSON.stringify(ctx.sessionManager.getEntries())); });
+  if (process.env.PI_PROOF_CASE === "r1-external") pi.on("session_start", (_event, ctx) => {
+    const timer = setInterval(() => { if (existsSync(join(dir, "abort-input"))) { clearInterval(timer); ctx.abort(); mark("external-aborted"); } }, 20);
+  });
   pi.registerShortcut("ctrl+shift+c", { handler: ctx => { ctx.compact({ onError: error => { writeFileSync(join(dir, "compact-error"), String(error)); } }); } });
   pi.registerShortcut("ctrl+shift+s", { handler: ctx => { savedImages = ctx.ui.getEditorText().match(/\\[recovered image [^\\]]+\\]/g) ?? []; ctx.ui.setEditorText("first-image\\n" + savedImages[0]); mark("split-images"); } });
   pi.registerShortcut("ctrl+shift+t", { handler: ctx => { ctx.ui.setEditorText("tail-image\\n" + savedImages[1]); mark("tail-image-ready"); } });
@@ -69,7 +82,7 @@ export default function(pi) {
     ctx.ui.notify("REPLACEMENT_RESULT_CANCELLED=" + result.cancelled); mark("replacement-finished");
   } });
   pi.on("session_before_switch", async (_event, ctx) => {
-    if (["shortcut-stale", "replacement-shutdown"].includes(process.env.PI_PROOF_CASE)) return;
+    if (["shortcut-stale", "replacement-shutdown"].includes(process.env.PI_PROOF_CASE) || process.env.PI_PROOF_CASE.startsWith("r1-bash")) return;
     ctx.ui.setStatus("proof", "REPLACEMENT_FENCE_HELD"); mark("switch-held"); await hold("switch"); return { cancel: true };
   });
   pi.registerShortcut("ctrl+shift+h", { handler: async (ctx) => {
@@ -124,7 +137,18 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 	});
 	afterEach(async () => {
 		for (const p of proofs.splice(0)) {
-			for (const gate of ["input", "run", "switch", "shortcut", "cleanup", "settlement", "compaction", "flushed"])
+			for (const gate of [
+				"input",
+				"run",
+				"switch",
+				"shortcut",
+				"cleanup",
+				"settlement",
+				"compaction",
+				"flushed",
+				"bash",
+				"editor",
+			])
 				writeFileSync(join(p.dir, `release-${gate}`), "release");
 			if (!existsSync(join(p.dir, "exit"))) {
 				p.keys("C-c");
@@ -168,6 +192,45 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 				JSON.stringify({ compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 1 } }),
 			);
 		writeFileSync(join(dir, "proof.mjs"), fixture);
+		const targetCwd = scenario.startsWith("r1-bash") ? join(dir, "receiving-cwd") : dir;
+		if (scenario.startsWith("r1-bash")) mkdirSync(targetCwd);
+		writeFileSync(
+			join(dir, "target.jsonl"),
+			`${JSON.stringify({ type: "session", version: 3, id: "target", timestamp: new Date().toISOString(), cwd: targetCwd })}\n`,
+		);
+		if (scenario === "r1-external") {
+			writeFileSync(
+				join(dir, "external.mjs"),
+				`import { existsSync, writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(join(dir, "editor-held"))}, "ready");\nwhile (!existsSync(${JSON.stringify(join(dir, "release-editor"))})) await new Promise(resolve => setTimeout(resolve, 20));\nwriteFileSync(process.argv[2], "external-edited");\n`,
+			);
+			writeFileSync(
+				join(dir, "agent", "settings.json"),
+				JSON.stringify({ externalEditor: `${process.execPath} ${join(dir, "external.mjs")}` }),
+			);
+		}
+		if (scenario.startsWith("r1-bash") || scenario === "r1-import") {
+			const built = process.env.PI_R1_DIST ?? resolve("dist");
+			writeFileSync(
+				join(dir, "native-tui.mjs"),
+				`import fixture from "./proof.mjs";
+import { registerFauxProvider } from ${JSON.stringify(resolve("../ai/dist/compat.js"))};
+import { createAgentSessionRuntime, createAgentSessionServices, createAgentSessionFromServices } from ${JSON.stringify(join(built, "core/agent-session-runtime.js"))};
+import { AuthStorage } from ${JSON.stringify(join(built, "core/auth-storage.js"))};
+import { ModelRuntime } from ${JSON.stringify(join(built, "core/model-runtime.js"))};
+import { SessionManager } from ${JSON.stringify(join(built, "core/session-manager.js"))};
+import { InteractiveMode } from ${JSON.stringify(join(built, "modes/interactive/interactive-mode.js"))};
+const faux = registerFauxProvider();
+const modelRuntime = await ModelRuntime.create({ credentials: AuthStorage.inMemory(), modelsPath: null, allowModelNetwork: false });
+modelRuntime.registerProvider(faux.getModel().provider, { baseUrl: faux.getModel().baseUrl, api: faux.api, apiKey: "offline-faux-test-only", models: faux.models });
+const factory = async ({ cwd, agentDir, sessionManager, sessionStartEvent }) => {
+  const services = await createAgentSessionServices({ cwd, agentDir, modelRuntime, resourceLoaderOptions: { extensionFactories: [fixture], noSkills: true, noPromptTemplates: true, noThemes: true } });
+  return { ...await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: faux.getModel(), noTools: true }), services, diagnostics: services.diagnostics };
+};
+const host = await createAgentSessionRuntime(factory, { cwd: process.cwd(), agentDir: process.env.PI_CODING_AGENT_DIR, sessionManager: SessionManager.create(process.cwd(), process.cwd()) });
+await new InteractiveMode(host).run();
+`,
+			);
+		}
 		const name = `${prefix}-${label}`;
 		tmux("new-session", "-d", "-s", name, "-x", "140", "-y", "50", "-c", dir);
 		tmux("set-option", "-s", "extended-keys", "on");
@@ -199,6 +262,8 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 			PI_PROOF_CASE: scenario,
 			PI_PACKAGE_DIR: resolve("."),
 		};
+		if (scenario.startsWith("r1-bash") || scenario === "r1-import")
+			args.splice(0, args.length, join(dir, "native-tui.mjs"));
 		const command = `set +m; env -i ${Object.entries(env)
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(
@@ -252,6 +317,106 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 		p.frame("ready");
 		return p;
 	}
+
+	// pi#117 R1-4: custom cleanup must precede transfer of compaction staging into recovery.
+	it("R1-4: signal with mounted custom interaction preserves staged original image recovery", async () => {
+		const p = await launch("r1-custom-staging", "r4-custom-staging");
+		p.submit("seed");
+		await p.mark("settled");
+		p.submit("run-held");
+		await p.mark("run-held");
+		p.text("queue-image");
+		p.keys("M-Enter");
+		await p.mark("image-created");
+		await vi.waitFor(() => expect(p.frame("queued-original")).toContain("attached-original"));
+		p.keys("M-Up");
+		await vi.waitFor(() => expect(editorFrame(p.frame("original-recovered"))).toContain("[recovered image"));
+		p.text("\x1b[67;6u");
+		writeFileSync(join(p.dir, "release-run"), "release");
+		await p.mark("compaction-held");
+		p.keys("Enter");
+		await vi.waitFor(() => expect(p.frame("original-staged")).toContain("Steering: attached-original"));
+		p.text("\x1b[77;6u");
+		await p.mark("custom-mounted");
+		await vi.waitFor(() => expect(p.frame("custom-mounted")).toContain("CUSTOM_MOUNTED"));
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
+		expect(await p.exit()).toBe(0);
+		await vi.waitFor(() => {
+			const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+			const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
+			expect(json).toBeDefined();
+			const receipt = JSON.parse(json!);
+			expect(receipt.text).toContain("attached-original");
+			expect(receipt.images).toEqual([
+				{
+					type: "image",
+					mimeType: "image/png",
+					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+				},
+			]);
+		});
+	});
+	// pi#117 R1-5: transfer finalizers must recheck latched shutdown after handled input.
+	it("R1-5: handled compaction flush shutdown exits without later activity", async () => {
+		const p = await launch("r1-flush-shutdown", "r4-flush-shutdown");
+		p.submit("seed");
+		await p.mark("settled");
+		p.text("\x1b[67;6u");
+		await p.mark("compaction-held");
+		p.submit("shutdown-handled");
+		await vi.waitFor(() => expect(p.frame("shutdown-staged")).toContain("Steering: shutdown-handled"));
+		writeFileSync(join(p.dir, "release-compaction"), "release");
+		await p.mark("admission-shutdown");
+		expect(await p.exit()).toBe(0);
+	});
+	// pi#117 R1-6: import cancellation must not clear a newer fenced editor draft.
+	it("R1-6: cancelled import preserves newer draft submitted while fenced", async () => {
+		const p = await launch("r1-import-draft", "r1-import");
+		p.submit(`/import ${join(p.dir, "target.jsonl")}`);
+		await vi.waitFor(() => expect(p.frame("import-confirm")).toContain("Replace current session"));
+		p.keys("Enter");
+		await p.mark("switch-held");
+		p.submit("newer-fenced-draft");
+		await vi.waitFor(() => expect(editorFrame(p.frame("import-fenced"))).toContain("newer-fenced-draft"));
+		writeFileSync(join(p.dir, "release-switch"), "release");
+		await vi.waitFor(() => expect(p.frame("import-cancelled")).toContain("Import cancelled"));
+		expect(editorFrame(p.frame("import-draft-retained"))).toContain("newer-fenced-draft");
+	});
+	// pi#117 R1-6: asynchronous rejection can recover editor content while external input is stopped.
+	it("R1-6: external editor completion preserves asynchronous admission recovery", async () => {
+		const p = await launch("r1-external-recovery", "r1-external");
+		p.submit("held-A");
+		await p.mark("input-held");
+		p.text("newer-draft");
+		p.keys("C-g");
+		await p.mark("editor-held");
+		writeFileSync(join(p.dir, "abort-input"), "abort");
+		await p.mark("external-aborted");
+		await new Promise((done) => setTimeout(done, 100));
+		writeFileSync(join(p.dir, "release-editor"), "release");
+		await vi.waitFor(() => expect(editorFrame(p.frame("external-complete"))).toContain("external-edited"));
+		expect(editorFrame(p.frame("external-recovery-retained"))).toContain("held-A");
+	});
+	// pi#117 R1-7: real native non-owned TUI must not retarget a held bash hook across cwd replacement.
+	it.each(["handled", "executable"])(
+		"R1-7: held TUI bash %s result cannot target receiving cwd or history",
+		async (kind) => {
+			const p = await launch(`r1-bash-${kind}`, `r1-bash-${kind}`);
+			const sentinel = join(p.dir, "bash-sentinel");
+			p.submit(`!pwd > ${sentinel}`);
+			await p.mark("bash-held");
+			p.submit("/replace-bash");
+			await p.mark("bash-replaced");
+			writeFileSync(join(p.dir, "release-bash"), "release");
+			await p.mark("bash-released");
+			await vi.waitFor(() => expect(p.frame("bash-refused")).toContain("INPUT_ADMISSION_DISPOSED"));
+			expect(existsSync(sentinel)).toBe(false);
+			process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
+			expect(await p.exit()).toBe(0);
+			expect(readFileSync(join(p.dir, "bash-history"), "utf8")).not.toContain("retired-handled-result");
+			expect(readFileSync(join(p.dir, "bash-history"), "utf8")).not.toContain("bashExecution");
+		},
+	);
 
 	it("held Enter input refuses replacement and Escape recovery keeps a newer draft", async () => {
 		const p = await launch("draft-recovery", "recovery");

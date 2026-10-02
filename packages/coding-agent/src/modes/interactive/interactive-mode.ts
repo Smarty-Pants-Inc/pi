@@ -3246,8 +3246,8 @@ export class InteractiveMode {
 				return;
 			}
 			if (text === "/import" || text.startsWith("/import ")) {
-				await this.handleImportCommand(text);
 				this.editor.setText("");
+				await this.handleImportCommand(text);
 				return;
 			}
 			if (text === "/share") {
@@ -4322,10 +4322,12 @@ export class InteractiveMode {
 					// terminal. If the terminal is gone, the restore writes below emit EIO,
 					// which the stdout/stderr error handler turns into emergencyTerminalExit;
 					// the render loop is already idle, so this cannot hot-spin (see #4144).
-					for (const text of this.pendingUserInputs.splice(0)) this.restoreRejectedInput(text);
-					for (const message of this.compactionQueuedMessages.splice(0)) this.restoreRejectedInput(message.text);
+					// Custom interactions restore their saved editor on close. Close them
+					// before transferring staged text/images so cleanup cannot overwrite recovery.
 					this.cancelUIHolds();
 					this.disposeActiveSelector();
+					for (const text of this.pendingUserInputs.splice(0)) this.restoreRejectedInput(text);
+					for (const message of this.compactionQueuedMessages.splice(0)) this.restoreRejectedInput(message.text);
 					await this.runtimeHost.dispose({
 						terminal: true,
 						beforeShutdown: async () => {
@@ -4429,6 +4431,15 @@ export class InteractiveMode {
 	/**
 	 * Check if shutdown was requested and perform shutdown if so.
 	 */
+	private scheduleShutdownRecheck(): void {
+		// A BUSY shutdown attempt must unwind before retrying released transfer custody.
+		setImmediate(() => {
+			void this.checkShutdownRequested().catch((cause: unknown) =>
+				this.uncaughtCrash(cause instanceof Error ? cause : new Error(String(cause))),
+			);
+		});
+	}
+
 	private async checkShutdownRequested(): Promise<void> {
 		if (!this.shutdownRequested || !this.session.isIdle || this.session.isSettling || this.runtimeHost.inputsFenced)
 			return;
@@ -4738,7 +4749,18 @@ export class InteractiveMode {
 				content,
 			});
 			if (result.status === "complete") {
-				this.editor.setText(result.content);
+				// Terminal input is stopped, but asynchronous abort/refusal may restore
+				// additional input while the external editor owns the initiating draft.
+				const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
+				const recovered =
+					draft === content
+						? ""
+						: content && draft.startsWith(`${content}\n`)
+							? draft.slice(content.length)
+							: draft
+								? `\n${draft}`
+								: "";
+				this.editor.setText(`${result.content}${recovered}`);
 			}
 		} finally {
 			try {
@@ -5056,6 +5078,7 @@ export class InteractiveMode {
 					this.compactionQueueTransfers--;
 					this.stagingAudit?.("compaction-prompt-settled");
 					this.compactionQueueWork.delete(promptPromise);
+					this.scheduleShutdownRecheck();
 				});
 			this.compactionQueueWork.add(promptPromise);
 			// The detached prompt can restore staging after this flush returns.
@@ -5086,6 +5109,7 @@ export class InteractiveMode {
 		} finally {
 			this.compactionQueueTransfers--;
 			this.stagingAudit?.("compaction-transfer-settled");
+			this.scheduleShutdownRecheck();
 		}
 	}
 
@@ -7158,7 +7182,8 @@ export class InteractiveMode {
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
-		const extensionRunner = this.session.extensionRunner;
+		const session = this.session;
+		const extensionRunner = session.extensionRunner;
 
 		// Emit user_bash event to let extensions intercept
 		let eventResult: UserBashEventResult | undefined;
@@ -7167,10 +7192,23 @@ export class InteractiveMode {
 				type: "user_bash",
 				command,
 				excludeFromContext,
-				cwd: this.sessionManager.getCwd(),
+				cwd: session.sessionManager.getCwd(),
 			});
 		} catch {
 			// The extension runner already reported the error. Do not fall back to local execution.
+			return;
+		}
+
+		// A hook may outlive ordinary replacement. Its result belongs only to the
+		// originating session, before any receiving-session execution, persistence, or UI.
+		if (session !== this.session || session.isDisposed) {
+			this.handleInputAdmissionError(
+				new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash was not executed or recorded"),
+			);
+			return;
+		}
+		if (session.inputsFenced || session.shutdownSignal.aborted) {
+			this.handleInputAdmissionError(new InputAdmissionError("INPUT_ADMISSION_FENCED", "bash was not accepted"));
 			return;
 		}
 
@@ -7199,7 +7237,7 @@ export class InteractiveMode {
 			);
 
 			// Record the result in session
-			this.session.recordBashResult(command, result, { excludeFromContext });
+			session.recordBashResult(command, result, { excludeFromContext });
 			this.bashComponent = undefined;
 			this.ui.requestRender();
 			return;
@@ -7220,7 +7258,7 @@ export class InteractiveMode {
 		this.ui.requestRender();
 
 		try {
-			const result = await this.session.executeBash(
+			const result = await session.executeBash(
 				command,
 				(chunk) => {
 					if (this.bashComponent) {

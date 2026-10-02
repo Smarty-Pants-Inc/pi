@@ -26,6 +26,21 @@ afterEach(() => {
 });
 
 describe("RpcClient child process failures", () => {
+	// pi#117 R1-3: pipe close after escalation is not successful server cleanup.
+	test("R1-3: forced SIGKILL is reported as incomplete shutdown even when pipes close", async () => {
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+process.on("SIGTERM", () => {});
+process.stdin.resume();
+`),
+		});
+		try {
+			await client.start();
+			await expect(client.stop()).rejects.toThrow(/shutdown incomplete: forced SIGKILL/);
+		} finally {
+			await client.stop().catch(() => {});
+		}
+	}, 10000);
 	// smarty-dev#3048: the client must read authoritative shutdown receipts before detaching stdout.
 	test("stop drains the complete attachment-bearing rejection receipt before child close", async () => {
 		const attachment = "x".repeat(2 * 1024 * 1024);

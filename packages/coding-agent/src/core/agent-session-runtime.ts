@@ -643,7 +643,16 @@ export class AgentSessionRuntime {
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
 		if (this._disposed || this.session.isDisposed) return;
 		const outgoing = this.#captureOutgoing(true);
-		const releaseInputs = await this.fenceLifecycle(outgoing, options?.rejectQueuedInput);
+		// Terminal cleanup authorization does not depend on a receipt callback.
+		// Without one, empty runtimes may close, but undelivered queues remain owned.
+		const rejectQueuedInput =
+			options?.rejectQueuedInput ??
+			(options?.terminal
+				? () => {
+						throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "queued input requires a rejection receipt");
+					}
+				: undefined);
+		const releaseInputs = await this.fenceLifecycle(outgoing, rejectQueuedInput);
 		try {
 			// Host terminal teardown may await, but it must happen only after admission closes.
 			await options?.beforeShutdown?.();

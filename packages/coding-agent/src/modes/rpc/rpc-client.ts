@@ -216,9 +216,17 @@ export class RpcClient {
 		// until `close`, including when the child has already exited before stop().
 		const childProcess = this.process;
 		if (childProcess.exitCode === null && childProcess.signalCode === null) childProcess.kill("SIGTERM");
+		// Server budgets are command cancellation (1s), cleanup (1s), and final
+		// transport drainage (1s). Leave scheduling margin before escalating.
 		const timeout = setTimeout(() => {
-			if (childProcess.exitCode === null && childProcess.signalCode === null) childProcess.kill("SIGKILL");
-		}, 1000);
+			if (childProcess.exitCode === null && childProcess.signalCode === null) {
+				this.drainError = new Error(
+					`RPC shutdown incomplete: forced SIGKILL after 5000 ms. Stderr: ${this.stderr}`,
+				);
+				this.exitError ??= this.drainError;
+				childProcess.kill("SIGKILL");
+			}
+		}, 5000);
 		try {
 			await this.processClosed;
 		} finally {
