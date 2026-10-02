@@ -56,20 +56,28 @@ write_fixture probe.yml $'jobs:\n  check:\n    runs-on: smarty-linux-x64'
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
 echo "PASS: smarty-linux-x64 fixture"
 
-# Checked-in allowlist: exactly build-binaries.yml smoke-test-binaries macos-latest/windows-latest.
+# Checked-in allowlist: two smoke platforms plus the approved npm trusted publisher.
 smoke_job=$'jobs:\n  build:\n    runs-on: smarty-linux-x64\n  smoke-test-binaries:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner:\n          - smarty-linux-x64\n          - macos-latest\n          - windows-latest'
-write_fixture build-binaries.yml "$smoke_job"
+publish_job=$'\n  publish-npm:\n    runs-on: ubuntu-latest'
+approved_jobs="$smoke_job$publish_job"
+write_fixture build-binaries.yml "$approved_jobs"
 bash "$guard" "$fixture_dir"
-echo "PASS: allowlisted smoke-test-binaries macos-latest/windows-latest"
+echo "PASS: all three allowlisted entries (smoke macos-latest/windows-latest; publish-npm ubuntu-latest)"
 
-expect_rejected 'allowlisted label in another job' "$smoke_job"$'\n  stage:\n    runs-on: macos-latest' 'unapproved hosted runner' build-binaries.yml
-expect_rejected 'allowlisted label in another file' "$smoke_job" 'unapproved hosted runner' other.yml
-expect_rejected 'third hosted label in allowlisted job' "$smoke_job"$'\n          - ubuntu-latest' 'unapproved hosted runner' build-binaries.yml
-expect_rejected 'other hosted label next to allowlisted one' "$smoke_job"$'\n          - [macos-latest, ubuntu-24.04]' 'unapproved hosted runner' build-binaries.yml
-expect_rejected 'inline exception marker' "$smoke_job"$'\n  stage:\n    runs-on: windows-latest # hosted-exception: approved' 'unapproved hosted runner' build-binaries.yml
-expect_rejected 'hosted label outside jobs' $'env:\n  os: macos-latest\n'"$smoke_job" 'unapproved hosted runner' build-binaries.yml
-expect_rejected 'unused allowlist entry' "${smoke_job%$'\n          - windows-latest'}" 'unused hosted-runner allowlist entry' build-binaries.yml
+expect_rejected 'allowlisted smoke label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: macos-latest' 'unapproved hosted runner' build-binaries.yml
+expect_rejected 'allowlisted publisher label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: ubuntu-latest' 'unapproved hosted runner' build-binaries.yml
+expect_rejected 'allowlisted label in another file' "$approved_jobs" 'unapproved hosted runner' other.yml
+expect_rejected 'third hosted label in allowlisted smoke job' "$smoke_job"$'\n          - ubuntu-latest'"$publish_job" 'unapproved hosted runner' build-binaries.yml
+expect_rejected 'other hosted label next to allowlisted one' "$smoke_job"$'\n          - [macos-latest, ubuntu-24.04]'"$publish_job" 'unapproved hosted runner' build-binaries.yml
+for label in ubuntu-24.04 ubuntu-22.04 ubuntu-24.04-arm macos-latest windows-latest; do
+  expect_rejected "publish-npm on $label" "$smoke_job"$'\n  publish-npm:\n    runs-on: '"$label" 'unapproved hosted runner' build-binaries.yml
+done
+expect_rejected 'other hosted label next to approved publisher' "$smoke_job"$'\n  publish-npm:\n    runs-on: [ubuntu-latest, ubuntu-24.04]' 'unapproved hosted runner' build-binaries.yml
+expect_rejected 'inline exception marker' "$approved_jobs"$'\n  stage:\n    runs-on: windows-latest # hosted-exception: approved' 'unapproved hosted runner' build-binaries.yml
+expect_rejected 'hosted label outside jobs' $'env:\n  os: macos-latest\n'"$approved_jobs" 'unapproved hosted runner' build-binaries.yml
+expect_rejected 'unused smoke allowlist entry' "${smoke_job%$'\n          - windows-latest'}$publish_job" 'unused hosted-runner allowlist entry' build-binaries.yml
+expect_rejected 'unused publisher allowlist entry' "$smoke_job" 'unused hosted-runner allowlist entry' build-binaries.yml
 printf '%s\n' 'build-binaries.yml smoke-test-binaries macos-latest' > "$fixture_dir/no-url.txt"
-expect_rejected 'allowlist entry without approval URL' "$smoke_job" 'malformed allowlist entry' build-binaries.yml "$fixture_dir/no-url.txt"
-expect_rejected 'empty allowlist' "$smoke_job" 'unapproved hosted runner' build-binaries.yml "$fixture_dir/empty.txt"
+expect_rejected 'allowlist entry without approval URL' "$approved_jobs" 'malformed allowlist entry' build-binaries.yml "$fixture_dir/no-url.txt"
+expect_rejected 'empty allowlist' "$approved_jobs" 'unapproved hosted runner' build-binaries.yml "$fixture_dir/empty.txt"
 echo "All hosted-runner guard probes passed"
