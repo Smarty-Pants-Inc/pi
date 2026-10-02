@@ -83,4 +83,68 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.usage.cost.input).toBeGreaterThan(0);
 		expect(isRetryableAssistantError(result)).toBe(outputTokens === 0);
 	});
+	// smarty-dev#3200 / PR #114 round 3: a rejecting observer cannot erase reported generation.
+	it.each([
+		{ api: "responses", terminal: "failed" },
+		{ api: "codex", terminal: "failed" },
+		{ api: "responses", terminal: "incomplete" },
+		{ api: "codex", terminal: "incomplete" },
+		{ api: "responses", terminal: "completed" },
+		{ api: "codex", terminal: "completed" },
+		{ api: "codex", terminal: "done" },
+	])("retains $api $terminal usage when the raw observer rejects", async ({ api, terminal }) => {
+		let calls = 0;
+		const fetchStub: typeof fetch = async () => {
+			calls++;
+			return new Response(
+				`data: ${JSON.stringify({
+					type: `response.${terminal}`,
+					sequence_number: 0,
+					response: {
+						id: "resp_observer_usage",
+						status: terminal === "done" ? "completed" : terminal,
+						output: [],
+						error: { code: "server_error", message: "503 overloaded" },
+						usage: {
+							input_tokens: 20,
+							output_tokens: 1,
+							total_tokens: 21,
+							input_tokens_details: { cached_tokens: 3 },
+							output_tokens_details: { reasoning_tokens: 1 },
+						},
+					},
+				})}\n\n`,
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+		};
+		const onProviderStreamEvent = async () => {
+			await Promise.resolve();
+			throw new Error("fetch failed");
+		};
+		const result = await retryAssistantCall(
+			async () =>
+				api === "codex"
+					? streamCodex({ ...model, api: "openai-codex-responses" }, context, {
+							apiKey: codexToken,
+							transport: "sse",
+							fetch: fetchStub,
+							onProviderStreamEvent,
+						}).result()
+					: streamResponses(model, context, {
+							apiKey: "local-dummy",
+							fetch: fetchStub,
+							onProviderStreamEvent,
+						}).result(),
+			{ enabled: true, maxRetries: 2, baseDelayMs: 0 },
+			undefined,
+		);
+		expect(calls).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("fetch failed");
+		expect(result.content).toEqual([]);
+		expect(result.responseId).toBe("resp_observer_usage");
+		expect(result.usage).toMatchObject({ input: 17, cacheRead: 3, output: 1, reasoning: 1, totalTokens: 21 });
+		expect(result.usage.cost.output).toBeGreaterThan(0);
+		expect(isRetryableAssistantError(result)).toBe(false);
+	});
 });

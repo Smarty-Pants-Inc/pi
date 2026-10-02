@@ -9,7 +9,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { zstdDecompressSync } from "node:zlib";
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const cli = join(repo, "packages/coding-agent/dist/bundle/cli.js");
@@ -20,6 +21,15 @@ const scratch = mkdtempSync(join(process.env.TMPDIR || tmpdir(), "pi-cli-retry-"
 const out = process.env.PI_RETRY_PROBE_OUT ? resolve(process.env.PI_RETRY_PROBE_OUT) : join(scratch, "evidence");
 mkdirSync(out, { recursive: true });
 const provider = "retry-local-stub";
+const models = ["primary", "alternate"].map((id) => ({
+	id,
+	name: id,
+	reasoning: false,
+	input: ["text"],
+	contextWindow: 1000000,
+	maxTokens: 4096,
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+}));
 const cases = [
 	{ name: "json-one-drop", mode: "json", steps: ["drop", "ok"], calls: 2, retries: 1, outcome: "completed" },
 	{ name: "print-one-drop", mode: "text", steps: ["drop", "ok"], calls: 2, retries: 1, outcome: "completed" },
@@ -58,6 +68,28 @@ const cases = [
 		retries: 0,
 		outcome: "error",
 	},
+	// smarty-dev#3200 / PR #114 round 3: a truncated alternate cannot naturally continue.
+	...[0, 2].map((maxRetries) => ({
+		name: `fallback-truncated-tool-${maxRetries}-retries`,
+		mode: "json",
+		fallback: true,
+		maxRetries,
+		steps: [...Array(maxRetries + 1).fill("drop"), "truncated-tool", "truncated-tool", "ok"],
+		calls: maxRetries + 2,
+		retries: maxRetries,
+		outcome: "error",
+	})),
+	// Use actual built SSE adapters with a rejecting public raw-event callback.
+	...["responses", "codex"].map((observerApi) => ({
+		name: `no-replay-after-${observerApi}-observer-usage`,
+		mode: "json",
+		fallback: true,
+		observerApi,
+		steps: ["failed-usage", "ok"],
+		calls: 1,
+		retries: 0,
+		outcome: "error",
+	})),
 	{
 		name: "fallback-tool-later-budget",
 		mode: "json",
@@ -75,10 +107,13 @@ const server = createServer(async (request, response) => {
 		const state = states.get(name);
 		assert.ok(state, `Unexpected request URL ${request.url}`);
 		assert.equal(request.method, "POST");
-		assert.equal(request.url, `/${name}/v1/responses`);
+		assert.equal(request.url, `/${name}/v1/${state.observerApi === "codex" ? "codex/responses" : "responses"}`);
 		const chunks = [];
 		for await (const chunk of request) chunks.push(chunk);
-		const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+		const bytes = Buffer.concat(chunks);
+		const body = JSON.parse(
+			(request.headers["content-encoding"] === "zstd" ? zstdDecompressSync(bytes) : bytes).toString("utf8"),
+		);
 		const index = state.requests.length;
 		const step = state.steps[index] || "unexpected";
 		state.requests.push({ model: body.model, step, input: body.input });
@@ -109,13 +144,13 @@ const server = createServer(async (request, response) => {
 			return;
 		}
 		let output;
-		if (step === "tool") {
+		if (step === "tool" || step === "truncated-tool") {
 			output = {
 				type: "function_call",
 				id: `fc_${index}`,
 				call_id: `call_${index}`,
 				name: "read",
-				arguments: JSON.stringify({ path: join(scratch, "tool-marker.txt") }),
+				arguments: step === "truncated-tool" ? '{"path":' : JSON.stringify({ path: join(scratch, "tool-marker.txt") }),
 				status: "completed",
 			};
 			send({
@@ -154,6 +189,20 @@ const server = createServer(async (request, response) => {
 				response.end();
 				return;
 			}
+		}
+		if (step === "truncated-tool") {
+			send({
+				type: "response.incomplete",
+				response: {
+					id,
+					status: "incomplete",
+					output: [],
+					incomplete_details: { reason: "max_output_tokens" },
+					usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 },
+				},
+			});
+			response.end();
+			return;
 		}
 		send({ type: "response.output_item.done", output_index: 0, item: output });
 		send({
@@ -239,7 +288,11 @@ try {
 			join(agentDir, "settings.json"),
 			JSON.stringify(
 				{
-					retry: { baseDelayMs: 50, ...(state.fallback ? { fallbackModel: `${provider}/alternate` } : {}) },
+					retry: {
+						baseDelayMs: 50,
+						maxRetries: state.maxRetries ?? 2,
+						...(state.fallback ? { fallbackModel: `${provider}/alternate` } : {}),
+					},
 					compaction: { enabled: false },
 					cacheWarming: "off",
 				},
@@ -256,15 +309,7 @@ try {
 							baseUrl: `http://127.0.0.1:${port}/${state.name}/v1`,
 							api: "openai-responses",
 							apiKey: "non-secret-local-stub",
-							models: ["primary", "alternate"].map((id) => ({
-								id,
-								name: id,
-								reasoning: false,
-								input: ["text"],
-								contextWindow: 1000000,
-								maxTokens: 4096,
-								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-							})),
+							models,
 						},
 					},
 				},
@@ -272,6 +317,42 @@ try {
 				2,
 			),
 		);
+		const observerExtension = join(cwd, "observer-provider.mjs");
+		if (state.observerApi) {
+			const adapter = pathToFileURL(
+				join(repo, `packages/ai/dist/api/openai-${state.observerApi === "codex" ? "codex-responses" : "responses"}.js`),
+			).href;
+			// Synthetic local-only token, not credentials; no external service is used.
+			const apiKey = state.observerApi === "codex"
+				? `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "local-test" } })).toString("base64")}.test`
+				: "non-secret-local-stub";
+			writeFileSync(observerExtension, `
+import { stream } from ${JSON.stringify(adapter)};
+export default function (pi) {
+  pi.registerProvider(${JSON.stringify(provider)}, {
+    api: "retry-observer-api",
+    apiKey: ${JSON.stringify(apiKey)},
+    baseUrl: ${JSON.stringify(`http://127.0.0.1:${port}/${state.name}/v1`)},
+    models: ${JSON.stringify(models)},
+    streamSimple(model, context, options) {
+      return stream({ ...model, api: ${JSON.stringify(state.observerApi === "codex" ? "openai-codex-responses" : "openai-responses")} }, context, {
+        ...options, transport: "sse",
+        async onProviderStreamEvent(event, eventModel) {
+          await options?.onProviderStreamEvent?.(event, eventModel);
+          if (event.type === "response.failed") {
+            await Promise.resolve();
+            throw new Error("fetch failed");
+          }
+        },
+      });
+    },
+  });
+}
+`);
+			writeFileSync(join(dir, "observer-provider.mjs"), readFileSync(observerExtension));
+			// Model config must not override the extension's observer wrapper API.
+			writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+		}
 		const args = [
 			...(state.mode === "json" ? ["--mode", "json"] : ["-p"]),
 			"--provider",
@@ -284,6 +365,7 @@ try {
 			sessionDir,
 			"--offline",
 			"--no-extensions",
+			...(state.observerApi ? ["--extension", observerExtension] : []),
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-themes",
@@ -328,7 +410,8 @@ try {
 			assert.equal(result.code, 0, result.stderr);
 			assert.equal(state.requests.length, state.calls, "request attempt count");
 			assert.equal(retries, state.retries, "stderr retry notices");
-			const fallbackExpected = state.fallback && state.calls >= 4;
+			const primaryAttempts = (state.maxRetries ?? 2) + 1;
+			const fallbackExpected = state.fallback && state.calls > primaryAttempts;
 			assert.equal(switches.length, fallbackExpected ? 1 : 0, "persisted fallback custom record");
 			assert.equal(
 				entries.filter((entry) => entry.type === "model_change" && entry.modelId === "alternate").length,
@@ -352,7 +435,7 @@ try {
 			assert.deepEqual(
 				state.requests.map((request) => request.model),
 				Array.from({ length: state.calls }, (_, index) =>
-					fallbackExpected && index >= 3 ? "alternate" : "primary",
+					fallbackExpected && index >= primaryAttempts ? "alternate" : "primary",
 				),
 			);
 			if (state.mode === "json") {
@@ -382,6 +465,21 @@ try {
 				assert.equal(result.events.filter((event) => event.type === "tool_execution_start").length, 1);
 				assert.ok(JSON.stringify(state.requests.at(-1).input).includes("deterministic tool result marker"));
 			}
+			if (state.name.startsWith("fallback-truncated-tool-")) {
+				assert.equal(state.requests.filter((request) => request.model === "alternate").length, 1);
+				assert.equal(result.events.filter((event) => event.type === "auto_retry_end" && !event.success).length, 1);
+				assert.equal(result.events.filter((event) => event.type === "auto_retry_end" && event.success).length, 0);
+				const toolEnds = result.events.filter((event) => event.type === "tool_execution_end");
+				assert.equal(toolEnds.length, 1);
+				assert.equal(toolEnds[0].isError, true);
+				assert.match(toolEnds[0].result.content[0].text, /was not executed/);
+			}
+			if (state.observerApi) {
+				const message = entries.findLast((entry) => entry.message?.role === "assistant").message;
+				assert.equal(message.usage.output, 1, "observer failure retains the reported output usage");
+				assert.equal(message.content.length, 0);
+				assert.match(message.errorMessage, /fetch failed/);
+			}
 			if (state.name === "no-replay-after-failed-usage")
 				assert.equal(entries.findLast((entry) => entry.message?.role === "assistant").message.usage.output, 1);
 		} catch (error) {
@@ -396,6 +494,12 @@ try {
 			fallbackRecords: switches.length,
 			settlement: result.events.at(-1)?.outcome,
 			exitCode: result.code,
+			assistantTerminals: entries.filter((entry) => entry.message?.role === "assistant").map(({ message }) => ({
+				model: message.model,
+				stopReason: message.stopReason,
+				outputTokens: message.usage.output,
+				...(message.errorMessage ? { error: message.errorMessage } : {}),
+			})),
 			...(failure ? { failure } : {}),
 		};
 		summaries.push(summary);
@@ -406,9 +510,19 @@ try {
 		.sort();
 	const hash = createHash("sha256");
 	for (const file of files) hash.update(String(file)).update(readFileSync(join(dirname(cli), String(file))));
+	const builtAdapterSha256 = Object.fromEntries(
+		["openai-responses", "openai-responses-shared", "openai-codex-responses"].map((name) => [
+			name,
+			createHash("sha256").update(readFileSync(join(repo, `packages/ai/dist/api/${name}.js`))).digest("hex"),
+		]),
+	);
 	writeFileSync(
 		join(out, "receipt.json"),
-		JSON.stringify({ head, trackedDirty: dirty, cli, bundleSha256: hash.digest("hex"), summaries }, null, 2),
+		JSON.stringify(
+			{ head, trackedDirty: dirty, cli, bundleSha256: hash.digest("hex"), builtAdapterSha256, summaries },
+			null,
+			2,
+		),
 	);
 	assert.ok(
 		summaries.every((summary) => summary.pass),

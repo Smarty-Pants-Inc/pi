@@ -608,7 +608,19 @@ export async function processResponsesStream<TApi extends Api>(
 	};
 
 	for await (const event of openaiStream) {
-		await options?.onProviderStreamEvent?.(event, model);
+		try {
+			await options?.onProviderStreamEvent?.(event, model);
+		} catch (error) {
+			// A rejecting observer must not erase provider-reported generation and permit replay.
+			if (
+				event.type === "response.failed" ||
+				event.type === "response.completed" ||
+				event.type === "response.incomplete"
+			) {
+				finalizeResponsesUsage(event.response, output, model, options);
+			}
+			throw error;
+		}
 		if (event.type === "response.created") {
 			output.responseId = event.response.id;
 		} else if (event.type === "response.output_item.added") {

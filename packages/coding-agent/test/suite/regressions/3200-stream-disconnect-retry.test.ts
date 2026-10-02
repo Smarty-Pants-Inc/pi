@@ -90,6 +90,41 @@ describe("premature stream recovery", () => {
 		},
 	);
 
+	// smarty-dev#3200 / PR #114 round 3: truncated tool calls must not bypass the alternate bound.
+	it.each([0, 2])("stops a truncated alternate tool call with %s primary retries", async (maxRetries) => {
+		const h = await createHarness({
+			models: [{ id: "primary" }, { id: "alternate" }],
+			settings: { retry: { maxRetries, baseDelayMs: 0, fallbackModel: "faux/alternate" } },
+		});
+		harnesses.push(h);
+		const requests: string[] = [];
+		h.setResponses(
+			[
+				...Array.from({ length: maxRetries + 1 }, () =>
+					fauxAssistantMessage("", { stopReason: "error", errorMessage: disconnect }),
+				),
+				fauxAssistantMessage([fauxToolCall("read", {})], { stopReason: "length" }),
+				fauxAssistantMessage([fauxToolCall("read", {})], { stopReason: "length" }),
+				fauxAssistantMessage("must not recover"),
+			].map((response) => (_context, _options, _state, model) => {
+				requests.push(model.id);
+				return response;
+			}),
+		);
+		await h.session.prompt("test");
+		expect(requests).toEqual([...Array(maxRetries + 1).fill("primary"), "alternate"]);
+		expect(h.eventsOfType("auto_retry_end")).toMatchObject([{ success: false, attempt: maxRetries }]);
+		expect(h.eventsOfType("tool_execution_end")).toMatchObject([
+			{
+				isError: true,
+				result: { content: [{ type: "text", text: expect.stringContaining("was not executed") }] },
+			},
+		]);
+		expect(h.eventsOfType("agent_settled")).toMatchObject([{ outcome: "error" }]);
+		expect(h.session.messages.at(-2)).toMatchObject({ role: "assistant", stopReason: "length" });
+		expect(h.session.messages.at(-1)).toMatchObject({ role: "toolResult", isError: true });
+	});
+
 	it.each(["faux/missing", "faux/primary", "missing-provider/alternate"])(
 		"does not switch to an unavailable or identical alternate: %s",
 		async (fallbackModel) => {

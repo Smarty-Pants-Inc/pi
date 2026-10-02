@@ -833,7 +833,12 @@ export class AgentSession {
 		toolResults: ToolResultMessage[],
 	): Promise<boolean> {
 		this._lastActivityOutcome =
-			message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
+			message.stopReason === "aborted"
+				? "aborted"
+				: message.stopReason === "error" ||
+						(this._retryFallbackInFlight && message.stopReason !== "stop" && message.stopReason !== "toolUse")
+					? "error"
+					: "completed";
 		const messageEntryId = this._findPersistedMessageEntryId(message);
 		if (!this._extensionRunner.hasHandlers("turn_end")) return false;
 		if (!messageEntryId) {
@@ -878,6 +883,9 @@ export class AgentSession {
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
 			const previousDecision = await previousFinishTurn?.(turn, signal);
+			// End an unsuccessful one-shot alternate before truncated tools or queued input
+			// can select a natural next turn. Successful toolUse clears this flag at message_end.
+			if (this._retryFallbackInFlight) return { action: "end" };
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;

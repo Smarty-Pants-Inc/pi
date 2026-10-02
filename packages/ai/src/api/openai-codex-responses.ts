@@ -755,6 +755,21 @@ async function* mapCodexEvents(
 		try {
 			await options?.onProviderStreamEvent?.(event, model);
 		} catch (error) {
+			// Retain terminal usage even when the observer prevents shared normalization.
+			if (
+				event.type === "response.failed" ||
+				event.type === "response.done" ||
+				event.type === "response.completed" ||
+				event.type === "response.incomplete"
+			) {
+				const response = (event as unknown as Extract<ResponseStreamEvent, { type: "response.completed" }>)
+					.response;
+				finalizeResponsesUsage(response, output, model, {
+					serviceTier: options?.serviceTier,
+					resolveServiceTier: resolveCodexServiceTier,
+					applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+				});
+			}
 			// Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
 			throw new ProviderStreamEventCallbackError(error);
 		}
