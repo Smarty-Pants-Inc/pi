@@ -6,12 +6,22 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 type RecordLine = Record<string, unknown>;
 const cli = process.env.PI_ADMISSION_CLI ?? resolve("dist/bundle/cli.js");
-const fixture = `import { createFauxCore, fauxAssistantMessage } from ${JSON.stringify(resolve("../ai/dist/providers/faux.js"))};
+const fixture = `import { createFauxCore, fauxAssistantMessage, fauxToolCall } from ${JSON.stringify(resolve("../ai/dist/providers/faux.js"))};
 export default function(pi) {
   const faux = createFauxCore({ provider: "admission-faux" });
-  faux.setResponses(Array.from({ length: 8 }, () => fauxAssistantMessage("offline answer")));
   const round4 = process.env.PI_ROUND4_CASE;
+  faux.setResponses([
+    ...(round4?.startsWith("tool-hook") ? [fauxAssistantMessage([fauxToolCall("probe", {})], { stopReason: "toolUse" })] : []),
+    ...Array.from({ length: 8 }, () => fauxAssistantMessage("offline answer")),
+  ]);
   const held = async (name, ctx) => { ctx.ui.notify(name + "-held"); await new Promise(resolve => setTimeout(resolve, 60000)); };
+  pi.registerTool({ name: "probe", label: "probe", description: "offline probe", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [{ type: "text", text: "probe-ran" }], details: {} }) });
+  pi.on("tool_call", async (_event, ctx) => { if (round4?.includes("tool_call")) { await held("tool_call", ctx); return { block: true, reason: "late-tool-call-result" }; } });
+  pi.on("tool_call", async (_event, ctx) => { if (round4?.includes("tool_call")) ctx.ui.notify("late-second-tool_call-handler"); });
+  pi.on("tool_result", async (_event, ctx) => { if (round4?.includes("tool_result")) { await held("tool_result", ctx); return { content: [{ type: "text", text: "late-tool-result" }] }; } });
+  pi.on("tool_result", async (_event, ctx) => { if (round4?.includes("tool_result")) ctx.ui.notify("late-second-tool_result-handler"); });
+  let releaseLate; const lateGate = new Promise(resolve => { releaseLate = resolve; });
+  pi.registerCommand("release-late", { handler: async () => { releaseLate(); } });
   pi.on("agent_start", async (_event, ctx) => { if (round4?.includes("fence-release")) await ctx.ui.confirm("run-release", "release run", { timeout: 10000 }); });
   for (const boundary of ["turn_end", "agent_before_settle"]) pi.on(boundary, async (_event, ctx) => { if (round4?.includes(boundary)) await held(boundary, ctx); });
   pi.on("user_bash", async (_event, ctx) => { if (round4?.includes("retired-bash")) { await ctx.ui.confirm("bash-held", "release bash", { timeout: 10000 }); if (round4.endsWith("true")) return { result: { output: "retired-handled-result", exitCode: 0, cancelled: false, truncated: false } }; } });
@@ -43,6 +53,7 @@ export default function(pi) {
       console.error(JSON.stringify({ proof: "print-input", admission: pi.hostCapabilities.inputAdmission, idle: ctx.isIdle(), pending: ctx.isPromptPending() }));
       return { action: "handled" };
     }
+    if (event.text.startsWith("late-send:")) { ctx.ui.notify("late-send-held"); await lateGate; pi.sendUserMessage("late-sent"); pi.sendMessage({ customType: "late-custom", content: "late-sent-custom", display: true }, { triggerTurn: true }); ctx.ui.notify("late-send-attempted"); return { action: "handled" }; }
     if (event.text.startsWith("nondialog:")) { ctx.ui.notify("input-nondialog-held"); await new Promise((resolve) => setTimeout(resolve, 60000)); }
     if (event.text.startsWith("hold:")) await ctx.ui.confirm("input-held", event.text, { timeout: 10000 });
     if (event.text.includes("handled")) return { action: "handled" };
@@ -94,7 +105,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			cli,
 			"--offline",
 			"--no-session",
-			"--no-tools",
+			...(label.startsWith("tool-hook") ? ["--tools", "probe"] : ["--no-tools"]),
 			"--no-extensions",
 			"--no-skills",
 			"--no-prompt-templates",
@@ -637,6 +648,83 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			]);
 		},
 	);
+	// smarty-dev#3048 / PR #110 R5 (security R4-S2): held tool interception hooks cannot block terminal shutdown.
+	it.each([
+		["tool_call", "EOF"],
+		["tool_call", "SIGTERM"],
+		["tool_result", "EOF"],
+		["tool_result", "SIGTERM"],
+	] as const)(
+		"round5 terminal cancellation releases a held %s hook under %s and returns original queued attachments",
+		async (hook, ending) => {
+			const p = await launch(`tool-hook-${hook}-${ending}`);
+			p.send({ id: "run", type: "prompt", message: "run" });
+			expect(await p.response("run")).toMatchObject({ success: true });
+			await p.marker(`${hook}-held`);
+			const image = { type: "image", mimeType: "image/png", data: "original-queued-bytes" };
+			p.send({ id: "queued", type: "follow_up", message: "tool-hook-queue", images: [image] });
+			expect(await p.response("queued")).toMatchObject({ success: true });
+			if (ending === "EOF") p.child.stdin.end();
+			else p.child.kill(ending);
+			expect(
+				await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))]),
+			).toEqual({ code: ending === "EOF" ? 0 : 143, signal: null });
+			expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
+				expect.objectContaining({
+					messages: [
+						expect.objectContaining({
+							content: [{ type: "text", text: "transformed:tool-hook-queue" }, image],
+						}),
+					],
+				}),
+			]);
+			const output = JSON.stringify(p.records);
+			expect(output).not.toContain("late-tool-call-result");
+			expect(output).not.toContain("late-tool-result");
+			expect(output).not.toContain(`late-second-${hook}-handler`);
+			// The tool call is finalized as an aborted error result; nothing from the held hook is applied.
+			expect(p.records.filter((record) => record.type === "tool_execution_end")).toEqual([
+				expect.objectContaining({
+					isError: true,
+					result: expect.objectContaining({
+						content: [{ type: "text", text: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }],
+					}),
+				}),
+			]);
+		},
+	);
+	// smarty-dev#3048 / PR #110 R5 (security R4-S1): cancelled input handlers cannot acquire fresh admission.
+	it("round5 an aborted input handler cannot submit native input after refusal", async () => {
+		const p = await launch("late-send");
+		p.send({ id: "held", type: "prompt", message: "late-send:x" });
+		await p.marker("late-send-held");
+		p.send({ id: "abort", type: "abort" });
+		expect(await p.response("held")).toMatchObject({
+			success: false,
+			error: expect.stringContaining("INPUT_ADMISSION_ABORTED"),
+		});
+		p.send({ id: "release", type: "prompt", message: "/release-late" });
+		expect(await p.response("release")).toMatchObject({ success: true });
+		await p.marker("late-send-attempted");
+		await new Promise((resolve) => setTimeout(resolve, 300));
+		p.send({ id: "state", type: "get_state" });
+		expect((await p.response("state")).data).toMatchObject({ pendingMessageCount: 0, isStreaming: false });
+		expect(p.records.filter((record) => record.type === "extension_error")).toEqual([
+			expect.objectContaining({
+				event: "send_user_message",
+				error: expect.stringContaining("INPUT_ADMISSION_ABORTED"),
+			}),
+			expect.objectContaining({ event: "send_message", error: expect.stringContaining("INPUT_ADMISSION_ABORTED") }),
+		]);
+		expect(p.records.some((record) => record.type === "agent_start")).toBe(false);
+		p.send({ id: "fresh", type: "prompt", message: "fresh" });
+		expect(await p.response("fresh")).toMatchObject({ success: true });
+		await vi.waitFor(() => expect(p.records.some((record) => record.type === "agent_settled")).toBe(true));
+		p.send({ id: "messages", type: "get_messages" });
+		const messages = JSON.stringify((await p.response("messages")).data);
+		expect(messages).toContain("transformed:fresh");
+		expect(messages).not.toContain("late-sent");
+	});
 	// smarty-dev#3048 / PR #110 R3-9 (security R3-S1): successful acquisition cannot orphan settlement.
 	it.each([
 		["cancelled", "EOF"],

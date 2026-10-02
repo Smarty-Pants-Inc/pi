@@ -673,12 +673,21 @@ export class AgentSession {
 			}
 
 			try {
-				return await runner.emitToolCall({
-					type: "tool_call",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					input: args as Record<string, unknown>,
-				});
+				// Terminal shutdown stops waiting on a held handler; the abandoned dispatch is
+				// observed, skips remaining handlers, and its late result is discarded.
+				const shutdown = this._shutdownCancellation.signal;
+				return await raceWithAbortSignal(
+					runner.emitToolCall(
+						{
+							type: "tool_call",
+							toolName: toolCall.name,
+							toolCallId: toolCall.id,
+							input: args as Record<string, unknown>,
+						},
+						shutdown,
+					),
+					shutdown,
+				);
 			} catch (err) {
 				if (err instanceof Error) {
 					throw err;
@@ -689,17 +698,25 @@ export class AgentSession {
 
 		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
 			const runner = this._extensionRunner;
+			const shutdown = this._shutdownCancellation.signal;
+			// Terminal shutdown rejects here; the loop finalizes an error tool result instead.
 			const hookResult = runner.hasHandlers("tool_result")
-				? await runner.emitToolResult({
-						type: "tool_result",
-						toolName: toolCall.name,
-						toolCallId: toolCall.id,
-						input: args as Record<string, unknown>,
-						content: result.content,
-						details: result.details,
-						isError,
-						usage: result.usage,
-					})
+				? await raceWithAbortSignal(
+						runner.emitToolResult(
+							{
+								type: "tool_result",
+								toolName: toolCall.name,
+								toolCallId: toolCall.id,
+								input: args as Record<string, unknown>,
+								content: result.content,
+								details: result.details,
+								isError,
+								usage: result.usage,
+							},
+							shutdown,
+						),
+						shutdown,
+					)
 				: undefined;
 
 			const content = hookResult?.content ?? result.content ?? [];
@@ -2153,6 +2170,8 @@ export class AgentSession {
 	}
 
 	private _admitInput(): InputAdmission {
+		// A handler of cancelled input inherits its admission; it must not acquire a fresh one.
+		this._inputAdmissionScope.getStore()?.controller.signal.throwIfAborted();
 		this._assertInputsOpen();
 		this._shutdownCancellation.signal.throwIfAborted();
 		const admission: InputAdmission = {
@@ -2201,7 +2220,13 @@ export class AgentSession {
 		}
 
 		const inputResult = await this._awaitInput(
-			this._extensionRunner.emitInput(text, images, source, streamingBehavior),
+			this._extensionRunner.emitInput(
+				text,
+				images,
+				source,
+				streamingBehavior,
+				this._inputAdmissionScope.getStore()?.controller.signal,
+			),
 		);
 		if (inputResult.action === "handled") {
 			return undefined;
@@ -2812,6 +2837,8 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		// Covers direct append, streaming queues and next-turn delivery from cancelled input handlers.
+		this._inputAdmissionScope.getStore()?.controller.signal.throwIfAborted();
 		this._assertInputsOpen();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
