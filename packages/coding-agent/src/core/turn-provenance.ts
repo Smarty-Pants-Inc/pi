@@ -385,6 +385,31 @@ export function resolveExtensionTurnProvenance(
 }
 
 /**
+ * Keep the occurrence, but not its admitted sender, after an unauthorized payload change.
+ * Called with the loader's private descriptor for each modifying hook, never extension metadata.
+ */
+export function transformTurnProvenance(
+	provenance: TurnProvenance,
+	caller: TurnProvenanceCaller | undefined,
+	trust: TurnProvenanceTrust | undefined,
+): TurnProvenance {
+	if (provenance.channel === "terminal") return provenance;
+	const allowed =
+		provenance.channel === "voice"
+			? trust?.voiceExtensions
+			: provenance.channel === "fabric"
+				? trust?.fabricExtensions
+				: undefined;
+	if (caller && trusts(allowed, caller)) return provenance;
+	return Object.freeze({
+		v: provenance.v,
+		turnId: provenance.turnId,
+		receivedAt: provenance.receivedAt,
+		channel: "terminal",
+	});
+}
+
+/**
  * Provenance of host input, stamped now. Only input from the interactive editor is offered to the
  * attestation reader; any failure, malformed answer or other path gives `terminal` with no principal.
  */

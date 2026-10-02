@@ -10,6 +10,7 @@ import {
 	type Model,
 	type Provider,
 	type ProviderHeaders,
+	type TextContent,
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
@@ -25,7 +26,11 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
-import { finalizeExtensionTurnProvenanceCaller } from "../turn-provenance.ts";
+import {
+	finalizeExtensionTurnProvenanceCaller,
+	getExtensionTurnProvenanceCaller,
+	type TurnProvenanceCaller,
+} from "../turn-provenance.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartEvent,
@@ -88,6 +93,15 @@ import type {
 	UserBashEvent,
 	UserBashEventResult,
 } from "./types.ts";
+
+// Compare text/image payload values, not object identity or renderer/provider metadata.
+function turnPayload(content: string | (TextContent | ImageContent)[] | null | undefined) {
+	return (typeof content === "string" ? [{ type: "text" as const, text: content }] : (content ?? [])).map((part) =>
+		part.type === "text"
+			? { type: part.type, text: part.text }
+			: { type: part.type, data: part.data, mimeType: part.mimeType },
+	);
+}
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
 // Only editor-global shortcuts are reserved here. Picker-specific bindings are not.
@@ -1161,13 +1175,22 @@ export class ExtensionRunner {
 		return action;
 	}
 
-	async emitMessageEnd(event: MessageEndEvent): Promise<AgentMessage | undefined> {
+	async emitMessageEnd(
+		event: MessageEndEvent,
+		// Host-only callback; the bound modifier identity is never supplied by a handler.
+		onPayloadChanged?: (caller: TurnProvenanceCaller | undefined) => void,
+	): Promise<AgentMessage | undefined> {
 		const ctx = this.createContext();
 		let currentMessage = event.message;
 		let modified = false;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "message_end")) {
 			for (const handler of handlers) {
+				const caller = getExtensionTurnProvenanceCaller(ext);
+				const payload =
+					onPayloadChanged && (currentMessage.role === "user" || currentMessage.role === "custom")
+						? turnPayload(currentMessage.content)
+						: undefined;
 				try {
 					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
 					const handlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
@@ -1193,6 +1216,14 @@ export class ExtensionRunner {
 						error: message,
 						stack,
 					});
+				} finally {
+					// Detect in-place edits too, including edits made before a handler throws.
+					if (
+						payload !== undefined &&
+						(currentMessage.role === "user" || currentMessage.role === "custom") &&
+						!isDeepStrictEqual(payload, turnPayload(currentMessage.content))
+					)
+						onPayloadChanged?.(caller);
 				}
 			}
 		}
@@ -1543,6 +1574,8 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
+		// Host-only callback, evaluated per handler rather than only on the final view.
+		onPayloadChanged?: (caller: TurnProvenanceCaller | undefined) => void,
 	): Promise<InputEventResult> {
 		const ctx = this.createContext();
 		let currentText = text;
@@ -1550,6 +1583,9 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input")) {
 			for (const handler of handlers) {
+				const caller = getExtensionTurnProvenanceCaller(ext);
+				const previousText = currentText;
+				const previousImages = onPayloadChanged ? turnPayload(currentImages) : undefined;
 				try {
 					const event: InputEvent = {
 						type: "input",
@@ -1571,6 +1607,12 @@ export class ExtensionRunner {
 						error: err instanceof Error ? err.message : String(err),
 						stack: err instanceof Error ? err.stack : undefined,
 					});
+				} finally {
+					if (
+						onPayloadChanged &&
+						(previousText !== currentText || !isDeepStrictEqual(previousImages, turnPayload(currentImages)))
+					)
+						onPayloadChanged(caller);
 				}
 			}
 		}

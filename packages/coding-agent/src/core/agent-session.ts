@@ -152,6 +152,7 @@ import {
 	type TurnProvenance,
 	type TurnProvenanceCaller,
 	type TurnProvenanceClaim,
+	transformTurnProvenance,
 } from "./turn-provenance.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 
@@ -1176,6 +1177,15 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		// A raw Agent submission is a new, unadmitted occurrence. Published tickets are
+		// consumed below, so resubmitting the same object cannot reuse its old sender.
+		if (
+			event.type === "message_start" &&
+			(event.message.role === "user" || event.message.role === "custom") &&
+			!this.#turnProvenance.has(event.message)
+		) {
+			this.#turnProvenance.set(event.message, resolveExtensionTurnProvenance(undefined, undefined, undefined));
+		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1232,6 +1242,8 @@ export class AgentSession {
 							event.message.details,
 							provenance,
 						);
+				// Consume immediately after a successful append, even if later observers fail.
+				this.#turnProvenance.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1247,6 +1259,8 @@ export class AgentSession {
 				entryId = this.#ordinaryOwner
 					? await appendOwnedTerminalMessage(this.sessionManager, event.message, provenance)
 					: appendHarnessMessage(this.sessionManager, event.message, provenance);
+				// Consume immediately after a successful append, even if later observers fail.
+				this.#turnProvenance.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1407,7 +1421,19 @@ export class AgentSession {
 				type: "message_end",
 				message: event.message,
 			};
-			const replacement = await this._extensionRunner.emitMessageEnd(extensionEvent);
+			const provenance = this.#turnProvenance.get(event.message);
+			const replacement = await this._extensionRunner.emitMessageEnd(
+				extensionEvent,
+				provenance?.channel !== "terminal" && provenance
+					? (caller) => {
+							const current = this.#turnProvenance.get(event.message)!;
+							this.#turnProvenance.set(
+								event.message,
+								transformTurnProvenance(current, caller, this.settingsManager.getTurnProvenanceTrust()),
+							);
+						}
+					: undefined,
+			);
 			if (replacement) {
 				// Untyped extension handlers can return messages with null/missing content;
 				// normalize so it never enters agent state or session history.
@@ -2037,20 +2063,35 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		source: InputSource,
+		provenance: TurnProvenance,
 		streamingBehavior?: "steer" | "followUp",
-	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+	): Promise<{ text: string; images: ImageContent[] | undefined; provenance: TurnProvenance } | undefined> {
 		if (!this._extensionRunner.hasHandlers("input")) {
-			return { text, images };
+			return { text, images, provenance };
 		}
 
-		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		const inputResult = await this._extensionRunner.emitInput(
+			text,
+			images,
+			source,
+			streamingBehavior,
+			provenance.channel !== "terminal"
+				? (caller) => {
+						provenance = transformTurnProvenance(
+							provenance,
+							caller,
+							this.settingsManager.getTurnProvenanceTrust(),
+						);
+					}
+				: undefined,
+		);
 		if (inputResult.action === "handled") {
 			return undefined;
 		}
 		if (inputResult.action === "transform") {
-			return { text: inputResult.text, images: inputResult.images ?? images };
+			return { text: inputResult.text, images: inputResult.images ?? images, provenance };
 		}
-		return { text, images };
+		return { text, images, provenance };
 	}
 
 	private async _normalizePromptImages(
@@ -2129,7 +2170,7 @@ export class AgentSession {
 		let messages: AgentMessage[] | undefined;
 
 		try {
-			const provenance = this._turnProvenanceFor(text, options);
+			const admittedProvenance = this._turnProvenanceFor(text, options);
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
@@ -2169,6 +2210,7 @@ export class AgentSession {
 				text,
 				options?.images,
 				options?.source ?? "interactive",
+				admittedProvenance,
 				mustQueue() ? options?.streamingBehavior : undefined,
 			);
 			if (!processedInput) {
@@ -2176,7 +2218,7 @@ export class AgentSession {
 				preflightResult?.(true);
 				return;
 			}
-			const { text: currentText, images: currentImages } = processedInput;
+			const { text: currentText, images: currentImages, provenance } = processedInput;
 
 			// Expand skill commands (/skill:name args) and prompt templates (/template args)
 			let expandedText = currentText;
@@ -2542,6 +2584,7 @@ export class AgentSession {
 			text,
 			images,
 			source,
+			provenance,
 			this.isStreaming ? behavior : undefined,
 		);
 		if (!processedInput) return;
@@ -2550,9 +2593,9 @@ export class AgentSession {
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images, provenance);
+			await this._queueSteer(expandedText, processedInput.images, processedInput.provenance);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images, provenance);
+			await this._queueFollowUp(expandedText, processedInput.images, processedInput.provenance);
 		}
 	}
 
@@ -2776,6 +2819,7 @@ export class AgentSession {
 			appMessage.details,
 			this.#turnProvenance.get(appMessage),
 		);
+		this.#turnProvenance.delete(appMessage);
 		this._recordMessageEntryId(appMessage, entryId);
 		this._entryIdsByMessage.set(appMessage, entryId);
 		this._refreshFinalizedContext();
@@ -2806,6 +2850,7 @@ export class AgentSession {
 					message.details,
 					this.#turnProvenance.get(message),
 				);
+				this.#turnProvenance.delete(message);
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
 					this._pendingCustomMessages.shift();
