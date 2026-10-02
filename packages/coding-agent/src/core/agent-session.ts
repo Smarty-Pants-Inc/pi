@@ -26,7 +26,14 @@ import {
 	type PrepareNextTurnContext,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, getCurrentSystemMessage, type RetryPolicy, retryDelayMs } from "@earendil-works/pi-ai";
+import {
+	contentText,
+	getCurrentSystemMessage,
+	hasAssistantOutput,
+	isPrematureStreamError,
+	type RetryPolicy,
+	retryDelayMs,
+} from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -239,6 +246,7 @@ export type AgentSessionEvent =
 			waitMessage?: string;
 	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "auto_retry_fallback"; fromModel: string; toModel: string; attempt: number; errorMessage: string }
 	| {
 			type: "summarization_retry_scheduled";
 			attempt: number;
@@ -463,6 +471,11 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryFallbackUsed = false;
+	/** Only the first alternate request in the current recovery episode is one-shot. */
+	private _retryFallbackInFlight = false;
+	// Sticky per assistant request: providers may discard partial content on error.
+	private _assistantOutputObserved = false;
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
 
@@ -820,7 +833,12 @@ export class AgentSession {
 		toolResults: ToolResultMessage[],
 	): Promise<boolean> {
 		this._lastActivityOutcome =
-			message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
+			message.stopReason === "aborted"
+				? "aborted"
+				: message.stopReason === "error" ||
+						(this._retryFallbackInFlight && message.stopReason !== "stop" && message.stopReason !== "toolUse")
+					? "error"
+					: "completed";
 		const messageEntryId = this._findPersistedMessageEntryId(message);
 		if (!this._extensionRunner.hasHandlers("turn_end")) return false;
 		if (!messageEntryId) {
@@ -865,6 +883,9 @@ export class AgentSession {
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
 			const previousDecision = await previousFinishTurn?.(turn, signal);
+			// End an unsuccessful one-shot alternate before truncated tools or queued input
+			// can select a natural next turn. Successful toolUse clears this flag at message_end.
+			if (this._retryFallbackInFlight) return { action: "end" };
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
@@ -1130,6 +1151,19 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		// Synthetic run failures publish another message_start, but not a new turn_start.
+		if (event.type === "turn_start") this._assistantOutputObserved = false;
+		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
+			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
+		} else if (event.type === "message_update" && event.message.role === "assistant") {
+			const update = event.assistantMessageEvent;
+			this._assistantOutputObserved ||=
+				hasAssistantOutput(event.message) ||
+				update.type.startsWith("toolcall_") ||
+				("delta" in update && update.delta.length > 0) ||
+				("content" in update && update.content.length > 0);
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1215,13 +1249,20 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+				const fallbackSucceeded =
+					this._retryFallbackInFlight &&
+					(assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse");
+				if (
+					fallbackSucceeded ||
+					(assistantMsg.stopReason !== "error" && this._retryAttempt > 0 && !this._retryFallbackInFlight)
+				) {
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this._retryAttempt,
 					});
 					this._retryAttempt = 0;
+					this._retryFallbackInFlight = false;
 				}
 			}
 		}
@@ -1241,13 +1282,12 @@ export class AgentSession {
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		if (this._agentRunAbortRequested) return false;
 		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
-		if (!message || this._throttleWaitUsed) return false;
+		if (!message || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
+		if (this._assistantOutputObserved || hasAssistantOutput(message)) return false;
 		if (throttledLimitWait(message)) return true;
-		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
-			return false;
-		}
-		return this._isRetryableError(message);
+		const settings = this._getRetrySettings(message);
+		if (!settings.enabled || !this._isRetryableError(message)) return false;
+		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
 
 	private _findPersistedMessageEntryId(message: AgentMessage): string | undefined {
@@ -1803,7 +1843,7 @@ export class AgentSession {
 		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
-		const dispatch = async (continuation = false) => {
+		const dispatch = async (continuation = false, fromQueuedMessages = false) => {
 			this.#ordinaryOwner?.assertCompactionIdle();
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
@@ -1811,7 +1851,7 @@ export class AgentSession {
 			// No await or external callback may separate this check from dispatch.
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
-			const run = continuation || !messages ? agent.continue() : agent.prompt(messages);
+			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
 			} catch (cause) {
@@ -1832,6 +1872,8 @@ export class AgentSession {
 		this._lastActivityOutcome = "completed";
 		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
+		this._retryFallbackUsed = false;
+		this._retryFallbackInFlight = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -1844,8 +1886,10 @@ export class AgentSession {
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
 				if (!continueAfterRun && !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
-				if (this.#ordinaryOwner) await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true));
-				else await dispatch(true);
+				const fromQueuedMessages = continueAfterRun === "queuedInput";
+				if (this.#ordinaryOwner)
+					await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true, fromQueuedMessages));
+				else await dispatch(true, fromQueuedMessages);
 			}
 		} catch (error) {
 			runFailed = true;
@@ -1891,7 +1935,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _handlePostAgentRun(): Promise<boolean> {
+	private async _handlePostAgentRun(): Promise<boolean | "queuedInput"> {
 		const message = this._lastAssistantMessage;
 		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;
@@ -1905,8 +1949,12 @@ export class AgentSession {
 
 		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
 		const throttleWaitUsed = this._throttleWaitUsed;
+		const fallbackAttempt = this._retryFallbackInFlight;
 		this._throttleWaitUsed = false;
-		const throttleWait = throttleWaitUsed ? undefined : throttledLimitWait(message);
+		const throttleWait =
+			fallbackAttempt || throttleWaitUsed || this._assistantOutputObserved || hasAssistantOutput(message)
+				? undefined
+				: throttledLimitWait(message);
 		let retrying: boolean;
 		if (throttleWait) {
 			this._retryAttempt++;
@@ -1925,7 +1973,7 @@ export class AgentSession {
 			return false;
 		}
 
-		if (message.stopReason === "error" && this._retryAttempt > 0) {
+		if ((message.stopReason === "error" && this._retryAttempt > 0) || fallbackAttempt) {
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
@@ -1933,11 +1981,12 @@ export class AgentSession {
 				finalError: message.errorMessage,
 			});
 			this._retryAttempt = 0;
+			this._retryFallbackInFlight = false;
 		}
 
-		// An error on the one-shot throttle retry is final: no overflow compaction-and-retry either.
+		// The one-shot alternate and failed throttle retry cannot recover through compaction either.
 		const compaction =
-			throttleWaitUsed && message.stopReason === "error"
+			fallbackAttempt || (throttleWaitUsed && message.stopReason === "error")
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -1949,7 +1998,10 @@ export class AgentSession {
 
 		// The low-level loop drains both queues before agent_end. Messages queued by
 		// agent_end handlers require a fresh run before pre-settlement handlers fire.
-		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+		const queued = !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+		// A failed alternate's synthetic tool results are terminal. Retained input
+		// must be selected before another request, rather than resuming that tool turn.
+		return fallbackAttempt && queued ? "queuedInput" : queued;
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
@@ -4387,6 +4439,8 @@ export class AgentSession {
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
+		// Never restart a request once output or a tool call has been streamed.
+		if (this._assistantOutputObserved) return false;
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
 		return isRetryableAssistantError(message);
@@ -4427,9 +4481,10 @@ export class AgentSession {
 	}
 
 	private _finishCancelledRetry(): void {
-		if (this._retryAttempt === 0) return;
+		if (this._retryAttempt === 0 && !this._retryFallbackInFlight) return;
 		const attempt = this._retryAttempt;
 		this._retryAttempt = 0;
+		this._retryFallbackInFlight = false;
 		this._emit({
 			type: "auto_retry_end",
 			success: false,
@@ -4443,8 +4498,8 @@ export class AgentSession {
 	 * @returns true if the caller should continue the agent, false otherwise
 	 */
 	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
-		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled) {
+		const settings = this._getRetrySettings(message);
+		if (!settings.enabled || this._retryFallbackInFlight) {
 			return false;
 		}
 
@@ -4453,10 +4508,76 @@ export class AgentSession {
 		if (this._retryAttempt > settings.maxRetries) {
 			// Preserve the completed attempt count so post-run handling can emit the final failure.
 			this._retryAttempt--;
-			return false;
+			try {
+				return await this._prepareRetryFallback(message);
+			} catch (error) {
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this._retryAttempt,
+					finalError: error instanceof Error ? error.message : String(error),
+				});
+				this._retryAttempt = 0;
+				throw error;
+			}
 		}
 
 		return this._waitAndRetry(message, retryDelayMs(settings, this._retryAttempt), settings.maxRetries);
+	}
+
+	private _getRetrySettings(message: AssistantMessage): RetryPolicy {
+		const settings = this.settingsManager.getRetrySettings();
+		// A dropped stream gets at most two retries, even with a larger ordinary retry budget.
+		return isPrematureStreamError(message) ? { ...settings, maxRetries: Math.min(2, settings.maxRetries) } : settings;
+	}
+
+	private _getRetryFallbackModel(): Model<string> | undefined {
+		const reference = this.settingsManager.getRetryFallbackModel();
+		// Sealed owner runtimes authorize one provider identity; alternates require fresh receiving.
+		if (!reference || this._retryFallbackUsed || this.#ordinaryOwner) return undefined;
+		const slash = reference.indexOf("/");
+		if (slash <= 0) return undefined;
+		const model = this._modelRuntime.getModel(reference.slice(0, slash), reference.slice(slash + 1));
+		if (!model || modelsAreEqual(model, this.model) || !this._modelRuntime.hasConfiguredAuth(model.provider))
+			return undefined;
+		return model;
+	}
+
+	private async _prepareRetryFallback(message: AssistantMessage): Promise<boolean> {
+		if (this.#ordinaryOwner && this.settingsManager.getRetryFallbackModel()) {
+			throw new Error(
+				"Retry fallback refused: owned runtime pins provider identity; a fresh owner allocation is required.",
+			);
+		}
+		const model = this._getRetryFallbackModel();
+		const previousModel = this.model;
+		if (!model || !previousModel || this._agentRunAbortRequested) return false;
+		const event = {
+			type: "auto_retry_fallback",
+			fromModel: `${previousModel.provider}/${previousModel.id}`,
+			toModel: `${model.provider}/${model.id}`,
+			attempt: this._retryAttempt,
+			errorMessage: message.errorMessage || "Unknown error",
+		} as const;
+		// Reuse context admission and thinking-level clamping, but do not change global defaults
+		// or drain queued input during this post-run recovery. Oversized targets are refused.
+		await this._compactForModelSwitch(model, () => {
+			if (this._agentRunAbortRequested) return;
+			this._omitRecoveryAttempt(message);
+			this.agent.state.model = model;
+			this.sessionManager.appendModelChange(model.provider, model.id);
+			this.setThinkingLevel(this._getThinkingLevelForModelSwitch(model));
+			this._retryFallbackUsed = true;
+			this._retryFallbackInFlight = true;
+			const entryId = this.sessionManager.appendCustomEntry(event.type, event);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+			this._emit(event);
+		});
+		if (!this._retryFallbackUsed) return false;
+		await this._emitModelSelect(model, previousModel, "set");
+		// Retain the count for this episode's terminal notice, not as a later-request retry bound.
+		return !this._agentRunAbortRequested;
 	}
 
 	/**
