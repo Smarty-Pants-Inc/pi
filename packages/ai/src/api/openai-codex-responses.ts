@@ -42,7 +42,12 @@ import {
 import { uuidv7 } from "../utils/uuid.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
-import { convertResponsesMessages, convertResponsesTools, processResponsesStream } from "./openai-responses-shared.ts";
+import {
+	convertResponsesMessages,
+	convertResponsesTools,
+	finalizeResponsesUsage,
+	processResponsesStream,
+} from "./openai-responses-shared.ts";
 import { buildBaseOptions } from "./simple-options.ts";
 
 // ============================================================================
@@ -666,7 +671,7 @@ async function processStream(
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	await processResponsesStream(
-		mapCodexEvents(parseSSE(response, options?.signal), output, model, options?.onProviderStreamEvent),
+		mapCodexEvents(parseSSE(response, options?.signal), output, model, options),
 		output,
 		stream,
 		model,
@@ -744,11 +749,11 @@ async function* mapCodexEvents(
 	events: AsyncIterable<Record<string, unknown>>,
 	output: AssistantMessage,
 	model: Model<"openai-codex-responses">,
-	onProviderStreamEvent: StreamOptions["onProviderStreamEvent"] | undefined,
+	options: OpenAICodexResponsesOptions | undefined,
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		try {
-			await onProviderStreamEvent?.(event, model);
+			await options?.onProviderStreamEvent?.(event, model);
 		} catch (error) {
 			// Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
 			throw new ProviderStreamEventCallbackError(error);
@@ -765,7 +770,14 @@ async function* mapCodexEvents(
 		}
 
 		if (type === "response.failed") {
-			const response = (event as { response?: { error?: { code?: string; message?: string } } }).response;
+			const response = (event as unknown as Extract<ResponseStreamEvent, { type: "response.failed" }>).response;
+			// Keep CodexApiError identity (no transport fallback), but retain the replay barrier.
+			finalizeResponsesUsage(response, output, model, {
+				serviceTier: options?.serviceTier,
+				resolveServiceTier: resolveCodexServiceTier,
+				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
+			});
+			output.rawStopReason = response?.status;
 			const code = response?.error?.code;
 			const message = response?.error?.message;
 			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
@@ -1542,12 +1554,7 @@ async function processWebSocketStream(
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
-				mapCodexEvents(
-					parseWebSocket(socket, options?.signal, idleTimeoutMs),
-					output,
-					model,
-					options?.onProviderStreamEvent,
-				),
+				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output, model, options),
 				onStart,
 			),
 			output,

@@ -472,6 +472,8 @@ export class AgentSession {
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
 	private _retryFallbackUsed = false;
+	/** Only the first alternate request in the current recovery episode is one-shot. */
+	private _retryFallbackInFlight = false;
 	// Sticky per assistant request: providers may discard partial content on error.
 	private _assistantOutputObserved = false;
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
@@ -1141,8 +1143,10 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
-		if (event.type === "message_start" && event.message.role === "assistant") {
-			this._assistantOutputObserved = hasAssistantOutput(event.message);
+		// Synthetic run failures publish another message_start, but not a new turn_start.
+		if (event.type === "turn_start") this._assistantOutputObserved = false;
+		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
+			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
 		} else if (event.type === "message_update" && event.message.role === "assistant") {
 			const update = event.assistantMessageEvent;
 			this._assistantOutputObserved ||=
@@ -1237,13 +1241,20 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+				const fallbackSucceeded =
+					this._retryFallbackInFlight &&
+					(assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse");
+				if (
+					fallbackSucceeded ||
+					(assistantMsg.stopReason !== "error" && this._retryAttempt > 0 && !this._retryFallbackInFlight)
+				) {
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this._retryAttempt,
 					});
 					this._retryAttempt = 0;
+					this._retryFallbackInFlight = false;
 				}
 			}
 		}
@@ -1263,12 +1274,11 @@ export class AgentSession {
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		if (this._agentRunAbortRequested) return false;
 		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
-		if (!message || this._throttleWaitUsed) return false;
+		if (!message || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
 		if (this._assistantOutputObserved || hasAssistantOutput(message)) return false;
 		if (throttledLimitWait(message)) return true;
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || !this._isRetryableError(message)) return false;
-		if (this._retryFallbackUsed && this._retryAttempt > 0) return false;
 		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
 
@@ -1855,6 +1865,7 @@ export class AgentSession {
 		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
 		this._retryFallbackUsed = false;
+		this._retryFallbackInFlight = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -1928,9 +1939,10 @@ export class AgentSession {
 
 		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
 		const throttleWaitUsed = this._throttleWaitUsed;
+		const fallbackAttempt = this._retryFallbackInFlight;
 		this._throttleWaitUsed = false;
 		const throttleWait =
-			throttleWaitUsed || this._assistantOutputObserved || hasAssistantOutput(message)
+			fallbackAttempt || throttleWaitUsed || this._assistantOutputObserved || hasAssistantOutput(message)
 				? undefined
 				: throttledLimitWait(message);
 		let retrying: boolean;
@@ -1951,7 +1963,7 @@ export class AgentSession {
 			return false;
 		}
 
-		if (message.stopReason === "error" && this._retryAttempt > 0) {
+		if ((message.stopReason === "error" && this._retryAttempt > 0) || fallbackAttempt) {
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
@@ -1959,11 +1971,12 @@ export class AgentSession {
 				finalError: message.errorMessage,
 			});
 			this._retryAttempt = 0;
+			this._retryFallbackInFlight = false;
 		}
 
-		// An error on the one-shot throttle retry is final: no overflow compaction-and-retry either.
+		// The one-shot alternate and failed throttle retry cannot recover through compaction either.
 		const compaction =
-			throttleWaitUsed && message.stopReason === "error"
+			fallbackAttempt || (throttleWaitUsed && message.stopReason === "error")
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -4455,9 +4468,10 @@ export class AgentSession {
 	}
 
 	private _finishCancelledRetry(): void {
-		if (this._retryAttempt === 0) return;
+		if (this._retryAttempt === 0 && !this._retryFallbackInFlight) return;
 		const attempt = this._retryAttempt;
 		this._retryAttempt = 0;
+		this._retryFallbackInFlight = false;
 		this._emit({
 			type: "auto_retry_end",
 			success: false,
@@ -4472,7 +4486,7 @@ export class AgentSession {
 	 */
 	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
 		const settings = this._getRetrySettings(message);
-		if (!settings.enabled || (this._retryFallbackUsed && this._retryAttempt > 0)) {
+		if (!settings.enabled || this._retryFallbackInFlight) {
 			return false;
 		}
 
@@ -4541,6 +4555,7 @@ export class AgentSession {
 			this.sessionManager.appendModelChange(model.provider, model.id);
 			this.setThinkingLevel(this._getThinkingLevelForModelSwitch(model));
 			this._retryFallbackUsed = true;
+			this._retryFallbackInFlight = true;
 			const entryId = this.sessionManager.appendCustomEntry(event.type, event);
 			const entry = this.sessionManager.getEntry(entryId);
 			if (entry) this._emit({ type: "entry_appended", entry });
@@ -4548,7 +4563,7 @@ export class AgentSession {
 		});
 		if (!this._retryFallbackUsed) return false;
 		await this._emitModelSelect(model, previousModel, "set");
-		// Retain the exhausted retry count: the alternate gets one attempt, not a fresh budget.
+		// Retain the count for this episode's terminal notice, not as a later-request retry bound.
 		return !this._agentRunAbortRequested;
 	}
 
