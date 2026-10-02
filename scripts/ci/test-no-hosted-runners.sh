@@ -51,10 +51,11 @@ ${prefix}${key}: ${indicator} # no block scalar is allowed
   done
 done
 
+# smarty-dev#1246: literal Forge labels must remain accepted.
 : > "$fixture_dir/empty.txt"
 write_fixture probe.yml $'jobs:\n  check:\n    runs-on: smarty-linux-x64'
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
-echo "PASS: smarty-linux-x64 fixture"
+echo "PASS: literal smarty-linux-x64 fixture"
 
 # Checked-in allowlist: two smoke platforms plus the approved npm trusted publisher.
 smoke_job=$'jobs:\n  build:\n    runs-on: smarty-linux-x64\n  smoke-test-binaries:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner:\n          - smarty-linux-x64\n          - macos-latest\n          - windows-latest'
@@ -63,6 +64,12 @@ approved_jobs="$smoke_job$publish_job"
 write_fixture build-binaries.yml "$approved_jobs"
 bash "$guard" "$fixture_dir"
 echo "PASS: all three allowlisted entries (smoke macos-latest/windows-latest; publish-npm ubuntu-latest)"
+
+# smarty-dev#1246 / pi#111 R3: keep approved entries used so the alias is the only failure.
+alias_diagnostic='runs-on via YAML anchor/alias is not allowed (smarty-dev#1246); write the label literally'
+expect_rejected 'alias hiding ubuntu-latest' $'env:\n  HOSTED_IMAGE: &image ubuntu-latest\n'"$approved_jobs"$'\n  check:\n    runs-on: *image' "$alias_diagnostic" build-binaries.yml
+expect_rejected 'anchored hosted runs-on' "$approved_jobs"$'\n  check:\n    runs-on: &image ubuntu-latest' "$alias_diagnostic" build-binaries.yml
+expect_rejected 'alias hiding smarty-linux-x64' $'env:\n  FORGE_IMAGE: &image smarty-linux-x64\n'"$approved_jobs"$'\n  check:\n    runs-on: *image' "$alias_diagnostic" build-binaries.yml
 
 expect_rejected 'allowlisted smoke label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: macos-latest' 'unapproved hosted runner' build-binaries.yml
 expect_rejected 'allowlisted publisher label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: ubuntu-latest' 'unapproved hosted runner' build-binaries.yml

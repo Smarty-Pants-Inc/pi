@@ -42,6 +42,11 @@ awk '
         sub(/:.*/, "", job)
       }
     }
+    # Reject indirection rather than resolve YAML anchors and aliases.
+    if ($0 ~ /runs-on:[[:space:]]*[&*]/) {
+      printf "%s:%d: runs-on via YAML anchor/alias is not allowed (smarty-dev#1246); write the label literally\n", FILENAME, FNR > "/dev/stderr"
+      failed = 1
+    }
     if ($0 ~ /(^|[[:space:]-])(runs-on|os|runner):[[:space:]]*[>|][-+]?[[:space:]]*(#.*)?$/) {
       printf "%s:%d: block-scalar runner value is forbidden: %s\n", FILENAME, FNR, $0 > "/dev/stderr"
       failed = 1
