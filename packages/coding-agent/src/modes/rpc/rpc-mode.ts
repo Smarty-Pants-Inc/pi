@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -110,12 +111,12 @@ export async function runRpcMode(
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
-	const outputCancellation = new AbortController();
+	const transportCancellation = new AbortController();
 	const waitForOutputBackpressure = async (): Promise<void> => {
 		try {
-			await raceWithAbortSignal(waitForRawStdoutBackpressure(), outputCancellation.signal);
+			await raceWithAbortSignal(waitForRawStdoutBackpressure(), transportCancellation.signal);
 		} catch (cause) {
-			if (!outputCancellation.signal.aborted || cause !== outputCancellation.signal.reason) throw cause;
+			if (!transportCancellation.signal.aborted || cause !== transportCancellation.signal.reason) throw cause;
 		}
 	};
 
@@ -539,26 +540,29 @@ export async function runRpcMode(
 			case "prompt": {
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
-				let preflightSucceeded = false;
-				const promptWork = session
-					.prompt(command.message, {
+				let dispositionSent = false;
+				const promptSession = session;
+				const promptWork = raceWithAbortSignal(
+					promptSession.prompt(command.message, {
 						images: command.images,
 						streamingBehavior: command.streamingBehavior,
 						source: "rpc",
 						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								preflightSucceeded = true;
+							if (didSucceed && !dispositionSent && !transportCancellation.signal.aborted) {
+								dispositionSent = true;
 								output(success(id, "prompt"));
 							}
 						},
-					})
-					.catch((e: unknown) => {
-						if (!preflightSucceeded) {
-							output(error(id, "prompt", e instanceof Error ? e.message : String(e)));
-						}
-					});
+					}),
+					transportCancellation.signal,
+				).catch((e: unknown) => {
+					if (!dispositionSent) {
+						dispositionSent = true;
+						output(error(id, "prompt", e instanceof Error ? e.message : String(e)));
+					}
+				});
 				pendingCommandWork.add(promptWork);
-				pendingPromptWork.add(promptWork);
+				pendingPromptWork.set(promptWork, promptSession);
 				const finished = () => {
 					pendingCommandWork.delete(promptWork);
 					pendingPromptWork.delete(promptWork);
@@ -1045,7 +1049,7 @@ export async function runRpcMode(
 	let startupInputBytes = 0;
 	let startupCommands: RpcCommand[] = [];
 	const pendingCommandWork = new Set<Promise<void>>();
-	const pendingPromptWork = new Set<Promise<void>>();
+	const pendingPromptWork = new Map<Promise<void>, AgentSession>();
 
 	const cancelPendingExtensionRequests = () => {
 		for (const pending of [...pendingExtensionRequests.values()]) {
@@ -1072,7 +1076,7 @@ export async function runRpcMode(
 		shutdownPromise = (async (): Promise<never> => {
 			// Cancel before joining commands or the run; retain subscriptions for final events.
 			session.cancelForShutdown();
-			outputCancellation.abort(session.shutdownSignal.reason);
+			transportCancellation.abort(session.shutdownSignal.reason);
 			detachInput();
 			process.stdin.pause();
 			cancelPendingExtensionRequests();
@@ -1115,8 +1119,9 @@ export async function runRpcMode(
 
 	async function checkShutdownRequested(): Promise<void> {
 		// An extension command can request quit before its preflight response.
-		// Internal quit waits for that disposition; EOF and signals cancel immediately.
-		if (!shutdownRequested || !session.isIdle || pendingPromptWork.size > 0) return;
+		// Internal quit waits for current-session dispositions, not abandoned retired commands.
+		// EOF and signals cancel all transport-owned waits immediately.
+		if (!shutdownRequested || !session.isIdle || [...pendingPromptWork.values()].includes(session)) return;
 		await shutdown();
 	}
 

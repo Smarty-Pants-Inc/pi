@@ -4816,6 +4816,10 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
+		const navigationSignal = AbortSignal.any([
+			this._branchSummaryAbortController.signal,
+			this._shutdownCancellation.signal,
+		]);
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -4823,11 +4827,14 @@ export class AgentSession {
 
 			// Emit session_before_tree event
 			if (this._extensionRunner.hasHandlers("session_before_tree")) {
-				const result = (await this._extensionRunner.emit({
-					type: "session_before_tree",
-					preparation,
-					signal: this._branchSummaryAbortController.signal,
-				})) as SessionBeforeTreeResult | undefined;
+				const result = (await this._extensionRunner.emit(
+					{
+						type: "session_before_tree",
+						preparation,
+						signal: navigationSignal,
+					},
+					navigationSignal,
+				)) as SessionBeforeTreeResult | undefined;
 
 				if (result?.cancel) {
 					return { cancelled: true };
@@ -4863,7 +4870,7 @@ export class AgentSession {
 					apiKey,
 					headers,
 					env,
-					signal: this._branchSummaryAbortController.signal,
+					signal: navigationSignal,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
@@ -4906,6 +4913,9 @@ export class AgentSession {
 				newLeafId = targetId;
 			}
 
+			// Cancellation can release a held hook without authorizing its branch or label changes.
+			navigationSignal.throwIfAborted();
+
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
@@ -4941,18 +4951,30 @@ export class AgentSession {
 			this._refreshFinalizedContext();
 			this._restoreToolsFromTranscript();
 
-			// Emit session_tree event
-			await this._extensionRunner.emit({
-				type: "session_tree",
-				newLeafId: this.sessionManager.getLeafId(),
-				oldLeafId,
-				summaryEntry,
-				fromExtension: summaryText ? fromExtension : undefined,
-			});
+			// Navigation is already committed. Cancel its observer without claiming rollback.
+			try {
+				await this._extensionRunner.emit(
+					{
+						type: "session_tree",
+						newLeafId: this.sessionManager.getLeafId(),
+						oldLeafId,
+						summaryEntry,
+						fromExtension: summaryText ? fromExtension : undefined,
+					},
+					navigationSignal,
+				);
+			} catch (cause) {
+				if (!navigationSignal.aborted || cause !== navigationSignal.reason) throw cause;
+			}
 
 			// Emit to custom tools
 
 			return { editorText, cancelled: false, summaryEntry };
+		} catch (cause) {
+			if (navigationSignal.aborted && cause === navigationSignal.reason) {
+				return { cancelled: true, aborted: true };
+			}
+			throw cause;
 		} finally {
 			this._branchSummaryAbortController = undefined;
 			this._resolveIdleWaitIfIdle();

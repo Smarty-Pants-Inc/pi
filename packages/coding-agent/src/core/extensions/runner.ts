@@ -268,50 +268,6 @@ function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["t
 	return extensions.map((ext) => ({ ext, handlers: ext.handlers.get(event)?.slice() ?? [] }));
 }
 
-function snapshotBoundaryContext(context: BoundaryContextPreview) {
-	// Snapshot only projection-local views once per build. Canonical messages and
-	// their payloads stay shared; cloning full history would restore allocation churn.
-	const canonicalMessages = new Set<AgentMessage>();
-	const sharedContent = new Set<unknown>();
-	for (const { sourceEntry } of context.contextEntries) {
-		if (sourceEntry.type === "message") {
-			canonicalMessages.add(sourceEntry.message);
-			if ("content" in sourceEntry.message) sharedContent.add(sourceEntry.message.content);
-		} else if (sourceEntry.type === "custom_message") {
-			sharedContent.add(sourceEntry.content);
-		} else if (sourceEntry.type === "context_edit") {
-			sharedContent.add(sourceEntry.replacement?.content);
-		} else if (sourceEntry.type === "compaction" && sourceEntry.systemMessage) {
-			canonicalMessages.add(sourceEntry.systemMessage);
-			sharedContent.add(sourceEntry.systemMessage.content);
-		}
-	}
-	const localMessages = new Map<AgentMessage, object>();
-	for (const messages of [context.contextMessages, context.llmMessages]) {
-		for (const message of messages) {
-			if (canonicalMessages.has(message) || localMessages.has(message)) continue;
-			localMessages.set(message, {
-				...message,
-				...("content" in message && !sharedContent.has(message.content)
-					? { content: structuredClone(message.content) }
-					: {}),
-			});
-		}
-	}
-	return {
-		contextEntries: context.contextEntries.slice(),
-		contextMessages: context.contextMessages.slice(),
-		llmMessages: context.llmMessages.slice(),
-		pendingMessages: context.pendingMessages.slice(),
-		canContinue: context.canContinue,
-		contributions: context.contextEntries.map((entry) => ({
-			sourceEntry: entry.sourceEntry,
-			messages: entry.messages.slice(),
-		})),
-		localMessages: Array.from(localMessages),
-	};
-}
-
 function sameMessages(left: AgentMessage[], right: AgentMessage[]): boolean {
 	return left.length === right.length && left.every((message, index) => message === right[index]);
 }
@@ -1024,7 +980,10 @@ export class ExtensionRunner {
 		let previewPendingMessages = getPendingMessages?.().slice();
 		let context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
 		signal?.throwIfAborted();
-		let contextSnapshot = snapshotBoundaryContext(context);
+		if (!this.hasHandlers(baseEvent.type)) return { entries, continue: false, context, valid: true };
+		// One detached preview per build preserves observer sharing without exposing history.
+		context = structuredClone(context);
+		let contextSnapshot = structuredClone(context);
 		let valid = true;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
@@ -1040,8 +999,8 @@ export class ExtensionRunner {
 					}
 				}
 				const event = {
-					...baseEvent,
-					entries,
+					...structuredClone(baseEvent),
+					entries: structuredClone(entries),
 					continue: shouldContinue,
 					context,
 				} as TurnEndEvent | AgentBeforeSettleEvent;
@@ -1050,10 +1009,11 @@ export class ExtensionRunner {
 						| BoundaryResult
 						| undefined;
 					signal?.throwIfAborted();
-					if (handlerResult?.entries !== undefined) entries = handlerResult.entries;
+					entries = structuredClone(handlerResult?.entries !== undefined ? handlerResult.entries : event.entries);
 					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
 				} catch (err) {
 					signal?.throwIfAborted();
+					entries = structuredClone(event.entries);
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1074,20 +1034,7 @@ export class ExtensionRunner {
 					if (
 						valid &&
 						unchangedEntries &&
-						context.canContinue === contextSnapshot.canContinue &&
-						(["contextEntries", "contextMessages", "llmMessages", "pendingMessages"] as const).every(
-							(key) =>
-								Array.isArray(context[key]) &&
-								context[key].length === contextSnapshot[key].length &&
-								contextSnapshot[key].every((item, index) => item === context[key][index]),
-						) &&
-						contextSnapshot.contributions.every(
-							(entry, index) =>
-								entry.sourceEntry === context.contextEntries[index].sourceEntry &&
-								Array.isArray(context.contextEntries[index].messages) &&
-								sameMessages(entry.messages, context.contextEntries[index].messages),
-						) &&
-						contextSnapshot.localMessages.every(([message, snapshot]) => isDeepStrictEqual(message, snapshot)) &&
+						isDeepStrictEqual(context, contextSnapshot) &&
 						previewRevision === nextRevision &&
 						previewPendingMessages?.length === nextPendingMessages?.length &&
 						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
@@ -1097,9 +1044,9 @@ export class ExtensionRunner {
 
 					previewRevision = nextRevision;
 					previewPendingMessages = nextPendingMessages?.slice();
-					context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
+					context = structuredClone(await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal));
 					signal?.throwIfAborted();
-					contextSnapshot = snapshotBoundaryContext(context);
+					contextSnapshot = structuredClone(context);
 					valid = true;
 				} catch (err) {
 					signal?.throwIfAborted();
@@ -1115,7 +1062,12 @@ export class ExtensionRunner {
 		}
 
 		return valid
-			? { entries, continue: shouldContinue, context, valid: true }
+			? {
+					entries: structuredClone(entries),
+					continue: shouldContinue,
+					context: structuredClone(context),
+					valid: true,
+				}
 			: { entries: [], continue: false, context, valid: false };
 	}
 
@@ -1128,15 +1080,18 @@ export class ExtensionRunner {
 		);
 	}
 
-	emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
-		const dispatch = this.emitEvent(event);
+	emit<TEvent extends RunnerEmitEvent>(event: TEvent, signal?: AbortSignal): Promise<RunnerEmitResult<TEvent>> {
+		const dispatch = this.emitEvent(event, signal);
 		// Observer-only emitters may be fire-and-forget. Still observe terminal rejection.
 		void dispatch.catch(() => {});
 		return dispatch;
 	}
 
-	private async emitEvent<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
-		const signal = this.dispatchSignal(event.type);
+	private async emitEvent<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		operationSignal?: AbortSignal,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const signal = this.dispatchSignal(event.type, operationSignal ?? ("signal" in event ? event.signal : undefined));
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
@@ -1144,11 +1099,17 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
 				try {
-					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					// Observers never receive writable aliases to native state or finalized history.
+					// Keep AbortSignal identity: structured cloning cannot preserve its behavior.
+					const snapshot =
+						"signal" in event
+							? { ...structuredClone({ ...event, signal: undefined }), signal: event.signal }
+							: structuredClone(event);
+					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
 					signal?.throwIfAborted();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
-						result = handlerResult as SessionBeforeEventResult;
+						result = structuredClone(handlerResult) as SessionBeforeEventResult;
 						if (result.cancel) {
 							return result as RunnerEmitResult<TEvent>;
 						}
@@ -1252,7 +1213,7 @@ export class ExtensionRunner {
 	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
 		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
-		const currentEvent: ToolResultEvent = { ...event };
+		const currentEvent: ToolResultEvent = structuredClone(event);
 		let modified = false;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "tool_result")) {
@@ -1299,12 +1260,12 @@ export class ExtensionRunner {
 			return undefined;
 		}
 
-		return {
+		return structuredClone({
 			content: currentEvent.content,
 			details: currentEvent.details,
 			isError: currentEvent.isError,
 			usage: currentEvent.usage,
-		};
+		});
 	}
 
 	async emitToolCall(event: ToolCallEvent, signal?: AbortSignal): Promise<ToolCallEventResult | undefined> {
@@ -1440,7 +1401,7 @@ export class ExtensionRunner {
 			}
 		}
 
-		return currentMessages;
+		return structuredClone(currentMessages);
 	}
 
 	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {

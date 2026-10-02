@@ -1984,6 +1984,7 @@ export class InteractiveMode {
 					try {
 						return await this.runtimeHost.newSession(options);
 					} catch (error: unknown) {
+						if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 						return this.handleFatalRuntimeError("Failed to create session", error);
 					}
 				},
@@ -1996,6 +1997,7 @@ export class InteractiveMode {
 						}
 						return { cancelled: result.cancelled };
 					} catch (error: unknown) {
+						if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 						return this.handleFatalRuntimeError("Failed to fork session", error);
 					}
 				},
@@ -2103,6 +2105,15 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+	}
+
+	private isTerminalRuntimeCancellation(error: unknown): boolean {
+		// Shutdown owns the cleanup join. An abandoned command must not join it or exit early.
+		return (
+			!!this.shutdownCompletion &&
+			this.session.shutdownSignal.aborted &&
+			error === this.session.shutdownSignal.reason
+		);
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -5843,6 +5854,7 @@ export class InteractiveMode {
 				this.showStatus("Resumed session in current cwd");
 				return result;
 			}
+			if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 			return this.handleFatalRuntimeError("Failed to resume session", error);
 		}
 	}
@@ -6565,6 +6577,7 @@ export class InteractiveMode {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
 			}
+			if (this.isTerminalRuntimeCancellation(error)) return;
 			await this.handleFatalRuntimeError("Failed to import session", error);
 		}
 	}
@@ -6895,6 +6908,7 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new Text(`${theme.fg("accent", "✓ New session started")}`, 1, 1));
 			this.ui.requestRender();
 		} catch (error: unknown) {
+			if (this.isTerminalRuntimeCancellation(error)) return;
 			await this.handleFatalRuntimeError("Failed to create session", error);
 		}
 	}
