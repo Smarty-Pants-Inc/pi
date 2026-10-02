@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
+import type { AgentActivityOutcome } from "../core/extensions/index.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
@@ -34,6 +35,7 @@ export interface PrintModeOptions {
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
+	let settledOutcome: AgentActivityOutcome | undefined;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
@@ -74,6 +76,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
+		settledOutcome = undefined;
 		await session.bindExtensions({
 			mode: mode === "json" ? "json" : "print",
 			commandContextActions: {
@@ -107,6 +110,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
+			if (event.type === "agent_settled") settledOutcome = event.outcome;
 			writeRetryNotice(event);
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
@@ -142,7 +146,14 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			const state = session.state;
 			const lastMessage = state.messages[state.messages.length - 1];
 
-			if (lastMessage?.role === "assistant") {
+			if (settledOutcome === "error" || settledOutcome === "aborted") {
+				const lastAssistant = state.messages
+					.slice()
+					.reverse()
+					.find((message) => message.role === "assistant");
+				console.error(lastAssistant?.errorMessage || `Request ${settledOutcome}`);
+				exitCode = 1;
+			} else if (lastMessage?.role === "assistant") {
 				const assistantMsg = lastMessage as AssistantMessage;
 				if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
 					console.error(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);

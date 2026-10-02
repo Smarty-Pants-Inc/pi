@@ -458,8 +458,8 @@ export class Agent {
 		await this.runPromptMessages(messages);
 	}
 
-	/** Continue from the current transcript. The last message must be a user or tool-result message. */
-	async continue(): Promise<void> {
+	/** Continue the transcript, or explicitly start from retained input after a terminal turn. */
+	async continue(options?: { fromQueuedMessages?: boolean }): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -469,7 +469,7 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 
-		if (lastMessage.role === "assistant") {
+		if (lastMessage.role === "assistant" || options?.fromQueuedMessages) {
 			const queuedSteering = this.steeringQueue.reserve();
 			if (queuedSteering.length > 0) {
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
@@ -482,7 +482,11 @@ export class Agent {
 				return;
 			}
 
-			throw new Error("Cannot continue from message role: assistant");
+			throw new Error(
+				options?.fromQueuedMessages
+					? "No queued messages to continue from"
+					: "Cannot continue from message role: assistant",
+			);
 		}
 
 		await this.runContinuation();

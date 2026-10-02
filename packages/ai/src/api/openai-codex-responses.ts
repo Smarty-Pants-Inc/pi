@@ -755,6 +755,11 @@ async function* mapCodexEvents(
 		try {
 			await options?.onProviderStreamEvent?.(event, model);
 		} catch (error) {
+			// The final assistant error must retain this non-transport origin for outer retry callers.
+			appendAssistantMessageDiagnostic(
+				output,
+				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
+			);
 			// Retain terminal usage even when the observer prevents shared normalization.
 			if (
 				event.type === "response.failed" ||

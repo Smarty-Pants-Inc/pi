@@ -279,6 +279,9 @@ export function throttledLimitWait(message: AssistantMessage): { delayMs: number
  */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	if (message.stopReason !== "error" || !message.errorMessage || hasAssistantOutput(message)) return false;
+	// An observer can fail after receiving generated output but before normalization records it.
+	// Retrying its transient-looking error would regenerate output, not repair the observer.
+	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;
 	// Providers mark a limit found in the parsed error body (e.g. the Smarty gateway's `smarty_limit`).
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)) return false;
 	const errorMessage = message.errorMessage;

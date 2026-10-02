@@ -1843,7 +1843,7 @@ export class AgentSession {
 		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
-		const dispatch = async (continuation = false) => {
+		const dispatch = async (continuation = false, fromQueuedMessages = false) => {
 			this.#ordinaryOwner?.assertCompactionIdle();
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
@@ -1851,7 +1851,7 @@ export class AgentSession {
 			// No await or external callback may separate this check from dispatch.
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
-			const run = continuation || !messages ? agent.continue() : agent.prompt(messages);
+			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
 			} catch (cause) {
@@ -1886,8 +1886,10 @@ export class AgentSession {
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
 				if (!continueAfterRun && !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
-				if (this.#ordinaryOwner) await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true));
-				else await dispatch(true);
+				const fromQueuedMessages = continueAfterRun === "queuedInput";
+				if (this.#ordinaryOwner)
+					await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true, fromQueuedMessages));
+				else await dispatch(true, fromQueuedMessages);
 			}
 		} catch (error) {
 			runFailed = true;
@@ -1933,7 +1935,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _handlePostAgentRun(): Promise<boolean> {
+	private async _handlePostAgentRun(): Promise<boolean | "queuedInput"> {
 		const message = this._lastAssistantMessage;
 		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;
@@ -1996,7 +1998,10 @@ export class AgentSession {
 
 		// The low-level loop drains both queues before agent_end. Messages queued by
 		// agent_end handlers require a fresh run before pre-settlement handlers fire.
-		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+		const queued = !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+		// A failed alternate's synthetic tool results are terminal. Retained input
+		// must be selected before another request, rather than resuming that tool turn.
+		return fallbackAttempt && queued ? "queuedInput" : queued;
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {

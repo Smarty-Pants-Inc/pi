@@ -31,6 +31,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -611,6 +612,11 @@ export async function processResponsesStream<TApi extends Api>(
 		try {
 			await options?.onProviderStreamEvent?.(event, model);
 		} catch (error) {
+			// Preserve observer origin even when it rejects before the first output is normalized.
+			appendAssistantMessageDiagnostic(
+				output,
+				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
+			);
 			// A rejecting observer must not erase provider-reported generation and permit replay.
 			if (
 				event.type === "response.failed" ||

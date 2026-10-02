@@ -125,6 +125,57 @@ describe("premature stream recovery", () => {
 		expect(h.session.messages.at(-1)).toMatchObject({ role: "toolResult", isError: true });
 	});
 
+	// smarty-dev#3200 / PR #114 round 4: retained follow-up must be consumed before any new alternate request.
+	it.each([0, 2])("starts queued follow-up after a truncated alternate (%s retries)", async (maxRetries) => {
+		let queued = false;
+		const h = await createHarness({
+			models: [{ id: "primary" }, { id: "alternate" }],
+			settings: { retry: { maxRetries, baseDelayMs: 0, fallbackModel: "faux/alternate" } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_end", async (event) => {
+						if (
+							!queued &&
+							event.message.role === "assistant" &&
+							event.message.model === "alternate" &&
+							event.message.stopReason === "length"
+						) {
+							queued = true;
+							await pi.sendUserMessage("ordinary follow-up", { deliverAs: "followUp" });
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		const requests: Array<{ model: string; input: string }> = [];
+		h.setResponses(
+			[
+				...Array.from({ length: maxRetries + 1 }, () =>
+					fauxAssistantMessage("", { stopReason: "error", errorMessage: disconnect }),
+				),
+				fauxAssistantMessage([fauxToolCall("read", {})], { stopReason: "length" }),
+				fauxAssistantMessage("follow-up completed"),
+				fauxAssistantMessage("unexpected request"),
+			].map((response) => (context, _options, _state, model) => {
+				requests.push({ model: model.id, input: JSON.stringify(context.messages) });
+				return response;
+			}),
+		);
+		await h.session.prompt("test");
+		expect(requests.map((request) => request.model)).toEqual([
+			...Array(maxRetries + 1).fill("primary"),
+			"alternate",
+			"alternate",
+		]);
+		expect(requests.at(-1)?.input).toContain("ordinary follow-up");
+		expect(h.eventsOfType("auto_retry_end")).toMatchObject([{ success: false, attempt: maxRetries }]);
+		expect(h.eventsOfType("tool_execution_end")).toMatchObject([{ isError: true }]);
+		expect(h.eventsOfType("agent_settled")).toMatchObject([{ outcome: "completed" }]);
+		expect(h.session.getLastAssistantText()).toBe("follow-up completed");
+		expect(h.session.pendingMessageCount).toBe(0);
+	});
+
 	it.each(["faux/missing", "faux/primary", "missing-provider/alternate"])(
 		"does not switch to an unavailable or identical alternate: %s",
 		async (fallbackModel) => {

@@ -147,4 +147,85 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.usage.cost.output).toBeGreaterThan(0);
 		expect(isRetryableAssistantError(result)).toBe(false);
 	});
+	// smarty-dev#3200 / PR #114 round 4: rejecting first nonterminal output must not look like transport failure.
+	it.each(
+		["responses", "codex"].flatMap((api) =>
+			["text", "reasoning-summary", "reasoning-text", "function", "custom"].map((shape) => ({ api, shape })),
+		),
+	)("does not regenerate after $api observer rejects first $shape output", async ({ api, shape }) => {
+		const item =
+			shape === "function"
+				? { type: "function_call", id: "fc_1", call_id: "call_1", name: "read", arguments: "" }
+				: shape === "custom"
+					? { type: "custom_tool_call", id: "ct_1", call_id: "call_1", name: "read", input: "" }
+					: shape === "text"
+						? { type: "message", id: "msg_1", role: "assistant", content: [], status: "in_progress" }
+						: { type: "reasoning", id: "rs_1", summary: [] };
+		const rejectType =
+			shape === "text"
+				? "response.output_text.delta"
+				: shape === "reasoning-summary"
+					? "response.reasoning_summary_text.delta"
+					: shape === "reasoning-text"
+						? "response.reasoning_text.delta"
+						: "response.output_item.added";
+		const events = [
+			{ type: "response.created", response: { id: "resp_observer", status: "in_progress", output: [] } },
+			{ type: "response.output_item.added", output_index: 0, item },
+			{
+				type: rejectType,
+				output_index: 0,
+				item_id: item.id,
+				content_index: 0,
+				summary_index: 0,
+				delta: "generated",
+			},
+		];
+		let calls = 0;
+		const fetchStub: typeof fetch = async () => {
+			calls++;
+			return new Response(
+				events
+					.map((event, sequence_number) => `data: ${JSON.stringify({ ...event, sequence_number })}\n\n`)
+					.join(""),
+				{
+					headers: { "content-type": "text/event-stream" },
+				},
+			);
+		};
+		let rejections = 0;
+		const onProviderStreamEvent = async (event: unknown) => {
+			if ((event as { type: string }).type === rejectType) {
+				rejections++;
+				await Promise.resolve();
+				throw new Error("fetch failed");
+			}
+		};
+		const result = await retryAssistantCall(
+			async () =>
+				api === "codex"
+					? streamCodex({ ...model, api: "openai-codex-responses" }, context, {
+							apiKey: codexToken,
+							transport: "sse",
+							fetch: fetchStub,
+							onProviderStreamEvent,
+						}).result()
+					: streamResponses(model, context, {
+							apiKey: "local-dummy",
+							fetch: fetchStub,
+							onProviderStreamEvent,
+						}).result(),
+			{ enabled: true, maxRetries: 2, baseDelayMs: 0 },
+			undefined,
+		);
+		expect(calls).toBe(1);
+		expect(rejections).toBe(1);
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("fetch failed");
+		expect(result.usage.output).toBe(0);
+		expect(result.diagnostics).toEqual(
+			expect.arrayContaining([expect.objectContaining({ type: "provider_stream_observer_error" })]),
+		);
+		expect(isRetryableAssistantError(result)).toBe(false);
+	});
 });

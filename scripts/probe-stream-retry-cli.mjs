@@ -79,6 +79,25 @@ const cases = [
 		retries: maxRetries,
 		outcome: "error",
 	})),
+	// smarty-dev#3200 / PR #114 round 4: queued input starts a new turn, never resumes the failed tool turn.
+	...[0, 2].map((maxRetries) => ({
+		name: `fallback-queued-follow-up-${maxRetries}-retries`,
+		mode: "json", fallback: true, queuedFollowUp: true, maxRetries,
+		steps: [...Array(maxRetries + 1).fill("drop"), "truncated-tool", "ok", "ok"],
+		calls: maxRetries + 3, retries: maxRetries, outcome: "completed",
+	})),
+	// smarty-dev#3200 / PR #114 round 4: plain print reports terminal recovery failure.
+	...["tool", "text"].map((shape) => ({
+		name: `print-fallback-truncated-${shape}`, mode: "text", fallback: true, maxRetries: 0,
+		steps: ["drop", `truncated-${shape}`, "ok"], calls: 2, retries: 0, outcome: "error", exitCode: 1,
+	})),
+	// smarty-dev#3200 / PR #114 round 4: first nonterminal observer failures cannot regenerate.
+	...["responses", "codex"].flatMap((observerApi) =>
+		["text", "reasoning-summary", "reasoning-text", "tool", "custom-tool"].map((observerShape) => ({
+			name: `no-replay-after-${observerApi}-observer-${observerShape}`, mode: "json", fallback: true,
+			observerApi, observerShape, steps: [observerShape, "ok"], calls: 1, retries: 0, outcome: "error",
+		})),
+	),
 	// Use actual built SSE adapters with a rejecting public raw-event callback.
 	...["responses", "codex"].map((observerApi) => ({
 		name: `no-replay-after-${observerApi}-observer-usage`,
@@ -144,6 +163,19 @@ const server = createServer(async (request, response) => {
 			return;
 		}
 		let output;
+		if (step.startsWith("reasoning-")) {
+			output = { type: "reasoning", id: `rs_${index}`, summary: [] };
+			send({ type: "response.output_item.added", output_index: 0, item: output });
+			send({ type: step === "reasoning-text" ? "response.reasoning_text.delta" : "response.reasoning_summary_text.delta", output_index: 0, item_id: output.id, summary_index: 0, content_index: 0, delta: "generated reasoning" });
+			response.end();
+			return;
+		}
+		if (step === "custom-tool") {
+			output = { type: "custom_tool_call", id: `ct_${index}`, call_id: `call_${index}`, name: "read", input: "" };
+			send({ type: "response.output_item.added", output_index: 0, item: output });
+			response.end();
+			return;
+		}
 		if (step === "tool" || step === "truncated-tool") {
 			output = {
 				type: "function_call",
@@ -190,7 +222,7 @@ const server = createServer(async (request, response) => {
 				return;
 			}
 		}
-		if (step === "truncated-tool") {
+		if (step === "truncated-tool" || step === "truncated-text") {
 			send({
 				type: "response.incomplete",
 				response: {
@@ -339,7 +371,7 @@ export default function (pi) {
         ...options, transport: "sse",
         async onProviderStreamEvent(event, eventModel) {
           await options?.onProviderStreamEvent?.(event, eventModel);
-          if (event.type === "response.failed") {
+          if (${JSON.stringify({ text: "response.output_text.delta", "reasoning-summary": "response.reasoning_summary_text.delta", "reasoning-text": "response.reasoning_text.delta", tool: "response.output_item.added", "custom-tool": "response.output_item.added" }[state.observerShape] || "response.failed")} === event.type) {
             await Promise.resolve();
             throw new Error("fetch failed");
           }
@@ -352,6 +384,21 @@ export default function (pi) {
 			writeFileSync(join(dir, "observer-provider.mjs"), readFileSync(observerExtension));
 			// Model config must not override the extension's observer wrapper API.
 			writeFileSync(join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+		}
+		const followUpExtension = join(cwd, "queued-follow-up.mjs");
+		if (state.queuedFollowUp) {
+			writeFileSync(followUpExtension, `
+export default function (pi) {
+  let queued = false;
+  pi.on("message_end", async (event) => {
+    if (!queued && event.message.role === "assistant" && event.message.model === "alternate" && event.message.stopReason === "length") {
+      queued = true;
+      await pi.sendUserMessage("ordinary queued follow-up marker", { deliverAs: "followUp" });
+    }
+  });
+}
+`);
+			writeFileSync(join(dir, "queued-follow-up.mjs"), readFileSync(followUpExtension));
 		}
 		const args = [
 			...(state.mode === "json" ? ["--mode", "json"] : ["-p"]),
@@ -366,6 +413,7 @@ export default function (pi) {
 			"--offline",
 			"--no-extensions",
 			...(state.observerApi ? ["--extension", observerExtension] : []),
+			...(state.queuedFollowUp ? ["--extension", followUpExtension] : []),
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-themes",
@@ -407,7 +455,7 @@ export default function (pi) {
 		let failure;
 		try {
 			assert.equal(result.signal, null, "CLI must exit normally");
-			assert.equal(result.code, 0, result.stderr);
+			assert.equal(result.code, state.exitCode ?? 0, result.stderr);
 			assert.equal(state.requests.length, state.calls, "request attempt count");
 			assert.equal(retries, state.retries, "stderr retry notices");
 			const primaryAttempts = (state.maxRetries ?? 2) + 1;
@@ -424,6 +472,7 @@ export default function (pi) {
 				const previousRequest = state.timeline.findLastIndex(
 					(entry, position) => position < index && entry.kind === "request",
 				);
+				if (state.queuedFollowUp && state.timeline[previousRequest].step === "truncated-tool") continue;
 				if (state.timeline[previousRequest].step === "tool") continue; // Natural tool turn, not recovery.
 				assert.ok(
 					state.timeline
@@ -452,6 +501,9 @@ export default function (pi) {
 						"retry/fallback notice precedes continuation",
 					);
 				}
+			} else if (state.outcome === "error") {
+				assert.equal(result.stdout.trim(), "", "failed print task must not output a successful answer");
+				assert.match(result.stderr, /failed|length|truncated/i);
 			} else {
 				assert.equal(result.stdout.trim(), "recovered by real CLI");
 				assert.ok(
@@ -474,7 +526,21 @@ export default function (pi) {
 				assert.equal(toolEnds[0].isError, true);
 				assert.match(toolEnds[0].result.content[0].text, /was not executed/);
 			}
-			if (state.observerApi) {
+			if (state.queuedFollowUp) {
+				const alternateRequests = state.requests.filter((request) => request.model === "alternate");
+				assert.equal(alternateRequests.length, 2);
+				assert.ok(JSON.stringify(alternateRequests[1].input).includes("ordinary queued follow-up marker"), "next alternate request consumes follow-up, not a failed-turn continuation");
+				const followUps = entries.filter((entry) => entry.message?.role === "user" && JSON.stringify(entry.message.content).includes("ordinary queued follow-up marker"));
+				assert.equal(followUps.length, 1, "follow-up delivered exactly once");
+				assert.equal(result.events.filter((event) => event.type === "auto_retry_end" && !event.success).length, 1);
+			}
+			if (state.observerShape) {
+				const message = entries.findLast((entry) => entry.message?.role === "assistant").message;
+				assert.equal(message.stopReason, "error");
+				assert.match(message.errorMessage, /fetch failed/);
+				assert.ok(message.diagnostics.some((diagnostic) => diagnostic.type === "provider_stream_observer_error"));
+			}
+			if (state.observerApi && !state.observerShape) {
 				const message = entries.findLast((entry) => entry.message?.role === "assistant").message;
 				assert.equal(message.usage.output, 1, "observer failure retains the reported output usage");
 				assert.equal(message.content.length, 0);
