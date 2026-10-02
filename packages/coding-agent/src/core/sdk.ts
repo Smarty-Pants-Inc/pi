@@ -3,6 +3,7 @@ import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from
 import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
@@ -369,6 +370,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		() => settingsManager.getCacheWarmingMode(),
 		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
 	);
+	// Request-preparation hooks stop waiting on terminal shutdown, like tool interception hooks.
+	let shutdownSignal: AbortSignal | undefined;
 	const buildRequestOptions = (
 		requestModel: Model<any>,
 		options: ModelsSimpleStreamOptions = {},
@@ -391,7 +394,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					requestHeaders,
 				);
 				return headerRunner?.hasHandlers("before_provider_headers")
-					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
+					? raceWithAbortSignal(headerRunner.emitBeforeProviderHeaders(headers ?? {}), shutdownSignal)
 					: (headers ?? {});
 			},
 		};
@@ -412,16 +415,19 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const transformProviderPayload = async (payload: unknown) => {
 		const runner = extensionRunnerRef.current;
 		if (!runner?.hasHandlers("before_provider_request")) return payload;
-		return runner.emitBeforeProviderRequest(payload);
+		return raceWithAbortSignal(runner.emitBeforeProviderRequest(payload), shutdownSignal);
 	};
 	const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
 		const runner = extensionRunnerRef.current;
 		if (!runner?.hasHandlers("after_provider_response")) return;
-		await runner.emit({
-			type: "after_provider_response",
-			status: response.status,
-			headers: response.headers,
-		});
+		await raceWithAbortSignal(
+			runner.emit({
+				type: "after_provider_response",
+				status: response.status,
+				headers: response.headers,
+			}),
+			shutdownSignal,
+		);
 	};
 	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
 		data,
@@ -470,7 +476,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		transformContext: async (messages, signal) => {
 			const selected = pairedContext?.select(messages, signal) ?? messages;
 			const runner = extensionRunnerRef.current;
-			const transformed = runner ? await runner.emitContext(selected) : selected;
+			const transformed = runner
+				? await raceWithAbortSignal(runner.emitContext(selected), shutdownSignal)
+				: selected;
 			pairedContext?.transformed(transformed, signal);
 			return transformed;
 		},
@@ -512,6 +520,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 	owner?.assertActive();
 	const session = new AgentSession(owner ? bindOrdinaryOptions(sessionConfig, owner) : sessionConfig);
+	shutdownSignal = session.shutdownSignal;
 	owner?.bindSession(session);
 	owner?.installProviderGuard(session);
 	if (owner) pairedContext = bindOrdinaryPairedContext(owner, session, convertToLlmWithBlockImages);

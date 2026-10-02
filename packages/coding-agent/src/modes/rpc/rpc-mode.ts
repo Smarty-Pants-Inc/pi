@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import type { AgentSession } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -25,6 +26,7 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
@@ -51,6 +53,7 @@ const MAX_BUFFERED_STARTUP_BYTES = MAX_STARTUP_INPUT_BYTES - MAX_STARTUP_UI_RESP
 // Keep branch pages well below the gateway's 64 MiB JSONL record limit.
 const BRANCH_PAGE_SERIALIZED_RESPONSE_TARGET_BYTES = 32 * 1024 * 1024;
 const MAX_ISSUED_BRANCH_PAGE_LEAVES = 32;
+const TERMINAL_COMMAND_JOIN_MS = 1000;
 
 // Brent's algorithm detects parent cycles across page boundaries with constant state.
 type BranchPageTraversalState = {
@@ -110,6 +113,14 @@ export async function runRpcMode(
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
+	const transportCancellation = new AbortController();
+	const waitForOutputBackpressure = async (): Promise<void> => {
+		try {
+			await raceWithAbortSignal(waitForRawStdoutBackpressure(), transportCancellation.signal);
+		} catch (cause) {
+			if (!transportCancellation.signal.aborted || cause !== transportCancellation.signal.reason) throw cause;
+		}
+	};
 
 	const pendingOutputWrites: Array<() => void> = [];
 	let outputFlushScheduled = false;
@@ -500,7 +511,7 @@ export async function runRpcMode(
 			return;
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
-			await waitForRawStdoutBackpressure();
+			await waitForOutputBackpressure();
 		});
 	};
 
@@ -513,7 +524,7 @@ export async function runRpcMode(
 		for (const signal of signals) {
 			const handler = () => {
 				killTrackedDetachedChildren();
-				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
+				void shutdown(signal === "SIGHUP" ? 129 : 143);
 			};
 			process.on(signal, handler);
 			signalCleanupHandlers.push(() => process.off(signal, handler));
@@ -521,8 +532,19 @@ export async function runRpcMode(
 	};
 
 	// Handle a single command
-	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
+	const handleCommand = async (
+		command: RpcCommand,
+		session: AgentSession,
+		respond: (response: RpcResponse) => void,
+	): Promise<RpcResponse | undefined> => {
 		const id = command.id;
+		const assertCommandSession = () => {
+			transportCancellation.signal.throwIfAborted();
+			if (runtimeHost.session !== session) {
+				throw new DOMException("Operation cancelled after session replacement", "AbortError");
+			}
+		};
+		assertCommandSession();
 
 		switch (command.type) {
 			// =================================================================
@@ -532,27 +554,14 @@ export async function runRpcMode(
 			case "prompt": {
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
-				let preflightSucceeded = false;
-				void session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						source: "rpc",
-						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								preflightSucceeded = true;
-								output(success(id, "prompt"));
-							}
-						},
-					})
-					.catch((e: unknown) => {
-						if (!preflightSucceeded) {
-							output(error(id, "prompt", e instanceof Error ? e.message : String(e)));
-						}
-					})
-					.finally(() => {
-						void checkShutdownRequested();
-					});
+				await session.prompt(command.message, {
+					images: command.images,
+					streamingBehavior: command.streamingBehavior,
+					source: "rpc",
+					preflightResult: (didSucceed) => {
+						if (didSucceed && !transportCancellation.signal.aborted) respond(success(id, "prompt"));
+					},
+				});
 				return undefined;
 			}
 
@@ -710,6 +719,7 @@ export async function runRpcMode(
 					cwd: session.sessionManager.getCwd(),
 				});
 
+				assertCommandSession();
 				if (eventResult?.result) {
 					session.recordBashResult(command.command, eventResult.result, {
 						excludeFromContext: command.excludeFromContext,
@@ -721,6 +731,7 @@ export async function runRpcMode(
 					excludeFromContext: command.excludeFromContext,
 					id,
 					operations: eventResult?.operations,
+					beforeRecord: assertCommandSession,
 				});
 				return success(id, "bash", result);
 			}
@@ -1027,12 +1038,15 @@ export async function runRpcMode(
 	// commands wait for the initial bind, while UI responses resolve immediately.
 	let extensionBindingsComplete = false;
 	let drainingStartupCommands = false;
-	let startupDrainComplete = false;
+	let startupBinding: Promise<void> | undefined;
 	let startupFatal = false;
 	let startupInputCount = 0;
 	let startupInputBytes = 0;
 	let startupCommands: RpcCommand[] = [];
 	const pendingCommandWork = new Set<Promise<void>>();
+	// Keep actual work and its originating owner, not just the cancellable disposition wait.
+	const pendingOperations = new Map<Promise<RpcResponse | undefined>, AgentSession>();
+	const pendingPromptWork = new Map<Promise<void>, AgentSession>();
 
 	const cancelPendingExtensionRequests = () => {
 		for (const pending of [...pendingExtensionRequests.values()]) {
@@ -1051,17 +1065,45 @@ export async function runRpcMode(
 			fatal: true,
 			error: "RPC startup command queue limit exceeded",
 		} satisfies RpcFatalErrorResponse);
-		startupCommands = [];
-		startupInputCount = 0;
-		startupInputBytes = 0;
-		detachInput();
-		process.stdin.pause();
-		cancelPendingExtensionRequests();
+		void shutdown(1);
 	};
 
-	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+	function shutdown(exitCode = 0): Promise<never> {
 		if (shutdownPromise) return shutdownPromise;
 		shutdownPromise = (async (): Promise<never> => {
+			// Cancel before joining commands or the run; retain subscriptions for final events.
+			for (const owner of new Set([session, ...pendingOperations.values()])) {
+				owner.cancelForShutdown();
+			}
+			transportCancellation.abort(session.shutdownSignal.reason);
+			detachInput();
+			process.stdin.pause();
+			cancelPendingExtensionRequests();
+			for (const command of startupCommands.splice(0)) {
+				output(error(command?.id, command?.type ?? "parse", "Operation cancelled for terminal shutdown"));
+			}
+			try {
+				await startupBinding;
+			} catch (cause) {
+				if (cause !== session.shutdownSignal.reason) {
+					console.error("RPC startup failed:", cause);
+					exitCode = 1;
+				}
+			}
+			await session.abort();
+			const commandDeadline = AbortSignal.timeout(TERMINAL_COMMAND_JOIN_MS);
+			try {
+				await raceWithAbortSignal(
+					Promise.allSettled([...pendingCommandWork, ...pendingOperations.keys()]),
+					commandDeadline,
+				);
+			} catch (cause) {
+				if (cause !== commandDeadline.reason) throw cause;
+				console.error(
+					`RPC command shutdown incomplete: ${pendingOperations.size} operation(s) exceeded ${TERMINAL_COMMAND_JOIN_MS} ms`,
+				);
+				if (exitCode === 0) exitCode = 1;
+			}
 			for (const cleanup of signalCleanupHandlers) {
 				cleanup();
 			}
@@ -1071,8 +1113,15 @@ export async function runRpcMode(
 			await runtimeHost.dispose();
 			detachInput();
 			process.stdin.pause();
-			if (signal !== "SIGTERM") {
-				await flushRawStdout();
+			// Journal persistence above is independent of delivery to a stalled reader.
+			// Final drainage has its own budget, not the already-aborted terminal signal.
+			const drainage = AbortSignal.timeout(1000);
+			try {
+				await raceWithAbortSignal(flushRawStdout(), drainage);
+			} catch (cause) {
+				if (cause !== drainage.reason) throw cause;
+				console.error("RPC output delivery incomplete: terminal drainage exceeded 1000 ms");
+				if (exitCode === 0) exitCode = 1;
 			}
 			return process.exit(exitCode);
 		})();
@@ -1080,37 +1129,55 @@ export async function runRpcMode(
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested || !session.isIdle) return;
+		// An extension command can request quit before its preflight response.
+		// Internal quit waits for current-session dispositions, not abandoned retired commands.
+		// EOF and signals cancel all transport-owned waits immediately.
+		if (!shutdownRequested || !session.isIdle || [...pendingPromptWork.values()].includes(session)) return;
 		await shutdown();
 	}
 
-	const handleCommandInput = async (command: RpcCommand): Promise<void> => {
+	const handleCommandInput = async (command: RpcCommand, commandSession: AgentSession): Promise<void> => {
+		let dispositionSent = false;
+		const respond = (response: RpcResponse) => {
+			if (dispositionSent) return;
+			dispositionSent = true;
+			output(response);
+		};
+		// Register the owner before dispatch can yield or invoke extension code.
+		const operation = Promise.resolve().then(() => {
+			transportCancellation.signal.throwIfAborted();
+			return handleCommand(command, commandSession, respond);
+		});
+		pendingOperations.set(operation, commandSession);
+		const finished = () => pendingOperations.delete(operation);
+		void operation.then(finished, finished);
 		try {
-			const response = await handleCommand(command);
-			if (response) {
-				output(response);
-				await waitForRawStdoutBackpressure();
-			}
-			await checkShutdownRequested();
+			const response = await raceWithAbortSignal(operation, transportCancellation.signal);
+			transportCancellation.signal.throwIfAborted();
+			if (response) respond(response);
 		} catch (commandError: unknown) {
-			output(
+			respond(
 				error(
 					command.id,
 					command.type,
 					commandError instanceof Error ? commandError.message : String(commandError),
 				),
 			);
-			await waitForRawStdoutBackpressure();
 		}
+		await waitForOutputBackpressure();
 	};
 
 	const trackCommandInput = (command: RpcCommand): Promise<void> => {
-		const work = handleCommandInput(command);
+		const commandSession = session;
+		const work = handleCommandInput(command, commandSession);
 		pendingCommandWork.add(work);
-		void work.then(
-			() => pendingCommandWork.delete(work),
-			() => pendingCommandWork.delete(work),
-		);
+		if (command.type === "prompt") pendingPromptWork.set(work, commandSession);
+		const finished = () => {
+			pendingCommandWork.delete(work);
+			pendingPromptWork.delete(work);
+			void checkShutdownRequested();
+		};
+		void work.then(finished, finished);
 		return work;
 	};
 
@@ -1121,7 +1188,7 @@ export async function runRpcMode(
 	};
 
 	const handleInputLine = async (line: string, rawFramedByteLength?: number) => {
-		if (startupFatal) return;
+		if (startupFatal || shutdownPromise) return;
 
 		const isStartupInput = !extensionBindingsComplete || drainingStartupCommands;
 		let inputBytes = 0;
@@ -1158,7 +1225,7 @@ export async function runRpcMode(
 					`Failed to parse command: ${parseError instanceof Error ? parseError.message : String(parseError)}`,
 				),
 			);
-			await waitForRawStdoutBackpressure();
+			await waitForOutputBackpressure();
 			return;
 		}
 
@@ -1204,9 +1271,7 @@ export async function runRpcMode(
 	const onInputEnd = () => {
 		inputEnded = true;
 		cancelPendingExtensionRequests();
-		if (startupDrainComplete) {
-			void waitForPendingCommandWork().then(() => shutdown());
-		}
+		void shutdown(startupFatal ? 1 : 0);
 	};
 
 	detachInput = (() => {
@@ -1231,17 +1296,24 @@ export async function runRpcMode(
 	})();
 
 	registerSignalHandlers();
-	await rebindSession();
+	// Publish the join before hooks can synchronously close input or overflow it.
+	startupBinding = Promise.resolve().then(rebindSession);
+	try {
+		await startupBinding;
+	} catch (cause) {
+		if (!shutdownPromise) throw cause;
+	}
+	if (shutdownPromise) return shutdownPromise;
 	if (startupFatal) return shutdown(1);
 
 	extensionBindingsComplete = true;
 	drainingStartupCommands = true;
-	while (!startupFatal) {
-		while (!startupFatal && startupCommands.length > 0) {
+	while (!startupFatal && !shutdownPromise) {
+		while (!startupFatal && !shutdownPromise && startupCommands.length > 0) {
 			const commands = startupCommands;
 			startupCommands = [];
 			for (const command of commands) {
-				if (startupFatal) break;
+				if (startupFatal || shutdownPromise) break;
 				trackCommandInput(command);
 			}
 			await Promise.resolve();
@@ -1251,7 +1323,6 @@ export async function runRpcMode(
 	}
 	if (startupFatal) return shutdown(1);
 	drainingStartupCommands = false;
-	startupDrainComplete = true;
 	startupInputCount = 0;
 	startupInputBytes = 0;
 	if (inputEnded) {

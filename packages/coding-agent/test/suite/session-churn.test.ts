@@ -418,7 +418,9 @@ describe("session boundary allocation churn", () => {
 		expect(observations[0].contextEntries.at(-1)?.sourceEntry.id).toBe(entryId);
 		expect(observations[0].pendingMessages).toEqual(pending);
 		expect(observations[0].canContinue).toBe(true);
-		expect(result.context).toBe(observations[0]);
+		// smarty-dev#3048 / PR #116 R2-S3: accepted previews must detach handler-owned aliases.
+		expect(result.context).toEqual(observations[0]);
+		expect(result.context).not.toBe(observations[0]);
 		expect(build).toHaveBeenCalledTimes(pausedBuild + 1);
 	});
 
@@ -434,7 +436,7 @@ describe("session boundary allocation churn", () => {
 						pi.on("agent_before_settle", () => ({ entries: malformed as unknown as SessionBoundaryDraft[] }));
 						pi.on("agent_before_settle", (event) => {
 							repaired = true;
-							expect(event.entries).toBe(malformed);
+							expect(event.entries).toEqual(malformed);
 							return { entries: [] };
 						});
 					},
