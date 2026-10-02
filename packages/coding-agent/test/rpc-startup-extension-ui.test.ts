@@ -740,7 +740,8 @@ describe("RPC startup extension UI", () => {
 		}
 	});
 
-	it("waits for a command scheduled after startup drain before EOF shutdown", async () => {
+	// smarty-dev#3048 / PR #116 R3-1: EOF refuses late commands but still joins their underlying work.
+	it("cancels and joins a command scheduled after startup drain before EOF shutdown", async () => {
 		const listenerSnapshot = takeListenerSnapshot();
 		let sessionStartComplete = false;
 		let startupInputSent = false;
@@ -751,7 +752,7 @@ describe("RPC startup extension UI", () => {
 		const dispose = vi.fn(async () => {
 			shutdownAfterLateResponse = rpcIo.outputLines.some((line) => {
 				const record = JSON.parse(line) as Record<string, unknown>;
-				return record.type === "response" && record.id === "late-bash" && record.success === true;
+				return record.type === "response" && record.id === "late-bash" && record.success === false;
 			});
 		});
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
@@ -801,13 +802,6 @@ describe("RPC startup extension UI", () => {
 					throw new Error("Expected an attached input handler for the late startup command");
 				}
 				lineHandler(JSON.stringify({ id: "late-bash", type: "bash", command: "late" }));
-				const onInputEnd = (process.stdin.listeners("end") as NodeListener[]).find(
-					(listener) => !listenerSnapshot.stdinEnd.includes(listener),
-				);
-				if (!onInputEnd) {
-					throw new Error("Expected RPC mode to listen for stdin EOF");
-				}
-				onInputEnd.call(process.stdin);
 			});
 		};
 
@@ -831,6 +825,20 @@ describe("RPC startup extension UI", () => {
 				expect(lateCommandSent).toBe(true);
 				expect(executeBash).toHaveBeenCalledTimes(2);
 			});
+			const onInputEnd = (process.stdin.listeners("end") as NodeListener[]).find(
+				(listener) => !listenerSnapshot.stdinEnd.includes(listener),
+			);
+			if (!onInputEnd) throw new Error("Expected RPC mode to listen for stdin EOF");
+			onInputEnd.call(process.stdin);
+			await vi.waitFor(() => {
+				const responses = rpcIo.outputLines
+					.map((line) => JSON.parse(line) as Record<string, unknown>)
+					.filter((record) => record.id === "late-bash");
+				expect(responses).toEqual([
+					expect.objectContaining({ success: false, error: expect.stringMatching(/cancel/i) }),
+				]);
+			});
+			expect(harness.session.shutdownSignal.aborted).toBe(true);
 			expect(dispose).not.toHaveBeenCalled();
 
 			resolveLateBash({ output: "", exitCode: undefined, cancelled: true, truncated: false });

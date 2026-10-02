@@ -4639,7 +4639,13 @@ export class AgentSession {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+		options?: {
+			excludeFromContext?: boolean;
+			id?: string;
+			operations?: BashOperations;
+			/** @internal Revalidate the host command lifetime before persisting an async result. */
+			beforeRecord?: () => void;
+		},
 	): Promise<BashResult> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
 		const abortController = new AbortController();
@@ -4664,6 +4670,7 @@ export class AgentSession {
 				},
 			);
 
+			options?.beforeRecord?.();
 			this.recordBashResult(command, result, options);
 			return result;
 		} finally {

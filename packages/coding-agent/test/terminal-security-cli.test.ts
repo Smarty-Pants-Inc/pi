@@ -59,6 +59,8 @@ await auth.modify(faux.getModel().provider, async () => ({ type: "api_key", key:
 const modelRuntime = await ModelRuntime.create({ credentials: auth, modelsPath: null, allowModelNetwork: false });
 modelRuntime.registerProvider(faux.getModel().provider, { baseUrl: faux.getModel().baseUrl, api: faux.api, apiKey: "offline-faux-test-only", models: faux.models });
 let release, captured;
+const otherModel = { ...faux.models[0], id: "other", name: "other" };
+if (scenario.startsWith("retired-model")) modelRuntime.registerProvider(faux.getModel().provider, { baseUrl: faux.getModel().baseUrl, api: faux.api, apiKey: "offline-faux-test-only", models: [...faux.models, otherModel] });
 let replacementRan = false;
 let generation = 0;
 const extensionFactory = pi => {
@@ -73,8 +75,26 @@ const extensionFactory = pi => {
     ctx.ui.notify("held"); await new Promise(resolve => setTimeout(resolve, 60000));
   });
   pi.registerCommand("quit", { handler: async (_args, ctx) => { ctx.shutdown(); } });
+  pi.registerCommand("release-bash", { handler: async () => { release(); } });
   pi.registerCommand("hold-command", { handler: async (_args, ctx) => { mark("held"); ctx.ui.notify("held"); await new Promise(resolve => setTimeout(resolve, 60000)); mark("late-command"); } });
   pi.registerTool({ name: "probe", label: "probe", description: "offline probe", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [{ type: "text", text: "tool answer" }], details: { nested: { text: "original" } } }) });
+  pi.on("user_bash", async (_event, ctx) => {
+    if (!scenario.startsWith("retired-bash")) return;
+    if (scenario.endsWith("exec-ignore")) return { operations: { exec: async (_command, _cwd, options) => {
+      options.signal.addEventListener("abort", () => mark("operation-cancelled"), { once: true });
+      mark("held"); await new Promise(resolve => { release = resolve; setTimeout(resolve, 60000); });
+      mark("late-bash-operation"); return { exitCode: 0 };
+    } } };
+    mark("held"); ctx.ui.notify("held");
+    await new Promise(resolve => { release = resolve; setTimeout(resolve, 60000); });
+    mark("late-bash-hook");
+    if (scenario.endsWith("result")) return { result: { output: "late-bash-result", exitCode: 0, cancelled: false, truncated: false } };
+    if (scenario.endsWith("operations")) return { operations: { exec: async () => { mark("late-bash-exec"); return { exitCode: 0 }; } } };
+  });
+  pi.on("model_select", async (_event, ctx) => {
+    if (!scenario.startsWith("retired-model")) return;
+    mark("held"); ctx.ui.notify("held"); await new Promise(resolve => setTimeout(resolve, 60000)); mark("late-model");
+  });
   pi.on("session_before_switch", async () => { if (scenario.startsWith("tui-")) { mark("held"); await new Promise(resolve => setTimeout(resolve, 60000)); } });
   for (const hook of ["agent_end", "tool_execution_end", "turn_end", "agent_before_settle"]) pi.on(hook, async event => {
     if (scenario !== "alias-" + hook) return;
@@ -99,7 +119,15 @@ const extensionFactory = pi => {
     captured.content.push({ type: "text", text: "late appended mutation" });
     captured.extra = { late: true }; mark("late-mutation");
   });
-  pi.on("session_shutdown", (_event, ctx) => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    if (_event.reason === "quit" && scenario.startsWith("retired-")) {
+      mark("cleanup-start");
+      const originBefore = JSON.stringify(initialSession.sessionManager.getEntries());
+      const receivingBefore = JSON.stringify(ctx.sessionManager.getEntries());
+      if (scenario.includes("terminal-late")) release();
+      await new Promise(resolve => setTimeout(resolve, 200)); mark("async-cleanup-done");
+      writeFileSync(join(dir, "bash-owner-proof.json"), JSON.stringify({ originStable: originBefore === JSON.stringify(initialSession.sessionManager.getEntries()), receivingStable: receivingBefore === JSON.stringify(ctx.sessionManager.getEntries()) }));
+    }
     writeFileSync(join(dir, "journal-path"), ctx.sessionManager.getSessionFile()); mark("cleanup-done");
     if (_event.reason === "quit") mark("cleanup-quit-" + generation);
     if (scenario === "tui-replace" || scenario === "tui-builtin") { mark("cleanup-start"); return new Promise(resolve => setTimeout(() => { mark("async-cleanup-done"); resolve(); }, 200)); }
@@ -111,6 +139,12 @@ const factory = async ({ cwd, sessionManager, sessionStartEvent }) => {
   return { ...await createAgentSessionFromServices({ services, sessionManager, sessionStartEvent, model: faux.getModel(), noTools: "builtin", tools: scenario === "alias-tool_execution_end" ? ["probe"] : [] }), services, diagnostics: services.diagnostics };
 };
 const host = await createAgentSessionRuntime(factory, { cwd: dir, agentDir: join(dir, "agent"), sessionManager: SessionManager.create(dir, dir) });
+const initialSession = host.session;
+if (scenario.startsWith("retired-")) initialSession.shutdownSignal.addEventListener("abort", () => mark("owner-a-terminal-cancelled"), { once: true });
+if (scenario === "retired-export") host.session.exportToHtml = async () => {
+  host.session.shutdownSignal.addEventListener("abort", () => mark("operation-cancelled"), { once: true });
+  mark("held"); await new Promise(resolve => setTimeout(resolve, 60000)); mark("late-export"); return "late-export.html";
+};
 if (scenario === "pressure-command") { host.session.sessionManager.appendMessage(fauxAssistantMessage("offline seed")); host.session.refreshContext(); }
 if (scenario.startsWith("tui-")) await new InteractiveMode(host).run();
 else if (scenario === "print-pressure") { const code = await runPrintMode(host, { mode: "json", initialMessage: "offline prompt" }); process.exit(code); }
@@ -260,6 +294,29 @@ describe.skipIf(!existsSync(cli))("terminal security process regressions", () =>
 					writeFileSync(join(evidence, `security-${label}.jsonl`), stdout);
 					writeFileSync(join(evidence, `security-${label}.stderr.log`), stderr);
 					writeFileSync(join(evidence, `security-${label}.exit.json`), JSON.stringify(result));
+					const markers = [
+						"held",
+						"owner-a-terminal-cancelled",
+						"operation-cancelled",
+						"cleanup-start",
+						"cleanup-done",
+						"async-cleanup-done",
+						"cleanup-quit-2",
+						"late-bash-hook",
+						"late-bash-exec",
+						"late-bash-operation",
+						"late-export",
+						"late-model",
+					];
+					writeFileSync(
+						join(evidence, `security-${label}.proof.json`),
+						JSON.stringify(Object.fromEntries(markers.map((name) => [name, existsSync(join(dir, name))]))),
+					);
+					if (existsSync(join(dir, "bash-owner-proof.json")))
+						writeFileSync(
+							join(evidence, `security-${label}.owners.json`),
+							readFileSync(join(dir, "bash-owner-proof.json")),
+						);
 					const journalPath = join(dir, "journal-path");
 					if (existsSync(journalPath)) {
 						const journal = readFileSync(journalPath, "utf8");
@@ -326,6 +383,136 @@ describe.skipIf(!existsSync(cli))("terminal security process regressions", () =>
 			expect(existsSync(join(p.dir, "late-command"))).toBe(false);
 		},
 	);
+	// smarty-dev#3048 / PR #116 R3-1 and R3-S1: shared transport lifetime, not prompt-only cancellation.
+	it.each(
+		["bash-pass", "bash-result", "bash-operations", "bash-exec-ignore", "model-set", "model-cycle", "export"].flatMap(
+			(kind) => (["EOF", "SIGTERM", "SIGHUP", "quit"] as const).map((ending) => ({ kind, ending })),
+		),
+	)("R3-1 / R3-S1: retired non-prompt $kind cancels and joins under $ending", async ({ kind, ending }) => {
+		const p = await launch(`retired-${kind}`, true);
+		await p.wait((record) => record.message === "ready");
+		const type = kind.startsWith("bash")
+			? "bash"
+			: kind === "model-set"
+				? "set_model"
+				: kind === "model-cycle"
+					? "cycle_model"
+					: "export_html";
+		p.send({
+			id: "held-a",
+			type,
+			...(type === "bash"
+				? { command: `printf executed > ${shellQuote(join(p.dir, "late-bash-exec"))}` }
+				: type === "set_model"
+					? { provider: "faux", modelId: "other" }
+					: {}),
+		});
+		await p.mark("held");
+		p.send({ id: "replace-b", type: "new_session" });
+		expect(await p.wait((record) => record.id === "replace-b")).toMatchObject({
+			success: true,
+			data: { cancelled: false },
+		});
+		p.send({ id: "seed-b", type: "prompt", message: "offline seed" });
+		await p.wait((record) => record.type === "agent_settled");
+		if (ending === "EOF") p.child.stdin.end();
+		else if (ending === "quit") p.send({ id: "quit-b", type: "prompt", message: "/quit" });
+		else p.child.kill(ending);
+		expect(await p.exit()).toEqual({
+			code:
+				ending === "EOF" || ending === "quit"
+					? kind === "export" || kind === "bash-exec-ignore"
+						? 1
+						: 0
+					: ending === "SIGTERM"
+						? 143
+						: 129,
+			signal: null,
+		});
+		expect(p.records.filter((record) => record.id === "held-a")).toEqual([
+			expect.objectContaining({ command: type, success: false, error: expect.stringMatching(/cancel/i) }),
+		]);
+		if (ending === "quit")
+			expect(p.records.filter((record) => record.id === "quit-b")).toEqual([
+				expect.objectContaining({ success: true }),
+			]);
+		expect(existsSync(join(p.dir, "cleanup-quit-2"))).toBe(true);
+		expect(existsSync(join(p.dir, "async-cleanup-done"))).toBe(true);
+		for (const mark of ["late-bash-hook", "late-bash-exec", "late-model", "late-export"])
+			expect(existsSync(join(p.dir, mark)), mark).toBe(false);
+		const journal = readFileSync(readFileSync(join(p.dir, "journal-path"), "utf8"), "utf8");
+		expect(journal).not.toContain("bashExecution");
+		expect(existsSync(join(p.dir, "owner-a-terminal-cancelled"))).toBe(true);
+		if (kind === "export" || kind === "bash-exec-ignore") {
+			expect(existsSync(join(p.dir, "operation-cancelled"))).toBe(true);
+			expect(p.stderr()).toContain("RPC command shutdown incomplete");
+		} else expect(p.stderr()).not.toContain("shutdown incomplete");
+	});
+	// smarty-dev#3048 / PR #116 R3-S1: a resumed retired hook must not execute or persist into B.
+	it.each(["pass", "result", "operations", "exec-ignore"])(
+		"R3-S1: released retired bash %s cannot retarget B",
+		async (kind) => {
+			const p = await launch(`retired-bash-${kind}`, true);
+			await p.wait((record) => record.message === "ready");
+			p.send({
+				id: "held-a",
+				type: "bash",
+				command: `printf executed > ${shellQuote(join(p.dir, "late-bash-exec"))}`,
+			});
+			await p.mark("held");
+			p.send({ id: "replace-b", type: "new_session" });
+			expect(await p.wait((record) => record.id === "replace-b")).toMatchObject({ success: true });
+			p.send({ id: "release-b", type: "prompt", message: "/release-bash" });
+			expect(await p.wait((record) => record.id === "held-a")).toMatchObject({
+				success: false,
+				error: expect.stringMatching(/cancel.*replacement/i),
+			});
+			p.send({ id: "entries-b", type: "get_entries" });
+			const entries = await p.wait((record) => record.id === "entries-b");
+			expect(JSON.stringify(entries)).not.toContain("bashExecution");
+			expect(existsSync(join(p.dir, kind === "exec-ignore" ? "late-bash-operation" : "late-bash-hook"))).toBe(true);
+			expect(existsSync(join(p.dir, "late-bash-exec"))).toBe(false);
+			p.child.stdin.end();
+			expect(await p.exit()).toEqual({ code: 0, signal: null });
+			expect(p.records.filter((record) => record.id === "held-a")).toHaveLength(1);
+			expect(existsSync(join(p.dir, "cleanup-quit-2"))).toBe(true);
+		},
+	);
+	// smarty-dev#3048 / PR #116 R3-S1: abandoned hooks/operations actually resume during B's cleanup.
+	it.each(
+		["pass", "result", "operations", "exec-ignore"].flatMap((kind) =>
+			(["EOF", "SIGTERM", "SIGHUP", "quit"] as const).map((ending) => ({ kind, ending })),
+		),
+	)("R3-S1: terminal-late bash $kind cannot persist during B cleanup under $ending", async ({ kind, ending }) => {
+		const p = await launch(`retired-bash-terminal-late-${kind}`, true);
+		await p.wait((record) => record.message === "ready");
+		p.send({ id: "held-a", type: "bash", command: `printf executed > ${shellQuote(join(p.dir, "late-bash-exec"))}` });
+		await p.mark("held");
+		p.send({ id: "replace-b", type: "new_session" });
+		expect(await p.wait((record) => record.id === "replace-b")).toMatchObject({ success: true });
+		p.send({ id: "seed-b", type: "prompt", message: "offline seed" });
+		await p.wait((record) => record.type === "agent_settled");
+		if (ending === "EOF") p.child.stdin.end();
+		else if (ending === "quit") p.send({ id: "quit-b", type: "prompt", message: "/quit" });
+		else p.child.kill(ending);
+		expect(await p.exit()).toEqual({
+			code:
+				ending === "EOF" || ending === "quit" ? (kind === "exec-ignore" ? 1 : 0) : ending === "SIGTERM" ? 143 : 129,
+			signal: null,
+		});
+		expect(p.records.filter((record) => record.id === "held-a")).toEqual([
+			expect.objectContaining({ success: false, error: expect.stringMatching(/cancel/i) }),
+		]);
+		expect(existsSync(join(p.dir, kind === "exec-ignore" ? "late-bash-operation" : "late-bash-hook"))).toBe(true);
+		expect(existsSync(join(p.dir, "late-bash-exec"))).toBe(false);
+		expect(existsSync(join(p.dir, "cleanup-quit-2"))).toBe(true);
+		expect(existsSync(join(p.dir, "async-cleanup-done"))).toBe(true);
+		expect(JSON.parse(readFileSync(join(p.dir, "bash-owner-proof.json"), "utf8"))).toEqual({
+			originStable: true,
+			receivingStable: true,
+		});
+		if (kind === "exec-ignore") expect(p.stderr()).toContain("RPC command shutdown incomplete");
+	});
 	it("R2-S1 / R2-1: command-owned replacement remains legitimate", async () => {
 		const p = await launch("retired", true);
 		await p.wait((record) => record.message === "ready");
