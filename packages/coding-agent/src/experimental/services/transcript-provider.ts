@@ -1,16 +1,8 @@
-import { type Context, defineFacet, type Facet, type MutableReplicatedState } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import {
-	type AgentLane,
-	type HarnessEvent,
-	type LaneSnapshot,
-	type LaneTranscriptSnapshot,
-	type LaneWatchEvent,
-	reduceLaneSnapshot,
-	type WatchHandle,
-} from "@earendil-works/pi-agent-core";
-import { Transcript, type Transcript as TranscriptService, type TranscriptState } from "./transcript.ts";
+import { type Context, defineFacet, type Facet } from "@earendil-works/chord";
+import type { Conversation } from "@earendil-works/pi-durable";
+import { Transcript } from "./transcript.ts";
 
+<<<<<<< HEAD
 interface TranscriptRuntime {
 	readonly service: TranscriptService;
 	activate(): Promise<void>;
@@ -90,16 +82,20 @@ export function createTranscriptService(
 }
 
 export function createTranscriptServiceFacet(lane: AgentLane): Facet {
+=======
+/** Serve the conversation's durable view state. The facet owns and disposes the attached state. */
+export async function createTranscriptServiceFacet(conversation: Conversation, context: Context): Promise<Facet> {
+	const state = await conversation.viewState(context);
+>>>>>>> upstream-v1.0.1
 	return defineFacet({
 		id: "@pi/transcript",
 		setup(env) {
-			const runtime = createTranscriptService(lane, env.replicatedState);
-			env.provide(Transcript, runtime.service);
-			env.onActivate(() => runtime.activate());
-			env.own(() => runtime.dispose());
+			env.own(() => state.dispose());
+			env.provide(Transcript, { state });
 		},
 	});
 }
+<<<<<<< HEAD
 
 function toLaneWatchEvent(event: HarnessEvent): LaneWatchEvent | undefined {
 	switch (event.type) {
@@ -137,3 +133,5 @@ function withoutUndefined<T>(value: T): T {
 			.map(([key, item]) => [key, withoutUndefined(item)]),
 	) as T;
 }
+=======
+>>>>>>> upstream-v1.0.1

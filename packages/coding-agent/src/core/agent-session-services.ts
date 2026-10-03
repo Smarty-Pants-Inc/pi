@@ -204,7 +204,23 @@ export async function createAgentSessionServices(
 		}
 	}
 	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
+<<<<<<< HEAD
 	if (!owner) await modelRuntime.refresh({ allowNetwork: false });
+=======
+	for (const { definition, extensionPath } of extensionsResult.runtime.pendingVirtualModelRegistrations) {
+		try {
+			modelRuntime.registerVirtualModel(definition);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			diagnostics.push({
+				type: "error",
+				message: `Extension "${extensionPath}" error: ${message}`,
+			});
+		}
+	}
+	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
+	await modelRuntime.refresh({ allowNetwork: false });
+>>>>>>> upstream-v1.0.1
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
 	const services: AgentSessionServices = {

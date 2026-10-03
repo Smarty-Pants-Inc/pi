@@ -1,45 +1,6 @@
-export { uuidv7 } from "@earendil-works/pi-ai";
-export type {
-	AttributeValue,
-	ExactTelemetryAttributes,
-	InferEventAttributes,
-	InferOptionalAttributes,
-	InferRequiredAndOptionalAttributes,
-	InferStartAttributes,
-	RecordedTelemetryEvent,
-	RecordedTelemetrySpan,
-	SchemaTelemetrySpan,
-	SpanAttributes,
-	SpanAttributes as TelemetrySpanAttributes,
-	SpanOptions,
-	SpanStatus,
-	TelemetryAttributeDefinition,
-	TelemetryAttributeMetadata,
-	TelemetryAttributeType,
-	TelemetryContext,
-	TelemetryEventAttributeDefinition,
-	TelemetryEventDefinition,
-	TelemetryParentDefinition,
-	TelemetrySchemaDefinition,
-	TelemetrySchemaSpanEndAttributes,
-	TelemetrySchemaSpanEventAttributes,
-	TelemetrySchemaSpanEventName,
-	TelemetrySchemaSpanName,
-	TelemetrySchemaSpanStartAttributes,
-	TelemetrySchemaSpanUnion,
-	TelemetrySpan,
-	TelemetrySpanDefinition,
-	TelemetryStartAttributeDefinition,
-	TypedSpanStarter,
-} from "@earendil-works/pi-telemetry";
-export {
-	createTypedSpanStarter,
-	defineTelemetrySchema,
-	InMemoryTelemetryContext,
-	NOOP_TELEMETRY_CONTEXT,
-} from "@earendil-works/pi-telemetry";
 export * from "./agent.ts";
 export * from "./agent-loop.ts";
+<<<<<<< HEAD
 export * from "./harness/agent-harness.ts";
 export {
 	type BranchPreparation,
@@ -147,7 +108,8 @@ export {
 export { applyShellOutputUpdate } from "./harness/utils/output-capture.ts";
 export * from "./harness/utils/shell-output.ts";
 export * from "./harness/utils/truncate.ts";
+=======
+>>>>>>> upstream-v1.0.1
 export * from "./proxy.ts";
-export * from "./search/index.ts";
 export { setDefaultStreamFn } from "./stream-fn.ts";
 export * from "./types.ts";

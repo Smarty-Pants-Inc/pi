@@ -107,10 +107,16 @@ describe("Anthropic empty thinking signature compat", () => {
 	// Regression for #9323: Fireworks emits unsigned thinking that must survive replay.
 	it.each([
 		"accounts/fireworks/models/deepseek-v4p1-flash",
+<<<<<<< HEAD
 		"accounts/fireworks/routers/deepseek-flash-latest",
 		"accounts/fireworks/models/qwen3p8-max",
 		"accounts/fireworks/models/qwen3p8-2p4t-a95b",
 		"accounts/fireworks/models/inkling",
+=======
+		"accounts/fireworks/models/qwen3p8-max",
+		"accounts/fireworks/models/qwen3p8-2p4t-a95b",
+		"accounts/fireworks/models/nemotron-3-ultra-nvfp4",
+>>>>>>> upstream-v1.0.1
 	] as const)("preserves unsigned thinking for Fireworks %s", async (modelId) => {
 		const model = getModel("fireworks", modelId);
 		expect(model.compat?.allowEmptySignature).toBe(true);
@@ -129,7 +135,11 @@ describe("Anthropic empty thinking signature compat", () => {
 		const model = getModel("fireworks", "accounts/fireworks/models/deepseek-v4p1-flash");
 		const payload = await capturePayload(
 			model,
+<<<<<<< HEAD
 			makeContext("", "internal reasoning", "fireworks", "accounts/fireworks/models/inkling"),
+=======
+			makeContext("", "internal reasoning", "fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4"),
+>>>>>>> upstream-v1.0.1
 		);
 		expect(payload.messages?.find((message) => message.role === "assistant")?.content).toEqual([
 			{ type: "text", text: "internal reasoning" },

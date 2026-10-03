@@ -1,8 +1,15 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+<<<<<<< HEAD
 import { type Context, createStaticFacetLoader, defineFacet, defineService } from "@earendil-works/chord";
 import { AgentHarness, BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
+=======
+import { createStaticFacetLoader, defineFacet } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+>>>>>>> upstream-v1.0.1
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { consumeInternalProcessRole } from "../../src/experimental/process.ts";
 import { runSessionWorkerWithHarness } from "../../src/experimental/session-worker.ts";
 import { KeyedProbe } from "./keyed-service.ts";
@@ -17,14 +24,16 @@ export const TerminalPublication = defineService<{
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	const role = consumeInternalProcessRole();
 	if (role !== "session-worker") throw new Error("Faux Session worker requires a session-worker invocation");
-	void runSessionWorkerWithHarness(process.argv.slice(2), async (session, options) => {
+	void runSessionWorkerWithHarness(process.argv.slice(2), async (databasePath, options) => {
 		if (options.provider !== "anthropic" || options.model !== "claude-sonnet-4-5") {
 			throw new Error(`Unexpected faux worker model: ${options.provider}/${options.model}`);
 		}
 		const faux = fauxProvider();
-		faux.setResponses([fauxAssistantMessage("deterministic remote answer", { timestamp: 20 })]);
+		const answer = fauxAssistantMessage("deterministic remote answer", { timestamp: 20 });
+		faux.setResponses([answer, answer]);
 		const models = createModels();
 		models.setProvider(faux.provider);
+<<<<<<< HEAD
 		const harness = (
 			await AgentHarness.create(
 				{
@@ -58,6 +67,17 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				});
 			return opened;
 		};
+=======
+		const harness = await Harness.open(
+			await openNodeSqliteStorage(databasePath),
+			{ models, registry: createRegistry() },
+			BACKGROUND_CONTEXT,
+		);
+		const model = faux.getModel();
+		const conversation = await harness.root(BACKGROUND_CONTEXT, {
+			agent: { cwd: options.metadata.cwd, model: { provider: model.provider, modelId: model.id } },
+		});
+>>>>>>> upstream-v1.0.1
 		const keyedProbeFacet = defineFacet({
 			id: "@test/keyed-probe",
 			setup(env) {
@@ -104,7 +124,11 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				env.onActivate(() => spawn("first"));
 			},
 		});
+<<<<<<< HEAD
 		return { harness, lane, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
+=======
+		return { harness, conversation, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
+>>>>>>> upstream-v1.0.1
 	}).catch((error: unknown) => {
 		console.error(error);
 		process.exit(1);

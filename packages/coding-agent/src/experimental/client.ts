@@ -1,9 +1,7 @@
 import { resolve } from "node:path";
-import { BACKGROUND_CONTEXT, type LaneWatchEvent } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ClientCommand } from "../cli/experimental/commands/client.ts";
 import { activateBuiltinClientServices, openClientRuntime } from "./client-runtime.ts";
-import type { AgentOperationResponse } from "./services/agent-controller.ts";
 import type { SessionAddress } from "./services/sessions.ts";
 
 export type ClientResult =
@@ -17,8 +15,6 @@ export type ClientResult =
 export interface RunClientOptions {
 	/** Directory searched when --connect is omitted. Defaults to PI_SERVER_DIR or ~/.pi/server. */
 	readonly directory?: string;
-	/** Receives snapshot-ordered main-lane events while a prompt is active. */
-	readonly onEvent?: (event: LaneWatchEvent) => void | Promise<void>;
 }
 
 /** Discover servers, then list Sessions, attach to one, or create one for a prompt. */
@@ -79,6 +75,7 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 			return { kind: "attached", serverId: match.route.serverId, sessionId };
 		}
 
+<<<<<<< HEAD
 		const agent = match.agent;
 		const completedText = new Map<string, string>();
 		const terminalRunIds = new Set<string>();
@@ -134,22 +131,14 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 			unsubscribeAttachment();
 			await deliveryTail;
 		}
+=======
+		const response = await match.agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
+>>>>>>> upstream-v1.0.1
 		if (!response.accepted) throw new Error(response.error.message);
-		if (response.error !== null) throw new Error(response.error.message);
-		return {
-			kind: "prompted",
-			serverId: match.route.serverId,
-			sessionId,
-			text: completedText.get(response.operationId) ?? "",
-		};
+		const result = await match.agent.waitForPrompt(response.operationId, BACKGROUND_CONTEXT);
+		if (result.status === "unanswered") throw new Error(`Prompt was not answered: ${result.reason}`);
+		return { kind: "prompted", serverId: match.route.serverId, sessionId, text: result.text };
 	} finally {
 		await runtime.dispose();
 	}
-}
-
-function messageText(message: AssistantMessage): string {
-	return message.content
-		.filter((content) => content.type === "text")
-		.map((content) => content.text)
-		.join("");
 }

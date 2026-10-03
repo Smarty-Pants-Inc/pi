@@ -554,6 +554,7 @@ export async function runRpcMode(
 			case "prompt": {
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
+<<<<<<< HEAD
 				await session.prompt(command.message, {
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
@@ -562,17 +563,35 @@ export async function runRpcMode(
 						if (didSucceed && !transportCancellation.signal.aborted) respond(success(id, "prompt"));
 					},
 				});
+=======
+				let preflightSucceeded = false;
+				void session
+					.prompt(command.message, {
+						images: command.images,
+						streamingBehavior: command.streamingBehavior,
+						source: "rpc",
+						preflightResult: (disposition) => {
+							preflightSucceeded = true;
+							output(success(id, "prompt", { disposition }));
+						},
+					})
+					.catch((e) => {
+						if (!preflightSucceeded) {
+							output(error(id, "prompt", e.message));
+						}
+					});
+>>>>>>> upstream-v1.0.1
 				return undefined;
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images, { source: "rpc" });
-				return success(id, "steer");
+				const disposition = await session.steer(command.message, command.images, { source: "rpc" });
+				return success(id, "steer", { disposition });
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images, { source: "rpc" });
-				return success(id, "follow_up");
+				const disposition = await session.followUp(command.message, command.images, { source: "rpc" });
+				return success(id, "follow_up", { disposition });
 			}
 
 			case "abort": {
