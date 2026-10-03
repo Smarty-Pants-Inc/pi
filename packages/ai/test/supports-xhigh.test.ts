@@ -193,15 +193,12 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model!)).toEqual(["low", "high", "max"]);
 	});
 
-<<<<<<< HEAD
 	it("includes only high plus off for OpenCode Go HY4 Preview", () => {
 		const model = getModel("opencode-go", "hy4-preview");
 		expect(model).toBeDefined();
 		expect(getSupportedThinkingLevels(model!)).toEqual(["off", "high"]);
 	});
 
-=======
->>>>>>> upstream-v1.0.1
 	it("excludes thinking off for Moonshot Kimi K2.7 Code models", () => {
 		const cases = [getModel("moonshotai", "kimi-k2.7-code"), getModel("moonshotai-cn", "kimi-k2.7-code")];
 

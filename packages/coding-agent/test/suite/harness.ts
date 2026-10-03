@@ -120,12 +120,9 @@ export interface HarnessOptions {
 	extensionFactories?: Array<InlineExtension | CreateTestExtensionsResultInput>;
 	withConfiguredAuth?: boolean;
 	modelsJson?: Record<string, unknown>;
-<<<<<<< HEAD
 	prepareRequest?: Agent["prepareRequest"];
-=======
 	/** Session to continue, for example to test a resume. Default: a new in-memory session. */
 	sessionManager?: SessionManager;
->>>>>>> upstream-v1.0.1
 }
 
 export interface Harness {
@@ -163,11 +160,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-<<<<<<< HEAD
-	const sessionManager = options.persistSession ? SessionManager.create(tempDir, tempDir) : SessionManager.inMemory();
-=======
-	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
->>>>>>> upstream-v1.0.1
+	const sessionManager =
+		options.sessionManager ?? (options.persistSession ? SessionManager.create(tempDir, tempDir) : SessionManager.inMemory());
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();

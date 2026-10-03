@@ -62,11 +62,7 @@
 		"generate-model-catalog": "node scripts/generate-models.ts --strict --json-only --json-output ../../.artifacts/model-catalog",
 		"check:model-data": "node scripts/check-model-data.ts",
 		"build": "npm run generate-models && npm run build:offline",
-<<<<<<< HEAD
 		"build:offline": "npm run check:model-data && tsgo -p tsconfig.build.json && shx chmod 755 dist/cli.js && shx rm -rf dist/providers/data && shx cp -r src/providers/data dist/providers/data",
-=======
-		"build:offline": "npm run check:model-data && tsc -p tsconfig.build.json && shx rm -rf dist/providers/data && shx cp -r src/providers/data dist/providers/data",
->>>>>>> upstream-v1.0.1
 		"test": "vitest --run",
 		"prepublishOnly": "npm run clean && npm run build"
 	},

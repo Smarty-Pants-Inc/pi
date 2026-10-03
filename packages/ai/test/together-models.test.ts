@@ -21,10 +21,7 @@ afterEach(() => {
 });
 
 describe("Together models", () => {
-<<<<<<< HEAD
 	// Regression for Smarty-Pants-Inc/pi#100: K2.6 was removed from Together's catalog.
-=======
->>>>>>> upstream-v1.0.1
 	it("registers the default Kimi K3 model via OpenAI-compatible Chat Completions API", () => {
 		const model = getModel("together", "moonshotai/Kimi-K3");
 
@@ -70,7 +67,6 @@ describe("Together models", () => {
 			thinkingFormat: "openai",
 		});
 
-<<<<<<< HEAD
 		const minimax = getModel("together", "MiniMaxAI/MiniMax-M2.7");
 		expect(minimax.thinkingLevelMap).toEqual({ off: null, minimal: null, low: null, medium: null });
 		expect(minimax.compat?.thinkingFormat).toBeUndefined();
@@ -118,9 +114,6 @@ describe("Together models", () => {
 			Model<"openai-completions">
 		>;
 		const deepSeekV4 = models[modelId];
-=======
-		const deepSeekV4 = getModel("together", "deepseek-ai/DeepSeek-V4-Pro-0813");
->>>>>>> upstream-v1.0.1
 		expect(deepSeekV4.thinkingLevelMap).toEqual({
 			minimal: null,
 			low: null,
