@@ -9,8 +9,10 @@ export async function readOAuthCredentialResponse(response: Response, operation:
 
 const CREDENTIAL_FIELD =
 	/^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]id|authorization)$/i;
+// Quote delimiters may have any number of JSON-serialization backslashes. If a field's
+// separator/value is missing or a quoted value is unfinished, discard the rest of the fragment.
 const CREDENTIAL_TEXT =
-	/((?:["']?)(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]id|authorization)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|Bearer\s+[^\s"',;}&]+|[^\s,;}&]+)/gi;
+	/((?:\\*["'])?\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]id|authorization)\b(?:\\*["'])?)(?:\s*[:=]\s*(?:\\*"[^"]*(?:"|$)|\\*'[^']*(?:'|$)|Bearer\s+[^\s"',;}&]+|[^\s"',;}&]+|[\s\S]*)|[\s\S]*)/gi;
 
 /** Include the active JWT account claim even when a native error echoes it without a field label. */
 export function getOAuthDiagnosticSecrets(token: string | undefined): string[] {
@@ -56,7 +58,7 @@ export function redactOAuthDiagnostic(text: string, secrets: readonly string[] =
 			// Plain text, partial JSON and native errors still go through field/literal redaction below.
 		}
 	}
-	text = text.replace(CREDENTIAL_TEXT, '$1"[REDACTED]"').replace(/\bBearer\s+[^\s"',;}]+/gi, "Bearer [REDACTED]");
+	text = text.replace(CREDENTIAL_TEXT, '$1: "[REDACTED]"').replace(/\bBearer\s+[^\s"',;}]+/gi, "Bearer [REDACTED]");
 	// SDK error messages can contain JSON whose message is itself serialized credential-bearing JSON.
 	text = text.replace(/"(?:\\.|[^"\\])*"/g, (quoted, offset: number) => {
 		try {
@@ -76,7 +78,7 @@ export function redactOAuthDiagnostic(text: string, secrets: readonly string[] =
 			return quoted;
 		}
 	});
-	return text.replace(CREDENTIAL_TEXT, '$1"[REDACTED]"');
+	return text.replace(CREDENTIAL_TEXT, '$1: "[REDACTED]"');
 }
 
 /** Clone log arguments into safe data; never hand the original Error/cause or custom inspect hooks to console. */
@@ -95,7 +97,7 @@ export function redactOAuthDiagnosticValue(
 			value instanceof Error ? { ...value, name: value.name, message: value.message, stack: value.stack } : value;
 		return Object.fromEntries(
 			Object.entries(entries).map(([key, item]) => [
-				redactOAuthDiagnostic(key, secrets),
+				CREDENTIAL_FIELD.test(key) ? key : redactOAuthDiagnostic(key, secrets),
 				CREDENTIAL_FIELD.test(key)
 					? item === "***"
 						? "***"

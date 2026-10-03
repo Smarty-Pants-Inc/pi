@@ -11,7 +11,7 @@ import type {
 	ModelType,
 	ModelTypeMap,
 } from "../types.ts";
-import { ModelsError } from "./models-error.ts";
+import { ModelsError, SafeSetupError } from "./models-error.ts";
 
 /** The type of a model. Models without `type` are chat models. */
 export function getModelType(model: AnyModel): ModelType {
@@ -25,7 +25,7 @@ export function isModelType<TType extends ModelType>(model: AnyModel, type: TTyp
 
 export function assertChatModel(model: AnyModel): asserts model is Model<Api> {
 	if (!isModelType(model, "chat")) {
-		throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not a chat model`);
+		throw new SafeSetupError("provider", `Model ${model.provider}/${model.id} is not a chat model`);
 	}
 }
 

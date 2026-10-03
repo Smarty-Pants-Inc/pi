@@ -12,6 +12,14 @@ export class ModelsError extends Error {
 	}
 }
 
+/** Package-owned setup diagnostics with no credentials or arbitrary callback text/cause. */
+export class SafeSetupError extends ModelsError {
+	constructor(code: ModelsErrorCode, message: string) {
+		super(code, message);
+		this.name = "SafeSetupError";
+	}
+}
+
 /** Callers surface `error.message` only, so keep the underlying reason in it. */
 function withCauseDetail(message: string, cause: unknown): string {
 	if (cause === undefined || cause === null) return message;

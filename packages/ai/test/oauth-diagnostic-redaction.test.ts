@@ -33,6 +33,32 @@ describe("OAuth diagnostic redaction", () => {
 		}
 	});
 
+	// pi#127 / audit-2b P1-1: delimiter escaping is not limited to one JSON layer.
+	it.each(["refresh_token", "access_token", "id_token", "account_id", "chatgpt_account_id", "Authorization"])(
+		"redacts arbitrary escaped delimiters and malformed fragments for %s",
+		(field) => {
+			const secret = "FAKE_UNKNOWN_FRAGMENT_127";
+			for (let depth = 0; depth < 5; depth++) {
+				for (const quote of ['"', "'"]) {
+					const delimiter = "\\".repeat(depth) + quote;
+					for (const value of [
+						`${delimiter}${secret}${delimiter}, code=server_error`,
+						`${delimiter}${secret} unfinished fragment`,
+					]) {
+						const result = redactOAuthDiagnostic(`503 server_error ${delimiter}${field}${delimiter}: ${value}`);
+						expect(result).not.toContain(secret);
+						expect(result).toContain("503 server_error");
+						if (value.includes("code=")) expect(result).toContain("code=server_error");
+					}
+				}
+			}
+			const result = redactOAuthDiagnostic(`503 server_error ${field} ${secret} unfinished fragment`);
+			expect(result).not.toContain(secret);
+			expect(result).not.toContain("unfinished fragment");
+			expect(result).toContain("503 server_error");
+		},
+	);
+
 	it("redacts unquoted authorization headers without leaving the bearer value", () => {
 		expect(redactOAuthDiagnostic("connection failed Authorization: Bearer FAKE_BEARER_127")).not.toContain(
 			"FAKE_BEARER_127",
