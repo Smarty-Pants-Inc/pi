@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, type ImageContent, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -591,6 +593,240 @@ describe("native input admission v1", () => {
 		expect(h.session.isIdle).toBe(true);
 		expect(h.session.pendingMessageCount).toBe(0);
 		expect(laterHandler).toHaveBeenCalledOnce();
+	});
+
+	// smarty-dev#3814 / PR #117 R5-1/R5-S1: cancelled tree hooks must not regain input authority after failed recoverable disposal.
+	it.each(
+		(["session_before_tree", "session_tree"] as const).flatMap((hook) =>
+			(
+				[
+					"prompt",
+					"steer",
+					"followUp",
+					"sendUserMessage",
+					"custom-append",
+					"custom-nextTurn",
+					"custom-trigger",
+					"extension-user",
+					"extension-custom",
+				] as const
+			).map((entry) => [hook, entry] as const),
+		),
+	)("failed recoverable disposal refuses actual late %s %s", async (hook, entry) => {
+		const entered = gate(),
+			held = gate();
+		let h!: Harness;
+		let lateHandler: Promise<void> | undefined;
+		let lateResult: unknown;
+		const laterHandler = vi.fn();
+		h = await setup([
+			(pi) => {
+				const onTree = () => {
+					lateHandler = (async () => {
+						entered.release();
+						await held.promise;
+						const message = { customType: "late-tree", content: "late custom", display: false };
+						if (entry === "extension-user") pi.sendUserMessage("late native");
+						else if (entry === "extension-custom") pi.sendMessage(message, { triggerTurn: true });
+						else {
+							const submission =
+								entry === "custom-append"
+									? h.session.sendCustomMessage(message)
+									: entry === "custom-nextTurn"
+										? h.session.sendCustomMessage(message, { deliverAs: "nextTurn" })
+										: entry === "custom-trigger"
+											? h.session.sendCustomMessage(message, { triggerTurn: true })
+											: h.session[entry]("late native");
+							lateResult = await submission.then(
+								() => "accepted",
+								(error: unknown) => error,
+							);
+						}
+					})();
+					return lateHandler;
+				};
+				if (hook === "session_before_tree") {
+					pi.on(hook, onTree);
+					pi.on(hook, laterHandler);
+				} else {
+					pi.on(hook, onTree);
+					pi.on(hook, laterHandler);
+				}
+			},
+		]);
+		h.setResponses([
+			fauxAssistantMessage("original reply"),
+			fauxAssistantMessage("fresh reply"),
+			fauxAssistantMessage("steer reply"),
+			fauxAssistantMessage("follow-up reply"),
+		]);
+		const errors: Array<{ event: string; error: string }> = [];
+		h.session.extensionRunner.onError((error) => errors.push(error));
+		const runtime = await runtimeFor(h);
+		await h.session.prompt("original input");
+		const target = h.sessionManager
+			.getEntries()
+			.find((item) => item.type === "message" && item.message.role === "assistant")?.parentId;
+		expect(target).toBeTruthy();
+		const navigation = h.session.navigateTree(target!, { summarize: false });
+		await entered.promise;
+		await h.session.steer("retained steer", [{ type: "image", data: "original-steer", mimeType: "image/png" }]);
+		await h.session.followUp("retained follow-up", [
+			{ type: "image", data: "original-follow-up", mimeType: "image/png" },
+		]);
+		const queues = structuredClone(h.session.agent.getQueuedMessages());
+		expect(queues).toHaveLength(2);
+		const messages = structuredClone(h.session.messages);
+		const history = structuredClone(h.sessionManager.getEntries());
+		const revision = h.sessionManager.revision();
+		const receipt = vi.fn(() => {
+			throw new Error("authoritative receipt failed");
+		});
+		await expect(runtime.dispose({ rejectQueuedInput: receipt })).rejects.toThrow("authoritative receipt failed");
+		expect(await navigation).toMatchObject({ cancelled: hook === "session_before_tree" });
+		expect(receipt).toHaveBeenCalledExactlyOnceWith(queues, h.session);
+		expect(runtime.session).toBe(h.session);
+		expect(runtime.inputsFenced).toBe(false);
+		expect(h.session.isDisposed).toBe(false);
+		expect(h.session.isCompacting).toBe(false);
+		// Release the actual abandoned handler only after cancellation, refusal and reopening.
+		held.release();
+		await lateHandler;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		if (entry === "extension-user" || entry === "extension-custom") {
+			expect(errors).toEqual([
+				expect.objectContaining({
+					event: entry === "extension-user" ? "send_user_message" : "send_message",
+					error: expect.stringContaining("INPUT_ADMISSION_ABORTED"),
+				}),
+			]);
+		} else {
+			expect(lateResult).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+			expect(errors).toEqual([]);
+		}
+		expect(laterHandler).not.toHaveBeenCalled();
+		expect(h.session.inputAdmissionCount).toBe(0);
+		expect(h.session.agent.getQueuedMessages()).toEqual(queues);
+		expect(h.session.messages).toEqual(messages);
+		expect(h.sessionManager.getEntries()).toEqual(history);
+		expect(h.sessionManager.revision()).toBe(revision);
+		expect(h.eventsOfType("agent_start")).toHaveLength(1);
+		expect(h.getPendingResponseCount()).toBe(3);
+		// Genuinely fresh external input still runs after recoverable refusal.
+		await h.session.prompt("unrelated fresh external input");
+		expect(getUserTexts(h)).toContain("unrelated fresh external input");
+		expect(getUserTexts(h)).not.toContain("late native");
+		expect(h.session.messages.some((item) => item.role === "custom" && item.customType === "late-tree")).toBe(false);
+		expect(h.session.isIdle).toBe(true);
+	});
+
+	// smarty-dev#3814 / PR #117 R5-2/R5-S2: cancelled settlement descendants cannot start effectful native entries.
+	it.each(["bash", "compact"] as const)(
+		"failed recoverable disposal refuses actual late settlement %s",
+		async (entry) => {
+			const entered = gate(),
+				held = gate();
+			let h!: Harness;
+			let lateHandler: Promise<void> | undefined;
+			let lateResult: unknown;
+			let settlementStarted = false;
+			h = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("agent_settled", () => {
+							if (settlementStarted) return;
+							settlementStarted = true;
+							lateHandler = (async () => {
+								entered.release();
+								await held.promise;
+								const call =
+									entry === "bash"
+										? h.session.executeBash(`printf late > '${join(h.tempDir, "late-sentinel")}'`)
+										: h.session.compact();
+								lateResult = await call.then(
+									() => "accepted",
+									(error: unknown) => error,
+								);
+							})();
+							return lateHandler;
+						});
+					},
+				],
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+			});
+			harnesses.push(h);
+			h.setResponses([
+				fauxAssistantMessage("original reply"),
+				fauxAssistantMessage("summary A"),
+				fauxAssistantMessage("summary B"),
+			]);
+			const runtime = await runtimeFor(h);
+			const run = h.session.prompt("original input");
+			await entered.promise;
+			await h.session.steer("retained steer", [{ type: "image", data: "original-steer", mimeType: "image/png" }]);
+			await h.session.followUp("retained follow-up");
+			const queues = structuredClone(h.session.agent.getQueuedMessages());
+			const messages = structuredClone(h.session.messages);
+			const history = structuredClone(h.sessionManager.getEntries());
+			const revision = h.sessionManager.revision();
+			await expect(
+				runtime.dispose({
+					rejectQueuedInput: () => {
+						throw new Error("authoritative receipt failed");
+					},
+				}),
+			).rejects.toThrow("authoritative receipt failed");
+			await run;
+			expect(runtime.inputsFenced).toBe(false);
+			expect(h.session.isDisposed).toBe(false);
+			const bashEvents = h.events.length;
+			held.release();
+			await lateHandler;
+			expect(lateResult).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+			expect(existsSync(join(h.tempDir, "late-sentinel"))).toBe(false);
+			expect(h.events.slice(bashEvents)).toEqual([]);
+			expect(h.getPendingResponseCount()).toBe(2);
+			expect(h.session.agent.getQueuedMessages()).toEqual(queues);
+			expect(h.session.messages).toEqual(messages);
+			expect(h.sessionManager.getEntries()).toEqual(history);
+			expect(h.sessionManager.revision()).toBe(revision);
+			// Unrelated fresh SDK calls still work after recoverable refusal.
+			if (entry === "bash") {
+				const sentinel = join(h.tempDir, "fresh-sentinel");
+				expect(await h.session.executeBash(`printf fresh > '${sentinel}'`)).toMatchObject({ exitCode: 0 });
+				expect(existsSync(sentinel)).toBe(true);
+				expect(h.session.messages.at(-1)).toMatchObject({ role: "bashExecution" });
+			} else {
+				await h.session.compact();
+				expect(h.getPendingResponseCount()).toBe(1);
+				expect(h.sessionManager.getEntries().at(-1)).toMatchObject({ type: "compaction" });
+			}
+		},
+	);
+
+	// smarty-dev#3814: compact() aborting the caller's own held input admission is not revocation.
+	it("an input handler can still compact through ctx.compact()", async () => {
+		let completion!: Promise<unknown>;
+		const h = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event, ctx) => {
+						if (event.text !== "compact-now") return;
+						completion = new Promise((resolve) => {
+							ctx.compact({ onComplete: resolve, onError: resolve });
+						});
+						return { action: "handled" };
+					});
+				},
+			],
+			settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+		});
+		harnesses.push(h);
+		h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("input summary")]);
+		await h.session.prompt("original input");
+		await h.session.prompt("compact-now").catch(() => undefined);
+		expect(await completion).toMatchObject({ summary: expect.stringContaining("input summary") });
+		expect(h.sessionManager.getEntries().at(-1)).toMatchObject({ type: "compaction" });
 	});
 
 	// smarty-dev#3048 / PR #117 R4-S13: detaching scheduling must preserve usable, uncancelled delivery.

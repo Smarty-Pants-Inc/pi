@@ -2287,6 +2287,18 @@ export class AgentSession {
 		this._assertInputsOpen();
 	}
 
+	/**
+	 * Effectful native entries (bash, compaction, tree, model/loadout/history mutation) refuse cancelled
+	 * dispatch or input descendants, and return the inherited revocation to compose into their own work.
+	 */
+	private _inheritedCancellation(): AbortSignal | undefined {
+		const signals = [this._dispatchCancellationScope.getStore(), this._inputAdmissionScope.getStore()?.signal].filter(
+			(signal): signal is AbortSignal => signal !== undefined,
+		);
+		for (const signal of signals) signal.throwIfAborted();
+		return signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+	}
+
 	private async _awaitInput<T>(operation: Promise<T>): Promise<T> {
 		const admission = this._inputAdmissionScope.getStore();
 		const result = await raceWithAbortSignal(
@@ -3309,7 +3321,12 @@ export class AgentSession {
 		this._modelSwitchDispatches.clear();
 	}
 
-	private async _compactForModelSwitch(model: Model<any>, commit: () => void): Promise<void> {
+	private async _compactForModelSwitch(model: Model<any>, guardedCommit: () => void): Promise<void> {
+		this._inheritedCancellation();
+		const commit = () => {
+			this._inheritedCancellation();
+			guardedCommit();
+		};
 		if (this._modelSwitchCompactionPending)
 			throw new Error("Model switch refused: another model switch compaction is in progress.");
 		if (
@@ -3525,6 +3542,7 @@ export class AgentSession {
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		this._inheritedCancellation();
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -3707,16 +3725,31 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		// Refuse a cancelled descendant before it can abort unrelated work or request a summary.
+		const admission = this._inputAdmissionScope.getStore();
+		const ownsHeldAdmission = admission !== undefined && this._inputAdmissions.has(admission);
+		const inherited = this._inheritedCancellation();
 		await this.abort();
+		// ponytail: abort() itself ends a caller's held admission (an extension command calling ctx.compact()).
+		// That is not revocation; such callers keep only the entry check, and later disposal aborts compaction.
+		const revocation = ownsHeldAdmission ? undefined : inherited;
+		revocation?.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
-		return this.#compactSession(customInstructions);
+		return this.#compactSession(customInstructions, undefined, revocation);
 	}
 
 	/** Same session implementation; manual cancellation stays in its entry wrapper. */
-	async #compactSession(customInstructions?: string, attempt?: OriginalCompactionAttempt): Promise<CompactionResult> {
+	async #compactSession(
+		customInstructions?: string,
+		attempt?: OriginalCompactionAttempt,
+		inherited?: AbortSignal,
+	): Promise<CompactionResult> {
 		const controller = new AbortController();
 		this._compactionAbortController = controller;
-		const signal = attempt ? AbortSignal.any([controller.signal, attempt.signal]) : controller.signal;
+		const signals = [controller.signal, attempt?.signal, inherited].filter(
+			(item): item is AbortSignal => item !== undefined,
+		);
+		const signal = signals.length > 1 ? AbortSignal.any(signals) : controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let fromExtension = false;
 		let cancelledByExtension = false;
@@ -4043,7 +4076,10 @@ export class AgentSession {
 	 * Cancel in-progress branch summarization.
 	 */
 	abortBranchSummary(): void {
-		this._branchSummaryAbortController?.abort();
+		// The reason is also the refusal that abandoned tree-hook descendants observe.
+		this._branchSummaryAbortController?.abort(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "tree navigation cancelled"),
+		);
 	}
 
 	/**
@@ -5092,10 +5128,13 @@ export class AgentSession {
 		},
 	): Promise<BashResult> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
+		const inherited = this._inheritedCancellation();
 		this._assertInputsOpen();
 		this._shutdownCancellation.signal.throwIfAborted();
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
+		// Later revocation kills the spawned command; recordBashResult rechecks before history append.
+		const signal = inherited ? AbortSignal.any([abortController.signal, inherited]) : abortController.signal;
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -5112,7 +5151,7 @@ export class AgentSession {
 						onChunk?.(delta);
 						this._emit({ type: "bash_execution_update", id: options?.id, delta });
 					},
-					signal: abortController.signal,
+					signal,
 				},
 			);
 
@@ -5129,6 +5168,7 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		this._inheritedCancellation();
 		if (this._inputsDisposed)
 			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash result was not recorded");
 		const bashMessage: BashExecutionMessage = {
@@ -5194,6 +5234,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
+		this._inheritedCancellation();
 		this.sessionManager.appendSessionInfo(name);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
@@ -5220,6 +5261,7 @@ export class AgentSession {
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: tree requires separate receiving");
+		const inherited = this._inheritedCancellation();
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
@@ -5274,7 +5316,13 @@ export class AgentSession {
 		const navigationSignal = AbortSignal.any([
 			this._branchSummaryAbortController.signal,
 			this._shutdownCancellation.signal,
+			...(inherited ? [inherited] : []),
 		]);
+		// A signal in event data is not ancestry: install it so abandoned hook descendants stay revoked.
+		const emitTreeHook = (event: Parameters<ExtensionRunner["emit"]>[0]) =>
+			this._dispatchCancellationScope.run(navigationSignal, () =>
+				this._extensionRunner.emit(event, navigationSignal),
+			);
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -5282,14 +5330,11 @@ export class AgentSession {
 
 			// Emit session_before_tree event
 			if (this._extensionRunner.hasHandlers("session_before_tree")) {
-				const result = (await this._extensionRunner.emit(
-					{
-						type: "session_before_tree",
-						preparation,
-						signal: navigationSignal,
-					},
-					navigationSignal,
-				)) as SessionBeforeTreeResult | undefined;
+				const result = (await emitTreeHook({
+					type: "session_before_tree",
+					preparation,
+					signal: navigationSignal,
+				})) as SessionBeforeTreeResult | undefined;
 
 				if (result?.cancel) {
 					return { cancelled: true };
@@ -5408,16 +5453,13 @@ export class AgentSession {
 
 			// Navigation is already committed. Cancel its observer without claiming rollback.
 			try {
-				await this._extensionRunner.emit(
-					{
-						type: "session_tree",
-						newLeafId: this.sessionManager.getLeafId(),
-						oldLeafId,
-						summaryEntry,
-						fromExtension: summaryText ? fromExtension : undefined,
-					},
-					navigationSignal,
-				);
+				await emitTreeHook({
+					type: "session_tree",
+					newLeafId: this.sessionManager.getLeafId(),
+					oldLeafId,
+					summaryEntry,
+					fromExtension: summaryText ? fromExtension : undefined,
+				});
 			} catch (cause) {
 				if (!navigationSignal.aborted || cause !== navigationSignal.reason) throw cause;
 			}
