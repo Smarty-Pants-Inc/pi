@@ -471,6 +471,204 @@ describe("native input admission v1", () => {
 		expect(h.session.getSteeringMessages()).toEqual(["not receipted"]);
 	});
 
+	// smarty-dev#3048 / PR #117 R4-S13: reopened admission must not restore a cancelled settlement's authority.
+	it.each([
+		"prompt",
+		"steer",
+		"followUp",
+		"sendUserMessage",
+		"custom-append",
+		"custom-nextTurn",
+		"custom-trigger",
+		"extension-user",
+		"extension-custom",
+	] as const)("failed recoverable disposal refuses actual late settlement %s", async (entry) => {
+		const entered = gate(),
+			held = gate();
+		let h!: Harness;
+		let lateHandler: Promise<void> | undefined;
+		let lateResult: unknown;
+		let settlementStarted = false;
+		const laterHandler = vi.fn();
+		h = await setup([
+			(pi) => {
+				pi.on("agent_settled", () => {
+					if (settlementStarted) return;
+					settlementStarted = true;
+					lateHandler = (async () => {
+						entered.release();
+						await held.promise;
+						const message = { customType: "late-settlement", content: "late custom", display: false };
+						if (entry === "extension-user") pi.sendUserMessage("late native");
+						else if (entry === "extension-custom") pi.sendMessage(message, { triggerTurn: true });
+						else {
+							const submission =
+								entry === "custom-append"
+									? h.session.sendCustomMessage(message)
+									: entry === "custom-nextTurn"
+										? h.session.sendCustomMessage(message, { deliverAs: "nextTurn" })
+										: entry === "custom-trigger"
+											? h.session.sendCustomMessage(message, { triggerTurn: true })
+											: h.session[entry]("late native");
+							lateResult = await submission.then(
+								() => "accepted",
+								(error: unknown) => error,
+							);
+						}
+					})();
+					return lateHandler;
+				});
+				pi.on("agent_settled", laterHandler);
+			},
+		]);
+		h.setResponses([
+			fauxAssistantMessage("original reply"),
+			fauxAssistantMessage("fresh reply"),
+			fauxAssistantMessage("steer reply"),
+			fauxAssistantMessage("follow-up reply"),
+		]);
+		const errors: Array<{ event: string; error: string }> = [];
+		h.session.extensionRunner.onError((error) => errors.push(error));
+		const runtime = await runtimeFor(h);
+		const run = h.session.prompt("original input");
+		await entered.promise;
+		// The original prompt has transferred its admission; only settlement's authority can revoke descendants.
+		expect(h.session.inputAdmissionCount).toBe(0);
+		expect(h.session.isSettling).toBe(true);
+		await h.session.steer("retained steer", [{ type: "image", data: "original-steer", mimeType: "image/png" }]);
+		await h.session.followUp("retained follow-up", [
+			{ type: "image", data: "original-follow-up", mimeType: "image/png" },
+		]);
+		const queues = structuredClone(h.session.agent.getQueuedMessages());
+		const messages = structuredClone(h.session.messages);
+		const history = structuredClone(h.sessionManager.getEntries());
+		const revision = h.sessionManager.revision();
+		const receipt = vi.fn(() => {
+			throw new Error("authoritative receipt failed");
+		});
+		await expect(runtime.dispose({ rejectQueuedInput: receipt })).rejects.toThrow("authoritative receipt failed");
+		await run;
+		expect(receipt).toHaveBeenCalledExactlyOnceWith(queues, h.session);
+		expect(runtime.session).toBe(h.session);
+		expect(runtime.inputsFenced).toBe(false);
+		expect(h.session.isDisposed).toBe(false);
+		expect(h.session.shutdownSignal.aborted).toBe(false);
+		expect(h.session.isSettling).toBe(false);
+		expect(h.session.agent.getQueuedMessages()).toEqual(queues);
+		// Complete the real handler only after cancellation/refusal/reopening, not merely the outer settlement wait.
+		held.release();
+		await lateHandler;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		if (entry === "extension-user" || entry === "extension-custom") {
+			expect(errors).toEqual([
+				expect.objectContaining({
+					event: entry === "extension-user" ? "send_user_message" : "send_message",
+					error: expect.stringContaining("INPUT_ADMISSION_ABORTED"),
+				}),
+			]);
+		} else {
+			expect(lateResult).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+			expect(errors).toEqual([]);
+		}
+		expect(laterHandler).not.toHaveBeenCalled();
+		expect(h.session.inputAdmissionCount).toBe(0);
+		expect(h.session.agent.getQueuedMessages()).toEqual(queues);
+		expect(h.session.getSteeringMessages()).toEqual(["retained steer"]);
+		expect(h.session.getFollowUpMessages()).toEqual(["retained follow-up"]);
+		expect(h.session.pendingMessageCount).toBe(2);
+		expect(h.session.messages).toEqual(messages);
+		expect(h.sessionManager.getEntries()).toEqual(history);
+		expect(h.sessionManager.revision()).toBe(revision);
+		expect(h.eventsOfType("agent_start")).toHaveLength(1);
+		expect(h.getPendingResponseCount()).toBe(3);
+		// A fresh external submission may legitimately run and consume retained queues after reopening.
+		await h.session.prompt("unrelated fresh external input");
+		expect(getUserTexts(h)).toContain("unrelated fresh external input");
+		expect(getUserTexts(h)).not.toContain("late native");
+		expect(
+			h.session.messages.some((message) => message.role === "custom" && message.customType === "late-settlement"),
+		).toBe(false);
+		expect(h.session.isIdle).toBe(true);
+		expect(h.session.pendingMessageCount).toBe(0);
+		expect(laterHandler).toHaveBeenCalledOnce();
+	});
+
+	// smarty-dev#3048 / PR #117 R4-S13: detaching scheduling must preserve usable, uncancelled delivery.
+	it.each(["native", "custom"] as const)(
+		"uncancelled detached settlement %s delivery remains usable",
+		async (entry) => {
+			let scheduled = false;
+			const h = await setup([
+				(pi) => {
+					pi.on("agent_settled", () => {
+						if (scheduled) return;
+						scheduled = true;
+						if (entry === "native") pi.sendUserMessage("uncancelled detached input");
+						else
+							pi.sendMessage(
+								{ customType: "uncancelled-detached", content: "detached custom", display: false },
+								{ triggerTurn: true },
+							);
+					});
+				},
+			]);
+			h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("detached reply")]);
+			const errors = vi.fn();
+			h.session.extensionRunner.onError(errors);
+			await h.session.prompt("original input");
+			expect(h.eventsOfType("agent_start")).toHaveLength(2);
+			expect(h.eventsOfType("agent_settled")).toHaveLength(2);
+			expect(errors).not.toHaveBeenCalled();
+			expect(h.session.isIdle).toBe(true);
+			if (entry === "native") expect(getUserTexts(h)).toEqual(["original input", "uncancelled detached input"]);
+			else
+				expect(h.session.messages).toContainEqual(
+					expect.objectContaining({ role: "custom", customType: "uncancelled-detached" }),
+				);
+		},
+	);
+
+	// smarty-dev#3048 / PR #117 R4-S13: deferred external input keeps its own lineage, not the draining settlement's.
+	it.each(["native", "custom"] as const)(
+		"unrelated external %s delivery waits for uncancelled settlement",
+		async (entry) => {
+			const entered = gate(),
+				held = gate();
+			let first = true;
+			const h = await setup([
+				(pi) => {
+					pi.on("agent_settled", async () => {
+						if (!first) return;
+						first = false;
+						entered.release();
+						await held.promise;
+					});
+				},
+			]);
+			h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("external reply")]);
+			const run = h.session.prompt("original input");
+			await entered.promise;
+			const delivery =
+				entry === "native"
+					? h.session.sendUserMessage("external deferred input")
+					: h.session.sendCustomMessage(
+							{ customType: "external-deferred", content: "external custom", display: false },
+							{ triggerTurn: true },
+						);
+			const result = delivery.then(
+				() => "delivered",
+				(error: unknown) => error,
+			);
+			expect(h.eventsOfType("agent_start")).toHaveLength(1);
+			held.release();
+			await run;
+			expect(await result).toBe("delivered");
+			expect(h.eventsOfType("agent_start")).toHaveLength(2);
+			expect(h.eventsOfType("agent_settled")).toHaveLength(2);
+			expect(h.session.isIdle).toBe(true);
+		},
+	);
+
 	it("only acknowledges a prompt after native dispatch, not after a failed final dispatch check", async () => {
 		const h = await setup();
 		const preflight = vi.fn();

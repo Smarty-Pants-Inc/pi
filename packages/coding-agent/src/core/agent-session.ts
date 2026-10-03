@@ -403,6 +403,8 @@ interface InputFenceScope {
 
 interface InputAdmission {
 	controller: AbortController;
+	/** Own cancellation combined with inherited dispatch revocation. */
+	signal: AbortSignal;
 	fenceScope: InputFenceScope | undefined;
 	release(): void;
 }
@@ -437,6 +439,8 @@ export class AgentSession {
 	readonly capabilities = HOST_CAPABILITIES;
 	private readonly _inputAdmissions = new Set<InputAdmission>();
 	private readonly _inputAdmissionScope = new AsyncLocalStorage<InputAdmission>();
+	/** Cancellation lineage survives handoff and detachment from settlement scheduling. */
+	private readonly _dispatchCancellationScope = new AsyncLocalStorage<AbortSignal | undefined>();
 	private _inputFence: object | undefined;
 	private readonly _inputFenceScope = new AsyncLocalStorage<InputFenceScope | undefined>();
 	private readonly _shutdownCancellation = new AbortController();
@@ -1177,6 +1181,10 @@ export class AgentSession {
 		this._isEmittingAgentSettled = true;
 		const scope = { active: true };
 		const cancellation = this._settlementCancellation;
+		const inheritedCancellation = this._dispatchCancellationScope.getStore();
+		const signal = inheritedCancellation
+			? AbortSignal.any([inheritedCancellation, cancellation.signal])
+			: cancellation.signal;
 		let completed!: () => void;
 		this._settlementCompletion = new Promise<void>((resolve) => {
 			completed = resolve;
@@ -1184,13 +1192,19 @@ export class AgentSession {
 		try {
 			try {
 				await raceWithAbortSignal(
-					this._agentSettledScope.run(scope, () => this._extensionRunner.emit({ type: "agent_settled", outcome })),
-					cancellation.signal,
+					this._dispatchCancellationScope.run(signal, () =>
+						this._agentSettledScope.run(scope, () =>
+							this._extensionRunner.emit({ type: "agent_settled", outcome }, signal),
+						),
+					),
+					signal,
 				);
 			} catch (error) {
-				if (!cancellation.signal.aborted) throw error;
+				if (!signal.aborted) throw error;
 			}
-			this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome }));
+			this._dispatchCancellationScope.run(signal, () =>
+				this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome })),
+			);
 		} finally {
 			// Detached descendants of finished/cancelled handlers cannot own delivery.
 			scope.active = false;
@@ -1933,7 +1947,7 @@ export class AgentSession {
 			// inherit another input's scope, but must leave that held input cancellable.
 			// No yield between ending admission and the original synchronous run entry.
 			if (!continuation) {
-				transferringAdmission?.controller.signal.throwIfAborted();
+				transferringAdmission?.signal.throwIfAborted();
 				transferringAdmission?.release();
 			}
 			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
@@ -2238,12 +2252,14 @@ export class AgentSession {
 	}
 
 	private _admitInput(): InputAdmission {
-		// A handler of cancelled input inherits its admission; it must not acquire a fresh one.
-		this._inputAdmissionScope.getStore()?.controller.signal.throwIfAborted();
-		this._assertInputsOpen();
+		// Neither cancelled input nor cancelled dispatch descendants may acquire fresh authority.
+		this._checkInputAdmission();
 		this._shutdownCancellation.signal.throwIfAborted();
+		const controller = new AbortController();
+		const cancellation = this._dispatchCancellationScope.getStore();
 		const admission: InputAdmission = {
-			controller: new AbortController(),
+			controller,
+			signal: cancellation ? AbortSignal.any([controller.signal, cancellation]) : controller.signal,
 			fenceScope: this._inputFenceScope.getStore(),
 			release: () => {
 				if (!this._inputAdmissions.delete(admission)) return;
@@ -2257,8 +2273,8 @@ export class AgentSession {
 
 	private async _withInputAdmission(admission: InputAdmission, operation: () => Promise<void>): Promise<void> {
 		try {
-			await this._inputFenceScope.run(admission.fenceScope, () =>
-				this._inputAdmissionScope.run(admission, operation),
+			await this._dispatchCancellationScope.run(admission.signal, () =>
+				this._inputFenceScope.run(admission.fenceScope, () => this._inputAdmissionScope.run(admission, operation)),
 			);
 		} finally {
 			admission.release();
@@ -2266,13 +2282,17 @@ export class AgentSession {
 	}
 
 	private _checkInputAdmission(): void {
-		this._inputAdmissionScope.getStore()?.controller.signal.throwIfAborted();
+		this._dispatchCancellationScope.getStore()?.throwIfAborted();
+		this._inputAdmissionScope.getStore()?.signal.throwIfAborted();
 		this._assertInputsOpen();
 	}
 
 	private async _awaitInput<T>(operation: Promise<T>): Promise<T> {
 		const admission = this._inputAdmissionScope.getStore();
-		const result = await raceWithAbortSignal(operation, admission?.controller.signal);
+		const result = await raceWithAbortSignal(
+			operation,
+			this._dispatchCancellationScope.getStore() ?? admission?.signal,
+		);
 		if (!admission || this._inputAdmissions.has(admission)) this._checkInputAdmission();
 		return result;
 	}
@@ -2293,7 +2313,7 @@ export class AgentSession {
 				images,
 				source,
 				streamingBehavior,
-				this._inputAdmissionScope.getStore()?.controller.signal,
+				this._inputAdmissionScope.getStore()?.signal,
 			),
 		);
 		if (inputResult.action === "handled") {
@@ -2926,11 +2946,13 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
-		// Deferred delivery retains the submitting callback's revocable permission, not settlement's scope.
+		// Deferred delivery retains the submitter's permission and cancellation, not the drainer's scope.
 		const fenceScope = this._inputFenceScope.getStore();
 		const inheritedAdmission = this._inputAdmissionScope.getStore();
-		// Covers direct append, streaming queues and next-turn delivery from cancelled input handlers.
-		inheritedAdmission?.controller.signal.throwIfAborted();
+		const cancellation = this._dispatchCancellationScope.getStore();
+		// Covers direct append, streaming queues and next-turn delivery from cancelled descendants.
+		cancellation?.throwIfAborted();
+		inheritedAdmission?.signal.throwIfAborted();
 		this._assertInputsOpen();
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
@@ -2969,12 +2991,14 @@ export class AgentSession {
 					const dispatch = async () => {
 						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
 						if (!this._modelSwitchDispatches.has(appMessage)) return;
-						const delivery = this._inputFenceScope.run(fenceScope, () => {
-							const send = () => this.sendCustomMessage(appMessage, options);
-							return inheritedAdmission
-								? this._inputAdmissionScope.run(inheritedAdmission, send)
-								: this._inputAdmissionScope.exit(send);
-						});
+						const delivery = this._dispatchCancellationScope.run(cancellation, () =>
+							this._inputFenceScope.run(fenceScope, () => {
+								const send = () => this.sendCustomMessage(appMessage, options);
+								return inheritedAdmission
+									? this._inputAdmissionScope.run(inheritedAdmission, send)
+									: this._inputAdmissionScope.exit(send);
+							}),
+						);
 						// Re-entry synchronously transfers ownership to a run, held queue, or another switch.
 						this._modelSwitchDispatches.delete(appMessage);
 						await delivery;
@@ -3001,12 +3025,14 @@ export class AgentSession {
 			}
 			if (this._isEmittingAgentSettled) {
 				const dispatch = () =>
-					this._inputFenceScope.run(fenceScope, () => {
-						const send = () => this.sendCustomMessage(appMessage, options);
-						return inheritedAdmission
-							? this._inputAdmissionScope.run(inheritedAdmission, send)
-							: this._inputAdmissionScope.exit(send);
-					});
+					this._dispatchCancellationScope.run(cancellation, () =>
+						this._inputFenceScope.run(fenceScope, () => {
+							const send = () => this.sendCustomMessage(appMessage, options);
+							return inheritedAdmission
+								? this._inputAdmissionScope.run(inheritedAdmission, send)
+								: this._inputAdmissionScope.exit(send);
+						}),
+					);
 				if (this._agentSettledScope.getStore()?.active) {
 					// Only a handler owning settlement must schedule without joining itself.
 					this._deferredSettledActions.push(dispatch);
@@ -4559,7 +4585,7 @@ export class AgentSession {
 					});
 				},
 				sendUserMessage: (content, options) => {
-					// The extension API returns void: retain admission, but do not treat it as an awaited SDK self-join.
+					// Detach scheduling to avoid an SDK self-join, but keep the separately captured cancellation lineage.
 					this._agentSettledScope
 						.exit(() => this.sendUserMessage(content, options))
 						.catch((err) => {
