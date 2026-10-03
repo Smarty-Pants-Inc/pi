@@ -103,7 +103,11 @@ export type {
 	// Events - Input
 	InputEvent,
 	InputEventResult,
+	InputMetadata,
 	InputSource,
+	InputSubmission,
+	InputSubmissionEvent,
+	InputSubmissionEventResult,
 	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,

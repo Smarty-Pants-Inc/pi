@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import type { InputSubmission } from "../src/index.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+
+type PendingUserInput = { text: string; submissionPromise?: Promise<InputSubmission> };
 
 type SubmitContext = {
 	defaultEditor: { onSubmit?: (text: string) => void };
@@ -12,15 +15,26 @@ type SubmitContext = {
 		isStreaming: boolean;
 		isBashRunning: boolean;
 		prompt: (text: string, options?: unknown) => Promise<void>;
+		captureInputSubmission: (
+			text: string,
+			options?: { streamingBehavior?: "steer" | "followUp" },
+		) => Promise<InputSubmission>;
 	};
+	isExtensionCommand: (text: string) => boolean;
 	flushPendingBashComponents: () => void;
-	onInputCallback?: (text: string) => void;
-	pendingUserInputs: string[];
+	onInputCallback?: (text: string, submissionPromise?: Promise<InputSubmission>) => void;
+	pendingUserInputs: PendingUserInput[];
+	currentInputSubmission?: Promise<InputSubmission>;
+	captureEditorSubmission: (
+		text: string,
+		streamingBehavior?: "steer" | "followUp",
+	) => Promise<InputSubmission> | undefined;
 };
 
 type InputContext = {
-	onInputCallback?: (text: string) => void;
-	pendingUserInputs: string[];
+	onInputCallback?: (text: string, submissionPromise?: Promise<InputSubmission>) => void;
+	pendingUserInputs: PendingUserInput[];
+	currentInputSubmission?: Promise<InputSubmission>;
 };
 
 type StartupSubmitContext = {
@@ -32,12 +46,17 @@ type InteractiveModePrivate = {
 	handleStartupSubmit(this: StartupSubmitContext, text: string): void;
 	setupEditorSubmitHandler(this: SubmitContext): void;
 	getUserInput(this: InputContext): Promise<string>;
+	captureEditorSubmission(
+		this: SubmitContext,
+		text: string,
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<InputSubmission> | undefined;
 };
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as InteractiveModePrivate;
 
 function createSubmitContext(): SubmitContext {
-	return {
+	const context: SubmitContext = {
 		defaultEditor: {},
 		editor: {
 			addToHistory: vi.fn(),
@@ -48,10 +67,15 @@ function createSubmitContext(): SubmitContext {
 			isStreaming: false,
 			isBashRunning: false,
 			prompt: vi.fn(async () => {}),
+			captureInputSubmission: vi.fn(async () => ({ source: "interactive" as const })),
 		},
+		isExtensionCommand: vi.fn(() => false),
 		flushPendingBashComponents: vi.fn(),
 		pendingUserInputs: [],
+		captureEditorSubmission: (text, streamingBehavior) =>
+			interactiveModePrototype.captureEditorSubmission.call(context, text, streamingBehavior),
 	};
+	return context;
 }
 
 describe("InteractiveMode startup input", () => {
@@ -73,18 +97,82 @@ describe("InteractiveMode startup input", () => {
 
 		await context.defaultEditor.onSubmit?.(" early prompt ");
 
-		expect(context.pendingUserInputs).toEqual(["early prompt"]);
+		expect(context.pendingUserInputs).toEqual([{ text: "early prompt", submissionPromise: expect.any(Promise) }]);
+		expect(context.session.captureInputSubmission).toHaveBeenCalledWith("early prompt", {
+			streamingBehavior: undefined,
+		});
 		expect(context.flushPendingBashComponents).toHaveBeenCalledTimes(1);
 		expect(context.editor.addToHistory).toHaveBeenCalledWith("early prompt");
 	});
 
 	it("returns queued startup input before installing a new input callback", async () => {
+		const submissionPromise = Promise.resolve<InputSubmission>({
+			source: "interactive",
+			metadata: { author: "Alice" },
+		});
 		const context: InputContext = {
-			pendingUserInputs: ["queued prompt"],
+			pendingUserInputs: [{ text: "queued prompt", submissionPromise }],
 		};
 
 		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("queued prompt");
 		expect(context.onInputCallback).toBeUndefined();
 		expect(context.pendingUserInputs).toEqual([]);
+		expect(context.currentInputSubmission).toBe(submissionPromise);
+	});
+
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#4078.
+	it("captures attribution before startup input is dequeued by a later typist", async () => {
+		let currentAuthor = "Alice";
+		const context = createSubmitContext();
+		context.session.captureInputSubmission = vi.fn(
+			async (): Promise<InputSubmission> => ({ source: "interactive", metadata: { author: currentAuthor } }),
+		);
+		interactiveModePrototype.setupEditorSubmitHandler.call(context);
+		await context.defaultEditor.onSubmit?.("same");
+		currentAuthor = "Bob";
+		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("same");
+		await expect(context.currentInputSubmission).resolves.toEqual({
+			source: "interactive",
+			metadata: { author: "Alice" },
+		});
+		expect(context.session.captureInputSubmission).toHaveBeenCalledOnce();
+	});
+
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#4078.
+	it("keeps public getUserInput string delivery while forwarding a pending submission promise", async () => {
+		const context = createSubmitContext();
+		interactiveModePrototype.setupEditorSubmitHandler.call(context);
+		const input = interactiveModePrototype.getUserInput.call(context);
+		let resolveSubmission!: (submission: InputSubmission) => void;
+		const submissionPromise = new Promise<InputSubmission>((resolve) => {
+			resolveSubmission = resolve;
+		});
+		context.session.captureInputSubmission = vi.fn(() => submissionPromise);
+		await context.defaultEditor.onSubmit?.("same");
+		await expect(input).resolves.toBe("same");
+		expect(context.currentInputSubmission).toBe(submissionPromise);
+		expect(context.onInputCallback).toBeUndefined();
+		resolveSubmission({ source: "interactive", metadata: { author: "Alice" } });
+		await expect(context.currentInputSubmission).resolves.toEqual({
+			source: "interactive",
+			metadata: { author: "Alice" },
+		});
+	});
+
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#4078.
+	it("observes delayed capture rejection without losing the queued original text", async () => {
+		const context = createSubmitContext();
+		let rejectSubmission!: (error: Error) => void;
+		const submissionPromise = new Promise<InputSubmission>((_, reject) => {
+			rejectSubmission = reject;
+		});
+		context.session.captureInputSubmission = vi.fn(() => submissionPromise);
+		interactiveModePrototype.setupEditorSubmitHandler.call(context);
+		await context.defaultEditor.onSubmit?.("same");
+		const rejected = expect(submissionPromise).rejects.toThrow("capture failed");
+		rejectSubmission(new Error("capture failed"));
+		await rejected;
+		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("same");
+		expect(context.currentInputSubmission).toBe(submissionPromise);
 	});
 });

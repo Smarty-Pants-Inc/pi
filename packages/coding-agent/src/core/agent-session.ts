@@ -14,6 +14,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
@@ -95,6 +96,7 @@ import {
 	ExtensionRunner,
 	type ExtensionUIContext,
 	type InputSource,
+	type InputSubmission,
 	type MessageEndEvent,
 	type MessageStartEvent,
 	type MessageUpdateEvent,
@@ -212,7 +214,8 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
-	| Exclude<AgentEvent, { type: "agent_end" }>
+	| Exclude<AgentEvent, { type: "agent_end" | "message_start" }>
+	| MessageStartEvent
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
@@ -225,7 +228,7 @@ export type AgentSessionEvent =
 			followUp: readonly string[];
 	  }
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
-	| { type: "entry_appended"; entry: SessionEntry }
+	| { type: "entry_appended"; entry: SessionEntry; beforeMessage?: AgentMessage }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
 	| {
@@ -331,6 +334,8 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
+	/** Forward an already-captured submission without recapturing. Its source is authoritative. */
+	submission?: InputSubmission;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
 	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
@@ -489,6 +494,16 @@ export class AgentSession {
 	private _extensionRunner!: ExtensionRunner;
 	private _turnIndex = 0;
 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
+	/** Queue-bound origin data, never attached to model-visible or persisted message objects. */
+	private readonly _inputSubmissions = new WeakMap<AgentMessage, InputSubmission>();
+	/** Reserve durable user entry identity before extensions append entries bound to that message. */
+	private readonly _userMessageEntryIds = new WeakMap<AgentMessage, string>();
+	/** Only appendEntry calls within an awaited user message_start receive a rendering hint and binding. */
+	private readonly _userMessageStartScope = new AsyncLocalStorage<{
+		active: boolean;
+		message: AgentMessage;
+		entryId: string;
+	}>();
 	private readonly _boundaryDispatchedMessages = new WeakSet<object>();
 	private _lastAssistantMessage: AssistantMessage | undefined;
 	private _lastAssistantToolResults: AgentMessage[] = [];
@@ -1208,6 +1223,7 @@ export class AgentSession {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
+			this._userMessageEntryIds.set(event.message, randomUUID());
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
 			if (messageText) {
@@ -1235,7 +1251,23 @@ export class AgentSession {
 				if (!this._shutdownCancellation.signal.aborted) throw error;
 			}
 		}
-		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		const input = event.type === "message_start" ? this._inputSubmissions.get(event.message) : undefined;
+		const entryId = event.type === "message_start" ? this._userMessageEntryIds.get(event.message) : undefined;
+		this._emit(
+			event.type === "agent_end"
+				? { ...event, willRetry: this._willRetryAfterAgentEnd(event) }
+				: event.type === "message_start"
+					? {
+							...event,
+							...(input ? { input: structuredClone(input) } : {}),
+							...(entryId ? { entryId } : {}),
+						}
+					: event,
+		);
+		// Attribution belongs to this emission only, not a later low-level replay of the same message object.
+		if (event.type === "message_start" && event.message.role === "user") {
+			this._inputSubmissions.delete(event.message);
+		}
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
 		else await this._persistAgentEvent(event);
@@ -1275,8 +1307,12 @@ export class AgentSession {
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.#ordinaryOwner
-					? await appendOwnedTerminalMessage(this.sessionManager, event.message)
-					: this.sessionManager.appendMessage(event.message);
+					? await appendOwnedTerminalMessage(
+							this.sessionManager,
+							event.message,
+							this._userMessageEntryIds.get(event.message),
+						)
+					: this.sessionManager.appendMessage(event.message, this._userMessageEntryIds.get(event.message));
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1426,11 +1462,24 @@ export class AgentSession {
 			}
 			this._turnIndex++;
 		} else if (event.type === "message_start") {
+			const input = this._inputSubmissions.get(event.message);
+			const entryId = this._userMessageEntryIds.get(event.message);
 			const extensionEvent: MessageStartEvent = {
 				type: "message_start",
 				message: event.message,
+				...(input ? { input } : {}),
+				...(entryId ? { entryId } : {}),
 			};
-			await this._extensionRunner.emit(extensionEvent);
+			if (event.message.role === "user" && entryId) {
+				const scope = { active: true, message: event.message, entryId };
+				try {
+					await this._userMessageStartScope.run(scope, () => this._extensionRunner.emit(extensionEvent));
+				} finally {
+					scope.active = false;
+				}
+			} else {
+				await this._extensionRunner.emit(extensionEvent);
+			}
 		} else if (event.type === "message_update") {
 			const extensionEvent: MessageUpdateEvent = {
 				type: "message_update",
@@ -2085,17 +2134,42 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Capture origin metadata without processing, transforming, or queueing input.
+	 * Hosts that stage input during compaction can forward the result through PromptOptions.submission.
+	 * Metadata must be structured-cloneable; use JSON-compatible values when persisting it with appendEntry.
+	 */
+	async captureInputSubmission(
+		text: string,
+		options?: Pick<PromptOptions, "images" | "source" | "streamingBehavior">,
+	): Promise<InputSubmission> {
+		this._shutdownCancellation.signal.throwIfAborted();
+		return this._extensionRunner.emitInputSubmission(
+			text,
+			options?.images,
+			options?.source ?? "interactive",
+			options?.streamingBehavior,
+		);
+	}
+
 	private async _runInputHandlers(
 		text: string,
 		images: ImageContent[] | undefined,
-		source: InputSource,
+		submission: InputSubmission,
 		streamingBehavior?: "steer" | "followUp",
 	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
 		if (!this._extensionRunner.hasHandlers("input")) {
 			return { text, images };
 		}
 
-		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		const inputResult = await this._extensionRunner.emitInput(
+			text,
+			images,
+			submission.source,
+			streamingBehavior,
+			undefined,
+			submission.metadata,
+		);
 		if (inputResult.action === "handled") {
 			return undefined;
 		}
@@ -2139,6 +2213,21 @@ export class AgentSession {
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
 		if (this._isEmittingAgentSettled) {
+			// Capture before deferral, but keep extension commands out of submission hooks.
+			const commandName = text.startsWith("/") ? text.slice(1).split(" ", 1)[0] : undefined;
+			const isCommand =
+				(options?.expandPromptTemplates ?? true) && commandName && this._extensionRunner.getCommand(commandName);
+			if (!options?.submission && !isCommand) {
+				const preflightToken = {};
+				this._promptPreflights.add(preflightToken);
+				try {
+					options = { ...options, submission: await this.captureInputSubmission(text, options) };
+				} finally {
+					this._promptPreflights.delete(preflightToken);
+				}
+				// Settlement may have finished while metadata capture was awaiting a handler.
+				if (!this._isEmittingAgentSettled) return this.prompt(text, options);
+			}
 			const completion = new Promise<void>((resolve, reject) => {
 				this._deferredSettledActions.push(async () => {
 					try {
@@ -2229,11 +2318,20 @@ export class AgentSession {
 				(options?.streamingBehavior !== undefined &&
 					this._promptPreflights.values().next().value !== preflightToken);
 
+			// Reserve the existing preflight before capture so async handlers cannot admit a competing run.
+			const submission = options?.submission
+				? structuredClone(options.submission)
+				: await this.captureInputSubmission(text, {
+						images: options?.images,
+						source: options?.source,
+						streamingBehavior: mustQueue() ? options?.streamingBehavior : undefined,
+					});
+
 			// Emit input event for extension interception (before skill/template expansion)
 			const processedInput = await this._runInputHandlers(
 				text,
 				options?.images,
-				options?.source ?? "interactive",
+				submission,
 				mustQueue() ? options?.streamingBehavior : undefined,
 			);
 			if (!processedInput) {
@@ -2260,9 +2358,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, submission);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, currentImages, submission);
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
@@ -2308,8 +2406,8 @@ export class AgentSession {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
-					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
-					else await this._queueSteer(expandedText, currentImages);
+					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, submission);
+					else await this._queueSteer(expandedText, currentImages, submission);
 					// Input already queued behind this prompt is retained with it, and so are
 					// triggered messages held during this preflight: the stop holds for them too.
 					this._inputQueuedBehindPreflight = false;
@@ -2347,11 +2445,13 @@ export class AgentSession {
 			messages = [];
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
 			userContent.push(...normalized.images);
-			messages.push({
+			const userMessage: AgentMessage = {
 				role: "user",
 				content: userContent,
 				timestamp: Date.now(),
-			});
+			};
+			this._inputSubmissions.set(userMessage, submission);
+			messages.push(userMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -2547,6 +2647,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		submission?: InputSubmission,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
@@ -2555,7 +2656,7 @@ export class AgentSession {
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source);
+			await this._prepareQueuedInput(text, images, behavior, source, submission);
 		} finally {
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
@@ -2569,15 +2670,23 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		capturedSubmission?: InputSubmission,
 	): Promise<void> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
 
+		const submission = capturedSubmission
+			? structuredClone(capturedSubmission)
+			: await this.captureInputSubmission(text, {
+					images,
+					source,
+					streamingBehavior: this.isStreaming ? behavior : undefined,
+				});
 		const processedInput = await this._runInputHandlers(
 			text,
 			images,
-			source,
+			submission,
 			this.isStreaming ? behavior : undefined,
 		);
 		if (!processedInput) return;
@@ -2586,9 +2695,9 @@ export class AgentSession {
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images);
+			await this._queueSteer(expandedText, processedInput.images, submission);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images);
+			await this._queueFollowUp(expandedText, processedInput.images, submission);
 		}
 	}
 
@@ -2598,11 +2707,15 @@ export class AgentSession {
 	 * before the next LLM call.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
-	 * @param options Input source; defaults to interactive
+	 * @param options Input source (defaults to interactive), or an already-captured submission with authoritative source
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+	async steer(
+		text: string,
+		images?: ImageContent[],
+		options?: Pick<PromptOptions, "source" | "submission">,
+	): Promise<void> {
+		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive", options?.submission);
 	}
 
 	/**
@@ -2610,17 +2723,25 @@ export class AgentSession {
 	 * Delivered only when agent has no more tool calls or steering messages.
 	 * Expands skill commands and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
-	 * @param options Input source; defaults to interactive
+	 * @param options Input source (defaults to interactive), or an already-captured submission with authoritative source
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+	async followUp(
+		text: string,
+		images?: ImageContent[],
+		options?: Pick<PromptOptions, "source" | "submission">,
+	): Promise<void> {
+		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive", options?.submission);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(
+		text: string,
+		images: ImageContent[] | undefined,
+		submission: InputSubmission,
+	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
@@ -2628,17 +2749,19 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this._inputSubmissions.set(message, submission);
+		this.agent.steer(message);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images: ImageContent[] | undefined,
+		submission: InputSubmission,
+	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
@@ -2646,7 +2769,9 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this._inputSubmissions.set(message, submission);
+		this.agent.followUp(message);
 	}
 
 	/**
@@ -4274,10 +4399,19 @@ export class AgentSession {
 					});
 				},
 				appendEntry: (customType, data) => {
-					const entryId = this.sessionManager.appendCustomEntry(customType, data);
+					const scope = this._userMessageStartScope.getStore();
+					const entryId = this.sessionManager.appendCustomEntry(
+						customType,
+						data,
+						scope?.active ? scope.entryId : undefined,
+					);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
-						this._emit({ type: "entry_appended", entry });
+						this._emit({
+							type: "entry_appended",
+							entry,
+							...(scope?.active ? { beforeMessage: scope.message } : {}),
+						});
 					}
 				},
 				setSessionName: (name) => {

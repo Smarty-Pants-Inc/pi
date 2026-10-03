@@ -113,6 +113,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 |-----------|-------------|
 | `message-renderer.ts` | Custom message rendering with colors and expandable details via `registerMessageRenderer` |
 | `entry-renderer.ts` | TUI-only session entry rendering via `appendEntry` and `registerEntryRenderer` |
+| `input-author.ts` | Render submission-bound, unverified author metadata as `name:` without changing native user content |
 | `debug-provider.ts` | Toggle raw provider stream capture with `/debug-provider` and inspect each assistant message in a TUI-only session entry |
 | `event-bus.ts` | Inter-extension communication via `pi.events` |
 

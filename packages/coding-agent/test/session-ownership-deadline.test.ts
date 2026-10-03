@@ -268,7 +268,9 @@ test("terminal append uses a captured serialized private route", () => {
 	expect(manager).toContain("this.#ownedTerminalTail = run.then(() => undefined);");
 	expect(agent).toContain("await this._flushPendingBashMessagesOwnedTerminal();");
 	expect(agent).toContain("await this._flushPendingCustomMessagesOwnedTerminal();");
-	expect(agent).toContain("await appendOwnedTerminalMessage(this.sessionManager, event.message)");
+	expect(agent).toMatch(
+		/await appendOwnedTerminalMessage\(\s*this\.sessionManager,\s*event\.message,\s*this\._userMessageEntryIds\.get\(event\.message\),\s*\)/,
+	);
 	expect(agent).toContain("await appendOwnedTerminalCustomMessage(");
 	expect(agent).toContain("Leave the failed message and suffix retained");
 	expect(manager).toContain("nativeWriteAccepted: true");

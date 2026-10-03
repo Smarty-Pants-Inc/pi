@@ -100,6 +100,16 @@ Use each event’s declared result type rather than assuming every return value 
 
 Events cover resource discovery, sessions, agent and message lifecycle, providers, tools, and raw input.
 
+### Submission metadata
+
+`input_submission` captures metadata when an input is submitted, before it waits in a queue. It does not transform or consume input; existing `input` handlers keep those responsibilities. Return `{ metadata: { ... } }` to attach JSON-compatible data. Handlers see earlier metadata, and later keys override earlier keys.
+
+Pi carries the submission's `source` and metadata with its native user message through steering, follow-up, and compaction queues. `input` handlers can inspect `event.metadata`, and that user's `message_start` exposes `event.input`. Assistant messages and messages injected directly into the low-level agent have no submission metadata. Metadata is not added to message content or model context, and it is not automatically persisted.
+
+To display durable metadata, call `pi.appendEntry()` in that user's `message_start` handler and register an entry renderer. Pi binds those entries to the native session entry ID exposed as `event.entryId`, outside model message content. It emits and renders them before that user message, after any preceding streaming assistant. Transcript replay hides a bound entry if its target is absent, including when forking or re-editing before that user message. Handled, cleared, or failed-before-delivery inputs do not reach `message_start`, so they create no such entry. See [`input-author.ts`](../examples/extensions/input-author.ts), which renders an unverified author as `name:` without changing the prompt.
+
+An SDK host with its own submission queue can call `session.captureInputSubmission(text, options)` at acceptance, retain the returned submission with that input, and forward it using `{ submission }` to `prompt()`, `steer()`, or `followUp()`. Do not recapture at queue drain or correlate authors by text or FIFO order. Dequeuing text for editing discards its old submission; submitting the edited text captures a new one.
+
 `before_agent_start` exposes both the current prompt and its structured `systemPromptOptions`. Prefer changing prompt sections, selected tools, or guidelines so Pi can append a transcript delta. Returning `systemPrompt`, or setting `forceSystemPrompt`, replaces the whole prompt for that run while the transcript continues recording the structured sections. Providers receive the forced text as their leading system prompt.
 
 `message_end` can replace a finalized message while preserving its role. `tool_call` can mutate input or block execution. `tool_result` handlers compose, with each handler seeing prior changes.

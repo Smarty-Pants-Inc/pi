@@ -59,14 +59,14 @@ export const CURRENT_SESSION_VERSION = 3;
 
 const ownedTerminalPersistence = new WeakMap<SessionManager, () => Promise<void>>();
 type OwnedTerminalAppender = {
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage): Promise<string>;
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage, entryId?: string): Promise<string>;
 	appendCustomMessage<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
 	): Promise<string>;
-	appendCustomEntry(type: string, data?: unknown): Promise<string>;
+	appendCustomEntry(type: string, data?: unknown, beforeMessageId?: string): Promise<string>;
 };
 const ownedTerminalAppenders = new WeakMap<SessionManager, OwnedTerminalAppender>();
 
@@ -81,10 +81,11 @@ export function persistOwnedTerminalSession(manager: SessionManager): Promise<vo
 export function appendOwnedTerminalMessage(
 	manager: SessionManager,
 	message: Message | CustomMessage | BashExecutionMessage,
+	entryId?: string,
 ): Promise<string> {
 	const append = ownedTerminalAppenders.get(manager)?.appendMessage;
 	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(message);
+	return append(message, entryId);
 }
 
 /** Private captured route used only by the original owner's terminal callbacks. */
@@ -101,10 +102,15 @@ export function appendOwnedTerminalCustomMessage<T = unknown>(
 }
 
 /** Private captured route for non-message retained-session entries. */
-export function appendOwnedTerminalEntry(manager: SessionManager, type: string, data?: unknown): Promise<string> {
+export function appendOwnedTerminalEntry(
+	manager: SessionManager,
+	type: string,
+	data?: unknown,
+	beforeMessageId?: string,
+): Promise<string> {
 	const append = ownedTerminalAppenders.get(manager)?.appendCustomEntry;
 	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(type, data);
+	return append(type, data, beforeMessageId);
 }
 
 export interface SessionHeader {
@@ -196,6 +202,8 @@ export interface CustomEntry<T = unknown> extends SessionEntryBase {
 	type: "custom";
 	customType: string;
 	data?: T;
+	/** Render before this native user-message entry only while that entry is selected. May point forward. */
+	beforeMessageId?: string;
 }
 
 /** Label entry for user-defined bookmarks/markers on entries. */
@@ -340,8 +348,13 @@ export function assertValidSessionId(id: string): void {
 	}
 }
 
-/** Generate a unique short ID (8 hex chars, collision-checked) */
-function generateId(byId: { has(id: string): boolean }): string {
+/** Validate a supplied entry ID or generate a unique short ID (8 hex chars, collision-checked). */
+function generateId(byId: { has(id: string): boolean }, entryId?: string): string {
+	if (entryId !== undefined) {
+		if (typeof entryId !== "string" || entryId.length === 0) throw new Error("Entry id must be a non-empty string");
+		if (byId.has(entryId)) throw new Error(`Entry ${entryId} already exists`);
+		return entryId;
+	}
 	for (let i = 0; i < 100; i++) {
 		const id = randomUUID().slice(0, 8);
 		if (!byId.has(id)) return id;
@@ -1101,10 +1114,11 @@ export class SessionManager {
 		if (ownedJournal) {
 			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
 			ownedTerminalAppenders.set(this, {
-				appendMessage: (message) => this.#appendMessageOwnedTerminal(message),
+				appendMessage: (message, entryId) => this.#appendMessageOwnedTerminal(message, entryId),
 				appendCustomMessage: (customType, content, display, details) =>
 					this.#appendCustomMessageOwnedTerminal(customType, content, display, details),
-				appendCustomEntry: (type, data) => this.#appendCustomEntryOwnedTerminal(type, data),
+				appendCustomEntry: (type, data, beforeMessageId) =>
+					this.#appendCustomEntryOwnedTerminal(type, data, beforeMessageId),
 			});
 			ownedJournal.assertActive();
 			this.sessionFile = ownedJournal.file;
@@ -1439,15 +1453,18 @@ export class SessionManager {
 		return run;
 	}
 
-	#appendMessageOwnedTerminal(message: Message | CustomMessage | BashExecutionMessage): Promise<string> {
+	#appendMessageOwnedTerminal(
+		message: Message | CustomMessage | BashExecutionMessage,
+		entryId?: string,
+	): Promise<string> {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendMessage(message));
+		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendMessage(message, entryId));
 		return this.#enqueueOwnedTerminal(async () => {
 			const entry: SessionMessageEntry = {
 				type: "message",
-				id: generateId(this.byId),
+				id: generateId(this.byId, entryId),
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
 				message,
@@ -1484,16 +1501,18 @@ export class SessionManager {
 		});
 	}
 
-	#appendCustomEntryOwnedTerminal(type: string, data?: unknown): Promise<string> {
+	#appendCustomEntryOwnedTerminal(type: string, data?: unknown, beforeMessageId?: string): Promise<string> {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendCustomEntry(type, data));
+		if (!isOwnedTerminalWrite(this.#ownedJournal))
+			return Promise.resolve(this.appendCustomEntry(type, data, beforeMessageId));
 		return this.#enqueueOwnedTerminal(async () => {
 			const entry: CustomEntry = {
 				type: "custom",
 				customType: type,
 				data,
+				...(beforeMessageId !== undefined ? { beforeMessageId } : {}),
 				id: generateId(this.byId),
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
@@ -1584,10 +1603,10 @@ export class SessionManager {
 	 * so it is easier to find them.
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage, entryId?: string): string {
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.byId),
+			id: generateId(this.byId, entryId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
@@ -1671,11 +1690,12 @@ export class SessionManager {
 	}
 
 	/** Append a custom entry (for extensions) as child of current leaf, then advance leaf. Returns entry id. */
-	appendCustomEntry(customType: string, data?: unknown): string {
+	appendCustomEntry(customType: string, data?: unknown, beforeMessageId?: string): string {
 		const entry: CustomEntry = {
 			type: "custom",
 			customType,
 			data,
+			...(beforeMessageId !== undefined ? { beforeMessageId } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),

@@ -451,6 +451,11 @@ describe("AgentSession concurrent prompt guard", () => {
 				emit: (event: { type: string; message?: { role?: string } }) => Promise<void>;
 				emitMessageEnd: (event: { type: string; message?: { role?: string } }) => Promise<undefined>;
 				emitToolCall: (event: { type: string; toolCallId: string }) => Promise<undefined>;
+				emitInputSubmission: (
+					text: string,
+					images: unknown,
+					source: "interactive" | "rpc" | "extension",
+				) => Promise<{ source: "interactive" | "rpc" | "extension" }>;
 				emitInput: (
 					text: string,
 					images: unknown,
@@ -467,6 +472,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		};
 		sessionWithRunner._extensionRunner = {
 			hasHandlers: (eventType) => eventType === "tool_call",
+			emitInputSubmission: async (_text, _images, source) => ({ source }),
 			emit: async () => {},
 			emitMessageEnd: async () => undefined,
 			emitToolCall: async () => {
@@ -597,6 +603,11 @@ describe("AgentSession concurrent prompt guard", () => {
 				hasHandlers: (eventType: string) => boolean;
 				emit: (event: { type: string; message?: { role?: string } }) => Promise<void>;
 				emitMessageEnd: (event: { type: string; message?: { role?: string } }) => Promise<undefined>;
+				emitInputSubmission: (
+					text: string,
+					images: unknown,
+					source: "interactive" | "rpc" | "extension",
+				) => Promise<{ source: "interactive" | "rpc" | "extension" }>;
 				emitInput: (
 					text: string,
 					images: unknown,
@@ -613,6 +624,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		};
 		sessionWithRunner._extensionRunner = {
 			hasHandlers: () => false,
+			emitInputSubmission: async (_text, _images, source) => ({ source }),
 			emit: async () => {},
 			emitMessageEnd: async (event) => {
 				if (event.type === "message_end" && event.message?.role === "assistant") {
