@@ -2156,9 +2156,10 @@ describe("runToolCall", () => {
 			result: { content: [{ type: "text", text: "nope" }] },
 			isError: true,
 		});
+		// pi#127 F1: diagnostics must name options.tools, even when context.tools is absent.
 		expect(await runToolCall(call("d", "missing", {}), options)).toMatchObject({
 			result: {
-				content: [{ type: "text", text: "Tool missing not found. No tools are available in this session." }],
+				content: [{ type: "text", text: "Tool missing not found. Available tools in this session: echo, failing" }],
 			},
 			isError: true,
 		});

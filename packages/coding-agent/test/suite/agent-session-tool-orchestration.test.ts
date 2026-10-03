@@ -97,10 +97,11 @@ describe("AgentSession tool orchestration", () => {
 			(message): message is ToolResultMessage => message.role === "toolResult",
 		);
 		if (!result) throw new Error("No tool result");
+		// pi#127 F1: nested diagnostics must list callable helpers, not model-only orchestrators.
 		expect(result.content).toEqual([
 			{
 				type: "text",
-				text: "helped | echo: hi | Tool run_tools not found. Available tools in this session: echo, run_tools",
+				text: "helped | echo: hi | Tool run_tools not found. Available tools in this session: echo, helper",
 			},
 		]);
 		const parent = result.toolCallId;
