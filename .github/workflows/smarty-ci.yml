@@ -30,16 +30,29 @@ concurrency:
 jobs:
   smarty-ci:
     name: ${{ github.event_name == 'workflow_dispatch' && 'Pi full gate not requested' || 'smarty-ci' }}
-    if: github.event_name != 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    # Same-repository PRs are write-authorized, including current/future org write Apps
+    # (smarty-dev#2177); admit them without contributor or bot-author allowlists.
+    # Fork source remains excluded from this runner; retired pr-gate.yml stays deleted.
+    if: (github.event_name != 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: smarty-linux-x64
+    # Forge disposable VMs: 2 vCPU / 8 GB, up to 7 VMs in the shared pool.
+    timeout-minutes: 150
     steps:
+    - name: Install Forge base prerequisites
+      timeout-minutes: 10
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ca-certificates curl git python3 build-essential pkg-config
     - name: Checkout exact qualification source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         ref: ${{ github.sha }}
         persist-credentials: false
       timeout-minutes: 5
+    - name: Reject unapproved hosted runners
+      run: bash scripts/ci/no-hosted-runners.sh
+    - name: Test hosted-runner guard
+      run: bash scripts/ci/test-no-hosted-runners.sh
     - name: Setup Node22
       uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
       with:
@@ -84,8 +97,8 @@ jobs:
         printf '%s\n' 'da47a9e55f6a50f53729ec199bb52f27150001b66438cdd3187ed99b73534f78  .local/pack-stage.mjs' | sha256sum --check
         cp .local/pack-stage.mjs "$RUNNER_TEMP/pi-emergency/evidence/"
       timeout-minutes: 2
-    - name: Existing disposable system dependencies
-      timeout-minutes: 5
+    - name: Disposable Forge system dependencies
+      timeout-minutes: 10
       run: |
         set -o pipefail
         {
@@ -131,7 +144,7 @@ jobs:
         find "$EVIDENCE_DIR/model-data" -type f -print0 | sort -z | xargs -0 sha256sum > "$EVIDENCE_DIR/model-data-sha256.txt"
         PI_JOB
     - name: build
-      timeout-minutes: 10
+      timeout-minutes: 20
       run: |
         set -o pipefail
         env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
@@ -148,7 +161,7 @@ jobs:
         git diff --exit-code HEAD --
         PI_JOB
     - name: check
-      timeout-minutes: 10
+      timeout-minutes: 20
       run: |
         set -o pipefail
         env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
@@ -165,7 +178,7 @@ jobs:
         git diff --exit-code HEAD --
         PI_JOB
     - name: complete-tests
-      timeout-minutes: 30
+      timeout-minutes: 60
       run: |
         set -o pipefail
         env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
@@ -230,10 +243,15 @@ jobs:
         retention-days: 7
   emergency-compaction:
     name: Pi emergency compaction regressions
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    if: (github.event_name == 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: smarty-linux-x64
+    timeout-minutes: 90
     steps:
+    - name: Install Forge base prerequisites
+      timeout-minutes: 10
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ca-certificates curl git python3 build-essential pkg-config
     - name: Validate exact source syntax
       env:
         EXPECTED_SOURCE: ${{ inputs.source_sha }}
@@ -296,8 +314,8 @@ jobs:
         printf '%s\n' 'da47a9e55f6a50f53729ec199bb52f27150001b66438cdd3187ed99b73534f78  .local/pack-stage.mjs' | sha256sum --check
         cp .local/pack-stage.mjs "$RUNNER_TEMP/pi-emergency/evidence/"
       timeout-minutes: 2
-    - name: Existing disposable system dependencies
-      timeout-minutes: 5
+    - name: Disposable Forge system dependencies
+      timeout-minutes: 10
       run: |
         set -o pipefail
         {
