@@ -298,14 +298,13 @@ function createClient(
 	const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey);
 	const redactArgs = (message: string, args: unknown[]) =>
 		[message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, diagnosticSecrets));
-	const logger: ClientOptions["logger"] = isChatGPTSignIn(model, apiKey)
-		? {
-				error: (message, ...args) => console.error(...redactArgs(message, args)),
-				warn: (message, ...args) => console.warn(...redactArgs(message, args)),
-				info: (message, ...args) => console.info(...redactArgs(message, args)),
-				debug: (message, ...args) => console.debug(...redactArgs(message, args)),
-			}
-		: undefined;
+	// OAuth credentials can also be used with a caller-configured endpoint; never gate log safety on the URL.
+	const logger: ClientOptions["logger"] = {
+		error: (message, ...args) => console.error(...redactArgs(message, args)),
+		warn: (message, ...args) => console.warn(...redactArgs(message, args)),
+		info: (message, ...args) => console.info(...redactArgs(message, args)),
+		debug: (message, ...args) => console.debug(...redactArgs(message, args)),
+	};
 	return new OpenAI({
 		apiKey,
 		logger,

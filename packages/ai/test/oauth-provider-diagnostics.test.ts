@@ -230,7 +230,7 @@ it("redacts generic retry text and the final response", async () => {
 });
 
 // pi#127 / B-F2: catch-only protection cannot sanitize the SDK's debug console sink.
-it.each(["HTTP", "transport", "retry cap"])("redacts OAuth SDK %s debug records", async (kind) => {
+it.each(["HTTP", "transport", "retry cap", "custom endpoint"])("redacts OAuth SDK %s debug records", async (kind) => {
 	vi.stubEnv("OPENAI_LOG", "debug");
 	const records: unknown[] = [];
 	for (const level of ["debug", "info", "warn", "error"] as const) {
@@ -239,8 +239,9 @@ it.each(["HTTP", "transport", "retry cap"])("redacts OAuth SDK %s debug records"
 		});
 	}
 	const { models, model } = await runtime(openaiProvider());
+	const requestModel = kind === "custom endpoint" ? { ...model, baseUrl: "https://fake.invalid/v1" } : model;
 	const output = await models.complete(
-		model,
+		requestModel,
 		{ messages: [] },
 		{
 			maxRetries: kind === "retry cap" ? 1 : 0,
