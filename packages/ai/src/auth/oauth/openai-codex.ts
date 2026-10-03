@@ -121,18 +121,25 @@ async function fetchWithLoginCancellation(input: string, init: RequestInit): Pro
 
 async function readTokenResponse(response: Response, operation: TokenOperation): Promise<OAuthToken> {
 	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(`OpenAI Codex token ${operation} failed (${response.status}): ${text || response.statusText}`);
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`OpenAI Codex token ${operation} failed (HTTP ${response.status})`);
 	}
 
-	const rawJson = await response.json();
+	let rawJson: unknown;
+	try {
+		rawJson = await response.json();
+	} catch {
+		throw new Error(`OpenAI Codex token ${operation} response is invalid JSON`);
+	}
 	const json = rawJson as {
 		access_token?: string;
 		refresh_token?: string;
 		expires_in?: number;
 	} | null;
 	if (!json?.access_token || !json.refresh_token || typeof json.expires_in !== "number") {
-		throw new Error(`OpenAI Codex token ${operation} response missing fields: ${JSON.stringify(json)}`);
+		throw new Error(
+			`OpenAI Codex token ${operation} response missing or invalid access_token, refresh_token or expires_in`,
+		);
 	}
 
 	return {
@@ -177,8 +184,8 @@ async function refreshAccessToken(refreshToken: string, signal: AbortSignal): Pr
 			}),
 			signal,
 		});
-	} catch (error) {
-		throw new Error(`OpenAI Codex token refresh error: ${error instanceof Error ? error.message : String(error)}`);
+	} catch {
+		throw new Error(`OpenAI Codex token refresh request ${signal.aborted ? "cancelled" : "failed"}`);
 	}
 
 	return readTokenResponse(response, "refresh");

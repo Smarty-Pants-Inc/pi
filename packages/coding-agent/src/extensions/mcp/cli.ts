@@ -1,3 +1,4 @@
+import { describeMcpTransport, safeMcpErrorMessage as errorMessage } from "../../core/mcp-reporting.ts";
 /**
  * `pi mcp`: add, remove, and check MCP servers and sign in to them outside a session. Agents run it
  * through bash to configure servers, verify an `mcp.json` they wrote, and start an OAuth sign-in;
@@ -102,15 +103,6 @@ interface ServerReport {
 	resources?: number;
 	resourceTemplates?: number;
 	error?: string;
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-function describeTransport(entry: McpServerEntry): string {
-	const { config } = entry;
-	return "url" in config ? config.url : [config.command, ...(config.args ?? [])].join(" ");
 }
 
 function createConnection(entry: McpServerEntry, options: McpCommandOptions, credentials: McpOAuthCredentialStore) {
@@ -260,11 +252,11 @@ export async function runMcpCommand(args: string[], options: McpCommandOptions):
 /** Parse `KEY=VALUE` pairs of a repeatable option into a record. */
 function parsePairs(option: string, pairs: string[] | undefined, error: (line: string) => void) {
 	if (!pairs) return {};
-	const record: Record<string, string> = {};
+	const record: Record<string, string> = Object.create(null);
 	for (const pair of pairs) {
 		const separator = pair.indexOf("=");
 		if (separator <= 0) {
-			error(`--${option} expects KEY=VALUE, got "${pair}".`);
+			error(`--${option} expects KEY=VALUE.`);
 			return undefined;
 		}
 		record[pair.slice(0, separator)] = pair.slice(separator + 1);
@@ -445,7 +437,7 @@ async function list(
 				source: entry.source,
 				enabled: entry.config.enabled !== false,
 				exposure: entry.config.exposure ?? "codemode",
-				transport: describeTransport(entry),
+				transport: describeMcpTransport(entry.config),
 				state: "disabled",
 				tools: [],
 			};

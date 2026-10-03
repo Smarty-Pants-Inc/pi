@@ -163,7 +163,11 @@ function isExposure(value: unknown): value is McpExposure {
 
 /** The exposure an alias stands for; other values are returned unchanged. */
 function resolveExposureAlias(value: unknown): unknown {
-	return typeof value === "string" ? (MCP_EXPOSURE_ALIASES[value] ?? value) : value;
+	return typeof value === "string"
+		? Object.hasOwn(MCP_EXPOSURE_ALIASES, value)
+			? MCP_EXPOSURE_ALIASES[value]
+			: value
+		: value;
 }
 
 /** A copy of the server entry with exposure aliases replaced by their current names. */
@@ -190,7 +194,7 @@ function toolPatternRegExp(pattern: string): RegExp {
 /** Exposure of one tool of a server: its `toolExposure` entry, else the server's `exposure`. */
 export function getMcpToolExposure(config: McpServerConfig, toolName: string): McpExposure {
 	const overrides = config.toolExposure ?? {};
-	const exact = overrides[toolName];
+	const exact = Object.hasOwn(overrides, toolName) ? overrides[toolName] : undefined;
 	if (exact !== undefined) return exact;
 	for (const [pattern, exposure] of Object.entries(overrides)) {
 		if (pattern.includes("*") && toolPatternRegExp(pattern).test(toolName)) return exposure;

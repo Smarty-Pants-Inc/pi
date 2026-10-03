@@ -529,7 +529,7 @@ for await (const line of createInterface({ input: process.stdin })) {
 				},
 			],
 		);
-		await expect(failing.connection.getClient()).rejects.toThrow("status 400: bad");
+		await expect(failing.connection.getClient()).rejects.toThrow("status 400");
 		expect(failing.connection.state).toBe("failed");
 		expect(failing.opened()).toBe(1);
 	});

@@ -199,7 +199,13 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 	constructor(options: StreamableHttpTransportOptions) {
 		super();
 		this.options = Object.freeze({ ...options, headers: options.headers ? { ...options.headers } : undefined });
-		this.url = new URL(options.url);
+		try {
+			this.url = new URL(options.url);
+		} catch {
+			throw new Error("Invalid MCP HTTP URL");
+		}
+		if (this.url.username || this.url.password)
+			throw new Error("MCP HTTP URL userinfo is unsupported; use authentication headers");
 		const fetch = options.fetch ?? globalThis.fetch;
 		// Call fetch without a receiver. `this.fetch(...)` and `context.fetch(...)` would pass the transport or
 		// the auth context as `this`, which Cloudflare Workers reject for the platform fetch ("Illegal invocation").
