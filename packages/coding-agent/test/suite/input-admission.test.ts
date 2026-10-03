@@ -720,8 +720,8 @@ describe("native input admission v1", () => {
 		expect(h.session.isIdle).toBe(true);
 	});
 
-	// smarty-dev#3814 / PR #117 R5-2/R5-S2: cancelled settlement descendants cannot start effectful native entries.
-	it.each(["bash", "compact"] as const)(
+	// smarty-dev#3814 / PR #117 R5-2/R5-S2 and R6-3/R6-S3: cancelled settlement descendants cannot start effectful native entries.
+	it.each(["bash", "compact", "bug-report"] as const)(
 		"failed recoverable disposal refuses actual late settlement %s",
 		async (entry) => {
 			const entered = gate(),
@@ -729,6 +729,7 @@ describe("native input admission v1", () => {
 			let h!: Harness;
 			let lateHandler: Promise<void> | undefined;
 			let lateResult: unknown;
+			let lateAuthCalls = 0;
 			let settlementStarted = false;
 			h = await createHarness({
 				extensionFactories: [
@@ -739,10 +740,13 @@ describe("native input admission v1", () => {
 							lateHandler = (async () => {
 								entered.release();
 								await held.promise;
+								lateAuthCalls = authCalls.mock.calls.length;
 								const call =
 									entry === "bash"
 										? h.session.executeBash(`printf late > '${join(h.tempDir, "late-sentinel")}'`)
-										: h.session.compact();
+										: entry === "compact"
+											? h.session.compact()
+											: h.session.summarizeForBugReport({ signal: new AbortController().signal });
 								lateResult = await call.then(
 									() => "accepted",
 									(error: unknown) => error,
@@ -755,6 +759,10 @@ describe("native input admission v1", () => {
 				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
 			});
 			harnesses.push(h);
+			const authCalls = vi.spyOn(
+				h.session as unknown as { _getSummarizationRequestAuth: (...args: unknown[]) => Promise<unknown> },
+				"_getSummarizationRequestAuth",
+			);
 			h.setResponses([
 				fauxAssistantMessage("original reply"),
 				fauxAssistantMessage("summary A"),
@@ -783,6 +791,7 @@ describe("native input admission v1", () => {
 			held.release();
 			await lateHandler;
 			expect(lateResult).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+			expect(authCalls).toHaveBeenCalledTimes(lateAuthCalls);
 			expect(existsSync(join(h.tempDir, "late-sentinel"))).toBe(false);
 			expect(h.events.slice(bashEvents)).toEqual([]);
 			expect(h.getPendingResponseCount()).toBe(2);
@@ -796,13 +805,183 @@ describe("native input admission v1", () => {
 				expect(await h.session.executeBash(`printf fresh > '${sentinel}'`)).toMatchObject({ exitCode: 0 });
 				expect(existsSync(sentinel)).toBe(true);
 				expect(h.session.messages.at(-1)).toMatchObject({ role: "bashExecution" });
-			} else {
+			} else if (entry === "compact") {
 				await h.session.compact();
 				expect(h.getPendingResponseCount()).toBe(1);
 				expect(h.sessionManager.getEntries().at(-1)).toMatchObject({ type: "compaction" });
+			} else {
+				expect(await h.session.summarizeForBugReport({ signal: new AbortController().signal })).toContain(
+					"summary A",
+				);
+				expect(h.getPendingResponseCount()).toBe(1);
+				expect(h.sessionManager.revision()).toBe(revision);
 			}
 		},
 	);
+
+	// PR #117 R6-1/R6-S1: cancelled compaction-hook descendants cannot regain native authority after failed recoverable disposal.
+	it.each(
+		(["session_before_compact", "session_compact", "session_compact_failed"] as const).flatMap((hook) =>
+			(["prompt", "custom-trigger", "extension-user", "bash"] as const).map((entry) => [hook, entry] as const),
+		),
+	)("failed recoverable disposal refuses actual late %s %s", async (hook, entry) => {
+		const entered = gate(),
+			held = gate();
+		let h!: Harness;
+		let lateHandler: Promise<void> | undefined;
+		let lateResult: unknown;
+		const laterHandler = vi.fn();
+		h = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					// A non-abort failure: its observer runs after the operation controller is cleared.
+					if (hook === "session_compact_failed") pi.on("session_before_compact", () => ({ cancel: true }));
+					// Both handlers ignore the event payload, so one overload covers all three hooks.
+					const on = (handler: () => Promise<void> | undefined) => pi.on(hook as "session_compact", handler);
+					on(() => {
+						lateHandler = (async () => {
+							entered.release();
+							await held.promise;
+							if (entry === "extension-user") pi.sendUserMessage("late native");
+							else {
+								const call =
+									entry === "prompt"
+										? h.session.prompt("late native")
+										: entry === "custom-trigger"
+											? h.session.sendCustomMessage(
+													{ customType: "late-compaction", content: "late custom", display: false },
+													{ triggerTurn: true },
+												)
+											: h.session.executeBash(`printf late > '${join(h.tempDir, "late-sentinel")}'`);
+								lateResult = await call.then(
+									() => "accepted",
+									(error: unknown) => error,
+								);
+							}
+						})();
+						return lateHandler;
+					});
+					on(laterHandler);
+				},
+			],
+			settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+		});
+		harnesses.push(h);
+		h.setResponses([
+			fauxAssistantMessage("original reply"),
+			fauxAssistantMessage("summary A"),
+			fauxAssistantMessage("fresh reply"),
+			fauxAssistantMessage("steer reply"),
+			fauxAssistantMessage("follow-up reply"),
+		]);
+		const errors: Array<{ event: string; error: string }> = [];
+		h.session.extensionRunner.onError((error) => errors.push(error));
+		const runtime = await runtimeFor(h);
+		await h.session.prompt("original input");
+		// An independent SDK compaction, outside any input or settlement callback.
+		const compaction = h.session.compact().then(
+			() => "compacted",
+			(error: unknown) => error,
+		);
+		await entered.promise;
+		await h.session.steer("retained steer", [{ type: "image", data: "original-steer", mimeType: "image/png" }]);
+		await h.session.followUp("retained follow-up", [
+			{ type: "image", data: "original-follow-up", mimeType: "image/png" },
+		]);
+		const queues = structuredClone(h.session.agent.getQueuedMessages());
+		expect(queues).toHaveLength(2);
+		const messages = structuredClone(h.session.messages);
+		const history = structuredClone(h.sessionManager.getEntries());
+		const revision = h.sessionManager.revision();
+		const pending = h.getPendingResponseCount();
+		const receipt = vi.fn(() => {
+			throw new Error("authoritative receipt failed");
+		});
+		await expect(runtime.dispose({ rejectQueuedInput: receipt })).rejects.toThrow("authoritative receipt failed");
+		expect(receipt).toHaveBeenCalledExactlyOnceWith(queues, h.session);
+		expect(runtime.session).toBe(h.session);
+		expect(runtime.inputsFenced).toBe(false);
+		expect(h.session.isDisposed).toBe(false);
+		expect(h.session.isCompacting).toBe(false);
+		const events = h.events.length;
+		// Release the actual abandoned handler only after cancellation, refusal and reopening.
+		held.release();
+		await lateHandler;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(await compaction).toMatchObject({ message: "Compaction cancelled" });
+		if (entry === "extension-user") {
+			expect(errors).toEqual([
+				expect.objectContaining({ event: "send_user_message", error: expect.stringContaining("aborted") }),
+			]);
+		} else {
+			expect(lateResult).toMatchObject({ name: "AbortError" });
+			expect(errors).toEqual([]);
+		}
+		expect(laterHandler).not.toHaveBeenCalled();
+		expect(existsSync(join(h.tempDir, "late-sentinel"))).toBe(false);
+		expect(h.events.slice(events).filter((event) => event.type !== "compaction_end")).toEqual([]);
+		expect(h.session.inputAdmissionCount).toBe(0);
+		expect(h.session.agent.getQueuedMessages()).toEqual(queues);
+		expect(h.session.messages).toEqual(messages);
+		expect(h.sessionManager.getEntries()).toEqual(history);
+		expect(h.sessionManager.revision()).toBe(revision);
+		expect(h.eventsOfType("agent_start")).toHaveLength(1);
+		expect(h.getPendingResponseCount()).toBe(pending);
+		// Genuinely fresh external input still runs after recoverable refusal.
+		await h.session.prompt("unrelated fresh external input");
+		expect(getUserTexts(h)).toContain("unrelated fresh external input");
+		expect(getUserTexts(h)).not.toContain("late native");
+		expect(h.session.messages.some((item) => item.role === "custom" && item.customType === "late-compaction")).toBe(
+			false,
+		);
+		expect(h.session.isIdle).toBe(true);
+	});
+
+	// PR #117 R6-2/R6-S2: held-admission ctx.compact() must not allocate a summary after idle disposal.
+	it("an input handler's ctx.compact() cannot start after an earlier idle observer disposes the session", async () => {
+		const entered = gate(),
+			held = gate();
+		let completion!: Promise<unknown>;
+		const h = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event, ctx) => {
+						if (event.text !== "compact-now") return;
+						entered.release();
+						await held.promise;
+						completion = new Promise((resolve) => {
+							ctx.compact({ onComplete: resolve, onError: resolve });
+						});
+						return { action: "handled" };
+					});
+				},
+			],
+			settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+		});
+		harnesses.push(h);
+		h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("late summary")]);
+		await h.session.prompt("original input");
+		const authCalls = vi.spyOn(
+			h.session as unknown as { _getSummarizationRequestAuth: (...args: unknown[]) => Promise<unknown> },
+			"_getSummarizationRequestAuth",
+		);
+		const history = structuredClone(h.sessionManager.getEntries());
+		const revision = h.sessionManager.revision();
+		const input = h.session.prompt("compact-now").catch(() => undefined);
+		await entered.promise;
+		expect(h.session.isIdle).toBe(false);
+		// Registered while the input admission is still held, before ctx.compact() runs.
+		const disposal = h.session.waitForIdle().then(() => h.session.dispose());
+		held.release();
+		await input;
+		await disposal;
+		expect(h.session.isDisposed).toBe(true);
+		expect(await completion).toMatchObject({ code: "INPUT_ADMISSION_DISPOSED" });
+		expect(authCalls).not.toHaveBeenCalled();
+		expect(h.getPendingResponseCount()).toBe(1);
+		expect(h.sessionManager.getEntries()).toEqual(history);
+		expect(h.sessionManager.revision()).toBe(revision);
+	});
 
 	// smarty-dev#3814: compact() aborting the caller's own held input admission is not revocation.
 	it("an input handler can still compact through ctx.compact()", async () => {

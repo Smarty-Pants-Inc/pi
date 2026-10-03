@@ -405,6 +405,8 @@ interface InputAdmission {
 	controller: AbortController;
 	/** Own cancellation combined with inherited dispatch revocation. */
 	signal: AbortSignal;
+	/** Inherited dispatch revocation alone, without this admission's own cancellation. */
+	parent: AbortSignal | undefined;
 	fenceScope: InputFenceScope | undefined;
 	release(): void;
 }
@@ -490,6 +492,8 @@ export class AgentSession {
 	private readonly _modelSwitchDispatches = new Map<CustomMessage, "steer" | "followUp" | undefined>();
 	/** Compaction hooks may await message acceptance, but must not await their enclosing switch. */
 	private readonly _compactionHookScope = new AsyncLocalStorage<boolean>();
+	/** In-flight compaction hook dispatches; abortCompaction() revokes them with their operation. */
+	private readonly _compactionHooks = new Set<AbortController>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1135,8 +1139,32 @@ export class AgentSession {
 		event: SessionBeforeCompactEvent | SessionCompactEvent | SessionCompactFailedEvent,
 		signal?: AbortSignal,
 	): Promise<SessionBeforeCompactResult | undefined> {
-		// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
-		return this._compactionHookScope.run(true, () => raceWithAbortSignal(this._extensionRunner.emit(event), signal));
+		// A signal argument is not ancestry: install operation and inherited revocation so abandoned hook
+		// descendants cannot start fresh native work (PR #117 R6-1). Failure observers run after the
+		// operation's controller is cleared, so abortCompaction() also revokes this hook's own controller.
+		const hook = new AbortController();
+		const inherited = this._dispatchCancellationScope.getStore();
+		const ancestry = AbortSignal.any(
+			[signal, inherited, hook.signal].filter((item): item is AbortSignal => item !== undefined),
+		);
+		// ponytail: a compaction that already ended cancelled still notifies its failure observers
+		// (aborted: true), as before; they only run under revoked ancestry and cannot start new work.
+		const dispatchSignal = signal?.aborted ? inherited : ancestry;
+		this._compactionHooks.add(hook);
+		try {
+			// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
+			return await this._compactionHookScope.run(true, () =>
+				this._dispatchCancellationScope.run(ancestry, () =>
+					raceWithAbortSignal(this._extensionRunner.emit(event, dispatchSignal), ancestry),
+				),
+			);
+		} catch (error) {
+			// Cancelling a notification alone does not replace the compaction's own outcome.
+			if (event.type === "session_compact_failed" && hook.signal.aborted && error === hook.signal.reason) return;
+			throw error;
+		} finally {
+			this._compactionHooks.delete(hook);
+		}
 	}
 
 	private async _emitSessionCompactFailed(
@@ -2260,6 +2288,7 @@ export class AgentSession {
 		const admission: InputAdmission = {
 			controller,
 			signal: cancellation ? AbortSignal.any([controller.signal, cancellation]) : controller.signal,
+			parent: cancellation,
 			fenceScope: this._inputFenceScope.getStore(),
 			release: () => {
 				if (!this._inputAdmissions.delete(admission)) return;
@@ -3729,13 +3758,24 @@ export class AgentSession {
 		const admission = this._inputAdmissionScope.getStore();
 		const ownsHeldAdmission = admission !== undefined && this._inputAdmissions.has(admission);
 		const inherited = this._inheritedCancellation();
+		const dispatch = this._dispatchCancellationScope.getStore();
 		await this.abort();
-		// ponytail: abort() itself ends a caller's held admission (an extension command calling ctx.compact()).
-		// That is not revocation; such callers keep only the entry check, and later disposal aborts compaction.
-		const revocation = ownsHeldAdmission ? undefined : inherited;
+		// abort() itself ends a caller's held admission (an extension command calling ctx.compact()). Only that
+		// self-abort is exempt: keep the admission's independently inherited revocation (PR #117 R6-2).
+		const revocation = ownsHeldAdmission ? (dispatch === admission.signal ? admission.parent : dispatch) : inherited;
 		revocation?.throwIfAborted();
+		// The abort join can let an idle observer retire this session before any compaction controller exists.
+		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "compaction was not started");
+		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
-		return this.#compactSession(customInstructions, undefined, revocation);
+		if (!ownsHeldAdmission) return this.#compactSession(customInstructions, undefined, revocation);
+		this._assertInputsOpen();
+		// Hooks and their descendants inherit that revocation, not the admission this call ended itself.
+		return this._inputAdmissionScope.exit(() =>
+			this._dispatchCancellationScope.run(revocation, () =>
+				this.#compactSession(customInstructions, undefined, revocation),
+			),
+		);
 	}
 
 	/** Same session implementation; manual cancellation stays in its entry wrapper. */
@@ -4070,6 +4110,7 @@ export class AgentSession {
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+		for (const hook of this._compactionHooks) hook.abort();
 	}
 
 	/**
@@ -5655,11 +5696,25 @@ export class AgentSession {
 	 * Used when the user declines to share the transcript itself.
 	 */
 	async summarizeForBugReport(options: { hint?: string; signal: AbortSignal }): Promise<string> {
+		// A revoked descendant cannot start an auxiliary provider request (PR #117 R6-3).
+		const inherited = this._inheritedCancellation();
+		const signal = AbortSignal.any(
+			[options.signal, this._shutdownCancellation.signal, inherited].filter(
+				(item): item is AbortSignal => item !== undefined,
+			),
+		);
+		signal.throwIfAborted();
 		const model = this.model;
 		if (!model) {
 			throw new Error("No model selected");
 		}
-		const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
+		const {
+			model: requestModel,
+			apiKey,
+			headers,
+			env,
+		} = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
+		signal.throwIfAborted();
 		return generateBugReportSummary({
 			messages: this.messages,
 			hint: options.hint,
@@ -5667,7 +5722,7 @@ export class AgentSession {
 			apiKey,
 			headers,
 			env,
-			signal: options.signal,
+			signal,
 			thinkingLevel: this.thinkingLevel,
 			streamFn: this.agent.streamFunction,
 			retry: this.settingsManager.getRetrySettings(),
