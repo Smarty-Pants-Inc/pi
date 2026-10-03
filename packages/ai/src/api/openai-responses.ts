@@ -1,5 +1,6 @@
-import OpenAI from "openai";
+import OpenAI, { type ClientOptions } from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import { getOAuthDiagnosticSecrets, redactOAuthDiagnosticValue } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -153,6 +154,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			timestamp: Date.now(),
 		};
 
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey);
 		try {
 			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
@@ -187,6 +189,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
+					diagnosticSecrets,
 				},
 			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -194,6 +197,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 
 			await processResponsesStream(withResponsesEvidence(response, openaiStream), output, stream, model, {
 				onProviderStreamEvent: options?.onProviderStreamEvent,
+				diagnosticSecrets,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
@@ -221,7 +225,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			const errorMessage = formatProviderError(
-				normalizeProviderError(error),
+				normalizeProviderError(error, diagnosticSecrets),
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
@@ -291,8 +295,20 @@ function createClient(
 		Object.assign(headers, optionsHeaders);
 	}
 
+	const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey);
+	const redactArgs = (message: string, args: unknown[]) =>
+		[message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, diagnosticSecrets));
+	const logger: ClientOptions["logger"] = isChatGPTSignIn(model, apiKey)
+		? {
+				error: (message, ...args) => console.error(...redactArgs(message, args)),
+				warn: (message, ...args) => console.warn(...redactArgs(message, args)),
+				info: (message, ...args) => console.info(...redactArgs(message, args)),
+				debug: (message, ...args) => console.debug(...redactArgs(message, args)),
+			}
+		: undefined;
 	return new OpenAI({
 		apiKey,
+		logger,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,

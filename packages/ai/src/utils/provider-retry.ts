@@ -1,3 +1,4 @@
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import { smartyLimitMessage } from "./error-body.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
@@ -6,6 +7,7 @@ interface ProviderRetryOptions {
 	maxRetries?: number;
 	maxRetryDelayMs?: number;
 	signal?: AbortSignal;
+	diagnosticSecrets?: readonly string[];
 }
 
 interface ProviderError extends Error {
@@ -51,18 +53,24 @@ function validateServerRetryDelayMs(
 	return delayMs;
 }
 
-function getRetryDelayMs(error: ProviderError, retryIndex: number, maxRetryDelayMs: number | undefined): number {
+function getRetryDelayMs(
+	error: ProviderError,
+	retryIndex: number,
+	maxRetryDelayMs: number | undefined,
+	secrets?: readonly string[],
+): number {
+	const message = redactOAuthDiagnostic(error.message, secrets);
 	const retryAfterMs = error.headers?.get("retry-after-ms");
 	if (retryAfterMs) {
 		const value = Number.parseFloat(retryAfterMs);
-		if (Number.isFinite(value)) return validateServerRetryDelayMs(value, maxRetryDelayMs, error.message);
+		if (Number.isFinite(value)) return validateServerRetryDelayMs(value, maxRetryDelayMs, message);
 	}
 
 	const retryAfter = error.headers?.get("retry-after");
 	if (retryAfter) {
 		const seconds = Number.parseFloat(retryAfter);
 		const delayMs = Number.isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
-		if (Number.isFinite(delayMs)) return validateServerRetryDelayMs(delayMs, maxRetryDelayMs, error.message);
+		if (Number.isFinite(delayMs)) return validateServerRetryDelayMs(delayMs, maxRetryDelayMs, message);
 	}
 
 	const exponentialDelay = Math.min(0.5 * 2 ** retryIndex, 8) * 1000;
@@ -122,7 +130,10 @@ export async function retryProviderRequest<T>(
 
 			const retryIndex = maxRetries - retriesRemaining;
 			retriesRemaining--;
-			await abortableSleep(getRetryDelayMs(error, retryIndex, options.maxRetryDelayMs), options.signal);
+			await abortableSleep(
+				getRetryDelayMs(error, retryIndex, options.maxRetryDelayMs, options.diagnosticSecrets),
+				options.signal,
+			);
 		}
 	}
 }

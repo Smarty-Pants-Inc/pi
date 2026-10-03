@@ -39,13 +39,14 @@ const BUDGETS = {
 			maxFiles: 15,
 			forbid: ["providers/", "models.generated.ts", "index.ts", "utils/validation.ts", "utils/typebox-helpers.ts"],
 		},
-		"./utils/*": { maxFiles: 3, forbid: ["providers/", "api/", "index.ts"] },
+		// Diagnostics also reach the shared, dependency-free OAuth credential redactor.
+		"./utils/*": { maxFiles: 4, forbid: ["providers/", "api/", "index.ts"] },
 	},
 	"packages/durable": {
 		".": {
 			// The built-in tool task validates arguments with pi-ai's TypeBox-based validation, so TypeBox is allowed.
-			// The fork's retry error-body parser is also reached by upstream durable compaction.
-			maxFiles: 61,
+			// The retry error-body parser and its dependency-free OAuth redactor are reached by durable compaction.
+			maxFiles: 62,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

@@ -10,7 +10,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../../utils/oauth-page.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { LoginOptions, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
-import { readOAuthCredentialResponse } from "./credential-response.ts";
+import { oauthAuthorizationError, readOAuthCredentialResponse } from "./credential-response.ts";
 import { generatePKCE } from "./pkce.ts";
 
 // every login registers a new client with this ID; OpenAI returns the issued client ID in the callback
@@ -74,7 +74,7 @@ function authorizationResultFromManualInput(input: string, expectedState: string
 		throw new Error(`The pasted callback URL must start with ${REDIRECT_URI}`);
 	}
 	const error = url.searchParams.get("error");
-	if (error) throw new Error(`ChatGPT authorization failed: ${error}`);
+	if (error) throw new Error(`ChatGPT authorization failed: ${oauthAuthorizationError(error)}`);
 	return authorizationResultFromCallback(url, expectedState);
 }
 
@@ -102,8 +102,9 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 
 				const error = url.searchParams.get("error");
 				if (error) {
-					sendHtml(response, 400, oauthErrorHtml("ChatGPT was not connected.", `Error: ${error}`));
-					rejectResult(new Error(`ChatGPT authorization failed: ${error}`));
+					const code = oauthAuthorizationError(error);
+					sendHtml(response, 400, oauthErrorHtml("ChatGPT was not connected.", `Error: ${code}`));
+					rejectResult(new Error(`ChatGPT authorization failed: ${code}`));
 					return;
 				}
 
