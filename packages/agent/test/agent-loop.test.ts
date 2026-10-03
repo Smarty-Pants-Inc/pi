@@ -405,6 +405,73 @@ describe("agentLoop with AgentMessage", () => {
 		expect(toolResult?.role === "toolResult" ? toolResult.usage : undefined).toEqual(patchedToolUsage);
 	});
 
+	// smarty-dev#3240: sharing the diagnostic with the durable harness must preserve both loop execution modes.
+	it.each(["sequential", "parallel"] as const)(
+		"reports unknown tools through the %s loop in events and transcript results",
+		async (toolExecution) => {
+			const toolSchema = Type.Object({});
+			const names = ["t00", ...Array.from({ length: 45 }, (_, i) => `t${String(44 - i).padStart(2, "0")}`), "t44"];
+			let executions = 0;
+			const tools: AgentTool<typeof toolSchema, undefined>[] = names.map((name) => ({
+				name,
+				label: name,
+				description: name,
+				parameters: toolSchema,
+				async execute() {
+					executions++;
+					return { content: [], details: undefined };
+				},
+			}));
+			for (const loadout of [[], tools]) {
+				const expected =
+					loadout.length === 0
+						? "Tool missing not found. No tools are available in this session."
+						: `Tool missing not found. Available tools in this session: ${Array.from({ length: 40 }, (_, i) => `t${String(i).padStart(2, "0")}`).join(", ")}, ... (5 more)`;
+				const events: AgentEvent[] = [];
+				const messages = await runAgentLoop(
+					[createUserMessage("call missing")],
+					{ messages: [], tools: loadout },
+					{
+						model: createModel(),
+						convertToLlm: identityConverter,
+						toolExecution,
+						finishTurn: () => ({ action: "end" }),
+					},
+					(event) => {
+						events.push(event);
+					},
+					undefined,
+					() => {
+						const stream = new MockAssistantStream();
+						queueMicrotask(() =>
+							stream.push({
+								type: "done",
+								reason: "toolUse",
+								message: createAssistantMessage(
+									[{ type: "toolCall", id: "missing-1", name: "missing", arguments: {} }],
+									"toolUse",
+								),
+							}),
+						);
+						return stream;
+					},
+				);
+				expect(messages.find((message) => message.role === "toolResult")).toMatchObject({
+					toolCallId: "missing-1",
+					toolName: "missing",
+					isError: true,
+					content: [{ type: "text", text: expected }],
+				});
+				expect(events.find((event) => event.type === "tool_execution_end")).toMatchObject({
+					toolCallId: "missing-1",
+					isError: true,
+					result: { content: [{ type: "text", text: expected }] },
+				});
+			}
+			expect(executions).toBe(0);
+		},
+	);
+
 	it("should not execute tool calls from a length-truncated assistant message", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: string[] = [];

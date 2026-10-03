@@ -250,14 +250,21 @@ function countOccurrences(content: string, oldText: string): number {
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
+function getNotFoundError(
+	path: string,
+	editIndex: number,
+	totalEdits: number,
+	content: string,
+	oldText: string,
+): Error {
+	const hint = getNearestMatchHint(content, oldText);
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines. No edits were applied.\n${hint}`,
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines. No edits were applied.\n- edits[${editIndex}]: ${hint}`,
 	);
 }
 
@@ -267,37 +274,50 @@ function bigrams(text: string): Set<string> {
 	return set;
 }
 
-/** Nearest line to the first non-blank line of oldText (Dice similarity on character bigrams). */
+/** Start of the nearest block, scored using Dice similarity on corresponding lines' character bigrams. */
 export function findNearestLine(content: string, oldText: string): { line: number; excerpt: string } | undefined {
-	const needle = oldText
-		.split("\n")
-		.find((line) => line.trim().length > 0)
-		?.trim();
+	const needle = normalizeToLF(oldText).trim();
 	if (!needle) return undefined;
-	const needleGrams = bigrams(needle);
-	let best: { line: number; excerpt: string; score: number } | undefined;
-	content.split("\n").forEach((text, index) => {
-		const trimmed = text.trim();
-		if (!trimmed) return;
-		const grams = bigrams(trimmed);
-		let shared = 0;
-		for (const gram of grams) if (needleGrams.has(gram)) shared++;
-		const score = (2 * shared) / (grams.size + needleGrams.size || 1);
-		if (!best || score > best.score) best = { line: index + 1, excerpt: trimmed, score };
+	const needleGrams = needle.split("\n").map((line) => bigrams(line.trim()));
+	const lines = normalizeToLF(content).split("\n");
+	let bestIndex = -1;
+	let bestScore = 0;
+	for (let index = 0; index < lines.length; index++) {
+		let score = 0;
+		for (let offset = 0; offset < needleGrams.length && index + offset < lines.length; offset++) {
+			const expected = needleGrams[offset];
+			// Blank lines supply no similarity evidence (smarty-dev#3240).
+			if (expected.size === 0) continue;
+			const grams = bigrams(lines[index + offset].trim());
+			let shared = 0;
+			for (const gram of grams) if (expected.has(gram)) shared++;
+			score += (2 * shared) / (grams.size + expected.size);
+		}
+		if (score > bestScore) {
+			bestIndex = index;
+			bestScore = score;
+		}
+	}
+	if (bestIndex === -1) return undefined;
+	const text = lines[bestIndex].trim();
+	const excerpt = text.length > 80 ? `${text.slice(0, 77)}...` : text;
+	return { line: bestIndex + 1, excerpt };
+}
+
+function getNearestMatchHint(content: string, oldText: string): string {
+	const nearest = findNearestLine(content, oldText);
+	if (!nearest) return "no similar line";
+	const lines = normalizeToLF(content).split("\n");
+	if (lines[lines.length - 1] === "") lines.pop();
+	const snippet = lines.slice(nearest.line - 1, nearest.line + 2).map((text, index) => {
+		const excerpt = text.length > 80 ? `${text.slice(0, 77)}...` : text;
+		return `  ${nearest.line + index}: ${excerpt}`;
 	});
-	if (!best || best.score === 0) return undefined;
-	const excerpt = best.excerpt.length > 80 ? `${best.excerpt.slice(0, 77)}...` : best.excerpt;
-	return { line: best.line, excerpt };
+	return `nearest match at line ${nearest.line}:\n${snippet.join("\n")}`;
 }
 
 function getAllNotFoundError(path: string, content: string, edits: Edit[], missing: number[]): Error {
-	const lines = missing.map((i) => {
-		const nearest = findNearestLine(content, edits[i].oldText);
-		const hint = nearest
-			? `nearest match at line ${nearest.line}: ${JSON.stringify(nearest.excerpt)}`
-			: "no similar line";
-		return `- edits[${i}]: ${hint}`;
-	});
+	const lines = missing.map((i) => `- edits[${i}]: ${getNearestMatchHint(content, edits[i].oldText)}`);
 	return new Error(
 		`Could not find ${missing.length} of ${edits.length} edits in ${path}. Each oldText must match exactly including all whitespace and newlines. No edits were applied.\n${lines.join("\n")}`,
 	);
@@ -359,7 +379,7 @@ export function applyEditsToNormalizedContent(
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
 	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
 
-	// Report every non-matching edit at once, each with its nearest line (smarty-dev#1528 K13).
+	// Report every non-matching edit at once, each with its nearest snippet (smarty-dev#1528 K13, #3240).
 	const missing = initialMatches.flatMap((match, i) => (match.found ? [] : [i]));
 	if (missing.length > 0 && normalizedEdits.length > 1) {
 		throw getAllNotFoundError(path, normalizedContent, normalizedEdits, missing);
@@ -370,7 +390,7 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			throw getNotFoundError(path, i, normalizedEdits.length, normalizedContent, edit.oldText);
 		}
 
 		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);

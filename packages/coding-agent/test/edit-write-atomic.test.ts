@@ -25,6 +25,7 @@ import { type AssistantMessage, type AssistantMessageEvent, EventStream, type Mo
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createEditTool } from "../src/core/tools/edit.ts";
+import { computeEditDiff, computeEditsDiff } from "../src/core/tools/edit-diff.ts";
 import { createReadTool } from "../src/core/tools/read.ts";
 import { createWriteTool } from "../src/core/tools/write.ts";
 
@@ -241,6 +242,45 @@ describe("edit/write atomic and sequential (smarty-dev#977)", () => {
 		await createWriteTool(dir).execute("w", { path: file, content: "c\n" });
 		expect(readFileSync(file, "utf-8")).toBe("c\n");
 		expect(readdirSync(dir)).toEqual([name]);
+	});
+
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#3240.
+	it.each([1, 2])(
+		"a failed %i-edit call and its preview share a hint and leave original bytes intact",
+		async (count) => {
+			const file = join(dir, "keep.txt");
+			const original = Buffer.from(
+				"\uFEFFkeep “quotes”  \r\nsection:\r\nobsolete setting\r\nobsolete details\r\n\r\nsection:\r\ntarget setting value\r\ntarget details value\r\ntail  \r\n",
+			);
+			writeFileSync(file, original);
+			const missing = { oldText: "section:\r\ntarget setting valu3\r\ntarget details valu3", newText: "changed" };
+			const edits = [missing];
+			if (count === 2) edits.unshift({ oldText: 'keep "quotes"', newText: "KEEP" });
+			const hint = "nearest match at line 6:\n  6: section:\n  7: target setting value\n  8: target details value";
+			const preview =
+				count === 1
+					? await computeEditDiff(file, missing.oldText, missing.newText, dir)
+					: await computeEditsDiff(file, edits, dir);
+			expect(preview).toEqual({ error: expect.stringContaining(hint) });
+			await expect(createEditTool(dir).execute("e", { path: file, edits })).rejects.toThrow(hint);
+			expect(readFileSync(file)).toEqual(original);
+			expect(readdirSync(dir)).toEqual(["keep.txt"]);
+		},
+	);
+
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#3240.
+	it("a successful mixed exact/fuzzy batch still preserves unchanged file bytes", async () => {
+		const file = join(dir, "batch.txt");
+		writeFileSync(file, "\uFEFFkeep “quotes”  \r\nexact line\r\ntarget “value”  \r\ntail  \r\n");
+		await createEditTool(dir).execute("e", {
+			path: file,
+			edits: [
+				{ oldText: "exact line", newText: "EXACT" },
+				{ oldText: 'target "value"', newText: "TARGET" },
+			],
+		});
+		expect(readFileSync(file)).toEqual(Buffer.from("\uFEFFkeep “quotes”  \r\nEXACT\r\nTARGET\r\ntail  \r\n"));
+		expect(readdirSync(dir)).toEqual(["batch.txt"]);
 	});
 
 	it("a failing write leaves the original intact and no temp file", async () => {

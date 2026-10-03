@@ -51,6 +51,7 @@ interface Fixture {
 interface FixtureOptions {
 	calls: Array<{ name: string; value?: string }>;
 	tools?: AgentHarnessTool<undefined>[];
+	activeToolNames?: string[];
 	mode?: "sequential" | "parallel";
 	stopReason?: "toolUse" | "length";
 	callStates?: (resultEntryIds: string[]) => ToolCall[];
@@ -152,7 +153,7 @@ async function createFixture(options: FixtureOptions): Promise<Fixture> {
 	const configuration: LaneConfiguration = {
 		model: { provider: model.provider, modelId: model.id },
 		thinkingLevel: "off",
-		activeToolNames: options.calls.map(({ name }) => name),
+		activeToolNames: options.activeToolNames ?? options.calls.map(({ name }) => name),
 	};
 	const assistant = fauxAssistantMessage(
 		options.calls.map(({ name, value = name }, index) => fauxToolCall(name, { value }, { id: `call-${index}` })),
@@ -599,7 +600,7 @@ describe("durable tool batch", () => {
 		expect(missingEntry?.type === "message" ? missingEntry.message : undefined).toMatchObject({
 			role: "toolResult",
 			isError: true,
-			content: [{ type: "text", text: 'Tool "missing" is unavailable' }],
+			content: [{ type: "text", text: "Tool missing not found. No tools are available in this session." }],
 		});
 		expect(
 			missingEntry?.type === "message" && missingEntry.message.role === "toolResult"
@@ -614,10 +615,64 @@ describe("durable tool batch", () => {
 			args: { value: "missing" },
 		});
 		expect(missingEnds[0]).toMatchObject({
-			result: { content: [{ type: "text", text: 'Tool "missing" is unavailable' }], details: undefined },
+			result: {
+				content: [{ type: "text", text: "Tool missing not found. No tools are available in this session." }],
+				details: undefined,
+			},
 			isError: true,
 		});
 	});
+
+	// smarty-dev#3240: exercise the durable receiver, including captured active-tool filtering and restoration.
+	it.each(["sequential", "parallel"] as const)(
+		"persists the active-loadout diagnostic and emits the same %s tool outcome",
+		async (mode) => {
+			const cases = [
+				{ names: [], listed: "No tools are available in this session." },
+				{ names: ["write", "read", "bash", "read"], listed: "Available tools in this session: bash, read, write" },
+				...([40, 45] as const).map((count) => ({
+					names: ["t00", ...Array.from({ length: count }, (_, i) => `t${String(count - 1 - i).padStart(2, "0")}`)],
+					listed: `Available tools in this session: ${Array.from({ length: 40 }, (_, i) => `t${String(i).padStart(2, "0")}`).join(", ")}${count > 40 ? ", ... (5 more)" : ""}`,
+				})),
+			];
+			for (const { names, listed } of cases) {
+				const execute = vi.fn(async () => ({ content: [], details: {} }));
+				const fixture = await createFixture({
+					calls: [{ name: "missing" }],
+					tools: [...names, "inactive"].map((name) => tool(name, execute)),
+					activeToolNames: names,
+					mode,
+				});
+				const beforeTool = vi.fn(() => undefined);
+				const afterTool = vi.fn(() => undefined);
+				fixture.hooks.on("before_tool", beforeTool);
+				fixture.hooks.on("after_tool", afterTool);
+				expect(await driveTools(fixture)).toEqual({ kind: "continue" });
+				const entry = await fixture.session.getEntry(fixture.resultEntryIds[0]!, BACKGROUND_CONTEXT);
+				const expectedContent = [{ type: "text", text: `Tool missing not found. ${listed}` }];
+				expect(entry?.type === "message" ? entry.message : undefined).toMatchObject({
+					role: "toolResult",
+					toolCallId: "call-0",
+					toolName: "missing",
+					isError: true,
+					content: expectedContent,
+				});
+				expect(fixture.events.filter((event) => event.type === "tool_end")).toEqual([
+					expect.objectContaining({
+						isError: true,
+						terminate: false,
+						result: { content: expectedContent, details: undefined },
+					}),
+				]);
+				expect(currentRun(fixture)).toMatchObject({ at: "checkpoint", continuation: { kind: "need_assistant" } });
+				expect(execute).not.toHaveBeenCalled();
+				expect(beforeTool).not.toHaveBeenCalled();
+				expect(afterTool).not.toHaveBeenCalled();
+				expect(fixture.observations).not.toContain("intent_commit");
+				await expectProjectionRestores(fixture);
+			}
+		},
+	);
 
 	it("awaits update delivery and checkpoint persistence before after_tool", async () => {
 		const releaseUpdate = deferred<void>();
