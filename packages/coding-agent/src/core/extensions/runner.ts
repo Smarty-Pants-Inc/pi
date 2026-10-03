@@ -256,9 +256,10 @@ export type ShutdownHandler = () => void;
 export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
+		await extensionRunner.emit(event, signal);
 		return true;
 	}
 	return false;
@@ -530,7 +531,22 @@ export class ExtensionRunner {
 	}
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		const wrapped = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		// A caller may capture ui or an individual method before replacement. Check
+		// lifetime at invocation too, not only when ctx.ui is first read.
+		this.uiContext = uiContext
+			? new Proxy(wrapped, {
+					get: (target, key, receiver) => {
+						this.assertActive();
+						const value: unknown = Reflect.get(target, key, receiver);
+						if (typeof value !== "function") return value;
+						return (...args: unknown[]) => {
+							this.assertActive();
+							return Reflect.apply(value, target, args);
+						};
+					},
+				})
+			: noOpUIContext;
 		this.mode = mode;
 	}
 

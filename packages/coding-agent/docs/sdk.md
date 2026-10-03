@@ -53,7 +53,7 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 `cwd` selects the workspace used for project resource discovery, context files, session grouping, and built-in tool paths. Pass it explicitly when the target differs from `process.cwd()`.
 
-`session.dispose()` aborts active work, invalidates extension contexts, disconnects from the agent, and removes event listeners. Call it when the session is no longer needed.
+`session.dispose()` invalidates extension contexts, disconnects from the agent, and removes event listeners. It refuses active, admitted or queued input rather than dropping it. First `await session.abort()`, and explicitly recover any undelivered queues before disposal. See [Native input admission](input-admission.md) for the versioned accounting and replacement-fence contract.
 
 `AgentSessionRuntime` adds `newSession()`, `switchSession()`, `fork()`, and `importFromJsonl()`. Each operation replaces the active `AgentSession` and recreates services for the target working directory.
 
