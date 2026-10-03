@@ -86,7 +86,11 @@ function parseConfigValueReference(config: string): ConfigValueReference {
 }
 
 function resolveEnvConfigValue(name: string, env?: Record<string, string>): string | undefined {
-	return env?.[name] || process.env[name] || undefined;
+	return (
+		(env && Object.hasOwn(env, name) ? env[name] : undefined) ||
+		(Object.hasOwn(process.env, name) ? process.env[name] : undefined) ||
+		undefined
+	);
 }
 
 function getTemplateEnvVarNames(parts: TemplatePart[]): string[] {
@@ -234,7 +238,7 @@ export function resolveConfigValueOrThrow(config: string, description: string, e
 
 	const reference = parseConfigValueReference(config);
 	if (reference.type === "command") {
-		throw new Error(`Failed to resolve ${description} from shell command: ${reference.config.slice(1)}`);
+		throw new Error(`Failed to resolve ${description} from shell command (command text omitted)`);
 	}
 
 	if (reference.type === "template") {
@@ -258,7 +262,7 @@ export function resolveHeaders(
 	env?: Record<string, string>,
 ): Record<string, string> | undefined {
 	if (!headers) return undefined;
-	const resolved: Record<string, string> = {};
+	const resolved: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(headers)) {
 		const resolvedValue = resolveConfigValue(value, env);
 		if (resolvedValue) {
@@ -274,7 +278,7 @@ export function resolveHeadersOrThrow(
 	env?: Record<string, string>,
 ): Record<string, string> | undefined {
 	if (!headers) return undefined;
-	const resolved: Record<string, string> = {};
+	const resolved: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(headers)) {
 		resolved[key] = resolveConfigValueOrThrow(value, `${description} header "${key}"`, env);
 	}

@@ -66,7 +66,12 @@ export class FileAuthStorageBackend implements AuthStorageBackend {
 
 	private ensureFileExists(): void {
 		if (!existsSync(this.authPath)) {
-			writeFileSync(this.authPath, "{}", AUTH_FILE_WRITE_OPTIONS);
+			try {
+				writeFileSync(this.authPath, "{}", { ...AUTH_FILE_WRITE_OPTIONS, flag: "wx" });
+			} catch (error) {
+				if (!(typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST"))
+					throw error;
+			}
 		}
 	}
 

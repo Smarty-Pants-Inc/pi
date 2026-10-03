@@ -1,6 +1,14 @@
 import { expect, expectTypeOf, it } from "vitest";
+import { flattenClassifierModelCatalog } from "../src/model-catalog.ts";
 import { GITHUB_COPILOT_MODELS } from "../src/providers/github-copilot.models.ts";
 import { XAI_MODELS } from "../src/providers/xai.models.ts";
+
+// smarty-dev#3155: a pinned snapshot may predate a provider's classifier catalog.
+it("types empty classifier catalogs without unknown model values", () => {
+	const catalog = flattenClassifierModelCatalog("opencode", {});
+	expect(Object.values(catalog)).toEqual([]);
+	expectTypeOf(Object.values(catalog)).toEqualTypeOf<never[]>();
+});
 
 it("derives model API, ID, and provider literals from grouped model data", () => {
 	expectTypeOf(XAI_MODELS["grok-4.5"].api).toEqualTypeOf<"openai-responses">();
