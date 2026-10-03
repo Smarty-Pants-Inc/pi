@@ -10,6 +10,7 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../../utils/oauth-page.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { LoginOptions, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { readOAuthCredentialResponse } from "./credential-response.ts";
 import { generatePKCE } from "./pkce.ts";
 
 // every login registers a new client with this ID; OpenAI returns the issued client ID in the callback
@@ -132,20 +133,25 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 }
 
 async function requestToken(body: URLSearchParams, signal: AbortSignal): Promise<TokenResponse> {
-	const response = await fetch(TOKEN_URL, {
-		method: "POST",
-		headers: {
-			accept: "application/json",
-			"content-type": "application/x-www-form-urlencoded",
-		},
-		body,
-		signal,
-	});
-	if (!response.ok) {
-		const responseBody = await response.text().catch(() => "");
-		throw new Error(`OpenAI OAuth token request failed (${response.status}): ${responseBody || response.statusText}`);
+	let response: Response;
+	try {
+		response = await fetch(TOKEN_URL, {
+			method: "POST",
+			headers: {
+				accept: "application/json",
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			body,
+			signal,
+		});
+	} catch {
+		throw new Error(`OpenAI OAuth token request ${signal.aborted ? "cancelled" : "failed"}`);
 	}
-	const data: unknown = await response.json();
+	if (!response.ok) {
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`OpenAI OAuth token request failed (HTTP ${response.status})`);
+	}
+	const data = await readOAuthCredentialResponse(response, "OpenAI OAuth token");
 	if (typeof data !== "object" || data === null || Array.isArray(data)) {
 		throw new Error("OpenAI OAuth token response must be an object");
 	}
