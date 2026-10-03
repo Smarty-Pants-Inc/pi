@@ -54,6 +54,8 @@ import {
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
 const RECENT_RESIDENT_ENTRIES = 100;
+/** The recent window must not retain 100 arbitrarily large extension snapshots (smarty-dev#4250). */
+const RECENT_RESIDENT_BYTES = 8 * 1024 * 1024;
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -717,17 +719,26 @@ function readEntriesFromFile(filePath: string, cold: boolean): FileEntry[] {
 	if (!existsSync(resolvedFilePath)) return [];
 
 	const entries: FileEntry[] = [];
+	let residentStart = 0;
+	let residentBytes = 0;
 	const { missingFinalNewline } = readSessionFileLines(
 		resolvedFilePath,
 		(line, offset, length) => {
 			const entry = parseSessionEntryLine(line);
 			if (!entry) return;
 			const location = { file: resolvedFilePath, offset, length };
-			if (cold && entry.type !== "session") {
-				entries.push(toColdEntry(entry, location));
-			} else {
-				if (cold) setEntryLocation(entry, location);
-				entries.push(entry);
+			entries.push(entry);
+			if (!cold) return;
+			setEntryLocation(entry, location);
+			// Keep a bounded parsed tail from this scan. Making it cold only to hydrate it again
+			// in #releaseColdEntries doubles the reads and parsing of recent large lines.
+			residentBytes += length;
+			while (entries.length - residentStart > RECENT_RESIDENT_ENTRIES || residentBytes > RECENT_RESIDENT_BYTES) {
+				const previous = entries[residentStart];
+				const previousLocation = getEntryLocation(previous)!;
+				residentBytes -= previousLocation.length;
+				if (previous.type !== "session") entries[residentStart] = toColdEntry(previous, previousLocation);
+				residentStart++;
 			}
 		},
 		SESSION_READ_BUFFER_SIZE,
@@ -1305,15 +1316,38 @@ export class SessionManager {
 	/**
 	 * Bound session memory (smarty-dev#2177): keep the current context and the most recent entries
 	 * resident; every other entry keeps only its small fields and reads large ones from the file.
+	 * Extension-only state and superseded compactions do not contribute model context. The recent
+	 * window has a byte limit and never rehydrates entries just because they are recent.
 	 * Runs after load, compaction and leaf moves; entries appended between runs stay resident.
 	 */
 	#releaseColdEntries(): void {
 		if (this.#ownedJournal || !this.persist || !this.flushed) return;
 		const hot = new Set<string>();
-		for (const entry of buildContextEntries([], this.leafId, this.byId)) hot.add(entry.id);
-		for (let i = Math.max(0, this.fileEntries.length - RECENT_RESIDENT_ENTRIES); i < this.fileEntries.length; i++) {
+		const contextEntries = buildContextEntries([], this.leafId, this.byId);
+		for (let i = 0; i < contextEntries.length; i++) {
+			const entry = contextEntries[i];
+			// buildContextEntries also preserves state for the UI. Only model contributions need
+			// hydration: custom snapshots and older retained compactions must stay lazy (#4250).
+			if (
+				entry.type === "message" ||
+				entry.type === "custom_message" ||
+				entry.type === "branch_summary" ||
+				entry.type === "context_edit" ||
+				(entry.type === "compaction" && i === 0)
+			) {
+				hot.add(entry.id);
+			}
+		}
+		let recentBytes = 0;
+		for (
+			let i = this.fileEntries.length - 1;
+			i >= Math.max(0, this.fileEntries.length - RECENT_RESIDENT_ENTRIES);
+			i--
+		) {
 			const entry = this.fileEntries[i];
-			if (entry.type !== "session") hot.add(entry.id);
+			recentBytes += getEntryLocation(entry)?.length ?? 0;
+			if (recentBytes > RECENT_RESIDENT_BYTES) break;
+			if (entry.type !== "session" && !isColdEntry(entry)) hot.add(entry.id);
 		}
 		let changed = false;
 		for (let i = 0; i < this.fileEntries.length; i++) {
