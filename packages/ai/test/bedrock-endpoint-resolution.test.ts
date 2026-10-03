@@ -119,6 +119,50 @@ describe("bedrock endpoint resolution", () => {
 		expect(config.region).toBe("eu-central-1");
 	});
 
+	// Regression for Smarty-Pants-Inc/pi#125: India profiles cannot default to us-east-1.
+	it.each([
+		"in.anthropic.claude-haiku-4-5-20251001-v1:0",
+		"in.anthropic.claude-opus-5",
+		"in.anthropic.claude-sonnet-5",
+	] as const)("uses ap-south-1 for %s without region or profile overrides", async (modelId) => {
+		const model = getModel("amazon-bedrock", modelId);
+		expect(model.baseUrl).toBe("https://bedrock-runtime.ap-south-1.amazonaws.com");
+
+		for (const options of [
+			{ apiKey: "test-bedrock-key" },
+			{ env: { AWS_ACCESS_KEY_ID: "test-access-key", AWS_SECRET_ACCESS_KEY: "test-secret-key" } },
+		]) {
+			const config = await captureClientConfig(model, options);
+			expect(config.endpoint).toBe("https://bedrock-runtime.ap-south-1.amazonaws.com");
+			expect(config.region).toBe("ap-south-1");
+		}
+	});
+
+	it("preserves configured regions for India profiles", async () => {
+		const model = getModel("amazon-bedrock", "in.anthropic.claude-haiku-4-5-20251001-v1:0");
+		const overrides: BedrockOptions[] = [
+			{ region: "ap-south-2" },
+			{ env: { AWS_REGION: "ap-south-2" } },
+			{ env: { AWS_DEFAULT_REGION: "ap-south-2" } },
+			{ profile: "india-profile", region: "ap-south-2" },
+		];
+		for (const options of overrides) {
+			const config = await captureClientConfig(model, options);
+			expect(config.endpoint).toBeUndefined();
+			expect(config.region).toBe("ap-south-2");
+		}
+	});
+
+	it("defers India endpoint and region resolution to an ambient profile", async () => {
+		process.env.AWS_PROFILE = "india-profile";
+		const model = getModel("amazon-bedrock", "in.anthropic.claude-haiku-4-5-20251001-v1:0");
+		const config = await captureClientConfig(model);
+
+		expect(config.profile).toBe("india-profile");
+		expect(config.endpoint).toBeUndefined();
+		expect(config.region).toBeUndefined();
+	});
+
 	it("handles missing regions for explicit, scoped, and ambient profiles", async () => {
 		const model = getModel("amazon-bedrock", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0");
 
