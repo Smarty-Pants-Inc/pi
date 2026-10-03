@@ -121,6 +121,7 @@ class Execution {
 	private receivedBytes = 0;
 	private receivedItems = 0;
 	private admittedCalls = 0;
+	private sentBytes = 0;
 
 	constructor(options: ExecutionOptions) {
 		this.promise = new Promise<CodemodeResult>((resolve) => {
@@ -202,6 +203,14 @@ class Execution {
 	};
 
 	private post(message: HostToWorkerMessage): void {
+		if (this.finished) return;
+		// Reply credits also belong to the host: a guest may stop consuming them.
+		const bytes = Buffer.byteLength(message.payload ?? "") + 128;
+		this.sentBytes += bytes;
+		if (bytes > MAX_MESSAGE_BYTES || this.sentBytes > MAX_TRANSIT_BYTES) {
+			this.finish({ kind: "sandbox", message: "Sandbox reply budget exceeded" });
+			return;
+		}
 		this.worker?.postMessage(message);
 	}
 

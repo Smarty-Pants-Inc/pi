@@ -13,6 +13,7 @@ export function boundedJson(value: unknown, maxBytes = MAX_MESSAGE_BYTES): strin
 	return JSON.stringify(value, (key, item: unknown) => {
 		bytes += key.length * 6 + 8;
 		if (typeof item === "string") bytes += item.length * 6;
+		if (typeof item === "number") bytes += 32;
 		if (bytes > maxBytes) throw new Error("Sandbox message byte budget exceeded");
 		return item;
 	});
