@@ -24,6 +24,12 @@ function isProviderError(error: unknown): error is ProviderError {
 /** Mirrors the pinned OpenAI/Anthropic SDK retry policy; review when either SDK is upgraded. */
 function isRetryableProviderError(error: ProviderError): boolean {
 	if (smartyLimitMessage(error) !== undefined) return false;
+	const body = (error as ProviderError & { error?: { code?: unknown; type?: unknown } }).error;
+	if (
+		body?.code === "subscription_sharing_usage_limit_exceeded" ||
+		body?.type === "subscription_sharing_usage_limit_exceeded"
+	)
+		return false;
 	const shouldRetry = error.headers?.get("x-should-retry");
 	if (shouldRetry === "true") return true;
 	if (shouldRetry === "false") return false;

@@ -481,7 +481,7 @@ describe("OpenAI Codex OAuth", () => {
 				},
 				neverAbortedSignal,
 			),
-		).rejects.toThrow(/OpenAI Codex token refresh failed \(401\).*Could not validate your token/);
+		).rejects.toThrow("OpenAI Codex token refresh failed (HTTP 401)");
 		expect(consoleError).not.toHaveBeenCalled();
 	});
 

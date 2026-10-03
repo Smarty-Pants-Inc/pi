@@ -1,5 +1,5 @@
 // biome-ignore-all lint/suspicious/noTemplateCurlyInString: MCP credentials must remain literal environment references in configuration.
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -18,7 +18,13 @@ describe("pi mcp", () => {
 		const agentDir = dir ?? mkdtempSync(join(tmpdir(), "pi-mcp-command-"));
 		if (!dir) dirs.push(agentDir);
 		writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
-		if (servers) writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: servers }));
+		if (servers) {
+			writeFileSync(join(agentDir, "mcp.json"), JSON.stringify({ mcpServers: servers }), { mode: 0o600 });
+			if (args.includes("-l")) {
+				mkdirSync(join(agentDir, ".pi"), { recursive: true });
+				writeFileSync(join(agentDir, ".pi", "mcp.json"), "{}", { mode: 0o600 });
+			}
+		}
 		const output: string[] = [];
 		const exitCode = await runMcpCommand(args, {
 			cwd: agentDir,
@@ -44,7 +50,7 @@ describe("pi mcp", () => {
 		expect(output).toContain("fixture: connected, 1 tool (codemode, global)\n");
 		expect(output).toContain("  tools: echo");
 		expect(output).toContain(
-			"broken: failed (codemode, global)\n  pi-test-missing-mcp-server\n  spawn pi-test-missing-mcp-server ENOENT",
+			"broken: failed (codemode, global)\n  stdio (command and arguments omitted)\n  MCP operation failed; check server configuration and private logs",
 		);
 		expect(output).toContain("parked: disabled (codemode, global)");
 		expect(output).toContain("config error: ");
@@ -79,7 +85,7 @@ describe("pi mcp", () => {
 	it("adds stdio servers and passes options after the command through", async () => {
 		const added = await run(
 			["add", "--env", "A=${A}", "--env", "B=${B}", "files", "--", "npx", "-y", "server", "--root", "."],
-			undefined,
+			{},
 		);
 		expect(added.exitCode).toBe(0);
 		expect(added.output).toContain('Added global MCP server "files"');
@@ -168,7 +174,7 @@ describe("pi mcp", () => {
 	});
 
 	it("adds and removes project servers", async () => {
-		const added = await run(["add", "-l", "local", "--", "node", "server.js"], undefined);
+		const added = await run(["add", "-l", "local", "--", "node", "server.js"], {});
 		expect(added.output).toContain("The project is not trusted");
 		const projectConfig = join(added.agentDir, ".pi", "mcp.json");
 		expect(readConfig(projectConfig)).toEqual({ mcpServers: { local: { command: "node", args: ["server.js"] } } });

@@ -12,11 +12,33 @@
  */
 import { parentPort, workerData } from "node:worker_threads";
 import { JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
+import { boundedJson, MAX_CALLS, MAX_TRANSIT_BYTES, MAX_TRANSIT_ITEMS } from "./budgets.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
 
+let postedBytes = 0;
+let postedItems = 0;
+let postedCalls = 0;
+let overflowed = false;
 function post(message: WorkerToHostMessage): void {
-	parentPort?.postMessage(message);
+	if (overflowed) return;
+	try {
+		postedBytes += Buffer.byteLength(boundedJson(message) ?? "");
+		if (
+			++postedItems > MAX_TRANSIT_ITEMS ||
+			postedBytes > MAX_TRANSIT_BYTES ||
+			(message.type === "call" && ++postedCalls > MAX_CALLS)
+		)
+			throw new Error("Sandbox transit budget exceeded");
+		parentPort?.postMessage(message);
+	} catch {
+		overflowed = true;
+		Atomics.store(new Int32Array((workerData as WorkerData).interrupt), 0, 1);
+		parentPort?.postMessage({
+			type: "crash",
+			message: "Sandbox producer budget exceeded",
+		} satisfies WorkerToHostMessage);
+	}
 }
 
 function crash(error: unknown): void {

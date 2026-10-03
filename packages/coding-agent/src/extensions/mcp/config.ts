@@ -89,8 +89,8 @@ function readConfigFile(path: string, scope: "global" | "project", state: McpCon
 	let parsed: unknown;
 	try {
 		parsed = JSON.parse(readFileSync(path, "utf8"));
-	} catch (error) {
-		errors.push(`${path}: ${error instanceof Error ? error.message : String(error)}`);
+	} catch {
+		errors.push(`${path}: invalid MCP configuration JSON`);
 		return;
 	}
 	if (!isRecord(parsed) || (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers))) {
@@ -167,9 +167,9 @@ export function updateMcpServerConfig(path: string, name: string, patch: McpServ
 export function addMcpServerConfig(path: string, name: string, config: McpServerConfig): boolean {
 	let replaced = false;
 	editMcpServers(path, (servers, parsed) => {
-		const target = servers ?? {};
-		replaced = target[name] !== undefined;
-		target[name] = config;
+		const target = servers ?? Object.create(null);
+		replaced = Object.hasOwn(target, name);
+		Object.defineProperty(target, name, { value: config, enumerable: true, configurable: true, writable: true });
 		parsed.mcpServers = target;
 		return true;
 	});
@@ -181,7 +181,7 @@ export function removeMcpServerConfig(path: string, name: string): boolean {
 	if (!existsSync(path)) return false;
 	let removed = false;
 	editMcpServers(path, (servers) => {
-		if (!servers || servers[name] === undefined) return false;
+		if (!servers || !Object.hasOwn(servers, name)) return false;
 		delete servers[name];
 		removed = true;
 		return true;
@@ -203,6 +203,12 @@ function hasLiteralMcpCredentials(document: unknown): boolean {
 	if (!isRecord(document) || !isRecord(document.mcpServers)) return false;
 	for (const server of Object.values(document.mcpServers)) {
 		if (!isRecord(server)) continue;
+		// Command/argv are opaque at the native receiver; do not certify unchecked strings nonsecret.
+		if (
+			typeof server.command === "string" &&
+			((Array.isArray(server.args) && server.args.length > 0) || /[=\s]/.test(server.command))
+		)
+			return true;
 		// Any custom header or child environment variable can carry credentials. Do not rely on
 		// names, or exempt a literal merely because another part of the value references an env var.
 		for (const field of ["headers", "env"] as const) {
@@ -275,7 +281,12 @@ function editMcpServers(
 	edit: (servers: Record<string, unknown> | undefined, parsed: Record<string, unknown>) => boolean,
 ): void {
 	const text = existsSync(path) ? readFileSync(path, "utf8") : undefined;
-	const parsed: unknown = text === undefined ? {} : JSON.parse(text);
+	let parsed: unknown;
+	try {
+		parsed = text === undefined ? {} : JSON.parse(text);
+	} catch {
+		throw new Error("Invalid MCP configuration JSON");
+	}
 	if (!isRecord(parsed) || (parsed.mcpServers !== undefined && !isRecord(parsed.mcpServers))) {
 		throw new Error(`${path}: expected an object with an "mcpServers" object`);
 	}

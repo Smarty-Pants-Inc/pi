@@ -3,8 +3,7 @@
  * execute.lazy.ts so the sandbox runtime only loads when a script runs.
  */
 
-import { randomBytes } from "node:crypto";
-import { writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool, AgentToolCallOutcome, AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -194,6 +193,7 @@ function createLimiter(limit: number): <T>(run: () => Promise<T>) => Promise<T> 
 	let active = 0;
 	const waiting: (() => void)[] = [];
 	return async (run) => {
+		if (waiting.length >= 16) throw new Error("Model call queue budget exceeded");
 		if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
 		active++;
 		try {
@@ -260,12 +260,18 @@ function formatError(result: Extract<CodemodeResult, { ok: false }>, calls: read
 
 /** Write the full text output to a temp file, like bash does for truncated output. */
 async function spillOutput(text: string): Promise<{ path: string } | { error: string }> {
-	const path = join(tmpdir(), `pi-codemode-${randomBytes(8).toString("hex")}.txt`);
+	if (Buffer.byteLength(text) > 16 * 1024 * 1024) return { error: "Output exceeds spill byte budget" };
+	let directory: string | undefined;
 	try {
-		await writeFile(path, text);
+		// Retained for the user to read until profile/system temporary-storage cleanup.
+		// mkdtemp owns a 0700 directory; exclusive 0600 creation never follows an existing file.
+		directory = await mkdtemp(join(tmpdir(), "pi-codemode-"));
+		const path = join(directory, "output.txt");
+		await writeFile(path, text, { flag: "wx", mode: 0o600 });
 		return { path };
-	} catch (error) {
-		return { error: error instanceof Error ? error.message : String(error) };
+	} catch {
+		if (directory) await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+		return { error: "Private output storage unavailable" };
 	}
 }
 
@@ -382,7 +388,7 @@ export async function executeCodemode(
 				? createModelGlobals(ctx.modelRegistry, toolCallId, calls, publish, addModelUsage, addGeneratedImages)
 				: []),
 		],
-		timeoutMs: sourceOptions.timeoutMs ?? Number.POSITIVE_INFINITY,
+		timeoutMs: sourceOptions.timeoutMs ?? 300_000,
 		memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
 		wasm: loadQuickJSWasm(getQuickJSWasmPath()),
 		workerUrl: getCodemodeWorkerSpecifier(),
@@ -569,6 +575,7 @@ function createModelGlobals(
 		}
 		const checked = checkContext(context);
 
+		if (calls.length >= 64) throw new Error("Model call budget exceeded");
 		const record: CodemodeNestedCall = {
 			id: `${toolCallId}/${name}/${++callCount}`,
 			name,
@@ -610,8 +617,15 @@ function createModelGlobals(
 			return model === undefined ? undefined : toModelInfo(model);
 		},
 		"models.classify": (args, { signal }) =>
-			runModelCall("models.classify", "classifier", args as unknown[], checkClassifierContext, (resolved, context) =>
-				models.classify(resolved, context, { signal }),
+			runModelCall(
+				"models.classify",
+				"classifier",
+				args as unknown[],
+				checkClassifierContext,
+				(resolved, context) => {
+					signal.throwIfAborted();
+					return models.classify(resolved, context, { signal });
+				},
 			),
 		"models.generateImages": (args, { signal }) =>
 			runModelCall(
@@ -620,6 +634,7 @@ function createModelGlobals(
 				args as unknown[],
 				checkImagesContext,
 				async (resolved, context) => {
+					signal.throwIfAborted();
 					const result = await models.generateImages(resolved, context, { signal });
 					addGeneratedImages(result.output.filter((block) => block.type === "image").length);
 					return result;

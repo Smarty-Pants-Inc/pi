@@ -4,7 +4,7 @@
  * append. The file is rotated to `mcp.log.1` once it grows past `MAX_LOG_BYTES`.
  */
 
-import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 const MAX_LOG_BYTES = 5 * 1024 * 1024;
@@ -52,7 +52,24 @@ export class McpServerLog {
 				if (this.currentSize() > MAX_LOG_BYTES) renameSync(this.path, `${this.path}.1`);
 				this.size = this.currentSize();
 			}
-			appendFileSync(this.path, line);
+			const fd = openSync(
+				this.path,
+				constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0),
+				0o600,
+			);
+			try {
+				const stat = fstatSync(fd);
+				if (
+					!stat.isFile() ||
+					stat.nlink !== 1 ||
+					(stat.mode & 0o077) !== 0 ||
+					(process.getuid && stat.uid !== process.getuid())
+				)
+					return;
+				writeFileSync(fd, line);
+			} finally {
+				closeSync(fd);
+			}
 			this.size += Buffer.byteLength(line);
 		} catch {
 			// Ignore: the log is best effort.
@@ -61,7 +78,15 @@ export class McpServerLog {
 
 	private currentSize(): number {
 		try {
-			return statSync(this.path).size;
+			const stat = lstatSync(this.path);
+			if (
+				!stat.isFile() ||
+				stat.nlink !== 1 ||
+				(stat.mode & 0o077) !== 0 ||
+				(process.getuid && stat.uid !== process.getuid())
+			)
+				throw new Error("Unsafe MCP log destination");
+			return stat.size;
 		} catch {
 			return 0;
 		}

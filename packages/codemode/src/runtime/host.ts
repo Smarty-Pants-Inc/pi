@@ -13,6 +13,16 @@ import type {
 } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
 import {
+	boundedJson,
+	MAX_CALLS,
+	MAX_EXECUTION_MS,
+	MAX_MESSAGE_BYTES,
+	MAX_OUTPUT_ITEMS,
+	MAX_PENDING_CALLS,
+	MAX_TRANSIT_BYTES,
+	MAX_TRANSIT_ITEMS,
+} from "./budgets.ts";
+import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
 	type WorkerData,
@@ -108,6 +118,9 @@ class Execution {
 	private readonly calls: CodemodeCall[] = [];
 	private readonly pending = new Map<number, PendingCall>();
 	private finished = false;
+	private receivedBytes = 0;
+	private receivedItems = 0;
+	private admittedCalls = 0;
 
 	constructor(options: ExecutionOptions) {
 		this.promise = new Promise<CodemodeResult>((resolve) => {
@@ -194,12 +207,35 @@ class Execution {
 
 	private handleMessage(message: unknown): void {
 		if (this.finished || !isWorkerToHostMessage(message)) return;
+		try {
+			const encoded = boundedJson(message);
+			this.receivedBytes += Buffer.byteLength(encoded ?? "");
+			if (++this.receivedItems > MAX_TRANSIT_ITEMS || this.receivedBytes > MAX_TRANSIT_BYTES)
+				throw new Error("Sandbox transit budget exceeded");
+		} catch {
+			this.finish({ kind: "sandbox", message: "Sandbox message budget exceeded" });
+			return;
+		}
 		switch (message.type) {
 			case "output":
+				if (this.output.length >= MAX_OUTPUT_ITEMS) {
+					this.finish({ kind: "sandbox", message: "Sandbox output item budget exceeded" });
+					break;
+				}
 				this.output.push(message.item);
 				break;
 			case "call":
-				void this.handleCall(message);
+				if (
+					++this.admittedCalls > MAX_CALLS ||
+					this.pending.size >= MAX_PENDING_CALLS ||
+					this.pending.has(message.id)
+				) {
+					this.finish({ kind: "sandbox", message: "Sandbox call admission budget exceeded" });
+					break;
+				}
+				void this.handleCall(message).catch(() =>
+					this.finish({ kind: "sandbox", message: "Sandbox call delivery failed" }),
+				);
 				break;
 			case "done":
 				this.handleDone(message);
@@ -263,10 +299,10 @@ class Execution {
 			if (!tool) throw new Error(`Unknown ${isTool ? "tool" : "global"} "${name}"`);
 			const args: unknown = message.args === undefined ? undefined : JSON.parse(message.args);
 			const value = await tool.execute(args, { signal: pending.controller.signal });
-			reply = { type: "result", id, ok: true, payload: value === undefined ? undefined : JSON.stringify(value) };
+			reply = { type: "result", id, ok: true, payload: value === undefined ? undefined : boundedJson(value) };
 			status = "ok";
 		} catch (error) {
-			reply = { type: "result", id, ok: false, payload: errorMessage(error) };
+			reply = { type: "result", id, ok: false, payload: errorMessage(error).slice(0, 2000) };
 			status = "error";
 		}
 
@@ -334,7 +370,10 @@ export class CodemodeSandbox {
 	private closed = false;
 
 	constructor(options: CodemodeSandboxOptions = {}) {
-		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		this.timeoutMs = Math.min(
+			Number.isFinite(options.timeoutMs) ? Math.max(1, options.timeoutMs!) : DEFAULT_TIMEOUT_MS,
+			MAX_EXECUTION_MS,
+		);
 		this.memoryLimitBytes = options.memoryLimitBytes;
 		this.wasm = options.wasm;
 		this.workerUrl = options.workerUrl ?? defaultWorkerUrl();
@@ -379,14 +418,21 @@ export class CodemodeSandbox {
 	 */
 	execute(code: string, options: CodemodeExecuteOptions = {}): Promise<CodemodeResult> {
 		if (this.closed) return Promise.reject(new Error("Sandbox is closed"));
+		if (Buffer.byteLength(code) > MAX_MESSAGE_BYTES)
+			return Promise.reject(new Error("Sandbox code byte budget exceeded"));
+		const store = serializeStore(options.store);
+		boundedJson(store);
 		const execution = new Execution({
 			code,
 			tools: new Map(this.toolsByName),
 			globals: this.globalsByName,
-			timeoutMs: options.timeoutMs ?? this.timeoutMs,
+			timeoutMs: Math.min(
+				Number.isFinite(options.timeoutMs) ? Math.max(1, options.timeoutMs!) : this.timeoutMs,
+				this.timeoutMs,
+			),
 			signal: options.signal,
 			memoryLimitBytes: this.memoryLimitBytes,
-			store: serializeStore(options.store),
+			store,
 			wasm: this.wasm === undefined ? loadQuickJSWasm() : Promise.resolve(this.wasm),
 			workerUrl: this.workerUrl,
 		});
