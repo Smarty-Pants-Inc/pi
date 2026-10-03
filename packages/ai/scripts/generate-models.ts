@@ -1227,6 +1227,7 @@ function getAnthropicMessagesCompat(provider: string, modelId: string): Anthropi
 }
 
 function getBedrockBaseUrl(modelId: string): string {
+	if (modelId.startsWith("in.")) return "https://bedrock-runtime.ap-south-1.amazonaws.com";
 	return modelId.startsWith("eu.")
 		? "https://bedrock-runtime.eu-central-1.amazonaws.com"
 		: "https://bedrock-runtime.us-east-1.amazonaws.com";
