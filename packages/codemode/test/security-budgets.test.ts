@@ -26,6 +26,17 @@ it("does not allow a guest execution option to raise the trusted deadline", asyn
 	}
 });
 
+// pi#127 F5: reply transit is bounded independently of guest output/call argument size.
+it("bounds aggregate host reply bytes", async () => {
+	const sandbox = new CodemodeSandbox({ tools: [{ name: "medium", execute: () => "x".repeat(512 * 1024) }] });
+	try {
+		const result = await sandbox.execute("for (let i = 0; i < 40; i++) await tools.medium({}); return true;");
+		expect(result).toMatchObject({ ok: false, error: { kind: "sandbox", message: "Sandbox reply budget exceeded" } });
+	} finally {
+		await sandbox.close();
+	}
+});
+
 it("bounds result serialization before constructing the reply", async () => {
 	const sandbox = new CodemodeSandbox({ tools: [{ name: "large", execute: () => "x".repeat(10 * 1024 * 1024) }] });
 	try {
