@@ -8,9 +8,12 @@
 
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
+import type { AgentActivityOutcome } from "../core/extensions/index.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
+import { writeRetryNotice } from "./retry-notice.ts";
 
 /**
  * Options for print mode.
@@ -33,18 +36,39 @@ export interface PrintModeOptions {
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages } = options;
 	let exitCode = 0;
+	let settledOutcome: AgentActivityOutcome | undefined;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
-	let disposed = false;
+	const outputCancellation = new AbortController();
+	let disposalCompletion: Promise<void> | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
-	const disposeRuntime = async (): Promise<void> => {
-		if (disposed) return;
-		disposed = true;
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
-		await runtimeHost.dispose();
+	const disposeRuntime = (): Promise<void> => {
+		if (disposalCompletion) return disposalCompletion;
+		disposalCompletion = (async () => {
+			// Release in-flight transport waits before the native idle join. Publication
+			// remains subscribed until final events have been persisted and emitted.
+			outputCancellation.abort(new Error("Print transport cancelled for terminal shutdown"));
+			try {
+				await runtimeHost.dispose();
+				unsubscribe?.();
+				unsubscribeBackpressure?.();
+				// Persistence above must not depend on an unread pipe. Drainage gets its
+				// own finite budget, independent of the cancelled transport waits.
+				const drainage = AbortSignal.timeout(1000);
+				try {
+					await raceWithAbortSignal(flushRawStdout(), drainage);
+				} catch (cause) {
+					if (cause !== drainage.reason) throw cause;
+					console.error("Print output delivery incomplete: terminal drainage exceeded 1000 ms");
+					exitCode = 1;
+				}
+			} finally {
+				for (const cleanup of signalCleanupHandlers) cleanup();
+			}
+		})();
+		return disposalCompletion;
 	};
 
 	const registerSignalHandlers = (): void => {
@@ -73,6 +97,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
+		settledOutcome = undefined;
 		await session.bindExtensions({
 			mode: mode === "json" ? "json" : "print",
 			commandContextActions: {
@@ -106,16 +131,20 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
+			if (event.type === "agent_settled") settledOutcome = event.outcome;
+			writeRetryNotice(event);
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(toJsonEvent(event))}\n`);
-			} else if (event.type === "auto_retry_start" && event.waitMessage !== undefined) {
-				console.error(`Waiting ${Math.ceil(event.delayMs / 1000)}s: ${event.waitMessage}`);
 			}
 		});
 		unsubscribeBackpressure =
 			mode === "json"
 				? session.agent.subscribe(async () => {
-						await waitForRawStdoutBackpressure();
+						try {
+							await raceWithAbortSignal(waitForRawStdoutBackpressure(), outputCancellation.signal);
+						} catch (cause) {
+							if (!outputCancellation.signal.aborted || cause !== outputCancellation.signal.reason) throw cause;
+						}
 					})
 				: undefined;
 	};
@@ -142,7 +171,14 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			const state = session.state;
 			const lastMessage = state.messages[state.messages.length - 1];
 
-			if (lastMessage?.role === "assistant") {
+			if (settledOutcome === "error" || settledOutcome === "aborted") {
+				const lastAssistant = state.messages
+					.slice()
+					.reverse()
+					.find((message) => message.role === "assistant");
+				console.error(lastAssistant?.errorMessage || `Request ${settledOutcome}`);
+				exitCode = 1;
+			} else if (lastMessage?.role === "assistant") {
 				const assistantMsg = lastMessage as AssistantMessage;
 				if (assistantMsg.stopReason === "error" || assistantMsg.stopReason === "aborted") {
 					console.error(assistantMsg.errorMessage || `Request ${assistantMsg.stopReason}`);
@@ -156,16 +192,11 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				}
 			}
 		}
-
-		return exitCode;
 	} catch (error: unknown) {
 		console.error(error instanceof Error ? error.message : String(error));
-		return 1;
+		exitCode = 1;
 	} finally {
-		for (const cleanup of signalCleanupHandlers) {
-			cleanup();
-		}
 		await disposeRuntime();
-		await flushRawStdout();
 	}
+	return exitCode;
 }

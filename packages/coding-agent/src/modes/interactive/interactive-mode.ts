@@ -1104,8 +1104,26 @@ export class InteractiveMode {
 		this.setupEditorSubmitHandler();
 		this.ui.requestRender();
 
-		// Initialize extensions first so resources are shown before messages
-		await this.rebindCurrentSession();
+		// Initial binding cancellation is expected during terminal shutdown.
+		// Observe it here so run/main cannot become an unhandled rejection that
+		// cuts off asynchronous session_shutdown cleanup and terminal restoration.
+		try {
+			await this.rebindCurrentSession();
+		} catch (error) {
+			if (
+				!this.shutdownCompletion ||
+				!this.session.shutdownSignal.aborted ||
+				error !== this.session.shutdownSignal.reason
+			) {
+				throw error;
+			}
+			await this.shutdownCompletion;
+			return;
+		}
+		if (this.shutdownCompletion) {
+			await this.shutdownCompletion;
+			return;
+		}
 
 		// Render initial messages AFTER showing loaded resources
 		this.renderInitialMessages();
@@ -1153,6 +1171,10 @@ export class InteractiveMode {
 	 */
 	async run(): Promise<void> {
 		await this.init();
+		if (this.shutdownCompletion) {
+			await this.shutdownCompletion;
+			return;
+		}
 
 		if (!this.stagingAudit && !process.env.PI_OFFLINE) {
 			const controller = new AbortController();
@@ -2008,6 +2030,7 @@ export class InteractiveMode {
 					try {
 						return await this.runtimeHost.newSession(options);
 					} catch (error: unknown) {
+						if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 						return this.handleFatalRuntimeError("Failed to create session", error);
 					}
 				},
@@ -2020,6 +2043,7 @@ export class InteractiveMode {
 						}
 						return { cancelled: result.cancelled };
 					} catch (error: unknown) {
+						if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 						return this.handleFatalRuntimeError("Failed to fork session", error);
 					}
 				},
@@ -2128,6 +2152,15 @@ export class InteractiveMode {
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+	}
+
+	private isTerminalRuntimeCancellation(error: unknown): boolean {
+		// Shutdown owns the cleanup join. An abandoned command must not join it or exit early.
+		return (
+			!!this.shutdownCompletion &&
+			this.session.shutdownSignal.aborted &&
+			error === this.session.shutdownSignal.reason
+		);
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -3791,6 +3824,12 @@ export class InteractiveMode {
 				break;
 			}
 
+			case "auto_retry_fallback": {
+				this.showWarning(`Failed over from ${event.fromModel} to ${event.toModel} after ${event.attempt} retries`);
+				this.ui.requestRender();
+				break;
+			}
+
 			case "auto_retry_end": {
 				// Restore escape handler
 				if (this.retryEscapeHandler) {
@@ -4318,46 +4357,51 @@ export class InteractiveMode {
 	 * repaint the final frame while the process is exiting.
 	 */
 	private isShuttingDown = false;
+	private shutdownCompletion?: Promise<void>;
 
-	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
-		if (this.isShuttingDown) return;
+	private shutdown(options?: { fromSignal?: boolean }): Promise<void> {
+		if (this.shutdownCompletion) return this.shutdownCompletion;
+		if (this.isShuttingDown) return Promise.resolve();
 		this.isShuttingDown = true;
-		// Keep signal handlers registered until terminal cleanup has completed.
-		// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
-		// dispatch and re-sends the signal if only its own listeners remain.
+		this.shutdownCompletion = (async () => {
+			// Keep signal handlers registered until terminal cleanup has completed.
+			// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
+			// dispatch and re-sends the signal if only its own listeners remain.
 
-		if (options?.fromSignal) {
-			// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
-			// (session_shutdown) BEFORE touching the terminal. Extension teardown
-			// such as removing sockets does not write to the tty, so it must not be
-			// skipped if a later terminal-restore write fails on a dead or stalled
-			// terminal. If the terminal is gone, the restore writes below emit EIO,
-			// which the stdout/stderr error handler turns into emergencyTerminalExit;
-			// the render loop is already idle, so this cannot hot-spin (see #4144).
-			await this.runtimeHost.dispose();
+			if (options?.fromSignal) {
+				// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
+				// (session_shutdown) BEFORE touching the terminal. Extension teardown
+				// such as removing sockets does not write to the tty, so it must not be
+				// skipped if a later terminal-restore write fails on a dead or stalled
+				// terminal. If the terminal is gone, the restore writes below emit EIO,
+				// which the stdout/stderr error handler turns into emergencyTerminalExit;
+				// the render loop is already idle, so this cannot hot-spin (see #4144).
+				await this.runtimeHost.dispose();
+				this.themeController.disableAutoSync();
+				await this.ui.terminal.drainInput(1000);
+				this.stop();
+				process.exit(0);
+			}
+
+			// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
+			// TUI before emitting shutdown events so extension UI cleanup cannot repaint
+			// the final frame while the process is exiting.
+			// Drain any in-flight Kitty key release events before stopping.
+			// This prevents escape sequences from leaking to the parent shell over slow SSH.
 			this.themeController.disableAutoSync();
 			await this.ui.terminal.drainInput(1000);
+
 			this.stop();
+			await this.runtimeHost.dispose();
+
+			const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
+			if (resumeCommand) {
+				process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
+			}
+
 			process.exit(0);
-		}
-
-		// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
-		// TUI before emitting shutdown events so extension UI cleanup cannot repaint
-		// the final frame while the process is exiting.
-		// Drain any in-flight Kitty key release events before stopping.
-		// This prevents escape sequences from leaking to the parent shell over slow SSH.
-		this.themeController.disableAutoSync();
-		await this.ui.terminal.drainInput(1000);
-
-		this.stop();
-		await this.runtimeHost.dispose();
-
-		const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
-		if (resumeCommand) {
-			process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
-		}
-
-		process.exit(0);
+		})();
+		return this.shutdownCompletion;
 	}
 
 	private emergencyTerminalExit(): never {
@@ -5900,6 +5944,7 @@ export class InteractiveMode {
 				this.showStatus("Resumed session in current cwd");
 				return result;
 			}
+			if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 			return this.handleFatalRuntimeError("Failed to resume session", error);
 		}
 	}
@@ -6718,6 +6763,7 @@ export class InteractiveMode {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
 			}
+			if (this.isTerminalRuntimeCancellation(error)) return;
 			await this.handleFatalRuntimeError("Failed to import session", error);
 		}
 	}
@@ -7057,6 +7103,7 @@ export class InteractiveMode {
 			this.chatContainer.addChild(new ThemedText(() => theme.fg("accent", "✓ New session started"), 1, 1));
 			this.ui.requestRender();
 		} catch (error: unknown) {
+			if (this.isTerminalRuntimeCancellation(error)) return;
 			await this.handleFatalRuntimeError("Failed to create session", error);
 		}
 	}

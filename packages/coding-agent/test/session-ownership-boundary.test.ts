@@ -118,6 +118,7 @@ function hookBoundary() {
 		abort: async () => {
 			hook("abort");
 		},
+		cancelForShutdown: () => {},
 		dispose,
 	} as unknown as AgentSession;
 	const runtime = new AgentSessionRuntime(

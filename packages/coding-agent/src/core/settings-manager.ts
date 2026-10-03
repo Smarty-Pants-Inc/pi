@@ -49,6 +49,8 @@ export interface RetrySettings {
 	baseDelayMs?: number; // default: 2000 (exponential backoff: 2s, 4s, 8s)
 	maxAgentDelayMs?: number; // default: 60000
 	provider?: ProviderRetrySettings;
+	/** Exact provider/modelId used once after agent retries are exhausted. Off by default. */
+	fallbackModel?: string;
 }
 
 export type TuiMode = RendererTuiMode;
@@ -1004,6 +1006,10 @@ export class SettingsManager {
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
 			maxAgentDelayMs: this.settings.retry?.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
 		};
+	}
+
+	getRetryFallbackModel(): string | undefined {
+		return this.settings.retry?.fallbackModel;
 	}
 
 	getHttpIdleTimeoutMs(): number {

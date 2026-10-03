@@ -153,6 +153,7 @@ export class AgentSessionRuntime {
 		if (this.#owner && !allowOwned)
 			throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: replacement requires separate receiving");
 		const session = this.session;
+		if (!allowOwned) session.shutdownSignal?.throwIfAborted();
 		const sessionManager = session.sessionManager;
 		assertOrdinaryRuntime(sessionManager, this.#owner, this.createRuntime);
 		this.#owner?.assertSessionStart(session);
@@ -175,6 +176,7 @@ export class AgentSessionRuntime {
 		reason: "new" | "resume",
 		targetSessionFile?: string,
 	): Promise<{ cancelled: boolean }> {
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		const runner = outgoing.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_switch")) {
 			return { cancelled: false };
@@ -185,6 +187,7 @@ export class AgentSessionRuntime {
 			reason,
 			targetSessionFile,
 		});
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		return { cancelled: result?.cancel === true };
 	}
 
@@ -193,6 +196,7 @@ export class AgentSessionRuntime {
 		entryId: string,
 		options: { position: "before" | "at" },
 	): Promise<{ cancelled: boolean }> {
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		const runner = outgoing.session.extensionRunner;
 		if (!runner.hasHandlers("session_before_fork")) {
 			return { cancelled: false };
@@ -203,6 +207,7 @@ export class AgentSessionRuntime {
 			entryId,
 			...options,
 		});
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		return { cancelled: result?.cancel === true };
 	}
 
@@ -214,7 +219,9 @@ export class AgentSessionRuntime {
 		// Settle any active response first so the aborted turn (including tool
 		// results) is persisted to the outgoing session before it is replaced.
 		this.#assertCurrent(outgoing);
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		await outgoing.session.abort();
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
 			type: "session_shutdown",
@@ -228,9 +235,11 @@ export class AgentSessionRuntime {
 	}
 
 	async #replace(outgoing: OutgoingSession, options: Parameters<CreateAgentSessionRuntimeFactory>[0]): Promise<void> {
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(options.sessionManager);
 		const { session, services, diagnostics, modelFallbackMessage } = await this.createRuntime(Object.freeze(options));
+		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(session.sessionManager);
 		this._session = session;
@@ -466,6 +475,8 @@ export class AgentSessionRuntime {
 	async dispose(): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		const outgoing = this.#captureOutgoing(true);
+		// Stop held extension dispatch before owner close or native idle joins.
+		outgoing.session.cancelForShutdown();
 		if (this.#owner) {
 			// Publish the shared task before invoking close callbacks. Sealed-owner
 			// terminal persistence checks identity, not active-owner permission.
@@ -500,6 +511,8 @@ export class AgentSessionRuntime {
 			}
 			return this.#ownerDisposal;
 		}
+		await outgoing.session.abort();
+		this.#assertCurrent(outgoing);
 		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
 			type: "session_shutdown",
 			reason: "quit",

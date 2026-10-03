@@ -33,7 +33,14 @@ import {
 	runToolCall,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
-import { contentText, getCurrentSystemMessage, type RetryPolicy, retryDelayMs } from "@earendil-works/pi-ai";
+import {
+	contentText,
+	getCurrentSystemMessage,
+	hasAssistantOutput,
+	isPrematureStreamError,
+	type RetryPolicy,
+	retryDelayMs,
+} from "@earendil-works/pi-ai";
 import type {
 	AssistantMessage,
 	AuthResult,
@@ -266,6 +273,7 @@ export type AgentSessionEvent =
 			waitMessage?: string;
 	  }
 	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| { type: "auto_retry_fallback"; fromModel: string; toModel: string; attempt: number; errorMessage: string }
 	| {
 			type: "summarization_retry_scheduled";
 			attempt: number;
@@ -448,6 +456,8 @@ export class AgentSession {
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	#ordinaryPreflights = 0;
 	#pendingModeInput?: () => boolean;
+	private readonly _shutdownCancellation = new AbortController();
+	private _settlementCompletion?: Promise<void>;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -498,6 +508,11 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	private _retryFallbackUsed = false;
+	/** Only the first alternate request in the current recovery episode is one-shot. */
+	private _retryFallbackInFlight = false;
+	// Sticky per assistant request: providers may discard partial content on error.
+	private _assistantOutputObserved = false;
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
 	/**
@@ -524,6 +539,7 @@ export class AgentSession {
 	/** Settlement descendants await acceptance, never delivery that requires their handler to return. */
 	private readonly _agentSettledScope = new AsyncLocalStorage<{ active: boolean }>();
 	private readonly _deferredSettledActions: Array<() => Promise<void>> = [];
+	private readonly _settlementActionScope = new AsyncLocalStorage<{ active: boolean }>();
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -759,13 +775,20 @@ export class AgentSession {
 		}
 
 		try {
-			return await runner.emitToolCall({
-				type: "tool_call",
-				toolName: toolCall.name,
-				toolCallId: toolCall.id,
-				...(parentToolCallId ? { parentToolCallId } : {}),
-				input: args as Record<string, unknown>,
-			});
+			const shutdown = this._shutdownCancellation.signal;
+			return await raceWithAbortSignal(
+				runner.emitToolCall(
+					{
+						type: "tool_call",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						...(parentToolCallId ? { parentToolCallId } : {}),
+						input: args as Record<string, unknown>,
+					},
+					shutdown,
+				),
+				shutdown,
+			);
 		} catch (err) {
 			if (err instanceof Error) {
 				throw err;
@@ -780,19 +803,26 @@ export class AgentSession {
 		parentToolCallId?: string,
 	): Promise<AfterToolCallResult | undefined> {
 		const runner = this._extensionRunner;
+		const shutdown = this._shutdownCancellation.signal;
 		const hookResult = runner.hasHandlers("tool_result")
-			? await runner.emitToolResult({
-					type: "tool_result",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					...(parentToolCallId ? { parentToolCallId } : {}),
-					input: args as Record<string, unknown>,
-					content: result.content,
-					details: result.details,
-					...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
-					isError,
-					usage: result.usage,
-				})
+			? await raceWithAbortSignal(
+					runner.emitToolResult(
+						{
+							type: "tool_result",
+							toolName: toolCall.name,
+							toolCallId: toolCall.id,
+							...(parentToolCallId ? { parentToolCallId } : {}),
+							input: args as Record<string, unknown>,
+							content: result.content,
+							details: result.details,
+							...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+							isError,
+							usage: result.usage,
+						},
+						shutdown,
+					),
+					shutdown,
+				)
 			: undefined;
 
 		const content = hookResult?.content ?? result.content ?? [];
@@ -1025,7 +1055,12 @@ export class AgentSession {
 		toolResults: ToolResultMessage[],
 	): Promise<boolean> {
 		this._lastActivityOutcome =
-			message.stopReason === "aborted" ? "aborted" : message.stopReason === "error" ? "error" : "completed";
+			message.stopReason === "aborted"
+				? "aborted"
+				: message.stopReason === "error" ||
+						(this._retryFallbackInFlight && message.stopReason !== "stop" && message.stopReason !== "toolUse")
+					? "error"
+					: "completed";
 		const messageEntryId = this._findPersistedMessageEntryId(message);
 		if (!this._extensionRunner.hasHandlers("turn_end")) return false;
 		if (!messageEntryId) {
@@ -1041,19 +1076,27 @@ export class AgentSession {
 			return entryId ? [entryId] : [];
 		});
 		const revision = this.sessionManager.revision();
-		const boundary = await this._extensionRunner.emitBoundary(
-			{
-				type: "turn_end",
-				turnIndex: this._turnIndex,
-				message,
-				toolResults,
-				messageEntryId,
-				toolResultEntryIds,
-				outcome: this._lastActivityOutcome,
-			},
-			(entries) => this._buildBoundaryContext(entries, "turn_end"),
-			() => this._getPendingBoundaryMessages(),
-		);
+		let boundary: Awaited<ReturnType<ExtensionRunner["emitBoundary"]>>;
+		try {
+			boundary = await this._extensionRunner.emitBoundary(
+				{
+					type: "turn_end",
+					turnIndex: this._turnIndex,
+					message,
+					toolResults,
+					messageEntryId,
+					toolResultEntryIds,
+					outcome: this._lastActivityOutcome,
+				},
+				(entries) => this._buildBoundaryContext(entries, "turn_end"),
+				() => this._getPendingBoundaryMessages(),
+				this._shutdownCancellation.signal,
+			);
+		} catch (error) {
+			if (this._shutdownCancellation.signal.aborted) return false;
+			throw error;
+		}
+		if (this._shutdownCancellation.signal.aborted) return false;
 		if (boundary.entries.length > 0) this._commitBoundaryDrafts(boundary.entries);
 		// Carry captured-manager changes into agent state even if continuation is requested later.
 		else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
@@ -1069,7 +1112,12 @@ export class AgentSession {
 		this.agent.finishTurn = async (turn, signal) => {
 			this._boundaryDispatchedMessages.add(turn.message);
 			const extensionContinue = await this._dispatchTurnEndBoundary(turn.message, turn.toolResults);
+			// Terminal cancellation ends the low-level loop before it can drain undelivered queues.
+			if (this._shutdownCancellation.signal.aborted) return { action: "end" };
 			const previousDecision = await previousFinishTurn?.(turn, signal);
+			// End an unsuccessful one-shot alternate before truncated tools or queued input
+			// can select a natural next turn. Successful toolUse clears this flag at message_end.
+			if (this._retryFallbackInFlight) return { action: "end" };
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
@@ -1307,27 +1355,38 @@ export class AgentSession {
 		this.#auditState("session_run_settled");
 		this._isEmittingAgentSettled = true;
 		const scope = { active: true };
+		let completed!: () => void;
+		this._settlementCompletion = new Promise<void>((resolve) => {
+			completed = resolve;
+		});
 		try {
-			await this._agentSettledScope.run(scope, async () => {
-				await this._extensionRunner.emit({ type: "agent_settled", outcome });
-				this._emit({ type: "agent_settled", outcome });
-			});
+			try {
+				await this._agentSettledScope.run(scope, () =>
+					this._extensionRunner.emit({ type: "agent_settled", outcome }),
+				);
+			} catch (error) {
+				if (!this._shutdownCancellation.signal.aborted) throw error;
+			}
+			this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome }));
 		} finally {
-			// Detached descendants of a finished handler are external delivery waiters again.
 			scope.active = false;
 			this._isEmittingAgentSettled = false;
-		}
-
-		const deferred = this._deferredSettledActions.splice(0);
-		if (deferred.length > 0) {
 			try {
-				for (const action of deferred) await action();
+				for (const action of this._deferredSettledActions.splice(0)) {
+					const actionScope = { active: true };
+					try {
+						await this._settlementActionScope.run(actionScope, action).catch((error: unknown) => {
+							if (!this._shutdownCancellation.signal.aborted) throw error;
+						});
+					} finally {
+						actionScope.active = false;
+					}
+				}
 			} finally {
 				this._resolveIdleWaitIfIdle();
+				completed();
 			}
-			return;
 		}
-		this._resolveIdleWaitIfIdle();
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -1345,6 +1404,19 @@ export class AgentSession {
 				this._nestedToolCalls.clear();
 			}
 		}
+		// Synthetic run failures publish another message_start, but not a new turn_start.
+		if (event.type === "turn_start") this._assistantOutputObserved = false;
+		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
+			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
+		} else if (event.type === "message_update" && event.message.role === "assistant") {
+			const update = event.assistantMessageEvent;
+			this._assistantOutputObserved ||=
+				hasAssistantOutput(event.message) ||
+				update.type.startsWith("toolcall_") ||
+				("delta" in update && update.delta.length > 0) ||
+				("content" in update && update.content.length > 0);
+		}
+
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -1367,8 +1439,14 @@ export class AgentSession {
 			}
 		}
 
-		// Emit to extensions first, then notify public listeners.
-		await this._emitExtensionEvent(event);
+		// Terminal cancellation releases extension waits, not final event publication/persistence.
+		if (!this._shutdownCancellation.signal.aborted) {
+			try {
+				await this._emitExtensionEvent(event);
+			} catch (error) {
+				if (!this._shutdownCancellation.signal.aborted) throw error;
+			}
+		}
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
@@ -1430,13 +1508,20 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
-				if (assistantMsg.stopReason !== "error" && this._retryAttempt > 0) {
+				const fallbackSucceeded =
+					this._retryFallbackInFlight &&
+					(assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse");
+				if (
+					fallbackSucceeded ||
+					(assistantMsg.stopReason !== "error" && this._retryAttempt > 0 && !this._retryFallbackInFlight)
+				) {
 					this._emit({
 						type: "auto_retry_end",
 						success: true,
 						attempt: this._retryAttempt,
 					});
 					this._retryAttempt = 0;
+					this._retryFallbackInFlight = false;
 				}
 			}
 		}
@@ -1456,13 +1541,12 @@ export class AgentSession {
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
 		if (this._agentRunAbortRequested) return false;
 		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
-		if (!message || this._throttleWaitUsed) return false;
+		if (!message || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
+		if (this._assistantOutputObserved || hasAssistantOutput(message)) return false;
 		if (throttledLimitWait(message)) return true;
-		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
-			return false;
-		}
-		return this._isRetryableError(message);
+		const settings = this._getRetrySettings(message);
+		if (!settings.enabled || !this._isRetryableError(message)) return false;
+		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
 
 	private _findPersistedMessageEntryId(message: AgentMessage): string | undefined {
@@ -2132,7 +2216,7 @@ export class AgentSession {
 		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
-		const dispatch = async (continuation = false) => {
+		const dispatch = async (continuation = false, fromQueuedMessages = false) => {
 			this.#ordinaryOwner?.assertCompactionIdle();
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
@@ -2140,7 +2224,7 @@ export class AgentSession {
 			// No await or external callback may separate this check from dispatch.
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
-			const run = continuation || !messages ? agent.continue() : agent.prompt(messages);
+			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
 			} catch (cause) {
@@ -2167,6 +2251,8 @@ export class AgentSession {
 		this._lastActivityOutcome = "completed";
 		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
+		this._retryFallbackUsed = false;
+		this._retryFallbackInFlight = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -2179,8 +2265,10 @@ export class AgentSession {
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
 				if (!continueAfterRun && !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
-				if (this.#ordinaryOwner) await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true));
-				else await dispatch(true);
+				const fromQueuedMessages = continueAfterRun === "queuedInput";
+				if (this.#ordinaryOwner)
+					await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(true, fromQueuedMessages));
+				else await dispatch(true, fromQueuedMessages);
 			}
 		} catch (error) {
 			runFailed = true;
@@ -2227,7 +2315,7 @@ export class AgentSession {
 		}
 	}
 
-	private async _handlePostAgentRun(): Promise<boolean> {
+	private async _handlePostAgentRun(): Promise<boolean | "queuedInput"> {
 		const message = this._lastAssistantMessage;
 		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;
@@ -2241,8 +2329,12 @@ export class AgentSession {
 
 		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
 		const throttleWaitUsed = this._throttleWaitUsed;
+		const fallbackAttempt = this._retryFallbackInFlight;
 		this._throttleWaitUsed = false;
-		const throttleWait = throttleWaitUsed ? undefined : throttledLimitWait(message);
+		const throttleWait =
+			fallbackAttempt || throttleWaitUsed || this._assistantOutputObserved || hasAssistantOutput(message)
+				? undefined
+				: throttledLimitWait(message);
 		let retrying: boolean;
 		if (throttleWait) {
 			this._retryAttempt++;
@@ -2262,7 +2354,7 @@ export class AgentSession {
 			return false;
 		}
 
-		if (message.stopReason === "error" && this._retryAttempt > 0) {
+		if ((message.stopReason === "error" && this._retryAttempt > 0) || fallbackAttempt) {
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
@@ -2270,11 +2362,12 @@ export class AgentSession {
 				finalError: message.errorMessage,
 			});
 			this._retryAttempt = 0;
+			this._retryFallbackInFlight = false;
 		}
 
-		// An error on the one-shot throttle retry is final: no overflow compaction-and-retry either.
+		// The one-shot alternate and failed throttle retry cannot recover through compaction either.
 		const compaction =
-			throttleWaitUsed && message.stopReason === "error"
+			fallbackAttempt || (throttleWaitUsed && message.stopReason === "error")
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -2286,7 +2379,10 @@ export class AgentSession {
 
 		// The low-level loop drains both queues before agent_end. Messages queued by
 		// agent_end handlers require a fresh run before pre-settlement handlers fire.
-		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+		const queued = !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+		// A failed alternate's synthetic tool results are terminal. Retained input
+		// must be selected before another request, rather than resuming that tool turn.
+		return fallbackAttempt && queued ? "queuedInput" : queued;
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
@@ -2299,7 +2395,9 @@ export class AgentSession {
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
 				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
 				() => this._getPendingBoundaryMessages(),
+				this._shutdownCancellation.signal,
 			);
+			if (this._shutdownCancellation.signal.aborted) return false;
 			if (result.entries.length > 0) this._commitBoundaryDrafts(result.entries);
 			// Captured SDK managers can append context without proposing any drafts.
 			// Agent.continue() checks agent state before request preparation can refresh it.
@@ -2313,6 +2411,9 @@ export class AgentSession {
 				return false;
 			}
 			return shouldContinue;
+		} catch (error) {
+			if (this._shutdownCancellation.signal.aborted) return false;
+			throw error;
 		} finally {
 			this._isBeforeSettle = false;
 		}
@@ -2370,9 +2471,30 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
 		if (this._isEmittingAgentSettled) {
-			this._deferredSettledActions.push(async () => await this.prompt(text, options));
-			return;
+			const completion = new Promise<void>((resolve, reject) => {
+				this._deferredSettledActions.push(async () => {
+					try {
+						await this.prompt(text, options);
+						resolve();
+					} catch (error) {
+						reject(error);
+					}
+				});
+			});
+			// A settlement handler can await acceptance, not its own deferred delivery.
+			if (this._agentSettledScope.getStore()?.active) {
+				void completion.catch((error: unknown) => {
+					this._extensionRunner.emitError({
+						extensionPath: "<settlement>",
+						event: "prompt",
+						error: error instanceof Error ? error.message : String(error),
+					});
+				});
+				return;
+			}
+			return completion;
 		}
 		if (!this.#ordinaryOwner) return this._prompt(text, options);
 		this.#ordinaryOwner.assertSessionStart(this);
@@ -2627,6 +2749,7 @@ export class AgentSession {
 	 * assistant message: the messages are the run's input, as they would have been without the wait.
 	 */
 	private _runTriggeredBehindPreflight(): void {
+		if (this._shutdownCancellation.signal.aborted) return;
 		// Keep ownership here while a switch is pending: its compaction caller discards
 		// the usual continuation decision, so moving these into agent queues would strand them.
 		if (
@@ -2660,6 +2783,7 @@ export class AgentSession {
 	 * next prompt.
 	 */
 	private _runInputQueuedBehindPreflight(): void {
+		if (this._shutdownCancellation.signal.aborted) return;
 		if (
 			this._modelSwitchCompactionPending ||
 			!this._inputQueuedBehindPreflight ||
@@ -2702,9 +2826,12 @@ export class AgentSession {
 		const ctx = this._extensionRunner.createCommandContext();
 
 		try {
-			await command.handler(args, ctx);
+			this._shutdownCancellation.signal.throwIfAborted();
+			await raceWithAbortSignal(Promise.resolve(command.handler(args, ctx)), this._shutdownCancellation.signal);
+			this._shutdownCancellation.signal.throwIfAborted();
 			return true;
 		} catch (err) {
+			this._shutdownCancellation.signal.throwIfAborted();
 			// Emit error via extension runner
 			this._extensionRunner.emitError({
 				extensionPath: `command:${commandName}`,
@@ -2895,6 +3022,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
 			role: "custom" as const,
@@ -3133,6 +3261,17 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
+	/** @internal Permanently stop extension dispatch waits before a terminal shutdown join. */
+	cancelForShutdown(): void {
+		this._shutdownCancellation.abort(new DOMException("Operation cancelled for terminal shutdown", "AbortError"));
+		this.abortBash();
+	}
+
+	/** @internal Shared terminal signal for provider and extension dispatch. */
+	get shutdownSignal(): AbortSignal {
+		return this._shutdownCancellation.signal;
+	}
+
 	/**
 	 * Abort current operation and wait for agent to become idle.
 	 */
@@ -3150,6 +3289,11 @@ export class AgentSession {
 		this.#originalAgent.abort();
 		this._resolveIdleWaitIfIdle();
 		await this.waitForIdle();
+		// Deferred work must not join the settlement whose completion it owns.
+		// The external terminal join still waits until every deferred action returns.
+		if (this._shutdownCancellation.signal.aborted && !this._settlementActionScope.getStore()?.active) {
+			await this._settlementCompletion;
+		}
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -4290,6 +4434,7 @@ export class AgentSession {
 	}
 
 	async bindExtensions(bindings: ExtensionBindings): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertSessionStart(this);
 		if (bindings.hasPendingInput !== undefined) this.#pendingModeInput = bindings.hasPendingInput;
 		if (bindings.uiContext !== undefined) {
@@ -4312,9 +4457,12 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
-		await this._extensionRunner.emit(this._sessionStartEvent);
+		await raceWithAbortSignal(this._extensionRunner.emit(this._sessionStartEvent), this._shutdownCancellation.signal);
 		this._extensionRunner.reportUnhandledMcpServers();
-		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
+		await raceWithAbortSignal(
+			this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup"),
+			this._shutdownCancellation.signal,
+		);
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -4327,6 +4475,7 @@ export class AgentSession {
 			reason,
 		);
 
+		this._shutdownCancellation.signal.throwIfAborted();
 		if (skillPaths.length === 0 && promptPaths.length === 0 && themePaths.length === 0) {
 			return;
 		}
@@ -4679,6 +4828,7 @@ export class AgentSession {
 			this._cwd,
 			this.sessionManager,
 			new ModelRegistry(this._modelRuntime),
+			this._shutdownCancellation.signal,
 		);
 		if (this._extensionRunnerRef) {
 			this._extensionRunnerRef.current = this._extensionRunner;
@@ -4746,6 +4896,8 @@ export class AgentSession {
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
+		// Never restart a request once output or a tool call has been streamed.
+		if (this._assistantOutputObserved) return false;
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, (this._modelForMessage(message) ?? this.model)?.contextWindow ?? 0)) return false;
 		return isRetryableAssistantError(message);
@@ -4786,9 +4938,10 @@ export class AgentSession {
 	}
 
 	private _finishCancelledRetry(): void {
-		if (this._retryAttempt === 0) return;
+		if (this._retryAttempt === 0 && !this._retryFallbackInFlight) return;
 		const attempt = this._retryAttempt;
 		this._retryAttempt = 0;
+		this._retryFallbackInFlight = false;
 		this._emit({
 			type: "auto_retry_end",
 			success: false,
@@ -4802,8 +4955,8 @@ export class AgentSession {
 	 * @returns true if the caller should continue the agent, false otherwise
 	 */
 	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
-		const settings = this.settingsManager.getRetrySettings();
-		if (!settings.enabled) {
+		const settings = this._getRetrySettings(message);
+		if (!settings.enabled || this._retryFallbackInFlight) {
 			return false;
 		}
 
@@ -4812,10 +4965,76 @@ export class AgentSession {
 		if (this._retryAttempt > settings.maxRetries) {
 			// Preserve the completed attempt count so post-run handling can emit the final failure.
 			this._retryAttempt--;
-			return false;
+			try {
+				return await this._prepareRetryFallback(message);
+			} catch (error) {
+				this._emit({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this._retryAttempt,
+					finalError: error instanceof Error ? error.message : String(error),
+				});
+				this._retryAttempt = 0;
+				throw error;
+			}
 		}
 
 		return this._waitAndRetry(message, retryDelayMs(settings, this._retryAttempt), settings.maxRetries);
+	}
+
+	private _getRetrySettings(message: AssistantMessage): RetryPolicy {
+		const settings = this.settingsManager.getRetrySettings();
+		// A dropped stream gets at most two retries, even with a larger ordinary retry budget.
+		return isPrematureStreamError(message) ? { ...settings, maxRetries: Math.min(2, settings.maxRetries) } : settings;
+	}
+
+	private _getRetryFallbackModel(): Model<string> | undefined {
+		const reference = this.settingsManager.getRetryFallbackModel();
+		// Sealed owner runtimes authorize one provider identity; alternates require fresh receiving.
+		if (!reference || this._retryFallbackUsed || this.#ordinaryOwner) return undefined;
+		const slash = reference.indexOf("/");
+		if (slash <= 0) return undefined;
+		const model = this._modelRuntime.getModel(reference.slice(0, slash), reference.slice(slash + 1));
+		if (!model || modelsAreEqual(model, this.model) || !this._modelRuntime.hasConfiguredAuth(model.provider))
+			return undefined;
+		return model;
+	}
+
+	private async _prepareRetryFallback(message: AssistantMessage): Promise<boolean> {
+		if (this.#ordinaryOwner && this.settingsManager.getRetryFallbackModel()) {
+			throw new Error(
+				"Retry fallback refused: owned runtime pins provider identity; a fresh owner allocation is required.",
+			);
+		}
+		const model = this._getRetryFallbackModel();
+		const previousModel = this.model;
+		if (!model || !previousModel || this._agentRunAbortRequested) return false;
+		const event = {
+			type: "auto_retry_fallback",
+			fromModel: `${previousModel.provider}/${previousModel.id}`,
+			toModel: `${model.provider}/${model.id}`,
+			attempt: this._retryAttempt,
+			errorMessage: message.errorMessage || "Unknown error",
+		} as const;
+		// Reuse context admission and thinking-level clamping, but do not change global defaults
+		// or drain queued input during this post-run recovery. Oversized targets are refused.
+		await this._compactForModelSwitch(model, () => {
+			if (this._agentRunAbortRequested) return;
+			this._omitRecoveryAttempt(message);
+			this.agent.state.model = model;
+			this.sessionManager.appendModelChange(model.provider, model.id);
+			this.setThinkingLevel(this._getThinkingLevelForModelSwitch(model));
+			this._retryFallbackUsed = true;
+			this._retryFallbackInFlight = true;
+			const entryId = this.sessionManager.appendCustomEntry(event.type, event);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+			this._emit(event);
+		});
+		if (!this._retryFallbackUsed) return false;
+		await this._emitModelSelect(model, previousModel, "set");
+		// Retain the count for this episode's terminal notice, not as a later-request retry bound.
+		return !this._agentRunAbortRequested;
 	}
 
 	/**
@@ -4897,7 +5116,13 @@ export class AgentSession {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+		options?: {
+			excludeFromContext?: boolean;
+			id?: string;
+			operations?: BashOperations;
+			/** @internal Revalidate the host command lifetime before persisting an async result. */
+			beforeRecord?: () => void;
+		},
 	): Promise<BashResult> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
 		const abortController = new AbortController();
@@ -4922,6 +5147,7 @@ export class AgentSession {
 				},
 			);
 
+			options?.beforeRecord?.();
 			this.recordBashResult(command, result, options);
 			return result;
 		} finally {
@@ -5074,6 +5300,10 @@ export class AgentSession {
 
 		// Set up abort controller for summarization
 		this._branchSummaryAbortController = new AbortController();
+		const navigationSignal = AbortSignal.any([
+			this._branchSummaryAbortController.signal,
+			this._shutdownCancellation.signal,
+		]);
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -5081,11 +5311,14 @@ export class AgentSession {
 
 			// Emit session_before_tree event
 			if (this._extensionRunner.hasHandlers("session_before_tree")) {
-				const result = (await this._extensionRunner.emit({
-					type: "session_before_tree",
-					preparation,
-					signal: this._branchSummaryAbortController.signal,
-				})) as SessionBeforeTreeResult | undefined;
+				const result = (await this._extensionRunner.emit(
+					{
+						type: "session_before_tree",
+						preparation,
+						signal: navigationSignal,
+					},
+					navigationSignal,
+				)) as SessionBeforeTreeResult | undefined;
 
 				if (result?.cancel) {
 					return { cancelled: true };
@@ -5113,11 +5346,10 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const signal = this._branchSummaryAbortController.signal;
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
-					...(await this._getSummarizationRequestAuth(this.model!, signal)),
-					signal,
+					...(await this._getSummarizationRequestAuth(this.model!, navigationSignal)),
+					signal: navigationSignal,
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,
@@ -5160,6 +5392,9 @@ export class AgentSession {
 				newLeafId = targetId;
 			}
 
+			// Cancellation can release a held hook without authorizing its branch or label changes.
+			navigationSignal.throwIfAborted();
+
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
 			let summaryEntry: BranchSummaryEntry | undefined;
@@ -5195,18 +5430,30 @@ export class AgentSession {
 			this._refreshFinalizedContext();
 			this._restoreToolsFromTranscript();
 
-			// Emit session_tree event
-			await this._extensionRunner.emit({
-				type: "session_tree",
-				newLeafId: this.sessionManager.getLeafId(),
-				oldLeafId,
-				summaryEntry,
-				fromExtension: summaryText ? fromExtension : undefined,
-			});
+			// Navigation is already committed. Cancel its observer without claiming rollback.
+			try {
+				await this._extensionRunner.emit(
+					{
+						type: "session_tree",
+						newLeafId: this.sessionManager.getLeafId(),
+						oldLeafId,
+						summaryEntry,
+						fromExtension: summaryText ? fromExtension : undefined,
+					},
+					navigationSignal,
+				);
+			} catch (cause) {
+				if (!navigationSignal.aborted || cause !== navigationSignal.reason) throw cause;
+			}
 
 			// Emit to custom tools
 
 			return { editorText, cancelled: false, summaryEntry };
+		} catch (cause) {
+			if (navigationSignal.aborted && cause === navigationSignal.reason) {
+				return { cancelled: true, aborted: true };
+			}
+			throw cause;
 		} finally {
 			this._branchSummaryAbortController = undefined;
 			this._resolveIdleWaitIfIdle();

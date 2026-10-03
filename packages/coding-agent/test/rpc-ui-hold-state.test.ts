@@ -79,7 +79,10 @@ async function withRpc(test: (fixture: RpcFixture) => Promise<void>): Promise<vo
 	} finally {
 		rpcIo.failOutput = false;
 		end();
-		await vi.waitFor(() => expect(dispose).toHaveBeenCalledOnce());
+		await vi.waitFor(() => {
+			expect(dispose).toHaveBeenCalledOnce();
+			expect(exit).toHaveBeenCalledWith(0);
+		});
 		exit.mockRestore();
 		for (const listener of process.stdin.listeners("end")) {
 			if (!previousEnd.includes(listener)) process.stdin.off("end", listener as () => void);

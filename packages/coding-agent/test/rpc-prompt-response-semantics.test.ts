@@ -223,10 +223,33 @@ async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): P
 	rpcIo.lineHandler = undefined;
 
 	const { runtimeHost, session, sessionManager, cleanup } = await createRuntimeHost(options);
+	const previousEnd = process.stdin.listeners("end");
+	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
+	const previousSignals = signals.map((signal) => ({ signal, listeners: process.listeners(signal) }));
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
 
-	return { lineHandler: rpcIo.lineHandler!, runtimeHost, session, sessionManager, cleanup };
+	return {
+		lineHandler: rpcIo.lineHandler!,
+		runtimeHost,
+		session,
+		sessionManager,
+		cleanup: async () => {
+			try {
+				await cleanup();
+			} finally {
+				// These in-process fixtures never exit. Remove only this run's listeners.
+				for (const listener of process.stdin.listeners("end")) {
+					if (!previousEnd.includes(listener)) process.stdin.off("end", listener as () => void);
+				}
+				for (const { signal, listeners } of previousSignals) {
+					for (const listener of process.listeners(signal)) {
+						if (!listeners.includes(listener)) process.off(signal, listener as () => void);
+					}
+				}
+			}
+		},
+	};
 }
 
 const rpcListenerRegistrations: Array<{ emitter: NodeJS.EventEmitter; event: string }> = [

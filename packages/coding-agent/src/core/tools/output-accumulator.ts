@@ -3,6 +3,7 @@ import { createWriteStream, type WriteStream } from "node:fs";
 import { open } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { finished } from "node:stream/promises";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
 
 export interface OutputAccumulatorOptions {
@@ -60,6 +61,7 @@ export class OutputAccumulator {
 
 	private tempFilePath: string | undefined;
 	private tempFileStream: WriteStream | undefined;
+	private tempFileCompletion: Promise<Error | undefined> | undefined;
 
 	constructor(options: OutputAccumulatorOptions = {}) {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -133,19 +135,9 @@ export class OutputAccumulator {
 		const stream = this.tempFileStream;
 		this.tempFileStream = undefined;
 
-		await new Promise<void>((resolve, reject) => {
-			const onError = (error: Error) => {
-				stream.off("finish", onFinish);
-				reject(error);
-			};
-			const onFinish = () => {
-				stream.off("error", onError);
-				resolve();
-			};
-			stream.once("error", onError);
-			stream.once("finish", onFinish);
-			stream.end();
-		});
+		stream.end();
+		const error = await this.tempFileCompletion;
+		if (error) throw error;
 	}
 
 	/**
@@ -254,7 +246,12 @@ export class OutputAccumulator {
 			return;
 		}
 		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
-		this.tempFileStream = createWriteStream(this.tempFilePath);
+		this.tempFileStream = createWriteStream(this.tempFilePath, { flags: "wx", mode: 0o600 });
+		// Capture even early open errors, then report them when the caller closes the file.
+		this.tempFileCompletion = finished(this.tempFileStream).then(
+			() => undefined,
+			(error: Error) => error,
+		);
 		for (const chunk of this.rawChunks) {
 			this.tempFileStream.write(chunk);
 		}

@@ -104,7 +104,8 @@ describe("test harness", () => {
 
 	it("retry on transient error", async () => {
 		harness = await createHarness({
-			responses: [{ error: "overloaded_error" }, "recovered"],
+			// smarty-dev#3200: retry requires no reported generation; faux defaults to 50 output tokens.
+			responses: [{ error: "overloaded_error", usage: { output: 0 } }, "recovered"],
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
 		});
 

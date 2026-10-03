@@ -123,12 +123,21 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 | `httpIdleTimeoutMs` | number | `300000` | HTTP header and body idle timeout in milliseconds. Set to `0` to disable. |
 | `websocketConnectTimeoutMs` | number | `15000` | WebSocket connection timeout in milliseconds. Set to `0` to disable. |
 | `retry.enabled` | boolean | `true` | Enable automatic agent-level retry for transient failures. |
-| `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts. |
+| `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts. Premature stream endings are capped at `2`. |
 | `retry.baseDelayMs` | number | `2000` | Initial exponential-backoff delay in milliseconds. |
 | `retry.maxAgentDelayMs` | number | `60000` | Maximum agent-level retry delay in milliseconds. |
+| `retry.fallbackModel` | string | None (off) | Exact `provider/modelId` of the configured alternate model to try once after transient agent retries are exhausted. |
 | `retry.provider.timeoutMs` | number | `httpIdleTimeoutMs` | Provider request timeout in milliseconds. |
 | `retry.provider.maxRetries` | number | `0` | Provider-level retry attempts. |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Maximum server-requested delay in milliseconds. Set to `0` to disable the limit. |
+
+Agent retries and fallback only restart requests with no output: nonempty text or reasoning, any tool-call block (including a partial call), or reported output tokens prevent recovery. Empty reasoning blocks and encrypted reasoning signatures alone do not count as output. Pi also remembers streamed deltas if a provider discards partial content in its final error.
+
+Premature stream endings use at most two retries with the configured exponential backoff (by default 2s, then 4s). Lower `retry.maxRetries` values still apply, and `retry.enabled: false` disables both retry and fallback. Other transient failures keep their ordinary retry budget.
+
+Set `retry.fallbackModel` only to an explicitly chosen family alternate, for example `"cliproxyapi/your-alternate-model-id"`. Pi does not infer a family or select an alternate automatically. The alternate must exist in the model registry, have configured authentication, differ from the current model, and fit the current context. It gets one attempt, not a fresh retry budget. Unknown or unavailable alternates do not switch models. Global startup defaults are unchanged; the switched model remains selected in the session. The sealed `--owner-host-profile` interactive runtime pins a single provider identity and refuses fallback; changing that identity requires a fresh owner allocation. Ordinary print/JSON/RPC invocations do not use that sealed runtime.
+
+A switch appends a `model_change` entry and a custom `auto_retry_fallback` entry containing `fromModel`, `toModel`, `attempt`, and `errorMessage`, and emits an `auto_retry_fallback` event. Print, JSON, and RPC modes immediately write retry, exhausted-retry, and fallback notices to stderr; JSON/RPC stdout also carries the recovery events. Consume through `agent_settled`, not the first failed `message_end` or `agent_end`.
 
 Keep `retry.provider.maxRetries` at `0` unless provider-level retries are required. Provider retries can delay Pi from handling quota and usage-limit errors itself.
 
