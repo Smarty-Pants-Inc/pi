@@ -3,10 +3,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import inputAuthor from "../examples/extensions/input-author.ts";
 import type { InputSubmission } from "../src/index.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
-import { createHarness, getMessageText, type Harness } from "./suite/harness.ts";
+import { createHarness, getMessageText, getUserTexts, type Harness } from "./suite/harness.ts";
 
 type QueuedInput = { text: string; mode: "steer" | "followUp"; submissionPromise?: Promise<InputSubmission> };
 type PendingInput = { text: string; submissionPromise?: Promise<InputSubmission> };
+type CapturingStreamingInput = { text: string; mode: "steer" | "followUp"; cancelled: boolean };
 type SubmissionUI = {
 	session: Harness["session"];
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
@@ -15,6 +16,9 @@ type SubmissionUI = {
 	compactionQueuedMessages: QueuedInput[];
 	compactionQueueTransfers: number;
 	inputSubmissionTransfers: number;
+	capturingStreamingInputs: Set<CapturingStreamingInput>;
+	clearAllQueues: () => { steering: string[]; followUp: string[] };
+	restoreQueuedMessagesToEditor: (options?: { abort?: boolean; currentText?: string }) => number;
 	captureEditorSubmission: (text: string, mode?: "steer" | "followUp") => Promise<InputSubmission> | undefined;
 	submitStreamingInput: (text: string, mode: "steer" | "followUp") => Promise<void>;
 	isExtensionCommand: (text: string) => boolean;
@@ -27,6 +31,7 @@ type SubmissionUI = {
 	awaitInputSubmission: (
 		text: string,
 		submissionPromise?: Promise<InputSubmission>,
+		capture?: CapturingStreamingInput,
 	) => Promise<InputSubmission | undefined | null>;
 	updatePendingMessagesDisplay: () => void;
 	showStatus: (message: string) => void;
@@ -43,6 +48,10 @@ type SubmissionUIPrototype = {
 	): Promise<InputSubmission> | undefined;
 	submitStreamingInput(this: SubmissionUI, text: string, mode: "steer" | "followUp"): Promise<void>;
 	handleFollowUp(this: SubmissionUI): Promise<void>;
+	handleDequeue(this: SubmissionUI): void;
+	getAllQueuedMessages(this: SubmissionUI): { steering: string[]; followUp: string[] };
+	clearAllQueues(this: SubmissionUI): { steering: string[]; followUp: string[] };
+	restoreQueuedMessagesToEditor(this: SubmissionUI, options?: { abort?: boolean; currentText?: string }): number;
 	queueCompactionMessage(
 		this: SubmissionUI,
 		text: string,
@@ -54,6 +63,7 @@ type SubmissionUIPrototype = {
 		this: SubmissionUI,
 		text: string,
 		submissionPromise?: Promise<InputSubmission>,
+		capture?: CapturingStreamingInput,
 	): Promise<InputSubmission | undefined | null>;
 };
 const prototype = InteractiveMode.prototype as unknown as SubmissionUIPrototype;
@@ -82,6 +92,9 @@ function createSubmissionUI(harness: Harness) {
 		compactionQueuedMessages: [],
 		compactionQueueTransfers: 0,
 		inputSubmissionTransfers: 0,
+		capturingStreamingInputs: new Set(),
+		clearAllQueues: () => prototype.clearAllQueues.call(context),
+		restoreQueuedMessagesToEditor: (options) => prototype.restoreQueuedMessagesToEditor.call(context, options),
 		captureEditorSubmission: (text, mode) => prototype.captureEditorSubmission.call(context, text, mode),
 		submitStreamingInput: (text, mode) => prototype.submitStreamingInput.call(context, text, mode),
 		isExtensionCommand: (text) =>
@@ -89,9 +102,9 @@ function createSubmissionUI(harness: Harness) {
 		flushPendingBashComponents: vi.fn(),
 		queueCompactionMessage: (text, mode, submissionPromise) =>
 			prototype.queueCompactionMessage.call(context, text, mode, submissionPromise),
-		awaitInputSubmission: (text, submissionPromise) =>
-			prototype.awaitInputSubmission.call(context, text, submissionPromise),
-		updatePendingMessagesDisplay: vi.fn(),
+		awaitInputSubmission: (text, submissionPromise, capture) =>
+			prototype.awaitInputSubmission.call(context, text, submissionPromise, capture),
+		updatePendingMessagesDisplay: vi.fn(() => prototype.getAllQueuedMessages.call(context)),
 		showStatus: vi.fn(),
 		showError: vi.fn(),
 		ui: { requestRender: vi.fn() },
@@ -265,6 +278,216 @@ describe("interactive submission metadata", () => {
 				responseRelease.release();
 				await running;
 			}
+		},
+	);
+
+	// F2 regression for Smarty-Pants-Inc/smarty-dev#4078: actual dequeue cancels capture before native transfer.
+	it.each(["followUp", "steer"] as const)(
+		"does not resurrect a dequeued %s capture after Bob submits edited text",
+		async (mode) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			const captureStarted = gate();
+			const captureRelease = gate();
+			let currentAuthor = "Alice";
+			const captures: string[] = [];
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", async (event) => {
+							if (event.source !== "interactive") return;
+							const name = currentAuthor;
+							captures.push(name);
+							if (name === "Alice") {
+								captureStarted.release();
+								await captureRelease.promise;
+							}
+							return { metadata: { author: { name, source: "herdr-client", verified: false } } };
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("RPC response");
+				},
+				fauxAssistantMessage("Bob response"),
+				fauxAssistantMessage("unexpected resurrected response"),
+			]);
+			const running = harness.session.prompt("initial RPC", { source: "rpc" });
+			await responseStarted.promise;
+			const context = createSubmissionUI(harness);
+			context.editor.setText("same");
+			const alice =
+				mode === "followUp" ? prototype.handleFollowUp.call(context) : context.defaultEditor.onSubmit!("same");
+			await captureStarted.promise;
+			try {
+				expect(context.inputSubmissionTransfers).toBe(1);
+				expect(context.editor.getText()).toBe("");
+				const capturing = {
+					steering: mode === "steer" ? ["same"] : [],
+					followUp: mode === "followUp" ? ["same"] : [],
+				};
+				expect.soft(prototype.getAllQueuedMessages.call(context)).toEqual(capturing);
+				expect.soft(context.updatePendingMessagesDisplay).toHaveLastReturnedWith(capturing);
+				prototype.handleDequeue.call(context);
+				expect.soft(context.editor.getText(), "dequeue must restore a capture-stage submission").toBe("same");
+				expect.soft(context.showStatus).toHaveBeenCalledWith("Restored 1 queued message to editor");
+				expect(context.inputSubmissionTransfers).toBe(1);
+				prototype.handleDequeue.call(context);
+				expect.soft(context.editor.getText(), "repeated dequeue must not restore twice").toBe("same");
+				expect(context.inputSubmissionTransfers).toBe(1);
+				expect(context.showStatus).toHaveBeenLastCalledWith("No queued messages to restore");
+				expect(harness.session.pendingMessageCount).toBe(0);
+				currentAuthor = "Bob";
+				context.editor.setText("replacement");
+				await context.defaultEditor.onSubmit!("replacement");
+				expect(harness.session.pendingMessageCount).toBe(1);
+				expect(context.inputSubmissionTransfers).toBe(1);
+				expect
+					.soft(context.updatePendingMessagesDisplay)
+					.toHaveLastReturnedWith({ steering: ["replacement"], followUp: [] });
+				captureRelease.release();
+				await alice;
+				expect.soft(harness.session.pendingMessageCount, "old capture must not reenter native queues").toBe(1);
+				expect.soft(prototype.getAllQueuedMessages.call(context)).toEqual({
+					steering: ["replacement"],
+					followUp: [],
+				});
+				expect(context.editor.getText()).toBe("");
+			} finally {
+				captureRelease.release();
+				await alice;
+				responseRelease.release();
+				await running;
+			}
+			expect.soft(getUserTexts(harness)).toEqual(["initial RPC", "replacement"]);
+			expect
+				.soft(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom"))
+				.toMatchObject([{ customType: "input-author", data: { author: { name: "Bob" } } }]);
+			expect(captures).toEqual(["Alice", "Bob"]);
+			expect(context.inputSubmissionTransfers).toBe(0);
+			expect(context.showError).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(2);
+		},
+	);
+
+	// F2 late-rejection regression for Smarty-Pants-Inc/smarty-dev#4078.
+	it.each(["followUp", "steer"] as const)(
+		"does not restore a cancelled %s original over Bob's draft when the old capture rejects",
+		async (mode) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			let rejectCapture!: (error: Error) => void;
+			const harness = await createHarness();
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("done");
+				},
+			]);
+			const running = harness.session.prompt("initial RPC", { source: "rpc" });
+			await responseStarted.promise;
+			const context = createSubmissionUI(harness);
+			vi.spyOn(harness.session, "captureInputSubmission").mockImplementation(
+				() =>
+					new Promise((_, reject) => {
+						rejectCapture = reject;
+					}),
+			);
+			context.editor.setText("same");
+			const alice =
+				mode === "followUp" ? prototype.handleFollowUp.call(context) : context.defaultEditor.onSubmit!("same");
+			try {
+				prototype.handleDequeue.call(context);
+				expect.soft(context.editor.getText()).toBe("same");
+				expect(context.inputSubmissionTransfers).toBe(1);
+				prototype.handleDequeue.call(context);
+				expect.soft(context.editor.getText()).toBe("same");
+				expect(context.inputSubmissionTransfers).toBe(1);
+				context.editor.setText("Bob draft");
+				rejectCapture(new Error("late capture failure"));
+				await alice;
+				expect(context.editor.getText()).toBe("Bob draft");
+				expect(context.showError).not.toHaveBeenCalled();
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(context.inputSubmissionTransfers).toBe(0);
+			} finally {
+				rejectCapture(new Error("late capture failure"));
+				await alice;
+				responseRelease.release();
+				await running;
+			}
+			expect(getUserTexts(harness)).toEqual(["initial RPC"]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(1);
+		},
+	);
+
+	// F2 control for Smarty-Pants-Inc/smarty-dev#4078: asynchronous capture without clear still transfers.
+	it.each(["followUp", "steer"] as const)(
+		"delivers an uncleared asynchronous %s capture with Alice once",
+		async (mode) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			const captureStarted = gate();
+			const captureRelease = gate();
+			let captures = 0;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", async (event) => {
+							if (event.source !== "interactive") return;
+							captures++;
+							captureStarted.release();
+							await captureRelease.promise;
+							return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("RPC response");
+				},
+				fauxAssistantMessage("Alice response"),
+			]);
+			const running = harness.session.prompt("initial RPC", { source: "rpc" });
+			await responseStarted.promise;
+			const context = createSubmissionUI(harness);
+			context.editor.setText("same");
+			const alice =
+				mode === "followUp" ? prototype.handleFollowUp.call(context) : context.defaultEditor.onSubmit!("same");
+			await captureStarted.promise;
+			try {
+				expect(harness.session.pendingMessageCount).toBe(0);
+				captureRelease.release();
+				await alice;
+				expect(harness.session.pendingMessageCount).toBe(1);
+			} finally {
+				captureRelease.release();
+				await alice;
+				responseRelease.release();
+				await running;
+			}
+			expect(getUserTexts(harness)).toEqual(["initial RPC", "same"]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toMatchObject([
+				{ customType: "input-author", data: { author: { name: "Alice" } } },
+			]);
+			expect(context.inputSubmissionTransfers).toBe(0);
+			expect(context.showError).not.toHaveBeenCalled();
+			expect(captures).toBe(1);
+			expect(harness.faux.state.callCount).toBe(2);
 		},
 	);
 

@@ -249,6 +249,12 @@ type CompactionQueuedMessage = PendingUserInput & {
 	mode: "steer" | "followUp";
 };
 
+type CapturingStreamingInput = {
+	text: string;
+	mode: "steer" | "followUp";
+	cancelled: boolean;
+};
+
 type CompactionCostNotice = {
 	type: "compaction_cost";
 	kind: "compaction" | "branch_summary";
@@ -454,6 +460,8 @@ export class InteractiveMode {
 	// Sidecar of the exact input delivered by getUserInput, consumed by the single native run loop.
 	// This is not matched by text or correlated across the steering/follow-up queues.
 	private currentInputSubmission?: Promise<InputSubmission>;
+	private readonly capturingStreamingInputs = new Set<CapturingStreamingInput>();
+	// Includes cancelled captures until their asynchronous owner exits, and native handoffs until transfer.
 	private inputSubmissionTransfers = 0;
 	private userInputInFlight = false;
 	private readonly stagingAudit?: (kind: string) => void;
@@ -3239,6 +3247,8 @@ export class InteractiveMode {
 	}
 
 	private async submitStreamingInput(text: string, streamingBehavior: "steer" | "followUp"): Promise<void> {
+		const capture: CapturingStreamingInput = { text, mode: streamingBehavior, cancelled: false };
+		this.capturingStreamingInputs.add(capture);
 		this.inputSubmissionTransfers++;
 		this.stagingAudit?.("submission-transfer-start");
 		let pending = true;
@@ -3251,24 +3261,32 @@ export class InteractiveMode {
 		try {
 			const submissionPromise = this.captureEditorSubmission(text, streamingBehavior);
 			this.editor.addToHistory?.(text);
-			this.editor.setText("");
-			const submission = await this.awaitInputSubmission(text, submissionPromise);
-			if (submission === null) return;
-			await this.session.prompt(text, { streamingBehavior, submission, onInputTransferred: release });
+			// A synchronous capture handler may already have restored this input through dequeue.
+			if (!capture.cancelled) this.editor.setText("");
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
+			const submission = await this.awaitInputSubmission(text, submissionPromise, capture);
+			if (capture.cancelled || submission === null) return;
+			// Native preflight owns the input from here; do not also display or clear it as UI capture.
+			this.capturingStreamingInputs.delete(capture);
+			await this.session.prompt(text, { streamingBehavior, submission, onInputTransferred: release });
 		} finally {
+			this.capturingStreamingInputs.delete(capture);
 			release();
+			this.updatePendingMessagesDisplay();
+			this.ui.requestRender();
 		}
 	}
 
 	private async awaitInputSubmission(
 		text: string,
 		submissionPromise?: Promise<InputSubmission>,
+		capture?: CapturingStreamingInput,
 	): Promise<InputSubmission | undefined | null> {
 		try {
 			return await submissionPromise;
 		} catch (error) {
+			if (capture?.cancelled) return null;
 			const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
 			this.editor.setText([text, draft].filter((value) => value.trim()).join("\n\n"));
 			this.showError(
@@ -4763,26 +4781,32 @@ export class InteractiveMode {
 
 	/**
 	 * Get all queued messages (read-only).
-	 * Combines session queue and compaction queue.
+	 * Combines session queue, compaction queue, and accepted streaming inputs still capturing metadata.
 	 */
 	private getAllQueuedMessages(): { steering: string[]; followUp: string[] } {
+		const capturing = [...this.capturingStreamingInputs];
 		return {
 			steering: [
 				...this.session.getSteeringMessages(),
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
+				...capturing.filter((input) => input.mode === "steer").map((input) => input.text),
 			],
 			followUp: [
 				...this.session.getFollowUpMessages(),
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text),
+				...capturing.filter((input) => input.mode === "followUp").map((input) => input.text),
 			],
 		};
 	}
 
 	/**
 	 * Clear all queued messages and return their contents.
-	 * Clears both session queue and compaction queue.
+	 * Clears session and compaction queues and cancels streaming inputs still capturing metadata.
 	 */
 	private clearAllQueues(): { steering: string[]; followUp: string[] } {
+		const capturing = [...this.capturingStreamingInputs];
+		for (const input of capturing) input.cancelled = true;
+		this.capturingStreamingInputs.clear();
 		const { steering, followUp } = this.session.clearQueue();
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
@@ -4793,8 +4817,16 @@ export class InteractiveMode {
 		this.compactionQueuedMessages = [];
 		this.stagingAudit?.("queues-cleared");
 		return {
-			steering: [...steering, ...compactionSteering],
-			followUp: [...followUp, ...compactionFollowUp],
+			steering: [
+				...steering,
+				...compactionSteering,
+				...capturing.filter((input) => input.mode === "steer").map((input) => input.text),
+			],
+			followUp: [
+				...followUp,
+				...compactionFollowUp,
+				...capturing.filter((input) => input.mode === "followUp").map((input) => input.text),
+			],
 		};
 	}
 

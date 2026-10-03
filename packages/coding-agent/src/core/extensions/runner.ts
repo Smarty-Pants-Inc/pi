@@ -1085,8 +1085,12 @@ export class ExtensionRunner {
 		);
 	}
 
-	emit<TEvent extends RunnerEmitEvent>(event: TEvent, signal?: AbortSignal): Promise<RunnerEmitResult<TEvent>> {
-		const dispatch = this.emitEvent(event, signal);
+	emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		signal?: AbortSignal,
+		withHandlerScope?: (dispatch: () => Promise<unknown>) => Promise<unknown>,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const dispatch = this.emitEvent(event, signal, withHandlerScope);
 		// Observer-only emitters may be fire-and-forget. Still observe terminal rejection.
 		void dispatch.catch(() => {});
 		return dispatch;
@@ -1095,6 +1099,7 @@ export class ExtensionRunner {
 	private async emitEvent<TEvent extends RunnerEmitEvent>(
 		event: TEvent,
 		operationSignal?: AbortSignal,
+		withHandlerScope?: (dispatch: () => Promise<unknown>) => Promise<unknown>,
 	): Promise<RunnerEmitResult<TEvent>> {
 		const signal = this.dispatchSignal(event.type, operationSignal ?? ("signal" in event ? event.signal : undefined));
 		signal?.throwIfAborted();
@@ -1110,7 +1115,9 @@ export class ExtensionRunner {
 						"signal" in event
 							? { ...structuredClone({ ...event, signal: undefined }), signal: event.signal }
 							: structuredClone(event);
-					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
+					const handlerResult = withHandlerScope
+						? await withHandlerScope(() => this.dispatchHandler(handler, snapshot, ctx, signal))
+						: await this.dispatchHandler(handler, snapshot, ctx, signal);
 					signal?.throwIfAborted();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {

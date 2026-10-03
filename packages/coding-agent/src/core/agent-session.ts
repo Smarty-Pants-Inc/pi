@@ -496,6 +496,8 @@ export class AgentSession {
 	private readonly _entryIdsByMessage = new WeakMap<object, string>();
 	/** Queue-bound origin data, never attached to model-visible or persisted message objects. */
 	private readonly _inputSubmissions = new WeakMap<AgentMessage, InputSubmission>();
+	/** Unseen native queue objects whose provenance is revoked by explicit clear, not abort. */
+	private readonly _queuedUserMessages = new Set<AgentMessage>();
 	/** Reserve durable user entry identity before extensions append entries bound to that message. */
 	private readonly _userMessageEntryIds = new WeakMap<AgentMessage, string>();
 	/** Only appendEntry calls within an awaited user message_start receive a rendering hint and binding. */
@@ -1223,6 +1225,8 @@ export class AgentSession {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
+			// The native queue already transferred this object; a handler clearing siblings must not revoke it.
+			this._queuedUserMessages.delete(event.message);
 			this._userMessageEntryIds.set(event.message, randomUUID());
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
@@ -1471,12 +1475,15 @@ export class AgentSession {
 				...(entryId ? { entryId } : {}),
 			};
 			if (event.message.role === "user" && entryId) {
-				const scope = { active: true, message: event.message, entryId };
-				try {
-					await this._userMessageStartScope.run(scope, () => this._extensionRunner.emit(extensionEvent));
-				} finally {
-					scope.active = false;
-				}
+				await this._extensionRunner.emit(extensionEvent, undefined, async (dispatch) => {
+					const scope = { active: true, message: event.message, entryId };
+					try {
+						return await this._userMessageStartScope.run(scope, dispatch);
+					} finally {
+						// Detached work keeps its originating handler's inactive scope, not a waiting sibling's.
+						scope.active = false;
+					}
+				});
 			} else {
 				await this._extensionRunner.emit(extensionEvent);
 			}
@@ -1576,6 +1583,8 @@ export class AgentSession {
 			// Dispose must succeed even if an abort hook throws.
 		}
 
+		for (const message of this._queuedUserMessages) this._inputSubmissions.delete(message);
+		this._queuedUserMessages.clear();
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
@@ -2751,6 +2760,7 @@ export class AgentSession {
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this._inputSubmissions.set(message, submission);
+		this._queuedUserMessages.add(message);
 		this.agent.steer(message);
 	}
 
@@ -2771,6 +2781,7 @@ export class AgentSession {
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this._inputSubmissions.set(message, submission);
+		this._queuedUserMessages.add(message);
 		this.agent.followUp(message);
 	}
 
@@ -3021,6 +3032,8 @@ export class AgentSession {
 		this._followUpMessages = [];
 		this._triggeredBehindPreflight.splice(0);
 		this._modelSwitchDispatches.clear();
+		for (const message of this._queuedUserMessages) this._inputSubmissions.delete(message);
+		this._queuedUserMessages.clear();
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		this._resolveIdleWaitIfIdle();

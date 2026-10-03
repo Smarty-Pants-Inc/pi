@@ -274,6 +274,275 @@ describe("submission metadata", () => {
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
 	});
 
+	// F1 regression for Smarty-Pants-Inc/smarty-dev#4078: cleared, unseen native objects lose provenance.
+	it.each(["followUp", "steer"] as const)(
+		"does not reattribute a cleared unseen %s object reinserted by the low-level agent",
+		async (route) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			const starts: Array<InputSubmission | undefined> = [];
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", (event) =>
+							event.source === "interactive" ? { metadata: { author: author("Alice") } } : undefined,
+						);
+						pi.on("message_start", (event) => {
+							if (event.message.role === "user" && getMessageText(event.message) === "same")
+								starts.push(event.input);
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			await harness.session[route]("same", undefined, { source: "interactive" });
+			const saved = harness.session.agent.peekQueuedMessages()[0];
+			expect(saved?.role).toBe("user");
+			expect(harness.session.clearQueue()).toEqual({
+				steering: route === "steer" ? ["same"] : [],
+				followUp: route === "followUp" ? ["same"] : [],
+			});
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.sessionManager.getEntries()).toEqual([]);
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("RPC response");
+				},
+				fauxAssistantMessage("unknown insertion response"),
+			]);
+			const running = harness.session.prompt("later RPC", { source: "rpc" });
+			await responseStarted.promise;
+			try {
+				harness.session.agent.steer(saved);
+			} finally {
+				responseRelease.release();
+				await running;
+			}
+			expect(getUserTexts(harness)).toEqual(["later RPC", "same"]);
+			expect.soft(starts, "a retained object is not a new accepted submission").toEqual([undefined]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+		},
+	);
+
+	// F1 regression for Smarty-Pants-Inc/smarty-dev#4078: peek hides both the other queue and unselected siblings.
+	it.each(["one-at-a-time", "all"] as const)(
+		"revokes all cleared native objects in both queues even when %s preview hides them",
+		async (mode) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			const starts: Array<InputSubmission | undefined> = [];
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", (event) =>
+							event.source === "interactive" ? { metadata: { author: author("Alice") } } : undefined,
+						);
+						pi.on("message_start", (event) => {
+							if (event.message.role === "user" && getMessageText(event.message) === "same")
+								starts.push(event.input);
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			harness.session.agent.followUpMode = "all";
+			await harness.session.followUp("same", undefined, { source: "interactive" });
+			await harness.session.followUp("same", undefined, { source: "interactive" });
+			const followUps = harness.session.agent.peekQueuedMessages();
+			expect(followUps).toHaveLength(2);
+			harness.session.agent.steeringMode = "all";
+			await harness.session.steer("same", undefined, { source: "interactive" });
+			await harness.session.steer("same", undefined, { source: "interactive" });
+			const steering = harness.session.agent.peekQueuedMessages();
+			expect(steering).toHaveLength(2);
+			const saved = [...steering, ...followUps];
+			expect(new Set(saved).size).toBe(4);
+			harness.session.agent.steeringMode = mode;
+			harness.session.agent.followUpMode = mode;
+			expect(harness.session.agent.peekQueuedMessages()).toEqual(mode === "all" ? steering : [steering[0]]);
+			expect(harness.session.clearQueue()).toEqual({ steering: ["same", "same"], followUp: ["same", "same"] });
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.sessionManager.getEntries()).toEqual([]);
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("RPC response");
+				},
+				...Array.from({ length: 4 }, () => fauxAssistantMessage("unknown insertion response")),
+			]);
+			const running = harness.session.prompt("later RPC", { source: "rpc" });
+			await responseStarted.promise;
+			try {
+				for (const message of steering) harness.session.agent.steer(message);
+				for (const message of followUps) harness.session.agent.followUp(message);
+			} finally {
+				responseRelease.release();
+				await running;
+			}
+			expect(getUserTexts(harness)).toEqual(["later RPC", "same", "same", "same", "same"]);
+			expect.soft(starts).toEqual([undefined, undefined, undefined, undefined]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+		},
+	);
+
+	// F1/F3 control for Smarty-Pants-Inc/smarty-dev#4078: clearing siblings inside a user hook keeps the current boundary.
+	it("keeps the current user's origin and awaited binding when its handler clears hidden queued siblings", async () => {
+		const responseStarted = gate();
+		const responseRelease = gate();
+		const handlerStarted = gate();
+		const handlerRelease = gate();
+		const laterStarted = gate();
+		const laterRelease = gate();
+		let cleared: { steering: string[]; followUp: string[] } | undefined;
+		let currentEntryId: string | undefined;
+		const starts: Array<{ text: string; input?: InputSubmission }> = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input_submission", (event) =>
+						event.source === "interactive" ? { metadata: { author: author("Alice") } } : undefined,
+					);
+					pi.on("message_start", async (event) => {
+						if (event.message.role !== "user" || getMessageText(event.message) !== "current") return;
+						currentEntryId = event.entryId;
+						cleared = harness.session.clearQueue();
+						handlerStarted.release();
+						await handlerRelease.promise;
+						pi.appendEntry("awaited-state", { value: 1 });
+					});
+				},
+				inputAuthor,
+			],
+		});
+		harnesses.push(harness);
+		harness.session.subscribe((event) => {
+			if (event.type === "message_start" && event.message.role === "user")
+				starts.push({ text: getMessageText(event.message), input: event.input });
+		});
+		harness.setResponses([
+			async () => {
+				responseStarted.release();
+				await responseRelease.promise;
+				return fauxAssistantMessage("initial response");
+			},
+			fauxAssistantMessage("current response"),
+			async () => {
+				laterStarted.release();
+				await laterRelease.promise;
+				return fauxAssistantMessage("later RPC response");
+			},
+			fauxAssistantMessage("unknown sibling response"),
+		]);
+		const running = harness.session.prompt("initial RPC", { source: "rpc" });
+		await responseStarted.promise;
+		harness.session.agent.followUpMode = "all";
+		await harness.session.followUp("same", undefined, { source: "interactive" });
+		await harness.session.followUp("same", undefined, { source: "interactive" });
+		const followUps = harness.session.agent.peekQueuedMessages();
+		harness.session.agent.steeringMode = "all";
+		await harness.session.steer("current", undefined, { source: "interactive" });
+		await harness.session.steer("same", undefined, { source: "interactive" });
+		const sibling = harness.session.agent.peekQueuedMessages()[1];
+		try {
+			responseRelease.release();
+			await handlerStarted.promise;
+			expect(cleared).toEqual({ steering: ["same"], followUp: ["same", "same"] });
+			expect(harness.session.pendingMessageCount).toBe(0);
+		} finally {
+			responseRelease.release();
+			handlerRelease.release();
+			await running;
+		}
+		expect(getUserTexts(harness)).toEqual(["initial RPC", "current"]);
+		expect(starts[1]).toEqual({
+			text: "current",
+			input: { source: "interactive", metadata: { author: author("Alice") } },
+		});
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toMatchObject([
+			{ customType: "awaited-state", beforeMessageId: currentEntryId },
+			{ customType: "input-author", beforeMessageId: currentEntryId, data: { author: author("Alice") } },
+		]);
+		const later = harness.session.prompt("later RPC", { source: "rpc" });
+		await laterStarted.promise;
+		try {
+			for (const message of [sibling, ...followUps]) harness.session.agent.steer(message);
+		} finally {
+			laterRelease.release();
+			await later;
+		}
+		expect(getUserTexts(harness)).toEqual(["initial RPC", "current", "later RPC", "same", "same", "same"]);
+		expect.soft(starts.slice(3)).toEqual([
+			{ text: "same", input: undefined },
+			{ text: "same", input: undefined },
+			{ text: "same", input: undefined },
+		]);
+		expect(
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === "input-author"),
+		).toHaveLength(1);
+	});
+
+	// F1 control for Smarty-Pants-Inc/smarty-dev#4078: abort without clear retains accepted queue ownership.
+	it("keeps accepted Alice follow-up attribution across abort until explicit continuation without clear", async () => {
+		const responseStarted = gate();
+		const responseRelease = gate();
+		const starts: Array<InputSubmission | undefined> = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input_submission", (event) =>
+						event.source === "interactive" ? { metadata: { author: author("Alice") } } : undefined,
+					);
+					pi.on("message_start", (event) => {
+						if (event.message.role === "user" && getMessageText(event.message) === "accepted pending")
+							starts.push(event.input);
+					});
+				},
+				inputAuthor,
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([
+			async () => {
+				responseStarted.release();
+				await responseRelease.promise;
+				return fauxAssistantMessage("initial response");
+			},
+			fauxAssistantMessage("continuation response"),
+			fauxAssistantMessage("retained input response"),
+		]);
+		const running = harness.session.prompt("initial RPC", { source: "rpc" });
+		await responseStarted.promise;
+		try {
+			await harness.session.followUp("accepted pending", undefined, { source: "interactive" });
+			const accepted = harness.session.agent.peekQueuedMessages()[0];
+			const aborted = harness.session.abort();
+			responseRelease.release();
+			await Promise.all([running, aborted]);
+			expect(getUserTexts(harness)).toEqual(["initial RPC"]);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(harness.session.pendingMessageCount).toBe(1);
+			expect(harness.session.agent.peekQueuedMessages()[0]).toBe(accepted);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+			await harness.session.prompt("explicit continuation", { source: "rpc" });
+		} finally {
+			responseRelease.release();
+			await running;
+		}
+		expect(getUserTexts(harness)).toEqual(["initial RPC", "explicit continuation", "accepted pending"]);
+		expect(starts).toEqual([{ source: "interactive", metadata: { author: author("Alice") } }]);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toMatchObject([
+			{ customType: "input-author", data: { author: author("Alice") } },
+		]);
+		expect(harness.faux.state.callCount).toBe(3);
+	});
+
 	it("keeps RPC, extension, anonymous and unknown agent-origin inputs unattributed", async () => {
 		const responseStarted = gate();
 		const responseRelease = gate();
@@ -841,6 +1110,101 @@ describe("submission metadata", () => {
 			secondRelease.release();
 			await Promise.all([lateAppend, second]);
 		}
+	});
+
+	// F3 regression for Smarty-Pants-Inc/smarty-dev#4078: handler return, not sibling dispatch, ends binding.
+	it("leaves a detached append unbound after its user handler returns while a sibling handler waits", async () => {
+		const lateRelease = gate();
+		const siblingStarted = gate();
+		const siblingRelease = gate();
+		const latePublished = gate();
+		const lateEntries: unknown[] = [];
+		let lateAppend: Promise<void> | undefined;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_start", (event) => {
+						if (event.message.role !== "user") return;
+						lateAppend = lateRelease.promise.then(() => {
+							pi.appendEntry("late-state", { value: 1 });
+							latePublished.release();
+						});
+					});
+					pi.on("message_start", async (event) => {
+						if (event.message.role !== "user") return;
+						siblingStarted.release();
+						await siblingRelease.promise;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.subscribe((event) => {
+			if (event.type === "entry_appended" && event.entry.type === "custom")
+				lateEntries.push({ beforeMessage: event.beforeMessage, beforeMessageId: event.entry.beforeMessageId });
+		});
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const running = harness.session.prompt("user", { source: "rpc" });
+		await siblingStarted.promise;
+		try {
+			lateRelease.release();
+			await latePublished.promise;
+			expect.soft(lateEntries).toEqual([{ beforeMessage: undefined, beforeMessageId: undefined }]);
+		} finally {
+			lateRelease.release();
+			siblingRelease.release();
+			await Promise.all([running, lateAppend]);
+		}
+		const entry = harness.sessionManager.getEntries().find((entry) => entry.type === "custom");
+		expect(entry).toMatchObject({ type: "custom", customType: "late-state", data: { value: 1 } });
+		if (entry?.type !== "custom") throw new Error("Expected detached custom entry");
+		expect(entry.beforeMessageId).toBeUndefined();
+	});
+
+	// F3 control for Smarty-Pants-Inc/smarty-dev#4078: a genuinely awaited handler retains its binding.
+	it("binds an append after an await inside the still-awaited user handler", async () => {
+		const handlerStarted = gate();
+		const handlerRelease = gate();
+		let reservedId: string | undefined;
+		const publications: Array<{ text: string; id?: string }> = [];
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_start", async (event) => {
+						if (event.message.role !== "user") return;
+						reservedId = event.entryId;
+						handlerStarted.release();
+						await handlerRelease.promise;
+						pi.appendEntry("awaited-state", { value: 1 });
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.session.subscribe((event) => {
+			if (event.type === "entry_appended" && event.entry.type === "custom")
+				publications.push({ text: getMessageText(event.beforeMessage), id: event.entry.beforeMessageId });
+		});
+		harness.setResponses([fauxAssistantMessage("done")]);
+		const running = harness.session.prompt("user", { source: "rpc" });
+		await handlerStarted.promise;
+		try {
+			expect(getUserTexts(harness)).toEqual([]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+			expect(reservedId).toEqual(expect.any(String));
+		} finally {
+			handlerRelease.release();
+			await running;
+		}
+		const entries = harness.sessionManager.getEntries();
+		const userIndex = entries.findIndex((entry) => entry.type === "message" && entry.message.role === "user");
+		expect(entries[userIndex - 1]).toMatchObject({
+			type: "custom",
+			customType: "awaited-state",
+			beforeMessageId: reservedId,
+		});
+		expect(entries[userIndex]).toMatchObject({ type: "message", id: reservedId, message: { role: "user" } });
+		expect(publications).toEqual([{ text: "user", id: reservedId }]);
 	});
 
 	it("renders claimed names on one visible line without terminal controls", async () => {
