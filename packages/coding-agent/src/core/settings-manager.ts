@@ -227,7 +227,10 @@ function isToolModifier(entry: unknown): boolean {
 function mergeDefaultTools(base: string[] | undefined, overrides: string[] | undefined): string[] | undefined {
 	if (overrides === undefined) return base;
 	// Settings files are not validated; a malformed value replaces instead of throwing here.
-	if (!Array.isArray(base) || !Array.isArray(overrides) || !overrides.every(isToolModifier)) return overrides;
+	if (!Array.isArray(base) || !Array.isArray(overrides) || overrides.length === 0 || !overrides.every(isToolModifier))
+		return overrides;
+	// An explicitly empty inherited selection is not the absent/default baseline.
+	if (base.length === 0) return resolveDefaultTools(overrides, []);
 	return [...base, ...overrides];
 }
 
@@ -235,9 +238,9 @@ function mergeDefaultTools(base: string[] | undefined, overrides: string[] | und
  * Resolve a merged `defaultTools` list: plain names replace `DEFAULT_TOOL_NAMES`, then `+name` adds
  * and `-name` removes a tool, in list order.
  */
-function resolveDefaultTools(entries: string[]): string[] {
+function resolveDefaultTools(entries: string[], baseline: readonly string[] = DEFAULT_TOOL_NAMES): string[] {
 	const plain = entries.filter((entry) => !isToolModifier(entry));
-	const tools = plain.length > 0 || entries.length === 0 ? plain : [...DEFAULT_TOOL_NAMES];
+	const tools = plain.length > 0 || entries.length === 0 ? plain : [...baseline];
 	for (const entry of entries) {
 		if (!isToolModifier(entry)) continue;
 		const name = entry.slice(1);
