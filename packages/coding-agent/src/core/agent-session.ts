@@ -2261,11 +2261,19 @@ export class AgentSession {
 			if (!options?.submission && !isCommand) {
 				const preflightToken = {};
 				this._promptPreflights.add(preflightToken);
+				let captureSucceeded = false;
 				try {
 					options = { ...options, submission: await this.captureInputSubmission(text, options) };
 					options.inputCancellation?.throwIfAborted();
+					captureSucceeded = true;
 				} finally {
 					this._promptPreflights.delete(preflightToken);
+					if (!captureSucceeded) {
+						// No prompt will inherit this token's held work. Success must leave it
+						// for the captured prompt, rather than starting a competing trigger run.
+						this._runTriggeredBehindPreflight();
+						this._runInputQueuedBehindPreflight();
+					}
 				}
 				// Settlement may have finished while metadata capture was awaiting a handler.
 				if (!this._isEmittingAgentSettled) return this.prompt(text, options);
@@ -2460,13 +2468,27 @@ export class AgentSession {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
-					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, submission);
-					else await this._queueSteer(expandedText, currentImages, submission);
+					if (behavior === "followUp") {
+						await this._queueFollowUp(
+							expandedText,
+							currentImages,
+							submission,
+							inputCancellation,
+							onInputTransferred,
+						);
+					} else {
+						await this._queueSteer(
+							expandedText,
+							currentImages,
+							submission,
+							inputCancellation,
+							onInputTransferred,
+						);
+					}
 					// Input already queued behind this prompt is retained with it, and so are
 					// triggered messages held during this preflight: the stop holds for them too.
 					this._inputQueuedBehindPreflight = false;
 					this._queueTriggeredBehindPreflight();
-					onInputTransferred?.();
 					throw new Error(
 						`Prompt not sent: compaction ${outcome === "aborted" ? "was cancelled" : "failed"}. ` +
 							`Input is retained in the ${behavior} queue. ` +

@@ -2,9 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import type { InputSubmission } from "../src/index.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
-type PendingUserInput = { text: string; submissionPromise?: Promise<InputSubmission> };
+type PendingUserInput = {
+	text: string;
+	submissionPromise?: Promise<InputSubmission>;
+	cancellation?: AbortController;
+};
 
 type SubmitContext = {
+	inFlightInput?: PendingUserInput;
 	defaultEditor: { onSubmit?: (text: string) => void };
 	editor: {
 		addToHistory?: (text: string) => void;
@@ -32,6 +37,7 @@ type SubmitContext = {
 };
 
 type InputContext = {
+	inFlightInput?: PendingUserInput;
 	onInputCallback?: (text: string, submissionPromise?: Promise<InputSubmission>) => void;
 	pendingUserInputs: PendingUserInput[];
 	currentInputSubmission?: Promise<InputSubmission>;
@@ -91,18 +97,29 @@ describe("InteractiveMode startup input", () => {
 		expect(context.showStatus).toHaveBeenCalledWith("Startup is still in progress");
 	});
 
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#4078 (Astra F6).
 	it("queues a normal prompt submitted before the input callback is installed", async () => {
 		const context = createSubmitContext();
 		interactiveModePrototype.setupEditorSubmitHandler.call(context);
 
 		await context.defaultEditor.onSubmit?.(" early prompt ");
 
-		expect(context.pendingUserInputs).toEqual([{ text: "early prompt", submissionPromise: expect.any(Promise) }]);
+		expect(context.pendingUserInputs).toEqual([
+			{ text: "early prompt", submissionPromise: expect.any(Promise), cancellation: expect.any(AbortController) },
+		]);
+		const queuedInput = context.pendingUserInputs[0];
+		expect(queuedInput.cancellation?.signal.aborted).toBe(false);
 		expect(context.session.captureInputSubmission).toHaveBeenCalledWith("early prompt", {
 			streamingBehavior: undefined,
 		});
 		expect(context.flushPendingBashComponents).toHaveBeenCalledTimes(1);
 		expect(context.editor.addToHistory).toHaveBeenCalledWith("early prompt");
+
+		await expect(interactiveModePrototype.getUserInput.call(context)).resolves.toBe("early prompt");
+		expect(context.inFlightInput).toBe(queuedInput);
+		expect(context.inFlightInput?.cancellation).toBe(queuedInput.cancellation);
+		queuedInput.cancellation?.abort();
+		expect(context.inFlightInput?.cancellation?.signal.aborted).toBe(true);
 	});
 
 	it("returns queued startup input before installing a new input callback", async () => {
