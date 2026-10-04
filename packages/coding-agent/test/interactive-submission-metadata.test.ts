@@ -1,8 +1,13 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { Container } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import inputAuthor from "../examples/extensions/input-author.ts";
+import type { AgentSessionEvent } from "../src/core/agent-session.ts";
 import type { ExtensionUIContext, InputSubmission } from "../src/index.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { stripAnsi } from "../src/utils/ansi.ts";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "./suite/harness.ts";
 
 type QueuedInput = { text: string; mode: "steer" | "followUp"; submissionPromise?: Promise<InputSubmission> };
@@ -11,7 +16,12 @@ type CapturingStreamingInput = { text: string; mode: "steer" | "followUp"; cance
 type SubmissionUI = {
 	session: Harness["session"];
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
-	editor: { getText: () => string; setText: (text: string) => void; addToHistory: (text: string) => void };
+	editor: {
+		getText: () => string;
+		setText: (text: string) => void;
+		addToHistory: (text: string) => void;
+		onSubmit?: (text: string) => Promise<void>;
+	};
 	pendingUserInputs: PendingInput[];
 	compactionQueuedMessages: QueuedInput[];
 	compactionQueueTransfers: number;
@@ -49,6 +59,7 @@ type SubmissionUIPrototype = {
 	): Promise<InputSubmission> | undefined;
 	submitStreamingInput(this: SubmissionUI, text: string, mode: "steer" | "followUp"): Promise<void>;
 	handleFollowUp(this: SubmissionUI): Promise<void>;
+	getUserInput(this: SubmissionUI): Promise<string>;
 	handleDequeue(this: SubmissionUI): void;
 	getAllQueuedMessages(this: SubmissionUI): { steering: string[]; followUp: string[] };
 	clearAllQueues(this: SubmissionUI): { steering: string[]; followUp: string[] };
@@ -111,6 +122,7 @@ function createSubmissionUI(harness: Harness) {
 		ui: { requestRender: vi.fn() },
 	};
 	prototype.setupEditorSubmitHandler.call(context);
+	context.editor.onSubmit = context.defaultEditor.onSubmit;
 	return context;
 }
 
@@ -660,6 +672,322 @@ describe("interactive submission metadata", () => {
 		},
 	);
 
+	// R1 F1: Smarty-Pants-Inc/smarty-dev#4078. Actual compaction ends with capture still pending.
+	it.each(
+		(["steer", "followUp"] as const).flatMap((mode) =>
+			[false, true].flatMap((willRetry) =>
+				(["dequeue", "abort", "none"] as const).flatMap((cancel) =>
+					(cancel === "none" ? [false] : [false, true]).map((reject) => ({ mode, willRetry, cancel, reject })),
+				),
+			),
+		),
+	)(
+		"settles real compaction replay: $mode retry=$willRetry cancel=$cancel reject=$reject",
+		async ({ mode, willRetry, cancel, reject }) => {
+			const compactStarted = gate();
+			const compactRelease = gate();
+			const captureStarted = gate();
+			const captureRelease = gate();
+			const harness = await createHarness({
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", async (event) => {
+							if (event.source !== "interactive") return;
+							captureStarted.release();
+							await captureRelease.promise;
+							return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+						});
+						pi.on("session_before_compact", async (event) => {
+							compactStarted.release();
+							await compactRelease.promise;
+							return {
+								compaction: {
+									summary: "compacted",
+									firstKeptEntryId: event.preparation.firstKeptEntryId,
+									tokensBefore: event.preparation.tokensBefore,
+								},
+							};
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			if (reject) {
+				// Runner reports extension-hook errors and continues; reject the host capture promise itself.
+				const capture = harness.session.captureInputSubmission.bind(harness.session);
+				vi.spyOn(harness.session, "captureInputSubmission").mockImplementation(async (text, options) => {
+					await capture(text, options);
+					throw new Error("late capture failure");
+				});
+			}
+			harness.sessionManager.appendMessage({ role: "user", content: "old question", timestamp: 1 });
+			harness.sessionManager.appendMessage(fauxAssistantMessage("old response"));
+			harness.session.refreshContext();
+			const context = createSubmissionUI(harness);
+			await harness.session.bindExtensions({
+				mode: "tui",
+				uiContext: prototype.createExtensionUIContext.call(context),
+				abortHandler: () => {
+					context.restoreQueuedMessagesToEditor({ abort: true });
+				},
+			});
+			const compacting = harness.session.compact();
+			await compactStarted.promise;
+			context.editor.setText("Alice input");
+			await (mode === "steer"
+				? context.defaultEditor.onSubmit!("Alice input")
+				: prototype.handleFollowUp.call(context));
+			await captureStarted.promise;
+			compactRelease.release();
+			await compacting;
+			expect(harness.session.isCompacting).toBe(false);
+			const compactedUsers = getUserTexts(harness);
+			harness.setResponses([fauxAssistantMessage("Alice response"), fauxAssistantMessage("queued response")]);
+			const prompt = vi.spyOn(harness.session, "prompt");
+			const replay = prototype.flushCompactionQueue.call(context, { willRetry });
+			expect
+				.soft(prototype.getAllQueuedMessages.call(context)[mode === "steer" ? "steering" : "followUp"])
+				.toEqual(["Alice input"]);
+			if (cancel === "dequeue") prototype.handleDequeue.call(context);
+			else if (cancel === "abort") harness.session.extensionRunner.createCommandContext().abort();
+			if (cancel !== "none") {
+				expect.soft(context.editor.getText()).toBe("Alice input");
+				context.editor.setText("Bob draft");
+			}
+			captureRelease.release();
+			await replay;
+			if (cancel === "none" && willRetry) await harness.session.prompt("resume retry", { source: "rpc" });
+			await harness.session.waitForIdle();
+			await vi.waitFor(() => expect(context.compactionQueueTransfers).toBe(0));
+			if (cancel === "none") {
+				expect(getUserTexts(harness)).toContain("Alice input");
+				expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toMatchObject([
+					{ customType: "input-author", data: { author: { name: "Alice" } } },
+				]);
+			} else {
+				expect(prompt).not.toHaveBeenCalled();
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(getUserTexts(harness)).toEqual(compactedUsers);
+				expect(harness.faux.state.callCount).toBe(0);
+				expect(context.editor.getText()).toBe("Bob draft");
+				expect(context.compactionQueuedMessages).toEqual([]);
+			}
+			expect(context.showError).not.toHaveBeenCalled();
+		},
+	);
+
+	// R1 F1 native awaits: Smarty-Pants-Inc/smarty-dev#4078. Handoff is not entry into preflight.
+	it.each(["prompt", "steer", "followUp"] as const)(
+		"cancels replay during native %s input preflight",
+		async (route) => {
+			const inputStarted = gate();
+			const inputRelease = gate();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input", async () => {
+							inputStarted.release();
+							await inputRelease.promise;
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const context = createSubmissionUI(harness);
+			prototype.queueCompactionMessage.call(context, "Alice input", route === "followUp" ? "followUp" : "steer");
+			harness.setResponses([fauxAssistantMessage("unexpected")]);
+			const replay = prototype.flushCompactionQueue.call(context, { willRetry: route !== "prompt" });
+			await inputStarted.promise;
+			expect
+				.soft(prototype.getAllQueuedMessages.call(context)[route === "followUp" ? "followUp" : "steering"])
+				.toEqual(["Alice input"]);
+			prototype.handleDequeue.call(context);
+			expect.soft(context.editor.getText()).toBe("Alice input");
+			context.editor.setText("Bob draft");
+			inputRelease.release();
+			await replay;
+			await harness.session.waitForIdle();
+			await vi.waitFor(() => expect(context.compactionQueueTransfers).toBe(0));
+			expect(context.compactionQueuedMessages).toEqual([]);
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(context.editor.getText()).toBe("Bob draft");
+			expect(context.showError).not.toHaveBeenCalled();
+		},
+	);
+
+	// Class ownership: Smarty-Pants-Inc/smarty-dev#4078. Direct queue callers have no TUI capture object.
+	it.each(["steer", "followUp"] as const)("owns direct %s before its capture hook aborts", async (route) => {
+		let context!: SubmissionUI;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input_submission", (_event, ctx) => {
+						ctx.ui.setEditorText("same");
+						ctx.abort();
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		context = createSubmissionUI(harness);
+		await harness.session.bindExtensions({
+			mode: "tui",
+			uiContext: prototype.createExtensionUIContext.call(context),
+			abortHandler: () => {
+				context.restoreQueuedMessagesToEditor({ abort: true });
+			},
+		});
+		const submitted = harness.session[route]("same");
+		expect.soft(context.editor.getText()).toBe("same\n\nsame");
+		await expect(submitted).rejects.toThrow();
+		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	// Class control: Smarty-Pants-Inc/smarty-dev#4078. Ordinary abort alone retains direct accepted input.
+	it.each(["steer", "followUp"] as const)("retains direct %s capture across abort without clear", async (route) => {
+		const captureStarted = gate();
+		const captureRelease = gate();
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input_submission", async (event) => {
+						if (event.source !== "interactive") return;
+						captureStarted.release();
+						await captureRelease.promise;
+						return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+					});
+				},
+				inputAuthor,
+			],
+		});
+		harnesses.push(harness);
+		const submitted = harness.session[route]("accepted input");
+		await captureStarted.promise;
+		expect.soft(harness.session.pendingMessageCount).toBe(1);
+		await harness.session.abort();
+		captureRelease.release();
+		await submitted;
+		expect(harness.session.pendingMessageCount).toBe(1);
+		harness.setResponses([fauxAssistantMessage("RPC response"), fauxAssistantMessage("Alice response")]);
+		await harness.session.prompt("continue", { source: "rpc" });
+		expect(getUserTexts(harness)).toEqual(["continue", "accepted input"]);
+		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toMatchObject([
+			{ customType: "input-author", data: { author: { name: "Alice" } } },
+		]);
+	});
+
+	// R1 F2 and class check: Smarty-Pants-Inc/smarty-dev#4078. Equal drafts remain distinct.
+	it.each(
+		[
+			"compaction Enter",
+			"compaction followUp",
+			"idle Enter",
+			"idle followUp",
+			"waiting Enter",
+			"waiting followUp",
+		].flatMap((path) => ["", "Bob draft", "same"].map((draft) => ({ path, draft }))),
+	)("owns input before synchronous abort in $path (draft='$draft')", async ({ path, draft }) => {
+		let context!: SubmissionUI;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input_submission", (_event, ctx) => {
+						ctx.ui.setEditorText(draft);
+						ctx.abort();
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		context = createSubmissionUI(harness);
+		await harness.session.bindExtensions({
+			mode: "tui",
+			uiContext: prototype.createExtensionUIContext.call(context),
+			abortHandler: () => {
+				context.restoreQueuedMessagesToEditor({ abort: true });
+			},
+		});
+		vi.spyOn(harness.session, "isCompacting", "get").mockReturnValue(path.startsWith("compaction"));
+		if (path.startsWith("waiting")) void prototype.getUserInput.call(context);
+		context.editor.setText("same");
+		await (path.endsWith("followUp")
+			? prototype.handleFollowUp.call(context)
+			: context.defaultEditor.onSubmit!("same"));
+		expect(context.editor.getText()).toBe(draft ? `same\n\n${draft}` : "same");
+		expect(context.compactionQueuedMessages).toEqual([]);
+		expect(context.pendingUserInputs).toEqual([]);
+		expect(harness.session.pendingMessageCount).toBe(0);
+	});
+
+	// R1 F3: Smarty-Pants-Inc/smarty-dev#4078. Inspect retained live children, never a rebuild.
+	it.each(["before", "after", "none"])(
+		"keeps live author publication atomic (throwing observer: %s)",
+		async (order) => {
+			initTheme("dark");
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", () => ({
+							metadata: { author: { name: "Alice", source: "herdr-client", verified: false } },
+						}));
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			const chatContainer = new Container();
+			const live = Object.assign(Object.create(InteractiveMode.prototype), {
+				runtimeHost: { session: harness.session },
+				chatContainer,
+				isInitialized: true,
+				footer: { invalidate: () => {} },
+				pendingTools: new Map(),
+				toolOutputExpanded: false,
+				outputPad: 1,
+				ui: { requestRender: () => {}, terminal: { setProgress: () => {} } },
+				entriesRenderedByBoundaryCompaction: new Set(),
+				userPublicationComponents: new Map(),
+				stagedUserComponents: new Map(),
+				getMarkdownTransformers: () => [],
+				updatePendingMessagesDisplay: () => {},
+				clearStatusIndicator: () => {},
+				checkShutdownRequested: async () => {},
+			}) as {
+				handleEvent: (event: AgentSessionEvent) => Promise<void>;
+				addMessageToChat: (message: AgentMessage) => void;
+			};
+			const throwing = (event: AgentSessionEvent) => {
+				if (event.type === "message_start" && event.message.role === "user") throw new Error("publication failed");
+				if (event.type === "user_message_publication_failed") throw new Error("rollback observer failed");
+			};
+			if (order === "before") harness.session.subscribe(throwing);
+			harness.session.subscribe((event) => {
+				void live.handleEvent(event);
+			});
+			if (order === "after") harness.session.subscribe(throwing);
+			harness.setResponses([fauxAssistantMessage("Alice response")]);
+			await harness.session.prompt("Alice input");
+			const users = harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message" && entry.message.role === "user");
+			expect(users).toHaveLength(order === "none" ? 1 : 0);
+			live.addMessageToChat({ role: "user", content: "later input", timestamp: 2 });
+			const output = stripAnsi(chatContainer.render(100).join("\n"));
+			expect(output).toContain("later input");
+			if (order === "none") {
+				expect(output.indexOf("Alice:")).toBeLessThan(output.indexOf("Alice input"));
+				expect(output).toContain("Alice response");
+			} else {
+				expect(output).not.toContain("Alice:");
+				expect(harness.session.state.errorMessage).toBe("publication failed");
+			}
+		},
+	);
+
 	it("does not capture an extension command routed through the editor", async () => {
 		let captureCalls = 0;
 		let commandCalls = 0;
@@ -680,7 +1008,7 @@ describe("interactive submission metadata", () => {
 		harnesses.push(harness);
 		const context = createSubmissionUI(harness);
 		await context.defaultEditor.onSubmit?.("/local");
-		expect(context.pendingUserInputs).toEqual([{ text: "/local", submissionPromise: undefined }]);
+		expect(context.pendingUserInputs).toMatchObject([{ text: "/local", submissionPromise: undefined }]);
 		await harness.session.prompt(context.pendingUserInputs[0].text);
 		expect(commandCalls).toBe(1);
 		expect(captureCalls).toBe(0);

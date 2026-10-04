@@ -243,16 +243,19 @@ class ExpandableText extends Text implements Expandable {
 type PendingUserInput = {
 	text: string;
 	submissionPromise?: Promise<InputSubmission>;
+	cancellation?: AbortController;
 };
 
 type CompactionQueuedMessage = PendingUserInput & {
 	mode: "steer" | "followUp";
+	replaying?: boolean;
 };
 
 type CapturingStreamingInput = {
 	text: string;
 	mode: "steer" | "followUp";
 	cancelled: boolean;
+	cancellation: AbortController;
 };
 
 type CompactionCostNotice = {
@@ -455,7 +458,12 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string, submissionPromise?: Promise<InputSubmission>) => void;
+	private onInputCallback?: (
+		text: string,
+		submissionPromise?: Promise<InputSubmission>,
+		cancellation?: AbortController,
+	) => void;
+	private inFlightInput?: PendingUserInput;
 	private pendingUserInputs: PendingUserInput[] = [];
 	// Sidecar of the exact input delivered by getUserInput, consumed by the single native run loop.
 	// This is not matched by text or correlated across the steering/follow-up queues.
@@ -489,6 +497,8 @@ export class InteractiveMode {
 	// Streaming message tracking
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private readonly entriesRenderedByBoundaryCompaction = new Set<string>();
+	private readonly userPublicationComponents = new Map<string, Component[]>();
+	private readonly stagedUserComponents = new Map<string, CustomEntryComponent[]>();
 	private streamingMessage: AssistantMessage | undefined = undefined;
 
 	// Tool execution tracking: toolCallId -> component
@@ -1254,16 +1264,24 @@ export class InteractiveMode {
 			this.currentInputSubmission = undefined;
 			try {
 				const submission = await this.awaitInputSubmission(userInput, submissionPromise);
-				if (submission === null) continue;
-				const prompt = this.session.prompt(userInput, { submission });
+				if (submission === null || this.inFlightInput?.cancellation?.signal.aborted) continue;
+				const prompt = this.session.prompt(userInput, {
+					submission,
+					inputCancellation: this.inFlightInput?.cancellation?.signal,
+					onInputTransferred: () => {
+						this.inFlightInput = undefined;
+					},
+				});
 				// Original session preflight owns the input before TUI staging clears.
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-transferred");
 				await prompt;
 			} catch (error: unknown) {
+				if (this.inFlightInput?.cancellation?.signal.aborted) continue;
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
 			} finally {
+				this.inFlightInput = undefined;
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-settled");
 			}
@@ -2213,6 +2231,8 @@ export class InteractiveMode {
 		this.loadedResourcesContainer.clear();
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
+		this.stagedUserComponents.clear();
+		this.userPublicationComponents.clear();
 		this.compactionQueuedMessages = [];
 		this.stagingAudit?.("session-render-clear");
 		this.streamingComponent = undefined;
@@ -3247,7 +3267,12 @@ export class InteractiveMode {
 	}
 
 	private async submitStreamingInput(text: string, streamingBehavior: "steer" | "followUp"): Promise<void> {
-		const capture: CapturingStreamingInput = { text, mode: streamingBehavior, cancelled: false };
+		const capture: CapturingStreamingInput = {
+			text,
+			mode: streamingBehavior,
+			cancelled: false,
+			cancellation: new AbortController(),
+		};
 		this.capturingStreamingInputs.add(capture);
 		this.inputSubmissionTransfers++;
 		this.stagingAudit?.("submission-transfer-start");
@@ -3267,9 +3292,18 @@ export class InteractiveMode {
 			this.ui.requestRender();
 			const submission = await this.awaitInputSubmission(text, submissionPromise, capture);
 			if (capture.cancelled || submission === null) return;
-			// Native preflight owns the input from here; do not also display or clear it as UI capture.
-			this.capturingStreamingInputs.delete(capture);
-			await this.session.prompt(text, { streamingBehavior, submission, onInputTransferred: release });
+			// Remain visible and cancellable through native preflight, until the actual handoff.
+			await this.session.prompt(text, {
+				streamingBehavior,
+				submission,
+				inputCancellation: capture.cancellation.signal,
+				onInputTransferred: () => {
+					this.capturingStreamingInputs.delete(capture);
+					release();
+				},
+			});
+		} catch (error) {
+			if (!capture.cancelled) throw error;
 		} finally {
 			this.capturingStreamingInputs.delete(capture);
 			release();
@@ -3286,7 +3320,7 @@ export class InteractiveMode {
 		try {
 			return await submissionPromise;
 		} catch (error) {
-			if (capture?.cancelled) return null;
+			if (capture ? capture.cancelled : this.inFlightInput?.cancellation?.signal.aborted) return null;
 			const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
 			this.editor.setText([text, draft].filter((value) => value.trim()).join("\n\n"));
 			this.showError(
@@ -3468,8 +3502,7 @@ export class InteractiveMode {
 					this.editor.setText("");
 					await this.session.prompt(text);
 				} else {
-					const submissionPromise = this.captureEditorSubmission(text, "steer");
-					this.queueCompactionMessage(text, "steer", submissionPromise);
+					this.queueCompactionMessage(text, "steer");
 				}
 				return;
 			}
@@ -3481,20 +3514,19 @@ export class InteractiveMode {
 				return;
 			}
 
-			// Capture before editor changes or the idle/startup staging queue.
-			const submissionPromise = this.captureEditorSubmission(text);
-
-			// Normal message submission
-			// First, move any pending bash components to chat
-			this.flushPendingBashComponents();
-
-			if (this.onInputCallback) {
-				this.onInputCallback(text, submissionPromise);
-			} else {
-				this.pendingUserInputs.push({ text, submissionPromise });
-				this.stagingAudit?.("input-enqueued");
-			}
+			// Own accepted idle/startup input before a hook can abort or write another draft.
+			const input: PendingUserInput = { text, cancellation: new AbortController() };
+			this.pendingUserInputs.push(input);
 			this.editor.addToHistory?.(text);
+			this.editor.setText("");
+			input.submissionPromise = this.captureEditorSubmission(text);
+			if (input.cancellation!.signal.aborted) return;
+			this.flushPendingBashComponents();
+			this.stagingAudit?.("input-enqueued");
+			if (this.onInputCallback) {
+				this.pendingUserInputs.splice(this.pendingUserInputs.indexOf(input), 1);
+				this.onInputCallback(text, input.submissionPromise, input.cancellation);
+			}
 		};
 	}
 
@@ -3544,6 +3576,15 @@ export class InteractiveMode {
 			case "entry_appended":
 				if (this.entriesRenderedByBoundaryCompaction.delete(event.entry.id)) break;
 				if (event.entry.type === "custom") {
+					if (event.entry.beforeMessageId) {
+						const component = this.createCustomEntryComponent(event.entry);
+						if (component) {
+							const staged = this.stagedUserComponents.get(event.entry.beforeMessageId) ?? [];
+							staged.push(component);
+							this.stagedUserComponents.set(event.entry.beforeMessageId, staged);
+						}
+						break;
+					}
 					this.addCustomEntryToChat(event.entry, event.beforeMessage);
 					this.ui.requestRender();
 				} else if (event.entry.type === "usage" && event.entry.kind === "cache_warm") {
@@ -3597,12 +3638,36 @@ export class InteractiveMode {
 				this.updateEditorBorderColor();
 				break;
 
+			case "user_message_publication_failed": {
+				this.stagedUserComponents.delete(event.entryId);
+				for (const component of this.userPublicationComponents.get(event.entryId) ?? []) {
+					this.chatContainer.removeChild(component);
+				}
+				this.userPublicationComponents.delete(event.entryId);
+				this.ui.requestRender();
+				break;
+			}
+
 			case "message_start":
 				if (event.message.role === "custom") {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
-					this.addMessageToChat(event.message);
+					const start = this.chatContainer.children.length;
+					if (event.entryId) this.userPublicationComponents.set(event.entryId, []);
+					try {
+						for (const component of (event.entryId ? this.stagedUserComponents.get(event.entryId) : undefined) ??
+							[]) {
+							component.setExpanded(this.toolOutputExpanded);
+							this.chatContainer.addChild(component);
+						}
+						if (event.entryId) this.stagedUserComponents.delete(event.entryId);
+						this.addMessageToChat(event.message);
+					} finally {
+						if (event.entryId) {
+							this.userPublicationComponents.set(event.entryId, this.chatContainer.children.slice(start));
+						}
+					}
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
@@ -3657,7 +3722,10 @@ export class InteractiveMode {
 				break;
 
 			case "message_end":
-				if (event.message.role === "user") break;
+				if (event.message.role === "user") {
+					this.userPublicationComponents.clear();
+					break;
+				}
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
@@ -3945,16 +4013,19 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
-	private addCustomEntryToChat(entry: Extract<SessionEntry, { type: "custom" }>, beforeMessage?: AgentMessage): void {
+	private createCustomEntryComponent(
+		entry: Extract<SessionEntry, { type: "custom" }>,
+	): CustomEntryComponent | undefined {
 		const renderer = this.session.extensionRunner.getEntryRenderer(entry.customType);
-		if (!renderer) {
-			return;
-		}
+		if (!renderer) return undefined;
 		const component = new CustomEntryComponent(entry, renderer);
 		component.setExpanded(this.toolOutputExpanded);
-		if (!component.hasContent()) {
-			return;
-		}
+		return component.hasContent() ? component : undefined;
+	}
+
+	private addCustomEntryToChat(entry: Extract<SessionEntry, { type: "custom" }>, beforeMessage?: AgentMessage): void {
+		const component = this.createCustomEntryComponent(entry);
+		if (!component) return;
 
 		// Entries appended at user message_start follow existing output and precede that native user message.
 		if (beforeMessage?.role !== "user" && this.streamingComponent) {
@@ -4334,6 +4405,7 @@ export class InteractiveMode {
 	async getUserInput(): Promise<string> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
+			this.inFlightInput = queuedInput;
 			this.currentInputSubmission = queuedInput.submissionPromise;
 			this.userInputInFlight = true;
 			this.stagingAudit?.("input-dequeued");
@@ -4341,8 +4413,9 @@ export class InteractiveMode {
 		}
 
 		return new Promise((resolve) => {
-			this.onInputCallback = (text: string, submissionPromise?: Promise<InputSubmission>) => {
+			this.onInputCallback = (text, submissionPromise, cancellation) => {
 				this.onInputCallback = undefined;
+				this.inFlightInput = { text, submissionPromise, cancellation };
 				this.currentInputSubmission = submissionPromise;
 				this.userInputInFlight = true;
 				this.stagingAudit?.("input-delivered");
@@ -4575,8 +4648,7 @@ export class InteractiveMode {
 				this.editor.setText("");
 				await this.session.prompt(text);
 			} else {
-				const submissionPromise = this.captureEditorSubmission(text, "followUp");
-				this.queueCompactionMessage(text, "followUp", submissionPromise);
+				this.queueCompactionMessage(text, "followUp");
 			}
 			return;
 		}
@@ -4787,6 +4859,10 @@ export class InteractiveMode {
 		const capturing = [...this.capturingStreamingInputs];
 		return {
 			steering: [
+				...(this.inFlightInput && !this.inFlightInput.cancellation?.signal.aborted
+					? [this.inFlightInput.text]
+					: []),
+				...this.pendingUserInputs.map((input) => input.text),
 				...this.session.getSteeringMessages(),
 				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
 				...capturing.filter((input) => input.mode === "steer").map((input) => input.text),
@@ -4805,8 +4881,16 @@ export class InteractiveMode {
 	 */
 	private clearAllQueues(): { steering: string[]; followUp: string[] } {
 		const capturing = [...this.capturingStreamingInputs];
-		for (const input of capturing) input.cancelled = true;
+		for (const input of capturing) {
+			input.cancelled = true;
+			input.cancellation.abort();
+		}
 		this.capturingStreamingInputs.clear();
+		const idleInputs = this.pendingUserInputs.splice(0);
+		if (this.inFlightInput && !this.inFlightInput.cancellation?.signal.aborted)
+			idleInputs.unshift(this.inFlightInput);
+		for (const input of idleInputs) input.cancellation?.abort();
+		for (const message of this.compactionQueuedMessages) message.cancellation?.abort();
 		const { steering, followUp } = this.session.clearQueue();
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
@@ -4818,6 +4902,7 @@ export class InteractiveMode {
 		this.stagingAudit?.("queues-cleared");
 		return {
 			steering: [
+				...idleInputs.map((input) => input.text),
 				...steering,
 				...compactionSteering,
 				...capturing.filter((input) => input.mode === "steer").map((input) => input.text),
@@ -4875,10 +4960,13 @@ export class InteractiveMode {
 		mode: "steer" | "followUp",
 		submissionPromise?: Promise<InputSubmission>,
 	): void {
-		this.compactionQueuedMessages.push({ text, mode, submissionPromise });
+		const message: CompactionQueuedMessage = { text, mode, cancellation: new AbortController() };
+		this.compactionQueuedMessages.push(message);
 		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(text);
 		this.editor.setText("");
+		message.submissionPromise = submissionPromise ?? this.captureEditorSubmission(text, mode);
+		if (message.cancellation!.signal.aborted) return;
 		this.updatePendingMessagesDisplay();
 		this.showStatus("Queued message for after compaction");
 	}
@@ -4898,134 +4986,85 @@ export class InteractiveMode {
 			return;
 		}
 
-		const queuedMessages = [...this.compactionQueuedMessages];
+		const queuedMessages = this.compactionQueuedMessages.filter((message) => !message.replaying);
+		if (queuedMessages.length === 0) return;
+		for (const message of queuedMessages) {
+			message.replaying = true;
+			message.cancellation ??= new AbortController();
+		}
 		const session = this.session;
 		const pending = new Set(queuedMessages);
-		const restored = new Set<CompactionQueuedMessage>();
-		const restoreQueue = (error: unknown, failed = [...pending]) => {
-			const retained = failed.filter((message) => {
-				pending.delete(message);
-				if (restored.has(message)) return false;
-				restored.add(message);
-				return true;
-			});
-			const restoring = new Set([
-				...retained,
-				...this.compactionQueuedMessages.filter((message) => restored.has(message)),
-			]);
-			this.compactionQueuedMessages = [
-				...queuedMessages.filter((message) => restoring.has(message)),
-				...this.compactionQueuedMessages.filter((message) => !restoring.has(message)),
-			];
-			this.stagingAudit?.("compaction-restored");
-			this.updatePendingMessagesDisplay();
+		const showFailure = (error: unknown) => {
 			this.showError(
 				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
 					error instanceof Error ? error.message : String(error)
 				}`,
 			);
 		};
+		const restoreQueue = (error: unknown, failed = [...pending]) => {
+			const retained = failed.filter((message) => pending.has(message) && !message.cancellation?.signal.aborted);
+			if (retained.length === 0) {
+				if (failed.length === 0) showFailure(error);
+				return;
+			}
+			for (const message of retained) {
+				pending.delete(message);
+				message.replaying = false;
+			}
+			this.stagingAudit?.("compaction-restored");
+			this.updatePendingMessagesDisplay();
+			showFailure(error);
+		};
 
 		this.compactionQueueTransfers++;
 		this.stagingAudit?.("compaction-transfer-start");
 		try {
-			this.compactionQueuedMessages = [];
-			this.stagingAudit?.("compaction-transfer-dequeued");
-			this.updatePendingMessagesDisplay();
-			if (options?.willRetry) {
-				// When retry is pending, queue messages for the retry turn
-				for (const message of queuedMessages) {
-					if (this.isExtensionCommand(message.text)) {
-						await session.prompt(message.text, {
-							submission: await message.submissionPromise,
-							onInputTransferred: () => {
-								pending.delete(message);
-							},
-						});
-					} else if (message.mode === "followUp") {
-						await session.followUp(message.text, undefined, { submission: await message.submissionPromise });
-					} else {
-						await session.steer(message.text, undefined, { submission: await message.submissionPromise });
-					}
+			// Leave every untransferred item in the shared queue through capture and native preflight.
+			let promptStarted = false;
+			for (const message of queuedMessages) {
+				if (message.cancellation!.signal.aborted) continue;
+				const submission = await message.submissionPromise;
+				if (message.cancellation!.signal.aborted) continue;
+				const onInputTransferred = () => {
 					pending.delete(message);
-				}
-				this.updatePendingMessagesDisplay();
-				return;
-			}
-
-			// Find first non-extension-command message to use as prompt
-			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
-			if (firstPromptIndex === -1) {
-				// All extension commands - execute them all
-				for (const message of queuedMessages) {
-					await session.prompt(message.text, {
-						submission: await message.submissionPromise,
-						onInputTransferred: () => {
-							pending.delete(message);
-						},
-					});
-					pending.delete(message);
-				}
-				return;
-			}
-
-			// Execute any extension commands before the first prompt
-			const preCommands = queuedMessages.slice(0, firstPromptIndex);
-			const firstPrompt = queuedMessages[firstPromptIndex];
-			const rest = queuedMessages.slice(firstPromptIndex + 1);
-
-			for (const message of preCommands) {
-				await session.prompt(message.text, {
-					submission: await message.submissionPromise,
-					onInputTransferred: () => {
-						pending.delete(message);
-					},
-				});
-				pending.delete(message);
-			}
-
-			// Start a prompt when idle, or queue it into a run still finishing compaction.
-			let firstTransferred = false;
-			const submission = await firstPrompt.submissionPromise;
-			const started = session.prompt(firstPrompt.text, {
-				streamingBehavior: firstPrompt.mode,
-				submission,
-				onInputTransferred: () => {
-					firstTransferred = true;
-				},
-			});
-			// This promise alone owns restoration of its input, even if a later transfer fails.
-			pending.delete(firstPrompt);
-			const promptPromise = started
-				.catch((error) => {
-					restoreQueue(error, firstTransferred ? [] : [firstPrompt]);
-				})
-				.finally(() => {
-					this.compactionQueueTransfers--;
-					this.stagingAudit?.("compaction-prompt-settled");
-				});
-			// The detached prompt can restore staging after this flush returns.
-			this.compactionQueueTransfers++;
-			this.stagingAudit?.("compaction-prompt-pending");
-
-			// Queue remaining messages
-			for (const message of rest) {
+					const index = this.compactionQueuedMessages.indexOf(message);
+					if (index >= 0) this.compactionQueuedMessages.splice(index, 1);
+					this.stagingAudit?.("compaction-input-transferred");
+					this.updatePendingMessagesDisplay();
+				};
+				const transferOptions = { submission, inputCancellation: message.cancellation!.signal, onInputTransferred };
 				if (this.isExtensionCommand(message.text)) {
-					await session.prompt(message.text, {
-						submission: await message.submissionPromise,
-						onInputTransferred: () => {
-							pending.delete(message);
-						},
-					});
+					await session.prompt(message.text, transferOptions);
+				} else if (!options?.willRetry && !promptStarted) {
+					promptStarted = true;
+					// The detached prompt alone owns its failure; later sibling failures cannot restore it.
+					const started = session.prompt(message.text, { ...transferOptions, streamingBehavior: message.mode });
+					pending.delete(message);
+					this.compactionQueueTransfers++;
+					void started
+						.catch((error) => {
+							if (message.cancellation!.signal.aborted) return;
+							if (this.compactionQueuedMessages.includes(message)) {
+								pending.add(message);
+								restoreQueue(error, [message]);
+							} else {
+								// Native ownership is irreversible, but its downstream failure still needs reporting.
+								showFailure(error);
+							}
+						})
+						.finally(() => {
+							this.compactionQueueTransfers--;
+							this.stagingAudit?.("compaction-prompt-settled");
+						});
 				} else if (message.mode === "followUp") {
-					await session.followUp(message.text, undefined, { submission: await message.submissionPromise });
+					await session.followUp(message.text, undefined, transferOptions);
 				} else {
-					await session.steer(message.text, undefined, { submission: await message.submissionPromise });
+					await session.steer(message.text, undefined, transferOptions);
 				}
-				pending.delete(message);
+				// Cancellation during native awaits must not admit or restore siblings from a withdrawn batch.
+				if (message.cancellation!.signal.aborted) continue;
 			}
 			this.updatePendingMessagesDisplay();
-			void promptPromise;
 		} catch (error) {
 			restoreQueue(error);
 		} finally {

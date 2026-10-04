@@ -216,6 +216,7 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 export type AgentSessionEvent =
 	| Exclude<AgentEvent, { type: "agent_end" | "message_start" }>
 	| MessageStartEvent
+	| { type: "user_message_publication_failed"; entryId: string }
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
@@ -341,6 +342,8 @@ export interface PromptOptions {
 	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
 	 * Unlike preflight acceptance, this remains true if the operation later fails. */
 	onInputTransferred?: () => void;
+	/** Internal TUI ownership: revoke accepted input only until native handoff. */
+	inputCancellation?: AbortSignal;
 }
 
 /** Options for model/thinking mutations. */
@@ -498,6 +501,12 @@ export class AgentSession {
 	private readonly _inputSubmissions = new WeakMap<AgentMessage, InputSubmission>();
 	/** Unseen native queue objects whose provenance is revoked by explicit clear, not abort. */
 	private readonly _queuedUserMessages = new Set<AgentMessage>();
+	/** Direct queue callers own accepted raw input before capture/input hooks; TUI callers supply their own signal. */
+	private readonly _capturingQueuedInputs = new Set<{
+		text: string;
+		behavior: "steer" | "followUp";
+		cancellation: AbortController;
+	}>();
 	/** Reserve durable user entry identity before extensions append entries bound to that message. */
 	private readonly _userMessageEntryIds = new WeakMap<AgentMessage, string>();
 	/** Only appendEntry calls within an awaited user message_start receive a rendering hint and binding. */
@@ -1271,6 +1280,21 @@ export class AgentSession {
 							}
 						: event,
 			);
+		} catch (error) {
+			if (isUserStart && startedUserMessage) {
+				const entryId = this._userMessageEntryIds.get(startedUserMessage);
+				if (entryId) {
+					// A failing earlier observer cannot prevent the TUI's rollback notification.
+					for (const listener of [...this._eventListeners]) {
+						try {
+							listener({ type: "user_message_publication_failed", entryId });
+						} catch {
+							// Preserve the original publication failure while notifying every subscriber.
+						}
+					}
+				}
+			}
+			throw error;
 		} finally {
 			// Keep provenance available during publication, but consume it even if a callback throws or mutates the event.
 			if (isUserStart && startedUserMessage) this._inputSubmissions.delete(startedUserMessage);
@@ -1588,6 +1612,8 @@ export class AgentSession {
 
 		for (const message of this._queuedUserMessages) this._inputSubmissions.delete(message);
 		this._queuedUserMessages.clear();
+		for (const capture of this._capturingQueuedInputs) capture.cancellation.abort();
+		this._capturingQueuedInputs.clear();
 		this._extensionRunner.invalidate(
 			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
 		);
@@ -1945,6 +1971,7 @@ export class AgentSession {
 		promptToken?: object,
 		automaticEnrollment?: OriginalAutomaticEnrollment,
 		onInputTransferred?: () => void,
+		inputCancellation?: AbortSignal,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
@@ -1956,7 +1983,8 @@ export class AgentSession {
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
 			if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
-			// No await or external callback may separate this check from dispatch.
+			// No await or external callback may separate these checks from native dispatch.
+			if (!continuation) inputCancellation?.throwIfAborted();
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
 			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
@@ -2224,6 +2252,7 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
+		options?.inputCancellation?.throwIfAborted();
 		if (this._isEmittingAgentSettled) {
 			// Capture before deferral, but keep extension commands out of submission hooks.
 			const commandName = text.startsWith("/") ? text.slice(1).split(" ", 1)[0] : undefined;
@@ -2234,6 +2263,7 @@ export class AgentSession {
 				this._promptPreflights.add(preflightToken);
 				try {
 					options = { ...options, submission: await this.captureInputSubmission(text, options) };
+					options.inputCancellation?.throwIfAborted();
 				} finally {
 					this._promptPreflights.delete(preflightToken);
 				}
@@ -2292,10 +2322,12 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		const onInputTransferred = options?.onInputTransferred;
+		const inputCancellation = options?.inputCancellation;
 		const preflightToken = {};
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			inputCancellation?.throwIfAborted();
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
@@ -2339,6 +2371,7 @@ export class AgentSession {
 						streamingBehavior: mustQueue() ? options?.streamingBehavior : undefined,
 					});
 
+			inputCancellation?.throwIfAborted();
 			// Emit input event for extension interception (before skill/template expansion)
 			const processedInput = await this._runInputHandlers(
 				text,
@@ -2346,6 +2379,7 @@ export class AgentSession {
 				submission,
 				mustQueue() ? options?.streamingBehavior : undefined,
 			);
+			inputCancellation?.throwIfAborted();
 			if (!processedInput) {
 				onInputTransferred?.();
 				preflightResult?.(true);
@@ -2362,6 +2396,7 @@ export class AgentSession {
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
 			while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+			inputCancellation?.throwIfAborted();
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
 			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
@@ -2370,12 +2405,17 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages, submission);
+					await this._queueFollowUp(
+						expandedText,
+						currentImages,
+						submission,
+						inputCancellation,
+						onInputTransferred,
+					);
 				} else {
-					await this._queueSteer(expandedText, currentImages, submission);
+					await this._queueSteer(expandedText, currentImages, submission, inputCancellation, onInputTransferred);
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
-				onInputTransferred?.();
 				preflightResult?.(true);
 				return;
 			}
@@ -2389,6 +2429,7 @@ export class AgentSession {
 				this._flushPendingCustomMessages();
 			}
 
+			inputCancellation?.throwIfAborted();
 			// Validate model
 			if (!this.model) {
 				throw new Error(formatNoModelSelectedMessage());
@@ -2397,6 +2438,7 @@ export class AgentSession {
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
 				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+			inputCancellation?.throwIfAborted();
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -2414,6 +2456,7 @@ export class AgentSession {
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
 				const outcome = await this._checkCompaction(lastAssistant, false);
+				inputCancellation?.throwIfAborted();
 				if (outcome === "failed" || outcome === "aborted") {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
@@ -2449,7 +2492,9 @@ export class AgentSession {
 				result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
 			if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
+			inputCancellation?.throwIfAborted();
 			const normalized = await this._normalizePromptImages(currentImages);
+			inputCancellation?.throwIfAborted();
 			const userText =
 				normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
@@ -2512,7 +2557,7 @@ export class AgentSession {
 		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
 		// run active synchronously, so later prompts still queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
-		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
+		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred, inputCancellation);
 		releasePreflight?.();
 		await run;
 	}
@@ -2660,16 +2705,34 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 		submission?: InputSubmission,
+		inputCancellation?: AbortSignal,
+		onInputTransferred?: () => void,
 	): Promise<void> {
+		inputCancellation?.throwIfAborted();
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
+		const capture = inputCancellation ? undefined : { text, behavior, cancellation: new AbortController() };
+		if (capture) this._capturingQueuedInputs.add(capture);
+		const transferred = () => {
+			if (capture) this._capturingQueuedInputs.delete(capture);
+			onInputTransferred?.();
+		};
 		if (this.#ordinaryOwner) {
 			this.#ordinaryPreflights++;
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source, submission);
+			await this._prepareQueuedInput(
+				text,
+				images,
+				behavior,
+				source,
+				submission,
+				inputCancellation ?? capture?.cancellation.signal,
+				transferred,
+			);
 		} finally {
+			if (capture) this._capturingQueuedInputs.delete(capture);
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
 				this.#auditState("queued_preflight_settled");
@@ -2683,6 +2746,8 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 		capturedSubmission?: InputSubmission,
+		inputCancellation?: AbortSignal,
+		onInputTransferred?: () => void,
 	): Promise<void> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2695,21 +2760,32 @@ export class AgentSession {
 					source,
 					streamingBehavior: this.isStreaming ? behavior : undefined,
 				});
+		inputCancellation?.throwIfAborted();
 		const processedInput = await this._runInputHandlers(
 			text,
 			images,
 			submission,
 			this.isStreaming ? behavior : undefined,
 		);
-		if (!processedInput) return;
+		inputCancellation?.throwIfAborted();
+		if (!processedInput) {
+			onInputTransferred?.();
+			return;
+		}
 
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images, submission);
+			await this._queueSteer(expandedText, processedInput.images, submission, inputCancellation, onInputTransferred);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images, submission);
+			await this._queueFollowUp(
+				expandedText,
+				processedInput.images,
+				submission,
+				inputCancellation,
+				onInputTransferred,
+			);
 		}
 	}
 
@@ -2725,9 +2801,17 @@ export class AgentSession {
 	async steer(
 		text: string,
 		images?: ImageContent[],
-		options?: Pick<PromptOptions, "source" | "submission">,
+		options?: Pick<PromptOptions, "source" | "submission" | "inputCancellation" | "onInputTransferred">,
 	): Promise<void> {
-		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive", options?.submission);
+		await this._queueUserInput(
+			text,
+			images,
+			"steer",
+			options?.source ?? "interactive",
+			options?.submission,
+			options?.inputCancellation,
+			options?.onInputTransferred,
+		);
 	}
 
 	/**
@@ -2741,9 +2825,17 @@ export class AgentSession {
 	async followUp(
 		text: string,
 		images?: ImageContent[],
-		options?: Pick<PromptOptions, "source" | "submission">,
+		options?: Pick<PromptOptions, "source" | "submission" | "inputCancellation" | "onInputTransferred">,
 	): Promise<void> {
-		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive", options?.submission);
+		await this._queueUserInput(
+			text,
+			images,
+			"followUp",
+			options?.source ?? "interactive",
+			options?.submission,
+			options?.inputCancellation,
+			options?.onInputTransferred,
+		);
 	}
 
 	/**
@@ -2753,10 +2845,12 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		submission: InputSubmission,
+		inputCancellation?: AbortSignal,
+		onInputTransferred?: () => void,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
+		inputCancellation?.throwIfAborted();
 		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -2765,6 +2859,8 @@ export class AgentSession {
 		this._inputSubmissions.set(message, submission);
 		this._queuedUserMessages.add(message);
 		this.agent.steer(message);
+		onInputTransferred?.();
+		this._emitQueueUpdate();
 	}
 
 	/**
@@ -2774,10 +2870,12 @@ export class AgentSession {
 		text: string,
 		images: ImageContent[] | undefined,
 		submission: InputSubmission,
+		inputCancellation?: AbortSignal,
+		onInputTransferred?: () => void,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
+		inputCancellation?.throwIfAborted();
 		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -2786,6 +2884,8 @@ export class AgentSession {
 		this._inputSubmissions.set(message, submission);
 		this._queuedUserMessages.add(message);
 		this.agent.followUp(message);
+		onInputTransferred?.();
+		this._emitQueueUpdate();
 	}
 
 	/**
@@ -3029,8 +3129,10 @@ export class AgentSession {
 	 * @returns Object with steering and followUp arrays
 	 */
 	clearQueue(): { steering: string[]; followUp: string[] } {
-		const steering = [...this._steeringMessages];
-		const followUp = [...this._followUpMessages];
+		const steering = [...this.getSteeringMessages()];
+		const followUp = [...this.getFollowUpMessages()];
+		for (const capture of this._capturingQueuedInputs) capture.cancellation.abort();
+		this._capturingQueuedInputs.clear();
 		this._steeringMessages = [];
 		this._followUpMessages = [];
 		this._triggeredBehindPreflight.splice(0);
@@ -3045,17 +3147,25 @@ export class AgentSession {
 
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
-		return this._steeringMessages.length + this._followUpMessages.length;
+		return this._steeringMessages.length + this._followUpMessages.length + this._capturingQueuedInputs.size;
 	}
 
 	/** Get pending steering messages (read-only) */
 	getSteeringMessages(): readonly string[] {
-		return this._steeringMessages;
+		return [
+			...this._steeringMessages,
+			...[...this._capturingQueuedInputs].filter((input) => input.behavior === "steer").map((input) => input.text),
+		];
 	}
 
 	/** Get pending follow-up messages (read-only) */
 	getFollowUpMessages(): readonly string[] {
-		return this._followUpMessages;
+		return [
+			...this._followUpMessages,
+			...[...this._capturingQueuedInputs]
+				.filter((input) => input.behavior === "followUp")
+				.map((input) => input.text),
+		];
 	}
 
 	get resourceLoader(): ResourceLoader {

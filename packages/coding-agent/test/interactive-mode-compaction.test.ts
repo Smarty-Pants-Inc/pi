@@ -295,6 +295,7 @@ describe("InteractiveMode compaction events", () => {
 			resolvePrompt = resolve;
 			rejectPrompt = reject;
 		});
+		let transfer!: () => void;
 		const queued = [{ text: "original input", mode: "steer" as const }];
 		const snapshots: { kind: string; transfers: number; queued: number }[] = [];
 		const fakeThis = {
@@ -302,7 +303,10 @@ describe("InteractiveMode compaction events", () => {
 			compactionQueueTransfers: 0,
 			session: {
 				clearQueue: vi.fn(),
-				prompt: vi.fn().mockReturnValue(prompt),
+				prompt: vi.fn((_text: string, options: { onInputTransferred: () => void }) => {
+					transfer = options.onInputTransferred;
+					return prompt;
+				}),
 				steer: vi.fn(),
 				followUp: vi.fn(),
 			},
@@ -320,18 +324,58 @@ describe("InteractiveMode compaction events", () => {
 			this: typeof fakeThis,
 		) => Promise<void>;
 		await flush.call(fakeThis);
-		expect(fakeThis.compactionQueuedMessages).toEqual([]);
+		// R1 F1, Smarty-Pants-Inc/smarty-dev#4078: preflight entry is not native handoff.
+		expect(fakeThis.compactionQueuedMessages).toEqual(queued);
 		expect(fakeThis.compactionQueueTransfers).toBe(1);
 		expect(snapshots[0]).toEqual({ kind: "compaction-transfer-start", transfers: 1, queued: 1 });
 		const intervening = { text: "newly staged input", mode: "steer" as const };
 		fakeThis.compactionQueuedMessages.push(intervening);
 		if (reject) rejectPrompt(new Error("preflight failed"));
-		else resolvePrompt();
+		else {
+			transfer();
+			resolvePrompt();
+		}
 		await vi.waitFor(() => expect(fakeThis.compactionQueueTransfers).toBe(0));
 		expect(fakeThis.compactionQueuedMessages).toEqual(reject ? [...queued, intervening] : [intervening]);
 		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
 		expect(fakeThis.showError).toHaveBeenCalledTimes(reject ? 1 : 0);
 		if (reject) expect(snapshots).toContainEqual({ kind: "compaction-restored", transfers: 1, queued: 2 });
+	});
+
+	// R1 F1 control, Smarty-Pants-Inc/smarty-dev#4078: handoff cannot be undone by downstream failure.
+	test("reports a detached prompt failure after handoff without restoring accepted input", async () => {
+		let transfer!: () => void;
+		let rejectPrompt!: (error: Error) => void;
+		const prompt = new Promise<void>((_, reject) => {
+			rejectPrompt = reject;
+		});
+		const queued = { text: "accepted input", mode: "steer" as const };
+		const fakeThis = {
+			compactionQueuedMessages: [queued],
+			compactionQueueTransfers: 0,
+			session: {
+				prompt: vi.fn((_text: string, options: { onInputTransferred: () => void }) => {
+					transfer = options.onInputTransferred;
+					return prompt;
+				}),
+			},
+			isExtensionCommand: () => false,
+			updatePendingMessagesDisplay: vi.fn(),
+			showError: vi.fn(),
+		};
+		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+		) => Promise<void>;
+		await flush.call(fakeThis);
+		expect(fakeThis.compactionQueuedMessages).toEqual([queued]);
+		transfer();
+		expect(fakeThis.compactionQueuedMessages).toEqual([]);
+		const newer = { text: "new draft", mode: "steer" as const };
+		fakeThis.compactionQueuedMessages.push(newer);
+		rejectPrompt(new Error("downstream failure"));
+		await vi.waitFor(() => expect(fakeThis.compactionQueueTransfers).toBe(0));
+		expect(fakeThis.compactionQueuedMessages).toEqual([newer]);
+		expect(fakeThis.showError).toHaveBeenCalledWith("Failed to send queued message: downstream failure");
 	});
 
 	test.each([false, true])(
@@ -350,6 +394,7 @@ describe("InteractiveMode compaction events", () => {
 				{ text: "accepted", mode: "followUp" as const },
 				{ text: "C", mode: "followUp" as const },
 			];
+			let followUpCalls = 0;
 			const fakeThis = {
 				compactionQueuedMessages: [...batch],
 				compactionQueueTransfers: 0,
@@ -357,7 +402,13 @@ describe("InteractiveMode compaction events", () => {
 					prompt: vi.fn(() => prompt),
 					clearQueue: vi.fn(),
 					steer: vi.fn(),
-					followUp: vi.fn().mockResolvedValueOnce(undefined).mockReturnValueOnce(tail),
+					followUp: vi.fn((_text: string, _images: undefined, options: { onInputTransferred: () => void }) => {
+						if (++followUpCalls === 1) {
+							options.onInputTransferred();
+							return Promise.resolve();
+						}
+						return tail;
+					}),
 				},
 				isExtensionCommand: () => false,
 				updatePendingMessagesDisplay: vi.fn(),
@@ -368,6 +419,8 @@ describe("InteractiveMode compaction events", () => {
 			) => Promise<void>;
 			const completion = flush.call(fakeThis);
 			await vi.waitFor(() => expect(fakeThis.session.followUp).toHaveBeenCalledTimes(2));
+			// Only the middle item reached native handoff; both outstanding preflights remain visible.
+			expect(fakeThis.compactionQueuedMessages).toEqual([batch[0], batch[2]]);
 			const intervening = { text: "B", mode: "steer" as const };
 			fakeThis.compactionQueuedMessages.push(intervening);
 			if (promptFirst) {
@@ -377,7 +430,7 @@ describe("InteractiveMode compaction events", () => {
 			} else {
 				rejectTail(new Error("tail"));
 				await completion;
-				expect(fakeThis.compactionQueuedMessages).toEqual([batch[2], intervening]);
+				expect(fakeThis.compactionQueuedMessages).toEqual([batch[0], batch[2], intervening]);
 				rejectPrompt(new Error("first"));
 			}
 			await completion;
@@ -411,7 +464,10 @@ describe("InteractiveMode compaction events", () => {
 			compactionQueueTransfers: 0,
 			session: {
 				clearQueue: vi.fn(),
-				prompt: vi.fn().mockResolvedValue(undefined),
+				prompt: vi.fn((_text: string, options: { onInputTransferred: () => void }) => {
+					options.onInputTransferred();
+					return Promise.resolve();
+				}),
 				steer: vi.fn().mockResolvedValue(undefined),
 				followUp: vi.fn().mockResolvedValue(undefined),
 			},
