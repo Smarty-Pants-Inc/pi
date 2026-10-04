@@ -1,3 +1,4 @@
+import { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	ClassifierAnswer,
@@ -9,6 +10,7 @@ import type {
 	ProviderHeaders,
 	Usage,
 } from "../types.ts";
+import { fetchBoundedResponse } from "../utils/bounded-response.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -187,7 +189,20 @@ export async function classifySystemOne(
 		timestamp: Date.now(),
 	};
 
+	const controller = new AbortController();
+	const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+	const timeoutMs = options?.timeoutMs ?? 60_000;
+	const timer =
+		Number.isFinite(timeoutMs) && timeoutMs > 0
+			? setTimeout(() => controller.abort(timeoutError(timeoutMs)), timeoutMs)
+			: undefined;
+	const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
+		...(options?.diagnosticSecrets ?? []),
+		...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
+	]);
 	try {
+		if (!timer) throw new Error("Timeout must be a positive finite number");
+		signal.throwIfAborted();
 		if (model.api !== transport.api) throw new Error(`Unsupported classifier API: ${model.api}`);
 		if (!options?.apiKey) throw new Error(`No API key for provider: ${model.provider}`);
 		const apiKey = options.apiKey;
@@ -197,29 +212,26 @@ export async function classifySystemOne(
 		const requestFetch = options.fetch ?? globalThis.fetch;
 		const { response, body } = await retryProviderRequest(
 			async () => {
-				const timeoutSignal = options.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
-				const signal =
-					options.signal && timeoutSignal
-						? AbortSignal.any([options.signal, timeoutSignal])
-						: (options.signal ?? timeoutSignal);
-				try {
-					const next = await requestFetch(transport.url(model), {
+				const next = await fetchBoundedResponse(
+					String(transport.url(model)),
+					{
 						method: "POST",
 						headers: requestHeaders(model, apiKey, options.headers),
 						body: JSON.stringify(payload),
 						signal,
-					});
-					if (!next.ok) throw httpError(transport.label, next, await next.text());
-					return { response: next, body: (await next.json()) as unknown };
-				} catch (error) {
-					if (timeoutSignal?.aborted && !options.signal?.aborted) throw timeoutError(options.timeoutMs!);
-					throw error;
-				}
+					},
+					16 * 1024 * 1024,
+					timeoutMs,
+					requestFetch,
+				);
+				if (!next.ok) throw httpError(transport.label, next, await next.text());
+				return { response: next, body: (await next.json()) as unknown };
 			},
 			{
 				maxRetries: options.maxRetries ?? 2,
 				maxRetryDelayMs: options.maxRetryDelayMs,
-				signal: options.signal,
+				signal,
+				diagnosticSecrets,
 			},
 		);
 		await options.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -231,7 +243,13 @@ export async function classifySystemOne(
 		return output;
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-		output.errorMessage = formatProviderError(normalizeProviderError(error), `${transport.label} error`);
+		output.errorMessage = formatProviderError(
+			normalizeProviderError(error, diagnosticSecrets),
+			`${transport.label} error`,
+		);
 		return output;
+	} finally {
+		controller.abort();
+		clearTimeout(timer);
 	}
 }

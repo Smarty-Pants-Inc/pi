@@ -6,6 +6,7 @@
  * https://api.kimi.com/coding as an `Authorization: Bearer` header.
  */
 
+import { fetchOAuthResponse, ResponseBodyError, runOAuthOperation } from "../../utils/bounded-response.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
@@ -68,7 +69,7 @@ function trustedHttpUrl(value: unknown): string | null {
 }
 
 async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal): Promise<DeviceAuthorization> {
-	const response = await fetch(`${oauthHost}/api/oauth/device_authorization`, {
+	const response = await fetchOAuthResponse(`${oauthHost}/api/oauth/device_authorization`, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -79,8 +80,7 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 	});
 
 	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(`Kimi Code device authorization failed with status ${response.status}${text ? `: ${text}` : ""}`);
+		throw new Error(`Kimi Code device authorization failed with status ${response.status}`);
 	}
 
 	const json = await readJson(response);
@@ -96,7 +96,7 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 		!trustedHttpUrl(verificationUriComplete) ||
 		!trustedHttpUrl(verificationUri)
 	) {
-		throw new Error(`Invalid Kimi Code device authorization response: ${JSON.stringify(json)}`);
+		throw new Error("Invalid Kimi Code device authorization response fields");
 	}
 
 	const interval = json?.interval;
@@ -130,7 +130,7 @@ function parseTokenResponse(json: Record<string, unknown> | null, operation: str
 		!Number.isFinite(expiresIn) ||
 		expiresIn <= 0
 	) {
-		throw new Error(`Kimi Code token ${operation} response missing fields: ${JSON.stringify(json)}`);
+		throw new Error(`Kimi Code token ${operation} response missing required fields`);
 	}
 	return {
 		access: accessToken,
@@ -150,7 +150,7 @@ async function pollForToken(
 		waitBeforeFirstPoll: true,
 		signal,
 		poll: async () => {
-			const response = await fetch(`${oauthHost}/api/oauth/token`, {
+			const response = await fetchOAuthResponse(`${oauthHost}/api/oauth/token`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
@@ -165,10 +165,9 @@ async function pollForToken(
 			});
 
 			if (response.status >= 500) {
-				const text = await response.text().catch(() => "");
 				return {
 					status: "failed",
-					message: `Kimi Code device token request failed with status ${response.status}${text ? `: ${text}` : ""}`,
+					message: `Kimi Code device token request failed with status ${response.status}`,
 				};
 			}
 
@@ -182,7 +181,6 @@ async function pollForToken(
 			}
 
 			const error = json?.error;
-			const description = typeof json?.error_description === "string" ? `: ${json.error_description}` : "";
 			if (error === "authorization_pending") {
 				return { status: "pending" };
 			}
@@ -201,7 +199,7 @@ async function pollForToken(
 			}
 			return {
 				status: "failed",
-				message: `Kimi Code device token request failed (status ${response.status})${typeof error === "string" ? `: ${error}${description}` : ""}`,
+				message: `Kimi Code device token request failed (status ${response.status})`,
 			};
 		},
 	});
@@ -223,7 +221,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 
 		let response: Response;
 		try {
-			response = await fetch(`${oauthHost}/api/oauth/token`, {
+			response = await fetchOAuthResponse(`${oauthHost}/api/oauth/token`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
@@ -237,7 +235,8 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 				signal: requestSignal(signal),
 			});
 		} catch (error) {
-			lastError = error instanceof Error ? error : new Error(String(error));
+			if (error instanceof ResponseBodyError) throw error;
+			lastError = new Error("Kimi Code token refresh request failed");
 			continue;
 		}
 
@@ -248,8 +247,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 
 		// Unauthorized: the stored credential is dead; Models clears it and prompts re-login.
 		if (response.status === 401 || response.status === 403 || json?.error === "invalid_grant") {
-			const description = typeof json?.error_description === "string" ? `: ${json.error_description}` : "";
-			throw new Error(`Kimi Code token refresh unauthorized (status ${response.status})${description}`);
+			throw new Error(`Kimi Code token refresh unauthorized (status ${response.status})`);
 		}
 
 		if (isRetryableRefreshFailure(response) && attempt < REFRESH_MAX_RETRIES) {
@@ -257,8 +255,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 			continue;
 		}
 
-		const text = JSON.stringify(json);
-		throw new Error(`Kimi Code token refresh failed with status ${response.status}${text ? `: ${text}` : ""}`);
+		throw new Error(`Kimi Code token refresh failed with status ${response.status}`);
 	}
 
 	throw lastError ?? new Error("Kimi Code token refresh failed");
@@ -283,10 +280,13 @@ export const kimiCodingOAuth: OAuthAuth = {
 	isSubscription: true,
 	loginLabel: "Sign in with Kimi Code",
 
-	login: loginKimiCoding,
+	login: (interaction) =>
+		runOAuthOperation(interaction.signal, 15 * 60_000, (signal) => loginKimiCoding({ ...interaction, signal })),
 
 	refresh: async (credential, signal) => {
-		const token = await refreshToken(getOauthHost(), credential.refresh, signal);
+		const token = await runOAuthOperation(signal, 60_000, (ownedSignal) =>
+			refreshToken(getOauthHost(), credential.refresh, ownedSignal),
+		);
 		return { type: "oauth", access: token.access, refresh: token.refresh, expires: token.expires };
 	},
 

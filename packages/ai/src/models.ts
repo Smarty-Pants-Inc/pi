@@ -769,7 +769,17 @@ class ModelsImpl implements MutableModels {
 			throw new ModelsError("auth", `${provider.name} does not support ${type} login`);
 		}
 		const loginOperation: Promise<Credential> = method.login({ ...interaction, signal }, options);
-		const credential = await raceWithAbortSignal(loginOperation, signal);
+		let credential: Credential;
+		try {
+			credential = await raceWithAbortSignal(loginOperation, signal);
+		} catch (error) {
+			if (signal.aborted) {
+				// Cancellation retires the accepted provider interaction before public settlement.
+				await loginOperation.catch(() => undefined);
+				throw new Error("Login cancelled");
+			}
+			throw error;
+		}
 		let mutationStarted = false;
 		let markMutationStarted: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {
@@ -869,6 +879,7 @@ class ModelsImpl implements MutableModels {
 			const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey, headers, [
 				...(resolution.diagnosticSecrets ?? []),
 				...(options?.diagnosticSecrets ?? []),
+				...getOAuthDiagnosticSecrets(auth.apiKey, auth.headers),
 			]);
 			if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
 			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));

@@ -11,6 +11,7 @@
  * It is only intended for CLI use, not browser environments.
  */
 
+import { fetchOAuthResponse, runOAuthOperation } from "../../utils/bounded-response.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
@@ -44,17 +45,6 @@ function parseAuthorizationInput(input: string): string | undefined {
 	return value;
 }
 
-function errorDetail(body: JsonObject): string | undefined {
-	if (typeof body.error_description === "string") return body.error_description;
-	if (typeof body.message === "string") return body.message;
-	if (typeof body.error === "string") return body.error;
-	if (body.error && typeof body.error === "object" && !Array.isArray(body.error)) {
-		const message = (body.error as JsonObject).message;
-		if (typeof message === "string") return message;
-	}
-	return undefined;
-}
-
 async function exchangeAuthorizationCode(
 	code: string,
 	verifier: string,
@@ -72,7 +62,7 @@ async function exchangeAuthorizationCode(
 	let response: Response;
 	let body: JsonObject = {};
 	try {
-		response = await fetch(TOKEN_URL, {
+		response = await fetchOAuthResponse(TOKEN_URL, {
 			method: "POST",
 			headers: { accept: "application/json", "content-type": "application/json" },
 			body: JSON.stringify({ code, code_verifier: verifier, code_challenge_method: "S256" }),
@@ -84,18 +74,17 @@ async function exchangeAuthorizationCode(
 		} catch {
 			if (response.ok) throw new Error("OpenRouter OAuth returned invalid JSON");
 		}
-	} catch (error) {
+	} catch {
 		if (signal.aborted) throw new Error("Login cancelled");
 		if (controller.signal.aborted) throw new Error("OpenRouter OAuth token exchange timed out");
-		throw error;
+		throw new Error("OpenRouter OAuth token request failed");
 	} finally {
 		clearTimeout(timeout);
 		signal.removeEventListener("abort", onAbort);
 	}
 
 	if (!response.ok) {
-		const detail = errorDetail(body);
-		throw new Error(`OpenRouter OAuth key exchange failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
+		throw new Error(`OpenRouter OAuth key exchange failed (HTTP ${response.status})`);
 	}
 
 	if (typeof body.key !== "string" || body.key.length === 0) {
@@ -159,7 +148,8 @@ async function loginOpenRouter(interaction: ProviderAuthInteraction): Promise<OA
 export const openRouterOAuth: OAuthAuth = {
 	name: "OpenRouter OAuth",
 	loginLabel: "Sign in with OpenRouter",
-	login: loginOpenRouter,
+	login: (interaction) =>
+		runOAuthOperation(interaction.signal, LOGIN_TIMEOUT_MS, (signal) => loginOpenRouter({ ...interaction, signal })),
 	async refresh(credential, _signal) {
 		return credential;
 	},

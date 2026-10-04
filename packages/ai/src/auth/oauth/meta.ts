@@ -13,6 +13,7 @@
  * user must sign in again.
  */
 
+import { fetchOAuthResponse, runOAuthOperation } from "../../utils/bounded-response.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
@@ -46,14 +47,6 @@ async function readJson(response: Response): Promise<Record<string, unknown> | n
 	}
 }
 
-function errorDetail(json: Record<string, unknown> | null): string {
-	for (const key of ["error_description", "detail", "message", "error"]) {
-		const value = json?.[key];
-		if (typeof value === "string" && value.trim()) return `: ${value.trim()}`;
-	}
-	return "";
-}
-
 /** The verification URI is opened in the user's browser; only http(s) URLs are trusted. */
 function trustedHttpUrl(value: unknown): string | null {
 	if (typeof value !== "string" || !value) return null;
@@ -71,7 +64,7 @@ function positiveNumber(value: unknown): number | undefined {
 }
 
 async function startDeviceAuthorization(signal: AbortSignal): Promise<DeviceAuthorization> {
-	const response = await fetch(DEVICE_AUTHORIZATION_URL, {
+	const response = await fetchOAuthResponse(DEVICE_AUTHORIZATION_URL, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -82,13 +75,13 @@ async function startDeviceAuthorization(signal: AbortSignal): Promise<DeviceAuth
 	});
 	const json = await readJson(response);
 	if (!response.ok) {
-		throw new Error(`Meta device authorization failed with status ${response.status}${errorDetail(json)}`);
+		throw new Error(`Meta device authorization failed with status ${response.status}`);
 	}
 	const deviceCode = json?.device_code;
 	const userCode = json?.user_code;
 	const verificationUri = trustedHttpUrl(json?.verification_uri_complete) ?? trustedHttpUrl(json?.verification_uri);
 	if (typeof deviceCode !== "string" || !deviceCode || typeof userCode !== "string" || !userCode || !verificationUri) {
-		throw new Error(`Invalid Meta device authorization response: ${JSON.stringify(json)}`);
+		throw new Error("Invalid Meta device authorization response fields");
 	}
 	return {
 		deviceCode,
@@ -106,7 +99,7 @@ async function pollForIdentityToken(device: DeviceAuthorization, signal: AbortSi
 		waitBeforeFirstPoll: true,
 		signal,
 		poll: async () => {
-			const response = await fetch(DEVICE_TOKEN_URL, {
+			const response = await fetchOAuthResponse(DEVICE_TOKEN_URL, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
@@ -135,7 +128,7 @@ async function pollForIdentityToken(device: DeviceAuthorization, signal: AbortSi
 				default:
 					return {
 						status: "failed",
-						message: `Meta device token request failed with status ${response.status}${errorDetail(json)}`,
+						message: `Meta device token request failed with status ${response.status}`,
 					};
 			}
 		},
@@ -144,7 +137,7 @@ async function pollForIdentityToken(device: DeviceAuthorization, signal: AbortSi
 
 /** Exchange an identity token for a Model API key. Keys are valid for about a day. */
 async function mintApiKey(identityToken: string, signal: AbortSignal): Promise<OAuthCredential> {
-	const response = await fetch(API_KEY_MINT_URL, {
+	const response = await fetchOAuthResponse(API_KEY_MINT_URL, {
 		method: "POST",
 		headers: {
 			Accept: "application/json",
@@ -158,17 +151,14 @@ async function mintApiKey(identityToken: string, signal: AbortSignal): Promise<O
 	const json = await readJson(response);
 	if (response.status === 401 || response.status === 403) {
 		// Identity token is not renewable (see file header); only a fresh device flow helps.
-		throw new Error(
-			`Meta session expired (status ${response.status}). Run \`/login meta\` to sign in again.${errorDetail(json)}`,
-		);
+		throw new Error(`Meta session expired (status ${response.status}). Run \`/login meta\` to sign in again.`);
 	}
 	if (!response.ok) {
-		throw new Error(`Meta API key mint failed with status ${response.status}${errorDetail(json)}`);
+		throw new Error(`Meta API key mint failed with status ${response.status}`);
 	}
 	const apiKey = json?.api_key;
 	if (typeof apiKey !== "string" || !apiKey) {
-		const actionUrl = trustedHttpUrl(json?.action_url);
-		throw new Error(`Meta did not issue an API key.${actionUrl ? ` Complete setup at ${actionUrl}` : ""}`);
+		throw new Error("Meta did not issue an API key");
 	}
 	return { type: "oauth", refresh: identityToken, access: apiKey, expires: Date.now() + API_KEY_LIFETIME_MS };
 }
@@ -198,9 +188,11 @@ export const metaOAuth: OAuthAuth = {
 	isSubscription: true,
 	loginLabel: "Sign in with Meta",
 
-	login: loginMeta,
+	login: (interaction) =>
+		runOAuthOperation(interaction.signal, 15 * 60_000, (signal) => loginMeta({ ...interaction, signal })),
 
-	refresh: (credential, signal) => mintApiKey(credential.refresh, signal),
+	refresh: (credential, signal) =>
+		runOAuthOperation(signal, 60_000, (ownedSignal) => mintApiKey(credential.refresh, ownedSignal)),
 
 	async toAuth(credential) {
 		return { apiKey: credential.access };

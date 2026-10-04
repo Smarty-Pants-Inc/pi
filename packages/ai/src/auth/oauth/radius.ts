@@ -10,8 +10,10 @@
  */
 
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
+import { fetchOAuthResponse, runOAuthOperation } from "../../utils/bounded-response.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
+import { readOAuthCredentialResponse } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { generatePKCE } from "./pkce.ts";
 
@@ -39,20 +41,18 @@ type DeviceAuthorizationResponse = {
 };
 
 async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): Promise<RadiusOAuthDiscovery> {
-	const response = await fetch(new URL("/v1/oauth", gateway), {
+	const response = await fetchOAuthResponse(new URL("/v1/oauth", gateway), {
 		headers: { accept: "application/json" },
 		signal,
 	});
 
 	if (!response.ok) {
-		throw new Error(
-			`Could not load Radius OAuth config from ${gateway}: ${response.status} ${await response.text()}`,
-		);
+		throw new Error(`Radius OAuth config request failed (HTTP ${response.status})`);
 	}
 
-	const discovery = (await response.json()) as Partial<RadiusOAuthDiscovery>;
+	const discovery = (await readOAuthCredentialResponse(response, "Radius OAuth")) as Partial<RadiusOAuthDiscovery>;
 	if (typeof discovery.authorizationEndpoint !== "string") {
-		throw new Error(`Invalid Radius OAuth config from ${gateway}`);
+		throw new Error("Invalid Radius OAuth config fields");
 	}
 	return { authorizationEndpoint: discovery.authorizationEndpoint };
 }
@@ -61,13 +61,8 @@ class OAuthResponseError extends Error {
 	readonly status: number;
 	readonly oauthError?: string;
 
-	constructor(status: number, oauthError: string | undefined, description: string | undefined, message: string) {
-		const detail = oauthError
-			? description
-				? `${oauthError}: ${description}`
-				: oauthError
-			: description || String(status);
-		super(`${message}: ${detail}`);
+	constructor(status: number, oauthError: string | undefined, message: string) {
+		super(`${message} (HTTP ${status})`);
 		this.status = status;
 		this.oauthError = oauthError;
 	}
@@ -76,19 +71,25 @@ class OAuthResponseError extends Error {
 async function readOAuthResponseError(response: Response, message: string): Promise<OAuthResponseError> {
 	const text = await response.text().catch(() => "");
 	let oauthError: string | undefined;
-	let description: string | undefined;
 
 	if (text) {
 		try {
 			const data = JSON.parse(text) as { error?: unknown; error_description?: unknown };
-			oauthError = typeof data.error === "string" ? data.error : undefined;
-			description = typeof data.error_description === "string" ? data.error_description : undefined;
+			oauthError = [
+				"authorization_pending",
+				"slow_down",
+				"expired_token",
+				"access_denied",
+				"invalid_grant",
+			].includes(String(data.error))
+				? String(data.error)
+				: undefined;
 		} catch {
-			description = text;
+			// An invalid OAuth error body has no safe protocol code.
 		}
 	}
 
-	return new OAuthResponseError(response.status, oauthError, description, message);
+	return new OAuthResponseError(response.status, oauthError, message);
 }
 
 async function requestOAuthToken(
@@ -98,7 +99,7 @@ async function requestOAuthToken(
 ): Promise<OAuthCredential> {
 	let response: Response;
 	try {
-		response = await fetch(new URL("/v1/oauth/token", gateway), {
+		response = await fetchOAuthResponse(new URL("/v1/oauth/token", gateway), {
 			method: "POST",
 			headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
 			body,
@@ -115,7 +116,7 @@ async function requestOAuthToken(
 		throw await readOAuthResponseError(response, "Radius OAuth token request failed");
 	}
 
-	const data = (await response.json()) as {
+	const data = (await readOAuthCredentialResponse(response, "Radius OAuth")) as {
 		access_token: string;
 		refresh_token: string;
 		expires_in: number;
@@ -138,7 +139,12 @@ async function loginWithBrowser(
 ): Promise<OAuthCredential> {
 	const { verifier, challenge } = await generatePKCE();
 	const state = crypto.randomUUID();
-	const authorizeUrl = new URL(authorizationEndpoint);
+	let authorizeUrl: URL;
+	try {
+		authorizeUrl = new URL(authorizationEndpoint);
+	} catch {
+		throw new Error("Invalid Radius OAuth authorization endpoint");
+	}
 	authorizeUrl.search = new URLSearchParams({
 		response_type: "code",
 		client_id: OAUTH_CLIENT_ID,
@@ -189,7 +195,7 @@ async function loginWithBrowser(
 async function requestDeviceAuthorization(gateway: string, signal: AbortSignal): Promise<DeviceAuthorizationResponse> {
 	let response: Response;
 	try {
-		response = await fetch(new URL("/v1/oauth/device", gateway), {
+		response = await fetchOAuthResponse(new URL("/v1/oauth/device", gateway), {
 			method: "POST",
 			headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({ client_id: OAUTH_CLIENT_ID, scope: OAUTH_SCOPE }),
@@ -206,7 +212,7 @@ async function requestDeviceAuthorization(gateway: string, signal: AbortSignal):
 		throw await readOAuthResponseError(response, "Radius OAuth device authorization failed");
 	}
 
-	const data = (await response.json()) as Partial<DeviceAuthorizationResponse>;
+	const data = (await readOAuthCredentialResponse(response, "Radius OAuth")) as Partial<DeviceAuthorizationResponse>;
 	if (!data.device_code || !data.user_code || !data.verification_uri || !data.expires_in) {
 		throw new Error("Radius OAuth device authorization response is missing required fields");
 	}
@@ -278,38 +284,43 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 	return {
 		name: options.name,
 
-		async login(interaction): Promise<OAuthCredential> {
-			const loginMethod = await interaction.prompt({
-				type: "select",
-				message: `Sign in to ${options.name}:`,
-				options: [
-					{ id: LOGIN_METHOD_BROWSER, label: "Sign in with browser (recommended)" },
-					{
-						id: LOGIN_METHOD_DEVICE_CODE,
-						label: "Sign in with device code (when signing in from another device)",
-					},
-				],
-			});
+		login: (interaction) =>
+			runOAuthOperation(interaction.signal, 15 * 60_000, async (signal): Promise<OAuthCredential> => {
+				interaction = { ...interaction, signal };
+				const loginMethod = await interaction.prompt({
+					type: "select",
+					signal: interaction.signal,
+					message: `Sign in to ${options.name}:`,
+					options: [
+						{ id: LOGIN_METHOD_BROWSER, label: "Sign in with browser (recommended)" },
+						{
+							id: LOGIN_METHOD_DEVICE_CODE,
+							label: "Sign in with device code (when signing in from another device)",
+						},
+					],
+				});
 
-			if (loginMethod === LOGIN_METHOD_DEVICE_CODE) {
-				return loginWithDeviceCode(gateway, interaction);
-			}
-			if (loginMethod === LOGIN_METHOD_BROWSER) {
-				const discovery = await loadRadiusOAuthDiscovery(gateway, interaction.signal);
-				return loginWithBrowser(gateway, discovery.authorizationEndpoint, interaction);
-			}
-			throw new Error(`Unknown ${options.name} sign-in method: ${loginMethod}`);
-		},
+				if (loginMethod === LOGIN_METHOD_DEVICE_CODE) {
+					return loginWithDeviceCode(gateway, interaction);
+				}
+				if (loginMethod === LOGIN_METHOD_BROWSER) {
+					const discovery = await loadRadiusOAuthDiscovery(gateway, interaction.signal);
+					return loginWithBrowser(gateway, discovery.authorizationEndpoint, interaction);
+				}
+				throw new Error("Unknown Radius sign-in method");
+			}),
 
 		async refresh(credential, signal): Promise<OAuthCredential> {
-			const refreshed = await requestOAuthToken(
-				gateway,
-				new URLSearchParams({
-					grant_type: "refresh_token",
-					client_id: OAUTH_CLIENT_ID,
-					refresh_token: credential.refresh,
-				}),
-				signal,
+			const refreshed = await runOAuthOperation(signal, 60_000, (ownedSignal) =>
+				requestOAuthToken(
+					gateway,
+					new URLSearchParams({
+						grant_type: "refresh_token",
+						client_id: OAUTH_CLIENT_ID,
+						refresh_token: credential.refresh,
+					}),
+					ownedSignal,
+				),
 			);
 			return refreshed;
 		},

@@ -10,6 +10,7 @@ import type {
 	BetaRawMessageStreamEvent as RawMessageStreamEvent,
 	BetaRefusalStopDetails as RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
+import { getOAuthDiagnosticSecrets, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import {
 	ANTHROPIC_FEDERATION_RULE_ID_ENV,
 	ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
@@ -38,6 +39,7 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
@@ -600,6 +602,10 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			timestamp: Date.now(),
 		};
 
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
+			...(options?.diagnosticSecrets ?? []),
+			...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
+		]);
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -607,7 +613,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			let inputTransformations: BetaThinkingDroppedInputTransformation[] | undefined;
 
 			if (options?.client) {
-				client = options.client;
+				// Clone SDK clients before dispatch, so logs cannot publish credentials and the caller's client is unchanged.
+				client =
+					typeof options.client.withOptions === "function"
+						? options.client.withOptions({ logLevel: "off" })
+						: options.client;
 				isOAuth = false;
 			} else {
 				const apiKey = options?.apiKey;
@@ -654,6 +664,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
+					diagnosticSecrets,
 				},
 			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -818,7 +829,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					const transformations = event.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
 					if (event.delta.stop_reason) {
-						output.rawStopReason = event.delta.stop_reason;
+						output.rawStopReason = redactOAuthDiagnostic(event.delta.stop_reason, diagnosticSecrets);
 						const stopReasonResult = mapStopReason(event.delta.stop_reason, event.delta.stop_details);
 						output.stopReason = stopReasonResult.stopReason;
 						if (stopReasonResult.errorMessage) {
@@ -893,7 +904,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -993,6 +1004,7 @@ function createClient(
 	// Copilot: Bearer auth.
 	if (model.provider === "github-copilot") {
 		const client = new PiAnthropic({
+			logLevel: "off",
 			apiKey: null,
 			authToken: apiKey ?? null,
 			baseURL: model.baseUrl,
@@ -1015,6 +1027,7 @@ function createClient(
 	// OAuth: Bearer auth, Claude Code identity headers
 	if (apiKey && isOAuthToken(apiKey)) {
 		const client = new PiAnthropic({
+			logLevel: "off",
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -1055,6 +1068,7 @@ function createClient(
 		const key = JSON.stringify([model.baseUrl, federation]);
 		if (federationClient?.key !== key || federationClient.fetch !== fetch) {
 			const client = new PiAnthropic({
+				logLevel: "off",
 				apiKey: null,
 				authToken: null,
 				config: federation,
@@ -1068,6 +1082,7 @@ function createClient(
 	}
 
 	const client = new PiAnthropic({
+		logLevel: "off",
 		apiKey: apiKey ?? null,
 		authToken: null,
 		baseURL: model.baseUrl,

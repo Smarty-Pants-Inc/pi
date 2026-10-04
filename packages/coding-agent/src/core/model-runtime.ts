@@ -57,6 +57,7 @@ import {
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
+import { getOAuthDiagnosticSecrets } from "@earendil-works/pi-ai/utils/error-body";
 import {
 	assertChatModel,
 	assertClassifierModel,
@@ -767,8 +768,15 @@ export class ModelRuntime implements Models {
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
+		const apiKey = providerOptions.apiKey ?? resolution.auth.apiKey;
 		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(resolution.auth.apiKey, resolution.auth.headers, [
+			...(resolution.diagnosticSecrets ?? []),
+			...(providerOptions.diagnosticSecrets ?? []),
+			...getOAuthDiagnosticSecrets(apiKey, headers),
+		]);
 		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+		diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));
 		const env =
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
@@ -795,7 +803,8 @@ export class ModelRuntime implements Models {
 			model: requestModel,
 			options: {
 				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+				apiKey,
+				diagnosticSecrets,
 				headers,
 				env,
 			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
