@@ -9,6 +9,7 @@ import type {
 	ClassifierResult,
 	JsonObject,
 } from "../types.ts";
+import { fetchBoundedResponse } from "../utils/bounded-response.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -222,6 +223,27 @@ interface RequestContext {
 	model: ClassifierModel<ClassifierApi>;
 	root: string;
 	options: ClassifierOptions | undefined;
+	signal: AbortSignal;
+	controller: AbortController;
+}
+
+/** On failure retire sibling native requests, then join every exact promise. */
+async function joinRequests<T>(request: RequestContext, promises: Promise<T>[]): Promise<T[]> {
+	let failure: { error: unknown } | undefined;
+	const results = await Promise.allSettled(
+		promises.map((promise) =>
+			promise.catch((error: unknown) => {
+				failure ??= { error };
+				request.controller.abort(error);
+				throw error;
+			}),
+		),
+	);
+	if (failure) throw failure.error;
+	return results.map((result) => {
+		if (result.status === "rejected") throw result.reason;
+		return result.value;
+	});
 }
 
 async function post(request: RequestContext, path: string, body: unknown, observe: boolean): Promise<unknown> {
@@ -243,26 +265,28 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 		) ?? {};
 	const { response, json } = await retryProviderRequest(
 		async () => {
-			const timeoutSignal = options?.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
-			const signal =
-				options?.signal && timeoutSignal
-					? AbortSignal.any([options.signal, timeoutSignal])
-					: (options?.signal ?? timeoutSignal);
 			try {
-				const next = await requestFetch(`${root}${path}`, {
-					method: "POST",
-					headers,
-					body: JSON.stringify(payload),
-					signal,
-				});
+				const next = await fetchBoundedResponse(
+					`${root}${path}`,
+					{
+						method: "POST",
+						headers,
+						body: JSON.stringify(payload),
+						signal: request.signal,
+					},
+					16 * 1024 * 1024,
+					options?.timeoutMs ?? 60_000,
+					requestFetch,
+				);
 				if (!next.ok) throw httpError(next, await next.text());
 				return { response: next, json: (await next.json()) as unknown };
 			} catch (error) {
-				if (timeoutSignal?.aborted && !options?.signal?.aborted) throw timeoutError(options!.timeoutMs!);
+				if (request.signal.aborted && !options?.signal?.aborted && request.signal.reason?.name === "TimeoutError")
+					throw timeoutError(options?.timeoutMs ?? 60_000);
 				throw error;
 			}
 		},
-		{ maxRetries: options?.maxRetries ?? 2, maxRetryDelayMs: options?.maxRetryDelayMs, signal: options?.signal },
+		{ maxRetries: options?.maxRetries ?? 2, maxRetryDelayMs: options?.maxRetryDelayMs, signal: request.signal },
 	);
 	if (observe) {
 		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -304,7 +328,7 @@ const labelTokenCache = new Map<string, number | undefined>();
  * otherwise return a different token than the model emits there.
  */
 async function resolveLabelToken(request: RequestContext, label: string): Promise<number | undefined> {
-	const [newline, withLabel] = await Promise.all([tokenize(request, "\n"), tokenize(request, `\n${label}`)]);
+	const [newline, withLabel] = await joinRequests(request, [tokenize(request, "\n"), tokenize(request, `\n${label}`)]);
 	if (withLabel.length === newline.length + 1 && newline.every((id, index) => withLabel[index] === id)) {
 		return withLabel[newline.length];
 	}
@@ -313,7 +337,8 @@ async function resolveLabelToken(request: RequestContext, label: string): Promis
 }
 
 async function labelTokens(request: RequestContext, labels: readonly string[]): Promise<number[]> {
-	const ids = await Promise.all(
+	const ids = await joinRequests(
+		request,
 		labels.map(async (label) => {
 			const key = `${request.root}\u0000${request.model.id}\u0000${label}`;
 			if (labelTokenCache.has(key)) return labelTokenCache.get(key);
@@ -395,10 +420,11 @@ async function classifyQuestion(
 	temperature: number,
 ): Promise<ClassifierAnswer> {
 	const rendered = renderQuestion(context, id);
-	const [tokens, prompt] = await Promise.all([
+	const [tokens, prompt] = await joinRequests<number[] | string>(request, [
 		labelTokens(request, rendered.labels),
 		renderPrompt(request, rendered.content),
 	]);
+	if (!Array.isArray(tokens) || typeof prompt !== "string") throw new Error("Invalid classifier preparation");
 	const depths = [Math.max(MIN_READOUT_DEPTH, READOUT_DEPTH_PER_LABEL * tokens.length), ...READOUT_ESCALATION];
 	let logprobs: Array<number | undefined> = [];
 	for (const depth of depths) {
@@ -429,7 +455,15 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		timestamp: Date.now(),
 	};
 
+	const controller = new AbortController();
+	const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
+	const timeoutMs = options?.timeoutMs ?? 60_000;
+	const timer =
+		Number.isFinite(timeoutMs) && timeoutMs > 0
+			? setTimeout(() => controller.abort(timeoutError(timeoutMs)), timeoutMs)
+			: undefined;
 	try {
+		if (!timer) throw new Error("Timeout must be a positive finite number");
 		if (model.api !== "llama-cpp-classify") throw new Error(`Unsupported classifier API: ${model.api}`);
 		const temperature = options?.temperature ?? 1;
 		if (!(temperature > 0) || !Number.isFinite(temperature)) {
@@ -437,7 +471,7 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		}
 		// Validate every question before the first request.
 		for (const id of Object.keys(context.questions)) renderQuestion(context, id);
-		const request: RequestContext = { model, root: llamaServerRoot(model.baseUrl), options };
+		const request: RequestContext = { model, root: llamaServerRoot(model.baseUrl), options, signal, controller };
 		const answers: Array<[string, ClassifierAnswer]> = [];
 		// One question at a time: each prompt starts with the same text up to its final
 		// question, which the server's prompt cache then evaluates only once.
@@ -451,5 +485,8 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(normalizeProviderError(error), `${LABEL} error`);
 		return output;
+	} finally {
+		controller.abort();
+		clearTimeout(timer);
 	}
 };

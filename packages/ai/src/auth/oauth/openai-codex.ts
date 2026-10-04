@@ -13,6 +13,7 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 	});
 }
 
+import { fetchBoundedResponse, ResponseBodyError } from "../../utils/bounded-response.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
@@ -109,10 +110,11 @@ function decodeJwt(token: string): JwtPayload | null {
 	}
 }
 
-async function fetchWithLoginCancellation(input: string, init: RequestInit): Promise<Response> {
+async function fetchWithLoginCancellation(input: string, init: RequestInit, operation: string): Promise<Response> {
 	try {
-		return await fetch(input, init);
-	} catch {
+		return await fetchBoundedResponse(input, init);
+	} catch (error) {
+		if (error instanceof ResponseBodyError) throw new Error(`${operation} response is invalid JSON`);
 		throw new Error(init.signal?.aborted ? "Login cancelled" : "OpenAI Codex OAuth request failed");
 	}
 }
@@ -156,18 +158,22 @@ async function exchangeAuthorizationCode(
 	redirectUri: string,
 	signal: AbortSignal,
 ): Promise<OAuthToken> {
-	const response = await fetchWithLoginCancellation(TOKEN_URL, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: new URLSearchParams({
-			grant_type: "authorization_code",
-			client_id: CLIENT_ID,
-			code,
-			code_verifier: verifier,
-			redirect_uri: redirectUri,
-		}),
-		signal,
-	});
+	const response = await fetchWithLoginCancellation(
+		TOKEN_URL,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({
+				grant_type: "authorization_code",
+				client_id: CLIENT_ID,
+				code,
+				code_verifier: verifier,
+				redirect_uri: redirectUri,
+			}),
+			signal,
+		},
+		"OpenAI Codex token exchange",
+	);
 
 	return readTokenResponse(response, "exchange");
 }
@@ -175,7 +181,7 @@ async function exchangeAuthorizationCode(
 async function refreshAccessToken(refreshToken: string, signal: AbortSignal): Promise<OAuthToken> {
 	let response: Response;
 	try {
-		response = await fetch(TOKEN_URL, {
+		response = await fetchBoundedResponse(TOKEN_URL, {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({
@@ -185,7 +191,8 @@ async function refreshAccessToken(refreshToken: string, signal: AbortSignal): Pr
 			}),
 			signal,
 		});
-	} catch {
+	} catch (error) {
+		if (error instanceof ResponseBodyError) throw new Error("OpenAI Codex token refresh response is invalid JSON");
 		throw new Error(`OpenAI Codex token refresh request ${signal.aborted ? "cancelled" : "failed"}`);
 	}
 
@@ -193,12 +200,16 @@ async function refreshAccessToken(refreshToken: string, signal: AbortSignal): Pr
 }
 
 async function startOpenAICodexDeviceAuth(signal: AbortSignal): Promise<DeviceAuthInfo> {
-	const response = await fetchWithLoginCancellation(DEVICE_USER_CODE_URL, {
-		method: "POST",
-		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ client_id: CLIENT_ID }),
-		signal,
-	});
+	const response = await fetchWithLoginCancellation(
+		DEVICE_USER_CODE_URL,
+		{
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ client_id: CLIENT_ID }),
+			signal,
+		},
+		"OpenAI Codex device code",
+	);
 
 	if (!response.ok) {
 		await response.body?.cancel().catch(() => undefined);
@@ -236,69 +247,87 @@ async function startOpenAICodexDeviceAuth(signal: AbortSignal): Promise<DeviceAu
 	};
 }
 
-async function pollOpenAICodexDeviceAuth(device: DeviceAuthInfo, signal: AbortSignal): Promise<DeviceTokenSuccess> {
-	return pollOAuthDeviceCodeFlow<DeviceTokenSuccess>({
-		intervalSeconds: device.intervalSeconds,
-		expiresInSeconds: DEVICE_CODE_TIMEOUT_SECONDS,
-		signal,
-		poll: async () => {
-			const response = await fetchWithLoginCancellation(DEVICE_TOKEN_URL, {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					device_auth_id: device.deviceAuthId,
-					user_code: device.userCode,
-				}),
-				signal,
-			});
+async function pollOpenAICodexDeviceAuth(
+	device: DeviceAuthInfo,
+	parentSignal: AbortSignal,
+): Promise<DeviceTokenSuccess> {
+	const controller = new AbortController();
+	const signal = AbortSignal.any([parentSignal, controller.signal]);
+	const timer = setTimeout(() => controller.abort(), DEVICE_CODE_TIMEOUT_SECONDS * 1000);
+	try {
+		return await pollOAuthDeviceCodeFlow<DeviceTokenSuccess>({
+			intervalSeconds: device.intervalSeconds,
+			expiresInSeconds: DEVICE_CODE_TIMEOUT_SECONDS,
+			signal,
+			poll: async () => {
+				const response = await fetchWithLoginCancellation(
+					DEVICE_TOKEN_URL,
+					{
+						method: "POST",
+						headers: { "Content-Type": "application/json" },
+						body: JSON.stringify({
+							device_auth_id: device.deviceAuthId,
+							user_code: device.userCode,
+						}),
+						signal,
+					},
+					"OpenAI Codex device auth",
+				);
 
-			if (response.ok) {
-				const rawJson = await readOAuthCredentialResponse(response, "OpenAI Codex device auth");
-				const json = rawJson as { authorization_code?: string; code_verifier?: string } | null;
-				if (
-					typeof json?.authorization_code !== "string" ||
-					!json.authorization_code ||
-					typeof json.code_verifier !== "string" ||
-					!json.code_verifier
-				) {
+				if (response.ok) {
+					const rawJson = await readOAuthCredentialResponse(response, "OpenAI Codex device auth");
+					const json = rawJson as { authorization_code?: string; code_verifier?: string } | null;
+					if (
+						typeof json?.authorization_code !== "string" ||
+						!json.authorization_code ||
+						typeof json.code_verifier !== "string" ||
+						!json.code_verifier
+					) {
+						return {
+							status: "failed",
+							message:
+								"OpenAI Codex device auth response missing or invalid authorization_code or code_verifier",
+						};
+					}
 					return {
-						status: "failed",
-						message: "OpenAI Codex device auth response missing or invalid authorization_code or code_verifier",
+						status: "complete",
+						value: { authorizationCode: json.authorization_code, codeVerifier: json.code_verifier },
 					};
 				}
+
+				if (response.status === 403 || response.status === 404) {
+					await response.body?.cancel().catch(() => undefined);
+					return { status: "pending" };
+				}
+
+				let errorCode: unknown;
+				try {
+					const json = (await readOAuthCredentialResponse(response, "OpenAI Codex device auth")) as {
+						error?: string | { code?: string };
+					} | null;
+					const error = json?.error;
+					errorCode = typeof error === "object" ? error?.code : error;
+				} catch {}
+
+				if (errorCode === "deviceauth_authorization_pending") {
+					return { status: "pending" };
+				}
+				if (errorCode === "slow_down") {
+					return { status: "slow_down" };
+				}
+
 				return {
-					status: "complete",
-					value: { authorizationCode: json.authorization_code, codeVerifier: json.code_verifier },
+					status: "failed",
+					message: `OpenAI Codex device auth failed with status ${response.status}`,
 				};
-			}
-
-			if (response.status === 403 || response.status === 404) {
-				await response.body?.cancel().catch(() => undefined);
-				return { status: "pending" };
-			}
-
-			let errorCode: unknown;
-			try {
-				const json = (await readOAuthCredentialResponse(response, "OpenAI Codex device auth")) as {
-					error?: string | { code?: string };
-				} | null;
-				const error = json?.error;
-				errorCode = typeof error === "object" ? error?.code : error;
-			} catch {}
-
-			if (errorCode === "deviceauth_authorization_pending") {
-				return { status: "pending" };
-			}
-			if (errorCode === "slow_down") {
-				return { status: "slow_down" };
-			}
-
-			return {
-				status: "failed",
-				message: `OpenAI Codex device auth failed with status ${response.status}`,
-			};
-		},
-	});
+			},
+		});
+	} catch (error) {
+		if (controller.signal.aborted && !parentSignal.aborted) throw new Error("Device flow timed out");
+		throw error;
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 async function createAuthorizationFlow(
