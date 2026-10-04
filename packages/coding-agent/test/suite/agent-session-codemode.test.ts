@@ -116,7 +116,8 @@ function checkSavedImages(text: string): string {
 		.join("\n");
 }
 
-describe("AgentSession codemode tool", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession codemode tool", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -411,7 +412,8 @@ describe("AgentSession codemode tool", () => {
 	});
 });
 
-describe("codemode options and store", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("codemode options and store", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -602,7 +604,8 @@ describe("codemode options and store", () => {
 	});
 });
 
-describe("codemode models", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("codemode models", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {

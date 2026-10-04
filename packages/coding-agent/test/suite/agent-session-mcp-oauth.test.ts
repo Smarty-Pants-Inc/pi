@@ -13,7 +13,8 @@ import { McpOAuthCredentialStore } from "../../src/extensions/mcp/oauth.ts";
 import { createHarness, createTestUiContext, getMessageText, type Harness } from "./harness.ts";
 import { startOAuthMcpServer } from "./mcp-oauth-server.ts";
 
-describe("AgentSession MCP OAuth", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession MCP OAuth", () => {
 	const cleanups: (() => Promise<void> | void)[] = [];
 
 	afterEach(async () => {

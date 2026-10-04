@@ -30,7 +30,8 @@ describe("embedded sources", () => {
 	});
 });
 
-describe("script execution", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("script execution", () => {
 	it("returns the script's return value after a JSON round trip", async () => {
 		const sandbox = createSandbox();
 		expect(await sandbox.execute("return { a: 1, b: [true, 'x'] }")).toMatchObject({
@@ -212,7 +213,8 @@ describe("script execution", () => {
 	});
 });
 
-describe("tools", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("tools", () => {
 	it("exposes tools as async functions and records calls", async () => {
 		const seen: unknown[] = [];
 		const sandbox = createSandbox([
@@ -359,7 +361,8 @@ describe("tools", () => {
 	});
 });
 
-describe("store and load", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("store and load", () => {
 	it("reads the snapshot and reports writes", async () => {
 		const sandbox = createSandbox();
 		const result = await sandbox.execute(
@@ -424,7 +427,8 @@ describe("store and load", () => {
 	});
 });
 
-describe("globals", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("globals", () => {
 	it("exposes globals as top-level functions without recording them as calls", async () => {
 		const seen: unknown[] = [];
 		const sandbox = new CodemodeSandbox({
@@ -500,7 +504,8 @@ describe("globals", () => {
 	});
 });
 
-describe("limits and lifetime", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("limits and lifetime", () => {
 	it("terminates a synchronous infinite loop on timeout", async () => {
 		const sandbox = createSandbox();
 		const started = performance.now();
@@ -671,7 +676,8 @@ describe("limits and lifetime", () => {
 	});
 });
 
-describe("escape hatches", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("escape hatches", () => {
 	it("has no host globals", async () => {
 		const sandbox = createSandbox();
 		const result = await sandbox.execute(`

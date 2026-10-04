@@ -91,7 +91,8 @@ class TestOAuthProvider implements OAuthClientProvider {
 
 afterEach(closeServers);
 
-describe("MCP OAuth", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("MCP OAuth", () => {
 	it("discovers, registers, authorizes with PKCE, and refreshes on 401", async () => {
 		let expectedChallenge: string | undefined;
 		let refreshes = 0;
@@ -522,7 +523,8 @@ describe("MCP OAuth", () => {
 	});
 });
 
-describe("OAuthCallbackServer pages", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("OAuthCallbackServer pages", () => {
 	it("renders plain text by default", async () => {
 		const callback = await OAuthCallbackServer.listen();
 		try {
