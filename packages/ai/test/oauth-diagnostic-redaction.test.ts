@@ -106,6 +106,54 @@ describe("OAuth diagnostic redaction", () => {
 		},
 	);
 
+	// pi#127 / round-4: encoded echoes need a safe boundary, not a larger enumeration depth.
+	it.each([9, 12, 20, 32])("masks JSON escape depth %s or fails closed", (depth) => {
+		const secret = 'FAKE_DEEP_127_"QUOTE\\BACK';
+		let value = secret;
+		// Unicode-escape each slash instead of doubling it: deep fixtures stay small.
+		for (let i = 0; i < depth; i++) value = value.replace(/\\/g, "\\u005c").replace(/"/g, "\\u0022");
+		const result = redactOAuthDiagnostic(`receipt=${value}`, [secret]);
+		expect(["receipt=***", "***"]).toContain(result);
+		if (depth > 16) expect(result).toBe("***");
+	});
+
+	it("fails closed when the unescape work budget is exhausted", () => {
+		const secret = 'FAKE_BUDGET_127_"QUOTE';
+		const value = JSON.stringify(secret).slice(1, -1);
+		expect(redactOAuthDiagnostic(`${"x".repeat(256 * 1024)} ${value}`, [secret])).toBe("***");
+	});
+
+	it.each(['FAKE_BASE64_127_"Q\\S/+=?%', "FAKE_BASE64_127_\uffff\ufffe", "FAKE_BASE64_127_\u00e9"])(
+		"masks UTF-8 standard and URL-safe base64 echoes of %s, with and without padding",
+		(secret) => {
+			const standard = Buffer.from(secret).toString("base64");
+			const url = standard.replace(/\+/g, "-").replace(/\//g, "_");
+			for (const value of [standard, standard.replace(/=+$/, ""), url, url.replace(/=+$/, "")]) {
+				expect(redactOAuthDiagnostic(JSON.stringify({ unrelated: value }), [secret])).toBe('{"unrelated":"***"}');
+				// Escaped base64 slashes must use the same fixed-point path.
+				expect(redactOAuthDiagnostic(`receipt=${value.replace(/\//g, "\\/")}`, [secret])).toBe("receipt=***");
+			}
+		},
+	);
+
+	it.each(["a", "the", "1234567"])("does not substring-mask short live value %s", (secret) => {
+		const text = `the theater theme other normal a word ${secret}`;
+		expect(redactOAuthDiagnostic(text, [secret])).toBe(text);
+		expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(secret))).toBe(text);
+		// Short values remain protected when a credential field or scheme identifies them.
+		expect(redactOAuthDiagnostic(`refresh_token=${secret}`, [secret])).not.toContain(`=${secret}`);
+		expect(redactOAuthDiagnostic(`Bearer ${secret}`, [secret])).toContain("***");
+	});
+
+	it("substring-masks live values at the eight-character threshold", () => {
+		expect(redactOAuthDiagnostic("receipt=X12345678Y", ["12345678"])).toBe("receipt=X***Y");
+	});
+
+	it("preserves escape-containing diagnostics with no encoded credential match", () => {
+		const text = 'server_error receipt="ordinary\\ntext" C:\\path';
+		expect(redactOAuthDiagnostic(text, ["FAKE_UNRELATED_127"])).toBe(text);
+	});
+
 	it("clones SDK log data without retaining errors, causes, custom inspect hooks or cycles", () => {
 		const secret = "FAKE_LOG_127";
 		const error = Object.assign(new Error(secret, { cause: new Error(secret) }), { refresh_token: secret });

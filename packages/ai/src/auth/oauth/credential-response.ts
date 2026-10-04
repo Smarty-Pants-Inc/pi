@@ -44,30 +44,91 @@ export function getOAuthDiagnosticSecrets(
 	return secrets;
 }
 
+// Short live values must not replace common words or individual letters in diagnostics.
+// Credential-labeled fields and Bearer values are still masked regardless of length.
+const MIN_DIAGNOSTIC_SECRET_LENGTH = 8;
+const MAX_DIAGNOSTIC_UNESCAPE_PASSES = 16;
+const MAX_DIAGNOSTIC_UNESCAPE_WORK = 256 * 1024;
+const JSON_ESCAPES: Readonly<Record<string, string>> = {
+	'"': '"',
+	"/": "/",
+	b: "\b",
+	f: "\f",
+	n: "\n",
+	r: "\r",
+	t: "\t",
+};
+
+/** Decode one layer, including fragments; consume slash runs once, without recursive parsing. */
+function unescapeDiagnostic(text: string): string {
+	const parts: string[] = [];
+	let copied = 0;
+	let i = text.indexOf("\\");
+	while (i !== -1) {
+		parts.push(text.slice(copied, i));
+		let end = i;
+		while (text[end] === "\\") end++;
+		const count = end - i;
+		parts.push("\\".repeat(Math.floor(count / 2)));
+		if (count % 2) {
+			const hex = text.slice(end + 1, end + 5);
+			if (text[end] === "u" && /^[0-9a-f]{4}$/i.test(hex)) {
+				parts.push(String.fromCharCode(Number.parseInt(hex, 16)));
+				end += 5;
+			} else if (Object.hasOwn(JSON_ESCAPES, text[end])) {
+				parts.push(JSON_ESCAPES[text[end++]]);
+			} else parts.push("\\");
+		}
+		copied = end;
+		i = text.indexOf("\\", end);
+	}
+	parts.push(text.slice(copied));
+	return parts.join("");
+}
+
 function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
-		if (!secret || secret.length > text.length) continue;
+		if (secret.length < MIN_DIAGNOSTIC_SECRET_LENGTH || secret.length > text.length) continue;
 		variants.add(secret);
-		// SDK error bodies, nested diagnostic strings and session JSON can each
-		// add an escape layer. Bound work to eight layers and the input size;
-		// literal matching remains linear per live-value variant, without regex.
-		let escaped = secret;
-		for (let depth = 0; depth < 8; depth++) {
-			const next = JSON.stringify(escaped).slice(1, -1);
-			if (next === escaped || next.length > text.length) break;
-			variants.add(next);
-			escaped = next;
-		}
+		// Browser-safe UTF-8 encoding: standard and URL-safe, padded and unpadded.
+		const base64 = btoa(Array.from(new TextEncoder().encode(secret), (byte) => String.fromCharCode(byte)).join(""));
+		variants.add(base64);
+		variants.add(base64.replace(/=+$/, ""));
+		const base64url = base64.replace(/\+/g, "-").replace(/\//g, "_");
+		variants.add(base64url);
+		variants.add(base64url.replace(/=+$/, ""));
 		try {
 			variants.add(encodeURIComponent(secret));
 		} catch {
 			// Invalid Unicode must not turn masking into another diagnostic failure.
 		}
 	}
+	if (!variants.size) return text;
 	// Mask complete headers/tokens before a shorter overlapping secret changes them.
-	for (const value of [...variants].sort((a, b) => b.length - a.length)) text = text.split(value).join("***");
-	return text;
+	const values = [...variants].sort((a, b) => b.length - a.length);
+	for (const value of values) text = text.split(value).join("***");
+	const original = text;
+	let encodedMatch = false;
+	let work = 0;
+	// Provider strings have no nesting limit. Decode to a fixed point, masking at
+	// every layer so literal backslashes in a secret cannot be decoded past it.
+	// Never publish an incompletely examined field when either work bound is hit.
+	for (let pass = 0; text.includes("\\"); pass++) {
+		work += text.length;
+		if (pass === MAX_DIAGNOSTIC_UNESCAPE_PASSES || work > MAX_DIAGNOSTIC_UNESCAPE_WORK) return "***";
+		const decoded = unescapeDiagnostic(text);
+		if (decoded === text) break;
+		text = decoded;
+		for (const value of values) {
+			if (!text.includes(value)) continue;
+			encodedMatch = true;
+			text = text.split(value).join("***");
+		}
+	}
+	// Keep untouched diagnostics byte-for-byte. Encoded matches use the safe
+	// decoded form, preserving useful context without reconstructing unsafe layers.
+	return encodedMatch ? text : original;
 }
 
 /** Redact live values first, independently of labels or serialization syntax. */
