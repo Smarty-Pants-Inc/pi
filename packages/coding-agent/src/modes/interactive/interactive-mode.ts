@@ -95,7 +95,6 @@ import type {
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
-import type { McpHttpServerConfig } from "../../core/mcp-servers.ts";
 import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
 import {
 	defaultModelPerProvider,
@@ -106,7 +105,7 @@ import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
 import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
-import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
+import { RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
@@ -123,7 +122,6 @@ import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
-import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -499,7 +497,10 @@ export class InteractiveMode {
 	// Status line tracking (for mutating immediately-sequential status updates)
 	private lastStatusSpacer: Spacer | undefined = undefined;
 	private lastStatusText: ThemedText | undefined = undefined;
-	private lastStatusMessage = "";
+	private lastStatusDisplay: { message: string } | undefined;
+	// This mode owns image storage. Retain leaves after stop/rebind: editor history and persisted
+	// session text contain their paths, so deleting on UI teardown would invalidate accepted input.
+	private clipboardImageDirectory: string | undefined;
 	private managedToolStatusStarted = false;
 
 	// Streaming message tracking
@@ -3250,11 +3251,13 @@ export class InteractiveMode {
 
 			const image = await readClipboardImage();
 			if (image) {
-				const tmpDir = os.tmpdir();
+				// mkdtemp creates an exclusively owned 0700 directory, independent of ambient umask.
+				this.clipboardImageDirectory ??= fs.mkdtempSync(path.join(os.tmpdir(), "pi-clipboard-"));
+				const tmpDir = this.clipboardImageDirectory;
 				const ext = extensionForImageMimeType(image.mimeType) ?? "png";
 				const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
 				const filePath = path.join(tmpDir, fileName);
-				fs.writeFileSync(filePath, Buffer.from(image.bytes));
+				fs.writeFileSync(filePath, Buffer.from(image.bytes), { mode: 0o600, flag: "wx" });
 
 				this.editor.insertTextAtCursor?.(filePath);
 				this.ui.requestRender();
@@ -3914,15 +3917,16 @@ export class InteractiveMode {
 
 		message = linkifyUrls(message);
 		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
-			this.lastStatusMessage = message;
+			if (this.lastStatusDisplay) this.lastStatusDisplay.message = message;
 			this.lastStatusText.invalidate();
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		this.lastStatusMessage = message;
-		const text = new ThemedText(() => theme.fg("dim", this.lastStatusMessage), 1, 0);
+		const display = { message };
+		this.lastStatusDisplay = display;
+		const text = new ThemedText(() => theme.fg("dim", display.message), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
@@ -6517,7 +6521,7 @@ export class InteractiveMode {
 			await this.loginProvider(dialog, providerId, "oauth");
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
-			if (providerId === RADIUS_PROVIDER_ID) this.offerRadiusMcpServer(providerId, providerName);
+			// Do not offer MCP setup: its production admissions are unconditionally refused.
 		} catch (error: unknown) {
 			restoreEditor();
 			const errorMsg = error instanceof Error ? error.message : String(error);
@@ -6531,59 +6535,6 @@ export class InteractiveMode {
 				this.showError(`Failed to login to ${providerName}: ${errorMsg}`);
 			}
 		}
-	}
-
-	/**
-	 * Offer to point the Radius MCP server in the global mcp.json at the Radius login, adding the server
-	 * when missing. Nothing is asked when a global server already uses this login.
-	 */
-	private offerRadiusMcpServer(providerId: string, providerName: string): void {
-		const mcpPath = path.join(getAgentDir(), "mcp.json");
-		const normalizeUrl = (url: string) => url.replace(/\/+$/u, "");
-		const { servers } = loadMcpConfig({
-			agentDir: getAgentDir(),
-			cwd: this.sessionManager.getCwd(),
-			projectTrusted: false,
-		});
-		const existing = servers.find(
-			(server) => "url" in server.config && normalizeUrl(server.config.url) === normalizeUrl(RADIUS_MCP_URL),
-		);
-		if (existing && "url" in existing.config && existing.config.auth?.provider === providerId) return;
-
-		let name = existing?.name ?? "radius";
-		if (!existing && servers.some((server) => server.name === name)) name = "radius-mcp";
-		const config: McpHttpServerConfig =
-			existing && "url" in existing.config
-				? { ...existing.config, auth: { provider: providerId } }
-				: { url: RADIUS_MCP_URL, auth: { provider: providerId } };
-		// `auth` replaces the MCP OAuth sign-in.
-		delete config.oauth;
-
-		this.showSelector((done) => {
-			const selector = new ExtensionSelectorComponent(
-				`Configure ${providerName} MCP in ${mcpPath}?`,
-				["Yes", "No"],
-				(option) => {
-					done();
-					if (option !== "Yes") return;
-					try {
-						addMcpServerConfig(mcpPath, name, config);
-					} catch (error: unknown) {
-						this.showError(
-							`Could not update ${mcpPath}: ${error instanceof Error ? error.message : String(error)}`,
-						);
-						return;
-					}
-					// The MCP extension reads mcp.json when the session starts.
-					void this.handleReloadCommand();
-				},
-				() => {
-					done();
-					this.ui.requestRender();
-				},
-			);
-			return { component: selector, focus: selector };
-		});
 	}
 
 	// =========================================================================
