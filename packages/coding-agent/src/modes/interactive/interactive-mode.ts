@@ -3240,8 +3240,7 @@ export class InteractiveMode {
 			return;
 		}
 		try {
-			const filePaths = await readClipboardFilePaths();
-			if (filePaths) {
+			const formatPaths = (filePaths: string[]): string => {
 				if (filePaths.some((filePath) => /\p{Cc}/u.test(filePath))) {
 					throw new Error("Clipboard file path contains control characters");
 				}
@@ -3255,7 +3254,11 @@ export class InteractiveMode {
 				const characterAfterCursor = cursor ? currentLine[cursor.col] : "";
 				const leadingSpace = characterBeforeCursor && !/\s/.test(characterBeforeCursor) ? " " : "";
 				const trailingSpace = characterAfterCursor && !/\s/.test(characterAfterCursor) ? " " : "";
-				this.editor.insertTextAtCursor?.(`${leadingSpace}${paths}${trailingSpace}`);
+				return `${leadingSpace}${paths}${trailingSpace}`;
+			};
+			const filePaths = await readClipboardFilePaths();
+			if (filePaths) {
+				this.editor.insertTextAtCursor?.(formatPaths(filePaths));
 				this.ui.requestRender();
 				return;
 			}
@@ -3266,9 +3269,11 @@ export class InteractiveMode {
 				const ext = extensionForImageMimeType(image.mimeType) ?? "png";
 				const fileName = `pi-clipboard-${crypto.randomUUID()}.${ext}`;
 				const filePath = path.join(tmpDir, fileName);
+				// Admit the generated path before writing, just like a native copied-file path.
+				const pasteText = formatPaths([filePath]);
 				fs.writeFileSync(filePath, Buffer.from(image.bytes));
 
-				this.editor.insertTextAtCursor?.(filePath);
+				this.editor.insertTextAtCursor?.(pasteText);
 				this.ui.requestRender();
 				return;
 			}
