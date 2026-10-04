@@ -19,6 +19,33 @@ vi.mock("../src/utils/clipboard-image.ts", () => ({
 
 beforeEach(() => vi.resetAllMocks());
 
+// pi#137 / smarty-dev#3535, security finding 12.
+test.each(['!cat "prefix ', "!cat 'prefix ", "!cat escaped\\ ", "!cat partial", "!cat $(echo ", "!cat <<EOF\n"])(
+	"refuses native path insertion outside a known unquoted boundary: %s",
+	async (editorText) => {
+		mocks.readClipboardFilePaths.mockResolvedValue(["/tmp/$(touch hacked)'\".png"]);
+		const context = {
+			editor: {
+				getCursor: () => ({ line: 0, col: editorText.length }),
+				getText: () => editorText,
+				insertTextAtCursor: vi.fn(),
+			},
+			isBashMode: true,
+			showError: vi.fn(),
+			ui: { requestRender: vi.fn() },
+		};
+		const prototype = InteractiveMode.prototype as unknown as {
+			handleClipboardPaste(this: typeof context): Promise<void>;
+		};
+		await prototype.handleClipboardPaste.call(context);
+		expect(context.editor.insertTextAtCursor).not.toHaveBeenCalled();
+		expect(context.showError).toHaveBeenCalledWith(
+			"Failed to paste from clipboard: Paste file paths at an unquoted shell argument boundary",
+		);
+		expect(mocks.readClipboardImage).not.toHaveBeenCalled();
+	},
+);
+
 test("Finder file paths take precedence over their icon image", async () => {
 	// Regression test for #9999.
 	const filePaths = ["/tmp/screenshot.png", "/tmp/My Photos/photo.png"];
@@ -120,8 +147,8 @@ test("bash mode shell-quotes file paths and inserts them as arguments", async ()
 	]);
 	const context = {
 		editor: {
-			getCursor: () => ({ line: 0, col: 3 }),
-			getText: () => "catDEST",
+			getCursor: () => ({ line: 0, col: 4 }),
+			getText: () => "cat DEST",
 			insertTextAtCursor,
 		},
 		isBashMode: true,
@@ -135,7 +162,7 @@ test("bash mode shell-quotes file paths and inserts them as arguments", async ()
 	await prototype.handleClipboardPaste.call(context);
 
 	expect(insertTextAtCursor).toHaveBeenCalledExactlyOnceWith(
-		" '/tmp/My Photos/photo.png' '/tmp/$(touch hacked).png' /tmp/plain.png ",
+		"'/tmp/My Photos/photo.png' '/tmp/$(touch hacked).png' /tmp/plain.png ",
 	);
 	expect(mocks.readClipboardImage).not.toHaveBeenCalled();
 });
