@@ -138,7 +138,7 @@ describe("Meta OAuth", () => {
 				{ type: "oauth", refresh: "identity-token", access: "", expires: 1 },
 				new AbortController().signal,
 			),
-		).rejects.toThrow("Complete setup at https://dev.meta.ai/billing");
+		).rejects.toThrow("Meta did not issue an API key");
 	});
 
 	it("uses the minted key as the request api key", async () => {
