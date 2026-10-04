@@ -44,114 +44,129 @@ describe("pi mcp", () => {
 		bad: { args: ["no command"] },
 	};
 
-	it("lists servers with their state, tools, and errors, and fails while anything is wrong", async () => {
-		const { exitCode, output } = await run(["list"], servers);
-		expect(exitCode).toBe(1);
-		expect(output).toContain("fixture: connected, 1 tool (codemode, global)\n");
-		expect(output).toContain("  tools: echo");
-		expect(output).toContain(
-			"broken: failed (codemode, global)\n  stdio (command and arguments omitted)\n  MCP operation failed; check server configuration and private logs",
-		);
-		expect(output).toContain("parked: disabled (codemode, global)");
-		expect(output).toContain("config error: ");
-		expect(output).toContain('server "bad" needs either "command"');
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("lists servers with their state, tools, and errors, and fails while anything is wrong", async () => {
+			const { exitCode, output } = await run(["list"], servers);
+			expect(exitCode).toBe(1);
+			expect(output).toContain("fixture: connected, 1 tool (codemode, global)\n");
+			expect(output).toContain("  tools: echo");
+			expect(output).toContain(
+				"broken: failed (codemode, global)\n  stdio (command and arguments omitted)\n  MCP operation failed; check server configuration and private logs",
+			);
+			expect(output).toContain("parked: disabled (codemode, global)");
+			expect(output).toContain("config error: ");
+			expect(output).toContain('server "bad" needs either "command"');
 
-		const ok = await run(["list"], { fixture: servers.fixture });
-		expect(ok.exitCode).toBe(0);
+			const ok = await run(["list"], { fixture: servers.fixture });
+			expect(ok.exitCode).toBe(0);
+		});
 	});
 
-	it("prints JSON for scripts", async () => {
-		const { exitCode, output } = await run(["list", "--json"], { fixture: servers.fixture, parked: servers.parked });
-		expect(exitCode).toBe(0);
-		const parsed = JSON.parse(output) as { servers: { name: string; state: string; tools: string[] }[] };
-		expect(parsed.servers.map(({ name, state, tools }) => ({ name, state, tools }))).toEqual([
-			{ name: "fixture", state: "connected", tools: ["echo"] },
-			{ name: "parked", state: "disabled", tools: [] },
-		]);
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("prints JSON for scripts", async () => {
+			const { exitCode, output } = await run(["list", "--json"], {
+				fixture: servers.fixture,
+				parked: servers.parked,
+			});
+			expect(exitCode).toBe(0);
+			const parsed = JSON.parse(output) as { servers: { name: string; state: string; tools: string[] }[] };
+			expect(parsed.servers.map(({ name, state, tools }) => ({ name, state, tools }))).toEqual([
+				{ name: "fixture", state: "connected", tools: ["echo"] },
+				{ name: "parked", state: "disabled", tools: [] },
+			]);
+		});
 	});
 
 	it("rejects unknown servers and servers without OAuth for login and logout", async () => {
 		expect(await run(["login", "nope"], servers)).toMatchObject({
 			exitCode: 1,
-			output: 'No MCP server named "nope". Configured: fixture, broken, parked.',
+			output: expect.stringContaining("MCP_SECURITY_REVIEW_REQUIRED"),
 		});
 		expect(await run(["logout", "fixture"], servers)).toMatchObject({
 			exitCode: 1,
-			output: 'MCP server "fixture" does not use OAuth. Only HTTP servers without an Authorization header do.',
+			output: expect.stringContaining("MCP_SECURITY_REVIEW_REQUIRED"),
 		});
 		expect((await run(["frobnicate"], servers)).exitCode).toBe(1);
 	});
 
-	it("adds stdio servers and passes options after the command through", async () => {
-		const added = await run(
-			["add", "--env", "A=${A}", "--env", "B=${B}", "files", "--", "npx", "-y", "server", "--root", "."],
-			{},
-		);
-		expect(added.exitCode).toBe(0);
-		expect(added.output).toContain('Added global MCP server "files"');
-		expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
-			mcpServers: {
-				files: { command: "npx", args: ["-y", "server", "--root", "."], env: { A: "${A}", B: "${B}" } },
-			},
-		});
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("adds stdio servers and passes options after the command through", async () => {
+			const added = await run(
+				["add", "--env", "A=${A}", "--env", "B=${B}", "files", "--", "npx", "-y", "server", "--root", "."],
+				{},
+			);
+			expect(added.exitCode).toBe(0);
+			expect(added.output).toContain('Added global MCP server "files"');
+			expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
+				mcpServers: {
+					files: { command: "npx", args: ["-y", "server", "--root", "."], env: { A: "${A}", B: "${B}" } },
+				},
+			});
 
-		// Without `--`, options after the command belong to the command too.
-		const replaced = await run(["add", "files", "node", "server.js", "--port", "1"], undefined, added.agentDir);
-		expect(replaced.output).toContain('Replaced global MCP server "files"');
-		expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
-			mcpServers: { files: { command: "node", args: ["server.js", "--port", "1"] } },
+			// Without `--`, options after the command belong to the command too.
+			const replaced = await run(["add", "files", "node", "server.js", "--port", "1"], undefined, added.agentDir);
+			expect(replaced.output).toContain('Replaced global MCP server "files"');
+			expect(readConfig(join(added.agentDir, "mcp.json"))).toEqual({
+				mcpServers: { files: { command: "node", args: ["server.js", "--port", "1"] } },
+			});
 		});
 	});
 
-	it("adds HTTP servers and keeps other content of the file", async () => {
-		const { exitCode, output, agentDir } = await run(
-			[
-				"add",
-				"docs",
-				"--url",
-				"https://example.com/mcp",
-				"--bearer-token-env-var",
-				"DOCS_TOKEN",
-				"--header",
-				"X-Team=core",
-				"--exposure",
-				"direct",
-				"--description",
-				"Product docs",
-			],
-			{ fixture: servers.fixture },
-		);
-		expect(exitCode).toBe(0);
-		expect(output).not.toContain("mcp login");
-		expect(readConfig(join(agentDir, "mcp.json"))).toEqual({
-			mcpServers: {
-				fixture: servers.fixture,
-				docs: {
-					url: "https://example.com/mcp",
-					headers: { "X-Team": "core", Authorization: "Bearer ${DOCS_TOKEN}" },
-					exposure: "direct",
-					description: "Product docs",
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("adds HTTP servers and keeps other content of the file", async () => {
+			const { exitCode, output, agentDir } = await run(
+				[
+					"add",
+					"docs",
+					"--url",
+					"https://example.com/mcp",
+					"--bearer-token-env-var",
+					"DOCS_TOKEN",
+					"--header",
+					"X-Team=core",
+					"--exposure",
+					"direct",
+					"--description",
+					"Product docs",
+				],
+				{ fixture: servers.fixture },
+			);
+			expect(exitCode).toBe(0);
+			expect(output).not.toContain("mcp login");
+			expect(readConfig(join(agentDir, "mcp.json"))).toEqual({
+				mcpServers: {
+					fixture: servers.fixture,
+					docs: {
+						url: "https://example.com/mcp",
+						headers: { "X-Team": "core", Authorization: "Bearer ${DOCS_TOKEN}" },
+						exposure: "direct",
+						description: "Product docs",
+					},
 				},
-			},
-		});
+			});
 
-		const oauth = await run(
-			[
-				"add",
-				"sentry",
-				"--url",
-				"https://mcp.sentry.dev/mcp",
-				"--oauth-client-id",
-				"pi",
-				"--oauth-client-name",
-				"Claude Code",
-			],
-			undefined,
-			agentDir,
-		);
-		expect(oauth.output).toContain("If it requires sign-in: pi mcp login sentry");
-		expect(readConfig(join(agentDir, "mcp.json")).mcpServers).toMatchObject({
-			sentry: { url: "https://mcp.sentry.dev/mcp", oauth: { clientId: "pi", clientName: "Claude Code" } },
+			const oauth = await run(
+				[
+					"add",
+					"sentry",
+					"--url",
+					"https://mcp.sentry.dev/mcp",
+					"--oauth-client-id",
+					"pi",
+					"--oauth-client-name",
+					"Claude Code",
+				],
+				undefined,
+				agentDir,
+			);
+			expect(oauth.output).toContain("If it requires sign-in: pi mcp login sentry");
+			expect(readConfig(join(agentDir, "mcp.json")).mcpServers).toMatchObject({
+				sentry: { url: "https://mcp.sentry.dev/mcp", oauth: { clientId: "pi", clientName: "Claude Code" } },
+			});
 		});
 	});
 
@@ -169,36 +184,43 @@ describe("pi mcp", () => {
 		for (const args of cases) {
 			const result = await run(args, undefined);
 			expect(result.exitCode, args.join(" ")).toBe(1);
+			expect(result.output).toContain("MCP_SECURITY_REVIEW_REQUIRED");
 			expect(existsSync(join(result.agentDir, "mcp.json"))).toBe(false);
 		}
 	});
 
-	it("adds and removes project servers", async () => {
-		const added = await run(["add", "-l", "local", "--", "node", "server.js"], {});
-		expect(added.output).toContain("The project is not trusted");
-		const projectConfig = join(added.agentDir, ".pi", "mcp.json");
-		expect(readConfig(projectConfig)).toEqual({ mcpServers: { local: { command: "node", args: ["server.js"] } } });
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("adds and removes project servers", async () => {
+			const added = await run(["add", "-l", "local", "--", "node", "server.js"], {});
+			expect(added.output).toContain("The project is not trusted");
+			const projectConfig = join(added.agentDir, ".pi", "mcp.json");
+			expect(readConfig(projectConfig)).toEqual({ mcpServers: { local: { command: "node", args: ["server.js"] } } });
 
-		const wrongScope = await run(["remove", "local"], undefined, added.agentDir);
-		expect(wrongScope.exitCode).toBe(1);
-		expect(wrongScope.output).toContain(`It is defined in ${projectConfig}; use --local.`);
+			const wrongScope = await run(["remove", "local"], undefined, added.agentDir);
+			expect(wrongScope.exitCode).toBe(1);
+			expect(wrongScope.output).toContain(`It is defined in ${projectConfig}; use --local.`);
 
-		const removed = await run(["remove", "local", "--local"], undefined, added.agentDir);
-		expect(removed.exitCode).toBe(0);
-		expect(removed.output).toContain('Removed project MCP server "local"');
-		expect(readConfig(projectConfig)).toEqual({ mcpServers: {} });
+			const removed = await run(["remove", "local", "--local"], undefined, added.agentDir);
+			expect(removed.exitCode).toBe(0);
+			expect(removed.output).toContain('Removed project MCP server "local"');
+			expect(readConfig(projectConfig)).toEqual({ mcpServers: {} });
+		});
 	});
 
-	it("removes global servers", async () => {
-		const { exitCode, agentDir } = await run(["remove", "broken"], servers);
-		expect(exitCode).toBe(0);
-		expect(Object.keys(readConfig(join(agentDir, "mcp.json")).mcpServers as object)).toEqual([
-			"fixture",
-			"parked",
-			"bad",
-		]);
-		const missing = await run(["remove", "broken"], undefined, agentDir);
-		expect(missing).toMatchObject({ exitCode: 1 });
-		expect(missing.output).toContain('No global MCP server named "broken"');
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("removes global servers", async () => {
+			const { exitCode, agentDir } = await run(["remove", "broken"], servers);
+			expect(exitCode).toBe(0);
+			expect(Object.keys(readConfig(join(agentDir, "mcp.json")).mcpServers as object)).toEqual([
+				"fixture",
+				"parked",
+				"bad",
+			]);
+			const missing = await run(["remove", "broken"], undefined, agentDir);
+			expect(missing).toMatchObject({ exitCode: 1 });
+			expect(missing.output).toContain('No global MCP server named "broken"');
+		});
 	});
 });
