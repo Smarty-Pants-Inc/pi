@@ -13,7 +13,7 @@ import {
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
-import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import type { BashSpawnEvent, ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
@@ -93,8 +93,14 @@ export interface BashOperations {
 	) => Promise<{ exitCode: number | null }>;
 }
 
+type LocalShellSpawn = Omit<BashSpawnEvent, "type" | "toolCallId" | "backend">;
+
 /** Shared process execution used by the built-in shell tools. */
-export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
+export function createLocalShellOperations(
+	shellName: string,
+	resolveShellConfig: () => ShellConfig,
+	beforeSpawn?: (spawn: LocalShellSpawn) => Promise<void>,
+): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			const timeoutMs = resolveTimeoutMs(timeout);
@@ -109,10 +115,17 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
 			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
-			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+			const shellPath = shellConfig.shell;
+			const shellArgs = commandFromStdin ? [...shellConfig.args] : [...shellConfig.args, command];
+			const effectiveEnv = { ...(env ?? getShellEnv()) };
+			if (beforeSpawn) {
+				await beforeSpawn({ command, shellPath, shellArgs: [...shellArgs], cwd, env: { ...effectiveEnv } });
+			}
+			if (signal?.aborted) throw new Error("aborted");
+			const child = spawn(shellPath, shellArgs, {
 				cwd,
 				detached: process.platform !== "win32",
-				env: env ?? getShellEnv(),
+				env: effectiveEnv,
 				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
 				windowsHide: true,
 			});
@@ -245,7 +258,9 @@ export function createShellToolDefinition(
 	config: ShellToolConfig,
 	options?: BashToolOptions,
 ): ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> {
-	const ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });
+	const customOperations = options?.operations;
+	const shellPath = options?.shellPath;
+	const ops = customOperations ?? createLocalBashOperations({ shellPath });
 	const commandPrefix = options?.commandPrefix;
 	const exposeSessionEnvironment = options?.exposeSessionEnvironment ?? true;
 	const spawnHook = options?.spawnHook;
@@ -259,7 +274,7 @@ export function createShellToolDefinition(
 		outputSchema: bashOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
-			_toolCallId,
+			toolCallId,
 			{ command, timeout }: { command: string; timeout?: number },
 			signal?: AbortSignal,
 			onUpdate?,
@@ -273,6 +288,27 @@ export function createShellToolDefinition(
 				exposeSessionEnvironment,
 				ctx,
 			);
+			// Snapshot hook output before any asynchronous handler can change a retained reference.
+			const execution: BashSpawnContext = {
+				command: spawnContext.command,
+				cwd: spawnContext.cwd,
+				env: { ...spawnContext.env },
+			};
+			const emitBashSpawn = config.name === "bash" ? ctx?.emitBashSpawn : undefined;
+			const beforeSpawn = emitBashSpawn
+				? async (spawn: LocalShellSpawn) => {
+						const result = await emitBashSpawn(
+							{ type: "bash_spawn", toolCallId, backend: "local-builtin", ...spawn },
+							signal,
+						);
+						if (result?.block) throw new Error(result.reason ?? "Bash spawn blocked");
+					}
+				: undefined;
+			const executionOps =
+				beforeSpawn && !customOperations
+					? createLocalShellOperations("bash", () => getShellConfig(shellPath), beforeSpawn)
+					: ops;
+
 			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
@@ -361,11 +397,19 @@ export function createShellToolDefinition(
 			try {
 				let exitCode: number | null;
 				try {
-					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
+					if (customOperations && emitBashSpawn) {
+						const result = await emitBashSpawn(
+							{ type: "bash_spawn", toolCallId, backend: "custom", ...execution, env: { ...execution.env } },
+							signal,
+						);
+						if (result?.block) throw new Error(result.reason ?? "Bash spawn blocked");
+					}
+					if (signal?.aborted) throw new Error("aborted");
+					const result = await executionOps.exec(execution.command, execution.cwd, {
 						onData: handleData,
 						signal,
 						timeout,
-						env: spawnContext.env,
+						env: execution.env,
 					});
 					exitCode = result.exitCode;
 				} catch (err) {

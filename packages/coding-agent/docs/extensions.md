@@ -128,6 +128,12 @@ Use `ctx.signal` for nested work owned by an active turn; commands and idle sess
 
 A `user_bash` handler that returns `undefined` passes the command to the next handler and then to local execution if no handler handles it. Returning `operations` or `result` stops propagation. A handler failure blocks the command rather than falling through to local execution.
 
+### `bash_spawn`
+
+`bash_spawn` fires immediately before the built-in bash executor runs, after the command prefix, spawn hook, working directory, environment, and local shell resolution have been applied. The event includes `toolCallId`, final `command`, `cwd`, an environment snapshot, `shellPath`/`shellArgs` for the stock local backend, and `backend` (`"local-builtin"` or `"custom"`). Each handler receives a detached snapshot, so mutations cannot rewrite execution or another handler’s view. Handlers run in registration order; the first veto or thrown error fails the tool call without spawning (or calling custom `exec`). Return `{ block: true, reason }` to veto.
+
+Check `pi.hostCapabilities.bashSpawnEvent` on the running host before granting execution. For `custom`, shell details are absent and Pi makes no claim about what that backend does. This event covers the built-in bash tool, not interactive `user_bash`, arbitrary replacement tools, or `pi.exec()`. Environment snapshots may contain secrets; do not log them indiscriminately.
+
 <a id="custom-tools"></a>
 <a id="register-tools"></a>
 
