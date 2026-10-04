@@ -4879,7 +4879,14 @@ export class InteractiveMode {
 	 * Clear all queued messages and return their contents.
 	 * Clears session and compaction queues and cancels streaming inputs still capturing metadata.
 	 */
-	private clearAllQueues(): { steering: string[]; followUp: string[] } {
+	private clearAllQueues(): { steering: string[]; followUp: string[]; clearFailure?: { error: unknown } } {
+		// Native clearQueue() mutates its queues before synchronously notifying observers.
+		// Keep its ownership snapshot locally: an observer can throw before clearQueue()
+		// returns, and restoration must still receive the accepted text exactly once.
+		const nativeQueuedBeforeClear = {
+			steering: [...this.session.getSteeringMessages()],
+			followUp: [...this.session.getFollowUpMessages()],
+		};
 		const capturing = [...this.capturingStreamingInputs];
 		for (const input of capturing) {
 			input.cancelled = true;
@@ -4891,7 +4898,18 @@ export class InteractiveMode {
 			idleInputs.unshift(this.inFlightInput);
 		for (const input of idleInputs) input.cancellation?.abort();
 		for (const message of this.compactionQueuedMessages) message.cancellation?.abort();
-		const { steering, followUp } = this.session.clearQueue();
+		let steering: string[];
+		let followUp: string[];
+		let clearFailure: { error: unknown } | undefined;
+		try {
+			({ steering, followUp } = this.session.clearQueue());
+		} catch (error) {
+			// Queue ownership was already withdrawn. Keep the pre-clear snapshot and
+			// defer failure reporting until the caller has restored editor ownership.
+			steering = nativeQueuedBeforeClear.steering;
+			followUp = nativeQueuedBeforeClear.followUp;
+			clearFailure = { error };
+		}
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
 			.map((msg) => msg.text);
@@ -4901,6 +4919,7 @@ export class InteractiveMode {
 		this.compactionQueuedMessages = [];
 		this.stagingAudit?.("queues-cleared");
 		return {
+			clearFailure,
 			steering: [
 				...idleInputs.map((input) => input.text),
 				...steering,
@@ -4935,22 +4954,23 @@ export class InteractiveMode {
 	}
 
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
-		const { steering, followUp } = this.clearAllQueues();
+		const { steering, followUp, clearFailure } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
-		if (allQueued.length === 0) {
-			this.updatePendingMessagesDisplay();
-			if (options?.abort) {
-				void this.session.abort();
-			}
-			return 0;
+		if (allQueued.length > 0) {
+			const queuedText = allQueued.join("\n\n");
+			const currentText = options?.currentText ?? this.editor.getText();
+			const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
+			this.editor.setText(combinedText);
 		}
-		const queuedText = allQueued.join("\n\n");
-		const currentText = options?.currentText ?? this.editor.getText();
-		const combinedText = [queuedText, currentText].filter((t) => t.trim()).join("\n\n");
-		this.editor.setText(combinedText);
 		this.updatePendingMessagesDisplay();
 		if (options?.abort) {
 			void this.session.abort();
+		}
+		if (clearFailure) {
+			const error = clearFailure.error;
+			this.showError(
+				`Failed to notify queued message clear: ${error instanceof Error ? error.message : String(error)}`,
+			);
 		}
 		return allQueued.length;
 	}

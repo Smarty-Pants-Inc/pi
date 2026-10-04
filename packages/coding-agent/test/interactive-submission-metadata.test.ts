@@ -17,8 +17,13 @@ import { stripAnsi } from "../src/utils/ansi.ts";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "./suite/harness.ts";
 
 type QueuedInput = { text: string; mode: "steer" | "followUp"; submissionPromise?: Promise<InputSubmission> };
-type PendingInput = { text: string; submissionPromise?: Promise<InputSubmission> };
-type CapturingStreamingInput = { text: string; mode: "steer" | "followUp"; cancelled: boolean };
+type PendingInput = { text: string; submissionPromise?: Promise<InputSubmission>; cancellation?: AbortController };
+type CapturingStreamingInput = {
+	text: string;
+	mode: "steer" | "followUp";
+	cancelled: boolean;
+	cancellation: AbortController;
+};
 type SubmissionUI = {
 	session: Harness["session"];
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> };
@@ -29,6 +34,8 @@ type SubmissionUI = {
 		onSubmit?: (text: string) => Promise<void>;
 	};
 	pendingUserInputs: PendingInput[];
+	inFlightInput?: PendingInput;
+	currentInputSubmission?: Promise<InputSubmission>;
 	compactionQueuedMessages: QueuedInput[];
 	compactionQueueTransfers: number;
 	inputSubmissionTransfers: number;
@@ -849,6 +856,386 @@ describe("interactive submission metadata", () => {
 		const submitted = harness.session[route]("same");
 		expect.soft(context.editor.getText()).toBe("same\n\nsame");
 		await expect(submitted).rejects.toThrow();
+		expect(harness.session.pendingMessageCount).toBe(0);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+	});
+
+	// F7 regression for Smarty-Pants-Inc/smarty-dev#4078: withdrawal survives a native clear observer throw.
+	it.each(
+		(["startup", "inFlight", "steer", "followUp"] as const).flatMap((captureStage) =>
+			(["dequeue", "abort"] as const).flatMap((cancel) =>
+				(["resolve", "reject"] as const).flatMap((settlement) =>
+					["Bob draft", "Alice input"].map((draft) => ({ captureStage, cancel, settlement, draft })),
+				),
+			),
+		),
+	)(
+		"restores $captureStage capture through throwing queue clear ($cancel, late $settlement, draft=$draft)",
+		async ({ captureStage, cancel, settlement, draft }) => {
+			const captureStarted = gate();
+			const captureRelease = gate();
+			let boundAbort!: () => void;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", async (event, ctx) => {
+							if (event.source !== "interactive") return;
+							boundAbort = () => ctx.abort();
+							captureStarted.release();
+							await captureRelease.promise;
+							return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			const capture = harness.session.captureInputSubmission.bind(harness.session);
+			const captureSpy = vi
+				.spyOn(harness.session, "captureInputSubmission")
+				.mockImplementation(async (text, options) => {
+					const submission = await capture(text, options);
+					if (options?.source !== "rpc" && settlement === "reject") throw new Error("late capture failure");
+					return submission;
+				});
+			const responseStarted = gate();
+			const responseRelease = gate();
+			const streaming = captureStage === "steer" || captureStage === "followUp";
+			if (streaming) {
+				harness.setResponses([
+					async () => {
+						responseStarted.release();
+						await responseRelease.promise;
+						return fauxAssistantMessage("initial response");
+					},
+				]);
+			}
+			const context = createSubmissionUI(harness);
+			await harness.session.bindExtensions({
+				mode: "tui",
+				uiContext: prototype.createExtensionUIContext.call(context),
+				abortHandler: () => {
+					context.restoreQueuedMessagesToEditor({ abort: true });
+				},
+			});
+			let running: Promise<unknown> | undefined;
+			let submitted: Promise<void> | undefined;
+			try {
+				if (streaming) {
+					running = harness.session.prompt("initial RPC", { source: "rpc" });
+					await responseStarted.promise;
+					context.editor.setText("Alice input");
+					submitted =
+						captureStage === "followUp"
+							? prototype.handleFollowUp.call(context)
+							: context.defaultEditor.onSubmit!("Alice input");
+				} else if (captureStage === "inFlight") {
+					const waiting = prototype.getUserInput.call(context);
+					const submitted = context.defaultEditor.onSubmit!("Alice input");
+					await expect(waiting).resolves.toBe("Alice input");
+					await submitted;
+				} else {
+					await context.defaultEditor.onSubmit!("Alice input");
+				}
+				await captureStarted.promise;
+				const owner = streaming
+					? [...context.capturingStreamingInputs][0]
+					: (context.inFlightInput ?? context.pendingUserInputs[0]);
+				context.editor.setText(draft);
+				let throwing = true;
+				harness.session.subscribe((event) => {
+					if (event.type === "queue_update" && throwing) {
+						throwing = false;
+						throw new Error("queue observer failed");
+					}
+				});
+				const withdraw = () => {
+					if (cancel === "dequeue") prototype.handleDequeue.call(context);
+					else boundAbort();
+				};
+				expect(withdraw).not.toThrow();
+				const restored = `Alice input\n\n${draft}`;
+				expect(context.editor.getText()).toBe(restored);
+				expect(owner.cancellation?.signal.aborted).toBe(true);
+				expect(context.showError).toHaveBeenCalledTimes(1);
+				withdraw();
+				expect(context.editor.getText()).toBe(restored);
+				expect(context.showError).toHaveBeenCalledWith(expect.stringContaining("queue observer failed"));
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(prototype.getAllQueuedMessages.call(context)).toEqual({ steering: [], followUp: [] });
+				// A later editor replacement must not be overwritten by late capture settlement either.
+				context.editor.setText("Carol draft");
+				captureRelease.release();
+				await Promise.allSettled(captureSpy.mock.results.map((result) => result.value));
+				await submitted;
+				expect(context.editor.getText()).toBe("Carol draft");
+				expect(context.inputSubmissionTransfers).toBe(0);
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+				expect(context.showError).toHaveBeenCalledTimes(1);
+			} finally {
+				captureRelease.release();
+				await submitted;
+				responseRelease.release();
+				if (running) await running;
+			}
+			expect(getUserTexts(harness)).toEqual(streaming ? ["initial RPC"] : []);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(streaming ? 1 : 0);
+		},
+	);
+
+	// F7 receiver regression for Smarty-Pants-Inc/smarty-dev#4078: execute the real startup/idle run loop.
+	it.each(
+		(["startup", "idle"] as const).flatMap((stage) =>
+			(["dequeue", "abort"] as const).flatMap((cancel) =>
+				[false, true].map((reject) => ({ stage, cancel, reject })),
+			),
+		),
+	)(
+		"withdraws real $stage receiver despite throwing clear ($cancel, reject=$reject)",
+		async ({ stage, cancel, reject }) => {
+			initTheme("dark");
+			const captureStarted = gate();
+			const captureRelease = gate();
+			let boundAbort!: () => void;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", async (_event, ctx) => {
+							boundAbort = () => ctx.abort();
+							captureStarted.release();
+							await captureRelease.promise;
+							return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			if (reject) {
+				const capture = harness.session.captureInputSubmission.bind(harness.session);
+				vi.spyOn(harness.session, "captureInputSubmission").mockImplementation(async (text, options) => {
+					await capture(text, options);
+					throw new Error("late capture failure");
+				});
+			}
+			const services: AgentSessionServices = {
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			};
+			const runtime = new AgentSessionRuntime(harness.session, services, async () => {
+				throw new Error("F7 receiver test must not replace the session");
+			});
+			const mode = new InteractiveMode(runtime);
+			const internal = mode as unknown as SubmissionUI & {
+				bindCurrentSessionExtensions(): Promise<void>;
+				setupEditorSubmitHandler(): void;
+				stagingAudit?: (kind: string) => void;
+				userInputInFlight: boolean;
+			};
+			await internal.bindCurrentSessionExtensions();
+			internal.setupEditorSubmitHandler();
+			vi.spyOn(mode, "init").mockResolvedValue();
+			internal.stagingAudit = () => {};
+			const inputWaiting = gate();
+			const exit = new Error("F7 test loop complete");
+			const getInput = mode.getUserInput.bind(mode);
+			vi.spyOn(mode, "getUserInput")
+				.mockImplementationOnce(() => {
+					const waiting = getInput();
+					inputWaiting.release();
+					return waiting;
+				})
+				.mockRejectedValue(exit);
+			const showError = vi.spyOn(mode, "showError");
+			if (stage === "startup") await internal.defaultEditor.onSubmit!("same");
+			const run = mode.run().catch((error: unknown) => {
+				expect(error).toBe(exit);
+			});
+			try {
+				await inputWaiting.promise;
+				if (stage === "idle") await internal.defaultEditor.onSubmit!("same");
+				await captureStarted.promise;
+				const accepted = internal.inFlightInput;
+				expect(accepted?.cancellation?.signal.aborted).toBe(false);
+				internal.editor.setText("same");
+				let throws = true;
+				harness.session.subscribe((event) => {
+					if (event.type === "queue_update" && throws) {
+						throws = false;
+						throw new Error("receiver queue observer failed");
+					}
+				});
+				const withdraw = () => {
+					if (cancel === "abort") boundAbort();
+					else prototype.handleDequeue.call(internal);
+				};
+				expect.soft(withdraw).not.toThrow();
+				expect.soft(internal.editor.getText()).toBe("same\n\nsame");
+				expect(accepted?.cancellation?.signal.aborted).toBe(true);
+				withdraw();
+				expect.soft(internal.editor.getText()).toBe("same\n\nsame");
+				internal.editor.setText("new draft after withdrawal");
+				captureRelease.release();
+				await run;
+				expect(internal.editor.getText()).toBe("new draft after withdrawal");
+				expect
+					.soft(showError)
+					.toHaveBeenCalledExactlyOnceWith(
+						"Failed to notify queued message clear: receiver queue observer failed",
+					);
+				expect(internal.userInputInFlight).toBe(false);
+				expect(internal.inFlightInput).toBeUndefined();
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+				expect(getUserTexts(harness)).toEqual([]);
+				expect(harness.sessionManager.getEntries()).toEqual([]);
+				expect(harness.faux.state.callCount).toBe(0);
+			} finally {
+				captureRelease.release();
+				await run;
+				mode.stop();
+				await runtime.dispose();
+			}
+		},
+	);
+
+	// F7 native control for Smarty-Pants-Inc/smarty-dev#4078: fallback and normal return own the same queue batch.
+	it.each([false, true].flatMap((throws) => ["dequeue", "abort"].map((cancel) => ({ throws, cancel }))))(
+		"restores native equal steer/followUp once (throw=$throws, $cancel)",
+		async ({ throws, cancel }) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const context = createSubmissionUI(harness);
+			await harness.session.bindExtensions({
+				mode: "tui",
+				uiContext: prototype.createExtensionUIContext.call(context),
+				abortHandler: () => {
+					context.restoreQueuedMessagesToEditor({ abort: true });
+				},
+			});
+			await harness.session.steer("same");
+			await harness.session.followUp("same");
+			expect(harness.session.pendingMessageCount).toBe(2);
+			context.editor.setText("same");
+			let shouldThrow = throws;
+			harness.session.subscribe((event) => {
+				if (event.type === "queue_update" && shouldThrow) {
+					shouldThrow = false;
+					throw new Error("native queue observer failed");
+				}
+			});
+			const withdraw = () => {
+				if (cancel === "abort") harness.session.extensionRunner.createCommandContext().abort();
+				else prototype.handleDequeue.call(context);
+			};
+			expect.soft(withdraw).not.toThrow();
+			expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame");
+			withdraw();
+			expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame");
+			expect(context.showError).toHaveBeenCalledTimes(throws ? 1 : 0);
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(getUserTexts(harness)).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(0);
+		},
+	);
+
+	// F7 mixed ownership regression for Smarty-Pants-Inc/smarty-dev#4078: equal text is not a shared owner.
+	it.each(["steer", "followUp"] as const)(
+		"restores mixed native and held %s owners without duplication",
+		async (route) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			const captureStarted = gate();
+			const captureRelease = gate();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", async (event) => {
+							if (event.source !== "interactive") return;
+							captureStarted.release();
+							await captureRelease.promise;
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("RPC response");
+				},
+			]);
+			const running = harness.session.prompt("initial RPC", { source: "rpc" });
+			await responseStarted.promise;
+			const context = createSubmissionUI(harness);
+			await harness.session.steer("same", undefined, { source: "rpc" });
+			await harness.session.followUp("same", undefined, { source: "rpc" });
+			context.editor.setText("same");
+			const submitted =
+				route === "steer" ? context.defaultEditor.onSubmit!("same") : prototype.handleFollowUp.call(context);
+			await captureStarted.promise;
+			try {
+				context.editor.setText("same");
+				let throws = true;
+				harness.session.subscribe((event) => {
+					if (event.type === "queue_update" && throws) {
+						throws = false;
+						throw new Error("mixed queue observer failed");
+					}
+				});
+				expect.soft(() => prototype.handleDequeue.call(context)).not.toThrow();
+				expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame\n\nsame");
+				prototype.handleDequeue.call(context);
+				expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame\n\nsame");
+				captureRelease.release();
+				await submitted;
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+				expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame\n\nsame");
+			} finally {
+				captureRelease.release();
+				await submitted;
+				responseRelease.release();
+				await running;
+			}
+			expect(getUserTexts(harness)).toEqual(["initial RPC"]);
+			expect(harness.faux.state.callCount).toBe(1);
+		},
+	);
+
+	// F7 reporting-order regression for Smarty-Pants-Inc/smarty-dev#4078: reporting is not the text owner.
+	it("restores withdrawn ownership before a failing observer-error reporter runs", async () => {
+		const harness = await createHarness();
+		harnesses.push(harness);
+		const context = createSubmissionUI(harness);
+		await context.defaultEditor.onSubmit!("Alice input");
+		const accepted = context.pendingUserInputs[0];
+		context.editor.setText("Bob draft");
+		let throws = true;
+		harness.session.subscribe((event) => {
+			if (event.type === "queue_update" && throws) {
+				throws = false;
+				throw new Error("queue observer failed");
+			}
+		});
+		vi.mocked(context.showError).mockImplementationOnce((message) => {
+			expect(message).toBe("Failed to notify queued message clear: queue observer failed");
+			expect(context.editor.getText()).toBe("Alice input\n\nBob draft");
+			throw new Error("error reporter failed");
+		});
+		expect(() => prototype.handleDequeue.call(context)).toThrow("error reporter failed");
+		expect(accepted.cancellation?.signal.aborted).toBe(true);
+		prototype.handleDequeue.call(context);
+		expect(context.editor.getText()).toBe("Alice input\n\nBob draft");
+		expect(context.pendingUserInputs).toEqual([]);
 		expect(harness.session.pendingMessageCount).toBe(0);
 		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
 	});
