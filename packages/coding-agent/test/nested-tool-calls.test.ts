@@ -161,6 +161,138 @@ describe("NestedToolCallRunner", () => {
 		expect(runner.takeRecord("free")).toMatchObject({ calls: { complete: true }, usage: undefined });
 	});
 
+	// pi#137 A6: sequential nested work excludes ordinary work in both admission orders.
+	it.each(["parallel", "sequential"] as const)("does not overlap mixed calls when %s starts first", async (first) => {
+		const order: string[] = [];
+		let releaseFirst = () => {};
+		let markStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const gate = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		const tools: AgentTool[] = ["parallel", "sequential"].map((name) => ({
+			name,
+			label: name,
+			description: name,
+			parameters: Type.Object({}),
+			executionMode: name === "sequential" ? "sequential" : undefined,
+			async execute() {
+				order.push(`start:${name}`);
+				if (name === first) {
+					markStarted();
+					await gate;
+				}
+				order.push(`end:${name}`);
+				return { content: [], details: {} };
+			},
+		}));
+		const { runner } = createRunner(tools);
+		const a = runner.execute("a", first, {});
+		await started;
+		const second = first === "parallel" ? "sequential" : "parallel";
+		const b = runner.execute("b", second, {});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		const beforeRelease = [...order];
+		releaseFirst();
+		await Promise.all([a, b]);
+		expect(beforeRelease).toEqual([`start:${first}`]);
+		expect(order).toEqual([`start:${first}`, `end:${first}`, `start:${second}`, `end:${second}`]);
+	});
+
+	it.each([false, true])(
+		"serializes sibling descendants without blocking their ancestors (session sequential=%s)",
+		async (sequential) => {
+			let active = 0;
+			let maxActive = 0;
+			const tools: AgentTool[] = [
+				{
+					name: "leaf",
+					label: "Leaf",
+					description: "Leaf",
+					parameters: Type.Object({}),
+					executionMode: "sequential",
+					async execute() {
+						maxActive = Math.max(maxActive, ++active);
+						await new Promise<void>((resolve) => setImmediate(resolve));
+						active--;
+						return { content: [], details: {} };
+					},
+				},
+			];
+			const { runner } = createRunner(tools, { sequential });
+			tools.push(
+				{
+					name: "middle",
+					label: "Middle",
+					description: "Middle",
+					parameters: Type.Object({}),
+					executionMode: "sequential",
+					async execute(id) {
+						await Promise.all([runner.execute(id, "leaf", {}), runner.execute(id, "leaf", {})]);
+						return { content: [], details: {} };
+					},
+				},
+				{
+					name: "parent",
+					label: "Parent",
+					description: "Parent",
+					parameters: Type.Object({}),
+					executionMode: "sequential",
+					async execute(id) {
+						await Promise.all([runner.execute(id, "middle", {}), runner.execute(id, "middle", {})]);
+						return { content: [], details: {} };
+					},
+				},
+			);
+			await runner.execute("call", "parent", {});
+			expect(maxActive).toBe(1);
+			expect(runner.takeRecord("call")?.calls?.calls).toHaveLength(7);
+		},
+		2000,
+	);
+
+	it("lets concurrent ordinary ancestors await exclusive descendants without deadlocking or overlapping", async () => {
+		let active = 0;
+		let maxActive = 0;
+		let arrivals = 0;
+		let releaseParents = () => {};
+		const bothParents = new Promise<void>((resolve) => {
+			releaseParents = resolve;
+		});
+		const tools: AgentTool[] = [
+			{
+				name: "leaf",
+				label: "Leaf",
+				description: "Leaf",
+				parameters: Type.Object({}),
+				executionMode: "sequential",
+				async execute() {
+					maxActive = Math.max(maxActive, ++active);
+					await new Promise<void>((resolve) => setImmediate(resolve));
+					active--;
+					return { content: [], details: {} };
+				},
+			},
+		];
+		const { runner } = createRunner(tools);
+		tools.push({
+			name: "parent",
+			label: "Parent",
+			description: "Parent",
+			parameters: Type.Object({}),
+			async execute(id) {
+				if (++arrivals === 2) releaseParents();
+				await bothParents;
+				await runner.execute(id, "leaf", {});
+				return { content: [], details: {} };
+			},
+		});
+		await Promise.all([runner.execute("a", "parent", {}), runner.execute("b", "parent", {})]);
+		expect(maxActive).toBe(1);
+	}, 2000);
+
 	it("serializes concurrent calls to sequential tools", async () => {
 		let active = 0;
 		let maxActive = { sequential: 0, parallel: 0 };
