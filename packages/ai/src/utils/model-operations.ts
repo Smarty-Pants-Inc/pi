@@ -25,7 +25,7 @@ export function isModelType<TType extends ModelType>(model: AnyModel, type: TTyp
 
 export function assertChatModel(model: AnyModel): asserts model is Model<Api> {
 	if (!isModelType(model, "chat")) {
-		throw new SafeSetupError("provider", `Model ${model.provider}/${model.id} is not a chat model`);
+		throw new SafeSetupError("not_chat");
 	}
 }
 

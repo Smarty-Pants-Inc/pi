@@ -69,7 +69,7 @@ describe("OAuth diagnostic redaction", () => {
 		"redacts active values in raw and JSON-escaped native errors",
 		(secret) => {
 			for (const text of [secret, JSON.stringify(secret)]) {
-				expect(redactOAuthDiagnostic(`TypeError: ${text}`, [secret])).toContain("[REDACTED]");
+				expect(redactOAuthDiagnostic(`TypeError: ${text}`, [secret])).toContain("***");
 			}
 		},
 	);
@@ -84,6 +84,6 @@ describe("OAuth diagnostic redaction", () => {
 		expect(result).not.toBe(value);
 		expect(
 			createAssistantMessageDiagnostic("provider_error", error, { refresh_token: secret }, [secret]).details,
-		).toEqual({ refresh_token: "[REDACTED]" });
+		).toEqual({ refresh_token: "***" });
 	});
 });

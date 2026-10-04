@@ -190,10 +190,7 @@ export function createVirtualModel(definition: Omit<VirtualModelDefinition, "rou
 /** Stream for a virtual model that was not routed, e.g. `stream()` with API-specific options. */
 function unroutedStream(model: Model<Api>): AssistantMessageEventStream {
 	return lazyStream(model, async () => {
-		throw new SafeSetupError(
-			"provider",
-			`Virtual model ${model.provider}/${model.id} must be routed before streaming`,
-		);
+		throw new SafeSetupError("virtual_unrouted");
 	});
 }
 

@@ -154,7 +154,11 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			timestamp: Date.now(),
 		};
 
-		const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey);
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(
+			options?.apiKey,
+			{ ...model.headers, ...options?.headers },
+			options?.diagnosticSecrets,
+		);
 		try {
 			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
@@ -169,6 +173,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				model,
 				normalizedContext,
 				apiKey,
+				diagnosticSecrets,
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
@@ -264,6 +269,7 @@ function createClient(
 	model: Model<"openai-responses">,
 	context: TranscriptContext,
 	apiKey: string,
+	diagnosticSecrets: readonly string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
@@ -295,7 +301,6 @@ function createClient(
 		Object.assign(headers, optionsHeaders);
 	}
 
-	const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey);
 	const redactArgs = (message: string, args: unknown[]) =>
 		[message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, diagnosticSecrets));
 	// OAuth credentials can also be used with a caller-configured endpoint; never gate log safety on the URL.

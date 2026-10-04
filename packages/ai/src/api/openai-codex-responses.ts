@@ -6,7 +6,7 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
-import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import { getOAuthDiagnosticSecrets, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -267,7 +267,11 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			timestamp: Date.now(),
 		};
 
-		const diagnosticSecrets = options?.apiKey ? [options.apiKey] : [];
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(
+			options?.apiKey,
+			{ ...model.headers, ...options?.headers },
+			options?.diagnosticSecrets,
+		);
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {

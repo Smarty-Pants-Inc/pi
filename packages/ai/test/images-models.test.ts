@@ -265,7 +265,8 @@ describe("Models with image models", () => {
 
 		const ghost = await models.generateImages(imageModel("ghost", "m"), context);
 		expect(ghost.stopReason).toBe("error");
-		expect(ghost.errorMessage).toContain("Unknown provider: ghost");
+		// pi#127: setup diagnostics come from fixed codes, not caller-owned identifiers.
+		expect(ghost.errorMessage).toBe("Unknown provider");
 
 		// Unconfigured auth is an error, matching stream().
 		const calls: GenerateCall[] = [];
