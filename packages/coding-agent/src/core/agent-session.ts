@@ -1320,13 +1320,12 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
+				const directEntryId = this._userMessageEntryIds.get(event.message);
 				entryId = this.#ordinaryOwner
-					? await appendOwnedTerminalMessage(
-							this.sessionManager,
-							event.message,
-							this._userMessageEntryIds.get(event.message),
-						)
-					: this.sessionManager.appendMessage(event.message, this._userMessageEntryIds.get(event.message));
+					? directEntryId
+						? await appendOwnedTerminalMessage(this.sessionManager, event.message, directEntryId)
+						: await appendOwnedTerminalMessage(this.sessionManager, event.message)
+					: this.sessionManager.appendMessage(event.message, directEntryId);
 				this._userMessageEntryIds.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
