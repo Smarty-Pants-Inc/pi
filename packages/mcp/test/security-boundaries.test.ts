@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { exchangeAuthorizationCode, refreshAuthorization, startAuthorization } from "../src/oauth/flow.ts";
-import { parseAuthorizationServerMetadata } from "../src/oauth/types.ts";
+import { parseAuthorizationServerMetadata, parseProtectedResourceMetadata } from "../src/oauth/types.ts";
 import { StreamableHttpTransport } from "../src/transports/streamable-http.ts";
 import { closeServers, listen, readBody } from "./helpers.ts";
 
@@ -68,6 +68,10 @@ it.each([307, 308])("rejects %s MCP POST, GET and DELETE redirects with custom c
 	expect(methods).toEqual(expect.arrayContaining(["POST", "GET", "DELETE"]));
 	expect(errors.length).toBeGreaterThan(0);
 	expect(stolen).toEqual([]);
+});
+
+it("keeps non-browser resource identifiers while restricting authorization targets", () => {
+	expect(parseProtectedResourceMetadata({ resource: "urn:example:resource" }).resource).toBe("urn:example:resource");
 });
 
 it.each(["file:///tmp/local", "myapp://localhost/login", "ftp://localhost/login", "http://remote.example/login"])(
