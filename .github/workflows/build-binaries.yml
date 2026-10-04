@@ -219,7 +219,7 @@ jobs:
           echo "root=${root}" >> "${GITHUB_OUTPUT}"
           echo "binary=${binary}" >> "${GITHUB_OUTPUT}"
 
-      - name: Smoke-test binary
+      - name: Smoke-test native tools and Codemode/MCP rejection
         shell: bash
         run: |
           "${{ steps.binary.outputs.binary }}" --help

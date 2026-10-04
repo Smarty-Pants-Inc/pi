@@ -142,7 +142,16 @@ function outputBytes(metafiles) {
 	);
 }
 
+// Runtime admission cuts do not remove static imports or the worker entry graph.
+// Check compiled prerequisites explicitly; never rescue release builds with source aliases.
 for (const entry of [
+	join(repoRoot, "packages", "chord", "dist", "index.js"),
+	join(repoRoot, "packages", "codemode", "dist", "index.js"),
+	join(repoRoot, "packages", "codemode", "dist", "declarations.js"),
+	join(repoRoot, "packages", "codemode", "dist", "source.js"),
+	join(repoRoot, "packages", "codemode", "dist", "runtime", "worker.js"),
+	join(repoRoot, "packages", "mcp", "dist", "index.js"),
+	join(repoRoot, "packages", "mcp", "dist", "oauth", "index.js"),
 	join(codingAgentDistDir, "cli.js"),
 	join(codingAgentDistDir, "index.js"),
 	join(codingAgentDistDir, "rpc-entry.js"),
