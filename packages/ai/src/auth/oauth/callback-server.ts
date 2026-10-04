@@ -113,7 +113,16 @@ export async function startOAuthCallbackServer<T>(
 				sendPage(response, 502, oauthErrorHtml(`${providerName} sign-in failed.`, failure.message));
 				finish({ error: failure });
 			}
-		})();
+		})().catch(() => {
+			// Observe the complete listener promise, including URL/route/page handling.
+			// Invalid requests must not settle a legitimate pending authorization.
+			try {
+				if (!response.headersSent) sendPage(response, 400, oauthErrorHtml("Invalid OAuth callback request."));
+				else response.destroy();
+			} catch {
+				response.destroy();
+			}
+		});
 	});
 
 	await new Promise<void>((resolve, reject) => {

@@ -292,10 +292,10 @@ async function tokenize(request: RequestContext, content: string): Promise<numbe
 
 /**
  * Label token IDs per server, model and label. A label is `undefined` when the
- * model's vocabulary splits it into several tokens. Failed lookups are evicted
- * so a later call retries them.
+ * model's vocabulary splits it into several tokens. Only completed immutable IDs
+ * are cached; each cold caller owns its tokenization and cancellation independently.
  */
-const labelTokenCache = new Map<string, Promise<number | undefined>>();
+const labelTokenCache = new Map<string, number | undefined>();
 
 /**
  * The token the model emits for `label` at the start of its reply. The reply
@@ -314,15 +314,12 @@ async function resolveLabelToken(request: RequestContext, label: string): Promis
 
 async function labelTokens(request: RequestContext, labels: readonly string[]): Promise<number[]> {
 	const ids = await Promise.all(
-		labels.map((label) => {
+		labels.map(async (label) => {
 			const key = `${request.root}\u0000${request.model.id}\u0000${label}`;
-			let pending = labelTokenCache.get(key);
-			if (!pending) {
-				pending = resolveLabelToken(request, label);
-				labelTokenCache.set(key, pending);
-				pending.catch(() => labelTokenCache.delete(key));
-			}
-			return pending;
+			if (labelTokenCache.has(key)) return labelTokenCache.get(key);
+			const id = await resolveLabelToken(request, label);
+			labelTokenCache.set(key, id);
+			return id;
 		}),
 	);
 	const tokens: number[] = [];
