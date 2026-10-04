@@ -1,3 +1,4 @@
+import type { OAuthRecoveryDecision } from "../../types.ts";
 import {
 	isPrematureProviderError,
 	isProviderContextOverflow,
@@ -123,9 +124,7 @@ export class OAuthDiagnosticError extends Error {
 		].includes(code)
 			? code
 			: "oauth_request_failed";
-		super(
-			`${safeOwnCode} (HTTP ${safeStatus ?? "unknown"})${safeCode ? ` provider_error=${safeCode}` : ""}${safeRecovery ? ` recovery=${safeRecovery}` : ""}${safeRetryable === undefined ? "" : ` retryable=${safeRetryable}`}`,
-		);
+		super(`${safeOwnCode} (HTTP ${safeStatus ?? "unknown"})${safeCode ? ` provider_error=${safeCode}` : ""}`);
 		this.name = "OAuthDiagnosticError";
 		this.code = safeOwnCode;
 		this.status = safeStatus;
@@ -171,6 +170,12 @@ export function safeOAuthError(
 	} catch {
 		return oauthDiagnosticError("oauth_request_failed");
 	}
+}
+
+/** Copy only validated owned decisions; never copy arbitrary provider error fields. */
+export function oauthRecoveryDecision(error: OAuthDiagnosticError): OAuthRecoveryDecision {
+	const safe = safeOAuthError(error);
+	return { recovery: safe.recovery, retryable: safe.retryable };
 }
 
 export async function fetchOAuth(input: string | URL, init?: RequestInit): Promise<Response> {

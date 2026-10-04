@@ -41,7 +41,11 @@
 	},
 	"overrides": [
 		{
-			"includes": ["packages/ai/test/retry-preservation.test.ts", "packages/ai/test/overflow-preservation.test.ts"],
+			"includes": [
+				"packages/ai/test/retry-preservation.test.ts",
+				"packages/ai/test/overflow-preservation.test.ts",
+				"packages/ai/test/sol-independent-acceptance.test.ts"
+			],
 			"formatter": { "enabled": false },
 			"linter": { "enabled": false },
 			"assist": { "enabled": false }

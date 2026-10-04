@@ -13,6 +13,7 @@ import type {
 import {
 	oauthDiagnosticError,
 	oauthDiagnosticLogger,
+	oauthRecoveryDecision,
 	redactOAuthDiagnostic,
 	safeOAuthError,
 } from "../auth/oauth/credential-response.ts";
@@ -918,8 +919,10 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = oauthDiagnostics
-				? redactOAuthDiagnostic(safeOAuthError(error, true).message, options?.diagnosticSecrets)
+			const safe = oauthDiagnostics ? safeOAuthError(error, true) : undefined;
+			output.oauthRecovery = safe ? oauthRecoveryDecision(safe) : undefined;
+			output.errorMessage = safe
+				? redactOAuthDiagnostic(safe.message, options?.diagnosticSecrets)
 				: error instanceof Error
 					? error.message
 					: JSON.stringify(error);

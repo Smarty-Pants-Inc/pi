@@ -94,9 +94,9 @@ import { getProviderOverflowPatterns, isProviderContextOverflow } from "./provid
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
 	// Case 1: Check error message patterns
 	if (message.stopReason === "error" && message.errorMessage) {
-		if (message.errorMessage.includes(" recovery=context_length_exceeded")) return true;
+		if (message.oauthRecovery?.recovery === "context_length_exceeded") return true;
 		// An explicit pre-suppression negative decision must not be reclassified from an allowlisted code.
-		if (/ retryable=(true|false)$/.test(message.errorMessage)) return false;
+		if (message.oauthRecovery?.retryable !== undefined) return false;
 		if (isProviderContextOverflow(message.errorMessage, message.provider)) return true;
 	}
 

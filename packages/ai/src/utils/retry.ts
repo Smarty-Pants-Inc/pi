@@ -8,7 +8,7 @@ import { isPrematureProviderError, isRetryableProviderError } from "./provider-e
 export function isPrematureStreamError(message: AssistantMessage): boolean {
 	return (
 		(message.stopReason === "error" && isPrematureProviderError(message.errorMessage ?? "")) ||
-		(message.stopReason === "error" && message.errorMessage?.includes(" recovery=premature_stream") === true)
+		(message.stopReason === "error" && message.oauthRecovery?.recovery === "premature_stream")
 	);
 }
 
@@ -190,8 +190,8 @@ export function isRetryableAssistantError(message: AssistantMessage): boolean {
 	// Providers mark a limit found in the parsed error body (e.g. the Smarty gateway's `smarty_limit`).
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)) return false;
 	const errorMessage = message.errorMessage;
-	if (errorMessage.includes(" retryable=false")) return false;
-	if (errorMessage.includes(" retryable=true")) return true;
-	if (errorMessage.includes(" recovery=retryable") || errorMessage.includes(" recovery=premature_stream")) return true;
+	if (message.oauthRecovery?.retryable !== undefined) return message.oauthRecovery.retryable;
+	if (message.oauthRecovery?.recovery === "retryable" || message.oauthRecovery?.recovery === "premature_stream")
+		return true;
 	return isRetryableProviderError(errorMessage);
 }

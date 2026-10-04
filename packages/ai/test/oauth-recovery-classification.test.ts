@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
-import { oauthDiagnosticError, safeOAuthError } from "../src/auth/oauth/credential-response.ts";
+import { oauthDiagnosticError, oauthRecoveryDecision, safeOAuthError } from "../src/auth/oauth/credential-response.ts";
 import { createModels } from "../src/models.ts";
 import { fauxAssistantMessage } from "../src/providers/faux.ts";
 import { openaiProvider } from "../src/providers/openai.ts";
@@ -17,7 +17,10 @@ it("retains quota precedence over HTTP retry status and an allowlisted transient
 		true,
 	);
 	expect(error.retryable).toBe(false);
-	const message = fauxAssistantMessage([], { stopReason: "error", errorMessage: error.message });
+	const message = {
+		...fauxAssistantMessage([], { stopReason: "error", errorMessage: error.message }),
+		oauthRecovery: oauthRecoveryDecision(error),
+	};
 	expect(isRetryableAssistantError(message)).toBe(false);
 });
 
@@ -27,7 +30,10 @@ it("retains the overflow exclusion for rate limits even with an overflow code", 
 		true,
 	);
 	expect(error.recovery).toBe("retryable");
-	const message = fauxAssistantMessage([], { stopReason: "error", errorMessage: error.message });
+	const message = {
+		...fauxAssistantMessage([], { stopReason: "error", errorMessage: error.message }),
+		oauthRecovery: oauthRecoveryDecision(error),
+	};
 	expect(isContextOverflow(message)).toBe(false);
 	expect(isRetryableAssistantError(message)).toBe(true);
 });
