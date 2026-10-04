@@ -169,10 +169,12 @@ describe("Radius OAuth", () => {
 		};
 
 		const failed = await login();
-		expect("error" in failed && failed.error.message).toContain(
+		// #4703: retain exact login diagnostics and positive callback-page coverage.
+		expect("error" in failed && failed.error.message).toBe(
 			"oauth_request_failed (HTTP 400) provider_error=invalid_grant",
 		);
 		expect(failed.status).toBe(502);
+		expect(failed.page).toContain("oauth_request_failed (HTTP 400) provider_error=invalid_grant");
 		expect(failed.page).not.toContain("code expired");
 
 		tokenStatus = 200;

@@ -280,9 +280,8 @@ export function getOAuthDiagnosticSecrets(
 	return secrets;
 }
 
-// Short live values must not replace common words or individual letters in diagnostics.
-// Credential-labeled fields and Bearer values are still masked regardless of length.
-const MIN_DIAGNOSTIC_SECRET_LENGTH = 8;
+// Explicitly known credentials are sensitive at every nonzero length, even when
+// masking them also changes ordinary words in a provider diagnostic.
 const MAX_DIAGNOSTIC_UNESCAPE_PASSES = 16;
 const MAX_DIAGNOSTIC_UNESCAPE_WORK = 256 * 1024;
 const JSON_ESCAPES: Readonly<Record<string, string>> = {
@@ -325,7 +324,7 @@ function unescapeDiagnostic(text: string): string {
 function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
-		if (secret.length < MIN_DIAGNOSTIC_SECRET_LENGTH || secret.length > text.length) continue;
+		if (secret.length === 0 || secret.length > text.length) continue;
 		variants.add(secret);
 		let serialized = secret;
 		for (let depth = 0; depth < 4; depth++) {

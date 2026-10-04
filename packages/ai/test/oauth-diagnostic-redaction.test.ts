@@ -138,12 +138,28 @@ describe("OAuth diagnostic redaction", () => {
 
 	it.each(["a", "the", "1234567"])("does not substring-mask short live value %s", (secret) => {
 		const text = `the theater theme other normal a word ${secret}`;
-		expect(redactOAuthDiagnostic(text, [secret])).toBe(text);
-		expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(secret))).toBe(text);
-		// Short values remain protected when a credential field or scheme identifies them.
+		// Unknown short words are not guessed to be credentials. Explicit live values are.
+		expect(redactOAuthDiagnostic(text)).toBe(text);
+		expect(redactOAuthDiagnostic(text, [secret])).not.toContain(secret);
+		expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(secret))).not.toContain(secret);
+		// Credential fields and schemes also protect unknown short values.
 		expect(redactOAuthDiagnostic(`refresh_token=${secret}`, [secret])).not.toContain(`=${secret}`);
 		expect(redactOAuthDiagnostic(`Bearer ${secret}`, [secret])).toContain("***");
 	});
+
+	// #4703: configured header credentials must mask even below the carry's old cutoff.
+	it.each(["x-api-key", "api-key", "proxy-authorization", "cf-aig-authorization"])(
+		"masks nonempty known %s credentials regardless of length",
+		(header) => {
+			for (const length of [1, 7, 8]) {
+				const secret = "Q9bZ2p7X".slice(0, length);
+				const value = header.endsWith("authorization") ? `Basic ${secret}` : secret;
+				const secrets = getOAuthDiagnosticSecrets(undefined, { [header]: value });
+				expect(redactOAuthDiagnostic(`receipt=${secret}`, secrets)).toBe("receipt=***");
+				expect(normalizeProviderError(new Error(`receipt=${secret}`), secrets).message).not.toContain(secret);
+			}
+		},
+	);
 
 	it("substring-masks live values at the eight-character threshold", () => {
 		expect(redactOAuthDiagnostic("receipt=X12345678Y", ["12345678"])).toBe("receipt=X***Y");
