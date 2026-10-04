@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { redactOAuthDiagnostic, redactOAuthDiagnosticValue } from "../src/auth/oauth/credential-response.ts";
+import {
+	getOAuthDiagnosticSecrets,
+	redactOAuthDiagnostic,
+	redactOAuthDiagnosticValue,
+} from "../src/auth/oauth/credential-response.ts";
 import { createAssistantMessageDiagnostic } from "../src/utils/diagnostics.ts";
 import { MAX_PROVIDER_ERROR_BODY_CHARS, normalizeProviderError } from "../src/utils/error-body.ts";
 
@@ -70,6 +74,34 @@ describe("OAuth diagnostic redaction", () => {
 		(secret) => {
 			for (const text of [secret, JSON.stringify(secret)]) {
 				expect(redactOAuthDiagnostic(`TypeError: ${text}`, [secret])).toContain("***");
+			}
+		},
+	);
+
+	// pi#127 / round-3 P1-1: credentials can differ from the API key and be echoed without their scheme.
+	it.each(["Authorization", "authorization", "AUTHORIZATION"])(
+		"captures complete %s and its bare credential",
+		(key) => {
+			const header = "bEaReR FAKE_HEADER_127";
+			const secrets = getOAuthDiagnosticSecrets("FAKE_ACCESS_127", { [key]: header });
+			expect(secrets).toContain(header);
+			expect(secrets).toContain("FAKE_HEADER_127");
+			expect(redactOAuthDiagnostic("503 server_error receipt=FAKE_HEADER_127", secrets)).toBe(
+				"503 server_error receipt=***",
+			);
+		},
+	);
+
+	// pi#127 / round-3 P1-2: generate each repeated JSON-escape layer from the live value, not field labels.
+	it.each(['FAKE_127_"QUOTE\\BACK/+=?%', "FAKE_127_\nLINE", "FAKE_127_\ud800UNICODE"])(
+		"masks repeated JSON-escape layers of %s",
+		(secret) => {
+			let value = secret;
+			for (let depth = 0; depth <= 8; depth++) {
+				expect(redactOAuthDiagnostic(`503 server_error receipt=${value}`, [secret])).toBe(
+					"503 server_error receipt=***",
+				);
+				value = JSON.stringify(value).slice(1, -1);
 			}
 		},
 	);

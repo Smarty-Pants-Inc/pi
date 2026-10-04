@@ -18,8 +18,18 @@ export function getOAuthDiagnosticSecrets(
 	const secrets = [...additional];
 	if (token) secrets.push(token, `Bearer ${token}`);
 	for (const [key, value] of Object.entries(headers)) {
-		if (value && ["authorization", "chatgpt-account-id", "account-id"].includes(key.toLowerCase()))
-			secrets.push(value);
+		if (!value) continue;
+		const name = key.toLowerCase();
+		if (["authorization", "chatgpt-account-id", "account-id"].includes(name)) secrets.push(value);
+		if (name === "authorization") {
+			// Keep the whole header and the credential: errors may echo either, under any label.
+			const authorization = value.trim();
+			const schemeEnd = authorization.search(/\s/);
+			if (schemeEnd !== -1) {
+				const credential = authorization.slice(schemeEnd).trim();
+				if (credential) secrets.push(credential);
+			}
+		}
 	}
 	if (!token) return secrets;
 	try {
@@ -37,9 +47,18 @@ export function getOAuthDiagnosticSecrets(
 function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
-		if (!secret) continue;
+		if (!secret || secret.length > text.length) continue;
 		variants.add(secret);
-		variants.add(JSON.stringify(secret).slice(1, -1));
+		// SDK error bodies, nested diagnostic strings and session JSON can each
+		// add an escape layer. Bound work to eight layers and the input size;
+		// literal matching remains linear per live-value variant, without regex.
+		let escaped = secret;
+		for (let depth = 0; depth < 8; depth++) {
+			const next = JSON.stringify(escaped).slice(1, -1);
+			if (next === escaped || next.length > text.length) break;
+			variants.add(next);
+			escaped = next;
+		}
 		try {
 			variants.add(encodeURIComponent(secret));
 		} catch {
