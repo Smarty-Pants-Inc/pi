@@ -35,6 +35,7 @@ import {
 	LiveDoc,
 	type LiveState,
 	resolveDeferredReceipt,
+	resolveRequestAcceptance,
 	type ToolSlot,
 } from "./live.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
@@ -65,6 +66,8 @@ export type GenerationCheckpoint =
 	  }
 	| {
 			phase: "request";
+			/** Written before dispatch. Recovery must not resend while provider acceptance is unknown. */
+			acceptanceUncertain?: boolean;
 			attempt: number;
 			compacted?: TaskId<CompactionResult>;
 			model: ModelRef;
@@ -185,7 +188,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 					streamOptions: settings.stream,
 					cutoff,
 				};
-				return { status: "running", checkpoint: { phase: "request", ...request } };
+				return { status: "running", checkpoint: { phase: "request", acceptanceUncertain: false, ...request } };
 			}, context);
 		},
 		request: async (task, runtime, context) => {
@@ -210,7 +213,19 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				signal: runtime.signal,
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			};
+			// Persist uncertainty before the provider can accept an effect. A handle retained only in memory
+			// cannot prevent duplicate spend after a crash when the first adoption write fails.
+			await runtime.commit(
+				() => ({
+					status: "running",
+					checkpoint: { ...task.state.checkpoint, acceptanceUncertain: true },
+				}),
+				context,
+			);
 			const message = await streamResponse(runtime, model, messages, options, attempt, context);
+			if (message.stopReason !== "deferred" || message.deferred === undefined) {
+				await resolveRequestAcceptance(runtime);
+			}
 			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
 			await classify(runtime, request, message, context);
 		},

@@ -27,6 +27,7 @@ export const DeferredReceiptsDoc = defineDoc<DeferredReceiptsState>({
 type Custody = {
 	accept(checkpoint: PollCheckpoint): Promise<void>;
 	resolve(): Promise<void>;
+	resolveRequest(): Promise<void>;
 };
 const custody = new WeakMap<object, Custody>();
 
@@ -45,6 +46,12 @@ export function resolveDeferredReceipt(runtime: object): Promise<void> {
 	const receiver = custody.get(runtime);
 	if (receiver === undefined) throw new Error("No deferred receipt custody for this invocation");
 	return receiver.resolve();
+}
+
+export function resolveRequestAcceptance(runtime: object): Promise<void> {
+	const receiver = custody.get(runtime);
+	if (receiver === undefined) throw new Error("No deferred receipt custody for this invocation");
+	return receiver.resolveRequest();
 }
 
 /** Presentation of one tool call of the current round. */

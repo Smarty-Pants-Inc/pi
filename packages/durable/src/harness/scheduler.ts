@@ -50,7 +50,7 @@ type RunnableTaskRecord = Extract<
 	AnyTaskRecord,
 	{ readonly state: { readonly status: "pending" | "running" | "waiting" } }
 >;
-type Checkpoint = { readonly phase: string };
+type Checkpoint = { readonly phase: string; readonly acceptanceUncertain?: boolean };
 type ErasedDefinition = TaskDefinition<JsonValue, Checkpoint, JsonValue, object>;
 type ErasedRuntime = TaskRuntime<JsonValue, Checkpoint, JsonValue, object>;
 type ErasedRunningTask = RunningTask<JsonValue, Checkpoint, JsonValue>;
@@ -196,6 +196,8 @@ export class TaskScheduler {
 	readonly #context: Context;
 	readonly #retireReceipt: TaskSchedulerOptions["retireReceipt"];
 	readonly #receipts = new Map<TaskId, DeferredReceipt>();
+	/** Accepted handles owned before any storage attempt; publication never clears this owner. */
+	readonly #unadopted = new Map<TaskId, DeferredReceipt>();
 	readonly #receiptCleanup = new Map<TaskId, Promise<void>>();
 	/** A failed retirement commit requires reopen; never spin or discard its last durable receipt. */
 	readonly #receiptBlocked = new Set<TaskId>();
@@ -335,7 +337,7 @@ export class TaskScheduler {
 			if (current === undefined) throw new Error(`Task ${id} does not exist`);
 			if (current.state.status === "terminal") return { result: "terminal" as const };
 			const invocation = this.#invocations.get(id);
-			if (invocation === undefined && current.state.status !== "completing") {
+			if (invocation === undefined && current.state.status !== "completing" && !this.#uncertainAcceptance(current)) {
 				await this.#loadScopes(false);
 				if (!this.#ownedLive().has(id)) {
 					const resolution = this.#resolve(current as RunnableTaskRecord, this.#registry.snapshot());
@@ -776,6 +778,7 @@ export class TaskScheduler {
 				// Taken once per pass, and only when some task is a candidate.
 				let snapshot: RegistrySnapshot | undefined;
 				for (const record of [...this.#live.values()]) {
+					if (this.#uncertainAcceptance(record) && !this.#invocations.has(record.id)) continue;
 					const receipt = this.#receipts.get(record.id);
 					// A failed cleanup may end the user run, but its session receipt remains in independent custody.
 					const abortAfterFailure = record.abortRequested && receipt?.status === "cancel_failed";
@@ -882,6 +885,7 @@ export class TaskScheduler {
 		owned: ReadonlyMap<TaskId, readonly TaskId[]>,
 	): TaskInspection["state"] {
 		if (this.#invocations.has(record.id)) return { kind: "running" };
+		if (this.#uncertainAcceptance(record)) return { kind: "blocked", reason: "acceptance_uncertain" };
 		if (record.state.status === "completing") return { kind: "completing" };
 		const on = this.#waitingOn(record, owned);
 		if (on.length > 0) return { kind: "waiting", on };
@@ -966,7 +970,10 @@ export class TaskScheduler {
 		if (receipt !== undefined && this.#needsReceiptCleanup(receipt)) return false;
 		if (previous === undefined) return true;
 		// 4. uncaught error.
-		if (previous.failure !== undefined) return { fault: previous.failure.error };
+		if (previous.failure !== undefined) {
+			if (this.#uncertainAcceptance(current)) return false;
+			return { fault: previous.failure.error };
+		}
 		// 6. no durable progress.
 		if (jsonEqual(current.state.checkpoint, previous.checkpoint)) {
 			const message = `Task ${current.kind} phase ${previous.checkpoint.phase} returned without durable progress`;
@@ -1133,29 +1140,90 @@ export class TaskScheduler {
 		}
 	}
 
-	/** Only an active generation can accept; abort/close do not erase a provider's receipt. */
-	#acceptReceipt(invocation: Invocation, checkpoint: PollCheckpoint): Promise<void> {
+	/** A durable pre-dispatch fence remains when no receipt write or cancellation can settle acceptance. */
+	#uncertainAcceptance(record: AnyTaskRecord): boolean {
+		if (this.#unadopted.has(record.id)) return true;
+		if (record.kind !== "pi.generation" || !("checkpoint" in record.state) || this.#receipts.has(record.id))
+			return false;
+		const checkpoint = record.state.checkpoint as Checkpoint;
+		// Unmarked historical request checkpoints cannot prove the old receiver never submitted.
+		return checkpoint.phase === "request" && checkpoint.acceptanceUncertain !== false;
+	}
+
+	/** A terminal non-deferred response confirms there is no deferred handle to adopt. */
+	#resolveRequestAcceptance(invocation: Invocation): Promise<void> {
 		return this.#retireReceipt(async (tx) => {
 			if (invocation.ended || invocation.mode !== "run") throw endedError(invocation);
 			const current = await tx.task(invocation.taskId);
-			if (current?.kind !== "pi.generation" || current.state.status !== "running") throw endedError(invocation);
-			const ledger = await tx.doc(DeferredReceiptsDoc);
-			const receipt: DeferredReceipt = {
-				taskId: invocation.taskId,
-				status: current.abortRequested ? "cancel_pending" : "accepted",
-				checkpoint,
-			};
-			ledger.receipts[String(invocation.taskId)] = copyJson(receipt, {
-				omitUndefinedProperties: true,
-			}) as DeferredReceiptsState["receipts"][string];
-			// Adoption and receipt retention are atomic, independent of ordinary run-write gates.
+			if (current?.state.status !== "running") throw endedError(invocation);
+			const checkpoint = current.state.checkpoint as Checkpoint;
+			if (checkpoint.phase !== "request" || !checkpoint.acceptanceUncertain) return;
 			tx.setTask(
 				withState(current, {
 					status: "running",
-					checkpoint: copyJson(checkpoint, { omitUndefinedProperties: true }),
+					checkpoint: { ...checkpoint, acceptanceUncertain: false },
 				}),
 			);
 		});
+	}
+
+	/** Own acceptance before the first write. Abort/close join this operation, even when storage rejects it. */
+	async #acceptReceipt(invocation: Invocation, checkpoint: PollCheckpoint): Promise<void> {
+		const receipt: DeferredReceipt = {
+			taskId: invocation.taskId,
+			status: "cancel_pending",
+			checkpoint: copyJson(checkpoint, { omitUndefinedProperties: true }) as unknown as PollCheckpoint,
+		};
+		this.#unadopted.set(invocation.taskId, receipt);
+		const adopt = (cancel: boolean): Promise<void> =>
+			this.#retireReceipt(async (tx) => {
+				if (invocation.ended || invocation.mode !== "run") throw endedError(invocation);
+				const current = await tx.task(invocation.taskId);
+				if (current?.kind !== "pi.generation" || current.state.status !== "running") throw endedError(invocation);
+				const ledger = await tx.doc(DeferredReceiptsDoc);
+				receipt.status = cancel || current.abortRequested ? "cancel_pending" : "accepted";
+				ledger.receipts[String(invocation.taskId)] = copyJson(receipt) as DeferredReceiptsState["receipts"][string];
+				// Successful adoption is still atomic. A failed first write instead adopts cancellation intent.
+				tx.setTask(
+					withState(
+						{ ...current, abortRequested: cancel || current.abortRequested },
+						{
+							status: "running",
+							checkpoint: copyJson(receipt.checkpoint),
+						},
+					),
+				);
+			});
+		try {
+			await adopt(false);
+			this.#unadopted.delete(invocation.taskId);
+		} catch (error) {
+			receipt.status = "cancel_pending";
+			try {
+				await adopt(true);
+				this.#unadopted.delete(invocation.taskId);
+			} catch (storageError) {
+				// Storage may be poisoned or wholly unavailable. Cancellation does not depend on another write,
+				// nor on the already-aborted run/close signal. Its promise stays owned by this joined invocation.
+				try {
+					const ref = receipt.checkpoint.model;
+					const model = this.#models.getModel(ref.provider, ref.modelId);
+					if (model === undefined) throw new Error("Deferred cancellation model is unavailable");
+					await this.#models.cancelDeferred(model, receipt.checkpoint.handle, {
+						signal: AbortSignal.timeout(5000),
+					});
+					this.#unadopted.delete(invocation.taskId);
+				} catch (cancelError) {
+					receipt.status = "cancel_failed";
+					this.#report(
+						new Error("Deferred receipt adoption and cancellation unresolved; request replay is fenced", {
+							cause: { receipt: copyJson(receipt), storageError, cancelError },
+						}),
+					);
+				}
+			}
+			throw error;
+		}
 	}
 
 	#resolveReceipt(invocation: Invocation): Promise<void> {
@@ -1374,6 +1442,7 @@ export class TaskScheduler {
 			bindDeferredCustody(runtime, {
 				accept: (checkpoint) => this.#acceptReceipt(invocation, checkpoint),
 				resolve: () => this.#resolveReceipt(invocation),
+				resolveRequest: () => this.#resolveRequestAcceptance(invocation),
 			});
 		}
 		return runtime;
