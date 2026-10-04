@@ -2331,10 +2331,9 @@ export class AgentSession {
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
-				const handled = await this._tryExecuteExtensionCommand(text);
+				const handled = await this._tryExecuteExtensionCommand(text, inputCancellation, onInputTransferred);
 				if (handled) {
-					// Extension command executed, no prompt to send
-					onInputTransferred?.();
+					// Command dispatch already transferred ownership, before invoking its handler.
 					preflightResult?.(true);
 					return;
 				}
@@ -2639,7 +2638,11 @@ export class AgentSession {
 	/**
 	 * Try to execute an extension command. Returns true if command was found and executed.
 	 */
-	private async _tryExecuteExtensionCommand(text: string): Promise<boolean> {
+	private async _tryExecuteExtensionCommand(
+		text: string,
+		inputCancellation?: AbortSignal,
+		onInputTransferred?: () => void,
+	): Promise<boolean> {
 		// Parse command name and args
 		const spaceIndex = text.indexOf(" ");
 		const commandName = spaceIndex === -1 ? text.slice(1) : text.slice(1, spaceIndex);
@@ -2651,8 +2654,13 @@ export class AgentSession {
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
 
+		// Context construction may run host code. Recheck cancellation afterwards, then
+		// irreversibly hand off immediately before dispatch: arbitrary command effects
+		// cannot be withdrawn while an asynchronous handler is awaiting.
+		this._shutdownCancellation.signal.throwIfAborted();
+		inputCancellation?.throwIfAborted();
+		onInputTransferred?.();
 		try {
-			this._shutdownCancellation.signal.throwIfAborted();
 			await raceWithAbortSignal(Promise.resolve(command.handler(args, ctx)), this._shutdownCancellation.signal);
 			this._shutdownCancellation.signal.throwIfAborted();
 			return true;

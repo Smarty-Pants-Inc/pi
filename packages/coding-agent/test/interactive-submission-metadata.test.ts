@@ -3,7 +3,13 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import inputAuthor from "../examples/extensions/input-author.ts";
-import type { AgentSessionEvent } from "../src/core/agent-session.ts";
+import type { AgentSessionEvent, ExtensionBindings } from "../src/core/agent-session.ts";
+import {
+	AgentSessionRuntime,
+	type AgentSessionServices,
+	type CreateAgentSessionRuntimeFactory,
+	createAgentSessionFromServices,
+} from "../src/core/agent-session-runtime.ts";
 import type { ExtensionUIContext, InputSubmission } from "../src/index.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -987,6 +993,208 @@ describe("interactive submission metadata", () => {
 			}
 		},
 	);
+
+	// Review P2, Smarty-Pants-Inc/smarty-dev#4078: exercise the real idle loop and runtime replacement.
+	it.each(["deliver", "dequeue", "command"] as const)(
+		"fences idle input preflight until %s settlement",
+		async (action) => {
+			initTheme("dark");
+			const inputStarted = gate();
+			const inputRelease = gate();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input", async () => {
+							inputStarted.release();
+							await inputRelease.promise;
+						});
+						pi.registerCommand("idle-command", {
+							handler: async () => {
+								inputStarted.release();
+								await inputRelease.promise;
+							},
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const services: AgentSessionServices = {
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			};
+			const factory: CreateAgentSessionRuntimeFactory = async ({ sessionManager, sessionStartEvent }) => ({
+				...(await createAgentSessionFromServices({
+					services,
+					sessionManager,
+					sessionStartEvent,
+					model: harness.getModel(),
+					noTools: "all",
+				})),
+				services,
+				diagnostics: [],
+			});
+			const runtime = new AgentSessionRuntime(harness.session, services, factory);
+			const mode = new InteractiveMode(runtime);
+			const internal = mode as unknown as {
+				bindCurrentSessionExtensions(): Promise<void>;
+				setupEditorSubmitHandler(): void;
+				defaultEditor: { onSubmit?: (text: string) => Promise<void> };
+				editor: { getText(): string; setText(text: string): void };
+				userInputInFlight: boolean;
+				stagingAudit?: (kind: string) => void;
+			};
+			let bindings: ExtensionBindings | undefined;
+			const bind = harness.session.bindExtensions.bind(harness.session);
+			vi.spyOn(harness.session, "bindExtensions").mockImplementation(async (options) => {
+				bindings = options;
+				await bind(options);
+			});
+			await internal.bindCurrentSessionExtensions();
+			internal.setupEditorSubmitHandler();
+			vi.spyOn(mode, "init").mockResolvedValue();
+			// Suppress only optional startup background work, not native input/replacement code.
+			internal.stagingAudit = () => {};
+			const settled = gate();
+			const exit = new Error("test loop complete");
+			const getInput = mode.getUserInput.bind(mode);
+			vi.spyOn(mode, "getUserInput")
+				.mockImplementationOnce(getInput)
+				.mockImplementation(async () => {
+					settled.release();
+					throw exit;
+				});
+			harness.setResponses([fauxAssistantMessage("Alice response")]);
+			const run = mode.run().catch((error: unknown) => {
+				expect(error).toBe(exit);
+			});
+			await internal.defaultEditor.onSubmit!(action === "command" ? "/idle-command" : "Alice input");
+			await inputStarted.promise;
+			try {
+				expect.soft(internal.userInputInFlight).toBe(action !== "command");
+				expect.soft(bindings?.hasPendingInput?.()).toBe(action !== "command");
+				if (action === "command") {
+					// Command ownership has transferred, even though its handler has not settled.
+					await expect(runtime.newSession()).resolves.toEqual({ cancelled: false });
+					expect(runtime.session).not.toBe(harness.session);
+				} else {
+					await expect(runtime.newSession()).rejects.toThrow("OWNER_TUI_TRANSFER_PENDING");
+					expect(runtime.session).toBe(harness.session);
+				}
+				if (action === "dequeue") {
+					prototype.handleDequeue.call(mode as unknown as SubmissionUI);
+					expect(internal.editor.getText()).toBe("Alice input");
+					await expect(runtime.newSession()).rejects.toThrow("OWNER_TUI_TRANSFER_PENDING");
+				}
+			} finally {
+				inputRelease.release();
+				await settled.promise;
+				await run;
+			}
+			expect(getUserTexts(harness)).toEqual(action === "deliver" ? ["Alice input"] : []);
+			expect(internal.userInputInFlight).toBe(false);
+			if (action !== "command") expect(bindings?.hasPendingInput?.()).toBe(false);
+			await expect(runtime.newSession()).resolves.toEqual({ cancelled: false });
+			expect(runtime.session).not.toBe(harness.session);
+			mode.stop();
+			await runtime.dispose();
+		},
+	);
+
+	// Review P1, Smarty-Pants-Inc/smarty-dev#4078: dispatched commands cannot be withdrawn.
+	it.each(["dequeue", "abort", "none"] as const)(
+		"transfers an asynchronous replay command before dispatch (%s)",
+		async (cancel) => {
+			const started = gate();
+			const release = gate();
+			let calls = 0;
+			let effects = 0;
+			let transfersAtEntry = -1;
+			let context!: SubmissionUI;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.registerCommand("slow", {
+							handler: async () => {
+								calls++;
+								transfersAtEntry = context.compactionQueuedMessages.length;
+								started.release();
+								await release.promise;
+								effects++;
+								pi.sendMessage(
+									{ customType: "command-effect", content: "triggered once", display: false },
+									{ triggerTurn: true },
+								);
+							},
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			context = createSubmissionUI(harness);
+			await harness.session.bindExtensions({
+				mode: "tui",
+				uiContext: prototype.createExtensionUIContext.call(context),
+				abortHandler: () => {
+					context.restoreQueuedMessagesToEditor({ abort: true });
+				},
+			});
+			harness.setResponses([fauxAssistantMessage("command response")]);
+			// Normal editor commands bypass compaction staging. Explicit host staging exercises replay.
+			prototype.queueCompactionMessage.call(context, "/slow", "steer");
+			const replay = prototype.flushCompactionQueue.call(context);
+			await started.promise;
+			try {
+				expect.soft(transfersAtEntry).toBe(0);
+				context.editor.setText("Bob draft");
+				if (cancel === "dequeue") prototype.handleDequeue.call(context);
+				else if (cancel === "abort") harness.session.extensionRunner.createCommandContext().abort();
+				expect.soft(context.editor.getText()).toBe("Bob draft");
+				expect.soft(context.compactionQueuedMessages).toEqual([]);
+			} finally {
+				release.release();
+				await replay;
+				await harness.session.waitForIdle();
+			}
+			await prototype.flushCompactionQueue.call(context);
+			expect(calls).toBe(1);
+			expect(effects).toBe(1);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(context.editor.getText()).toBe("Bob draft");
+			expect(context.showError).not.toHaveBeenCalled();
+		},
+	);
+
+	it("never dispatches a replay command cancelled while constructing command context", async () => {
+		let calls = 0;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("cancelled", {
+						handler: async () => {
+							calls++;
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		const context = createSubmissionUI(harness);
+		const createContext = harness.session.extensionRunner.createCommandContext.bind(harness.session.extensionRunner);
+		vi.spyOn(harness.session.extensionRunner, "createCommandContext").mockImplementation(() => {
+			prototype.handleDequeue.call(context);
+			return createContext();
+		});
+		prototype.queueCompactionMessage.call(context, "/cancelled", "steer");
+		await prototype.flushCompactionQueue.call(context);
+		expect(calls).toBe(0);
+		expect(context.editor.getText()).toBe("/cancelled");
+		expect(context.compactionQueuedMessages).toEqual([]);
+		expect(context.showError).not.toHaveBeenCalled();
+	});
 
 	it("does not capture an extension command routed through the editor", async () => {
 		let captureCalls = 0;

@@ -604,7 +604,7 @@ export class InteractiveMode {
 		this.options = { ...options, tuiMode };
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
-			if (this.compactionQueueTransfers > 0 || this.inputSubmissionTransfers > 0) {
+			if (this.compactionQueueTransfers > 0 || this.inputSubmissionTransfers > 0 || this.userInputInFlight) {
 				throw new Error("OWNER_TUI_TRANSFER_PENDING");
 			}
 			this.resetExtensionUI();
@@ -1270,11 +1270,11 @@ export class InteractiveMode {
 					inputCancellation: this.inFlightInput?.cancellation?.signal,
 					onInputTransferred: () => {
 						this.inFlightInput = undefined;
+						this.userInputInFlight = false;
+						this.stagingAudit?.("input-transferred");
 					},
 				});
-				// Original session preflight owns the input before TUI staging clears.
-				this.userInputInFlight = false;
-				this.stagingAudit?.("input-transferred");
+				// Keep idle ownership through native preflight, until actual transfer or settlement.
 				await prompt;
 			} catch (error: unknown) {
 				if (this.inFlightInput?.cancellation?.signal.aborted) continue;
