@@ -6,11 +6,13 @@
  * https://api.kimi.com/coding as an `Authorization: Bearer` header.
  */
 
+import { runOAuthOperation } from "../../utils/bounded-response.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import {
 	fetchOAuth,
+	OAuthDiagnosticError,
 	oauthDiagnosticError,
 	oauthResponseError,
 	readOAuthCredentialResponse,
@@ -236,6 +238,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 				signal: requestSignal(signal),
 			});
 		} catch (error) {
+			if (error instanceof OAuthDiagnosticError && error.code === "oauth_invalid_response") throw error;
 			lastError = safeOAuthError(error);
 			continue;
 		}
@@ -279,10 +282,13 @@ export const kimiCodingOAuth: OAuthAuth = withOAuthDiagnostics({
 	isSubscription: true,
 	loginLabel: "Sign in with Kimi Code",
 
-	login: loginKimiCoding,
+	login: (interaction) =>
+		runOAuthOperation(interaction.signal, 15 * 60_000, (signal) => loginKimiCoding({ ...interaction, signal })),
 
 	refresh: async (credential, signal) => {
-		const token = await refreshToken(getOauthHost(), credential.refresh, signal);
+		const token = await runOAuthOperation(signal, 60_000, (ownedSignal) =>
+			refreshToken(getOauthHost(), credential.refresh, ownedSignal),
+		);
 		return { type: "oauth", access: token.access, refresh: token.refresh, expires: token.expires };
 	},
 

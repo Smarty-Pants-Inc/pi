@@ -1,4 +1,5 @@
 import type { OAuthRecoveryDecision } from "../../types.ts";
+import { fetchOAuthResponse, ResponseBodyError } from "../../utils/bounded-response.ts";
 import {
 	isPrematureProviderError,
 	isProviderContextOverflow,
@@ -180,8 +181,9 @@ export function oauthRecoveryDecision(error: OAuthDiagnosticError): OAuthRecover
 
 export async function fetchOAuth(input: string | URL, init?: RequestInit): Promise<Response> {
 	try {
-		return await fetch(input, init);
-	} catch {
+		return await fetchOAuthResponse(input, init ?? {});
+	} catch (error) {
+		if (error instanceof ResponseBodyError) throw oauthDiagnosticError("oauth_invalid_response", error.status);
 		throw oauthDiagnosticError("oauth_request_failed");
 	}
 }
@@ -247,14 +249,21 @@ export function getOAuthDiagnosticSecrets(
 	for (const [key, value] of Object.entries(headers)) {
 		if (!value) continue;
 		const name = key.toLowerCase();
-		if (["authorization", "chatgpt-account-id", "account-id"].includes(name)) secrets.push(value);
-		if (name === "authorization") {
-			// Keep the whole header and the credential: errors may echo either, under any label.
-			const authorization = value.trim();
-			const schemeEnd = authorization.search(/\s/);
-			if (schemeEnd !== -1) {
-				const credential = authorization.slice(schemeEnd).trim();
-				if (credential) secrets.push(credential);
+		if (
+			[
+				"authorization",
+				"proxy-authorization",
+				"cf-aig-authorization",
+				"x-api-key",
+				"api-key",
+				"chatgpt-account-id",
+				"account-id",
+			].includes(name)
+		) {
+			secrets.push(value);
+			if (name.endsWith("authorization")) {
+				const separator = value.search(/\s/);
+				if (separator >= 0) secrets.push(value.slice(separator).trim());
 			}
 		}
 	}
@@ -318,6 +327,11 @@ function redactValues(text: string, secrets: readonly string[]): string {
 	for (const secret of secrets) {
 		if (secret.length < MIN_DIAGNOSTIC_SECRET_LENGTH || secret.length > text.length) continue;
 		variants.add(secret);
+		let serialized = secret;
+		for (let depth = 0; depth < 4; depth++) {
+			variants.add(serialized);
+			serialized = JSON.stringify(serialized).slice(1, -1);
+		}
 		// Browser-safe UTF-8 encoding: standard and URL-safe, padded and unpadded.
 		const base64 = btoa(Array.from(new TextEncoder().encode(secret), (byte) => String.fromCharCode(byte)).join(""));
 		variants.add(base64);
@@ -360,7 +374,16 @@ function redactValues(text: string, secrets: readonly string[]): string {
 
 /** Redact live values first, independently of labels or serialization syntax. */
 export function redactOAuthDiagnostic(text: string, secrets: readonly string[] = []): string {
+	// Apply the work bound before enumerated variants can consume escaped values.
+	if (secrets.length > 0 && text.includes("\\") && text.length > MAX_DIAGNOSTIC_UNESCAPE_WORK) return "***";
+	// Entirely Unicode-escaped opaque text is outside the rich diagnostic contract.
+	if (secrets.length > 0 && /^(?:\\u[0-9a-f]{4})+$/i.test(text)) return "Provider diagnostic details withheld";
 	text = redactValues(text, secrets);
+	// Rich diagnostics support four literal JSON layers. More nesting or arbitrary
+	// Unicode escaping cannot be safely reconstructed within that fixed budget.
+	if (secrets.length > 0 && (text.includes("\\".repeat(8)) || /\\u[0-9a-f]{4}/i.test(text))) {
+		return "Provider diagnostic details withheld";
+	}
 
 	// Second layer for unknown values. Each character is visited a bounded number
 	// of times; slash runs and quoted values are consumed, never searched again.

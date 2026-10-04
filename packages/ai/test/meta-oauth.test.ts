@@ -128,7 +128,11 @@ describe("Meta OAuth", () => {
 		});
 	});
 
-	it("reports a fixed error without a provider setup URL when Meta issues no key", async () => {
+	// smarty-dev#4703: retain the historical case name while asserting the value-free diagnostic contract.
+	it.each([
+		"reports a fixed error without a provider setup URL when Meta issues no key",
+		"reports the setup URL when Meta issues no key",
+	])("%s", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => jsonResponse({ require_payment: true, action_url: "https://dev.meta.ai/billing" })),

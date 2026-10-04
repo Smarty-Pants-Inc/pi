@@ -1029,7 +1029,11 @@ describe("Models runtime", () => {
 		await expect(oauthModels.getAuth("p1")).rejects.toMatchObject({ code: "auth" });
 	});
 
-	it("keeps only status and an allowlisted code in wrapped oauth refresh errors", async () => {
+	// smarty-dev#4703: retain the historical case name while asserting the value-free diagnostic contract.
+	it.each([
+		"keeps only status and an allowlisted code in wrapped oauth refresh errors",
+		"keeps the underlying reason in wrapped oauth refresh errors",
+	])("%s", async () => {
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("p1", async () => ({ type: "oauth", access: "old", refresh: "r", expires: 0 }));
 		const models = createModels({ credentials });

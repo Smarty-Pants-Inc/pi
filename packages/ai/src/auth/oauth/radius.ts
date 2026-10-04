@@ -10,6 +10,7 @@
  */
 
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
+import { runOAuthOperation } from "../../utils/bounded-response.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
 import {
@@ -134,7 +135,12 @@ async function loginWithBrowser(
 ): Promise<OAuthCredential> {
 	const { verifier, challenge } = await generatePKCE();
 	const state = crypto.randomUUID();
-	const authorizeUrl = new URL(authorizationEndpoint);
+	let authorizeUrl: URL;
+	try {
+		authorizeUrl = new URL(authorizationEndpoint);
+	} catch {
+		throw new Error("Invalid Radius OAuth authorization endpoint");
+	}
 	authorizeUrl.search = new URLSearchParams({
 		response_type: "code",
 		client_id: OAUTH_CLIENT_ID,
@@ -274,38 +280,43 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 	return withOAuthDiagnostics({
 		name: options.name,
 
-		async login(interaction): Promise<OAuthCredential> {
-			const loginMethod = await interaction.prompt({
-				type: "select",
-				message: `Sign in to ${options.name}:`,
-				options: [
-					{ id: LOGIN_METHOD_BROWSER, label: "Sign in with browser (recommended)" },
-					{
-						id: LOGIN_METHOD_DEVICE_CODE,
-						label: "Sign in with device code (when signing in from another device)",
-					},
-				],
-			});
+		login: (interaction) =>
+			runOAuthOperation(interaction.signal, 15 * 60_000, async (signal): Promise<OAuthCredential> => {
+				interaction = { ...interaction, signal };
+				const loginMethod = await interaction.prompt({
+					type: "select",
+					signal: interaction.signal,
+					message: `Sign in to ${options.name}:`,
+					options: [
+						{ id: LOGIN_METHOD_BROWSER, label: "Sign in with browser (recommended)" },
+						{
+							id: LOGIN_METHOD_DEVICE_CODE,
+							label: "Sign in with device code (when signing in from another device)",
+						},
+					],
+				});
 
-			if (loginMethod === LOGIN_METHOD_DEVICE_CODE) {
-				return loginWithDeviceCode(gateway, interaction);
-			}
-			if (loginMethod === LOGIN_METHOD_BROWSER) {
-				const discovery = await loadRadiusOAuthDiscovery(gateway, interaction.signal);
-				return loginWithBrowser(gateway, discovery.authorizationEndpoint, interaction);
-			}
-			throw oauthDiagnosticError("oauth_request_failed");
-		},
+				if (loginMethod === LOGIN_METHOD_DEVICE_CODE) {
+					return loginWithDeviceCode(gateway, interaction);
+				}
+				if (loginMethod === LOGIN_METHOD_BROWSER) {
+					const discovery = await loadRadiusOAuthDiscovery(gateway, interaction.signal);
+					return loginWithBrowser(gateway, discovery.authorizationEndpoint, interaction);
+				}
+				throw oauthDiagnosticError("oauth_request_failed");
+			}),
 
 		async refresh(credential, signal): Promise<OAuthCredential> {
-			const refreshed = await requestOAuthToken(
-				gateway,
-				new URLSearchParams({
-					grant_type: "refresh_token",
-					client_id: OAUTH_CLIENT_ID,
-					refresh_token: credential.refresh,
-				}),
-				signal,
+			const refreshed = await runOAuthOperation(signal, 60_000, (ownedSignal) =>
+				requestOAuthToken(
+					gateway,
+					new URLSearchParams({
+						grant_type: "refresh_token",
+						client_id: OAUTH_CLIENT_ID,
+						refresh_token: credential.refresh,
+					}),
+					ownedSignal,
+				),
 			);
 			return refreshed;
 		},

@@ -322,7 +322,11 @@ describe("xAI OAuth device flow", () => {
 		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 	});
 
-	it("allows the upstream code but discards its description on refresh failure", async () => {
+	// smarty-dev#4703: retain the historical case name while asserting the value-free diagnostic contract.
+	it.each([
+		"allows the upstream code but discards its description on refresh failure",
+		"surfaces the upstream error code and description on refresh failure",
+	])("%s", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => jsonResponse({ error: "invalid_grant", error_description: "refresh token revoked" }, 400)),

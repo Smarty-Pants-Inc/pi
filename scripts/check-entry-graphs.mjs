@@ -36,17 +36,17 @@ const WORKSPACE = {
 const BUDGETS = {
 	"packages/ai": {
 		"./models": {
-			maxFiles: 15,
+			maxFiles: 16,
 			forbid: ["providers/", "models.generated.ts", "index.ts", "utils/validation.ts", "utils/typebox-helpers.ts"],
 		},
-		// Diagnostics also reach the dependency-free OAuth redactor and shared recovery classifier.
-		"./utils/*": { maxFiles: 5, forbid: ["providers/", "api/", "index.ts"] },
+		// Diagnostics reach the OAuth redactor, recovery classifier and bounded response helper.
+		"./utils/*": { maxFiles: 6, forbid: ["providers/", "api/", "index.ts"] },
 	},
 	"packages/durable": {
 		".": {
 			// The built-in tool task validates arguments with pi-ai's TypeBox-based validation, so TypeBox is allowed.
-			// Durable compaction reaches the retry parser, OAuth redactor and shared recovery classifier.
-			maxFiles: 63,
+			// Durable compaction reaches retry, OAuth redaction/classification and bounded response helpers.
+			maxFiles: 64,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

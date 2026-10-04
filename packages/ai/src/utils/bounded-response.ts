@@ -77,3 +77,37 @@ export async function fetchBoundedResponse(
 		clearTimeout(timer);
 	}
 }
+
+/** OAuth transport errors never expose endpoint responses, parser messages or native exceptions. */
+export async function fetchOAuthResponse(input: string | URL, init: RequestInit): Promise<Response> {
+	try {
+		return await fetchBoundedResponse(String(input), init);
+	} catch (error) {
+		if (error instanceof ResponseBodyError)
+			throw new ResponseBodyError("OAuth response body failed validation", error.status);
+		throw new Error(init.signal?.aborted ? "Login cancelled" : "OAuth request failed");
+	}
+}
+
+/** One finite owner-composed budget covers phases, polling and retry backoff. */
+export async function runOAuthOperation<T>(
+	signal: AbortSignal,
+	timeoutMs: number,
+	operation: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+	const controller = new AbortController();
+	const ownedSignal = AbortSignal.any([signal, controller.signal]);
+	const timer = setTimeout(() => controller.abort(new Error("OAuth operation timed out")), timeoutMs);
+	try {
+		ownedSignal.throwIfAborted();
+		const result = await operation(ownedSignal);
+		ownedSignal.throwIfAborted();
+		return result;
+	} catch (error) {
+		if (ownedSignal.aborted) throw new Error(signal.aborted ? "Login cancelled" : "OAuth operation timed out");
+		throw error;
+	} finally {
+		controller.abort();
+		clearTimeout(timer);
+	}
+}

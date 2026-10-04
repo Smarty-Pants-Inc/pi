@@ -18,6 +18,7 @@ import {
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.ts";
 import { completeSummarization, estimateTokens, getSummarizationFailure } from "./compaction.ts";
 import {
+	addFileOp,
 	computeFileLists,
 	createFileOps,
 	extractFileOpsFromMessage,
@@ -156,7 +157,7 @@ export function collectEntriesForBranchSummary(
 function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 	switch (entry.type) {
 		case "message":
-			// Skip tool results - context is in assistant's tool call
+			// Skip tool-result prose; nested file metadata is extracted independently.
 			if (entry.message.role === "toolResult") return undefined;
 			return entry.message;
 
@@ -186,8 +187,10 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
  * This ensures we keep the most recent context when the branch is too long.
  *
  * Also collects file operations from:
- * - Tool calls in assistant messages
+ * - Direct assistant tool calls and nested calls recorded on tool results
  * - Existing branch_summary entries' details (for cumulative tracking)
+ *
+ * File metadata is deterministic and independent of the conversation token budget.
  *
  * @param entries - Entries in chronological order
  * @param tokenBudget - Maximum tokens to include (0 = no limit)
@@ -197,34 +200,29 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 	const fileOps = createFileOps();
 	let totalTokens = 0;
 
-	// First pass: collect file ops from ALL entries (even if they don't fit in token budget)
-	// This ensures we capture cumulative file tracking from nested branch summaries
-	// Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones
+	// Extract metadata in session order before filtering prose or selecting conversation tokens.
+	// Tool results can carry nested calls absent from the assistant's top-level tool call.
+	// Only pi-generated summary details are trusted for cumulative tracking.
 	for (const entry of entries) {
-		if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
+		if (entry.type === "message") {
+			extractFileOpsFromMessage(entry.message, fileOps);
+		} else if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
 			const details = entry.details as BranchSummaryDetails;
 			if (Array.isArray(details.readFiles)) {
-				for (const f of details.readFiles) fileOps.read.add(f);
+				for (const f of details.readFiles) addFileOp("read", { path: f }, fileOps);
 			}
 			if (Array.isArray(details.modifiedFiles)) {
-				// Modified files go into both edited and written for proper deduplication
-				for (const f of details.modifiedFiles) {
-					fileOps.edited.add(f);
-				}
+				// Summary details do not distinguish edits from writes.
+				for (const f of details.modifiedFiles) addFileOp("edit", { path: f }, fileOps);
 			}
 		}
 	}
-
-	// Messages the walk visits, newest first. File ops are extracted oldest first after the walk so
-	// the recency order (and the cap in computeFileLists) follows the session, not the walk.
-	const visited: AgentMessage[] = [];
 
 	// Second pass: walk from newest to oldest, adding messages until token budget
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
-		visited.push(message);
 
 		const tokens = estimateTokens(message);
 
@@ -244,7 +242,6 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		messages.unshift(message);
 		totalTokens += tokens;
 	}
-	for (let i = visited.length - 1; i >= 0; i--) extractFileOpsFromMessage(visited[i], fileOps);
 
 	return { messages, fileOps, totalTokens };
 }

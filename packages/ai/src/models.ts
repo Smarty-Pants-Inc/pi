@@ -780,7 +780,17 @@ class ModelsImpl implements MutableModels {
 				if (signal.aborted || isOAuthCancellation(error)) throw new Error("Login cancelled");
 				throw safeOAuthError(error);
 			});
-		const credential = await raceWithAbortSignal(loginOperation, signal);
+		let credential: Credential;
+		try {
+			credential = await raceWithAbortSignal(loginOperation, signal);
+		} catch (error) {
+			if (signal.aborted) {
+				await loginOperation.catch(() => undefined);
+				throw new Error("Login cancelled");
+			}
+			throw error;
+		}
+
 		let mutationStarted = false;
 		let markMutationStarted: (() => void) | undefined;
 		const started = new Promise<void>((resolve) => {
@@ -880,6 +890,7 @@ class ModelsImpl implements MutableModels {
 			const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey, headers, [
 				...(resolution.diagnosticSecrets ?? []),
 				...(options?.diagnosticSecrets ?? []),
+				...getOAuthDiagnosticSecrets(auth.apiKey, auth.headers),
 			]);
 			if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
 			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));

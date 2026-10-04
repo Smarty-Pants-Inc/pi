@@ -29,6 +29,7 @@ import type {
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
+import { captureToolImplementation } from "./types.ts";
 
 /** sourceMessage identifies queued input when tool declaration normalization copies it. */
 export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
@@ -186,7 +187,7 @@ async function runLoop(
 		while (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn) {
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
-				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
+				const nextTurnSnapshot = signal?.aborted ? undefined : await config.prepareNextTurn?.(lastCompletedTurn);
 				if (nextTurnSnapshot) {
 					currentContext = nextTurnSnapshot.context ?? currentContext;
 					preparedMessages = nextTurnSnapshot.messages ?? [];
@@ -562,7 +563,7 @@ async function executeToolCalls(
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	// Capture classification and callable methods before any awaited event or hook.
-	const tools = (currentContext.tools ?? []).map((tool) => ({ ...tool }));
+	const tools = (currentContext.tools ?? []).map(captureToolImplementation);
 	const queue = config.toolCallQueue ?? new ToolCallQueue();
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => tools.find((t) => t.name === tc.name)?.executionMode === "sequential",
@@ -818,7 +819,7 @@ async function prepareToolCall(
 	tools: readonly AgentTool<any>[] = currentContext.tools ?? [],
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const selected = tools.find((t) => t.name === toolCall.name);
-	const tool = selected && { ...selected };
+	const tool = selected && captureToolImplementation(selected);
 	if (!tool) {
 		return {
 			kind: "immediate",
@@ -994,7 +995,7 @@ async function finalizeExecutedToolCall(
 				result = {
 					...result,
 					content: afterResult.content ?? result.content,
-					details: afterResult.details ?? result.details,
+					details: afterResult.details !== undefined ? afterResult.details : result.details,
 					usage: afterResult.usage ?? result.usage,
 					terminate: afterResult.terminate ?? result.terminate,
 				};

@@ -11,6 +11,7 @@ import type {
 	BetaRefusalStopDetails as RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
 import {
+	getOAuthDiagnosticSecrets,
 	oauthDiagnosticError,
 	oauthDiagnosticLogger,
 	oauthRecoveryDecision,
@@ -45,6 +46,7 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
@@ -609,6 +611,10 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 		const oauthDiagnostics =
 			options?.oauthDiagnostics === true || (options?.apiKey !== undefined && isOAuthToken(options.apiKey));
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
+			...(options?.diagnosticSecrets ?? []),
+			...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
+		]);
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -616,7 +622,14 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			let inputTransformations: BetaThinkingDroppedInputTransformation[] | undefined;
 
 			if (options?.client) {
-				client = oauthDiagnostics ? options.client.withOptions({ logger: oauthDiagnosticLogger }) : options.client;
+				// Clone SDK clients before dispatch, so logs cannot publish credentials and the caller's client is unchanged.
+				client =
+					typeof options.client.withOptions === "function"
+						? options.client.withOptions({
+								logLevel: "off",
+								logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
+							})
+						: options.client;
 				isOAuth = false;
 			} else {
 				const apiKey = options?.apiKey;
@@ -664,7 +677,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
-					diagnosticSecrets: options?.diagnosticSecrets,
+					diagnosticSecrets,
 					oauthDiagnostics,
 				},
 			);
@@ -922,10 +935,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			const safe = oauthDiagnostics ? safeOAuthError(error, true) : undefined;
 			output.oauthRecovery = safe ? oauthRecoveryDecision(safe) : undefined;
 			output.errorMessage = safe
-				? redactOAuthDiagnostic(safe.message, options?.diagnosticSecrets)
-				: error instanceof Error
-					? error.message
-					: JSON.stringify(error);
+				? redactOAuthDiagnostic(safe.message, diagnosticSecrets)
+				: formatProviderError(normalizeProviderError(error, diagnosticSecrets));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -1026,6 +1037,7 @@ function createClient(
 	// Copilot: Bearer auth.
 	if (model.provider === "github-copilot") {
 		const client = new PiAnthropic({
+			logLevel: "off",
 			logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 			apiKey: null,
 			authToken: apiKey ?? null,
@@ -1049,6 +1061,7 @@ function createClient(
 	// OAuth: Bearer auth, Claude Code identity headers
 	if (apiKey && isOAuthToken(apiKey)) {
 		const client = new PiAnthropic({
+			logLevel: "off",
 			logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 			apiKey: null,
 			authToken: apiKey,
@@ -1090,6 +1103,7 @@ function createClient(
 		const key = JSON.stringify([model.baseUrl, federation]);
 		if (federationClient?.key !== key || federationClient.fetch !== fetch) {
 			const client = new PiAnthropic({
+				logLevel: "off",
 				logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 				apiKey: null,
 				authToken: null,
@@ -1104,6 +1118,7 @@ function createClient(
 	}
 
 	const client = new PiAnthropic({
+		logLevel: "off",
 		logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 		apiKey: apiKey ?? null,
 		authToken: null,

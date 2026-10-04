@@ -121,6 +121,7 @@ describe.sequential("Anthropic OAuth", () => {
 			{
 				type: "select",
 				message: "Select Anthropic login method:",
+				signal: expect.any(AbortSignal),
 				options: [
 					{ id: "browser", label: "Browser login (default)" },
 					{ id: "copy_code", label: "Copy code login (headless)" },

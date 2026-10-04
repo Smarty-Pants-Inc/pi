@@ -16,6 +16,8 @@
 import { oauthRecoveryDecision, redactOAuthDiagnostic, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import type { OAuthRecoveryDecision } from "../types.ts";
 
+export { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
+
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
 export interface NormalizedProviderError {

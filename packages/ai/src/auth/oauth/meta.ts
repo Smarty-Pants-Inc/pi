@@ -13,6 +13,7 @@
  * user must sign in again.
  */
 
+import { runOAuthOperation } from "../../utils/bounded-response.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import {
 	fetchOAuth,
@@ -199,9 +200,11 @@ export const metaOAuth: OAuthAuth = withOAuthDiagnostics({
 	isSubscription: true,
 	loginLabel: "Sign in with Meta",
 
-	login: loginMeta,
+	login: (interaction) =>
+		runOAuthOperation(interaction.signal, 15 * 60_000, (signal) => loginMeta({ ...interaction, signal })),
 
-	refresh: (credential, signal) => mintApiKey(credential.refresh, signal),
+	refresh: (credential, signal) =>
+		runOAuthOperation(signal, 60_000, (ownedSignal) => mintApiKey(credential.refresh, ownedSignal)),
 
 	async toAuth(credential) {
 		return { apiKey: credential.access };

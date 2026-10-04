@@ -5,6 +5,7 @@
  * It is only intended for CLI use, not browser environments.
  */
 
+import { runOAuthOperation } from "../../utils/bounded-response.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
@@ -267,27 +268,31 @@ export const anthropicOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "Anthropic (Claude Pro/Max)",
 	isSubscription: true,
 
-	async login(interaction) {
-		const method = await interaction.prompt({
-			type: "select",
-			message: "Select Anthropic login method:",
-			options: [
-				{ id: ANTHROPIC_BROWSER_LOGIN_METHOD, label: "Browser login (default)" },
-				{ id: ANTHROPIC_COPY_CODE_LOGIN_METHOD, label: "Copy code login (headless)" },
-			],
-		});
+	login: (interaction) =>
+		runOAuthOperation(interaction.signal, 5 * 60_000, async (signal) => {
+			interaction = { ...interaction, signal };
+			const method = await interaction.prompt({
+				type: "select",
+				signal: interaction.signal,
+				message: "Select Anthropic login method:",
+				options: [
+					{ id: ANTHROPIC_BROWSER_LOGIN_METHOD, label: "Browser login (default)" },
+					{ id: ANTHROPIC_COPY_CODE_LOGIN_METHOD, label: "Copy code login (headless)" },
+				],
+			});
 
-		if (method === ANTHROPIC_COPY_CODE_LOGIN_METHOD) {
-			return loginAnthropicCopyCode(interaction);
-		}
-		if (method !== ANTHROPIC_BROWSER_LOGIN_METHOD) {
-			throw oauthDiagnosticError("oauth_request_failed");
-		}
+			if (method === ANTHROPIC_COPY_CODE_LOGIN_METHOD) {
+				return loginAnthropicCopyCode(interaction);
+			}
+			if (method !== ANTHROPIC_BROWSER_LOGIN_METHOD) {
+				throw oauthDiagnosticError("oauth_request_failed");
+			}
 
-		return loginAnthropic(interaction);
-	},
+			return loginAnthropic(interaction);
+		}),
 
-	refresh: (credential, signal) => refreshAnthropicToken(credential.refresh, signal),
+	refresh: (credential, signal) =>
+		runOAuthOperation(signal, 60_000, (ownedSignal) => refreshAnthropicToken(credential.refresh, ownedSignal)),
 
 	async toAuth(credential) {
 		return { apiKey: credential.access };

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export const MODEL_DATA_SCHEMA_VERSION = 6;
@@ -307,6 +307,20 @@ export function validateModelDataDirectory(structure: ModelDataStructure, dataDi
 	if (errors.length > 0) throwValidationErrors(errors);
 }
 
+/** Re-stamp merged/local values without fetching or replacing any provider catalog. */
+export function regenerateModelDataManifest(packageRoot: string, generatedAt: string): void {
+	const structure = readModelDataStructure(packageRoot);
+	const dataDir = join(packageRoot, "src", "providers", "data");
+	const fileContents = Object.fromEntries(
+		Object.keys(structure).map((providerId) => {
+			const filename = `${providerId}.json`;
+			return [filename, readFileSync(join(dataDir, filename), "utf8")];
+		}),
+	);
+	const manifest = createModelDataManifest(structure, fileContents, generatedAt);
+	writeFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), `${JSON.stringify(manifest)}\n`);
+	validateModelDataDirectory(structure, dataDir);
+}
 export function validateGeneratedModelData(packageRoot: string): void {
 	const structure = readModelDataStructure(packageRoot);
 	validateModelDataDirectory(structure, join(packageRoot, "src", "providers", "data"));

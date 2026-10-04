@@ -11,6 +11,7 @@
  * It is only intended for CLI use, not browser environments.
  */
 
+import { runOAuthOperation } from "../../utils/bounded-response.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
@@ -79,10 +80,10 @@ async function exchangeAuthorizationCode(
 		} catch {
 			if (response.ok) throw oauthDiagnosticError("oauth_invalid_response", response.status);
 		}
-	} catch (error) {
+	} catch {
 		if (signal.aborted) throw new Error("Login cancelled");
 		if (controller.signal.aborted) throw new Error("OpenRouter OAuth token exchange timed out");
-		throw error;
+		throw new Error("OpenRouter OAuth token request failed");
 	} finally {
 		clearTimeout(timeout);
 		signal.removeEventListener("abort", onAbort);
@@ -153,7 +154,8 @@ async function loginOpenRouter(interaction: ProviderAuthInteraction): Promise<OA
 export const openRouterOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "OpenRouter OAuth",
 	loginLabel: "Sign in with OpenRouter",
-	login: loginOpenRouter,
+	login: (interaction) =>
+		runOAuthOperation(interaction.signal, LOGIN_TIMEOUT_MS, (signal) => loginOpenRouter({ ...interaction, signal })),
 	async refresh(credential, _signal) {
 		return credential;
 	},

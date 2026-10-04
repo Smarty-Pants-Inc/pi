@@ -79,7 +79,7 @@ export interface BeforeToolCallResult {
  *
  * Merge semantics are field-by-field:
  * - `content`: if provided, replaces the tool result content array in full
- * - `details`: if provided, replaces the tool result details value in full
+ * - `details`: if not undefined, replaces the tool result details value in full; null explicitly clears it
  * - `isError`: if provided, replaces the tool result error flag
  * - `usage`: if provided, replaces the tool result usage
  * - `terminate`: if provided, replaces the early-termination hint
@@ -497,6 +497,36 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	 * If omitted, the default execution mode applies.
 	 */
 	executionMode?: ToolExecutionMode;
+}
+
+/** Pin implementation references before yielding, preserving the original method receivers. */
+export function captureToolImplementation<
+	T extends {
+		name: string;
+		label: string;
+		description: string;
+		parameters: TSchema;
+		outputSchema?: TSchema;
+		constrainedSampling?: Tool["constrainedSampling"];
+		replay?: "never" | "safe";
+		execute: (...args: never[]) => unknown;
+		prepareArguments?: (args: never) => unknown;
+		executionMode?: ToolExecutionMode;
+	},
+>(tool: T): T {
+	return {
+		...tool,
+		name: tool.name,
+		label: tool.label,
+		description: tool.description,
+		parameters: tool.parameters,
+		outputSchema: tool.outputSchema,
+		constrainedSampling: tool.constrainedSampling,
+		replay: tool.replay,
+		executionMode: tool.executionMode,
+		execute: tool.execute.bind(tool),
+		prepareArguments: tool.prepareArguments?.bind(tool),
+	};
 }
 
 /** Context snapshot passed into the low-level agent loop. */

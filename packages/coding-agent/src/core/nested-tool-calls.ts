@@ -15,7 +15,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core";
-import { ToolCallQueue } from "@earendil-works/pi-agent-core";
+import { captureToolImplementation, ToolCallQueue } from "@earendil-works/pi-agent-core";
 import type { JsonObject, NestedToolCallRecord, NestedToolCalls, TextContent, Usage } from "@earendil-works/pi-ai";
 import { combineUsage } from "./usage-totals.ts";
 
@@ -267,7 +267,7 @@ export class NestedToolCallRunner {
 			name,
 			arguments: (args ?? {}) as AgentToolCall["arguments"],
 		};
-		const tools = this.host.getTools().map((tool) => ({ ...tool }));
+		const tools = this.host.getTools().map(captureToolImplementation);
 		const record = scope.recorder.start(toolCall);
 		await this.host.emit({
 			type: "tool_execution_start",
@@ -288,6 +288,7 @@ export class NestedToolCallRunner {
 			signal: AbortSignal.any([options.signal!, controller.signal]),
 			pending: [],
 		});
+		let finalized = false;
 		try {
 			return await this.queue.run(
 				{
@@ -317,6 +318,7 @@ export class NestedToolCallRunner {
 					);
 					await this.close(toolCall.id);
 
+					finalized = true;
 					scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
 					// Nested results are not persisted, so their usage is only counted through the recorder.
 					if (outcome.result.usage) scope.recorder.addUsage(outcome.result.usage);
@@ -332,6 +334,24 @@ export class NestedToolCallRunner {
 				},
 			);
 		} catch (error) {
+			// Every published start owns one end, including refused/cancelled lease admission.
+			// Mark before delivery so a rejecting observer cannot cause a second end attempt.
+			if (!finalized) {
+				finalized = true;
+				const result: AgentToolResult<unknown> = {
+					content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+					details: {},
+				};
+				scope.recorder.finish(record, true, textOf(result));
+				await this.host.emit({
+					type: "tool_execution_end",
+					toolCallId: toolCall.id,
+					toolName: name,
+					result,
+					isError: true,
+					parentToolCallId: callerId,
+				});
+			}
 			const child = this.scopes.get(toolCall.id);
 			if (child) child.failure ??= { error };
 			throw error;

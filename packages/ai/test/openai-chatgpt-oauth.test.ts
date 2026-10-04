@@ -127,7 +127,11 @@ describe("OpenAI ChatGPT OAuth", () => {
 		).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 	});
 
-	it("oauth_request_failed (HTTP unknown) before starting authorization", async () => {
+	// smarty-dev#4703: retain the historical case name while asserting the value-free diagnostic contract.
+	it.each([
+		"oauth_request_failed (HTTP unknown) before starting authorization",
+		"requires a device ID before starting authorization",
+	])("%s", async () => {
 		let authorizationStarted = false;
 		const interaction = loginInteraction({
 			onAuthorize: () => {

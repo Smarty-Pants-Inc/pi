@@ -6,6 +6,13 @@ import { openrouterProvider } from "../src/providers/openrouter.ts";
 
 const TOKEN_URL = "https://openrouter.ai/api/v1/auth/keys";
 const nativeFetch = globalThis.fetch;
+
+function pendingPrompt(prompt: { signal?: AbortSignal }): Promise<string> {
+	return new Promise((_, reject) => {
+		prompt.signal?.addEventListener("abort", () => reject(new Error("Login cancelled")), { once: true });
+	});
+}
+
 const neverAbortedSignal = new AbortController().signal;
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -68,7 +75,7 @@ describe.sequential("OpenRouter OAuth", () => {
 			signal: neverAbortedSignal,
 			prompt: (prompt) => {
 				manualSignal = prompt.signal;
-				return new Promise<string>(() => {});
+				return pendingPrompt(prompt);
 			},
 			notify: (event) => {
 				if (event.type !== "auth_url") return;
@@ -115,7 +122,7 @@ describe.sequential("OpenRouter OAuth", () => {
 		let callbackResponse: Promise<Response> | undefined;
 		const login = openRouterOAuth.login({
 			signal: neverAbortedSignal,
-			prompt: () => new Promise<string>(() => {}),
+			prompt: pendingPrompt,
 			notify: (event) => {
 				if (event.type !== "auth_url") return;
 				const callbackUrl = new URL(new URL(event.url).searchParams.get("callback_url") ?? "");
@@ -145,7 +152,7 @@ describe.sequential("OpenRouter OAuth", () => {
 		let firstCallback: Promise<Response> | undefined;
 		const login = openRouterOAuth.login({
 			signal: neverAbortedSignal,
-			prompt: () => new Promise<string>(() => {}),
+			prompt: pendingPrompt,
 			notify: (event) => {
 				if (event.type !== "auth_url") return;
 				callbackUrl = new URL(new URL(event.url).searchParams.get("callback_url") ?? "");
@@ -173,7 +180,7 @@ describe.sequential("OpenRouter OAuth", () => {
 		let callbackResponse: Promise<Response> | undefined;
 		const login = openRouterOAuth.login({
 			signal: neverAbortedSignal,
-			prompt: () => new Promise<string>(() => {}),
+			prompt: pendingPrompt,
 			notify: (event) => {
 				if (event.type !== "auth_url") return;
 				const callbackUrl = new URL(new URL(event.url).searchParams.get("callback_url") ?? "");
@@ -274,7 +281,7 @@ describe.sequential("OpenRouter OAuth", () => {
 		let callbackUrl: URL | undefined;
 		const login = openRouterOAuth.login({
 			signal: controller.signal,
-			prompt: () => new Promise<string>(() => {}),
+			prompt: pendingPrompt,
 			notify: (event) => {
 				if (event.type !== "auth_url") return;
 				callbackUrl = new URL(new URL(event.url).searchParams.get("callback_url") ?? "");
@@ -308,7 +315,7 @@ describe.sequential("OpenRouter OAuth", () => {
 		let callbackUrl: URL | undefined;
 		const login = openRouterOAuth.login({
 			signal: controller.signal,
-			prompt: () => new Promise<string>(() => {}),
+			prompt: pendingPrompt,
 			notify: (event) => {
 				if (event.type !== "auth_url") return;
 				callbackUrl = new URL(new URL(event.url).searchParams.get("callback_url") ?? "");
