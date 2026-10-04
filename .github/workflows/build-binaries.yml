@@ -216,9 +216,15 @@ jobs:
       - name: Smoke-test binary
         shell: bash
         run: |
+          set -euo pipefail
+          # Use the source archive that produced these binaries, not a mutable ref or another job's checkout.
+          source_root="pi-${RELEASE_TAG#v}"
+          smoke_script="${source_root}/scripts/smoke-test-codemode-binary.mjs"
+          mkdir -p smoke-source
+          tar -xzf "release-assets/${source_root}-source.tar.gz" -C smoke-source "${smoke_script}"
           "${{ steps.binary.outputs.binary }}" --help
           "${{ steps.binary.outputs.binary }}" --version
-          node scripts/smoke-test-codemode-binary.mjs "${{ steps.binary.outputs.binary }}"
+          node "smoke-source/${smoke_script}" "${{ steps.binary.outputs.binary }}"
 
   stage-github-release:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
