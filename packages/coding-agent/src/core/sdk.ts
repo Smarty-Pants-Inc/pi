@@ -250,6 +250,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		time("resourceLoader.reload");
 	}
 
+	// Direct SDK callers have not gone through createAgentSessionServices(), which normally
+	// bootstraps these registrations. Restore saved selections only after the queued virtual
+	// catalog entries exist; assistant history names the physical model, not its router.
+	const extensionsResult = resourceLoader.getExtensions();
+	for (const { definition, extensionPath } of extensionsResult.runtime.pendingVirtualModelRegistrations) {
+		try {
+			modelRuntime.registerVirtualModel(definition);
+		} catch (error) {
+			extensionsResult.errors.push({
+				path: extensionPath,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
+
 	// Check if session has existing data to restore
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
@@ -532,8 +548,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	owner?.bindSession(session);
 	owner?.installProviderGuard(session);
 	if (owner) pairedContext = bindOrdinaryPairedContext(owner, session, convertToLlmWithBlockImages);
-
-	const extensionsResult = resourceLoader.getExtensions();
 
 	return {
 		session,

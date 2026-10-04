@@ -260,11 +260,32 @@ export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
 ): Promise<boolean> {
-	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
-		return true;
+	if (!extensionRunner.hasHandlers("session_shutdown")) return false;
+	// Cleanup owns a fresh budget: the outgoing turn/terminal signal may already be aborted.
+	const cancellation = new AbortController();
+	const timeout = setTimeout(() => {
+		// Revoke authority before releasing callers to dispose or replace the runtime. Native
+		// promises cannot be forcibly stopped, but emit observes their eventual rejection.
+		extensionRunner.invalidate();
+		cancellation.abort(new Error("Session shutdown dispatch exceeded 1000 ms"));
+	}, 1000);
+	try {
+		await extensionRunner.emit(event, cancellation.signal);
+	} catch (error) {
+		if (!cancellation.signal.aborted) throw error;
+		try {
+			extensionRunner.emitError({
+				extensionPath: "<session_shutdown>",
+				event: event.type,
+				error: "Session shutdown cleanup unfinished after 1000 ms; outgoing extension authority revoked",
+			});
+		} catch {
+			// Fallible diagnostics cannot take teardown custody away from the caller.
+		}
+	} finally {
+		clearTimeout(timeout);
 	}
-	return false;
+	return true;
 }
 
 function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["type"]) {
@@ -1074,19 +1095,45 @@ export class ExtensionRunner {
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
 		let shouldContinue = false;
-		// Record the state represented by the preview before the builder can yield.
 		let previewRevision = this.sessionManager.revision();
-		let previewPendingMessages = getPendingMessages?.().slice();
-		let context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
-		signal?.throwIfAborted();
+		let previewPendingMessages = structuredClone(getPendingMessages?.());
+		let previewEntries: SessionBoundaryDraft[] = [];
+		const staleAdmission = new Error("Boundary context changed during 8 consecutive builds; dispatch refused");
+		const previewIsCurrent = () =>
+			previewRevision === this.sessionManager.revision() &&
+			isDeepStrictEqual(previewPendingMessages, getPendingMessages?.()) &&
+			isDeepStrictEqual(previewEntries, entries);
+		const rebuildContext = async (): Promise<BoundaryContextPreview> => {
+			for (let attempt = 0; attempt < 8; attempt++) {
+				signal?.throwIfAborted();
+				previewRevision = this.sessionManager.revision();
+				previewPendingMessages = structuredClone(getPendingMessages?.());
+				previewEntries = structuredClone(entries);
+				// The builder gets detached drafts, just like handlers. Recheck every input
+				// after its await, including the initial build and all replacement builds.
+				const built = await raceWithAbortSignal(Promise.resolve(buildContext(structuredClone(entries))), signal);
+				signal?.throwIfAborted();
+				if (previewIsCurrent()) return structuredClone(built);
+			}
+			throw staleAdmission;
+		};
+		let context = await rebuildContext();
+		if (!this.hasHandlers(baseEvent.type) && !previewIsCurrent()) throw staleAdmission;
 		if (!this.hasHandlers(baseEvent.type)) return { entries, continue: false, context, valid: true };
-		// One detached preview per build preserves observer sharing without exposing history.
-		context = structuredClone(context);
+		// One detached preview per stable build preserves no-op observer sharing.
 		let contextSnapshot = structuredClone(context);
 		let valid = true;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
+				// Even a stable async rebuild yields before its caller resumes. Reconcile
+				// again immediately before admitting the next handler.
+				if (!previewIsCurrent()) {
+					context = await rebuildContext();
+					contextSnapshot = structuredClone(context);
+					valid = true;
+				}
+				if (!previewIsCurrent()) throw staleAdmission;
 				// A failed proposal remains visible so a later handler can replace it.
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
@@ -1135,20 +1182,19 @@ export class ExtensionRunner {
 						unchangedEntries &&
 						isDeepStrictEqual(context, contextSnapshot) &&
 						previewRevision === nextRevision &&
-						previewPendingMessages?.length === nextPendingMessages?.length &&
-						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
+						isDeepStrictEqual(previewPendingMessages, nextPendingMessages)
 					) {
 						continue;
 					}
 
-					previewRevision = nextRevision;
-					previewPendingMessages = nextPendingMessages?.slice();
-					context = structuredClone(await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal));
+					context = await rebuildContext();
 					signal?.throwIfAborted();
+					if (!previewIsCurrent()) throw staleAdmission;
 					contextSnapshot = structuredClone(context);
 					valid = true;
 				} catch (err) {
 					signal?.throwIfAborted();
+					if (err === staleAdmission) throw err;
 					valid = false;
 					this.emitError({
 						extensionPath: ext.path,
