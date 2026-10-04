@@ -14,17 +14,20 @@ class BlockScalar(str):
 
 
 class WorkflowLoader(yaml.SafeLoader):
-    # Actions uses YAML 1.2 booleans: on/yes/off/no are strings. Copy the
-    # resolver lists so changing this loader does not mutate SafeLoader.
-    yaml_implicit_resolvers = {
-        first: [(tag, pattern) for tag, pattern in resolvers if tag != "tag:yaml.org,2002:bool"]
-        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
-    }
+    # Actions uses YAML 1.2 Core Schema (10.3.2), not PyYAML's YAML 1.1
+    # resolvers. Start empty so legacy booleans, numbers and timestamps stay
+    # strings, without changing SafeLoader for other callers.
+    yaml_implicit_resolvers = {}
+
+    def construct_core_int(self, node):
+        value = self.construct_scalar(node)
+        base = 8 if value.startswith("0o") else 16 if value.startswith("0x") else 10
+        return int(value, base)
 
     def construct_mapping(self, node, deep=False):
         keys = set()
         for key, _ in node.value:
-            if key.tag == "tag:yaml.org,2002:merge":
+            if key.tag == "tag:yaml.org,2002:merge" or (key.style is None and key.value == "<<"):
                 raise ValueError("unsupported YAML merge key")
             value = self.construct_object(key, deep=deep)
             if value in keys:
@@ -38,7 +41,20 @@ class WorkflowLoader(yaml.SafeLoader):
 
 
 WorkflowLoader.add_implicit_resolver(
-    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.IGNORECASE), list("tTfF")
+    "tag:yaml.org,2002:null", re.compile(r"^(?:null|Null|NULL|~|)\Z"), ["n", "N", "~", ""]
+)
+WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|True|TRUE|false|False|FALSE)\Z"), list("tTfF")
+)
+# Integer resolution precedes float resolution: both patterns match decimals.
+WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:int", re.compile(r"^(?:[-+]?[0-9]+|0o[0-7]+|0x[0-9a-fA-F]+)\Z"), list("-+0123456789")
+)
+WorkflowLoader.add_constructor("tag:yaml.org,2002:int", WorkflowLoader.construct_core_int)
+WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:float",
+    re.compile(r"^(?:[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN))\Z"),
+    list("-+0123456789."),
 )
 
 

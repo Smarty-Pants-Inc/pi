@@ -180,8 +180,76 @@ for pair in 'on yes' 'yes on' 'off no' 'no off' 'ON YES' 'On Yes' 'OFF NO' 'Off 
             runner: smarty-linux-x64" 'unapproved hosted runner'
 done
 
-# Actual booleans must still match across case variants in both operations.
-for value in true True TRUE tRuE false False FALSE fAlSe; do
+# pi#138 / smarty-dev#3644: Core Schema values must not collapse to YAML
+# 1.1 values, arbitrary-case booleans, or their quoted string spellings.
+# Exercise both exclusion and inclusion through the actual guard. The approved
+# jobs stay in use so a scalar mismatch must expose the unapproved hosted row.
+for pair in \
+  '010|8' 'tRuE|true' 'fAlSe|false' 'True|tRuE' 'TRUE|tRuE' \
+  '0o10|"0o10"' '0x10|"16"' '1_000|1000' '.inf|".inf"' '~|"~"' \
+  'on|true' 'yes|true' '1_0|10' '1:00|60' '0b10|2' '+0x10|16' \
+  '1e3|"1e3"' 'null|"null"'; do
+  IFS='|' read -r value other <<< "$pair"
+  expect_rejected "Core Schema matrix exclusion $value/$other" "$approved_jobs
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [smarty-linux-x64, ubuntu-latest]
+        feature: [$value]
+        exclude:
+          - runner: ubuntu-latest
+            feature: $other" 'unapproved hosted runner' build-binaries.yml "$allowlist"
+  expect_rejected "Core Schema matrix inclusion $value/$other" "$approved_jobs
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        feature: [$value]
+        include:
+          - feature: $other
+            runner: ubuntu-latest
+          - feature: $value
+            runner: smarty-linux-x64" 'unapproved hosted runner' build-binaries.yml "$allowlist"
+done
+
+# Equal Core Schema values must still match, including decimal leading zeroes,
+# octal/hex, exponent floats, nulls and strings previously coerced by YAML 1.1.
+for pair in \
+  '010|10' '+010|10' '-010|-10' '0o10|8' '0x10|16' '1e3|1000' \
+  '1.0e3|1000' '.5|0.5' '1.|1.0' '.inf|.INF' '-.Inf|-.INF' \
+  '~|null' 'Null|NULL' 'null|' '1_000|"1_000"' '1:00|"1:00"' \
+  '2001-01-01|"2001-01-01"' 'tRuE|"tRuE"' 'on|"on"' 'yes|"yes"'; do
+  IFS='|' read -r value other <<< "$pair"
+  write_fixture probe.yml "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [smarty-linux-x64, ubuntu-latest]
+        feature: [$value]
+        exclude:
+          - runner: ubuntu-latest
+            feature: $other"
+  bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+  echo "PASS: Core Schema matching exclusion $value/$other"
+  write_fixture probe.yml "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        feature: [$value]
+        include:
+          - feature: $other
+            runner: ubuntu-latest
+          - feature: $value
+            runner: smarty-linux-x64"
+  bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+  echo "PASS: Core Schema matching inclusion $value/$other"
+done
+
+# Actual booleans must still match across the six YAML 1.2 spellings.
+for value in true True TRUE false False FALSE; do
   write_fixture probe.yml "jobs:
   check:
     runs-on: \${{ matrix.runner }}
