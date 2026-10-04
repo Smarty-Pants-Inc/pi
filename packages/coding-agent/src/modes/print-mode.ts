@@ -6,7 +6,7 @@
  * - `pi --mode json "prompt"` - JSON event stream
  */
 
-import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type ImageContent, ProviderRequestLimitError } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import type { AgentActivityOutcome } from "../core/extensions/index.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
@@ -21,6 +21,8 @@ import { writeRetryNotice } from "./retry-notice.ts";
 export interface PrintModeOptions {
 	/** Output mode: "text" for final response only, "json" for all events */
 	mode: "text" | "json";
+	/** Maximum physical provider attempts for this dispatch. Omitted means unlimited. */
+	maxProviderRequests?: number;
 	/** Array of additional prompts to send after initialMessage */
 	messages?: string[];
 	/** First message to send (may contain @file content) */
@@ -34,8 +36,26 @@ export interface PrintModeOptions {
  * Sends prompts to the agent and outputs the result.
  */
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
-	const { mode, messages = [], initialMessage, initialImages } = options;
+	const { mode, messages = [], initialMessage, initialImages, maxProviderRequests } = options;
 	let exitCode = 0;
+	let providerRequests = 0;
+	let requestLimitError: Error | undefined;
+	let limitReported = false;
+	const requestLimitCancellation = new AbortController();
+	const requestGuard =
+		maxProviderRequests === undefined
+			? undefined
+			: {
+					signal: requestLimitCancellation.signal,
+					beforeProviderRequest: () => {
+						if (providerRequests >= maxProviderRequests) {
+							requestLimitError ??= new ProviderRequestLimitError(providerRequests, maxProviderRequests);
+							requestLimitCancellation.abort(requestLimitError);
+							throw requestLimitError;
+						}
+						providerRequests++;
+					},
+				};
 	let settledOutcome: AgentActivityOutcome | undefined;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
@@ -71,6 +91,18 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		return disposalCompletion;
 	};
 
+	requestLimitCancellation.signal.addEventListener(
+		"abort",
+		() => {
+			// Native disposal cancels the current (possibly rebound) session's tools,
+			// hooks, retries and owned processes before joining and persisting it.
+			killTrackedDetachedChildren();
+			// The prompt is still joined below; finally observes any disposal failure.
+			void disposeRuntime().catch(() => {});
+		},
+		{ once: true },
+	);
+
 	const registerSignalHandlers = (): void => {
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
 		if (process.platform !== "win32") {
@@ -97,6 +129,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;
+		if (requestGuard) session.modelRuntime.providerRequestGuard = requestGuard;
 		settledOutcome = undefined;
 		await session.bindExtensions({
 			mode: mode === "json" ? "json" : "print",
@@ -150,6 +183,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	};
 
 	try {
+		if (
+			maxProviderRequests !== undefined &&
+			(!Number.isSafeInteger(maxProviderRequests) || maxProviderRequests < 1)
+		) {
+			throw new Error("maxProviderRequests must be a positive safe integer");
+		}
 		if (mode === "json") {
 			const header = session.sessionManager.getHeader();
 			if (header) {
@@ -161,10 +200,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		if (initialMessage) {
 			await session.prompt(initialMessage, { images: initialImages });
+			if (requestLimitError) throw requestLimitError;
 		}
 
 		for (const message of messages) {
 			await session.prompt(message);
+			if (requestLimitError) throw requestLimitError;
 		}
 
 		if (mode === "text") {
@@ -193,10 +234,15 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			}
 		}
 	} catch (error: unknown) {
-		console.error(error instanceof Error ? error.message : String(error));
+		console.error(requestLimitError?.message ?? (error instanceof Error ? error.message : String(error)));
+		limitReported = requestLimitError !== undefined;
 		exitCode = 1;
 	} finally {
 		await disposeRuntime();
+	}
+	if (requestLimitError) {
+		if (!limitReported) console.error(requestLimitError.message);
+		exitCode = 1;
 	}
 	return exitCode;
 }

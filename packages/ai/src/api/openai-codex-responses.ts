@@ -20,6 +20,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
 import {
 	appendAssistantMessageDiagnostic,
@@ -31,6 +32,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -397,6 +399,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					throw new Error("Request was aborted");
 				}
 
+				checkProviderRequest(options);
 				try {
 					const headerTimeoutSignal =
 						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
@@ -753,8 +756,14 @@ async function* mapCodexEvents(
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		try {
-			await options?.onProviderStreamEvent?.(event, model);
+			options?.signal?.throwIfAborted();
+			const observing = options?.onProviderStreamEvent?.(event, model);
+			if (observing) {
+				if (options?.signal) await raceWithAbortSignal(Promise.resolve(observing), options.signal);
+				else await observing;
+			}
 		} catch (error) {
+			if (options?.signal?.aborted) throw error;
 			// The final assistant error must retain this non-transport origin for outer retry callers.
 			appendAssistantMessageDiagnostic(
 				output,
@@ -1547,6 +1556,18 @@ async function processWebSocketStream(
 		options?.env,
 	);
 	let keepConnection = true;
+	let released = false;
+	const onAbort = () => {
+		// The parser may be suspended at a stream observer. Invalidate and close
+		// the owned connection here, without waiting for parser advancement.
+		keepConnection = false;
+		if (entry) entry.continuation = undefined;
+		if (!released) {
+			released = true;
+			release({ keep: false });
+		}
+	};
+	options?.signal?.addEventListener("abort", onAbort, { once: true });
 	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
 	// WebSocket continuation still works via connection-scoped previous_response_id state.
@@ -1571,6 +1592,7 @@ async function processWebSocketStream(
 		}
 	}
 	try {
+		checkProviderRequest(options);
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
@@ -1612,7 +1634,8 @@ async function processWebSocketStream(
 		keepConnection = false;
 		throw error;
 	} finally {
-		release({ keep: keepConnection });
+		options?.signal?.removeEventListener("abort", onAbort);
+		if (!released) release({ keep: keepConnection });
 	}
 }
 
