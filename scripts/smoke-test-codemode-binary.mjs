@@ -109,6 +109,10 @@ async function main() {
 	});
 
 	try {
+		const version = await runBinary(binary, ["--version"], tempDir);
+		if (version.exitCode !== 0 || !version.stdout.trim()) {
+			throw new Error(`Binary --version failed or printed no version (exit ${version.exitCode})\n${version.stdout}\n${version.stderr}`);
+		}
 		await new Promise((resolveListen, reject) => {
 			server.once("error", reject);
 			server.listen(0, "127.0.0.1", resolveListen);

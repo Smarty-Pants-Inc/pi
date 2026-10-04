@@ -32,6 +32,7 @@ interface SmokeOptions {
 	networkDuringRefusal?: boolean;
 	guestDuringRefusal?: boolean;
 	nativeResult?: string;
+	emptyVersion?: boolean;
 }
 
 async function exerciseSmoke(options: SmokeOptions = {}) {
@@ -52,6 +53,13 @@ async function exerciseSmoke(options: SmokeOptions = {}) {
 		const work = new Promise<void>((done) => {
 			setImmediate(async () => {
 				try {
+					if (args[0] === "--version") {
+						child.stdout.end(options.emptyVersion ? "" : "1.0.0\n");
+						child.stderr.end();
+						child.emit("close", 0);
+						child.emit("exit", 0);
+						return;
+					}
 					const builtin = args.find((arg) => arg.startsWith("builtin:"));
 					if (builtin || args[0] === "mcp") {
 						if (options.mutateConfig) await writeFile(join(childOptions.cwd, "mcp.json"), "mutated");
@@ -187,8 +195,21 @@ describe("PR #131 round-3 binary release", () => {
 			"../client",
 		]);
 		const compile = trace.find((args) => args.includes("--compile"));
-		expect(compile).toContain("--tsconfig");
-		expect(compile).toContain("../../tsconfig.base.json");
+		// PR #131: Bun treats a bare --tsconfig value as the first executable entrypoint.
+		expect(compile).toContain("--tsconfig-override=../../tsconfig.base.json");
+		expect(metadata.scripts["build:binary"]).not.toContain("--tsconfig ");
+		expect(compile?.filter((arg) => !arg.startsWith("--")).slice(1, -1)).toEqual([
+			"./dist/bun/cli.js",
+			"./src/utils/image-resize-worker.ts",
+			"./src/extensions/codemode/worker.ts",
+		]);
+	});
+
+	// PR #131: a successful exit with no version is not a working CLI binary.
+	it("rejects a binary that exits successfully without printing its version", async () => {
+		const result = await exerciseSmoke({ emptyVersion: true });
+		expect(String(result.failure)).toContain("version");
+		expect(result.calls).toEqual([["--version"]]);
 	});
 
 	// PR #131 F24: mandatory release smoke must accept the shipped cut, not demand a guest.
