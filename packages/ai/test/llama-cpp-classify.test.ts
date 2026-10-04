@@ -303,6 +303,81 @@ describe("llama.cpp classifier", () => {
 		expect(server.requests.filter((request) => request.url.endsWith("/tokenize"))).toHaveLength(firstTokenizations);
 	});
 
+	// smarty-dev#3535 / pi#137 A9: concurrent callers own their cancellation independently.
+	it.each([true, false])("isolates cancellation when abortFirst=%s", async (abortFirst) => {
+		const server = fakeServer();
+		const classifierModel = model();
+		const questions: ClassifierContext["questions"] = {
+			pick: { type: "choice", instructions: "Pick", criteria: { a: "", b: "" } },
+		};
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let started!: () => void;
+		const tokenizing = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		const fetch: typeof globalThis.fetch = async (input, init) => {
+			if (String(input).endsWith("/tokenize")) {
+				started();
+				await new Promise<void>((resolve, reject) => {
+					const signal = init?.signal;
+					const abort = () => reject(signal?.reason);
+					if (signal?.aborted) {
+						abort();
+						return;
+					}
+					signal?.addEventListener("abort", abort, { once: true });
+					void gate.then(() => {
+						signal?.removeEventListener("abort", abort);
+						resolve();
+					});
+				});
+			}
+			return server.fetch(input, init);
+		};
+		const a = new AbortController();
+		const b = new AbortController();
+		const first = classify(classifierModel, { state: {}, questions }, { fetch, signal: a.signal, maxRetries: 0 });
+		await tokenizing;
+		const second = classify(classifierModel, { state: {}, questions }, { fetch, signal: b.signal, maxRetries: 0 });
+		(abortFirst ? a : b).abort();
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const canceled = await Promise.race([
+			abortFirst ? first : second,
+			new Promise<"still waiting">((resolve) => {
+				timer = setTimeout(() => resolve("still waiting"), 250);
+			}),
+		]);
+		clearTimeout(timer);
+		release();
+		const [firstResult, secondResult] = await Promise.all([first, second]);
+		expect(canceled).not.toBe("still waiting");
+		expect(abortFirst ? firstResult.stopReason : secondResult.stopReason).toBe("aborted");
+		expect(abortFirst ? secondResult.stopReason : firstResult.stopReason).toBe("stop");
+	});
+
+	// smarty-dev#3535 / pi#137 A9: completed IDs must not cross fetch/auth contexts.
+	it("separates completed labels by fetch implementation and effective headers", async () => {
+		const classifierModel = model();
+		const questions: ClassifierContext["questions"] = {
+			pick: { type: "choice", instructions: "Pick", criteria: { a: "", b: "" } },
+		};
+		const first = fakeServer();
+		const second = fakeServer();
+		await classify(classifierModel, { state: {}, questions }, { fetch: first.fetch, apiKey: "one" });
+		await classify(classifierModel, { state: {}, questions }, { fetch: second.fetch, apiKey: "one" });
+		expect(second.requests.some((request) => request.url.endsWith("/tokenize"))).toBe(true);
+		const before = second.requests.length;
+		await classify(
+			classifierModel,
+			{ state: {}, questions },
+			{ fetch: second.fetch, headers: { Authorization: "Bearer two" } },
+		);
+		expect(second.requests.slice(before).some((request) => request.url.endsWith("/tokenize"))).toBe(true);
+	});
+
 	it("validates option counts before sending requests", async () => {
 		const server = fakeServer();
 		const criteria = Object.fromEntries(Array.from({ length: 63 }, (_value, index) => [`option${index}`, ""]));
