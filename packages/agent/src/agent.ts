@@ -369,15 +369,19 @@ export class Agent {
 		return this.followUpQueue.mode;
 	}
 
-	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
+	/** Queue a message to be injected after the current assistant turn finishes.
+	 * The optional synchronous handoff runs after insertion, before lifecycle observers. */
+	steer(message: AgentMessage, onEnqueued?: () => void): void {
 		this.steeringQueue.enqueue(message);
+		onEnqueued?.();
 		this.observe("queue_update");
 	}
 
-	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
+	/** Queue a message to run only after the agent would otherwise stop.
+	 * The optional synchronous handoff runs after insertion, before lifecycle observers. */
+	followUp(message: AgentMessage, onEnqueued?: () => void): void {
 		this.followUpQueue.enqueue(message);
+		onEnqueued?.();
 		this.observe("queue_update");
 	}
 

@@ -164,6 +164,41 @@ describe("passive native lifecycle observer", () => {
 		expect(agent.signal).toBeUndefined();
 	});
 
+	// F8 regression for Smarty-Pants-Inc/smarty-dev#4078: handoff must precede reentrant queue observation.
+	it.each((["steer", "followUp"] as const).flatMap((enqueue) => [false, true].map((throws) => ({ enqueue, throws }))))(
+		"hands off $enqueue after insertion before observation (throw=$throws)",
+		({ enqueue, throws }) => {
+			const agent = new Agent({
+				streamFn: () => {
+					throw new Error("no provider operation");
+				},
+			});
+			const message = { role: "user" as const, content: "accepted input", timestamp: 1 };
+			const trace: string[] = [];
+			let captured = true;
+			let once = true;
+			agent.observeLifecycle((event) => {
+				if (!once || event.type !== "queue_update" || event.steering + event.followUp !== 1) return;
+				once = false;
+				trace.push("observe");
+				expect.soft(captured).toBe(false);
+				expect(agent.peekQueuedMessages()).toEqual([message]);
+				agent.clearAllQueues();
+				if (throws) throw new Error("enqueue observation failed");
+			});
+			const enqueueInput = () =>
+				agent[enqueue](message, () => {
+					trace.push("handoff");
+					expect(agent.peekQueuedMessages()).toEqual([message]);
+					captured = false;
+				});
+			if (throws) expect(enqueueInput).toThrow("enqueue observation failed");
+			else expect(enqueueInput).not.toThrow();
+			expect(trace).toEqual(["handoff", "observe"]);
+			expect(agent.hasQueuedMessages()).toBe(false);
+		},
+	);
+
 	it("records settlement even when an awaited listener fails", async () => {
 		const agent = new Agent({
 			streamFn: () => {

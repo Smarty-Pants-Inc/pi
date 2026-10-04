@@ -2888,8 +2888,7 @@ export class AgentSession {
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this._inputSubmissions.set(message, submission);
 		this._queuedUserMessages.add(message);
-		this.agent.steer(message);
-		onInputTransferred?.();
+		this.agent.steer(message, onInputTransferred);
 		this._emitQueueUpdate();
 	}
 
@@ -2913,8 +2912,7 @@ export class AgentSession {
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this._inputSubmissions.set(message, submission);
 		this._queuedUserMessages.add(message);
-		this.agent.followUp(message);
-		onInputTransferred?.();
+		this.agent.followUp(message, onInputTransferred);
 		this._emitQueueUpdate();
 	}
 
