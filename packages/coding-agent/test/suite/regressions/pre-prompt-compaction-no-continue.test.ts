@@ -123,11 +123,13 @@ describe("pre-prompt compaction regression", () => {
 		expect(getUserTexts(harness)).not.toContain("processed:pending input");
 		expect(harness.session.getFollowUpMessages()).toEqual(["processed:pending input"]);
 		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		// Smarty-Pants-Inc/smarty-dev#4078 F8: these controls provide no enqueue handoff callback.
 		expect(queue).toHaveBeenCalledExactlyOnceWith(
 			expect.objectContaining({
 				role: "user",
 				content: [{ type: "text", text: "processed:pending input" }, ...images],
 			}),
+			undefined,
 		);
 		expect(beforeAgentStart).not.toHaveBeenCalled();
 		expect(continueSpy).not.toHaveBeenCalled();
