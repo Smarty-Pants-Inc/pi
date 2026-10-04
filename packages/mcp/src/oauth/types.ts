@@ -123,7 +123,13 @@ function safeUrl(value: unknown, name: string): string {
 	// URL parsing throws a `TypeError`, which discovery reserves for network failures.
 	if (!URL.canParse(text)) throw new Error(`Invalid ${name}`);
 	const url = new URL(text);
-	if (["javascript:", "data:", "vbscript:"].includes(url.protocol)) throw new Error(`Invalid ${name}`);
+	if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error(`Invalid ${name}`);
+	if (
+		name === "authorization endpoint" &&
+		url.protocol === "http:" &&
+		!["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+	)
+		throw new Error(`Invalid ${name}: HTTPS required except on loopback`);
 	return text;
 }
 

@@ -46,7 +46,7 @@ function installExitHook(): void {
 	process.once("exit", () => {
 		for (const pid of liveProcessGroups) {
 			try {
-				process.kill(-pid, "SIGTERM");
+				process.kill(-pid, "SIGKILL");
 			} catch {}
 		}
 	});
@@ -73,6 +73,7 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 	private stderrBuffer = Buffer.alloc(0);
 	private started = false;
 	private closed = false;
+	private closing: Promise<void> | undefined;
 
 	constructor(options: StdioTransportOptions) {
 		super();
@@ -105,7 +106,6 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 		if (USE_PROCESS_GROUPS && pid !== undefined) {
 			installExitHook();
 			liveProcessGroups.add(pid);
-			child.once("exit", () => liveProcessGroups.delete(pid));
 		}
 		child.stdout?.on("data", (chunk: Buffer | string) => this.handleStdout(chunk));
 		child.stdout?.on("error", (error) => this.emitError(error));
@@ -115,7 +115,8 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 		child.stderr?.on("data", (chunk: Buffer | string) => this.handleStderr(chunk));
 		child.stderr?.on("error", (error) => this.emitError(error));
 		child.on("close", () => {
-			this.child = undefined;
+			// A leader exit does not relinquish custody of its descendants.
+			void this.close();
 			if (this.stdoutBuffer.toString("utf8").trim()) {
 				this.emitError(new Error("MCP stdio server closed with an incomplete JSON-RPC message"));
 			}
@@ -150,32 +151,52 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 	}
 
 	async close(): Promise<void> {
-		if (this.closed) return;
+		if (this.closing) return this.closing;
 		this.closed = true;
 		const child = this.child;
 		if (!child) {
 			this.emitClose();
 			return;
 		}
-		if (child.exitCode !== null || child.signalCode !== null) {
-			child.stdin?.end();
-			return;
-		}
-		// Shutdown per the spec: close stdin and let the server exit, then SIGTERM, then SIGKILL.
 		const closeTimeoutMs = this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
-		await new Promise<void>((resolve) => {
+		this.closing = new Promise<void>((resolve) => {
+			let leaderClosed = child.exitCode !== null || child.signalCode !== null;
+			let escalated = false;
 			const timers: ReturnType<typeof setTimeout>[] = [];
-			child.once("close", () => {
+			const groupExists = () => {
+				if (!USE_PROCESS_GROUPS || child.pid === undefined) return false;
+				try {
+					process.kill(-child.pid, 0);
+					return true;
+				} catch {
+					return false;
+				}
+			};
+			const finish = () => {
 				for (const timer of timers) clearTimeout(timer);
-				// Children of the server that ignored stdin closing would otherwise outlive it.
-				killProcessTree(child, "SIGTERM");
+				if (child.pid !== undefined) liveProcessGroups.delete(child.pid);
+				this.child = undefined;
 				resolve();
-			});
+			};
+			const onClose = () => {
+				leaderClosed = true;
+				killProcessTree(child, "SIGTERM");
+				if (escalated || !groupExists()) finish();
+			};
+			child.once("close", onClose);
 			const grace = Math.min(STDIN_CLOSE_GRACE_MS, closeTimeoutMs);
 			timers.push(setTimeout(() => killProcessTree(child, "SIGTERM"), grace));
-			timers.push(setTimeout(() => killProcessTree(child, "SIGKILL"), grace + closeTimeoutMs));
+			timers.push(
+				setTimeout(() => {
+					killProcessTree(child, "SIGKILL");
+					escalated = true;
+					if (leaderClosed) finish();
+				}, grace + closeTimeoutMs),
+			);
 			child.stdin?.end();
+			if (leaderClosed) onClose();
 		});
+		return this.closing;
 	}
 
 	private handleStdout(chunk: Buffer | string): void {

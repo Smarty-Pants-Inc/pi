@@ -172,6 +172,29 @@ function discard(response: Response): Promise<void> {
 	return response.body?.cancel().catch(() => {}) ?? Promise.resolve();
 }
 
+async function readBoundedBody(response: Response, maxBytes: number, truncate = false): Promise<string> {
+	if (!response.body) return "";
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let bytes = 0;
+	let text = "";
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) return text + decoder.decode();
+			if (value.byteLength > maxBytes - bytes) {
+				await reader.cancel().catch(() => {});
+				if (truncate) return text + decoder.decode(value.subarray(0, maxBytes - bytes));
+				throw new Error(`MCP HTTP body exceeds ${maxBytes} bytes`);
+			}
+			bytes += value.byteLength;
+			text += decoder.decode(value, { stream: true });
+		}
+	} finally {
+		reader.releaseLock();
+	}
+}
+
 function describeHttpFailure(status: number, body: string): string {
 	const text = body.trim();
 	const snippet = text.length > ERROR_MESSAGE_BODY_CHARS ? `${text.slice(0, ERROR_MESSAGE_BODY_CHARS - 3)}...` : text;
@@ -241,7 +264,9 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		}
 		const type = contentType(response);
 		if (type === "application/json") {
-			const body: unknown = await response.json();
+			const body: unknown = JSON.parse(
+				await readBoundedBody(response, this.options.maxMessageBytes ?? DEFAULT_MAX_MESSAGE_BYTES),
+			);
 			for (const item of Array.isArray(body) ? body : [body]) this.emitMessage(parseJsonRpcMessage(item));
 			return;
 		}
@@ -262,7 +287,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 			const timeout = setTimeout(() => controller.abort(), 1_000);
 			try {
 				const { headers } = await this.headers();
-				await this.fetch(this.url, { method: "DELETE", headers, signal: controller.signal })
+				await this.fetch(this.url, { method: "DELETE", headers, signal: controller.signal, redirect: "error" })
 					.then(discard)
 					.catch(() => undefined);
 			} catch {
@@ -290,6 +315,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 				headers,
 				body: init.body,
 				signal: this.controller.signal,
+				redirect: "error",
 			});
 			if (attempt > 0 || !onUnauthorized || !needsAuthorization(response)) return response;
 			try {
@@ -317,7 +343,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 
 	private async checkResponse(response: Response): Promise<void> {
 		if (response.ok) return;
-		const body = (await response.text().catch(() => "")).slice(0, MAX_ERROR_BODY_BYTES);
+		const body = await readBoundedBody(response, MAX_ERROR_BODY_BYTES, true);
 		if (response.status === 401) throw new McpAuthRequiredError(response, body);
 		if (response.status === 404 && this.sessionIdValue) throw new McpSessionExpiredError(body);
 		throw new McpHttpError(response.status, describeHttpFailure(response.status, body), body);
