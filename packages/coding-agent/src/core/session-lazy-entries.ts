@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync } from "fs";
+import { closeSync, openSync, readSync, type Stats, statSync } from "fs";
 
 /**
  * Bounded session memory (smarty-dev#2177).
@@ -10,8 +10,8 @@ import { closeSync, openSync, readSync } from "fs";
  * Solution: an entry outside the hot set (current context plus a recent window) is replaced by a
  * "cold" copy. The copy keeps every small field (id, parentId, type, role, usage, model, ...) so
  * tree walks, context building and usage totals stay in memory. Each large field becomes an
- * enumerable accessor that re-reads the entry's JSONL line by byte offset, so JSON.stringify,
- * spreads and property reads see the same values as before.
+ * enumerable accessor backed by a byte-bounded hydrated LRU, so
+ * JSON.stringify, spreads and property reads see the same values as before.
  *
  * Cold copies are new objects: objects that the agent or the TUI still hold are never mutated.
  */
@@ -33,7 +33,30 @@ const locations = new WeakMap<object, EntryLocation>();
 const coldEntries = new WeakSet<object>();
 /** Entries already checked that have no large field; they stay resident as they are. */
 const smallEntries = new WeakSet<object>();
+/** Cache actual payload demand, not every retained UI/state entry (#4250). */
+// Charge serialized line bytes; parsed object overhead is not an absolute process heap bound.
+// A 150 MiB extension working set must fit: smaller caches thrash on every full scan (#4250).
+const HYDRATED_CACHE_BYTES = 160 * 1024 * 1024;
+const hydrated = new Map<EntryLocation, { value: Json; stats: Stats }>();
+let hydratedBytes = 0;
 let lastRead: { location: EntryLocation; value: Json } | undefined;
+
+function sameFilePrefix(previous: Stats, current: Stats): boolean {
+	return (
+		previous.dev === current.dev &&
+		previous.ino === current.ino &&
+		(current.size > previous.size || (current.size === previous.size && current.mtimeMs === previous.mtimeMs))
+	);
+}
+
+function forgetFile(file: string): void {
+	for (const [location] of hydrated) {
+		if (location.file !== file) continue;
+		hydrated.delete(location);
+		hydratedBytes -= location.length;
+	}
+	if (lastRead?.location.file === file) lastRead = undefined;
+}
 
 export function setEntryLocation(entry: object, location: EntryLocation): void {
 	locations.set(entry, location);
@@ -47,9 +70,26 @@ export function isColdEntry(entry: object): boolean {
 	return coldEntries.has(entry);
 }
 
-/** Read and parse one session line. The last line read is cached for consecutive field reads. */
+/** Read a line once per fitting extension working set; consecutive field reads stay cheap. */
 function readEntryLine(location: EntryLocation, id: unknown): Json {
-	if (lastRead?.location === location) return lastRead.value;
+	if (lastRead?.location === location && lastRead.value.id === id) return lastRead.value;
+	let stats: Stats;
+	try {
+		stats = statSync(location.file);
+	} catch (error) {
+		forgetFile(location.file);
+		throw new Error(`Session file changed on disk: cannot read entry ${String(id)} from ${location.file}`, {
+			cause: error,
+		});
+	}
+	const cached = hydrated.get(location);
+	if (cached && cached.value.id === id && sameFilePrefix(cached.stats, stats)) {
+		hydrated.delete(location);
+		hydrated.set(location, cached);
+		lastRead = { location, value: cached.value };
+		return cached.value;
+	}
+	if (cached) forgetFile(location.file);
 	const buffer = Buffer.allocUnsafe(location.length);
 	let fd: number;
 	try {
@@ -59,8 +99,8 @@ function readEntryLine(location: EntryLocation, id: unknown): Json {
 			cause: error,
 		});
 	}
+	let read = 0;
 	try {
-		let read = 0;
 		while (read < location.length) {
 			const n = readSync(fd, buffer, read, location.length - read, location.offset + read);
 			if (n === 0) break;
@@ -71,7 +111,7 @@ function readEntryLine(location: EntryLocation, id: unknown): Json {
 	}
 	let value: Json | undefined;
 	try {
-		value = JSON.parse(buffer.toString("utf8")) as Json;
+		value = JSON.parse(buffer.subarray(0, read).toString("utf8")) as Json;
 	} catch {
 		value = undefined;
 	}
@@ -79,6 +119,16 @@ function readEntryLine(location: EntryLocation, id: unknown): Json {
 		throw new Error(
 			`Session file changed on disk: entry ${String(id)} is no longer at byte ${location.offset} of ${location.file}`,
 		);
+	}
+	// One oversized line can serve consecutive fields, but cannot displace the bounded LRU.
+	if (location.length <= HYDRATED_CACHE_BYTES) {
+		hydrated.set(location, { value, stats });
+		hydratedBytes += location.length;
+		while (hydratedBytes > HYDRATED_CACHE_BYTES) {
+			const oldest = hydrated.keys().next().value!;
+			hydrated.delete(oldest);
+			hydratedBytes -= oldest.length;
+		}
 	}
 	lastRead = { location, value };
 	return value;
@@ -187,6 +237,7 @@ export function toHotEntry<T extends object>(entry: T): T {
 	const location = locations.get(entry)!;
 	if (lastRead?.location === location) lastRead = undefined;
 	const hot = readEntryLine(location, (entry as Json).id);
+	if (hydrated.delete(location)) hydratedBytes -= location.length;
 	lastRead = undefined;
 	setEntryLocation(hot, location);
 	return hot as T;
