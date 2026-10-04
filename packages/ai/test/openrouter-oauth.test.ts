@@ -7,9 +7,9 @@ import { openrouterProvider } from "../src/providers/openrouter.ts";
 const TOKEN_URL = "https://openrouter.ai/api/v1/auth/keys";
 const nativeFetch = globalThis.fetch;
 
-function pendingPrompt(prompt: { signal: AbortSignal }): Promise<string> {
+function pendingPrompt(prompt: { signal?: AbortSignal }): Promise<string> {
 	return new Promise((_, reject) => {
-		prompt.signal.addEventListener("abort", () => reject(new Error("Login cancelled")), { once: true });
+		prompt.signal?.addEventListener("abort", () => reject(new Error("Login cancelled")), { once: true });
 	});
 }
 
