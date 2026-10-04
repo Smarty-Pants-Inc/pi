@@ -1,12 +1,7 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-<<<<<<< HEAD
 import { type Context, createStaticFacetLoader, defineFacet, defineService } from "@earendil-works/chord";
 import { AgentHarness, BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
-=======
-import { createStaticFacetLoader, defineFacet } from "@earendil-works/chord";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
->>>>>>> upstream-v1.0.1
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -33,7 +28,6 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 		faux.setResponses([answer, answer]);
 		const models = createModels();
 		models.setProvider(faux.provider);
-<<<<<<< HEAD
 		const harness = (
 			await AgentHarness.create(
 				{
@@ -67,17 +61,6 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				});
 			return opened;
 		};
-=======
-		const harness = await Harness.open(
-			await openNodeSqliteStorage(databasePath),
-			{ models, registry: createRegistry() },
-			BACKGROUND_CONTEXT,
-		);
-		const model = faux.getModel();
-		const conversation = await harness.root(BACKGROUND_CONTEXT, {
-			agent: { cwd: options.metadata.cwd, model: { provider: model.provider, modelId: model.id } },
-		});
->>>>>>> upstream-v1.0.1
 		const keyedProbeFacet = defineFacet({
 			id: "@test/keyed-probe",
 			setup(env) {
@@ -124,11 +107,7 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				env.onActivate(() => spawn("first"));
 			},
 		});
-<<<<<<< HEAD
 		return { harness, lane, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
-=======
-		return { harness, conversation, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
->>>>>>> upstream-v1.0.1
 	}).catch((error: unknown) => {
 		console.error(error);
 		process.exit(1);

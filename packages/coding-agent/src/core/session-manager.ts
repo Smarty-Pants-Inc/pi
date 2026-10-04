@@ -1391,20 +1391,6 @@ export class SessionManager {
 		}
 		if (!this.persist || !this.sessionFile) return;
 
-<<<<<<< HEAD
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
-			if (this.flushed) {
-				this.#appendLine(this.sessionFile, entry);
-			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
-				this.flushed = false;
-			}
-			return;
-		}
-
-=======
->>>>>>> upstream-v1.0.1
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
 			const fd = openSync(this.sessionFile, "wx");

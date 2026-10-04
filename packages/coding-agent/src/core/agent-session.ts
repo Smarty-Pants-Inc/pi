@@ -17,27 +17,19 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
-<<<<<<< HEAD
-	Agent,
-=======
 	type AfterToolCallContext,
 	type AfterToolCallResult,
-	type Agent,
->>>>>>> upstream-v1.0.1
+	Agent,
 	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
-<<<<<<< HEAD
-	type PrepareNextTurnContext,
-=======
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
 	type PrepareNextTurnContext,
 	runToolCall,
->>>>>>> upstream-v1.0.1
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -137,14 +129,11 @@ import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
-<<<<<<< HEAD
+import { NestedToolCallRunner } from "./nested-tool-calls.ts";
 import type { OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
 import { assertOriginalCompactionAttempt, type OriginalCompactionAttempt } from "./ordinary-compaction.ts";
 import { assertOrdinaryRuntime, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
 import { createOrdinaryToolDefinitions } from "./ordinary-tools.ts";
-=======
-import { NestedToolCallRunner } from "./nested-tool-calls.ts";
->>>>>>> upstream-v1.0.1
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
@@ -376,16 +365,11 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
-<<<<<<< HEAD
-	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
-	preflightResult?: (success: boolean) => void;
+	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
+	preflightResult?: (disposition: PromptDisposition) => void;
 	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
 	 * Unlike preflight acceptance, this remains true if the operation later fails. */
 	onInputTransferred?: () => void;
-=======
-	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
-	preflightResult?: (disposition: PromptDisposition) => void;
->>>>>>> upstream-v1.0.1
 }
 
 /** Options for model/thinking mutations. */
@@ -523,7 +507,6 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
-<<<<<<< HEAD
 	private _retryFallbackUsed = false;
 	/** Only the first alternate request in the current recovery episode is one-shot. */
 	private _retryFallbackInFlight = false;
@@ -531,13 +514,11 @@ export class AgentSession {
 	private _assistantOutputObserved = false;
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
-=======
 	/**
 	 * Failed response that the next request repeats, set by auto-retry and overflow recovery. The
 	 * retry is routed with it as `failed`, since the context no longer contains it.
 	 */
 	private _failedResponse: AssistantMessage | undefined;
->>>>>>> upstream-v1.0.1
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -778,65 +759,6 @@ export class AgentSession {
 		this.agent.afterToolCall = (context) => this._afterToolCall(context);
 	}
 
-<<<<<<< HEAD
-			try {
-				// Terminal shutdown stops waiting on a held handler; the abandoned dispatch is
-				// observed, skips remaining handlers, and its late result is discarded.
-				const shutdown = this._shutdownCancellation.signal;
-				return await raceWithAbortSignal(
-					runner.emitToolCall(
-						{
-							type: "tool_call",
-							toolName: toolCall.name,
-							toolCallId: toolCall.id,
-							input: args as Record<string, unknown>,
-						},
-						shutdown,
-					),
-					shutdown,
-				);
-			} catch (err) {
-				if (err instanceof Error) {
-					throw err;
-				}
-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
-			}
-		};
-
-		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
-			const runner = this._extensionRunner;
-			const shutdown = this._shutdownCancellation.signal;
-			// Terminal shutdown rejects here; the loop finalizes an error tool result instead.
-			const hookResult = runner.hasHandlers("tool_result")
-				? await raceWithAbortSignal(
-						runner.emitToolResult(
-							{
-								type: "tool_result",
-								toolName: toolCall.name,
-								toolCallId: toolCall.id,
-								input: args as Record<string, unknown>,
-								content: result.content,
-								details: result.details,
-								isError,
-								usage: result.usage,
-							},
-							shutdown,
-						),
-						shutdown,
-					)
-				: undefined;
-
-			const content = hookResult?.content ?? result.content ?? [];
-			// Runs after the extension hook so images injected or replaced by extensions are normalized too.
-			this.#ordinaryOwner?.assertActive();
-			const resizeOptions = this.model?.inputLimits?.images?.resize;
-			const normalizedContent = this.#ordinaryOwner
-				? content
-				: await normalizeToolResultImages(content, {
-						autoResizeImages: this.settingsManager.getImageAutoResize(),
-						...(resizeOptions ? { resizeOptions } : {}),
-					});
-=======
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
 	private async _beforeToolCall(
 		{ toolCall, args }: BeforeToolCallContext,
@@ -847,14 +769,21 @@ export class AgentSession {
 			return undefined;
 		}
 
+		const shutdown = this._shutdownCancellation.signal;
 		try {
-			return await runner.emitToolCall({
-				type: "tool_call",
-				toolName: toolCall.name,
-				toolCallId: toolCall.id,
-				...(parentToolCallId ? { parentToolCallId } : {}),
-				input: args as Record<string, unknown>,
-			});
+			return await raceWithAbortSignal(
+				runner.emitToolCall(
+					{
+						type: "tool_call",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						...(parentToolCallId ? { parentToolCallId } : {}),
+						input: args as Record<string, unknown>,
+					},
+					shutdown,
+				),
+				shutdown,
+			);
 		} catch (err) {
 			if (err instanceof Error) {
 				throw err;
@@ -869,33 +798,42 @@ export class AgentSession {
 		parentToolCallId?: string,
 	): Promise<AfterToolCallResult | undefined> {
 		const runner = this._extensionRunner;
+		const shutdown = this._shutdownCancellation.signal;
 		const hookResult = runner.hasHandlers("tool_result")
-			? await runner.emitToolResult({
-					type: "tool_result",
-					toolName: toolCall.name,
-					toolCallId: toolCall.id,
-					...(parentToolCallId ? { parentToolCallId } : {}),
-					input: args as Record<string, unknown>,
-					content: result.content,
-					details: result.details,
-					...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
-					isError,
-					usage: result.usage,
-				})
+			? await raceWithAbortSignal(
+					runner.emitToolResult(
+						{
+							type: "tool_result",
+							toolName: toolCall.name,
+							toolCallId: toolCall.id,
+							...(parentToolCallId ? { parentToolCallId } : {}),
+							input: args as Record<string, unknown>,
+							content: result.content,
+							details: result.details,
+							...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+							isError,
+							usage: result.usage,
+						},
+						shutdown,
+					),
+					shutdown,
+				)
 			: undefined;
 
 		const content = hookResult?.content ?? result.content ?? [];
 		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
 		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
-		const normalizedContent = await normalizeToolResultImages(content, {
-			autoResizeImages: this.settingsManager.getImageAutoResize(),
-			...(resizeOptions ? { resizeOptions } : {}),
-		});
+		this.#ordinaryOwner?.assertActive();
+		const normalizedContent = this.#ordinaryOwner
+			? content
+			: await normalizeToolResultImages(content, {
+					autoResizeImages: this.settingsManager.getImageAutoResize(),
+					...(resizeOptions ? { resizeOptions } : {}),
+				});
 
 		if (!hookResult && normalizedContent === content) {
 			return undefined;
 		}
->>>>>>> upstream-v1.0.1
 
 		// The hook result already dropped structured content that replaced content no longer matches.
 		return {
@@ -907,33 +845,6 @@ export class AgentSession {
 		};
 	}
 
-<<<<<<< HEAD
-	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
-		this.#ordinaryOwner?.assertNativeTokenReservation();
-		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings(model);
-		const projection = this.sessionManager.buildSessionProjection();
-		if (!model || model.contextWindow <= 0) return { ...context, messages: projection.messages };
-		const tokens = estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens;
-		const overflow = tokens > model.contextWindow;
-		if (!shouldCompact(tokens, model.contextWindow, settings)) {
-			return { ...context, messages: projection.messages };
-		}
-
-		const outcome = await this._runAutoCompaction("threshold", false);
-		if (outcome === "failed" || outcome === "aborted") {
-			// Stop this run rather than sending unchanged oversized context or
-			// turning a compaction timeout into an ordinary agent retry.
-			this._stopAfterCompactionFailure = true;
-			this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
-			this.agent.abort();
-			throw new Error(
-				`${overflow ? "Context exceeds window: " : ""}Compaction ${outcome} before the next assistant turn`,
-			);
-		}
-		// Raw projection estimates drive proactive compaction, not hard admission:
-		// request preparation, context transforms and conversion can deliberately omit it.
-=======
 	/**
 	 * Run a call that the tool call `parentToolCallId` made through `ctx.executeTool()`. It goes
 	 * through the agent's tool pipeline with the session's hooks, against the callable tools.
@@ -944,6 +855,13 @@ export class AgentSession {
 		args: unknown,
 		options: ExecuteToolOptions,
 	): Promise<AgentToolCallOutcome> {
+		this._shutdownCancellation.signal.throwIfAborted();
+		options = {
+			...options,
+			signal: options.signal
+				? AbortSignal.any([options.signal, this._shutdownCancellation.signal])
+				: this._shutdownCancellation.signal,
+		};
 		this._nestedToolCalls ??= new NestedToolCallRunner({
 			getTools: () => this._getCallableTools(),
 			isSequential: () => this.agent.toolExecution === "sequential",
@@ -985,14 +903,20 @@ export class AgentSession {
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+		this.#ordinaryOwner?.assertNativeTokenReservation();
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
 		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
 			return { ...context, messages: projection.messages };
 		}
-		await this._runAutoCompaction("threshold", false);
->>>>>>> upstream-v1.0.1
+		const outcome = await this._runAutoCompaction("threshold", false);
+		if (outcome === "failed" || outcome === "aborted") {
+			this._stopAfterCompactionFailure = true;
+			this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
+			this.agent.abort();
+			throw new Error(`Compaction ${outcome} before the next assistant turn`);
+		}
 		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
 	}
 
@@ -1047,70 +971,62 @@ export class AgentSession {
 			}
 		};
 		this.agent.prepareRequest = async (request, signal) => {
+			signal = signal ? AbortSignal.any([signal, this.shutdownSignal]) : this.shutdownSignal;
+			signal.throwIfAborted();
 			const failed = this._failedResponse;
 			this._failedResponse = undefined;
-			const prepare = async () => {
-				const projection = this.sessionManager.buildSessionProjection();
-				const canonicalContext = {
-					...request.context,
-					messages: projection.messages,
-					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
-					tools: this.agent.state.tools.slice(),
-				};
-				const previous = await previousPrepareRequest?.(
-					{
-						...request,
-						context: canonicalContext,
-						model: this.agent.state.model,
-						thinkingLevel: this.agent.state.thinkingLevel,
-					},
-					signal,
-				);
-				return { previous, context: previous?.context ?? canonicalContext, projection };
+			const projection = this.sessionManager.buildSessionProjection();
+			const canonicalContext = {
+				...request.context,
+				messages: projection.messages,
+				// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
+				tools: this.agent.state.tools.slice(),
 			};
-<<<<<<< HEAD
 			canonicalMessages = snapshotMessages(canonicalContext.messages);
-			const previous = await previousPrepareRequest?.(
-				{
-					...request,
-					context: canonicalContext,
-					model: this.agent.state.model,
-					thinkingLevel: this.agent.state.thinkingLevel,
-				},
-				signal,
-			);
-			requestModel = previous?.model ?? this.agent.state.model;
-			// Snapshot before preparation and context transforms. Identity alone misses
-			// in-place edits, and opaque input is safe only when the final request fits.
-			canReproject =
-				(previous?.context === undefined || previous.context === canonicalContext) &&
-				canonicalMessages !== undefined &&
-				canonicalMessages === snapshotMessages(canonicalContext.messages);
-			return {
-				...previous,
-				context: previous?.context ?? canonicalContext,
-				model: requestModel,
-				thinkingLevel: previous?.thinkingLevel ?? this.agent.state.thinkingLevel,
-			};
-=======
-			let { previous, context, projection } = await prepare();
+			const previous = previousPrepareRequest
+				? await raceWithAbortSignal(
+						Promise.resolve(
+							previousPrepareRequest(
+								{
+									...request,
+									context: canonicalContext,
+									model: this.agent.state.model,
+									thinkingLevel: this.agent.state.thinkingLevel,
+								},
+								signal,
+							),
+						),
+						signal,
+					)
+				: undefined;
+			signal.throwIfAborted();
+			let context = previous?.context ?? canonicalContext;
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
+			requestModel = model;
+			// Preparation may consume one-shot context or mutate it in place. Never replay it.
+			canReproject =
+				context === canonicalContext &&
+				canonicalMessages !== undefined &&
+				canonicalMessages === snapshotMessages(canonicalContext.messages);
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
 
-			// The selection stays in agent state; only this request uses the routed model. A routing
-			// failure rejects, which ends the run with an error response. Only messages the user wrote
-			// start a turn; extension messages can follow them, e.g. from before_agent_start.
+			// The selection stays in agent state; only this request uses the routed model.
 			const lastResponse = context.messages.findLastIndex((message) => message.role === "assistant");
 			const userTurn = context.messages.slice(lastResponse + 1).some((message) => message.role === "user");
 			const state = getVirtualModelState(this.sessionManager.getBranch(), model.provider, model.id);
-			const route = await this._modelRuntime.resolveModel(model, convertToLlm(context.messages), {
-				reason: failed ? "retry" : userTurn ? "user" : "continuation",
-				thinkingLevel,
+			const route = await raceWithAbortSignal(
+				this._modelRuntime.resolveModel(model, convertToLlm(context.messages), {
+					reason: failed ? "retry" : userTurn ? "user" : "continuation",
+					thinkingLevel,
+					signal,
+					failed,
+					state,
+				}),
 				signal,
-				failed,
-				state,
-			});
+			);
+			signal.throwIfAborted();
+			requestModel = route.model;
 			if (route.state !== undefined && route.state !== state) {
 				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
 				const entry = this.sessionManager.getEntry(
@@ -1118,17 +1034,23 @@ export class AgentSession {
 				);
 				if (entry) this._emit({ type: "entry_appended", entry });
 			}
-			// The route stands: the router already decided this request. The state entry does not change
-			// the projection.
-			if (this._exceedsCompactionThreshold(route.model, projection)) {
-				await this._runAutoCompaction("threshold", false);
-				({ previous, context } = await prepare());
+			// Only canonical preparation can be rebuilt after compaction without replaying hooks.
+			// Opaque context is admitted after transforms/conversion against the physical window.
+			if (canReproject && this._exceedsCompactionThreshold(route.model, projection)) {
+				const outcome = await this._runAutoCompaction("threshold", false);
+				if (outcome === "failed" || outcome === "aborted") {
+					this._stopAfterCompactionFailure = true;
+					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
+					this.agent.abort();
+					throw new Error(`Compaction ${outcome} before the next assistant turn`);
+				}
+				signal.throwIfAborted();
+				context = { ...canonicalContext, messages: this.sessionManager.buildSessionProjection().messages };
+				canonicalMessages = snapshotMessages(context.messages);
 			}
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
->>>>>>> upstream-v1.0.1
 		};
 	}
-
 	private async _dispatchTurnEndBoundary(
 		message: AssistantMessage,
 		toolResults: ToolResultMessage[],
@@ -1470,7 +1392,6 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
-<<<<<<< HEAD
 		// Synthetic run failures publish another message_start, but not a new turn_start.
 		if (event.type === "turn_start") this._assistantOutputObserved = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
@@ -1484,7 +1405,6 @@ export class AgentSession {
 				("content" in update && update.content.length > 0);
 		}
 
-=======
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -1498,7 +1418,6 @@ export class AgentSession {
 				this._nestedToolCalls.clear();
 			}
 		}
->>>>>>> upstream-v1.0.1
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
@@ -2287,7 +2206,6 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
-<<<<<<< HEAD
 	private async _runAgentPrompt(
 		messages: AgentMessage | AgentMessage[] | undefined,
 		promptToken?: object,
@@ -2316,24 +2234,6 @@ export class AgentSession {
 					await run;
 				} catch (error) {
 					throw new AggregateError([cause, error], "INPUT_TRANSFER_OBSERVER_FAILED", { cause });
-=======
-	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
-		this._agentRunAbortRequested = false;
-		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
-		this._failedResponse = undefined;
-		this._recordSelection();
-		// The run records the loadout in the transcript; restored tools that did not register by now
-		// are dropped, so a tool that never registers does not stay pending.
-		this._pendingToolNames.clear();
-		this._isAgentRunActive = true;
-		try {
-			await this.agent.prompt(messages);
-			while (!this._agentRunAbortRequested) {
-				if (await this._handlePostAgentRun()) {
-					if (this._agentRunAbortRequested) break;
-					await this.agent.continue();
-					continue;
->>>>>>> upstream-v1.0.1
 				}
 				throw cause;
 			}
@@ -2342,6 +2242,10 @@ export class AgentSession {
 		this._stopAfterCompactionFailure = false;
 		this._compactionStopOutcome = undefined;
 		this._agentRunAbortRequested = false;
+		// A new prompt replaces any failed response left by pre-prompt compaction.
+		this._failedResponse = undefined;
+		this._recordSelection();
+		this._pendingToolNames.clear();
 		this._abortDuringBeforeSettle = false;
 		this._lastActivityOutcome = "completed";
 		this._inputQueuedBehindPreflight = false;
@@ -2619,7 +2523,6 @@ export class AgentSession {
 	): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
-<<<<<<< HEAD
 		const onInputTransferred = options?.onInputTransferred;
 		const preflightToken = {};
 		let messages: AgentMessage[] | undefined;
@@ -2632,7 +2535,7 @@ export class AgentSession {
 				if (handled) {
 					// Extension command executed, no prompt to send
 					onInputTransferred?.();
-					preflightResult?.(true);
+					preflightResult?.("handled");
 					return;
 				}
 			}
@@ -2668,7 +2571,7 @@ export class AgentSession {
 			);
 			if (!processedInput) {
 				onInputTransferred?.();
-				preflightResult?.(true);
+				preflightResult?.("handled");
 				return;
 			}
 			const { text: currentText, images: currentImages } = processedInput;
@@ -2696,7 +2599,7 @@ export class AgentSession {
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
-				preflightResult?.(true);
+				preflightResult?.("queued");
 				return;
 			}
 
@@ -2805,7 +2708,6 @@ export class AgentSession {
 			if (updateMessage) messages.unshift(updateMessage);
 		} catch (error) {
 			this._promptPreflights.delete(preflightToken);
-			preflightResult?.(false);
 			throw error;
 		} finally {
 			if (!messages) {
@@ -2813,67 +2715,17 @@ export class AgentSession {
 				this._runTriggeredBehindPreflight();
 				this._runInputQueuedBehindPreflight();
 			}
-=======
-		// Handle extension commands first (execute immediately, even during streaming)
-		// Extension commands manage their own LLM interaction via pi.sendMessage()
-		if (expandPromptTemplates && text.startsWith("/")) {
-			const handled = await this._tryExecuteExtensionCommand(text);
-			if (handled) {
-				// Extension command executed, no prompt to send
-				preflightResult?.("handled");
-				return;
-			}
->>>>>>> upstream-v1.0.1
 		}
 
-		if (this._compactionAbortController !== undefined) {
-			throw new Error(
-				"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
-			);
-		}
-
-		// Emit input event for extension interception (before skill/template expansion)
-		const processedInput = await this._runInputHandlers(
-			text,
-			options?.images,
-			options?.source ?? "interactive",
-			this.isStreaming ? options?.streamingBehavior : undefined,
-		);
-		if (!processedInput) {
-			preflightResult?.("handled");
-			return;
-		}
-		const { text: currentText, images: currentImages } = processedInput;
-
-		// Expand skill commands (/skill:name args) and prompt templates (/template args)
-		let expandedText = currentText;
-		if (expandPromptTemplates) {
-			expandedText = this._expandSkillCommand(expandedText);
-			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
-		}
-
-		// If streaming, queue via steer() or followUp() based on option
-		if (this.isStreaming) {
-			if (!options?.streamingBehavior) {
-				throw new Error(
-					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
-				);
-			}
-			if (options.streamingBehavior === "followUp") {
-				await this._queueFollowUp(expandedText, currentImages);
-			} else {
-				await this._queueSteer(expandedText, currentImages);
-			}
-			preflightResult?.("queued");
+		if (!messages) {
 			return;
 		}
 
-<<<<<<< HEAD
 		// A switch can also begin during before_agent_start or image normalization.
 		// Keep this prompt's admission token until its run can start, so triggered
 		// messages still queue behind it instead of acquiring a competing run.
 		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
-		preflightResult?.(true);
+		preflightResult?.("started");
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
 		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
@@ -2957,91 +2809,6 @@ export class AgentSession {
 				error: error instanceof Error ? error.message : String(error),
 			});
 		});
-=======
-		// Flush any pending bash and custom messages before the new prompt
-		this._flushPendingBashMessages();
-		this._flushPendingCustomMessages();
-
-		// Validate model
-		if (!this.model) {
-			throw new Error(formatNoModelSelectedMessage());
-		}
-
-		const hasConfiguredAuth =
-			this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-			(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
-		if (!hasConfiguredAuth) {
-			const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
-			if (isOAuth) {
-				throw new Error(
-					`Authentication failed for "${this.model.provider}". ` +
-						`Credentials may have expired or network is unavailable. ` +
-						`Run '/login ${this.model.provider}' to re-authenticate.`,
-				);
-			}
-			throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
-		}
-
-		// Check if we need to compact before sending (catches aborted responses).
-		// The user's new prompt is sent below, so do not call agent.continue() here.
-		const lastAssistant = this._findLastAssistantMessage();
-		if (lastAssistant) {
-			await this._checkCompaction(lastAssistant, false);
-		}
-
-		// Emit before_agent_start before normalizing images so extension-driven model
-		// selection determines the resize profile used for the request and history.
-		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-		const result = await this._extensionRunner.emitBeforeAgentStart(
-			expandedText,
-			currentImages,
-			this._baseSystemPromptOptions,
-		);
-		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-		// which updates the live loadout instead. An explicit edit wins; otherwise the live
-		// loadout is authoritative, so a setActiveTools() call is not undone here.
-		const handlerEditedTools =
-			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
-
-		const normalized = await this._normalizePromptImages(currentImages);
-		const userText = normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
-
-		// Build messages only after hooks and image normalization have completed.
-		const messages: AgentMessage[] = [];
-		const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
-		userContent.push(...normalized.images);
-		messages.push({
-			role: "user",
-			content: userContent,
-			timestamp: Date.now(),
-		});
-
-		// Inject any pending "nextTurn" messages as context alongside the user message
-		for (const msg of this._pendingNextTurnMessages) {
-			messages.push(msg);
-		}
-		this._pendingNextTurnMessages = [];
-
-		for (const msg of result.messages) {
-			messages.push({
-				role: "custom",
-				customType: msg.customType,
-				// Untyped extensions can pass null/missing content; normalize at ingestion.
-				content: msg.content ?? [],
-				display: msg.display,
-				details: msg.details,
-				timestamp: Date.now(),
-			});
-		}
-		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
-		this._runSystemPromptOptions = result.systemPromptOptions;
-		if (updateMessage) messages.unshift(updateMessage);
-
-		preflightResult?.("started");
-		await this._runAgentPrompt(messages);
->>>>>>> upstream-v1.0.1
 	}
 
 	/**
@@ -3112,8 +2879,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
-<<<<<<< HEAD
-	): Promise<void> {
+	): Promise<QueuedInputDisposition> {
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
 		if (this.#ordinaryOwner) {
@@ -3121,7 +2887,7 @@ export class AgentSession {
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source);
+			return await this._prepareQueuedInput(text, images, behavior, source);
 		} finally {
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
@@ -3135,10 +2901,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
-	): Promise<void> {
-=======
 	): Promise<QueuedInputDisposition> {
->>>>>>> upstream-v1.0.1
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
@@ -3897,24 +3660,24 @@ export class AgentSession {
 		reason: "manual" | "threshold" | "overflow",
 		attempt?: OriginalCompactionAttempt,
 	): Promise<CompactionResult> {
-<<<<<<< HEAD
 		this.#ordinaryOwner?.requestProvenance.interrupt(new Error("OWNER_REQUEST_CAPTURE_AUXILIARY"));
 		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
 		const stream = this.agent.streamFunction;
 		const summaryStream: typeof stream = attempt ? (...args) => attempt.request(() => stream(...args)) : stream;
 		let originalFailure: { cause: unknown } | undefined;
 		try {
+			const request = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
 			return await raceWithAbortSignal(
 				compact(
 					preparation,
-					requestModel,
-					apiKey,
-					headers,
+					request.model,
+					request.apiKey,
+					request.headers,
 					customInstructions,
 					signal,
-					this.thinkingLevel,
+					request.thinkingLevel,
 					summaryStream,
-					env,
+					request.env,
 					COMPACTION_RETRY_POLICY,
 					callbacks,
 					undefined, // sessionId
@@ -3939,24 +3702,6 @@ export class AgentSession {
 				throw cleanup;
 			}
 		}
-=======
-		// Resolve the request only when Pi summarizes itself: routing may call models or fail.
-		const request = await this._getSummarizationRequestAuth(model, signal);
-		return compact(
-			preparation,
-			request.model,
-			request.apiKey,
-			request.headers,
-			customInstructions,
-			signal,
-			request.thinkingLevel,
-			this.agent.streamFunction,
-			request.env,
-			this.settingsManager.getRetrySettings(),
-			this._summarizationRetryCallbacks({ source: "compaction", reason }),
-			undefined, // sessionId
-		);
->>>>>>> upstream-v1.0.1
 	}
 
 	private _clearManualCompactionState(controller: AbortController): void {
@@ -4009,16 +3754,6 @@ export class AgentSession {
 			}
 
 			const settings = this.settingsManager.getCompactionSettings(model);
-<<<<<<< HEAD
-			const {
-				model: requestModel,
-				apiKey,
-				headers,
-				env,
-			} = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
-
-=======
->>>>>>> upstream-v1.0.1
 			const pathEntries = this.sessionManager.getBranch();
 
 			const preparation = prepareCompaction(pathEntries, settings);
@@ -4079,12 +3814,7 @@ export class AgentSession {
 					preparation,
 					model,
 					customInstructions,
-<<<<<<< HEAD
 					signal,
-					env,
-=======
-					this._compactionAbortController.signal,
->>>>>>> upstream-v1.0.1
 					"manual",
 					attempt,
 				);
@@ -4444,7 +4174,7 @@ export class AgentSession {
 			this._overflowRecoveryAttempted = true;
 			this._omitRecoveryAttempt(assistantMessage, toolResults);
 			const retry = await this._runAutoCompaction("overflow", willRetry);
-			if (retry) this._failedResponse = assistantMessage;
+			if (retry === true) this._failedResponse = assistantMessage;
 			return retry;
 		}
 
@@ -4525,17 +4255,6 @@ export class AgentSession {
 			this._emit({ type: "compaction_start", reason });
 			signal.throwIfAborted();
 
-<<<<<<< HEAD
-			const {
-				model: requestModel,
-				apiKey,
-				headers,
-				env,
-			} = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
-			signal.throwIfAborted();
-
-=======
->>>>>>> upstream-v1.0.1
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
@@ -4579,18 +4298,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this.#runDefaultCompaction(
-					preparation,
-					model,
-					undefined,
-<<<<<<< HEAD
-					signal,
-					env,
-=======
-					abortController.signal,
->>>>>>> upstream-v1.0.1
-					reason,
-				);
+				const compactResult = await this.#runDefaultCompaction(preparation, model, undefined, signal, reason);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
@@ -4749,17 +4457,12 @@ export class AgentSession {
 		}
 
 		this._applyExtensionBindings(this._extensionRunner);
-<<<<<<< HEAD
 		await raceWithAbortSignal(this._extensionRunner.emit(this._sessionStartEvent), this._shutdownCancellation.signal);
+		this._extensionRunner.reportUnhandledMcpServers();
 		await raceWithAbortSignal(
 			this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup"),
 			this._shutdownCancellation.signal,
 		);
-=======
-		await this._extensionRunner.emit(this._sessionStartEvent);
-		this._extensionRunner.reportUnhandledMcpServers();
-		await this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup");
->>>>>>> upstream-v1.0.1
 	}
 
 	private async extendResourcesFromExtensions(reason: "startup" | "reload"): Promise<void> {
@@ -5643,19 +5346,13 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const signal = this._branchSummaryAbortController.signal;
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
-<<<<<<< HEAD
-					model: requestModel,
-					apiKey,
-					headers,
-					env,
+					...(await raceWithAbortSignal(
+						this._getSummarizationRequestAuth(this.model!, navigationSignal),
+						navigationSignal,
+					)),
 					signal: navigationSignal,
-=======
-					...(await this._getSummarizationRequestAuth(this.model!, signal)),
-					signal,
->>>>>>> upstream-v1.0.1
 					customInstructions,
 					replaceInstructions,
 					reserveTokens: branchSummarySettings.reserveTokens,

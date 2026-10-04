@@ -67,33 +67,6 @@ function rebuildBashResultRenderComponent(
 		if (options.expanded) {
 			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
 		} else {
-<<<<<<< HEAD
-			component.addChild({
-				render: (width: number) => {
-					// Every frame renders every tool result in the transcript, so return the same
-					// lines until the width changes or invalidate() runs (for example, on a theme change).
-					if (state.cachedLines === undefined || state.cachedWidth !== width) {
-						const preview = truncateToVisualLines(styledOutput, BASH_PREVIEW_LINES, width);
-						state.cachedSkipped = preview.skippedCount;
-						state.cachedWidth = width;
-						if (preview.skippedCount > 0) {
-							const hint =
-								theme.fg("muted", `... (${preview.skippedCount} earlier lines,`) +
-								` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-							state.cachedLines = ["", truncateToWidth(hint, width, "..."), ...preview.visualLines];
-						} else {
-							state.cachedLines = ["", ...preview.visualLines];
-						}
-					}
-					return state.cachedLines;
-				},
-				invalidate: () => {
-					state.cachedWidth = undefined;
-					state.cachedLines = undefined;
-					state.cachedSkipped = undefined;
-				},
-			});
-=======
 			component.addChild(new Spacer(1));
 			component.addChild(
 				new VisualLinePreview({
@@ -105,7 +78,6 @@ function rebuildBashResultRenderComponent(
 						` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`,
 				}),
 			);
->>>>>>> upstream-v1.0.1
 		}
 	}
 

@@ -610,7 +610,6 @@ describe("experimental durable server composition", () => {
 		expect(result).toMatchObject({ kind: "prompted", text: "deterministic remote answer" });
 	});
 
-<<<<<<< HEAD
 	// PR #11: the operation response must not dispose a still-publishing Transcript.
 	for (const outcome of ["completed", "deferred", "disconnect", "callback-error"] as const) {
 		test(`joins the prompt response with terminal publication (${outcome})`, async ({ onTestFinished }) => {
@@ -924,9 +923,6 @@ describe("experimental durable server composition", () => {
 	});
 
 	test("replicates terminal operation state after consecutive prompts", async ({ onTestFinished }) => {
-=======
-	test("replicates the transcript after consecutive prompts", async ({ onTestFinished }) => {
->>>>>>> upstream-v1.0.1
 		const spawn = vi
 			.spyOn(processRuntime, "spawnInternalProcess")
 			.mockImplementation((role, args, options) =>

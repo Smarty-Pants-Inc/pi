@@ -2,12 +2,8 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-<<<<<<< HEAD
 import { isDeepStrictEqual } from "node:util";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
-=======
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
->>>>>>> upstream-v1.0.1
 import {
 	getCurrentSystemMessage,
 	type ImageContent,

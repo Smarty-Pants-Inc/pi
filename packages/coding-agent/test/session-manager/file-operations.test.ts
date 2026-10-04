@@ -4,15 +4,9 @@ import {
 	closeSync,
 	existsSync,
 	mkdirSync,
-<<<<<<< HEAD
 	openSync,
 	readFileSync,
 	renameSync,
-=======
-	mkdtempSync,
-	openSync,
-	readFileSync,
->>>>>>> upstream-v1.0.1
 	rmSync,
 	writeFileSync,
 	writeSync,

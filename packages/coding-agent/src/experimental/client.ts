@@ -75,69 +75,34 @@ export async function runClient(command: ClientCommand, options: RunClientOption
 			return { kind: "attached", serverId: match.route.serverId, sessionId };
 		}
 
-<<<<<<< HEAD
-		const agent = match.agent;
-		const completedText = new Map<string, string>();
-		const terminalRunIds = new Set<string>();
-		let operationId: string | undefined;
-		let resolveTerminal: (() => void) | undefined;
-		let rejectTerminal!: (error: unknown) => void;
-		const terminal = new Promise<void>((resolve, reject) => {
-			resolveTerminal = resolve;
-			rejectTerminal = reject;
+		// Durable submissions replace transcript run events, but connection and attachment loss
+		// must still fail promptly while either the submission or its settled answer is pending.
+		let rejectLost!: (error: Error) => void;
+		const lost = new Promise<never>((_resolve, reject) => {
+			rejectLost = reject;
 		});
-		// Observe attachment/connection loss while the prompt RPC is still pending.
-		void terminal.catch(() => {});
-		let deliveryTail = Promise.resolve();
-		const unsubscribe = match.transcript.state.subscribe((value, _context, delivery) => {
-			if (delivery.kind !== "update" || value.event === null) return;
-			const event = value.event;
-			deliveryTail = deliveryTail.then(async () => {
-				if (event.type === "message_end" && event.runId !== undefined && event.message.role === "assistant") {
-					completedText.set(event.runId, messageText(event.message));
-				}
-				await options.onEvent?.(event);
-				if (event.type === "run_end" || event.type === "run_suspend") {
-					terminalRunIds.add(event.runId);
-					if (event.runId === operationId) resolveTerminal?.();
-				}
-			});
-			void deliveryTail.catch(rejectTerminal);
-		});
-		if (match.transcript.state.value?.snapshot === null || match.transcript.state.value?.snapshot === undefined) {
-			unsubscribe();
-			throw new Error("Transcript has no initialized snapshot");
-		}
+		void lost.catch(() => {});
 		const unsubscribeConnection = match.server.connection.subscribe((state) => {
-			if (state.status === "disconnected") rejectTerminal(new Error(state.reason));
+			if (state.status === "disconnected") rejectLost(new Error(state.reason));
 		});
 		const unsubscribeAttachment = match.session.attachment.subscribe((state) => {
 			if (state.status !== "attached" || state.sessionId !== sessionId) {
-				rejectTerminal(new Error(`Session ${sessionId} attachment lost while waiting for terminal publication`));
+				rejectLost(new Error(`Session ${sessionId} attachment lost while waiting for prompt settlement`));
 			}
 		});
-		let response: AgentOperationResponse;
 		try {
-			response = await agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
-			// The operation response and transcript updates use independent protocol
-			// messages, so the response can arrive before its terminal event.
-			if (response.accepted) {
-				operationId = response.operationId;
-				if (!terminalRunIds.has(operationId)) await terminal;
-			}
+			const response = await Promise.race([
+				match.agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT),
+				lost,
+			]);
+			if (!response.accepted) throw new Error(response.error.message);
+			const result = await Promise.race([match.agent.waitForPrompt(response.operationId, BACKGROUND_CONTEXT), lost]);
+			if (result.status === "unanswered") throw new Error(`Prompt was not answered: ${result.reason}`);
+			return { kind: "prompted", serverId: match.route.serverId, sessionId, text: result.text };
 		} finally {
-			unsubscribe();
 			unsubscribeConnection();
 			unsubscribeAttachment();
-			await deliveryTail;
 		}
-=======
-		const response = await match.agent.prompt({ message: command.prompt, images: null }, BACKGROUND_CONTEXT);
->>>>>>> upstream-v1.0.1
-		if (!response.accepted) throw new Error(response.error.message);
-		const result = await match.agent.waitForPrompt(response.operationId, BACKGROUND_CONTEXT);
-		if (result.status === "unanswered") throw new Error(`Prompt was not answered: ${result.reason}`);
-		return { kind: "prompted", serverId: match.route.serverId, sessionId, text: result.text };
 	} finally {
 		await runtime.dispose();
 	}

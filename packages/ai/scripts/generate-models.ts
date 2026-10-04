@@ -30,11 +30,8 @@ import type {
 import {
 	assertExactModelIds,
 	createModelDataManifest,
-<<<<<<< HEAD
 	filterOmittedProviders,
-=======
 	groupProviderModelData,
->>>>>>> upstream-v1.0.1
 	type ModelDataStructure,
 	MODEL_DATA_MANIFEST_FILE,
 	readModelDataProviderIds,

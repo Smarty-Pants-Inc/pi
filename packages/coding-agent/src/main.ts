@@ -697,16 +697,12 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 
-<<<<<<< HEAD
-=======
 	if (args[0] === "mcp") {
 		const { runMcpCommand } = await loadMcpCommand();
 		process.exitCode = await runMcpCommand(args.slice(1), { cwd, agentDir });
 		return;
 	}
 
-	const parsed = parseArgs(args);
->>>>>>> upstream-v1.0.1
 	if (parsed.diagnostics.length > 0) {
 		for (const d of parsed.diagnostics) {
 			const color = d.type === "error" ? chalk.red : chalk.yellow;

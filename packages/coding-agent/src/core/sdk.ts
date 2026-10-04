@@ -18,14 +18,9 @@ import { bindOrdinaryPairedContext } from "./ordinary-request-pair.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
-<<<<<<< HEAD
 import { assertUnownedSessionManager, getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { currentSessionOwnership } from "./session-ownership.ts";
-import { SettingsManager } from "./settings-manager.ts";
-=======
-import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import { DEFAULT_TOOL_NAMES, SettingsManager } from "./settings-manager.ts";
->>>>>>> upstream-v1.0.1
 import { time } from "./timings.ts";
 import {
 	createBashTool,

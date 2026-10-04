@@ -44,40 +44,20 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 	}
 }
 
-<<<<<<< HEAD
-		const args = block.arguments as Record<string, unknown> | undefined;
-		if (!args) continue;
-
-		const path = typeof args.path === "string" ? args.path : undefined;
-		if (!path) continue;
-
-		const set =
-			block.name === "read"
-				? fileOps.read
-				: block.name === "write"
-					? fileOps.written
-					: block.name === "edit"
-						? fileOps.edited
-						: undefined;
-		// Delete first so each set stays ordered from least to most recently used.
-		set?.delete(path);
-		set?.add(path);
-=======
 function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
 	const path = typeof args?.path === "string" ? args.path : undefined;
 	if (!path) return;
-	switch (toolName) {
-		case "read":
-			fileOps.read.add(path);
-			break;
-		case "write":
-			fileOps.written.add(path);
-			break;
-		case "edit":
-			fileOps.edited.add(path);
-			break;
->>>>>>> upstream-v1.0.1
-	}
+	const set =
+		toolName === "read"
+			? fileOps.read
+			: toolName === "write"
+				? fileOps.written
+				: toolName === "edit"
+					? fileOps.edited
+					: undefined;
+	// Delete first so each set stays ordered from least to most recently used.
+	set?.delete(path);
+	set?.add(path);
 }
 
 /**

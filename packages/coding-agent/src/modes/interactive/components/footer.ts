@@ -49,6 +49,8 @@ interface SessionStats {
 	sessionId: string;
 	leafId: string | null;
 	entryCount: number;
+	revision: number;
+	sessionName: string | undefined;
 	limitsModel: unknown;
 	usageTotals: UsageTotals;
 	latestCacheHitRate: number | undefined;
@@ -93,7 +95,9 @@ export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
 	// The footer renders on every frame; the totals walk the whole session, so reuse them
 	// until the session changes.
-	private totalsCache: { sessionManager: object; revision: number; totals: SessionTotals } | undefined;
+	private totalsCache:
+		| { sessionManager: object; revision: number; entryCount: number; totals: SessionTotals }
+		| undefined;
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
 	private sessionStats?: SessionStats;
@@ -135,6 +139,7 @@ export class FooterComponent implements Component {
 	private getSessionStats(): SessionStats {
 		const sessionManager = this.session.sessionManager;
 		const entryCount = sessionManager.getEntryCount();
+		const revision = sessionManager.revision();
 		const sessionId = sessionManager.getSessionId();
 		const leafId = sessionManager.getLeafId();
 		const limitsModel = this.session.routedModel?.model ?? this.session.model;
@@ -145,39 +150,16 @@ export class FooterComponent implements Component {
 			cached.sessionId === sessionId &&
 			cached.leafId === leafId &&
 			cached.entryCount === entryCount &&
+			cached.revision === revision &&
 			cached.limitsModel === limitsModel
 		) {
 			return cached;
 		}
 
-<<<<<<< HEAD
-		const sessionManager = this.session.sessionManager;
-		const revision = sessionManager.revision();
 		let cache = this.totalsCache;
-		if (cache?.sessionManager !== sessionManager || cache.revision !== revision) {
-			cache = { sessionManager, revision, totals: computeSessionTotals(sessionManager) };
+		if (cache?.sessionManager !== sessionManager || cache.revision !== revision || cache.entryCount !== entryCount) {
+			cache = { sessionManager, revision, entryCount, totals: computeSessionTotals(sessionManager) };
 			this.totalsCache = cache;
-=======
-		// Calculate cumulative usage from ALL session entries (not just post-compaction messages)
-		const usageTotals = createUsageTotals();
-		let latestCacheHitRate: number | undefined;
-
-		for (const entry of sessionManager.getEntries()) {
-			if (entry.type === "usage") {
-				addUsageToTotals(usageTotals, entry.usage);
-			} else if (entry.type === "message" && entry.message.role === "assistant") {
-				addUsageToTotals(usageTotals, entry.message.usage);
-
-				const latestPromptTokens =
-					entry.message.usage.input + entry.message.usage.cacheRead + entry.message.usage.cacheWrite;
-				latestCacheHitRate =
-					latestPromptTokens > 0 ? (entry.message.usage.cacheRead / latestPromptTokens) * 100 : undefined;
-			} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
-				addUsageToTotals(usageTotals, entry.message.usage);
-			} else if ((entry.type === "branch_summary" || entry.type === "compaction") && entry.usage) {
-				addUsageToTotals(usageTotals, entry.usage);
-			}
->>>>>>> upstream-v1.0.1
 		}
 		const { usageTotals, latestCacheHitRate, sessionName } = cache.totals;
 
@@ -189,6 +171,8 @@ export class FooterComponent implements Component {
 			sessionId,
 			leafId,
 			entryCount,
+			revision,
+			sessionName,
 			limitsModel,
 			usageTotals,
 			latestCacheHitRate,
@@ -199,7 +183,7 @@ export class FooterComponent implements Component {
 
 	render(width: number): string[] {
 		const state = this.session.state;
-		const { usageTotals, latestCacheHitRate, contextUsage } = this.getSessionStats();
+		const { usageTotals, latestCacheHitRate, contextUsage, sessionName } = this.getSessionStats();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
 		const contextPercentValue = contextUsage?.percent ?? 0;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";

@@ -3,7 +3,6 @@ import { Container, Text } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
-<<<<<<< HEAD
 import { initTheme, type Theme, theme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness } from "../harness.ts";
 
@@ -44,10 +43,6 @@ function createUiContext(
 		setToolsExpanded: () => {},
 	};
 }
-=======
-import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
-import { createHarness, createTestUiContext } from "../harness.ts";
->>>>>>> upstream-v1.0.1
 
 type LoadedResourcesResult<T> = { [K in keyof T]: T[K] } & { diagnostics: [] };
 

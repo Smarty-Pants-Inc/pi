@@ -13,21 +13,14 @@ import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
 import { resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
-<<<<<<< HEAD
 import { createExecCommand, type ExecOptions, execCommand, type OwnedExecScope } from "../exec.ts";
 import { HOST_CAPABILITIES } from "../host-capabilities.ts";
+import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
 import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "../ordinary-owner-context.ts";
 import { createOrdinarySenseExtension, type OrdinarySenseEntry } from "../ordinary-sense.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { currentSessionOwnership, ownershipOf, type SessionOwnership } from "../session-ownership.ts";
-import { createSyntheticSourceInfo } from "../source-info.ts";
-=======
-import type { ExecOptions } from "../exec.ts";
-import { execCommand } from "../exec.ts";
-import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
-import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
->>>>>>> upstream-v1.0.1
 import { time } from "../timings.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
@@ -788,7 +781,9 @@ export async function loadOwnedSenseExtension(context: OrdinaryOwnerContext): Pr
 	if (
 		!extension.tools.has("sense") ||
 		runtime.pendingProviderRegistrations.length ||
-		runtime.pendingNativeProviderRegistrations.length
+		runtime.pendingNativeProviderRegistrations.length ||
+		runtime.pendingVirtualModelRegistrations.length ||
+		runtime.mcpServers.list().length
 	) {
 		throw new Error("OWNER_SENSE_ENTRY_CONTRACT");
 	}

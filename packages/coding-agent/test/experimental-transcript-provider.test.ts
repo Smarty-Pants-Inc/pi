@@ -21,7 +21,6 @@ describe("Transcript service", () => {
 		const host = await createFacetHost({
 			facets: [await createTranscriptServiceFacet(conversation, BACKGROUND_CONTEXT), consumer],
 		});
-<<<<<<< HEAD
 
 		await listener?.(
 			{
@@ -123,16 +122,5 @@ describe("Transcript service", () => {
 
 		await runtime.dispose();
 		expect(unsubscribe).toHaveBeenCalledOnce();
-=======
-		try {
-			expect(views[0]?.entries).toEqual([]);
-			const submission = await conversation.submit({ type: "input", content: "question" }, BACKGROUND_CONTEXT);
-			await submission.wait(BACKGROUND_CONTEXT);
-			await expect.poll(() => views.at(-1)?.entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
-		} finally {
-			await host.dispose();
-			await close();
-		}
->>>>>>> upstream-v1.0.1
 	});
 });
