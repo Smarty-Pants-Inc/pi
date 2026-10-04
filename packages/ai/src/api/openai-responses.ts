@@ -34,16 +34,35 @@ const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
 const CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage";
 
-/**
- * OpenAI API keys start with `sk-`; a different credential sent directly to OpenAI
- * is a Sign in with ChatGPT access token.
- */
-function isChatGPTSignIn(model: Model<"openai-responses">, apiKey: string | undefined): boolean {
+function mergeHeaders(...sources: (ProviderHeaders | undefined)[]): ProviderHeaders {
+	const headers = new Map<string, [string, string | null]>();
+	for (const source of sources) {
+		for (const [name, value] of Object.entries(source ?? {})) {
+			headers.delete(name.toLowerCase());
+			headers.set(name.toLowerCase(), [name, value]);
+		}
+	}
+	return Object.fromEntries(headers.values());
+}
+
+/** OpenAI API keys start with `sk-`; other direct Bearer credentials are ChatGPT tokens. */
+function isChatGPTSignIn(
+	model: Model<"openai-responses">,
+	apiKey: string | undefined,
+	optionsHeaders: ProviderHeaders | undefined,
+): boolean {
+	const headers = mergeHeaders(
+		apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+		model.headers,
+		optionsHeaders,
+	);
+	const authorization = Object.entries(headers).find(([name]) => name.toLowerCase() === "authorization")?.[1];
+	const credential = authorization?.trim().match(/^Bearer\s+(.+)$/iu)?.[1];
 	return (
 		model.provider === "openai" &&
 		model.baseUrl === "https://api.openai.com/v1" &&
-		apiKey !== undefined &&
-		!apiKey.startsWith("sk-")
+		credential !== undefined &&
+		!credential.startsWith("sk-")
 	);
 }
 
@@ -155,7 +174,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 
 		try {
 			// Create OpenAI client
-			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
+			const apiKey = getClientApiKey(model.provider, options?.apiKey, mergeHeaders(model.headers, options?.headers));
 			const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 			const cacheSessionId = cacheRetention === "none" ? undefined : options?.sessionId;
 			const compat = getCompat(model);
@@ -241,7 +260,7 @@ export const streamSimple: StreamFunction<"openai-responses", SimpleStreamOption
 	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): AssistantMessageEventStream => {
-	getClientApiKey(model.provider, options?.apiKey, options?.headers);
+	getClientApiKey(model.provider, options?.apiKey, mergeHeaders(model.headers, options?.headers));
 
 	const base = {
 		...buildBaseOptions(model, context, options, options?.apiKey),
@@ -265,7 +284,7 @@ function createClient(
 	sessionId?: string,
 ) {
 	const compat = getCompat(model);
-	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
+	const headers = mergeHeaders({ "User-Agent": getPiUserAgent() }, model.headers);
 	if (model.provider === "github-copilot") {
 		const hasImages = hasCopilotVisionInput(context.messages);
 		const copilotHeaders = buildCopilotDynamicHeaders({
@@ -286,17 +305,15 @@ function createClient(
 		}
 	}
 
-	// Merge options headers last so they can override defaults
-	if (optionsHeaders) {
-		Object.assign(headers, optionsHeaders);
-	}
+	// Merge names case-insensitively and preserve null removals for the SDK.
+	const defaultHeaders = mergeHeaders(headers, optionsHeaders);
 
 	return new OpenAI({
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,
-		defaultHeaders: headers,
+		defaultHeaders,
 	});
 }
 
@@ -327,7 +344,7 @@ function buildParams(
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention, options?.env);
 	// Sign in with ChatGPT rejects these request fields.
-	const omitUnsupportedFields = isChatGPTSignIn(model, options?.apiKey);
+	const omitUnsupportedFields = isChatGPTSignIn(model, options?.apiKey, options?.headers);
 	const params: ResponseCreateParamsStreaming = {
 		model: model.id,
 		input: messages,
