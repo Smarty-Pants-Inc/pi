@@ -452,6 +452,8 @@ export type TaskInspection = {
 		| { readonly kind: "waiting"; readonly on: readonly TaskId[] }
 		/** Outcome held until its ordinary owned work drains. */
 		| { readonly kind: "completing" }
+		/** Provider acceptance is unresolved; neither run nor abort may discard its replay fence. */
+		| { readonly kind: "blocked"; readonly reason: "acceptance_uncertain" }
 		/** No registered definition can take it; aborting it settles it as `orphaned`. */
 		| {
 				readonly kind: "blocked";
