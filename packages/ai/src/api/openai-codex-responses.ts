@@ -507,7 +507,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets, true));
+			const normalizedError = normalizeProviderError(error, diagnosticSecrets, true);
+			output.oauthRecovery = normalizedError.oauthRecovery;
+			output.errorMessage = formatProviderError(normalizedError);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

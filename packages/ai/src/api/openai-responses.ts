@@ -233,8 +233,10 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			const normalizedError = normalizeProviderError(error, diagnosticSecrets, oauthDiagnostics);
+			output.oauthRecovery = normalizedError.oauthRecovery;
 			const errorMessage = formatProviderError(
-				normalizeProviderError(error, diagnosticSecrets, oauthDiagnostics),
+				normalizedError,
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.

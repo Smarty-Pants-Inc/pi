@@ -547,6 +547,12 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/** Owned pre-suppression decisions. Set only by the OAuth diagnostic projection, never from wire metadata. */
+export interface OAuthRecoveryDecision {
+	recovery?: "retryable" | "premature_stream" | "context_length_exceeded";
+	retryable?: boolean;
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
@@ -560,6 +566,8 @@ export interface AssistantMessage {
 	/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
 	thinkingLevel?: ModelThinkingLevel;
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
+	/** Recovery authority is structured; errorMessage is display text only. */
+	oauthRecovery?: OAuthRecoveryDecision;
 	usage: Usage;
 	stopReason: StopReason;
 	deferred?: DeferredHandle;

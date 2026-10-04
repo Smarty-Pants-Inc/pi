@@ -9,7 +9,7 @@
  * models.json custom provider with `"api": "pi-messages"`.
  */
 
-import { oauthDiagnosticError, oauthResponseError, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import { oauthRecoveryDecision, oauthResponseError, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -167,6 +167,33 @@ function createEmptyUsage(): PiMessagesUsage {
 	};
 }
 
+/** The cast wire event is untrusted: rebuild terminal-error accounting without provider metadata. */
+function projectErrorUsage(value: unknown): PiMessagesUsage {
+	const usage = createEmptyUsage();
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return usage;
+	const fields = value as Record<string, unknown>;
+	for (const key of [
+		"input",
+		"output",
+		"cacheRead",
+		"cacheWrite",
+		"totalTokens",
+		"cacheWrite1h",
+		"reasoning",
+	] as const) {
+		const number = fields[key];
+		if (typeof number === "number" && Number.isFinite(number)) usage[key] = number;
+	}
+	if (typeof fields.cost === "object" && fields.cost !== null && !Array.isArray(fields.cost)) {
+		const cost = fields.cost as Record<string, unknown>;
+		for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
+			const number = cost[key];
+			if (typeof number === "number" && Number.isFinite(number)) usage.cost[key] = number;
+		}
+	}
+	return usage;
+}
+
 function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesRewriteImpact | undefined): void {
 	if (!rewrite) {
 		return;
@@ -206,12 +233,14 @@ function createEventConverter(model: Model<"pi-messages">, oauthDiagnostics = fa
 				return { type: "done", reason: event.reason, message: partial };
 			case "error": {
 				const reason = event.reason === "aborted" ? "aborted" : "error";
+				const safe = oauthDiagnostics
+					? safeOAuthError({ message: event.errorMessage }, true, "oauth_stream_failed")
+					: undefined;
 				Object.assign(partial, {
 					stopReason: reason,
-					usage: event.usage,
-					errorMessage: oauthDiagnostics
-						? oauthDiagnosticError("oauth_stream_failed").message
-						: event.errorMessage,
+					usage: oauthDiagnostics ? projectErrorUsage(event.usage) : event.usage,
+					errorMessage: safe ? safe.message : event.errorMessage,
+					oauthRecovery: safe ? oauthRecoveryDecision(safe) : undefined,
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
@@ -332,6 +361,7 @@ function createErrorEvent(
 	oauthDiagnostics = false,
 ): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
+	const safe = oauthDiagnostics ? safeOAuthError(error, true) : undefined;
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
 		content: [],
@@ -340,11 +370,8 @@ function createErrorEvent(
 		model: model.id,
 		usage: createEmptyUsage(),
 		stopReason: reason,
-		errorMessage: oauthDiagnostics
-			? safeOAuthError(error).message
-			: error instanceof Error
-				? error.message
-				: String(error),
+		oauthRecovery: safe ? oauthRecoveryDecision(safe) : undefined,
+		errorMessage: safe ? safe.message : error instanceof Error ? error.message : String(error),
 		timestamp: Date.now(),
 	};
 

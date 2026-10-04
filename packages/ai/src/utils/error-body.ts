@@ -13,11 +13,14 @@
 // Anthropic / `@google/genai` happy path where the SDK already folded the body
 // into the message, so providers can preserve it without double-printing.
 
-import { redactOAuthDiagnostic, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import { oauthRecoveryDecision, redactOAuthDiagnostic, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import type { OAuthRecoveryDecision } from "../types.ts";
 
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
 export interface NormalizedProviderError {
+	/** Present only when the OAuth projection classified the untrusted error before suppression. */
+	oauthRecovery?: OAuthRecoveryDecision;
 	/** HTTP status code, when one could be extracted from the SDK error object. */
 	status?: number;
 	/** Raw HTTP body reason, already trimmed and truncated to the cap. */
@@ -44,7 +47,12 @@ export function normalizeProviderError(
 ): NormalizedProviderError {
 	if (oauthDiagnostics) {
 		const safe = safeOAuthError(error, true);
-		return { status: safe.status, message: redactOAuthDiagnostic(safe.message, secrets), messageCarriesBody: true };
+		return {
+			status: safe.status,
+			message: redactOAuthDiagnostic(safe.message, secrets),
+			messageCarriesBody: true,
+			oauthRecovery: oauthRecoveryDecision(safe),
+		};
 	}
 	if (!(error instanceof Error)) {
 		return { message: redactOAuthDiagnostic(safeJsonStringify(error), secrets), messageCarriesBody: false };
