@@ -1,5 +1,6 @@
 import { constants, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, parse, resolve } from "node:path";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -73,6 +74,7 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 
 // Terminal cleanup is independent of the already-aborted session signal.
 const TERMINAL_SHUTDOWN_DISPATCH_MS = 1000;
+const TERMINAL_DISPOSAL_JOIN_MS = 1000;
 
 interface OutgoingSession {
 	session: AgentSession;
@@ -505,6 +507,21 @@ export class AgentSessionRuntime {
 		}
 	}
 
+	async #joinForDisposal(outgoing: OutgoingSession): Promise<void> {
+		// An earlier idle join does not seal compaction admission. Repeat the join
+		// with a fresh runtime budget, never the RPC command's expired deadline.
+		const cancellation = new AbortController();
+		const timeout = setTimeout(
+			() => cancellation.abort(new Error(`Session disposal join exceeded ${TERMINAL_DISPOSAL_JOIN_MS} ms`)),
+			TERMINAL_DISPOSAL_JOIN_MS,
+		);
+		try {
+			await raceWithAbortSignal(outgoing.session.abort(), cancellation.signal);
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+
 	async dispose(): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		const outgoing = this.#captureOutgoing(true);
@@ -524,7 +541,7 @@ export class AgentSessionRuntime {
 					.close({
 						stop: () => {
 							this.#assertIdentity(outgoing);
-							return outgoing.session.abort();
+							return this.#joinForDisposal(outgoing);
 						},
 						persist: () => this.#disposeOutgoing(outgoing),
 					})
@@ -534,7 +551,7 @@ export class AgentSessionRuntime {
 			}
 			return this.#ownerDisposal;
 		}
-		await outgoing.session.abort();
+		await this.#joinForDisposal(outgoing);
 		this.#assertCurrent(outgoing);
 		await this.#disposeOutgoing(outgoing);
 	}
