@@ -2,18 +2,20 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { InMemoryCredentialStore, normalizeContext } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, normalizeContext, Type } from "@earendil-works/pi-ai";
 import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSession } from "../src/core/agent-session.ts";
-import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import { AgentSessionRuntime, type CreateAgentSessionRuntimeFactory } from "../src/core/agent-session-runtime.ts";
+import type { AgentSessionServices } from "../src/core/agent-session-services.ts";
 import { CacheWarmer } from "../src/core/cache-warmer.ts";
+import type { ToolDefinition } from "../src/core/extensions/index.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
-import { createTestResourceLoader } from "./utilities.ts";
+import { createTestExtensionsResult, createTestResourceLoader } from "./utilities.ts";
 
 // Keep protocol body output out of request-count test logs; output transport has its own tests.
 vi.mock("../src/core/output-guard.ts", () => ({
@@ -35,7 +37,7 @@ afterEach(async () => {
 	vi.useRealTimers();
 });
 
-function completion(tool = false): Response {
+function completion(tool = false, toolName = "unavailable"): Response {
 	const chunk = {
 		id: "test",
 		object: "chat.completion.chunk",
@@ -51,7 +53,7 @@ function completion(tool = false): Response {
 									index: 0,
 									id: "unknown",
 									type: "function",
-									function: { name: "unavailable", arguments: "{}" },
+									function: { name: toolName, arguments: "{}" },
 								},
 							],
 						}
@@ -66,45 +68,144 @@ function completion(tool = false): Response {
 	});
 }
 
-async function host(settings: Parameters<typeof SettingsManager.inMemory>[0] = {}) {
+async function host(settings: Parameters<typeof SettingsManager.inMemory>[0] = {}, customTools: ToolDefinition[] = []) {
 	directory = mkdtempSync(join(tmpdir(), "pi-request-limit-"));
 	const credentials = new InMemoryCredentialStore();
 	await credentials.modify("deepseek", async () => ({ type: "api_key", key: "synthetic-key" }));
-	const modelRuntime = await ModelRuntime.create({
-		credentials,
-		modelsPath: null,
-		refreshOnCreate: false,
-		allowModelNetwork: false,
-	});
-	const model = getBuiltinModel("deepseek", "deepseek-flash");
-	const created = await createAgentSession({
+	const createRuntime: CreateAgentSessionRuntimeFactory = async (options) => {
+		const modelRuntime = await ModelRuntime.create({
+			credentials,
+			modelsPath: null,
+			refreshOnCreate: false,
+			allowModelNetwork: false,
+		});
+		const extensionsResult = await createTestExtensionsResult([
+			(pi) => {
+				pi.registerCommand("replace", {
+					description: "Replace test session",
+					handler: async (_args, ctx) => {
+						await ctx.newSession();
+					},
+				});
+			},
+		]);
+		const created = await createAgentSession({
+			...options,
+			modelRuntime,
+			model: getBuiltinModel("deepseek", "deepseek-flash"),
+			thinkingLevel: "off",
+			noTools: customTools.length ? "builtin" : "all",
+			customTools,
+			settingsManager: SettingsManager.inMemory({
+				cacheWarming: "off",
+				compaction: { enabled: false },
+				retry: { enabled: false },
+				...settings,
+			}),
+			resourceLoader: createTestResourceLoader({ extensionsResult }),
+		});
+		session = created.session;
+		return {
+			...created,
+			services: { cwd: options.cwd, agentDir: options.agentDir } as AgentSessionServices,
+			diagnostics: [],
+		};
+	};
+	const created = await createRuntime({
 		cwd: directory,
 		agentDir: directory,
-		modelRuntime,
-		model,
-		thinkingLevel: "off",
-		noTools: "all",
 		sessionManager: SessionManager.inMemory(),
-		settingsManager: SettingsManager.inMemory({
-			cacheWarming: "off",
-			compaction: { enabled: false },
-			retry: { enabled: false },
-			...settings,
-		}),
-		resourceLoader: createTestResourceLoader(),
 	});
-	session = created.session;
-	return {
-		session,
-		setRebindSession: () => {},
-		dispose: async () => {
-			await created.session.abort();
-			created.session.dispose();
-		},
-	} as unknown as AgentSessionRuntime;
+	return new AgentSessionRuntime(created.session, created.services, createRuntime);
 }
 
 describe("print dispatch provider request limit", () => {
+	// PR #139 / smarty-dev#2751: warming exhaustion must cancel tools and join native shutdown, including rebinds.
+	it.each([
+		["text", false],
+		["json", false],
+		["text", true],
+		["json", true],
+	] as const)("cancels a tool waiting for abort in %s mode (rebound %s)", async (mode, rebound) => {
+		vi.useFakeTimers();
+		let toolCancelled = false;
+		let started!: () => void;
+		const toolStarted = new Promise<void>((resolve) => {
+			started = resolve;
+		});
+		let warmer: CacheWarmer | undefined;
+		let runtime!: AgentSessionRuntime;
+		runtime = await host({}, [
+			{
+				name: "wait",
+				label: "Wait",
+				description: "Wait for cancellation",
+				parameters: Type.Object({}),
+				execute: async (_id, _params, signal) => {
+					warmer = new CacheWarmer(
+						runtime.session.modelRuntime,
+						runtime.session.sessionManager,
+						() => "streaming",
+						async () => "warm",
+					);
+					warmer.start(
+						{
+							model: { ...runtime.session.model!, promptCache: { short: 20 } },
+							context: normalizeContext({ messages: [] }),
+							options: {},
+						},
+						() => true,
+					);
+					started();
+					await new Promise<void>((resolve) => {
+						signal?.addEventListener(
+							"abort",
+							() => {
+								toolCancelled = true;
+								resolve();
+							},
+							{ once: true },
+						);
+					});
+					return { content: [{ type: "text", text: "cancelled" }], details: undefined };
+				},
+			},
+		]);
+		const originalSession = runtime.session;
+		const fetch = vi.fn(async () => completion(true, "wait"));
+		if (rebound) fetch.mockImplementationOnce(async () => completion());
+		vi.stubGlobal("fetch", fetch);
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const dispose = vi.spyOn(runtime, "dispose");
+		let result: number | undefined;
+		const cap = rebound ? 2 : 1;
+		const running = runPrintMode(runtime, {
+			mode,
+			initialMessage: "test",
+			messages: rebound ? ["/replace", "wait"] : [],
+			maxProviderRequests: cap,
+		}).then((code) => {
+			result = code;
+			return code;
+		});
+		try {
+			await toolStarted;
+			if (rebound) expect(runtime.session).not.toBe(originalSession);
+			await vi.advanceTimersByTimeAsync(10_000);
+			expect.soft(toolCancelled).toBe(true);
+			expect(result).toBe(1);
+			expect(dispose).toHaveBeenCalledTimes(1);
+			expect(runtime.session.shutdownSignal.aborted).toBe(true);
+			expect(fetch).toHaveBeenCalledTimes(cap);
+			expect(errors).toHaveBeenCalledWith(
+				`Provider request limit reached (${cap}/${cap}); no further requests allowed`,
+			);
+		} finally {
+			warmer?.cancel();
+			await runtime.dispose();
+			await running;
+		}
+	});
 	it.each(["text", "json"] as const)("stops unknown-tool continuations at exactly N in %s mode", async (mode) => {
 		const bodies: string[] = [];
 		const fetch = vi.fn(async (_input: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => {

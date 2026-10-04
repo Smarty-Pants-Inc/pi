@@ -12,6 +12,7 @@ import { streamSimple as completions } from "../src/api/openai-completions.ts";
 import { streamSimple as responses } from "../src/api/openai-responses.ts";
 import { streamSimple as piMessages } from "../src/api/pi-messages.ts";
 import type { Api, AssistantMessageEventStream, Model, SimpleStreamOptions } from "../src/types.ts";
+import { checkProviderRequest } from "../src/utils/provider-retry.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 function model<T extends Api>(api: T): Model<T> {
@@ -53,6 +54,89 @@ afterEach(async () => {
 });
 
 describe("physical provider admission", () => {
+	// PR #139 / smarty-dev#2751: cap cancellation cannot wait for a native stream observer.
+	it.each([undefined, "cap-held-observer"])(
+		"closes and settles a held Codex observer (session %s)",
+		async (sessionId) => {
+			let closed = false;
+			let frames = 0;
+			class HeldWebSocket extends EventTarget {
+				constructor() {
+					super();
+					queueMicrotask(() => this.dispatchEvent(new Event("open")));
+				}
+				send(): void {
+					frames++;
+					queueMicrotask(() =>
+						this.dispatchEvent(
+							Object.assign(new Event("message"), {
+								data: JSON.stringify({
+									type: "response.created",
+									response: { id: "held", status: "in_progress" },
+								}),
+							}),
+						),
+					);
+				}
+				close(): void {
+					closed = true;
+				}
+			}
+			vi.stubGlobal("WebSocket", HeldWebSocket);
+			let entered!: () => void;
+			const observing = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			let release!: () => void;
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const controller = new AbortController();
+			let admitted = 0;
+			const beforeProviderRequest = () => {
+				if (admitted === 1) {
+					const error = new Error("Provider request limit reached (1/1)");
+					controller.abort(error);
+					throw error;
+				}
+				admitted++;
+			};
+			const fetch = vi.fn(async () => new Response("unexpected fallback", { status: 400 }));
+			const running = codex(model("openai-codex-responses"), context, {
+				apiKey: token,
+				fetch,
+				sessionId,
+				signal: controller.signal,
+				beforeProviderRequest,
+				onProviderStreamEvent: async () => {
+					entered();
+					await held;
+				},
+			}).result();
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			try {
+				await observing;
+				expect(() => checkProviderRequest({ signal: controller.signal, beforeProviderRequest })).toThrow(
+					"Provider request limit reached (1/1)",
+				);
+				expect.soft(closed).toBe(true);
+				const result = await Promise.race([
+					running,
+					new Promise<undefined>((resolve) => {
+						timeout = setTimeout(() => resolve(undefined), 250);
+					}),
+				]);
+				expect(result).toMatchObject({ stopReason: "aborted" });
+				expect(frames).toBe(1);
+				expect(admitted).toBe(1);
+				expect(fetch).not.toHaveBeenCalled();
+			} finally {
+				if (timeout) clearTimeout(timeout);
+				release();
+				await running;
+			}
+		},
+	);
 	it.each([1, 2, undefined])("shares Codex WebSocket and SSE fallback admission (limit %s)", async (limit) => {
 		let frames = 0;
 		class FailingWebSocket extends EventTarget {

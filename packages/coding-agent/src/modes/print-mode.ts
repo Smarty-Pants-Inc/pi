@@ -6,7 +6,7 @@
  * - `pi --mode json "prompt"` - JSON event stream
  */
 
-import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type ImageContent, ProviderRequestLimitError } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import type { AgentActivityOutcome } from "../core/extensions/index.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
@@ -49,9 +49,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 					signal: requestLimitCancellation.signal,
 					beforeProviderRequest: () => {
 						if (providerRequests >= maxProviderRequests) {
-							requestLimitError ??= new Error(
-								`Provider request limit reached (${providerRequests}/${maxProviderRequests}); no further requests allowed`,
-							);
+							requestLimitError ??= new ProviderRequestLimitError(providerRequests, maxProviderRequests);
 							requestLimitCancellation.abort(requestLimitError);
 							throw requestLimitError;
 						}
@@ -92,6 +90,18 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		})();
 		return disposalCompletion;
 	};
+
+	requestLimitCancellation.signal.addEventListener(
+		"abort",
+		() => {
+			// Native disposal cancels the current (possibly rebound) session's tools,
+			// hooks, retries and owned processes before joining and persisting it.
+			killTrackedDetachedChildren();
+			// The prompt is still joined below; finally observes any disposal failure.
+			void disposeRuntime().catch(() => {});
+		},
+		{ once: true },
+	);
 
 	const registerSignalHandlers = (): void => {
 		const signals: NodeJS.Signals[] = ["SIGTERM"];
