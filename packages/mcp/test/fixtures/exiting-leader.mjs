@@ -1,8 +1,9 @@
 // The leader exits on stdin EOF; its same-group descendant ignores SIGTERM and owns no stdio.
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 
-const descendant = spawn(process.execPath, [new URL("./term-resistant-descendant.mjs", import.meta.url).pathname], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+const descendant = spawn(process.execPath, [fileURLToPath(new URL("./term-resistant-descendant.mjs", import.meta.url))], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
 descendant.once("message", () => {
 	console.error(`descendant ${descendant.pid}`);
 	descendant.disconnect();

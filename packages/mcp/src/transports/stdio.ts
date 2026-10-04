@@ -1,8 +1,9 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import process from "node:process";
 import crossSpawn from "cross-spawn";
 import { type JsonRpcMessage, McpConnectionClosedError, parseJsonRpcMessage } from "../protocol/jsonrpc.ts";
 import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, TransportEvents } from "./transport.ts";
+import { spawnWindowsJob, type WindowsJob } from "./windows-job.ts";
 
 const DEFAULT_MAX_STDERR_BYTES = 64 * 1024;
 const DEFAULT_CLOSE_TIMEOUT_MS = 2_000;
@@ -16,16 +17,6 @@ let exitHookInstalled = false;
 
 function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
 	const pid = child.pid;
-	if (process.platform === "win32" && pid !== undefined) {
-		if (child.exitCode !== null) return;
-		// Windows has no graceful signals, and cross-spawn runs `.cmd` shims through cmd.exe; killing only
-		// that would leave the server running.
-		spawn("taskkill", ["/pid", String(pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on(
-			"error",
-			() => {},
-		);
-		return;
-	}
 	if (USE_PROCESS_GROUPS && pid !== undefined) {
 		try {
 			// Negative pid: the whole group, so wrappers like `npx` or `uvx` do not leave the server behind.
@@ -69,6 +60,7 @@ export interface StdioTransportOptions {
 export class StdioTransport extends TransportEvents implements McpTransport {
 	readonly options: Readonly<StdioTransportOptions>;
 	private child: ChildProcess | undefined;
+	private windowsJob: WindowsJob | undefined;
 	private stdoutBuffer = Buffer.alloc(0);
 	private stderrBuffer = Buffer.alloc(0);
 	private started = false;
@@ -93,14 +85,25 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 		if (this.closed) throw new McpConnectionClosedError();
 		this.started = true;
 		const env = this.options.inheritEnv === false ? { ...this.options.env } : { ...process.env, ...this.options.env };
-		const child = crossSpawn(this.options.command, this.options.args ?? [], {
+		const spawnOptions = {
 			cwd: this.options.cwd,
 			env,
-			stdio: ["pipe", "pipe", this.options.stderr === "inherit" ? "inherit" : "pipe"],
 			windowsHide: true,
 			// Own process group, so closing the transport can terminate the server's children too.
 			detached: USE_PROCESS_GROUPS,
-		});
+		};
+		if (!USE_PROCESS_GROUPS) {
+			this.windowsJob = spawnWindowsJob(this.options.command, this.options.args ?? [], spawnOptions, (chunk) => {
+				if (this.options.stderr === "inherit") process.stderr.write(chunk);
+				else this.handleStderr(chunk);
+			});
+		}
+		const child =
+			this.windowsJob?.child ??
+			crossSpawn(this.options.command, this.options.args ?? [], {
+				...spawnOptions,
+				stdio: ["pipe", "pipe", this.options.stderr === "inherit" ? "inherit" : "pipe"],
+			});
 		this.child = child;
 		const pid = child.pid;
 		if (USE_PROCESS_GROUPS && pid !== undefined) {
@@ -112,16 +115,16 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 		child.stdin?.on("error", (error) => {
 			if (!this.closed) this.emitError(error);
 		});
-		child.stderr?.on("data", (chunk: Buffer | string) => this.handleStderr(chunk));
+		if (!this.windowsJob) child.stderr?.on("data", (chunk: Buffer | string) => this.handleStderr(chunk));
 		child.stderr?.on("error", (error) => this.emitError(error));
 		child.on("close", () => {
 			// A leader exit does not relinquish custody of its descendants.
-			void this.close();
+			void this.close().catch((error: unknown) => this.emitError(error));
 			if (this.stdoutBuffer.toString("utf8").trim()) {
 				this.emitError(new Error("MCP stdio server closed with an incomplete JSON-RPC message"));
 			}
 			this.stdoutBuffer = Buffer.alloc(0);
-			this.emitClose();
+			if (!this.windowsJob) this.emitClose();
 		});
 
 		await new Promise<void>((resolve, reject) => {
@@ -136,6 +139,7 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 			child.once("spawn", onSpawn);
 			child.once("error", onError);
 		});
+		if (this.windowsJob) await this.windowsJob.ready;
 		child.on("error", (error) => {
 			if (!this.closed) this.emitError(error);
 		});
@@ -157,6 +161,16 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 		if (!child) {
 			this.emitClose();
 			return;
+		}
+		if (this.windowsJob) {
+			const job = this.windowsJob;
+			child.stdin?.end();
+			this.closing = job.close().then(() => {
+				this.child = undefined;
+				this.windowsJob = undefined;
+				this.emitClose();
+			});
+			return this.closing;
 		}
 		const closeTimeoutMs = this.options.closeTimeoutMs ?? DEFAULT_CLOSE_TIMEOUT_MS;
 		this.closing = new Promise<void>((resolve) => {

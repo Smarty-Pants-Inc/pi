@@ -7,9 +7,9 @@ const fixture = fileURLToPath(new URL("./fixtures/stdio-server.mjs", import.meta
 const stubborn = fileURLToPath(new URL("./fixtures/stubborn-server.mjs", import.meta.url));
 
 describe("StdioTransport", () => {
-	// pi#137 / smarty-dev#3535, security finding 9.
-	it.skipIf(process.platform === "win32")(
-		"retains kill escalation after the stdio leader exits",
+	// pi#137 / smarty-dev#3535, security finding 9 and A14 (Windows Job Object custody).
+	it(
+		"retains descendant custody after the stdio leader exits",
 		async () => {
 			const transport = new StdioTransport({
 				command: process.execPath,
@@ -49,7 +49,7 @@ describe("StdioTransport", () => {
 				}
 			}
 		},
-		10000,
+		process.platform === "win32" ? 40000 : 10000,
 	);
 
 	it("connects to a newline-delimited MCP server and captures stderr", async () => {
