@@ -26,6 +26,7 @@ export interface Args {
 	name?: string;
 	noSession?: boolean;
 	noAutoCompaction?: boolean;
+	maxProviderRequests?: number;
 	session?: string;
 	sessionId?: string;
 	fork?: string;
@@ -131,6 +132,19 @@ export function parseArgs(args: string[]): Args {
 				result.name = args[++i];
 			} else {
 				result.diagnostics.push({ type: "error", message: "--name requires a value" });
+			}
+		} else if (arg === "--max-provider-requests" || arg.startsWith("--max-provider-requests=")) {
+			const value = arg === "--max-provider-requests" ? args[i + 1] : arg.slice("--max-provider-requests=".length);
+			if (arg === "--max-provider-requests" && value !== undefined && !value.startsWith("-")) i++;
+			if (value === undefined || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+				result.diagnostics.push({
+					type: "error",
+					message: "--max-provider-requests requires a positive safe integer",
+				});
+			} else if (result.maxProviderRequests !== undefined) {
+				result.diagnostics.push({ type: "error", message: "--max-provider-requests must be supplied once" });
+			} else {
+				result.maxProviderRequests = Number(value);
 			}
 		} else if (arg === "--no-auto-compaction") {
 			result.noAutoCompaction = true;
@@ -334,6 +348,7 @@ ${chalk.bold("Options:")}
   --owner-host-profile <path>    Explicit qualified Linux owner profile (absolute path; off by default)
   --no-session                   Don't save session (ephemeral)
   --no-auto-compaction           Disable automatic compaction for this run without saving settings
+  --max-provider-requests <N>     Cap all physical provider requests in print/JSON mode (default: unlimited)
   --name, -n <name>              Set session display name
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching

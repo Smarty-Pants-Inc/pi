@@ -230,6 +230,7 @@ export async function classifySystemOne(
 			{
 				maxRetries: options.maxRetries ?? 2,
 				maxRetryDelayMs: options.maxRetryDelayMs,
+				beforeProviderRequest: options.beforeProviderRequest,
 				signal,
 				diagnosticSecrets,
 			},

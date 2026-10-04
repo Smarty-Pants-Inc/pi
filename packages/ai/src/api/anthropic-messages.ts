@@ -663,6 +663,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
+					beforeProviderRequest: options?.beforeProviderRequest,
 					signal: options?.signal,
 					diagnosticSecrets,
 				},

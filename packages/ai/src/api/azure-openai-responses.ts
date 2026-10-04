@@ -124,6 +124,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
+					beforeProviderRequest: options?.beforeProviderRequest,
 					signal: options?.signal,
 				},
 			);

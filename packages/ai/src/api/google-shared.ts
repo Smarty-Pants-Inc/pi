@@ -493,7 +493,7 @@ export function mapStopReasonString(reason: string): StopReason {
  */
 export function retryGoogleRequest<T>(
 	request: () => Promise<T>,
-	options?: Pick<StreamOptions, "maxRetries" | "maxRetryDelayMs" | "signal">,
+	options?: Pick<StreamOptions, "maxRetries" | "maxRetryDelayMs" | "signal" | "beforeProviderRequest">,
 ): Promise<T> {
 	return retryProviderRequest(
 		async () => {
@@ -509,6 +509,7 @@ export function retryGoogleRequest<T>(
 		{
 			maxRetries: options?.maxRetries,
 			maxRetryDelayMs: options?.maxRetryDelayMs,
+			beforeProviderRequest: options?.beforeProviderRequest,
 			signal: options?.signal,
 		},
 	);

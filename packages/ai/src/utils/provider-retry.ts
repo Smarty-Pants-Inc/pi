@@ -1,9 +1,10 @@
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import type { ProviderRequestOptions } from "../types.ts";
 import { smartyLimitMessage } from "./error-body.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
-interface ProviderRetryOptions {
+interface ProviderRetryOptions extends Pick<ProviderRequestOptions, "beforeProviderRequest"> {
 	maxRetries?: number;
 	maxRetryDelayMs?: number;
 	signal?: AbortSignal;
@@ -83,7 +84,16 @@ function getRetryDelayMs(
 	return exponentialDelay * (1 - Math.random() * 0.25);
 }
 
-function createAbortError(): Error {
+/** Terminal, body-free refusal shared by admission and cancellation paths. */
+export class ProviderRequestLimitError extends Error {
+	constructor(requests: number, limit: number) {
+		super(`Provider request limit reached (${requests}/${limit}); no further requests allowed`);
+		this.name = "ProviderRequestLimitError";
+	}
+}
+
+function createAbortError(signal?: AbortSignal): Error {
+	if (signal?.reason instanceof ProviderRequestLimitError) return signal.reason;
 	const error = new Error("Request aborted");
 	error.name = "AbortError";
 	return error;
@@ -92,13 +102,13 @@ function createAbortError(): Error {
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return new Promise((resolve, reject) => {
 		if (signal?.aborted) {
-			reject(createAbortError());
+			reject(createAbortError(signal));
 			return;
 		}
 
 		const onAbort = () => {
 			clearTimeout(timeout);
-			reject(createAbortError());
+			reject(createAbortError(signal));
 		};
 		const timeout = setTimeout(
 			() => {
@@ -109,6 +119,12 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 		);
 		signal?.addEventListener("abort", onAbort, { once: true });
 	});
+}
+
+/** Check cancellation and dispatch admission immediately before a physical attempt. */
+export function checkProviderRequest(options?: Pick<ProviderRequestOptions, "signal" | "beforeProviderRequest">): void {
+	if (options?.signal?.aborted) throw createAbortError(options.signal);
+	options?.beforeProviderRequest?.();
 }
 
 /**
@@ -127,11 +143,13 @@ export async function retryProviderRequest<T>(
 	let retriesRemaining = maxRetries;
 
 	for (;;) {
+		// Admission failures are terminal, not provider errors to retry.
+		checkProviderRequest(options);
 		try {
 			// Each retry is a fresh SDK request, so X-Stainless-Retry-Count remains zero.
 			return await request();
 		} catch (error) {
-			if (options.signal?.aborted) throw createAbortError();
+			if (options.signal?.aborted) throw createAbortError(options.signal);
 			if (retriesRemaining <= 0 || !isProviderError(error) || !isRetryableProviderError(error)) throw error;
 
 			const retryIndex = maxRetries - retriesRemaining;
