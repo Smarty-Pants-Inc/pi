@@ -49,7 +49,28 @@ describe("MCP OAuth credential store", () => {
 		const store = new McpOAuthCredentialStore(backend);
 
 		expect(store.remove("work", SERVER_URL)).toBe(true);
-		expect(storedKeys(backend)).toEqual([]);
+		// smarty-dev#3535 / pi#137 A12: retain only a logout generation, never credentials.
+		expect(storedKeys(backend)).toEqual([`mcp__work|${SERVER_URL}`]);
+		expect(store.forServer("work", SERVER_URL).load()).toBeUndefined();
+		expect(store.tokens("work", SERVER_URL)).toBeUndefined();
+		const raw = JSON.parse(backend.withLock((current) => ({ result: current ?? "{}" })));
+		expect(raw[`mcp__work|${SERVER_URL}`]).toEqual({
+			serverUrl: SERVER_URL,
+			revocationId: expect.any(String),
+			revoked: true,
+		});
 		expect(store.remove("work", SERVER_URL)).toBe(false);
+	});
+	// smarty-dev#3535 / pi#137 A12: absent credentials and new logins do not revive old operations.
+	it("invalidates pending writes even when logout finds no credentials", async () => {
+		const backend = new InMemoryAuthStorageBackend();
+		const first = new McpOAuthCredentialStore(backend).forServer("my_work", SERVER_URL).guarded();
+		const second = new McpOAuthCredentialStore(backend);
+		expect(second.remove("my-work", SERVER_URL)).toBe(false);
+		expect(() => first.save(state("stale"))).toThrow();
+		const current = second.forServer("my_work", SERVER_URL).guarded();
+		await current.save(state("new-login"));
+		expect(() => first.save(state("stale"))).toThrow();
+		expect(second.tokens("my-work", SERVER_URL)?.access_token).toBe("new-login");
 	});
 });

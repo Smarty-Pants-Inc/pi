@@ -10,7 +10,7 @@
  * Credentials live in `<agent-dir>/mcp-auth.json`, keyed by server name and URL.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { oauthErrorHtml, oauthSuccessHtml } from "@earendil-works/pi-ai/utils/oauth-page";
@@ -108,7 +108,8 @@ function mergeScopes(...scopes: (string | undefined)[]): string | undefined {
 	return merged.length > 0 ? merged.join(" ") : undefined;
 }
 
-type StoredStates = Record<string, McpOAuthState>;
+type StoredState = McpOAuthState & { revocationId?: string; revoked?: true };
+type StoredStates = Record<string, StoredState>;
 
 function parseStates(content: string | undefined): StoredStates {
 	if (!content?.trim()) return {};
@@ -132,6 +133,8 @@ function storeKeys(name: string, serverUrl: string): { key: string; legacyKey: s
 export interface McpOAuthServerStore extends McpOAuthStateStore {
 	/** Run `fn` while no other process refreshes the server's tokens. */
 	withRefreshLock<T>(fn: () => Promise<T>): Promise<T>;
+	/** Capture the persisted logout generation before remote work; reject stale publication. */
+	guarded(): McpOAuthStateStore;
 }
 
 /** Per-server OAuth state (client registration, tokens, pending PKCE verifier) in `mcp-auth.json`. */
@@ -147,21 +150,37 @@ export class McpOAuthCredentialStore {
 
 	forServer(name: string, serverUrl: string): McpOAuthServerStore {
 		const { key, legacyKey } = storeKeys(name, serverUrl);
-		return {
-			// The first server to load legacy state takes it over; others with the same URL sign in again.
-			load: () =>
-				this.backend.withLock((current) => {
-					const states = parseStates(current);
-					if (states[key] || !states[legacyKey]) return { result: states[key] };
+		// The first server to load legacy state takes it over; others with the same URL sign in again.
+		const load = () =>
+			this.backend.withLock((current) => {
+				const states = parseStates(current);
+				let next: string | undefined;
+				if (!states[key] && states[legacyKey]) {
 					states[key] = states[legacyKey];
 					delete states[legacyKey];
-					return { result: states[key], next: serializeStates(states) };
-				}),
-			save: (state) =>
-				this.write((states) => {
-					states[key] = state;
-				}),
+					next = serializeStates(states);
+				}
+				const stored = states[key];
+				if (!stored || stored.revoked) return { result: undefined, next };
+				const { revocationId: _revocationId, revoked: _revoked, ...state } = stored;
+				return { result: state, next };
+			});
+		const save = (state: McpOAuthState, expected?: { revocationId: string | undefined }) =>
+			this.write((states) => {
+				const revocationId = states[key]?.revocationId;
+				if (expected && expected.revocationId !== revocationId) throw new McpOAuthAuthorizationRequiredError();
+				states[key] = { ...state, ...(revocationId ? { revocationId } : {}) };
+			});
+		return {
+			load,
+			save: (state) => save(state),
 			withRefreshLock: (fn) => this.withRefreshLock(key, fn),
+			guarded: () => {
+				const revocationId = this.backend.withLock((current) => ({
+					result: parseStates(current)[key]?.revocationId,
+				}));
+				return { load, save: (state) => save(state, { revocationId }) };
+			},
 		};
 	}
 
@@ -196,7 +215,8 @@ export class McpOAuthCredentialStore {
 	tokens(name: string, serverUrl: string): McpOAuthState["tokens"] {
 		const { key, legacyKey } = storeKeys(name, serverUrl);
 		const states = this.backend.withLock((current) => ({ result: parseStates(current) }));
-		return (states[key] ?? states[legacyKey])?.tokens;
+		const state = states[key] ?? states[legacyKey];
+		return state?.revoked ? undefined : state?.tokens;
 	}
 
 	/** Returns whether credentials were stored for the server. Removes legacy state the server would take over. */
@@ -204,10 +224,12 @@ export class McpOAuthCredentialStore {
 		const { key, legacyKey } = storeKeys(name, serverUrl);
 		return this.backend.withLock((current) => {
 			const states = parseStates(current);
-			const stored = key in states ? key : legacyKey in states ? legacyKey : undefined;
-			if (!stored) return { result: false };
-			delete states[stored];
-			return { result: true, next: serializeStates(states) };
+			const state = states[key] ?? states[legacyKey];
+			const stored = state !== undefined && !state.revoked;
+			delete states[legacyKey];
+			// Keep a token-free tombstone even without stored credentials: a login may be in flight.
+			states[key] = { serverUrl: String(new URL(serverUrl)), revocationId: randomUUID(), revoked: true };
+			return { result: stored, next: serializeStates(states) };
 		});
 	}
 
@@ -312,7 +334,8 @@ export function createMcpAuthProvider(options: {
 	const refresh = (staleToken: string | undefined, fetch: McpFetch = globalThis.fetch, challenge?: OAuthChallenge) => {
 		refreshing ??= store
 			.withRefreshLock(async () => {
-				const state = await store.load();
+				const publicationStore = store.guarded();
+				const state = await publicationStore.load();
 				if (state?.tokens?.access_token !== staleToken) return;
 				if (!state?.tokens?.refresh_token) throw new McpOAuthAuthorizationRequiredError();
 				const settings = options.settings();
@@ -320,7 +343,7 @@ export function createMcpAuthProvider(options: {
 					callbackSettings(settings).fixedRedirectUrl ??
 					registeredRedirectUrls(state.clientInformation)[0] ??
 					FALLBACK_REDIRECT_URL;
-				const provider = createProvider(serverUrl, store, settings, redirectUrl, () => {});
+				const provider = createProvider(serverUrl, publicationStore, settings, redirectUrl, () => {});
 				// Refreshes the tokens, or reports that a new sign-in is needed.
 				const result = await authorizeMcp(provider, {
 					serverUrl,
@@ -455,12 +478,13 @@ async function listenForCallback(
  */
 export async function signInMcpServer(options: {
 	serverUrl: string;
-	store: McpOAuthStateStore;
+	store: McpOAuthStateStore & Partial<Pick<McpOAuthServerStore, "guarded">>;
 	settings: McpOAuthSettings;
 	challenge?: OAuthChallenge;
 	prompt: McpSignInPrompt;
 }): Promise<void> {
-	const { serverUrl, store, settings } = options;
+	const { serverUrl, settings } = options;
+	const store = options.store.guarded?.() ?? options.store;
 	const stored = await store.load();
 	const stepUp = options.challenge?.error === "insufficient_scope";
 	const callbackOptions = callbackSettings(settings);
