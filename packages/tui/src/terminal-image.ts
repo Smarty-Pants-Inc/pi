@@ -370,7 +370,7 @@ function getExplicitKittyImageRows(controls: string): number | undefined {
 	const value = /(?:^|,)r=(\d+)(?:,|$)/.exec(controls)?.[1];
 	if (value === undefined) return undefined;
 	const rows = Number.parseInt(value, 10);
-	return rows > 0 ? rows : undefined;
+	return Number.isSafeInteger(rows) && rows > 0 ? rows : undefined;
 }
 
 function getKittyImageRowsFromControls(controls: string, fallbackRows: number): number {
@@ -415,7 +415,8 @@ export function getKittyImagePlacementRows(line: string): number | undefined {
 	if (controls === undefined) return undefined;
 	const explicitRows = getExplicitKittyImageRows(controls);
 	if (explicitRows !== undefined) return explicitRows;
-	return getRegisteredKittyImageMetadataFromControls(controls)?.rows;
+	const rows = getRegisteredKittyImageMetadataFromControls(controls)?.rows;
+	return rows !== undefined && Number.isSafeInteger(rows) && rows > 0 ? rows : undefined;
 }
 
 /** Build a placement-only command for an image line emitted by {@link renderImage}. */

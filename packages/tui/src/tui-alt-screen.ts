@@ -1707,7 +1707,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			screen.some((line, row) => {
 				const placementRows = getKittyImagePlacementRows(line);
 				if (placementRows === undefined) return false;
-				for (let coveredRow = row; coveredRow < row + placementRows; coveredRow++) {
+				const endRow = row + Math.min(placementRows, screen.length - row);
+				for (let coveredRow = row; coveredRow < endRow; coveredRow++) {
 					if (changedRows[coveredRow]) return true;
 				}
 				return false;
