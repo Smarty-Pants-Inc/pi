@@ -2,6 +2,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import process from "node:process";
 import crossSpawn from "cross-spawn";
 import { type JsonRpcMessage, McpConnectionClosedError, parseJsonRpcMessage } from "../protocol/jsonrpc.ts";
+import { refuseMcpAdmission } from "../security-admission.ts";
 import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, TransportEvents } from "./transport.ts";
 
 const DEFAULT_MAX_STDERR_BYTES = 64 * 1024;
@@ -76,6 +77,7 @@ export class StdioTransport extends TransportEvents implements McpTransport {
 
 	constructor(options: StdioTransportOptions) {
 		super();
+		refuseMcpAdmission();
 		this.options = Object.freeze({ ...options, args: options.args ? [...options.args] : undefined });
 	}
 

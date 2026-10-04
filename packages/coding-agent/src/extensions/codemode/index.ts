@@ -6,6 +6,7 @@
  * `setActiveTools()`; the MCP extension activates it when MCP tools are only reachable from scripts.
  */
 
+import { refuseUnreviewedBuiltin } from "../../core/builtin-security-admission.ts";
 import type { ExtensionAPI, ExtensionFactory } from "../../core/extensions/types.ts";
 import type { CodemodeMode } from "../../core/settings-manager.ts";
 import { createCodemodeToolDefinition } from "./tool.ts";
@@ -30,6 +31,7 @@ function readInlineBudget(pi: ExtensionAPI): number | undefined {
 
 export function createCodemodeExtension(options: CodemodeExtensionOptions = {}): ExtensionFactory {
 	return (pi) => {
+		refuseUnreviewedBuiltin("codemode");
 		pi.registerTool({
 			...createCodemodeToolDefinition({
 				appendEntry: (customType, data) => pi.appendEntry(customType, data),

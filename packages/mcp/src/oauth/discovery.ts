@@ -6,6 +6,7 @@
 
 import type { McpFetch } from "../auth-provider.ts";
 import { LATEST_PROTOCOL_VERSION } from "../protocol/types.ts";
+import { refuseMcpAdmission } from "../security-admission.ts";
 import { OAuthIssuerMismatchError } from "./errors.ts";
 import {
 	type AuthorizationServerMetadata,
@@ -65,6 +66,7 @@ export async function discoverProtectedResourceMetadata(
 	serverUrl: string | URL,
 	options: { resourceMetadataUrl?: string | URL; protocolVersion?: string; fetch?: McpFetch } = {},
 ): Promise<OAuthProtectedResourceMetadata> {
+	refuseMcpAdmission();
 	const server = new URL(serverUrl);
 	const fetch = options.fetch ?? globalThis.fetch;
 	const version = options.protocolVersion ?? LATEST_PROTOCOL_VERSION;
@@ -103,6 +105,7 @@ export async function discoverAuthorizationServerMetadata(
 	authorizationServerUrl: string | URL,
 	options: { fetch?: McpFetch; protocolVersion?: string; skipIssuerValidation?: boolean } = {},
 ): Promise<AuthorizationServerMetadata | undefined> {
+	refuseMcpAdmission();
 	const fetch = options.fetch ?? globalThis.fetch;
 	for (const { url } of buildAuthorizationServerDiscoveryUrls(authorizationServerUrl)) {
 		const response = await fetchMetadata(url, fetch, options.protocolVersion ?? LATEST_PROTOCOL_VERSION);
@@ -133,6 +136,7 @@ export async function discoverOAuthServerInfo(
 		skipIssuerValidation?: boolean;
 	} = {},
 ): Promise<OAuthServerInfo> {
+	refuseMcpAdmission();
 	let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
 	try {
 		resourceMetadata = await discoverProtectedResourceMetadata(serverUrl, {

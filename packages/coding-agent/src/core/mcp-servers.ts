@@ -1,3 +1,5 @@
+import { refuseUnreviewedBuiltin } from "./builtin-security-admission.ts";
+
 /**
  * MCP server configuration and the servers extensions register with `pi.registerMcpServer()`.
  *
@@ -319,12 +321,14 @@ export class McpServerRegistry {
 
 	/** Register or replace a server. The caller checks ownership. */
 	register(server: RegisteredMcpServer): void {
+		refuseUnreviewedBuiltin("mcp");
 		this.servers.set(server.name, server);
 		this.changeListener?.();
 	}
 
 	/** Remove a server registered by `extensionPath`. Servers of other extensions are left alone. */
 	unregister(name: string, extensionPath: string): void {
+		refuseUnreviewedBuiltin("mcp");
 		if (this.servers.get(name)?.extensionPath !== extensionPath) return;
 		this.servers.delete(name);
 		this.changeListener?.();

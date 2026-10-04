@@ -12,6 +12,7 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
 import { resolvePath } from "../../utils/paths.ts";
+import { refuseUnreviewedBuiltin } from "../builtin-security-admission.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import { createExecCommand, type ExecOptions, execCommand, type OwnedExecScope } from "../exec.ts";
 import { HOST_CAPABILITIES } from "../host-capabilities.ts";
@@ -507,6 +508,7 @@ function createExtensionAPI(
 		},
 
 		registerMcpServer(name: string, config: McpServerConfig) {
+			refuseUnreviewedBuiltin("mcp");
 			assertActive();
 			const validated = validateMcpServerConfig(name, config);
 			if (typeof validated === "string") {
@@ -526,6 +528,7 @@ function createExtensionAPI(
 		},
 
 		unregisterMcpServer(name: string) {
+			refuseUnreviewedBuiltin("mcp");
 			assertActive();
 			applyRuntimeChange(() => runtime.mcpServers.unregister(name, extension.path));
 		},

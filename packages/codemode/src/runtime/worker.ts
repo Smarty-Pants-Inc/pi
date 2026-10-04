@@ -10,8 +10,10 @@
  * `@earendil-works/pi-codemode/worker` as a separate entrypoint and pass its URL
  * or embedded-module string specifier as `workerUrl`.
  */
+
 import { parentPort, workerData } from "node:worker_threads";
 import { JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
+import { refuseCodemodeAdmission } from "../security-admission.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
 
@@ -50,6 +52,7 @@ function describeException(error: JSException): string {
 }
 
 async function main(data: WorkerData): Promise<void> {
+	refuseCodemodeAdmission();
 	const interrupt = new Int32Array(data.interrupt);
 	const vm = await QuickJS.create({
 		wasm: data.wasm,

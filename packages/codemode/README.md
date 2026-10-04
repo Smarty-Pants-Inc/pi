@@ -1,5 +1,7 @@
 # @earendil-works/pi-codemode
 
+> **Fork security admission:** Codemode and MCP are disabled pending a reviewed re-enable. Existing configuration, `+builtin:codemode`, `+builtin:mcp`, `-e builtin:<name>`, SDK factory activation, and standalone package APIs cannot activate them in this revision. See `packages/coding-agent/docs/security-reenable.md`. The examples below describe the deferred feature, not an available admission.
+
 Runs model-written JavaScript in a QuickJS VM (compiled to WebAssembly) where the only capability is calling injected tools. Nested tool calls never enter the LLM context; only the script's output and return value do.
 
 Scripts use `tools`, `ALL_TOOLS`, `text`, `image`, `exit`, `store`, and `load`, and may start with a `// @options:` line. The coding agent uses it for its built-in `codemode` tool. It has no pi dependencies and can be used on its own to expose any functions (remote APIs, MCP servers, application services) to model-written scripts.

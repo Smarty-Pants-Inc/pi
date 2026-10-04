@@ -1,5 +1,7 @@
 # MCP Servers
 
+> **Fork security admission:** Codemode and MCP are disabled pending a reviewed re-enable. Existing configuration, `+builtin:codemode`, `+builtin:mcp`, `-e builtin:<name>`, SDK factory activation, and standalone package APIs cannot activate them in this revision. See `packages/coding-agent/docs/security-reenable.md`. The examples below describe the deferred feature, not an available admission.
+
 Pi connects to [Model Context Protocol](https://modelcontextprotocol.io) servers over stdio or streamable HTTP and makes their tools and resources available to the model.
 
 ## Quick setup
