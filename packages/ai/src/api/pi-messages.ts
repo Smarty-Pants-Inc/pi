@@ -29,6 +29,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
 
 export interface PiMessagesOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
@@ -389,6 +390,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				payload = nextPayload;
 			}
 
+			checkProviderRequest(options);
 			const response = await (options?.fetch ?? globalThis.fetch)(url, {
 				method: "POST",
 				headers: {

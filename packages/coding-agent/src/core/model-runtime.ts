@@ -154,6 +154,8 @@ function mergeHeaders(
 
 /** Configured pi-ai Models collection used by coding-agent and SDK consumers. */
 export class ModelRuntime implements Models {
+	/** One shared admission guard for an unattended dispatch, including warming and summaries. */
+	providerRequestGuard?: { beforeProviderRequest: () => void; signal: AbortSignal };
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	private readonly models: MutableModels;
 	private readonly credentials: RuntimeCredentials;
@@ -725,6 +727,7 @@ export class ModelRuntime implements Models {
 		model: TModel;
 		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 	}> {
+		const requestGuard = this.providerRequestGuard;
 		const owner = this.#ordinaryOwner;
 		owner?.assertCredentialBinding();
 		owner?.assertNativeTokenReservation();
@@ -770,6 +773,17 @@ export class ModelRuntime implements Models {
 			options: {
 				...providerOptions,
 				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+				...(requestGuard
+					? {
+							beforeProviderRequest: () => {
+								requestGuard.beforeProviderRequest();
+								providerOptions.beforeProviderRequest?.();
+							},
+							signal: providerOptions.signal
+								? AbortSignal.any([providerOptions.signal, requestGuard.signal])
+								: requestGuard.signal,
+						}
+					: {}),
 				headers,
 				env,
 			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,

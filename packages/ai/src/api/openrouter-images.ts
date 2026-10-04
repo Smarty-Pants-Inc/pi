@@ -77,6 +77,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 			{
 				maxRetries: options?.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs,
+				beforeProviderRequest: options?.beforeProviderRequest,
 				signal: options?.signal,
 			},
 		);

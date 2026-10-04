@@ -31,6 +31,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -397,6 +398,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					throw new Error("Request was aborted");
 				}
 
+				checkProviderRequest(options);
 				try {
 					const headerTimeoutSignal =
 						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
@@ -1571,6 +1573,7 @@ async function processWebSocketStream(
 		}
 	}
 	try {
+		checkProviderRequest(options);
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(

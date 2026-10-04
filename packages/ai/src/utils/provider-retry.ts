@@ -1,8 +1,9 @@
+import type { ProviderRequestOptions } from "../types.ts";
 import { smartyLimitMessage } from "./error-body.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
-interface ProviderRetryOptions {
+interface ProviderRetryOptions extends Pick<ProviderRequestOptions, "beforeProviderRequest"> {
 	maxRetries?: number;
 	maxRetryDelayMs?: number;
 	signal?: AbortSignal;
@@ -97,6 +98,12 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
+/** Check cancellation and dispatch admission immediately before a physical attempt. */
+export function checkProviderRequest(options?: Pick<ProviderRequestOptions, "signal" | "beforeProviderRequest">): void {
+	options?.signal?.throwIfAborted();
+	options?.beforeProviderRequest?.();
+}
+
 /**
  * Reproduce the retry behavior used by the OpenAI and Anthropic SDKs while making
  * their backoff sleep interruptible. Their built-in retry timers ignore the
@@ -113,6 +120,8 @@ export async function retryProviderRequest<T>(
 	let retriesRemaining = maxRetries;
 
 	for (;;) {
+		// Admission failures are terminal, not provider errors to retry.
+		checkProviderRequest(options);
 		try {
 			// Each retry is a fresh SDK request, so X-Stainless-Retry-Count remains zero.
 			return await request();

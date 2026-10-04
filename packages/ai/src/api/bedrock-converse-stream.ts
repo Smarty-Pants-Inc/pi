@@ -56,6 +56,7 @@ import { providerHeadersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
@@ -247,6 +248,16 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 		try {
 			const supportsStrictMode = model.compat?.supportsStrictMode ?? false;
 			const client = new BedrockRuntimeClient(config);
+			if (options.beforeProviderRequest) {
+				// Deserialize runs inside Smithy's retry middleware, once per physical attempt.
+				client.middlewareStack.add(
+					(next) => async (args) => {
+						checkProviderRequest(options);
+						return next(args);
+					},
+					{ step: "deserialize", name: "pi-provider-request-limit", priority: "low" },
+				);
+			}
 			let observedRawResponse = false;
 			if (options.onResponse) {
 				addResponseHeadersMiddleware(client, options.onResponse, model, () => {

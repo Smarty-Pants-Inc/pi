@@ -9,6 +9,23 @@ function providerError(status: number | undefined, headers?: Record<string, stri
 }
 
 describe("provider request retries", () => {
+	// Regression for Smarty-Pants-Inc/smarty-dev#2751: count physical attempts, not streams.
+	it("stops a provider retry at exactly N physical requests", async () => {
+		let count = 0;
+		const request = vi.fn(async () => {
+			throw providerError(429, { "retry-after-ms": "0" });
+		});
+		const options = {
+			maxRetries: 4,
+			beforeProviderRequest: () => {
+				if (count === 2) throw new Error("Provider request limit reached (2/2)");
+				count++;
+			},
+		};
+		await expect(retryProviderRequest(request, options)).rejects.toThrow("Provider request limit reached (2/2)");
+		expect(request).toHaveBeenCalledTimes(2);
+		expect(count).toBe(2);
+	});
 	afterEach(() => {
 		vi.useRealTimers();
 	});
