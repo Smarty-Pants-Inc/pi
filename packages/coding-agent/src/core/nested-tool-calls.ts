@@ -146,8 +146,12 @@ export interface NestedToolCallHost {
 interface CallScope {
 	recorder: NestedCallRecorder;
 	nextId: number;
-	/** Set inside a call that holds the exclusive queue, so its own nested calls do not wait on it. */
-	holdsQueue: boolean;
+	/** Actual call ancestry, not shared by sibling descendants. */
+	parent?: CallScope;
+	exclusive: boolean;
+	running: boolean;
+	/** Ordinary ancestors yield their admission while awaiting descendants. */
+	children: number;
 }
 
 function textOf(result: AgentToolResult<unknown>): string {
@@ -161,11 +165,52 @@ export class NestedToolCallRunner {
 	private readonly host: NestedToolCallHost;
 	/** Scopes by the id of the calling tool call. */
 	private readonly scopes = new Map<string, CallScope>();
-	/** Serializes nested calls that must not run concurrently. */
-	private queueTail: Promise<void> = Promise.resolve();
+	/** Admitted ordinary work shares the queue; exclusive work excludes unrelated branches. */
+	private readonly active = new Set<CallScope>();
+	private readonly waiting: { scope: CallScope; resume: () => void }[] = [];
 
 	constructor(host: NestedToolCallHost) {
 		this.host = host;
+	}
+
+	private isAncestor(ancestor: CallScope, scope: CallScope): boolean {
+		for (let parent = scope.parent; parent; parent = parent.parent) {
+			if (parent === ancestor) return true;
+		}
+		return false;
+	}
+
+	private conflicts(a: CallScope, b: CallScope): boolean {
+		return (a.exclusive || b.exclusive) && a !== b && !this.isAncestor(a, b) && !this.isAncestor(b, a);
+	}
+
+	private drain(): void {
+		for (let index = 0; index < this.waiting.length; ) {
+			const { scope, resume } = this.waiting[index];
+			const active = [...this.active];
+			const blocked =
+				active.some((other) => this.conflicts(scope, other)) ||
+				this.waiting.slice(0, index).some(
+					({ scope: earlier }) =>
+						this.conflicts(scope, earlier) &&
+						// A descendant may pass work blocked on its ancestor, otherwise reentry deadlocks.
+						!active.some((ancestor) => this.isAncestor(ancestor, scope) && this.conflicts(ancestor, earlier)),
+				);
+			if (blocked) {
+				index++;
+				continue;
+			}
+			this.waiting.splice(index, 1);
+			if (scope.exclusive || scope.children === 0) this.active.add(scope);
+			resume();
+		}
+	}
+
+	private admit(scope: CallScope): Promise<void> {
+		return new Promise((resume) => {
+			this.waiting.push({ scope, resume });
+			this.drain();
+		});
 	}
 
 	/**
@@ -180,7 +225,7 @@ export class NestedToolCallRunner {
 	): Promise<AgentToolCallOutcome> {
 		let scope = this.scopes.get(callerId);
 		if (!scope) {
-			scope = { recorder: new NestedCallRecorder(), nextId: 1, holdsQueue: false };
+			scope = { recorder: new NestedCallRecorder(), nextId: 1, exclusive: false, running: false, children: 0 };
 			this.scopes.set(callerId, scope);
 		}
 		const toolCall: AgentToolCall = {
@@ -198,23 +243,24 @@ export class NestedToolCallRunner {
 			parentToolCallId: callerId,
 		});
 
-		const exclusive =
-			!scope.holdsQueue &&
-			(this.host.isSequential() ||
-				this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential");
-		let release: (() => void) | undefined;
-		if (exclusive) {
-			const previous = this.queueTail;
-			this.queueTail = new Promise((resolve) => {
-				release = resolve;
-			});
-			await previous;
-		}
-		this.scopes.set(toolCall.id, {
+		const callScope: CallScope = {
 			recorder: scope.recorder,
 			nextId: 1,
-			holdsQueue: scope.holdsQueue || exclusive,
-		});
+			parent: scope,
+			exclusive:
+				this.host.isSequential() ||
+				this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential",
+			running: false,
+			children: 0,
+		};
+		this.scopes.set(toolCall.id, callScope);
+		scope.children++;
+		// A parallel parent awaiting nested work cannot retain a reader admission: two parents
+		// upgrading to sequential descendants would wait on one another. Exclusive ancestors
+		// retain their fence; only their own descendants may reenter it.
+		if (!scope.exclusive) this.active.delete(scope);
+		await this.admit(callScope);
+		callScope.running = true;
 		let outcome: AgentToolCallOutcome;
 		try {
 			outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
@@ -230,7 +276,15 @@ export class NestedToolCallRunner {
 			});
 		} finally {
 			this.scopes.delete(toolCall.id);
-			release?.();
+			callScope.running = false;
+			this.active.delete(callScope);
+			scope.children--;
+			if (scope.running && !scope.exclusive && scope.children === 0) {
+				// Reacquire the ordinary parent's admission before its last child returns.
+				await this.admit(scope);
+			} else {
+				this.drain();
+			}
 		}
 
 		scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
