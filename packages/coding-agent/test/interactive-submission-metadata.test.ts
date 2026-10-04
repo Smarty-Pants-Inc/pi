@@ -1,7 +1,7 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import inputAuthor from "../examples/extensions/input-author.ts";
-import type { InputSubmission } from "../src/index.ts";
+import type { ExtensionUIContext, InputSubmission } from "../src/index.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "./suite/harness.ts";
 
@@ -40,6 +40,7 @@ type SubmissionUI = {
 };
 
 type SubmissionUIPrototype = {
+	createExtensionUIContext(this: SubmissionUI): ExtensionUIContext;
 	setupEditorSubmitHandler(this: SubmissionUI): void;
 	captureEditorSubmission(
 		this: SubmissionUI,
@@ -281,6 +282,172 @@ describe("interactive submission metadata", () => {
 		},
 	);
 
+	// R2 regression for Smarty-Pants-Inc/smarty-dev#4078: capture synchronously invokes the native bound abort.
+	it.each(
+		(["followUp", "steer"] as const).flatMap((mode) =>
+			["", "Bob draft", "same"].map((newerDraft) => ({ mode, newerDraft })),
+		),
+	)(
+		"restores $mode once during synchronous capture abort (newer draft: '$newerDraft')",
+		async ({ mode, newerDraft }) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			let context!: SubmissionUI;
+			const observations: Array<{
+				text: string;
+				source: string;
+				mode?: string;
+				draft: string;
+				history: string[];
+				transfers: number;
+				capturing: number;
+				restored: string;
+				cancelled: boolean;
+			}> = [];
+			const inputs: string[] = [];
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", (event, ctx) => {
+							if (event.source !== "interactive") return;
+							const capture = [...context.capturingStreamingInputs][0];
+							const before = {
+								text: event.text,
+								source: event.source,
+								mode: event.streamingBehavior,
+								draft: ctx.ui.getEditorText(),
+								history: vi.mocked(context.editor.addToHistory).mock.calls.map(([text]) => text),
+								transfers: context.inputSubmissionTransfers,
+								capturing: context.capturingStreamingInputs.size,
+							};
+							if (newerDraft) ctx.ui.setEditorText(newerDraft);
+							ctx.abort();
+							observations.push({ ...before, restored: ctx.ui.getEditorText(), cancelled: capture.cancelled });
+							return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+						});
+						pi.on("input", (event) => {
+							inputs.push(event.text);
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			context = createSubmissionUI(harness);
+			await harness.session.bindExtensions({
+				mode: "tui",
+				uiContext: prototype.createExtensionUIContext.call(context),
+				abortHandler: () => {
+					context.restoreQueuedMessagesToEditor({ abort: true });
+				},
+			});
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("RPC response");
+				},
+			]);
+			const running = harness.session.prompt("initial RPC", { source: "rpc" });
+			await responseStarted.promise;
+			const abortSpy = vi.spyOn(harness.session, "abort");
+			const promptSpy = vi.spyOn(harness.session, "prompt");
+			let submitted: Promise<void> | undefined;
+			try {
+				context.editor.setText("same");
+				submitted =
+					mode === "followUp" ? prototype.handleFollowUp.call(context) : context.defaultEditor.onSubmit!("same");
+				// Observe in the accepting call, before the capture promise can settle or enter native queues.
+				expect.soft(context.editor.getText()).toBe(newerDraft ? `same\n\n${newerDraft}` : "same");
+				expect(context.inputSubmissionTransfers).toBe(1);
+				expect(context.capturingStreamingInputs.size).toBe(0);
+				expect(harness.session.pendingMessageCount).toBe(0);
+				await submitted;
+				expect.soft(observations).toEqual([
+					{
+						text: "same",
+						source: "interactive",
+						mode,
+						draft: "",
+						history: ["same"],
+						transfers: 1,
+						capturing: 1,
+						restored: newerDraft ? `same\n\n${newerDraft}` : "same",
+						cancelled: true,
+					},
+				]);
+				expect.soft(context.editor.getText()).toBe(newerDraft ? `same\n\n${newerDraft}` : "same");
+				expect(context.inputSubmissionTransfers).toBe(0);
+				expect(abortSpy).toHaveBeenCalledTimes(1);
+				expect(promptSpy).not.toHaveBeenCalled();
+				expect(context.showError).not.toHaveBeenCalled();
+			} finally {
+				responseRelease.release();
+				await submitted;
+				await running;
+				await harness.session.waitForIdle();
+			}
+			expect(getUserTexts(harness)).toEqual(["initial RPC"]);
+			expect(inputs).toEqual(["initial RPC"]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(1);
+		},
+	);
+
+	// R2 control for Smarty-Pants-Inc/smarty-dev#4078: equal text is not equal editor ownership.
+	it.each(["followUp", "steer"] as const)(
+		"restores a native queued %s and a genuinely separate identical draft as two copies",
+		async (mode) => {
+			const responseStarted = gate();
+			const responseRelease = gate();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", (event) => {
+							if (event.source !== "interactive") return;
+							return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([
+				async () => {
+					responseStarted.release();
+					await responseRelease.promise;
+					return fauxAssistantMessage("RPC response");
+				},
+			]);
+			const running = harness.session.prompt("initial RPC", { source: "rpc" });
+			await responseStarted.promise;
+			const context = createSubmissionUI(harness);
+			try {
+				context.editor.setText("same");
+				await (mode === "followUp"
+					? prototype.handleFollowUp.call(context)
+					: context.defaultEditor.onSubmit!("same"));
+				expect(context.editor.getText()).toBe("");
+				expect(harness.session.pendingMessageCount).toBe(1);
+				context.editor.setText("same");
+				expect(context.restoreQueuedMessagesToEditor({ abort: true })).toBe(1);
+				expect(context.editor.getText()).toBe("same\n\nsame");
+				prototype.handleDequeue.call(context);
+				expect(context.editor.getText()).toBe("same\n\nsame");
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(context.inputSubmissionTransfers).toBe(0);
+				expect(context.capturingStreamingInputs.size).toBe(0);
+			} finally {
+				responseRelease.release();
+				await running;
+				await harness.session.waitForIdle();
+			}
+			expect(getUserTexts(harness)).toEqual(["initial RPC"]);
+			expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(1);
+		},
+	);
+
 	// F2 regression for Smarty-Pants-Inc/smarty-dev#4078: actual dequeue cancels capture before native transfer.
 	it.each(["followUp", "steer"] as const)(
 		"does not resurrect a dequeued %s capture after Bob submits edited text",
@@ -471,9 +638,11 @@ describe("interactive submission metadata", () => {
 			await captureStarted.promise;
 			try {
 				expect(harness.session.pendingMessageCount).toBe(0);
+				context.editor.setText("Bob draft");
 				captureRelease.release();
 				await alice;
 				expect(harness.session.pendingMessageCount).toBe(1);
+				expect(context.editor.getText()).toBe("Bob draft");
 			} finally {
 				captureRelease.release();
 				await alice;

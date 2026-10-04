@@ -1222,55 +1222,58 @@ export class AgentSession {
 				("content" in update && update.content.length > 0);
 		}
 
-		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
-		// This ensures the UI sees the updated queue state
-		if (event.type === "message_start" && event.message.role === "user") {
-			// The native queue already transferred this object; a handler clearing siblings must not revoke it.
-			this._queuedUserMessages.delete(event.message);
-			this._userMessageEntryIds.set(event.message, randomUUID());
-			this._overflowRecoveryAttempted = false;
-			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
-					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
+		const startedUserMessage = event.type === "message_start" ? event.message : undefined;
+		const isUserStart = startedUserMessage?.role === "user";
+		try {
+			// When a user message starts, check if it's from either queue and remove it BEFORE emitting
+			// This ensures the UI sees the updated queue state
+			if (event.type === "message_start" && event.message.role === "user") {
+				// The native queue already transferred this object; a handler clearing siblings must not revoke it.
+				this._queuedUserMessages.delete(event.message);
+				this._userMessageEntryIds.set(event.message, randomUUID());
+				this._overflowRecoveryAttempted = false;
+				const messageText = contentText(event.message.content, "");
+				if (messageText) {
+					// Check steering queue first
+					const steeringIndex = this._steeringMessages.indexOf(messageText);
+					if (steeringIndex !== -1) {
+						this._steeringMessages.splice(steeringIndex, 1);
 						this._emitQueueUpdate();
+					} else {
+						// Check follow-up queue
+						const followUpIndex = this._followUpMessages.indexOf(messageText);
+						if (followUpIndex !== -1) {
+							this._followUpMessages.splice(followUpIndex, 1);
+							this._emitQueueUpdate();
+						}
 					}
 				}
 			}
-		}
 
-		// Terminal cancellation releases extension waits, not final event publication/persistence.
-		if (!this._shutdownCancellation.signal.aborted) {
-			try {
-				await this._emitExtensionEvent(event);
-			} catch (error) {
-				if (!this._shutdownCancellation.signal.aborted) throw error;
+			// Terminal cancellation releases extension waits, not final event publication/persistence.
+			if (!this._shutdownCancellation.signal.aborted) {
+				try {
+					await this._emitExtensionEvent(event);
+				} catch (error) {
+					if (!this._shutdownCancellation.signal.aborted) throw error;
+				}
 			}
-		}
-		const input = event.type === "message_start" ? this._inputSubmissions.get(event.message) : undefined;
-		const entryId = event.type === "message_start" ? this._userMessageEntryIds.get(event.message) : undefined;
-		this._emit(
-			event.type === "agent_end"
-				? { ...event, willRetry: this._willRetryAfterAgentEnd(event) }
-				: event.type === "message_start"
-					? {
-							...event,
-							...(input ? { input: structuredClone(input) } : {}),
-							...(entryId ? { entryId } : {}),
-						}
-					: event,
-		);
-		// Attribution belongs to this emission only, not a later low-level replay of the same message object.
-		if (event.type === "message_start" && event.message.role === "user") {
-			this._inputSubmissions.delete(event.message);
+			const input = event.type === "message_start" ? this._inputSubmissions.get(event.message) : undefined;
+			const entryId = event.type === "message_start" ? this._userMessageEntryIds.get(event.message) : undefined;
+			this._emit(
+				event.type === "agent_end"
+					? { ...event, willRetry: this._willRetryAfterAgentEnd(event) }
+					: event.type === "message_start"
+						? {
+								...event,
+								...(input ? { input: structuredClone(input) } : {}),
+								...(entryId ? { entryId } : {}),
+							}
+						: event,
+			);
+		} finally {
+			// Keep provenance available during publication, but consume it even if a callback throws or mutates the event.
+			if (isUserStart && startedUserMessage) this._inputSubmissions.delete(startedUserMessage);
 		}
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));

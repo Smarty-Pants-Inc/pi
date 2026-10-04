@@ -1,4 +1,4 @@
-import type { AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -272,6 +272,128 @@ describe("submission metadata", () => {
 		await harness.session.prompt("same", { source: "rpc" });
 		expect(getUserTexts(harness)).toEqual(["same"]);
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+	});
+
+	// R1 regression for Smarty-Pants-Inc/smarty-dev#4078: observers cannot preserve consumed provenance.
+	it.each([
+		{ route: "prompt", failure: "message_start" },
+		{ route: "steer", failure: "queue_update" },
+		{ route: "followUp", failure: "queue_update" },
+		{ route: "prompt", failure: "extension_error" },
+	] as const)("consumes named $route provenance despite a throwing $failure observer", async ({ route, failure }) => {
+		initTheme("dark");
+		const initialStarted = gate();
+		const initialRelease = gate();
+		const laterStarted = gate();
+		const laterRelease = gate();
+		const starts: Array<InputSubmission | undefined> = [];
+		let saved: AgentMessage | undefined;
+		let thrown = false;
+		const observerError = new Error("user-start observer failed");
+		const harness = await createHarness({
+			settings: { retry: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("input_submission", (event) =>
+						event.source === "interactive" ? { metadata: { author: author("Alice") } } : undefined,
+					);
+					pi.on("message_start", (event) => {
+						if (event.message.role !== "user" || getMessageText(event.message) !== "named") return;
+						starts.push(event.input);
+						if (failure === "extension_error" && !thrown) throw new Error("extension failed");
+					});
+				},
+				inputAuthor,
+			],
+		});
+		harnesses.push(harness);
+		if (failure === "extension_error") {
+			await harness.session.bindExtensions({
+				onError: () => {
+					thrown = true;
+					saved = harness.session.agent.state.streamingMessage ?? undefined;
+					throw observerError;
+				},
+			});
+		}
+		harness.session.subscribe((event) => {
+			if (thrown) return;
+			if (
+				(failure === "message_start" &&
+					event.type === "message_start" &&
+					event.message.role === "user" &&
+					getMessageText(event.message) === "named") ||
+				(failure === "queue_update" && event.type === "queue_update" && harness.session.pendingMessageCount === 0)
+			) {
+				saved = harness.session.agent.state.streamingMessage ?? undefined;
+				thrown = true;
+				throw observerError;
+			}
+		});
+		harness.setResponses([
+			async () => {
+				initialStarted.release();
+				await initialRelease.promise;
+				return fauxAssistantMessage("initial RPC response");
+			},
+		]);
+		try {
+			if (route === "prompt") {
+				await harness.session.prompt("named", { source: "interactive" });
+			} else {
+				const initial = harness.session.prompt("initial RPC", { source: "rpc" });
+				await initialStarted.promise;
+				try {
+					await harness.session[route]("named", undefined, { source: "interactive" });
+				} finally {
+					initialRelease.release();
+					await initial;
+				}
+			}
+			expect(thrown).toBe(true);
+			if (!saved || saved.role !== "user") throw new Error("Expected the exact failed native user-start object");
+			expect(getMessageText(saved)).toBe("named");
+			expect(harness.faux.state.callCount).toBe(route === "prompt" ? 0 : 1);
+			expect(harness.session.state.errorMessage).toBe(observerError.message);
+			expect(getUserTexts(harness)).toEqual(route === "prompt" ? [] : ["initial RPC"]);
+			const firstAuthors = harness.sessionManager.getEntries().filter((entry) => entry.type === "custom");
+			expect(firstAuthors).toHaveLength(failure === "message_start" ? 1 : 0);
+			const danglingId = firstAuthors[0]?.type === "custom" ? firstAuthors[0].beforeMessageId : undefined;
+			if (failure === "message_start") expect(danglingId).toEqual(expect.any(String));
+			expect(renderNativeTranscript(harness)).not.toContain("Alice:");
+			harness.session.clearQueue();
+			harness.setResponses([
+				async () => {
+					laterStarted.release();
+					await laterRelease.promise;
+					return fauxAssistantMessage("later RPC response");
+				},
+				fauxAssistantMessage("unknown insertion response"),
+			]);
+			const later = harness.session.prompt("later RPC", { source: "rpc" });
+			await laterStarted.promise;
+			try {
+				harness.session.agent.steer(saved);
+			} finally {
+				laterRelease.release();
+				await later;
+			}
+			expect(getUserTexts(harness)).toEqual([...(route === "prompt" ? [] : ["initial RPC"]), "later RPC", "named"]);
+			expect.soft(starts.at(-1), "a failed native start still consumes one-shot attribution").toBeUndefined();
+			if (failure !== "queue_update") {
+				expect(starts[0]).toEqual({ source: "interactive", metadata: { author: author("Alice") } });
+				expect(starts).toHaveLength(2);
+			} else expect(starts).toHaveLength(1);
+			expect
+				.soft(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom"))
+				.toEqual(firstAuthors);
+			expect.soft(renderNativeTranscript(harness)).not.toContain("Alice:");
+			if (danglingId) expect(harness.sessionManager.getEntry(danglingId)).toBeUndefined();
+			expect(harness.faux.state.callCount).toBe(route === "prompt" ? 2 : 3);
+		} finally {
+			initialRelease.release();
+			laterRelease.release();
+		}
 	});
 
 	// F1 regression for Smarty-Pants-Inc/smarty-dev#4078: cleared, unseen native objects lose provenance.

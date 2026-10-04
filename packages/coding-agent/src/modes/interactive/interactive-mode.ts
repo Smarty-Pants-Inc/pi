@@ -3259,10 +3259,10 @@ export class InteractiveMode {
 			this.stagingAudit?.("submission-transferred");
 		};
 		try {
-			const submissionPromise = this.captureEditorSubmission(text, streamingBehavior);
+			// Transfer accepted text out of the editor before capture hooks can synchronously restore it.
 			this.editor.addToHistory?.(text);
-			// A synchronous capture handler may already have restored this input through dequeue.
-			if (!capture.cancelled) this.editor.setText("");
+			this.editor.setText("");
+			const submissionPromise = this.captureEditorSubmission(text, streamingBehavior);
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 			const submission = await this.awaitInputSubmission(text, submissionPromise, capture);
