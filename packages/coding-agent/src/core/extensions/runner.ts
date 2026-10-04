@@ -1128,12 +1128,13 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				// Even a stable async rebuild yields before its caller resumes. Reconcile
 				// again immediately before admitting the next handler.
-				if (!previewIsCurrent()) {
+				// Invalid proposals retain the last valid preview so a later handler can repair
+				// them. Rebuilding here would throw outside the proposal validation boundary.
+				if (valid && !previewIsCurrent()) {
 					context = await rebuildContext();
 					contextSnapshot = structuredClone(context);
-					valid = true;
 				}
-				if (!previewIsCurrent()) throw staleAdmission;
+				if (valid && !previewIsCurrent()) throw staleAdmission;
 				// A failed proposal remains visible so a later handler can replace it.
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;

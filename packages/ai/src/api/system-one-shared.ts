@@ -242,9 +242,10 @@ export async function classifySystemOne(
 		output.answers = parseAnswers(transport.label, result.answers, context);
 		return output;
 	} catch (error) {
+		const timedOut = controller.signal.aborted && !options?.signal?.aborted;
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, diagnosticSecrets),
+			normalizeProviderError(timedOut ? timeoutError(timeoutMs) : error, diagnosticSecrets),
 			`${transport.label} error`,
 		);
 		return output;

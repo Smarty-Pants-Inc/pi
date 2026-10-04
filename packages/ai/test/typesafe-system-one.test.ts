@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { classify } from "../src/api/typesafe-system-one.ts";
 import type { ClassifierContext, ClassifierModel } from "../src/types.ts";
 
@@ -47,6 +47,7 @@ const wireAnswers = {
 };
 
 describe("TypeSafe System One", () => {
+	afterEach(() => vi.useRealTimers());
 	it("maps public bool questions and answers to TypeSafe noul values", async () => {
 		const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
 			const payload = JSON.parse(String(init?.body)) as {
@@ -167,22 +168,61 @@ describe("TypeSafe System One", () => {
 		expect(serializedAnswers.__proto__).toEqual({ type: "bool", probability: 0.75 });
 	});
 
+	// PR #131: the retry wrapper must preserve the owned timeout rather than report a caller abort.
 	it("reports request timeouts separately from caller cancellation", async () => {
-		const result = await classify(model, context, {
+		vi.useFakeTimers();
+		let requestStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			requestStarted = resolve;
+		});
+		const operation = classify(model, context, {
 			apiKey: "secret",
 			timeoutMs: 5,
 			maxRetries: 0,
 			fetch: async (_input, init) => {
 				const signal = init?.signal;
 				if (!signal) throw new Error("missing request signal");
+				requestStarted();
 				return new Promise<Response>((_resolve, reject) => {
 					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
 				});
 			},
 		});
+		await started;
+		await vi.advanceTimersByTimeAsync(5);
+		const result = await operation;
 
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Request timed out after 5ms");
+	});
+
+	// PR #131: caller cancellation must not be mislabeled as an owned request deadline.
+	it("preserves caller cancellation before the request deadline", async () => {
+		vi.useFakeTimers();
+		const owner = new AbortController();
+		let requestStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			requestStarted = resolve;
+		});
+		const operation = classify(model, context, {
+			apiKey: "secret",
+			timeoutMs: 5,
+			maxRetries: 0,
+			signal: owner.signal,
+			fetch: async (_input, init) => {
+				const signal = init?.signal;
+				if (!signal) throw new Error("missing request signal");
+				requestStarted();
+				return new Promise<Response>((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				});
+			},
+		});
+		await started;
+		owner.abort();
+		const result = await operation;
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe("Request aborted");
 	});
 
 	it("creates a fresh timeout for every retry attempt", async () => {

@@ -244,6 +244,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const sessionManager = suppliedManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
+	// Inspect the captured manager before preparing extension resources. Virtual model
+	// registration below must precede saved model selection, not session context inspection.
+	const existingSession = sessionManager.buildSessionContext();
+	const hasExistingSession = existingSession.messages.length > 0;
+	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
 		await resourceLoader.reload();
@@ -267,10 +273,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
 
 	// Check if session has existing data to restore
-	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession = existingSession.messages.length > 0;
-	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
-
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
 

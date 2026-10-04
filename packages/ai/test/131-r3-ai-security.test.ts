@@ -562,6 +562,10 @@ describe.each(oauthReaders)("F11 $name", (entry) => {
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
 		let cancelled = false;
 		let producer: ReadableStreamDefaultController<Uint8Array> | undefined;
+		let fetchStarted!: () => void;
+		const acceptedFetch = new Promise<void>((resolve) => {
+			fetchStarted = resolve;
+		});
 		let calls = 0;
 		const body = new ReadableStream<Uint8Array>({
 			start(controller) {
@@ -595,6 +599,7 @@ describe.each(oauthReaders)("F11 $name", (entry) => {
 				},
 				{ once: true },
 			);
+			fetchStarted();
 			return new Response(body, { status });
 		});
 		// Native fetch aborts its accepted body too. Emulate that contract rather than
@@ -622,8 +627,10 @@ describe.each(oauthReaders)("F11 $name", (entry) => {
 				settled = true;
 			},
 		);
-		// Allow loopback listen/manual cancellation to settle before advancing native deadlines.
-		await new Promise<void>((resolve) => setImmediate(resolve));
+		// PR #131: PKCE generation and loopback admission use native async work, not the fake
+		// clock. Wait for the accepted body request before advancing its 30-second deadline.
+		if (entry.phase === "poll") await vi.advanceTimersByTimeAsync(1100);
+		await acceptedFetch;
 		await vi.advanceTimersByTimeAsync(31_100);
 		const retiredByDeadline = cancelled;
 		// Baseline response.json/text ignores a mocked fetch signal: close and join explicitly.
