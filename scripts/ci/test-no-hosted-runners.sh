@@ -138,6 +138,77 @@ echo 'PASS: object matrix and partial include expansion'
 write_fixture probe.yml $'jobs:\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [smarty-linux-x64, ubuntu-latest]\n        exclude:\n          - runner: ubuntu-latest'
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
 echo 'PASS: excluded hosted matrix entry is not selected'
+# pi#138 / smarty-dev#3644: YAML 1.1 booleans must not hide hosted rows.
+expect_rejected 'reviewer on/yes exclusion counterexample' 'on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [smarty-linux-x64, ubuntu-latest]
+        feature: [on]
+        exclude:
+          - runner: ubuntu-latest
+            feature: yes
+    steps:
+      - run: echo probe' 'unapproved hosted runner'
+
+for pair in 'on yes' 'yes on' 'off no' 'no off' 'ON YES' 'On Yes' 'OFF NO' 'Off No'; do
+  read -r value other <<< "$pair"
+  expect_rejected "distinct string matrix exclusion $value/$other" "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [smarty-linux-x64, ubuntu-latest]
+        feature: [$value]
+        exclude:
+          - runner: ubuntu-latest
+            feature: $other" 'unapproved hosted runner'
+  # If these strings collapse to one boolean, the second include overwrites
+  # the hosted runner instead of leaving it in an additional matrix row.
+  expect_rejected "distinct string matrix inclusion $value/$other" "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        feature: [$value]
+        include:
+          - feature: $other
+            runner: ubuntu-latest
+          - feature: $value
+            runner: smarty-linux-x64" 'unapproved hosted runner'
+done
+
+# Actual booleans must still match across case variants in both operations.
+for value in true True TRUE tRuE false False FALSE fAlSe; do
+  write_fixture probe.yml "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [smarty-linux-x64, ubuntu-latest]
+        feature: [$value]
+        exclude:
+          - runner: ubuntu-latest
+            feature: ${value,,}"
+  bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+  echo "PASS: boolean matrix exclusion $value/${value,,}"
+  write_fixture probe.yml "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        feature: [$value]
+        include:
+          - feature: ${value,,}
+            runner: ubuntu-latest
+          - feature: $value
+            runner: smarty-linux-x64"
+  bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+  echo "PASS: boolean matrix inclusion $value/${value,,}"
+done
+
 write_fixture probe.yml $'env:\n  LABELS: &labels [self-hosted, smarty-linux-x64]\njobs:\n  check:\n    runs-on: {group: fleet, labels: *labels}'
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
 echo 'PASS: literal runner group with resolved labels'

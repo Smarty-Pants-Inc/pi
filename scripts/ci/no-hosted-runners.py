@@ -14,6 +14,13 @@ class BlockScalar(str):
 
 
 class WorkflowLoader(yaml.SafeLoader):
+    # Actions uses YAML 1.2 booleans: on/yes/off/no are strings. Copy the
+    # resolver lists so changing this loader does not mutate SafeLoader.
+    yaml_implicit_resolvers = {
+        first: [(tag, pattern) for tag, pattern in resolvers if tag != "tag:yaml.org,2002:bool"]
+        for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+    }
+
     def construct_mapping(self, node, deep=False):
         keys = set()
         for key, _ in node.value:
@@ -28,6 +35,11 @@ class WorkflowLoader(yaml.SafeLoader):
     def construct_scalar(self, node):
         value = super().construct_scalar(node)
         return BlockScalar(value) if node.style in ("|", ">") else value
+
+
+WorkflowLoader.add_implicit_resolver(
+    "tag:yaml.org,2002:bool", re.compile(r"^(?:true|false)$", re.IGNORECASE), list("tTfF")
+)
 
 
 def matrix_rows(job):
