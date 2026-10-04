@@ -905,6 +905,10 @@ export interface TurnEndEvent extends BoundaryState {
 export interface MessageStartEvent {
 	type: "message_start";
 	message: AgentMessage;
+	/** Reserved entry ID for a directly submitted user message, persisted at message_end. */
+	entryId?: string;
+	/** Direct prompt origin data. Absent for queued/staged input; never part of model content. */
+	input?: InputSubmission;
 }
 
 /** Fired during assistant message streaming with token-by-token updates */
@@ -989,6 +993,27 @@ export interface UserBashEvent {
 /** Source of user input */
 export type InputSource = "interactive" | "rpc" | "extension";
 
+/** Structured-cloneable extension data, excluded from model content. Use JSON values with appendEntry. */
+export type InputMetadata = Record<string, unknown>;
+
+/** Origin data for one directly submitted idle normal prompt. */
+export interface InputSubmission {
+	source: InputSource;
+	metadata?: InputMetadata;
+}
+
+/** Metadata-only capture before direct prompt input handlers and expansion. Never fired for queued/staged input. */
+export interface InputSubmissionEvent extends InputSubmission {
+	type: "input_submission";
+	text: string;
+	images?: ImageContent[];
+}
+
+/** Metadata is shallow-merged across handlers; later keys win. Mutations and failed results are ignored. */
+export interface InputSubmissionEventResult {
+	metadata?: InputMetadata;
+}
+
 /** Fired when user input is received, before agent processing */
 export interface InputEvent {
 	type: "input";
@@ -998,6 +1023,8 @@ export interface InputEvent {
 	images?: ImageContent[];
 	/** Where the input came from */
 	source: InputSource;
+	/** Direct prompt metadata for observation only. Input transforms cannot change it. */
+	metadata?: InputMetadata;
 	/** How the input will be delivered during streaming, or undefined when idle */
 	streamingBehavior?: "steer" | "followUp";
 }
@@ -1238,6 +1265,7 @@ export type ExtensionEvent =
 	| ModelSelectEvent
 	| ThinkingLevelSelectEvent
 	| UserBashEvent
+	| InputSubmissionEvent
 	| InputEvent
 	| ToolCallEvent
 	| ToolResultEvent;
@@ -1463,6 +1491,10 @@ export interface ExtensionAPI {
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): () => void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
+	on(
+		event: "input_submission",
+		handler: ExtensionHandler<InputSubmissionEvent, InputSubmissionEventResult>,
+	): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
 
 	// =========================================================================
@@ -1542,7 +1574,8 @@ export interface ExtensionAPI {
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): void;
 
-	/** Append a custom entry to the session for state persistence (not sent to LLM). */
+	/** Append state-only data, never sent to the LLM.
+	 * During an awaited direct user message_start handler, binds rendering to that message's entry ID. */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
 
 	// =========================================================================

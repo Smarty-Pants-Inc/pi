@@ -446,6 +446,7 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
+	private userInputWasBuffered = false;
 	private userInputInFlight = false;
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -472,6 +473,7 @@ export class InteractiveMode {
 	// Streaming message tracking
 	private streamingComponent: AssistantMessageComponent | undefined = undefined;
 	private readonly entriesRenderedByBoundaryCompaction = new Set<string>();
+	private readonly userPublicationComponents = new Map<string, Component[]>();
 	private streamingMessage: AssistantMessage | undefined = undefined;
 
 	// Tool execution tracking: toolCallId -> component
@@ -1231,7 +1233,10 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				const prompt = this.session.prompt(userInput);
+				const prompt = this.session.prompt(
+					userInput,
+					this.userInputWasBuffered ? { suppressInputMetadata: true } : undefined,
+				);
 				// Original session preflight owns the input before TUI staging clears.
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-transferred");
@@ -3458,6 +3463,8 @@ export class InteractiveMode {
 			case "entry_appended":
 				if (this.entriesRenderedByBoundaryCompaction.delete(event.entry.id)) break;
 				if (event.entry.type === "custom") {
+					// Bound entries render only when their exact native user message is published.
+					if (event.entry.beforeMessageId) break;
 					this.addCustomEntryToChat(event.entry);
 					this.ui.requestRender();
 				} else if (event.entry.type === "usage" && event.entry.kind === "cache_warm") {
@@ -3511,12 +3518,31 @@ export class InteractiveMode {
 				this.updateEditorBorderColor();
 				break;
 
+			case "user_message_publication_failed":
+				for (const component of this.userPublicationComponents.get(event.entryId) ?? [])
+					this.chatContainer.removeChild(component);
+				this.userPublicationComponents.delete(event.entryId);
+				this.ui.requestRender();
+				break;
+
 			case "message_start":
 				if (event.message.role === "custom") {
 					this.addMessageToChat(event.message);
 					this.ui.requestRender();
 				} else if (event.message.role === "user") {
-					this.addMessageToChat(event.message);
+					const start = this.chatContainer.children.length;
+					try {
+						if (event.entryId) {
+							for (const entry of this.sessionManager.getBranch()) {
+								if (entry.type === "custom" && entry.beforeMessageId === event.entryId)
+									this.addCustomEntryToChat(entry);
+							}
+						}
+						this.addMessageToChat(event.message);
+					} finally {
+						if (event.entryId)
+							this.userPublicationComponents.set(event.entryId, this.chatContainer.children.slice(start));
+					}
 					this.updatePendingMessagesDisplay();
 					this.ui.requestRender();
 				} else if (event.message.role === "assistant") {
@@ -3571,7 +3597,10 @@ export class InteractiveMode {
 				break;
 
 			case "message_end":
-				if (event.message.role === "user") break;
+				if (event.message.role === "user") {
+					this.userPublicationComponents.clear();
+					break;
+				}
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
@@ -4093,7 +4122,20 @@ export class InteractiveMode {
 		entries: SessionEntry[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
+		const boundEntries = new Map<string, Extract<SessionEntry, { type: "custom" }>[]>();
+		for (const entry of entries) {
+			if (entry.type === "custom" && entry.beforeMessageId) {
+				const bound = boundEntries.get(entry.beforeMessageId) ?? [];
+				bound.push(entry);
+				boundEntries.set(entry.beforeMessageId, bound);
+			}
+		}
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
+			// An orphan must never appear standalone or attach itself to the next user message.
+			if (entry.type === "custom" && entry.beforeMessageId) return [];
+			if (entry.type === "message" && entry.message.role === "user") {
+				return [...(boundEntries.get(entry.id) ?? []), ...sessionEntryToContextMessages(entry)];
+			}
 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
 				return [entry];
 			}
@@ -4240,6 +4282,7 @@ export class InteractiveMode {
 	async getUserInput(): Promise<string> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
+			this.userInputWasBuffered = true;
 			this.userInputInFlight = true;
 			this.stagingAudit?.("input-dequeued");
 			return queuedInput;
@@ -4248,6 +4291,7 @@ export class InteractiveMode {
 		return new Promise((resolve) => {
 			this.onInputCallback = (text: string) => {
 				this.onInputCallback = undefined;
+				this.userInputWasBuffered = false;
 				this.userInputInFlight = true;
 				this.stagingAudit?.("input-delivered");
 				resolve(text);

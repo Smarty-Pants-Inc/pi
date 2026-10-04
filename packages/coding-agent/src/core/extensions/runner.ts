@@ -57,7 +57,11 @@ import type {
 	ExtensionUIContext,
 	InputEvent,
 	InputEventResult,
+	InputMetadata,
 	InputSource,
+	InputSubmission,
+	InputSubmissionEvent,
+	InputSubmissionEventResult,
 	LoadExtensionsResult,
 	MarkdownTransformer,
 	MessageEndEvent,
@@ -185,6 +189,7 @@ type RunnerEmitEvent = Exclude<
 	| BeforeAgentStartEvent
 	| MessageEndEvent
 	| ResourcesDiscoverEvent
+	| InputSubmissionEvent
 	| InputEvent
 	| TurnEndEvent
 	| AgentBeforeSettleEvent
@@ -1080,8 +1085,12 @@ export class ExtensionRunner {
 		);
 	}
 
-	emit<TEvent extends RunnerEmitEvent>(event: TEvent, signal?: AbortSignal): Promise<RunnerEmitResult<TEvent>> {
-		const dispatch = this.emitEvent(event, signal);
+	emit<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		signal?: AbortSignal,
+		withHandlerScope?: (dispatch: () => Promise<unknown>) => Promise<unknown>,
+	): Promise<RunnerEmitResult<TEvent>> {
+		const dispatch = this.emitEvent(event, signal, withHandlerScope);
 		// Observer-only emitters may be fire-and-forget. Still observe terminal rejection.
 		void dispatch.catch(() => {});
 		return dispatch;
@@ -1090,6 +1099,7 @@ export class ExtensionRunner {
 	private async emitEvent<TEvent extends RunnerEmitEvent>(
 		event: TEvent,
 		operationSignal?: AbortSignal,
+		withHandlerScope?: (dispatch: () => Promise<unknown>) => Promise<unknown>,
 	): Promise<RunnerEmitResult<TEvent>> {
 		const signal = this.dispatchSignal(event.type, operationSignal ?? ("signal" in event ? event.signal : undefined));
 		signal?.throwIfAborted();
@@ -1105,7 +1115,9 @@ export class ExtensionRunner {
 						"signal" in event
 							? { ...structuredClone({ ...event, signal: undefined }), signal: event.signal }
 							: structuredClone(event);
-					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
+					const handlerResult = withHandlerScope
+						? await withHandlerScope(() => this.dispatchHandler(handler, snapshot, ctx, signal))
+						: await this.dispatchHandler(handler, snapshot, ctx, signal);
 					signal?.throwIfAborted();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
@@ -1578,6 +1590,56 @@ export class ExtensionRunner {
 		return { skillPaths, promptPaths, themePaths };
 	}
 
+	/** Capture metadata only for an eligible direct prompt, before transforming its input. */
+	async emitInputSubmission(
+		text: string,
+		images: ImageContent[] | undefined,
+		source: InputSource,
+		initialMetadata?: InputMetadata,
+	): Promise<InputSubmission> {
+		const signal = this.dispatchSignal("input_submission");
+		signal?.throwIfAborted();
+		const ctx = this.createContext();
+		let metadata = initialMetadata === undefined ? undefined : structuredClone(initialMetadata);
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input_submission")) {
+			for (const handler of handlers) {
+				signal?.throwIfAborted();
+				try {
+					const event: InputSubmissionEvent = structuredClone({
+						type: "input_submission",
+						text,
+						images,
+						source,
+						metadata,
+					});
+					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| InputSubmissionEventResult
+						| undefined;
+					signal?.throwIfAborted();
+					if (result?.metadata !== undefined) {
+						if (
+							typeof result.metadata !== "object" ||
+							result.metadata === null ||
+							Array.isArray(result.metadata)
+						) {
+							throw new Error("input_submission metadata must be an object");
+						}
+						metadata = { ...metadata, ...structuredClone(result.metadata) };
+					}
+				} catch (error) {
+					signal?.throwIfAborted();
+					this.emitError({
+						extensionPath: ext.path,
+						event: "input_submission",
+						error: error instanceof Error ? error.message : String(error),
+						stack: error instanceof Error ? error.stack : undefined,
+					});
+				}
+			}
+		}
+		return { source, ...(metadata !== undefined ? { metadata } : {}) };
+	}
+
 	/** Emit input event. Transforms chain, "handled" short-circuits. */
 	async emitInput(
 		text: string,
@@ -1585,6 +1647,7 @@ export class ExtensionRunner {
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
 		signal?: AbortSignal,
+		metadata?: InputMetadata,
 	): Promise<InputEventResult> {
 		signal = this.dispatchSignal("input", signal);
 		const ctx = this.createContext();
@@ -1602,6 +1665,7 @@ export class ExtensionRunner {
 						images: currentImages,
 						source,
 						streamingBehavior,
+						...(metadata !== undefined ? { metadata: structuredClone(metadata) } : {}),
 					};
 					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as InputEventResult | undefined;
 					signal?.throwIfAborted();
