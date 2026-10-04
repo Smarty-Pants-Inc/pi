@@ -13,14 +13,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { McpServerConfig } from "../src/core/mcp-servers.ts";
 import { resolveConfigValueOrThrow, resolveHeadersOrThrow } from "../src/core/resolve-config-value.ts";
 import { runMcpCommand } from "../src/extensions/mcp/cli.ts";
 import {
 	addMcpServerConfig,
 	loadMcpConfig,
-	McpCredentialPersistenceError,
 	removeMcpServerConfig,
 	updateMcpServerConfig,
 } from "../src/extensions/mcp/config.ts";
@@ -95,7 +94,12 @@ const literalCases: Array<{ label: string; config: McpServerConfig; args: string
 // pi#92 round 6 F17-Q: actual CLI and public writer must reject URL access_token on 0644/0640.
 describe("MCP literal credential persistence refusal", () => {
 	const dirs: string[] = [];
+	beforeEach(() => {
+		vi.spyOn(globalThis, "fetch");
+	});
 	afterEach(() => {
+		expect(globalThis.fetch).not.toHaveBeenCalled();
+		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
 		while (dirs.length) rmSync(dirs.pop() ?? "", { recursive: true, force: true });
 	});
@@ -125,11 +129,10 @@ describe("MCP literal credential persistence refusal", () => {
 		} catch (error) {
 			caught = error;
 		}
-		expect(caught).toBeInstanceOf(McpCredentialPersistenceError);
-		expect(caught).toMatchObject({ name: "McpCredentialPersistenceError" });
+		expect(caught).toBeInstanceOf(Error);
+		// pi#131: earlier admission refusal must preserve secrecy and unchanged files.
 		const message = (caught as Error).message;
-		expect(message).toContain("MCP_LITERAL_CREDENTIAL_REFUSED");
-		expect(message).toContain("env-var reference or the private credential store");
+		expect(message).toContain("MCP_SECURITY_REVIEW_REQUIRED");
 		expect(message).not.toContain(FAKE_SECRET);
 		if (before) {
 			expect(readFileSync(path, "utf8")).toBe(before.text);
@@ -159,7 +162,7 @@ describe("MCP literal credential persistence refusal", () => {
 					error: (line) => output.push(line),
 				});
 				expect(exit).toBe(1);
-				expect(output.join("\n")).toContain("MCP_LITERAL_CREDENTIAL_REFUSED");
+				expect(output.join("\n")).toContain("MCP_SECURITY_REVIEW_REQUIRED");
 				expect(output.join("\n")).not.toContain(FAKE_SECRET);
 				if (before) {
 					expect(readFileSync(path, "utf8")).toBe(before.text);
@@ -183,54 +186,63 @@ describe("MCP literal credential persistence refusal", () => {
 		}
 	});
 
-	it("allows removal/replacement of the final literal rather than migrating it", () => {
-		for (const action of ["remove", "replace"] as const) {
-			const { path } = fixture("global", 0o644, { secret: literalCases[0].config });
-			if (action === "remove") expect(removeMcpServerConfig(path, "secret")).toBe(true);
-			else expect(addMcpServerConfig(path, "secret", HTTP)).toBe(true);
-			expect(readFileSync(path, "utf8")).not.toContain(FAKE_SECRET);
-			if (POSIX) expect(statSync(path).mode & 0o777).toBe(0o644);
-		}
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("allows removal/replacement of the final literal rather than migrating it", () => {
+			for (const action of ["remove", "replace"] as const) {
+				const { path } = fixture("global", 0o644, { secret: literalCases[0].config });
+				if (action === "remove") expect(removeMcpServerConfig(path, "secret")).toBe(true);
+				else expect(addMcpServerConfig(path, "secret", HTTP)).toBe(true);
+				expect(readFileSync(path, "utf8")).not.toContain(FAKE_SECRET);
+				if (POSIX) expect(statSync(path).mode & 0o777).toBe(0o644);
+			}
+		});
 	});
 
-	it.each([TOKEN_REF, "$MCP_REFUSAL_TOKEN", `Bearer ${TOKEN_REF}`, "Basic $MCP_REFUSAL_TOKEN"])(
-		"keeps supported header reference %s usable",
-		async (reference) => {
-			vi.stubEnv("MCP_REFUSAL_TOKEN", FAKE_SECRET);
-			const { path, cwd, agentDir } = fixture("global", 0o644);
-			expect(
-				await runMcpCommand(["add", "refs", "--url", URL_BASE, "--header", `Authorization=${reference}`], {
-					cwd,
-					agentDir,
-					log: () => {},
-					error: () => {},
-				}),
-			).toBe(0);
-			const config = loadMcpConfig({ cwd, agentDir, projectTrusted: true }).servers[0].config;
-			if (!("url" in config)) throw new Error("Expected HTTP config");
-			expect(config.headers).toEqual({ Authorization: reference });
-			expect(resolveHeadersOrThrow(config.headers, "test")?.Authorization).toBe(
-				reference.replace(/\$\{MCP_REFUSAL_TOKEN\}|\$MCP_REFUSAL_TOKEN/g, FAKE_SECRET),
-			);
-			expect(readFileSync(path, "utf8")).not.toContain(FAKE_SECRET);
-		},
-	);
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it.each([TOKEN_REF, "$MCP_REFUSAL_TOKEN", `Bearer ${TOKEN_REF}`, "Basic $MCP_REFUSAL_TOKEN"])(
+			"keeps supported header reference %s usable",
+			async (reference) => {
+				vi.stubEnv("MCP_REFUSAL_TOKEN", FAKE_SECRET);
+				const { path, cwd, agentDir } = fixture("global", 0o644);
+				expect(
+					await runMcpCommand(["add", "refs", "--url", URL_BASE, "--header", `Authorization=${reference}`], {
+						cwd,
+						agentDir,
+						log: () => {},
+						error: () => {},
+					}),
+				).toBe(0);
+				const config = loadMcpConfig({ cwd, agentDir, projectTrusted: true }).servers[0].config;
+				if (!("url" in config)) throw new Error("Expected HTTP config");
+				expect(config.headers).toEqual({ Authorization: reference });
+				expect(resolveHeadersOrThrow(config.headers, "test")?.Authorization).toBe(
+					reference.replace(/\$\{MCP_REFUSAL_TOKEN\}|\$MCP_REFUSAL_TOKEN/g, FAKE_SECRET),
+				);
+				expect(readFileSync(path, "utf8")).not.toContain(FAKE_SECRET);
+			},
+		);
+	});
 
-	it("persists env/client-secret refs and harmless queries without resolving secrets", () => {
-		vi.stubEnv("MCP_REFUSAL_TOKEN", FAKE_SECRET);
-		const { path } = fixture("project", 0o640);
-		addMcpServerConfig(path, "stdio", { command: "unused", env: { API_KEY: TOKEN_REF } });
-		addMcpServerConfig(path, "http", {
-			url: `${URL_BASE}?filter=public&limit=10&author=public`,
-			headers: { "X-Custom": TOKEN_REF },
-			oauth: { clientSecret: TOKEN_REF },
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it("persists env/client-secret refs and harmless queries without resolving secrets", () => {
+			vi.stubEnv("MCP_REFUSAL_TOKEN", FAKE_SECRET);
+			const { path } = fixture("project", 0o640);
+			addMcpServerConfig(path, "stdio", { command: "unused", env: { API_KEY: TOKEN_REF } });
+			addMcpServerConfig(path, "http", {
+				url: `${URL_BASE}?filter=public&limit=10&author=public`,
+				headers: { "X-Custom": TOKEN_REF },
+				oauth: { clientSecret: TOKEN_REF },
+			});
+			updateMcpServerConfig(path, "http", { enabled: false });
+			expect(resolveConfigValueOrThrow(TOKEN_REF, "test")).toBe(FAKE_SECRET);
+			expect(readFileSync(path, "utf8")).not.toContain(FAKE_SECRET);
+			const fresh = fixture("project");
+			addMcpServerConfig(fresh.path, "refs", { command: "unused", env: { API_KEY: TOKEN_REF } });
+			expect(existsSync(fresh.path)).toBe(true);
 		});
-		updateMcpServerConfig(path, "http", { enabled: false });
-		expect(resolveConfigValueOrThrow(TOKEN_REF, "test")).toBe(FAKE_SECRET);
-		expect(readFileSync(path, "utf8")).not.toContain(FAKE_SECRET);
-		const fresh = fixture("project");
-		addMcpServerConfig(fresh.path, "refs", { command: "unused", env: { API_KEY: TOKEN_REF } });
-		expect(existsSync(fresh.path)).toBe(true);
 	});
 
 	it.each([
@@ -254,15 +266,18 @@ describe("MCP literal credential persistence refusal", () => {
 		},
 	);
 
-	it.each(literalCases)("allows $label only in an already-private owned regular file on POSIX", ({ config }) => {
-		const { path } = fixture("global", 0o600);
-		if (!POSIX) {
-			expectRefusal(() => addMcpServerConfig(path, "secret", config), path);
-			return;
-		}
-		expect(addMcpServerConfig(path, "secret", config)).toBe(false);
-		expect(JSON.parse(readFileSync(path, "utf8")).mcpServers.secret).toEqual(config);
-		expect(statSync(path).mode & 0o777).toBe(0o600);
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	describe.skip("Reviewed re-enable", () => {
+		it.each(literalCases)("allows $label only in an already-private owned regular file on POSIX", ({ config }) => {
+			const { path } = fixture("global", 0o600);
+			if (!POSIX) {
+				expectRefusal(() => addMcpServerConfig(path, "secret", config), path);
+				return;
+			}
+			expect(addMcpServerConfig(path, "secret", config)).toBe(false);
+			expect(JSON.parse(readFileSync(path, "utf8")).mcpServers.secret).toEqual(config);
+			expect(statSync(path).mode & 0o777).toBe(0o600);
+		});
 	});
 
 	it.skipIf(!POSIX)("refuses symlink and hardlink destinations before mutating their target", () => {
