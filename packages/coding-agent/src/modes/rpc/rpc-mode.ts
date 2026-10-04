@@ -12,7 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
-import type { AgentSession } from "../../core/agent-session.ts";
+import type { AgentSession, PromptDisposition, QueuedInputDisposition } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -554,43 +554,28 @@ export async function runRpcMode(
 			case "prompt": {
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
-<<<<<<< HEAD
 				await session.prompt(command.message, {
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
 					source: "rpc",
-					preflightResult: (didSucceed) => {
-						if (didSucceed && !transportCancellation.signal.aborted) respond(success(id, "prompt"));
+					preflightResult: (disposition: PromptDisposition) => {
+						if (!transportCancellation.signal.aborted) respond(success(id, "prompt", { disposition }));
 					},
 				});
-=======
-				let preflightSucceeded = false;
-				void session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						source: "rpc",
-						preflightResult: (disposition) => {
-							preflightSucceeded = true;
-							output(success(id, "prompt", { disposition }));
-						},
-					})
-					.catch((e) => {
-						if (!preflightSucceeded) {
-							output(error(id, "prompt", e.message));
-						}
-					});
->>>>>>> upstream-v1.0.1
 				return undefined;
 			}
 
 			case "steer": {
-				const disposition = await session.steer(command.message, command.images, { source: "rpc" });
+				const disposition: QueuedInputDisposition = await session.steer(command.message, command.images, {
+					source: "rpc",
+				});
 				return success(id, "steer", { disposition });
 			}
 
 			case "follow_up": {
-				const disposition = await session.followUp(command.message, command.images, { source: "rpc" });
+				const disposition: QueuedInputDisposition = await session.followUp(command.message, command.images, {
+					source: "rpc",
+				});
 				return success(id, "follow_up", { disposition });
 			}
 

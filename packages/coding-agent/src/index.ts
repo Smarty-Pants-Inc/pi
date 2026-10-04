@@ -215,11 +215,8 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
-<<<<<<< HEAD
 export { HOST_CAPABILITIES, type HostCapabilities } from "./core/host-capabilities.ts";
-=======
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
->>>>>>> upstream-v1.0.1
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {

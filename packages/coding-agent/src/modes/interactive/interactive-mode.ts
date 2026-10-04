@@ -499,7 +499,7 @@ export class InteractiveMode {
 	// Status line tracking (for mutating immediately-sequential status updates)
 	private lastStatusSpacer: Spacer | undefined = undefined;
 	private lastStatusText: ThemedText | undefined = undefined;
-	private lastStatusMessage = "";
+	private lastStatusState: { message: string } | undefined;
 	private managedToolStatusStarted = false;
 
 	// Streaming message tracking
@@ -624,12 +624,8 @@ export class InteractiveMode {
 			logDirectory: getAgentDir(),
 			terminal: options.terminal,
 			onRightClickPaste: this.onRightClickPaste,
-<<<<<<< HEAD
 			fullscreenCopyOnSelect: !this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect(),
-=======
-			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 			fullscreenWheelScrollLines: this.settingsManager.getFullscreenWheelScrollLines(),
->>>>>>> upstream-v1.0.1
 		});
 		this.ui = createInteractiveTuiReference(() => this.renderer);
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
@@ -925,12 +921,8 @@ export class InteractiveMode {
 			logDirectory: getAgentDir(),
 			terminal,
 			onRightClickPaste: this.onRightClickPaste,
-<<<<<<< HEAD
 			fullscreenCopyOnSelect: !this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect(),
-=======
-			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 			fullscreenWheelScrollLines: this.settingsManager.getFullscreenWheelScrollLines(),
->>>>>>> upstream-v1.0.1
 		});
 		nextUi.setClearOnShrink(clearOnShrink);
 		nextUi.onDebug = onDebug;
@@ -2121,12 +2113,8 @@ export class InteractiveMode {
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
 		this.applyFullscreenScrollbarSetting();
 		if (this.renderer instanceof TuiAltScreen) {
-<<<<<<< HEAD
 			this.renderer.setCopyOnSelect(!this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect());
-=======
-			this.renderer.setCopyOnSelect(this.settingsManager.getFullscreenCopyOnSelect());
 			this.renderer.setWheelScrollLines(this.settingsManager.getFullscreenWheelScrollLines());
->>>>>>> upstream-v1.0.1
 		}
 		this.footer.setSession(this.session);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
@@ -3933,16 +3921,23 @@ export class InteractiveMode {
 		const secondLast = children.length > 1 ? children[children.length - 2] : undefined;
 
 		message = linkifyUrls(message);
-		if (last && secondLast && last === this.lastStatusText && secondLast === this.lastStatusSpacer) {
-			this.lastStatusMessage = message;
+		if (
+			last &&
+			secondLast &&
+			last === this.lastStatusText &&
+			secondLast === this.lastStatusSpacer &&
+			this.lastStatusState
+		) {
+			this.lastStatusState.message = message;
 			this.lastStatusText.invalidate();
 			this.ui.requestRender();
 			return;
 		}
 
 		const spacer = new Spacer(1);
-		this.lastStatusMessage = message;
-		const text = new ThemedText(() => theme.fg("dim", this.lastStatusMessage), 1, 0);
+		const state = { message };
+		this.lastStatusState = state;
+		const text = new ThemedText(() => theme.fg("dim", state.message), 1, 0);
 		this.chatContainer.addChild(spacer);
 		this.chatContainer.addChild(text);
 		this.lastStatusSpacer = spacer;
@@ -4723,23 +4718,17 @@ export class InteractiveMode {
 
 	showError(errorMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-<<<<<<< HEAD
+		const linkedMessage = linkifyUrls(errorMessage);
 		this.chatContainer.addChild(
-			new Text(theme.fg("error", `Error: ${linkifyUrls(errorMessage)}`), this.outputPad, 0),
+			new ThemedText(() => theme.fg("error", `Error: ${linkedMessage}`), this.outputPad, 0),
 		);
-=======
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("error", `Error: ${errorMessage}`), this.outputPad, 0));
->>>>>>> upstream-v1.0.1
 		this.ui.requestRender();
 	}
 
 	showWarning(warningMessage: string): void {
 		this.chatContainer.addChild(new Spacer(1));
-<<<<<<< HEAD
-		this.chatContainer.addChild(new Text(theme.fg("warning", `Warning: ${linkifyUrls(warningMessage)}`), 1, 0));
-=======
-		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `Warning: ${warningMessage}`), 1, 0));
->>>>>>> upstream-v1.0.1
+		const linkedMessage = linkifyUrls(warningMessage);
+		this.chatContainer.addChild(new ThemedText(() => theme.fg("warning", `Warning: ${linkedMessage}`), 1, 0));
 		this.ui.requestRender();
 	}
 

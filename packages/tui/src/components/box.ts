@@ -106,15 +106,9 @@ export class Box implements Component {
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const leftPad = " ".repeat(this.paddingX);
 
-<<<<<<< HEAD
-		// Render all children. Compare their raw lines with the last render before padding them:
-		// the TUI renders every box on every frame, and unchanged children mostly return the same
-		// strings, so this is a reference compare instead of a copy and a text compare.
-=======
 		// Render all children. Keep the child lines unpadded: children usually return the same string
 		// objects every frame, so the cache check below is a cheap identity comparison per line.
 		// Padding here would create new strings that must be compared character by character.
->>>>>>> upstream-v1.0.1
 		const childLines: string[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
 		for (const child of this.children) {
