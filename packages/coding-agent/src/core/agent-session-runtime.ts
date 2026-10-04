@@ -71,6 +71,9 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 		.join("");
 }
 
+// Terminal cleanup is independent of the already-aborted session signal.
+const TERMINAL_SHUTDOWN_DISPATCH_MS = 1000;
+
 interface OutgoingSession {
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -472,6 +475,36 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
+	async #disposeOutgoing(outgoing: OutgoingSession): Promise<void> {
+		this.#assertIdentity(outgoing);
+		const cancellation = new AbortController();
+		const timeout = setTimeout(
+			() => cancellation.abort(new Error(`Session shutdown dispatch exceeded ${TERMINAL_SHUTDOWN_DISPATCH_MS} ms`)),
+			TERMINAL_SHUTDOWN_DISPATCH_MS,
+		);
+		try {
+			if (outgoing.session.extensionRunner.hasHandlers("session_shutdown")) {
+				// Cancel dispatch itself, not only its caller's wait: later handlers must
+				// not start after the deadline. The runner observes late native rejection.
+				await outgoing.session.extensionRunner.emit(
+					{ type: "session_shutdown", reason: "quit" },
+					cancellation.signal,
+				);
+			}
+		} finally {
+			clearTimeout(timeout);
+			this.#assertIdentity(outgoing);
+			try {
+				this.beforeSessionInvalidate?.();
+			} finally {
+				this.#assertIdentity(outgoing);
+				// Invalidate even when accepted cleanup did not finish. Captured native
+				// contexts lose authority; RPC reports abandonment and retires the process.
+				outgoing.session.dispose();
+			}
+		}
+	}
+
 	async dispose(): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		const outgoing = this.#captureOutgoing(true);
@@ -493,17 +526,7 @@ export class AgentSessionRuntime {
 							this.#assertIdentity(outgoing);
 							return outgoing.session.abort();
 						},
-						persist: async () => {
-							this.#assertIdentity(outgoing);
-							await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-								type: "session_shutdown",
-								reason: "quit",
-							});
-							this.#assertIdentity(outgoing);
-							this.beforeSessionInvalidate?.();
-							this.#assertIdentity(outgoing);
-							outgoing.session.dispose();
-						},
+						persist: () => this.#disposeOutgoing(outgoing),
 					})
 					.then(resolve, reject);
 			} catch (cause) {
@@ -513,14 +536,7 @@ export class AgentSessionRuntime {
 		}
 		await outgoing.session.abort();
 		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.#assertCurrent(outgoing);
-		this.beforeSessionInvalidate?.();
-		this.#assertCurrent(outgoing);
-		outgoing.session.dispose();
+		await this.#disposeOutgoing(outgoing);
 	}
 }
 

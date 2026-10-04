@@ -1110,7 +1110,16 @@ export async function runRpcMode(
 			session.stopMessageEntryIdCapture();
 			unsubscribe?.();
 			unsubscribeBackpressure?.();
-			await runtimeHost.dispose();
+			try {
+				await runtimeHost.dispose();
+			} catch {
+				// A deadline is an incomplete disposition, not successful cleanup. Do
+				// not let shutdown rejection prevent final output drainage and retirement.
+				console.error(
+					"RPC session cleanup incomplete: unfinished shutdown work abandoned before process retirement",
+				);
+				if (exitCode === 0) exitCode = 1;
+			}
 			detachInput();
 			process.stdin.pause();
 			// Journal persistence above is independent of delivery to a stalled reader.
