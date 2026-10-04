@@ -38,6 +38,9 @@ import {
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 const EXIT_STDIO_GRACE_MS = 100;
+// An idle grace preserves finite trailing output; activity must not renew group ownership indefinitely.
+const EXIT_STDIO_DEADLINE_MS = 1000;
+const SPILL_DRAIN_DEADLINE_MS = 2000;
 const SPILL_HIGH_WATER_MARK = 1024 * 1024;
 
 type SpillChunk = string | Uint8Array;
@@ -329,11 +332,13 @@ function waitForChildProcess(
 		let exitCode: number | null = null;
 		let exitSignal: NodeJS.Signals | null = null;
 		let postExitTimer: ReturnType<typeof setTimeout> | undefined;
+		let postExitDeadlineTimer: ReturnType<typeof setTimeout> | undefined;
 		let stdoutEnded = child.stdout === null;
 		let stderrEnded = child.stderr === null;
 
 		const cleanup = (): void => {
 			if (postExitTimer) clearTimeout(postExitTimer);
+			if (postExitDeadlineTimer) clearTimeout(postExitDeadlineTimer);
 			child.removeListener("error", onError);
 			child.removeListener("exit", onExit);
 			child.removeListener("close", onClose);
@@ -384,7 +389,11 @@ function waitForChildProcess(
 			exitCode = code;
 			exitSignal = signal;
 			maybeFinalizeAfterExit();
-			if (!settled) armIdleTimer();
+			if (!settled) {
+				// Armed exactly once at leader exit, independent of both pipes and spill/backpressure.
+				postExitDeadlineTimer = setTimeout(finalize, EXIT_STDIO_DEADLINE_MS);
+				armIdleTimer();
+			}
 		};
 		const onClose = (code: number | null, signal: NodeJS.Signals | null): void => {
 			exitCode = code;
@@ -537,7 +546,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 				if (retirement !== undefined) return retirement;
 				const pid = child?.pid;
 				if (pid === undefined || process.platform === "win32") return Promise.resolve();
-				// Signal once at pipe settlement/abort, while group custody is retained; no later escalation timer.
+				// Signal once at pipe settlement, the absolute post-exit deadline, or abort, while retaining custody.
 				// No positive-PID fallback: an absent group is retired, not a reason to signal a potentially reused leader PID.
 				retirement = (async () => {
 					try {
@@ -645,11 +654,20 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			const finishSpill = async (): Promise<void> => {
 				await spillStart;
 				const stream = spillStream;
-				if (stream === undefined || spillError !== undefined || stream.destroyed) return;
+				if (stream === undefined || stream.closed) return;
 				await new Promise<void>((resolveFinish) => {
-					stream.once("error", () => resolveFinish());
-					stream.once("finish", resolveFinish);
-					stream.end();
+					// No more pipe input is accepted here. Drain only the already accepted bytes, for a finite budget.
+					const drainTimer = setTimeout(() => {
+						failSpill(new Error(`Shell output drain exceeded ${SPILL_DRAIN_DEADLINE_MS}ms`));
+						stream.destroy();
+					}, SPILL_DRAIN_DEADLINE_MS);
+					// Join the file descriptor close, including destruction on error/deadline; finish alone is not custody.
+					stream.once("close", () => {
+						clearTimeout(drainTimer);
+						resolveFinish();
+					});
+					if (spillError !== undefined || stream.destroyed) stream.destroy();
+					else stream.end();
 				});
 			};
 
