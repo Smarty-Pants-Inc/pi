@@ -24,10 +24,12 @@ export interface OAuthCallbackServerOptions<T> {
 	state?: string;
 	/**
 	 * Finishes the sign-in with the received code before the browser page is sent, so the page can
-	 * show exchange failures. Pass `async (code) => code` to exchange the code later.
+	 * show exchange failures. The exchange must honor the callback-owned signal; terminal wait
+	 * settlement joins its disposition. Pass `async (code) => code` to exchange the code later.
 	 */
-	complete: (code: string) => Promise<T>;
+	complete: (code: string, signal: AbortSignal) => Promise<T>;
 	signal?: AbortSignal;
+	/** Absolute callback/exchange deadline, defaults to five minutes. */
 	timeoutMs?: number;
 }
 
@@ -63,6 +65,8 @@ export async function startOAuthCallbackServer<T>(
 	// A cancelled or closed wait may never be observed.
 	waitPromise.catch(() => undefined);
 
+	const completionController = new AbortController();
+	let completion: Promise<T> | undefined;
 	let claimed = false;
 	let settled = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
@@ -72,8 +76,15 @@ export async function startOAuthCallbackServer<T>(
 		settled = true;
 		if (timer) clearTimeout(timer);
 		signal?.removeEventListener("abort", onAbort);
-		if ("error" in result) rejectWait(result.error);
-		else resolveWait(result.value);
+		// Cancellation owns the exact accepted exchange. Observe and join its disposition
+		// before exposing terminal settlement; a late value cannot win after cancellation.
+		if ("error" in result) completionController.abort(result.error);
+		const settle = () => {
+			if ("error" in result) rejectWait(result.error);
+			else resolveWait(result.value);
+		};
+		if (completion) void completion.then(settle, settle);
+		else settle();
 	};
 
 	const server = createServer((request, response) => {
@@ -105,10 +116,13 @@ export async function startOAuthCallbackServer<T>(
 			}
 			claimed = true;
 			try {
-				const value = await options.complete(code);
+				completion = Promise.resolve().then(() => options.complete(code, completionController.signal));
+				const value = await completion;
+				if (settled) return;
 				sendPage(response, 200, oauthSuccessHtml(`Signed in to ${providerName}. You may now close this page.`));
 				finish({ value });
 			} catch (error) {
+				if (settled) return;
 				const failure = error instanceof Error ? error : new Error(String(error));
 				sendPage(response, 502, oauthErrorHtml(`${providerName} sign-in failed.`, failure.message));
 				finish({ error: failure });
@@ -125,24 +139,35 @@ export async function startOAuthCallbackServer<T>(
 		});
 	});
 
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(options.port, options.host, () => {
-			server.off("error", reject);
-			resolve();
+	signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(options.port, options.host, () => {
+				server.off("error", reject);
+				resolve();
+			});
 		});
-	});
+		if (signal?.aborted) throw new Error("Login cancelled");
+	} catch (error) {
+		signal?.removeEventListener("abort", onAbort);
+		server.close();
+		server.closeAllConnections();
+		throw error;
+	}
 	const address = server.address();
 	if (!address || typeof address === "string") {
+		signal?.removeEventListener("abort", onAbort);
 		server.close();
+		server.closeAllConnections();
 		throw new Error("OAuth callback server did not bind to TCP");
 	}
 
 	server.on("error", (error) => finish({ error }));
-	signal?.addEventListener("abort", onAbort, { once: true });
-	if (options.timeoutMs !== undefined) {
-		timer = setTimeout(() => finish({ error: new Error(`${providerName} sign-in timed out`) }), options.timeoutMs);
-	}
+	timer = setTimeout(
+		() => finish({ error: new Error(`${providerName} sign-in timed out`) }),
+		options.timeoutMs ?? 5 * 60 * 1000,
+	);
 	const redirectHost = options.redirectHost ?? options.host;
 	return {
 		redirectUri: `http://${redirectHost.includes(":") ? `[${redirectHost}]` : redirectHost}:${address.port}${options.path}`,
@@ -153,6 +178,7 @@ export async function startOAuthCallbackServer<T>(
 		close: () => {
 			finish({ error: new Error("OAuth callback server closed") });
 			server.close();
+			server.closeAllConnections();
 		},
 	};
 }
