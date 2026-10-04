@@ -9,7 +9,8 @@ type JsonContainer = Record<string, JsonValue> | JsonValue[];
  */
 export function assignJson(target: JsonContainer, key: string | number, value: JsonValue): void {
 	const slots = target as Record<string | number, JsonValue>;
-	const current = slots[key];
+	const own = Object.hasOwn(slots, key);
+	const current = own ? slots[key] : undefined;
 	if (isRecord(current) && isRecord(value)) {
 		for (const name of Object.keys(current)) if (!Object.hasOwn(value, name)) delete current[name];
 		for (const [name, child] of Object.entries(value)) assignJson(current, name, child);
@@ -23,7 +24,7 @@ export function assignJson(target: JsonContainer, key: string | number, value: J
 		}
 		return;
 	}
-	if (current !== value) slots[key] = value;
+	if (!own || current !== value) slots[key] = value;
 }
 
 function isRecord(value: JsonValue | undefined): value is Record<string, JsonValue> {

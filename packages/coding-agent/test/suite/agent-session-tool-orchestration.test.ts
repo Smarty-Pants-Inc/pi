@@ -118,6 +118,102 @@ describe("AgentSession tool orchestration", () => {
 		expect(persisted?.type === "message" && persisted.message).toMatchObject({ nestedCalls: result.nestedCalls });
 	});
 
+	// pi#107 F1: nested calls must not bypass SDK authorization or result-redaction hooks.
+	it.each(["direct", "nested"].flatMap((route) => ["deny", "redact", "allow"].map((policy) => ({ route, policy }))))(
+		"uses public hooks for $route $policy calls",
+		async ({ route, policy }) => {
+			let executions = 0;
+			const extensionCalls: Array<{ type: string; parent?: string }> = [];
+			const publicCalls: string[] = [];
+			const nestedSignal = new AbortController().signal;
+			const harness = await createHarness({
+				initialActiveToolNames: [],
+				extensionFactories: [
+					(pi) => {
+						pi.registerTool({
+							name: "protected",
+							label: "protected",
+							description: "Returns private data.",
+							parameters: Type.Object({}),
+							execute: async () => {
+								executions++;
+								return {
+									content: [{ type: "text", text: "private" }],
+									details: { private: true },
+									structuredContent: { private: true },
+								};
+							},
+						});
+						pi.registerTool({
+							name: "composite",
+							label: "composite",
+							description: "Calls protected.",
+							parameters: Type.Object({}),
+							execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+								const outcome = await ctx.executeTool("protected", {}, { signal: nestedSignal });
+								return { ...outcome.result, isError: outcome.isError };
+							},
+						});
+						pi.on("tool_call", (event) => {
+							if (event.toolName === "protected")
+								extensionCalls.push({ type: event.type, parent: event.parentToolCallId });
+						});
+						pi.on("tool_result", (event) => {
+							if (event.toolName === "protected")
+								extensionCalls.push({ type: event.type, parent: event.parentToolCallId });
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			await harness.session.bindExtensions({});
+			const agent = harness.session.agent;
+			const before = agent.beforeToolCall;
+			const after = agent.afterToolCall;
+			agent.beforeToolCall = async (context, signal) => {
+				const result = await before?.(context, signal);
+				if (context.toolCall.name !== "protected") return result;
+				publicCalls.push("before");
+				expect(signal).toBe(route === "nested" ? nestedSignal : agent.signal);
+				return policy === "deny" ? { block: true, reason: "SDK denied" } : result;
+			};
+			agent.afterToolCall = async (context, signal) => {
+				const result = await after?.(context, signal);
+				if (context.toolCall.name !== "protected") return result;
+				publicCalls.push("after");
+				expect(signal).toBe(route === "nested" ? nestedSignal : agent.signal);
+				return policy === "redact"
+					? { content: [{ type: "text", text: "redacted" }], details: {}, structuredContent: { safe: true } }
+					: result;
+			};
+			const name = route === "nested" ? "composite" : "protected";
+			harness.setResponses([
+				fauxAssistantMessage([fauxToolCall(name, {})], { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			await harness.session.prompt("go");
+			const result = harness.session.messages.find(
+				(message): message is ToolResultMessage => message.role === "toolResult" && message.toolName === name,
+			);
+			if (!result) throw new Error("No tool result");
+			expect(executions).toBe(policy === "deny" ? 0 : 1);
+			expect(publicCalls).toEqual(policy === "deny" ? ["before"] : ["before", "after"]);
+			expect(result.isError).toBe(policy === "deny");
+			expect(result.content).toEqual([
+				{ type: "text", text: policy === "deny" ? "SDK denied" : policy === "redact" ? "redacted" : "private" },
+			]);
+			if (policy === "redact") {
+				expect(result.details).toEqual({});
+				const executed = harness.eventsOfType("tool_execution_end").find((event) => event.toolName === name);
+				expect(executed?.result.structuredContent).toEqual({ safe: true });
+			}
+			const parent = route === "nested" ? result.toolCallId : undefined;
+			expect(extensionCalls).toEqual(
+				(policy === "deny" ? ["tool_call"] : ["tool_call", "tool_result"]).map((type) => ({ type, parent })),
+			);
+		},
+	);
+
 	it("registers codemode and tool_search inactive until they are named", async () => {
 		const extensionFactories = [createCodemodeExtension(), createToolSearchExtension()];
 		const plain = await createHarness({ extensionFactories });
