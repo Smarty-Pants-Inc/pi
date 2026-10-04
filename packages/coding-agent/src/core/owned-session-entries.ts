@@ -16,9 +16,16 @@ export function materializeOwnedEntry<T extends FileEntry>(entry: T): T {
 		if (property.value === undefined && absentFields.has(key)) continue;
 		Object.defineProperty(normalized, key, { value: property.value, enumerable: true });
 	}
+	assertBoundedEntryDepth(normalized);
+	if (!isJsonValue(normalized)) throw new Error("OWNER_ENTRY_NOT_JSON");
+	return JSON.parse(JSON.stringify(normalized)) as T;
+}
+
+function assertBoundedEntryDepth(entry: unknown): void {
 	// smarty-dev#3535: upstream Chord no longer bounds JSON depth. Keep the native-owner
 	// boundary bounded before its recursive validation/serialization, without invoking accessors.
-	const pending: Array<{ value: object; depth: number }> = [{ value: normalized, depth: 0 }];
+	if (entry === null || typeof entry !== "object") return;
+	const pending: Array<{ value: object; depth: number }> = [{ value: entry, depth: 0 }];
 	const visitedDepths = new Map<object, number>();
 	while (pending.length > 0) {
 		const { value, depth } = pending.pop()!;
@@ -31,8 +38,6 @@ export function materializeOwnedEntry<T extends FileEntry>(entry: T): T {
 			}
 		}
 	}
-	if (!isJsonValue(normalized)) throw new Error("OWNER_ENTRY_NOT_JSON");
-	return JSON.parse(JSON.stringify(normalized)) as T;
 }
 
 /** No migration, skipped line, fabricated header or tail repair on an owned open. */
@@ -43,6 +48,7 @@ export function parseOwnedSessionEntries(bytes: Buffer, expectedSessionId: strin
 	// Use the native parser, but refuse any line it would skip or repair.
 	const values: unknown[] = parseSessionEntries(text);
 	if (values.length !== lines.length) throw new Error("OWNER_JOURNAL_SKIPPED_LINE");
+	for (const value of values) assertBoundedEntryDepth(value);
 	if (values.some((entry, index) => JSON.stringify(entry) !== lines[index])) throw new Error("OWNER_JOURNAL_ENCODING");
 	const header = values[0];
 	if (
