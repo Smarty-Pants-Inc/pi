@@ -74,6 +74,7 @@ export function getToolResult(harness: Harness, toolName: string): ToolResultMes
 /** An extension UI context that does nothing, with `overrides` applied. */
 export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {}): ExtensionUIContext {
 	return {
+		holdState: () => undefined,
 		select: async () => undefined,
 		confirm: async () => false,
 		input: async () => undefined,
@@ -161,7 +162,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
 	const sessionManager =
-		options.sessionManager ?? (options.persistSession ? SessionManager.create(tempDir, tempDir) : SessionManager.inMemory());
+		options.sessionManager ??
+		(options.persistSession ? SessionManager.create(tempDir, tempDir) : SessionManager.inMemory());
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();

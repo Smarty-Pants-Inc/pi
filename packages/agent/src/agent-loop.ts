@@ -769,7 +769,7 @@ async function prepareToolCall(
 	if (!tool) {
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(toolNotFoundMessage(toolCall.name, currentContext.tools ?? [])),
+			result: createErrorToolResult(toolNotFoundMessage(toolCall.name, tools)),
 			isError: true,
 		};
 	}

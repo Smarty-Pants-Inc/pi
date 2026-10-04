@@ -4,6 +4,7 @@ import {
 	closeSync,
 	existsSync,
 	mkdirSync,
+	mkdtempSync,
 	openSync,
 	readFileSync,
 	renameSync,
@@ -428,7 +429,7 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		);
 	});
 
-	it("defers first-turn disk persistence on a newly created owner", () => {
+	it("persists the first user turn on a newly created owner", () => {
 		const manager = SessionManager.create(tempDir, tempDir);
 		const file = manager.getSessionFile();
 		if (!file) throw new Error("Expected a session file path");
@@ -442,7 +443,8 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 			message: { role: "user", content: "pending", timestamp: 1 },
 		});
 		expect(manager.getLeafId()).toBe(user);
-		expect(existsSync(file)).toBe(false);
+		expect(existsSync(file)).toBe(true);
+		expect(SessionManager.open(file, tempDir).getEntries()).toEqual(manager.getEntries());
 	});
 
 	it("exposes manager/disk divergence when an explicit-owner append fails", () => {

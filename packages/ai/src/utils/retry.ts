@@ -34,7 +34,6 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"\\bSelected model is at capacity\\. Please try a different model\\.",
 	"\\bslow_down\\b",
 	"currently experiencing high demand",
-	"model is at capacity",
 	"rate.?limit",
 	"too many requests",
 	"429",

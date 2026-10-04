@@ -1,126 +1,84 @@
-import { createFacetHost, defineFacet } from "@earendil-works/chord";
+import { createFacetHost, defineFacet, type JsonValue } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { fauxAssistantMessage, type ToolResultMessage } from "@earendil-works/pi-ai";
 import type { ConversationView } from "@earendil-works/pi-durable";
 import { describe, expect, test } from "vitest";
+import { appendToolResult } from "../../durable/src/harness/tool.ts";
 import { Transcript } from "../src/experimental/services/transcript.ts";
 import { createTranscriptServiceFacet } from "../src/experimental/services/transcript-provider.ts";
 import { openFauxConversation } from "./experimental-durable-support.ts";
 
+async function openTranscript() {
+	const runtime = await openFauxConversation([fauxAssistantMessage("answer")]);
+	const views: ConversationView[] = [];
+	const consumer = defineFacet({
+		id: "test-transcript-consumer",
+		setup(env) {
+			const transcript = env.use(Transcript);
+			env.onActivate(() => env.own(transcript.state.subscribe((value) => void views.push(value))));
+		},
+	});
+	const host = await createFacetHost({
+		facets: [await createTranscriptServiceFacet(runtime.conversation, BACKGROUND_CONTEXT), consumer],
+	});
+	return { ...runtime, host, views };
+}
+
 describe("Transcript service", () => {
-	test("replicates the conversation view as it changes", async () => {
-		const { conversation, close } = await openFauxConversation([fauxAssistantMessage("answer")]);
-		const views: ConversationView[] = [];
-		const consumer = defineFacet({
-			id: "test-transcript-consumer",
-			setup(env) {
-				const transcript = env.use(Transcript);
-				env.onActivate(() => env.own(transcript.state.subscribe((value) => void views.push(value))));
-			},
-		});
-		const host = await createFacetHost({
-			facets: [await createTranscriptServiceFacet(conversation, BACKGROUND_CONTEXT), consumer],
-		});
+	test("replicates the conversation view as it changes and resets", async () => {
+		const { conversation, close, host, views } = await openTranscript();
+		try {
+			expect(views[0]?.entries).toEqual([]);
+			const submission = await conversation.submit({ type: "input", content: "question" }, BACKGROUND_CONTEXT);
+			await submission.wait(BACKGROUND_CONTEXT);
+			await expect.poll(() => views.at(-1)?.entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+			await conversation.reset("replacement", BACKGROUND_CONTEXT);
+			await expect.poll(() => views.at(-1)?.entries.map((entry) => entry.kind)).toEqual(["pi.reset"]);
+		} finally {
+			await host.dispose();
+			await close();
+		}
+	});
 
-		await listener?.(
-			{
-				type: "entry_added",
-				lane: "main",
-				entry: {
-					id: "entry-1",
-					parentId: null,
-					seq: 1,
-					timestamp: 2,
-					type: "message",
-					message: { role: "user", content: "hello", timestamp: 2 },
-				},
-			},
-			BACKGROUND_CONTEXT,
-		);
-		expect(states.at(-1)).toMatchObject({
-			snapshot: { tipId: "entry-1", transcript: [{ id: "entry-1" }] },
-			event: { type: "entry_added" },
-		});
-
-		// smarty-dev#890: a tool result with `details: undefined` still reaches subscribers.
-		await listener?.(
-			{
-				type: "tool_end",
-				lane: "main",
-				runId: "run-1",
-				toolCallId: "call-1",
-				toolName: "read",
-				result: { content: [{ type: "text", text: "file" }], details: undefined },
-				isError: false,
-				endedAt: 2,
-			} as unknown as HarnessEvent,
-			BACKGROUND_CONTEXT,
-		);
-		expect(states.at(-1)).toMatchObject({ event: { type: "tool_end", toolCallId: "call-1" } });
-		expect(states.at(-1)?.event).not.toHaveProperty("result.details");
-
-		// pi#51 review: an own `__proto__` key from JSON.parse stays a key (in the event and the settled
-		// tool), next to a dropped undefined property; it must not become the copy's prototype.
-		const details = JSON.parse('{"__proto__":{"marker":"kept"},"other":1}') as Record<string, unknown>;
-		(details as Record<string, unknown>).gone = undefined;
-		await listener?.(
-			{
-				type: "tool_start",
-				lane: "main",
-				runId: "run-1",
-				turnId: "turn-1",
-				toolCallId: "call-2",
-				toolName: "read",
-				args: {},
-			} as unknown as HarnessEvent,
-			BACKGROUND_CONTEXT,
-		);
-		await listener?.(
-			{
-				type: "tool_end",
-				lane: "main",
-				runId: "run-1",
-				turnId: "turn-1",
-				toolCallId: "call-2",
-				toolName: "read",
-				result: { content: [{ type: "text", text: "file" }], details },
-				isError: false,
-				terminate: false,
-				endedAt: 2,
-			} as unknown as HarnessEvent,
-			BACKGROUND_CONTEXT,
-		);
-		const published = (states.at(-1)?.event as { result?: { details?: Record<string, unknown> } }).result?.details;
-		expect(published && Object.hasOwn(published, "__proto__")).toBe(true);
-		expect(published && Object.getPrototypeOf(published)).toBe(Object.prototype);
-		expect(published).not.toHaveProperty("gone");
-		const settled = (
-			states.at(-1)?.snapshot?.operation as {
-				runningTools?: { toolCallId: string; result?: { details?: object } }[];
+	// smarty-dev#890 / pi#51: the durable transaction replaces the old lane-event sanitizer.
+	test.each([false, true])("replicates normalized tool results (own prototype key: %s)", async (withDetails) => {
+		const { harness, conversation, close, host, views } = await openTranscript();
+		const details = JSON.parse('{"__proto__":{"marker":"kept"},"other":1}') as Record<string, JsonValue | undefined>;
+		details.gone = undefined;
+		try {
+			const entry = await harness.commit(
+				(tx) =>
+					appendToolResult(
+						tx,
+						conversation.id,
+						{ type: "toolCall", id: "call-1", name: "read", arguments: {} },
+						{
+							content: [{ type: "text", text: "file" }],
+							details: withDetails ? (details as JsonValue) : undefined,
+						},
+						2,
+					),
+				BACKGROUND_CONTEXT,
+			);
+			await expect.poll(() => views.at(-1)?.entries.at(-1)?.id).toBe(entry.id);
+			for (const message of [entry.model?.[0], views.at(-1)?.entries.at(-1)?.model?.[0]]) {
+				expect(message).toMatchObject({
+					role: "toolResult",
+					toolCallId: "call-1",
+					content: [{ type: "text", text: "file" }],
+				});
+				if (!withDetails) expect(message).not.toHaveProperty("details");
+				else {
+					const copied = (message as ToolResultMessage).details as Record<string, JsonValue>;
+					expect(Object.hasOwn(copied, "__proto__")).toBe(true);
+					expect(Object.getPrototypeOf(copied)).toBe(Object.prototype);
+					expect(copied.__proto__).toEqual({ marker: "kept" });
+					expect(copied).not.toHaveProperty("gone");
+				}
 			}
-		)?.runningTools?.find((tool) => tool.toolCallId === "call-2")?.result?.details;
-		expect(settled && Object.hasOwn(settled, "__proto__")).toBe(true);
-
-		const navigation: HarnessEvent = {
-			type: "navigation_end",
-			lane: "main",
-			runId: "navigation-1",
-			status: "completed",
-			fromTipId: "entry-1",
-			tipId: "replacement-tip",
-			endedAt: 3,
-		};
-		await listener?.(navigation, BACKGROUND_CONTEXT);
-		await vi.waitFor(() => expect(states.at(-1)?.event).toBeNull());
-		expect(states.at(-2)).toMatchObject({
-			snapshot: { tipId: "entry-1" },
-			event: { type: "navigation_end" },
-		});
-		expect(states.at(-1)).toMatchObject({ snapshot: { tipId: "replacement-tip" }, event: null });
-		expect(runtime.service.state.value).toMatchObject({ snapshot: { tipId: "replacement-tip" }, event: null });
-		expect(resnapshot).toHaveBeenCalledOnce();
-
-		await runtime.dispose();
-		expect(unsubscribe).toHaveBeenCalledOnce();
+		} finally {
+			await host.dispose();
+			await close();
+		}
 	});
 });

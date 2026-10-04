@@ -7,6 +7,8 @@ const durableSrcTesting = fileURLToPath(new URL("./src/testing/index.ts", import
 export default defineConfig({
 	test: {
 		environment: "node",
+		// Reopen conformance performs thousands of disk commits, also under low-priority CI load.
+		testTimeout: 30_000,
 	},
 	resolve: {
 		conditions: ["source"],

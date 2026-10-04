@@ -317,7 +317,9 @@ describe("AgentSession MCP integration", () => {
 
 		const result = toolResult(harness, "mcp__docs__search");
 		expect(result.isError).toBe(true);
-		expect(getMessageText(result)).toBe("Tool mcp__docs__search not found");
+		expect(getMessageText(result)).toBe(
+			"Tool mcp__docs__search not found. Available tools in this session: codemode",
+		);
 		expect(calls).toEqual([]);
 	});
 

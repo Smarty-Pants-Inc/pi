@@ -2,19 +2,18 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { Container, Text } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentSessionEvent } from "../../../src/core/agent-session.ts";
+import type { ExtensionUIContext } from "../../../src/core/extensions/index.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
-import { initTheme, type Theme, theme } from "../../../src/modes/interactive/theme/theme.ts";
+import { initTheme, theme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness } from "../harness.ts";
 
-function createUiContext(
-	onNotify: (message: string, type: "info" | "warning" | "error" | undefined) => void,
-): ExtensionUIContext {
+function createTestUiContext(overrides: Partial<ExtensionUIContext> = {}): ExtensionUIContext {
 	return {
 		holdState: () => undefined,
 		select: async () => undefined,
 		confirm: async () => false,
 		input: async () => undefined,
-		notify: onNotify,
+		notify: () => {},
 		onTerminalInput: () => () => {},
 		setStatus: () => {},
 		setWorkingMessage: () => {},
@@ -38,9 +37,10 @@ function createUiContext(
 		},
 		getAllThemes: () => [],
 		getTheme: () => undefined,
-		setTheme: (_theme: string | Theme) => ({ success: false, error: "Theme switching not available in tests" }),
+		setTheme: () => ({ success: false, error: "Theme switching not available in tests" }),
 		getToolsExpanded: () => false,
 		setToolsExpanded: () => {},
+		...overrides,
 	};
 }
 

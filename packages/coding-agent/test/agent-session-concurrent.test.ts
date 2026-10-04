@@ -200,6 +200,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		const model = getModel("anthropic", "claude-sonnet-4-5")!;
 		let abortSignal: AbortSignal | undefined;
 		let sawSteeringMessage = false;
+		let completeFirstTurn = false;
 		let lastInputSource: string | undefined;
 		const queueEvents: Array<{ steering: readonly string[]; followUp: readonly string[] }> = [];
 
@@ -236,7 +237,9 @@ describe("AgentSession concurrent prompt guard", () => {
 
 					stream.push({ type: "start", partial: createAssistantMessage("") });
 					const checkAbort = () => {
-						if (abortSignal?.aborted) {
+						if (completeFirstTurn) {
+							stream.push({ type: "done", reason: "stop", message: createAssistantMessage("First turn done") });
+						} else if (abortSignal?.aborted) {
 							stream.push({ type: "error", reason: "aborted", error: createAssistantMessage("Aborted") });
 						} else {
 							setTimeout(checkAbort, 5);
@@ -298,8 +301,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		expect(lastInputSource).toBe("extension");
 		expect(queueEvents.some((event) => event.steering.includes("Steer from extension"))).toBe(true);
 
-		await session.abort();
-		await firstPrompt.catch(() => {});
+		// Explicit abort must not start another turn. Finish normally to consume the queued steer.
+		completeFirstTurn = true;
+		await firstPrompt;
 
 		expect(sawSteeringMessage).toBe(true);
 	});

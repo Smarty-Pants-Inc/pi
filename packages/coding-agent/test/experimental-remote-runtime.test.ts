@@ -3,7 +3,6 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Context, createFacetHost, defineFacet, defineService, type ReplicatedState } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { LaneWatchEvent } from "@earendil-works/pi-agent-core";
 import { Client, ServerError as ClientServerError } from "@earendil-works/pi-client";
 import { createUnixTransportFactory } from "@earendil-works/pi-client/unix";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
@@ -610,9 +609,9 @@ describe("experimental durable server composition", () => {
 		expect(result).toMatchObject({ kind: "prompted", text: "deterministic remote answer" });
 	});
 
-	// PR #11: the operation response must not dispose a still-publishing Transcript.
-	for (const outcome of ["completed", "deferred", "disconnect", "callback-error"] as const) {
-		test(`joins the prompt response with terminal publication (${outcome})`, async ({ onTestFinished }) => {
+	// pi#11 / smarty-dev#3535: admission is not completion; the durable receipt owns the answer.
+	for (const outcome of ["completed", "disconnect", "settlement-error"] as const) {
+		test(`joins prompt admission with durable settlement (${outcome})`, async ({ onTestFinished }) => {
 			const spawn = vi
 				.spyOn(processRuntime, "spawnInternalProcess")
 				.mockImplementation((role, args, options) =>
@@ -628,8 +627,7 @@ describe("experimental durable server composition", () => {
 			const services = createSessionServiceBinding(controlClient, { services: [TerminalPublication] });
 			await services.ready(BACKGROUND_CONTEXT);
 			const publication = services.use(TerminalPublication);
-			await publication.hold(outcome === "deferred", BACKGROUND_CONTEXT);
-
+			await publication.hold(outcome === "settlement-error", BACKGROUND_CONTEXT);
 			let receiveResponse!: (response: AgentOperationResponse) => void;
 			const responseReceived = new Promise<AgentOperationResponse>((resolve) => {
 				receiveResponse = resolve;
@@ -650,30 +648,8 @@ describe("experimental durable server composition", () => {
 				return result;
 			});
 			onTestFinished(() => request.mockRestore());
-			let releaseCallback!: () => void;
-			const callbackGate = new Promise<void>((resolve) => {
-				releaseCallback = resolve;
-			});
-			let enterCallback!: () => void;
-			const callbackEntered = new Promise<void>((resolve) => {
-				enterCallback = resolve;
-			});
-			const events: LaneWatchEvent[] = [];
 			let finished = false;
-			const prompting = runClient(
-				{ command: "client", sessionId: "demo-1", prompt: "question" },
-				{
-					directory,
-					async onEvent(event) {
-						events.push(event);
-						if (event.type === "run_end" || event.type === "run_suspend") {
-							enterCallback();
-							await callbackGate;
-							if (outcome === "callback-error") throw new Error("terminal callback failed");
-						}
-					},
-				},
-			);
+			const prompting = runClient({ command: "client", sessionId: "demo-1", prompt: "question" }, { directory });
 			void prompting.then(
 				() => {
 					finished = true;
@@ -685,42 +661,26 @@ describe("experimental durable server composition", () => {
 			try {
 				const response = await responseReceived;
 				expect(response).toMatchObject({ accepted: true, error: null, operationId: expect.any(String) });
-				const terminal = await publication.held(BACKGROUND_CONTEXT);
-				expect(terminal).toEqual({
-					type: outcome === "deferred" ? "run_suspend" : "run_end",
-					runId: response.operationId,
+				expect(await publication.held(BACKGROUND_CONTEXT)).toEqual({
+					status: "done",
+					operationId: response.operationId,
 				});
-				expect(events.filter((event) => event.type === "run_end" || event.type === "run_suspend")).toEqual([]);
 				expect(finished).toBe(false);
 				if (outcome === "disconnect") {
 					if (promptClient === undefined) throw new Error("Prompt client was not captured");
-					promptClient.disconnect("terminal publication disconnected");
-					await expect(prompting).rejects.toThrow("terminal publication disconnected");
-					expect(finished).toBe(true);
+					promptClient.disconnect("settlement publication disconnected");
+					await expect(prompting).rejects.toThrow("settlement publication disconnected");
 				} else {
 					await publication.release(BACKGROUND_CONTEXT);
-					await Promise.race([
-						callbackEntered,
-						prompting.then(() => {
-							throw new Error("Client returned before terminal callback delivery");
-						}),
-					]);
-					expect(finished).toBe(false);
-					releaseCallback();
-					if (outcome === "callback-error") {
-						await expect(prompting).rejects.toThrow("terminal callback failed");
-					} else {
+					if (outcome === "settlement-error") await expect(prompting).rejects.toThrow("Internal server error");
+					else
 						await expect(prompting).resolves.toMatchObject({
 							kind: "prompted",
-							text: outcome === "deferred" ? "" : "deterministic remote answer",
+							text: "deterministic remote answer",
 						});
-					}
-					expect(events.filter((event) => event.type === "run_end" || event.type === "run_suspend")).toEqual([
-						expect.objectContaining(terminal),
-					]);
 				}
+				expect(finished).toBe(true);
 			} finally {
-				releaseCallback();
 				await publication.release(BACKGROUND_CONTEXT);
 				await prompting.catch(() => {});
 				await services.dispose(BACKGROUND_CONTEXT);
@@ -728,10 +688,8 @@ describe("experimental durable server composition", () => {
 		});
 	}
 
-	// PR #11: worker loss releases the Session attachment, not the public connection.
-	test("rejects held terminal publication after internal worker loss and removes its watches", async ({
-		onTestFinished,
-	}) => {
+	// pi#11: worker loss releases the attachment, not the still-live public connection.
+	test("rejects held durable settlement after worker loss and removes its watches", async ({ onTestFinished }) => {
 		const spawn = vi
 			.spyOn(processRuntime, "spawnInternalProcess")
 			.mockImplementation((role, args, options) =>
@@ -748,7 +706,6 @@ describe("experimental durable server composition", () => {
 		await services.ready(BACKGROUND_CONTEXT);
 		const publication = services.use(TerminalPublication);
 		await publication.hold(false, BACKGROUND_CONTEXT);
-
 		const activeWatches = new Set<string>();
 		const removedWatches: string[] = [];
 		function trackWatch<T>(name: string, state: ReplicatedState<T>): ReplicatedState<T> {
@@ -774,7 +731,6 @@ describe("experimental durable server composition", () => {
 				const activated = await realActivate(server);
 				return {
 					...activated,
-					transcript: { state: trackWatch("transcript", activated.transcript.state) },
 					server: {
 						connection: trackWatch("connection", activated.server.connection),
 						get acceptsUnavailableServices() {
@@ -798,96 +754,27 @@ describe("experimental durable server composition", () => {
 				};
 			});
 		onTestFinished(() => activate.mockRestore());
-		let receiveResponse!: (response: AgentOperationResponse) => void;
-		const responseReceived = new Promise<AgentOperationResponse>((resolve) => {
-			receiveResponse = resolve;
-		});
-		let promptClient: Client | undefined;
-		const realRequest = Client.prototype.request;
-		const request = vi.spyOn(Client.prototype, "request").mockImplementation(async function (
-			this: Client,
-			target,
-			call,
-			signal,
-		) {
-			const result = await realRequest.call(this, target, call, signal);
-			if (call.serviceId === AgentController.id && call.member === "prompt") {
-				promptClient = this;
-				receiveResponse(result as AgentOperationResponse);
-			}
-			return result;
-		});
-		onTestFinished(() => request.mockRestore());
-		const disposalStates: {
-			connected: boolean;
-			attachment: Client["attachment"];
-			active: string[];
-			removed: string[];
-		}[] = [];
-		const realDispose = Client.prototype.dispose;
-		const dispose = vi.spyOn(Client.prototype, "dispose").mockImplementation(function (this: Client) {
-			if (this === promptClient) {
-				disposalStates.push({
-					connected: this.connected,
-					attachment: this.attachment,
-					active: [...activeWatches],
-					removed: [...removedWatches].sort(),
-				});
-			}
-			return realDispose.call(this);
-		});
-		onTestFinished(() => dispose.mockRestore());
-		const events: LaneWatchEvent[] = [];
-		let finished = false;
-		const prompting = runClient(
-			{ command: "client", sessionId: "demo-1", prompt: "question" },
-			{
-				directory,
-				onEvent: (event) => {
-					events.push(event);
-				},
-			},
-		);
-		const promptSettled = prompting.then(
-			() => {
-				finished = true;
-				throw new Error("Client returned before worker-loss barriers completed");
-			},
-			(error: unknown) => {
-				finished = true;
-				throw error;
-			},
-		);
+		const prompting = runClient({ command: "client", sessionId: "demo-1", prompt: "question" }, { directory });
+		void prompting.catch(() => {});
 		let workerKilled = false;
 		try {
-			const response = await Promise.race([responseReceived, promptSettled]);
-			expect(response).toMatchObject({ accepted: true, error: null, operationId: expect.any(String) });
-			expect(await Promise.race([publication.held(BACKGROUND_CONTEXT), promptSettled])).toEqual({
-				type: "run_end",
-				runId: response.operationId,
+			expect(await publication.held(BACKGROUND_CONTEXT)).toMatchObject({
+				status: "done",
+				operationId: expect.any(String),
 			});
-			expect(finished).toBe(false);
-			expect([...activeWatches].sort()).toEqual(["attachment", "connection", "transcript"]);
+			expect([...activeWatches].sort()).toEqual(["attachment", "connection"]);
 			expect(removedWatches).toEqual([]);
-			expect(promptClient?.connected).toBe(true);
-			const workerPid = runtime.workerPids.get("demo-1");
-			if (workerPid === undefined) throw new Error("Session worker was not captured");
-			process.kill(workerPid, "SIGKILL");
+			const pid = runtime.workerPids.get("demo-1");
+			if (pid === undefined) throw new Error("Session worker was not captured");
+			process.kill(pid, "SIGKILL");
 			workerKilled = true;
+			// The in-flight RPC may fail before attachment-loss publication reaches the client.
 			await expect(prompting).rejects.toThrow(
-				"Session demo-1 attachment lost while waiting for terminal publication",
+				/attachment lost while waiting for prompt settlement|Internal server error/,
 			);
-			expect(finished).toBe(true);
-			expect(disposalStates).toEqual([
-				{
-					connected: true,
-					attachment: undefined,
-					active: [],
-					removed: ["attachment", "connection", "transcript"],
-				},
-			]);
+			expect([...activeWatches]).toEqual([]);
+			expect(removedWatches.sort()).toEqual(["attachment", "connection"]);
 			expect(controlClient.connected).toBe(true);
-			expect(events.filter((event) => event.type === "run_end" || event.type === "run_suspend")).toEqual([]);
 		} finally {
 			if (!workerKilled) await publication.release(BACKGROUND_CONTEXT);
 			await prompting.catch(() => {});
@@ -895,7 +782,8 @@ describe("experimental durable server composition", () => {
 		}
 	});
 
-	test("rejects prompt admission without waiting for a terminal event", async ({ onTestFinished }) => {
+	// smarty-dev#3535: a rejected admission must never invoke waitForPrompt.
+	test("rejects prompt admission without waiting for settlement", async ({ onTestFinished }) => {
 		const spawn = vi
 			.spyOn(processRuntime, "spawnInternalProcess")
 			.mockImplementation((role, args, options) =>
@@ -907,19 +795,28 @@ describe("experimental durable server composition", () => {
 			);
 		onTestFinished(() => spawn.mockRestore());
 		const { directory } = await makeServer();
-		const events: string[] = [];
+		const realRequest = Client.prototype.request;
+		let waits = 0;
+		const request = vi.spyOn(Client.prototype, "request").mockImplementation(function (
+			this: Client,
+			target,
+			call,
+			signal,
+		) {
+			if (call.serviceId === AgentController.id && call.member === "prompt")
+				return Promise.resolve({
+					accepted: false,
+					operationId: null,
+					error: { code: "operation_failed", message: "rejected admission" },
+				});
+			if (call.serviceId === AgentController.id && call.member === "waitForPrompt") waits++;
+			return realRequest.call(this, target, call, signal);
+		});
+		onTestFinished(() => request.mockRestore());
 		await expect(
-			runClient(
-				{ command: "client", sessionId: "demo-1", prompt: "" },
-				{
-					directory,
-					onEvent: (event) => {
-						events.push(event.type);
-					},
-				},
-			),
-		).rejects.toThrow("Acceptance must append at least one message");
-		expect(events).toEqual([]);
+			runClient({ command: "client", sessionId: "demo-1", prompt: "question" }, { directory }),
+		).rejects.toThrow("rejected admission");
+		expect(waits).toBe(0);
 	});
 
 	test("replicates terminal operation state after consecutive prompts", async ({ onTestFinished }) => {

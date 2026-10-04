@@ -98,6 +98,15 @@ describe("owned native materialization", () => {
 		for (let i = 0; i < 600; i++) deep = { child: deep };
 		expect(() => materializeOwnedEntry(custom(deep))).toThrow("OWNER_ENTRY_NOT_JSON");
 	});
+
+	// smarty-dev#3535: a shallow alias must not hide the same value on a deeper path.
+	test("bounds depth through repeated non-cyclic references", () => {
+		let shared: unknown = null;
+		for (let i = 0; i < 200; i++) shared = { child: shared };
+		let deep = shared;
+		for (let i = 0; i < 400; i++) deep = { child: deep };
+		expect(() => materializeOwnedEntry(custom({ deep, shared }))).toThrow("OWNER_ENTRY_NOT_JSON");
+	});
 });
 
 describe("strict owned native open", () => {

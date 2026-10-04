@@ -1,7 +1,7 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Context, createStaticFacetLoader, defineFacet, defineService } from "@earendil-works/chord";
-import { AgentHarness, BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
 import { createRegistry, Harness } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
@@ -9,10 +9,9 @@ import { consumeInternalProcessRole } from "../../src/experimental/process.ts";
 import { runSessionWorkerWithHarness } from "../../src/experimental/session-worker.ts";
 import { KeyedProbe } from "./keyed-service.ts";
 
-type TerminalEvent = { type: "run_end" | "run_suspend"; runId: string };
 export const TerminalPublication = defineService<{
-	hold(deferred: boolean, context: Context): Promise<void>;
-	held(context: Context): Promise<TerminalEvent>;
+	hold(failDelivery: boolean, context: Context): Promise<void>;
+	held(context: Context): Promise<{ status: "done" | "unanswered"; operationId: string }>;
 	release(context: Context): Promise<void>;
 }>("test.terminal-publication");
 
@@ -28,46 +27,47 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 		faux.setResponses([answer, answer]);
 		const models = createModels();
 		models.setProvider(faux.provider);
-		const harness = (
-			await AgentHarness.create(
-				{
-					session,
-					models,
-					model: faux.getModel(),
-					tools: [],
-					resources: {},
-				},
-				BACKGROUND_CONTEXT,
-			)
-		).harness;
-		const lane = await harness.lane("main", BACKGROUND_CONTEXT);
+		const harness = await Harness.open(
+			await openNodeSqliteStorage(databasePath),
+			{ models, registry: createRegistry() },
+			BACKGROUND_CONTEXT,
+		);
+		const model = faux.getModel();
+		const conversation = await harness.root(BACKGROUND_CONTEXT, {
+			agent: { cwd: options.metadata.cwd, model: { provider: model.provider, modelId: model.id } },
+		});
 		let gate: Promise<void> | undefined;
 		let release = (): void => {};
-		let held: Promise<TerminalEvent> | undefined;
-		let reportHeld = (_event: TerminalEvent): void => {};
-		const watch = lane.watch.bind(lane);
-		lane.watch = async (context) => {
-			const opened = await watch(context);
-			const start = opened.start.bind(opened);
-			// PR #11: hold the real terminal event before Transcript publishes it,
-			// without blocking the harness event bus or fabricating a lifecycle event.
-			opened.start = (listener) =>
-				start(async (event, context) => {
-					if (gate !== undefined && (event.type === "run_end" || event.type === "run_suspend")) {
-						reportHeld({ type: event.type, runId: event.runId });
+		let failDelivery = false;
+		let held: Promise<{ status: "done" | "unanswered"; operationId: string }> | undefined;
+		let reportHeld = (_result: { status: "done" | "unanswered"; operationId: string }): void => {};
+		const submission = harness.submission.bind(harness);
+		// pi#11 / smarty-dev#3535: gate the real durable settlement receipt, not a fabricated run event.
+		harness.submission = async (id, context) => {
+			const opened = await submission(id, context);
+			if (opened === undefined) return undefined;
+			return {
+				id: opened.id,
+				status: opened.status.bind(opened),
+				abort: opened.abort.bind(opened),
+				async wait(context) {
+					const result = await opened.wait(context);
+					if (gate !== undefined) {
+						reportHeld({ status: result.status, operationId: String(id) });
 						await gate;
+						if (failDelivery) throw new Error("settlement delivery failed");
 					}
-					await listener(event, context);
-				});
-			return opened;
+					return result;
+				},
+			};
 		};
 		const keyedProbeFacet = defineFacet({
 			id: "@test/keyed-probe",
 			setup(env) {
 				env.provide(TerminalPublication, {
-					async hold(deferred, context) {
-						if (gate !== undefined) throw new Error("Terminal publication is already held");
-						await harness.setStreamOptions({ deferred }, context);
+					async hold(fail) {
+						if (gate !== undefined) throw new Error("Settlement publication is already held");
+						failDelivery = fail;
 						held = new Promise((resolve) => {
 							reportHeld = resolve;
 						});
@@ -76,7 +76,7 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 						});
 					},
 					async held() {
-						if (held === undefined) throw new Error("Terminal publication is not held");
+						if (held === undefined) throw new Error("Settlement publication is not held");
 						return held;
 					},
 					async release() {
@@ -107,7 +107,7 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				env.onActivate(() => spawn("first"));
 			},
 		});
-		return { harness, lane, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
+		return { harness, conversation, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
 	}).catch((error: unknown) => {
 		console.error(error);
 		process.exit(1);

@@ -106,6 +106,7 @@ async function createRuntimeHost(options: {
 	failFirstResponse?: boolean;
 	retry?: boolean;
 	extensionFactories?: ExtensionFactory[];
+	extensionsResult?: Awaited<ReturnType<typeof createTestExtensionsResult>>;
 }): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	session: AgentSession;
@@ -158,11 +159,10 @@ async function createRuntimeHost(options: {
 	if (options.withAuth) {
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 	}
-	const resourceLoader = createTestResourceLoader(
-		options.extensionFactories
-			? { extensionsResult: await createTestExtensionsResult(options.extensionFactories, tempDir) }
-			: undefined,
-	);
+	const extensionsResult =
+		options.extensionsResult ??
+		(options.extensionFactories ? await createTestExtensionsResult(options.extensionFactories, tempDir) : undefined);
+	const resourceLoader = createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
 	const session = new AgentSession({
 		agent,
@@ -216,6 +216,7 @@ async function startRpcMode(options: {
 	failFirstResponse?: boolean;
 	retry?: boolean;
 	extensionFactories?: ExtensionFactory[];
+	extensionsResult?: Awaited<ReturnType<typeof createTestExtensionsResult>>;
 }): Promise<{
 	lineHandler: (line: string) => void;
 	session: AgentSession;
@@ -427,6 +428,7 @@ describe("RPC prompt response semantics", () => {
 						type: "response",
 						command: type,
 						success: true,
+						data: { disposition: "queued" },
 					});
 				});
 			}
