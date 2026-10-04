@@ -170,6 +170,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	challenge: OAuthChallenge | undefined;
 	private client: McpClient | undefined;
 	private opening: Promise<McpClient> | undefined;
+	private openingClient: McpClient | undefined;
+	private closing: Promise<void> | undefined;
 	private closed = false;
 	/** Stderr of the last stdio server that failed to connect. */
 	private stderrTail: string | undefined;
@@ -370,6 +372,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private async connectOnce(): Promise<McpClient> {
+		if (this.closed) throw new Error("shut down before connecting");
 		const client = new McpClient({
 			name: "pi",
 			version: VERSION,
@@ -381,6 +384,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		let transport: McpTransport | undefined;
 		try {
 			transport = this.createTransport(this.entry, this.cwd, this.authProvider);
+			this.openingClient = client;
 			await client.connect(transport);
 			client.onNotification("notifications/tools/list_changed", () => {
 				void this.refreshTools(client);
@@ -415,6 +419,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 				this.stderrTail = transport.stderr.trim().slice(-STDERR_TAIL_CHARS) || undefined;
 			}
 			throw error;
+		} finally {
+			if (this.openingClient === client) this.openingClient = undefined;
 		}
 	}
 
@@ -461,14 +467,18 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	async close(): Promise<void> {
+		if (this.closing) return this.closing;
 		this.closed = true;
 		this.state = "closed";
 		this.changed();
-		const client = this.client;
+		const clients = new Set([this.client, this.openingClient]);
 		this.client = undefined;
-		await client?.close().catch(() => undefined);
-		// A refresh the server already answered may have rotated the refresh token; exiting before the
-		// new tokens are saved would lose the grant.
-		await this.authProvider?.settled();
+		this.closing = (async () => {
+			await Promise.all([...clients].map((client) => client?.close().catch(() => undefined)));
+			await this.opening?.catch(() => undefined);
+			// Preserve refresh grants whose responses arrived before shutdown.
+			await this.authProvider?.settled();
+		})();
+		return this.closing;
 	}
 }

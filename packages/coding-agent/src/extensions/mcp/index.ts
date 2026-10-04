@@ -108,6 +108,8 @@ interface McpServer {
 	message?: string;
 	/** Settles when the connection started for the server connected or failed. */
 	ready?: Promise<void>;
+	/** Revoked when this server is disabled, removed, replaced, or started again. */
+	startup?: symbol;
 }
 
 const EXPOSURE_DESCRIPTIONS: Record<Exclude<McpExposure, "hidden">, string> = {
@@ -319,7 +321,6 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			};
 		};
 
-		const connections = () => servers.flatMap((server) => (server.connection ? [server.connection] : []));
 		const findServer = (name: string) => servers.find((server) => server.entry.name === name);
 
 		/** Servers extensions registered, except names `mcp.json` defines, which take precedence. */
@@ -367,7 +368,9 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 
 		const registerTools = (connection: McpServerConnection) => {
 			const server = connection.entry.name;
-			const entry = findServer(server)?.entry ?? connection.entry;
+			const owner = findServer(server);
+			if (!sessionActive || !owner || !isEnabled(owner) || owner.connection !== connection) return;
+			const entry = owner.entry;
 			const description = entry.config.description?.trim();
 			const namespace = {
 				name: mcpNamespace(server),
@@ -522,8 +525,12 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		};
 
 		/** Create the server's connection, loading the MCP runtime on first use. */
-		const createConnection = async (server: McpServer): Promise<McpServerConnection> => {
+		const createConnection = async (
+			server: McpServer,
+			isCurrent: () => boolean,
+		): Promise<McpServerConnection | undefined> => {
 			const runtime = await loadMcpRuntime();
+			if (!isCurrent()) return undefined;
 			const connection = new runtime.McpServerConnection({
 				entry: server.entry,
 				cwd: sessionCwd,
@@ -546,15 +553,28 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		 */
 		const startConnection = (
 			server: McpServer,
-			isCurrent: () => boolean,
+			sessionIsCurrent: () => boolean,
 			after?: Promise<unknown>,
 		): Promise<void> => {
+			const startup = Symbol();
+			server.startup = startup;
+			const isCurrent = () =>
+				sessionIsCurrent() &&
+				sessionActive &&
+				findServer(server.entry.name) === server &&
+				isEnabled(server) &&
+				server.startup === startup;
 			const ready = (async () => {
 				await after;
 				if (!isCurrent()) return;
-				const connection = await createConnection(server);
-				if (!isCurrent()) return;
+				const connection = await createConnection(server, isCurrent);
+				if (!connection) return;
+				if (!isCurrent()) {
+					await connection.close();
+					return;
+				}
 				await connection.getClient().catch(() => undefined);
+				if (!isCurrent()) await connection.close();
 			})();
 			server.ready = ready.catch(() => undefined);
 			return ready;
@@ -667,11 +687,13 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			const failed = saveConfig(server, { enabled }, inProject);
 			if (failed) return failed;
 			if (!enabled) {
+				server.startup = undefined;
 				const connection = server.connection;
 				server.connection = undefined;
 				hideTools(server.entry.name);
 				emitChange();
 				await connection?.close();
+				await server.ready;
 				return undefined;
 			}
 			await startConnection(server, () => true);
@@ -1112,7 +1134,13 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 			servers.push(...added);
 			emitChange();
 			ensureDiscoveryActive(ctx);
-			await Promise.all(removed.map((server) => server.connection?.close()));
+			await Promise.all(
+				removed.map(async (server) => {
+					server.startup = undefined;
+					await server.connection?.close();
+					await server.ready;
+				}),
+			);
 			const connecting = added.filter(isEnabled);
 			if (current !== generation || connecting.length === 0) return;
 			try {
@@ -1132,10 +1160,16 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 		pi.on("session_shutdown", async () => {
 			sessionActive = false;
 			generation++;
-			const closing = connections();
+			const closing = servers;
 			servers = [];
 			emitChange();
-			await Promise.all(closing.map((connection) => connection.close()));
+			await Promise.all(
+				closing.map(async (server) => {
+					server.startup = undefined;
+					await server.connection?.close();
+					await server.ready;
+				}),
+			);
 		});
 
 		pi.registerCommand("mcp", {
