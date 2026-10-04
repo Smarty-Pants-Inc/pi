@@ -361,7 +361,7 @@ function createErrorEvent(
 	oauthDiagnostics = false,
 ): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
-	const safe = oauthDiagnostics ? safeOAuthError(error, true) : undefined;
+	const safe = oauthDiagnostics ? safeOAuthError(error) : undefined;
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
 		content: [],

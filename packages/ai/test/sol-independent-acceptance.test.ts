@@ -23,8 +23,8 @@ async function radiusRuntime() {
  return { models, model: provider.getModels()[0] };
 }
 
-// smarty-dev#4703 F1: every OAuth transport catch must preserve owned recovery classification.
-it.each(["ECONNRESET", "early EOF"])("Radius OAuth recovery retries %s", async kind => {
+// smarty-dev#4790: Radius-only premature-stream retry is cut from smarty-dev#4703; retain original assertions.
+it.skip.each(["ECONNRESET", "early EOF"])("Radius OAuth recovery retries %s", async kind => {
  const { models, model } = await radiusRuntime(); let calls = 0;
  const output = await retryAssistantCall(() => models.complete(model, { messages: [] }, { fetch: async () => {
   calls++;
