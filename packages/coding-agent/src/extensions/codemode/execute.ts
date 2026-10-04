@@ -262,7 +262,7 @@ function formatError(result: Extract<CodemodeResult, { ok: false }>, calls: read
 async function spillOutput(text: string): Promise<{ path: string } | { error: string }> {
 	const path = join(tmpdir(), `pi-codemode-${randomBytes(8).toString("hex")}.txt`);
 	try {
-		await writeFile(path, text);
+		await writeFile(path, text, { flag: "wx", mode: 0o600 });
 		return { path };
 	} catch (error) {
 		return { error: error instanceof Error ? error.message : String(error) };
