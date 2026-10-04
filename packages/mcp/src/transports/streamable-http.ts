@@ -9,6 +9,7 @@ import {
 	parseJsonRpcMessage,
 	toError,
 } from "../protocol/jsonrpc.ts";
+import { refuseMcpAdmission } from "../security-admission.ts";
 import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, TransportEvents } from "./transport.ts";
 
 const MAX_ERROR_BODY_BYTES = 8 * 1024;
@@ -198,6 +199,7 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 
 	constructor(options: StreamableHttpTransportOptions) {
 		super();
+		refuseMcpAdmission();
 		this.options = Object.freeze({ ...options, headers: options.headers ? { ...options.headers } : undefined });
 		try {
 			this.url = new URL(options.url);

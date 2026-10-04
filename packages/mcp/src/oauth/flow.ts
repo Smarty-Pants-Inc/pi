@@ -6,6 +6,7 @@
 
 import type { AuthProvider, McpFetch, UnauthorizedContext } from "../auth-provider.ts";
 import { isObject } from "../protocol/jsonrpc.ts";
+import { refuseMcpAdmission } from "../security-admission.ts";
 import {
 	discoverAuthorizationServerMetadata,
 	discoverOAuthServerInfo,
@@ -152,6 +153,7 @@ export async function startAuthorization(
 		resource?: string;
 	},
 ): Promise<{ authorizationUrl: URL; codeVerifier: string }> {
+	refuseMcpAdmission();
 	const metadata = options.metadata;
 	if (metadata && !metadata.response_types_supported.includes("code")) {
 		throw new Error("Authorization server does not support authorization codes");
@@ -178,6 +180,7 @@ async function tokenRequest(
 	options: TokenRequestOptions,
 	params: URLSearchParams,
 ): Promise<OAuthTokens> {
+	refuseMcpAdmission();
 	const url = secureEndpoint(options.metadata?.token_endpoint ?? new URL("/token", authorizationServerUrl));
 	const headers = new Headers({ Accept: "application/json", "content-type": "application/x-www-form-urlencoded" });
 	if (options.resource) params.set("resource", options.resource);
@@ -231,6 +234,7 @@ export async function registerClient(
 		fetch?: McpFetch;
 	},
 ): Promise<OAuthClientInformationFull> {
+	refuseMcpAdmission();
 	const endpoint = options.metadata?.registration_endpoint;
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
@@ -252,6 +256,7 @@ export async function exchangeAuthorizationCode(
 	authorizationServerUrl: string | URL,
 	options: TokenRequestOptions & { code: string; codeVerifier: string; redirectUrl: string | URL },
 ): Promise<OAuthTokens> {
+	refuseMcpAdmission();
 	return tokenRequest(
 		authorizationServerUrl,
 		options,
@@ -268,6 +273,7 @@ export async function refreshAuthorization(
 	authorizationServerUrl: string | URL,
 	options: TokenRequestOptions & { refreshToken: string },
 ): Promise<OAuthTokens> {
+	refuseMcpAdmission();
 	const tokens = await tokenRequest(
 		authorizationServerUrl,
 		options,
@@ -396,6 +402,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 }
 
 export async function authorizeMcp(provider: OAuthClientProvider, options: OAuthFlowOptions): Promise<OAuthFlowResult> {
+	refuseMcpAdmission();
 	try {
 		return await runFlow(provider, options);
 	} catch (error) {
@@ -418,6 +425,7 @@ export async function authorizeMcp(provider: OAuthClientProvider, options: OAuth
  * tokens, a second refresh with the old refresh token would fail and discard the new grant.
  */
 export function adaptOAuthProvider(provider: OAuthClientProvider): AuthProvider {
+	refuseMcpAdmission();
 	let inFlight: Promise<void> | undefined;
 	return {
 		token: async () => (await provider.tokens())?.access_token,

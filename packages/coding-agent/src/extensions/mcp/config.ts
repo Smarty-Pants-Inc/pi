@@ -37,6 +37,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME } from "../../config.ts";
+import { refuseUnreviewedBuiltin } from "../../core/builtin-security-admission.ts";
 import {
 	type McpExposure,
 	type McpServerConfig,
@@ -124,6 +125,7 @@ function readConfigFile(path: string, scope: "global" | "project", state: McpCon
  * `enabled: false`, so they can be enabled again.
  */
 export function loadMcpConfig(options: { agentDir: string; cwd: string; projectTrusted: boolean }): LoadedMcpConfig {
+	refuseUnreviewedBuiltin("mcp");
 	const state: McpConfigState = { servers: new Map(), errors: [] };
 	readConfigFile(join(options.agentDir, "mcp.json"), "global", state);
 	if (options.projectTrusted) readConfigFile(join(options.cwd, CONFIG_DIR_NAME, "mcp.json"), "project", state);
@@ -145,6 +147,7 @@ export interface McpServerConfigPatch {
  * rewritten with its indentation.
  */
 export function updateMcpServerConfig(path: string, name: string, patch: McpServerConfigPatch): void {
+	refuseUnreviewedBuiltin("mcp");
 	editMcpServers(path, (servers) => {
 		const server = servers?.[name];
 		if (!isRecord(server)) throw new Error(`${path} does not define MCP server "${name}"`);
@@ -165,6 +168,7 @@ export function updateMcpServerConfig(path: string, name: string, patch: McpServ
  * name is replaced. Returns true when an entry was replaced.
  */
 export function addMcpServerConfig(path: string, name: string, config: McpServerConfig): boolean {
+	refuseUnreviewedBuiltin("mcp");
 	let replaced = false;
 	editMcpServers(path, (servers, parsed) => {
 		const target = servers ?? Object.create(null);
@@ -178,6 +182,7 @@ export function addMcpServerConfig(path: string, name: string, config: McpServer
 
 /** Remove a server from an `mcp.json`. Returns false when the file does not define it. */
 export function removeMcpServerConfig(path: string, name: string): boolean {
+	refuseUnreviewedBuiltin("mcp");
 	if (!existsSync(path)) return false;
 	let removed = false;
 	editMcpServers(path, (servers) => {

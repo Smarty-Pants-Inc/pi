@@ -33,6 +33,7 @@ import {
 	type SupportedProtocolVersion,
 	type Tool,
 } from "./protocol/types.ts";
+import { refuseMcpAdmission } from "./security-admission.ts";
 import type { McpTransport } from "./transports/transport.ts";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
@@ -169,6 +170,7 @@ export class McpClient {
 	private disposers: (() => void)[] = [];
 
 	constructor(options: McpClientOptions) {
+		refuseMcpAdmission();
 		this.options = Object.freeze({ ...options });
 		this.requestHandlers.set("ping", () => ({}));
 		const roots = options.roots;

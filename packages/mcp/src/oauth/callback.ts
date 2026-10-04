@@ -1,4 +1,5 @@
 import { createServer, type Server, type ServerResponse } from "node:http";
+import { refuseMcpAdmission } from "../security-admission.ts";
 
 export interface OAuthCallback {
 	code: string;
@@ -59,6 +60,7 @@ export class OAuthCallbackServer {
 	}
 
 	static async listen(options: OAuthCallbackServerOptions = {}): Promise<OAuthCallbackServer> {
+		refuseMcpAdmission();
 		const host = options.host ?? "127.0.0.1";
 		const redirectHost = options.redirectHost ?? host;
 		const path = options.path ?? "/callback";

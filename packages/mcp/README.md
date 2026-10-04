@@ -1,5 +1,7 @@
 # @earendil-works/pi-mcp
 
+> **Fork security admission:** Codemode and MCP are disabled pending a reviewed re-enable. Existing configuration, `+builtin:codemode`, `+builtin:mcp`, `-e builtin:<name>`, SDK factory activation, and standalone package APIs cannot activate them in this revision. See `packages/coding-agent/docs/security-reenable.md`. The examples below describe the deferred feature, not an available admission.
+
 A small, standalone Model Context Protocol client. It does not depend on the official MCP SDK or other pi packages.
 
 The package provides a transport-neutral client core, stdio and Streamable HTTP transports, and an in-memory testing transport.

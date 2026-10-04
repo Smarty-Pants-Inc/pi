@@ -1,5 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { toCodemodeIdentifier } from "../identifier.ts";
+import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type {
 	CodemodeCall,
 	CodemodeCallStatus,
@@ -379,6 +380,7 @@ export class CodemodeSandbox {
 	private closed = false;
 
 	constructor(options: CodemodeSandboxOptions = {}) {
+		refuseCodemodeAdmission();
 		this.timeoutMs = Math.min(
 			Number.isFinite(options.timeoutMs) ? Math.max(1, options.timeoutMs!) : DEFAULT_TIMEOUT_MS,
 			MAX_EXECUTION_MS,

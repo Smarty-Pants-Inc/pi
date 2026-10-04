@@ -1,3 +1,4 @@
+import { refuseMcpAdmission } from "../security-admission.ts";
 import type { OAuthClientProvider } from "./flow.ts";
 import type { OAuthClientInformationMixed, OAuthClientMetadata, OAuthDiscoveryState, OAuthTokens } from "./types.ts";
 
@@ -50,6 +51,7 @@ export class McpOAuthProvider implements OAuthClientProvider {
 	private writes: Promise<void> = Promise.resolve();
 
 	constructor(options: McpOAuthProviderOptions) {
+		refuseMcpAdmission();
 		this.serverUrl = String(new URL(options.serverUrl));
 		this.redirectUrl = String(options.redirectUrl);
 		this.clientMetadata = {
