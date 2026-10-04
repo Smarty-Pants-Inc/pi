@@ -3329,6 +3329,31 @@ export class AgentSession {
 		}
 	}
 
+	private async _runCompactionCompletion<T>(
+		callback: (value: T, context: CompactionCompletionContext) => void | Promise<void>,
+		value: T,
+	): Promise<void> {
+		// Each invocation has its own lifetime, including the onComplete -> onError handoff.
+		let active = true;
+		const context: CompactionCompletionContext = {
+			waitForIdle: async () => {
+				if (active) await this._waitForOperationIdle();
+				// An escaping join loses its exemption when its callback returns.
+				if (!active) await this.waitForIdle();
+			},
+			abort: async () => {
+				await this._abort(!active);
+				if (!active) await this.waitForIdle();
+			},
+		};
+		try {
+			const continuation = callback(value, context);
+			if (continuation) await continuation;
+		} finally {
+			active = false;
+		}
+	}
+
 	private async _waitForOperationIdle(): Promise<void> {
 		while (!this._isOperationIdle) {
 			this._operationIdleWait ??= new Promise<void>((resolve) => {
@@ -4687,24 +4712,18 @@ export class AgentSession {
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
-					// Explicit capability, never async ancestry: callback-owned joins exclude ALL
-					// callbacks so nested/concurrent completions cannot form a wait cycle.
-					// Once this completion returns, captured capabilities become external joins.
-					const context: CompactionCompletionContext = {
-						waitForIdle: () =>
-							this._compactionCompletions.has(completion) ? this._waitForOperationIdle() : this.waitForIdle(),
-						abort: () => this._abort(!this._compactionCompletions.has(completion)),
-					};
-					const completion = (async () => {
-						try {
-							const result = await this.compact(options?.customInstructions);
-							await options?.onComplete?.(result, context);
-						} catch (error) {
-							const err = error instanceof Error ? error : new Error(String(error));
-							if (!options?.onError) throw err;
-							await options.onError(err, context);
-						}
-					})()
+					// Register custody before options getters or synchronous error callbacks run.
+					const completion = Promise.resolve()
+						.then(async () => {
+							try {
+								const result = await this.compact(options?.customInstructions);
+								if (options?.onComplete) await this._runCompactionCompletion(options.onComplete, result);
+							} catch (error) {
+								const err = error instanceof Error ? error : new Error(String(error));
+								if (!options?.onError) throw err;
+								await this._runCompactionCompletion(options.onError, err);
+							}
+						})
 						.catch((error: unknown) => {
 							try {
 								this._extensionRunner.emitError({

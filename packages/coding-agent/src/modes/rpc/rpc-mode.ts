@@ -1093,6 +1093,7 @@ export async function runRpcMode(
 					terminalCancellation.abort(new Error(`RPC terminal shutdown exceeded ${TERMINAL_COMMAND_JOIN_MS} ms`)),
 				TERMINAL_COMMAND_JOIN_MS,
 			);
+			let currentSessionJoined = false;
 			try {
 				try {
 					await raceWithAbortSignal(startupBinding ?? Promise.resolve(), commandDeadline);
@@ -1104,6 +1105,7 @@ export async function runRpcMode(
 				}
 				try {
 					await raceWithAbortSignal(session.abort(), commandDeadline);
+					currentSessionJoined = true;
 					await raceWithAbortSignal(
 						Promise.allSettled([...pendingCommandWork, ...pendingOperations.keys()]),
 						commandDeadline,
@@ -1122,7 +1124,11 @@ export async function runRpcMode(
 				unsubscribe?.();
 				unsubscribeBackpressure?.();
 				try {
-					await raceWithAbortSignal(runtimeHost.dispose(), commandDeadline);
+					// Raw self-joins have already exhausted their bounded join allowance. Do not
+					// restart that join in dispose, or lend its expired signal to a live runtime.
+					if (!currentSessionJoined) throw commandDeadline.reason;
+					// Retired commands cannot spend the current runtime's shutdown dispatch budget.
+					await runtimeHost.dispose();
 				} catch {
 					// A deadline is an incomplete disposition, not successful cleanup. Do
 					// not let shutdown rejection prevent final output drainage and retirement.
