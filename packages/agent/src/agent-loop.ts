@@ -223,14 +223,19 @@ async function runLoop(
 			if (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages) break;
 			contextOnlyTurn = false;
 
-			const requestUpdate = await config.prepareRequest?.(
-				{
-					context: currentContext,
-					model: config.model,
-					thinkingLevel: config.reasoning ?? "off",
-				},
-				signal,
-			);
+			// Queued input still reaches the provider with the aborted signal, as upstream does.
+			// Do not re-enter request preparation (routing/compaction/state admission) for
+			// an already-cancelled turn. Cancellation during preparation keeps its guards.
+			const requestUpdate = signal?.aborted
+				? undefined
+				: await config.prepareRequest?.(
+						{
+							context: currentContext,
+							model: config.model,
+							thinkingLevel: config.reasoning ?? "off",
+						},
+						signal,
+					);
 			if (requestUpdate) {
 				currentContext = requestUpdate.context ?? currentContext;
 				config = {
@@ -689,15 +694,6 @@ async function executeToolCallsParallel(
 					signal,
 				},
 				async () => {
-					if (signal?.aborted) {
-						const finalized = {
-							toolCall,
-							result: createErrorToolResult("Operation aborted"),
-							isError: true,
-						} satisfies FinalizedToolCallOutcome;
-						await emitToolExecutionEnd(finalized, emit);
-						return finalized;
-					}
 					const executed = await executePreparedToolCall(
 						preparation,
 						signal,
@@ -711,6 +707,17 @@ async function executeToolCallsParallel(
 						config,
 						signal,
 					);
+					await emitToolExecutionEnd(finalized, emit);
+					return finalized;
+				},
+				async () => {
+					// #8935: start was emitted before preflight. Refused admission still
+					// owes one end, but must not execute or invoke result hooks.
+					const finalized = {
+						toolCall,
+						result: createErrorToolResult("Operation aborted"),
+						isError: true,
+					} satisfies FinalizedToolCallOutcome;
 					await emitToolExecutionEnd(finalized, emit);
 					return finalized;
 				},

@@ -20,10 +20,18 @@ export class ToolCallQueue {
 		return this.active.has(id);
 	}
 
-	async run<T>(admission: ToolCallAdmission, execute: () => Promise<T>): Promise<T> {
-		const release = await this.acquire(admission);
+	/** onAborted settles a started pipeline only when admission is refused by cancellation. */
+	async run<T>(admission: ToolCallAdmission, execute: () => Promise<T>, onAborted?: () => Promise<T>): Promise<T> {
+		let release: (() => void) | undefined;
 		try {
+			release = await this.acquire(admission);
 			admission.signal?.throwIfAborted();
+		} catch (error) {
+			release?.();
+			if (admission.signal?.aborted && onAborted) return await onAborted();
+			throw error;
+		}
+		try {
 			return await execute();
 		} finally {
 			release();
