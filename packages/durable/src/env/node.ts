@@ -288,9 +288,40 @@ function killProcessTree(pid: number): void {
 	}
 }
 
+/** Join group retirement, not pipe/leader settlement. Linux zombies are dead and belong to their reaper. */
+async function waitForProcessGroup(pgid: number): Promise<void> {
+	const deadline = Date.now() + 2000;
+	for (;;) {
+		try {
+			process.kill(-pgid, 0);
+		} catch (error) {
+			if (isNodeError(error) && error.code === "ESRCH") return;
+			throw error;
+		}
+		if (process.platform === "linux") {
+			let live = false;
+			for (const name of await readdir("/proc")) {
+				if (!/^\d+$/.test(name)) continue;
+				let stat: string;
+				try {
+					stat = await readFile(`/proc/${name}/stat`, "utf8");
+				} catch (error) {
+					if (isNodeError(error) && (error.code === "ENOENT" || error.code === "ESRCH")) continue;
+					throw error;
+				}
+				const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+				if (Number(fields[2]) === pgid && fields[0] !== "Z" && fields[0] !== "X") live = true;
+			}
+			if (!live) return;
+		}
+		if (Date.now() >= deadline) throw new Error(`Process group ${pgid} did not retire within 2000ms`);
+		await new Promise<void>((resolveWait) => setTimeout(resolveWait, 10));
+	}
+}
 function waitForChildProcess(
 	child: ChildProcess,
 	spillIsDraining: () => boolean,
+	retireGroup: () => Promise<void>,
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
 	return new Promise((resolvePromise, reject) => {
 		let settled = false;
@@ -317,7 +348,7 @@ function waitForChildProcess(
 			cleanup();
 			child.stdout?.destroy();
 			child.stderr?.destroy();
-			resolvePromise({ code: exitCode, signal: exitSignal });
+			void retireGroup().then(() => resolvePromise({ code: exitCode, signal: exitSignal }), reject);
 		};
 		const maybeFinalizeAfterExit = (): void => {
 			if (exited && stdoutEnded && stderrEnded) finalize();
@@ -344,7 +375,9 @@ function waitForChildProcess(
 			if (settled) return;
 			settled = true;
 			cleanup();
-			reject(error);
+			child.stdout?.destroy();
+			child.stderr?.destroy();
+			void retireGroup().then(() => reject(error), reject);
 		};
 		const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
 			exited = true;
@@ -440,7 +473,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 	cwd: string;
 	private shellPath?: string;
 	private shellEnv?: NodeJS.ProcessEnv;
-	private activeChildPids = new Set<number>();
+	private activeChildGroups = new Map<number, { retire: () => Promise<void>; done: Promise<void> }>();
 
 	constructor(options: { cwd: string; shellPath?: string; shellEnv?: NodeJS.ProcessEnv }) {
 		this.cwd = options.cwd;
@@ -484,6 +517,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 		}
 
 		return await new Promise((resolvePromise) => {
+			const { promise: childDone, resolve: finishChild } = Promise.withResolvers<void>();
 			let settled = false;
 			let timedOut = false;
 			let callbackError: ExecutionError | undefined;
@@ -497,8 +531,35 @@ export class NodeExecutionEnv implements ExecutionEnv {
 			let spillStream: WriteStream | undefined;
 			let spillBackpressured = false;
 
+			let retirement: Promise<void> | undefined;
+			let retirementFailed = false;
+			const retireGroup = (): Promise<void> => {
+				if (retirement !== undefined) return retirement;
+				const pid = child?.pid;
+				if (pid === undefined || process.platform === "win32") return Promise.resolve();
+				// Signal once at pipe settlement/abort, while group custody is retained; no later escalation timer.
+				// No positive-PID fallback: an absent group is retired, not a reason to signal a potentially reused leader PID.
+				retirement = (async () => {
+					try {
+						process.kill(-pid, "SIGKILL");
+					} catch (error) {
+						if (isNodeError(error) && error.code === "ESRCH") return;
+						throw error;
+					}
+					await waitForProcessGroup(pid);
+				})().catch((error: unknown) => {
+					retirementFailed = true;
+					const cause = toError(error);
+					throw new ExecutionError("unknown", `Failed to retire process group ${pid}: ${cause.message}`, cause);
+				});
+				return retirement;
+			};
 			const onAbort = () => {
-				if (child?.pid) killProcessTree(child.pid);
+				if (process.platform === "win32") {
+					if (child?.pid) killProcessTree(child.pid);
+				} else {
+					void retireGroup().catch(() => {});
+				}
 			};
 			const failCallback = (error: unknown) => {
 				if (callbackError !== undefined) return;
@@ -527,8 +588,9 @@ export class NodeExecutionEnv implements ExecutionEnv {
 				settled = true;
 				if (timeoutId) clearTimeout(timeoutId);
 				if (signal) signal.removeEventListener("abort", onAbort);
-				if (child?.pid) this.activeChildPids.delete(child.pid);
+				if (child?.pid && !retirementFailed) this.activeChildGroups.delete(child.pid);
 				resolvePromise(result);
+				finishChild();
 			};
 			const pauseOutput = () => {
 				child?.stdout?.pause();
@@ -604,7 +666,13 @@ export class NodeExecutionEnv implements ExecutionEnv {
 						windowsHide: true,
 					},
 				);
-				if (child.pid) this.activeChildPids.add(child.pid);
+				if (child.pid) {
+					const pid = child.pid;
+					this.activeChildGroups.set(pid, {
+						retire: process.platform === "win32" ? async () => killProcessTree(pid) : retireGroup,
+						done: process.platform === "win32" ? Promise.resolve() : childDone,
+					});
+				}
 				if (commandFromStdin) {
 					child.stdin?.on("error", () => {});
 					child.stdin?.end(command);
@@ -656,6 +724,7 @@ export class NodeExecutionEnv implements ExecutionEnv {
 					spillError === undefined &&
 					spillStart !== undefined &&
 					(spillStream === undefined || spillBackpressured),
+				retireGroup,
 			).then(
 				async ({ code, signal: exitSignal }) => {
 					await finishSpill();
@@ -685,7 +754,12 @@ export class NodeExecutionEnv implements ExecutionEnv {
 					const exitCode = code ?? (exitSignal ? 128 + (osConstants.signals[exitSignal] ?? 0) : 1);
 					settle(ok({ exitCode, ...(spillPath === undefined ? {} : { spillPath }) }));
 				},
-				(error: Error) => settle(err(new ExecutionError("spawn_error", error.message, error))),
+				(error: Error) =>
+					settle(
+						err(
+							error instanceof ExecutionError ? error : new ExecutionError("spawn_error", error.message, error),
+						),
+					),
 			);
 		});
 	}
@@ -951,7 +1025,11 @@ export class NodeExecutionEnv implements ExecutionEnv {
 	}
 
 	async cleanup(_context: Context): Promise<void> {
-		for (const pid of this.activeChildPids) killProcessTree(pid);
-		this.activeChildPids.clear();
+		await Promise.all(
+			[...this.activeChildGroups.values()].map(async (group) => {
+				await group.retire();
+				await group.done;
+			}),
+		);
 	}
 }

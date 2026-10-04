@@ -24,6 +24,13 @@ import type {
 } from "../types.ts";
 import { agentHooks } from "./agent.ts";
 import { readContext } from "./context.ts";
+import {
+	bindDeferredCustody,
+	type DeferredReceipt,
+	DeferredReceiptsDoc,
+	type DeferredReceiptsState,
+	type PollCheckpoint,
+} from "./live.ts";
 import type {
 	Agent,
 	AnyTask,
@@ -154,6 +161,8 @@ export type TaskSchedulerOptions = {
 	) => Promise<ConversationHandle | undefined>;
 	/** Context for scheduler commits and invocations; carries no caller cancellation. */
 	readonly context: Context;
+	/** Receipt-only retirement writes for owned invocations, joined before Storage closes. */
+	readonly retireReceipt: (change: (tx: Transaction) => Promise<void>) => Promise<void>;
 };
 
 /**
@@ -185,6 +194,12 @@ export class TaskScheduler {
 	readonly #withdrawInputs: TaskSchedulerOptions["withdrawInputs"];
 	readonly #conversation: TaskSchedulerOptions["conversation"];
 	readonly #context: Context;
+	readonly #retireReceipt: TaskSchedulerOptions["retireReceipt"];
+	readonly #receipts = new Map<TaskId, DeferredReceipt>();
+	readonly #receiptCleanup = new Map<TaskId, Promise<void>>();
+	/** A failed retirement commit requires reopen; never spin or discard its last durable receipt. */
+	readonly #receiptBlocked = new Set<TaskId>();
+	readonly #receiptController = new AbortController();
 	readonly #live = new Map<TaskId, AnyTaskRecord>();
 	readonly #invocations = new Map<TaskId, Invocation>();
 	readonly #taskWaiters = new Waiters<TaskId, SettledTask<JsonValue>>();
@@ -225,6 +240,7 @@ export class TaskScheduler {
 		this.#withdrawInputs = options.withdrawInputs;
 		this.#conversation = options.conversation;
 		this.#context = options.context;
+		this.#retireReceipt = options.retireReceipt;
 	}
 
 	/** Load live tasks and change surviving `running` tasks back to `pending`. Dispatches nothing. */
@@ -232,17 +248,56 @@ export class TaskScheduler {
 		this.#session.subscribeCommits((publication) => this.#observe(publication));
 		this.#session.subscribeClose(() => this.#seal());
 		this.#unsubscribeRegistry = this.#registry.subscribe(() => this.#kick());
+		this.#loadReceipts((await this.#session.snapshot(DeferredReceiptsDoc, context)) ?? { receipts: {} });
 		await this.#session.commitWith(async (tx) => {
 			// Every table read before the first write.
 			const scans = [];
 			for (const status of LIVE_STATUSES) {
 				scans.push(await scanAll((cursor) => tx.scanTasks({ status }, SCAN_PAGE_SIZE, cursor)));
 			}
+			// Poll checkpoints are receipts too, including a checkpoint persisted before the ledger existed.
+			const unjournaled = scans
+				.flat()
+				.filter(
+					(record) =>
+						record.kind === "pi.generation" &&
+						record.state.status !== "completing" &&
+						record.state.status !== "terminal" &&
+						(record.state.checkpoint as Checkpoint).phase === "poll" &&
+						!this.#receipts.has(record.id),
+				);
+			if (unjournaled.length > 0) {
+				const ledger = await tx.doc(DeferredReceiptsDoc);
+				for (const record of unjournaled) {
+					const receipt: DeferredReceipt = {
+						taskId: record.id,
+						status: record.abortRequested ? "cancel_pending" : "accepted",
+						checkpoint: record.state.checkpoint as unknown as PollCheckpoint,
+					};
+					ledger.receipts[String(record.id)] = copyJson(receipt) as DeferredReceiptsState["receipts"][string];
+				}
+				this.#loadReceipts(ledger);
+			}
 			for (const records of scans) {
 				for (const record of records) {
 					this.#live.set(record.id, record);
-					if (record.state.status === "running") {
-						tx.setTask(withState(record, { status: "pending", checkpoint: record.state.checkpoint }));
+					if (record.state.status === "completing" || record.state.status === "terminal") continue;
+					const receipt = this.#receipts.get(record.id);
+					// Reconcile acceptance before any surviving request can be resent.
+					const checkpoint =
+						receipt?.status === "accepted" && (record.state.checkpoint as Checkpoint).phase === "request"
+							? receipt.checkpoint
+							: undefined;
+					if (record.state.status === "running" || checkpoint !== undefined) {
+						tx.setTask(
+							withState(record, {
+								status: "pending",
+								checkpoint:
+									checkpoint === undefined
+										? record.state.checkpoint
+										: copyJson(checkpoint, { omitUndefinedProperties: true }),
+							}),
+						);
 					}
 					if (record.state.status === "waiting" && record.state.policy === "failFast") {
 						this.#failFastChecks.add(record.id);
@@ -263,7 +318,10 @@ export class TaskScheduler {
 
 	/** Wait for every invocation signalled by `#seal()`. Writes nothing. */
 	async join(): Promise<void> {
-		await Promise.allSettled([...this.#invocations.values()].map((invocation) => invocation.done));
+		await Promise.allSettled([
+			...[...this.#invocations.values()].map((invocation) => invocation.done),
+			...this.#receiptCleanup.values(),
+		]);
 	}
 
 	/**
@@ -349,6 +407,16 @@ export class TaskScheduler {
 		const updated: AnyTaskRecord[] = [];
 		const failed: TaskId[] = [];
 		let changed = false;
+		for (const change of publication.changes) {
+			if (
+				change.type === "document" &&
+				change.record.kind === DeferredReceiptsDoc.definition.kind &&
+				change.value !== null
+			) {
+				this.#loadReceipts(change.value as DeferredReceiptsState);
+				changed = true;
+			}
+		}
 		for (const change of publication.changes) {
 			if (change.type !== "task") continue;
 			changed = true;
@@ -665,6 +733,7 @@ export class TaskScheduler {
 	/** Close listener: runs synchronously once admission is sealed, before `join()`. */
 	#seal(): void {
 		this.#closing = true;
+		this.#receiptController.abort();
 		this.#unsubscribeRegistry();
 		const error = closedError();
 		this.#taskWaiters.rejectAll(error);
@@ -684,6 +753,7 @@ export class TaskScheduler {
 		try {
 			while (this.#dirty && this.#enabled && !this.#closing) {
 				this.#dirty = false;
+				this.#startReceiptCleanup();
 				for (const reservation of await this.#reserve()) this.#start(reservation);
 			}
 		} catch (error) {
@@ -706,6 +776,14 @@ export class TaskScheduler {
 				// Taken once per pass, and only when some task is a candidate.
 				let snapshot: RegistrySnapshot | undefined;
 				for (const record of [...this.#live.values()]) {
+					const receipt = this.#receipts.get(record.id);
+					// A failed cleanup may end the user run, but its session receipt remains in independent custody.
+					const abortAfterFailure = record.abortRequested && receipt?.status === "cancel_failed";
+					if (
+						!abortAfterFailure &&
+						(this.#receiptCleanup.has(record.id) || (receipt !== undefined && this.#needsReceiptCleanup(receipt)))
+					)
+						continue;
 					if (this.#invocations.has(record.id) || this.#waitingOn(record, owned).length > 0) continue;
 					if (record.state.status === "completing") continue;
 					const runnable = record as RunnableTaskRecord;
@@ -884,6 +962,8 @@ export class TaskScheduler {
 	): Decision {
 		// 3. abort mark: end; a fresh abort invocation starts once the task's ordinary owned work is gone.
 		if (current.abortRequested) return false;
+		const receipt = this.#receipts.get(current.id);
+		if (receipt !== undefined && this.#needsReceiptCleanup(receipt)) return false;
 		if (previous === undefined) return true;
 		// 4. uncaught error.
 		if (previous.failure !== undefined) return { fault: previous.failure.error };
@@ -1043,6 +1123,118 @@ export class TaskScheduler {
 		return true;
 	}
 
+	// ─── Deferred receipt custody ────────────────────────────────────────────
+
+	#loadReceipts(state: DeferredReceiptsState): void {
+		this.#receipts.clear();
+		for (const receipt of Object.values(state.receipts)) {
+			const detached = copyJson(receipt) as unknown as DeferredReceipt;
+			this.#receipts.set(detached.taskId, detached);
+		}
+	}
+
+	/** Only an active generation can accept; abort/close do not erase a provider's receipt. */
+	#acceptReceipt(invocation: Invocation, checkpoint: PollCheckpoint): Promise<void> {
+		return this.#retireReceipt(async (tx) => {
+			if (invocation.ended || invocation.mode !== "run") throw endedError(invocation);
+			const current = await tx.task(invocation.taskId);
+			if (current?.kind !== "pi.generation" || current.state.status !== "running") throw endedError(invocation);
+			const ledger = await tx.doc(DeferredReceiptsDoc);
+			const receipt: DeferredReceipt = {
+				taskId: invocation.taskId,
+				status: current.abortRequested ? "cancel_pending" : "accepted",
+				checkpoint,
+			};
+			ledger.receipts[String(invocation.taskId)] = copyJson(receipt, {
+				omitUndefinedProperties: true,
+			}) as DeferredReceiptsState["receipts"][string];
+			// Adoption and receipt retention are atomic, independent of ordinary run-write gates.
+			tx.setTask(
+				withState(current, {
+					status: "running",
+					checkpoint: copyJson(checkpoint, { omitUndefinedProperties: true }),
+				}),
+			);
+		});
+	}
+
+	#resolveReceipt(invocation: Invocation): Promise<void> {
+		if (!this.#receipts.has(invocation.taskId)) return Promise.resolve();
+		return this.#retireReceipt(async (tx) => {
+			if (invocation.ended || invocation.mode !== "run") throw endedError(invocation);
+			delete (await tx.doc(DeferredReceiptsDoc)).receipts[String(invocation.taskId)];
+		});
+	}
+
+	#needsReceiptCleanup(receipt: DeferredReceipt): boolean {
+		const record = this.#live.get(receipt.taskId);
+		return (
+			receipt.status !== "accepted" ||
+			record === undefined ||
+			record.abortRequested ||
+			record.state.status === "completing" ||
+			(record.state.checkpoint as Checkpoint).phase !== "poll"
+		);
+	}
+
+	/** One cancellable, joined cleanup per receipt. Failed/missing cancellation retains durable custody. */
+	#startReceiptCleanup(): void {
+		for (const receipt of this.#receipts.values()) {
+			const id = receipt.taskId;
+			if (
+				this.#receiptBlocked.has(id) ||
+				this.#invocations.has(id) ||
+				this.#receiptCleanup.has(id) ||
+				!this.#needsReceiptCleanup(receipt)
+			)
+				continue;
+			const signal = this.#receiptController.signal;
+			const cleanup = (async () => {
+				while (!signal.aborted && this.#receipts.has(id)) {
+					try {
+						await this.#retireReceipt(async (tx) => {
+							const ledger = await tx.doc(DeferredReceiptsDoc);
+							const stored = ledger.receipts[String(id)];
+							if (stored !== undefined) stored.status = "cancel_pending";
+						});
+						signal.throwIfAborted();
+						const ref = receipt.checkpoint.model;
+						const model = this.#models.getModel(ref.provider, ref.modelId);
+						if (model === undefined)
+							throw new Error(`Deferred cancellation model ${ref.provider}/${ref.modelId} is unavailable`);
+						await this.#models.cancelDeferred(model, receipt.checkpoint.handle, { signal });
+						// A confirmed cancellation arriving during close still resolves its owned receipt.
+						await this.#retireReceipt(async (tx) => {
+							delete (await tx.doc(DeferredReceiptsDoc)).receipts[String(id)];
+						});
+						return;
+					} catch (error) {
+						if (signal.aborted) return;
+						this.#report(error);
+						await this.#retireReceipt(async (tx) => {
+							const stored = (await tx.doc(DeferredReceiptsDoc)).receipts[String(id)];
+							if (stored !== undefined) stored.status = "cancel_failed";
+						});
+					}
+					try {
+						await delay(5000, signal);
+					} catch {
+						return;
+					}
+				}
+			})()
+				.catch((error: unknown) => {
+					this.#receiptBlocked.add(id);
+					if (!this.#closing) this.#report(error);
+				})
+				.finally(() => {
+					this.#receiptCleanup.delete(id);
+					this.#kick();
+				});
+			this.#receiptCleanup.set(id, cleanup);
+		}
+	}
+
 	// ─── Invocation runtime ──────────────────────────────────────────────────
 
 	#runtime(invocation: Invocation, phase: Phase): ErasedRuntime {
@@ -1071,7 +1263,7 @@ export class TaskScheduler {
 			},
 		};
 		const settings = this.#settings;
-		return {
+		const runtime: ErasedRuntime = {
 			taskId: invocation.taskId as TaskId<JsonValue>,
 			conversationId: invocation.conversationId,
 			signal: invocation.controller.signal,
@@ -1178,6 +1370,13 @@ export class TaskScheduler {
 				this.#report(error);
 			},
 		};
+		if (phase.task().definition.name === "pi.generation") {
+			bindDeferredCustody(runtime, {
+				accept: (checkpoint) => this.#acceptReceipt(invocation, checkpoint),
+				resolve: () => this.#resolveReceipt(invocation),
+			});
+		}
+		return runtime;
 	}
 
 	/** Run a committed-state read unless the invocation has ended. */
@@ -1310,6 +1509,7 @@ function canReserve(task: AnyTask, record: AnyTaskRecord): boolean {
 }
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
+	if (signal.aborted) return Promise.reject(signal.reason);
 	return new Promise((resolve, reject) => {
 		const onAbort = (): void => {
 			clearTimeout(timer);

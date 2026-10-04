@@ -195,6 +195,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 				return record === undefined ? undefined : boundConversation(id, binding, this.#submissions, this.#tasks);
 			},
 			context: withoutAbortSignal(context),
+			retireReceipt: (change) => this.commitRetirementWith(change, context),
 		});
 		this.#submissions = new Submissions(this, storage, now, settings, () => this.#tasks.resume());
 		this.#taskGraph = new TaskGraphView(this, storage);
@@ -323,7 +324,7 @@ class HarnessImpl<Tool extends ToolRegistration> extends SessionImpl implements 
 		return super.close(context);
 	}
 
-	/** Join task invocations after admission is sealed and before Storage closes; writes no task outcome. */
+	/** Join invocations and receipt retirement after admission is sealed, before Storage closes. */
 	protected override beforeClose(): Promise<void> {
 		return this.#tasks.join();
 	}
