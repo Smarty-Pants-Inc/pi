@@ -490,6 +490,8 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	/** Includes completion/error observers of fire-and-forget extension compaction. */
 	private readonly _compactionCompletions = new Set<Promise<void>>();
+	/** Only a retained callback descendant may exclude its own completion from an idle join. */
+	private readonly _compactionCompletionScope = new AsyncLocalStorage<{ completion?: Promise<void> }>();
 	private _operationIdleWait: Promise<void> | undefined;
 	private _resolveOperationIdleWait: (() => void) | undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -3331,6 +3333,22 @@ export class AgentSession {
 	}
 
 	async waitForIdle(): Promise<void> {
+		const ownCompletion = this._compactionCompletionScope.getStore()?.completion;
+		if (ownCompletion && this._compactionCompletions.has(ownCompletion)) {
+			// The callback cannot join its own return. External callers still use true idle,
+			// and this caller still joins every operation and every other completion.
+			while (true) {
+				if (!this._isOperationIdle) {
+					this._operationIdleWait ??= new Promise<void>((resolve) => {
+						this._resolveOperationIdleWait = resolve;
+					});
+					await this._operationIdleWait;
+				}
+				const others = [...this._compactionCompletions].filter((completion) => completion !== ownCompletion);
+				if (this._isOperationIdle && others.length === 0) return;
+				await Promise.all(others);
+			}
+		}
 		if (this.isIdle) {
 			return;
 		}
@@ -4678,14 +4696,15 @@ export class AgentSession {
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
+					const scope: { completion?: Promise<void> } = {};
 					const completion = (async () => {
 						try {
 							const result = await this.compact(options?.customInstructions);
-							await options?.onComplete?.(result);
+							await this._compactionCompletionScope.run(scope, () => options?.onComplete?.(result));
 						} catch (error) {
 							const err = error instanceof Error ? error : new Error(String(error));
 							if (!options?.onError) throw err;
-							await options.onError(err);
+							await this._compactionCompletionScope.run(scope, () => options.onError?.(err));
 						}
 					})()
 						.catch((error: unknown) => {
@@ -4703,6 +4722,7 @@ export class AgentSession {
 							this._compactionCompletions.delete(completion);
 							this._resolveIdleWaitIfIdle();
 						});
+					scope.completion = completion;
 					this._compactionCompletions.add(completion);
 				},
 				getSystemPrompt: () => this.systemPrompt,
