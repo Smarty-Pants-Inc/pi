@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	answerFromProbabilities,
 	classify,
@@ -403,3 +403,39 @@ function completionDepths(requests: RecordedRequest[]): number[] {
 		.filter((request) => request.url.endsWith("/completion"))
 		.map((request) => Number(request.body.n_probs));
 }
+
+// PR #131 P2-22: cold tokenization work must not borrow another caller's cancellation.
+it("aborting a cold classifier does not fail a concurrent live classifier", async () => {
+	const classifierModel = model();
+	const questions: ClassifierContext = {
+		state: {},
+		questions: { pick: { type: "choice", instructions: "Pick", criteria: { a: "", b: "" } } },
+	};
+	const controller = new AbortController();
+	const server = fakeServer();
+	let pending = 0;
+	const heldFetch: typeof server.fetch = (input, init) => {
+		if (!String(input).endsWith("/tokenize")) return server.fetch(input, init);
+		pending++;
+		return new Promise<Response>((_resolve, reject) => {
+			init?.signal?.addEventListener("abort", () => reject(new Error("first caller cancelled")), { once: true });
+		});
+	};
+	const first = classify(classifierModel, questions, { signal: controller.signal, fetch: heldFetch, maxRetries: 0 });
+	let second: ReturnType<typeof classify> | undefined;
+	try {
+		await vi.waitFor(() => expect(pending).toBeGreaterThan(0));
+		second = classify(classifierModel, questions, { fetch: server.fetch, maxRetries: 0 });
+		await vi.waitFor(() =>
+			expect(server.requests.some((request) => request.url.endsWith("/apply-template"))).toBe(true),
+		);
+		controller.abort();
+		const [aborted, live] = await Promise.all([first, second]);
+		expect(aborted.stopReason).toBe("aborted");
+		expect(live.stopReason).toBe("stop");
+		expect(server.requests.filter((request) => request.url.endsWith("/tokenize")).length).toBeGreaterThan(0);
+	} finally {
+		controller.abort();
+		await Promise.allSettled([first, ...(second ? [second] : [])]);
+	}
+});

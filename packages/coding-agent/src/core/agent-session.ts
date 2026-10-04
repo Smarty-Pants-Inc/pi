@@ -25,6 +25,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
@@ -94,6 +95,7 @@ import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
 	type AgentActivityOutcome,
 	type BoundaryContextPreview,
+	type CompactionCompletionContext,
 	type ContextUsage,
 	type ExecuteToolOptions,
 	type ExtensionCommandContextActions,
@@ -487,6 +489,11 @@ export class AgentSession {
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
+	/** Includes completion/error observers of fire-and-forget extension compaction. */
+	private readonly _compactionCompletions = new Set<Promise<void>>();
+	/** Real operation joins are separate from retained callback continuations. */
+	private _operationIdleWait: Promise<void> | undefined;
+	private _resolveOperationIdleWait: (() => void) | undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _stopAfterCompactionFailure = false;
 	/** Settlement outcome of the compaction that stopped the run; a later synthetic turn_end cannot replace it. */
@@ -572,6 +579,8 @@ export class AgentSession {
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	/** Created on the first `ctx.executeTool()` call. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
+	/** Retains parent attribution when SDK hosts wrap the public tool hooks. */
+	private readonly _nestedToolCallParents = new WeakMap<AgentToolCall, string>();
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -755,8 +764,10 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
-		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.beforeToolCall = (context) =>
+			this._beforeToolCall(context, this._nestedToolCallParents.get(context.toolCall));
+		this.agent.afterToolCall = (context) =>
+			this._afterToolCall(context, this._nestedToolCallParents.get(context.toolCall));
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -846,16 +857,21 @@ export class AgentSession {
 	}
 
 	/** Run a call made through `ctx.executeTool()` through the session's tool pipeline. */
-	private async _executeNestedToolCall(
+	private _executeNestedToolCall(
 		parentToolCallId: string,
 		name: string,
 		args: unknown,
 		options: ExecuteToolOptions,
 	): Promise<AgentToolCallOutcome> {
+		return this._getNestedToolCallRunner().execute(parentToolCallId, name, args, options);
+	}
+
+	private _getNestedToolCallRunner(): NestedToolCallRunner {
 		this._nestedToolCalls ??= new NestedToolCallRunner({
 			getTools: () => this._getCallableTools(),
 			isSequential: () => this.agent.toolExecution === "sequential",
-			runToolCall: (toolCall, parentId, signal, onUpdate) => {
+			queue: this.agent.toolCallQueue,
+			runToolCall: (toolCall, parentId, signal, onUpdate, tools) => {
 				const assistantMessage = this._findLastAssistantMessage();
 				if (!assistantMessage) {
 					return Promise.resolve({
@@ -864,12 +880,13 @@ export class AgentSession {
 						isError: true,
 					});
 				}
+				this._nestedToolCallParents.set(toolCall, parentId);
 				return runToolCall(toolCall, {
-					tools: this._getCallableTools(),
+					tools,
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
-					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
-					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					beforeToolCall: async (context, signal) => this.agent.beforeToolCall?.(context, signal),
+					afterToolCall: async (context, signal) => this.agent.afterToolCall?.(context, signal),
 					signal,
 					onUpdate,
 				});
@@ -879,7 +896,7 @@ export class AgentSession {
 				this._emit(event);
 			},
 		});
-		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+		return this._nestedToolCalls;
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -921,6 +938,7 @@ export class AgentSession {
 
 	private _installAgentRequestProjection(): void {
 		let requestModel = this.agent.state.model;
+		let requestSignal: AbortSignal | undefined;
 		let canReproject = true;
 		let canonicalMessages: string | undefined;
 		const previousConvertToLlm = this.agent.convertToLlm;
@@ -944,7 +962,7 @@ export class AgentSession {
 					throw error;
 				this.#ordinaryOwner?.assertNativeTokenReservation();
 				const revision = this.sessionManager.revision();
-				const outcome = await this._runAutoCompaction("overflow", false);
+				const outcome = await this._runAutoCompaction("overflow", false, requestSignal);
 				if (outcome === "failed" || outcome === "aborted") {
 					this._stopAfterCompactionFailure = true;
 					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
@@ -970,6 +988,8 @@ export class AgentSession {
 			}
 		};
 		this.agent.prepareRequest = async (request, signal) => {
+			signal?.throwIfAborted();
+			requestSignal = signal;
 			const failed = this._failedResponse;
 			this._failedResponse = undefined;
 			const prepare = async () => {
@@ -990,6 +1010,7 @@ export class AgentSession {
 					},
 					signal,
 				);
+				signal?.throwIfAborted();
 				// Snapshot before preparation and context transforms. Identity alone misses
 				// in-place edits, and opaque input is safe only when the final request fits.
 				canReproject =
@@ -1017,6 +1038,7 @@ export class AgentSession {
 				failed,
 				state,
 			});
+			signal?.throwIfAborted();
 			if (route.state !== undefined && route.state !== state) {
 				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
 				const entry = this.sessionManager.getEntry(
@@ -1027,7 +1049,8 @@ export class AgentSession {
 			// The route stands: the router already decided this request. The state entry does not change
 			// the projection.
 			if (this._exceedsCompactionThreshold(route.model, projection)) {
-				const outcome = await this._runAutoCompaction("threshold", false);
+				signal?.throwIfAborted();
+				const outcome = await this._runAutoCompaction("threshold", false, signal);
 				if (outcome === "failed" || outcome === "aborted") {
 					this._stopAfterCompactionFailure = true;
 					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
@@ -1331,6 +1354,12 @@ export class AgentSession {
 	}
 
 	private _resolveIdleWaitIfIdle(): void {
+		if (this._isOperationIdle && this._resolveOperationIdleWait) {
+			const resolve = this._resolveOperationIdleWait;
+			this._resolveOperationIdleWait = undefined;
+			this._operationIdleWait = undefined;
+			resolve();
+		}
 		if (!this.isIdle || !this._resolveIdleWait) {
 			return;
 		}
@@ -1405,7 +1434,7 @@ export class AgentSession {
 					message.usage = message.usage ? combineUsage(message.usage, summary.usage) : summary.usage;
 				}
 			} else if (event.type === "agent_end") {
-				this._nestedToolCalls.clear();
+				await this._nestedToolCalls.clear();
 			}
 		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
@@ -1792,6 +1821,11 @@ export class AgentSession {
 
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
+		return this._isOperationIdle && this._compactionCompletions.size === 0;
+	}
+
+	/** Manual compaction must join prior operations, not its own accepted completion. */
+	private get _isOperationIdle(): boolean {
 		return (
 			!this._isAgentRunActive &&
 			!this.isCompacting &&
@@ -3267,6 +3301,10 @@ export class AgentSession {
 	 * Abort current operation and wait for agent to become idle.
 	 */
 	async abort(): Promise<void> {
+		return this._abort(true);
+	}
+
+	private async _abort(includeCompactionCompletions: boolean): Promise<void> {
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_ABORTED"));
 		this.#ordinaryOwner?.stopAutomatic();
 		if (this._isAgentRunActive) this._agentRunAbortRequested = true;
@@ -3279,7 +3317,11 @@ export class AgentSession {
 		if (this._isBeforeSettle) this._abortDuringBeforeSettle = true;
 		this.#originalAgent.abort();
 		this._resolveIdleWaitIfIdle();
-		await this.waitForIdle();
+		if (includeCompactionCompletions) {
+			await this.waitForIdle();
+		} else {
+			await this._waitForOperationIdle();
+		}
 		// Deferred work must not join the settlement whose completion it owns.
 		// The external terminal join still waits until every deferred action returns.
 		if (this._shutdownCancellation.signal.aborted && !this._settlementActionScope.getStore()?.active) {
@@ -3287,6 +3329,41 @@ export class AgentSession {
 		}
 	}
 
+	private async _runCompactionCompletion<T>(
+		callback: (value: T, context: CompactionCompletionContext) => void | Promise<void>,
+		value: T,
+	): Promise<void> {
+		// Each invocation has its own lifetime, including the onComplete -> onError handoff.
+		let active = true;
+		const context: CompactionCompletionContext = {
+			waitForIdle: async () => {
+				if (active) await this._waitForOperationIdle();
+				// An escaping join loses its exemption when its callback returns.
+				if (!active) await this.waitForIdle();
+			},
+			abort: async () => {
+				await this._abort(!active);
+				if (!active) await this.waitForIdle();
+			},
+		};
+		try {
+			const continuation = callback(value, context);
+			if (continuation) await continuation;
+		} finally {
+			active = false;
+		}
+	}
+
+	private async _waitForOperationIdle(): Promise<void> {
+		while (!this._isOperationIdle) {
+			this._operationIdleWait ??= new Promise<void>((resolve) => {
+				this._resolveOperationIdleWait = resolve;
+			});
+			await this._operationIdleWait;
+		}
+	}
+
+	/** External joins always retain every compaction callback continuation. */
 	async waitForIdle(): Promise<void> {
 		if (this.isIdle) {
 			return;
@@ -3717,7 +3794,7 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
-		await this.abort();
+		await this._abort(false);
 		this.#ordinaryOwner?.assertCompactionIdle();
 		return this.#compactSession(customInstructions);
 	}
@@ -4217,14 +4294,19 @@ export class AgentSession {
 	 * @param willRetry Whether to continue the interrupted turn after overflow compaction
 	 * @returns A continuation decision, or an explicit failed/aborted outcome.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<CompactionOutcome> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		originSignal?: AbortSignal,
+	): Promise<CompactionOutcome> {
+		if (originSignal?.aborted) return "aborted";
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
 		if (this.isCompacting) return "failed";
 		const controller = new AbortController();
 		this._autoCompactionAbortController = controller;
 		this.#auditState("auto_compaction_preparing");
-		const signal = controller.signal;
+		const signal = originSignal ? AbortSignal.any([controller.signal, originSignal]) : controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let started = false;
 		let fromExtension = false;
@@ -4630,15 +4712,34 @@ export class AgentSession {
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
-					void (async () => {
-						try {
-							const result = await this.compact(options?.customInstructions);
-							options?.onComplete?.(result);
-						} catch (error) {
-							const err = error instanceof Error ? error : new Error(String(error));
-							options?.onError?.(err);
-						}
-					})();
+					// Register custody before options getters or synchronous error callbacks run.
+					const completion = Promise.resolve()
+						.then(async () => {
+							try {
+								const result = await this.compact(options?.customInstructions);
+								if (options?.onComplete) await this._runCompactionCompletion(options.onComplete, result);
+							} catch (error) {
+								const err = error instanceof Error ? error : new Error(String(error));
+								if (!options?.onError) throw err;
+								await this._runCompactionCompletion(options.onError, err);
+							}
+						})
+						.catch((error: unknown) => {
+							try {
+								this._extensionRunner.emitError({
+									extensionPath: "<compaction>",
+									event: "compact",
+									error: error instanceof Error ? error.message : String(error),
+								});
+							} catch {
+								// Error observers cannot orphan the accepted completion either.
+							}
+						})
+						.finally(() => {
+							this._compactionCompletions.delete(completion);
+							this._resolveIdleWaitIfIdle();
+						});
+					this._compactionCompletions.add(completion);
 				},
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
@@ -4722,7 +4823,10 @@ export class AgentSession {
 				.filter((entry): entry is readonly [string, string[]] => entry !== undefined),
 		);
 		const runner = this._extensionRunner;
-		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
+		const wrappedExtensionTools = wrapRegisteredTools(
+			allCustomTools.map((registered) => ({ ...registered, definition: { ...registered.definition } })),
+			runner,
+		);
 		const wrappedBuiltInTools = wrapRegisteredTools(
 			Array.from(this._baseToolDefinitions.values())
 				.filter((definition) => this._isAllowedTool(definition.name))
@@ -4738,6 +4842,15 @@ export class AgentSession {
 		const toolRegistry = new Map(wrappedBuiltInTools.map((tool) => [tool.name, tool]));
 		for (const tool of wrappedExtensionTools as AgentTool[]) {
 			toolRegistry.set(tool.name, tool);
+		}
+		for (const [name, tool] of toolRegistry) {
+			toolRegistry.set(name, {
+				...tool,
+				execute: (id, args, signal, onUpdate) =>
+					this._getNestedToolCallRunner().runParent(id, signal, (ownedSignal) =>
+						tool.execute(id, args, ownedSignal, onUpdate),
+					),
+			});
 		}
 		this._toolRegistry = toolRegistry;
 
@@ -4794,7 +4907,7 @@ export class AgentSession {
 				? Object.fromEntries(
 						Object.entries(this._baseToolsOverride).map(([name, tool]) => [
 							name,
-							createToolDefinitionFromAgentTool(tool),
+							createToolDefinitionFromAgentTool({ ...tool }),
 						]),
 					)
 				: createAllToolDefinitions(this._cwd, {

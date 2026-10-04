@@ -152,7 +152,7 @@ async function loginWithBrowser(
 		port: CALLBACK_PORT,
 		path: CALLBACK_PATH,
 		state,
-		complete: (code) =>
+		complete: (code, signal) =>
 			requestOAuthToken(
 				gateway,
 				new URLSearchParams({
@@ -162,7 +162,7 @@ async function loginWithBrowser(
 					code,
 					code_verifier: verifier,
 				}),
-				interaction.signal,
+				signal,
 			),
 		signal: interaction.signal,
 	});

@@ -81,6 +81,10 @@ Print, JSON, and RPC modes cannot show the built-in trust prompt. If no command-
 
 Use `--approve` or `--no-approve` when an automated run needs an explicit one-time decision.
 
+## Codemode and MCP availability
+
+This fork refuses Codemode and MCP execution and configuration mutations until their security boundaries have been reviewed. See [Codemode and MCP reviewed re-enable](security-reenable.md) for the affected entry points, refusal diagnostics, and requirements for re-enabling them.
+
 ## Reduce impact and improve recovery
 
 These practices do not replace isolation, but they reduce exposure or make recovery easier:

@@ -7,11 +7,11 @@
 
 import { randomBytes } from "node:crypto";
 import { createServer, type Server, type ServerResponse } from "node:http";
+import { fetchBoundedResponse, ResponseBodyError } from "../../utils/bounded-response.ts";
 import { oauthErrorHtml, oauthSuccessHtml } from "../../utils/oauth-page.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { LoginOptions, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import {
-	fetchOAuth,
 	oauthAuthorizationError,
 	oauthDiagnosticError,
 	oauthResponseError,
@@ -59,12 +59,18 @@ function randomValue(): string {
 	return randomBytes(32).toString("base64url");
 }
 
+class CallbackAdmissionError extends Error {}
+
+function admitCallbackState(url: URL, expectedState: string): void {
+	const state = url.searchParams.get("state");
+	if (!state) throw new CallbackAdmissionError("Missing OAuth state");
+	if (state !== expectedState) throw new CallbackAdmissionError("OAuth state mismatch");
+}
+
 function authorizationResultFromCallback(url: URL, expectedState: string): AuthorizationResult {
+	admitCallbackState(url, expectedState);
 	const code = url.searchParams.get("code");
 	if (!code) throw new Error("Missing authorization code");
-	const state = url.searchParams.get("state");
-	if (!state) throw new Error("Missing OAuth state");
-	if (state !== expectedState) throw new Error("OAuth state mismatch");
 	const clientId = url.searchParams.get("client_id")?.trim();
 	if (!clientId) throw oauthDiagnosticError("oauth_invalid_response");
 	return { code, clientId };
@@ -75,12 +81,13 @@ function authorizationResultFromManualInput(input: string, expectedState: string
 	try {
 		url = new URL(input.trim());
 	} catch {
-		throw new Error("Paste the full callback URL from the browser");
+		throw new CallbackAdmissionError("Paste the full callback URL from the browser");
 	}
 	const expected = new URL(REDIRECT_URI);
 	if (url.origin !== expected.origin || url.pathname !== expected.pathname) {
-		throw new Error(`The pasted callback URL must start with ${REDIRECT_URI}`);
+		throw new CallbackAdmissionError(`The pasted callback URL must start with ${REDIRECT_URI}`);
 	}
+	admitCallbackState(url, expectedState);
 	const error = url.searchParams.get("error");
 	if (error) throw oauthDiagnosticError("oauth_authorization_failed", 400, error);
 	return authorizationResultFromCallback(url, expectedState);
@@ -103,11 +110,15 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 		const server = createServer((request, response) => {
 			try {
 				const url = new URL(request.url || "", REDIRECT_URI);
-				if (url.pathname !== CALLBACK_PATH) {
+				if (request.method !== "GET" || url.pathname !== CALLBACK_PATH) {
 					sendHtml(response, 404, oauthErrorHtml("Callback route not found."));
 					return;
 				}
 
+				if (url.searchParams.get("state") !== expectedState) {
+					sendHtml(response, 400, oauthErrorHtml("OAuth state mismatch"));
+					return;
+				}
 				const error = url.searchParams.get("error");
 				if (error) {
 					const code = oauthAuthorizationError(error);
@@ -144,7 +155,7 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 async function requestToken(body: URLSearchParams, signal: AbortSignal): Promise<TokenResponse> {
 	let response: Response;
 	try {
-		response = await fetchOAuth(TOKEN_URL, {
+		response = await fetchBoundedResponse(TOKEN_URL, {
 			method: "POST",
 			headers: {
 				accept: "application/json",
@@ -153,7 +164,8 @@ async function requestToken(body: URLSearchParams, signal: AbortSignal): Promise
 			body,
 			signal,
 		});
-	} catch {
+	} catch (error) {
+		if (error instanceof ResponseBodyError) throw oauthDiagnosticError("oauth_invalid_response", error.status);
 		throw oauthDiagnosticError("oauth_request_failed");
 	}
 	if (!response.ok) {
@@ -288,14 +300,24 @@ async function loginOpenAIChatGPT(
 	});
 
 	const manualAbort = new AbortController();
-	const manualCode = interaction
-		.prompt({
-			type: "manual_code",
-			message: "Complete login in your browser, or paste the final redirect URL here:",
-			placeholder: REDIRECT_URI,
-			signal: AbortSignal.any([manualAbort.signal, interaction.signal]),
-		})
-		.then((input) => authorizationResultFromManualInput(input, state));
+	const manualCode = (async () => {
+		const signal = AbortSignal.any([manualAbort.signal, interaction.signal]);
+		while (true) {
+			signal.throwIfAborted();
+			const input = await interaction.prompt({
+				type: "manual_code",
+				message: "Complete login in your browser, or paste the final redirect URL here:",
+				placeholder: REDIRECT_URI,
+				signal,
+			});
+			try {
+				return authorizationResultFromManualInput(input, state);
+			} catch (error) {
+				if (!(error instanceof CallbackAdmissionError)) throw error;
+				interaction.notify({ type: "info", message: error.message });
+			}
+		}
+	})();
 
 	try {
 		const result = await (callback ? Promise.race([callback.result, manualCode]) : manualCode);

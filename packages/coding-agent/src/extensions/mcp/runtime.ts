@@ -1,3 +1,4 @@
+import { safeMcpErrorMessage as errorMessage } from "../../core/mcp-reporting.ts";
 /**
  * The part of the MCP integration that talks to servers: connections, transports, and OAuth
  * sign-in. It pulls in the MCP client, so index.ts loads it through runtime.lazy.ts only when a
@@ -61,10 +62,6 @@ export type McpTransportFactory = (
 	authProvider: AuthProvider | undefined,
 ) => McpTransport;
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
 /** Network failures and overloaded or restarting servers, which are worth another attempt. */
 function isTransientError(error: unknown): boolean {
 	if (error instanceof McpHttpError) {
@@ -107,7 +104,7 @@ export function createDefaultTransport(
 			authProvider,
 		});
 	}
-	const env: Record<string, string> = {};
+	const env: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(config.env ?? {})) {
 		env[key] = resolveConfigValueOrThrow(value, `MCP server "${name}" env "${key}"`);
 	}
@@ -423,18 +420,17 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 			return new Error(signInRequiredMessage(this.entry));
 		}
 		this.state = this.closed ? "closed" : "failed";
-		this.error = this.stderrTail ? `${errorMessage(error)}\n${this.stderrTail}` : errorMessage(error);
+		this.error = `${errorMessage(error)}${this.stderrTail ? " (child stderr omitted)" : ""}`;
 		this.changed();
 		return new Error(`MCP server "${this.entry.name}" failed to connect: ${this.error}`);
 	}
 
 	/** The transport dropped. The next call reconnects; until then the status shows why. */
-	private handleClientClose(client: McpClient, stdio: StdioTransport | undefined): void {
+	private handleClientClose(client: McpClient, _stdio: StdioTransport | undefined): void {
 		if (this.client !== client || this.closed) return;
 		this.client = undefined;
 		this.state = "disconnected";
-		const stderr = stdio?.stderr.trim().slice(-STDERR_TAIL_CHARS);
-		this.error = stderr ? `Connection closed\n${stderr}` : "Connection closed";
+		this.error = "Connection closed";
 		this.changed();
 	}
 

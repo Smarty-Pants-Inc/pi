@@ -116,7 +116,8 @@ function createFakeServer(
 	return pair;
 }
 
-describe("AgentSession MCP integration", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession MCP integration", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -876,7 +877,8 @@ return { docs, sameForAliases: aliases.every((alias) => JSON.stringify(alias) ==
 	});
 });
 
-describe("AgentSession MCP servers registered by extensions", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession MCP servers registered by extensions", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -993,7 +995,8 @@ describe("AgentSession MCP servers registered by extensions", () => {
 	});
 });
 
-describe("AgentSession MCP tools after resume and reload", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession MCP tools after resume and reload", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {

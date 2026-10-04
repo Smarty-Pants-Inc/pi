@@ -112,7 +112,7 @@ async function loginOpenRouter(interaction: ProviderAuthInteraction): Promise<OA
 		host: getCallbackHost(),
 		port: 0,
 		path: `/oauth/callback/${crypto.randomUUID()}`,
-		complete: (code) => exchangeAuthorizationCode(code, verifier, interaction.signal),
+		complete: (code, signal) => exchangeAuthorizationCode(code, verifier, signal),
 		signal: interaction.signal,
 		timeoutMs: LOGIN_TIMEOUT_MS,
 	});

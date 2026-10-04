@@ -1,3 +1,5 @@
+import { refuseUnreviewedBuiltin } from "../../core/builtin-security-admission.ts";
+import { describeMcpTransport, safeMcpErrorMessage as errorMessage } from "../../core/mcp-reporting.ts";
 /**
  * Built-in MCP integration.
  *
@@ -112,10 +114,6 @@ const EXPOSURE_DESCRIPTIONS: Record<Exclude<McpExposure, "hidden">, string> = {
 	deferred: "not declared until tool_search loads them, then called directly; no codemode needed",
 	direct: "declared to the model like built-in tools",
 };
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
 
 function firstLine(text: string): string {
 	return text.split("\n", 1)[0] ?? "";
@@ -262,16 +260,11 @@ function attentionRank(server: McpServer): number {
 	}
 }
 
-function describeTransport(entry: McpServerEntry): string {
-	const { config } = entry;
-	if ("url" in config) return config.url;
-	return [config.command, ...(config.args ?? [])].join(" ");
-}
-
 const MCP_USAGE = "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp reconnect [server]";
 
 export function createMcpExtension(options: McpExtensionOptions = {}): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
+		refuseUnreviewedBuiltin("mcp");
 		let servers: McpServer[] = [];
 		/** Servers from `mcp.json`, which take precedence over registered servers of the same name. */
 		let configuredEntries: McpServerEntry[] = [];
@@ -737,7 +730,7 @@ export function createMcpExtension(options: McpExtensionOptions = {}): Extension
 				items.push({ value: "disable", label: "Disable", description: saved });
 			}
 			const details = [
-				describeTransport(entry),
+				describeMcpTransport(entry.config),
 				`${entry.scope ?? "config"}: ${entry.source}`,
 				`State: ${describeState(server, false)}`,
 			];

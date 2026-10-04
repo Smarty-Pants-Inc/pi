@@ -1110,7 +1110,7 @@ export default function(pi: ExtensionAPI) {
 			expect(loaded).toEqual(["llama"]);
 		});
 
-		it("should load built-in extensions after file extensions with and without trust resolution", async () => {
+		it("should keep MCP disabled beside file extensions with and without trust resolution", async () => {
 			const userExtDir = join(agentDir, "extensions");
 			mkdirSync(userExtDir, { recursive: true });
 			writeFileSync(join(userExtDir, "user.ts"), "export default function() {}");
@@ -1122,7 +1122,8 @@ export default function(pi: ExtensionAPI) {
 				agentDir,
 				extensionFactories: [{ name: "mcp", builtin: true, factory: () => {} }],
 			});
-			const expected = [join(userExtDir, "user.ts"), "builtin:mcp"];
+			// PR #131: project trust cannot re-enable MCP.
+			const expected = [join(userExtDir, "user.ts")];
 
 			await loader.reload({ resolveProjectTrust: async () => true });
 			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(expected);
@@ -1130,7 +1131,7 @@ export default function(pi: ExtensionAPI) {
 			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(expected);
 		});
 
-		it("should disable built-in extensions with noExtensions unless loaded with -e builtin:<name>", async () => {
+		it("should refuse explicit MCP but allow reviewed built-ins with noExtensions", async () => {
 			const loaded: string[] = [];
 			const loader = new DefaultResourceLoader({
 				cwd,
@@ -1142,13 +1143,26 @@ export default function(pi: ExtensionAPI) {
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
-			await loader.reload();
+			// PR #131: explicit -e must refuse before either factory runs.
+			await expect(loader.reload()).rejects.toThrow("MCP_SECURITY_REVIEW_REQUIRED");
+			expect(loader.getExtensions().extensions).toEqual([]);
+			expect(loaded).toEqual([]);
 
-			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(["builtin:mcp"]);
-			expect(loader.getExtensions().errors).toEqual([
+			const reviewedLoader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				noExtensions: true,
+				additionalExtensionPaths: ["builtin:llama", "builtin:missing"],
+				extensionFactories: [{ name: "llama", builtin: true, factory: () => void loaded.push("llama") }],
+			});
+			await reviewedLoader.reload();
+			expect(reviewedLoader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
+				"builtin:llama",
+			]);
+			expect(reviewedLoader.getExtensions().errors).toEqual([
 				{ path: "builtin:missing", error: "Unknown built-in extension: builtin:missing" },
 			]);
-			expect(loaded).toEqual(["mcp"]);
+			expect(loaded).toEqual(["llama"]);
 		});
 
 		it("should apply project built-in extension overrides after trust resolves", async () => {
@@ -1176,11 +1190,9 @@ export default function(pi: ExtensionAPI) {
 				},
 			});
 
-			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
-				"builtin:mcp",
-				"<inline:plain>",
-			]);
-			expect(loaded).toEqual(["plain", "mcp"]);
+			// PR #131: the project override cannot activate the dormant MCP factory.
+			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(["<inline:plain>"]);
+			expect(loaded).toEqual(["plain"]);
 		});
 	});
 

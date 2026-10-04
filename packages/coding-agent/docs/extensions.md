@@ -214,6 +214,21 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
+`ctx.compact()` is fire-and-forget, but Pi awaits and retains its `onComplete` and `onError` callbacks through their entire continuation. Both receive a second argument, `CompactionCompletionContext`, for explicitly callback-owned joins:
+
+```typescript
+ctx.compact({
+  onComplete: async (_result, completion) => {
+    await completion.waitForIdle(); // Joins real agent/compaction work, not callback returns.
+    // Or await completion.abort() to cancel and join that work.
+  },
+});
+```
+
+These joins exclude **all** retained completion callbacks, so nested or concurrent callbacks cannot wait on each other. Pass this capability only to work the callback awaits. No exemption is inherited by timers or other async descendants: unrelated work must use the original command context or session join. After the callback returns, its captured capability becomes a full external join.
+
+`AgentSession.waitForIdle()` and `AgentSession.abort()` always wait for every callback continuation, even when called from a callback. Awaiting these raw-session joins from that same callback is a self-join; use the callback argument instead. Runtime replacement also keeps full external custody. RPC terminal shutdown bounds unfinished joins by its 1000 ms retirement budget and reports abandonment as a nonzero exit, not successful idle.
+
 <a id="state-management"></a>
 <a id="persist-state"></a>
 

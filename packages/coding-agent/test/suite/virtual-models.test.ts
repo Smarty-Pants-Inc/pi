@@ -302,6 +302,26 @@ describe("AgentSession virtual models", () => {
 		expect(projections).toHaveBeenCalledTimes(4);
 	});
 
+	// pi#131: preserving queued steering must not admit state returned by a cancelled request.
+	it("does not admit router state or call the provider when the current request is aborted during routing", async () => {
+		const { harness, requests } = await createRoutedHarness((request, ctx) => {
+			ctx.abort();
+			return { ...defaultRoute(request, ctx), state: { stale: true } };
+		});
+		harness.setResponses([fauxAssistantMessage("must not execute")]);
+
+		await harness.session.prompt("cancel during routing");
+
+		expect(requests).toHaveLength(1);
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(
+			harness.sessionManager
+				.getBranch()
+				.filter((entry) => entry.type === "custom" && entry.customType === VIRTUAL_MODEL_STATE_ENTRY),
+		).toEqual([]);
+		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	});
+
 	it("stores router state on the branch and passes it to later requests", async () => {
 		const states: unknown[] = [];
 		const { harness, reasons } = await createRoutedHarness(

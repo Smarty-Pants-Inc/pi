@@ -3,9 +3,49 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { defineDoc } from "../documents.ts";
 import type { Transaction } from "../session/transaction.ts";
 import type { EntryId, SubmissionId, SubmissionSettlement, TaskId, TaskRecord, Tx } from "../types.ts";
-import { convertPartial } from "./generation.ts";
+import { convertPartial, type GenerationCheckpoint } from "./generation.ts";
 import type { SchedulerOutcome } from "./scheduler.ts";
 import type { CompactionReason, CompactionResult, ToolDiagnostic } from "./types.ts";
+
+export type PollCheckpoint = Extract<GenerationCheckpoint, { phase: "poll" }>;
+export type DeferredReceipt = {
+	taskId: TaskId;
+	status: "accepted" | "cancel_pending" | "cancel_failed";
+	checkpoint: PollCheckpoint;
+};
+export type DeferredReceiptsState = { receipts: Record<string, JsonRepresentation<DeferredReceipt>> };
+
+/** Session custody, deliberately not task-scoped: terminal tasks must not retire unresolved receipts. */
+export const DeferredReceiptsDoc = defineDoc<DeferredReceiptsState>({
+	kind: "pi.deferred-receipts",
+	version: 1,
+	scope: "session",
+	initial: () => ({ receipts: {} }),
+	checkpointWhen: () => true,
+});
+
+type Custody = {
+	accept(checkpoint: PollCheckpoint): Promise<void>;
+	resolve(): Promise<void>;
+};
+const custody = new WeakMap<object, Custody>();
+
+/** Internal capability; it is not a general task write path and is never exposed on TaskRuntime. */
+export function bindDeferredCustody(runtime: object, receiver: Custody): void {
+	custody.set(runtime, receiver);
+}
+
+export function acceptDeferredReceipt(runtime: object, checkpoint: PollCheckpoint): Promise<void> {
+	const receiver = custody.get(runtime);
+	if (receiver === undefined) throw new Error("No deferred receipt custody for this invocation");
+	return receiver.accept(checkpoint);
+}
+
+export function resolveDeferredReceipt(runtime: object): Promise<void> {
+	const receiver = custody.get(runtime);
+	if (receiver === undefined) throw new Error("No deferred receipt custody for this invocation");
+	return receiver.resolve();
+}
 
 /** Presentation of one tool call of the current round. */
 export type ToolSlot = {

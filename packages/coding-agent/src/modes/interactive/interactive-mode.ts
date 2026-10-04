@@ -2290,17 +2290,8 @@ export class InteractiveMode {
 				this.shutdownRequested = true;
 			},
 			getContextUsage: () => this.session.getContextUsage(),
-			compact: (options) => {
-				void (async () => {
-					try {
-						const result = await this.session.compact(options?.customInstructions);
-						options?.onComplete?.(result);
-					} catch (error) {
-						const err = error instanceof Error ? error : new Error(String(error));
-						options?.onError?.(err);
-					}
-				})();
-			},
+			// Use core ownership/containment for shortcut callbacks too.
+			compact: (options) => extensionRunner.createContext().compact(options),
 			getSystemPrompt: () => this.session.systemPrompt,
 		});
 
@@ -3232,9 +3223,22 @@ export class InteractiveMode {
 				if (filePaths.some((filePath) => /\p{Cc}/u.test(filePath))) {
 					throw new Error("Clipboard file path contains control characters");
 				}
-				const paths = this.isBashMode ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
 				const cursor = this.editor.getCursor?.();
-				const currentLine = cursor ? (this.editor.getText().split("\n")[cursor.line] ?? "") : "";
+				const editorText = cursor ? this.editor.getText() : "";
+				// Standalone filename quoting is safe only in a proven unquoted command.
+				// Refuse complex shell syntax rather than guessing the cursor's quote/escape state.
+				if (
+					this.isBashMode &&
+					(!cursor ||
+						cursor.line !== 0 ||
+						cursor.col < 0 ||
+						cursor.col > editorText.length ||
+						/[^a-zA-Z0-9_./~:@ \t!-]/.test(editorText))
+				) {
+					throw new Error("Automatic filename paste requires a simple unquoted shell command");
+				}
+				const paths = this.isBashMode ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
+				const currentLine = cursor ? (editorText.split("\n")[cursor.line] ?? "") : "";
 				const characterBeforeCursor = cursor && cursor.col > 0 ? currentLine[cursor.col - 1] : "";
 				const characterAfterCursor = cursor ? currentLine[cursor.col] : "";
 				const leadingSpace = characterBeforeCursor && !/\s/.test(characterBeforeCursor) ? " " : "";

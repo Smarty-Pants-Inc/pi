@@ -1,3 +1,5 @@
+import { refuseUnreviewedBuiltin } from "./builtin-security-admission.ts";
+
 /**
  * MCP server configuration and the servers extensions register with `pi.registerMcpServer()`.
  *
@@ -163,7 +165,11 @@ function isExposure(value: unknown): value is McpExposure {
 
 /** The exposure an alias stands for; other values are returned unchanged. */
 function resolveExposureAlias(value: unknown): unknown {
-	return typeof value === "string" ? (MCP_EXPOSURE_ALIASES[value] ?? value) : value;
+	return typeof value === "string"
+		? Object.hasOwn(MCP_EXPOSURE_ALIASES, value)
+			? MCP_EXPOSURE_ALIASES[value]
+			: value
+		: value;
 }
 
 /** A copy of the server entry with exposure aliases replaced by their current names. */
@@ -190,7 +196,7 @@ function toolPatternRegExp(pattern: string): RegExp {
 /** Exposure of one tool of a server: its `toolExposure` entry, else the server's `exposure`. */
 export function getMcpToolExposure(config: McpServerConfig, toolName: string): McpExposure {
 	const overrides = config.toolExposure ?? {};
-	const exact = overrides[toolName];
+	const exact = Object.hasOwn(overrides, toolName) ? overrides[toolName] : undefined;
 	if (exact !== undefined) return exact;
 	for (const [pattern, exposure] of Object.entries(overrides)) {
 		if (pattern.includes("*") && toolPatternRegExp(pattern).test(toolName)) return exposure;
@@ -276,12 +282,14 @@ export class McpServerRegistry {
 
 	/** Register or replace a server. The caller checks ownership. */
 	register(server: RegisteredMcpServer): void {
+		refuseUnreviewedBuiltin("mcp");
 		this.servers.set(server.name, server);
 		this.changeListener?.();
 	}
 
 	/** Remove a server registered by `extensionPath`. Servers of other extensions are left alone. */
 	unregister(name: string, extensionPath: string): void {
+		refuseUnreviewedBuiltin("mcp");
 		if (this.servers.get(name)?.extensionPath !== extensionPath) return;
 		this.servers.delete(name);
 		this.changeListener?.();

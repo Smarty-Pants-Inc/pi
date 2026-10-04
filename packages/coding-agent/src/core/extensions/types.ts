@@ -320,10 +320,23 @@ export interface ContextUsage {
 	percent: number | null;
 }
 
+/** Explicit joins owned by a retained compaction callback, not by its async descendants. */
+export interface CompactionCompletionContext {
+	/**
+	 * Wait for agent/compaction work, excluding ALL completion callbacks to avoid cycles.
+	 * Only use for work awaited by this callback; unrelated work must use an external join.
+	 * After the callback returns, this becomes a full external idle join.
+	 */
+	waitForIdle(): Promise<void>;
+	/** Abort real work and join it with the same callback exclusion as waitForIdle(). */
+	abort(): Promise<void>;
+}
+
 export interface CompactOptions {
 	customInstructions?: string;
-	onComplete?: (result: CompactionResult) => void;
-	onError?: (error: Error) => void;
+	/** Awaited and retained through its complete continuation, including onError handling. */
+	onComplete?: (result: CompactionResult, ctx: CompactionCompletionContext) => void | Promise<void>;
+	onError?: (error: Error, ctx: CompactionCompletionContext) => void | Promise<void>;
 }
 
 /**

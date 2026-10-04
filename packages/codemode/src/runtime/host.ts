@@ -1,5 +1,6 @@
 import { Worker } from "node:worker_threads";
 import { toCodemodeIdentifier } from "../identifier.ts";
+import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type {
 	CodemodeCall,
 	CodemodeCallStatus,
@@ -12,6 +13,16 @@ import type {
 	CodemodeTool,
 } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
+import {
+	boundedJson,
+	MAX_CALLS,
+	MAX_EXECUTION_MS,
+	MAX_MESSAGE_BYTES,
+	MAX_OUTPUT_ITEMS,
+	MAX_PENDING_CALLS,
+	MAX_TRANSIT_BYTES,
+	MAX_TRANSIT_ITEMS,
+} from "./budgets.ts";
 import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
@@ -38,7 +49,7 @@ function errorMessage(error: unknown): string {
 }
 
 function serializeStore(store: Readonly<Record<string, unknown>> | undefined): Record<string, string> {
-	const serialized: Record<string, string> = {};
+	const serialized: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(store ?? {})) {
 		const json = JSON.stringify(value);
 		if (json !== undefined) serialized[key] = json;
@@ -46,9 +57,21 @@ function serializeStore(store: Readonly<Record<string, unknown>> | undefined): R
 	return serialized;
 }
 
-function parseStoreWrites(json: string): CodemodeStoreWrites {
-	const writes: CodemodeStoreWrites = { set: {}, delete: [] };
-	for (const [key, value] of JSON.parse(json) as [string, string?][]) {
+function parseStoreWrites(json: unknown): CodemodeStoreWrites {
+	if (typeof json !== "string") throw new TypeError("Store writes must be JSON text");
+	const entries: unknown = JSON.parse(json);
+	if (!Array.isArray(entries)) throw new TypeError("Store writes must be an entry array");
+	const writes: CodemodeStoreWrites = { set: Object.create(null), delete: [] };
+	for (const entry of entries) {
+		if (
+			!Array.isArray(entry) ||
+			(entry.length !== 1 && entry.length !== 2) ||
+			typeof entry[0] !== "string" ||
+			(entry.length === 2 && typeof entry[1] !== "string")
+		) {
+			throw new TypeError("Invalid store write entry");
+		}
+		const [key, value] = entry as [string, string?];
 		if (value === undefined) writes.delete.push(key);
 		else writes.set[key] = JSON.parse(value);
 	}
@@ -96,6 +119,10 @@ class Execution {
 	private readonly calls: CodemodeCall[] = [];
 	private readonly pending = new Map<number, PendingCall>();
 	private finished = false;
+	private receivedBytes = 0;
+	private receivedItems = 0;
+	private admittedCalls = 0;
+	private sentBytes = 0;
 
 	constructor(options: ExecutionOptions) {
 		this.promise = new Promise<CodemodeResult>((resolve) => {
@@ -177,17 +204,48 @@ class Execution {
 	};
 
 	private post(message: HostToWorkerMessage): void {
+		if (this.finished) return;
+		// Reply credits also belong to the host: a guest may stop consuming them.
+		const bytes = Buffer.byteLength(message.payload ?? "") + 128;
+		this.sentBytes += bytes;
+		if (bytes > MAX_MESSAGE_BYTES || this.sentBytes > MAX_TRANSIT_BYTES) {
+			this.finish({ kind: "sandbox", message: "Sandbox reply budget exceeded" });
+			return;
+		}
 		this.worker?.postMessage(message);
 	}
 
 	private handleMessage(message: unknown): void {
 		if (this.finished || !isWorkerToHostMessage(message)) return;
+		try {
+			const encoded = boundedJson(message);
+			this.receivedBytes += Buffer.byteLength(encoded ?? "");
+			if (++this.receivedItems > MAX_TRANSIT_ITEMS || this.receivedBytes > MAX_TRANSIT_BYTES)
+				throw new Error("Sandbox transit budget exceeded");
+		} catch {
+			this.finish({ kind: "sandbox", message: "Sandbox message budget exceeded" });
+			return;
+		}
 		switch (message.type) {
 			case "output":
+				if (this.output.length >= MAX_OUTPUT_ITEMS) {
+					this.finish({ kind: "sandbox", message: "Sandbox output item budget exceeded" });
+					break;
+				}
 				this.output.push(message.item);
 				break;
 			case "call":
-				void this.handleCall(message);
+				if (
+					++this.admittedCalls > MAX_CALLS ||
+					this.pending.size >= MAX_PENDING_CALLS ||
+					this.pending.has(message.id)
+				) {
+					this.finish({ kind: "sandbox", message: "Sandbox call admission budget exceeded" });
+					break;
+				}
+				void this.handleCall(message).catch(() =>
+					this.finish({ kind: "sandbox", message: "Sandbox call delivery failed" }),
+				);
 				break;
 			case "done":
 				this.handleDone(message);
@@ -199,12 +257,41 @@ class Execution {
 	}
 
 	private handleDone(message: Extract<WorkerToHostMessage, { type: "done" }>): void {
-		if (!message.ok) {
-			const parsed = JSON.parse(message.error) as Omit<CodemodeError, "kind">;
-			this.finish({ kind: "script", ...parsed });
-			return;
+		// Guest intrinsics can forge even valid JSON. Decode and validate every
+		// completion field before finish() retires cancellation and deadline ownership.
+		try {
+			if (message.ok === false) {
+				if (typeof message.error !== "string") throw new TypeError("Script error must be JSON text");
+				const parsed: unknown = JSON.parse(message.error);
+				if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+					throw new TypeError("Script error must be an object");
+				}
+				const error = parsed as Record<string, unknown>;
+				if (
+					!Object.hasOwn(error, "message") ||
+					typeof error.message !== "string" ||
+					(Object.hasOwn(error, "name") && typeof error.name !== "string") ||
+					(Object.hasOwn(error, "stack") && typeof error.stack !== "string")
+				) {
+					throw new TypeError("Invalid script error fields");
+				}
+				this.finish({
+					kind: "script",
+					message: error.message,
+					...(Object.hasOwn(error, "name") ? { name: error.name as string } : {}),
+					...(Object.hasOwn(error, "stack") ? { stack: error.stack as string } : {}),
+				});
+				return;
+			}
+			if (message.ok !== true || (message.value !== undefined && typeof message.value !== "string")) {
+				throw new TypeError("Invalid completion fields");
+			}
+			const value: unknown = message.value === undefined ? undefined : JSON.parse(message.value);
+			const writes = parseStoreWrites(message.writes);
+			this.finish(undefined, value, writes);
+		} catch {
+			this.finish({ kind: "sandbox", message: "Invalid sandbox completion metadata" });
 		}
-		this.finish(undefined, message.value === undefined ? undefined : JSON.parse(message.value), message.writes);
 	}
 
 	private async handleCall(message: Extract<WorkerToHostMessage, { type: "call" }>): Promise<void> {
@@ -222,10 +309,10 @@ class Execution {
 			if (!tool) throw new Error(`Unknown ${isTool ? "tool" : "global"} "${name}"`);
 			const args: unknown = message.args === undefined ? undefined : JSON.parse(message.args);
 			const value = await tool.execute(args, { signal: pending.controller.signal });
-			reply = { type: "result", id, ok: true, payload: value === undefined ? undefined : JSON.stringify(value) };
+			reply = { type: "result", id, ok: true, payload: value === undefined ? undefined : boundedJson(value) };
 			status = "ok";
 		} catch (error) {
-			reply = { type: "result", id, ok: false, payload: errorMessage(error) };
+			reply = { type: "result", id, ok: false, payload: errorMessage(error).slice(0, 2000) };
 			status = "error";
 		}
 
@@ -239,7 +326,7 @@ class Execution {
 		this.post(reply);
 	}
 
-	private finish(error: CodemodeError | undefined, value?: unknown, writes?: string): void {
+	private finish(error: CodemodeError | undefined, value?: unknown, writes?: CodemodeStoreWrites): void {
 		if (this.finished) return;
 		this.finished = true;
 		clearTimeout(this.timer);
@@ -259,7 +346,7 @@ class Execution {
 					value,
 					output: this.output,
 					calls: this.calls,
-					storeWrites: writes === undefined ? { set: {}, delete: [] } : parseStoreWrites(writes),
+					storeWrites: writes ?? { set: Object.create(null), delete: [] },
 				};
 		if (!this.worker) {
 			this.resolveResult(result);
@@ -293,7 +380,11 @@ export class CodemodeSandbox {
 	private closed = false;
 
 	constructor(options: CodemodeSandboxOptions = {}) {
-		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+		refuseCodemodeAdmission();
+		this.timeoutMs = Math.min(
+			Number.isFinite(options.timeoutMs) ? Math.max(1, options.timeoutMs!) : DEFAULT_TIMEOUT_MS,
+			MAX_EXECUTION_MS,
+		);
 		this.memoryLimitBytes = options.memoryLimitBytes;
 		this.wasm = options.wasm;
 		this.workerUrl = options.workerUrl ?? defaultWorkerUrl();
@@ -338,14 +429,21 @@ export class CodemodeSandbox {
 	 */
 	execute(code: string, options: CodemodeExecuteOptions = {}): Promise<CodemodeResult> {
 		if (this.closed) return Promise.reject(new Error("Sandbox is closed"));
+		if (Buffer.byteLength(code) > MAX_MESSAGE_BYTES)
+			return Promise.reject(new Error("Sandbox code byte budget exceeded"));
+		const store = serializeStore(options.store);
+		boundedJson(store);
 		const execution = new Execution({
 			code,
 			tools: new Map(this.toolsByName),
 			globals: this.globalsByName,
-			timeoutMs: options.timeoutMs ?? this.timeoutMs,
+			timeoutMs: Math.min(
+				Number.isFinite(options.timeoutMs) ? Math.max(1, options.timeoutMs!) : this.timeoutMs,
+				this.timeoutMs,
+			),
 			signal: options.signal,
 			memoryLimitBytes: this.memoryLimitBytes,
-			store: serializeStore(options.store),
+			store,
 			wasm: this.wasm === undefined ? loadQuickJSWasm() : Promise.resolve(this.wasm),
 			workerUrl: this.workerUrl,
 		});

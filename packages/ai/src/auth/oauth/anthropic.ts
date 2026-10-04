@@ -70,6 +70,7 @@ async function postJson(url: string, body: Record<string, string | number>, sign
 			Accept: "application/json",
 		},
 		body: JSON.stringify(body),
+		redirect: "error",
 		signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
 	});
 

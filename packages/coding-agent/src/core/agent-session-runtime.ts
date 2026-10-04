@@ -1,5 +1,6 @@
 import { constants, copyFileSync, existsSync, mkdirSync } from "node:fs";
 import { basename, join, parse, resolve } from "node:path";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { resolvePath } from "../utils/paths.ts";
 import type { AgentSession } from "./agent-session.ts";
 import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agent-session-services.ts";
@@ -70,6 +71,10 @@ function extractUserMessageText(content: string | Array<{ type: string; text?: s
 		.map((part) => part.text)
 		.join("");
 }
+
+// Terminal cleanup is independent of the already-aborted session signal.
+const TERMINAL_SHUTDOWN_DISPATCH_MS = 1000;
+const TERMINAL_DISPOSAL_JOIN_MS = 1000;
 
 interface OutgoingSession {
 	session: AgentSession;
@@ -472,6 +477,51 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
+	async #disposeOutgoing(outgoing: OutgoingSession): Promise<void> {
+		this.#assertIdentity(outgoing);
+		const cancellation = new AbortController();
+		const timeout = setTimeout(
+			() => cancellation.abort(new Error(`Session shutdown dispatch exceeded ${TERMINAL_SHUTDOWN_DISPATCH_MS} ms`)),
+			TERMINAL_SHUTDOWN_DISPATCH_MS,
+		);
+		try {
+			if (outgoing.session.extensionRunner.hasHandlers("session_shutdown")) {
+				// Cancel dispatch itself, not only its caller's wait: later handlers must
+				// not start after the deadline. The runner observes late native rejection.
+				await outgoing.session.extensionRunner.emit(
+					{ type: "session_shutdown", reason: "quit" },
+					cancellation.signal,
+				);
+			}
+		} finally {
+			clearTimeout(timeout);
+			this.#assertIdentity(outgoing);
+			try {
+				this.beforeSessionInvalidate?.();
+			} finally {
+				this.#assertIdentity(outgoing);
+				// Invalidate even when accepted cleanup did not finish. Captured native
+				// contexts lose authority; RPC reports abandonment and retires the process.
+				outgoing.session.dispose();
+			}
+		}
+	}
+
+	async #joinForDisposal(outgoing: OutgoingSession): Promise<void> {
+		// An earlier idle join does not seal compaction admission. Repeat the join
+		// with a fresh runtime budget, never the RPC command's expired deadline.
+		const cancellation = new AbortController();
+		const timeout = setTimeout(
+			() => cancellation.abort(new Error(`Session disposal join exceeded ${TERMINAL_DISPOSAL_JOIN_MS} ms`)),
+			TERMINAL_DISPOSAL_JOIN_MS,
+		);
+		try {
+			await raceWithAbortSignal(outgoing.session.abort(), cancellation.signal);
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+
 	async dispose(): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		const outgoing = this.#captureOutgoing(true);
@@ -491,19 +541,9 @@ export class AgentSessionRuntime {
 					.close({
 						stop: () => {
 							this.#assertIdentity(outgoing);
-							return outgoing.session.abort();
+							return this.#joinForDisposal(outgoing);
 						},
-						persist: async () => {
-							this.#assertIdentity(outgoing);
-							await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-								type: "session_shutdown",
-								reason: "quit",
-							});
-							this.#assertIdentity(outgoing);
-							this.beforeSessionInvalidate?.();
-							this.#assertIdentity(outgoing);
-							outgoing.session.dispose();
-						},
+						persist: () => this.#disposeOutgoing(outgoing),
 					})
 					.then(resolve, reject);
 			} catch (cause) {
@@ -511,16 +551,9 @@ export class AgentSessionRuntime {
 			}
 			return this.#ownerDisposal;
 		}
-		await outgoing.session.abort();
+		await this.#joinForDisposal(outgoing);
 		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.#assertCurrent(outgoing);
-		this.beforeSessionInvalidate?.();
-		this.#assertCurrent(outgoing);
-		outgoing.session.dispose();
+		await this.#disposeOutgoing(outgoing);
 	}
 }
 

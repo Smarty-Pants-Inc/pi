@@ -64,6 +64,7 @@ export class SessionImpl implements Session {
 	readonly #host: TransactionHost;
 	#tail: Promise<void> = Promise.resolve();
 	#closing: Promise<void> | undefined;
+	#storageClosed = false;
 	#poison: { readonly error: unknown } | undefined;
 
 	constructor(storage: Storage) {
@@ -100,6 +101,16 @@ export class SessionImpl implements Session {
 		return this.#enqueue(() => this.#runCommit(change, context, scope));
 	}
 
+	/**
+	 * Internal retirement lane for a subclass's already-owned work. beforeClose() must join its users before
+	 * Storage closes. Admission to ordinary Session writes remains sealed; this never admits new task effects.
+	 */
+	protected commitRetirementWith<T>(change: (tx: Transaction) => T | Promise<T>, context: Context): Promise<T> {
+		return this.#enqueue(() => {
+			if (this.#storageClosed) throw new Error("Session storage is closed");
+			return this.#runCommit(change, withoutAbortSignal(context));
+		});
+	}
 	/** Internal: run a read-only job on the mutation line so multi-read derivations observe one committed state. */
 	readOnLine<T>(job: () => Promise<T>): Promise<T> {
 		try {
@@ -355,6 +366,7 @@ export class SessionImpl implements Session {
 				.then(() => this.beforeClose())
 				.then(() =>
 					this.#enqueue(async () => {
+						this.#storageClosed = true;
 						this.#commitListeners.clear();
 						this.#documents.clear();
 						await this.#storage.close(cleanup);
