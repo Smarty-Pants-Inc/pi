@@ -224,6 +224,18 @@ interface RequestContext {
 	options: ClassifierOptions | undefined;
 }
 
+function requestHeaders({ model, options }: RequestContext): Record<string, string> {
+	return (
+		providerHeadersToRecord(
+			{
+				"content-type": "application/json",
+				...(options?.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}),
+			},
+			model.headers,
+			options?.headers,
+		) ?? {}
+	);
+}
 async function post(request: RequestContext, path: string, body: unknown, observe: boolean): Promise<unknown> {
 	const { model, root, options } = request;
 	let payload = body;
@@ -232,15 +244,7 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 		if (transformed !== undefined) payload = transformed;
 	}
 	const requestFetch = options?.fetch ?? globalThis.fetch;
-	const headers =
-		providerHeadersToRecord(
-			{
-				"content-type": "application/json",
-				...(options?.apiKey ? { authorization: `Bearer ${options.apiKey}` } : {}),
-			},
-			model.headers,
-			options?.headers,
-		) ?? {};
+	const headers = requestHeaders(request);
 	const { response, json } = await retryProviderRequest(
 		async () => {
 			const timeoutSignal = options?.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
@@ -292,10 +296,11 @@ async function tokenize(request: RequestContext, content: string): Promise<numbe
 
 /**
  * Label token IDs per server, model and label. A label is `undefined` when the
- * model's vocabulary splits it into several tokens. Failed lookups are evicted
- * so a later call retries them.
+ * model's vocabulary splits it into several tokens. Only completed lookups are
+ * cached: in-flight work always belongs to the caller's signal and timeout.
+ * Fetch implementations and effective headers have separate cache scopes.
  */
-const labelTokenCache = new Map<string, Promise<number | undefined>>();
+const labelTokenCaches = new WeakMap<typeof globalThis.fetch, Map<string, number | undefined>>();
 
 /**
  * The token the model emits for `label` at the start of its reply. The reply
@@ -313,16 +318,22 @@ async function resolveLabelToken(request: RequestContext, label: string): Promis
 }
 
 async function labelTokens(request: RequestContext, labels: readonly string[]): Promise<number[]> {
+	const requestFetch = request.options?.fetch ?? globalThis.fetch;
+	let cache = labelTokenCaches.get(requestFetch);
+	if (!cache) {
+		cache = new Map();
+		labelTokenCaches.set(requestFetch, cache);
+	}
+	const headers = JSON.stringify(
+		[...new Headers(requestHeaders(request)).entries()].sort(([a], [b]) => a.localeCompare(b)),
+	);
 	const ids = await Promise.all(
-		labels.map((label) => {
-			const key = `${request.root}\u0000${request.model.id}\u0000${label}`;
-			let pending = labelTokenCache.get(key);
-			if (!pending) {
-				pending = resolveLabelToken(request, label);
-				labelTokenCache.set(key, pending);
-				pending.catch(() => labelTokenCache.delete(key));
-			}
-			return pending;
+		labels.map(async (label) => {
+			const key = JSON.stringify([request.root, request.model.id, headers, label]);
+			if (cache.has(key)) return cache.get(key);
+			const id = await resolveLabelToken(request, label);
+			cache.set(key, id);
+			return id;
 		}),
 	);
 	const tokens: number[] = [];
