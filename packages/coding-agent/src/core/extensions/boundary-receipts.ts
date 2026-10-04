@@ -22,18 +22,26 @@ export function receiveBoundaryEntries(
 	if (!Array.isArray(selected)) return { entries: structuredClone(selected), receipts: [] };
 	let firstNew = true;
 	const consumed = new Map<SessionBoundaryDraft, number>();
-	// Capture candidates before any draft accessor is evaluated by structuredClone.
+	// Capture every possible fresh slot before indexed selectors or draft accessors run.
 	const candidates = new Array<TurnReceipt>(selected.length);
+	for (let index = 0, length = candidates.length; index < length; index++) {
+		candidates[index] = captureTerminalTurnReceipt();
+	}
+	// Materialize indexed selection once; receipt slots and cloning must share these references.
+	const materialized = new Array<SessionBoundaryDraft>(candidates.length);
 	for (let index = 0, length = selected.length; index < length; index++) {
-		if (!(index in selected)) continue;
-		const draft = selected[index];
+		if (index in selected) materialized[index] = selected[index];
+	}
+	for (let index = 0, length = materialized.length; index < length; index++) {
+		if (!(index in materialized)) continue;
+		const draft = materialized[index];
 		const occurrence = consumed.get(draft) ?? 0;
 		consumed.set(draft, occurrence + 1);
 		const prior = slots.get(draft)?.[occurrence];
-		candidates[index] = prior ?? (firstNew ? observed : captureTerminalTurnReceipt());
+		candidates[index] = prior ?? (firstNew ? observed : candidates[index]);
 		if (!prior) firstNew = false;
 	}
-	const entries = structuredClone(selected);
+	const entries = structuredClone(materialized);
 	// Classify the snapshot, not a retained accessor that can change on later reads.
 	const receipts = new Array<TurnReceipt | undefined>(entries.length);
 	for (let index = 0, length = entries.length; index < length; index++) {
