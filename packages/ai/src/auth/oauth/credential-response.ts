@@ -18,8 +18,25 @@ export function getOAuthDiagnosticSecrets(
 	const secrets = [...additional];
 	if (token) secrets.push(token, `Bearer ${token}`);
 	for (const [key, value] of Object.entries(headers)) {
-		if (value && ["authorization", "chatgpt-account-id", "account-id"].includes(key.toLowerCase()))
+		if (!value) continue;
+		const name = key.toLowerCase();
+		if (
+			[
+				"authorization",
+				"proxy-authorization",
+				"cf-aig-authorization",
+				"x-api-key",
+				"api-key",
+				"chatgpt-account-id",
+				"account-id",
+			].includes(name)
+		) {
 			secrets.push(value);
+			if (name.endsWith("authorization")) {
+				const separator = value.search(/\s/);
+				if (separator >= 0) secrets.push(value.slice(separator).trim());
+			}
+		}
 	}
 	if (!token) return secrets;
 	try {
@@ -38,8 +55,12 @@ function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
 		if (!secret) continue;
-		variants.add(secret);
-		variants.add(JSON.stringify(secret).slice(1, -1));
+		let serialized = secret;
+		// Support a fixed number of additional JSON layers without recursive decoding.
+		for (let depth = 0; depth < 4; depth++) {
+			variants.add(serialized);
+			serialized = JSON.stringify(serialized).slice(1, -1);
+		}
 		try {
 			variants.add(encodeURIComponent(secret));
 		} catch {
@@ -54,6 +75,11 @@ function redactValues(text: string, secrets: readonly string[]): string {
 /** Redact live values first, independently of labels or serialization syntax. */
 export function redactOAuthDiagnostic(text: string, secrets: readonly string[] = []): string {
 	text = redactValues(text, secrets);
+	// Rich diagnostics support four literal JSON layers. More nesting or arbitrary
+	// Unicode escaping cannot be safely reconstructed within that fixed budget.
+	if (secrets.length > 0 && (text.includes("\\".repeat(8)) || /\\u[0-9a-f]{4}/i.test(text))) {
+		return "Provider diagnostic details withheld";
+	}
 
 	// Second layer for unknown values. Each character is visited a bounded number
 	// of times; slash runs and quoted values are consumed, never searched again.

@@ -193,10 +193,15 @@ export async function waitForCallbackOrManualInput<T>(
 	callback: OAuthCallbackServer<T> | undefined,
 	prompt: { message: string; placeholder: string },
 ): Promise<{ type: "callback"; value: T } | { type: "manual"; input: string }> {
+	interaction.signal.throwIfAborted();
 	const manualAbort = new AbortController();
+	const signal = AbortSignal.any([interaction.signal, manualAbort.signal]);
 	let manualError: Error | undefined;
-	const manual = interaction
-		.prompt({ type: "manual_code", ...prompt, signal: manualAbort.signal })
+	const manual = Promise.resolve()
+		.then(() => {
+			signal.throwIfAborted();
+			return interaction.prompt({ type: "manual_code", ...prompt, signal });
+		})
 		.then((input) => {
 			callback?.cancel();
 			return input;
@@ -215,5 +220,7 @@ export async function waitForCallbackOrManualInput<T>(
 		return { type: "manual", input: input ?? "" };
 	} finally {
 		manualAbort.abort();
+		// The exact accepted prompt is observed above and joined on every terminal path.
+		await manual;
 	}
 }

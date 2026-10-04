@@ -15,6 +15,8 @@
 
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 
+export { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
+
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
 export interface NormalizedProviderError {
