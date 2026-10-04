@@ -20,16 +20,20 @@ export function receiveBoundaryEntries(
 	observed: TurnReceipt,
 ): { entries: SessionBoundaryDraft[]; receipts: (TurnReceipt | undefined)[] } {
 	if (!Array.isArray(selected)) return { entries: structuredClone(selected), receipts: [] };
+	// The first length is the selection bound; never coerce a proxy's nonnumeric value.
+	const length = selected.length;
+	if (typeof length !== "number") throw new RangeError("Invalid array length");
 	let firstNew = true;
 	const consumed = new Map<SessionBoundaryDraft, number>();
+	// Native Array validation rejects invalid numeric bounds before capture or indexed effects.
+	const candidates = new Array<TurnReceipt>(length);
 	// Capture every possible fresh slot before indexed selectors or draft accessors run.
-	const candidates = new Array<TurnReceipt>(selected.length);
-	for (let index = 0, length = candidates.length; index < length; index++) {
+	for (let index = 0; index < length; index++) {
 		candidates[index] = captureTerminalTurnReceipt();
 	}
 	// Materialize indexed selection once; receipt slots and cloning must share these references.
-	const materialized = new Array<SessionBoundaryDraft>(candidates.length);
-	for (let index = 0, length = selected.length; index < length; index++) {
+	const materialized = new Array<SessionBoundaryDraft>(length);
+	for (let index = 0; index < length; index++) {
 		if (index in selected) materialized[index] = selected[index];
 	}
 	for (let index = 0, length = materialized.length; index < length; index++) {
