@@ -61,6 +61,7 @@ export class InteractiveThemeController {
 	private readonly showError: (message: string) => void;
 	private readonly onChanged: () => void;
 	private currentThemeSetting: string | undefined;
+	private previewThemeSetting: string | undefined;
 	// Last reported colors; a query that times out keeps them instead of erasing them.
 	private terminalColors: TerminalColors | undefined;
 	private activeThemeName: string | undefined;
@@ -101,6 +102,7 @@ export class InteractiveThemeController {
 	 * Theme pairs and the system theme follow terminal appearance changes.
 	 */
 	applyFromSettings(): void {
+		this.previewThemeSetting = undefined;
 		const themeSetting = this.getThemeSetting();
 		const themeName = this.resolveThemeName();
 		this.setAutoSync(parseAutoThemeSetting(themeSetting) !== undefined || themeName === SYSTEM_THEME_NAME);
@@ -118,13 +120,18 @@ export class InteractiveThemeController {
 	}
 
 	getThemeSelection(): string | undefined {
-		return this.currentThemeSetting ?? this.getSettingsManager().getThemeSetting() ?? this.activeThemeName;
+		return (
+			this.currentThemeSetting ??
+			this.getSettingsManager().getThemeSetting() ??
+			(this.activeThemeName === "<in-memory>" ? this.activeThemeName : SYSTEM_THEME_NAME)
+		);
 	}
 
 	setThemeName(themeName: string, showError = false): ThemeResult {
 		this.setAutoSync(themeName === SYSTEM_THEME_NAME);
 		const result = this.applyThemeName(themeName, showError);
 		if (result.success) {
+			this.previewThemeSetting = undefined;
 			this.currentThemeSetting = themeName;
 		}
 		return result;
@@ -136,6 +143,7 @@ export class InteractiveThemeController {
 	}
 
 	setThemeInstance(themeInstance: Theme): ThemeResult {
+		this.previewThemeSetting = undefined;
 		this.setAutoSync(false);
 		setThemeInstance(themeInstance);
 		this.activeThemeName = "<in-memory>";
@@ -147,7 +155,18 @@ export class InteractiveThemeController {
 		const themeName = resolveThemeSetting(themeSettingOrName, getTerminalTheme()) ?? this.activeThemeName;
 		if (!themeName) return;
 		if (setTheme(themeName, true).success) {
-			this.ui.invalidate();
+			// The selector cancels by previewing its original committed setting.
+			this.previewThemeSetting =
+				themeSettingOrName === (this.getThemeSetting() ?? SYSTEM_THEME_NAME) ? undefined : themeSettingOrName;
+			this.activeThemeName = themeName;
+			this.setAutoSync(
+				parseAutoThemeSetting(themeSettingOrName) !== undefined ||
+					themeName === SYSTEM_THEME_NAME ||
+					parseAutoThemeSetting(this.getThemeSetting()) !== undefined ||
+					(resolveThemeSetting(this.getThemeSetting(), getTerminalTheme()) ?? SYSTEM_THEME_NAME) ===
+						SYSTEM_THEME_NAME,
+			);
+			this.notifyChanged();
 			this.ui.requestRender();
 		}
 	}
@@ -172,7 +191,10 @@ export class InteractiveThemeController {
 
 	/** The theme for the current setting and terminal appearance. Without a setting, pi uses the system theme. */
 	private resolveThemeName(): string {
-		return resolveThemeSetting(this.getThemeSetting(), getTerminalTheme()) ?? SYSTEM_THEME_NAME;
+		return (
+			resolveThemeSetting(this.previewThemeSetting ?? this.getThemeSetting(), getTerminalTheme()) ??
+			SYSTEM_THEME_NAME
+		);
 	}
 
 	private applyThemeName(themeName: string, showError = false): ThemeResult {
