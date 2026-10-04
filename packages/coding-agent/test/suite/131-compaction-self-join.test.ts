@@ -1,6 +1,6 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { expect, it } from "vitest";
-import type { ExtensionCommandContext } from "../../src/core/extensions/types.ts";
+import type { CompactionCompletionContext, ExtensionCommandContext } from "../../src/core/extensions/types.ts";
 import { createHarness } from "./harness.ts";
 
 function deferred() {
@@ -11,7 +11,7 @@ function deferred() {
 	return { promise, resolve };
 }
 
-// PR #131 NEW-P2-01: reentrant joins exclude only their own retained callback, never external custody.
+// PR #131 NEW-P2-01: explicit callback joins exclude all callbacks, never external custody.
 it.each([
 	["onComplete", "waitForIdle"],
 	["onComplete", "abort"],
@@ -63,9 +63,9 @@ it.each([
 		await harness.session.prompt("one");
 		await harness.session.prompt("two");
 		commandContext.compact({
-			[callback]: async () => {
+			[callback]: async (_result: unknown, owned: CompactionCompletionContext) => {
 				entered.resolve();
-				inner = (join === "waitForIdle" ? commandContext.waitForIdle() : harness.session.abort()).then(() => {
+				inner = (join === "waitForIdle" ? owned.waitForIdle() : owned.abort()).then(() => {
 					innerResolved = true;
 				});
 				// Release a broken baseline cycle without orphaning any accepted work.

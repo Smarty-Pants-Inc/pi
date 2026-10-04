@@ -95,6 +95,7 @@ import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
 	type AgentActivityOutcome,
 	type BoundaryContextPreview,
+	type CompactionCompletionContext,
 	type ContextUsage,
 	type ExecuteToolOptions,
 	type ExtensionCommandContextActions,
@@ -490,8 +491,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	/** Includes completion/error observers of fire-and-forget extension compaction. */
 	private readonly _compactionCompletions = new Set<Promise<void>>();
-	/** Only a retained callback descendant may exclude its own completion from an idle join. */
-	private readonly _compactionCompletionScope = new AsyncLocalStorage<{ completion?: Promise<void> }>();
+	/** Real operation joins are separate from retained callback continuations. */
 	private _operationIdleWait: Promise<void> | undefined;
 	private _resolveOperationIdleWait: (() => void) | undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
@@ -3319,11 +3319,8 @@ export class AgentSession {
 		this._resolveIdleWaitIfIdle();
 		if (includeCompactionCompletions) {
 			await this.waitForIdle();
-		} else if (!this._isOperationIdle) {
-			this._operationIdleWait ??= new Promise<void>((resolve) => {
-				this._resolveOperationIdleWait = resolve;
-			});
-			await this._operationIdleWait;
+		} else {
+			await this._waitForOperationIdle();
 		}
 		// Deferred work must not join the settlement whose completion it owns.
 		// The external terminal join still waits until every deferred action returns.
@@ -3332,23 +3329,17 @@ export class AgentSession {
 		}
 	}
 
-	async waitForIdle(): Promise<void> {
-		const ownCompletion = this._compactionCompletionScope.getStore()?.completion;
-		if (ownCompletion && this._compactionCompletions.has(ownCompletion)) {
-			// The callback cannot join its own return. External callers still use true idle,
-			// and this caller still joins every operation and every other completion.
-			while (true) {
-				if (!this._isOperationIdle) {
-					this._operationIdleWait ??= new Promise<void>((resolve) => {
-						this._resolveOperationIdleWait = resolve;
-					});
-					await this._operationIdleWait;
-				}
-				const others = [...this._compactionCompletions].filter((completion) => completion !== ownCompletion);
-				if (this._isOperationIdle && others.length === 0) return;
-				await Promise.all(others);
-			}
+	private async _waitForOperationIdle(): Promise<void> {
+		while (!this._isOperationIdle) {
+			this._operationIdleWait ??= new Promise<void>((resolve) => {
+				this._resolveOperationIdleWait = resolve;
+			});
+			await this._operationIdleWait;
 		}
+	}
+
+	/** External joins always retain every compaction callback continuation. */
+	async waitForIdle(): Promise<void> {
 		if (this.isIdle) {
 			return;
 		}
@@ -4696,15 +4687,22 @@ export class AgentSession {
 				},
 				getContextUsage: () => this.getContextUsage(),
 				compact: (options) => {
-					const scope: { completion?: Promise<void> } = {};
+					// Explicit capability, never async ancestry: callback-owned joins exclude ALL
+					// callbacks so nested/concurrent completions cannot form a wait cycle.
+					// Once this completion returns, captured capabilities become external joins.
+					const context: CompactionCompletionContext = {
+						waitForIdle: () =>
+							this._compactionCompletions.has(completion) ? this._waitForOperationIdle() : this.waitForIdle(),
+						abort: () => this._abort(!this._compactionCompletions.has(completion)),
+					};
 					const completion = (async () => {
 						try {
 							const result = await this.compact(options?.customInstructions);
-							await this._compactionCompletionScope.run(scope, () => options?.onComplete?.(result));
+							await options?.onComplete?.(result, context);
 						} catch (error) {
 							const err = error instanceof Error ? error : new Error(String(error));
 							if (!options?.onError) throw err;
-							await this._compactionCompletionScope.run(scope, () => options.onError?.(err));
+							await options.onError(err, context);
 						}
 					})()
 						.catch((error: unknown) => {
@@ -4722,7 +4720,6 @@ export class AgentSession {
 							this._compactionCompletions.delete(completion);
 							this._resolveIdleWaitIfIdle();
 						});
-					scope.completion = completion;
 					this._compactionCompletions.add(completion);
 				},
 				getSystemPrompt: () => this.systemPrompt,

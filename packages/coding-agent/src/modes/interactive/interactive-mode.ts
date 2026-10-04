@@ -2290,17 +2290,8 @@ export class InteractiveMode {
 				this.shutdownRequested = true;
 			},
 			getContextUsage: () => this.session.getContextUsage(),
-			compact: (options) => {
-				void (async () => {
-					try {
-						const result = await this.session.compact(options?.customInstructions);
-						options?.onComplete?.(result);
-					} catch (error) {
-						const err = error instanceof Error ? error : new Error(String(error));
-						options?.onError?.(err);
-					}
-				})();
-			},
+			// Use core ownership/containment for shortcut callbacks too.
+			compact: (options) => extensionRunner.createContext().compact(options),
 			getSystemPrompt: () => this.session.systemPrompt,
 		});
 

@@ -1082,43 +1082,57 @@ export async function runRpcMode(
 			for (const command of startupCommands.splice(0)) {
 				output(error(command?.id, command?.type ?? "parse", "Operation cancelled for terminal shutdown"));
 			}
+			// One shared budget covers every pre-retirement join, including raw-session
+			// self-joins in compaction callbacks. A deadline is abandonment, not idle.
+			const terminalCancellation = new AbortController();
+			const commandDeadline = terminalCancellation.signal;
+			// Unlike AbortSignal.timeout(), keep Node alive until an honest exit disposition
+			// even when EOF leaves only a callback promise (no referenced I/O handles).
+			const commandTimeout = setTimeout(
+				() =>
+					terminalCancellation.abort(new Error(`RPC terminal shutdown exceeded ${TERMINAL_COMMAND_JOIN_MS} ms`)),
+				TERMINAL_COMMAND_JOIN_MS,
+			);
 			try {
-				await startupBinding;
-			} catch (cause) {
-				if (cause !== session.shutdownSignal.reason) {
-					console.error("RPC startup failed:", cause);
-					exitCode = 1;
+				try {
+					await raceWithAbortSignal(startupBinding ?? Promise.resolve(), commandDeadline);
+				} catch (cause) {
+					if (cause !== session.shutdownSignal.reason) {
+						console.error("RPC startup failed:", cause);
+						exitCode = 1;
+					}
 				}
-			}
-			await session.abort();
-			const commandDeadline = AbortSignal.timeout(TERMINAL_COMMAND_JOIN_MS);
-			try {
-				await raceWithAbortSignal(
-					Promise.allSettled([...pendingCommandWork, ...pendingOperations.keys()]),
-					commandDeadline,
-				);
-			} catch (cause) {
-				if (cause !== commandDeadline.reason) throw cause;
-				console.error(
-					`RPC command shutdown incomplete: ${pendingOperations.size} operation(s) exceeded ${TERMINAL_COMMAND_JOIN_MS} ms`,
-				);
-				if (exitCode === 0) exitCode = 1;
-			}
-			for (const cleanup of signalCleanupHandlers) {
-				cleanup();
-			}
-			session.stopMessageEntryIdCapture();
-			unsubscribe?.();
-			unsubscribeBackpressure?.();
-			try {
-				await runtimeHost.dispose();
-			} catch {
-				// A deadline is an incomplete disposition, not successful cleanup. Do
-				// not let shutdown rejection prevent final output drainage and retirement.
-				console.error(
-					"RPC session cleanup incomplete: unfinished shutdown work abandoned before process retirement",
-				);
-				if (exitCode === 0) exitCode = 1;
+				try {
+					await raceWithAbortSignal(session.abort(), commandDeadline);
+					await raceWithAbortSignal(
+						Promise.allSettled([...pendingCommandWork, ...pendingOperations.keys()]),
+						commandDeadline,
+					);
+				} catch (cause) {
+					if (cause !== commandDeadline.reason) throw cause;
+					console.error(
+						`RPC command shutdown incomplete: session or ${pendingOperations.size} operation(s) exceeded ${TERMINAL_COMMAND_JOIN_MS} ms`,
+					);
+					if (exitCode === 0) exitCode = 1;
+				}
+				for (const cleanup of signalCleanupHandlers) {
+					cleanup();
+				}
+				session.stopMessageEntryIdCapture();
+				unsubscribe?.();
+				unsubscribeBackpressure?.();
+				try {
+					await raceWithAbortSignal(runtimeHost.dispose(), commandDeadline);
+				} catch {
+					// A deadline is an incomplete disposition, not successful cleanup. Do
+					// not let shutdown rejection prevent final output drainage and retirement.
+					console.error(
+						"RPC session cleanup incomplete: unfinished shutdown work abandoned before process retirement",
+					);
+					if (exitCode === 0) exitCode = 1;
+				}
+			} finally {
+				clearTimeout(commandTimeout);
 			}
 			detachInput();
 			process.stdin.pause();
