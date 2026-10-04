@@ -51,6 +51,38 @@ function createRunner(tools: AgentTool[], options: { sequential?: boolean } = {}
 }
 
 describe("NestedToolCallRunner", () => {
+	// pi#137 / smarty-dev#3535, A18. Recording must not preempt the tool error pipeline.
+	it.each([
+		[
+			"cycle",
+			() => {
+				const value: Record<string, unknown> = {};
+				value.self = value;
+				return value;
+			},
+		],
+		["BigInt", () => ({ value: 1n })],
+		["function", () => () => {}],
+		["undefined toJSON", () => ({ toJSON: () => undefined })],
+		[
+			"throwing toJSON",
+			() => ({
+				toJSON: () => {
+					throw new Error("invalid JSON");
+				},
+			}),
+		],
+	] as const)("lets the error pipeline settle unrecordable %s arguments", async (_name, makeArgs) => {
+		const { runner, events } = createRunner([]);
+		const outcome = await runner.execute("call", "missing", makeArgs());
+		expect(outcome.isError).toBe(true);
+		expect(events.map((event) => event.type)).toEqual(["tool_execution_start", "tool_execution_end"]);
+		const summary = runner.takeRecord("call");
+		expect(summary?.calls?.complete).toBe(false);
+		expect(summary?.calls?.calls[0]).toMatchObject({ status: "error", error: "Tool missing not found" });
+		expect(summary?.calls?.calls[0].arguments).toBeUndefined();
+	});
+
 	it("assigns ids below the caller, emits events with the parent id, and records the calls", async () => {
 		const echo: AgentTool = {
 			name: "echo",
