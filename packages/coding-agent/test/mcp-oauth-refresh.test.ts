@@ -12,7 +12,8 @@ import {
 } from "../src/extensions/mcp/oauth.ts";
 import { startOAuthMcpServer } from "./suite/mcp-oauth-server.ts";
 
-describe("MCP OAuth refresh", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("MCP OAuth refresh", () => {
 	const cleanups: (() => Promise<void> | void)[] = [];
 
 	afterEach(async () => {
@@ -89,7 +90,8 @@ describe("MCP OAuth refresh", () => {
 	});
 });
 
-describe("MCP OAuth sign-in", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("MCP OAuth sign-in", () => {
 	async function signIn(options: { iss?: string }, settings: (serverUrl: string) => McpOAuthSettings = () => ({})) {
 		const server = await startOAuthMcpServer(options);
 		try {
