@@ -1130,6 +1130,7 @@ export class ModelRuntime implements Models {
 		const name = `Virtual model ${model.provider}/${model.id}`;
 		const virtual = this.virtualModels.get(model.provider)?.get(model.id);
 		if (!virtual) throw new Error(`${name} is not registered.`);
+		options.signal?.throwIfAborted();
 		const { failed, ...request } = options;
 		const latest = findLatestResponse(messages);
 		const previousModel = latest && this.getPhysicalModel(latest.provider, latest.model);
@@ -1142,6 +1143,7 @@ export class ModelRuntime implements Models {
 			failed: failedModel && failed && { model: failedModel, thinkingLevel: failed.thinkingLevel, message: failed },
 			messages,
 		});
+		options.signal?.throwIfAborted();
 		const target = this.getPhysicalModel(route.model.provider, route.model.id);
 		const routed = `${name} routed to ${route.model.provider}/${route.model.id}`;
 		if (!target) throw new Error(`${routed}, which is not a physical model.`);

@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
+import { ToolCallQueue } from "./tool-call-queue.ts";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -219,6 +220,8 @@ type ActiveRun = {
  * and exposes queueing APIs for steering and follow-up messages.
  */
 export class Agent {
+	/** Shared with nested dispatchers so callable exclusivity covers one complete pipeline. */
+	public readonly toolCallQueue = new ToolCallQueue();
 	private _state: MutableAgentState;
 	private readonly listeners = new Set<(event: AgentEvent, signal: AbortSignal) => Promise<void> | void>();
 	private readonly steeringQueue: PendingMessageQueue;
@@ -559,6 +562,7 @@ export class Agent {
 			thinkingBudgets: this.thinkingBudgets,
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
+			toolCallQueue: this.toolCallQueue,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			finishTurn: this.finishTurn,

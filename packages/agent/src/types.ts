@@ -15,6 +15,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
+import type { ToolCallQueue } from "./tool-call-queue.ts";
 
 /**
  * Stream function used by the agent loop. `Models.streamSimple` satisfies
@@ -315,6 +316,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * Default: "parallel"
 	 */
 	toolExecution?: ToolExecutionMode;
+	/** Admission shared with native nested dispatch; held through end observers. */
+	toolCallQueue?: ToolCallQueue;
 
 	/**
 	 * Called before a tool is executed, after arguments have been validated.

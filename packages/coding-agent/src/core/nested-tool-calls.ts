@@ -5,7 +5,7 @@
  * `parentToolCallId`, and records the calls and their usage on the model-issued call's tool result
  * message.
  *
- * Nothing here runs until a tool calls `ctx.executeTool()`.
+ * Parents are admitted for their execute lifetime. Nested work only starts through `ctx.executeTool()`.
  */
 
 import type {
@@ -15,6 +15,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core";
+import { ToolCallQueue } from "@earendil-works/pi-agent-core";
 import type { JsonObject, NestedToolCallRecord, NestedToolCalls, TextContent, Usage } from "@earendil-works/pi-ai";
 import { combineUsage } from "./usage-totals.ts";
 
@@ -101,7 +102,7 @@ export class NestedCallRecorder {
 }
 
 export interface NestedToolCallOptions {
-	/** Defaults to the calling tool's signal. */
+	/** Additional cancellation; the calling tool's cancellation always applies. */
 	signal?: AbortSignal;
 	/** Receives partial results of the nested tool, in addition to `tool_execution_update` events. */
 	onUpdate?: AgentToolUpdateCallback;
@@ -132,12 +133,15 @@ export interface NestedToolCallHost {
 	getTools(): readonly AgentTool[];
 	/** Whether every nested call runs exclusively, as when the agent executes tool calls sequentially. */
 	isSequential(): boolean;
+	/** Same admission queue as model-issued calls. */
+	queue?: ToolCallQueue;
 	/** Run the call through the tool pipeline, with hooks that report `parentToolCallId`. */
 	runToolCall(
 		toolCall: AgentToolCall,
 		parentToolCallId: string,
 		signal: AbortSignal | undefined,
 		onUpdate: (partialResult: AgentToolResult<unknown>) => Promise<void>,
+		tools: readonly AgentTool[],
 	): Promise<AgentToolCallOutcome>;
 	emit(event: NestedToolExecutionEvent): Promise<void>;
 }
@@ -146,8 +150,12 @@ export interface NestedToolCallHost {
 interface CallScope {
 	recorder: NestedCallRecorder;
 	nextId: number;
-	/** Set inside a call that holds the exclusive queue, so its own nested calls do not wait on it. */
-	holdsQueue: boolean;
+	accepting: boolean;
+	controller: AbortController;
+	signal: AbortSignal;
+	pending: Promise<void>[];
+	failure?: { error: unknown };
+	closing?: Promise<void>;
 }
 
 function textOf(result: AgentToolResult<unknown>): string {
@@ -161,34 +169,105 @@ export class NestedToolCallRunner {
 	private readonly host: NestedToolCallHost;
 	/** Scopes by the id of the calling tool call. */
 	private readonly scopes = new Map<string, CallScope>();
-	/** Serializes nested calls that must not run concurrently. */
-	private queueTail: Promise<void> = Promise.resolve();
+	private readonly queue: ToolCallQueue;
 
 	constructor(host: NestedToolCallHost) {
 		this.host = host;
+		this.queue = host.queue ?? new ToolCallQueue();
+	}
+
+	/** Admit a model-issued parent for exactly its execute lifetime. */
+	open(toolCallId: string, signal?: AbortSignal): void {
+		if (this.scopes.has(toolCallId)) throw new Error("Tool call is already admitted");
+		const controller = new AbortController();
+		this.scopes.set(toolCallId, {
+			recorder: new NestedCallRecorder(),
+			nextId: 1,
+			accepting: true,
+			controller,
+			signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+			pending: [],
+		});
+	}
+
+	async runParent<T>(
+		toolCallId: string,
+		signal: AbortSignal | undefined,
+		execute: (signal: AbortSignal) => Promise<T>,
+	): Promise<T> {
+		const nested = this.scopes.get(toolCallId);
+		// Nested dispatch owns its full pipeline, including result hooks and end delivery.
+		if (nested) {
+			if (!nested.accepting) throw new Error("Parent tool call has retired");
+			return execute(nested.signal);
+		}
+		this.open(toolCallId, signal);
+		const scope = this.scopes.get(toolCallId)!;
+		try {
+			return await execute(scope.signal);
+		} catch (error) {
+			scope.failure ??= { error };
+			throw error;
+		} finally {
+			await this.close(toolCallId);
+		}
+	}
+
+	/** Retire admission before cancelling and joining every accepted descendant. */
+	close(toolCallId: string): Promise<void> {
+		const scope = this.scopes.get(toolCallId);
+		if (!scope) return Promise.resolve();
+		if (scope.closing) return scope.closing;
+		scope.accepting = false;
+		scope.controller.abort(new Error("Parent tool execution finished"));
+		scope.closing = Promise.all(scope.pending).then(() => {
+			if (scope.failure) throw scope.failure.error;
+		});
+		return scope.closing;
 	}
 
 	/**
 	 * Run `name` on behalf of the call `callerId`. The nested call gets the id `<callerId>/<n>`.
-	 * Never rejects for tool failures: they come back as `isError: true`.
+	 * Tool failures return `isError: true`; retired admission and observer failures reject.
 	 */
-	async execute(
+	execute(
 		callerId: string,
 		name: string,
 		args: unknown,
 		options: NestedToolCallOptions = {},
 	): Promise<AgentToolCallOutcome> {
-		let scope = this.scopes.get(callerId);
-		if (!scope) {
-			scope = { recorder: new NestedCallRecorder(), nextId: 1, holdsQueue: false };
-			this.scopes.set(callerId, scope);
-		}
+		const scope = this.scopes.get(callerId);
+		if (!scope?.accepting) return Promise.reject(new Error("Parent tool call has retired"));
+		const signals = options.signal ? [scope.signal, options.signal] : [scope.signal];
+		const signal = AbortSignal.any(signals);
+		if (signal.aborted) return Promise.reject(signal.reason);
+		const operation = this.executeCall(callerId, scope, name, args, { ...options, signal });
+		// Observe the exact child promise immediately, including fire-and-forget callers.
+		scope.pending.push(
+			operation.then(
+				() => {},
+				(error: unknown) => {
+					scope.failure ??= { error };
+				},
+			),
+		);
+		return operation;
+	}
+
+	private async executeCall(
+		callerId: string,
+		scope: CallScope,
+		name: string,
+		args: unknown,
+		options: NestedToolCallOptions,
+	): Promise<AgentToolCallOutcome> {
 		const toolCall: AgentToolCall = {
 			type: "toolCall",
 			id: `${callerId}/${scope.nextId++}`,
 			name,
 			arguments: (args ?? {}) as AgentToolCall["arguments"],
 		};
+		const tools = this.host.getTools().map((tool) => ({ ...tool }));
 		const record = scope.recorder.start(toolCall);
 		await this.host.emit({
 			type: "tool_execution_start",
@@ -199,52 +278,70 @@ export class NestedToolCallRunner {
 		});
 
 		const exclusive =
-			!scope.holdsQueue &&
-			(this.host.isSequential() ||
-				this.host.getTools().find((tool) => tool.name === name)?.executionMode === "sequential");
-		let release: (() => void) | undefined;
-		if (exclusive) {
-			const previous = this.queueTail;
-			this.queueTail = new Promise((resolve) => {
-				release = resolve;
-			});
-			await previous;
-		}
+			this.host.isSequential() || tools.find((tool) => tool.name === name)?.executionMode === "sequential";
+		const controller = new AbortController();
 		this.scopes.set(toolCall.id, {
 			recorder: scope.recorder,
 			nextId: 1,
-			holdsQueue: scope.holdsQueue || exclusive,
+			accepting: true,
+			controller,
+			signal: AbortSignal.any([options.signal!, controller.signal]),
+			pending: [],
 		});
-		let outcome: AgentToolCallOutcome;
 		try {
-			outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
-				options.onUpdate?.(partialResult);
-				await this.host.emit({
-					type: "tool_execution_update",
-					toolCallId: toolCall.id,
-					toolName: name,
-					args: toolCall.arguments,
-					partialResult,
-					parentToolCallId: callerId,
-				});
-			});
-		} finally {
-			this.scopes.delete(toolCall.id);
-			release?.();
-		}
+			return await this.queue.run(
+				{
+					id: toolCall.id,
+					parentId: this.queue.has(callerId) ? callerId : undefined,
+					exclusive,
+					signal: options.signal,
+				},
+				async () => {
+					options.signal?.throwIfAborted();
+					const outcome = await this.host.runToolCall(
+						toolCall,
+						callerId,
+						options.signal,
+						async (partialResult) => {
+							await options.onUpdate?.(partialResult);
+							await this.host.emit({
+								type: "tool_execution_update",
+								toolCallId: toolCall.id,
+								toolName: name,
+								args: toolCall.arguments,
+								partialResult,
+								parentToolCallId: callerId,
+							});
+						},
+						tools,
+					);
+					await this.close(toolCall.id);
 
-		scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
-		// Nested results are not persisted, so their usage is only counted through the recorder.
-		if (outcome.result.usage) scope.recorder.addUsage(outcome.result.usage);
-		await this.host.emit({
-			type: "tool_execution_end",
-			toolCallId: toolCall.id,
-			toolName: name,
-			result: outcome.result,
-			isError: outcome.isError,
-			parentToolCallId: callerId,
-		});
-		return outcome;
+					scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
+					// Nested results are not persisted, so their usage is only counted through the recorder.
+					if (outcome.result.usage) scope.recorder.addUsage(outcome.result.usage);
+					await this.host.emit({
+						type: "tool_execution_end",
+						toolCallId: toolCall.id,
+						toolName: name,
+						result: outcome.result,
+						isError: outcome.isError,
+						parentToolCallId: callerId,
+					});
+					return outcome;
+				},
+			);
+		} catch (error) {
+			const child = this.scopes.get(toolCall.id);
+			if (child) child.failure ??= { error };
+			throw error;
+		} finally {
+			try {
+				await this.close(toolCall.id);
+			} finally {
+				this.scopes.delete(toolCall.id);
+			}
+		}
 	}
 
 	/** Remove and return the record of the nested calls a model-issued call made. */
@@ -255,7 +352,10 @@ export class NestedToolCallRunner {
 		return { calls: scope.recorder.snapshot(), usage: scope.recorder.totalUsage };
 	}
 
-	clear(): void {
+	async clear(): Promise<void> {
+		const settled = await Promise.allSettled([...this.scopes.keys()].map((id) => this.close(id)));
 		this.scopes.clear();
+		const failure = settled.find((result) => result.status === "rejected");
+		if (failure?.status === "rejected") throw failure.reason;
 	}
 }
