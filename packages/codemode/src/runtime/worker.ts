@@ -12,6 +12,7 @@
  */
 import { parentPort, workerData } from "node:worker_threads";
 import { JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
+import { validateOutput } from "./output-validation.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
 
@@ -61,6 +62,8 @@ async function main(data: WorkerData): Promise<void> {
 		wasi: discardOutput,
 	});
 
+	let outputChars = 0;
+	let outputItems = 0;
 	// Called from the prelude with primitives only.
 	const bridge = vm.newFunction("bridge", (kind, a, b, c) => {
 		switch (kind.toString()) {
@@ -74,15 +77,16 @@ async function main(data: WorkerData): Promise<void> {
 					args: c === undefined || c.isUndefined ? undefined : c.toString(),
 				});
 				break;
-			case "output":
-				post({
-					type: "output",
-					item:
-						a.toString() === "image"
-							? { type: "image", data: b.toString(), mimeType: c.toString() }
-							: { type: "text", text: b.toString() },
-				});
+			case "output": {
+				const item =
+					a.toString() === "image"
+						? { type: "image" as const, data: b.toString(), mimeType: c.toString() }
+						: { type: "text" as const, text: b.toString() };
+				outputChars = validateOutput(item, outputChars, outputItems);
+				outputItems++;
+				post({ type: "output", item });
 				break;
+			}
 			case "done":
 				if (a.toBoolean()) {
 					post({

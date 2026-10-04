@@ -12,6 +12,8 @@ import type {
 	CodemodeTool,
 } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
+import { validateOutput } from "./output-validation.ts";
+import { MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "./prelude-source.ts";
 import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
@@ -47,10 +49,30 @@ function serializeStore(store: Readonly<Record<string, unknown>> | undefined): R
 }
 
 function parseStoreWrites(json: string): CodemodeStoreWrites {
+	if (typeof json !== "string" || json.length > MAX_STORE_TOTAL_CHARS * 8)
+		throw new Error("Invalid store writes size");
+	const entries: unknown = JSON.parse(json);
+	if (!Array.isArray(entries) || entries.length > 100_000) throw new Error("Invalid store writes array");
 	const writes: CodemodeStoreWrites = { set: {}, delete: [] };
-	for (const [key, value] of JSON.parse(json) as [string, string?][]) {
-		if (value === undefined) writes.delete.push(key);
-		else writes.set[key] = JSON.parse(value);
+	let chars = 0;
+	for (const entry of entries) {
+		if (!Array.isArray(entry) || (entry.length !== 1 && entry.length !== 2) || typeof entry[0] !== "string") {
+			throw new Error("Invalid store write tuple");
+		}
+		const [key, value] = entry;
+		if (entry.length === 2 && (typeof value !== "string" || value.length > MAX_STORE_VALUE_CHARS)) {
+			throw new Error("Invalid store write value");
+		}
+		chars += key.length + (value?.length ?? 0);
+		if (chars > MAX_STORE_TOTAL_CHARS) throw new Error("Store writes exceed size limit");
+		if (entry.length === 1) writes.delete.push(key);
+		else
+			Object.defineProperty(writes.set, key, {
+				value: JSON.parse(value),
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
 	}
 	return writes;
 }
@@ -93,6 +115,7 @@ class Execution {
 	private readonly signal: AbortSignal | undefined;
 	private readonly timer: NodeJS.Timeout | undefined;
 	private readonly output: CodemodeOutputItem[] = [];
+	private outputChars = 0;
 	private readonly calls: CodemodeCall[] = [];
 	private readonly pending = new Map<number, PendingCall>();
 	private finished = false;
@@ -184,7 +207,12 @@ class Execution {
 		if (this.finished || !isWorkerToHostMessage(message)) return;
 		switch (message.type) {
 			case "output":
-				this.output.push(message.item);
+				try {
+					this.outputChars = validateOutput(message.item, this.outputChars, this.output.length);
+					this.output.push(message.item);
+				} catch (error) {
+					this.finish({ kind: "sandbox", message: errorMessage(error) });
+				}
 				break;
 			case "call":
 				void this.handleCall(message);
@@ -199,12 +227,34 @@ class Execution {
 	}
 
 	private handleDone(message: Extract<WorkerToHostMessage, { type: "done" }>): void {
-		if (!message.ok) {
-			const parsed = JSON.parse(message.error) as Omit<CodemodeError, "kind">;
-			this.finish({ kind: "script", ...parsed });
-			return;
+		try {
+			if (!message.ok) {
+				const parsed: unknown = JSON.parse(message.error);
+				if (
+					typeof parsed !== "object" ||
+					parsed === null ||
+					!("message" in parsed) ||
+					typeof parsed.message !== "string"
+				) {
+					throw new Error("Invalid script error");
+				}
+				const name = "name" in parsed ? parsed.name : undefined;
+				const stack = "stack" in parsed ? parsed.stack : undefined;
+				if (
+					(name !== undefined && typeof name !== "string") ||
+					(stack !== undefined && typeof stack !== "string")
+				) {
+					throw new Error("Invalid script error details");
+				}
+				this.finish({ kind: "script", message: parsed.message, name, stack });
+				return;
+			}
+			const writes = parseStoreWrites(message.writes);
+			const value: unknown = message.value === undefined ? undefined : JSON.parse(message.value);
+			this.finish(undefined, value, writes);
+		} catch (error) {
+			this.finish({ kind: "sandbox", message: `Malformed sandbox completion: ${errorMessage(error)}` });
 		}
-		this.finish(undefined, message.value === undefined ? undefined : JSON.parse(message.value), message.writes);
 	}
 
 	private async handleCall(message: Extract<WorkerToHostMessage, { type: "call" }>): Promise<void> {
@@ -239,7 +289,7 @@ class Execution {
 		this.post(reply);
 	}
 
-	private finish(error: CodemodeError | undefined, value?: unknown, writes?: string): void {
+	private finish(error: CodemodeError | undefined, value?: unknown, writes?: CodemodeStoreWrites): void {
 		if (this.finished) return;
 		this.finished = true;
 		clearTimeout(this.timer);
@@ -259,7 +309,7 @@ class Execution {
 					value,
 					output: this.output,
 					calls: this.calls,
-					storeWrites: writes === undefined ? { set: {}, delete: [] } : parseStoreWrites(writes),
+					storeWrites: writes ?? { set: {}, delete: [] },
 				};
 		if (!this.worker) {
 			this.resolveResult(result);
