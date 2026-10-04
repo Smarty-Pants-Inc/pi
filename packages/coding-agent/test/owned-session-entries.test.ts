@@ -110,6 +110,20 @@ describe("owned native materialization", () => {
 });
 
 describe("strict owned native open", () => {
+	// smarty-dev#3535 / pi#137 A7: owned open must share the writer's depth admission.
+	test("bounds parsed journal depth before recursive validation or serialization", () => {
+		let accepted: unknown = null;
+		for (let i = 0; i < 512; i++) accepted = { child: accepted };
+		expect(parseOwnedSessionEntries(journal(custom(accepted)), header.id)).toEqual([header, custom(accepted)]);
+		let rejected: unknown = null;
+		for (let i = 0; i < 600; i++) rejected = { child: rejected };
+		expect(() => parseOwnedSessionEntries(journal(custom(rejected)), header.id)).toThrow("OWNER_ENTRY_NOT_JSON");
+		const deep = `${'{"child":'.repeat(10000)}null${"}".repeat(10000)}`;
+		const bytes = Buffer.from(
+			`${JSON.stringify(header)}\n${JSON.stringify(custom(null)).replace('"data":null', `"data":${deep}`)}\n`,
+		);
+		expect(() => parseOwnedSessionEntries(bytes, header.id)).toThrow("OWNER_ENTRY_NOT_JSON");
+	});
 	test("loads a control-only journal without inventing an assistant", () => {
 		const entry = custom({ revision: 1 });
 		expect(parseOwnedSessionEntries(journal(entry), header.id)).toEqual([header, entry]);
