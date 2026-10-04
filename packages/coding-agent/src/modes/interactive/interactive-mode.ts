@@ -123,7 +123,7 @@ import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
-import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
+import { addMcpServerConfig, getAvailableMcpServerName, loadMcpConfig } from "../../extensions/mcp/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
@@ -6566,8 +6566,7 @@ export class InteractiveMode {
 		);
 		if (existing && "url" in existing.config && existing.config.auth?.provider === providerId) return;
 
-		let name = existing?.name ?? "radius";
-		if (!existing && servers.some((server) => server.name === name)) name = "radius-mcp";
+		const name = existing?.name;
 		const config: McpHttpServerConfig =
 			existing && "url" in existing.config
 				? { ...existing.config, auth: { provider: providerId } }
@@ -6583,7 +6582,9 @@ export class InteractiveMode {
 					done();
 					if (option !== "Yes") return;
 					try {
-						addMcpServerConfig(mcpPath, name, config);
+						addMcpServerConfig(mcpPath, name ?? getAvailableMcpServerName(mcpPath, "radius"), config, {
+							expectedUrl: RADIUS_MCP_URL,
+						});
 					} catch (error: unknown) {
 						this.showError(
 							`Could not update ${mcpPath}: ${error instanceof Error ? error.message : String(error)}`,
