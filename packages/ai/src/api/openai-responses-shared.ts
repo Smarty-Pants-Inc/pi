@@ -14,6 +14,7 @@ import type {
 	ResponseStreamEvent,
 	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -110,6 +111,7 @@ function convertToolResultOutput<TApi extends Api>(
 }
 
 export interface OpenAIResponsesStreamOptions {
+	diagnosticSecrets?: readonly string[];
 	onProviderStreamEvent?: StreamOptions["onProviderStreamEvent"];
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	grammarToolInputProperties?: ReadonlyMap<string, string>;
@@ -597,11 +599,13 @@ export async function processResponsesStream<TApi extends Api>(
 		const status = response?.status;
 		const incompleteDetails = response?.incomplete_details as { reason?: unknown } | null | undefined;
 		const incompleteReason = typeof incompleteDetails?.reason === "string" ? incompleteDetails.reason : undefined;
-		output.rawStopReason = incompleteReason ? `${status}.${incompleteReason}` : status;
+		const rawStopReason = incompleteReason ? `${status}.${incompleteReason}` : status;
+		output.rawStopReason =
+			rawStopReason === undefined ? undefined : redactOAuthDiagnostic(rawStopReason, options?.diagnosticSecrets);
 		const mappedStop = mapStopReason(status, incompleteReason);
 		output.stopReason = mappedStop.stopReason;
 		if (mappedStop.errorMessage === undefined) delete output.errorMessage;
-		else output.errorMessage = mappedStop.errorMessage;
+		else output.errorMessage = redactOAuthDiagnostic(mappedStop.errorMessage, options?.diagnosticSecrets);
 		if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 			output.stopReason = "toolUse";
 		}
@@ -614,7 +618,12 @@ export async function processResponsesStream<TApi extends Api>(
 			// Preserve observer origin even when it rejects before the first output is normalized.
 			appendAssistantMessageDiagnostic(
 				output,
-				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
+				createAssistantMessageDiagnostic(
+					"provider_stream_observer_error",
+					error,
+					undefined,
+					options?.diagnosticSecrets,
+				),
 			);
 			// A rejecting observer must not erase provider-reported generation and permit replay.
 			if (
@@ -775,7 +784,10 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
 			finalizeResponsesUsage(event.response, output, model, options);
-			output.rawStopReason = event.response?.status;
+			output.rawStopReason =
+				event.response?.status === undefined
+					? undefined
+					: redactOAuthDiagnostic(event.response.status, options?.diagnosticSecrets);
 			const error = event.response?.error;
 			const details = event.response?.incomplete_details;
 			const msg = error

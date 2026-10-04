@@ -134,6 +134,8 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	/** Explicit parent context for telemetry produced by this logical request. */
 	telemetryContext?: TelemetryContext;
 	apiKey?: string;
+	/** Live credential values to redact at diagnostic sinks; never sent to the provider. */
+	diagnosticSecrets?: readonly string[];
 	/**
 	 * Optional fetch implementation for provider HTTP requests.
 	 * Defaults to `globalThis.fetch`. Provider adapters that cannot inject a custom implementation may reject it.

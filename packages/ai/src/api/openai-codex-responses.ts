@@ -6,6 +6,7 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
+import { getOAuthDiagnosticSecrets, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -266,6 +267,11 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			timestamp: Date.now(),
 		};
 
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(
+			options?.apiKey,
+			{ ...model.headers, ...options?.headers },
+			options?.diagnosticSecrets,
+		);
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
@@ -273,6 +279,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			}
 
 			const accountId = extractAccountId(apiKey);
+			diagnosticSecrets.push(accountId);
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				getDeclaredTools(normalizedContext.messages),
 				model.compat?.supportsOpenAIGrammarTools ?? false,
@@ -329,6 +336,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							cacheSessionId,
 							accountId,
 							grammarToolInputProperties,
+							diagnosticSecrets,
 							options,
 						);
 
@@ -360,15 +368,20 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						}
 						appendAssistantMessageDiagnostic(
 							output,
-							createAssistantMessageDiagnostic("provider_transport_failure", error, {
-								configuredTransport: transport,
-								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
-								eventsEmitted: websocketStarted,
-								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-							}),
+							createAssistantMessageDiagnostic(
+								"provider_transport_failure",
+								error,
+								{
+									configuredTransport: transport,
+									...(websocketStarted ? {} : { fallbackTransport: "sse" }),
+									eventsEmitted: websocketStarted,
+									phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+									requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+								},
+								diagnosticSecrets,
+							),
 						);
-						recordWebSocketFailure(cacheSessionId, error);
+						recordWebSocketFailure(cacheSessionId, error, diagnosticSecrets);
 						if (websocketStarted) {
 							throw error;
 						}
@@ -477,7 +490,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				startEmitted = true;
 				stream.push({ type: "start", partial: output });
 			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, options);
+			await processStream(response, output, stream, model, grammarToolInputProperties, diagnosticSecrets, options);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -493,7 +506,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -668,14 +681,16 @@ async function processStream(
 	stream: AssistantMessageEventStream,
 	model: Model<"openai-codex-responses">,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
+	diagnosticSecrets: readonly string[],
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	await processResponsesStream(
-		mapCodexEvents(parseSSE(response, options?.signal), output, model, options),
+		mapCodexEvents(parseSSE(response, options?.signal), output, model, options, diagnosticSecrets),
 		output,
 		stream,
 		model,
 		{
+			diagnosticSecrets,
 			serviceTier: options?.serviceTier,
 			grammarToolInputProperties,
 			resolveServiceTier: resolveCodexServiceTier,
@@ -750,6 +765,7 @@ async function* mapCodexEvents(
 	output: AssistantMessage,
 	model: Model<"openai-codex-responses">,
 	options: OpenAICodexResponsesOptions | undefined,
+	diagnosticSecrets: readonly string[],
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		try {
@@ -758,7 +774,7 @@ async function* mapCodexEvents(
 			// The final assistant error must retain this non-transport origin for outer retry callers.
 			appendAssistantMessageDiagnostic(
 				output,
-				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
+				createAssistantMessageDiagnostic("provider_stream_observer_error", error, undefined, diagnosticSecrets),
 			);
 			// Retain terminal usage even when the observer prevents shared normalization.
 			if (
@@ -797,7 +813,8 @@ async function* mapCodexEvents(
 				resolveServiceTier: resolveCodexServiceTier,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			});
-			output.rawStopReason = response?.status;
+			output.rawStopReason =
+				response?.status === undefined ? undefined : redactOAuthDiagnostic(response.status, diagnosticSecrets);
 			const code = response?.error?.code;
 			const message = response?.error?.message;
 			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
@@ -1007,13 +1024,17 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
+function recordWebSocketFailure(
+	sessionId: string | undefined,
+	error: unknown,
+	diagnosticSecrets: readonly string[],
+): void {
 	if (!sessionId) return;
 	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	stats.lastWebSocketError = formatThrownValue(error);
+	stats.lastWebSocketError = redactOAuthDiagnostic(formatThrownValue(error), diagnosticSecrets);
 	stats.websocketFallbackActive = true;
 }
 
@@ -1535,6 +1556,7 @@ async function processWebSocketStream(
 	cacheSessionId: string | undefined,
 	accountId: string,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
+	diagnosticSecrets: readonly string[],
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	const { socket, entry, reused, release } = await acquireWebSocket(
@@ -1563,7 +1585,7 @@ async function processWebSocketStream(
 		if (requestBody.previous_response_id) {
 			stats.deltaRequests++;
 			stats.lastDeltaInputItems = requestBody.input?.length ?? 0;
-			stats.lastPreviousResponseId = requestBody.previous_response_id;
+			stats.lastPreviousResponseId = redactOAuthDiagnostic(requestBody.previous_response_id, diagnosticSecrets);
 		} else {
 			stats.fullContextRequests++;
 			stats.lastDeltaInputItems = undefined;
@@ -1574,13 +1596,20 @@ async function processWebSocketStream(
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
-				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output, model, options),
+				mapCodexEvents(
+					parseWebSocket(socket, options?.signal, idleTimeoutMs),
+					output,
+					model,
+					options,
+					diagnosticSecrets,
+				),
 				onStart,
 			),
 			output,
 			stream,
 			model,
 			{
+				diagnosticSecrets,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				resolveServiceTier: resolveCodexServiceTier,
@@ -1657,7 +1686,7 @@ function extractAccountId(token: string): string {
 		if (parts.length !== 3) throw new Error("Invalid token");
 		const payload = JSON.parse(atob(parts[1]));
 		const accountId = payload?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
-		if (!accountId) throw new Error("No account ID in token");
+		if (typeof accountId !== "string" || !accountId) throw new Error("No account ID in token");
 		return accountId;
 	} catch {
 		throw new Error("Failed to extract accountId from token");

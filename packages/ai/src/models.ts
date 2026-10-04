@@ -1,6 +1,7 @@
-import { lazyStream } from "./api/lazy.ts";
+import { lazyStream, requestSetupError, SafeSetupError } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
+import { getOAuthDiagnosticSecrets } from "./auth/oauth/credential-response.ts";
 import { type AuthResolutionOverrides, ModelsError, resolveProviderAuth } from "./auth/resolve.ts";
 import type {
 	AuthCheck,
@@ -824,7 +825,7 @@ class ModelsImpl implements MutableModels {
 	private requireProvider(model: AnyModel): Provider {
 		const provider = this.providers.get(model.provider);
 		if (!provider) {
-			throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
+			throw new SafeSetupError("provider");
 		}
 		return provider;
 	}
@@ -845,27 +846,45 @@ class ModelsImpl implements MutableModels {
 		requestOptions: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 	}> {
 		this.requireProvider(model);
-		const resolution = await this.getAuth(model, {
-			apiKey: options?.apiKey,
-			env: options?.env,
-			signal: options?.signal,
-		});
-		if (!resolution) {
-			throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+		let resolution: AuthResult | undefined;
+		try {
+			resolution = await this.getAuth(model, {
+				apiKey: options?.apiKey,
+				env: options?.env,
+				signal: options?.signal,
+			});
+		} catch (error) {
+			// Auth resolvers/stores can echo credentials, including through a ModelsError cause.
+			throw requestSetupError(error);
 		}
-		const auth = resolution.auth;
+		if (!resolution) {
+			throw new SafeSetupError("auth");
+		}
 
-		// Explicit request options win per-field; the Models-only transform runs last.
-		const apiKey = options?.apiKey ?? auth.apiKey;
-		let headers = mergeHeaders(auth.headers, options?.headers);
-		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
-		const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
-		const requestModel: TModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
-		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
-		const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
-			ProviderRequestOptions<TModel>;
+		try {
+			const auth = resolution.auth;
+			// Explicit request options win per-field; the Models-only transform runs last.
+			const apiKey = options?.apiKey ?? auth.apiKey;
+			let headers = mergeHeaders(auth.headers, options?.headers);
+			const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey, headers, [
+				...(resolution.diagnosticSecrets ?? []),
+				...(options?.diagnosticSecrets ?? []),
+			]);
+			if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
+			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));
+			const env =
+				resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
+			const requestModel: TModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+			const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
+			const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
+				ProviderRequestOptions<TModel>;
 
-		return { requestModel, requestOptions };
+			requestOptions.diagnosticSecrets = diagnosticSecrets;
+			return { requestModel, requestOptions };
+		} catch (error) {
+			// A failed callback is a diagnostic, not the caller's intentional raw-header interface.
+			throw requestSetupError(error);
+		}
 	}
 
 	stream<TApi extends Api>(
@@ -917,7 +936,7 @@ class ModelsImpl implements MutableModels {
 		return lazyStream(model, async () => {
 			const provider = this.requireChatProvider(model);
 			if (!provider.fetchDeferred) {
-				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+				throw new SafeSetupError("deferred");
 			}
 			const { requestModel, requestOptions } = await this.applyAuth(model, options);
 			return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
@@ -939,7 +958,7 @@ class ModelsImpl implements MutableModels {
 	): Promise<void> {
 		const provider = this.requireChatProvider(model);
 		if (!provider.cancelDeferred) {
-			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+			throw new SafeSetupError("deferred");
 		}
 		const { requestModel, requestOptions } = await this.applyAuth(model, options);
 		await provider.cancelDeferred(requestModel, handle, requestOptions);
@@ -1069,7 +1088,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		const streams = apiFor(model);
 		if (!streams) {
 			return lazyStream(model, async () => {
-				throw new ModelsError("stream", `Provider ${input.id} has no API implementation for "${model.api}"`);
+				throw new SafeSetupError("stream");
 			});
 		}
 		return run(streams);
@@ -1123,10 +1142,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 			lazyStream(model, async () => {
 				const implementation = apiFor(model);
 				if (!implementation?.fetchDeferred) {
-					throw new ModelsError(
-						"provider",
-						`Provider ${input.id} does not support deferred responses for "${model.api}"`,
-					);
+					throw new SafeSetupError("deferred");
 				}
 				return implementation.fetchDeferred(model, handle, options);
 			});

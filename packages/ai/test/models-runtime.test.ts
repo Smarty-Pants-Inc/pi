@@ -1153,7 +1153,8 @@ describe("Models runtime", () => {
 		const models = createModels();
 		const result = await models.completeSimple(testModel("ghost", "model-a"), context);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("Unknown provider: ghost");
+		// pi#127: setup diagnostics come from fixed codes, not caller-owned identifiers.
+		expect(result.errorMessage).toBe("Unknown provider");
 	});
 
 	it("streams through the provider", async () => {

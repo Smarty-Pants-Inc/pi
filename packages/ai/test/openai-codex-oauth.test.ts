@@ -426,7 +426,8 @@ describe("OpenAI Codex OAuth", () => {
 		expect(pollTimes).toHaveLength(3);
 	});
 
-	it("includes the response body in OpenAI Codex device auth poll failures", async () => {
+	// pi#127: credential-bearing error bodies must not reach ordinary login diagnostics.
+	it("omits the response body in OpenAI Codex device auth poll failures", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: unknown): Promise<Response> => {
@@ -449,9 +450,7 @@ describe("OpenAI Codex OAuth", () => {
 			loginOpenAICodexDeviceCodeForTest({
 				onDeviceCode: () => {},
 			}),
-		).rejects.toThrow(
-			'OpenAI Codex device auth failed with status 500: {"error":"server_error","error_description":"try again later"}',
-		);
+		).rejects.toThrow("OpenAI Codex device auth failed with status 500");
 	});
 
 	it("does not write token refresh failures to stderr", async () => {

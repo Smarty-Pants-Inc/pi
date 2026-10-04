@@ -1,3 +1,4 @@
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage } from "../types.ts";
 import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
 
@@ -222,7 +223,10 @@ export async function retryAssistantCall(
 	let attempt = 0;
 	let lastRetry: { attempt: number; errorMessage: string } | undefined;
 	for (;;) {
-		const response = await produce();
+		const produced = await produce();
+		const errorMessage =
+			produced.errorMessage === undefined ? undefined : redactOAuthDiagnostic(produced.errorMessage);
+		const response = errorMessage === produced.errorMessage ? produced : { ...produced, errorMessage };
 
 		// Abort: terminal but not successful. Never retry an aborted message.
 		if (response.stopReason === "aborted") {

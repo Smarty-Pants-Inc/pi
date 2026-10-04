@@ -1,5 +1,26 @@
 import type { Api, AssistantMessage, AssistantMessageEvent, Model, ProviderStreams } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { ModelsError, SafeSetupError } from "../utils/models-error.ts";
+
+export { SafeSetupError } from "../utils/models-error.ts";
+
+/** Classification itself is untrusted: instanceof and code access can invoke Proxy traps. */
+export function requestSetupError(error: unknown, preserveCode = false): SafeSetupError {
+	try {
+		if (preserveCode && error instanceof SafeSetupError) return new SafeSetupError(error.code);
+		if (error instanceof ModelsError) return new SafeSetupError("setup_ModelsError");
+		if (error instanceof TypeError) return new SafeSetupError("setup_TypeError");
+		if (error instanceof RangeError) return new SafeSetupError("setup_RangeError");
+		if (error instanceof SyntaxError) return new SafeSetupError("setup_SyntaxError");
+		if (error instanceof ReferenceError) return new SafeSetupError("setup_ReferenceError");
+		if (error instanceof URIError) return new SafeSetupError("setup_URIError");
+		if (error instanceof EvalError) return new SafeSetupError("setup_EvalError");
+		if (error instanceof Error) return new SafeSetupError("setup_Error");
+	} catch {
+		// Never surface the trap's thrown value or attempt another classification.
+	}
+	return new SafeSetupError("setup_ThrownValue");
+}
 
 function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMessage {
 	return {
@@ -17,7 +38,7 @@ function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMe
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
+		errorMessage: requestSetupError(error, true).message,
 		timestamp: Date.now(),
 	};
 }

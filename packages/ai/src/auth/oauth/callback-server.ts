@@ -8,6 +8,7 @@
 import { createServer, type ServerResponse } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../../utils/oauth-page.ts";
 import type { ProviderAuthInteraction } from "../types.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 
 export interface OAuthCallbackServerOptions<T> {
 	/** Provider name used on the browser page, for example `OpenAI`. */
@@ -92,9 +93,9 @@ export async function startOAuthCallbackServer<T>(
 			}
 			const error = url.searchParams.get("error");
 			if (error) {
-				const description = url.searchParams.get("error_description") ?? error;
-				sendPage(response, 400, oauthErrorHtml(`${providerName} authorization failed.`, description));
-				finish({ error: new Error(`${providerName} authorization failed: ${description}`) });
+				const code = oauthAuthorizationError(error);
+				sendPage(response, 400, oauthErrorHtml(`${providerName} authorization failed.`, code));
+				finish({ error: new Error(`${providerName} authorization failed: ${code}`) });
 				return;
 			}
 			const code = url.searchParams.get("code");
