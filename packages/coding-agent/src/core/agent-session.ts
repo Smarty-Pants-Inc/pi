@@ -29,6 +29,7 @@ import {
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	captureToolImplementation,
 	type PrepareNextTurnContext,
 	runToolCall,
 	type ThinkingLevel,
@@ -623,6 +624,7 @@ export class AgentSession {
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
 		this._unsubscribeAgent = this.agent.subscribe(this._handleAgentEvent);
+		this._installQueuedInputCustody();
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
 		this._installAgentBoundaryHooks();
@@ -909,7 +911,11 @@ export class AgentSession {
 		);
 	}
 
-	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
+	private async _compactBeforeNextAssistantResponse(
+		context: AgentContext,
+		signal?: AbortSignal,
+	): Promise<AgentContext> {
+		signal?.throwIfAborted();
 		this.#ordinaryOwner?.assertNativeTokenReservation();
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
@@ -920,7 +926,7 @@ export class AgentSession {
 
 		const overflow =
 			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens > model.contextWindow;
-		const outcome = await this._runAutoCompaction("threshold", false);
+		const outcome = await this._runAutoCompaction("threshold", false, signal);
 		if (outcome === "failed" || outcome === "aborted") {
 			// Stop this run rather than sending unchanged oversized context or
 			// turning a compaction timeout into an ordinary agent retry.
@@ -1138,6 +1144,47 @@ export class AgentSession {
 		};
 	}
 
+	private readonly _queuedInputCustody = new WeakMap<AgentMessage, { id: string; original: string }>();
+	private _queuedInputAppendFailure: { error: unknown } | undefined;
+	private _queuedInputTransferFailed = false;
+
+	private _installQueuedInputCustody(): void {
+		this.agent.transferQueuedMessage = async (message, queue) => {
+			try {
+				if (this._queuedInputAppendFailure) throw this._queuedInputAppendFailure.error;
+				const accepted = structuredClone(message);
+				if (accepted.role !== "user") return;
+				const append = async () => {
+					const revision = this.sessionManager.revision();
+					try {
+						const id = this.#ordinaryOwner
+							? await appendOwnedTerminalMessage(this.sessionManager, accepted)
+							: this.sessionManager.appendMessage(accepted);
+						this._queuedInputCustody.set(message, { id, original: JSON.stringify(accepted) });
+						this._entryIdsByMessage.set(message, id);
+					} catch (error) {
+						// A legacy append can change the index before its disk write throws.
+						// Owned journals also fail closed on uncertain terminal writes.
+						// Keep both queues, but never replay an uncertain append in this session.
+						if (this.#ordinaryOwner || this.sessionManager.revision() !== revision) {
+							this._queuedInputAppendFailure = { error };
+						}
+						throw error;
+					}
+				};
+				if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(append);
+				else await append();
+				const pending = queue === "steer" ? this._steeringMessages : this._followUpMessages;
+				const index = pending.indexOf(contentText(accepted.content, ""));
+				if (index !== -1) pending.splice(index, 1);
+			} catch (error) {
+				this._queuedInputTransferFailed = true;
+				this._lastActivityOutcome = "error";
+				throw error;
+			}
+		};
+	}
+
 	private _installAgentNextTurnRefresh(): void {
 		const previousPrepareNextTurnWithContext =
 			this.agent.prepareNextTurnWithContext ??
@@ -1145,8 +1192,11 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-			const context = await this._compactBeforeNextAssistantResponse(turn.context);
+			signal?.throwIfAborted();
+			const context = await this._compactBeforeNextAssistantResponse(turn.context, signal);
+			signal?.throwIfAborted();
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
+			signal?.throwIfAborted();
 			const nextContext = previousSnapshot?.context ?? context;
 			const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
 			const options = normalizeBuildSystemPromptOptions({
@@ -1437,26 +1487,11 @@ export class AgentSession {
 				await this._nestedToolCalls.clear();
 			}
 		}
-		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
-		// This ensures the UI sees the updated queue state
+		// Agent consumes only after journal custody succeeds. Queue notifications are now fallible
+		// publication, never the ownership transfer itself.
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
-			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
-					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
-				}
-			}
+			if (this._queuedInputCustody.has(event.message)) this._emitQueueUpdate();
 		}
 
 		// Terminal cancellation releases extension waits, not final event publication/persistence.
@@ -1467,18 +1502,32 @@ export class AgentSession {
 				if (!this._shutdownCancellation.signal.aborted) throw error;
 			}
 		}
+		const persist = async () => {
+			if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
+			else await this._persistAgentEvent(event);
+		};
+		const queuedEnd = event.type === "message_end" && this._queuedInputCustody.has(event.message);
+		if (queuedEnd) await persist();
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
-
-		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
-		else await this._persistAgentEvent(event);
+		// Other persistence (including turn_end custom-message flushing) retains its publication order.
+		if (!queuedEnd) await persist();
 	};
 
 	private async _persistAgentEvent(event: AgentEvent): Promise<void> {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
+			const custody = this._queuedInputCustody.get(event.message);
+			if (custody && event.message.role === "user") {
+				entryId = custody.id;
+				// Preserve supported message_end replacement without duplicating accepted input.
+				if (JSON.stringify(event.message) !== custody.original) {
+					this.sessionManager.appendContextEdit(custody.id, event.message);
+				}
+				this._queuedInputCustody.delete(event.message);
+			}
 			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
+			else if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
 				entryId = this.#ordinaryOwner
 					? await appendOwnedTerminalCustomMessage(
@@ -1559,7 +1608,7 @@ export class AgentSession {
 	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
-		if (this._agentRunAbortRequested) return false;
+		if (this._agentRunAbortRequested || this._queuedInputTransferFailed) return false;
 		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
 		if (!message || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
 		if (this._assistantOutputObserved || hasAssistantOutput(message)) return false;
@@ -2274,6 +2323,7 @@ export class AgentSession {
 		this._pendingToolNames.clear();
 		this._abortDuringBeforeSettle = false;
 		this._lastActivityOutcome = "completed";
+		this._queuedInputTransferFailed = false;
 		this._inputQueuedBehindPreflight = false;
 		this._isAgentRunActive = true;
 		this._retryFallbackUsed = false;
@@ -2285,7 +2335,11 @@ export class AgentSession {
 			else if (this.#ordinaryOwner)
 				await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(), messages);
 			else await dispatch();
-			while (!this._agentRunAbortRequested && !this._stopAfterCompactionFailure) {
+			while (
+				!this._agentRunAbortRequested &&
+				!this._stopAfterCompactionFailure &&
+				!this._queuedInputTransferFailed
+			) {
 				const continueAfterRun = await this._handlePostAgentRun();
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
 				if (!continueAfterRun && !(await this._runBeforeSettleBoundary())) break;
@@ -2496,6 +2550,7 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		if (this._queuedInputAppendFailure) throw this._queuedInputAppendFailure.error;
 		this._shutdownCancellation.signal.throwIfAborted();
 		if (this._isEmittingAgentSettled) {
 			const completion = new Promise<void>((resolve, reject) => {
@@ -4824,7 +4879,10 @@ export class AgentSession {
 		);
 		const runner = this._extensionRunner;
 		const wrappedExtensionTools = wrapRegisteredTools(
-			allCustomTools.map((registered) => ({ ...registered, definition: { ...registered.definition } })),
+			allCustomTools.map((registered) => ({
+				...registered,
+				definition: captureToolImplementation(registered.definition),
+			})),
 			runner,
 		);
 		const wrappedBuiltInTools = wrapRegisteredTools(
@@ -4907,7 +4965,7 @@ export class AgentSession {
 				? Object.fromEntries(
 						Object.entries(this._baseToolsOverride).map(([name, tool]) => [
 							name,
-							createToolDefinitionFromAgentTool({ ...tool }),
+							createToolDefinitionFromAgentTool(captureToolImplementation(tool)),
 						]),
 					)
 				: createAllToolDefinitions(this._cwd, {

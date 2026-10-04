@@ -188,6 +188,11 @@ class PendingMessageQueue {
 		return this.selected;
 	}
 
+	hasReserved(message: AgentMessage): boolean {
+		const index = this.messages.indexOf(message);
+		return index >= 0 && index < this.reserved;
+	}
+
 	consume(message: AgentMessage): void {
 		const index = this.messages.indexOf(message);
 		if (index >= 0 && index < this.reserved) {
@@ -264,6 +269,8 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
+	/** Transfer queued input to durable custody before consuming it or publishing events. */
+	public transferQueuedMessage?: (message: AgentMessage, queue: "steer" | "followUp") => Promise<void>;
 
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
@@ -664,11 +671,19 @@ export class Agent {
 			this.observe(event.type);
 		}
 		switch (event.type) {
-			case "message_start":
-				this.steeringQueue.consume(sourceMessage ?? event.message);
-				this.followUpQueue.consume(sourceMessage ?? event.message);
+			case "message_start": {
+				const source = sourceMessage ?? event.message;
+				const queue = this.steeringQueue.hasReserved(source)
+					? "steer"
+					: this.followUpQueue.hasReserved(source)
+						? "followUp"
+						: undefined;
+				if (queue) await this.transferQueuedMessage?.(event.message, queue);
+				this.steeringQueue.consume(source);
+				this.followUpQueue.consume(source);
 				this._state.streamingMessage = event.message;
 				break;
+			}
 
 			case "message_update":
 				this._state.streamingMessage = event.message;
