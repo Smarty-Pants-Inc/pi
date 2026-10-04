@@ -59,17 +59,26 @@ export class NestedCallRecorder {
 			return undefined;
 		}
 		const record: NestedToolCallRecord = { id: toolCall.id, name: toolCall.name, status: "unfinished" };
-		const json = JSON.stringify(toolCall.arguments ?? {});
-		const bytes = encoder.encode(json).length;
-		if (
-			bytes > NESTED_CALL_LIMITS.maxArgumentBytesPerCall ||
-			this.argumentBytes + bytes > NESTED_CALL_LIMITS.maxArgumentBytesTotal
-		) {
-			record.argumentsBytes = bytes;
+		try {
+			const json = JSON.stringify(toolCall.arguments ?? {});
+			if (json === undefined) {
+				this.complete = false;
+			} else {
+				const bytes = encoder.encode(json).length;
+				if (
+					bytes > NESTED_CALL_LIMITS.maxArgumentBytesPerCall ||
+					this.argumentBytes + bytes > NESTED_CALL_LIMITS.maxArgumentBytesTotal
+				) {
+					record.argumentsBytes = bytes;
+					this.complete = false;
+				} else {
+					record.arguments = JSON.parse(json) as JsonObject;
+					this.argumentBytes += bytes;
+				}
+			}
+		} catch {
+			// Recording is best-effort. Invalid arguments still belong to the tool validation/error pipeline.
 			this.complete = false;
-		} else {
-			record.arguments = JSON.parse(json) as JsonObject;
-			this.argumentBytes += bytes;
 		}
 		this.calls.push(record);
 		this.startedAt.set(record, performance.now());
