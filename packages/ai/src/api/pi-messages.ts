@@ -359,23 +359,39 @@ function createErrorEvent(
 	error: unknown,
 	aborted: boolean,
 	oauthDiagnostics = false,
+	callbackError = false,
+	partial?: AssistantMessage,
 ): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
-	const safe = oauthDiagnostics ? safeOAuthError(error) : undefined;
+	// Local callbacks cannot supply transport status or recovery authority.
+	const diagnosticError = callbackError && oauthDiagnostics ? undefined : error;
+	const safe = oauthDiagnostics ? safeOAuthError(diagnosticError) : undefined;
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
-		content: [],
+		content: callbackError ? (partial?.content ?? []) : [],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
-		usage: createEmptyUsage(),
+		usage: callbackError ? (partial?.usage ?? createEmptyUsage()) : createEmptyUsage(),
 		stopReason: reason,
-		oauthRecovery: safe ? oauthRecoveryDecision(safe) : undefined,
+		oauthRecovery: callbackError ? { retryable: false } : safe ? oauthRecoveryDecision(safe) : undefined,
 		errorMessage: safe ? safe.message : error instanceof Error ? error.message : String(error),
 		timestamp: Date.now(),
 	};
 
-	if (!aborted && error instanceof PiMessagesResponseError) {
+	if (callbackError) {
+		appendAssistantMessageDiagnostic(
+			assistantMessage,
+			createAssistantMessageDiagnostic(
+				"provider_stream_observer_error",
+				diagnosticError,
+				undefined,
+				[],
+				oauthDiagnostics,
+			),
+		);
+	}
+	if (!callbackError && !aborted && error instanceof PiMessagesResponseError) {
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
 			createAssistantMessageDiagnostic(
@@ -406,6 +422,8 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 ): AssistantMessageEventStream => {
 	const eventStream = new AssistantMessageEventStream();
 	const convertEvent = createEventConverter(model, options?.oauthDiagnostics);
+	let callbackError = false;
+	let partial: AssistantMessage | undefined;
 
 	void (async () => {
 		try {
@@ -431,7 +449,9 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 					toolChoice: options?.toolChoice,
 				},
 			};
+			callbackError = true;
 			const nextPayload = await options?.onPayload?.(payload, model);
+			callbackError = false;
 			if (nextPayload !== undefined) {
 				payload = nextPayload;
 			}
@@ -448,7 +468,9 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				signal: options?.signal,
 			});
 
+			callbackError = true;
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			callbackError = false;
 
 			if (!response.ok) {
 				if (options?.oauthDiagnostics) throw await oauthResponseError(response, true);
@@ -460,8 +482,11 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 			}
 
 			for await (const piEvent of readPiMessagesEvents(response.body)) {
+				callbackError = true;
 				await options?.onProviderStreamEvent?.(piEvent, model);
+				callbackError = false;
 				const event = convertEvent(piEvent);
+				if ("partial" in event) partial = event.partial;
 				eventStream.push(event);
 				if (event.type === "done" || event.type === "error") {
 					return;
@@ -470,7 +495,16 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false, options?.oauthDiagnostics));
+			eventStream.push(
+				createErrorEvent(
+					model,
+					error,
+					options?.signal?.aborted ?? false,
+					options?.oauthDiagnostics,
+					callbackError,
+					partial,
+				),
+			);
 		}
 	})();
 
