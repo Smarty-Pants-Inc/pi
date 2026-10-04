@@ -34,6 +34,7 @@ import {
 	type ModelDataStructure,
 	MODEL_DATA_MANIFEST_FILE,
 	readModelDataProviderIds,
+	regenerateModelDataManifest,
 	validateGeneratedModelData,
 	validateModelDataDirectory,
 } from "./model-data.ts";
@@ -49,6 +50,7 @@ const packageRoot = join(__dirname, "..");
 
 function readGeneratorOptions(args: string[]): {
 	strict: boolean;
+	refreshLocalContracts: boolean;
 	dataOnly: boolean;
 	jsonOnly: boolean;
 	jsonOutputDir: string | undefined;
@@ -56,6 +58,7 @@ function readGeneratorOptions(args: string[]): {
 	omitProviderIds: Set<string>;
 } {
 	let strict = false;
+	let refreshLocalContracts = false;
 	let dataOnly = false;
 	let jsonOnly = false;
 	let jsonOutputDir: string | undefined;
@@ -64,6 +67,10 @@ function readGeneratorOptions(args: string[]): {
 
 	for (let index = 0; index < args.length; index++) {
 		const arg = args[index];
+		if (arg === "--refresh-local-contracts") {
+			refreshLocalContracts = true;
+			continue;
+		}
 		if (arg === "--strict") {
 			strict = true;
 			continue;
@@ -97,7 +104,10 @@ function readGeneratorOptions(args: string[]): {
 
 	if (jsonOnly && !jsonOutputDir) throw new Error("--json-only requires --json-output");
 	if (dataOnly && (jsonOnly || jsonOutputDir)) throw new Error("--data-only cannot be combined with JSON catalog output");
-	return { strict, dataOnly, jsonOnly, jsonOutputDir, pretty, omitProviderIds };
+	if (refreshLocalContracts && args.length !== 1) {
+		throw new Error("--refresh-local-contracts cannot be combined with other options");
+	}
+	return { strict, refreshLocalContracts, dataOnly, jsonOnly, jsonOutputDir, pretty, omitProviderIds };
 }
 
 const generatorOptions = readGeneratorOptions(process.argv.slice(2));
@@ -1036,7 +1046,26 @@ function getGoogleThinkingLevelMap(
 	return undefined;
 }
 
+// Verified effort families also need stable metadata when upstream options lag behind
+// shipped aliases. Magistral deliberately retains its separate prompt_mode contract.
+function applyMistralThinkingLevelMetadata(model: Model<Api>): void {
+	if (model.provider !== "mistral" || model.api !== "mistral-conversations" || !model.reasoning) return;
+	if (model.thinkingLevelMap !== undefined) return;
+	const noneHigh = new Set([
+		"mistral-medium-2604", "mistral-medium-3.5", "mistral-medium-latest",
+		"mistral-small-2603", "mistral-small-latest",
+	]);
+	const values: ModelsDevReasoningOption[] | undefined = noneHigh.has(model.id)
+		? [{ type: "effort", values: ["none", "high"] }]
+		: model.id === "zai-glm-5-2"
+			? [{ type: "effort", values: ["none", "high", "max"] }]
+			: model.id === "zai-glm-5-3"
+				? [{ type: "effort", values: ["low", "high", "max"] }]
+				: undefined;
+	if (values) model.thinkingLevelMap = getEffortThinkingLevelMap(values);
+}
 function applyThinkingLevelMetadata(model: Model<any>): void {
+	applyMistralThinkingLevelMetadata(model);
 	if (
 		(model.api === "openai-responses" || model.api === "azure-openai-responses") &&
 		model.id.startsWith("gpt-5")
@@ -2760,7 +2789,40 @@ const CLOUDFLARE_WORKERS_AI_CLASSIFIER_MODELS: ClassifierModel<"cloudflare-worke
 	},
 ];
 
+// Refresh only the reviewed contracts from shipped local values. No upstream
+// fetch, credentials, catalog replacement, source generation or cleanup runs here.
+function refreshLocalModelContracts(): void {
+	validateGeneratedModelData(packageRoot);
+	const dataDir = join(packageRoot, "src", "providers", "data");
+	const manifest = JSON.parse(readFileSync(join(dataDir, MODEL_DATA_MANIFEST_FILE), "utf8")) as { generatedAt: string };
+	for (const provider of ["mistral", "opencode", "opencode-go"]) {
+		const path = join(dataDir, `${provider}.json`);
+		const original = readFileSync(path, "utf8");
+		const groups = JSON.parse(original) as Record<string, Record<string, AnyModel>>;
+		for (const models of Object.values(groups)) {
+			for (const model of Object.values(models)) {
+				if (model.type !== "chat") continue;
+				applyMistralThinkingLevelMetadata(model);
+				if (model.api === "anthropic-messages" && model.id === "qwen3.8-flash") {
+					model.compat = { ...model.compat, ...getAnthropicMessagesCompat(model.provider, model.id) };
+				}
+			}
+		}
+		const updated = `${JSON.stringify(groups)}\n`;
+		if (updated !== original) {
+			writeFileSync(path, updated);
+			console.log(`Refreshed local contracts: ${provider}.json`);
+		}
+	}
+	// Keep the upstream timestamp: this refresh is deterministic, not a new fetch.
+	regenerateModelDataManifest(packageRoot, manifest.generatedAt);
+	console.log("Regenerated local catalog manifest; generated model identities unchanged. No network or cleanup.");
+}
 async function generateModels() {
+	if (generatorOptions.refreshLocalContracts) {
+		refreshLocalModelContracts();
+		return;
+	}
 	// Fetch models from all upstream catalogs.
 	// models.dev: Anthropic, Google, OpenAI, Groq, Cerebras, and others
 	// OpenRouter: its tool-capable routed catalog
