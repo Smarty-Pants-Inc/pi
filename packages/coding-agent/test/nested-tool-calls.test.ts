@@ -47,7 +47,11 @@ function createRunner(tools: AgentTool[], options: { sequential?: boolean } = {}
 			events.push(event);
 		},
 	};
-	return { runner: new NestedToolCallRunner(host), events };
+	const runner = new NestedToolCallRunner(host);
+	// Model-issued parents are explicitly admitted by the session execution wrapper.
+	runner.open("call");
+	runner.open("free");
+	return { runner, events };
 }
 
 describe("NestedToolCallRunner", () => {

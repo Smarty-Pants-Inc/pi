@@ -978,19 +978,26 @@ export class ExtensionRunner {
 				},
 			},
 			executeTool: {
-				value: async (name: string, args: unknown, options: ExecuteToolOptions = {}) => {
-					runner.assertActive();
+				value: (name: string, args: unknown, options: ExecuteToolOptions = {}) => {
+					try {
+						runner.assertActive();
+					} catch (error) {
+						return Promise.reject(error);
+					}
 					if (!runner.executeToolFn) {
-						return {
+						return Promise.resolve({
 							toolCall: { type: "toolCall", id: `${toolCallId}/0`, name, arguments: {} },
 							result: {
 								content: [{ type: "text", text: "Nested tool calls are not available in this context" }],
 								details: {},
 							},
 							isError: true,
-						};
+						});
 					}
-					return runner.executeToolFn(toolCallId, name, args, { ...options, signal: options.signal ?? signal });
+					if (signal?.aborted) return Promise.reject(signal.reason);
+					const childSignal =
+						signal && options.signal ? AbortSignal.any([signal, options.signal]) : (signal ?? options.signal);
+					return runner.executeToolFn(toolCallId, name, args, { ...options, signal: childSignal });
 				},
 			},
 		});

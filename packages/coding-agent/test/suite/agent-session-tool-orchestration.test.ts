@@ -174,14 +174,26 @@ describe("AgentSession tool orchestration", () => {
 				const result = await before?.(context, signal);
 				if (context.toolCall.name !== "protected") return result;
 				publicCalls.push("before");
-				expect(signal).toBe(route === "nested" ? nestedSignal : agent.signal);
+				if (route === "nested") {
+					expect(signal).toBeInstanceOf(AbortSignal);
+					expect(signal).not.toBe(nestedSignal);
+					expect(signal?.aborted).toBe(false);
+				} else {
+					expect(signal).toBe(agent.signal);
+				}
 				return policy === "deny" ? { block: true, reason: "SDK denied" } : result;
 			};
 			agent.afterToolCall = async (context, signal) => {
 				const result = await after?.(context, signal);
 				if (context.toolCall.name !== "protected") return result;
 				publicCalls.push("after");
-				expect(signal).toBe(route === "nested" ? nestedSignal : agent.signal);
+				if (route === "nested") {
+					expect(signal).toBeInstanceOf(AbortSignal);
+					expect(signal).not.toBe(nestedSignal);
+					expect(signal?.aborted).toBe(false);
+				} else {
+					expect(signal).toBe(agent.signal);
+				}
 				return policy === "redact"
 					? { content: [{ type: "text", text: "redacted" }], details: {}, structuredContent: { safe: true } }
 					: result;
@@ -214,19 +226,20 @@ describe("AgentSession tool orchestration", () => {
 		},
 	);
 
-	it("registers codemode and tool_search inactive until they are named", async () => {
-		const extensionFactories = [createCodemodeExtension(), createToolSearchExtension()];
+	it("refuses unreviewed codemode and registers tool_search inactive until named", async () => {
+		await expect(createHarness({ extensionFactories: [createCodemodeExtension()] })).rejects.toThrow(
+			"CODEMODE_SECURITY_REVIEW_REQUIRED",
+		);
+		const extensionFactories = [createToolSearchExtension()];
 		const plain = await createHarness({ extensionFactories });
 		harnesses.push(plain);
-		expect(plain.session.getAllTools().map((tool) => tool.name)).toEqual(
-			expect.arrayContaining(["codemode", "tool_search"]),
-		);
+		expect(plain.session.getAllTools().map((tool) => tool.name)).toEqual(expect.arrayContaining(["tool_search"]));
 		expect(plain.session.getActiveToolNames()).toEqual(["read", "bash", "edit", "write"]);
 
 		// --tools and the defaultTools setting name them explicitly.
-		const allowed = await createHarness({ allowedToolNames: ["read", "codemode"], extensionFactories });
+		const allowed = await createHarness({ allowedToolNames: ["read", "tool_search"], extensionFactories });
 		harnesses.push(allowed);
-		expect(allowed.session.getActiveToolNames()).toEqual(["read", "codemode"]);
+		expect(allowed.session.getActiveToolNames()).toEqual(["read", "tool_search"]);
 		const initial = await createHarness({ initialActiveToolNames: ["tool_search"], extensionFactories });
 		harnesses.push(initial);
 		expect(initial.session.getActiveToolNames()).toEqual(["tool_search"]);
