@@ -29,7 +29,14 @@ import { addTools } from "./agent.ts";
 import { createCompaction, estimateContext, selectCut } from "./compaction.ts";
 import { applyBoundary, prepareBoundary } from "./inbox.ts";
 import { assignJson } from "./json.ts";
-import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
+import {
+	acceptDeferredReceipt,
+	endRun,
+	LiveDoc,
+	type LiveState,
+	resolveDeferredReceipt,
+	type ToolSlot,
+} from "./live.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
 import { appendToolResult, harnessError, ToolTask, type ToolTaskResult } from "./tool.ts";
 import type {
@@ -251,16 +258,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 	},
 	abort: async (task, runtime, context) => {
 		const checkpoint = task.state.checkpoint;
-		if (checkpoint.phase === "poll") {
-			const model = runtime.models.getModel(checkpoint.model.provider, checkpoint.model.modelId);
-			if (model !== undefined) {
-				try {
-					await runtime.models.cancelDeferred(model, checkpoint.handle, { signal: runtime.signal });
-				} catch (error) {
-					runtime.report(error);
-				}
-			}
-		}
+		// The scheduler attempts cancellation and retains unresolved session custody before admitting this handler.
 		const conversationId = runtime.conversationId;
 		// Runs after the round's tool tasks are terminal; calls never started get `aborted` results (spec §8.5).
 		const unstarted =
@@ -419,8 +417,6 @@ async function classify(
 	message: AssistantMessage,
 	context: Context,
 ): Promise<void> {
-	// An abort mark or close: the abort invocation or the reopened run handles the committed state.
-	runtime.signal.throwIfAborted();
 	const conversationId = runtime.conversationId;
 	const { attempt, compacted, model: ref, cutoff } = request;
 	if (message.stopReason === "deferred" && message.deferred !== undefined) {
@@ -429,21 +425,29 @@ async function classify(
 			runtime.now() + (handle.pollAfterMs ?? DEFAULT_POLL_AFTER_MS),
 			request.pollAt === undefined ? Number.NEGATIVE_INFINITY : request.pollAt + 1,
 		);
+		const checkpoint = {
+			phase: "poll",
+			attempt,
+			...(compacted === undefined ? {} : { compacted }),
+			model: ref,
+			cutoff,
+			handle,
+			pollAt,
+		} as const;
+		// Acceptance is an owned effect even after abort/close; retain it before the ordinary write fence.
+		await acceptDeferredReceipt(runtime, checkpoint);
+		runtime.signal.throwIfAborted();
 		await runtime.commit(async (tx) => {
 			(await tx.doc(LiveDoc, conversationId)).generation = { attempt, deferred: { pollAt } };
-			const checkpoint = {
-				phase: "poll",
-				attempt,
-				...(compacted === undefined ? {} : { compacted }),
-				model: ref,
-				cutoff,
-				handle,
-				pollAt,
-			} as const;
 			return { status: "running", checkpoint };
 		}, context);
 		return;
 	}
+	if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") {
+		await resolveDeferredReceipt(runtime);
+	}
+	// Transcript writes still obey abort/close; final receipt resolution does not admit another request.
+	runtime.signal.throwIfAborted();
 	await runtime.hooks.each("afterResponse", (hook) => hook(message, runtime, context));
 	const calls = message.content.filter((content): content is ToolCall => content.type === "toolCall");
 	if (message.stopReason === "toolUse" && calls.length > 0) {
