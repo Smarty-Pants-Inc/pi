@@ -9,7 +9,9 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.ts";
 import type { AgentActivityOutcome } from "../core/extensions/index.ts";
+import { takeModeInputPlan } from "../core/mode-turn-receipts.ts";
 import { flushRawStdout, waitForRawStdoutBackpressure, writeRawStdout } from "../core/output-guard.ts";
+import { promptReceived } from "../core/received-input.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
@@ -35,6 +37,7 @@ export interface PrintModeOptions {
  */
 export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: PrintModeOptions): Promise<number> {
 	const { mode, messages = [], initialMessage, initialImages } = options;
+	const inputPlan = takeModeInputPlan(options, initialMessage, initialImages, messages);
 	let exitCode = 0;
 	let settledOutcome: AgentActivityOutcome | undefined;
 	let session = runtimeHost.session;
@@ -159,12 +162,12 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 
 		await rebindSession();
 
-		if (initialMessage) {
-			await session.prompt(initialMessage, { images: initialImages });
+		if (inputPlan.initial) {
+			await promptReceived(session, inputPlan.initial);
 		}
 
-		for (const message of messages) {
-			await session.prompt(message);
+		for (const input of inputPlan.remaining) {
+			await promptReceived(session, input);
 		}
 
 		if (mode === "text") {

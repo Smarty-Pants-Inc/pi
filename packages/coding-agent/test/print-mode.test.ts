@@ -1,5 +1,7 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSession, PromptOptions } from "../src/core/agent-session.ts";
+import { bindReceivedInputSession } from "../src/core/received-input.ts";
 import type { SessionShutdownEvent } from "../src/index.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
 
@@ -17,7 +19,7 @@ type FakeSession = {
 	extensionRunner: FakeExtensionRunner;
 	bindExtensions: ReturnType<typeof vi.fn>;
 	subscribe: ReturnType<typeof vi.fn>;
-	prompt: ReturnType<typeof vi.fn>;
+	prompt: ReturnType<typeof vi.fn<(text: string, options?: PromptOptions) => Promise<void>>>;
 	reload: ReturnType<typeof vi.fn>;
 };
 
@@ -70,9 +72,24 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		extensionRunner,
 		bindExtensions: vi.fn(async () => {}),
 		subscribe: vi.fn(() => () => {}),
-		prompt: vi.fn(async () => {}),
+		prompt: vi.fn(async (_text: string, _options?: PromptOptions) => {}),
 		reload: vi.fn(async () => {}),
 	};
+	// Mode-only output/settlement fixture. Real ingress/persistence is covered by
+	// test/suite/turn-provenance-mode-print.test.ts using the faux harness.
+	bindReceivedInputSession(session as unknown as AgentSession, {
+		prompt: async (input, options) => {
+			if (input.images) await session.prompt(input.text, { ...options, images: input.images });
+			else if (options) await session.prompt(input.text, options);
+			else await session.prompt(input.text);
+		},
+		steer: async () => {
+			throw new Error("Print mode does not steer");
+		},
+		followUp: async () => {
+			throw new Error("Print mode does not follow up");
+		},
+	});
 
 	return {
 		session,
