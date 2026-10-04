@@ -167,13 +167,7 @@ export function safeOAuthError(
 					? "premature_stream"
 					: "retryable"
 				: undefined;
-		return oauthDiagnosticError(
-			fallbackCode,
-			shape?.status,
-			body?.code ?? shape?.code,
-			recovery,
-			retryable,
-		);
+		return oauthDiagnosticError(fallbackCode, shape?.status, body?.code ?? shape?.code, recovery, retryable);
 	} catch {
 		return oauthDiagnosticError("oauth_request_failed");
 	}
