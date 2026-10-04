@@ -29,7 +29,7 @@ export function createFileOps(): FileOperations {
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
 	if (message.role === "toolResult") {
-		// Calls made from codemode scripts are recorded on the script's result.
+		// Any native composite tool can record nested calls on its result.
 		for (const call of message.nestedCalls?.calls ?? []) addFileOp(call.name, call.arguments, fileOps);
 		return;
 	}
@@ -44,7 +44,10 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 	}
 }
 
-function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
+// Keep edit/write recency together without changing the public operation-set shape.
+const modifiedFileOrder = new WeakMap<FileOperations, Set<string>>();
+
+export function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
 	const path = typeof args?.path === "string" ? args.path : undefined;
 	if (!path) return;
 	const set =
@@ -58,6 +61,15 @@ function addFileOp(toolName: string, args: Record<string, unknown> | undefined, 
 	// Delete first so native and nested calls keep least-to-most-recent ordering (pi#88).
 	set?.delete(path);
 	set?.add(path);
+	if (toolName === "write" || toolName === "edit") {
+		let order = modifiedFileOrder.get(fileOps);
+		if (!order) {
+			order = new Set();
+			modifiedFileOrder.set(fileOps, order);
+		}
+		order.delete(path);
+		order.add(path);
+	}
 }
 
 /**
@@ -82,6 +94,11 @@ export interface FileLists {
  */
 export function computeFileLists(fileOps: FileOperations): FileLists {
 	const modified = new Set([...fileOps.edited, ...fileOps.written]);
+	// Carried details may seed the operation sets directly. Keep those first, then replay
+	// the shared touch order so interleaved edits/writes and repeated paths stay recent.
+	for (const path of modifiedFileOrder.get(fileOps) ?? []) {
+		if (modified.delete(path)) modified.add(path);
+	}
 	const readOnly = [...fileOps.read].filter((f) => !modified.has(f));
 	const modifiedFiles = [...modified];
 	return {
