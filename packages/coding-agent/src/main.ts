@@ -721,6 +721,17 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
+	if (
+		parsed.maxProviderRequests !== undefined &&
+		(appMode === "interactive" || appMode === "rpc") &&
+		!parsed.help &&
+		parsed.listModels === undefined
+	) {
+		console.error(
+			chalk.red("Error: --max-provider-requests is supported only in print/JSON mode; use --print or --mode json"),
+		);
+		process.exit(1);
+	}
 	const shouldTakeOverStdout = appMode !== "interactive" && !isPlainRuntimeMetadataCommand(parsed);
 	if (shouldTakeOverStdout) {
 		takeOverStdout();
@@ -1068,6 +1079,7 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		const exitCode = await runPrintMode(runtime, {
 			mode: toPrintOutputMode(appMode),
+			maxProviderRequests: parsed.maxProviderRequests,
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,
