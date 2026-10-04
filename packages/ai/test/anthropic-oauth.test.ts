@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import type { AuthEvent, AuthPrompt } from "../src/auth/types.ts";
@@ -35,6 +36,30 @@ function getJsonBody(init?: RequestInit): Record<string, string> {
 }
 
 describe.sequential("Anthropic OAuth", () => {
+	// pi#137 / smarty-dev#3535, security finding 1.
+	it("does not authorize browser login when another process owns the callback port", async () => {
+		const received = vi.fn();
+		const blocker = createServer(received);
+		await new Promise<void>((resolve) => blocker.listen(53692, "127.0.0.1", resolve));
+		const notify = vi.fn();
+		const tokenFetch = vi.fn();
+		vi.stubGlobal("fetch", tokenFetch);
+		try {
+			await expect(
+				anthropicOAuth.login({
+					signal: neverAbortedSignal,
+					notify,
+					prompt: async () => "browser",
+				}),
+			).rejects.toThrow("Select Copy code login instead");
+			expect(notify).not.toHaveBeenCalled();
+			expect(tokenFetch).not.toHaveBeenCalled();
+			expect(received).not.toHaveBeenCalled();
+		} finally {
+			await new Promise<void>((resolve, reject) => blocker.close((error) => (error ? reject(error) : resolve())));
+		}
+	});
+
 	afterEach(() => {
 		vi.unstubAllGlobals();
 	});
@@ -47,6 +72,8 @@ describe.sequential("Anthropic OAuth", () => {
 			const body = getJsonBody(init);
 			expect(body.grant_type).toBe("authorization_code");
 			expect(body.code).toBe("manual-code");
+			expect(body.state).not.toBe(body.code_verifier);
+			expect(body.state).toBe(new URL(authUrl).searchParams.get("state"));
 			expect(body.redirect_uri).toBe("http://localhost:53692/callback");
 			return jsonResponse({
 				access_token: "access-token",

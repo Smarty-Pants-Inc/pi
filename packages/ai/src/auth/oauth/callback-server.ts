@@ -62,10 +62,14 @@ export async function startOAuthCallbackServer<T>(
 	// A cancelled or closed wait may never be observed.
 	waitPromise.catch(() => undefined);
 
+	let bound = false;
 	let claimed = false;
 	let settled = false;
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	const onAbort = () => finish({ error: new Error("Login cancelled") });
+	const onAbort = () => {
+		finish({ error: new Error("Login cancelled") });
+		if (bound && server.listening) server.close();
+	};
 	const finish = (result: { value: T | undefined } | { error: Error }): void => {
 		if (settled) return;
 		settled = true;
@@ -112,16 +116,35 @@ export async function startOAuthCallbackServer<T>(
 				sendPage(response, 502, oauthErrorHtml(`${providerName} sign-in failed.`, failure.message));
 				finish({ error: failure });
 			}
-		})();
+		})()
+			.catch(() => {
+				// Invalid request targets and response failures must not reject an unobserved handler.
+				if (!response.headersSent) sendPage(response, 400, oauthErrorHtml("Malformed callback request."));
+				else response.destroy();
+			})
+			.catch(() => response.destroy());
 	});
 
-	await new Promise<void>((resolve, reject) => {
-		server.once("error", reject);
-		server.listen(options.port, options.host, () => {
-			server.off("error", reject);
-			resolve();
+	signal?.addEventListener("abort", onAbort, { once: true });
+	try {
+		await new Promise<void>((resolve, reject) => {
+			server.once("error", reject);
+			server.listen(options.port, options.host, () => {
+				server.off("error", reject);
+				resolve();
+			});
 		});
-	});
+	} catch (error) {
+		signal?.removeEventListener("abort", onAbort);
+		server.close();
+		throw error;
+	}
+	bound = true;
+	if (signal?.aborted) {
+		onAbort();
+		server.close();
+		throw new Error("Login cancelled");
+	}
 	const address = server.address();
 	if (!address || typeof address === "string") {
 		server.close();
@@ -129,7 +152,6 @@ export async function startOAuthCallbackServer<T>(
 	}
 
 	server.on("error", (error) => finish({ error }));
-	signal?.addEventListener("abort", onAbort, { once: true });
 	if (options.timeoutMs !== undefined) {
 		timer = setTimeout(() => finish({ error: new Error(`${providerName} sign-in timed out`) }), options.timeoutMs);
 	}

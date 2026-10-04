@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, request, Server } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "../src/auth/oauth/callback-server.ts";
 import type { AuthPrompt, ProviderAuthInteraction } from "../src/auth/types.ts";
@@ -47,6 +47,56 @@ describe.sequential("OAuth callback server", () => {
 
 	afterEach(() => {
 		for (const server of servers.splice(0)) server.close();
+	});
+
+	// pi#137 / smarty-dev#3535, security findings 4 and 5.
+	it("returns 400 for malformed request targets without failing the login", async () => {
+		const server = await start<string>();
+		const url = new URL(server.redirectUri);
+		const status = await new Promise<number | undefined>((resolve, reject) => {
+			request({ hostname: url.hostname, port: url.port, path: "//[", method: "GET" }, (response) => {
+				response.resume();
+				response.on("end", () => resolve(response.statusCode));
+			})
+				.on("error", reject)
+				.end();
+		});
+		expect(status).toBe(400);
+		expect(
+			(await nativeFetch(callbackUrl(server.redirectUri, { code: "valid", state: "expected-state" }))).status,
+		).toBe(200);
+		await expect(server.wait()).resolves.toBe("completed:valid");
+	});
+
+	it.each(["before bind", "after bind"])("closes a callback server cancelled %s", async (boundary) => {
+		const controller = new AbortController();
+		const nativeListen = Server.prototype.listen;
+		let bindingServer: Server | undefined;
+		const spy = vi.spyOn(Server.prototype, "listen").mockImplementation(function (
+			this: Server,
+			...args: Parameters<Server["listen"]>
+		) {
+			bindingServer = this;
+			if (boundary === "before bind") {
+				controller.abort();
+				return Reflect.apply(nativeListen, this, args) as Server;
+			}
+			const callback = args.at(-1);
+			return Reflect.apply(nativeListen, this, [
+				...args.slice(0, -1),
+				() => {
+					controller.abort();
+					if (typeof callback === "function") callback();
+				},
+			]) as Server;
+		});
+		try {
+			await expect(start<string>({ signal: controller.signal })).rejects.toThrow("Login cancelled");
+			expect(bindingServer?.listening).toBe(false);
+			expect(bindingServer?.address()).toBeNull();
+		} finally {
+			spy.mockRestore();
+		}
 	});
 
 	it("ignores stray requests and resolves with the completed code", async () => {
