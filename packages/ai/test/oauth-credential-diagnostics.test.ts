@@ -116,19 +116,12 @@ describe.each(stages)("value-free credential diagnostics: $name", (stage) => {
 		expect(error).toBeInstanceOf(Error);
 		const message = (error as Error).message;
 		expect(message).not.toContain(SECRET);
-		if (kind === "partial") {
-			expect(message).toBe(
-				chatGPT
-					? `${stage.operation} response has invalid ${stage.fields}`
-					: `${stage.operation} response missing or invalid ${stage.fields}`,
-			);
-		} else if (kind === "malformed JSON" || kind === "body error") {
-			expect(message).toBe(`${stage.operation} response is invalid JSON`);
+		if (["partial", "malformed JSON", "body error"].includes(kind)) {
+			expect(message).toBe("oauth_invalid_response (HTTP 200)");
 		} else if (kind === "HTTP error") {
-			expect(message).toContain("500");
-			expect(message).toContain(stage.operation);
+			expect(message).toBe("oauth_request_failed (HTTP 500)");
 		} else {
-			expect(message).toContain("request failed");
+			expect(message).toBe("oauth_request_failed (HTTP unknown)");
 		}
 		expect(fetchMock).toHaveBeenCalled();
 		expect(await credentials.read(providerId)).toBeUndefined();
@@ -153,11 +146,7 @@ it.each(["initialization", "polling"])("redacts missing fields in %s through Mod
 		models.setProvider(openaiCodexProvider());
 		await expect(
 			models.login("openai-codex", "oauth", { signal, prompt: async () => "device_code", notify: () => {} }),
-		).rejects.toThrow(
-			stage === "initialization"
-				? "OpenAI Codex device code response missing or invalid device_auth_id, user_code or interval"
-				: "OpenAI Codex device auth response missing or invalid authorization_code or code_verifier",
-		);
+		).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 	} finally {
 		vi.unstubAllGlobals();
 	}

@@ -101,7 +101,8 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 			);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			expect(output.stopReason).toBe("error");
-			expect(output.errorMessage).toContain("server_error");
+			expect(output.errorMessage).toMatch(/oauth_(request|stream)_failed/);
+			if (kind.startsWith("HTTP")) expect(output.errorMessage).toContain("503");
 			expectRedacted(output);
 		},
 	);
@@ -195,7 +196,7 @@ it("redacts WebSocket fallback message, stack, code and stats before a successfu
 	const output = await stream.result();
 	expect(output.stopReason).toBe("stop");
 	expect(events).toContain("start");
-	expect(output.diagnostics?.[0].error?.message).toContain("connection failed");
+	expect(output.diagnostics?.[0].error?.message).toContain("oauth_request_failed");
 	expectRedacted(getOpenAICodexWebSocketDebugStats("fake-session-127"));
 });
 
@@ -255,7 +256,7 @@ it.each(["HTTP", "transport", "retry cap", "custom endpoint"])("redacts OAuth SD
 	expect(output.stopReason).toBe("error");
 	expect(records.length).toBeGreaterThan(0);
 	expectRedacted({ records, output });
-	if (kind === "retry cap") expect(output.errorMessage).toContain("Server requested 2s retry delay");
+	if (kind === "retry cap") expect(output.errorMessage).toContain("oauth_request_failed");
 });
 
 // pi#127 / B-F3: callback errors/descriptions are untrusted diagnostic input.

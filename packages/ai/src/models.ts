@@ -1,7 +1,7 @@
 import { lazyStream, requestSetupError, SafeSetupError } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
-import { getOAuthDiagnosticSecrets } from "./auth/oauth/credential-response.ts";
+import { getOAuthDiagnosticSecrets, isOAuthCancellation, safeOAuthError } from "./auth/oauth/credential-response.ts";
 import { type AuthResolutionOverrides, ModelsError, resolveProviderAuth } from "./auth/resolve.ts";
 import type {
 	AuthCheck,
@@ -620,7 +620,11 @@ class ModelsImpl implements MutableModels {
 				provider.id,
 				async (current) => {
 					if (current?.type !== "oauth" || Date.now() < current.expires) return undefined;
-					return oauth.refresh(current, signal);
+					try {
+						return await oauth.refresh(current, signal);
+					} catch (error) {
+						throw safeOAuthError(error);
+					}
 				},
 				{ signal },
 			);
@@ -768,7 +772,14 @@ class ModelsImpl implements MutableModels {
 		if (!method?.login) {
 			throw new ModelsError("auth", `${provider.name} does not support ${type} login`);
 		}
-		const loginOperation: Promise<Credential> = method.login({ ...interaction, signal }, options);
+		const login = method.login.bind(method);
+		const loginOperation: Promise<Credential> = Promise.resolve()
+			.then<Credential>(() => login({ ...interaction, signal }, options))
+			.catch((error: unknown) => {
+				if (type !== "oauth") throw error;
+				if (signal.aborted || isOAuthCancellation(error)) throw new Error("Login cancelled");
+				throw safeOAuthError(error);
+			});
 		const credential = await raceWithAbortSignal(loginOperation, signal);
 		let mutationStarted = false;
 		let markMutationStarted: (() => void) | undefined;
@@ -880,6 +891,7 @@ class ModelsImpl implements MutableModels {
 				ProviderRequestOptions<TModel>;
 
 			requestOptions.diagnosticSecrets = diagnosticSecrets;
+			requestOptions.oauthDiagnostics = resolution.source === "OAuth" || options?.oauthDiagnostics === true;
 			return { requestModel, requestOptions };
 		} catch (error) {
 			// A failed callback is a diagnostic, not the caller's intentional raw-header interface.

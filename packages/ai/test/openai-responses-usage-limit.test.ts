@@ -62,7 +62,8 @@ describe("OpenAI Responses ChatGPT usage limit", () => {
 
 		const errorMessage = await getErrorMessage(response);
 
-		expect(errorMessage).toContain("subscription_sharing_usage_limit_exceeded: Usage limit reached.");
+		expect(errorMessage).toContain("provider_error=subscription_sharing_usage_limit_exceeded");
+		expect(errorMessage).not.toContain("Usage limit reached.");
 		expect(errorMessage).toContain("Check your ChatGPT usage: https://chatgpt.com/settings/usage");
 	});
 });

@@ -136,6 +136,8 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	apiKey?: string;
 	/** Live credential values to redact at diagnostic sinks; never sent to the provider. */
 	diagnosticSecrets?: readonly string[];
+	/** Fixed-code diagnostics only for OAuth-authenticated requests. */
+	oauthDiagnostics?: boolean;
 	/**
 	 * Optional fetch implementation for provider HTTP requests.
 	 * Defaults to `globalThis.fetch`. Provider adapters that cannot inject a custom implementation may reject it.

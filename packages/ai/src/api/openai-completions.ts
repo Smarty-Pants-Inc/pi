@@ -11,6 +11,7 @@ import type {
 	ChatCompletionSystemMessageParam,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
+import { oauthDiagnosticError, oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -356,6 +357,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				options?.fetch,
 				cacheSessionId,
 				compat,
+				options?.oauthDiagnostics,
 			);
 			let params = buildParams(
 				model,
@@ -380,6 +382,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
+					diagnosticSecrets: options?.diagnosticSecrets,
+					oauthDiagnostics: options?.oauthDiagnostics,
 				},
 			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -581,11 +585,25 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				}
 
 				if (choice.finish_reason) {
-					output.rawStopReason = choice.finish_reason;
+					output.rawStopReason = options?.oauthDiagnostics
+						? [
+								"stop",
+								"end",
+								"length",
+								"function_call",
+								"tool_calls",
+								"content_filter",
+								"network_error",
+							].includes(choice.finish_reason)
+							? choice.finish_reason
+							: "unknown"
+						: choice.finish_reason;
 					const finishReasonResult = mapStopReason(choice.finish_reason);
 					output.stopReason = finishReasonResult.stopReason;
 					if (finishReasonResult.errorMessage) {
-						output.errorMessage = finishReasonResult.errorMessage;
+						output.errorMessage = options?.oauthDiagnostics
+							? oauthDiagnosticError("oauth_stream_failed").message
+							: finishReasonResult.errorMessage;
 					}
 					hasFinishReason = true;
 				}
@@ -718,7 +736,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const limitMessage = smartyLimitMessage(error);
+			const limitMessage = options?.oauthDiagnostics ? undefined : smartyLimitMessage(error);
 			if (limitMessage !== undefined) {
 				// Show the gateway's limit message as-is, and mark it final so the generic retry does not retry it.
 				// A throttled limit with a short Retry-After carries the wait for the agent's one-shot retry.
@@ -738,13 +756,15 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								},
 				});
 			} else {
-				output.errorMessage = formatProviderError(normalizeProviderError(error));
+				output.errorMessage = formatProviderError(
+					normalizeProviderError(error, options?.diagnosticSecrets, options?.oauthDiagnostics),
+				);
 				// Some providers via OpenRouter give additional information in this field.
 				// normalizeProviderError already stringifies the parsed body (error.error)
 				// into errorMessage, so only append the raw metadata when it is not already
 				// present to avoid double-printing it.
 				const rawMetadata = (error as any)?.error?.metadata?.raw;
-				if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
+				if (!options?.oauthDiagnostics && rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
 					output.errorMessage += `\n${rawMetadata}`;
 				}
 			}
@@ -785,6 +805,7 @@ function createClient(
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
+	oauthDiagnostics = false,
 ) {
 	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
 	if (model.provider === "github-copilot") {
@@ -814,6 +835,7 @@ function createClient(
 	}
 
 	return new OpenAI({
+		logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,

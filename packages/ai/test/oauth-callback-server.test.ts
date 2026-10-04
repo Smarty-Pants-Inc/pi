@@ -96,8 +96,9 @@ describe.sequential("OAuth callback server", () => {
 		);
 		expect(failure.status).toBe(502);
 		expect(failure.body).toContain("Example sign-in failed.");
-		expect(failure.body).toContain("token exchange failed");
-		await expect(server.wait()).rejects.toThrow("token exchange failed");
+		expect(failure.body).toContain("oauth_request_failed (HTTP unknown)");
+		expect(failure.body).not.toContain("token exchange failed");
+		await expect(server.wait()).rejects.toThrow("oauth_request_failed (HTTP unknown)");
 	});
 
 	it("rejects the wait when the provider redirects with an error", async () => {
@@ -114,7 +115,7 @@ describe.sequential("OAuth callback server", () => {
 		expect(failure.status).toBe(400);
 		expect(failure.body).toContain("access_denied");
 		expect(failure.body).not.toContain("User denied access");
-		await expect(server.wait()).rejects.toThrow("Example authorization failed: access_denied");
+		await expect(server.wait()).rejects.toThrow("oauth_authorization_failed (HTTP 400) provider_error=access_denied");
 	});
 
 	it("completes only the first callback", async () => {

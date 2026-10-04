@@ -140,7 +140,7 @@ describe("Responses terminal usage replay barrier", () => {
 		);
 		expect(calls).toBe(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("fetch failed");
+		expect(result.errorMessage).toContain(api === "codex" ? "oauth_request_failed" : "fetch failed");
 		expect(result.content).toEqual([]);
 		expect(result.responseId).toBe("resp_observer_usage");
 		expect(result.usage).toMatchObject({ input: 17, cacheRead: 3, output: 1, reasoning: 1, totalTokens: 21 });
@@ -221,7 +221,7 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(calls).toBe(1);
 		expect(rejections).toBe(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("fetch failed");
+		expect(result.errorMessage).toContain(api === "codex" ? "oauth_request_failed" : "fetch failed");
 		expect(result.usage.output).toBe(0);
 		expect(result.diagnostics).toEqual(
 			expect.arrayContaining([expect.objectContaining({ type: "provider_stream_observer_error" })]),

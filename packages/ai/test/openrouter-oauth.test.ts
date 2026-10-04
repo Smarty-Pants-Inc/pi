@@ -124,7 +124,8 @@ describe.sequential("OpenRouter OAuth", () => {
 			},
 		});
 
-		await expect(login).rejects.toThrow("OpenRouter OAuth key exchange failed (HTTP 403): invalid code");
+		await expect(login).rejects.toThrow("oauth_request_failed (HTTP 403)");
+		expect(await (await callbackResponse)?.text()).not.toContain("invalid code");
 		expect((await callbackResponse)?.status).toBe(502);
 	});
 
@@ -181,7 +182,7 @@ describe.sequential("OpenRouter OAuth", () => {
 			},
 		});
 
-		await expect(login).rejects.toThrow('OpenRouter OAuth response carries no "key"');
+		await expect(login).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 		expect((await callbackResponse)?.status).toBe(502);
 	});
 
@@ -264,7 +265,7 @@ describe.sequential("OpenRouter OAuth", () => {
 				prompt: async () => "   ",
 				notify: () => {},
 			}),
-		).rejects.toThrow("Missing authorization code");
+		).rejects.toThrow("oauth_request_failed (HTTP unknown)");
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 

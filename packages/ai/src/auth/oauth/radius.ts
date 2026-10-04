@@ -12,6 +12,14 @@
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
+import {
+	fetchOAuth,
+	OAuthDiagnosticError,
+	oauthDiagnosticError,
+	oauthResponseError,
+	readOAuthCredentialResponse,
+	withOAuthDiagnostics,
+} from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { generatePKCE } from "./pkce.ts";
 
@@ -39,56 +47,33 @@ type DeviceAuthorizationResponse = {
 };
 
 async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): Promise<RadiusOAuthDiscovery> {
-	const response = await fetch(new URL("/v1/oauth", gateway), {
+	const response = await fetchOAuth(new URL("/v1/oauth", gateway), {
 		headers: { accept: "application/json" },
 		signal,
 	});
 
 	if (!response.ok) {
-		throw new Error(
-			`Could not load Radius OAuth config from ${gateway}: ${response.status} ${await response.text()}`,
-		);
+		throw oauthDiagnosticError("oauth_request_failed", response.status);
 	}
 
-	const discovery = (await response.json()) as Partial<RadiusOAuthDiscovery>;
+	const discovery = (await readOAuthCredentialResponse(response, "oauth")) as Partial<RadiusOAuthDiscovery>;
 	if (typeof discovery.authorizationEndpoint !== "string") {
-		throw new Error(`Invalid Radius OAuth config from ${gateway}`);
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
 	}
 	return { authorizationEndpoint: discovery.authorizationEndpoint };
 }
 
-class OAuthResponseError extends Error {
-	readonly status: number;
+class OAuthResponseError extends OAuthDiagnosticError {
 	readonly oauthError?: string;
-
-	constructor(status: number, oauthError: string | undefined, description: string | undefined, message: string) {
-		const detail = oauthError
-			? description
-				? `${oauthError}: ${description}`
-				: oauthError
-			: description || String(status);
-		super(`${message}: ${detail}`);
-		this.status = status;
-		this.oauthError = oauthError;
+	constructor(status: number, providerCode?: string) {
+		super("oauth_request_failed", status, providerCode);
+		this.oauthError = this.providerCode;
 	}
 }
 
-async function readOAuthResponseError(response: Response, message: string): Promise<OAuthResponseError> {
-	const text = await response.text().catch(() => "");
-	let oauthError: string | undefined;
-	let description: string | undefined;
-
-	if (text) {
-		try {
-			const data = JSON.parse(text) as { error?: unknown; error_description?: unknown };
-			oauthError = typeof data.error === "string" ? data.error : undefined;
-			description = typeof data.error_description === "string" ? data.error_description : undefined;
-		} catch {
-			description = text;
-		}
-	}
-
-	return new OAuthResponseError(response.status, oauthError, description, message);
+async function readOAuthResponseError(response: Response, _message: string): Promise<OAuthResponseError> {
+	const safe = await oauthResponseError(response);
+	return new OAuthResponseError(response.status, safe.providerCode);
 }
 
 async function requestOAuthToken(
@@ -98,7 +83,7 @@ async function requestOAuthToken(
 ): Promise<OAuthCredential> {
 	let response: Response;
 	try {
-		response = await fetch(new URL("/v1/oauth/token", gateway), {
+		response = await fetchOAuth(new URL("/v1/oauth/token", gateway), {
 			method: "POST",
 			headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
 			body,
@@ -115,13 +100,24 @@ async function requestOAuthToken(
 		throw await readOAuthResponseError(response, "Radius OAuth token request failed");
 	}
 
-	const data = (await response.json()) as {
+	const data = (await readOAuthCredentialResponse(response, "oauth")) as {
 		access_token: string;
 		refresh_token: string;
 		expires_in: number;
 		scope?: string;
 	};
 
+	if (
+		typeof data?.access_token !== "string" ||
+		!data.access_token ||
+		typeof data.refresh_token !== "string" ||
+		!data.refresh_token ||
+		typeof data.expires_in !== "number" ||
+		!Number.isFinite(data.expires_in) ||
+		data.expires_in <= 0
+	) {
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
+	}
 	return {
 		type: "oauth",
 		access: data.access_token,
@@ -179,7 +175,7 @@ async function loginWithBrowser(
 
 	try {
 		const credential = await callback.wait();
-		if (!credential) throw new Error("OAuth callback did not complete.");
+		if (!credential) throw oauthDiagnosticError("oauth_invalid_response");
 		return credential;
 	} finally {
 		callback.close();
@@ -189,7 +185,7 @@ async function loginWithBrowser(
 async function requestDeviceAuthorization(gateway: string, signal: AbortSignal): Promise<DeviceAuthorizationResponse> {
 	let response: Response;
 	try {
-		response = await fetch(new URL("/v1/oauth/device", gateway), {
+		response = await fetchOAuth(new URL("/v1/oauth/device", gateway), {
 			method: "POST",
 			headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({ client_id: OAUTH_CLIENT_ID, scope: OAUTH_SCOPE }),
@@ -206,9 +202,9 @@ async function requestDeviceAuthorization(gateway: string, signal: AbortSignal):
 		throw await readOAuthResponseError(response, "Radius OAuth device authorization failed");
 	}
 
-	const data = (await response.json()) as Partial<DeviceAuthorizationResponse>;
+	const data = (await readOAuthCredentialResponse(response, "oauth")) as Partial<DeviceAuthorizationResponse>;
 	if (!data.device_code || !data.user_code || !data.verification_uri || !data.expires_in) {
-		throw new Error("Radius OAuth device authorization response is missing required fields");
+		throw oauthDiagnosticError("oauth_invalid_response");
 	}
 
 	return {
@@ -256,9 +252,9 @@ async function loginWithDeviceCode(gateway: string, interaction: ProviderAuthInt
 					case "slow_down":
 						return { status: "slow_down" };
 					case "expired_token":
-						return { status: "failed", message: "Device authorization expired." };
+						return { status: "failed", error: error };
 					case "access_denied":
-						return { status: "failed", message: "Device authorization was denied." };
+						return { status: "failed", error: error };
 					default:
 						throw error;
 				}
@@ -275,7 +271,7 @@ export interface RadiusOAuthOptions {
 export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 	const gateway = normalizeRadiusGatewayUrl(options.gateway);
 
-	return {
+	return withOAuthDiagnostics({
 		name: options.name,
 
 		async login(interaction): Promise<OAuthCredential> {
@@ -298,7 +294,7 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 				const discovery = await loadRadiusOAuthDiscovery(gateway, interaction.signal);
 				return loginWithBrowser(gateway, discovery.authorizationEndpoint, interaction);
 			}
-			throw new Error(`Unknown ${options.name} sign-in method: ${loginMethod}`);
+			throw oauthDiagnosticError("oauth_request_failed");
 		},
 
 		async refresh(credential, signal): Promise<OAuthCredential> {
@@ -317,5 +313,5 @@ export function createRadiusOAuth(options: RadiusOAuthOptions): OAuthAuth {
 		async toAuth(credential) {
 			return { apiKey: credential.access };
 		},
-	};
+	});
 }

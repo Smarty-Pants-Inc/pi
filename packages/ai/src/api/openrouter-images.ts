@@ -6,6 +6,7 @@ import type {
 	ChatCompletionContentPartText,
 	ChatCompletionCreateParamsNonStreaming,
 } from "openai/resources/chat/completions.js";
+import { oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantImages,
 	ImageApi,
@@ -58,7 +59,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		if (!apiKey) {
 			throw new Error(`No API key for provider: ${model.provider}`);
 		}
-		const client = createClient(model, apiKey, options?.headers, options?.fetch);
+		const client = createClient(model, apiKey, options?.headers, options?.fetch, options?.oauthDiagnostics);
 		let params = buildParams(model, context);
 		const nextParams = await options?.onPayload?.(params, model);
 		if (nextParams !== undefined) {
@@ -78,6 +79,8 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 				maxRetries: options?.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs,
 				signal: options?.signal,
+				diagnosticSecrets: options?.diagnosticSecrets,
+				oauthDiagnostics: options?.oauthDiagnostics,
 			},
 		);
 		await options?.onResponse?.({ status: rawResponse.status, headers: headersToRecord(rawResponse.headers) }, model);
@@ -111,7 +114,9 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		return output;
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-		output.errorMessage = formatProviderError(normalizeProviderError(error));
+		output.errorMessage = formatProviderError(
+			normalizeProviderError(error, options?.diagnosticSecrets, options?.oauthDiagnostics),
+		);
 		return output;
 	}
 };
@@ -121,8 +126,10 @@ function createClient(
 	apiKey: string,
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
+	oauthDiagnostics = false,
 ): OpenAI {
 	return new OpenAI({
+		logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,

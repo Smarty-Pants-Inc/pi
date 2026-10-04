@@ -135,7 +135,7 @@ describe("Kimi Code OAuth", () => {
 		);
 
 		const credentialPromise = kimiCodingOAuth.login(createInteraction([]));
-		const assertion = expect(credentialPromise).rejects.toThrow("expired");
+		const assertion = expect(credentialPromise).rejects.toThrow("provider_error=expired_token");
 		await vi.advanceTimersByTimeAsync(5000);
 		await assertion;
 	});
@@ -157,7 +157,7 @@ describe("Kimi Code OAuth", () => {
 		);
 
 		const credentialPromise = kimiCodingOAuth.login(createInteraction([]));
-		const assertion = expect(credentialPromise).rejects.toThrow("denied");
+		const assertion = expect(credentialPromise).rejects.toThrow("provider_error=access_denied");
 		await vi.advanceTimersByTimeAsync(5000);
 		await assertion;
 	});
@@ -265,6 +265,6 @@ describe("Kimi Code OAuth", () => {
 				{ type: "oauth", access: "old", refresh: "old", expires: 0 },
 				new AbortController().signal,
 			),
-		).rejects.toThrow("unauthorized");
+		).rejects.toThrow("oauth_request_failed (HTTP 400) provider_error=invalid_grant");
 	});
 });

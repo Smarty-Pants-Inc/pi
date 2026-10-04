@@ -500,7 +500,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 				onDeviceCode,
 				onPrompt: async () => "",
 			}),
-		).rejects.toThrow(/Untrusted verification_uri/);
+		).rejects.toThrow(/oauth_invalid_response/);
 		expect(onDeviceCode).not.toHaveBeenCalled();
 	});
 
@@ -716,9 +716,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 			onDeviceCode: () => {},
 			onPrompt: async () => "",
 		});
-		const rejection = expect(loginPromise).rejects.toThrow(
-			/Device flow timed out after one or more slow_down responses/,
-		);
+		const rejection = expect(loginPromise).rejects.toThrow(/oauth_request_failed/);
 
 		await vi.advanceTimersByTimeAsync(4999);
 		expect(accessTokenPollTimes).toEqual([]);

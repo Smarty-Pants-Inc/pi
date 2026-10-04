@@ -9,6 +9,7 @@
  * models.json custom provider with `"api": "pi-messages"`.
  */
 
+import { oauthDiagnosticError, oauthResponseError, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -177,7 +178,7 @@ function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesR
 	});
 }
 
-function createEventConverter(model: Model<"pi-messages">) {
+function createEventConverter(model: Model<"pi-messages">, oauthDiagnostics = false) {
 	const partial: AssistantMessage = {
 		role: "assistant",
 		content: [],
@@ -201,19 +202,21 @@ function createEventConverter(model: Model<"pi-messages">) {
 				if (event.providerThinkingLevel !== undefined) {
 					partial.providerThinkingLevel = event.providerThinkingLevel;
 				}
-				appendRewriteDiagnostic(partial, event.rewrite);
+				if (!oauthDiagnostics) appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "done", reason: event.reason, message: partial };
 			case "error":
 				Object.assign(partial, {
 					stopReason: event.reason,
 					usage: event.usage,
-					errorMessage: event.errorMessage,
+					errorMessage: oauthDiagnostics
+						? oauthDiagnosticError("oauth_stream_failed").message
+						: event.errorMessage,
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
 					partial.providerThinkingLevel = event.providerThinkingLevel;
 				}
-				appendRewriteDiagnostic(partial, event.rewrite);
+				if (!oauthDiagnostics) appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "error", reason: event.reason, error: partial };
 			case "start":
 				break;
@@ -320,7 +323,12 @@ function parsePiMessagesEvent(raw: string): PiMessagesEvent | undefined {
 	return data && data !== "[DONE]" ? (JSON.parse(data) as PiMessagesEvent) : undefined;
 }
 
-function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: boolean): AssistantMessageEvent {
+function createErrorEvent(
+	model: Model<"pi-messages">,
+	error: unknown,
+	aborted: boolean,
+	oauthDiagnostics = false,
+): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
@@ -330,14 +338,24 @@ function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: 
 		model: model.id,
 		usage: createEmptyUsage(),
 		stopReason: reason,
-		errorMessage: error instanceof Error ? error.message : String(error),
+		errorMessage: oauthDiagnostics
+			? safeOAuthError(error).message
+			: error instanceof Error
+				? error.message
+				: String(error),
 		timestamp: Date.now(),
 	};
 
 	if (!aborted && error instanceof PiMessagesResponseError) {
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
-			createAssistantMessageDiagnostic("pi_messages_response_failure", error, error.diagnosticDetails),
+			createAssistantMessageDiagnostic(
+				"pi_messages_response_failure",
+				error,
+				error.diagnosticDetails,
+				[],
+				oauthDiagnostics,
+			),
 		);
 	}
 
@@ -358,7 +376,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	options?: PiMessagesOptions,
 ): AssistantMessageEventStream => {
 	const eventStream = new AssistantMessageEventStream();
-	const convertEvent = createEventConverter(model);
+	const convertEvent = createEventConverter(model, options?.oauthDiagnostics);
 
 	void (async () => {
 		try {
@@ -404,6 +422,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 
 			if (!response.ok) {
+				if (options?.oauthDiagnostics) throw await oauthResponseError(response);
 				const body = await response.text();
 				throw createPiMessagesResponseError(model, url, response, body);
 			}
@@ -422,7 +441,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false));
+			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false, options?.oauthDiagnostics));
 		}
 	})();
 

@@ -10,7 +10,14 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../../utils/oauth-page.ts";
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { LoginOptions, OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
-import { oauthAuthorizationError, readOAuthCredentialResponse } from "./credential-response.ts";
+import {
+	fetchOAuth,
+	oauthAuthorizationError,
+	oauthDiagnosticError,
+	oauthResponseError,
+	readOAuthCredentialResponse,
+	withOAuthDiagnostics,
+} from "./credential-response.ts";
 import { generatePKCE } from "./pkce.ts";
 
 // every login registers a new client with this ID; OpenAI returns the issued client ID in the callback
@@ -40,6 +47,7 @@ type CallbackServer = {
 };
 
 type TokenResponse = {
+	httpStatus: number;
 	access_token?: unknown;
 	refresh_token?: unknown;
 	expires_in?: unknown;
@@ -58,7 +66,7 @@ function authorizationResultFromCallback(url: URL, expectedState: string): Autho
 	if (!state) throw new Error("Missing OAuth state");
 	if (state !== expectedState) throw new Error("OAuth state mismatch");
 	const clientId = url.searchParams.get("client_id")?.trim();
-	if (!clientId) throw new Error("OpenAI OAuth registration callback did not contain an issued client ID");
+	if (!clientId) throw oauthDiagnosticError("oauth_invalid_response");
 	return { code, clientId };
 }
 
@@ -74,7 +82,7 @@ function authorizationResultFromManualInput(input: string, expectedState: string
 		throw new Error(`The pasted callback URL must start with ${REDIRECT_URI}`);
 	}
 	const error = url.searchParams.get("error");
-	if (error) throw new Error(`ChatGPT authorization failed: ${oauthAuthorizationError(error)}`);
+	if (error) throw oauthDiagnosticError("oauth_authorization_failed", 400, error);
 	return authorizationResultFromCallback(url, expectedState);
 }
 
@@ -104,7 +112,7 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 				if (error) {
 					const code = oauthAuthorizationError(error);
 					sendHtml(response, 400, oauthErrorHtml("ChatGPT was not connected.", `Error: ${code}`));
-					rejectResult(new Error(`ChatGPT authorization failed: ${code}`));
+					rejectResult(oauthDiagnosticError("oauth_authorization_failed", 400, code));
 					return;
 				}
 
@@ -136,7 +144,7 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 async function requestToken(body: URLSearchParams, signal: AbortSignal): Promise<TokenResponse> {
 	let response: Response;
 	try {
-		response = await fetch(TOKEN_URL, {
+		response = await fetchOAuth(TOKEN_URL, {
 			method: "POST",
 			headers: {
 				accept: "application/json",
@@ -146,36 +154,39 @@ async function requestToken(body: URLSearchParams, signal: AbortSignal): Promise
 			signal,
 		});
 	} catch {
-		throw new Error(`OpenAI OAuth token request ${signal.aborted ? "cancelled" : "failed"}`);
+		throw oauthDiagnosticError("oauth_request_failed");
 	}
 	if (!response.ok) {
-		await response.body?.cancel().catch(() => undefined);
-		throw new Error(`OpenAI OAuth token request failed (HTTP ${response.status})`);
+		throw await oauthResponseError(response);
 	}
 	const data = await readOAuthCredentialResponse(response, "OpenAI OAuth token");
 	if (typeof data !== "object" || data === null || Array.isArray(data)) {
-		throw new Error("OpenAI OAuth token response must be an object");
+		throw oauthDiagnosticError("oauth_request_failed");
 	}
-	return data as TokenResponse;
+	return { ...data, httpStatus: response.status } as TokenResponse;
 }
 
-function requireTokenString(value: unknown, field: "access_token" | "refresh_token" | "scope"): string {
+function requireTokenString(
+	value: unknown,
+	_field: "access_token" | "refresh_token" | "scope",
+	status: number,
+): string {
 	if (typeof value !== "string" || value.trim().length === 0) {
-		throw new Error(`OpenAI OAuth token response has invalid ${field}`);
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 	return value;
 }
 
 function credentialFromTokenResponse(token: TokenResponse, clientId: string): OAuthCredential {
-	const access = requireTokenString(token.access_token, "access_token");
-	const refresh = requireTokenString(token.refresh_token, "refresh_token");
-	const scope = requireTokenString(token.scope, "scope");
+	const access = requireTokenString(token.access_token, "access_token", token.httpStatus);
+	const refresh = requireTokenString(token.refresh_token, "refresh_token", token.httpStatus);
+	const scope = requireTokenString(token.scope, "scope", token.httpStatus);
 	if (typeof token.expires_in !== "number" || !Number.isFinite(token.expires_in) || token.expires_in <= 0) {
-		throw new Error("OpenAI OAuth token response has invalid expires_in");
+		throw oauthDiagnosticError("oauth_invalid_response", token.httpStatus);
 	}
 	const scopes = scope.trim().split(/\s+/).filter(Boolean);
 	if (!scopes.includes(DIRECT_TOKEN_SCOPE)) {
-		throw new Error(`OpenAI OAuth grant did not include ${DIRECT_TOKEN_SCOPE}`);
+		throw oauthDiagnosticError("oauth_invalid_response", token.httpStatus);
 	}
 	return {
 		type: "oauth",
@@ -207,7 +218,7 @@ async function exchangeAuthorizationCode(
 	// Pi does not use the ID token to identify the user or read profile data.
 	// Keep the presence check as part of the token-response contract.
 	if (typeof token.id_token !== "string" || token.id_token.trim().length === 0) {
-		throw new Error("OpenAI OAuth token response did not contain an ID token");
+		throw oauthDiagnosticError("oauth_invalid_response", token.httpStatus);
 	}
 	return credentialFromTokenResponse(token, clientId);
 }
@@ -215,7 +226,7 @@ async function exchangeAuthorizationCode(
 async function refreshAccessToken(credential: OAuthCredential, signal: AbortSignal): Promise<OAuthCredential> {
 	const clientId = credential.clientId;
 	if (typeof clientId !== "string" || clientId.trim().length === 0) {
-		throw new Error("Stored OpenAI OAuth credential does not contain an issued client ID; reconnect ChatGPT");
+		throw oauthDiagnosticError("oauth_invalid_response");
 	}
 	const token = await requestToken(
 		new URLSearchParams({
@@ -248,10 +259,10 @@ async function loginOpenAIChatGPT(
 	let callback: CallbackServer | undefined;
 	try {
 		callback = await startCallbackServer(state);
-	} catch (error) {
+	} catch {
 		interaction.notify({
 			type: "info",
-			message: `Could not listen on ${REDIRECT_URI}; paste the final redirect URL to continue. ${error instanceof Error ? error.message : String(error)}`,
+			message: `Could not listen on ${REDIRECT_URI}; paste the final redirect URL to continue. oauth_callback_unavailable`,
 		});
 	}
 
@@ -305,7 +316,7 @@ async function loginOpenAIChatGPT(
 	}
 }
 
-export const openaiChatGPTOAuth: OAuthAuth = {
+export const openaiChatGPTOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "OpenAI (ChatGPT subscription)",
 	isSubscription: true,
 	loginLabel: "Sign in with ChatGPT",
@@ -314,4 +325,4 @@ export const openaiChatGPTOAuth: OAuthAuth = {
 	async toAuth(credential) {
 		return { apiKey: credential.access };
 	},
-};
+});

@@ -112,7 +112,7 @@ describe("OpenAI ChatGPT OAuth", () => {
 		const fetchMock = stubTokenEndpoint(tokenResponse());
 
 		await expect(openaiChatGPTOAuth.login(loginInteraction(), { getDeviceId: () => DEVICE_ID })).rejects.toThrow(
-			"registration callback did not contain an issued client ID",
+			"oauth_invalid_response (HTTP unknown)",
 		);
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
@@ -124,10 +124,10 @@ describe("OpenAI ChatGPT OAuth", () => {
 			openaiChatGPTOAuth.login(loginInteraction({ callbackClientId: "oaiapp_issued" }), {
 				getDeviceId: () => DEVICE_ID,
 			}),
-		).rejects.toThrow("grant did not include chatgpt.tokens.use.direct");
+		).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 	});
 
-	it("requires a device ID before starting authorization", async () => {
+	it("oauth_request_failed (HTTP unknown) before starting authorization", async () => {
 		let authorizationStarted = false;
 		const interaction = loginInteraction({
 			onAuthorize: () => {
@@ -135,9 +135,9 @@ describe("OpenAI ChatGPT OAuth", () => {
 			},
 		});
 
-		await expect(openaiChatGPTOAuth.login(interaction)).rejects.toThrow("requires a device ID");
+		await expect(openaiChatGPTOAuth.login(interaction)).rejects.toThrow("oauth_request_failed (HTTP unknown)");
 		await expect(openaiChatGPTOAuth.login(interaction, { getDeviceId: () => "not-a-uuid" })).rejects.toThrow(
-			"requires a device ID",
+			"oauth_request_failed (HTTP unknown)",
 		);
 		expect(authorizationStarted).toBe(false);
 	});
@@ -147,7 +147,7 @@ describe("OpenAI ChatGPT OAuth", () => {
 		stubTokenEndpoint(responseWithoutRefresh);
 
 		await expect(openaiChatGPTOAuth.refresh(connectedCredential(), neverAbortedSignal)).rejects.toThrow(
-			"token response has invalid refresh_token",
+			"oauth_invalid_response (HTTP 200)",
 		);
 	});
 

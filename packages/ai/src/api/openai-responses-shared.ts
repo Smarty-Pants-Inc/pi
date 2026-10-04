@@ -14,7 +14,7 @@ import type {
 	ResponseStreamEvent,
 	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
-import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import { oauthDiagnosticError, oauthStopReason, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -112,6 +112,7 @@ function convertToolResultOutput<TApi extends Api>(
 
 export interface OpenAIResponsesStreamOptions {
 	diagnosticSecrets?: readonly string[];
+	oauthDiagnostics?: boolean;
 	onProviderStreamEvent?: StreamOptions["onProviderStreamEvent"];
 	serviceTier?: ResponseCreateParamsStreaming["service_tier"];
 	grammarToolInputProperties?: ReadonlyMap<string, string>;
@@ -601,11 +602,22 @@ export async function processResponsesStream<TApi extends Api>(
 		const incompleteReason = typeof incompleteDetails?.reason === "string" ? incompleteDetails.reason : undefined;
 		const rawStopReason = incompleteReason ? `${status}.${incompleteReason}` : status;
 		output.rawStopReason =
-			rawStopReason === undefined ? undefined : redactOAuthDiagnostic(rawStopReason, options?.diagnosticSecrets);
+			rawStopReason === undefined
+				? undefined
+				: redactOAuthDiagnostic(
+						options?.oauthDiagnostics ? oauthStopReason(status, incompleteReason) : rawStopReason,
+						options?.diagnosticSecrets,
+					);
 		const mappedStop = mapStopReason(status, incompleteReason);
 		output.stopReason = mappedStop.stopReason;
 		if (mappedStop.errorMessage === undefined) delete output.errorMessage;
-		else output.errorMessage = redactOAuthDiagnostic(mappedStop.errorMessage, options?.diagnosticSecrets);
+		else
+			output.errorMessage = redactOAuthDiagnostic(
+				options?.oauthDiagnostics
+					? oauthDiagnosticError("oauth_stream_failed", undefined, incompleteReason).message
+					: mappedStop.errorMessage,
+				options?.diagnosticSecrets,
+			);
 		if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 			output.stopReason = "toolUse";
 		}
@@ -623,6 +635,7 @@ export async function processResponsesStream<TApi extends Api>(
 					error,
 					undefined,
 					options?.diagnosticSecrets,
+					options?.oauthDiagnostics,
 				),
 			);
 			// A rejecting observer must not erase provider-reported generation and permit replay.
@@ -780,14 +793,19 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			throw options?.oauthDiagnostics
+				? oauthDiagnosticError("oauth_stream_failed", undefined, event.code)
+				: new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
 			finalizeResponsesUsage(event.response, output, model, options);
 			output.rawStopReason =
 				event.response?.status === undefined
 					? undefined
-					: redactOAuthDiagnostic(event.response.status, options?.diagnosticSecrets);
+					: redactOAuthDiagnostic(
+							options?.oauthDiagnostics ? oauthStopReason(event.response.status) : event.response.status,
+							options?.diagnosticSecrets,
+						);
 			const error = event.response?.error;
 			const details = event.response?.incomplete_details;
 			const msg = error
@@ -795,7 +813,9 @@ export async function processResponsesStream<TApi extends Api>(
 				: details?.reason
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
-			throw new Error(msg);
+			throw options?.oauthDiagnostics
+				? oauthDiagnosticError("oauth_stream_failed", undefined, error?.code)
+				: new Error(msg);
 		}
 	}
 	if (!sawTerminalResponseEvent) {

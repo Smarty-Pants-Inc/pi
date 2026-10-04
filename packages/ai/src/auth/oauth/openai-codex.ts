@@ -16,7 +16,13 @@ if (typeof process !== "undefined" && (process.versions?.node || process.version
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
-import { readOAuthCredentialResponse } from "./credential-response.ts";
+import {
+	fetchOAuth,
+	oauthDiagnosticError,
+	oauthResponseError,
+	readOAuthCredentialResponse,
+	withOAuthDiagnostics,
+} from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { generatePKCE } from "./pkce.ts";
 
@@ -111,7 +117,7 @@ function decodeJwt(token: string): JwtPayload | null {
 
 async function fetchWithLoginCancellation(input: string, init: RequestInit): Promise<Response> {
 	try {
-		return await fetch(input, init);
+		return await fetchOAuth(input, init);
 	} catch {
 		throw new Error(init.signal?.aborted ? "Login cancelled" : "OpenAI Codex OAuth request failed");
 	}
@@ -119,8 +125,7 @@ async function fetchWithLoginCancellation(input: string, init: RequestInit): Pro
 
 async function readTokenResponse(response: Response, operation: TokenOperation): Promise<OAuthToken> {
 	if (!response.ok) {
-		await response.body?.cancel().catch(() => undefined);
-		throw new Error(`OpenAI Codex token ${operation} failed (HTTP ${response.status})`);
+		throw await oauthResponseError(response);
 	}
 
 	const rawJson = await readOAuthCredentialResponse(response, `OpenAI Codex token ${operation}`);
@@ -138,9 +143,7 @@ async function readTokenResponse(response: Response, operation: TokenOperation):
 		!Number.isFinite(json.expires_in) ||
 		json.expires_in <= 0
 	) {
-		throw new Error(
-			`OpenAI Codex token ${operation} response missing or invalid access_token, refresh_token or expires_in`,
-		);
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
 	}
 
 	return {
@@ -175,7 +178,7 @@ async function exchangeAuthorizationCode(
 async function refreshAccessToken(refreshToken: string, signal: AbortSignal): Promise<OAuthToken> {
 	let response: Response;
 	try {
-		response = await fetch(TOKEN_URL, {
+		response = await fetchOAuth(TOKEN_URL, {
 			method: "POST",
 			headers: { "Content-Type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({
@@ -186,7 +189,7 @@ async function refreshAccessToken(refreshToken: string, signal: AbortSignal): Pr
 			signal,
 		});
 	} catch {
-		throw new Error(`OpenAI Codex token refresh request ${signal.aborted ? "cancelled" : "failed"}`);
+		throw oauthDiagnosticError("oauth_request_failed");
 	}
 
 	return readTokenResponse(response, "refresh");
@@ -200,15 +203,7 @@ async function startOpenAICodexDeviceAuth(signal: AbortSignal): Promise<DeviceAu
 		signal,
 	});
 
-	if (!response.ok) {
-		await response.body?.cancel().catch(() => undefined);
-		if (response.status === 404) {
-			throw new Error(
-				"OpenAI Codex device code login is not enabled for this server. Use browser login or verify the server URL.",
-			);
-		}
-		throw new Error(`OpenAI Codex device code request failed with status ${response.status}`);
-	}
+	if (!response.ok) throw await oauthResponseError(response);
 
 	const rawJson = await readOAuthCredentialResponse(response, "OpenAI Codex device code");
 	const json = rawJson as {
@@ -226,7 +221,7 @@ async function startOpenAICodexDeviceAuth(signal: AbortSignal): Promise<DeviceAu
 		!Number.isFinite(intervalSeconds) ||
 		intervalSeconds < 0
 	) {
-		throw new Error("OpenAI Codex device code response missing or invalid device_auth_id, user_code or interval");
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
 	}
 
 	return {
@@ -261,10 +256,7 @@ async function pollOpenAICodexDeviceAuth(device: DeviceAuthInfo, signal: AbortSi
 					typeof json.code_verifier !== "string" ||
 					!json.code_verifier
 				) {
-					return {
-						status: "failed",
-						message: "OpenAI Codex device auth response missing or invalid authorization_code or code_verifier",
-					};
+					return { status: "failed", error: oauthDiagnosticError("oauth_invalid_response", response.status) };
 				}
 				return {
 					status: "complete",
@@ -293,10 +285,7 @@ async function pollOpenAICodexDeviceAuth(device: DeviceAuthInfo, signal: AbortSi
 				return { status: "slow_down" };
 			}
 
-			return {
-				status: "failed",
-				message: `OpenAI Codex device auth failed with status ${response.status}`,
-			};
+			return { status: "failed", error: oauthDiagnosticError("oauth_request_failed", response.status, errorCode) };
 		},
 	});
 }
@@ -332,7 +321,7 @@ function getAccountId(accessToken: string): string | null {
 function credentialsFromToken(token: OAuthToken): OAuthCredential {
 	const accountId = getAccountId(token.access);
 	if (!accountId) {
-		throw new Error("Failed to extract accountId from token");
+		throw oauthDiagnosticError("oauth_invalid_response");
 	}
 
 	return {
@@ -418,7 +407,7 @@ async function refreshOpenAICodexToken(refreshToken: string, signal: AbortSignal
 	return credentialsFromToken(await refreshAccessToken(refreshToken, signal));
 }
 
-export const openaiCodexOAuth: OAuthAuth = {
+export const openaiCodexOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "OpenAI (ChatGPT Plus/Pro)",
 	isSubscription: true,
 
@@ -436,7 +425,7 @@ export const openaiCodexOAuth: OAuthAuth = {
 			return loginOpenAICodexDeviceCode(interaction);
 		}
 		if (method !== OPENAI_CODEX_BROWSER_LOGIN_METHOD) {
-			throw new Error(`Unknown OpenAI Codex login method: ${method}`);
+			throw oauthDiagnosticError("oauth_request_failed");
 		}
 
 		return loginOpenAICodex(interaction);
@@ -447,4 +436,4 @@ export const openaiCodexOAuth: OAuthAuth = {
 	async toAuth(credential) {
 		return { apiKey: credential.access };
 	},
-};
+});

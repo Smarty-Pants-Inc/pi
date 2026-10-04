@@ -8,7 +8,7 @@
 import { createServer, type ServerResponse } from "node:http";
 import { oauthErrorHtml, oauthSuccessHtml } from "../../utils/oauth-page.ts";
 import type { ProviderAuthInteraction } from "../types.ts";
-import { oauthAuthorizationError } from "./credential-response.ts";
+import { oauthAuthorizationError, oauthDiagnosticError, safeOAuthError } from "./credential-response.ts";
 
 export interface OAuthCallbackServerOptions<T> {
 	/** Provider name used on the browser page, for example `OpenAI`. */
@@ -95,7 +95,7 @@ export async function startOAuthCallbackServer<T>(
 			if (error) {
 				const code = oauthAuthorizationError(error);
 				sendPage(response, 400, oauthErrorHtml(`${providerName} authorization failed.`, code));
-				finish({ error: new Error(`${providerName} authorization failed: ${code}`) });
+				finish({ error: oauthDiagnosticError("oauth_authorization_failed", 400, code) });
 				return;
 			}
 			const code = url.searchParams.get("code");
@@ -109,7 +109,7 @@ export async function startOAuthCallbackServer<T>(
 				sendPage(response, 200, oauthSuccessHtml(`Signed in to ${providerName}. You may now close this page.`));
 				finish({ value });
 			} catch (error) {
-				const failure = error instanceof Error ? error : new Error(String(error));
+				const failure = safeOAuthError(error);
 				sendPage(response, 502, oauthErrorHtml(`${providerName} sign-in failed.`, failure.message));
 				finish({ error: failure });
 			}

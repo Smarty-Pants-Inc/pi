@@ -1029,7 +1029,7 @@ describe("Models runtime", () => {
 		await expect(oauthModels.getAuth("p1")).rejects.toMatchObject({ code: "auth" });
 	});
 
-	it("keeps the underlying reason in wrapped oauth refresh errors", async () => {
+	it("keeps only status and an allowlisted code in wrapped oauth refresh errors", async () => {
 		const credentials = new InMemoryCredentialStore();
 		await credentials.modify("p1", async () => ({ type: "oauth", access: "old", refresh: "r", expires: 0 }));
 		const models = createModels({ credentials });
@@ -1039,7 +1039,10 @@ describe("Models runtime", () => {
 				auth: {
 					oauth: testOAuth({
 						refresh: async () => {
-							throw new Error("token refresh failed (400): invalid_grant");
+							throw Object.assign(new Error("UNIQUE_PROVIDER_BODY_CANARY_4703_NOT_A_CREDENTIAL"), {
+								status: 400,
+								code: "invalid_grant",
+							});
 						},
 					}),
 				},
@@ -1047,7 +1050,7 @@ describe("Models runtime", () => {
 		);
 
 		await expect(models.getAuth("p1")).rejects.toThrow(
-			"OAuth refresh failed for p1: token refresh failed (400): invalid_grant",
+			"OAuth refresh failed for p1: oauth_request_failed (HTTP 400) provider_error=invalid_grant",
 		);
 	});
 

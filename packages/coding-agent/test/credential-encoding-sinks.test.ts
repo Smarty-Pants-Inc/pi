@@ -30,6 +30,12 @@ function escaped(value: string, depth: number): string {
 }
 
 const variants = [
+	// smarty-dev#4703 / pi#136: this is NOT a credential or a redactor input.
+	{
+		name: "noncredential-provider-body-canary",
+		body: "UNIQUE_PROVIDER_BODY_CANARY_4703_NOT_A_CREDENTIAL",
+		secrets: ["UNIQUE_PROVIDER_BODY_CANARY_4703_NOT_A_CREDENTIAL"],
+	},
 	{ name: "bare-headers", body: `receipt=${original} ${transformed}`, secrets: [original, transformed] },
 	{
 		name: "url",

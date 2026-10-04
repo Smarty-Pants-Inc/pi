@@ -1,4 +1,4 @@
-import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import { redactOAuthDiagnostic, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import { smartyLimitMessage } from "./error-body.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
@@ -8,6 +8,7 @@ interface ProviderRetryOptions {
 	maxRetryDelayMs?: number;
 	signal?: AbortSignal;
 	diagnosticSecrets?: readonly string[];
+	oauthDiagnostics?: boolean;
 }
 
 interface ProviderError extends Error {
@@ -58,8 +59,9 @@ function getRetryDelayMs(
 	retryIndex: number,
 	maxRetryDelayMs: number | undefined,
 	secrets?: readonly string[],
+	oauthDiagnostics = false,
 ): number {
-	const message = redactOAuthDiagnostic(error.message, secrets);
+	const message = redactOAuthDiagnostic(oauthDiagnostics ? safeOAuthError(error).message : error.message, secrets);
 	const retryAfterMs = error.headers?.get("retry-after-ms");
 	if (retryAfterMs) {
 		const value = Number.parseFloat(retryAfterMs);
@@ -131,7 +133,13 @@ export async function retryProviderRequest<T>(
 			const retryIndex = maxRetries - retriesRemaining;
 			retriesRemaining--;
 			await abortableSleep(
-				getRetryDelayMs(error, retryIndex, options.maxRetryDelayMs, options.diagnosticSecrets),
+				getRetryDelayMs(
+					error,
+					retryIndex,
+					options.maxRetryDelayMs,
+					options.diagnosticSecrets,
+					options.oauthDiagnostics,
+				),
 				options.signal,
 			);
 		}

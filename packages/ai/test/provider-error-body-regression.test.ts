@@ -138,7 +138,7 @@ describe("provider error body passthrough (per-tier regression)", () => {
 	});
 
 	it("openai-completions (body-blind text) surfaces status + body", async () => {
-		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "test" }));
+		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "sk-test" }));
 
 		expect(output.stopReason).toBe("error");
 		expect(output.errorMessage).toContain("403");
@@ -156,7 +156,7 @@ describe("provider error body passthrough (per-tier regression)", () => {
 			metadata: { raw: "upstream WAF blocked policy XYZ" },
 		};
 
-		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "test" }));
+		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "sk-test" }));
 
 		expect(output.errorMessage).toContain("upstream WAF blocked policy XYZ");
 		const occurrences = output.errorMessage?.match(/upstream WAF blocked policy XYZ/g) ?? [];
@@ -164,7 +164,7 @@ describe("provider error body passthrough (per-tier regression)", () => {
 	});
 
 	it("openai-responses (status-only) keeps the prefix and surfaces the body", async () => {
-		const output = await drainResult(streamOpenAIResponses(responsesModel, context, { apiKey: "test" }));
+		const output = await drainResult(streamOpenAIResponses(responsesModel, context, { apiKey: "sk-test" }));
 
 		expect(output.stopReason).toBe("error");
 		expect(output.errorMessage).toContain("OpenAI API error (403)");

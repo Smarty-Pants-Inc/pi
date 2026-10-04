@@ -1,3 +1,5 @@
+import { safeOAuthError } from "./credential-response.ts";
+
 const CANCEL_MESSAGE = "Login cancelled";
 const TIMEOUT_MESSAGE = "Device flow timed out";
 const SLOW_DOWN_TIMEOUT_MESSAGE =
@@ -11,7 +13,7 @@ const SLOW_DOWN_INTERVAL_INCREMENT_MS = 5000;
 type OAuthDeviceCodeIncompletePollResult =
 	| { status: "pending" }
 	| { status: "slow_down"; intervalSeconds?: number }
-	| { status: "failed"; message: string };
+	| { status: "failed"; error: unknown };
 
 export type OAuthDeviceCodePollResult<T> = OAuthDeviceCodeIncompletePollResult | { status: "complete"; value: T };
 
@@ -71,7 +73,7 @@ export async function pollOAuthDeviceCodeFlow<T>(options: OAuthDeviceCodePollOpt
 			return result.value;
 		}
 		if (result.status === "failed") {
-			throw new Error(result.message);
+			throw safeOAuthError(result.error);
 		}
 		if (result.status === "slow_down") {
 			slowDownResponses += 1;

@@ -220,7 +220,7 @@ describe("xAI OAuth device flow", () => {
 			),
 		);
 
-		await expect(loginXaiForTest({ onDeviceCode: () => {} })).rejects.toThrow("Untrusted verification URI");
+		await expect(loginXaiForTest({ onDeviceCode: () => {} })).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 	});
 
 	it.each(["http://accounts.x.ai/oauth2/device", "file:///etc/passwd", "not a url"])(
@@ -231,7 +231,7 @@ describe("xAI OAuth device flow", () => {
 				vi.fn(async () => jsonResponse(deviceCodeResponse({ verification_uri: verificationUri }))),
 			);
 
-			await expect(loginXaiForTest({ onDeviceCode: () => {} })).rejects.toThrow("Untrusted verification URI");
+			await expect(loginXaiForTest({ onDeviceCode: () => {} })).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 		},
 	);
 
@@ -251,7 +251,7 @@ describe("xAI OAuth device flow", () => {
 			);
 
 			const loginPromise = loginXaiForTest({ onDeviceCode: () => {} });
-			const assertion = expect(loginPromise).rejects.toThrow("xAI device authorization was denied");
+			const assertion = expect(loginPromise).rejects.toThrow("oauth_request_failed (HTTP 400)");
 			await vi.advanceTimersByTimeAsync(1000);
 			await assertion;
 		},
@@ -319,17 +319,17 @@ describe("xAI OAuth device flow", () => {
 			vi.fn(async () => jsonResponse(tokenResponse({ access_token: undefined }))),
 		);
 
-		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow("Invalid xAI OAuth response field: access_token");
+		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 	});
 
-	it("surfaces the upstream error code and description on refresh failure", async () => {
+	it("allows the upstream code but discards its description on refresh failure", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => jsonResponse({ error: "invalid_grant", error_description: "refresh token revoked" }, 400)),
 		);
 
 		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow(
-			"xAI OAuth token refresh failed (HTTP 400): invalid_grant: refresh token revoked",
+			"oauth_request_failed (HTTP 400) provider_error=invalid_grant",
 		);
 	});
 });

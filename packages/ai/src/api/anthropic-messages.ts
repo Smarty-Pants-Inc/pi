@@ -11,6 +11,12 @@ import type {
 	BetaRefusalStopDetails as RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
 import {
+	oauthDiagnosticError,
+	oauthDiagnosticLogger,
+	redactOAuthDiagnostic,
+	safeOAuthError,
+} from "../auth/oauth/credential-response.ts";
+import {
 	ANTHROPIC_FEDERATION_RULE_ID_ENV,
 	ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
 	ANTHROPIC_ORGANIZATION_ID_ENV,
@@ -600,6 +606,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			timestamp: Date.now(),
 		};
 
+		const oauthDiagnostics =
+			options?.oauthDiagnostics === true || (options?.apiKey !== undefined && isOAuthToken(options.apiKey));
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -607,7 +615,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			let inputTransformations: BetaThinkingDroppedInputTransformation[] | undefined;
 
 			if (options?.client) {
-				client = options.client;
+				client = oauthDiagnostics ? options.client.withOptions({ logger: oauthDiagnosticLogger }) : options.client;
 				isOAuth = false;
 			} else {
 				const apiKey = options?.apiKey;
@@ -634,6 +642,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					copilotDynamicHeaders,
 					cacheSessionId,
 					federation,
+					oauthDiagnostics,
 				);
 				client = created.client;
 				isOAuth = created.isOAuthToken;
@@ -654,6 +663,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
+					diagnosticSecrets: options?.diagnosticSecrets,
+					oauthDiagnostics,
 				},
 			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -818,11 +829,25 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					const transformations = event.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
 					if (event.delta.stop_reason) {
-						output.rawStopReason = event.delta.stop_reason;
+						output.rawStopReason = oauthDiagnostics
+							? [
+									"end_turn",
+									"max_tokens",
+									"tool_use",
+									"refusal",
+									"pause_turn",
+									"stop_sequence",
+									"sensitive",
+								].includes(event.delta.stop_reason)
+								? event.delta.stop_reason
+								: "unknown"
+							: event.delta.stop_reason;
 						const stopReasonResult = mapStopReason(event.delta.stop_reason, event.delta.stop_details);
 						output.stopReason = stopReasonResult.stopReason;
 						if (stopReasonResult.errorMessage) {
-							output.errorMessage = stopReasonResult.errorMessage;
+							output.errorMessage = oauthDiagnostics
+								? oauthDiagnosticError("oauth_stream_failed").message
+								: stopReasonResult.errorMessage;
 						}
 					}
 					// Only update usage fields if present (not null).
@@ -893,7 +918,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			output.errorMessage = oauthDiagnostics
+				? redactOAuthDiagnostic(safeOAuthError(error).message, options?.diagnosticSecrets)
+				: error instanceof Error
+					? error.message
+					: JSON.stringify(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -989,10 +1018,12 @@ function createClient(
 	dynamicHeaders?: Record<string, string>,
 	sessionId?: string,
 	federation?: AnthropicFederationConfig,
+	oauthDiagnostics = false,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Copilot: Bearer auth.
 	if (model.provider === "github-copilot") {
 		const client = new PiAnthropic({
+			logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 			apiKey: null,
 			authToken: apiKey ?? null,
 			baseURL: model.baseUrl,
@@ -1015,6 +1046,7 @@ function createClient(
 	// OAuth: Bearer auth, Claude Code identity headers
 	if (apiKey && isOAuthToken(apiKey)) {
 		const client = new PiAnthropic({
+			logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -1055,6 +1087,7 @@ function createClient(
 		const key = JSON.stringify([model.baseUrl, federation]);
 		if (federationClient?.key !== key || federationClient.fetch !== fetch) {
 			const client = new PiAnthropic({
+				logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 				apiKey: null,
 				authToken: null,
 				config: federation,
@@ -1068,6 +1101,7 @@ function createClient(
 	}
 
 	const client = new PiAnthropic({
+		logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 		apiKey: apiKey ?? null,
 		authToken: null,
 		baseURL: model.baseUrl,

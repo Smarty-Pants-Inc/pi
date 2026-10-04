@@ -14,6 +14,12 @@
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
+import {
+	fetchOAuth,
+	oauthDiagnosticError,
+	readOAuthCredentialResponse,
+	withOAuthDiagnostics,
+} from "./credential-response.ts";
 import { generatePKCE } from "./pkce.ts";
 
 const AUTHORIZE_URL = "https://openrouter.ai/auth";
@@ -44,17 +50,6 @@ function parseAuthorizationInput(input: string): string | undefined {
 	return value;
 }
 
-function errorDetail(body: JsonObject): string | undefined {
-	if (typeof body.error_description === "string") return body.error_description;
-	if (typeof body.message === "string") return body.message;
-	if (typeof body.error === "string") return body.error;
-	if (body.error && typeof body.error === "object" && !Array.isArray(body.error)) {
-		const message = (body.error as JsonObject).message;
-		if (typeof message === "string") return message;
-	}
-	return undefined;
-}
-
 async function exchangeAuthorizationCode(
 	code: string,
 	verifier: string,
@@ -72,17 +67,17 @@ async function exchangeAuthorizationCode(
 	let response: Response;
 	let body: JsonObject = {};
 	try {
-		response = await fetch(TOKEN_URL, {
+		response = await fetchOAuth(TOKEN_URL, {
 			method: "POST",
 			headers: { accept: "application/json", "content-type": "application/json" },
 			body: JSON.stringify({ code, code_verifier: verifier, code_challenge_method: "S256" }),
 			signal: controller.signal,
 		});
 		try {
-			const parsed = (await response.json()) as unknown;
+			const parsed = (await readOAuthCredentialResponse(response, "oauth")) as unknown;
 			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) body = parsed as JsonObject;
 		} catch {
-			if (response.ok) throw new Error("OpenRouter OAuth returned invalid JSON");
+			if (response.ok) throw oauthDiagnosticError("oauth_invalid_response", response.status);
 		}
 	} catch (error) {
 		if (signal.aborted) throw new Error("Login cancelled");
@@ -94,12 +89,11 @@ async function exchangeAuthorizationCode(
 	}
 
 	if (!response.ok) {
-		const detail = errorDetail(body);
-		throw new Error(`OpenRouter OAuth key exchange failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
+		throw oauthDiagnosticError("oauth_request_failed", response.status, body.error);
 	}
 
 	if (typeof body.key !== "string" || body.key.length === 0) {
-		throw new Error('OpenRouter OAuth response carries no "key"');
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
 	}
 
 	return {
@@ -156,7 +150,7 @@ async function loginOpenRouter(interaction: ProviderAuthInteraction): Promise<OA
 	}
 }
 
-export const openRouterOAuth: OAuthAuth = {
+export const openRouterOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "OpenRouter OAuth",
 	loginLabel: "Sign in with OpenRouter",
 	login: loginOpenRouter,
@@ -166,4 +160,4 @@ export const openRouterOAuth: OAuthAuth = {
 	async toAuth(credential) {
 		return { apiKey: credential.access };
 	},
-};
+});

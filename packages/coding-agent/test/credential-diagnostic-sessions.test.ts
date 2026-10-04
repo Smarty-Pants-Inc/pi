@@ -146,7 +146,10 @@ describe.each([openaiProvider(), openaiCodexProvider()])("credential diagnostic 
 					expect(output.stopReason).toBe("error");
 					if (kind === "observer") expect(output.diagnostics?.[0].type).toBe("provider_stream_observer_error");
 					if (kind === "stop") expect(output.rawStopReason).toBeDefined();
-					if (kind.includes("HTTP")) expect(output.errorMessage).toContain("server_error");
+					if (kind.includes("HTTP")) {
+						expect(output.errorMessage).toContain("oauth_request_failed");
+						expect(output.errorMessage).toContain("503");
+					}
 					const retryObservers: unknown[] = [];
 					if (kind === "HTTP") {
 						await retryAssistantCall(

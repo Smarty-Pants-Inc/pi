@@ -8,6 +8,14 @@
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
+import {
+	fetchOAuth,
+	oauthDiagnosticError,
+	oauthResponseError,
+	readOAuthCredentialResponse,
+	safeOAuthError,
+	withOAuthDiagnostics,
+} from "./credential-response.ts";
 import { generatePKCE } from "./pkce.ts";
 
 const decode = (s: string) => atob(s);
@@ -54,25 +62,8 @@ function parseAuthorizationInput(input: string): { code?: string; state?: string
 	return { code: value };
 }
 
-function formatErrorDetails(error: unknown): string {
-	if (error instanceof Error) {
-		const details: string[] = [`${error.name}: ${error.message}`];
-		const errorWithCode = error as Error & { code?: string; errno?: number | string; cause?: unknown };
-		if (errorWithCode.code) details.push(`code=${errorWithCode.code}`);
-		if (typeof errorWithCode.errno !== "undefined") details.push(`errno=${String(errorWithCode.errno)}`);
-		if (typeof error.cause !== "undefined") {
-			details.push(`cause=${formatErrorDetails(error.cause)}`);
-		}
-		if (error.stack) {
-			details.push(`stack=${error.stack}`);
-		}
-		return details.join("; ");
-	}
-	return String(error);
-}
-
 async function postJson(url: string, body: Record<string, string | number>, signal: AbortSignal): Promise<string> {
-	const response = await fetch(url, {
+	const response = await fetchOAuth(url, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
@@ -82,13 +73,24 @@ async function postJson(url: string, body: Record<string, string | number>, sign
 		signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
 	});
 
-	const responseBody = await response.text();
-
-	if (!response.ok) {
-		throw new Error(`HTTP request failed. status=${response.status}; url=${url}; body=${responseBody}`);
+	if (!response.ok) throw await oauthResponseError(response);
+	const token = (await readOAuthCredentialResponse(response, "oauth")) as {
+		access_token?: unknown;
+		refresh_token?: unknown;
+		expires_in?: unknown;
+	} | null;
+	if (
+		typeof token?.access_token !== "string" ||
+		!token.access_token ||
+		typeof token.refresh_token !== "string" ||
+		!token.refresh_token ||
+		typeof token.expires_in !== "number" ||
+		!Number.isFinite(token.expires_in) ||
+		token.expires_in <= 0
+	) {
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
 	}
-
-	return responseBody;
+	return JSON.stringify(token);
 }
 
 async function exchangeAuthorizationCode(
@@ -113,18 +115,14 @@ async function exchangeAuthorizationCode(
 			signal,
 		);
 	} catch (error) {
-		throw new Error(
-			`Token exchange request failed. url=${TOKEN_URL}; redirect_uri=${redirectUri}; response_type=authorization_code; details=${formatErrorDetails(error)}`,
-		);
+		throw safeOAuthError(error);
 	}
 
 	let tokenData: { access_token: string; refresh_token: string; expires_in: number };
 	try {
 		tokenData = JSON.parse(responseBody) as { access_token: string; refresh_token: string; expires_in: number };
 	} catch (error) {
-		throw new Error(
-			`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
-		);
+		throw safeOAuthError(error);
 	}
 
 	return {
@@ -241,7 +239,7 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 			signal,
 		);
 	} catch (error) {
-		throw new Error(`Anthropic token refresh request failed. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`);
+		throw safeOAuthError(error);
 	}
 
 	let data: { access_token: string; refresh_token: string; expires_in: number; scope?: string };
@@ -253,9 +251,7 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 			scope?: string;
 		};
 	} catch (error) {
-		throw new Error(
-			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
-		);
+		throw safeOAuthError(error);
 	}
 
 	return {
@@ -266,7 +262,7 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 	};
 }
 
-export const anthropicOAuth: OAuthAuth = {
+export const anthropicOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "Anthropic (Claude Pro/Max)",
 	isSubscription: true,
 
@@ -284,7 +280,7 @@ export const anthropicOAuth: OAuthAuth = {
 			return loginAnthropicCopyCode(interaction);
 		}
 		if (method !== ANTHROPIC_BROWSER_LOGIN_METHOD) {
-			throw new Error(`Unknown Anthropic login method: ${method}`);
+			throw oauthDiagnosticError("oauth_request_failed");
 		}
 
 		return loginAnthropic(interaction);
@@ -295,4 +291,4 @@ export const anthropicOAuth: OAuthAuth = {
 	async toAuth(credential) {
 		return { apiKey: credential.access };
 	},
-};
+});

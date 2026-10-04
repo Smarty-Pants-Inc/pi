@@ -154,6 +154,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			timestamp: Date.now(),
 		};
 
+		const oauthDiagnostics = options?.oauthDiagnostics === true || isChatGPTSignIn(model, options?.apiKey);
 		const diagnosticSecrets = getOAuthDiagnosticSecrets(
 			options?.apiKey,
 			{ ...model.headers, ...options?.headers },
@@ -177,6 +178,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
+				oauthDiagnostics,
 			);
 			let params = buildParams(model, normalizedContext, options, compat, grammarToolInputProperties);
 			const nextParams = await options?.onPayload?.(params, model);
@@ -195,6 +197,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
 					diagnosticSecrets,
+					oauthDiagnostics,
 				},
 			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -203,6 +206,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			await processResponsesStream(withResponsesEvidence(response, openaiStream), output, stream, model, {
 				onProviderStreamEvent: options?.onProviderStreamEvent,
 				diagnosticSecrets,
+				oauthDiagnostics,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
@@ -230,7 +234,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			const errorMessage = formatProviderError(
-				normalizeProviderError(error, diagnosticSecrets),
+				normalizeProviderError(error, diagnosticSecrets, oauthDiagnostics),
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
@@ -273,6 +277,7 @@ function createClient(
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
+	oauthDiagnostics = false,
 ) {
 	const compat = getCompat(model);
 	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
@@ -302,7 +307,9 @@ function createClient(
 	}
 
 	const redactArgs = (message: string, args: unknown[]) =>
-		[message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, diagnosticSecrets));
+		oauthDiagnostics
+			? ["oauth_sdk_diagnostic (HTTP unknown)"]
+			: [message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, diagnosticSecrets));
 	// OAuth credentials can also be used with a caller-configured endpoint; never gate log safety on the URL.
 	const logger: ClientOptions["logger"] = {
 		error: (message, ...args) => console.error(...redactArgs(message, args)),

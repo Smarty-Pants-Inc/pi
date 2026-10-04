@@ -432,7 +432,7 @@ describe("openai-codex streaming", () => {
 
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Codex SSE response headers timed out after 10ms");
+		expect(result.errorMessage).toBe("oauth_request_failed (HTTP unknown)");
 	});
 
 	it("aborts SSE body reads after response headers arrive", async () => {
@@ -537,7 +537,7 @@ describe("openai-codex streaming", () => {
 
 		const result = await resultStream.result();
 		expect(result.stopReason).toBe("aborted");
-		expect(result.errorMessage).toBe("Request was aborted");
+		expect(result.errorMessage).toBe("oauth_request_failed (HTTP unknown)");
 		expect(events).toContain("text_delta:one");
 		expect(events).not.toContain("text_delta:two");
 		expect(cancelled).toBe(true);
@@ -1688,7 +1688,7 @@ describe("openai-codex streaming", () => {
 			websocketFailures: 1,
 			sseFallbacks: 1,
 			websocketFallbackActive: true,
-			lastWebSocketError: "WebSocket connect timeout after 50ms",
+			lastWebSocketError: "oauth_request_failed (HTTP unknown)",
 		});
 	});
 
@@ -1933,7 +1933,7 @@ describe("openai-codex streaming", () => {
 
 		const result = await resultPromise;
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("WebSocket idle timeout after 50ms");
+		expect(result.errorMessage).toBe("oauth_request_failed (HTTP unknown)");
 		expect(fetchMock).not.toHaveBeenCalled();
 	});
 
@@ -2209,7 +2209,7 @@ describe("openai-codex streaming", () => {
 			fullContextRequests: 1,
 			deltaRequests: 1,
 			lastDeltaInputItems: 2,
-			lastPreviousResponseId: "resp_1",
+			lastPreviousResponseId: "oauth_previous_response",
 		});
 	});
 
@@ -2540,7 +2540,7 @@ describe("openai-codex streaming", () => {
 		}).result();
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("Server requested 2s retry delay (max: 1s)");
+		expect(result.errorMessage).toBe("oauth_request_failed (HTTP unknown)");
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 

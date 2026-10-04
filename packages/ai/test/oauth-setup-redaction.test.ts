@@ -79,7 +79,7 @@ describe.each([openaiProvider(), openaiCodexProvider()])("setup and escaped diag
 				expect(fetch).toHaveBeenCalledTimes(1);
 				expect(result.output.stopReason).toBe("error");
 				expect(result.output.errorMessage).toContain("503");
-				expect(result.output.errorMessage).toContain("server_error");
+				expect(result.output.errorMessage).toContain("oauth_request_failed");
 				if (provider.id === "openai") expect(records.length).toBeGreaterThan(0);
 				expectPrivate({ result, records });
 			},

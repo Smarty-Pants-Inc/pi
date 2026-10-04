@@ -124,7 +124,7 @@ describe("Radius OAuth", () => {
 		vi.stubGlobal("fetch", fetchMock);
 
 		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
-		await expect(oauth.login(interaction("browser"))).rejects.toThrow(`Invalid Radius OAuth config from ${GATEWAY}`);
+		await expect(oauth.login(interaction("browser"))).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
@@ -169,9 +169,11 @@ describe("Radius OAuth", () => {
 		};
 
 		const failed = await login();
-		expect("error" in failed && failed.error.message).toContain("invalid_grant: code expired");
+		expect("error" in failed && failed.error.message).toContain(
+			"oauth_request_failed (HTTP 400) provider_error=invalid_grant",
+		);
 		expect(failed.status).toBe(502);
-		expect(failed.page).toContain("code expired");
+		expect(failed.page).not.toContain("code expired");
 
 		tokenStatus = 200;
 		const succeeded = await login();

@@ -5,6 +5,13 @@
 import { GITHUB_COPILOT_MODELS } from "../../providers/github-copilot.models.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import {
+	fetchOAuth,
+	oauthDiagnosticError,
+	oauthResponseError,
+	readOAuthCredentialResponse,
+	withOAuthDiagnostics,
+} from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 const decode = (s: string) => atob(s);
@@ -93,7 +100,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 function parseGitHubCopilotModelCatalog(raw: unknown, allowPolicyFallback: boolean) {
 	const data = asRecord(raw)?.data;
 	if (!Array.isArray(data)) {
-		throw new Error("Invalid Copilot models response");
+		throw oauthDiagnosticError("oauth_invalid_response");
 	}
 
 	const accountModels = data.flatMap((rawItem) => {
@@ -145,7 +152,7 @@ async function fetchWithRateLimitRetry(
 	const requestSignal = retryBudgetSignal ? AbortSignal.any([signal, retryBudgetSignal]) : signal;
 	const retryDeadline = retryBudgetSignal ? Date.now() + retryPolicy.maxElapsedMs : undefined;
 	for (let retry = 0; ; retry++) {
-		const response = await fetch(url, {
+		const response = await fetchOAuth(url, {
 			...init,
 			signal: AbortSignal.any([requestSignal, AbortSignal.timeout(5000)]),
 		});
@@ -189,23 +196,22 @@ async function fetchGitHubCopilotModels(
 		retryPolicy,
 	);
 	if (!response.ok) {
-		throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
+		throw oauthDiagnosticError("oauth_request_failed", response.status);
 	}
-	return parseGitHubCopilotModelCatalog(await response.json(), allowPolicyFallback);
+	return parseGitHubCopilotModelCatalog(await readOAuthCredentialResponse(response, "oauth"), allowPolicyFallback);
 }
 
-async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
-	const response = await fetch(url, init);
+async function fetchJson(url: string, init: RequestInit): Promise<{ data: unknown; status: number }> {
+	const response = await fetchOAuth(url, init);
 	if (!response.ok) {
-		const text = await response.text();
-		throw new Error(`${response.status} ${response.statusText}: ${text}`);
+		throw await oauthResponseError(response);
 	}
-	return response.json();
+	return { data: await readOAuthCredentialResponse(response, "oauth"), status: response.status };
 }
 
 async function startDeviceFlow(domain: string, signal: AbortSignal): Promise<DeviceCodeResponse> {
 	const urls = getUrls(domain);
-	const data = await fetchJson(urls.deviceCodeUrl, {
+	const { data, status } = await fetchJson(urls.deviceCodeUrl, {
 		method: "POST",
 		headers: {
 			Accept: "application/json",
@@ -220,7 +226,7 @@ async function startDeviceFlow(domain: string, signal: AbortSignal): Promise<Dev
 	});
 
 	if (!data || typeof data !== "object") {
-		throw new Error("Invalid device code response");
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 
 	const deviceCode = (data as Record<string, unknown>).device_code;
@@ -236,7 +242,7 @@ async function startDeviceFlow(domain: string, signal: AbortSignal): Promise<Dev
 		(interval !== undefined && typeof interval !== "number") ||
 		typeof expiresIn !== "number"
 	) {
-		throw new Error("Invalid device code response fields");
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 
 	// The verification URI is opened in the user's browser and to prevent `open` from
@@ -245,10 +251,10 @@ async function startDeviceFlow(domain: string, signal: AbortSignal): Promise<Dev
 	try {
 		parsedUri = new URL(verificationUri);
 	} catch {
-		throw new Error("Untrusted verification_uri in device code response");
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 	if (parsedUri.protocol !== "https:" && parsedUri.protocol !== "http:") {
-		throw new Error("Untrusted verification_uri in device code response");
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 
 	return {
@@ -272,7 +278,7 @@ async function pollForGitHubAccessToken(
 		waitBeforeFirstPoll: true,
 		signal,
 		poll: async () => {
-			const raw = await fetchJson(urls.accessTokenUrl, {
+			const { data: raw, status } = await fetchJson(urls.accessTokenUrl, {
 				method: "POST",
 				headers: {
 					Accept: "application/json",
@@ -292,7 +298,7 @@ async function pollForGitHubAccessToken(
 			}
 
 			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
-				const { error, error_description: description, interval } = raw as DeviceTokenErrorResponse;
+				const { error, interval } = raw as DeviceTokenErrorResponse;
 				if (error === "authorization_pending") {
 					return { status: "pending" };
 				}
@@ -300,12 +306,10 @@ async function pollForGitHubAccessToken(
 				if (error === "slow_down") {
 					return { status: "slow_down", intervalSeconds: typeof interval === "number" ? interval : undefined };
 				}
-
-				const descriptionSuffix = description ? `: ${description}` : "";
-				return { status: "failed", message: `Device flow failed: ${error}${descriptionSuffix}` };
+				return { status: "failed", error: oauthDiagnosticError("oauth_request_failed", status, error) };
 			}
 
-			return { status: "failed", message: "Invalid device token response" };
+			return { status: "failed", error: oauthDiagnosticError("oauth_invalid_response", status) };
 		},
 	});
 }
@@ -318,7 +322,7 @@ async function refreshGitHubCopilotAccessToken(
 	const domain = enterpriseDomain || "github.com";
 	const urls = getUrls(domain);
 
-	const raw = await fetchJson(urls.copilotTokenUrl, {
+	const { data: raw, status } = await fetchJson(urls.copilotTokenUrl, {
 		headers: {
 			Accept: "application/json",
 			Authorization: `Bearer ${refreshToken}`,
@@ -328,14 +332,14 @@ async function refreshGitHubCopilotAccessToken(
 	});
 
 	if (!raw || typeof raw !== "object") {
-		throw new Error("Invalid Copilot token response");
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 
 	const token = (raw as Record<string, unknown>).token;
 	const expiresAt = (raw as Record<string, unknown>).expires_at;
 
 	if (typeof token !== "string" || typeof expiresAt !== "number") {
-		throw new Error("Invalid Copilot token response fields");
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 
 	return {
@@ -402,7 +406,7 @@ async function enableGitHubCopilotModel(
 		return false;
 	}
 	if (response.status === 429) {
-		throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
+		throw oauthDiagnosticError("oauth_request_failed");
 	}
 	return response.ok;
 }
@@ -441,7 +445,7 @@ async function loginGitHubCopilot(interaction: ProviderAuthInteraction): Promise
 
 	const trimmed = input.trim();
 	const enterpriseDomain = normalizeDomain(input);
-	if (trimmed && !enterpriseDomain) throw new Error("Invalid GitHub Enterprise URL/domain");
+	if (trimmed && !enterpriseDomain) throw oauthDiagnosticError("oauth_invalid_response");
 	const domain = enterpriseDomain || "github.com";
 
 	const device = await startDeviceFlow(domain, interaction.signal);
@@ -490,7 +494,7 @@ function copilotEnterpriseDomain(credential: OAuthCredential): string | undefine
 	return normalizeDomain(enterpriseUrl) ?? undefined;
 }
 
-export const githubCopilotOAuth: OAuthAuth = {
+export const githubCopilotOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "GitHub Copilot",
 	isSubscription: true,
 	login: loginGitHubCopilot,
@@ -504,4 +508,4 @@ export const githubCopilotOAuth: OAuthAuth = {
 			baseUrl: getGitHubCopilotBaseUrl(credential.access, copilotEnterpriseDomain(credential)),
 		};
 	},
-};
+});

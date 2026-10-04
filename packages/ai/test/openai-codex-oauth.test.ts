@@ -361,7 +361,7 @@ describe("OpenAI Codex OAuth", () => {
 		await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
 		const rejection = await rejectionPromise;
 		expect(rejection).toBeInstanceOf(Error);
-		expect((rejection as Error).message).toBe("Device flow timed out");
+		expect((rejection as Error).message).toBe("oauth_request_failed (HTTP unknown)");
 	});
 
 	it("treats OpenAI Codex device auth 403 and 404 responses as pending", async () => {
@@ -450,7 +450,7 @@ describe("OpenAI Codex OAuth", () => {
 			loginOpenAICodexDeviceCodeForTest({
 				onDeviceCode: () => {},
 			}),
-		).rejects.toThrow("OpenAI Codex device auth failed with status 500");
+		).rejects.toThrow("oauth_request_failed (HTTP 500)");
 	});
 
 	it("does not write token refresh failures to stderr", async () => {
@@ -480,7 +480,7 @@ describe("OpenAI Codex OAuth", () => {
 				},
 				neverAbortedSignal,
 			),
-		).rejects.toThrow("OpenAI Codex token refresh failed (HTTP 401)");
+		).rejects.toThrow("oauth_request_failed (HTTP 401)");
 		expect(consoleError).not.toHaveBeenCalled();
 	});
 

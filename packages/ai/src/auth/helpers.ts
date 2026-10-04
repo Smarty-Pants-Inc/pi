@@ -1,3 +1,4 @@
+import { withOAuthDiagnostics } from "./oauth/credential-response.ts";
 import type { ApiKeyAuth, OAuthAuth } from "./types.ts";
 
 /**
@@ -48,12 +49,12 @@ export function lazyOAuth(input: {
 		promise ??= input.load();
 		return promise;
 	};
-	return {
+	return withOAuthDiagnostics({
 		name: input.name,
 		isSubscription: input.isSubscription,
 		loginLabel: input.loginLabel,
 		login: async (interaction, options) => (await loaded()).login(interaction, options),
 		refresh: async (credential, signal) => (await loaded()).refresh(credential, signal),
 		toAuth: async (credential) => (await loaded()).toAuth(credential),
-	};
+	});
 }

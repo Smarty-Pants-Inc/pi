@@ -32,6 +32,7 @@ export function buildBaseOptions(
 		telemetryContext: options?.telemetryContext,
 		apiKey: apiKey || options?.apiKey,
 		diagnosticSecrets: options?.diagnosticSecrets,
+		oauthDiagnostics: options?.oauthDiagnostics,
 		fetch: options?.fetch,
 		transport: options?.transport,
 		cacheRetention: options?.cacheRetention,

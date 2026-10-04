@@ -9,6 +9,14 @@
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import {
+	fetchOAuth,
+	oauthDiagnosticError,
+	oauthResponseError,
+	readOAuthCredentialResponse,
+	safeOAuthError,
+	withOAuthDiagnostics,
+} from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 const CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
@@ -48,7 +56,7 @@ function formUrlEncode(fields: Record<string, string>): string {
 
 async function readJson(response: Response): Promise<Record<string, unknown> | null> {
 	try {
-		const json = await response.json();
+		const json = await readOAuthCredentialResponse(response, "oauth");
 		return json && typeof json === "object" ? (json as Record<string, unknown>) : null;
 	} catch {
 		return null;
@@ -68,7 +76,7 @@ function trustedHttpUrl(value: unknown): string | null {
 }
 
 async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal): Promise<DeviceAuthorization> {
-	const response = await fetch(`${oauthHost}/api/oauth/device_authorization`, {
+	const response = await fetchOAuth(`${oauthHost}/api/oauth/device_authorization`, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -79,8 +87,7 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 	});
 
 	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(`Kimi Code device authorization failed with status ${response.status}${text ? `: ${text}` : ""}`);
+		throw await oauthResponseError(response);
 	}
 
 	const json = await readJson(response);
@@ -96,7 +103,7 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 		!trustedHttpUrl(verificationUriComplete) ||
 		!trustedHttpUrl(verificationUri)
 	) {
-		throw new Error(`Invalid Kimi Code device authorization response: ${JSON.stringify(json)}`);
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
 	}
 
 	const interval = json?.interval;
@@ -117,7 +124,7 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 	};
 }
 
-function parseTokenResponse(json: Record<string, unknown> | null, operation: string): TokenResponse {
+function parseTokenResponse(json: Record<string, unknown> | null, _operation: string, status: number): TokenResponse {
 	const accessToken = json?.access_token;
 	const refreshToken = json?.refresh_token;
 	const expiresIn = json?.expires_in;
@@ -130,7 +137,7 @@ function parseTokenResponse(json: Record<string, unknown> | null, operation: str
 		!Number.isFinite(expiresIn) ||
 		expiresIn <= 0
 	) {
-		throw new Error(`Kimi Code token ${operation} response missing fields: ${JSON.stringify(json)}`);
+		throw oauthDiagnosticError("oauth_invalid_response", status);
 	}
 	return {
 		access: accessToken,
@@ -150,7 +157,7 @@ async function pollForToken(
 		waitBeforeFirstPoll: true,
 		signal,
 		poll: async () => {
-			const response = await fetch(`${oauthHost}/api/oauth/token`, {
+			const response = await fetchOAuth(`${oauthHost}/api/oauth/token`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
@@ -165,24 +172,19 @@ async function pollForToken(
 			});
 
 			if (response.status >= 500) {
-				const text = await response.text().catch(() => "");
-				return {
-					status: "failed",
-					message: `Kimi Code device token request failed with status ${response.status}${text ? `: ${text}` : ""}`,
-				};
+				return { status: "failed", error: await oauthResponseError(response) };
 			}
 
 			const json = await readJson(response);
 			if (response.ok && typeof json?.access_token === "string") {
 				try {
-					return { status: "complete", value: parseTokenResponse(json, "poll") };
+					return { status: "complete", value: parseTokenResponse(json, "poll", response.status) };
 				} catch (error) {
-					return { status: "failed", message: error instanceof Error ? error.message : String(error) };
+					return { status: "failed", error: safeOAuthError(error) };
 				}
 			}
 
 			const error = json?.error;
-			const description = typeof json?.error_description === "string" ? `: ${json.error_description}` : "";
 			if (error === "authorization_pending") {
 				return { status: "pending" };
 			}
@@ -194,15 +196,12 @@ async function pollForToken(
 				};
 			}
 			if (error === "expired_token") {
-				return { status: "failed", message: "Kimi Code device authorization expired. Please restart login." };
+				return { status: "failed", error: oauthDiagnosticError("oauth_request_failed", response.status, error) };
 			}
 			if (error === "access_denied") {
-				return { status: "failed", message: "Kimi Code login was denied." };
+				return { status: "failed", error: oauthDiagnosticError("oauth_request_failed", response.status, error) };
 			}
-			return {
-				status: "failed",
-				message: `Kimi Code device token request failed (status ${response.status})${typeof error === "string" ? `: ${error}${description}` : ""}`,
-			};
+			return { status: "failed", error: oauthDiagnosticError("oauth_request_failed", response.status, error) };
 		},
 	});
 }
@@ -223,7 +222,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 
 		let response: Response;
 		try {
-			response = await fetch(`${oauthHost}/api/oauth/token`, {
+			response = await fetchOAuth(`${oauthHost}/api/oauth/token`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
@@ -237,31 +236,28 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 				signal: requestSignal(signal),
 			});
 		} catch (error) {
-			lastError = error instanceof Error ? error : new Error(String(error));
+			lastError = safeOAuthError(error);
 			continue;
 		}
 
 		const json = await readJson(response);
 		if (response.ok) {
-			return parseTokenResponse(json, "refresh");
+			return parseTokenResponse(json, "refresh", response.status);
 		}
 
 		// Unauthorized: the stored credential is dead; Models clears it and prompts re-login.
 		if (response.status === 401 || response.status === 403 || json?.error === "invalid_grant") {
-			const description = typeof json?.error_description === "string" ? `: ${json.error_description}` : "";
-			throw new Error(`Kimi Code token refresh unauthorized (status ${response.status})${description}`);
+			throw oauthDiagnosticError("oauth_request_failed", response.status, json?.error);
 		}
 
 		if (isRetryableRefreshFailure(response) && attempt < REFRESH_MAX_RETRIES) {
-			lastError = new Error(`Kimi Code token refresh failed with status ${response.status}`);
+			lastError = oauthDiagnosticError("oauth_request_failed", response.status, json?.error);
 			continue;
 		}
-
-		const text = JSON.stringify(json);
-		throw new Error(`Kimi Code token refresh failed with status ${response.status}${text ? `: ${text}` : ""}`);
+		throw oauthDiagnosticError("oauth_request_failed", response.status, json?.error);
 	}
 
-	throw lastError ?? new Error("Kimi Code token refresh failed");
+	throw lastError ?? oauthDiagnosticError("oauth_request_failed");
 }
 
 async function loginKimiCoding(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
@@ -278,7 +274,7 @@ async function loginKimiCoding(interaction: ProviderAuthInteraction): Promise<OA
 	return { type: "oauth", access: token.access, refresh: token.refresh, expires: token.expires };
 }
 
-export const kimiCodingOAuth: OAuthAuth = {
+export const kimiCodingOAuth: OAuthAuth = withOAuthDiagnostics({
 	name: "Kimi Code (subscription)",
 	isSubscription: true,
 	loginLabel: "Sign in with Kimi Code",
@@ -293,4 +289,4 @@ export const kimiCodingOAuth: OAuthAuth = {
 	async toAuth(credential) {
 		return { headers: { Authorization: `Bearer ${credential.access}` } };
 	},
-};
+});

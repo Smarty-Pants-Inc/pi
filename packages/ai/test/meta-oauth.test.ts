@@ -128,7 +128,7 @@ describe("Meta OAuth", () => {
 		});
 	});
 
-	it("reports the setup URL when Meta issues no key", async () => {
+	it("reports a fixed error without a provider setup URL when Meta issues no key", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => jsonResponse({ require_payment: true, action_url: "https://dev.meta.ai/billing" })),
@@ -138,7 +138,7 @@ describe("Meta OAuth", () => {
 				{ type: "oauth", refresh: "identity-token", access: "", expires: 1 },
 				new AbortController().signal,
 			),
-		).rejects.toThrow("Complete setup at https://dev.meta.ai/billing");
+		).rejects.toThrow("oauth_invalid_response (HTTP 200)");
 	});
 
 	it("uses the minted key as the request api key", async () => {

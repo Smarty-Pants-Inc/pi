@@ -1,4 +1,8 @@
-import { redactOAuthDiagnostic, redactOAuthDiagnosticValue } from "../auth/oauth/credential-response.ts";
+import {
+	redactOAuthDiagnostic,
+	redactOAuthDiagnosticValue,
+	safeOAuthError,
+} from "../auth/oauth/credential-response.ts";
 import type { JsonObject } from "../types.ts";
 
 export interface DiagnosticErrorInfo {
@@ -21,7 +25,15 @@ export function formatThrownValue(value: unknown): string {
 	return String(value);
 }
 
-export function extractDiagnosticError(error: unknown, secrets: readonly string[] = []): DiagnosticErrorInfo {
+export function extractDiagnosticError(
+	error: unknown,
+	secrets: readonly string[] = [],
+	oauthDiagnostics = false,
+): DiagnosticErrorInfo {
+	if (oauthDiagnostics) {
+		const safe = safeOAuthError(error);
+		return { name: safe.name, message: redactOAuthDiagnostic(safe.message, secrets), code: safe.code };
+	}
 	if (!(error instanceof Error))
 		return { name: "ThrownValue", message: redactOAuthDiagnostic(formatThrownValue(error), secrets) };
 	const code = (error as Error & { code?: unknown }).code;
@@ -39,12 +51,13 @@ export function createAssistantMessageDiagnostic(
 	error: unknown,
 	details?: JsonObject,
 	secrets: readonly string[] = [],
+	oauthDiagnostics = false,
 ): AssistantMessageDiagnostic {
 	return {
 		type,
 		timestamp: Date.now(),
-		error: extractDiagnosticError(error, secrets),
-		details: redactOAuthDiagnosticValue(details, secrets) as JsonObject | undefined,
+		error: extractDiagnosticError(error, secrets, oauthDiagnostics),
+		details: oauthDiagnostics ? undefined : (redactOAuthDiagnosticValue(details, secrets) as JsonObject | undefined),
 	};
 }
 

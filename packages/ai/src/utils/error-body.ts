@@ -13,7 +13,7 @@
 // Anthropic / `@google/genai` happy path where the SDK already folded the body
 // into the message, so providers can preserve it without double-printing.
 
-import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import { redactOAuthDiagnostic, safeOAuthError } from "../auth/oauth/credential-response.ts";
 
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
@@ -37,7 +37,15 @@ type SdkErrorShape = Error & {
 	$response?: { statusCode?: unknown; body?: unknown };
 };
 
-export function normalizeProviderError(error: unknown, secrets: readonly string[] = []): NormalizedProviderError {
+export function normalizeProviderError(
+	error: unknown,
+	secrets: readonly string[] = [],
+	oauthDiagnostics = false,
+): NormalizedProviderError {
+	if (oauthDiagnostics) {
+		const safe = safeOAuthError(error);
+		return { status: safe.status, message: redactOAuthDiagnostic(safe.message, secrets), messageCarriesBody: true };
+	}
 	if (!(error instanceof Error)) {
 		return { message: redactOAuthDiagnostic(safeJsonStringify(error), secrets), messageCarriesBody: false };
 	}

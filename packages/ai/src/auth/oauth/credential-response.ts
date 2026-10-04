@@ -1,10 +1,174 @@
+import type { OAuthAuth } from "../types.ts";
+
+export function isOAuthCancellation(error: unknown): boolean {
+	try {
+		return error instanceof Error && error.message === "Login cancelled";
+	} catch {
+		return false;
+	}
+}
+
+export function withOAuthDiagnostics(auth: OAuthAuth): OAuthAuth {
+	return {
+		...auth,
+		async login(interaction, options) {
+			try {
+				return await auth.login(interaction, options);
+			} catch (error) {
+				if (interaction.signal.aborted || isOAuthCancellation(error)) throw new Error("Login cancelled");
+				throw safeOAuthError(error);
+			}
+		},
+		async refresh(credential, signal) {
+			try {
+				return await auth.refresh(credential, signal);
+			} catch (error) {
+				throw safeOAuthError(error);
+			}
+		},
+		async toAuth(credential) {
+			try {
+				return await auth.toAuth(credential);
+			} catch (error) {
+				throw safeOAuthError(error);
+			}
+		},
+	};
+}
+
+export const oauthDiagnosticLogger = {
+	error: (_message: string, ..._args: unknown[]) => console.error("oauth_sdk_diagnostic (HTTP unknown)"),
+	warn: (_message: string, ..._args: unknown[]) => console.warn("oauth_sdk_diagnostic (HTTP unknown)"),
+	info: (_message: string, ..._args: unknown[]) => console.info("oauth_sdk_diagnostic (HTTP unknown)"),
+	debug: (_message: string, ..._args: unknown[]) => console.debug("oauth_sdk_diagnostic (HTTP unknown)"),
+};
+
+const PROVIDER_ERROR_CODES = new Set([
+	"access_denied",
+	"authorization_denied",
+	"authorization_pending",
+	"deviceauth_authorization_pending",
+	"expired_token",
+	"invalid_client",
+	"invalid_grant",
+	"invalid_request",
+	"invalid_scope",
+	"unauthorized_client",
+	"unsupported_grant_type",
+	"unsupported_response_type",
+	"server_error",
+	"temporarily_unavailable",
+	"slow_down",
+	"rate_limit_exceeded",
+	"insufficient_quota",
+	"usage_limit_reached",
+	"usage_not_included",
+	"subscription_sharing_usage_limit_exceeded",
+	"websocket_connection_limit_reached",
+	"previous_response_not_found",
+]);
+
+/** Membership, not just syntax, is the boundary for provider-controlled diagnostic codes. */
+export function oauthProviderErrorCode(value: unknown): string | undefined {
+	return typeof value === "string" && /^[a-z_]{1,64}$/.test(value) && PROVIDER_ERROR_CODES.has(value)
+		? value
+		: undefined;
+}
+
+export type OAuthDiagnosticCode =
+	| "oauth_request_failed"
+	| "oauth_invalid_response"
+	| "oauth_authorization_failed"
+	| "oauth_stream_failed"
+	| "oauth_transport_failed";
+
+export class OAuthDiagnosticError extends Error {
+	readonly code: OAuthDiagnosticCode;
+	readonly status?: number;
+	readonly providerCode?: string;
+	constructor(code: OAuthDiagnosticCode, status?: number, providerCode?: unknown) {
+		const safeStatus =
+			typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+		const safeCode = oauthProviderErrorCode(providerCode);
+		const safeOwnCode: OAuthDiagnosticCode = [
+			"oauth_request_failed",
+			"oauth_invalid_response",
+			"oauth_authorization_failed",
+			"oauth_stream_failed",
+			"oauth_transport_failed",
+		].includes(code)
+			? code
+			: "oauth_request_failed";
+		super(`${safeOwnCode} (HTTP ${safeStatus ?? "unknown"})${safeCode ? ` provider_error=${safeCode}` : ""}`);
+		this.name = "OAuthDiagnosticError";
+		this.code = safeOwnCode;
+		this.status = safeStatus;
+		this.providerCode = safeCode;
+	}
+}
+
+export function oauthDiagnosticError(
+	code: OAuthDiagnosticCode,
+	status?: number,
+	providerCode?: unknown,
+): OAuthDiagnosticError {
+	return new OAuthDiagnosticError(code, status, providerCode);
+}
+
+/** Never retain the original Error, cause, stack, SDK message, or response payload. */
+export function safeOAuthError(error: unknown): OAuthDiagnosticError {
+	try {
+		if (error instanceof OAuthDiagnosticError)
+			return oauthDiagnosticError(error.code, error.status, error.providerCode);
+		const shape = error as { status?: number; code?: unknown; error?: { code?: unknown } } | null;
+		return oauthDiagnosticError("oauth_request_failed", shape?.status, shape?.error?.code ?? shape?.code);
+	} catch {
+		return oauthDiagnosticError("oauth_request_failed");
+	}
+}
+
+export async function fetchOAuth(input: string | URL, init?: RequestInit): Promise<Response> {
+	try {
+		return await fetch(input, init);
+	} catch {
+		throw oauthDiagnosticError("oauth_request_failed");
+	}
+}
+
+export async function oauthResponseError(response: Response): Promise<OAuthDiagnosticError> {
+	let code: unknown;
+	try {
+		const json = (await response.json()) as { error?: unknown } | null;
+		const error = json?.error;
+		code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : error;
+	} catch {
+		/* Body/parser failures are untrusted too. */
+	}
+	return oauthDiagnosticError("oauth_request_failed", response.status, code);
+}
+
 /** Credential response bodies and parser/stream errors must never become login diagnostics. */
-export async function readOAuthCredentialResponse(response: Response, operation: string): Promise<unknown> {
+export async function readOAuthCredentialResponse(response: Response, _operation: string): Promise<unknown> {
 	try {
 		return await response.json();
 	} catch {
-		throw new Error(`${operation} response is invalid JSON`);
+		throw oauthDiagnosticError("oauth_invalid_response", response.status);
 	}
+}
+
+export function oauthStopReason(status: unknown, reason?: unknown): string {
+	const safeStatus =
+		typeof status === "string" &&
+		["completed", "incomplete", "failed", "cancelled", "in_progress", "queued"].includes(status)
+			? status
+			: "unknown";
+	const safeReason =
+		reason === "max_output_tokens" || reason === "content_filter" || oauthProviderErrorCode(reason) !== undefined
+			? String(reason)
+			: reason === undefined
+				? undefined
+				: "unknown";
+	return safeReason ? `${safeStatus}.${safeReason}` : safeStatus;
 }
 
 const CREDENTIAL_FIELD =

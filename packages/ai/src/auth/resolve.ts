@@ -1,6 +1,7 @@
 import type { ProviderEnv } from "../types.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { ModelsError } from "../utils/models-error.ts";
+import { safeOAuthError } from "./oauth/credential-response.ts";
 
 export { ModelsError, type ModelsErrorCode } from "../utils/models-error.ts";
 
@@ -135,7 +136,9 @@ async function resolveStoredOAuth(
 						]);
 						return await oauth.refresh(current, refreshSignal);
 					} catch (error) {
-						throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error });
+						throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, {
+							cause: safeOAuthError(error),
+						});
 					}
 				},
 				{ signal },
@@ -168,7 +171,9 @@ async function resolveStoredOAuth(
 			].filter((value): value is string => typeof value === "string" && value.length > 0),
 		};
 	} catch (error) {
-		throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
+		throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, {
+			cause: safeOAuthError(error),
+		});
 	}
 }
 

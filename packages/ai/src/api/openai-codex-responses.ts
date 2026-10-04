@@ -6,7 +6,13 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
-import { getOAuthDiagnosticSecrets, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import {
+	getOAuthDiagnosticSecrets,
+	oauthResponseError,
+	oauthStopReason,
+	redactOAuthDiagnostic,
+	safeOAuthError,
+} from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -370,7 +376,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							output,
 							createAssistantMessageDiagnostic(
 								"provider_transport_failure",
-								error,
+								safeOAuthError(error),
 								{
 									configuredTransport: transport,
 									...(websocketStarted ? {} : { fallbackTransport: "sse" }),
@@ -451,12 +457,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					}
 
 					// Parse error for friendly message on final attempt or non-retryable error
-					const fakeResponse = new Response(errorText, {
-						status: response.status,
-						statusText: response.statusText,
-					});
-					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					throw await oauthResponseError(new Response(errorText, { status: response.status }));
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -506,7 +507,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
+			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets, true));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -691,6 +692,7 @@ async function processStream(
 		model,
 		{
 			diagnosticSecrets,
+			oauthDiagnostics: true,
 			serviceTier: options?.serviceTier,
 			grammarToolInputProperties,
 			resolveServiceTier: resolveCodexServiceTier,
@@ -774,7 +776,13 @@ async function* mapCodexEvents(
 			// The final assistant error must retain this non-transport origin for outer retry callers.
 			appendAssistantMessageDiagnostic(
 				output,
-				createAssistantMessageDiagnostic("provider_stream_observer_error", error, undefined, diagnosticSecrets),
+				createAssistantMessageDiagnostic(
+					"provider_stream_observer_error",
+					error,
+					undefined,
+					diagnosticSecrets,
+					true,
+				),
 			);
 			// Retain terminal usage even when the observer prevents shared normalization.
 			if (
@@ -814,7 +822,9 @@ async function* mapCodexEvents(
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			});
 			output.rawStopReason =
-				response?.status === undefined ? undefined : redactOAuthDiagnostic(response.status, diagnosticSecrets);
+				response?.status === undefined
+					? undefined
+					: redactOAuthDiagnostic(oauthStopReason(response.status), diagnosticSecrets);
 			const code = response?.error?.code;
 			const message = response?.error?.message;
 			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
@@ -1034,7 +1044,7 @@ function recordWebSocketFailure(
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	stats.lastWebSocketError = redactOAuthDiagnostic(formatThrownValue(error), diagnosticSecrets);
+	stats.lastWebSocketError = redactOAuthDiagnostic(safeOAuthError(error).message, diagnosticSecrets);
 	stats.websocketFallbackActive = true;
 }
 
@@ -1585,7 +1595,7 @@ async function processWebSocketStream(
 		if (requestBody.previous_response_id) {
 			stats.deltaRequests++;
 			stats.lastDeltaInputItems = requestBody.input?.length ?? 0;
-			stats.lastPreviousResponseId = redactOAuthDiagnostic(requestBody.previous_response_id, diagnosticSecrets);
+			stats.lastPreviousResponseId = "oauth_previous_response";
 		} else {
 			stats.fullContextRequests++;
 			stats.lastDeltaInputItems = undefined;
@@ -1610,6 +1620,7 @@ async function processWebSocketStream(
 			model,
 			{
 				diagnosticSecrets,
+				oauthDiagnostics: true,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
 				resolveServiceTier: resolveCodexServiceTier,
@@ -1648,33 +1659,6 @@ async function processWebSocketStream(
 // ============================================================================
 // Error Handling
 // ============================================================================
-
-async function parseErrorResponse(response: Response): Promise<{ message: string; friendlyMessage?: string }> {
-	const raw = await response.text();
-	let message = raw || response.statusText || "Request failed";
-	let friendlyMessage: string | undefined;
-
-	try {
-		const parsed = JSON.parse(raw) as {
-			error?: { code?: string; type?: string; message?: string; plan_type?: string; resets_at?: number };
-		};
-		const err = parsed?.error;
-		if (err) {
-			const code = err.code || err.type || "";
-			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
-				const plan = err.plan_type ? ` (${err.plan_type.toLowerCase()} plan)` : "";
-				const mins = err.resets_at
-					? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
-					: undefined;
-				const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
-				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
-			}
-			message = err.message || friendlyMessage || message;
-		}
-	} catch {}
-
-	return { message, friendlyMessage };
-}
 
 // ============================================================================
 // Auth & Headers
