@@ -94,6 +94,7 @@ export class RpcClient {
 	private eventListeners: RpcEventListener[] = [];
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
 		new Map();
+	private pendingCollectors = new Set<(error: Error) => void>();
 	private requestId = 0;
 	private stderr = "";
 	private exitError: Error | null = null;
@@ -562,31 +563,63 @@ export class RpcClient {
 	 * Collect events until agent becomes idle.
 	 */
 	collectEvents(timeout = 60000): Promise<RpcAgentSessionEvent[]> {
-		return new Promise((resolve, reject) => {
-			const events: RpcAgentSessionEvent[] = [];
-			const timer = setTimeout(() => {
-				unsubscribe();
-				reject(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
-			}, timeout);
+		return this.createEventCollector(timeout).promise;
+	}
 
+	private createEventCollector(timeout: number): {
+		promise: Promise<RpcAgentSessionEvent[]>;
+		cancel: () => RpcAgentSessionEvent[];
+	} {
+		const events: RpcAgentSessionEvent[] = [];
+		let finish: (error?: Error) => void = () => {};
+		const promise = new Promise<RpcAgentSessionEvent[]>((resolve, reject) => {
+			let finished = false;
+			const timer = setTimeout(() => {
+				finish(new Error(`Timeout collecting events. Stderr: ${this.stderr}`));
+			}, timeout);
 			const unsubscribe = this.onEvent((event) => {
 				events.push(event);
-				if (event.type === "agent_settled") {
-					clearTimeout(timer);
-					unsubscribe();
-					resolve(events);
-				}
+				if (event.type === "agent_settled") finish();
 			});
+			const fail = (error: Error) => finish(error);
+			finish = (error?: Error) => {
+				if (finished) return;
+				finished = true;
+				clearTimeout(timer);
+				unsubscribe();
+				this.pendingCollectors.delete(fail);
+				if (error) reject(error);
+				else resolve(events);
+			};
+			this.pendingCollectors.add(fail);
+			if (this.exitError) fail(this.exitError);
 		});
+		// Prompt preflight may still be pending (or reject) when the collector fails.
+		// Observe immediately without replacing the promise returned to its eventual owner.
+		void promise.catch(() => {});
+		return {
+			promise,
+			cancel: () => {
+				finish();
+				return events;
+			},
+		};
 	}
 
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<RpcAgentSessionEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		// Subscribe before sending so a fast run cannot finish before collection starts.
+		const collector = this.createEventCollector(timeout);
+		try {
+			const disposition = await this.prompt(message, images);
+			if (disposition === "handled") return collector.cancel();
+			// Started and queued input belong to the active drain's agent_settled boundary.
+			return await collector.promise;
+		} finally {
+			collector.cancel();
+		}
 	}
 
 	// =========================================================================
@@ -631,6 +664,9 @@ export class RpcClient {
 			pending.reject(error);
 		}
 		this.pendingRequests.clear();
+		for (const reject of [...this.pendingCollectors]) {
+			reject(error);
+		}
 	}
 
 	private async send(command: RpcCommandBody): Promise<RpcResponse> {
