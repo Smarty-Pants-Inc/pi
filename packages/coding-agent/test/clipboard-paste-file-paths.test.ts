@@ -139,3 +139,31 @@ test("bash mode shell-quotes file paths and inserts them as arguments", async ()
 	);
 	expect(mocks.readClipboardImage).not.toHaveBeenCalled();
 });
+
+// PR #131 P2-24: standalone quoting cannot protect a filename inside an existing shell quote.
+test.each(['echo "DEST"', "echo 'DEST'", "echo `DEST`", "echo \\DEST", "echo # DEST", "cat <<EOF\nDEST\nEOF"])(
+	"refuses automatic filename insertion in unproven shell context %s",
+	async (editorText) => {
+		mocks.readClipboardFilePaths.mockResolvedValue(["/tmp/$(touch pi131-marker).png"]);
+		const insertTextAtCursor = vi.fn<(text: string) => void>();
+		const showError = vi.fn<(message: string) => void>();
+		const context = {
+			editor: {
+				getCursor: () => ({ line: 0, col: editorText.indexOf("DEST") }),
+				getText: () => editorText,
+				insertTextAtCursor,
+			},
+			isBashMode: true,
+			showError,
+			ui: { requestRender: vi.fn() },
+		};
+		const prototype = InteractiveMode.prototype as unknown as {
+			handleClipboardPaste(this: typeof context): Promise<void>;
+		};
+		await prototype.handleClipboardPaste.call(context);
+		expect(insertTextAtCursor).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledExactlyOnceWith(
+			"Failed to paste from clipboard: Automatic filename paste requires a simple unquoted shell command",
+		);
+	},
+);
