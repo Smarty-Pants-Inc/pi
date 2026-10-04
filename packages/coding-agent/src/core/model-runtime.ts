@@ -83,9 +83,7 @@ import {
 } from "./provider-composer.ts";
 import { withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
-<<<<<<< HEAD
 import { currentSessionOwnership } from "./session-ownership.ts";
-=======
 import {
 	createVirtualModel,
 	findLatestResponse,
@@ -100,7 +98,6 @@ interface RegisteredVirtualModel {
 	model: Model<Api>;
 	route: VirtualModelDefinition["route"];
 }
->>>>>>> upstream-v1.0.1
 
 interface ModelRuntimeSnapshot {
 	all: readonly Model<Api>[];
@@ -933,17 +930,13 @@ export class ModelRuntime implements Models {
 		}
 	}
 
-<<<<<<< HEAD
-	login(providerId: string, type: AuthType, interaction: AuthInteraction): Promise<Credential> {
-		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
-=======
 	login(
 		providerId: string,
 		type: AuthType,
 		interaction: AuthInteraction,
 		options?: LoginOptions,
 	): Promise<Credential> {
->>>>>>> upstream-v1.0.1
+		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(interaction.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			const credential = await this.models.login(providerId, type, { ...interaction, signal }, options);
@@ -1082,6 +1075,7 @@ export class ModelRuntime implements Models {
 	 * Throws when the id belongs to a physical model of that provider.
 	 */
 	registerVirtualModel(definition: VirtualModelDefinition): void {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		const { provider: providerId, id } = definition;
 		if (!providerId.trim() || !id.trim()) throw new Error("Virtual model provider and id must not be empty.");
 		const existing = this.models.getModel(providerId, id);
@@ -1103,6 +1097,7 @@ export class ModelRuntime implements Models {
 	}
 
 	unregisterVirtualModel(providerId: string, id: string): void {
+		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		const models = this.virtualModels.get(providerId);
 		if (!models?.delete(id)) return;
 		if (models.size === 0) this.virtualModels.delete(providerId);

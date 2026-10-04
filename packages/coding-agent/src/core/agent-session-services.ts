@@ -204,9 +204,6 @@ export async function createAgentSessionServices(
 		}
 	}
 	extensionsResult.runtime.pendingNativeProviderRegistrations = [];
-<<<<<<< HEAD
-	if (!owner) await modelRuntime.refresh({ allowNetwork: false });
-=======
 	for (const { definition, extensionPath } of extensionsResult.runtime.pendingVirtualModelRegistrations) {
 		try {
 			modelRuntime.registerVirtualModel(definition);
@@ -219,8 +216,7 @@ export async function createAgentSessionServices(
 		}
 	}
 	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
-	await modelRuntime.refresh({ allowNetwork: false });
->>>>>>> upstream-v1.0.1
+	if (!owner) await modelRuntime.refresh({ allowNetwork: false });
 	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
 	const services: AgentSessionServices = {
