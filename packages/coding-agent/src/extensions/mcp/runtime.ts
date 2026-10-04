@@ -172,6 +172,9 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	private opening: Promise<McpClient> | undefined;
 	private openingClient: McpClient | undefined;
 	private closing: Promise<void> | undefined;
+	private activeCalls = new Map<McpClient, number>();
+	private retiring = new Map<McpClient, ReturnType<typeof setTimeout> | undefined>();
+	private clientClosures = new Map<McpClient, Promise<void>>();
 	private closed = false;
 	/** Stderr of the last stdio server that failed to connect. */
 	private stderrTail: string | undefined;
@@ -294,7 +297,7 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		for (let attempt = 1; ; attempt++) {
 			const client = await this.getClient();
 			try {
-				return await run(client);
+				return await this.trackClientCall(client, run);
 			} catch (error) {
 				if (readOnly && attempt === 1 && error instanceof McpHttpError && isTransientError(error)) {
 					await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_DELAYS_MS[0]));
@@ -302,9 +305,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 				}
 				if (error instanceof McpSessionExpiredError && attempt === 1) {
 					// The server no longer knows the session (restart, deploy), so it did not run the request.
-					// Retry once on a new session. The old client is detached but not closed: closing would
-					// fail its other in-flight calls, which instead get the same 404 and retry the same way.
-					if (this.client === client) this.client = undefined;
+					// Retry once on a new session, retaining custody while other calls drain.
+					this.retireClient(client);
 					continue;
 				}
 				if (!this.needsSignIn(error)) throw error;
@@ -313,6 +315,36 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 				throw new Error(signInRequiredMessage(this.entry));
 			}
 		}
+	}
+
+	private async trackClientCall<T>(client: McpClient, run: (client: McpClient) => Promise<T>): Promise<T> {
+		this.activeCalls.set(client, (this.activeCalls.get(client) ?? 0) + 1);
+		try {
+			return await run(client);
+		} finally {
+			const remaining = (this.activeCalls.get(client) ?? 1) - 1;
+			if (remaining > 0) this.activeCalls.set(client, remaining);
+			else {
+				this.activeCalls.delete(client);
+				if (this.retiring.has(client)) void this.dropClient(client);
+			}
+		}
+	}
+
+	private retireClient(client: McpClient): void {
+		if (this.client === client) this.client = undefined;
+		if (this.retiring.has(client)) return;
+		this.retiring.set(client, undefined);
+		if (!this.activeCalls.has(client)) {
+			void this.dropClient(client);
+			return;
+		}
+		// Progress and caller-supplied unlimited timeouts cannot retain old sessions forever.
+		const drainMs =
+			this.timeoutMs > 0 ? Math.min(this.timeoutMs, DEFAULT_TIMEOUT_SECONDS * 1000) : DEFAULT_TIMEOUT_SECONDS * 1000;
+		const timer = setTimeout(() => void this.dropClient(client), drainMs);
+		timer.unref?.();
+		this.retiring.set(client, timer);
 	}
 
 	/** Connect again with fresh credentials, for example after signing in. */
@@ -325,7 +357,11 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	/** Disconnect after the stored credentials were removed. */
 	async signOut(): Promise<void> {
 		await this.opening?.catch(() => undefined);
-		if (this.client) await this.dropClient(this.client);
+		await Promise.all(
+			[...new Set([this.client, ...this.retiring.keys(), ...this.clientClosures.keys()])].map((client) =>
+				client ? this.dropClient(client) : undefined,
+			),
+		);
 		if (!this.closed) this.markNeedsAuth();
 	}
 
@@ -347,9 +383,21 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		this.onChange?.(this);
 	}
 
-	private async dropClient(client: McpClient): Promise<void> {
+	private dropClient(client: McpClient): Promise<void> {
 		if (this.client === client) this.client = undefined;
-		await client.close().catch(() => undefined);
+		const timer = this.retiring.get(client);
+		if (timer) clearTimeout(timer);
+		const existing = this.clientClosures.get(client);
+		if (existing) return existing;
+		const closing = Promise.resolve()
+			.then(() => client.close())
+			.catch(() => undefined)
+			.finally(() => {
+				this.retiring.delete(client);
+				this.clientClosures.delete(client);
+			});
+		this.clientClosures.set(client, closing);
+		return closing;
 	}
 
 	private async open(): Promise<McpClient> {
@@ -446,8 +494,9 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private async refreshTools(client: McpClient): Promise<void> {
+		if (this.client !== client || this.closed) return;
 		try {
-			const tools = await client.listTools();
+			const tools = await this.trackClientCall(client, (current) => current.listTools());
 			if (this.client !== client || this.closed) return;
 			this.tools = tools;
 			this.onTools(this);
@@ -458,7 +507,8 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 	}
 
 	private async refreshResources(client: McpClient): Promise<void> {
-		const { resources, resourceTemplates } = await fetchResources(client);
+		if (this.client !== client || this.closed) return;
+		const { resources, resourceTemplates } = await this.trackClientCall(client, fetchResources);
 		if (this.client !== client || this.closed) return;
 		this.resources = resources;
 		this.resourceTemplates = resourceTemplates;
@@ -471,10 +521,15 @@ export class McpServerConnection implements McpToolCaller, McpResourceServer {
 		this.closed = true;
 		this.state = "closed";
 		this.changed();
-		const clients = new Set([this.client, this.openingClient]);
+		const clients = new Set([
+			this.client,
+			this.openingClient,
+			...this.retiring.keys(),
+			...this.clientClosures.keys(),
+		]);
 		this.client = undefined;
 		this.closing = (async () => {
-			await Promise.all([...clients].map((client) => client?.close().catch(() => undefined)));
+			await Promise.all([...clients].map((client) => (client ? this.dropClient(client) : undefined)));
 			await this.opening?.catch(() => undefined);
 			// Preserve refresh grants whose responses arrived before shutdown.
 			await this.authProvider?.settled();
