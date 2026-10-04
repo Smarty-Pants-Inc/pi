@@ -42,7 +42,8 @@ function validateTimeout(timeout: number | undefined): void {
  * Runs a command through the environment's shell. Its output streams to `api.output()`, where the Harness keeps the
  * tail within the default limits; the result content is that retained output. Output beyond the limits is spilled to a
  * file whose path is reported as a diagnostic. A nonzero exit or timeout throws, which makes an error result that still
- * carries the output and diagnostics.
+ * carries the output and diagnostics. Omitting timeout leaves the running shell unbounded; the native Node environment
+ * still bounds trailing pipe output after shell exit, retires its POSIX process group, and joins accepted spill writes.
  */
 export function createBashTool(options?: BashToolOptions): ToolRegistration<typeof bashSchema> {
 	return defineTool({
