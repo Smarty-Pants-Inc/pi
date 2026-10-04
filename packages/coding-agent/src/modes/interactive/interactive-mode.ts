@@ -63,7 +63,12 @@ import {
 	getDocsPath,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import {
+	type AgentSession,
+	type AgentSessionEvent,
+	type PromptOptions,
+	parseSkillBlock,
+} from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
@@ -446,7 +451,6 @@ export class InteractiveMode {
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
 	private pendingUserInputs: string[] = [];
-	private userInputWasBuffered = false;
 	private userInputInFlight = false;
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -1211,7 +1215,7 @@ export class InteractiveMode {
 		// Process initial messages
 		if (initialMessage) {
 			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
+				await this.session.prompt(initialMessage, { images: initialImages, suppressInputMetadata: true });
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
@@ -1221,7 +1225,7 @@ export class InteractiveMode {
 		if (initialMessages) {
 			for (const message of initialMessages) {
 				try {
-					await this.session.prompt(message);
+					await this.session.prompt(message, { suppressInputMetadata: true });
 				} catch (error: unknown) {
 					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 					this.showError(errorMessage);
@@ -1233,10 +1237,7 @@ export class InteractiveMode {
 		while (true) {
 			const userInput = await this.getUserInput();
 			try {
-				const prompt = this.session.prompt(
-					userInput,
-					this.userInputWasBuffered ? { suppressInputMetadata: true } : undefined,
-				);
+				const prompt = this.session.prompt(userInput.text, userInput.options);
 				// Original session preflight owns the input before TUI staging clears.
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-transferred");
@@ -3461,6 +3462,11 @@ export class InteractiveMode {
 				break;
 
 			case "entry_appended":
+				// A user end notification precedes persistence. Release rollback components only after append succeeds.
+				if (event.entry.type === "message" && event.entry.message.role === "user") {
+					this.userPublicationComponents.delete(event.entry.id);
+					break;
+				}
 				if (this.entriesRenderedByBoundaryCompaction.delete(event.entry.id)) break;
 				if (event.entry.type === "custom") {
 					// Bound entries render only when their exact native user message is published.
@@ -3597,10 +3603,7 @@ export class InteractiveMode {
 				break;
 
 			case "message_end":
-				if (event.message.role === "user") {
-					this.userPublicationComponents.clear();
-					break;
-				}
+				if (event.message.role === "user") break;
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
@@ -4279,22 +4282,22 @@ export class InteractiveMode {
 		);
 	}
 
-	async getUserInput(): Promise<string> {
+	async getUserInput(): Promise<{ text: string; options: PromptOptions }> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
-			this.userInputWasBuffered = true;
 			this.userInputInFlight = true;
 			this.stagingAudit?.("input-dequeued");
-			return queuedInput;
+			return { text: queuedInput, options: { suppressInputMetadata: true } };
 		}
 
 		return new Promise((resolve) => {
 			this.onInputCallback = (text: string) => {
 				this.onInputCallback = undefined;
-				this.userInputWasBuffered = false;
+				// Freeze this direct datum before resolving: another submit in the same dispatch may change latest-author.
+				const metadata = this.session.captureInputMetadata(text);
 				this.userInputInFlight = true;
 				this.stagingAudit?.("input-delivered");
-				resolve(text);
+				resolve({ text, options: { metadata, inputMetadataCaptured: true } });
 			};
 		});
 	}

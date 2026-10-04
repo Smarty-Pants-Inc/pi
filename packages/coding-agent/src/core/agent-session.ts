@@ -340,6 +340,8 @@ export interface PromptOptions {
 	metadata?: InputMetadata;
 	/** @internal Buffered TUI delivery: skip input_submission capture and ignore explicit metadata. */
 	suppressInputMetadata?: boolean;
+	/** @internal Metadata was synchronously read at direct acceptance; never read latest-author again. */
+	inputMetadataCaptured?: boolean;
 	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
 	preflightResult?: (success: boolean) => void;
 	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
@@ -1248,7 +1250,12 @@ export class AgentSession {
 
 		const startedMessage = event.type === "message_start" ? event.message : undefined;
 		const input = startedMessage ? this._inputSubmissions.get(startedMessage) : undefined;
-		const entryId = input ? randomUUID() : undefined;
+		const terminalMessage = event.type === "message_end" ? event.message : undefined;
+		const entryId = input
+			? randomUUID()
+			: terminalMessage
+				? this._userMessageEntryIds.get(terminalMessage)
+				: undefined;
 		if (startedMessage && entryId) this._userMessageEntryIds.set(startedMessage, entryId);
 		try {
 			// Terminal cancellation releases extension waits, not final event publication/persistence.
@@ -1266,9 +1273,12 @@ export class AgentSession {
 						? { ...event, entryId, input: structuredClone(input) }
 						: event,
 			);
+			if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
+			else await this._persistAgentEvent(event);
 		} catch (error) {
 			if (entryId) {
-				if (startedMessage) this._userMessageEntryIds.delete(startedMessage);
+				const message = startedMessage ?? terminalMessage;
+				if (message) this._userMessageEntryIds.delete(message);
 				// Notify every subscriber so a failed publication cannot leave a visible orphan label.
 				for (const listener of [...this._eventListeners]) {
 					try {
@@ -1281,10 +1291,8 @@ export class AgentSession {
 			throw error;
 		} finally {
 			if (startedMessage) this._inputSubmissions.delete(startedMessage);
+			if (terminalMessage) this._userMessageEntryIds.delete(terminalMessage);
 		}
-
-		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
-		else await this._persistAgentEvent(event);
 	};
 
 	private async _persistAgentEvent(event: AgentEvent): Promise<void> {
@@ -1321,16 +1329,21 @@ export class AgentSession {
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				const directEntryId = this._userMessageEntryIds.get(event.message);
+				// Consume before append (including an awaited owned append), not just after success.
+				this._userMessageEntryIds.delete(event.message);
 				entryId = this.#ordinaryOwner
 					? directEntryId
 						? await appendOwnedTerminalMessage(this.sessionManager, event.message, directEntryId)
 						: await appendOwnedTerminalMessage(this.sessionManager, event.message)
 					: this.sessionManager.appendMessage(event.message, directEntryId);
-				this._userMessageEntryIds.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
 					this._retainTerminalPublicationFailure(error);
+				}
+				if (directEntryId) {
+					const entry = this.sessionManager.getEntry(entryId);
+					if (entry) this._emit({ type: "entry_appended", entry });
 				}
 			}
 			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
@@ -2201,6 +2214,30 @@ export class AgentSession {
 		return { images: normalizedImages, hints };
 	}
 
+	/** Synchronous metadata-only read for the eligible waiting editor callback. Never used by queues. */
+	captureInputMetadata(text: string, options?: PromptOptions): InputMetadata | undefined {
+		if (
+			!this.isIdle ||
+			this.isSettling ||
+			this._settlementActionScope.getStore()?.active ||
+			this.isPromptPending ||
+			options?.streamingBehavior !== undefined ||
+			options?.suppressInputMetadata ||
+			options?.source === "extension"
+		)
+			return undefined;
+		if ((options?.expandPromptTemplates ?? true) && text.startsWith("/")) {
+			const commandName = text.slice(1).split(" ", 1)[0];
+			if (this._extensionRunner.getCommand(commandName)) return undefined;
+		}
+		return this._extensionRunner.emitInputSubmission(
+			text,
+			options?.images,
+			options?.source ?? "interactive",
+			options?.metadata,
+		).metadata;
+	}
+
 	/**
 	 * Send a prompt to the agent.
 	 * - Handles extension commands (registered via pi.registerCommand) immediately, even during streaming
@@ -2212,6 +2249,15 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
+		// Detach SDK metadata and read synchronous handlers before owner admission or command lookup can yield.
+		// The TUI carries its already-read datum in these same options, not in any pending-input queue.
+		options = {
+			...options,
+			metadata: options?.inputMetadataCaptured
+				? structuredClone(options.metadata)
+				: this.captureInputMetadata(text, options),
+			inputMetadataCaptured: true,
+		};
 		if (this._isEmittingAgentSettled) {
 			const completion = new Promise<void>((resolve, reject) => {
 				this._deferredSettledActions.push(async () => {
@@ -2307,14 +2353,9 @@ export class AgentSession {
 				!options?.suppressInputMetadata &&
 				options?.source !== "extension";
 			this._promptPreflights.add(preflightToken);
-			const submission =
+			const submission: InputSubmission | undefined =
 				directInput && (options?.metadata !== undefined || this._extensionRunner.hasHandlers("input_submission"))
-					? await this._extensionRunner.emitInputSubmission(
-							text,
-							options?.images,
-							options?.source ?? "interactive",
-							options?.metadata,
-						)
+					? { source: options?.source ?? "interactive", metadata: options?.metadata }
 					: undefined;
 			const mustQueue = () =>
 				this.isStreaming ||

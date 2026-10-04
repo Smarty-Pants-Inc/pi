@@ -118,7 +118,8 @@ describe("direct prompt labels", () => {
 		expect(JSON.stringify(reopened.buildSessionContext())).not.toContain("Alice");
 	});
 
-	it("accepts SDK metadata as detached data and merges capture results without changing model content", async () => {
+	// pi#4078 F1: a Promise result cannot identify the accepted sender; SDK data stays detached, async results fail closed.
+	it("accepts detached SDK metadata but ignores async capture results without changing model content", async () => {
 		const starts: MessageStartEvent[] = [];
 		const gate = deferred();
 		const entered = deferred();
@@ -150,7 +151,7 @@ describe("direct prompt labels", () => {
 		await prompt;
 		expect(starts[0]?.input).toEqual({
 			source: "rpc",
-			metadata: { author: "SDK Alice", nested: { stable: true }, origin: "sdk" },
+			metadata: { author: "SDK Alice", nested: { stable: true } },
 		});
 		expect(labels(harness)[0]?.beforeMessageId).toBe(starts[0]?.entryId);
 	});

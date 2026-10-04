@@ -1590,13 +1590,13 @@ export class ExtensionRunner {
 		return { skillPaths, promptPaths, themePaths };
 	}
 
-	/** Capture metadata only for an eligible direct prompt, before transforming its input. */
-	async emitInputSubmission(
+	/** Capture at acceptance without yielding to an earlier observer or a later sender. */
+	emitInputSubmission(
 		text: string,
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		initialMetadata?: InputMetadata,
-	): Promise<InputSubmission> {
+	): InputSubmission {
 		const signal = this.dispatchSignal("input_submission");
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
@@ -1612,9 +1612,29 @@ export class ExtensionRunner {
 						source,
 						metadata,
 					});
-					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as
-						| InputSubmissionEventResult
-						| undefined;
+					// Use the existing registered reference directly: dispatchHandler always yields.
+					const returned: unknown = handler(event, ctx);
+					if (
+						returned !== null &&
+						(typeof returned === "object" || typeof returned === "function") &&
+						"then" in returned &&
+						typeof returned.then === "function"
+					) {
+						// A latest-author lookup after a yield cannot identify the accepted sender.
+						// Observe rejection, but never apply asynchronous metadata or await observers.
+						void Promise.resolve(returned)
+							.catch((error: unknown) => {
+								this.emitError({
+									extensionPath: ext.path,
+									event: "input_submission",
+									error: error instanceof Error ? error.message : String(error),
+									stack: error instanceof Error ? error.stack : undefined,
+								});
+							})
+							.catch(() => {});
+						continue;
+					}
+					const result = returned as InputSubmissionEventResult | undefined;
 					signal?.throwIfAborted();
 					if (result?.metadata !== undefined) {
 						if (

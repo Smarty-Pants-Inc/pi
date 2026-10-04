@@ -1002,14 +1002,15 @@ export interface InputSubmission {
 	metadata?: InputMetadata;
 }
 
-/** Metadata-only capture before direct prompt input handlers and expansion. Never fired for queued/staged input. */
+/** Synchronous metadata-only capture at direct acceptance, before input handlers/expansion. Never fired for queued/staged input. */
 export interface InputSubmissionEvent extends InputSubmission {
 	type: "input_submission";
 	text: string;
 	images?: ImageContent[];
 }
 
-/** Metadata is shallow-merged across handlers; later keys win. Mutations and failed results are ignored. */
+/** Synchronous metadata is shallow-merged; later keys win. Mutations, failures and Promise results are ignored.
+ * Async observers may run, but cannot identify a sender by reading latest-author after a yield. */
 export interface InputSubmissionEventResult {
 	metadata?: InputMetadata;
 }
