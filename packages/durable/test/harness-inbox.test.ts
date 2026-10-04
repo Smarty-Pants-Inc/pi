@@ -189,10 +189,10 @@ describe("inbox", () => {
 		const occupying = root.commit(async (tx) => void (await tx.doc(Marker)).n++, context);
 		await held.entered;
 		first.release();
-		await yielded.promise;
 		await flush();
 		setup.settings.followUpMode = "all";
 		held.release();
+		await yielded.promise;
 		await occupying;
 		const settled = await f2.wait(context);
 		expect(await status(f1)).toEqual({ ...settled, id: f1.id, entry: expect.any(Number) });
