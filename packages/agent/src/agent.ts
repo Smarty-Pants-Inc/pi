@@ -395,8 +395,12 @@ export class Agent {
 
 	/** Remove all queued steering and follow-up messages. */
 	clearAllQueues(): void {
-		this.clearSteeringQueue();
-		this.clearFollowUpQueue();
+		try {
+			this.clearSteeringQueue();
+		} finally {
+			// Observer failures must not leave follow-up input replayable after withdrawal.
+			this.clearFollowUpQueue();
+		}
 	}
 
 	/** Returns true when either queue still contains pending messages. */

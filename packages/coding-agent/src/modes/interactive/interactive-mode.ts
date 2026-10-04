@@ -4880,9 +4880,10 @@ export class InteractiveMode {
 	 * Clears session and compaction queues and cancels streaming inputs still capturing metadata.
 	 */
 	private clearAllQueues(): { steering: string[]; followUp: string[]; clearFailure?: { error: unknown } } {
-		// Native clearQueue() mutates its queues before synchronously notifying observers.
-		// Keep its ownership snapshot locally: an observer can throw before clearQueue()
-		// returns, and restoration must still receive the accepted text exactly once.
+		// Native clearQueue() withdraws session ownership, and Agent.clearAllQueues()
+		// completes both low-level clears even if a lifecycle notification throws.
+		// Keep the snapshot: either native or session observers can prevent the return,
+		// and restoration must still receive the accepted text exactly once.
 		const nativeQueuedBeforeClear = {
 			steering: [...this.session.getSteeringMessages()],
 			followUp: [...this.session.getFollowUpMessages()],

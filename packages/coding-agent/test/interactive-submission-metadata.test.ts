@@ -1105,6 +1105,189 @@ describe("interactive submission metadata", () => {
 		},
 	);
 
+	// F7 regression for Smarty-Pants-Inc/smarty-dev#4078: both native clears complete before propagating errors.
+	it.each(["first", "second", "both", "undefined", "string"] as const)(
+		"empties both low-level queues when the lifecycle observer throws on $0 clear",
+		async (failure) => {
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const agent = harness.session.agent;
+			const firstError = new Error("first clear failed");
+			const secondError = new Error("second clear failed");
+			let armed = false;
+			const observations: Array<{ steering: number; followUp: number }> = [];
+			agent.observeLifecycle((event) => {
+				if (!armed || event.type !== "queue_update") return;
+				observations.push({ steering: event.steering, followUp: event.followUp });
+				if (observations.length === 1 && failure !== "second") {
+					if (failure === "undefined") throw undefined;
+					if (failure === "string") throw "non-Error clear failure";
+					throw firstError;
+				}
+				if (observations.length === 2 && (failure === "second" || failure === "both")) throw secondError;
+			});
+			agent.steer({ role: "user", content: "native steer", timestamp: 1 });
+			agent.followUp({ role: "user", content: "native followUp", timestamp: 2 });
+			armed = true;
+			let threw = false;
+			let caught: unknown;
+			try {
+				agent.clearAllQueues();
+			} catch (error) {
+				threw = true;
+				caught = error;
+			}
+			expect.soft(agent.hasQueuedMessages()).toBe(false);
+			expect.soft(agent.peekQueuedMessages()).toEqual([]);
+			expect.soft(observations).toEqual([
+				{ steering: 0, followUp: 1 },
+				{ steering: 0, followUp: 0 },
+			]);
+			expect(threw).toBe(true);
+			// Standard finally precedence: a second notification failure supersedes the first.
+			expect(caught).toBe(
+				failure === "second" || failure === "both"
+					? secondError
+					: failure === "undefined"
+						? undefined
+						: failure === "string"
+							? "non-Error clear failure"
+							: firstError,
+			);
+		},
+	);
+
+	// F7 review blocker, Smarty-Pants-Inc/smarty-dev#4078: use real dequeue and the held hook's bound ctx.abort.
+	it.each(
+		(["dequeue", "abort"] as const).flatMap((cancel) =>
+			[1, 2].flatMap((notification) =>
+				["held Alice", "newer draft"].flatMap((draft) =>
+					[false, true].map((reject) => ({ cancel, notification, draft, reject })),
+				),
+			),
+		),
+	)(
+		"completes first withdrawal through lifecycle observer failure ($cancel, notification=$notification, draft=$draft, reject=$reject)",
+		async ({ cancel, notification, draft, reject }) => {
+			initTheme("dark");
+			const captureStarted = gate();
+			const captureRelease = gate();
+			let boundAbort!: () => void;
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("input_submission", async (event, ctx) => {
+							if (event.source !== "interactive") return;
+							if (event.text === "held Alice") {
+								boundAbort = () => ctx.abort();
+								captureStarted.release();
+								await captureRelease.promise;
+							}
+							return { metadata: { author: { name: "Alice", source: "herdr-client", verified: false } } };
+						});
+					},
+					inputAuthor,
+				],
+			});
+			harnesses.push(harness);
+			if (reject) {
+				const capture = harness.session.captureInputSubmission.bind(harness.session);
+				vi.spyOn(harness.session, "captureInputSubmission").mockImplementation(async (text, options) => {
+					const submission = await capture(text, options);
+					if (text === "held Alice") throw new Error("late host capture rejection");
+					return submission;
+				});
+			}
+			const services: AgentSessionServices = {
+				cwd: harness.tempDir,
+				agentDir: harness.tempDir,
+				modelRuntime: harness.session.modelRuntime,
+				settingsManager: harness.settingsManager,
+				resourceLoader: harness.session.resourceLoader,
+				diagnostics: [],
+			};
+			const runtime = new AgentSessionRuntime(harness.session, services, async () => {
+				throw new Error("F7 withdrawal must not replace the session");
+			});
+			const mode = new InteractiveMode(runtime);
+			const internal = mode as unknown as SubmissionUI & {
+				bindCurrentSessionExtensions(): Promise<void>;
+				setupEditorSubmitHandler(): void;
+			};
+			const showError = vi.spyOn(mode, "showError").mockImplementation(() => {});
+			const showStatus = vi.spyOn(internal, "showStatus").mockImplementation(() => {});
+			let armed = false;
+			const observations: Array<{ steering: number; followUp: number }> = [];
+			harness.session.agent.observeLifecycle((event) => {
+				if (!armed || event.type !== "queue_update") return;
+				observations.push({ steering: event.steering, followUp: event.followUp });
+				if (observations.length === notification) throw new Error("native lifecycle clear failure");
+			});
+			let accepted: PendingInput | undefined;
+			try {
+				await internal.bindCurrentSessionExtensions();
+				internal.setupEditorSubmitHandler();
+				await harness.session.steer("native steer");
+				await harness.session.followUp("native followUp");
+				internal.editor.setText("held Alice");
+				await internal.defaultEditor.onSubmit!("held Alice");
+				await captureStarted.promise;
+				accepted = internal.pendingUserInputs[0];
+				internal.editor.setText(draft);
+				armed = true;
+				expect(() => {
+					if (cancel === "abort") boundAbort();
+					else prototype.handleDequeue.call(internal);
+				}).not.toThrow();
+				// No second withdrawal may conceal a leftover low-level follow-up here.
+				expect.soft(harness.session.agent.hasQueuedMessages()).toBe(false);
+				expect.soft(harness.session.agent.peekQueuedMessages()).toEqual([]);
+				expect.soft(observations).toEqual([
+					{ steering: 0, followUp: 1 },
+					{ steering: 0, followUp: 0 },
+				]);
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(harness.session.getSteeringMessages()).toEqual([]);
+				expect(harness.session.getFollowUpMessages()).toEqual([]);
+				expect(accepted?.cancellation?.signal.aborted).toBe(true);
+				const restored = `held Alice\n\nnative steer\n\nnative followUp\n\n${draft}`;
+				expect(internal.editor.getText()).toBe(restored);
+				expect(showError).toHaveBeenCalledExactlyOnceWith(
+					"Failed to notify queued message clear: native lifecycle clear failure",
+				);
+				if (cancel === "dequeue")
+					expect(showStatus).toHaveBeenLastCalledWith("Restored 3 queued messages to editor");
+				captureRelease.release();
+				await Promise.allSettled([accepted!.submissionPromise!]);
+				expect(internal.editor.getText()).toBe(restored);
+				internal.editor.setText("replacement draft");
+				harness.setResponses([fauxAssistantMessage("fresh response"), fauxAssistantMessage("unexpected replay")]);
+				await harness.session.prompt("fresh RPC", { source: "rpc" });
+				expect.soft(getUserTexts(harness)).toEqual(["fresh RPC"]);
+				expect
+					.soft(
+						harness
+							.eventsOfType("message_start")
+							.filter((event) => event.message.role === "user")
+							.map((event) => getMessageText(event.message)),
+					)
+					.toEqual(["fresh RPC"]);
+				expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+				expect.soft(harness.faux.state.callCount).toBe(1);
+				expect(internal.editor.getText()).toBe("replacement draft");
+				expect(showError).toHaveBeenCalledTimes(1);
+				// Only after first-clear emptiness and the fresh RPC probe may repeat-withdrawal be exercised.
+				prototype.handleDequeue.call(internal);
+				expect(internal.editor.getText()).toBe("replacement draft");
+			} finally {
+				captureRelease.release();
+				if (accepted?.submissionPromise) await Promise.allSettled([accepted.submissionPromise]);
+				mode.stop();
+				await runtime.dispose();
+			}
+		},
+	);
+
 	// F7 native control for Smarty-Pants-Inc/smarty-dev#4078: fallback and normal return own the same queue batch.
 	it.each([false, true].flatMap((throws) => ["dequeue", "abort"].map((cancel) => ({ throws, cancel }))))(
 		"restores native equal steer/followUp once (throw=$throws, $cancel)",
@@ -1136,6 +1319,9 @@ describe("interactive submission metadata", () => {
 			};
 			expect.soft(withdraw).not.toThrow();
 			expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame");
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.session.agent.peekQueuedMessages()).toEqual([]);
 			withdraw();
 			expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame");
 			expect(context.showError).toHaveBeenCalledTimes(throws ? 1 : 0);
@@ -1193,6 +1379,9 @@ describe("interactive submission metadata", () => {
 				});
 				expect.soft(() => prototype.handleDequeue.call(context)).not.toThrow();
 				expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame\n\nsame");
+				expect(harness.session.pendingMessageCount).toBe(0);
+				expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+				expect(harness.session.agent.peekQueuedMessages()).toEqual([]);
 				prototype.handleDequeue.call(context);
 				expect.soft(context.editor.getText()).toBe("same\n\nsame\n\nsame\n\nsame");
 				captureRelease.release();
