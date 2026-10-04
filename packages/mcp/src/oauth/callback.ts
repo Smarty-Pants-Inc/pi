@@ -122,7 +122,13 @@ export class OAuthCallbackServer {
 	}
 
 	private handle(rawUrl: string, response: ServerResponse): void {
-		const url = new URL(rawUrl, this.redirectUrl);
+		let url: URL;
+		try {
+			url = new URL(rawUrl, this.redirectUrl);
+		} catch {
+			this.reply(response, 400, { ok: false, message: "Invalid callback URL" });
+			return;
+		}
 		if (!this.paths.includes(url.pathname)) {
 			this.reply(response, 404, { ok: false, message: "Not found" });
 			return;
