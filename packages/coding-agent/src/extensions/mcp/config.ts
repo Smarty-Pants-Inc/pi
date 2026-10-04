@@ -192,15 +192,50 @@ export function updateMcpServerConfig(
 	});
 }
 
+/** Find a free name, including malformed entries and names sharing a normalized namespace. */
+export function getAvailableMcpServerName(path: string, preferred: string): string {
+	let name = preferred;
+	editMcpServers(path, (servers) => {
+		const namespaces = new Set(Object.keys(servers ?? {}).map(mcpNamespace));
+		for (let suffix = 1; namespaces.has(mcpNamespace(name)); suffix++) {
+			name = suffix === 1 ? `${preferred}-mcp` : `${preferred}-mcp-${suffix}`;
+		}
+		return false;
+	});
+	return name;
+}
+
 /**
  * Add a server to an `mcp.json`, creating the file when missing. An existing entry with the same
- * name is replaced. Returns true when an entry was replaced.
+ * name is replaced. Returns true when an entry was replaced. With `expectedUrl`, replacement is
+ * allowed only for a valid HTTP server at that URL, and namespace collisions are refused.
  */
-export function addMcpServerConfig(path: string, name: string, config: McpServerConfig): boolean {
+export function addMcpServerConfig(
+	path: string,
+	name: string,
+	config: McpServerConfig,
+	options: { expectedUrl?: string } = {},
+): boolean {
 	let replaced = false;
 	editMcpServers(path, (servers, parsed) => {
 		const target = servers ?? {};
-		replaced = target[name] !== undefined;
+		replaced = Object.hasOwn(target, name);
+		if (options.expectedUrl !== undefined) {
+			const clash = Object.keys(target).find(
+				(other) => other !== name && mcpNamespace(other) === mcpNamespace(name),
+			);
+			if (clash) throw new Error(`${path}: server "${name}" conflicts with "${clash}"`);
+			if (replaced) {
+				const existing = validateMcpServerConfig(name, target[name]);
+				if (
+					typeof existing === "string" ||
+					!("url" in existing) ||
+					existing.url.replace(/\/+$/u, "") !== options.expectedUrl.replace(/\/+$/u, "")
+				) {
+					throw new Error(`${path}: refusing to replace nonmatching MCP server "${name}"`);
+				}
+			}
+		}
 		target[name] = config;
 		parsed.mcpServers = target;
 		return true;
