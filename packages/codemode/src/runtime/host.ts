@@ -40,7 +40,7 @@ function errorMessage(error: unknown): string {
 }
 
 function serializeStore(store: Readonly<Record<string, unknown>> | undefined): Record<string, string> {
-	const serialized: Record<string, string> = {};
+	const serialized: Record<string, string> = Object.create(null);
 	for (const [key, value] of Object.entries(store ?? {})) {
 		const json = JSON.stringify(value);
 		if (json !== undefined) serialized[key] = json;
