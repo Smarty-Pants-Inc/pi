@@ -260,10 +260,13 @@ export function getOAuthDiagnosticSecrets(
 				"account-id",
 			].includes(name)
 		) {
-			secrets.push(value);
+			// Fetch/Headers trim field values before dispatch. Retain both forms so
+			// diagnostics mask the configured value and the value sent on the wire.
+			const normalized = value.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+			secrets.push(value, normalized);
 			if (name.endsWith("authorization")) {
-				const separator = value.search(/\s/);
-				if (separator >= 0) secrets.push(value.slice(separator).trim());
+				const separator = normalized.search(/[\t ]/);
+				if (separator >= 0) secrets.push(normalized.slice(separator).replace(/^[\t ]+/, ""));
 			}
 		}
 	}
@@ -321,6 +324,18 @@ function unescapeDiagnostic(text: string): string {
 	return parts.join("");
 }
 
+/** Canonicalize percent escapes for comparison, including mixed literal/encoded bytes.
+ * Invalid UTF-8 cannot hide an adjacent valid credential; replacement decoding
+ * still examines valid subsequences. Untouched diagnostics retain their bytes.
+ */
+function unescapePercentDiagnostic(text: string): string {
+	return text.replace(/(?:%[0-9a-f]{2})+/gi, (encoded) => {
+		const bytes = new Uint8Array(encoded.length / 3);
+		for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(encoded.slice(i * 3 + 1, i * 3 + 3), 16);
+		return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+	});
+}
+
 function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
@@ -354,17 +369,19 @@ function redactValues(text: string, secrets: readonly string[]): string {
 	// Provider strings have no nesting limit. Decode to a fixed point, masking at
 	// every layer so literal backslashes in a secret cannot be decoded past it.
 	// Never publish an incompletely examined field when either work bound is hit.
-	for (let pass = 0; text.includes("\\"); pass++) {
+	for (let pass = 0; text.includes("\\") || /%[0-9a-f]{2}/i.test(text); pass++) {
 		work += text.length;
 		if (pass === MAX_DIAGNOSTIC_UNESCAPE_PASSES || work > MAX_DIAGNOSTIC_UNESCAPE_WORK) return "***";
-		const decoded = unescapeDiagnostic(text);
-		if (decoded === text) break;
-		text = decoded;
-		for (const value of values) {
-			if (!text.includes(value)) continue;
-			encodedMatch = true;
-			text = text.split(value).join("***");
+		const previous = text;
+		for (const decode of [unescapeDiagnostic, unescapePercentDiagnostic]) {
+			text = decode(text);
+			for (const value of values) {
+				if (!text.includes(value)) continue;
+				encodedMatch = true;
+				text = text.split(value).join("***");
+			}
 		}
+		if (text === previous) break;
 	}
 	// Keep untouched diagnostics byte-for-byte. Encoded matches use the safe
 	// decoded form, preserving useful context without reconstructing unsafe layers.
@@ -374,7 +391,8 @@ function redactValues(text: string, secrets: readonly string[]): string {
 /** Redact live values first, independently of labels or serialization syntax. */
 export function redactOAuthDiagnostic(text: string, secrets: readonly string[] = []): string {
 	// Apply the work bound before enumerated variants can consume escaped values.
-	if (secrets.length > 0 && text.includes("\\") && text.length > MAX_DIAGNOSTIC_UNESCAPE_WORK) return "***";
+	if (secrets.length > 0 && (text.includes("\\") || text.includes("%")) && text.length > MAX_DIAGNOSTIC_UNESCAPE_WORK)
+		return "***";
 	// Entirely Unicode-escaped opaque text is outside the rich diagnostic contract.
 	if (secrets.length > 0 && /^(?:\\u[0-9a-f]{4})+$/i.test(text)) return "Provider diagnostic details withheld";
 	text = redactValues(text, secrets);

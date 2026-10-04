@@ -563,6 +563,10 @@ describe.each(oauthReaders)("F11 $name", (entry) => {
 		let cancelled = false;
 		let producer: ReadableStreamDefaultController<Uint8Array> | undefined;
 		let calls = 0;
+		let acceptBody: (() => void) | undefined;
+		const bodyAccepted = new Promise<void>((resolve) => {
+			acceptBody = resolve;
+		});
 		const body = new ReadableStream<Uint8Array>({
 			start(controller) {
 				producer = controller;
@@ -595,6 +599,7 @@ describe.each(oauthReaders)("F11 $name", (entry) => {
 				},
 				{ once: true },
 			);
+			acceptBody?.();
 			return new Response(body, { status });
 		});
 		// Native fetch aborts its accepted body too. Emulate that contract rather than
@@ -622,8 +627,11 @@ describe.each(oauthReaders)("F11 $name", (entry) => {
 				settled = true;
 			},
 		);
-		// Allow loopback listen/manual cancellation to settle before advancing native deadlines.
-		await new Promise<void>((resolve) => setImmediate(resolve));
+		// smarty-dev#4703: PKCE native crypto and loopback admission are not
+		// synchronized by one setImmediate. Start deadline measurement only once
+		// fetch has accepted the target body and installed its abort listener.
+		if (entry.phase === "poll") await vi.advanceTimersByTimeAsync(1100);
+		await bodyAccepted;
 		await vi.advanceTimersByTimeAsync(31_100);
 		const retiredByDeadline = cancelled;
 		// Baseline response.json/text ignores a mocked fetch signal: close and join explicitly.

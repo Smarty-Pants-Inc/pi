@@ -367,6 +367,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				cacheSessionId,
 				compat,
 				options?.oauthDiagnostics,
+				diagnosticSecrets,
 			);
 			let params = buildParams(
 				model,
@@ -818,6 +819,7 @@ function createClient(
 	sessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
 	oauthDiagnostics = false,
+	diagnosticSecrets: string[] = [],
 ) {
 	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
 	if (model.provider === "github-copilot") {
@@ -845,6 +847,13 @@ function createClient(
 	if (optionsHeaders) {
 		Object.assign(headers, optionsHeaders);
 	}
+
+	// One outgoing-header boundary: collection and dispatch use the same
+	// normalized snapshot, after all header sources have been merged.
+	for (const [key, value] of Object.entries(headers)) {
+		if (value !== null) headers[key] = value.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+	}
+	diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));
 
 	return new OpenAI({
 		logLevel: "off",
