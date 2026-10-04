@@ -1094,26 +1094,38 @@ export class ExtensionRunner {
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
+		let acceptedEntries: SessionBoundaryDraft[] = [];
 		let shouldContinue = false;
 		let previewRevision = this.sessionManager.revision();
 		let previewPendingMessages = structuredClone(getPendingMessages?.());
 		let previewEntries: SessionBoundaryDraft[] = [];
 		const staleAdmission = new Error("Boundary context changed during 8 consecutive builds; dispatch refused");
-		const previewIsCurrent = () =>
+		const previewIsCurrent = (drafts = entries) =>
 			previewRevision === this.sessionManager.revision() &&
 			isDeepStrictEqual(previewPendingMessages, getPendingMessages?.()) &&
-			isDeepStrictEqual(previewEntries, entries);
-		const rebuildContext = async (): Promise<BoundaryContextPreview> => {
+			isDeepStrictEqual(previewEntries, drafts);
+		const rebuildContext = async (drafts = entries): Promise<BoundaryContextPreview> => {
 			for (let attempt = 0; attempt < 8; attempt++) {
 				signal?.throwIfAborted();
-				previewRevision = this.sessionManager.revision();
-				previewPendingMessages = structuredClone(getPendingMessages?.());
-				previewEntries = structuredClone(entries);
+				const revision = this.sessionManager.revision();
+				const pendingMessages = structuredClone(getPendingMessages?.());
+				const draftSnapshot = structuredClone(drafts);
 				// The builder gets detached drafts, just like handlers. Recheck every input
 				// after its await, including the initial build and all replacement builds.
-				const built = await raceWithAbortSignal(Promise.resolve(buildContext(structuredClone(entries))), signal);
+				const built = await raceWithAbortSignal(Promise.resolve(buildContext(structuredClone(drafts))), signal);
 				signal?.throwIfAborted();
-				if (previewIsCurrent()) return structuredClone(built);
+				if (
+					revision === this.sessionManager.revision() &&
+					isDeepStrictEqual(pendingMessages, getPendingMessages?.()) &&
+					isDeepStrictEqual(draftSnapshot, drafts)
+				) {
+					const detached = structuredClone(built);
+					// Failed builds must not advance the last accepted preview's freshness.
+					previewRevision = revision;
+					previewPendingMessages = pendingMessages;
+					previewEntries = draftSnapshot;
+					return detached;
+				}
 			}
 			throw staleAdmission;
 		};
@@ -1128,13 +1140,14 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				// Even a stable async rebuild yields before its caller resumes. Reconcile
 				// again immediately before admitting the next handler.
-				// Invalid proposals retain the last valid preview so a later handler can repair
-				// them. Rebuilding here would throw outside the proposal validation boundary.
-				if (valid && !previewIsCurrent()) {
-					context = await rebuildContext();
+				// Malformed proposals remain repairable, but never become preview inputs.
+				// Reconcile canonical/queue changes and projection mutations independently.
+				const previewDrafts = valid ? entries : acceptedEntries;
+				if (!previewIsCurrent(previewDrafts) || !isDeepStrictEqual(context, contextSnapshot)) {
+					context = await rebuildContext(previewDrafts);
 					contextSnapshot = structuredClone(context);
 				}
-				if (valid && !previewIsCurrent()) throw staleAdmission;
+				if (!previewIsCurrent(previewDrafts)) throw staleAdmission;
 				// A failed proposal remains visible so a later handler can replace it.
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
@@ -1192,6 +1205,7 @@ export class ExtensionRunner {
 					signal?.throwIfAborted();
 					if (!previewIsCurrent()) throw staleAdmission;
 					contextSnapshot = structuredClone(context);
+					acceptedEntries = structuredClone(entries);
 					valid = true;
 				} catch (err) {
 					signal?.throwIfAborted();

@@ -246,9 +246,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	// Inspect the captured manager before preparing extension resources. Virtual model
 	// registration below must precede saved model selection, not session context inspection.
-	const existingSession = sessionManager.buildSessionContext();
-	const hasExistingSession = existingSession.messages.length > 0;
-	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	sessionManager.buildSessionContext();
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
@@ -271,6 +269,11 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		}
 	}
 	extensionsResult.runtime.pendingVirtualModelRegistrations = [];
+
+	// Resource preparation can append canonical history to the captured manager.
+	const existingSession = sessionManager.buildSessionContext();
+	const hasExistingSession = existingSession.messages.length > 0;
+	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
 
 	// Check if session has existing data to restore
 	let model = options.model;
@@ -475,7 +478,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model,
 			thinkingLevel,
 			tools: [],
-			messages: existingSession.messages,
+			messages: sessionManager.buildSessionContext().messages,
 		},
 		convertToLlm: (messages) => {
 			const converted = convertToLlmWithBlockImages(messages);
