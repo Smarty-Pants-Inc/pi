@@ -204,9 +204,10 @@ function createEventConverter(model: Model<"pi-messages">, oauthDiagnostics = fa
 				}
 				if (!oauthDiagnostics) appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "done", reason: event.reason, message: partial };
-			case "error":
+			case "error": {
+				const reason = event.reason === "aborted" ? "aborted" : "error";
 				Object.assign(partial, {
-					stopReason: event.reason,
+					stopReason: reason,
 					usage: event.usage,
 					errorMessage: oauthDiagnostics
 						? oauthDiagnosticError("oauth_stream_failed").message
@@ -217,7 +218,8 @@ function createEventConverter(model: Model<"pi-messages">, oauthDiagnostics = fa
 					partial.providerThinkingLevel = event.providerThinkingLevel;
 				}
 				if (!oauthDiagnostics) appendRewriteDiagnostic(partial, event.rewrite);
-				return { type: "error", reason: event.reason, error: partial };
+				return { type: "error", reason, error: partial };
+			}
 			case "start":
 				break;
 			case "text_start":
@@ -422,7 +424,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 
 			if (!response.ok) {
-				if (options?.oauthDiagnostics) throw await oauthResponseError(response);
+				if (options?.oauthDiagnostics) throw await oauthResponseError(response, true);
 				const body = await response.text();
 				throw createPiMessagesResponseError(model, url, response, body);
 			}

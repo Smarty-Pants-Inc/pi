@@ -1,3 +1,8 @@
+import {
+	isPrematureProviderError,
+	isProviderContextOverflow,
+	isRetryableProviderError,
+} from "../../utils/provider-error-classification.ts";
 import type { OAuthAuth } from "../types.ts";
 
 export function isOAuthCancellation(error: unknown): boolean {
@@ -66,6 +71,10 @@ const PROVIDER_ERROR_CODES = new Set([
 	"subscription_sharing_usage_limit_exceeded",
 	"websocket_connection_limit_reached",
 	"previous_response_not_found",
+	"context_length_exceeded",
+	"request_too_large",
+	"subscription_sharing_usage_unavailable",
+	"subscription_sharing_user_unavailable",
 ]);
 
 /** Membership, not just syntax, is the boundary for provider-controlled diagnostic codes. */
@@ -82,11 +91,26 @@ export type OAuthDiagnosticCode =
 	| "oauth_stream_failed"
 	| "oauth_transport_failed";
 
+export type OAuthRecoveryCode = "retryable" | "premature_stream" | "context_length_exceeded";
+
 export class OAuthDiagnosticError extends Error {
 	readonly code: OAuthDiagnosticCode;
 	readonly status?: number;
 	readonly providerCode?: string;
-	constructor(code: OAuthDiagnosticCode, status?: number, providerCode?: unknown) {
+	readonly recovery?: OAuthRecoveryCode;
+	readonly retryable?: boolean;
+	constructor(
+		code: OAuthDiagnosticCode,
+		status?: number,
+		providerCode?: unknown,
+		recovery?: unknown,
+		retryable?: unknown,
+	) {
+		const safeRetryable = typeof retryable === "boolean" ? retryable : undefined;
+		const safeRecovery =
+			recovery === "retryable" || recovery === "premature_stream" || recovery === "context_length_exceeded"
+				? recovery
+				: undefined;
 		const safeStatus =
 			typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
 		const safeCode = oauthProviderErrorCode(providerCode);
@@ -99,11 +123,15 @@ export class OAuthDiagnosticError extends Error {
 		].includes(code)
 			? code
 			: "oauth_request_failed";
-		super(`${safeOwnCode} (HTTP ${safeStatus ?? "unknown"})${safeCode ? ` provider_error=${safeCode}` : ""}`);
+		super(
+			`${safeOwnCode} (HTTP ${safeStatus ?? "unknown"})${safeCode ? ` provider_error=${safeCode}` : ""}${safeRecovery ? ` recovery=${safeRecovery}` : ""}${safeRetryable === undefined ? "" : ` retryable=${safeRetryable}`}`,
+		);
 		this.name = "OAuthDiagnosticError";
 		this.code = safeOwnCode;
 		this.status = safeStatus;
 		this.providerCode = safeCode;
+		this.recovery = safeRecovery;
+		this.retryable = safeRetryable;
 	}
 }
 
@@ -111,17 +139,41 @@ export function oauthDiagnosticError(
 	code: OAuthDiagnosticCode,
 	status?: number,
 	providerCode?: unknown,
+	recovery?: unknown,
+	retryable?: unknown,
 ): OAuthDiagnosticError {
-	return new OAuthDiagnosticError(code, status, providerCode);
+	return new OAuthDiagnosticError(code, status, providerCode, recovery, retryable);
 }
 
 /** Never retain the original Error, cause, stack, SDK message, or response payload. */
-export function safeOAuthError(error: unknown): OAuthDiagnosticError {
+export function safeOAuthError(
+	error: unknown,
+	classifyRecovery = false,
+	fallbackCode: OAuthDiagnosticCode = "oauth_request_failed",
+): OAuthDiagnosticError {
 	try {
 		if (error instanceof OAuthDiagnosticError)
-			return oauthDiagnosticError(error.code, error.status, error.providerCode);
-		const shape = error as { status?: number; code?: unknown; error?: { code?: unknown } } | null;
-		return oauthDiagnosticError("oauth_request_failed", shape?.status, shape?.error?.code ?? shape?.code);
+			return oauthDiagnosticError(error.code, error.status, error.providerCode, error.recovery, error.retryable);
+		const shape = error as { status?: number; code?: unknown; message?: unknown; error?: unknown } | null;
+		const body = shape?.error as { code?: unknown } | null;
+		if (!classifyRecovery) return oauthDiagnosticError(fallbackCode, shape?.status, body?.code ?? shape?.code);
+		// Consume provider text only to classify recovery. Never retain it on the returned error.
+		const text = `${typeof shape?.message === "string" ? shape.message : ""} ${JSON.stringify(shape?.error) ?? ""} ${typeof shape?.code === "string" ? shape.code : ""} ${typeof shape?.status === "number" ? shape.status : ""}`;
+		const retryable = isRetryableProviderError(text);
+		const recovery: OAuthRecoveryCode | undefined = isProviderContextOverflow(text)
+			? "context_length_exceeded"
+			: retryable
+				? isPrematureProviderError(text)
+					? "premature_stream"
+					: "retryable"
+				: undefined;
+		return oauthDiagnosticError(
+			fallbackCode,
+			shape?.status,
+			body?.code ?? shape?.code,
+			recovery,
+			retryable,
+		);
 	} catch {
 		return oauthDiagnosticError("oauth_request_failed");
 	}
@@ -135,16 +187,28 @@ export async function fetchOAuth(input: string | URL, init?: RequestInit): Promi
 	}
 }
 
-export async function oauthResponseError(response: Response): Promise<OAuthDiagnosticError> {
-	let code: unknown;
+export async function oauthResponseError(response: Response, classifyRecovery = false): Promise<OAuthDiagnosticError> {
 	try {
-		const json = (await response.json()) as { error?: unknown } | null;
-		const error = json?.error;
-		code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : error;
+		const text = await response.text();
+		let error: unknown;
+		try {
+			const json = JSON.parse(text) as { error?: unknown } | null;
+			error = json?.error;
+		} catch {
+			/* Plain HTTP bodies can still carry a recovery signal, but never diagnostics. */
+		}
+		return safeOAuthError(
+			{
+				status: response.status,
+				message: classifyRecovery ? text : undefined,
+				error: typeof error === "string" ? { code: error } : error,
+			},
+			classifyRecovery,
+		);
 	} catch {
 		/* Body/parser failures are untrusted too. */
 	}
-	return oauthDiagnosticError("oauth_request_failed", response.status, code);
+	return oauthDiagnosticError("oauth_request_failed", response.status);
 }
 
 /** Credential response bodies and parser/stream errors must never become login diagnostics. */

@@ -14,7 +14,12 @@ import type {
 	ResponseStreamEvent,
 	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
-import { oauthDiagnosticError, oauthStopReason, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import {
+	oauthDiagnosticError,
+	oauthStopReason,
+	redactOAuthDiagnostic,
+	safeOAuthError,
+} from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -794,7 +799,7 @@ export async function processResponsesStream<TApi extends Api>(
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
 			throw options?.oauthDiagnostics
-				? oauthDiagnosticError("oauth_stream_failed", undefined, event.code)
+				? safeOAuthError({ code: event.code, message: event.message }, true, "oauth_stream_failed")
 				: new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
@@ -814,7 +819,7 @@ export async function processResponsesStream<TApi extends Api>(
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
 			throw options?.oauthDiagnostics
-				? oauthDiagnosticError("oauth_stream_failed", undefined, error?.code)
+				? safeOAuthError({ code: error?.code, message: msg }, true, "oauth_stream_failed")
 				: new Error(msg);
 		}
 	}

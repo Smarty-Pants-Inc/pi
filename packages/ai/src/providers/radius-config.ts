@@ -1,3 +1,4 @@
+import { oauthDiagnosticError, oauthResponseError, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import type { OAuthCredential } from "../auth/types.ts";
 import type { Model, ThinkingLevelMap } from "../types.ts";
 
@@ -81,16 +82,31 @@ export async function loadRadiusGatewayConfig(
 	gateway: string,
 	apiKey?: string,
 	signal?: AbortSignal,
+	oauthDiagnostics = false,
 ): Promise<RadiusGatewayConfig> {
 	const headers: Record<string, string> = { accept: "application/json" };
 	if (apiKey) headers.authorization = `Bearer ${apiKey}`;
-	const response = await fetch(new URL("/v1/config", gateway), { headers, signal });
+	let response: Response;
+	try {
+		response = await fetch(new URL("/v1/config", gateway), { headers, signal });
+	} catch (error) {
+		throw oauthDiagnostics ? safeOAuthError(error) : error;
+	}
 	if (!response.ok) {
+		if (oauthDiagnostics) throw await oauthResponseError(response);
 		throw new Error(
 			`Could not load Radius config from ${gateway}: ${response.status}: ${truncateHttpBody(await response.text())}`,
 		);
 	}
-	const config = sanitizeRadiusGatewayConfig(await response.json());
-	if (!config) throw new Error(`Invalid Radius config from ${gateway}`);
+	let config: RadiusGatewayConfig | undefined;
+	try {
+		config = sanitizeRadiusGatewayConfig(await response.json());
+	} catch (error) {
+		throw oauthDiagnostics ? oauthDiagnosticError("oauth_invalid_response", response.status) : error;
+	}
+	if (!config) {
+		if (oauthDiagnostics) throw oauthDiagnosticError("oauth_invalid_response", response.status);
+		throw new Error(`Invalid Radius config from ${gateway}`);
+	}
 	return config;
 }

@@ -457,7 +457,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					}
 
 					// Parse error for friendly message on final attempt or non-retryable error
-					throw await oauthResponseError(new Response(errorText, { status: response.status }));
+					throw await oauthResponseError(new Response(errorText, { status: response.status }), true);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {

@@ -43,7 +43,7 @@ export function normalizeProviderError(
 	oauthDiagnostics = false,
 ): NormalizedProviderError {
 	if (oauthDiagnostics) {
-		const safe = safeOAuthError(error);
+		const safe = safeOAuthError(error, true);
 		return { status: safe.status, message: redactOAuthDiagnostic(safe.message, secrets), messageCarriesBody: true };
 	}
 	if (!(error instanceof Error)) {

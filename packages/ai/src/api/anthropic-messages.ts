@@ -919,7 +919,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			output.errorMessage = oauthDiagnostics
-				? redactOAuthDiagnostic(safeOAuthError(error).message, options?.diagnosticSecrets)
+				? redactOAuthDiagnostic(safeOAuthError(error, true).message, options?.diagnosticSecrets)
 				: error instanceof Error
 					? error.message
 					: JSON.stringify(error);
