@@ -269,57 +269,58 @@ async function loginOpenAIChatGPT(
 	const state = randomValue();
 	const nonce = randomValue();
 	let callback: CallbackServer | undefined;
-	try {
-		callback = await startCallbackServer(state);
-	} catch {
-		interaction.notify({
-			type: "info",
-			message: `Could not listen on ${REDIRECT_URI}; paste the final redirect URL to continue. oauth_callback_unavailable`,
-		});
-	}
-
-	const authorizationUrl = new URL(AUTHORIZE_URL);
-	authorizationUrl.search = new URLSearchParams({
-		client_id: DYNAMIC_CLIENT_ID,
-		agent_name_hint: AGENT_NAME_HINT,
-		ext_agent_host_id: hostId,
-		response_type: "code",
-		redirect_uri: REDIRECT_URI,
-		resource: RESOURCE,
-		scope: SCOPE,
-		state,
-		code_challenge: challenge,
-		code_challenge_method: "S256",
-		nonce,
-	}).toString();
-	interaction.notify({
-		type: "auth_url",
-		url: authorizationUrl.toString(),
-		instructions:
-			"Complete sign-in in your browser. If the callback does not complete, paste the final redirect URL here.",
-	});
-
 	const manualAbort = new AbortController();
-	const manualCode = (async () => {
-		const signal = AbortSignal.any([manualAbort.signal, interaction.signal]);
-		while (true) {
-			signal.throwIfAborted();
-			const input = await interaction.prompt({
-				type: "manual_code",
-				message: "Complete login in your browser, or paste the final redirect URL here:",
-				placeholder: REDIRECT_URI,
-				signal,
-			});
-			try {
-				return authorizationResultFromManualInput(input, state);
-			} catch (error) {
-				if (!(error instanceof CallbackAdmissionError)) throw error;
-				interaction.notify({ type: "info", message: error.message });
-			}
-		}
-	})();
-
+	// Own listener retirement before any notification or prompt callback can throw.
 	try {
+		try {
+			callback = await startCallbackServer(state);
+		} catch {
+			interaction.notify({
+				type: "info",
+				message: `Could not listen on ${REDIRECT_URI}; paste the final redirect URL to continue. oauth_callback_unavailable`,
+			});
+		}
+
+		const authorizationUrl = new URL(AUTHORIZE_URL);
+		authorizationUrl.search = new URLSearchParams({
+			client_id: DYNAMIC_CLIENT_ID,
+			agent_name_hint: AGENT_NAME_HINT,
+			ext_agent_host_id: hostId,
+			response_type: "code",
+			redirect_uri: REDIRECT_URI,
+			resource: RESOURCE,
+			scope: SCOPE,
+			state,
+			code_challenge: challenge,
+			code_challenge_method: "S256",
+			nonce,
+		}).toString();
+		interaction.notify({
+			type: "auth_url",
+			url: authorizationUrl.toString(),
+			instructions:
+				"Complete sign-in in your browser. If the callback does not complete, paste the final redirect URL here.",
+		});
+
+		const manualCode = (async () => {
+			const signal = AbortSignal.any([manualAbort.signal, interaction.signal]);
+			while (true) {
+				signal.throwIfAborted();
+				const input = await interaction.prompt({
+					type: "manual_code",
+					message: "Complete login in your browser, or paste the final redirect URL here:",
+					placeholder: REDIRECT_URI,
+					signal,
+				});
+				try {
+					return authorizationResultFromManualInput(input, state);
+				} catch (error) {
+					if (!(error instanceof CallbackAdmissionError)) throw error;
+					interaction.notify({ type: "info", message: error.message });
+				}
+			}
+		})();
+
 		const result = await (callback ? Promise.race([callback.result, manualCode]) : manualCode);
 		interaction.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
 		return await exchangeAuthorizationCode(result.code, verifier, result.clientId, interaction.signal);

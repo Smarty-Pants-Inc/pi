@@ -172,14 +172,15 @@ async function loginWithBrowser(
 			),
 		signal: interaction.signal,
 	});
-	interaction.notify({ type: "progress", message: `Listening for OAuth callback on ${REDIRECT_URI}` });
-	interaction.notify({
-		type: "auth_url",
-		url: authorizeUrl.toString(),
-		instructions: "Continue in your browser.",
-	});
-
+	// Binding creates resource custody before notifications can call caller code.
 	try {
+		interaction.notify({ type: "progress", message: `Listening for OAuth callback on ${REDIRECT_URI}` });
+		interaction.notify({
+			type: "auth_url",
+			url: authorizeUrl.toString(),
+			instructions: "Continue in your browser.",
+		});
+
 		const credential = await callback.wait();
 		if (!credential) throw oauthDiagnosticError("oauth_invalid_response");
 		return credential;
