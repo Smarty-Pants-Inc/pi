@@ -31,7 +31,7 @@ it("enumerates all provider stream receivers, rejecting an unbound new receiver"
 	const receivers: string[] = [];
 	for (const file of readdirSync(directory).filter((name) => name.endsWith(".ts") && name !== "lazy.ts")) {
 		const source = readFileSync(new URL(file, directory), "utf8");
-		if (!/export (?:const|function) stream[:(]/.test(source) && !/new AssistantMessageEventStream\(/.test(source))
+		if (!/export (?:const|function) stream\b/.test(source) && !/new AssistantMessageEventStream\(/.test(source))
 			continue;
 		receivers.push(file);
 		expect(source.includes("new AssistantMessageEventStream()"), file).toBe(false);

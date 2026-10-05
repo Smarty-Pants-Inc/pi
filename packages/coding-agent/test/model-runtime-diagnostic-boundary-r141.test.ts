@@ -12,6 +12,7 @@ import {
 import { stream as anthropicStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as azureStream } from "@earendil-works/pi-ai/api/azure-openai-responses";
 import { stream as mistralStream } from "@earendil-works/pi-ai/api/mistral-conversations";
+import { stream as completionsStream } from "@earendil-works/pi-ai/api/openai-completions";
 import { describe, expect, it, vi } from "vitest";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import { InMemoryCodingAgentModelsStore } from "../src/core/models-store.ts";
@@ -70,12 +71,18 @@ it.each([undefined, false, true])("derives OAuth diagnostics after option spread
 });
 
 // pi#141: production JSONL persistence, not a simulated session serializer.
-it.each([
-	["Q7Z9V2B4 ", "Q7Z9V2B4"],
-	["Q7 Z9", "Q7+%5a9"],
-	["Q7.EXAMPLE.", "q7.example"],
-	["éQ7.example", "xn--q7-9ia.example"],
-])("persists no generated or canonical alias for %s", async (key, alias) => {
+// Keep the already-private OpenAI runtime path as a control; the rich custom-provider
+// direct entry is the disclosed receiver and must also be safe before persistence.
+it.each(
+	[
+		["Q7Z9V2B4 ", "Q7Z9V2B4"],
+		["Q7 Z9", "Q7+%5a9"],
+		["Q7.EXAMPLE.", "q7.example"],
+		["éQ7.example", "xn--q7-9ia.example"],
+	].flatMap(([key, alias]) =>
+		(["direct rich", "ModelRuntime"] as const).map((receiver) => ({ key, alias, receiver })),
+	),
+)("persists no generated or canonical alias for $key through $receiver", async ({ key, alias, receiver }) => {
 	const models = await runtime();
 	const model = { ...models.getModels("openai")[0], api: "openai-completions" as const, compat: undefined };
 	let wire: Headers | undefined;
@@ -84,16 +91,15 @@ it.each([
 		return Response.json({ error: { message: `receipt=https://echo.invalid/?v=${alias}` } }, { status: 400 });
 	});
 	const events: unknown[] = [];
-	const eventStream = models.stream(
-		model,
-		{ messages: [] },
-		{
-			apiKey: key,
-			env: {},
-			maxRetries: 0,
-			fetch,
-		},
-	);
+	const options = { apiKey: key, env: {}, maxRetries: 0, fetch };
+	const eventStream =
+		receiver === "ModelRuntime"
+			? models.stream(model, { messages: [] }, options)
+			: completionsStream(
+					{ ...model, provider: "audit", baseUrl: "https://mock.invalid/v1" },
+					normalizeContext({ messages: [] }),
+					options,
+				);
 	for await (const event of eventStream) events.push(event);
 	const output = await eventStream.result();
 	expect(fetch).toHaveBeenCalledTimes(1);
