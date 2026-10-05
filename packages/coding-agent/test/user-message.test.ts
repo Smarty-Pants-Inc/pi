@@ -117,11 +117,52 @@ describe("UserMessageComponent custom rendering", () => {
 		expect(stripAnsi(component.render(20).join("\n"))).toContain("custom hello");
 	});
 
-	test("empty custom output has no orphan OSC zones", () => {
+	// Refs pi#144 / smarty-dev#5049: compact output must open A before closing B/C, even on one row.
+	test.each([0, 1, 3])("custom output with %i rows emits exactly one ordered OSC zone", (height) => {
 		initTheme("dark");
-		const component = new UserMessageComponent("hidden", undefined, 1, [], { renderer: () => new Container() });
-		expect(component.render(20)).toEqual([]);
+		const text = Array.from({ length: height }, (_, i) => `row ${i + 1}`).join("\n");
+		const component = new UserMessageComponent("hello", undefined, 1, [], {
+			renderer: () => new Text(text, 0, 0),
+			leadingSpacer: true,
+		});
+		const expected =
+			height === 0
+				? ["", ...new UserMessageComponent("hello").render(20)]
+				: text.split("\n").map((line) => line.padEnd(20));
+		if (height > 0) {
+			expected[0] = OSC133_ZONE_START + expected[0];
+			expected[height - 1] += OSC133_ZONE_END + OSC133_ZONE_FINAL;
+		}
+		for (let i = 0; i < 2; i++) {
+			const lines = component.render(20);
+			expect(lines).toEqual(expected);
+			expect(lines.join("\n").match(/\x1b\]133;[ABC]\x07/g)).toEqual([
+				OSC133_ZONE_START,
+				OSC133_ZONE_END,
+				OSC133_ZONE_FINAL,
+			]);
+		}
 	});
+
+	test.each(["dark", "light"])(
+		"empty custom output falls back to native %s output without orphan OSC zones",
+		(name) => {
+			initTheme(name);
+			const transformers = [(text: string) => `${text} transformed`];
+			const native = new UserMessageComponent("**hello**", undefined, 1, transformers).render(20);
+			const component = new UserMessageComponent("**hello**", undefined, 1, transformers, {
+				renderer: () => new Container(),
+				leadingSpacer: true,
+			});
+			expect(component.render(20)).toEqual(["", ...native]);
+			expect(
+				component
+					.render(20)
+					.join("\n")
+					.match(/\x1b\]133;[ABC]\x07/g),
+			).toEqual([OSC133_ZONE_START, OSC133_ZONE_END, OSC133_ZONE_FINAL]);
+		},
+	);
 
 	test.each([4, 10, 40])("feed component fits width %i with wide and combining characters", (width) => {
 		initTheme("dark");

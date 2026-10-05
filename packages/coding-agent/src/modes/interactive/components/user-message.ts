@@ -53,10 +53,10 @@ export class UserMessageComponent extends Container {
 		this.rebuild();
 	}
 
-	private rebuild(): void {
+	private rebuild(useRenderer = true): void {
 		this.clear();
 		this.customRendered = false;
-		if (this.options.renderer) {
+		if (useRenderer && this.options.renderer) {
 			try {
 				const component = this.options.renderer(
 					this.text,
@@ -93,13 +93,25 @@ export class UserMessageComponent extends Container {
 	}
 
 	override render(width: number): string[] {
-		const lines = super.render(width);
+		let lines = super.render(width);
+		if (this.customRendered && lines.length === 0) {
+			// Empty custom output must not hide the user message or leave an orphan prompt zone.
+			this.rebuild(false);
+			lines = super.render(width);
+		}
 		if (lines.length === 0) {
 			return lines;
 		}
 
 		lines[0] = OSC133_ZONE_START + lines[0];
-		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+		const last = lines.length - 1;
+		if (this.customRendered) {
+			// Close after all custom content, including when start and end share one row.
+			lines[last] += OSC133_ZONE_END + OSC133_ZONE_FINAL;
+		} else {
+			// Keep native closing markers before its bottom-padding row, byte for byte.
+			lines[last] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[last];
+		}
 		if (!this.customRendered && this.options.leadingSpacer) {
 			lines.unshift("");
 		}
