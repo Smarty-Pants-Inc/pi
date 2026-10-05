@@ -172,6 +172,10 @@ export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 
 export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 	type: "branch_summary";
+	/** Served summary model; its usage is attributed to this identity. */
+	provider?: string;
+	model?: string;
+	diagnostics?: AssistantMessage["diagnostics"];
 	fromId: string;
 	summary: string;
 	/** Extension-specific data (not sent to LLM) */
@@ -2058,6 +2062,7 @@ export class SessionManager {
 		details?: unknown,
 		fromHook?: boolean,
 		usage?: Usage,
+		metadata?: Pick<BranchSummaryEntry, "provider" | "model" | "diagnostics">,
 	): string {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
@@ -2066,6 +2071,7 @@ export class SessionManager {
 		const fromId = this.leafId ?? "root";
 		if (!this.#ownedJournal) this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
+			...structuredClone(metadata),
 			type: "branch_summary",
 			id: generateId(this.byId),
 			parentId: branchFromId,

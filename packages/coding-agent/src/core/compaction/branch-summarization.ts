@@ -8,7 +8,7 @@
 import type { AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
 import type { RetryCallbacks, RetryPolicy } from "@earendil-works/pi-ai";
 import { contentText, normalizeContext } from "@earendil-works/pi-ai";
-import type { Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, Model, SimpleStreamOptions, Usage } from "@earendil-works/pi-ai/compat";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -34,6 +34,10 @@ import {
 
 export interface BranchSummaryResult {
 	summary?: string;
+	/** Served response identity attributes this summary and its usage, not the requested alias. */
+	provider?: string;
+	model?: string;
+	diagnostics?: AssistantMessage["diagnostics"];
 	usage?: Usage;
 	readFiles?: string[];
 	modifiedFiles?: string[];
@@ -377,6 +381,9 @@ export async function generateBranchSummary(
 	return {
 		summary: summary || "No summary generated",
 		usage: response.usage,
+		provider: response.provider,
+		model: response.model,
+		diagnostics: response.diagnostics === undefined ? undefined : structuredClone(response.diagnostics),
 		readFiles,
 		modifiedFiles,
 	};

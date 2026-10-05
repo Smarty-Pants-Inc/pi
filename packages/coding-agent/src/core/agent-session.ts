@@ -5539,6 +5539,7 @@ export class AgentSession {
 			let summaryText: string | undefined;
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
+			let summaryMetadata: Pick<BranchSummaryEntry, "provider" | "model" | "diagnostics"> | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
@@ -5562,6 +5563,7 @@ export class AgentSession {
 				}
 				summaryText = result.summary;
 				summaryUsage = result.usage;
+				summaryMetadata = { provider: result.provider, model: result.model, diagnostics: result.diagnostics };
 				summaryDetails = {
 					readFiles: result.readFiles || [],
 					modifiedFiles: result.modifiedFiles || [],
@@ -5603,6 +5605,7 @@ export class AgentSession {
 					summaryDetails,
 					fromExtension,
 					summaryUsage,
+					summaryMetadata,
 				);
 				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
 
