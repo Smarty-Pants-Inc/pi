@@ -213,10 +213,39 @@ for pair in \
             runner: smarty-linux-x64" 'unapproved hosted runner' build-binaries.yml "$allowlist"
 done
 
+# pi#138: Actions parses hex through signed Int32, unlike Python integers.
+# Fail closed outside the nonnegative Int32 range, before either exclude or
+# include can hide a hosted row. Keep the reviewer's inclusion order verbatim.
+for pair in '0x80000000|2147483648' '0xffffffff|4294967295' '0x100000000|4294967296'; do
+  IFS='|' read -r hex decimal <<< "$pair"
+  expect_rejected "unsupported hex matrix exclusion $hex/$decimal" "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [smarty-linux-x64, ubuntu-latest]
+        feature: [$hex]
+        exclude:
+          - runner: ubuntu-latest
+            feature: $decimal" 'unsupported hexadecimal integer'
+  expect_rejected "unsupported hex matrix inclusion $decimal/$hex" "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        feature: [$decimal]
+        include:
+          - feature: $hex
+            runner: ubuntu-latest
+          - feature: $decimal
+            runner: smarty-linux-x64" 'unsupported hexadecimal integer'
+done
+
 # Equal Core Schema values must still match, including decimal leading zeroes,
 # octal/hex, exponent floats, nulls and strings previously coerced by YAML 1.1.
 for pair in \
   '010|10' '+010|10' '-010|-10' '0o10|8' '0x10|16' '1e3|1000' \
+  '0x0|0' '0x7fffffff|2147483647' \
   '1.0e3|1000' '.5|0.5' '1.|1.0' '.inf|.INF' '-.Inf|-.INF' \
   '~|null' 'Null|NULL' 'null|' '1_000|"1_000"' '1:00|"1:00"' \
   '2001-01-01|"2001-01-01"' 'tRuE|"tRuE"' 'on|"on"' 'yes|"yes"'; do

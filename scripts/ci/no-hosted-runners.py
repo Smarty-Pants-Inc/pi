@@ -22,7 +22,14 @@ class WorkflowLoader(yaml.SafeLoader):
     def construct_core_int(self, node):
         value = self.construct_scalar(node)
         base = 8 if value.startswith("0o") else 16 if value.startswith("0x") else 10
-        return int(value, base)
+        number = int(value, base)
+        # Actions converts hex with Int32.TryParse(AllowHexSpecifier), which
+        # interprets the high bit as a sign and rejects values beyond 32 bits.
+        # Fail closed on that range rather than letting Python's unsigned
+        # magnitude remove or overwrite a possible runner row (pi#138).
+        if base == 16 and number > 0x7fffffff:
+            raise ValueError(f"unsupported hexadecimal integer: {value}")
+        return number
 
     def construct_mapping(self, node, deep=False):
         keys = set()
