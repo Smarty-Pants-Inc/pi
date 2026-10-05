@@ -1154,6 +1154,15 @@ export abstract class TuiBase extends Container implements TUI {
 		const { target, rgb } = response;
 		const key = String(target);
 		if (query.replied.has(key)) {
+			if (query.replied.size === TERMINAL_COLOR_REPLY_COUNT) {
+				// Duplicate trailing OSC belongs to the outgoing complete batch. Require a
+				// full quiet interval rather than issuing a successor in that reply tail.
+				clearTimeout(query.retirementTimer);
+				query.retirementTimer = setTimeout(
+					() => this.retireTerminalColorQuery(query, true),
+					TERMINAL_COLOR_DRAIN_MS,
+				);
+			}
 			return true;
 		}
 		query.replied.add(key);

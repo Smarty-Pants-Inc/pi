@@ -116,3 +116,23 @@ it("a delayed old DA1 cannot settle a newly issued query after a complete no-DA1
 		tui.stop();
 	}
 });
+
+it("drains duplicate OSC tail before issuing a successor and does not reassign it", async () => {
+	const terminal = new ColorTerminal();
+	const tui = new TuiMainScreen(terminal);
+	try {
+		const first = tui.queryTerminalColors({ timeoutMs: 300 });
+		colors(tui, "000000");
+		await first;
+		const second = tui.queryTerminalColors({ timeoutMs: 300 });
+		await wait(35);
+		input(tui, "\x1b]11;#000000\x07");
+		await wait(25);
+		assert.equal(terminal.writes.length, 1, "late outgoing OSC must postpone successor admission");
+		await sent(terminal, 2);
+		colors(tui, "ffffff");
+		assert.deepEqual((await second).background, { r: 255, g: 255, b: 255 });
+	} finally {
+		tui.stop();
+	}
+});
