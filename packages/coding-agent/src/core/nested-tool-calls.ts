@@ -209,14 +209,17 @@ export class NestedToolCallRunner {
 			scope.failure ??= { error };
 			throw error;
 		} finally {
-			await this.close(toolCallId);
+			await this.closeScope(scope);
 		}
 	}
 
 	/** Retire admission before cancelling and joining every accepted descendant. */
 	close(toolCallId: string): Promise<void> {
 		const scope = this.scopes.get(toolCallId);
-		if (!scope) return Promise.resolve();
+		return scope ? this.closeScope(scope) : Promise.resolve();
+	}
+
+	private closeScope(scope: CallScope): Promise<void> {
 		if (scope.closing) return scope.closing;
 		scope.accepting = false;
 		scope.controller.abort(new Error("Parent tool execution finished"));
@@ -280,16 +283,20 @@ export class NestedToolCallRunner {
 		const exclusive =
 			this.host.isSequential() || tools.find((tool) => tool.name === name)?.executionMode === "sequential";
 		const controller = new AbortController();
-		this.scopes.set(toolCall.id, {
+		const child: CallScope = {
 			recorder: scope.recorder,
 			nextId: 1,
 			accepting: true,
 			controller,
 			signal: AbortSignal.any([options.signal!, controller.signal]),
 			pending: [],
-		});
+		};
 		let finalized = false;
 		try {
+			// Provider/display IDs are not invocation authority. Refuse an alias
+			// collision before mutation, retaining the other invocation's custody.
+			if (this.scopes.has(toolCall.id)) throw new Error("Nested tool call ID collision");
+			this.scopes.set(toolCall.id, child);
 			return await this.queue.run(
 				{
 					id: toolCall.id,
@@ -316,7 +323,7 @@ export class NestedToolCallRunner {
 						},
 						tools,
 					);
-					await this.close(toolCall.id);
+					await this.closeScope(child);
 
 					finalized = true;
 					scope.recorder.finish(record, outcome.isError, textOf(outcome.result));
@@ -352,14 +359,13 @@ export class NestedToolCallRunner {
 					parentToolCallId: callerId,
 				});
 			}
-			const child = this.scopes.get(toolCall.id);
-			if (child) child.failure ??= { error };
+			child.failure ??= { error };
 			throw error;
 		} finally {
 			try {
-				await this.close(toolCall.id);
+				await this.closeScope(child);
 			} finally {
-				this.scopes.delete(toolCall.id);
+				if (this.scopes.get(toolCall.id) === child) this.scopes.delete(toolCall.id);
 			}
 		}
 	}
@@ -373,7 +379,7 @@ export class NestedToolCallRunner {
 	}
 
 	async clear(): Promise<void> {
-		const settled = await Promise.allSettled([...this.scopes.keys()].map((id) => this.close(id)));
+		const settled = await Promise.allSettled([...this.scopes.values()].map((scope) => this.closeScope(scope)));
 		this.scopes.clear();
 		const failure = settled.find((result) => result.status === "rejected");
 		if (failure?.status === "rejected") throw failure.reason;
