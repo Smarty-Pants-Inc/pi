@@ -18,6 +18,8 @@ const SETUP_MESSAGES = Object.freeze({
 	stream: "Provider has no API implementation",
 	deferred: "Provider does not support deferred responses",
 	not_chat: "Model is not a chat model",
+	not_image: "Model is not an image model",
+	not_classifier: "Model is not a classifier model",
 	virtual_unrouted: "Virtual model must be routed before streaming",
 	setup_ModelsError: "request setup failed: ModelsError",
 	setup_TypeError: "request setup failed: TypeError",

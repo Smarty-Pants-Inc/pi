@@ -11,7 +11,7 @@ import type {
 	ModelType,
 	ModelTypeMap,
 } from "../types.ts";
-import { ModelsError, SafeSetupError } from "./models-error.ts";
+import { SafeSetupError } from "./models-error.ts";
 
 /** The type of a model. Models without `type` are chat models. */
 export function getModelType(model: AnyModel): ModelType {
@@ -31,13 +31,13 @@ export function assertChatModel(model: AnyModel): asserts model is Model<Api> {
 
 export function assertImageModel(model: AnyModel): asserts model is ImageModel<ImageApi> {
 	if (!isModelType(model, "image")) {
-		throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not an image model`);
+		throw new SafeSetupError("not_image");
 	}
 }
 
 export function assertClassifierModel(model: AnyModel): asserts model is ClassifierModel<ClassifierApi> {
 	if (!isModelType(model, "classifier")) {
-		throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not a classifier model`);
+		throw new SafeSetupError("not_classifier");
 	}
 }
 
