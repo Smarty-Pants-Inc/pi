@@ -107,6 +107,8 @@ export interface CompactionResult<T = unknown> {
 	firstKeptEntryId: string;
 	tokensBefore: number;
 	estimatedTokensAfter?: number;
+	/** Summary/context committed, but completion publication failed; retrying would duplicate the effect. */
+	notificationFailure?: { code: "COMPACTION_NOTIFICATION_FAILED"; count: number };
 	/** Usage from the LLM call(s) that generated this summary, if available */
 	usage?: Usage;
 	/** Extension-specific data (e.g., ArtifactIndex, version markers for structured compaction) */

@@ -3871,9 +3871,11 @@ export class AgentSession {
 		let fromExtension = false;
 		let cancelledByExtension = false;
 		let originalStateCleared = false;
+		let committedResult: CompactionResult | undefined;
+		let completionPublished = false;
 		const clearManualState = () => {
-			if (attempt && originalStateCleared) return;
-			if (attempt) originalStateCleared = true; // A failed audit/idle notification is not safe to repeat.
+			if (originalStateCleared) return;
+			originalStateCleared = true; // A failed audit/idle notification is not safe to repeat.
 			this._clearManualCompactionState(controller);
 		};
 
@@ -3998,6 +4000,7 @@ export class AgentSession {
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
+			committedResult = { summary, firstKeptEntryId, tokensBefore, estimatedTokensAfter, usage, details };
 
 			// Match the actual append, even when an earlier entry has the same summary.
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.id === compactionId) as
@@ -4017,19 +4020,13 @@ export class AgentSession {
 				);
 			}
 
-			const compactionResult: CompactionResult = {
-				summary,
-				firstKeptEntryId,
-				tokensBefore,
-				estimatedTokensAfter,
-				usage,
-				details,
-			};
+			const compactionResult = committedResult;
 			attempt?.check();
 			// Manual listeners may submit queued prompts. The selected operation's
 			// separate owner fence remains active through all completion hooks.
 			clearTimeout(timeout);
 			clearManualState();
+			completionPublished = true;
 			this._emit({
 				type: "compaction_end",
 				reason: "manual",
@@ -4039,6 +4036,31 @@ export class AgentSession {
 			});
 			return compactionResult;
 		} catch (error) {
+			if (committedResult) {
+				// The row and context already committed. Publication failure cannot turn
+				// that effect into a retryable summary failure or session_compact_failed.
+				committedResult.notificationFailure = { code: "COMPACTION_NOTIFICATION_FAILED", count: 1 };
+				try {
+					clearManualState();
+				} catch {
+					committedResult.notificationFailure.count++;
+				}
+				if (!completionPublished) {
+					completionPublished = true;
+					try {
+						this._emit({
+							type: "compaction_end",
+							reason: "manual",
+							result: committedResult,
+							aborted: false,
+							willRetry: false,
+						});
+					} catch {
+						committedResult.notificationFailure.count++;
+					}
+				}
+				return committedResult;
+			}
 			if (attempt) {
 				const errors: unknown[] = [error];
 				let aborted = false;
