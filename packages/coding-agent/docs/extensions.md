@@ -188,6 +188,27 @@ Register an entry or message renderer when custom stored content should appear i
 <a id="interact-with-the-user"></a>
 <a id="account-for-each-mode"></a>
 
+### User-message rendering
+
+`pi.registerUserMessageRenderer(renderer)` replaces the display of user text in the interactive transcript:
+
+```typescript
+import { Text } from "@earendil-works/pi-tui";
+
+pi.registerUserMessageRenderer((text, { outputPad, timestamp }, theme) => {
+  const label = theme.bold(theme.fg("accent", `YOU · ${new Date(timestamp).toLocaleTimeString()}`));
+  return new Text(`${label}\n${text}`, outputPad, 0);
+});
+```
+
+The callback receives display text, the original message timestamp in milliseconds since the Unix epoch, the `outputPad` setting, and the active `Theme`. Return a `Component` or `undefined` for Pi's exact native Markdown rendering. Callback errors also fall back to native rendering, as with custom-message renderers. The first extension registering a user renderer wins; another registration by that same extension replaces its callback.
+
+A custom component owns its background, padding, and outside spacing. Pi keeps OSC 133 prompt zones around either rendering, including custom blank lines. Return an empty component to hide a block without emitting orphan zones. Components must fit the available width and support `invalidate()` as described in [Terminal UI](tui.md). Pi reinvokes the callback when the user component is invalidated or its output padding changes.
+
+The hook applies to newly submitted and replayed user text. Skill invocations remain native collapsible blocks; only their trailing user text uses the hook. It does not change stored messages, images, editor history, editing/forking, or model context. Native fallback still applies Markdown transformers; custom components render the supplied text themselves. Reload replaces registrations and rebuilds the transcript. RPC, JSON, and print modes do not invoke terminal renderers.
+
+See [`user-message-renderer.ts`](../examples/extensions/user-message-renderer.ts) for a plain-text feed with a timestamp label, background, and unshaded outside spacing.
+
 ### UI and modes
 
 `ctx.ui` provides dialogs, notifications, status text, widgets, titles, editor access, and custom components.

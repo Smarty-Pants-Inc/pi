@@ -3930,11 +3930,11 @@ export class InteractiveMode {
 			case "user": {
 				const textContent = this.getUserMessageText(message);
 				if (textContent) {
-					if (this.chatContainer.children.length > 0) {
-						this.chatContainer.addChild(new Spacer(1));
-					}
 					const skillBlock = parseSkillBlock(textContent);
 					if (skillBlock) {
+						if (this.chatContainer.children.length > 0) {
+							this.chatContainer.addChild(new Spacer(1));
+						}
 						// Render skill block (collapsible)
 						const component = new SkillInvocationMessageComponent(
 							skillBlock,
@@ -3944,12 +3944,16 @@ export class InteractiveMode {
 						this.chatContainer.addChild(component);
 						// Render user message separately if present
 						if (skillBlock.userMessage) {
-							this.chatContainer.addChild(new Spacer(1));
 							const userComponent = new UserMessageComponent(
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								this.outputPad,
 								this.getMarkdownTransformers(),
+								{
+									renderer: this.session.extensionRunner.getUserMessageRenderer(),
+									timestamp: message.timestamp,
+									leadingSpacer: true,
+								},
 							);
 							this.chatContainer.addChild(userComponent);
 						}
@@ -3959,6 +3963,11 @@ export class InteractiveMode {
 							this.getMarkdownThemeWithSettings(),
 							this.outputPad,
 							this.getMarkdownTransformers(),
+							{
+								renderer: this.session.extensionRunner.getUserMessageRenderer(),
+								timestamp: message.timestamp,
+								leadingSpacer: this.chatContainer.children.length > 0,
+							},
 						);
 						this.chatContainer.addChild(userComponent);
 					}

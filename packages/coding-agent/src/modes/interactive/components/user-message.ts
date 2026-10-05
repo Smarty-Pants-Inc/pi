@@ -1,11 +1,18 @@
 import { Box, Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
-import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
+import type { MarkdownTransformer, UserMessageRenderer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+
+interface UserMessageComponentOptions {
+	renderer?: UserMessageRenderer;
+	timestamp?: number;
+	/** Native transcript separation; custom renderers own their spacing. */
+	leadingSpacer?: boolean;
+}
 
 /**
  * Component that renders a user message
@@ -15,18 +22,24 @@ export class UserMessageComponent extends Container {
 	private markdownTheme: MarkdownTheme;
 	private outputPad: number;
 	private markdownTransformers: readonly MarkdownTransformer[];
+	private options: UserMessageComponentOptions;
+	private timestamp: number;
+	private customRendered = false;
 
 	constructor(
 		text: string,
 		markdownTheme: MarkdownTheme = getMarkdownTheme(),
 		outputPad = 1,
 		markdownTransformers: readonly MarkdownTransformer[] = [],
+		options: UserMessageComponentOptions = {},
 	) {
 		super();
 		this.text = text;
 		this.markdownTheme = markdownTheme;
 		this.outputPad = outputPad;
 		this.markdownTransformers = markdownTransformers;
+		this.options = options;
+		this.timestamp = options.timestamp ?? Date.now();
 		this.rebuild();
 	}
 
@@ -35,8 +48,30 @@ export class UserMessageComponent extends Container {
 		this.rebuild();
 	}
 
+	override invalidate(): void {
+		super.invalidate();
+		this.rebuild();
+	}
+
 	private rebuild(): void {
 		this.clear();
+		this.customRendered = false;
+		if (this.options.renderer) {
+			try {
+				const component = this.options.renderer(
+					this.text,
+					{ outputPad: this.outputPad, timestamp: this.timestamp },
+					theme,
+				);
+				if (component) {
+					this.customRendered = true;
+					this.addChild(component);
+					return;
+				}
+			} catch {
+				// Fall through to native rendering, as with custom-message renderers.
+			}
+		}
 		const contentBox = new Box(this.outputPad, 1, (content: string) => theme.bg("userMessageBg", content));
 		contentBox.addChild(
 			new Markdown(
@@ -65,6 +100,9 @@ export class UserMessageComponent extends Container {
 
 		lines[0] = OSC133_ZONE_START + lines[0];
 		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
+		if (!this.customRendered && this.options.leadingSpacer) {
+			lines.unshift("");
+		}
 		return lines;
 	}
 }
