@@ -270,6 +270,7 @@ async function loginOpenAIChatGPT(
 	const nonce = randomValue();
 	let callback: CallbackServer | undefined;
 	const manualAbort = new AbortController();
+	let manualCode: Promise<AuthorizationResult> | undefined;
 	// Own listener retirement before any notification or prompt callback can throw.
 	try {
 		try {
@@ -302,7 +303,7 @@ async function loginOpenAIChatGPT(
 				"Complete sign-in in your browser. If the callback does not complete, paste the final redirect URL here.",
 		});
 
-		const manualCode = (async () => {
+		manualCode = (async () => {
 			const signal = AbortSignal.any([manualAbort.signal, interaction.signal]);
 			while (true) {
 				signal.throwIfAborted();
@@ -320,6 +321,8 @@ async function loginOpenAIChatGPT(
 				}
 			}
 		})();
+		// Observe immediately, including exits before the race has been awaited.
+		void manualCode.catch(() => {});
 
 		const result = await (callback ? Promise.race([callback.result, manualCode]) : manualCode);
 		interaction.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
@@ -336,6 +339,9 @@ async function loginOpenAIChatGPT(
 		// may send that login's callback over the spare connection. This server would then handle
 		// it and reject it with "OAuth state mismatch", and the new login would never see it.
 		callback?.server.closeAllConnections();
+		// A race observes the losing prompt but does not own its asynchronous
+		// cancellation. Keep login live until that exact accepted work drains.
+		await manualCode?.catch(() => {});
 	}
 }
 

@@ -96,3 +96,96 @@ it.each(["chatgpt", "radius"])(
 		}
 	},
 );
+
+function gate() {
+	let resolve!: () => void;
+	const promise = new Promise<void>((done) => {
+		resolve = done;
+	});
+	return { promise, resolve };
+}
+// pi#141 / security F8: Promise.race observes its loser, but does not join prompt retirement.
+it("keeps browser-won ChatGPT login owned until the accepted manual prompt drains", async () => {
+	vi.stubGlobal(
+		"fetch",
+		vi.fn(async () =>
+			Response.json({
+				access_token: "synthetic-access",
+				refresh_token: "synthetic-refresh",
+				id_token: "synthetic-id",
+				expires_in: 3600,
+				scope: "chatgpt.tokens.use.direct",
+			}),
+		),
+	);
+	const controller = new AbortController();
+	const started = gate();
+	const cancelled = gate();
+	const release = gate();
+	let authorize: URL | undefined;
+	let manual: Promise<string> | undefined;
+	let drained = false;
+	let settled = false;
+	const operation = openaiChatGPTOAuth
+		.login(
+			{
+				signal: controller.signal,
+				notify(event) {
+					if (event.type === "auth_url") authorize = new URL(event.url);
+				},
+				prompt(request) {
+					const signal = request.signal;
+					if (!signal) throw new Error("Missing owned manual prompt signal");
+					manual = new Promise<string>((_resolve, reject) => {
+						signal.addEventListener(
+							"abort",
+							() => {
+								cancelled.resolve();
+								void release.promise.then(() => {
+									drained = true;
+									reject(new Error("synthetic manual prompt cancelled"));
+								});
+							},
+							{ once: true },
+						);
+						started.resolve();
+					});
+					return manual;
+				},
+			},
+			{ getDeviceId: () => "e61bbe28-07ef-466d-8e5d-a344f94ab305" },
+		)
+		.finally(() => {
+			settled = true;
+		});
+	void operation.catch(() => {});
+	const watchdog = setTimeout(() => {
+		controller.abort();
+		release.resolve();
+	}, 2000);
+	try {
+		await started.promise;
+		if (!authorize) throw new Error("Missing authorization URL");
+		const callback = new URL(authorize.searchParams.get("redirect_uri") ?? "");
+		callback.searchParams.set("state", authorize.searchParams.get("state") ?? "");
+		callback.searchParams.set("code", "synthetic-code");
+		callback.searchParams.set("client_id", "oaiapp_synthetic");
+		owned.servers[0].callback(callback.pathname + callback.search);
+		await cancelled.promise;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(owned.servers[0].listening).toBe(false);
+		expect(owned.servers[0].sockets.every((socket) => socket.destroyed)).toBe(true);
+		expect(settled).toBe(false);
+		expect(drained).toBe(false);
+		release.resolve();
+		await manual?.catch(() => {});
+		expect((await operation).access).toBe("synthetic-access");
+		expect(drained).toBe(true);
+	} finally {
+		clearTimeout(watchdog);
+		controller.abort();
+		release.resolve();
+		await manual?.catch(() => {});
+		await operation.catch(() => {});
+	}
+});
