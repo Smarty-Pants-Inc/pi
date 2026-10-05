@@ -1,4 +1,4 @@
-import { captureTerminalTurnReceipt, type TurnReceipt } from "../turn-receipts.ts";
+import { captureSiblingTerminalTurnReceipt, type TurnReceipt } from "../turn-receipts.ts";
 import type { SessionBoundaryDraft } from "./types.ts";
 
 /** Snapshot references before dispatch; each repeated reference owns a FIFO slot. */
@@ -23,13 +23,12 @@ export function receiveBoundaryEntries(
 	// The first length is the selection bound; never coerce a proxy's nonnumeric value.
 	const length = selected.length;
 	if (typeof length !== "number") throw new RangeError("Invalid array length");
-	let firstNew = true;
 	const consumed = new Map<SessionBoundaryDraft, number>();
 	// Native Array validation rejects invalid numeric bounds before capture or indexed effects.
 	const candidates = new Array<TurnReceipt>(length);
 	// Capture every possible fresh slot before indexed selectors or draft accessors run.
 	for (let index = 0; index < length; index++) {
-		candidates[index] = captureTerminalTurnReceipt();
+		candidates[index] = index === 0 ? observed : captureSiblingTerminalTurnReceipt(observed);
 	}
 	// Materialize indexed selection once; receipt slots and cloning must share these references.
 	const materialized = new Array<SessionBoundaryDraft>(length);
@@ -42,8 +41,7 @@ export function receiveBoundaryEntries(
 		const occurrence = consumed.get(draft) ?? 0;
 		consumed.set(draft, occurrence + 1);
 		const prior = slots.get(draft)?.[occurrence];
-		candidates[index] = prior ?? (firstNew ? observed : candidates[index]);
-		if (!prior) firstNew = false;
+		candidates[index] = prior ?? candidates[index];
 	}
 	const entries = structuredClone(materialized);
 	// Classify the snapshot, not a retained accessor that can change on later reads.

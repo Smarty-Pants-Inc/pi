@@ -2334,7 +2334,9 @@ export class SessionManager {
 
 	/** Create an in-memory session (no file persistence), optionally from entries held outside the filesystem. */
 	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions, entries?: FileEntry[]): SessionManager {
-		const snapshot = entries === undefined ? undefined : (JSON.parse(JSON.stringify(entries)) as FileEntry[]);
+		// Own the containers; _buildIndex detaches and seals reserved metadata.
+		// Unrelated live payloads retain their in-memory representation, not JSON wire semantics.
+		const snapshot = entries?.map((entry) => ({ ...entry }));
 		return new SessionManager(cwd, "", undefined, false, options, snapshot);
 	}
 

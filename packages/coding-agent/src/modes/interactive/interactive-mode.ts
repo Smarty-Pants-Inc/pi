@@ -437,6 +437,7 @@ export class InteractiveMode {
 	private statusContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
+	private ordinaryEditorSubmit: EditorComponent["onSubmit"];
 	private editorComponentFactory: EditorFactory | undefined;
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
@@ -3406,17 +3407,21 @@ export class InteractiveMode {
 			}
 
 			// Normal message submission
-			const input = receiveInput(text);
-			// First, move any pending bash components to chat
-			this.flushPendingBashComponents();
-			if (this.onInputCallback) {
-				this.onInputCallback(input);
-			} else {
-				this.pendingUserInputs.push(input);
-				this.stagingAudit?.("input-enqueued");
-			}
-			this.editor.addToHistory?.(text);
+			this.submitEditorInput(receiveInput(text));
 		};
+		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;
+	}
+
+	/** Shared idle submission path; the caller owns admission before any editor effects. */
+	private submitEditorInput(input: ReceivedInput): void {
+		this.flushPendingBashComponents();
+		if (this.onInputCallback) {
+			this.onInputCallback(input);
+		} else {
+			this.pendingUserInputs.push(input);
+			this.stagingAudit?.("input-enqueued");
+		}
+		this.editor.addToHistory?.(input.text);
 	}
 
 	private subscribeToAgent(): void {
@@ -4507,8 +4512,14 @@ export class InteractiveMode {
 		}
 		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
 		else if (this.editor.onSubmit) {
-			this.editor.setText("");
-			this.editor.onSubmit(text);
+			if (text.startsWith("/") || text.startsWith("!") || this.editor.onSubmit !== this.ordinaryEditorSubmit) {
+				this.editor.setText("");
+				await this.editor.onSubmit(text);
+			} else {
+				const input = receiveInput(text);
+				this.editor.setText("");
+				this.submitEditorInput(input);
+			}
 		}
 	}
 

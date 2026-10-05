@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import type { EditorComponent, Terminal } from "@earendil-works/pi-tui";
 import { afterEach, expect, it, vi } from "vitest";
@@ -65,11 +66,127 @@ function modeFor(h: Harness, initialMessages: string[] = []): InteractiveMode {
 }
 
 function reopenedReceipts(h: Harness) {
-	return SessionManager.open(h.sessionManager.getSessionFile()!)
+	const receipts = SessionManager.open(h.sessionManager.getSessionFile()!)
 		.getEntries()
 		.filter((entry) => entry.type === "message" && entry.message.role === "user")
 		.map(getTurnProvenance);
+	const physical = readFileSync(h.sessionManager.getSessionFile()!, "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line) as { type: string; message?: { role: string } })
+		.filter((entry) => entry.type === "message" && entry.message?.role === "user")
+		.map(getTurnProvenance);
+	expect(physical).toEqual(receipts);
+	expect(
+		h.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message" && entry.message.role === "user")
+			.map(getTurnProvenance),
+	).toEqual(receipts);
+	return receipts;
 }
+
+// pi#145 SR145-3: idle follow-up owns its receipt before custom-editor clearing.
+it("captures idle follow-up before a delayed editor clear", async () => {
+	const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+	h.setResponses([fauxAssistantMessage("done")]);
+	const mode = modeFor(h);
+	const internals = mode as unknown as {
+		setupEditorSubmitHandler(): void;
+		handleFollowUp(): Promise<void>;
+		setCustomEditorComponent(factory: () => EditorComponent): void;
+		editor: EditorComponent;
+		getReceivedUserInput(): Promise<ReceivedInput>;
+	};
+	internals.setupEditorSubmitHandler();
+	internals.editor.setText("follow-up");
+	let draft = "follow-up";
+	internals.setCustomEditorComponent(() => ({
+		getText: () => draft,
+		setText: (text) => {
+			if (text === "") vi.setSystemTime("2026-10-01T12:01:00.000Z");
+			draft = text;
+		},
+		handleInput: () => {},
+		render: () => [],
+		invalidate: () => {},
+	}));
+	internals.editor.setText("follow-up");
+	vi.useFakeTimers({ toFake: ["Date"] });
+	const first = "2026-10-01T12:00:00.000Z";
+	vi.setSystemTime(first);
+	try {
+		await internals.handleFollowUp();
+		vi.spyOn(mode, "init").mockResolvedValue(undefined);
+		const dequeue = internals.getReceivedUserInput.bind(mode);
+		let count = 0;
+		const end = new Error("test loop end");
+		vi.spyOn(internals, "getReceivedUserInput").mockImplementation(() =>
+			++count > 1 ? Promise.reject(end) : dequeue(),
+		);
+		await expect(mode.run()).rejects.toBe(end);
+		expect(reopenedReceipts(h)).toEqual([expect.objectContaining({ receivedAt: first, channel: "terminal" })]);
+	} finally {
+		vi.useRealTimers();
+	}
+});
+
+// pi#145 control: streaming follow-up already captures before custom-editor effects.
+it("retains streaming follow-up before a delayed custom-editor clear", async () => {
+	let release!: () => void;
+	let entered!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const started = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	let requests = 0;
+	const h = await createHarness({
+		persistSession: true,
+		settings: { compaction: { enabled: false } },
+		prepareRequest: async () => {
+			if (++requests === 1) {
+				entered();
+				await held;
+			}
+		},
+	});
+	h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+	const mode = modeFor(h);
+	const internals = mode as unknown as {
+		setupEditorSubmitHandler(): void;
+		handleFollowUp(): Promise<void>;
+		setCustomEditorComponent(factory: () => EditorComponent): void;
+		editor: EditorComponent;
+	};
+	internals.setupEditorSubmitHandler();
+	internals.editor.setText("streaming-follow-up");
+	let draft = "";
+	internals.setCustomEditorComponent(() => ({
+		getText: () => draft,
+		setText: (text) => {
+			if (text === "") vi.setSystemTime("2026-10-01T12:01:00.000Z");
+			draft = text;
+		},
+		handleInput: () => {},
+		render: () => [],
+		invalidate: () => {},
+	}));
+	const running = h.session.prompt("start");
+	try {
+		await started;
+		expect(h.session.isStreaming).toBe(true);
+		vi.useFakeTimers({ toFake: ["Date"] });
+		vi.setSystemTime("2026-10-01T12:00:00.000Z");
+		await internals.handleFollowUp();
+	} finally {
+		release();
+		await running;
+		vi.useRealTimers();
+	}
+	expect(reopenedReceipts(h)[1]).toMatchObject({ receivedAt: "2026-10-01T12:00:00.000Z", channel: "terminal" });
+});
 
 // pi#95: direct interactive initial batches must precede init and all previous batch turns.
 it("captures repeated initial inputs before held interactive startup", async () => {

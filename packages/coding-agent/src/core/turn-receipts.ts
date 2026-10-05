@@ -19,6 +19,14 @@ export function captureTerminalTurnReceipt(): TurnReceipt {
 	return receipt;
 }
 
+/** Issue another occurrence at an already trusted observation, never a caller-provided time. */
+export function captureSiblingTerminalTurnReceipt(observed: TurnReceipt): TurnReceipt {
+	const record = records.get(observed);
+	if (!record) throw new Error("Turn receipt was not issued by the harness");
+	const receipt = Object.freeze({}) as TurnReceipt;
+	records.set(receipt, Object.freeze({ ...record, turnId: randomUUID() }));
+	return receipt;
+}
 export function receiptRecord(receipt?: TurnReceipt): TerminalRecord {
 	return (receipt && records.get(receipt)) ?? records.get(captureTerminalTurnReceipt())!;
 }

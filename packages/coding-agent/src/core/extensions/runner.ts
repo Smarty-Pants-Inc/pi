@@ -1014,6 +1014,7 @@ export class ExtensionRunner {
 				} as TurnEndEvent | AgentBeforeSettleEvent;
 				const previousReceipts = entryReceipts;
 				const slots = boundaryReceiptSlots(event.entries, entryReceipts);
+				let receivedSelection = false;
 				try {
 					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
 						| BoundaryResult
@@ -1028,14 +1029,18 @@ export class ExtensionRunner {
 					);
 					entries = received.entries;
 					entryReceipts = received.receipts;
+					receivedSelection = true;
 					const returnedContinue = handlerResult?.continue;
 					if (returnedContinue !== undefined) shouldContinue = returnedContinue;
 				} catch (err) {
 					signal?.throwIfAborted();
 					// Existing semantics retain drafts mutated before a handler throws.
-					const retained = receiveBoundaryEntries(event.entries, slots, captureTerminalTurnReceipt());
-					entries = retained.entries;
-					entryReceipts = retained.receipts;
+					// A secondary flag failure cannot discard a successfully received selection.
+					if (!receivedSelection) {
+						const retained = receiveBoundaryEntries(event.entries, slots, captureTerminalTurnReceipt());
+						entries = retained.entries;
+						entryReceipts = retained.receipts;
+					}
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
