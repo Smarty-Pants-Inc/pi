@@ -446,6 +446,8 @@ export class AgentSession {
 	private _inputFence: object | undefined;
 	private readonly _inputFenceScope = new AsyncLocalStorage<InputFenceScope | undefined>();
 	private readonly _shutdownCancellation = new AbortController();
+	/** Ordinary retirement, unlike a failed recoverable receipt, permanently revokes auxiliary work. */
+	private readonly _disposalCancellation = new AbortController();
 	private _settlementCancellation = new AbortController();
 	private _settlementCompletion?: Promise<void>;
 	private _inputsDisposed = false;
@@ -1138,6 +1140,7 @@ export class AgentSession {
 	private async _emitCompactionHook(
 		event: SessionBeforeCompactEvent | SessionCompactEvent | SessionCompactFailedEvent,
 		signal?: AbortSignal,
+		beforeDispatch?: () => void,
 	): Promise<SessionBeforeCompactResult | undefined> {
 		// A signal argument is not ancestry: install operation and inherited revocation so abandoned hook
 		// descendants cannot start fresh native work (PR #117 R6-1). Failure observers run after the
@@ -1149,21 +1152,33 @@ export class AgentSession {
 		);
 		// ponytail: a compaction that already ended cancelled still notifies its failure observers
 		// (aborted: true), as before; they only run under revoked ancestry and cannot start new work.
-		const dispatchSignal = signal?.aborted ? inherited : ancestry;
+		const dispatchSignal = signal?.aborted
+			? AbortSignal.any([hook.signal, ...(inherited ? [inherited] : [])])
+			: ancestry;
 		this._compactionHooks.add(hook);
+		let dispatched = false;
 		try {
+			// Reserve notification custody before clearing operation state or publishing public completion.
+			// Reentrant disposal/abort must revoke the next observer too (pi#132 R1-1).
+			beforeDispatch?.();
 			// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
-			return await this._compactionHookScope.run(true, () =>
-				this._dispatchCancellationScope.run(ancestry, () =>
-					raceWithAbortSignal(this._extensionRunner.emit(event, dispatchSignal), ancestry),
-				),
+			const dispatch = this._compactionHookScope.run(true, () =>
+				this._dispatchCancellationScope.run(ancestry, () => this._extensionRunner.emit(event, dispatchSignal)),
 			);
+			dispatched = true;
+			// An already-aborted operation ends the outer wait before notification dispatch settles.
+			// Keep its separately cancellable runner lifetime tracked until that dispatch actually settles.
+			void dispatch.then(
+				() => this._compactionHooks.delete(hook),
+				() => this._compactionHooks.delete(hook),
+			);
+			return await raceWithAbortSignal(dispatch, ancestry);
 		} catch (error) {
 			// Cancelling a notification alone does not replace the compaction's own outcome.
 			if (event.type === "session_compact_failed" && hook.signal.aborted && error === hook.signal.reason) return;
 			throw error;
 		} finally {
-			this._compactionHooks.delete(hook);
+			if (!dispatched) this._compactionHooks.delete(hook);
 		}
 	}
 
@@ -1171,16 +1186,21 @@ export class AgentSession {
 		event: Omit<SessionCompactFailedEvent, "type">,
 		signal?: AbortSignal,
 		preserveDistinctFailure = false,
+		beforeNotification?: () => void,
 	): Promise<void> {
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
+			let notified = !beforeNotification;
 			try {
-				await this._emitCompactionHook({ type: "session_compact_failed", ...event }, signal);
+				await this._emitCompactionHook({ type: "session_compact_failed", ...event }, signal, () => {
+					beforeNotification?.();
+					notified = true;
+				});
 			} catch (error) {
 				// A terminal notification cannot extend an expired compaction or
 				// replace its failed/aborted outcome. Its promise stays observed.
-				if (!signal?.aborted || (preserveDistinctFailure && error !== signal.reason)) throw error;
+				if (!notified || !signal?.aborted || (preserveDistinctFailure && error !== signal.reason)) throw error;
 			}
-		}
+		} else beforeNotification?.();
 	}
 
 	private _getIdleWaitPromise(): Promise<void> {
@@ -1586,6 +1606,9 @@ export class AgentSession {
 		if (!this.isIdle || this.isSettling)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "abort and settle the active operation before disposal");
 		this._inputsDisposed = true;
+		this._disposalCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "auxiliary operation cancelled by disposal"),
+		);
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
 		try {
 			this.abortRetry();
@@ -3984,27 +4007,29 @@ export class AgentSession {
 					errors.push(cleanup);
 				}
 				try {
-					clearManualState();
-				} catch (cleanup) {
-					errors.push(cleanup);
-				}
-				try {
-					this._emit({
-						type: "compaction_end",
-						reason: "manual",
-						result: undefined,
-						aborted,
-						willRetry: false,
-						errorMessage,
-					});
-				} catch (cleanup) {
-					errors.push(cleanup);
-				}
-				try {
 					await this._emitSessionCompactFailed(
 						{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
 						signal,
 						true,
+						() => {
+							try {
+								clearManualState();
+							} catch (cleanup) {
+								errors.push(cleanup);
+							}
+							try {
+								this._emit({
+									type: "compaction_end",
+									reason: "manual",
+									result: undefined,
+									aborted,
+									willRetry: false,
+									errorMessage,
+								});
+							} catch (cleanup) {
+								errors.push(cleanup);
+							}
+						},
 					);
 				} catch (cleanup) {
 					errors.push(cleanup);
@@ -4016,18 +4041,21 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = cancelledByExtension || isCompactionCancelled(signal);
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
-			clearManualState();
-			this._emit({
-				type: "compaction_end",
-				reason: "manual",
-				result: undefined,
-				aborted,
-				willRetry: false,
-				errorMessage,
-			});
 			await this._emitSessionCompactFailed(
 				{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
 				signal,
+				false,
+				() => {
+					clearManualState();
+					this._emit({
+						type: "compaction_end",
+						reason: "manual",
+						result: undefined,
+						aborted,
+						willRetry: false,
+						errorMessage,
+					});
+				},
 			);
 			throw aborted ? new Error("Compaction cancelled", { cause: error }) : error;
 		} finally {
@@ -4220,21 +4248,20 @@ export class AgentSession {
 				const errorMessage = contextOverflow
 					? "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
 					: "Truncated response recovery failed after one compact-and-retry attempt.";
-				this._emit({
-					type: "compaction_end",
-					reason: "overflow",
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage,
-				});
-				await this._emitSessionCompactFailed({
-					reason: "overflow",
-					errorMessage,
-					aborted: false,
-					willRetry: false,
-					fromExtension: false,
-				});
+				await this._emitSessionCompactFailed(
+					{ reason: "overflow", errorMessage, aborted: false, willRetry: false, fromExtension: false },
+					undefined,
+					false,
+					() =>
+						this._emit({
+							type: "compaction_end",
+							reason: "overflow",
+							result: undefined,
+							aborted: false,
+							willRetry: false,
+							errorMessage,
+						}),
+				);
 				return "failed";
 			}
 
@@ -4444,10 +4471,19 @@ export class AgentSession {
 					? `Context overflow recovery failed: ${message}`
 					: `Auto-compaction failed: ${message}`;
 			if (started || signal.aborted) {
-				this._emit({ type: "compaction_end", reason, result: undefined, aborted, willRetry: false, errorMessage });
 				await this._emitSessionCompactFailed(
 					{ reason, errorMessage, aborted, willRetry: false, fromExtension },
 					signal,
+					false,
+					() =>
+						this._emit({
+							type: "compaction_end",
+							reason,
+							result: undefined,
+							aborted,
+							willRetry: false,
+							errorMessage,
+						}),
 				);
 			}
 			return aborted ? "aborted" : "failed";
@@ -5698,8 +5734,9 @@ export class AgentSession {
 	async summarizeForBugReport(options: { hint?: string; signal: AbortSignal }): Promise<string> {
 		// A revoked descendant cannot start an auxiliary provider request (PR #117 R6-3).
 		const inherited = this._inheritedCancellation();
+		this._disposalCancellation.signal.throwIfAborted();
 		const signal = AbortSignal.any(
-			[options.signal, this._shutdownCancellation.signal, inherited].filter(
+			[options.signal, this._shutdownCancellation.signal, this._disposalCancellation.signal, inherited].filter(
 				(item): item is AbortSignal => item !== undefined,
 			),
 		);

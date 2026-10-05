@@ -937,6 +937,234 @@ describe("native input admission v1", () => {
 		expect(h.session.isIdle).toBe(true);
 	});
 
+	// pi#132 R1-1 / smarty-dev#4361 R6-1: reserve failure custody before public completion callbacks.
+	it.each(["prompt", "custom-trigger", "bash"] as const)(
+		"completion-listener disposal revokes subsequent failure notification %s",
+		async (entry) => {
+			const held = gate();
+			let h!: Harness;
+			let lateHandler: Promise<void> | undefined;
+			let lateResult: unknown;
+			const laterHandler = vi.fn();
+			h = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", () => ({ cancel: true }));
+						pi.on("session_compact_failed", () => {
+							lateHandler = (async () => {
+								await held.promise;
+								const call =
+									entry === "prompt"
+										? h.session.prompt("late native")
+										: entry === "custom-trigger"
+											? h.session.sendCustomMessage(
+													{ customType: "late-compaction", content: "late custom", display: false },
+													{ triggerTurn: true },
+												)
+											: h.session.executeBash(`printf late > '${join(h.tempDir, "late-sentinel")}'`);
+								lateResult = await call.then(
+									() => "accepted",
+									(error: unknown) => error,
+								);
+							})();
+							return lateHandler;
+						});
+						pi.on("session_compact_failed", laterHandler);
+					},
+				],
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+			});
+			harnesses.push(h);
+			h.setResponses([
+				fauxAssistantMessage("original reply"),
+				fauxAssistantMessage("fresh reply"),
+				fauxAssistantMessage("steer reply"),
+				fauxAssistantMessage("follow-up reply"),
+			]);
+			await h.session.prompt("original input");
+			await h.session.steer("retained steer", [{ type: "image", data: "original-steer", mimeType: "image/png" }]);
+			await h.session.followUp("retained follow-up", [
+				{ type: "image", data: "original-follow-up", mimeType: "image/png" },
+			]);
+			const runtime = await runtimeFor(h);
+			const queues = structuredClone(h.session.agent.getQueuedMessages());
+			const messages = structuredClone(h.session.messages);
+			const history = structuredClone(h.sessionManager.getEntries());
+			const revision = h.sessionManager.revision();
+			const calls = h.faux.state.callCount;
+			const receipt = vi.fn(() => {
+				throw new Error("authoritative receipt failed");
+			});
+			let disposal!: Promise<unknown>;
+			h.session.subscribe((event) => {
+				if (event.type === "compaction_end" && event.reason === "manual" && !event.result) {
+					disposal = runtime.dispose({ rejectQueuedInput: receipt }).catch((error: unknown) => error);
+				}
+			});
+			const compaction = h.session.compact().catch((error: unknown) => error);
+			await vi.waitFor(() => expect(disposal).toBeDefined());
+			expect(await disposal).toMatchObject({ message: "authoritative receipt failed" });
+			expect(receipt).toHaveBeenCalledExactlyOnceWith(queues, h.session);
+			expect(h.session.inputsFenced).toBe(false);
+			expect(h.session.isDisposed).toBe(false);
+			// The real observer, if dispatched, returns only after the receipt refusal and reopening.
+			held.release();
+			await lateHandler;
+			expect(await compaction).toMatchObject({ message: "Compaction cancelled" });
+			if (lateHandler) expect(lateResult).toMatchObject({ name: "AbortError" });
+			expect(laterHandler).not.toHaveBeenCalled();
+			expect(existsSync(join(h.tempDir, "late-sentinel"))).toBe(false);
+			expect(h.faux.state.callCount).toBe(calls);
+			expect(h.eventsOfType("agent_start")).toHaveLength(1);
+			expect(h.session.agent.getQueuedMessages()).toEqual(queues);
+			expect(h.session.messages).toEqual(messages);
+			expect(h.sessionManager.getEntries()).toEqual(history);
+			expect(h.sessionManager.revision()).toBe(revision);
+			await h.session.prompt("unrelated fresh external input");
+			expect(getUserTexts(h)).toContain("unrelated fresh external input");
+			expect(h.session.pendingMessageCount).toBe(0);
+		},
+	);
+
+	// pi#132 R1-1: exhausted overflow also publishes completion before its failure notification.
+	it("exhausted overflow completion-listener disposal revokes subsequent failure notification", async () => {
+		const observer = vi.fn();
+		const h = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 1_000_000, maxTokens: 100 }],
+			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", (event) => ({
+						compaction: {
+							summary: "overflow compacted",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					}));
+					pi.on("session_compact_failed", () => {
+						observer();
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		h.setResponses([
+			() => fauxAssistantMessage("x".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
+			() => fauxAssistantMessage("y".repeat(64), { stopReason: "length", timestamp: Date.now() + 10_000 }),
+		]);
+		const runtime = await runtimeFor(h);
+		let disposal: Promise<void> | undefined;
+		h.session.subscribe((event) => {
+			if (event.type === "compaction_end" && event.errorMessage?.includes("after one compact-and-retry"))
+				disposal = runtime.dispose({ rejectQueuedInput: () => {} });
+		});
+		await h.session.prompt("x".repeat(5000));
+		expect(disposal).toBeDefined();
+		await disposal;
+		expect(h.session.isDisposed).toBe(true);
+		expect(observer).not.toHaveBeenCalled();
+		expect(h.faux.state.callCount).toBe(2);
+	});
+
+	// pi#132 R1-S2: already-aborted failure telemetry retains a separately revocable runner lifetime.
+	it("ordinary disposal revokes an already-aborted held failure notification", async () => {
+		const entered = gate(),
+			held = gate();
+		let notification!: Promise<void>;
+		const later = vi.fn();
+		const h = await createHarness({
+			settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", (_event, ctx) => {
+						ctx.abort();
+					});
+					pi.on("session_compact_failed", () => {
+						notification = (async () => {
+							entered.release();
+							await held.promise;
+						})();
+						return notification;
+					});
+					pi.on("session_compact_failed", () => {
+						later();
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		h.setResponses([fauxAssistantMessage("original reply")]);
+		await h.session.prompt("original input");
+		const compaction = h.session.compact().catch((error: unknown) => error);
+		await entered.promise;
+		expect(await compaction).toMatchObject({ message: "Compaction cancelled" });
+		expect(h.session.isCompacting).toBe(false);
+		await (await runtimeFor(h)).dispose();
+		held.release();
+		await notification;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(later).not.toHaveBeenCalled();
+	});
+
+	// pi#132 R1-2/R1-S1 / smarty-dev#4361 R6-3: independent summaries share actual disposal lifetime.
+	it.each(["session", "runtime"] as const)(
+		"ordinary %s disposal revokes held-auth bug-report summary",
+		async (entry) => {
+			const h = await setup();
+			h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("must not request")]);
+			await h.session.prompt("original input");
+			const runtime = await runtimeFor(h);
+			const entered = gate(),
+				held = gate(),
+				finished = gate();
+			const auth = h.session.modelRuntime.getAuth.bind(h.session.modelRuntime);
+			let authSignal: AbortSignal | undefined;
+			const authCalls = vi.spyOn(h.session.modelRuntime, "getAuth").mockImplementation(async (model, options) => {
+				authSignal = options?.signal;
+				entered.release();
+				await held.promise; // Deliberately ignore cancellation, then complete real auth.
+				try {
+					return await auth(model, options);
+				} finally {
+					finished.release();
+				}
+			});
+			const calls = h.faux.state.callCount;
+			const history = structuredClone(h.sessionManager.getEntries());
+			const revision = h.sessionManager.revision();
+			const caller = new AbortController();
+			const summary = h.session.summarizeForBugReport({ signal: caller.signal }).catch((error: unknown) => error);
+			await entered.promise;
+			if (entry === "session") h.session.dispose();
+			else await runtime.dispose();
+			expect(h.session.isDisposed).toBe(true);
+			held.release();
+			expect(await summary).toMatchObject({ code: "INPUT_ADMISSION_DISPOSED" });
+			await finished.promise;
+			expect(authSignal?.aborted).toBe(true);
+			expect(caller.signal.aborted).toBe(false);
+			expect(authCalls).toHaveBeenCalledOnce();
+			expect(h.faux.state.callCount).toBe(calls);
+			expect(h.getPendingResponseCount()).toBe(1);
+			expect(h.sessionManager.getEntries()).toEqual(history);
+			expect(h.sessionManager.revision()).toBe(revision);
+		},
+	);
+
+	it("fresh bug-report summary on an ordinarily disposed session refuses before auth", async () => {
+		const h = await setup();
+		h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("must not request")]);
+		await h.session.prompt("original input");
+		const authCalls = vi.spyOn(h.session.modelRuntime, "getAuth");
+		const calls = h.faux.state.callCount;
+		h.session.dispose();
+		await expect(h.session.summarizeForBugReport({ signal: new AbortController().signal })).rejects.toThrow(
+			"INPUT_ADMISSION_DISPOSED",
+		);
+		expect(authCalls).not.toHaveBeenCalled();
+		expect(h.faux.state.callCount).toBe(calls);
+	});
+
 	// PR #117 R6-2/R6-S2: held-admission ctx.compact() must not allocate a summary after idle disposal.
 	it("an input handler's ctx.compact() cannot start after an earlier idle observer disposes the session", async () => {
 		const entered = gate(),
