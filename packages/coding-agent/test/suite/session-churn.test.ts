@@ -426,18 +426,22 @@ describe("session boundary allocation churn", () => {
 
 	// smarty-dev#2177 / pi#94: JavaScript extensions can return non-array proposals.
 	it.each([null, {}, "malformed"])(
-		"isolates malformed entries %j and lets a later handler repair",
+		"isolates malformed entries %j and preserves prior valid proposals for later handlers",
 		async (malformed) => {
 			const errors: string[] = [];
 			let repaired = false;
+			const kept: SessionBoundaryDraft = { type: "custom", customType: "preceding-valid", data: true };
 			const harness = await createHarness({
 				extensionFactories: [
 					(pi) => {
+						// PR #141: malformed proposals are contained, not exposed for another handler to repair.
+						pi.on("agent_before_settle", () => ({ entries: [kept], continue: true }));
 						pi.on("agent_before_settle", () => ({ entries: malformed as unknown as SessionBoundaryDraft[] }));
 						pi.on("agent_before_settle", (event) => {
 							repaired = true;
-							expect(event.entries).toEqual(malformed);
-							return { entries: [] };
+							expect(event.entries).toEqual([kept]);
+							expect(event.continue).toBe(true);
+							return undefined;
 						});
 					},
 				],
@@ -454,7 +458,7 @@ describe("session boundary allocation churn", () => {
 			);
 			expect(repaired).toBe(true);
 			expect(errors).toEqual(["Invalid boundary entries: Boundary entries must be an array"]);
-			expect(result).toMatchObject({ valid: true, entries: [], continue: false });
+			expect(result).toMatchObject({ valid: true, entries: [kept], continue: true });
 		},
 	);
 
