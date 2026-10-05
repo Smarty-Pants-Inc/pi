@@ -245,7 +245,12 @@ export function getOAuthDiagnosticSecrets(
 	additional: readonly string[] = [],
 ): string[] {
 	const secrets = [...additional];
-	if (token) secrets.push(token, `Bearer ${token}`);
+	if (token) {
+		// Match generated Authorization as well as configured input. Headers trim
+		// HTTP whitespace; the bare suffix can be echoed without the scheme.
+		const normalizedToken = token.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+		secrets.push(token, normalizedToken, `Bearer ${token}`, `Bearer ${normalizedToken}`);
+	}
 	for (const [key, value] of Object.entries(headers)) {
 		if (!value) continue;
 		const name = key.toLowerCase();
@@ -339,7 +344,7 @@ function unescapePercentDiagnostic(text: string): string {
 function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
-		if (secret.length === 0 || secret.length > text.length) continue;
+		if (secret.length === 0) continue;
 		variants.add(secret);
 		let serialized = secret;
 		for (let depth = 0; depth < 4; depth++) {
@@ -355,6 +360,15 @@ function redactValues(text: string, secrets: readonly string[]): string {
 		variants.add(base64url.replace(/=+$/, ""));
 		try {
 			variants.add(encodeURIComponent(secret));
+			variants.add(new URLSearchParams({ v: secret }).toString().slice(2));
+			// Only a whole host or URL is admitted for host equivalence; reject
+			// strings whose delimiters would instead introduce paths or userinfo.
+			const url = new URL(secret.includes("://") ? secret : `https://${secret}/`);
+			if (secret.includes("://")) variants.add(url.toString());
+			if (!url.username && !url.password && !url.port && url.pathname === "/" && !url.search && !url.hash) {
+				variants.add(url.hostname);
+				variants.add(url.hostname.replace(/\.$/, ""));
+			}
 		} catch {
 			// Invalid Unicode must not turn masking into another diagnostic failure.
 		}
@@ -369,7 +383,7 @@ function redactValues(text: string, secrets: readonly string[]): string {
 	// Provider strings have no nesting limit. Decode to a fixed point, masking at
 	// every layer so literal backslashes in a secret cannot be decoded past it.
 	// Never publish an incompletely examined field when either work bound is hit.
-	for (let pass = 0; text.includes("\\") || /%[0-9a-f]{2}/i.test(text); pass++) {
+	for (let pass = 0; text.includes("\\") || text.includes("+") || /%[0-9a-f]{2}/i.test(text); pass++) {
 		work += text.length;
 		if (pass === MAX_DIAGNOSTIC_UNESCAPE_PASSES || work > MAX_DIAGNOSTIC_UNESCAPE_WORK) return "***";
 		const previous = text;
@@ -379,6 +393,19 @@ function redactValues(text: string, secrets: readonly string[]): string {
 				if (!text.includes(value)) continue;
 				encodedMatch = true;
 				text = text.split(value).join("***");
+			}
+			// Compare a separate form-decoded view. Do not destroy literal plus
+			// bytes while a JSON/percent-escaped credential is still being decoded.
+			let form = text.replace(/\+/g, " ");
+			let formMatch = false;
+			for (const value of values) {
+				if (!form.includes(value)) continue;
+				formMatch = true;
+				form = form.split(value).join("***");
+			}
+			if (formMatch) {
+				encodedMatch = true;
+				text = form;
 			}
 		}
 		if (text === previous) break;
@@ -391,7 +418,11 @@ function redactValues(text: string, secrets: readonly string[]): string {
 /** Redact live values first, independently of labels or serialization syntax. */
 export function redactOAuthDiagnostic(text: string, secrets: readonly string[] = []): string {
 	// Apply the work bound before enumerated variants can consume escaped values.
-	if (secrets.length > 0 && (text.includes("\\") || text.includes("%")) && text.length > MAX_DIAGNOSTIC_UNESCAPE_WORK)
+	if (
+		secrets.length > 0 &&
+		(text.includes("\\") || text.includes("%") || text.includes("+")) &&
+		text.length > MAX_DIAGNOSTIC_UNESCAPE_WORK
+	)
 		return "***";
 	// Entirely Unicode-escaped opaque text is outside the rich diagnostic contract.
 	if (secrets.length > 0 && /^(?:\\u[0-9a-f]{4})+$/i.test(text)) return "Provider diagnostic details withheld";
