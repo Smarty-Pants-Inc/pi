@@ -4,6 +4,8 @@ import type { SessionBoundaryDraft } from "./types.ts";
 /** Snapshot references before dispatch; each repeated reference owns a FIFO slot. */
 export function boundaryReceiptSlots(entries: SessionBoundaryDraft[], receipts: (TurnReceipt | undefined)[]) {
 	const slots = new Map<SessionBoundaryDraft, (TurnReceipt | undefined)[]>();
+	// Invalid proposals remain visible to later handlers, but have no receipt slots.
+	if (!Array.isArray(entries)) return slots;
 	for (let index = 0; index < entries.length; index++) {
 		const draft = entries[index];
 		const queue = slots.get(draft);

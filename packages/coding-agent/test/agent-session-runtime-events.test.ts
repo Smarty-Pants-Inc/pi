@@ -11,6 +11,7 @@ import {
 } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { type ReceivedInput, receiveInput } from "../src/core/received-input.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import type {
 	ExtensionFactory,
@@ -216,8 +217,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			const session = runtimeHost.session;
 			session.agent.state.messages = [fauxAssistantMessage("previous response")];
 			await session.followUp("unrelated session input");
-			const input = { text: "original A", mode: "steer" as const };
-			const later = { text: "new B", mode: "steer" as const };
+			const input = { input: receiveInput("original A"), mode: "steer" as const };
+			const later = { input: receiveInput("new B"), mode: "steer" as const };
 			const mode = {
 				session,
 				compactionQueuedMessages: [input],
@@ -241,7 +242,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 				await vi.waitFor(() => expect(mode.compactionQueueTransfers).toBe(0));
 				expect(mode.showError).toHaveBeenCalledTimes(1);
 				expect(mode.compactionQueuedMessages).toEqual([later]);
-				expect(session.getSteeringMessages()).toEqual([input.text]);
+				expect(session.getSteeringMessages()).toEqual([input.input.text]);
 				expect(session.getFollowUpMessages()).toEqual(["unrelated session input"]);
 				expect(dispatch).not.toHaveBeenCalled();
 			} finally {
@@ -257,7 +258,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const cause = new Error("original post-run failure");
 		const mode = {
 			session,
-			compactionQueuedMessages: [{ text: "dispatched A", mode: "steer" as const }],
+			compactionQueuedMessages: [{ input: receiveInput("dispatched A"), mode: "steer" as const }],
 			compactionQueueTransfers: 0,
 			isExtensionCommand: () => false,
 			updatePendingMessagesDisplay: vi.fn(),
@@ -266,15 +267,18 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const post = vi
 			.spyOn(session as unknown as { _handlePostAgentRun(): Promise<boolean> }, "_handlePostAgentRun")
 			.mockRejectedValue(cause);
-		const prompt = vi.spyOn(session, "prompt");
+		const prompt = vi.spyOn(
+			session as unknown as { _promptReceived(input: ReceivedInput): Promise<void> },
+			"_promptReceived",
+		);
 		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof mode,
 		) => Promise<void>;
 		try {
 			await flush.call(mode);
-			mode.compactionQueuedMessages.push({ text: "new B", mode: "steer" });
+			mode.compactionQueuedMessages.push({ input: receiveInput("new B"), mode: "steer" });
 			await vi.waitFor(() => expect(mode.compactionQueueTransfers).toBe(0));
-			expect(mode.compactionQueuedMessages.map((message) => message.text)).toEqual(["new B"]);
+			expect(mode.compactionQueuedMessages.map((message) => message.input.text)).toEqual(["new B"]);
 			expect(
 				session.messages.some(
 					(message) => message.role === "user" && JSON.stringify(message).includes("dispatched A"),
@@ -305,8 +309,8 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			if (event.type === "agent_start") await blocked;
 		});
 		let overlap: Promise<void> | undefined;
-		const input = { text: "refused A", mode: "steer" as const };
-		const later = { text: "new B", mode: "steer" as const };
+		const input = { input: receiveInput("refused A"), mode: "steer" as const };
+		const later = { input: receiveInput("new B"), mode: "steer" as const };
 		const mode = {
 			session,
 			compactionQueuedMessages: [input],
@@ -320,7 +324,10 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			overlap = session.agent.prompt("original overlapping run");
 			expect(session.agent.signal).toBeDefined();
 		};
-		const prompt = vi.spyOn(session, "prompt");
+		const prompt = vi.spyOn(
+			session as unknown as { _promptReceived(input: ReceivedInput): Promise<void> },
+			"_promptReceived",
+		);
 		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof mode,
 		) => Promise<void>;
@@ -329,7 +336,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			await vi.waitFor(() => expect(mode.compactionQueueTransfers).toBe(0));
 			expect(mode.compactionQueuedMessages).toEqual([input, later]);
 			expect(session.getSteeringMessages()).toEqual([]);
-			expect(session.messages.some((message) => JSON.stringify(message).includes(input.text))).toBe(false);
+			expect(session.messages.some((message) => JSON.stringify(message).includes(input.input.text))).toBe(false);
 			await expect(prompt.mock.results[0].value).rejects.toThrow("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 		} finally {
 			release();

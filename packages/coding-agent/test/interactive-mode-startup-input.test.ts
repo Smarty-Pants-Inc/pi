@@ -14,6 +14,8 @@ type SubmitContext = {
 		isBashRunning: boolean;
 		prompt: (text: string, options?: unknown) => Promise<void>;
 	};
+	dispatchEditorInput(this: SubmitContext, input: ReceivedInput): Promise<void>;
+	submitEditorInput(this: SubmitContext, input: ReceivedInput): void;
 	flushPendingBashComponents: () => void;
 	onInputCallback?: (input: ReceivedInput) => void;
 	pendingUserInputs: ReceivedInput[];
@@ -33,6 +35,8 @@ type StartupSubmitContext = {
 type InteractiveModePrivate = {
 	handleStartupSubmit(this: StartupSubmitContext, text: string): void;
 	setupEditorSubmitHandler(this: SubmitContext): void;
+	dispatchEditorInput(this: SubmitContext, input: ReceivedInput): Promise<void>;
+	submitEditorInput(this: SubmitContext, input: ReceivedInput): void;
 	getReceivedUserInput(this: InputContext): Promise<ReceivedInput>;
 	getUserInput(this: InputContext): Promise<string>;
 };
@@ -52,6 +56,8 @@ function createSubmitContext(): SubmitContext {
 			isBashRunning: false,
 			prompt: vi.fn(async () => {}),
 		},
+		dispatchEditorInput: interactiveModePrototype.dispatchEditorInput,
+		submitEditorInput: interactiveModePrototype.submitEditorInput,
 		flushPendingBashComponents: vi.fn(),
 		pendingUserInputs: [],
 	};
