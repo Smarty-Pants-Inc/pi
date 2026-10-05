@@ -319,6 +319,29 @@ type OverlayFocusRestorePolicy = "clear" | "preserve";
 export class Container implements Component {
 	children: Component[] = [];
 	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
+	private renderedComponents = new Set<Component>();
+
+	/** Locate a child in the last plain vertical-container render, without rendering siblings. */
+	getRenderedComponentRange(component: Component, width: number): { row: number; height: number } | undefined {
+		const layout = this.mouseLayout;
+		if (!layout || layout.width !== width || layout.children.length !== this.children.length) return undefined;
+		let row = 0;
+		for (let i = 0; i < layout.children.length; i++) {
+			const child = layout.children[i];
+			if (child.component !== this.children[i]) return undefined;
+			if (child.component === component) return { row, height: child.height };
+			if (
+				child.component instanceof Container &&
+				child.component.render === Container.prototype.render &&
+				child.component.renderedComponents.has(component)
+			) {
+				const range = child.component.getRenderedComponentRange(component, width);
+				return range ? { row: row + range.row, height: range.height } : undefined;
+			}
+			row += child.height;
+		}
+		return undefined;
+	}
 
 	addChild(component: Component): void {
 		this.children.push(component);
@@ -366,9 +389,14 @@ export class Container implements Component {
 	render(width: number): string[] {
 		const lines: string[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
+		this.renderedComponents.clear();
 		for (const child of this.children) {
 			const childLines = child.render(width);
 			mouseChildren.push({ component: child, height: childLines.length });
+			this.renderedComponents.add(child);
+			if (child instanceof Container && child.render === Container.prototype.render) {
+				for (const descendant of child.renderedComponents) this.renderedComponents.add(descendant);
+			}
 			for (const line of childLines) {
 				lines.push(line);
 			}
@@ -442,7 +470,11 @@ export interface TUI extends Component {
 	start(): void;
 	stop(options?: TuiStopOptions): void;
 	renderNow(force?: boolean): void;
-	requestRender(force?: boolean): void;
+	requestRender(force?: boolean, animation?: boolean): void;
+	/** Redraw only an animated component when its previous geometry can be reused. */
+	requestAnimationRender?(component: Component): void;
+	/** Ordinary renders and terminal input count as activity, but animation clocks do not. */
+	onActivity?(listener: () => void): () => void;
 	addInputListener(listener: TuiInputListener): () => void;
 	removeInputListener(listener: TuiInputListener): void;
 	onTerminalColorSchemeChange(listener: (scheme: TerminalColorScheme) => void): () => void;
@@ -462,11 +494,63 @@ export function isViewportTUI(tui: TUI): tui is ViewportTUI {
 	return (tui as Partial<ViewportTUI>)[VIEWPORT_TUI] === true;
 }
 
+// Renderer replacements reuse the terminal. Keep loader wake-up subscriptions across that handoff.
+const terminalActivityListeners = new WeakMap<Terminal, Set<() => void>>();
+
 export abstract class TuiBase extends Container implements TUI {
 	abstract readonly mode: TuiMode;
 	public terminal: Terminal;
 	private focusedComponent: Component | null = null;
 	private inputListeners = new Set<TuiInputListener>();
+	private readonly activityListeners: Set<() => void>;
+	private animationComponents = new Set<Component>();
+	private animationRenderScheduled = false;
+
+	onActivity(listener: () => void): () => void {
+		this.activityListeners.add(listener);
+		return () => this.activityListeners.delete(listener);
+	}
+
+	/** Only fixed-height text with an unchanged cursor is safe to paint without a layout pass. */
+	protected getAnimationLines(
+		component: Component,
+		width: number,
+		height: number,
+		cursor?: { row: number; col: number },
+	): string[] | undefined {
+		const lines = component.render(width);
+		const nextCursor = this.extractCursorPosition(lines, height);
+		if (nextCursor?.row !== cursor?.row || nextCursor?.col !== cursor?.col) return undefined;
+		if (
+			lines.length !== height ||
+			lines.some((line) => isImageLine(line) || line.includes(CURSOR_MARKER) || visibleWidth(line) > width)
+		)
+			return undefined;
+		return lines.map((line) => normalizeTerminalOutput(line) + SEGMENT_RESET);
+	}
+
+	protected renderAnimation(_component: Component): boolean {
+		return false;
+	}
+
+	requestAnimationRender(component: Component): void {
+		if (this.stopped) return;
+		this.animationComponents.add(component);
+		if (this.animationRenderScheduled) return;
+		this.animationRenderScheduled = true;
+		process.nextTick(() => {
+			this.animationRenderScheduled = false;
+			const components = [...this.animationComponents];
+			this.animationComponents.clear();
+			if (this.stopped || this.renderRequested) return;
+			for (const animated of components) {
+				if (!this.renderAnimation(animated)) {
+					this.requestRender(false, true);
+					break;
+				}
+			}
+		});
+	}
 
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
@@ -499,6 +583,8 @@ export abstract class TuiBase extends Container implements TUI {
 	constructor(terminal: Terminal, showHardwareCursor?: boolean, logDirectory?: string) {
 		super();
 		this.terminal = terminal;
+		this.activityListeners = terminalActivityListeners.get(terminal) ?? new Set();
+		terminalActivityListeners.set(terminal, this.activityListeners);
 		this.logDirectory = logDirectory;
 		if (showHardwareCursor !== undefined) {
 			this.showHardwareCursor = showHardwareCursor;
@@ -949,7 +1035,10 @@ export abstract class TuiBase extends Container implements TUI {
 		this.doRender();
 	}
 
-	requestRender(force = false): void {
+	requestRender(force = false, animation = false): void {
+		if (!animation) {
+			for (const listener of this.activityListeners) listener();
+		}
 		if (force) {
 			this.resetRenderState();
 			this.requestImmediateRender();
@@ -1004,6 +1093,7 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private handleTerminalInput(data: string): void {
+		for (const listener of this.activityListeners) listener();
 		if (this.consumeOsc11BackgroundResponse(data)) {
 			return;
 		}

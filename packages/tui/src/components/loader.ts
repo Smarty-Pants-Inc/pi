@@ -1,4 +1,4 @@
-import type { TUI } from "../tui.ts";
+import type { Component, TUI } from "../tui.ts";
 import { Text } from "./text.ts";
 
 export interface LoaderIndicatorOptions {
@@ -10,16 +10,19 @@ export interface LoaderIndicatorOptions {
 
 const DEFAULT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const DEFAULT_INTERVAL_MS = 80;
+const IDLE_AFTER_MS = 10_000;
+const IDLE_INTERVAL_MS = 1000;
 
-/**
- * Loader component that updates with an optional spinning animation.
- */
+/** Loader component that animates locally and slows down while waiting for output. */
 export class Loader extends Text {
 	private frames = [...DEFAULT_FRAMES];
 	private intervalMs = DEFAULT_INTERVAL_MS;
 	private currentFrame = 0;
 	private intervalId: NodeJS.Timeout | null = null;
-	private ui: TUI | null = null;
+	private ui: TUI;
+	private animationTarget: Component = this;
+	private unsubscribeActivity?: () => void;
+	private lastActivityAt = Date.now();
 	private renderIndicatorVerbatim = false;
 	private spinnerColorFn: (str: string) => string;
 	private messageColorFn: (str: string) => string;
@@ -45,15 +48,33 @@ export class Loader extends Text {
 	}
 
 	start(): void {
+		this.stop();
+		this.lastActivityAt = Date.now();
 		this.updateDisplay();
+		if (this.frames.length <= 1) return;
+		this.unsubscribeActivity = this.ui.onActivity?.(() => {
+			const wasIdle = Date.now() - this.lastActivityAt >= IDLE_AFTER_MS;
+			this.lastActivityAt = Date.now();
+			if (wasIdle) {
+				if (this.intervalId) clearTimeout(this.intervalId);
+				this.restartAnimation();
+			}
+		});
 		this.restartAnimation();
 	}
 
 	stop(): void {
 		if (this.intervalId) {
-			clearInterval(this.intervalId);
+			clearTimeout(this.intervalId);
 			this.intervalId = null;
 		}
+		this.unsubscribeActivity?.();
+		this.unsubscribeActivity = undefined;
+	}
+
+	/** Redirect animation redraws when another component embeds this loader (for example, an editor border). */
+	setAnimationTarget(component?: Component): void {
+		this.animationTarget = component ?? this;
 	}
 
 	setMessage(message: string): void {
@@ -63,7 +84,7 @@ export class Loader extends Text {
 
 	override invalidate(): void {
 		super.invalidate();
-		this.updateDisplay();
+		this.updateDisplay(true);
 	}
 
 	setIndicator(indicator?: LoaderIndicatorOptions): void {
@@ -75,14 +96,15 @@ export class Loader extends Text {
 	}
 
 	private restartAnimation(): void {
-		this.stop();
-		if (this.frames.length <= 1) {
-			return;
-		}
-		this.intervalId = setInterval(() => {
-			this.currentFrame = (this.currentFrame + 1) % this.frames.length;
-			this.updateDisplay();
-		}, this.intervalMs);
+		const idle = Date.now() - this.lastActivityAt >= IDLE_AFTER_MS;
+		this.intervalId = setTimeout(
+			() => {
+				this.currentFrame = (this.currentFrame + 1) % this.frames.length;
+				this.updateDisplay(true);
+				this.restartAnimation();
+			},
+			idle ? Math.max(this.intervalMs, IDLE_INTERVAL_MS) : this.intervalMs,
+		);
 	}
 
 	protected getRenderedIndicator(): string {
@@ -90,12 +112,11 @@ export class Loader extends Text {
 		return this.renderIndicatorVerbatim ? frame : this.spinnerColorFn(frame);
 	}
 
-	private updateDisplay(): void {
+	private updateDisplay(animation = false): void {
 		const renderedFrame = this.getRenderedIndicator();
 		const indicator = renderedFrame.length > 0 ? `${renderedFrame} ` : "";
 		this.setText(`${indicator}${this.messageColorFn(this.message)}`);
-		if (this.ui) {
-			this.ui.requestRender();
-		}
+		if (animation && this.ui.requestAnimationRender) this.ui.requestAnimationRender(this.animationTarget);
+		else this.ui.requestRender(false, animation);
 	}
 }

@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { type Component, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
@@ -131,6 +131,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	private hardwareCursorRow = 0;
 	private maxLinesRendered = 0;
 	private previousViewportTop = 0;
+	private previousCursorPosition: { row: number; col: number } | null = null;
+	private animationLayoutValid = false;
 
 	captureRenderState(): TuiMainScreenRenderState {
 		return {
@@ -145,6 +147,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	restoreRenderState(state: TuiMainScreenRenderState): void {
+		this.animationLayoutValid = false;
 		this.previousLines = state.previousLines.map((line) => (isImageLine(line) ? "" : line));
 		this.previousKittyImageIds = new Set();
 		this.previousWidth = state.previousWidth;
@@ -156,6 +159,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override resetRenderState(): void {
+		this.animationLayoutValid = false;
 		this.previousLines = [];
 		this.previousWidth = -1;
 		this.previousHeight = -1;
@@ -244,6 +248,55 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		return this.deleteKittyImages(ids);
 	}
 
+	protected override renderAnimation(component: Component): boolean {
+		const width = this.terminal.columns;
+		const height = this.terminal.rows;
+		if (
+			this.hasOverlayEntries ||
+			!this.animationLayoutValid ||
+			this.lastLinesHaveImages ||
+			this.previousWidth !== width ||
+			this.previousHeight !== height
+		)
+			return false;
+		const range = this.getRenderedComponentRange(component, width);
+		if (
+			!range ||
+			range.row < this.previousViewportTop ||
+			range.row + range.height > this.previousViewportTop + height ||
+			range.row + range.height > this.previousLines.length
+		)
+			return false;
+		const cursor = this.previousCursorPosition;
+		const lines = this.getAnimationLines(
+			component,
+			width,
+			range.height,
+			cursor && cursor.row >= range.row && cursor.row < range.row + range.height
+				? { row: cursor.row - range.row, col: cursor.col }
+				: undefined,
+		);
+		if (!lines) return false;
+		let buffer = "\x1b[?2026h\x1b7";
+		let changed = false;
+		let row = this.hardwareCursorRow;
+		for (let i = 0; i < lines.length; i++) {
+			const target = range.row + i;
+			if (lines[i] === this.previousLines[target]) continue;
+			const delta = target - row;
+			if (delta > 0) buffer += `\x1b[${delta}B`;
+			else if (delta < 0) buffer += `\x1b[${-delta}A`;
+			buffer += `\r\x1b[2K${lines[i]}`;
+			this.previousLines[target] = lines[i];
+			changed = true;
+			row = target;
+		}
+		if (changed) {
+			this.terminal.write(`${buffer}\x1b8\x1b[?2026l`);
+		}
+		return true;
+	}
+
 	protected doRender(): void {
 		if (this.stopped) return;
 		const width = this.terminal.columns;
@@ -262,6 +315,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Render all components to get new lines
 		let newLines = this.render(width);
+		this.animationLayoutValid = true;
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.hasOverlayEntries) {
@@ -270,6 +324,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
+		this.previousCursorPosition = cursorPos;
 
 		newLines = this.applyLineResets(newLines);
 		// Most frames have no images; skip the per-line Kitty scans then.

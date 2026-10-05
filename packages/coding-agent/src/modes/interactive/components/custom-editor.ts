@@ -30,7 +30,9 @@ export class CustomEditor extends Editor {
 	}
 
 	setWorkingStatusIndicator(indicator: StatusIndicator | undefined): void {
+		this.workingStatusIndicator?.setAnimationTarget();
 		this.workingStatusIndicator = indicator;
+		if (this.embedWorkingStatus) indicator?.setAnimationTarget(this);
 	}
 
 	protected override renderTopBorder(width: number, hiddenLineCount: number): string {

@@ -454,8 +454,8 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	args: TArgs;
 	/** Unique id for this tool execution. Stable across call/result renders for the same tool call. */
 	toolCallId: string;
-	/** Invalidate just this tool execution component for redraw. */
-	invalidate: () => void;
+	/** Invalidate just this tool execution component. Animation clocks do not count as output activity. */
+	invalidate: (options?: { animation?: boolean }) => void;
 	/** Previously returned component for this render slot, if any. */
 	lastComponent: Component | undefined;
 	/** Shared renderer state for this tool row. Initialized by tool-execution.ts. */
