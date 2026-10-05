@@ -6,11 +6,11 @@ import { AgentSessionRuntime, createAgentSessionRuntime } from "../src/core/agen
 import type { AgentSessionServices } from "../src/core/agent-session-services.ts";
 import type { ModelRuntime } from "../src/core/model-runtime.ts";
 import { OwnedJournal, OwnerAdmission, OwnerHost, openReleaseFile } from "../src/core/owner-effects.ts";
-import type { ResourceLoader } from "../src/core/resource-loader.ts";
 import { type CreateAgentSessionOptions, createAgentSession } from "../src/core/sdk.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { currentSessionOwnership, ownershipOf, SessionOwnership } from "../src/core/session-ownership.ts";
 import type { SettingsManager } from "../src/core/settings-manager.ts";
+import { repairResources } from "./repair-r141-support.ts";
 
 // Negative construction/ordering only. No native owner, grant or mocked native
 // success. Incomplete runtime dependencies must never reach an effect.
@@ -269,7 +269,7 @@ describe("unbound runtime refusal ordering", () => {
 			agentDir: "/synthetic",
 			modelRuntime: {} as ModelRuntime,
 			settingsManager: {} as SettingsManager,
-			resourceLoader: {} as ResourceLoader,
+			resourceLoader: repairResources(),
 		};
 		await expect(createAgentSession(options)).rejects.toBe(stop);
 		expect(reads).toBe(1);
