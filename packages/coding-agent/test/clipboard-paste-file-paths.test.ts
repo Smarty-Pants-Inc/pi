@@ -120,8 +120,8 @@ test("bash mode shell-quotes file paths and inserts them as arguments", async ()
 	]);
 	const context = {
 		editor: {
-			getCursor: () => ({ line: 0, col: 3 }),
-			getText: () => "catDEST",
+			getCursor: () => ({ line: 0, col: 4 }),
+			getText: () => "!catDEST",
 			insertTextAtCursor,
 		},
 		isBashMode: true,
@@ -144,6 +144,7 @@ test("bash mode shell-quotes file paths and inserts them as arguments", async ()
 test.each(['echo "DEST"', "echo 'DEST'", "echo `DEST`", "echo \\DEST", "echo # DEST", "cat <<EOF\nDEST\nEOF"])(
 	"refuses automatic filename insertion in unproven shell context %s",
 	async (editorText) => {
+		editorText = `!${editorText}`;
 		mocks.readClipboardFilePaths.mockResolvedValue(["/tmp/$(touch pi131-marker).png"]);
 		const insertTextAtCursor = vi.fn<(text: string) => void>();
 		const showError = vi.fn<(message: string) => void>();

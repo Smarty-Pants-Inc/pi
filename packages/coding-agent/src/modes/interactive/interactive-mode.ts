@@ -3225,11 +3225,12 @@ export class InteractiveMode {
 					throw new Error("Clipboard file path contains control characters");
 				}
 				const cursor = this.editor.getCursor?.();
-				const editorText = cursor ? this.editor.getText() : "";
+				const editorText = this.editor.getText?.() ?? "";
+				const bashMode = editorText.trimStart().startsWith("!");
 				// Standalone filename quoting is safe only in a proven unquoted command.
 				// Refuse complex shell syntax rather than guessing the cursor's quote/escape state.
 				if (
-					this.isBashMode &&
+					bashMode &&
 					(!cursor ||
 						cursor.line !== 0 ||
 						cursor.col < 0 ||
@@ -3238,7 +3239,7 @@ export class InteractiveMode {
 				) {
 					throw new Error("Automatic filename paste requires a simple unquoted shell command");
 				}
-				const paths = this.isBashMode ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
+				const paths = bashMode ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
 				const currentLine = cursor ? (editorText.split("\n")[cursor.line] ?? "") : "";
 				const characterBeforeCursor = cursor && cursor.col > 0 ? currentLine[cursor.col - 1] : "";
 				const characterAfterCursor = cursor ? currentLine[cursor.col] : "";
@@ -3438,7 +3439,8 @@ export class InteractiveMode {
 					}
 					this.editor.addToHistory?.(text);
 					await this.handleBashCommand(command, isExcluded);
-					this.isBashMode = false;
+					// An older command owns no editor state after its await. Reconcile the current input.
+					this.isBashMode = this.editor.getText().trimStart().startsWith("!");
 					this.updateEditorBorderColor();
 					return;
 				}
