@@ -35,6 +35,61 @@ import { captureToolImplementation, isToolImplementationCurrent } from "./types.
 export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
 
 /**
+ * Clone a tool result for a hook without losing enumerable metadata on native values.
+ * structuredClone copies Error and RegExp instances but omits their custom enumerable
+ * properties, which are part of the accepted arbitrary details contract.
+ */
+function cloneToolResult<T>(value: T): T {
+	const clone = structuredClone(value);
+	const copies = new WeakMap<object, object>();
+
+	const restoreNativeMetadata = (source: unknown, target?: unknown): unknown => {
+		if (source === null || typeof source !== "object") return target === undefined ? structuredClone(source) : target;
+		const existing = copies.get(source);
+		if (existing) return existing;
+		const copy: object = target === undefined ? structuredClone(source) : (target as object);
+		copies.set(source, copy);
+
+		// Native metadata may contain cycles or refer to values elsewhere in the result.
+		// Reuse the same source-to-copy map through every supported container.
+		if (source instanceof Map && copy instanceof Map) {
+			const entries = [...copy.entries()];
+			copy.clear();
+			let index = 0;
+			for (const [key, entry] of source) {
+				const [copiedKey, copiedEntry] = entries[index++];
+				copy.set(restoreNativeMetadata(key, copiedKey), restoreNativeMetadata(entry, copiedEntry));
+			}
+		} else if (source instanceof Set && copy instanceof Set) {
+			const entries = [...copy.values()];
+			copy.clear();
+			let index = 0;
+			for (const entry of source) copy.add(restoreNativeMetadata(entry, entries[index++]));
+		}
+		if (source instanceof Error && copy instanceof Error && "cause" in source) {
+			copy.cause = restoreNativeMetadata(source.cause, copy.cause);
+		}
+
+		const sourceRecord = source as Record<string, unknown>;
+		const copyRecord = copy as Record<string, unknown>;
+		for (const key of Object.keys(source)) {
+			if (source instanceof Error || source instanceof RegExp || Object.hasOwn(copy, key)) {
+				Object.defineProperty(copy, key, {
+					value: restoreNativeMetadata(sourceRecord[key], Object.hasOwn(copy, key) ? copyRecord[key] : undefined),
+					writable: true,
+					enumerable: true,
+					configurable: true,
+				});
+			}
+		}
+		return copy;
+	};
+
+	restoreNativeMetadata(value, clone);
+	return clone;
+}
+
+/**
  * Start an agent loop with a new prompt message.
  * The prompt is added to the context and events are emitted for it.
  */
@@ -1070,8 +1125,8 @@ async function finalizeExecutedToolCall(
 		try {
 			// Hooks receive a working copy, never the retained completed-native facts.
 			// If copying fails, skip the hook and report a transformation failure.
-			completedResult = structuredClone(executed.result);
-			result = structuredClone(completedResult);
+			completedResult = cloneToolResult(executed.result);
+			result = cloneToolResult(completedResult);
 			const afterResult = await config.afterToolCall(
 				{
 					assistantMessage,
