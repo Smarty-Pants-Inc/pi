@@ -15,7 +15,7 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 } from "@earendil-works/pi-agent-core";
-import { captureToolImplementation, ToolCallQueue } from "@earendil-works/pi-agent-core";
+import { captureToolImplementation, isToolImplementationCurrent, ToolCallQueue } from "@earendil-works/pi-agent-core";
 import type { JsonObject, NestedToolCallRecord, NestedToolCalls, TextContent, Usage } from "@earendil-works/pi-ai";
 import { combineUsage } from "./usage-totals.ts";
 
@@ -270,7 +270,7 @@ export class NestedToolCallRunner {
 			name,
 			arguments: (args ?? {}) as AgentToolCall["arguments"],
 		};
-		const tools = this.host.getTools().map(captureToolImplementation);
+		const tools = this.host.getTools().map((tool) => captureToolImplementation(tool, () => this.host.getTools()));
 		const record = scope.recorder.start(toolCall);
 		await this.host.emit({
 			type: "tool_execution_start",
@@ -306,23 +306,34 @@ export class NestedToolCallRunner {
 				},
 				async () => {
 					options.signal?.throwIfAborted();
-					const outcome = await this.host.runToolCall(
-						toolCall,
-						callerId,
-						options.signal,
-						async (partialResult) => {
-							await options.onUpdate?.(partialResult);
-							await this.host.emit({
-								type: "tool_execution_update",
-								toolCallId: toolCall.id,
-								toolName: name,
-								args: toolCall.arguments,
-								partialResult,
-								parentToolCallId: callerId,
-							});
-						},
-						tools,
-					);
+					const selected = tools.find((tool) => tool.name === name);
+					const outcome: AgentToolCallOutcome =
+						selected && !isToolImplementationCurrent(selected)
+							? {
+									toolCall,
+									isError: true,
+									result: {
+										content: [{ type: "text", text: "Tool registration is no longer callable" }],
+										details: {},
+									},
+								}
+							: await this.host.runToolCall(
+									toolCall,
+									callerId,
+									options.signal,
+									async (partialResult) => {
+										await options.onUpdate?.(partialResult);
+										await this.host.emit({
+											type: "tool_execution_update",
+											toolCallId: toolCall.id,
+											toolName: name,
+											args: toolCall.arguments,
+											partialResult,
+											parentToolCallId: callerId,
+										});
+									},
+									tools,
+								);
 					await this.closeScope(child);
 
 					finalized = true;

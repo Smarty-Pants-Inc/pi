@@ -318,6 +318,8 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	toolExecution?: ToolExecutionMode;
 	/** Admission shared with native nested dispatch; held through end observers. */
 	toolCallQueue?: ToolCallQueue;
+	/** Current registrations eligible to execute, rechecked after observers/hooks/admission. */
+	getCurrentTools?: () => readonly AgentTool[];
 
 	/**
 	 * Called before a tool is executed, after arguments have been validated.
@@ -499,6 +501,13 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 	executionMode?: ToolExecutionMode;
 }
 
+const capturedToolAuthorities = new WeakMap<object, { identity: object; isCurrent: () => boolean }>();
+
+/** Check host-owned registration authority without switching the previously authorized implementation. */
+export function isToolImplementationCurrent(tool: object): boolean {
+	return capturedToolAuthorities.get(tool)?.isCurrent() ?? true;
+}
+
 /** Pin implementation references before yielding, preserving the original method receivers. */
 export function captureToolImplementation<
 	T extends {
@@ -513,8 +522,10 @@ export function captureToolImplementation<
 		prepareArguments?: (args: never) => unknown;
 		executionMode?: ToolExecutionMode;
 	},
->(tool: T): T {
-	return {
+>(tool: T, getCurrentTools?: () => readonly object[]): T {
+	const previous = capturedToolAuthorities.get(tool);
+	const identity = previous?.identity ?? tool;
+	const captured = {
 		...tool,
 		name: tool.name,
 		label: tool.label,
@@ -527,6 +538,16 @@ export function captureToolImplementation<
 		execute: tool.execute.bind(tool),
 		prepareArguments: tool.prepareArguments?.bind(tool),
 	};
+	capturedToolAuthorities.set(captured, {
+		identity,
+		isCurrent: () =>
+			(previous?.isCurrent() ?? true) &&
+			(!getCurrentTools ||
+				getCurrentTools().some(
+					(current) => (capturedToolAuthorities.get(current)?.identity ?? current) === identity,
+				)),
+	});
+	return captured;
 }
 
 /** Context snapshot passed into the low-level agent loop. */

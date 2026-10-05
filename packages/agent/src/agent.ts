@@ -570,6 +570,7 @@ export class Agent {
 			maxRetryDelayMs: this.maxRetryDelayMs,
 			toolExecution: this.toolExecution,
 			toolCallQueue: this.toolCallQueue,
+			getCurrentTools: () => this._state.tools,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
 			finishTurn: this.finishTurn,

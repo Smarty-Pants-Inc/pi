@@ -29,7 +29,7 @@ import type {
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
-import { captureToolImplementation } from "./types.ts";
+import { captureToolImplementation, isToolImplementationCurrent } from "./types.ts";
 
 /** sourceMessage identifies queued input when tool declaration normalization copies it. */
 export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
@@ -563,7 +563,9 @@ async function executeToolCalls(
 ): Promise<ExecutedToolCallBatch> {
 	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
 	// Capture classification and callable methods before any awaited event or hook.
-	const tools = (currentContext.tools ?? []).map(captureToolImplementation);
+	const tools = (currentContext.tools ?? []).map((tool) =>
+		captureToolImplementation(tool, config.getCurrentTools ?? (() => currentContext.tools ?? [])),
+	);
 	const queue = config.toolCallQueue ?? new ToolCallQueue();
 	const hasSequentialToolCall = toolCalls.some(
 		(tc) => tools.find((t) => t.name === tc.name)?.executionMode === "sequential",
@@ -775,7 +777,7 @@ type ExecutedToolCallOutcome = {
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
 
 /** The `beforeToolCall` and `afterToolCall` hooks of {@link AgentLoopConfig}. */
-export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">;
+export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall" | "getCurrentTools">;
 
 type ToolUpdateSink = (partialResult: AgentToolResult<any>) => Promise<void> | void;
 
@@ -916,7 +918,10 @@ export interface RunToolCallOptions extends ToolCallHooks {
  */
 export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallOptions): Promise<AgentToolCallOutcome> {
 	const { assistantMessage, context, signal } = options;
-	const preparation = await prepareToolCall(context, assistantMessage, toolCall, options, signal, options.tools);
+	const tools = options.tools.map((tool) =>
+		captureToolImplementation(tool, options.getCurrentTools ?? (() => options.tools)),
+	);
+	const preparation = await prepareToolCall(context, assistantMessage, toolCall, options, signal, tools);
 	if (preparation.kind === "immediate") {
 		return { toolCall, result: preparation.result, isError: preparation.isError };
 	}
@@ -938,6 +943,10 @@ async function executePreparedToolCall(
 	};
 
 	try {
+		if (signal?.aborted) return { result: createErrorToolResult("Operation aborted"), isError: true };
+		if (!isToolImplementationCurrent(prepared.tool)) {
+			return { result: createErrorToolResult("Tool registration is no longer callable"), isError: true };
+		}
 		result = await prepared.tool.execute(prepared.toolCall.id, prepared.args as never, signal, (partialResult) => {
 			if (!acceptingUpdates) return;
 			try {
