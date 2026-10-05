@@ -584,29 +584,13 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	context: TranscriptContext,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
-	// Clone exactly once before binding publication and adapter diagnostic policy.
-	// SDK cloning can add environment headers and uses the current middleware.
-	let suppliedClient = options?.client;
-	let suppliedClientFailure: { error: unknown } | undefined;
-	if (suppliedClient) {
-		try {
-			suppliedClient =
-				typeof suppliedClient.withOptions === "function"
-					? suppliedClient.withOptions({ logLevel: "off", logger: oauthDiagnosticLogger })
-					: suppliedClient;
-		} catch (error) {
-			suppliedClientFailure = { error };
-		}
-	}
-	const suppliedClientOptions = suppliedClient
-		? (suppliedClient as unknown as { _options?: ClientOptions })._options
-		: undefined;
-	let suppliedClientOAuth = false;
-	if (options?.client && suppliedClient) {
+	// Cloning may bind new authentication, but must not lower the original client's diagnostic policy.
+	const bindClientDiagnostics = (client: Anthropic) => {
+		const clientOptions = (client as unknown as { _options?: ClientOptions })._options;
 		const secrets = getOAuthDiagnosticSecrets(
-			suppliedClient.apiKey ?? undefined,
+			client.apiKey ?? undefined,
 			{},
-			getOAuthDiagnosticSecrets(suppliedClient.authToken ?? undefined),
+			getOAuthDiagnosticSecrets(client.authToken ?? undefined),
 		);
 		const collectHeaders = (headers: unknown, name = "x-api-key"): void => {
 			if (typeof headers === "string") {
@@ -624,25 +608,47 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				for (const [key, value] of Object.entries(headers)) collectHeaders(value, key);
 			}
 		};
-		collectHeaders(suppliedClientOptions?.defaultHeaders);
-		suppliedClientOAuth = model.provider !== "github-copilot" && secrets.some(isOAuthToken);
+		collectHeaders(clientOptions?.defaultHeaders);
 		// Dynamic/custom authentication cannot be completely captured before dispatch.
 		const unboundAuth =
-			Object.getPrototypeOf(suppliedClient) !== Anthropic.prototype ||
-			Boolean(suppliedClientFailure) ||
-			!suppliedClientOptions ||
-			typeof suppliedClientOptions.apiKey === "function" ||
-			Boolean(suppliedClient.credentials) ||
-			Boolean(suppliedClient.middleware?.length) ||
+			Object.getPrototypeOf(client) !== Anthropic.prototype ||
+			!clientOptions ||
+			typeof clientOptions.apiKey === "function" ||
+			Boolean(client.credentials) ||
+			Boolean(clientOptions.middleware?.length) ||
+			Boolean(client.middleware?.length) ||
 			secrets.length === 0;
+		return { secrets, withhold: Boolean(client.authToken) || secrets.some(isOAuthToken) || unboundAuth };
+	};
+	let suppliedClient = options?.client;
+	const originalDiagnostics = suppliedClient ? bindClientDiagnostics(suppliedClient) : undefined;
+	let suppliedClientFailure: { error: unknown } | undefined;
+	if (suppliedClient) {
+		try {
+			suppliedClient =
+				typeof suppliedClient.withOptions === "function"
+					? suppliedClient.withOptions({ logLevel: "off", logger: oauthDiagnosticLogger })
+					: suppliedClient;
+		} catch (error) {
+			suppliedClientFailure = { error };
+		}
+	}
+	let suppliedClientOAuth = false;
+	if (options?.client && suppliedClient) {
+		const cloneDiagnostics = bindClientDiagnostics(suppliedClient);
+		suppliedClientOAuth = model.provider !== "github-copilot" && cloneDiagnostics.secrets.some(isOAuthToken);
 		options = {
 			...options,
-			diagnosticSecrets: [...(options.diagnosticSecrets ?? []), ...secrets],
+			diagnosticSecrets: [
+				...(options.diagnosticSecrets ?? []),
+				...(originalDiagnostics?.secrets ?? []),
+				...cloneDiagnostics.secrets,
+			],
 			oauthDiagnostics:
 				options.oauthDiagnostics === true ||
-				Boolean(suppliedClient.authToken) ||
-				secrets.some(isOAuthToken) ||
-				unboundAuth,
+				Boolean(suppliedClientFailure) ||
+				originalDiagnostics?.withhold === true ||
+				cloneDiagnostics.withhold,
 		};
 	}
 	const stream = new AssistantMessageEventStream(model, options);

@@ -160,6 +160,158 @@ it.each(["cloneEnvironment", "subclass", "currentMiddleware"] as const)(
 	},
 );
 
+// pi#141 / P1-AUDIT-CLIENT-REGRESSION: cloning must not lower the original diagnostic policy.
+it.each([
+	"rotatedBearerClone",
+	"opaqueProxyMutableHeader",
+	"opaqueProxyDecoratedClone",
+	"recordBearerMutable",
+	"tuplesProxyMutable",
+] as const)("retains supplied-client withholding across cloning (%s)", async (kind) => {
+	vi.stubEnv("ANTHROPIC_CUSTOM_HEADERS", "");
+	const key = `SYNTHETIC_DISPOSITION_${kind}`;
+	const headers: Record<string, string> | [string, string][] =
+		kind === "tuplesProxyMutable"
+			? [["X-Api-Key", "SYNTHETIC_INITIAL_DISPOSITION"]]
+			: { "X-Api-Key": "SYNTHETIC_INITIAL_DISPOSITION" };
+	const mutate = kind.includes("Mutable");
+	let sent = 0;
+	let actual: string | null | undefined;
+	const underlying = new Anthropic({
+		apiKey: "SYNTHETIC_STATIC_DISPOSITION",
+		authToken: kind === "rotatedBearerClone" || kind === "recordBearerMutable" ? "SYNTHETIC_INITIAL_BEARER" : null,
+		credentials: null,
+		webhookKey: null,
+		defaultHeaders: headers,
+		baseURL: "https://mock.invalid",
+		maxRetries: 0,
+		fetch: async (_input, init) => {
+			sent++;
+			actual = new Headers(init?.headers).get("x-api-key");
+			return Response.json(
+				{ error: { message: `receipt=${key} DISPOSITION_DIAGNOSTIC`, nested: { receipt: key } } },
+				{ status: 403 },
+			);
+		},
+	});
+	const originalClone = underlying.withOptions.bind(underlying);
+	if (kind === "rotatedBearerClone" || kind === "recordBearerMutable" || kind === "opaqueProxyDecoratedClone") {
+		underlying.withOptions = (opts) => {
+			const copy = originalClone({ ...opts, ...(kind === "opaqueProxyDecoratedClone" ? {} : { authToken: null }) });
+			if (!mutate) {
+				const preparer = copy as unknown as { prepareRequest: Anthropic["prepareRequest"] };
+				const prepare = preparer.prepareRequest.bind(copy);
+				preparer.prepareRequest = async (request, ctx) => {
+					await prepare(request, ctx);
+					(request.headers as Headers).set("x-api-key", key);
+				};
+			}
+			return copy;
+		};
+	}
+	const client =
+		kind.startsWith("opaqueProxy") || kind === "tuplesProxyMutable"
+			? new Proxy(underlying, {
+					get(target, prop) {
+						if (prop === "_options") return undefined;
+						const value: unknown = Reflect.get(target, prop, target);
+						return typeof value === "function" ? value.bind(target) : value;
+					},
+				})
+			: underlying;
+	const events = stream(model, normalizeContext({ messages: [] }), {
+		client,
+		oauthDiagnostics: false,
+		maxRetries: 0,
+		onPayload: mutate
+			? () => {
+					if (Array.isArray(headers)) headers[0][1] = key;
+					else headers["X-Api-Key"] = key;
+				}
+			: undefined,
+	});
+	const published: unknown[] = [];
+	for await (const event of events) published.push(event);
+	const output = await events.result();
+	const directory = mkdtempSync(join(tmpdir(), "pi-r141-disposition-"));
+	const session = SessionManager.create(directory, directory);
+	session.appendMessage({ role: "user", content: "synthetic", timestamp: 0 });
+	session.appendMessage(output);
+	const file = session.getSessionFile();
+	if (!file) throw new Error("Missing actual journal");
+	const jsonl = readFileSync(file, "utf8");
+	// Wire observations must be asserted outside the provider catch.
+	expect(sent).toBe(1);
+	expect(actual).toBe(key);
+	expect(output.stopReason).toBe("error");
+	expect(jsonl).toContain('"role":"assistant"');
+	for (const surface of [JSON.stringify(published), JSON.stringify(output), jsonl]) {
+		expect(surface.split(key).length - 1).toBe(0);
+		expect(surface).not.toContain("DISPOSITION_DIAGNOSTIC");
+	}
+});
+
+// pi#141: paired diagnostic controls retain base policy without changing request formatting.
+it.each(["opaqueProxyExplicitWithholding", "transparentProxyMutableHeader", "opaqueProxyStaticHeader"] as const)(
+	"preserves supplied-client disposition control (%s)",
+	async (kind) => {
+		vi.stubEnv("ANTHROPIC_CUSTOM_HEADERS", "");
+		const key = `SYNTHETIC_CONTROL_${kind}`;
+		const mutates = kind !== "opaqueProxyStaticHeader";
+		const headers = { "X-Api-Key": mutates ? "SYNTHETIC_CONTROL_INITIAL" : key };
+		let sent = 0;
+		let actual: string | null | undefined;
+		const underlying = new Anthropic({
+			apiKey: "SYNTHETIC_CONTROL_BASE",
+			authToken: null,
+			credentials: null,
+			webhookKey: null,
+			defaultHeaders: headers,
+			baseURL: "https://mock.invalid",
+			maxRetries: 0,
+			fetch: async (_input, init) => {
+				sent++;
+				actual = new Headers(init?.headers).get("x-api-key");
+				return Response.json({ error: { message: `receipt=${key}` } }, { status: 403 });
+			},
+		});
+		const client = new Proxy(underlying, {
+			get(target, prop) {
+				if (prop === "_options" && kind !== "transparentProxyMutableHeader") return undefined;
+				const value: unknown = Reflect.get(target, prop, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const events = stream(model, normalizeContext({ messages: [] }), {
+			client,
+			oauthDiagnostics: kind === "opaqueProxyExplicitWithholding",
+			maxRetries: 0,
+			onPayload: mutates
+				? () => {
+						headers["X-Api-Key"] = key;
+					}
+				: undefined,
+		});
+		const published: unknown[] = [];
+		for await (const event of events) published.push(event);
+		const output = await events.result();
+		const directory = mkdtempSync(join(tmpdir(), "pi-r141-disposition-control-"));
+		const session = SessionManager.create(directory, directory);
+		session.appendMessage({ role: "user", content: "synthetic", timestamp: 0 });
+		session.appendMessage(output);
+		const file = session.getSessionFile();
+		if (!file) throw new Error("Missing actual journal");
+		const jsonl = readFileSync(file, "utf8");
+		expect(sent).toBe(1);
+		expect(actual).toBe(key);
+		expect(output.stopReason).toBe("error");
+		for (const surface of [JSON.stringify(published), JSON.stringify(output), jsonl]) {
+			if (kind === "transparentProxyMutableHeader") expect(surface).toContain(key);
+			else expect(surface).not.toContain(key);
+		}
+	},
+);
+
 // pi#141 / P2-AUDIT-BEARER-SEMANTICS: diagnostic withholding is not an OAuth protocol switch.
 it.each(["audit", "github-copilot"])("preserves generic bearer request formatting (%s)", async (provider) => {
 	vi.stubEnv("ANTHROPIC_CUSTOM_HEADERS", "");
