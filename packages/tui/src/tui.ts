@@ -155,15 +155,21 @@ type PendingTerminalColorQuery = {
 	 */
 	deliver: ((colors: TerminalColors) => void) | undefined;
 	timer: NodeJS.Timeout | undefined;
+	retirementTimer: NodeJS.Timeout | undefined;
+	started: boolean;
+	start(): void;
+	cancel(): void;
 };
 
+/** Quiet drain after a complete OSC batch when DA1 is absent. */
+const TERMINAL_COLOR_DRAIN_MS = 50;
 const TERMINAL_PALETTE_SIZE = 16;
 /** OSC 10 and 11 plus OSC 4 for every palette color. */
 const TERMINAL_COLOR_REPLY_COUNT = 2 + TERMINAL_PALETTE_SIZE;
 /**
  * Default colors, palette colors 0-15, and a trailing primary device attributes (DA1) request.
- * Every terminal answers DA1 and terminals answer in order, so the DA1 reply marks the end of
- * the color replies, including for terminals that ignore the color queries.
+ * DA1, when supported, marks the end of the ordered color replies. Some terminals omit it;
+ * a complete OSC batch then drains before the next request is issued.
  */
 const TERMINAL_COLOR_QUERY = `\x1b]10;?\x07\x1b]11;?\x07${Array.from(
 	{ length: TERMINAL_PALETTE_SIZE },
@@ -514,6 +520,8 @@ export abstract class TuiBase extends Container implements TUI {
 	 * replies belong to the oldest one. Queries stay here after a timeout to collect late replies.
 	 */
 	private pendingTerminalColorQueries: PendingTerminalColorQuery[] = [];
+	/** Bounded tombstones consume delayed DA1 without completing a newer color query. */
+	private retiredTerminalColorDa1: number[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
 	/** Directory for debug/crash logs. When undefined, debug logging is disabled and crash dumps fall back to the OS temp directory. */
@@ -970,6 +978,13 @@ export abstract class TuiBase extends Container implements TUI {
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
 		this.cancelRenderTimer();
+		for (const query of this.pendingTerminalColorQueries) {
+			clearTimeout(query.timer);
+			clearTimeout(query.retirementTimer);
+			query.cancel();
+		}
+		this.pendingTerminalColorQueries = [];
+		this.retiredTerminalColorDa1 = [];
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
@@ -1120,13 +1135,15 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private consumeTerminalColorResponse(data: string): boolean {
-		const query = this.pendingTerminalColorQueries[0];
-		if (!query) {
-			return false;
+		this.retiredTerminalColorDa1 = this.retiredTerminalColorDa1.filter((expires) => expires > Date.now());
+		if (DEVICE_ATTRIBUTES_RESPONSE_PATTERN.test(data) && this.retiredTerminalColorDa1.length > 0) {
+			this.retiredTerminalColorDa1.shift();
+			return true;
 		}
+		const query = this.pendingTerminalColorQueries[0];
+		if (!query?.started) return false;
 		if (DEVICE_ATTRIBUTES_RESPONSE_PATTERN.test(data)) {
-			this.pendingTerminalColorQueries.shift();
-			this.completeTerminalColorQuery(query);
+			this.retireTerminalColorQuery(query, false);
 			return true;
 		}
 
@@ -1136,7 +1153,7 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		const { target, rgb } = response;
 		const key = String(target);
-		if (!query.deliver || query.replied.has(key)) {
+		if (query.replied.has(key)) {
 			return true;
 		}
 		query.replied.add(key);
@@ -1148,9 +1165,31 @@ export abstract class TuiBase extends Container implements TUI {
 			query.palette[target] = rgb;
 		}
 		if (query.replied.size === TERMINAL_COLOR_REPLY_COUNT) {
-			this.completeTerminalColorQuery(query);
+			try {
+				this.completeTerminalColorQuery(query);
+			} finally {
+				query.retirementTimer = setTimeout(
+					() => this.retireTerminalColorQuery(query, true),
+					TERMINAL_COLOR_DRAIN_MS,
+				);
+			}
 		}
 		return true;
+	}
+
+	private retireTerminalColorQuery(query: PendingTerminalColorQuery, missingDa1: boolean): void {
+		if (this.pendingTerminalColorQueries[0] !== query) return;
+		this.pendingTerminalColorQueries.shift();
+		clearTimeout(query.retirementTimer);
+		if (missingDa1) {
+			this.retiredTerminalColorDa1.push(Date.now() + 1000);
+			this.retiredTerminalColorDa1 = this.retiredTerminalColorDa1.slice(-16);
+		}
+		try {
+			this.completeTerminalColorQuery(query);
+		} finally {
+			this.pendingTerminalColorQueries[0]?.start();
+		}
 	}
 
 	private terminalColorQueryResult(query: PendingTerminalColorQuery): TerminalColors {
@@ -1501,14 +1540,33 @@ export abstract class TuiBase extends Container implements TUI {
 				replied: new Set(),
 				deliver: resolve,
 				timer: undefined,
+				retirementTimer: undefined,
+				started: false,
+				cancel: () => {
+					query.deliver = undefined;
+					resolve(this.terminalColorQueryResult(query));
+				},
+				start: () => {
+					if (query.started) return;
+					query.started = true;
+					this.terminal.write(TERMINAL_COLOR_QUERY);
+				},
 			};
-			// Resolve with the replies so far, and keep collecting late replies for `onLateReply`.
+			// The caller's bound includes waiting for an outgoing batch. Never issue overlapping
+			// unframed requests: incomplete no-DA1 batches retain custody of possible late OSC.
+			// A queued query times out empty rather than relabelling those old values as fresh.
 			query.timer = setTimeout(() => {
+				if (!query.started) {
+					const index = this.pendingTerminalColorQueries.indexOf(query);
+					if (index !== -1) this.pendingTerminalColorQueries.splice(index, 1);
+					query.cancel();
+					return;
+				}
 				query.deliver = onLateReply;
 				resolve(this.terminalColorQueryResult(query));
 			}, timeoutMs);
 			this.pendingTerminalColorQueries.push(query);
-			this.terminal.write(TERMINAL_COLOR_QUERY);
+			if (this.pendingTerminalColorQueries.length === 1) query.start();
 		});
 	}
 }
