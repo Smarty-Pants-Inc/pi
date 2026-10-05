@@ -198,6 +198,7 @@ export class TaskScheduler {
 	readonly #receipts = new Map<TaskId, DeferredReceipt>();
 	/** Accepted handles owned before any storage attempt; publication never clears this owner. */
 	readonly #unadopted = new Map<TaskId, DeferredReceipt>();
+	readonly #confirmedCancellation = new Set<TaskId>();
 	readonly #receiptCleanup = new Map<TaskId, Promise<void>>();
 	/** A failed retirement commit requires reopen; never spin or discard its last durable receipt. */
 	readonly #receiptBlocked = new Set<TaskId>();
@@ -318,12 +319,24 @@ export class TaskScheduler {
 		this.#kick();
 	}
 
-	/** Wait for every invocation signalled by `#seal()`. Writes nothing. */
+	/** Join owned work, retaining sole handles until receipt retirement is durably recoverable. */
 	async join(): Promise<void> {
 		await Promise.allSettled([
 			...[...this.#invocations.values()].map((invocation) => invocation.done),
 			...this.#receiptCleanup.values(),
 		]);
+		// A storage outage must not let close discard the sole accepted handle. Retry on the
+		// receipt-only recovery lane; never reopen ordinary task admission or repeat submission.
+		while (this.#unadopted.size > 0) {
+			for (const receipt of this.#unadopted.values()) {
+				try {
+					await this.#recoverUnadopted(receipt);
+				} catch (error) {
+					this.#report(error);
+				}
+			}
+			if (this.#unadopted.size > 0) await delay(50, new AbortController().signal);
+		}
 	}
 
 	/**
@@ -1212,7 +1225,7 @@ export class TaskScheduler {
 					await this.#models.cancelDeferred(model, receipt.checkpoint.handle, {
 						signal: AbortSignal.timeout(5000),
 					});
-					this.#unadopted.delete(invocation.taskId);
+					this.#confirmedCancellation.add(invocation.taskId);
 				} catch (cancelError) {
 					receipt.status = "cancel_failed";
 					this.#report(
@@ -1221,9 +1234,40 @@ export class TaskScheduler {
 						}),
 					);
 				}
+				try {
+					await this.#recoverUnadopted(receipt);
+				} catch (recoveryError) {
+					this.#report(recoveryError);
+				}
 			}
 			throw error;
 		}
+	}
+
+	/** Cold-load recovery owns the same handle even if an uncertain prior batch actually committed. */
+	async #recoverUnadopted(receipt: DeferredReceipt): Promise<void> {
+		const confirmed = this.#confirmedCancellation.has(receipt.taskId);
+		await this.#retireReceipt(async (tx) => {
+			const current = await tx.task(receipt.taskId);
+			const ledger = await tx.doc(DeferredReceiptsDoc);
+			if (confirmed) delete ledger.receipts[String(receipt.taskId)];
+			else ledger.receipts[String(receipt.taskId)] = copyJson(receipt) as DeferredReceiptsState["receipts"][string];
+			if (current !== undefined && current.state.status !== "terminal" && current.state.status !== "completing") {
+				tx.setTask(
+					withState(
+						{ ...current, abortRequested: true },
+						{
+							status: "running",
+							checkpoint: confirmed
+								? { ...(current.state.checkpoint as Checkpoint), acceptanceUncertain: false }
+								: copyJson(receipt.checkpoint),
+						},
+					),
+				);
+			}
+		});
+		this.#unadopted.delete(receipt.taskId);
+		this.#confirmedCancellation.delete(receipt.taskId);
 	}
 
 	#resolveReceipt(invocation: Invocation): Promise<void> {

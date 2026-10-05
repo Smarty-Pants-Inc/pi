@@ -108,6 +108,16 @@ export class SessionImpl implements Session {
 	protected commitRetirementWith<T>(change: (tx: Transaction) => T | Promise<T>, context: Context): Promise<T> {
 		return this.#enqueue(() => {
 			if (this.#storageClosed) throw new Error("Session storage is closed");
+			if (this.#poison !== undefined) {
+				// Only already-owned receipt retirement may use this lane. A fresh kernel cold-loads
+				// storage after an uncertain batch; ordinary admission remains permanently poisoned.
+				const recovery = new SessionImpl(this.#storage);
+				recovery.subscribeCommits((publication, callContext) => {
+					this.#documents.clear();
+					for (const listener of [...this.#commitListeners]) listener(publication, callContext);
+				});
+				return recovery.commitWith(change, withoutAbortSignal(context));
+			}
 			return this.#runCommit(change, withoutAbortSignal(context));
 		});
 	}
