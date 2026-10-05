@@ -1134,16 +1134,9 @@ export class ExtensionRunner {
 					valid = true;
 				}
 				if (!previewIsCurrent()) throw staleAdmission;
-				// A failed proposal remains visible so a later handler can replace it.
-				const hadEntries = Array.isArray(entries) && entries.length > 0;
-				let previousEntries: SessionBoundaryDraft[] | undefined;
-				if (hadEntries) {
-					try {
-						previousEntries = structuredClone(entries);
-					} catch {
-						// Uncloneable extension data must still follow the usual preview validation.
-					}
-				}
+				const hadEntries = entries.length > 0;
+				const previousEntries = structuredClone(entries);
+				const previousContinue: boolean = shouldContinue;
 				const event = {
 					...structuredClone(baseEvent),
 					entries: structuredClone(entries),
@@ -1159,7 +1152,12 @@ export class ExtensionRunner {
 					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
 				} catch (err) {
 					signal?.throwIfAborted();
-					entries = structuredClone(event.entries);
+					try {
+						entries = structuredClone(event.entries);
+					} catch {
+						entries = previousEntries;
+						shouldContinue = previousContinue;
+					}
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1195,7 +1193,12 @@ export class ExtensionRunner {
 				} catch (err) {
 					signal?.throwIfAborted();
 					if (err === staleAdmission) throw err;
-					valid = false;
+					// Discard this proposal only. Earlier validated contributions retain custody.
+					entries = previousEntries;
+					shouldContinue = previousContinue;
+					context = await rebuildContext();
+					contextSnapshot = structuredClone(context);
+					valid = true;
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
