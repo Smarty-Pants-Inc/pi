@@ -1,14 +1,17 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import type { EditorComponent, Terminal } from "@earendil-works/pi-tui";
 import { afterEach, expect, it, vi } from "vitest";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
 import type { ReceivedInput } from "../../src/core/received-input.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
+import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
 import { getTurnProvenance } from "../../src/core/turn-provenance.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../src/modes/interactive/theme/theme.ts";
-import { createHarness, type Harness } from "./harness.ts";
+import { createTestResourceLoader } from "../utilities.ts";
+import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
@@ -87,9 +90,48 @@ function reopenedReceipts(h: Harness) {
 }
 
 // pi#145 SR145-3: idle follow-up owns its receipt before custom-editor clearing.
-it("captures idle follow-up before a delayed editor clear", async () => {
-	const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
-	h.setResponses([fauxAssistantMessage("done")]);
+it.each([
+	["plain input", "follow-up", "follow-up"],
+	["unregistered slash name", "/unregistered argument", "/unregistered argument"],
+	["prompt template", "/receipt-template argument", "Template body argument"],
+	["skill invocation", "/skill:receipt-skill argument", "Skill body"],
+])("captures idle follow-up %s before a delayed editor clear", async (_kind, submitted, expectedText) => {
+	const resourceLoader = createTestResourceLoader();
+	const h = await createHarness({
+		persistSession: true,
+		settings: { compaction: { enabled: false } },
+		resourceLoader,
+	});
+	const templatePath = join(h.tempDir, "receipt-template.md");
+	const skillPath = join(h.tempDir, "SKILL.md");
+	writeFileSync(templatePath, "Template body $ARGUMENTS");
+	writeFileSync(skillPath, "---\nname: receipt-skill\ndescription: Receipt test\n---\nSkill body");
+	resourceLoader.getPrompts = () => ({
+		prompts: [
+			{
+				name: "receipt-template",
+				description: "Receipt test",
+				content: readFileSync(templatePath, "utf8"),
+				filePath: templatePath,
+				sourceInfo: createSyntheticSourceInfo(templatePath, { source: "test" }),
+			},
+		],
+		diagnostics: [],
+	});
+	resourceLoader.getSkills = () => ({
+		skills: [
+			{
+				name: "receipt-skill",
+				description: "Receipt test",
+				filePath: skillPath,
+				baseDir: h.tempDir,
+				disableModelInvocation: false,
+				sourceInfo: createSyntheticSourceInfo(skillPath, { source: "test" }),
+			},
+		],
+		diagnostics: [],
+	});
+	h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 	const mode = modeFor(h);
 	const internals = mode as unknown as {
 		setupEditorSubmitHandler(): void;
@@ -99,8 +141,8 @@ it("captures idle follow-up before a delayed editor clear", async () => {
 		getReceivedUserInput(): Promise<ReceivedInput>;
 	};
 	internals.setupEditorSubmitHandler();
-	internals.editor.setText("follow-up");
-	let draft = "follow-up";
+	internals.editor.setText(submitted);
+	let draft = submitted;
 	internals.setCustomEditorComponent(() => ({
 		getText: () => draft,
 		setText: (text) => {
@@ -111,24 +153,98 @@ it("captures idle follow-up before a delayed editor clear", async () => {
 		render: () => [],
 		invalidate: () => {},
 	}));
-	internals.editor.setText("follow-up");
+	internals.editor.setText(submitted);
 	vi.useFakeTimers({ toFake: ["Date"] });
 	const first = "2026-10-01T12:00:00.000Z";
 	vi.setSystemTime(first);
 	try {
+		await internals.handleFollowUp();
+		internals.editor.setText(submitted);
+		vi.setSystemTime(first);
 		await internals.handleFollowUp();
 		vi.spyOn(mode, "init").mockResolvedValue(undefined);
 		const dequeue = internals.getReceivedUserInput.bind(mode);
 		let count = 0;
 		const end = new Error("test loop end");
 		vi.spyOn(internals, "getReceivedUserInput").mockImplementation(() =>
-			++count > 1 ? Promise.reject(end) : dequeue(),
+			++count > 2 ? Promise.reject(end) : dequeue(),
 		);
 		await expect(mode.run()).rejects.toBe(end);
-		expect(reopenedReceipts(h)).toEqual([expect.objectContaining({ receivedAt: first, channel: "terminal" })]);
+		const receipts = reopenedReceipts(h);
+		expect(receipts).toHaveLength(2);
+		expect(new Set(receipts.map((receipt) => receipt?.turnId)).size).toBe(2);
+		for (const receipt of receipts) {
+			expect(receipt).toMatchObject({ receivedAt: first, channel: "terminal", v: 1 });
+			expect(Object.keys(receipt!).sort()).toEqual(["channel", "receivedAt", "turnId", "v"]);
+		}
+		const expected = submitted.startsWith("/skill:")
+			? `<skill name="receipt-skill" location="${skillPath}">\nReferences are relative to ${h.tempDir}.\n\n${expectedText}\n</skill>\n\nargument`
+			: expectedText;
+		expect(getUserTexts(h)).toEqual([expected, expected]);
 	} finally {
 		vi.useRealTimers();
 	}
+});
+
+// pi#145 controls: the shared dispatcher must still consume built-in and bash commands.
+it.each(["enter", "follow-up"])("preserves handled commands on idle %s", async (action) => {
+	const h = await createHarness({ settings: { compaction: { enabled: false } } });
+	const mode = modeFor(h);
+	const internals = mode as unknown as {
+		setupEditorSubmitHandler(): void;
+		handleFollowUp(): Promise<void>;
+		handleBashCommand(command: string, excluded: boolean): Promise<void>;
+		editor: EditorComponent;
+		pendingUserInputs: ReceivedInput[];
+	};
+	internals.setupEditorSubmitHandler();
+	const bash = vi.spyOn(internals, "handleBashCommand").mockResolvedValue(undefined);
+	for (const command of ["/name receipt-control", "!echo receipt-control", "!!echo excluded"]) {
+		internals.editor.setText(command);
+		if (action === "follow-up") await internals.handleFollowUp();
+		else await internals.editor.onSubmit?.(command);
+	}
+	expect(h.sessionManager.getSessionName()).toBe("receipt-control");
+	expect(bash.mock.calls).toEqual([
+		["echo receipt-control", false],
+		["echo excluded", true],
+	]);
+	expect(internals.pendingUserInputs).toEqual([]);
+	expect(getUserTexts(h)).toEqual([]);
+});
+
+// pi#145 control: registered extension slash commands must not fall through as user turns.
+it("preserves an idle follow-up extension command", async () => {
+	const handled = vi.fn();
+	const h = await createHarness({
+		settings: { compaction: { enabled: false } },
+		extensionFactories: [
+			(api) => {
+				api.registerCommand("receipt-command", { description: "Receipt control", handler: handled });
+			},
+		],
+	});
+	const mode = modeFor(h);
+	const internals = mode as unknown as {
+		setupEditorSubmitHandler(): void;
+		handleFollowUp(): Promise<void>;
+		editor: EditorComponent;
+		getReceivedUserInput(): Promise<ReceivedInput>;
+	};
+	internals.setupEditorSubmitHandler();
+	internals.editor.setText("/receipt-command argument");
+	await internals.handleFollowUp();
+	vi.spyOn(mode, "init").mockResolvedValue(undefined);
+	const dequeue = internals.getReceivedUserInput.bind(mode);
+	let count = 0;
+	const end = new Error("test loop end");
+	vi.spyOn(internals, "getReceivedUserInput").mockImplementation(() =>
+		++count > 1 ? Promise.reject(end) : dequeue(),
+	);
+	await expect(mode.run()).rejects.toBe(end);
+	expect(handled).toHaveBeenCalledOnce();
+	expect(handled.mock.calls[0][0]).toBe("argument");
+	expect(getUserTexts(h)).toEqual([]);
 });
 
 // pi#145 control: streaming follow-up already captures before custom-editor effects.
