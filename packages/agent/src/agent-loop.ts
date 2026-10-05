@@ -1064,9 +1064,14 @@ async function finalizeExecutedToolCall(
 	let result = executed.result;
 	let isError = executed.isError;
 	let publicationFailure = executed.publicationFailure;
+	let completedResult = executed.result;
 
 	if (config.afterToolCall) {
 		try {
+			// Hooks receive a working copy, never the retained completed-native facts.
+			// If copying fails, skip the hook and report a transformation failure.
+			completedResult = structuredClone(executed.result);
+			result = structuredClone(completedResult);
 			const afterResult = await config.afterToolCall(
 				{
 					assistantMessage,
@@ -1098,7 +1103,7 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = executed.result;
+			result = completedResult;
 			isError = executed.isError;
 			publicationFailure ??= { error };
 		}

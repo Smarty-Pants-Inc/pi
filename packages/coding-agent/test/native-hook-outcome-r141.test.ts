@@ -27,10 +27,10 @@ const usage = {
 	totalTokens: 9,
 	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
 };
-// pi#141 / P2-AUDIT-NATIVE: completed receipts and usage survive earlier publication/hook failures.
+// pi#141 / P2-AUDIT-NATIVE: completed receipts and usage survive publication failures, including mutating hooks.
 it.each(
 	(["parallel", "sequential"] as const).flatMap((toolExecution) =>
-		(["afterToolCall", "updateObserver", "asyncUpdateObserver"] as const).map((failure) => ({
+		(["afterToolCall", "updateObserver", "asyncUpdateObserver", "mutatingAfterToolCall"] as const).map((failure) => ({
 			toolExecution,
 			failure,
 		})),
@@ -45,8 +45,12 @@ it.each(
 		parameters: Type.Object({}),
 		execute: async (id, _args, _signal, update) => {
 			native++;
-			if (failure !== "afterToolCall") update?.({ content: [], details: {} });
-			return { content: [{ type: "text", text: `accepted:${id}` }], details: { receipt: id }, usage };
+			if (failure === "updateObserver" || failure === "asyncUpdateObserver") update?.({ content: [], details: {} });
+			return {
+				content: [{ type: "text", text: `accepted:${id}` }],
+				details: { receipt: id },
+				usage: structuredClone(usage),
+			};
 		},
 	};
 	const response = {
@@ -67,8 +71,16 @@ it.each(
 		},
 	});
 	agent.finishTurn = async () => ({ action: "end" });
-	if (failure === "afterToolCall")
-		agent.afterToolCall = async () => {
+	if (failure === "afterToolCall" || failure === "mutatingAfterToolCall")
+		agent.afterToolCall = async ({ result }) => {
+			if (failure === "mutatingAfterToolCall") {
+				result.content.length = 0;
+				(result.details as { receipt: string }).receipt = "changed-by-rejected-hook";
+				if (result.usage) {
+					result.usage.input = 0;
+					result.usage.cost.total = 0;
+				}
+			}
 			rejected = true;
 			throw new Error("synthetic post-native failure");
 		};

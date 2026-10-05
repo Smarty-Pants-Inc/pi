@@ -584,16 +584,29 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	context: TranscriptContext,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
-	// Bind supplied-client authentication once, before both stream publication and adapter diagnostics.
-	const suppliedClientOptions = options?.client
-		? (options.client as unknown as { _options?: ClientOptions })._options
+	// Clone exactly once before binding publication and adapter diagnostic policy.
+	// SDK cloning can add environment headers and uses the current middleware.
+	let suppliedClient = options?.client;
+	let suppliedClientFailure: { error: unknown } | undefined;
+	if (suppliedClient) {
+		try {
+			suppliedClient =
+				typeof suppliedClient.withOptions === "function"
+					? suppliedClient.withOptions({ logLevel: "off", logger: oauthDiagnosticLogger })
+					: suppliedClient;
+		} catch (error) {
+			suppliedClientFailure = { error };
+		}
+	}
+	const suppliedClientOptions = suppliedClient
+		? (suppliedClient as unknown as { _options?: ClientOptions })._options
 		: undefined;
 	let suppliedClientOAuth = false;
-	if (options?.client) {
+	if (options?.client && suppliedClient) {
 		const secrets = getOAuthDiagnosticSecrets(
-			options.client.apiKey ?? undefined,
+			suppliedClient.apiKey ?? undefined,
 			{},
-			getOAuthDiagnosticSecrets(options.client.authToken ?? undefined),
+			getOAuthDiagnosticSecrets(suppliedClient.authToken ?? undefined),
 		);
 		const collectHeaders = (headers: unknown, name = "x-api-key"): void => {
 			if (typeof headers === "string") {
@@ -612,19 +625,24 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			}
 		};
 		collectHeaders(suppliedClientOptions?.defaultHeaders);
-		suppliedClientOAuth = Boolean(options.client.authToken) || secrets.some(isOAuthToken);
+		suppliedClientOAuth = model.provider !== "github-copilot" && secrets.some(isOAuthToken);
 		// Dynamic/custom authentication cannot be completely captured before dispatch.
 		const unboundAuth =
-			!(options.client instanceof Anthropic) ||
+			Object.getPrototypeOf(suppliedClient) !== Anthropic.prototype ||
+			Boolean(suppliedClientFailure) ||
 			!suppliedClientOptions ||
 			typeof suppliedClientOptions.apiKey === "function" ||
-			Boolean(options.client.credentials) ||
-			Boolean(suppliedClientOptions.middleware?.length) ||
+			Boolean(suppliedClient.credentials) ||
+			Boolean(suppliedClient.middleware?.length) ||
 			secrets.length === 0;
 		options = {
 			...options,
 			diagnosticSecrets: [...(options.diagnosticSecrets ?? []), ...secrets],
-			oauthDiagnostics: options.oauthDiagnostics === true || suppliedClientOAuth || unboundAuth,
+			oauthDiagnostics:
+				options.oauthDiagnostics === true ||
+				Boolean(suppliedClient.authToken) ||
+				secrets.some(isOAuthToken) ||
+				unboundAuth,
 		};
 	}
 	const stream = new AssistantMessageEventStream(model, options);
@@ -664,15 +682,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			let usageModel = model;
 			let inputTransformations: BetaThinkingDroppedInputTransformation[] | undefined;
 
-			if (options?.client) {
-				// Clone SDK clients before dispatch, so logs cannot publish credentials and the caller's client is unchanged.
-				client =
-					typeof options.client.withOptions === "function"
-						? options.client.withOptions({
-								logLevel: "off",
-								logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
-							})
-						: options.client;
+			if (suppliedClient) {
+				if (suppliedClientFailure) throw suppliedClientFailure.error;
+				client = suppliedClient;
 				isOAuth = suppliedClientOAuth;
 			} else {
 				const apiKey = options?.apiKey;
