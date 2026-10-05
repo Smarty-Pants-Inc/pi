@@ -1494,12 +1494,15 @@ export class AgentSession {
 			if (this._queuedInputCustody.has(event.message)) this._emitQueueUpdate();
 		}
 
+		// Observer publication is fallible; it must not discard an accepted
+		// native outcome or prevent the mandatory journal receiver from running.
+		let publicationFailure: { error: unknown } | undefined;
 		// Terminal cancellation releases extension waits, not final event publication/persistence.
 		if (!this._shutdownCancellation.signal.aborted) {
 			try {
 				await this._emitExtensionEvent(event);
 			} catch (error) {
-				if (!this._shutdownCancellation.signal.aborted) throw error;
+				if (!this._shutdownCancellation.signal.aborted) publicationFailure = { error };
 			}
 		}
 		const persist = async () => {
@@ -1508,9 +1511,14 @@ export class AgentSession {
 		};
 		const queuedEnd = event.type === "message_end" && this._queuedInputCustody.has(event.message);
 		if (queuedEnd) await persist();
-		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		try {
+			this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
+		} catch (error) {
+			publicationFailure ??= { error };
+		}
 		// Other persistence (including turn_end custom-message flushing) retains its publication order.
 		if (!queuedEnd) await persist();
+		if (publicationFailure) throw publicationFailure.error;
 	};
 
 	private async _persistAgentEvent(event: AgentEvent): Promise<void> {

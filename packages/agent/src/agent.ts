@@ -724,11 +724,17 @@ export class Agent {
 		if (!signal) {
 			throw new Error("Agent listener invoked outside active run");
 		}
+		let failure: { error: unknown } | undefined;
 		for (const listener of this.listeners) {
-			await listener(event, signal);
+			try {
+				await listener(event, signal);
+			} catch (error) {
+				failure ??= { error };
+			}
 		}
 		// The session persists input through message_end listeners. A throwing
 		// observer must not skip that transfer after the queue consumed the input.
 		if (event.type === "message_end") this.observe("queue_update");
+		if (failure) throw failure.error;
 	}
 }

@@ -288,6 +288,7 @@ async function runLoop(
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
+				if (executedToolBatch.failure) throw executedToolBatch.failure.error;
 			}
 
 			lastCompletedTurn = {
@@ -588,6 +589,7 @@ async function executeToolCalls(
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	failure?: { error: unknown };
 };
 
 async function executeToolCallsSequential(
@@ -602,6 +604,7 @@ async function executeToolCallsSequential(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
+	let failure: { error: unknown } | undefined;
 
 	for (const toolCall of toolCalls) {
 		await queue.run({ id: toolCall.id, exclusive: true, signal }, async () => {
@@ -636,14 +639,18 @@ async function executeToolCallsSequential(
 				);
 			}
 
-			await emitToolExecutionEnd(finalized, emit);
+			await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
+				failure ??= { error };
+			});
 			const toolResultMessage = createToolResultMessage(finalized);
-			await emitToolResultMessage(toolResultMessage, emit);
+			await emitToolResultMessage(toolResultMessage, emit).catch((error: unknown) => {
+				failure ??= { error };
+			});
 			finalizedCalls.push(finalized);
 			messages.push(toolResultMessage);
 		});
 
-		if (signal?.aborted) {
+		if (signal?.aborted || failure) {
 			break;
 		}
 	}
@@ -651,6 +658,7 @@ async function executeToolCallsSequential(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		failure,
 	};
 }
 
@@ -665,6 +673,7 @@ async function executeToolCallsParallel(
 	queue: ToolCallQueue,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	let failure: { error: unknown } | undefined;
 
 	for (const toolCall of toolCalls) {
 		await emit({
@@ -681,7 +690,9 @@ async function executeToolCallsParallel(
 				result: preparation.result,
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
-			await emitToolExecutionEnd(finalized, emit);
+			await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
+				failure ??= { error };
+			});
 			finalizedCalls.push(finalized);
 			if (signal?.aborted) {
 				break;
@@ -710,7 +721,9 @@ async function executeToolCallsParallel(
 						config,
 						signal,
 					);
-					await emitToolExecutionEnd(finalized, emit);
+					await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
+						failure ??= { error };
+					});
 					return finalized;
 				},
 				async () => {
@@ -721,7 +734,9 @@ async function executeToolCallsParallel(
 						result: createErrorToolResult("Operation aborted"),
 						isError: true,
 					} satisfies FinalizedToolCallOutcome;
-					await emitToolExecutionEnd(finalized, emit);
+					await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
+						failure ??= { error };
+					});
 					return finalized;
 				},
 			),
@@ -731,7 +746,6 @@ async function executeToolCallsParallel(
 		}
 	}
 
-	let failure: { error: unknown } | undefined;
 	const settled = await Promise.allSettled(
 		finalizedCalls.map((entry) =>
 			(typeof entry === "function" ? entry() : Promise.resolve(entry)).catch((error: unknown) => {
@@ -740,19 +754,22 @@ async function executeToolCallsParallel(
 			}),
 		),
 	);
-	// End observers can fail while other tools still execute. Never release batch custody early.
-	if (failure) throw failure.error;
+	// End observers can fail while other tools still execute. Join every accepted
+	// pipeline, then publish every known native outcome before propagating failure.
 	const orderedFinalizedCalls = settled.flatMap((entry) => (entry.status === "fulfilled" ? [entry.value] : []));
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
+		await emitToolResultMessage(toolResultMessage, emit).catch((error: unknown) => {
+			failure ??= { error };
+		});
 		messages.push(toolResultMessage);
 	}
 
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		failure,
 	};
 }
 
@@ -1058,6 +1075,16 @@ function createToolResultMessage(finalized: FinalizedToolCallOutcome): ToolResul
 }
 
 async function emitToolResultMessage(toolResultMessage: ToolResultMessage, emit: AgentEventSink): Promise<void> {
-	await emit({ type: "message_start", message: toolResultMessage });
-	await emit({ type: "message_end", message: toolResultMessage });
+	let failure: { error: unknown } | undefined;
+	try {
+		await emit({ type: "message_start", message: toolResultMessage });
+	} catch (error) {
+		failure = { error };
+	}
+	try {
+		await emit({ type: "message_end", message: toolResultMessage });
+	} catch (error) {
+		failure ??= { error };
+	}
+	if (failure) throw failure.error;
 }
