@@ -1149,11 +1149,11 @@ export class AgentSession {
 	private _queuedInputTransferFailed = false;
 
 	private _installQueuedInputCustody(): void {
-		this.agent.transferQueuedMessage = async (message, queue) => {
+		this.agent.transferQueuedMessage = async (message, queue, source) => {
 			try {
 				if (this._queuedInputAppendFailure) throw this._queuedInputAppendFailure.error;
 				const accepted = structuredClone(message);
-				if (accepted.role !== "user") return;
+				if (accepted.role !== "user" && accepted.role !== "system") return;
 				const append = async () => {
 					const revision = this.sessionManager.revision();
 					try {
@@ -1161,7 +1161,9 @@ export class AgentSession {
 							? await appendOwnedTerminalMessage(this.sessionManager, accepted)
 							: this.sessionManager.appendMessage(accepted);
 						this._queuedInputCustody.set(message, { id, original: JSON.stringify(accepted) });
+						this._entryIdsByMessage.set(source, id);
 						this._entryIdsByMessage.set(message, id);
+						this._recordMessageEntryId(message, id);
 					} catch (error) {
 						// A legacy append can change the index before its disk write throws.
 						// Owned journals also fail closed on uncertain terminal writes.
@@ -1526,7 +1528,7 @@ export class AgentSession {
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
 			const custody = this._queuedInputCustody.get(event.message);
-			if (custody && event.message.role === "user") {
+			if (custody && (event.message.role === "user" || event.message.role === "system")) {
 				entryId = custody.id;
 				// Preserve supported message_end replacement without duplicating accepted input.
 				if (JSON.stringify(event.message) !== custody.original) {

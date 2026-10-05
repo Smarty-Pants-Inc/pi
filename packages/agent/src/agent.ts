@@ -270,7 +270,11 @@ export class Agent {
 	/** Tool execution strategy for assistant messages that contain multiple tool calls. */
 	public toolExecution: ToolExecutionMode;
 	/** Transfer queued input to durable custody before consuming it or publishing events. */
-	public transferQueuedMessage?: (message: AgentMessage, queue: "steer" | "followUp") => Promise<void>;
+	public transferQueuedMessage?: (
+		message: AgentMessage,
+		queue: "steer" | "followUp",
+		source: AgentMessage,
+	) => Promise<void>;
 
 	constructor(options: AgentOptions) {
 		// Older compiled consumers may omit options or streamFn even though the current API requires them.
@@ -679,7 +683,7 @@ export class Agent {
 					: this.followUpQueue.hasReserved(source)
 						? "followUp"
 						: undefined;
-				if (queue) await this.transferQueuedMessage?.(event.message, queue);
+				if (queue) await this.transferQueuedMessage?.(event.message, queue, source);
 				this.steeringQueue.consume(source);
 				this.followUpQueue.consume(source);
 				this._state.streamingMessage = event.message;
