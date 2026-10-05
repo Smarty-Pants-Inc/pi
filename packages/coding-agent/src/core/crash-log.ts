@@ -142,7 +142,7 @@ export function recordCrash(
 	}
 }
 
-/** Return the newest recent crash, marking pending records as announced. */
+/** Return the newest recent crash and mark only that record as announced; older unseen crashes stay pending (smarty-dev#5271). */
 export function takeUnnotifiedCrash(path = crashLogPath(), now = Date.now()): CrashRecord | undefined {
 	const records = readCrashLog(path);
 	const crash = [...records]
@@ -151,7 +151,7 @@ export function takeUnnotifiedCrash(path = crashLogPath(), now = Date.now()): Cr
 	if (!crash) return undefined;
 	try {
 		writeCrashLog(
-			records.map((record) => (record.notified ? record : { ...record, notified: true })),
+			records.map((record) => (record === crash ? { ...record, notified: true } : record)),
 			path,
 		);
 	} catch {
