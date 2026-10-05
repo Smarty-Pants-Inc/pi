@@ -1143,17 +1143,21 @@ export class ExtensionRunner {
 					continue: shouldContinue,
 					context,
 				} as TurnEndEvent | AgentBeforeSettleEvent;
+				let handlerCompleted = false;
 				try {
 					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
 						| BoundaryResult
 						| undefined;
 					signal?.throwIfAborted();
+					handlerCompleted = true;
 					entries = structuredClone(handlerResult?.entries !== undefined ? handlerResult.entries : event.entries);
 					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
 				} catch (err) {
 					signal?.throwIfAborted();
 					try {
-						entries = structuredClone(event.entries);
+						// A malformed returned proposal rolls back the whole contribution, including draft edits.
+						entries = handlerCompleted ? previousEntries : structuredClone(event.entries);
+						if (handlerCompleted) shouldContinue = previousContinue;
 					} catch {
 						entries = previousEntries;
 						shouldContinue = previousContinue;

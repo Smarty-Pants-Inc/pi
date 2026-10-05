@@ -20,8 +20,15 @@ describe("malformed boundary contribution isolation", () => {
 				first.handlers.set("agent_before_settle", [async () => ({ entries: [draft], continue: true })]);
 				bad.handlers.set("agent_before_settle", [
 					async (event) => {
-						if (!mutation) return { entries, continue: false };
 						if (typeof event !== "object" || event === null) throw new Error("Expected boundary event");
+						if (!mutation) {
+							if (typeof entries !== "number" && entries[0] !== null) {
+								Reflect.set(event, "entries", [
+									{ type: "custom", customType: "discard-this-edit", data: "bad" },
+								]);
+							}
+							return { entries, continue: false };
+						}
 						Reflect.set(event, "entries", entries);
 						Reflect.set(event, "continue", false);
 						return undefined;
