@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { Context, JsonRepresentation } from "@earendil-works/chord";
 import { createModels, type DeferredHandle, fauxAssistantMessage, type Models } from "@earendil-works/pi-ai";
 import {
+	createSession,
 	defineDoc,
 	GenerationTask,
 	type Harness,
@@ -153,10 +154,33 @@ async function fixture(
 			cancellation = "success";
 		},
 		close: async () => {
+			storage.mode = "healthy";
 			release.resolve();
 			for (const harness of harnesses) await harness.close(context);
 		},
 	};
+}
+
+/** PR #141: a permanent outage is not an accepted close result. Restore storage only after proving retention. */
+async function recoverClose(f: Awaited<ReturnType<typeof fixture>>, harness: Harness, id: TaskId): Promise<void> {
+	await waitFor(() => f.stats().cancellations > 0);
+	let closed = false;
+	const closing = harness.close(context).then(() => {
+		closed = true;
+	});
+	try {
+		await new Promise((resolve) => setTimeout(resolve, 20));
+		if (closed) {
+			// This mock rejects poll adoption, not a confirmed-cancellation fence resolution.
+			expect(await f.storage.task(id, context)).toMatchObject({
+				abortRequested: true,
+				state: { checkpoint: { acceptanceUncertain: false } },
+			});
+		}
+	} finally {
+		f.storage.mode = "healthy";
+		await closing;
+	}
 }
 
 async function idOf(harness: Harness, conversationId: Parameters<Harness["conversation"]>[0]): Promise<TaskId> {
@@ -285,22 +309,19 @@ describe("PR #131 round-3 receipt adoption", () => {
 			await f.reached.promise;
 			const id = await idOf(opened.harness, opened.root.id);
 			f.release.resolve();
-			await waitFor(() => f.storage.failures > 0);
-			await opened.harness.close(context);
+			await recoverClose(f, opened.harness, id);
 			f.storage.mode = "healthy";
 			opened = await f.open();
 			opened.harness.resume();
 			await new Promise((resolve) => setTimeout(resolve, 30));
 			expect(f.stats().requests).toBe(1);
-			expect(
-				(await opened.harness.inspect(context)).tasks.find((task) => task.record.id === id)?.state,
-			).toMatchObject({
-				kind: "blocked",
-				reason: "acceptance_uncertain",
+			expect((await opened.harness.snapshot(Receipts, context))?.receipts[String(id)]).toMatchObject({
+				status: "cancel_failed",
+				checkpoint: { handle: f.handle },
 			});
-			expect((await opened.harness.getTask(id, context))?.state).toMatchObject({
-				checkpoint: { acceptanceUncertain: true },
-			});
+			expect((await opened.harness.snapshot(Receipts, context))?.receipts[String(id)]?.checkpoint.handle).toEqual(
+				f.handle,
+			);
 		} finally {
 			await f.close();
 		}
@@ -314,22 +335,30 @@ describe("PR #131 round-3 receipt adoption", () => {
 			await opened.root.submit({ type: "input", content: "hi" }, context);
 			await f.reached.promise;
 			const id = await idOf(opened.harness, opened.root.id);
+			const dispatched = await f.storage.task(id, context);
 			f.release.resolve();
-			await waitFor(() => f.storage.failures > 0);
-			await opened.harness.close(context);
+			await recoverClose(f, opened.harness, id);
 			f.storage.mode = "healthy";
 			const stored = await f.storage.task(id, context);
 			if (stored?.state.status !== "running") throw new Error("Expected interrupted request");
-			const checkpoint = stored.state.checkpoint;
+			if (dispatched?.state.status !== "running") throw new Error("Expected dispatched request");
+			const checkpoint = dispatched.state.checkpoint;
 			if (checkpoint === null || typeof checkpoint !== "object" || Array.isArray(checkpoint))
 				throw new Error("Expected checkpoint object");
 			const { acceptanceUncertain: _uncertain, ...historicalCheckpoint } = checkpoint;
+			// Recreate an actual pre-ledger historical fence; do not erase modern custody implicitly.
+			const kernel = createSession(f.storage);
+			await kernel.commit(async (tx) => {
+				(await tx.doc(Receipts)).receipts = {};
+			}, context);
+			await kernel.close(context);
 			await f.storage.commit(
 				[
 					{
 						type: "task",
 						value: {
 							...stored,
+							abortRequested: false,
 							state: { ...stored.state, checkpoint: historicalCheckpoint },
 						},
 					},
@@ -454,20 +483,18 @@ describe("PR #131 round-3 receipt adoption", () => {
 			await f.reached.promise;
 			const id = await idOf(opened.harness, opened.root.id);
 			f.release.resolve();
-			await waitFor(() => f.storage.failures > 0);
-			await opened.harness.close(context);
+			await recoverClose(f, opened.harness, id);
 			expect(f.stats()).toEqual({ requests: 1, cancellations: 1 });
 			f.storage.mode = "healthy";
 			opened = await f.open();
+			expect(await opened.harness.getTask(id, context)).toMatchObject({
+				abortRequested: true,
+				state: { checkpoint: { acceptanceUncertain: false } },
+			});
 			opened.harness.resume();
 			await new Promise((resolve) => setTimeout(resolve, 30));
 			expect(f.stats().requests).toBe(1);
-			expect(
-				(await opened.harness.inspect(context)).tasks.find((task) => task.record.id === id)?.state,
-			).toMatchObject({
-				kind: "blocked",
-				reason: "acceptance_uncertain",
-			});
+			expect((await opened.harness.snapshot(Receipts, context))?.receipts ?? {}).toEqual({});
 		} finally {
 			await f.close();
 		}
@@ -483,8 +510,7 @@ describe("PR #131 round-3 receipt adoption", () => {
 				await f.reached.promise;
 				const id = await idOf(opened.harness, opened.root.id);
 				f.release.resolve();
-				await waitFor(() => f.storage.failures > 0);
-				await opened.harness.close(context);
+				await recoverClose(f, opened.harness, id);
 				expect(f.stats()).toEqual({ requests: 1, cancellations: 1 });
 				expect(
 					f.base.reports.some(
@@ -499,11 +525,9 @@ describe("PR #131 round-3 receipt adoption", () => {
 				opened.harness.resume();
 				await new Promise((resolve) => setTimeout(resolve, 30));
 				expect(f.stats().requests).toBe(1);
-				expect(
-					(await opened.harness.inspect(context)).tasks.find((task) => task.record.id === id)?.state,
-				).toMatchObject({
-					kind: "blocked",
-					reason: "acceptance_uncertain",
+				expect((await opened.harness.snapshot(Receipts, context))?.receipts[String(id)]).toMatchObject({
+					status: "cancel_failed",
+					checkpoint: { handle: f.handle },
 				});
 			} finally {
 				await f.close();

@@ -33,11 +33,12 @@ class TwoFailures extends MemoryStorage {
 		);
 		if (adopting || this.failures > 0) {
 			this.attempts++;
-			if (this.failures < 2 || !this.available) {
+			if (this.failures < 2) {
 				this.failures++;
 				if (this.failures === 1) throw new StorageRejected("synthetic first adoption rejected");
 				throw new Error("synthetic storage admission uncertainty");
 			}
+			if (!this.available) throw new Error("synthetic ongoing storage outage");
 		}
 		return super.commit(writes, ctx);
 	}
@@ -46,10 +47,13 @@ class TwoFailures extends MemoryStorage {
 
 // PR #141 security P2 #9: neither cancellation outcome may abandon the sole accepted receipt.
 describe("two-adoption failure custody", () => {
-	for (const cancellation of ["success", "failure"] as const) {
-		it(`durably retires ${cancellation} cancellation before close and does not submit twice`, async () => {
+	for (const { cancellation, delayed } of (["success", "failure"] as const).flatMap((cancellation) =>
+		[false, true].map((delayed) => ({ cancellation, delayed })),
+	)) {
+		it(`durably retires ${cancellation} cancellation before close and does not submit twice (outage: ${delayed})`, async () => {
 			const base = chatSetup();
 			const storage = new TwoFailures();
+			storage.available = !delayed;
 			const reached = deferred();
 			const release = deferred();
 			let requests = 0;
@@ -92,7 +96,20 @@ describe("two-adoption failure custody", () => {
 			const id = (await opened.harness.snapshot(LiveDoc, opened.root.id, context))!.run!.taskId;
 			release.resolve();
 			await waitFor(() => cancels > 0);
-			await opened.harness.close(context);
+			await expect(opened.harness.commit(() => {}, context)).rejects.toThrow(/poisoned/);
+			let closed = false;
+			const closing = opened.harness.close(context).then(() => {
+				closed = true;
+			});
+			try {
+				if (delayed) {
+					await new Promise((resolve) => setTimeout(resolve, 20));
+					expect(closed, "close must retain sole handle while storage is unavailable").toBe(false);
+				}
+			} finally {
+				storage.available = true;
+				await closing;
+			}
 			expect(storage.failures).toBe(2);
 			expect(requests).toBe(1);
 			const reopened = await openChat(storage, { ...base, models });
