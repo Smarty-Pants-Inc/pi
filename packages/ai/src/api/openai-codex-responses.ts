@@ -8,6 +8,7 @@ import type {
 
 import {
 	getOAuthDiagnosticSecrets,
+	OAuthDiagnosticError,
 	oauthResponseError,
 	oauthStopReason,
 	redactOAuthDiagnostic,
@@ -38,6 +39,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { isRetryableProviderError } from "../utils/provider-error-classification.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -132,20 +134,8 @@ function assertSuccessfulOutput(output: AssistantMessage): asserts output is Suc
 // Retry Helpers
 // ============================================================================
 
-function isTerminalRateLimitError(errorText: string): boolean {
-	return /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing/i.test(
-		errorText,
-	);
-}
-
 function isRetryableError(status: number, errorText: string): boolean {
-	if (status === 429 && isTerminalRateLimitError(errorText)) {
-		return false;
-	}
-	if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
-		return true;
-	}
-	return /rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused/i.test(errorText);
+	return isRetryableProviderError(`${status} ${errorText}`);
 }
 
 function getRetryAfterDelayMs(headers: Headers): number | undefined {
@@ -469,7 +459,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					if (
 						attempt < maxRetries &&
 						!(lastError instanceof RetryDelayExceededError) &&
-						!lastError.message.includes("usage limit")
+						(!(lastError instanceof OAuthDiagnosticError) || safeOAuthError(lastError, true).retryable === true)
 					) {
 						const delayMs = BASE_DELAY_MS * 2 ** attempt;
 						await sleep(delayMs, options?.signal);
