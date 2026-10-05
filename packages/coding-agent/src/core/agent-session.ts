@@ -3839,8 +3839,11 @@ export class AgentSession {
 
 	private _clearManualCompactionState(controller: AbortController): void {
 		if (this._compactionAbortController === controller) this._compactionAbortController = undefined;
-		this.#auditState("manual_compaction_settled");
-		this._resolveIdleWaitIfIdle();
+		try {
+			this.#auditState("manual_compaction_settled");
+		} finally {
+			this._resolveIdleWaitIfIdle();
+		}
 	}
 
 	/**
@@ -3999,10 +4002,11 @@ export class AgentSession {
 					usage,
 				);
 			}
+			committedResult = { summary, firstKeptEntryId, tokensBefore, usage, details };
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
-			committedResult = { summary, firstKeptEntryId, tokensBefore, estimatedTokensAfter, usage, details };
+			committedResult.estimatedTokensAfter = estimatedTokensAfter;
 
 			// Match the actual append, even when an earlier entry has the same summary.
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.id === compactionId) as
@@ -4039,6 +4043,8 @@ export class AgentSession {
 			return compactionResult;
 		} catch (error) {
 			if (committedResult) {
+				// A committed effect does not waive the original owner authority fence.
+				attempt?.check();
 				// The row and context already committed. Publication failure cannot turn
 				// that effect into a retryable summary failure or session_compact_failed.
 				committedResult.notificationFailure = { code: "COMPACTION_NOTIFICATION_FAILED", count: 1 };
