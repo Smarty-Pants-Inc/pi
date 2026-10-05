@@ -221,30 +221,32 @@ export class AgentSessionRuntime {
 		reason: SessionShutdownEvent["reason"],
 		targetSessionFile?: string,
 	): Promise<void> {
-		// Settle any active response first so the aborted turn (including tool
-		// results) is persisted to the outgoing session before it is replaced.
 		this.#assertCurrent(outgoing);
 		outgoing.session.shutdownSignal?.throwIfAborted();
-		await outgoing.session.abort();
-		outgoing.session.shutdownSignal?.throwIfAborted();
-		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason,
-			targetSessionFile,
-		});
-		this.#assertCurrent(outgoing);
-		this.beforeSessionInvalidate?.();
-		this.#assertCurrent(outgoing);
-		outgoing.session.dispose();
+		// Revoke held observer dispatch before joining the turn whose settlement it owns.
+		outgoing.session.cancelForShutdown();
+		try {
+			// Accepted native outcomes still drain/persist; failure of this bound refuses replacement.
+			await this.#joinForDisposal(outgoing);
+			this.#assertCurrent(outgoing);
+			await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+				type: "session_shutdown",
+				reason,
+				targetSessionFile,
+			});
+			this.#assertCurrent(outgoing);
+			this.beforeSessionInvalidate?.();
+		} finally {
+			this.#assertCurrent(outgoing);
+			outgoing.session.dispose();
+		}
 	}
 
 	async #replace(outgoing: OutgoingSession, options: Parameters<CreateAgentSessionRuntimeFactory>[0]): Promise<void> {
-		outgoing.session.shutdownSignal?.throwIfAborted();
+		// The outgoing terminal signal was deliberately cancelled by teardown; identity remains the fence.
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(options.sessionManager);
 		const { session, services, diagnostics, modelFallbackMessage } = await this.createRuntime(Object.freeze(options));
-		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(session.sessionManager);
 		this._session = session;
