@@ -706,6 +706,47 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("message and entry renderers", () => {
+		// Refs smarty-dev#5049: user-renderer registration follows existing load order and runtime ownership.
+		it("loads a user renderer, keeps the first extension and drops it when reloaded without registration", async () => {
+			const file = path.join(extensionsDir, "a-user-renderer.ts");
+			fs.writeFileSync(file, `export default function(pi) { pi.registerUserMessageRenderer(() => undefined); }`);
+			fs.writeFileSync(
+				path.join(extensionsDir, "b-user-renderer.ts"),
+				`export default function(pi) { pi.registerUserMessageRenderer(() => undefined); }`,
+			);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			expect(result.errors).toEqual([]);
+			expect(runner.getUserMessageRenderer()).toBe(result.extensions[0].userMessageRenderer);
+			expect(runner.getUserMessageRenderer()).not.toBe(result.extensions[1].userMessageRenderer);
+			fs.writeFileSync(file, `export default function() {}`);
+			fs.writeFileSync(path.join(extensionsDir, "b-user-renderer.ts"), `export default function() {}`);
+			const reloaded = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const next = new ExtensionRunner(
+				reloaded.extensions,
+				reloaded.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+			expect(next.getUserMessageRenderer()).toBeUndefined();
+		});
+
+		it("rejects user-renderer registration after runtime invalidation", async () => {
+			const runtime = createExtensionRuntime();
+			let register: (() => void) | undefined;
+			await loadExtensionFromFactory(
+				(pi) => {
+					register = () => pi.registerUserMessageRenderer(() => undefined);
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			runtime.invalidate("stale renderer runtime");
+			expect(() => register?.()).toThrow("stale renderer runtime");
+		});
+
 		it("gets Markdown transformers in extension load order", async () => {
 			const extCode = `
 				export default function(pi) {

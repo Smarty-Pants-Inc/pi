@@ -1338,6 +1338,20 @@ export interface MessageRenderOptions {
 	outputPad: number;
 }
 
+export interface UserMessageRenderOptions {
+	/** Horizontal padding configured by the outputPad setting. */
+	outputPad: number;
+	/** Original user-message timestamp in milliseconds since the Unix epoch. */
+	timestamp: number;
+}
+
+/** Display-only rendering of user text. Return undefined to use Pi's native rendering. */
+export type UserMessageRenderer = (
+	text: string,
+	options: UserMessageRenderOptions,
+	theme: Theme,
+) => Component | undefined;
+
 export interface MarkdownTransformContext {
 	messageType: "user" | "assistant" | "assistant-thinking";
 	isStreaming: boolean;
@@ -1515,6 +1529,9 @@ export interface ExtensionAPI {
 
 	/** Register a custom renderer for CustomMessageEntry. */
 	registerMessageRenderer<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
+
+	/** Register a display-only renderer for user text in the interactive transcript. */
+	registerUserMessageRenderer(renderer: UserMessageRenderer): void;
 
 	/** Register a transformer for user and assistant Markdown before Pi renders it in the interactive transcript. */
 	registerMarkdownTransformer(transformer: MarkdownTransformer): void;
@@ -1977,6 +1994,7 @@ export interface Extension {
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
+	userMessageRenderer?: UserMessageRenderer;
 	markdownTransformer?: MarkdownTransformer;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;

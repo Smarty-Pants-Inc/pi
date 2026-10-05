@@ -89,6 +89,7 @@ import type {
 	UIPromptKind,
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageRenderer,
 } from "./types.ts";
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
@@ -734,6 +735,10 @@ export class ExtensionRunner {
 			}
 		}
 		return undefined;
+	}
+
+	getUserMessageRenderer(): UserMessageRenderer | undefined {
+		return this.extensions.find((ext) => ext.userMessageRenderer)?.userMessageRenderer;
 	}
 
 	getMarkdownTransformers(): MarkdownTransformer[] {
