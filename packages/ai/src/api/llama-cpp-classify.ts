@@ -287,7 +287,16 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 				throw error;
 			}
 		},
-		{ maxRetries: options?.maxRetries ?? 2, maxRetryDelayMs: options?.maxRetryDelayMs, signal: request.signal },
+		{
+			maxRetries: options?.maxRetries ?? 2,
+			maxRetryDelayMs: options?.maxRetryDelayMs,
+			signal: request.signal,
+			diagnosticSecrets: getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
+				...(options?.diagnosticSecrets ?? []),
+				...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
+			]),
+			oauthDiagnostics: options?.oauthDiagnostics,
+		},
 	);
 	if (observe) {
 		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -487,11 +496,11 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		output.errorMessage = formatProviderError(
 			normalizeProviderError(
 				error,
-				getOAuthDiagnosticSecrets(
-					options?.apiKey,
-					{ ...model.headers, ...options?.headers },
-					options?.diagnosticSecrets,
-				),
+				getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
+					...(options?.diagnosticSecrets ?? []),
+					...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
+				]),
+				options?.oauthDiagnostics,
 			),
 			`${LABEL} error`,
 		);

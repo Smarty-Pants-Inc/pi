@@ -232,6 +232,7 @@ export async function classifySystemOne(
 				maxRetryDelayMs: options.maxRetryDelayMs,
 				signal,
 				diagnosticSecrets,
+				oauthDiagnostics: options.oauthDiagnostics,
 			},
 		);
 		await options.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
@@ -244,7 +245,7 @@ export async function classifySystemOne(
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, diagnosticSecrets),
+			normalizeProviderError(error, diagnosticSecrets, options?.oauthDiagnostics),
 			`${transport.label} error`,
 		);
 		return output;

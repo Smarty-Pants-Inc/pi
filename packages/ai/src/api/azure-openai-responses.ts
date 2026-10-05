@@ -1,5 +1,6 @@
 import { AzureOpenAI } from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import { oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -73,7 +74,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 	context: TranscriptContext,
 	options?: AzureOpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const stream = new AssistantMessageEventStream(model, options);
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	// Start async processing
@@ -268,6 +269,8 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 	const { baseUrl, apiVersion } = resolveAzureConfig(model, options);
 
 	return new AzureOpenAI({
+		logLevel: "off",
+		logger: oauthDiagnosticLogger,
 		apiKey,
 		apiVersion,
 		dangerouslyAllowBrowser: true,

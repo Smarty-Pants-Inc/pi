@@ -127,7 +127,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 	context: TranscriptContext,
 	options: BedrockOptions = {},
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const stream = new AssistantMessageEventStream(model, options);
 	// Bedrock has no mid-conversation system messages; fold them into the leading prompt.
 	const normalizedContext = collapseSystemMessages(context);
 

@@ -6,7 +6,7 @@ import type {
 	ChatCompletionContentPartText,
 	ChatCompletionCreateParamsNonStreaming,
 } from "openai/resources/chat/completions.js";
-import { oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
+import { getOAuthDiagnosticSecrets, oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantImages,
 	ImageApi,
@@ -54,12 +54,16 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		timestamp: Date.now(),
 	};
 
+	const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
+		...(options?.diagnosticSecrets ?? []),
+		...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
+	]);
 	try {
 		const apiKey = options?.apiKey;
 		if (!apiKey) {
 			throw new Error(`No API key for provider: ${model.provider}`);
 		}
-		const client = createClient(model, apiKey, options?.headers, options?.fetch, options?.oauthDiagnostics);
+		const client = createClient(model, apiKey, options?.headers, options?.fetch);
 		let params = buildParams(model, context);
 		const nextParams = await options?.onPayload?.(params, model);
 		if (nextParams !== undefined) {
@@ -79,7 +83,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 				maxRetries: options?.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs,
 				signal: options?.signal,
-				diagnosticSecrets: options?.diagnosticSecrets,
+				diagnosticSecrets,
 				oauthDiagnostics: options?.oauthDiagnostics,
 			},
 		);
@@ -115,7 +119,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, options?.diagnosticSecrets, options?.oauthDiagnostics),
+			normalizeProviderError(error, diagnosticSecrets, options?.oauthDiagnostics),
 		);
 		return output;
 	}
@@ -126,10 +130,10 @@ function createClient(
 	apiKey: string,
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
-	oauthDiagnostics = false,
 ): OpenAI {
 	return new OpenAI({
-		logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
+		logLevel: "off",
+		logger: oauthDiagnosticLogger,
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,

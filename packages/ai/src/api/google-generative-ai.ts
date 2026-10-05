@@ -61,7 +61,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 	context: TranscriptContext,
 	options?: GoogleOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const stream = new AssistantMessageEventStream(model, options);
 	const normalizedContext = collapseSystemMessages(context);
 
 	(async () => {

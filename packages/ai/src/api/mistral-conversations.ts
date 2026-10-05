@@ -126,7 +126,7 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 	context: TranscriptContext,
 	options?: MistralOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const stream = new AssistantMessageEventStream(model, options);
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	(async () => {

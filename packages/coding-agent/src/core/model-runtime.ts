@@ -53,6 +53,7 @@ import {
 	type Provider,
 	type ProviderHeaders,
 	type ProviderRequestOptions,
+	requestSetupError,
 	type SimpleStreamOptions,
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
@@ -752,63 +753,71 @@ export class ModelRuntime implements Models {
 		model: TModel;
 		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 	}> {
-		const owner = this.#ordinaryOwner;
-		owner?.assertCredentialBinding();
-		owner?.assertNativeTokenReservation();
-		owner?.assertSubmission();
-		owner?.assertPreparedFetch(options?.fetch);
-		const provider = this.models.getProvider(model.provider);
-		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
-		const resolution = await this.getAuth(model, {
-			apiKey: options?.apiKey,
-			env: options?.env,
-			signal: options?.signal,
-		});
-		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+		try {
+			const owner = this.#ordinaryOwner;
+			owner?.assertCredentialBinding();
+			owner?.assertNativeTokenReservation();
+			owner?.assertSubmission();
+			owner?.assertPreparedFetch(options?.fetch);
+			const provider = this.models.getProvider(model.provider);
+			if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
+			const resolution = await this.getAuth(model, {
+				apiKey: options?.apiKey,
+				env: options?.env,
+				signal: options?.signal,
+			});
+			if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
 
-		const { transformHeaders, ...rawProviderOptions } = options ?? {};
-		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
-		const apiKey = providerOptions.apiKey ?? resolution.auth.apiKey;
-		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
-		const diagnosticSecrets = getOAuthDiagnosticSecrets(resolution.auth.apiKey, resolution.auth.headers, [
-			...(resolution.diagnosticSecrets ?? []),
-			...(providerOptions.diagnosticSecrets ?? []),
-			...getOAuthDiagnosticSecrets(apiKey, headers),
-		]);
-		if (transformHeaders) headers = await transformHeaders(headers ?? {});
-		diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));
-		const env =
-			resolution.env || providerOptions.env
-				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
-				: undefined;
-		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
-		if (owner) {
-			owner.assertCredentialBinding();
-			owner.assertNativeTokenReservation();
-			owner.assertPreparedFetch(providerOptions.fetch);
-			owner.assertSubmission();
-			const allowed = owner.decision.record.provider;
-			if (
-				this.models.getProvider(model.provider) !== provider ||
-				requestModel.provider !== allowed.provider ||
-				requestModel.id !== allowed.model ||
-				requestModel.api !== allowed.api ||
-				requestModel.baseUrl !== allowed.baseUrl
-			) {
-				throw new Error("OWNER_PREPARED_PROVIDER_IDENTITY");
+			const { transformHeaders, ...rawProviderOptions } = options ?? {};
+			const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> &
+				ProviderRequestOptions<TModel>;
+			const apiKey = providerOptions.apiKey ?? resolution.auth.apiKey;
+			let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
+			const diagnosticSecrets = getOAuthDiagnosticSecrets(resolution.auth.apiKey, resolution.auth.headers, [
+				...(resolution.diagnosticSecrets ?? []),
+				...(providerOptions.diagnosticSecrets ?? []),
+				...getOAuthDiagnosticSecrets(apiKey, headers),
+			]);
+			if (transformHeaders) headers = await transformHeaders(headers ?? {});
+			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));
+			const env =
+				resolution.env || providerOptions.env
+					? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
+					: undefined;
+			const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+			if (owner) {
+				owner.assertCredentialBinding();
+				owner.assertNativeTokenReservation();
+				owner.assertPreparedFetch(providerOptions.fetch);
+				owner.assertSubmission();
+				const allowed = owner.decision.record.provider;
+				if (
+					this.models.getProvider(model.provider) !== provider ||
+					requestModel.provider !== allowed.provider ||
+					requestModel.id !== allowed.model ||
+					requestModel.api !== allowed.api ||
+					requestModel.baseUrl !== allowed.baseUrl
+				) {
+					throw new Error("OWNER_PREPARED_PROVIDER_IDENTITY");
+				}
 			}
+			return {
+				provider,
+				model: requestModel,
+				options: {
+					...providerOptions,
+					apiKey,
+					diagnosticSecrets,
+					oauthDiagnostics: resolution.source === "OAuth" || providerOptions.oauthDiagnostics === true,
+					headers,
+					env,
+				} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
+			};
+		} catch (error) {
+			// Preparation callbacks receive live credentials. Every exported
+			// operation must reject with owned text and no original cause chain.
+			throw requestSetupError(error);
 		}
-		return {
-			provider,
-			model: requestModel,
-			options: {
-				...providerOptions,
-				apiKey,
-				diagnosticSecrets,
-				headers,
-				env,
-			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
-		};
 	}
 
 	stream<TApi extends Api>(

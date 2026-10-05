@@ -1,4 +1,6 @@
-import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
+import { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
+import type { AssistantMessage, AssistantMessageEvent, ProviderHeaders, StreamOptions } from "../types.ts";
+import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 
 class FifoQueue<T> {
 	private incoming: T[] = [];
@@ -88,8 +90,10 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	}
 }
 
+const diagnosticPolicies = new WeakMap<AssistantMessageEventStream, { secrets: readonly string[]; oauth: boolean }>();
+
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
+	constructor(model?: { headers?: ProviderHeaders }, options?: StreamOptions) {
 		super(
 			(event) => event.type === "done" || event.type === "error",
 			(event) => {
@@ -101,6 +105,37 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new Error("Unexpected event type for final result");
 			},
 		);
+		if (model) {
+			diagnosticPolicies.set(this, {
+				secrets: getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
+					...(options?.diagnosticSecrets ?? []),
+					...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
+				]),
+				oauth: options?.oauthDiagnostics === true || options?.apiKey?.includes("sk-ant-oat") === true,
+			});
+		}
+	}
+
+	override push(event: AssistantMessageEvent): void {
+		const policy = diagnosticPolicies.get(this);
+		if (policy) {
+			const message =
+				"partial" in event
+					? event.partial
+					: event.type === "done"
+						? event.message
+						: event.type === "error"
+							? event.error
+							: undefined;
+			if (message) projectAssistantMessageDiagnostics(message, policy.secrets, policy.oauth);
+		}
+		super.push(event);
+	}
+
+	override end(result?: AssistantMessage): void {
+		const policy = diagnosticPolicies.get(this);
+		if (result && policy) projectAssistantMessageDiagnostics(result, policy.secrets, policy.oauth);
+		super.end(result);
 	}
 }
 

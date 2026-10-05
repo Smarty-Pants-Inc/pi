@@ -420,7 +420,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	context: TranscriptContext,
 	options?: PiMessagesOptions,
 ): AssistantMessageEventStream => {
-	const eventStream = new AssistantMessageEventStream();
+	const eventStream = new AssistantMessageEventStream(model, options);
 	const convertEvent = createEventConverter(model, options?.oauthDiagnostics);
 	let callbackError = false;
 	let partial: AssistantMessage | undefined;
