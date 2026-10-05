@@ -45,20 +45,11 @@ export function agentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): EventStream<AgentEvent, AgentMessage[]> {
-	const stream = createAgentStream();
+	const { stream, emit, fail } = createAgentStream(config);
 
-	void runAgentLoop(
-		prompts,
-		context,
-		config,
-		async (event) => {
-			stream.push(event);
-		},
-		signal,
-		streamFn,
-	).then((messages) => {
+	void runAgentLoop(prompts, context, config, emit, signal, streamFn).then((messages) => {
 		stream.end(messages);
-	});
+	}, fail);
 
 	return stream;
 }
@@ -85,19 +76,11 @@ export function agentLoopContinue(
 		throw new Error("Cannot continue from message role: assistant");
 	}
 
-	const stream = createAgentStream();
+	const { stream, emit, fail } = createAgentStream(config);
 
-	void runAgentLoopContinue(
-		context,
-		config,
-		async (event) => {
-			stream.push(event);
-		},
-		signal,
-		streamFn,
-	).then((messages) => {
+	void runAgentLoopContinue(context, config, emit, signal, streamFn).then((messages) => {
 		stream.end(messages);
-	});
+	}, fail);
 
 	return stream;
 }
@@ -154,11 +137,49 @@ export async function runAgentLoopContinue(
 	return newMessages;
 }
 
-function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
-	return new EventStream<AgentEvent, AgentMessage[]>(
+function createAgentStream(config: AgentLoopConfig): {
+	stream: EventStream<AgentEvent, AgentMessage[]>;
+	emit: AgentEventSink;
+	fail: (error: unknown) => void;
+} {
+	const stream = new EventStream<AgentEvent, AgentMessage[]>(
 		(event: AgentEvent) => event.type === "agent_end",
 		(event: AgentEvent) => (event.type === "agent_end" ? event.messages : []),
 	);
+	const messages: AgentMessage[] = [];
+	return {
+		stream,
+		emit: (event) => {
+			if (event.type === "message_end") messages.push(event.message);
+			stream.push(event);
+		},
+		fail: () => {
+			// The exported producer owns rejection. Preserve published outcomes and finish iteration/result.
+			const message: AssistantMessage = {
+				role: "assistant",
+				content: [],
+				api: config.model.api,
+				provider: config.model.provider,
+				model: config.model.id,
+				stopReason: "error",
+				errorMessage: "Agent loop failed",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			stream.push({ type: "message_start", message });
+			stream.push({ type: "message_end", message });
+			messages.push(message);
+			stream.push({ type: "agent_end", messages });
+			stream.end(messages);
+		},
+	};
 }
 
 /**
@@ -607,57 +628,89 @@ async function executeToolCallsSequential(
 	let failure: { error: unknown } | undefined;
 
 	for (const toolCall of toolCalls) {
-		await queue.run({ id: toolCall.id, exclusive: true, signal }, async () => {
-			await emit({
-				type: "tool_execution_start",
-				toolCallId: toolCall.id,
-				toolName: toolCall.name,
-				args: toolCall.arguments,
-			});
+		await queue.run(
+			{ id: toolCall.id, exclusive: true, signal },
+			async () => {
+				await emit({
+					type: "tool_execution_start",
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					args: toolCall.arguments,
+				});
 
-			const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal, tools);
-			let finalized: FinalizedToolCallOutcome;
-			if (preparation.kind === "immediate") {
-				finalized = {
-					toolCall,
-					result: preparation.result,
-					isError: preparation.isError,
-				};
-			} else {
-				const executed = await executePreparedToolCall(
-					preparation,
-					signal,
-					emitToolExecutionUpdate(toolCall, emit),
-				);
-				finalized = await finalizeExecutedToolCall(
+				const preparation = await prepareToolCall(
 					currentContext,
 					assistantMessage,
-					preparation,
-					executed,
+					toolCall,
 					config,
 					signal,
+					tools,
 				);
-			}
+				let finalized: FinalizedToolCallOutcome;
+				if (preparation.kind === "immediate") {
+					finalized = {
+						toolCall,
+						result: preparation.result,
+						isError: preparation.isError,
+					};
+				} else {
+					const executed = await executePreparedToolCall(
+						preparation,
+						signal,
+						emitToolExecutionUpdate(toolCall, emit),
+					);
+					finalized = await finalizeExecutedToolCall(
+						currentContext,
+						assistantMessage,
+						preparation,
+						executed,
+						config,
+						signal,
+					);
+				}
 
-			await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
-				failure ??= { error };
-			});
-			const toolResultMessage = createToolResultMessage(finalized);
-			await emitToolResultMessage(toolResultMessage, emit).catch((error: unknown) => {
-				failure ??= { error };
-			});
-			finalizedCalls.push(finalized);
-			messages.push(toolResultMessage);
-		});
+				await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
+					failure ??= { error };
+				});
+				const toolResultMessage = createToolResultMessage(finalized);
+				await emitToolResultMessage(toolResultMessage, emit).catch((error: unknown) => {
+					failure ??= { error };
+				});
+				finalizedCalls.push(finalized);
+				messages.push(toolResultMessage);
+			},
+			async () => {
+				const finalized: FinalizedToolCallOutcome = {
+					toolCall,
+					result: createErrorToolResult("Operation aborted"),
+					isError: true,
+				};
+				await emit({
+					type: "tool_execution_start",
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					args: toolCall.arguments,
+				});
+				await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
+					failure ??= { error };
+				});
+				const message = createToolResultMessage(finalized);
+				await emitToolResultMessage(message, emit).catch((error: unknown) => {
+					failure ??= { error };
+				});
+				finalizedCalls.push(finalized);
+				messages.push(message);
+			},
+		);
 
-		if (signal?.aborted || failure) {
+		if (failure) {
 			break;
 		}
 	}
 
 	return {
 		messages,
-		terminate: shouldTerminateToolBatch(finalizedCalls),
+		terminate: signal?.aborted === true || shouldTerminateToolBatch(finalizedCalls),
 		failure,
 	};
 }
