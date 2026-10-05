@@ -26,6 +26,7 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BuildMiddleware, DeserializeMiddleware, DocumentType, HttpResponse, MetadataBearer } from "@smithy/types";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -127,6 +128,32 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 	context: TranscriptContext,
 	options: BedrockOptions = {},
 ): AssistantMessageEventStream => {
+	const bearerToken =
+		options.bearerToken ||
+		options.apiKey ||
+		getProviderEnvValue("AWS_BEARER_TOKEN_BEDROCK", options.env) ||
+		undefined;
+	// Use the same resolved bearer source for SDK authentication and diagnostic publication.
+	// Signing credentials may also appear in setup/SDK errors; capture every configured field.
+	options = {
+		...options,
+		// SDK profile/default-chain tokens are not observable here; withhold their diagnostics.
+		oauthDiagnostics:
+			options.oauthDiagnostics === true ||
+			(!bearerToken &&
+				(Boolean(getProviderEnvValue("AWS_PROFILE", options.env) || options.profile) ||
+					!getProviderEnvValue("AWS_ACCESS_KEY_ID", options.env) ||
+					!getProviderEnvValue("AWS_SECRET_ACCESS_KEY", options.env))),
+		diagnosticSecrets: [
+			...(options.diagnosticSecrets ?? []),
+			...getOAuthDiagnosticSecrets(bearerToken),
+			...getOAuthDiagnosticSecrets(options.bearerToken),
+			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_BEARER_TOKEN_BEDROCK", options.env)),
+			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_ACCESS_KEY_ID", options.env)),
+			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_SECRET_ACCESS_KEY", options.env)),
+			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_SESSION_TOKEN", options.env)),
+		],
+	};
 	const stream = new AssistantMessageEventStream(model, options);
 	// Bedrock has no mid-conversation system messages; fold them into the leading prompt.
 	const normalizedContext = collapseSystemMessages(context);
@@ -179,11 +206,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 
 		// Resolve bearer token for Bedrock API key auth.
 		const skipAuth = getProviderEnvValue("AWS_BEDROCK_SKIP_AUTH", options.env) === "1";
-		const bearerToken =
-			options.bearerToken ||
-			options.apiKey ||
-			getProviderEnvValue("AWS_BEARER_TOKEN_BEDROCK", options.env) ||
-			undefined;
 		const useBearerToken = bearerToken !== undefined && !skipAuth;
 
 		// in Node.js/Bun environment only

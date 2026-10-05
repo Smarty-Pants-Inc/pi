@@ -669,6 +669,7 @@ async function executeToolCallsSequential(
 					);
 				}
 
+				failure ??= finalized.publicationFailure;
 				await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
 					failure ??= { error };
 				});
@@ -774,6 +775,7 @@ async function executeToolCallsParallel(
 						config,
 						signal,
 					);
+					failure ??= finalized.publicationFailure;
 					await emitToolExecutionEnd(finalized, emit).catch((error: unknown) => {
 						failure ??= { error };
 					});
@@ -839,10 +841,7 @@ type ImmediateToolCallOutcome = {
 	isError: boolean;
 };
 
-type ExecutedToolCallOutcome = {
-	result: AgentToolResult<any>;
-	isError: boolean;
-};
+type ExecutedToolCallOutcome = Pick<AgentToolCallOutcome, "result" | "isError" | "publicationFailure">;
 
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
 
@@ -996,7 +995,20 @@ export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallO
 		return { toolCall, result: preparation.result, isError: preparation.isError };
 	}
 	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}));
-	return finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
+	const finalized = await finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
+	if (!finalized.publicationFailure) return finalized;
+	// Direct callers still receive a tool error, but the accepted effect and its accounting
+	// remain available independently. Model-issued calls journal the native result first.
+	const error = finalized.publicationFailure.error;
+	return {
+		...finalized,
+		completedResult: finalized.result,
+		result: {
+			...finalized.result,
+			content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
+		},
+		isError: true,
+	};
 }
 
 async function executePreparedToolCall(
@@ -1032,11 +1044,13 @@ async function executePreparedToolCall(
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);
 	}
-	if (failure) {
-		const error = failure.error;
-		return { result: createErrorToolResult(error instanceof Error ? error.message : String(error)), isError: true };
+	if (result !== undefined) {
+		// Observer failures do not undo a completed native effect. Drain updates above,
+		// retain its receipt/usage, then propagate publication failure after journaling.
+		return { result, isError: result.isError === true, publicationFailure: failure };
 	}
-	return { result: result!, isError: result!.isError === true };
+	const error = failure?.error;
+	return { result: createErrorToolResult(error instanceof Error ? error.message : String(error)), isError: true };
 }
 
 async function finalizeExecutedToolCall(
@@ -1049,6 +1063,7 @@ async function finalizeExecutedToolCall(
 ): Promise<FinalizedToolCallOutcome> {
 	let result = executed.result;
 	let isError = executed.isError;
+	let publicationFailure = executed.publicationFailure;
 
 	if (config.afterToolCall) {
 		try {
@@ -1083,8 +1098,9 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = createErrorToolResult(error instanceof Error ? error.message : String(error));
-			isError = true;
+			result = executed.result;
+			isError = executed.isError;
+			publicationFailure ??= { error };
 		}
 	}
 
@@ -1092,6 +1108,7 @@ async function finalizeExecutedToolCall(
 		toolCall: prepared.toolCall,
 		result,
 		isError,
+		publicationFailure,
 	};
 }
 

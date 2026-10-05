@@ -1,4 +1,4 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import Anthropic from "@anthropic-ai/sdk";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
@@ -70,15 +70,16 @@ const minimalAnthropicEvents = [
 ];
 
 function createFakeAnthropicClient(response: Response): Anthropic {
-	return {
-		beta: {
-			messages: {
-				create: () => ({
-					asResponse: async () => response,
-				}),
-			},
-		},
-	} as unknown as Anthropic;
+	// pi#141: rich SSE diagnostics require a bound SDK credential, not an opaque client.
+	// The transport is still entirely in-process; every original assertion remains unchanged.
+	return new Anthropic({
+		apiKey: "synthetic-sse-client",
+		authToken: null,
+		webhookKey: null,
+		baseURL: "https://mock.invalid",
+		maxRetries: 0,
+		fetch: async () => response,
+	});
 }
 
 type ResponseContentBlock = { type: "thinking"; thinking: string; signature: string } | { type: "text"; text: string };

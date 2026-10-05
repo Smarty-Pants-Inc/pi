@@ -584,6 +584,49 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	context: TranscriptContext,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
+	// Bind supplied-client authentication once, before both stream publication and adapter diagnostics.
+	const suppliedClientOptions = options?.client
+		? (options.client as unknown as { _options?: ClientOptions })._options
+		: undefined;
+	let suppliedClientOAuth = false;
+	if (options?.client) {
+		const secrets = getOAuthDiagnosticSecrets(
+			options.client.apiKey ?? undefined,
+			{},
+			getOAuthDiagnosticSecrets(options.client.authToken ?? undefined),
+		);
+		const collectHeaders = (headers: unknown, name = "x-api-key"): void => {
+			if (typeof headers === "string") {
+				secrets.push(...getOAuthDiagnosticSecrets(headers, { [name]: headers }));
+			} else if (headers instanceof Headers) {
+				headers.forEach((value, key) => {
+					collectHeaders(value, key);
+				});
+			} else if (Array.isArray(headers)) {
+				for (const value of headers) {
+					if (Array.isArray(value) && typeof value[0] === "string") collectHeaders(value[1], value[0]);
+					else collectHeaders(value, name);
+				}
+			} else if (headers && typeof headers === "object") {
+				for (const [key, value] of Object.entries(headers)) collectHeaders(value, key);
+			}
+		};
+		collectHeaders(suppliedClientOptions?.defaultHeaders);
+		suppliedClientOAuth = Boolean(options.client.authToken) || secrets.some(isOAuthToken);
+		// Dynamic/custom authentication cannot be completely captured before dispatch.
+		const unboundAuth =
+			!(options.client instanceof Anthropic) ||
+			!suppliedClientOptions ||
+			typeof suppliedClientOptions.apiKey === "function" ||
+			Boolean(options.client.credentials) ||
+			Boolean(suppliedClientOptions.middleware?.length) ||
+			secrets.length === 0;
+		options = {
+			...options,
+			diagnosticSecrets: [...(options.diagnosticSecrets ?? []), ...secrets],
+			oauthDiagnostics: options.oauthDiagnostics === true || suppliedClientOAuth || unboundAuth,
+		};
+	}
 	const stream = new AssistantMessageEventStream(model, options);
 	const normalizedContext = resolveTranscript(context, getAnthropicCompat(model).supportsMidConvoSystemMessages);
 	const currentTools = getCurrentTools(normalizedContext.messages);
@@ -630,7 +673,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 								logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
 							})
 						: options.client;
-				isOAuth = false;
+				isOAuth = suppliedClientOAuth;
 			} else {
 				const apiKey = options?.apiKey;
 				const federation = getAnthropicFederation(model, apiKey, options?.headers, options?.env);
