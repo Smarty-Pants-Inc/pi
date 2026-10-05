@@ -35,9 +35,9 @@ import { captureToolImplementation, isToolImplementationCurrent } from "./types.
 export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
 
 /**
- * Clone a tool result for a hook without losing enumerable metadata on native values.
- * structuredClone copies Error and RegExp instances but omits their custom enumerable
- * properties, which are part of the accepted arbitrary details contract.
+ * Clone a tool result for a hook, restoring metadata and native state omitted by
+ * structuredClone. Ordinary accessors have already been evaluated by the snapshot;
+ * restoration must reuse those captured values rather than consume a getter again.
  */
 function cloneToolResult<T>(value: T): T {
 	const clone = structuredClone(value);
@@ -66,21 +66,38 @@ function cloneToolResult<T>(value: T): T {
 			let index = 0;
 			for (const entry of source) copy.add(restoreNativeMetadata(entry, entries[index++]));
 		}
-		if (source instanceof Error && copy instanceof Error && "cause" in source) {
-			copy.cause = restoreNativeMetadata(source.cause, copy.cause);
+		if (source instanceof AggregateError && copy instanceof Error) {
+			Object.setPrototypeOf(copy, AggregateError.prototype);
 		}
 
-		const sourceRecord = source as Record<string, unknown>;
-		const copyRecord = copy as Record<string, unknown>;
-		for (const key of Object.keys(source)) {
-			if (source instanceof Error || source instanceof RegExp || Object.hasOwn(copy, key)) {
-				Object.defineProperty(copy, key, {
-					value: restoreNativeMetadata(sourceRecord[key], Object.hasOwn(copy, key) ? copyRecord[key] : undefined),
-					writable: true,
-					enumerable: true,
-					configurable: true,
-				});
-			}
+		const sourceRecord = source as Record<PropertyKey, unknown>;
+		const copyRecord = copy as Record<PropertyKey, unknown>;
+		for (const key of Reflect.ownKeys(source)) {
+			const descriptor = Object.getOwnPropertyDescriptor(source, key);
+			if (!descriptor) continue;
+			const nativeState =
+				(source instanceof Error && key === "cause") ||
+				(source instanceof AggregateError && key === "errors") ||
+				(source instanceof RegExp && key === "lastIndex");
+			if (!descriptor.enumerable && !nativeState) continue;
+			const copiedDescriptor = Object.getOwnPropertyDescriptor(copy, key);
+			// A data descriptor lets us traverse the original graph without invoking
+			// accessors again. A captured accessor value is already an isolated snapshot.
+			const restored =
+				"value" in descriptor
+					? restoreNativeMetadata(
+							descriptor.value,
+							nativeState && key === "lastIndex" ? undefined : copiedDescriptor?.value,
+						)
+					: copiedDescriptor
+						? copiedDescriptor.value
+						: restoreNativeMetadata(sourceRecord[key]);
+			Object.defineProperty(copyRecord, key, {
+				value: restored,
+				writable: true,
+				enumerable: descriptor.enumerable,
+				configurable: copiedDescriptor?.configurable ?? true,
+			});
 		}
 		return copy;
 	};
