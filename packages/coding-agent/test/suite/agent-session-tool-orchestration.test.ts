@@ -4,7 +4,7 @@ import { fauxAssistantMessage, fauxToolCall, getCurrentTools, type TranscriptCon
 import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
+import type { ExtensionAPI, ExtensionToolContext } from "../../src/core/extensions/types.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import { createToolSearchExtension } from "../../src/extensions/tool-search/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -117,6 +117,61 @@ describe("AgentSession tool orchestration", () => {
 			.getBranch()
 			.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
 		expect(persisted?.type === "message" && persisted.message).toMatchObject({ nestedCalls: result.nestedCalls });
+	});
+
+	it("joins fire-and-forget native children before persisting complete parent provenance", async () => {
+		let retained: ExtensionToolContext | undefined;
+		let child: Promise<unknown> | undefined;
+		let effects = 0;
+		const harness = await createHarness({
+			initialActiveToolNames: [],
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "child",
+						label: "Child",
+						description: "Native child",
+						parameters: Type.Object({}),
+						execute: async () => {
+							await new Promise((resolve) => setTimeout(resolve, 20));
+							effects++;
+							return { content: [], details: {} };
+						},
+					});
+					pi.registerTool({
+						name: "parent",
+						label: "Parent",
+						description: "Native parent",
+						parameters: Type.Object({}),
+						execute: async (_id, _args, _signal, _update, ctx) => {
+							retained = ctx;
+							child = ctx.executeTool("child", {});
+							return { content: [], details: {} };
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("parent", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		try {
+			await harness.session.prompt("go");
+			const result = harness.session.messages.find((message) => message.role === "toolResult");
+			expect(result).toMatchObject({ nestedCalls: { complete: true, calls: [{ name: "child", status: "ok" }] } });
+			expect(effects).toBe(1);
+			await expect(retained!.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
+			expect(effects).toBe(1);
+			const persisted = harness.sessionManager
+				.getBranch()
+				.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
+			expect(persisted?.type === "message" && persisted.message).toMatchObject({ nestedCalls: { complete: true } });
+		} finally {
+			await child;
+		}
 	});
 
 	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)

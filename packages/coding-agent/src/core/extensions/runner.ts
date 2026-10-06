@@ -384,6 +384,8 @@ export class ExtensionRunner {
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
 	private executeToolFn: ExtensionContextActions["executeTool"];
 	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
+	/** Admission and joining are per call, not per session or captured context. */
+	private readonly toolScopes = new Map<string, { closed: boolean; pending: Set<Promise<unknown>> }>();
 	/** Registered MCP servers already reported as unhandled. */
 	private readonly reportedMcpServers = new Set<string>();
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
@@ -983,6 +985,12 @@ export class ExtensionRunner {
 	 */
 	createToolContext(toolCallId: string, signal: AbortSignal | undefined): ExtensionToolContext {
 		const runner = this;
+		let scope = this.toolScopes.get(toolCallId);
+		if (!scope) {
+			scope = { closed: false, pending: new Set() };
+			this.toolScopes.set(toolCallId, scope);
+		}
+		const callScope = scope;
 		// createContext() returns a fresh object, so adding properties does not affect other contexts.
 		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
 			tools: {
@@ -1004,10 +1012,34 @@ export class ExtensionRunner {
 							isError: true,
 						};
 					}
-					return runner.executeToolFn(toolCallId, name, args, { ...options, signal: options.signal ?? signal });
+					if (callScope.closed) throw new Error("Nested tool call scope is closed after parent settlement");
+					const signals = [signal, options.signal, runner.shutdownSignal].filter(
+						(candidate): candidate is AbortSignal => candidate !== undefined,
+					);
+					const childSignal = signals.length ? AbortSignal.any(signals) : undefined;
+					childSignal?.throwIfAborted();
+					// Register before dispatch: even fire-and-forget children belong to this call.
+					const pending = Promise.resolve().then(() => {
+						childSignal?.throwIfAborted();
+						return runner.executeToolFn!(toolCallId, name, args, { ...options, signal: childSignal });
+					});
+					callScope.pending.add(pending);
+					try {
+						return await pending;
+					} finally {
+						callScope.pending.delete(pending);
+					}
 				},
 			},
 		});
+	}
+
+	private async closeToolScope(toolCallId: string): Promise<void> {
+		const scope = this.toolScopes.get(toolCallId);
+		if (!scope) return;
+		scope.closed = true;
+		await Promise.allSettled(scope.pending);
+		this.toolScopes.delete(toolCallId);
 	}
 
 	createCommandContext(): ExtensionCommandContext {
@@ -1197,6 +1229,12 @@ export class ExtensionRunner {
 		event: TEvent,
 		operationSignal?: AbortSignal,
 	): Promise<RunnerEmitResult<TEvent>> {
+		// Join before any observer, persistence, or cancellation can skip finalization.
+		if (event.type === "tool_execution_end") {
+			await this.closeToolScope(event.toolCallId);
+		} else if (event.type === "agent_end") {
+			await Promise.all([...this.toolScopes.keys()].map((id) => this.closeToolScope(id)));
+		}
 		const signal = this.dispatchSignal(event.type, operationSignal ?? ("signal" in event ? event.signal : undefined));
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
@@ -1317,6 +1355,7 @@ export class ExtensionRunner {
 	}
 
 	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
+		await this.closeToolScope(event.toolCallId);
 		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = structuredClone(event);

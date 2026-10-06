@@ -148,6 +148,9 @@ interface CallScope {
 	nextId: number;
 	/** Set inside a call that holds the exclusive queue, so its own nested calls do not wait on it. */
 	holdsQueue: boolean;
+	closed: boolean;
+	signal?: AbortSignal;
+	pending: Set<Promise<AgentToolCallOutcome>>;
 }
 
 function textOf(result: AgentToolResult<unknown>): string {
@@ -172,7 +175,7 @@ export class NestedToolCallRunner {
 	 * Run `name` on behalf of the call `callerId`. The nested call gets the id `<callerId>/<n>`.
 	 * Never rejects for tool failures: they come back as `isError: true`.
 	 */
-	async execute(
+	execute(
 		callerId: string,
 		name: string,
 		args: unknown,
@@ -180,9 +183,35 @@ export class NestedToolCallRunner {
 	): Promise<AgentToolCallOutcome> {
 		let scope = this.scopes.get(callerId);
 		if (!scope) {
-			scope = { recorder: new NestedCallRecorder(), nextId: 1, holdsQueue: false };
+			scope = {
+				recorder: new NestedCallRecorder(),
+				nextId: 1,
+				holdsQueue: false,
+				closed: false,
+				pending: new Set(),
+			};
 			this.scopes.set(callerId, scope);
 		}
+		if (scope.closed) return Promise.reject(new Error("Nested tool call scope is closed"));
+		const signals = [scope.signal, options.signal].filter((signal): signal is AbortSignal => signal !== undefined);
+		const signal = signals.length ? AbortSignal.any(signals) : undefined;
+		if (signal?.aborted) return Promise.reject(signal.reason);
+		const pending = this.executeInScope(callerId, scope, name, args, { ...options, signal });
+		scope.pending.add(pending);
+		void pending.then(
+			() => scope.pending.delete(pending),
+			() => scope.pending.delete(pending),
+		);
+		return pending;
+	}
+
+	private async executeInScope(
+		callerId: string,
+		scope: CallScope,
+		name: string,
+		args: unknown,
+		options: NestedToolCallOptions,
+	): Promise<AgentToolCallOutcome> {
 		const toolCall: AgentToolCall = {
 			type: "toolCall",
 			id: `${callerId}/${scope.nextId++}`,
@@ -210,25 +239,40 @@ export class NestedToolCallRunner {
 			});
 			await previous;
 		}
-		this.scopes.set(toolCall.id, {
+		const childScope: CallScope = {
 			recorder: scope.recorder,
 			nextId: 1,
 			holdsQueue: scope.holdsQueue || exclusive,
-		});
+			closed: false,
+			signal: options.signal,
+			pending: new Set(),
+		};
+		this.scopes.set(toolCall.id, childScope);
 		let outcome: AgentToolCallOutcome;
 		try {
-			outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
-				options.onUpdate?.(partialResult);
-				await this.host.emit({
-					type: "tool_execution_update",
-					toolCallId: toolCall.id,
-					toolName: name,
-					args: toolCall.arguments,
-					partialResult,
-					parentToolCallId: callerId,
+			if (options.signal?.aborted) {
+				outcome = {
+					toolCall,
+					result: {
+						content: [{ type: "text", text: "Nested tool call cancelled before execution" }],
+						details: {},
+					},
+					isError: true,
+				};
+			} else
+				outcome = await this.host.runToolCall(toolCall, callerId, options.signal, async (partialResult) => {
+					options.onUpdate?.(partialResult);
+					await this.host.emit({
+						type: "tool_execution_update",
+						toolCallId: toolCall.id,
+						toolName: name,
+						args: toolCall.arguments,
+						partialResult,
+						parentToolCallId: callerId,
+					});
 				});
-			});
 		} finally {
+			await this.closeScope(childScope);
 			this.scopes.delete(toolCall.id);
 			release?.();
 		}
@@ -247,15 +291,28 @@ export class NestedToolCallRunner {
 		return outcome;
 	}
 
+	private async closeScope(scope: CallScope): Promise<void> {
+		scope.closed = true;
+		await Promise.allSettled(scope.pending);
+	}
+
 	/** Remove and return the record of the nested calls a model-issued call made. */
 	takeRecord(toolCallId: string): NestedCallSummary | undefined {
 		const scope = this.scopes.get(toolCallId);
 		this.scopes.delete(toolCallId);
 		if (!scope) return undefined;
+		scope.closed = true;
 		return { calls: scope.recorder.snapshot(), usage: scope.recorder.totalUsage };
 	}
 
 	clear(): void {
-		this.scopes.clear();
+		// Normal tool-end dispatch has already joined these calls. On abrupt teardown,
+		// close admission immediately but retain live recorder state until children settle.
+		for (const [id, scope] of this.scopes) {
+			scope.closed = true;
+			void this.closeScope(scope).then(() => {
+				if (this.scopes.get(id) === scope) this.scopes.delete(id);
+			});
+		}
 	}
 }
