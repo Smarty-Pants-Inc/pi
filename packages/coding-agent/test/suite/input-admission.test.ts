@@ -9,7 +9,7 @@ import {
 	type AgentSessionServices,
 	type CreateAgentSessionRuntimeFactory,
 } from "../../src/core/agent-session-runtime.ts";
-import type { BoundaryResult, ExtensionFactory } from "../../src/core/extensions/index.ts";
+import type { BoundaryResult, ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/index.ts";
 import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
@@ -721,7 +721,8 @@ describe("native input admission v1", () => {
 	});
 
 	// smarty-dev#3814 / PR #117 R5-2/R5-S2 and R6-3/R6-S3: cancelled settlement descendants cannot start effectful native entries.
-	it.each(["bash", "compact", "bug-report"] as const)(
+	// pi#132 R1-S5/R1-S7: native history, label, loadout and exec helpers also refuse revoked callbacks.
+	it.each(["bash", "compact", "bug-report", "append-entry", "set-label", "set-active-tools", "exec"] as const)(
 		"failed recoverable disposal refuses actual late settlement %s",
 		async (entry) => {
 			const entered = gate(),
@@ -731,9 +732,11 @@ describe("native input admission v1", () => {
 			let lateResult: unknown;
 			let lateAuthCalls = 0;
 			let settlementStarted = false;
+			let api!: ExtensionAPI;
 			h = await createHarness({
 				extensionFactories: [
 					(pi) => {
+						api = pi;
 						pi.on("agent_settled", () => {
 							if (settlementStarted) return;
 							settlementStarted = true;
@@ -741,12 +744,25 @@ describe("native input admission v1", () => {
 								entered.release();
 								await held.promise;
 								lateAuthCalls = authCalls.mock.calls.length;
-								const call =
+								const sentinel = join(h.tempDir, "late-sentinel");
+								const call: Promise<unknown> =
 									entry === "bash"
-										? h.session.executeBash(`printf late > '${join(h.tempDir, "late-sentinel")}'`)
+										? h.session.executeBash(`printf late > '${sentinel}'`)
 										: entry === "compact"
 											? h.session.compact()
-											: h.session.summarizeForBugReport({ signal: new AbortController().signal });
+											: entry === "bug-report"
+												? h.session.summarizeForBugReport({ signal: new AbortController().signal })
+												: entry === "exec"
+													? Promise.resolve().then(() =>
+															pi.exec("sh", ["-c", `printf late > '${sentinel}'`]),
+														)
+													: Promise.resolve().then(() =>
+															entry === "append-entry"
+																? pi.appendEntry("late-entry", { late: true })
+																: entry === "set-label"
+																	? pi.setLabel(h.sessionManager.getEntries()[0]!.id, "late-label")
+																	: pi.setActiveTools([]),
+														);
 								lateResult = await call.then(
 									() => "accepted",
 									(error: unknown) => error,
@@ -777,6 +793,8 @@ describe("native input admission v1", () => {
 			const messages = structuredClone(h.session.messages);
 			const history = structuredClone(h.sessionManager.getEntries());
 			const revision = h.sessionManager.revision();
+			const tools = h.session.getActiveToolNames();
+			const systemPrompt = h.session.systemPrompt;
 			await expect(
 				runtime.dispose({
 					rejectQueuedInput: () => {
@@ -799,8 +817,25 @@ describe("native input admission v1", () => {
 			expect(h.session.messages).toEqual(messages);
 			expect(h.sessionManager.getEntries()).toEqual(history);
 			expect(h.sessionManager.revision()).toBe(revision);
+			expect(h.session.getActiveToolNames()).toEqual(tools);
+			expect(h.session.systemPrompt).toBe(systemPrompt);
 			// Unrelated fresh SDK calls still work after recoverable refusal.
-			if (entry === "bash") {
+			if (entry === "exec") {
+				const sentinel = join(h.tempDir, "fresh-sentinel");
+				expect(await api.exec("sh", ["-c", `printf fresh > '${sentinel}'`])).toMatchObject({ code: 0 });
+				expect(existsSync(sentinel)).toBe(true);
+			} else if (entry === "append-entry") {
+				api.appendEntry("fresh-entry", { fresh: true });
+				expect(h.sessionManager.getEntries().at(-1)).toMatchObject({ type: "custom", customType: "fresh-entry" });
+			} else if (entry === "set-label") {
+				api.setLabel(h.sessionManager.getEntries()[0]!.id, "fresh-label");
+				expect(h.sessionManager.getLabel(h.sessionManager.getEntries()[0]!.id)).toBe("fresh-label");
+			} else if (entry === "set-active-tools") {
+				api.setActiveTools([]);
+				expect(h.session.getActiveToolNames()).toEqual([]);
+				h.session.setActiveToolsByName(tools);
+				expect(h.session.getActiveToolNames()).toEqual(tools);
+			} else if (entry === "bash") {
 				const sentinel = join(h.tempDir, "fresh-sentinel");
 				expect(await h.session.executeBash(`printf fresh > '${sentinel}'`)).toMatchObject({ exitCode: 0 });
 				expect(existsSync(sentinel)).toBe(true);
@@ -818,6 +853,165 @@ describe("native input admission v1", () => {
 			}
 		},
 	);
+
+	// pi#132 R1-S3: an unrelated SDK compact() cannot abort or compact a fenced (replacing) session.
+	it.each(["held-replacement", "fence-during-join"] as const)(
+		"external compaction refuses the lifecycle fence (%s)",
+		async (phase) => {
+			const entered = gate(),
+				held = gate();
+			const h = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_switch", async () => {
+							entered.release();
+							await held.promise;
+						});
+					},
+				],
+				settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+			});
+			harnesses.push(h);
+			const authCalls = vi.spyOn(
+				h.session as unknown as { _getSummarizationRequestAuth: (...args: unknown[]) => Promise<unknown> },
+				"_getSummarizationRequestAuth",
+			);
+			h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("summary A")]);
+			await h.session.prompt("original input");
+			const runtime = await runtimeFor(h);
+			const history = structuredClone(h.sessionManager.getEntries());
+			const revision = h.sessionManager.revision();
+			let compaction: Promise<unknown>;
+			let release: (() => void) | undefined;
+			let replacement: Promise<unknown> | undefined;
+			if (phase === "held-replacement") {
+				replacement = runtime.newSession().catch((error: unknown) => error);
+				await entered.promise;
+				expect(h.session.inputsFenced).toBe(true);
+				compaction = h.session.compact().catch((error: unknown) => error);
+			} else {
+				// The fence is acquired after compact() passed its entry check, while it joins abort().
+				compaction = h.session.compact().catch((error: unknown) => error);
+				release = await h.session.fenceInputs();
+			}
+			expect(await compaction).toMatchObject({ code: "INPUT_ADMISSION_FENCED" });
+			expect(authCalls).not.toHaveBeenCalled();
+			expect(h.getPendingResponseCount()).toBe(1);
+			expect(h.sessionManager.getEntries()).toEqual(history);
+			expect(h.sessionManager.revision()).toBe(revision);
+			release?.();
+			held.release();
+			await replacement;
+			if (phase === "fence-during-join") {
+				// After the fence is released, an ordinary compaction still works.
+				await h.session.compact();
+				expect(h.sessionManager.getEntries().at(-1)).toMatchObject({ type: "compaction" });
+			}
+		},
+	);
+
+	// pi#132 R1-S4: bash already started under live ancestry keeps its cancelled result and one history receipt.
+	it("already-started settlement bash keeps its cancelled result and history receipt after revocation", async () => {
+		const started = gate();
+		let h!: Harness;
+		let lateHandler: Promise<void> | undefined;
+		let lateResult: unknown;
+		let settlementStarted = false;
+		h = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("agent_settled", () => {
+						if (settlementStarted) return;
+						settlementStarted = true;
+						lateHandler = (async () => {
+							lateResult = await h.session
+								.executeBash("printf started; sleep 30", (chunk) => {
+									if (chunk.includes("started")) started.release();
+								})
+								.catch((error: unknown) => error);
+						})();
+						return lateHandler;
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		h.setResponses([fauxAssistantMessage("original reply")]);
+		const runtime = await runtimeFor(h);
+		const run = h.session.prompt("original input");
+		await started.promise;
+		await h.session.steer("retained steer");
+		const bashBefore = h.session.messages.filter((item) => item.role === "bashExecution").length;
+		await expect(
+			runtime.dispose({
+				rejectQueuedInput: () => {
+					throw new Error("authoritative receipt failed");
+				},
+			}),
+		).rejects.toThrow("authoritative receipt failed");
+		await run;
+		await lateHandler;
+		expect(lateResult).toMatchObject({ cancelled: true, output: expect.stringContaining("started") });
+		const receipts = h.session.messages.filter((item) => item.role === "bashExecution");
+		expect(receipts).toHaveLength(bashBefore + 1);
+		expect(receipts.at(-1)).toMatchObject({ command: "printf started; sleep 30", cancelled: true });
+		// Late public recording from the revoked lineage stays refused; fresh bash still works.
+		const sentinel = join(h.tempDir, "fresh-sentinel");
+		expect(await h.session.executeBash(`printf fresh > '${sentinel}'`)).toMatchObject({ exitCode: 0 });
+		expect(existsSync(sentinel)).toBe(true);
+	});
+
+	// pi#132 R1-S6: a refused handler-origin deferred action cannot orphan an unrelated external ticket behind it.
+	it("a revoked deferred settlement action does not orphan an unrelated external custom submission", async () => {
+		const entered = gate(),
+			held = gate();
+		let settlementStarted = false;
+		const h = await setup([
+			(pi) => {
+				pi.on("agent_settled", async () => {
+					if (settlementStarted) return;
+					settlementStarted = true;
+					pi.sendMessage(
+						{ customType: "handler-origin", content: "handler", display: false },
+						{ triggerTurn: true },
+					);
+					entered.release();
+					await held.promise;
+				});
+			},
+		]);
+		h.setResponses([fauxAssistantMessage("original reply"), fauxAssistantMessage("fresh reply")]);
+		const runtime = await runtimeFor(h);
+		const run = h.session.prompt("original input");
+		await entered.promise;
+		let settled = false;
+		const external = h.session
+			.sendCustomMessage({ customType: "external", content: "external", display: false }, { triggerTurn: true })
+			.then(
+				() => "accepted",
+				(error: unknown) => error,
+			)
+			.finally(() => {
+				settled = true;
+			});
+		await h.session.steer("retained steer");
+		await expect(
+			runtime.dispose({
+				rejectQueuedInput: () => {
+					throw new Error("authoritative receipt failed");
+				},
+			}),
+		).rejects.toThrow("authoritative receipt failed");
+		await run.catch(() => undefined);
+		await vi.waitFor(() => expect(settled).toBe(true), { timeout: 5000 });
+		const outcome = await external;
+		expect(outcome === "accepted" || (outcome as { code?: string }).code === "INPUT_ADMISSION_FENCED").toBe(true);
+		expect(h.session.messages.some((item) => item.role === "custom" && item.customType === "handler-origin")).toBe(
+			false,
+		);
+		held.release();
+		expect(h.session.isDisposed).toBe(false);
+	});
 
 	// PR #117 R6-1/R6-S1: cancelled compaction-hook descendants cannot regain native authority after failed recoverable disposal.
 	it.each(

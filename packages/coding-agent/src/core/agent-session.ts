@@ -1237,6 +1237,8 @@ export class AgentSession {
 		this._settlementCompletion = new Promise<void>((resolve) => {
 			completed = resolve;
 		});
+		// Run every removed ticket before propagating the first refusal, so none is orphaned (#132 R1-S6).
+		const failures: unknown[] = [];
 		try {
 			try {
 				await raceWithAbortSignal(
@@ -1261,9 +1263,9 @@ export class AgentSession {
 				for (const action of this._deferredSettledActions.splice(0)) {
 					const actionScope = { active: true };
 					try {
-						await this._settlementActionScope.run(actionScope, action).catch((error: unknown) => {
-							if (!this._shutdownCancellation.signal.aborted) throw error;
-						});
+						await this._settlementActionScope.run(actionScope, action);
+					} catch (error) {
+						if (!this._shutdownCancellation.signal.aborted) failures.push(error);
 					} finally {
 						actionScope.active = false;
 					}
@@ -1273,6 +1275,7 @@ export class AgentSession {
 				completed();
 			}
 		}
+		if (failures.length > 0) throw failures[0];
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -1739,6 +1742,12 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		this._inheritedCancellation();
+		this._setActiveTools(toolNames);
+	}
+
+	/** Internal restoration and registry refresh; public mutation entries check revocation first. */
+	private _setActiveTools(toolNames: string[]): void {
 		const tools: AgentTool[] = [];
 		const validToolNames: string[] = [];
 		for (const name of toolNames) {
@@ -3782,6 +3791,8 @@ export class AgentSession {
 		const ownsHeldAdmission = admission !== undefined && this._inputAdmissions.has(admission);
 		const inherited = this._inheritedCancellation();
 		const dispatch = this._dispatchCancellationScope.getStore();
+		// An unrelated caller must not abort or compact a session whose lifecycle a replacement fence owns (#132 R1-S3).
+		this._assertInputsOpen();
 		await this.abort();
 		// abort() itself ends a caller's held admission (an extension command calling ctx.compact()). Only that
 		// self-abort is exempt: keep the admission's independently inherited revocation (PR #117 R6-2).
@@ -3791,8 +3802,9 @@ export class AgentSession {
 		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "compaction was not started");
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
-		if (!ownsHeldAdmission) return this.#compactSession(customInstructions, undefined, revocation);
+		// A fence acquired during the abort join refuses both branches.
 		this._assertInputsOpen();
+		if (!ownsHeldAdmission) return this.#compactSession(customInstructions, undefined, revocation);
 		// Hooks and their descendants inherit that revocation, not the admission this call ended itself.
 		return this._inputAdmissionScope.exit(() =>
 			this._dispatchCancellationScope.run(revocation, () =>
@@ -4710,6 +4722,7 @@ export class AgentSession {
 						});
 				},
 				appendEntry: (customType, data) => {
+					this._inheritedCancellation();
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
@@ -4723,12 +4736,14 @@ export class AgentSession {
 					return this.sessionManager.getSessionName();
 				},
 				setLabel: (entryId, label) => {
+					this._inheritedCancellation();
 					this.sessionManager.appendLabelChange(entryId, label);
 				},
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
+				inheritedCancellation: () => this._inheritedCancellation(),
 				getCommands,
 				setModel: async (model) => {
 					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
@@ -4879,7 +4894,7 @@ export class AgentSession {
 			}
 		}
 
-		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
+		this._setActiveTools([...new Set(nextActiveToolNames)]);
 	}
 
 	private _buildRuntime(options: {
@@ -5233,7 +5248,8 @@ export class AgentSession {
 			);
 
 			options?.beforeRecord?.();
-			this.recordBashResult(command, result, options);
+			// Already-started work keeps its (possibly cancelled) receipt after in-flight revocation (#132 R1-S4).
+			this._appendBashResult(command, result, options);
 			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
@@ -5246,6 +5262,10 @@ export class AgentSession {
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
 		this._inheritedCancellation();
+		this._appendBashResult(command, result, options);
+	}
+
+	private _appendBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
 		if (this._inputsDisposed)
 			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash result was not recorded");
 		const bashMessage: BashExecutionMessage = {

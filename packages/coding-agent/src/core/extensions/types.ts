@@ -1908,6 +1908,8 @@ export interface ExtensionActions {
 	getAllTools: GetAllToolsHandler;
 	setActiveTools: SetActiveToolsHandler;
 	refreshTools: RefreshToolsHandler;
+	/** Optional host hook: throws for a revoked callback, else returns its inherited cancellation (pi.exec). */
+	inheritedCancellation?: () => AbortSignal | undefined;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
