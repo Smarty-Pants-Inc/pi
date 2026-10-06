@@ -1250,6 +1250,74 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 		},
 	);
 
+	// smarty-dev#5533 Astra R1: pre-teardown errors must not disable the still-live outgoing runtime.
+	it.each(["import", "switch"] as const)(
+		"keeps ingress usable after a %s fails before teardown",
+		async (operation) => {
+			let shutdowns = 0;
+			const { runtime, initial } = await withRuntime({
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_shutdown", () => {
+							shutdowns++;
+						});
+					},
+				],
+			});
+			const { harness } = initial;
+			const oldRequest = initial.request("stale after failed replacement", "stale-replacement");
+			const path = join(harness.tempDir, "missing.jsonl");
+			if (operation === "import") {
+				await expect(within(runtime.importFromJsonl(path))).rejects.toThrow("File not found");
+			} else {
+				await expect(
+					within(runtime.switchSession(path, { cwdOverride: join(harness.tempDir, "missing-cwd") })),
+				).rejects.toThrow("Stored session working directory does not exist");
+			}
+			expect(runtime.session).toBe(harness.session);
+			expect(shutdowns).toBe(0);
+			expect(await within(initial.api().submitUserMessage(oldRequest))).toMatchObject({
+				status: "rejected",
+				reason: "session_changed",
+			});
+			await runtime.session.prompt("/ingress-generation");
+			expect(initial.generation()).not.toBe(oldRequest.sessionGeneration);
+			harness.setResponses([fauxAssistantMessage("still-live runtime reply")]);
+			const fresh = initial.request("after failed replacement", "fresh-replacement");
+			expect(await within(initial.api().submitUserMessage(fresh))).toEqual({
+				status: "accepted",
+				sessionGeneration: fresh.sessionGeneration,
+			});
+			await within(runtime.session.waitForIdle());
+			expect(getUserTexts(harness)).toEqual(["after failed replacement"]);
+			expect(getAssistantTexts(harness)).toEqual(["still-live runtime reply"]);
+			expect(harness.faux.state.callCount).toBe(1);
+		},
+	);
+
+	// smarty-dev#5533 Astra R1 counterexample: teardown failure must still close ingress before disposal.
+	it("keeps ingress closed after replacement teardown starts and fails", async () => {
+		const { runtime, initial } = await withRuntime();
+		const sentinel = new Error("outgoing teardown failure");
+		runtime.setBeforeSessionInvalidate(() => {
+			throw sentinel;
+		});
+		await expect(within(runtime.newSession())).rejects.toBe(sentinel);
+		expect(runtime.session).toBe(initial.harness.session);
+		// The loader API is still bound: refusal must come from ingress, not API invalidation or disposal.
+		expect(() => initial.api().getActiveTools()).not.toThrow();
+		await runtime.session.prompt("/ingress-generation");
+		const fresh = initial.request("after teardown failure", "teardown-failure");
+		expect(await within(initial.api().submitUserMessage(fresh))).toEqual({
+			status: "rejected",
+			reason: "session_changed",
+			sessionGeneration: fresh.sessionGeneration,
+		});
+		expect(initial.inputs).toEqual([]);
+		expect(getUserTexts(initial.harness)).toEqual([]);
+		expect(initial.harness.faux.state.callCount).toBe(0);
+	});
+
 	// smarty-dev#5533 R1: a failed resource reload must not leak its suspension into a successful retry.
 	it("recovers ingress after a failed reload without replaying delayed admissions or queued reservations", async () => {
 		const entered = gate();

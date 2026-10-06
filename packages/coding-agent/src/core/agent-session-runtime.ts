@@ -272,15 +272,13 @@ export class AgentSessionRuntime {
 	private async withUserMessageReplacement<T>(operation: () => Promise<T>): Promise<T> {
 		const session = this.#captureOutgoing().session;
 		let suspended = false;
-		let failed = true;
 		try {
 			session.beginUserMessageSessionReplacement();
 			suspended = true;
-			const result = await operation();
-			failed = false;
-			return result;
+			return await operation();
 		} finally {
-			if (suspended) session.endUserMessageSessionReplacement(failed);
+			// teardownCurrent owns fail-closed behavior; pre-teardown errors leave the runtime usable.
+			if (suspended) session.endUserMessageSessionReplacement();
 		}
 	}
 
