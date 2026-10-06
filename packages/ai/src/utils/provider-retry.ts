@@ -1,4 +1,4 @@
-import { redactOAuthDiagnostic, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import { oauthDiagnosticError } from "../auth/oauth/credential-response.ts";
 import { smartyLimitMessage } from "./error-body.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
@@ -46,41 +46,26 @@ function isRetryableProviderError(error: ProviderError): boolean {
 	);
 }
 
-function validateServerRetryDelayMs(
-	delayMs: number,
-	maxRetryDelayMs: number | undefined,
-	providerErrorMessage: string,
-): number {
+function validateServerRetryDelayMs(delayMs: number, maxRetryDelayMs: number | undefined): number {
 	const maxDelayMs = maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
 	if (maxDelayMs > 0 && delayMs > maxDelayMs) {
-		throw new Error(
-			`Server requested ${Math.ceil(delayMs / 1000)}s retry delay (max: ${Math.ceil(maxDelayMs / 1000)}s). ${providerErrorMessage}`,
-		);
+		throw oauthDiagnosticError("oauth_retry_delay_exceeded", undefined, undefined, "retryable", true);
 	}
 	return delayMs;
 }
 
-function getRetryDelayMs(
-	error: ProviderError,
-	retryIndex: number,
-	maxRetryDelayMs: number | undefined,
-	secrets?: readonly string[],
-	oauthDiagnostics = false,
-): number {
-	const message = redactOAuthDiagnostic(oauthDiagnostics ? safeOAuthError(error).message : error.message, secrets);
+function getRetryDelayMs(error: ProviderError, retryIndex: number, maxRetryDelayMs: number | undefined): number {
 	const retryAfterMs = error.headers?.get("retry-after-ms");
 	if (retryAfterMs) {
 		const value = Number.parseFloat(retryAfterMs);
-		if (Number.isFinite(value)) return validateServerRetryDelayMs(value, maxRetryDelayMs, message);
+		if (Number.isFinite(value)) return validateServerRetryDelayMs(value, maxRetryDelayMs);
 	}
-
 	const retryAfter = error.headers?.get("retry-after");
 	if (retryAfter) {
 		const seconds = Number.parseFloat(retryAfter);
 		const delayMs = Number.isNaN(seconds) ? Date.parse(retryAfter) - Date.now() : seconds * 1000;
-		if (Number.isFinite(delayMs)) return validateServerRetryDelayMs(delayMs, maxRetryDelayMs, message);
+		if (Number.isFinite(delayMs)) return validateServerRetryDelayMs(delayMs, maxRetryDelayMs);
 	}
-
 	const exponentialDelay = Math.min(0.5 * 2 ** retryIndex, 8) * 1000;
 	return exponentialDelay * (1 - Math.random() * 0.25);
 }
@@ -138,16 +123,7 @@ export async function retryProviderRequest<T>(
 
 			const retryIndex = maxRetries - retriesRemaining;
 			retriesRemaining--;
-			await abortableSleep(
-				getRetryDelayMs(
-					error,
-					retryIndex,
-					options.maxRetryDelayMs,
-					options.diagnosticSecrets,
-					options.oauthDiagnostics,
-				),
-				options.signal,
-			);
+			await abortableSleep(getRetryDelayMs(error, retryIndex, options.maxRetryDelayMs), options.signal);
 		}
 	}
 }

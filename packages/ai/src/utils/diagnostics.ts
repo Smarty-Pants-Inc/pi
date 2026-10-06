@@ -2,11 +2,11 @@ import {
 	type OAuthDiagnosticCode,
 	oauthDiagnosticError,
 	oauthRecoveryDecision,
+	SETUP_MESSAGES,
 	safeOAuthError,
 	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, JsonObject } from "../types.ts";
-import { SETUP_MESSAGES } from "./models-error.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 export interface DiagnosticErrorInfo {
@@ -42,6 +42,7 @@ export function extractDiagnosticError(
 		oauth_authorization_failed: "provider_authorization_failed",
 		oauth_stream_failed: "provider_stream_failed",
 		oauth_transport_failed: "provider_transport_failed",
+		oauth_retry_delay_exceeded: "provider_retry_delay_exceeded",
 	};
 	const code = codes[safe.code];
 	return { name: "ProviderDiagnosticError", message: safe.message.replace(safe.code, code), code };
@@ -109,7 +110,7 @@ const OWNED_STOP_REASONS = new Set([
 function projectDiagnosticText(text: string, oauth: boolean): string {
 	if (Object.values(SETUP_MESSAGES).some((value) => value === text)) return text;
 	const owned =
-		/(?:^|: )((?:oauth|provider)_(?:request_failed|invalid_response|authorization_failed|stream_failed|transport_failed)) \(HTTP (unknown|[1-5]\d\d)\)(?: provider_error=([a-z_]+))?$/.exec(
+		/(?:^|: )((?:oauth|provider)_(?:request_failed|invalid_response|authorization_failed|stream_failed|transport_failed|retry_delay_exceeded)) \(HTTP (unknown|[1-5]\d\d)\)(?: provider_error=([a-z_]+))?$/.exec(
 			text,
 		);
 	const status = owned

@@ -1,6 +1,6 @@
-import { assistantMessageThrottleWait, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import { assistantMessageThrottleWait, PROVIDER_LIMIT_DIAGNOSTIC } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage } from "../types.ts";
-import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
+import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 
 import { isPrematureProviderError, isRetryableProviderError } from "./provider-error-classification.ts";
 
@@ -116,9 +116,7 @@ export async function retryAssistantCall(
 	let lastRetry: { attempt: number; errorMessage: string } | undefined;
 	for (;;) {
 		const produced = await produce();
-		const errorMessage =
-			produced.errorMessage === undefined ? undefined : redactOAuthDiagnostic(produced.errorMessage);
-		const response = errorMessage === produced.errorMessage ? produced : { ...produced, errorMessage };
+		const response = projectAssistantMessageDiagnostics(produced);
 
 		// Abort: terminal but not successful. Never retry an aborted message.
 		if (response.stopReason === "aborted") {
