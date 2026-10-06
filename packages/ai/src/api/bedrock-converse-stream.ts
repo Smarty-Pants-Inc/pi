@@ -26,6 +26,7 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BuildMiddleware, DeserializeMiddleware, DocumentType, HttpResponse, MetadataBearer } from "@smithy/types";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -130,7 +131,8 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 	context: TranscriptContext,
 	options: BedrockOptions = {},
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	// Bedrock has no mid-conversation system messages; fold them into the leading prompt.
 	const normalizedContext = collapseSystemMessages(context);
 
@@ -361,7 +363,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				finalizeStreamingBlock(block as Block);
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatBedrockError(error);
+			output.errorMessage = formatBedrockError(error, diagnosticSecrets);
 			if (output.stopReason === "error") {
 				appendBedrockFailureDiagnostic(output, error, responseRequestId);
 			}
@@ -401,8 +403,8 @@ const BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/lat
  * human-readable prefix so downstream consumers (retry logic, context-overflow
  * detection) can distinguish error categories via simple string matching.
  */
-function formatBedrockError(error: unknown): string {
-	const norm = normalizeProviderError(error);
+function formatBedrockError(error: unknown, diagnosticSecrets: readonly string[]): string {
+	const norm = normalizeProviderError(error, diagnosticSecrets);
 	// Surface the raw HTTP body (with status) when the SDK did not fold it into
 	// the message; otherwise fall back to the message. This is what stops a
 	// gateway 403 from collapsing to `Unknown: UnknownError`.

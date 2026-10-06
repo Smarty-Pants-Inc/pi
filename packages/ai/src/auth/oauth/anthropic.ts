@@ -82,13 +82,13 @@ async function postJson(url: string, body: Record<string, string | number>, sign
 		signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
 	});
 
-	const responseBody = await response.text();
-
 	if (!response.ok) {
-		throw new Error(`HTTP request failed. status=${response.status}; url=${url}; body=${responseBody}`);
+		// Credential endpoint bodies can echo the submitted code or refresh token.
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`HTTP request failed. status=${response.status}; url=${url}`);
 	}
 
-	return responseBody;
+	return response.text();
 }
 
 async function exchangeAuthorizationCode(
@@ -122,9 +122,7 @@ async function exchangeAuthorizationCode(
 	try {
 		tokenData = JSON.parse(responseBody) as { access_token: string; refresh_token: string; expires_in: number };
 	} catch (error) {
-		throw new Error(
-			`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
-		);
+		throw new Error(`Token exchange returned invalid JSON. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`);
 	}
 
 	return {
@@ -254,7 +252,7 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 		};
 	} catch (error) {
 		throw new Error(
-			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
+			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`,
 		);
 	}
 

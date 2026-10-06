@@ -14,6 +14,7 @@
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 import { generatePKCE } from "./pkce.ts";
 
 const AUTHORIZE_URL = "https://openrouter.ai/auth";
@@ -44,15 +45,9 @@ function parseAuthorizationInput(input: string): string | undefined {
 	return value;
 }
 
+/** The key exchange endpoint can echo the submitted code: keep only the protocol error code. */
 function errorDetail(body: JsonObject): string | undefined {
-	if (typeof body.error_description === "string") return body.error_description;
-	if (typeof body.message === "string") return body.message;
-	if (typeof body.error === "string") return body.error;
-	if (body.error && typeof body.error === "object" && !Array.isArray(body.error)) {
-		const message = (body.error as JsonObject).message;
-		if (typeof message === "string") return message;
-	}
-	return undefined;
+	return typeof body.error === "string" ? oauthAuthorizationError(body.error) : undefined;
 }
 
 async function exchangeAuthorizationCode(

@@ -189,7 +189,9 @@ async function fetchGitHubCopilotModels(
 		retryPolicy,
 	);
 	if (!response.ok) {
-		throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
+		// Authenticated request: its error body can echo the bearer token.
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`${response.status} ${response.statusText}`);
 	}
 	return parseGitHubCopilotModelCatalog(await response.json(), allowPolicyFallback);
 }
@@ -197,8 +199,9 @@ async function fetchGitHubCopilotModels(
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 	const response = await fetch(url, init);
 	if (!response.ok) {
-		const text = await response.text();
-		throw new Error(`${response.status} ${response.statusText}: ${text}`);
+		// Device and token endpoints can echo submitted codes or tokens.
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`${response.status} ${response.statusText}`);
 	}
 	return response.json();
 }
@@ -402,7 +405,8 @@ async function enableGitHubCopilotModel(
 		return false;
 	}
 	if (response.status === 429) {
-		throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`${response.status} ${response.statusText}`);
 	}
 	return response.ok;
 }

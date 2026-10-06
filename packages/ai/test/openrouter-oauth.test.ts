@@ -124,7 +124,8 @@ describe.sequential("OpenRouter OAuth", () => {
 			},
 		});
 
-		await expect(login).rejects.toThrow("OpenRouter OAuth key exchange failed (HTTP 403): invalid code");
+		// pi#150: the key exchange body can echo the submitted code; only the status is shown.
+		await expect(login).rejects.toThrow(/^OpenRouter OAuth key exchange failed \(HTTP 403\)$/);
 		expect((await callbackResponse)?.status).toBe(502);
 	});
 

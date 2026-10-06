@@ -331,6 +331,26 @@ function isUnknownModel(model: Model<any> | undefined): boolean {
 	return !!model && model.provider === "unknown" && model.id === "unknown" && model.api === "unknown";
 }
 
+/** True when text typed next would start outside any shell quote or backslash escape. */
+export function isUnquotedShellPosition(textBeforeCursor: string): boolean {
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (const character of textBeforeCursor) {
+		if (escaped) {
+			escaped = false;
+		} else if (quote === "'") {
+			if (character === "'") quote = undefined;
+		} else if (character === "\\") {
+			escaped = true;
+		} else if (quote === '"') {
+			if (character === '"') quote = undefined;
+		} else if (character === "'" || character === '"') {
+			quote = character;
+		}
+	}
+	return quote === undefined && !escaped;
+}
+
 function quoteIfNeeded(value: string): string {
 	if (value.length > 0 && !/[^a-zA-Z0-9_\-./~:@]/.test(value)) {
 		return value;
@@ -3271,9 +3291,23 @@ export class InteractiveMode {
 				if (filePaths.some((filePath) => /\p{Cc}/u.test(filePath))) {
 					throw new Error("Clipboard file path contains control characters");
 				}
-				const paths = this.isBashMode ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
+				// Also derive shell context from the current text: an older bash command that finishes
+				// can reset the mode flag while a newer `!` command is in the editor.
+				const text = this.editor.getText?.() ?? "";
+				const shellInput = this.isBashMode || text.trimStart().startsWith("!");
 				const cursor = this.editor.getCursor?.();
-				const currentLine = cursor ? (this.editor.getText().split("\n")[cursor.line] ?? "") : "";
+				const lines = text.split("\n");
+				const currentLine = cursor ? (lines[cursor.line] ?? "") : "";
+				if (shellInput) {
+					// Quoting only protects a path at an unquoted shell position.
+					const beforeCursor = cursor
+						? [...lines.slice(0, cursor.line), currentLine.slice(0, cursor.col)].join("\n")
+						: text;
+					if (!isUnquotedShellPosition(beforeCursor)) {
+						throw new Error("Paste file paths outside quotes in a shell command");
+					}
+				}
+				const paths = shellInput ? filePaths.map(quoteIfNeeded).join(" ") : filePaths.join("\n");
 				const characterBeforeCursor = cursor && cursor.col > 0 ? currentLine[cursor.col - 1] : "";
 				const characterAfterCursor = cursor ? currentLine[cursor.col] : "";
 				const leadingSpace = characterBeforeCursor && !/\s/.test(characterBeforeCursor) ? " " : "";
@@ -3470,7 +3504,8 @@ export class InteractiveMode {
 					}
 					this.editor.addToHistory?.(text);
 					await this.handleBashCommand(command, isExcluded);
-					this.isBashMode = false;
+					// The user may have typed a new `!` command while this one ran.
+					this.isBashMode = (this.editor.getText?.() ?? "").trimStart().startsWith("!");
 					this.updateEditorBorderColor();
 					return;
 				}

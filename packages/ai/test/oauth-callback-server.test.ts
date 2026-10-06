@@ -112,8 +112,9 @@ describe.sequential("OAuth callback server", () => {
 			),
 		);
 		expect(failure.status).toBe(400);
-		expect(failure.body).toContain("User denied access");
-		await expect(server.wait()).rejects.toThrow("Example authorization failed: User denied access");
+		expect(failure.body).toContain("access_denied");
+		expect(failure.body).not.toContain("User denied access");
+		await expect(server.wait()).rejects.toThrow("Example authorization failed: access_denied");
 	});
 
 	it("completes only the first callback", async () => {

@@ -169,9 +169,11 @@ describe("Radius OAuth", () => {
 		};
 
 		const failed = await login();
-		expect("error" in failed && failed.error.message).toContain("invalid_grant: code expired");
+		// pi#150: token endpoint text can echo secrets; only the protocol error code is shown.
+		expect("error" in failed && failed.error.message).toBe("Radius OAuth token request failed: invalid_grant");
 		expect(failed.status).toBe(502);
-		expect(failed.page).toContain("code expired");
+		expect(failed.page).toContain("invalid_grant");
+		expect(failed.page).not.toContain("code expired");
 
 		tokenStatus = 200;
 		const succeeded = await login();

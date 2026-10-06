@@ -184,7 +184,18 @@ async function resolveStoredOAuth(
 	}
 
 	try {
-		return { auth: await oauth.toAuth(credential), source: "OAuth" };
+		return {
+			auth: await oauth.toAuth(credential),
+			source: "OAuth",
+			diagnosticSecrets: [
+				credential.access,
+				credential.refresh,
+				credential.idToken,
+				credential.id_token,
+				credential.accountId,
+				credential.account_id,
+			].filter((value): value is string => typeof value === "string" && value.length > 0),
+		};
 	} catch (error) {
 		throw new ModelsError("oauth", `OAuth auth derivation failed for ${providerId}`, { cause: error });
 	}

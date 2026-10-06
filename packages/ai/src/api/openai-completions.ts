@@ -11,6 +11,11 @@ import type {
 	ChatCompletionSystemMessageParam,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
+import {
+	createRedactingSdkLogger,
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+} from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -313,7 +318,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 	context: TranscriptContext,
 	options?: OpenAICompletionsOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, getCompat(model).supportsMidConvoSystemMessages);
 
 	(async () => {
@@ -357,6 +363,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				model,
 				normalizedContext,
 				apiKey,
+				diagnosticSecrets,
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
@@ -744,7 +751,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								},
 				});
 			} else {
-				output.errorMessage = formatProviderError(normalizeProviderError(error));
+				output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
 				// Some providers via OpenRouter give additional information in this field.
 				// normalizeProviderError already stringifies the parsed body (error.error)
 				// into errorMessage, so only append the raw metadata when it is not already
@@ -787,6 +794,7 @@ function createClient(
 	model: Model<"openai-completions">,
 	context: TranscriptContext,
 	apiKey: string,
+	diagnosticSecrets: readonly string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
@@ -821,6 +829,7 @@ function createClient(
 
 	return new OpenAI({
 		apiKey,
+		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets)),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,

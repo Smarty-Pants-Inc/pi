@@ -61,13 +61,10 @@ class OAuthResponseError extends Error {
 	readonly status: number;
 	readonly oauthError?: string;
 
-	constructor(status: number, oauthError: string | undefined, description: string | undefined, message: string) {
-		const detail = oauthError
-			? description
-				? `${oauthError}: ${description}`
-				: oauthError
-			: description || String(status);
-		super(`${message}: ${detail}`);
+	constructor(status: number, oauthError: string | undefined, message: string) {
+		// Token endpoint text can echo submitted or issued secrets: show only a protocol-shaped error code.
+		const code = oauthError && /^[a-z_]{1,64}$/.test(oauthError) ? oauthError : undefined;
+		super(`${message}: ${code ?? String(status)}`);
 		this.status = status;
 		this.oauthError = oauthError;
 	}
@@ -76,19 +73,17 @@ class OAuthResponseError extends Error {
 async function readOAuthResponseError(response: Response, message: string): Promise<OAuthResponseError> {
 	const text = await response.text().catch(() => "");
 	let oauthError: string | undefined;
-	let description: string | undefined;
 
 	if (text) {
 		try {
-			const data = JSON.parse(text) as { error?: unknown; error_description?: unknown };
+			const data = JSON.parse(text) as { error?: unknown };
 			oauthError = typeof data.error === "string" ? data.error : undefined;
-			description = typeof data.error_description === "string" ? data.error_description : undefined;
 		} catch {
-			description = text;
+			// A non-JSON body is not shown.
 		}
 	}
 
-	return new OAuthResponseError(response.status, oauthError, description, message);
+	return new OAuthResponseError(response.status, oauthError, message);
 }
 
 async function requestOAuthToken(

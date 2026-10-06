@@ -1,5 +1,10 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import {
+	createRedactingSdkLogger,
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+} from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -130,7 +135,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 	context: TranscriptContext,
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, getCompat(model).supportsMidConvoSystemMessages);
 
 	// Start async processing
@@ -167,6 +173,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				model,
 				normalizedContext,
 				apiKey,
+				diagnosticSecrets,
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
@@ -222,7 +229,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			const errorMessage = formatProviderError(
-				normalizeProviderError(error),
+				normalizeProviderError(error, diagnosticSecrets),
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
@@ -261,6 +268,7 @@ function createClient(
 	model: Model<"openai-responses">,
 	context: TranscriptContext,
 	apiKey: string,
+	diagnosticSecrets: readonly string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
@@ -294,6 +302,8 @@ function createClient(
 
 	return new OpenAI({
 		apiKey,
+		// OAuth credentials can be sent to a caller-configured endpoint; never gate log safety on the URL.
+		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets)),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,

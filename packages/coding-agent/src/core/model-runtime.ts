@@ -25,6 +25,7 @@ import {
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
+	getOAuthDiagnosticSecrets,
 	type ImageApi,
 	type ImageModel,
 	type ImagesContext,
@@ -53,6 +54,9 @@ import {
 	type Provider,
 	type ProviderHeaders,
 	type ProviderRequestOptions,
+	protectAssistantMessageStream,
+	requestSetupError,
+	SafeSetupError,
 	type SimpleStreamOptions,
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
@@ -63,6 +67,8 @@ import {
 	assertImageModel,
 	classifierErrorResult,
 	imageErrorResult,
+	protectOperationError,
+	protectOperationResult,
 } from "@earendil-works/pi-ai/utils/model-operations";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
@@ -760,18 +766,37 @@ export class ModelRuntime implements Models {
 		owner?.assertSubmission();
 		owner?.assertPreparedFetch(options?.fetch);
 		const provider = this.models.getProvider(model.provider);
-		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
-		const resolution = await this.getAuth(model, {
-			apiKey: options?.apiKey,
-			env: options?.env,
-			signal: options?.signal,
-		});
-		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+		if (!provider) throw new SafeSetupError("provider");
+		let resolution: AuthResult | undefined;
+		try {
+			resolution = await this.getAuth(model, {
+				apiKey: options?.apiKey,
+				env: options?.env,
+				signal: options?.signal,
+			});
+		} catch (error) {
+			// Auth resolution and OAuth refresh can echo credentials, also through a ModelsError cause.
+			throw requestSetupError(error);
+		}
+		if (!resolution) throw new SafeSetupError("auth");
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
+		const apiKey = providerOptions.apiKey ?? resolution.auth.apiKey;
 		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
-		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey, headers ?? {}, [
+			...(resolution.diagnosticSecrets ?? []),
+			...(providerOptions.diagnosticSecrets ?? []),
+		]);
+		if (transformHeaders) {
+			try {
+				headers = await transformHeaders(headers ?? {});
+			} catch (error) {
+				// The transform saw the authenticated headers; its failure is a value-free category.
+				throw requestSetupError(error);
+			}
+			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers ?? {}));
+		}
 		const env =
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
@@ -798,7 +823,8 @@ export class ModelRuntime implements Models {
 			model: requestModel,
 			options: {
 				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+				apiKey,
+				diagnosticSecrets,
 				...(requestGuard
 					? {
 							beforeProviderRequest: () => {
@@ -822,12 +848,13 @@ export class ModelRuntime implements Models {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
-		return lazyStream(model, async () => {
+		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
 			const prepared = await this.prepareRequest(
 				model,
 				options as (StreamOptions & ModelsRequestTransforms) | undefined,
 			);
+			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			this.#ordinaryOwner?.assertSubmission();
 			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
 		});
@@ -862,9 +889,10 @@ export class ModelRuntime implements Models {
 				return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
 			});
 		}
-		return lazyStream(model, async () => {
+		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
 			const prepared = await this.prepareRequest(model, options);
+			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			this.#ordinaryOwner?.assertSubmission();
 			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
 		});
@@ -879,11 +907,12 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
+		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
 			const prepared = await this.prepareRequest(model, options);
+			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			if (!prepared.provider.fetchDeferred) {
-				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+				throw new SafeSetupError("deferred");
 			}
 			return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
 		});
@@ -902,12 +931,19 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredCancelOptions,
 	): Promise<void> {
-		assertChatModel(model);
-		const prepared = await this.prepareRequest(model, options);
-		if (!prepared.provider.cancelDeferred) {
-			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+		let secrets: readonly string[] = [];
+		try {
+			assertChatModel(model);
+			const prepared = await this.prepareRequest(model, options);
+			secrets = prepared.options.diagnosticSecrets ?? [];
+			if (!prepared.provider.cancelDeferred) {
+				throw new SafeSetupError("deferred");
+			}
+			await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
+		} catch (error) {
+			// The rejection is public SDK output: masked message only, never the raw error or its cause.
+			throw protectOperationError(error, secrets);
 		}
-		await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
 	}
 
 	async generateImages(
@@ -915,15 +951,20 @@ export class ModelRuntime implements Models {
 		context: ImagesContext,
 		options?: ModelsImagesOptions,
 	): Promise<AssistantImages> {
+		let secrets: readonly string[] = [];
 		try {
 			assertImageModel(model);
 			const prepared = await this.prepareRequest(model, options);
+			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.generateImages) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
 			}
-			return await prepared.provider.generateImages(prepared.model, context, prepared.options as ImagesOptions);
+			return protectOperationResult(
+				await prepared.provider.generateImages(prepared.model, context, prepared.options as ImagesOptions),
+				secrets,
+			);
 		} catch (error) {
-			return imageErrorResult(model, error, options?.signal?.aborted);
+			return imageErrorResult(model, error, options?.signal?.aborted, secrets);
 		}
 	}
 
@@ -932,15 +973,20 @@ export class ModelRuntime implements Models {
 		context: ClassifierContext,
 		options?: ModelsClassifierOptions,
 	): Promise<ClassifierResult> {
+		let secrets: readonly string[] = [];
 		try {
 			assertClassifierModel(model);
 			const prepared = await this.prepareRequest(model, options);
+			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.classify) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
 			}
-			return await prepared.provider.classify(prepared.model, context, prepared.options as ClassifierOptions);
+			return protectOperationResult(
+				await prepared.provider.classify(prepared.model, context, prepared.options as ClassifierOptions),
+				secrets,
+			);
 		} catch (error) {
-			return classifierErrorResult(model, error, options?.signal?.aborted);
+			return classifierErrorResult(model, error, options?.signal?.aborted, secrets);
 		}
 	}
 

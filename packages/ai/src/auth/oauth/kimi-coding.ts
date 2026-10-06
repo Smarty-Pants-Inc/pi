@@ -9,6 +9,7 @@
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 const CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
@@ -79,8 +80,9 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 	});
 
 	if (!response.ok) {
-		const text = await response.text().catch(() => "");
-		throw new Error(`Kimi Code device authorization failed with status ${response.status}${text ? `: ${text}` : ""}`);
+		// Credential endpoint bodies are never diagnostics: they can echo submitted or issued secrets.
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`Kimi Code device authorization failed with status ${response.status}`);
 	}
 
 	const json = await readJson(response);
@@ -96,7 +98,9 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 		!trustedHttpUrl(verificationUriComplete) ||
 		!trustedHttpUrl(verificationUri)
 	) {
-		throw new Error(`Invalid Kimi Code device authorization response: ${JSON.stringify(json)}`);
+		throw new Error(
+			"Invalid Kimi Code device authorization response: missing or invalid device_code, user_code or verification_uri",
+		);
 	}
 
 	const interval = json?.interval;
@@ -130,7 +134,9 @@ function parseTokenResponse(json: Record<string, unknown> | null, operation: str
 		!Number.isFinite(expiresIn) ||
 		expiresIn <= 0
 	) {
-		throw new Error(`Kimi Code token ${operation} response missing fields: ${JSON.stringify(json)}`);
+		throw new Error(
+			`Kimi Code token ${operation} response missing or invalid access_token, refresh_token or expires_in`,
+		);
 	}
 	return {
 		access: accessToken,
@@ -165,10 +171,10 @@ async function pollForToken(
 			});
 
 			if (response.status >= 500) {
-				const text = await response.text().catch(() => "");
+				await response.body?.cancel().catch(() => undefined);
 				return {
 					status: "failed",
-					message: `Kimi Code device token request failed with status ${response.status}${text ? `: ${text}` : ""}`,
+					message: `Kimi Code device token request failed with status ${response.status}`,
 				};
 			}
 
@@ -182,7 +188,6 @@ async function pollForToken(
 			}
 
 			const error = json?.error;
-			const description = typeof json?.error_description === "string" ? `: ${json.error_description}` : "";
 			if (error === "authorization_pending") {
 				return { status: "pending" };
 			}
@@ -201,7 +206,7 @@ async function pollForToken(
 			}
 			return {
 				status: "failed",
-				message: `Kimi Code device token request failed (status ${response.status})${typeof error === "string" ? `: ${error}${description}` : ""}`,
+				message: `Kimi Code device token request failed (status ${response.status})${typeof error === "string" ? `: ${oauthAuthorizationError(error)}` : ""}`,
 			};
 		},
 	});
@@ -248,8 +253,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 
 		// Unauthorized: the stored credential is dead; Models clears it and prompts re-login.
 		if (response.status === 401 || response.status === 403 || json?.error === "invalid_grant") {
-			const description = typeof json?.error_description === "string" ? `: ${json.error_description}` : "";
-			throw new Error(`Kimi Code token refresh unauthorized (status ${response.status})${description}`);
+			throw new Error(`Kimi Code token refresh unauthorized (status ${response.status})`);
 		}
 
 		if (isRetryableRefreshFailure(response) && attempt < REFRESH_MAX_RETRIES) {
@@ -257,8 +261,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 			continue;
 		}
 
-		const text = JSON.stringify(json);
-		throw new Error(`Kimi Code token refresh failed with status ${response.status}${text ? `: ${text}` : ""}`);
+		throw new Error(`Kimi Code token refresh failed with status ${response.status}`);
 	}
 
 	throw lastError ?? new Error("Kimi Code token refresh failed");

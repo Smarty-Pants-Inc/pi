@@ -1,3 +1,4 @@
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -127,7 +128,7 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 	context: TranscriptContext,
 	options?: MistralOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const stream = new AssistantMessageEventStream(getRequestDiagnosticSecrets(model, options));
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	(async () => {

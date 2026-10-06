@@ -48,6 +48,7 @@ export function buildBaseOptions(
 		beforeProviderRequest: options?.beforeProviderRequest,
 		telemetryContext: options?.telemetryContext,
 		apiKey: apiKey || options?.apiKey,
+		diagnosticSecrets: options?.diagnosticSecrets,
 		fetch: options?.fetch,
 		transport: options?.transport,
 		cacheRetention: options?.cacheRetention,

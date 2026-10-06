@@ -10,6 +10,7 @@ import type {
 	BetaRawMessageStreamEvent as RawMessageStreamEvent,
 	BetaRefusalStopDetails as RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import {
 	ANTHROPIC_FEDERATION_RULE_ID_ENV,
 	ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
@@ -573,7 +574,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	context: TranscriptContext,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const stream = new AssistantMessageEventStream(getRequestDiagnosticSecrets(model, options));
 	const normalizedContext = resolveTranscript(context, getAnthropicCompat(model).supportsMidConvoSystemMessages);
 	const currentTools = getCurrentTools(normalizedContext.messages);
 
