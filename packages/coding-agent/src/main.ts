@@ -50,12 +50,14 @@ import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
+import { captureCliInputPlan, finalizeCliInputPlan, handoffModeInputPlan } from "./core/mode-turn-receipts.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
 import { ModelRuntime } from "./core/model-runtime.ts";
 import { receiveOrdinaryOwner } from "./core/ordinary-owner-context.ts";
 import { createOrdinaryRuntime } from "./core/ordinary-runtime.ts";
 import { restoreStdout, takeOverStdout } from "./core/output-guard.ts";
 import { type AppMode, resolveProjectTrusted } from "./core/project-trust.ts";
+import { type ReceivedInput, receiveInput } from "./core/received-input.ts";
 import type { CreateAgentSessionOptions } from "./core/sdk.ts";
 import {
 	formatMissingSessionCwdPrompt,
@@ -84,7 +86,7 @@ const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP
  * Read all content from piped stdin.
  * Returns undefined if stdin is a TTY (interactive terminal).
  */
-async function readPipedStdin(): Promise<string | undefined> {
+async function readPipedStdin(): Promise<ReceivedInput | undefined> {
 	// If stdin is a TTY, we're running interactively - don't read stdin
 	if (process.stdin.isTTY) {
 		return undefined;
@@ -97,7 +99,8 @@ async function readPipedStdin(): Promise<string | undefined> {
 			data += chunk;
 		});
 		process.stdin.on("end", () => {
-			resolve(data.trim() || undefined);
+			const text = data.trim();
+			resolve(text ? receiveInput(text) : undefined);
 		});
 		process.stdin.resume();
 	});
@@ -733,6 +736,12 @@ export async function main(args: string[], options?: MainOptions) {
 		process.exit(0);
 	}
 
+	// Capture argv occurrences before setup, file processing, trust, or runtime awaits.
+	// RPC frames are admitted by rpc-mode at parse time instead.
+	if (parsed.mode !== "rpc" && !parsed.help && parsed.listModels === undefined) {
+		captureCliInputPlan(parsed, parsed.messages, parsed.fileArgs.length > 0);
+	}
+
 	let appMode = resolveAppMode(parsed, process.stdin.isTTY, process.stdout.isTTY);
 	if (
 		parsed.maxProviderRequests !== undefined &&
@@ -809,6 +818,13 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionManager.appendSessionInfo(name);
 	}
 	time("createSessionManager");
+
+	// Session selection may use stdin for a fork confirmation. Start the prompt
+	// reader after selection, but before resource/runtime and file processing awaits.
+	const stdinInputPromise =
+		appMode !== "rpc" && !parsed.help && parsed.listModels === undefined
+			? readPipedStdin()
+			: Promise.resolve(undefined);
 
 	const trustStore = new ProjectTrustStore(agentDir);
 	const sessionCwd = sessionManager.getCwd();
@@ -997,16 +1013,17 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	// Read piped stdin content (if any) - skip for RPC mode which uses stdin for JSON-RPC
-	let stdinContent: string | undefined;
+	let stdinInput: ReceivedInput | undefined;
 	if (appMode !== "rpc") {
-		stdinContent = await readPipedStdin();
-		if (stdinContent !== undefined && appMode === "interactive") {
+		stdinInput = await stdinInputPromise;
+		if (stdinInput !== undefined && appMode === "interactive") {
 			appMode = "print";
 		}
 	}
 	time("readPipedStdin");
 
-	const { initialMessage, initialImages } = await prepareInitialMessage(parsed, stdinContent);
+	const { initialMessage, initialImages } = await prepareInitialMessage(parsed, stdinInput?.text);
+	if (appMode !== "rpc") finalizeCliInputPlan(parsed, initialMessage, initialImages, stdinInput);
 	time("prepareInitialMessage");
 	// pi reads user-authored themes, so it opts into full validation before any theme loads.
 	setThemeJsonValidator(validateThemeJson);
@@ -1057,7 +1074,7 @@ export async function main(args: string[], options?: MainOptions) {
 		printTimings();
 		await runRpcMode(runtime, { autoCompactionDisabledForProcess });
 	} else if (appMode === "interactive") {
-		const interactiveMode = new InteractiveMode(runtime, {
+		const interactiveOptions = {
 			migratedProviders,
 			startupDiagnostics,
 			modelFallbackMessage,
@@ -1068,7 +1085,9 @@ export async function main(args: string[], options?: MainOptions) {
 			verbose: parsed.verbose,
 			tuiMode: parsed.tuiMode,
 			initialThemeSetting: parsed.useTheme,
-		});
+		};
+		handoffModeInputPlan(parsed, interactiveOptions);
+		const interactiveMode = new InteractiveMode(runtime, interactiveOptions);
 		if (startupBenchmark) {
 			await interactiveMode.init();
 			time("interactiveMode.init");
@@ -1091,13 +1110,15 @@ export async function main(args: string[], options?: MainOptions) {
 		await interactiveMode.run();
 	} else {
 		printTimings();
-		const exitCode = await runPrintMode(runtime, {
+		const printOptions = {
 			mode: toPrintOutputMode(appMode),
 			maxProviderRequests: parsed.maxProviderRequests,
 			messages: parsed.messages,
 			initialMessage,
 			initialImages,
-		});
+		};
+		handoffModeInputPlan(parsed, printOptions);
+		const exitCode = await runPrintMode(runtime, printOptions);
 		stopThemeWatcher();
 		restoreStdout();
 		if (exitCode !== 0) {

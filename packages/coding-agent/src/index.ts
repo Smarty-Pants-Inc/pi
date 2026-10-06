@@ -399,6 +399,16 @@ export {
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
 export {
+	getTurnProvenance,
+	TURN_PROVENANCE_VERSION,
+	type TurnChannel,
+	type TurnFabricVia,
+	type TurnPrincipal,
+	type TurnProvenance,
+	type TurnSender,
+	type TurnSenderKind,
+} from "./core/turn-provenance.ts";
+export {
 	type ModelRoute,
 	type ModelRouteReason,
 	type ModelRouteRequest,

@@ -26,7 +26,9 @@ import {
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
+import { captureTerminalTurnReceipt, type TurnReceipt } from "../turn-receipts.ts";
 import type { VirtualModelDefinition } from "../virtual-models.ts";
+import { boundaryReceiptSlots, receiveBoundaryEntries } from "./boundary-receipts.ts";
 import type {
 	AgentBeforeSettleEvent,
 	BeforeAgentStartEvent,
@@ -169,6 +171,7 @@ function isUserBashEventResult(value: unknown): value is UserBashEventResult {
 /** Combined result from all before_agent_start handlers. */
 interface BeforeAgentStartCombinedResult {
 	messages: NonNullable<BeforeAgentStartEventResult["message"]>[];
+	messageReceipts: TurnReceipt[];
 	systemPromptOptions: NormalizedBuildSystemPromptOptions;
 }
 
@@ -224,6 +227,7 @@ type BoundaryBaseEvent =
 
 interface BoundaryDispatchResult {
 	entries: SessionBoundaryDraft[];
+	entryReceipts: (TurnReceipt | undefined)[];
 	continue: boolean;
 	context: BoundaryContextPreview;
 	valid: boolean;
@@ -1104,7 +1108,10 @@ export class ExtensionRunner {
 
 	async emitBoundary(
 		baseEvent: BoundaryBaseEvent,
-		buildContext: (entries: SessionBoundaryDraft[]) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
+		buildContext: (
+			entries: SessionBoundaryDraft[],
+			receipts?: (TurnReceipt | undefined)[],
+		) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
 		getPendingMessages?: () => AgentMessage[],
 		signal?: AbortSignal,
 	): Promise<BoundaryDispatchResult> {
@@ -1112,13 +1119,14 @@ export class ExtensionRunner {
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
+		let entryReceipts: (TurnReceipt | undefined)[] = [];
 		let shouldContinue = false;
 		// Record the state represented by the preview before the builder can yield.
 		let previewRevision = this.sessionManager.revision();
 		let previewPendingMessages = getPendingMessages?.().slice();
 		let context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
 		signal?.throwIfAborted();
-		if (!this.hasHandlers(baseEvent.type)) return { entries, continue: false, context, valid: true };
+		if (!this.hasHandlers(baseEvent.type)) return { entries, entryReceipts, continue: false, context, valid: true };
 		// One detached preview per build preserves observer sharing without exposing history.
 		context = structuredClone(context);
 		let contextSnapshot = structuredClone(context);
@@ -1142,16 +1150,40 @@ export class ExtensionRunner {
 					continue: shouldContinue,
 					context,
 				} as TurnEndEvent | AgentBeforeSettleEvent;
+				const previousReceipts = entryReceipts;
+				const slots = boundaryReceiptSlots(event.entries, entryReceipts);
+				let receivedSelection = false;
+				let observed: TurnReceipt | undefined;
 				try {
 					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
 						| BoundaryResult
 						| undefined;
 					signal?.throwIfAborted();
-					entries = structuredClone(handlerResult?.entries !== undefined ? handlerResult.entries : event.entries);
-					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
+					observed = captureTerminalTurnReceipt();
+					const returnedEntries = handlerResult?.entries;
+					const received = receiveBoundaryEntries(
+						returnedEntries !== undefined ? returnedEntries : event.entries,
+						slots,
+						observed,
+					);
+					entries = received.entries;
+					entryReceipts = received.receipts;
+					receivedSelection = true;
+					const returnedContinue = handlerResult?.continue;
+					if (returnedContinue !== undefined) shouldContinue = returnedContinue;
 				} catch (err) {
 					signal?.throwIfAborted();
-					entries = structuredClone(event.entries);
+					// Existing semantics retain drafts mutated before a handler throws.
+					// A secondary flag failure cannot discard a successfully received selection.
+					if (!receivedSelection) {
+						const retained = receiveBoundaryEntries(
+							event.entries,
+							slots,
+							observed ?? captureTerminalTurnReceipt(),
+						);
+						entries = retained.entries;
+						entryReceipts = retained.receipts;
+					}
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1172,6 +1204,8 @@ export class ExtensionRunner {
 					if (
 						valid &&
 						unchangedEntries &&
+						previousReceipts.length === entryReceipts.length &&
+						previousReceipts.every((receipt, index) => receipt === entryReceipts[index]) &&
 						isDeepStrictEqual(context, contextSnapshot) &&
 						previewRevision === nextRevision &&
 						previewPendingMessages?.length === nextPendingMessages?.length &&
@@ -1182,7 +1216,9 @@ export class ExtensionRunner {
 
 					previewRevision = nextRevision;
 					previewPendingMessages = nextPendingMessages?.slice();
-					context = structuredClone(await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal));
+					context = structuredClone(
+						await raceWithAbortSignal(Promise.resolve(buildContext(entries, entryReceipts)), signal),
+					);
 					signal?.throwIfAborted();
 					contextSnapshot = structuredClone(context);
 					valid = true;
@@ -1202,11 +1238,12 @@ export class ExtensionRunner {
 		return valid
 			? {
 					entries: structuredClone(entries),
+					entryReceipts,
 					continue: shouldContinue,
 					context: structuredClone(context),
 					valid: true,
 				}
-			: { entries: [], continue: false, context, valid: false };
+			: { entries: [], entryReceipts: [], continue: false, context, valid: false };
 	}
 
 	private isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
@@ -1641,6 +1678,7 @@ export class ExtensionRunner {
 			return renderCurrentSystemPrompt();
 		};
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+		const messageReceipts: TurnReceipt[] = [];
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_agent_start")) {
 			for (const handler of handlers) {
@@ -1658,8 +1696,18 @@ export class ExtensionRunner {
 					signal?.throwIfAborted();
 
 					if (handlerResult) {
+						const receipt = captureTerminalTurnReceipt();
 						const result = handlerResult as BeforeAgentStartEventResult;
-						if (result.message) messages.push(result.message);
+						const message = result.message;
+						if (message) {
+							messages.push({
+								customType: message.customType,
+								content: message.content,
+								display: message.display,
+								details: message.details,
+							});
+							messageReceipts.push(receipt);
+						}
 						if (result.systemPrompt !== undefined) {
 							currentOptions.forceSystemPrompt = result.systemPrompt;
 						}
@@ -1678,7 +1726,7 @@ export class ExtensionRunner {
 			}
 		}
 
-		return { messages, systemPromptOptions: currentOptions };
+		return { messages, messageReceipts, systemPromptOptions: currentOptions };
 	}
 
 	async emitResourcesDiscover(

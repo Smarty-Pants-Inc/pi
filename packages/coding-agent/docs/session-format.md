@@ -46,6 +46,11 @@ A `message` entry stores an [`AgentMessage`](message-types.md). Message content 
 
 Session entry timestamps are ISO 8601 strings. The nested message timestamp is a Unix timestamp in milliseconds.
 
+New user/custom message entries also carry [turn provenance](turn-provenance.md),
+with a stable turn ID and first-receipt time. Current writers emit only
+`channel: "terminal"`, which means UNKNOWN for sender attribution. Older entries
+are not backfilled.
+
 ## Entry Base
 
 All entries (except `SessionHeader`) extend `SessionEntryBase`:

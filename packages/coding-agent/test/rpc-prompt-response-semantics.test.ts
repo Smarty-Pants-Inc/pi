@@ -14,6 +14,7 @@ import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import type { ExtensionFactory, LoadExtensionsResult } from "../src/core/extensions/index.ts";
+import type { ReceivedInput } from "../src/core/received-input.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
@@ -300,7 +301,10 @@ describe("RPC prompt response semantics", () => {
 
 	it("serializes a string prompt rejection as failure text", async () => {
 		const { lineHandler, session, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
-		const prompt = vi.spyOn(session, "prompt").mockRejectedValue("plain rejection");
+		// PR #145: mode input keeps its receipt through the package-private prompt route.
+		const prompt = vi
+			.spyOn(session as unknown as { _promptReceived(input: ReceivedInput): Promise<void> }, "_promptReceived")
+			.mockRejectedValue("plain rejection");
 
 		try {
 			lineHandler(JSON.stringify({ id: "string-rejection", type: "prompt", message: "Hello" }));
