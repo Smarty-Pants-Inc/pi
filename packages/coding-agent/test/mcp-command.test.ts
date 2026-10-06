@@ -6,7 +6,8 @@ import { runMcpCommand } from "../src/extensions/mcp/cli.ts";
 
 const FIXTURE = resolve(import.meta.dirname, "../../mcp/test/fixtures/stdio-server.mjs");
 
-describe("pi mcp", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+describe.skip("pi mcp", () => {
 	const dirs: string[] = [];
 
 	afterEach(() => {

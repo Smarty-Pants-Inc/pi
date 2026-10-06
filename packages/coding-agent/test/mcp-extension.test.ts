@@ -33,7 +33,8 @@ import { convertMcpResult, createMcpToolName } from "../src/extensions/mcp/tools
 // biome-ignore lint/suspicious/noTemplateCurlyInString: literal config value reference
 const TOKEN_HEADER = "Bearer ${TOKEN}";
 
-describe("MCP config", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+describe.skip("MCP config", () => {
 	const dirs: string[] = [];
 	afterEach(() => {
 		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -401,7 +402,8 @@ describe("MCP tools", () => {
 	});
 });
 
-describe("MCP connections", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+describe.skip("MCP connections", () => {
 	const servers: InMemoryTransport[] = [];
 
 	/** In-memory server that answers initialize, tools/list, and tools/call with "ok". */

@@ -1110,17 +1110,18 @@ export default function(pi: ExtensionAPI) {
 			expect(loaded).toEqual(["llama"]);
 		});
 
+		// MCP is refused before disabledBuiltinExtensions applies (smarty-dev#4506); use a reviewed built-in.
 		it("should skip disabledBuiltinExtensions even when settings or -e enable them", async () => {
 			mkdirSync(join(cwd, ".pi"), { recursive: true });
-			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
+			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ extensions: ["+builtin:tool-search"] }));
 			const loaded: string[] = [];
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
-				disabledBuiltinExtensions: ["mcp"],
-				additionalExtensionPaths: ["builtin:mcp"],
+				disabledBuiltinExtensions: ["tool-search"],
+				additionalExtensionPaths: ["builtin:tool-search"],
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "tool-search", builtin: true, factory: () => void loaded.push("tool-search") },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});

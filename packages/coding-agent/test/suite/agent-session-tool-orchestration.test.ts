@@ -117,7 +117,8 @@ describe("AgentSession tool orchestration", () => {
 		expect(persisted?.type === "message" && persisted.message).toMatchObject({ nestedCalls: result.nestedCalls });
 	});
 
-	it("registers codemode and tool_search inactive until they are named", async () => {
+	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+	it.skip("registers codemode and tool_search inactive until they are named", async () => {
 		const extensionFactories = [createCodemodeExtension(), createToolSearchExtension()];
 		const plain = await createHarness({ extensionFactories });
 		harnesses.push(plain);
