@@ -1,7 +1,7 @@
 import { isJsonValue } from "@earendil-works/chord";
 import { type FileEntry, parseSessionEntries, type SessionEntry, type SessionHeader } from "./session-manager.ts";
 
-const absentFields = new Set(["parentSession", "details", "usage", "fromHook", "data", "label", "name"]);
+const absentFields = new Set(["parentSession", "details", "usage", "fromHook", "data", "label", "name", "provenance"]);
 
 /** Native optional fields may be absent; arbitrary nested non-JSON is rejected. */
 export function materializeOwnedEntry<T extends FileEntry>(entry: T): T {
