@@ -3,6 +3,7 @@
 // error codes are checked on the whole serialized rejection object.
 import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import { redactOAuthDiagnosticValue } from "../src/auth/oauth/credential-response.ts";
 import { githubCopilotOAuth } from "../src/auth/oauth/github-copilot.ts";
 import { createRadiusOAuth } from "../src/auth/oauth/radius.ts";
@@ -64,6 +65,20 @@ describe("OAuth credential body errors", () => {
 	afterEach(() => {
 		vi.unstubAllGlobals();
 		vi.useRealTimers();
+	});
+
+	describe("Anthropic", () => {
+		it.each(brokenSuccessBodies)("refresh with %s keeps no credential", async (_, body) => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => body()),
+			);
+			const error = await rejectionOf(
+				anthropicOAuth.refresh({ type: "oauth", access: "old-access", refresh: "refresh-in", expires: 0 }, signal),
+			);
+			expect((error as Error).message).toMatch(/^Anthropic token refresh (returned invalid JSON|request failed)\./);
+			expect(serialized(error)).not.toContain(SECRET_PREFIX);
+		});
 	});
 
 	describe("Radius", () => {

@@ -88,7 +88,12 @@ async function postJson(url: string, body: Record<string, string | number>, sign
 		throw new Error(`HTTP request failed. status=${response.status}; url=${url}`);
 	}
 
-	return response.text();
+	try {
+		return await response.text();
+	} catch {
+		// A body-reader error can quote the credential body; report a fixed, value-free error.
+		throw new Error(`HTTP response body could not be read. status=${response.status}; url=${url}`);
+	}
 }
 
 async function exchangeAuthorizationCode(
@@ -121,8 +126,9 @@ async function exchangeAuthorizationCode(
 	let tokenData: { access_token: string; refresh_token: string; expires_in: number };
 	try {
 		tokenData = JSON.parse(responseBody) as { access_token: string; refresh_token: string; expires_in: number };
-	} catch (error) {
-		throw new Error(`Token exchange returned invalid JSON. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`);
+	} catch {
+		// The parser's message can quote the credential body; report a fixed, value-free error.
+		throw new Error(`Token exchange returned invalid JSON. url=${TOKEN_URL}`);
 	}
 
 	return {
@@ -250,10 +256,9 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 			expires_in: number;
 			scope?: string;
 		};
-	} catch (error) {
-		throw new Error(
-			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`,
-		);
+	} catch {
+		// The parser's message can quote the credential body; report a fixed, value-free error.
+		throw new Error(`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}`);
 	}
 
 	return {
