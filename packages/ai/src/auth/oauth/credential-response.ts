@@ -7,11 +7,25 @@ export async function readOAuthCredentialResponse(response: Response, operation:
 	}
 }
 
+// One label set for header names, field labels and object keys. A label is a credential label when one
+// of its words (split at "-", "_" and camelCase) ends in a credential word: X-Client-Credential,
+// X-Amz-Signature, x-csrftoken, sessionId. Whole words only, so "Unauthorized:", "credit:" and
+// "max_tokens:" stay readable. ponytail: name-based, a custom header needs no registration; a false
+// match only masks a value.
+const CREDENTIAL_WORD =
+	/(?:key|token|secret|auth|authorization|authentication|cookie|session(?:id)?|password|passwd|credentials?|creds?|signature|jwt|bearer|private)$/;
+function isCredentialLabel(label: string): boolean {
+	if (/account[_-]?id/i.test(label)) return true;
+	return label
+		.replace(/([a-z0-9])([A-Z])/g, "$1-$2")
+		.toLowerCase()
+		.split(/[^a-z0-9]+/)
+		.some((word) => CREDENTIAL_WORD.test(word));
+}
+// Labels whose value is a credential by definition: a bare label without a value ends the diagnostic (fail-closed).
 // API-key labels include prefixed header names such as x-api-key and x-goog-api-key.
-const CREDENTIAL_FIELD =
+const FAIL_CLOSED_FIELD =
 	/^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]id|authorization|(?:[a-z0-9]+[_-])*api[_-]?key)$/i;
-// ponytail: name-based, so a custom credential header needs no registration; a false match only masks a value.
-const SENSITIVE_HEADER = /key|token|secret|auth|cookie|session|password|account[_-]?id/i;
 /** Include the active JWT account claim even when a native error echoes it without a field label. */
 export function getOAuthDiagnosticSecrets(
 	token: string | undefined,
@@ -22,7 +36,7 @@ export function getOAuthDiagnosticSecrets(
 	if (token) secrets.push(token, `Bearer ${token}`);
 	for (const [key, value] of Object.entries(headers)) {
 		if (!value) continue;
-		if (!SENSITIVE_HEADER.test(key)) continue;
+		if (!isCredentialLabel(key)) continue;
 		secrets.push(value);
 		// "Bearer x", "Basic x", "Token x": the credential part can be echoed alone.
 		const separator = value.search(/\s/);
@@ -195,7 +209,8 @@ export function redactOAuthDiagnostic(text: string, secrets: readonly string[] =
 				}
 			} else break;
 		}
-		if (!CREDENTIAL_FIELD.test(key) && key.toLowerCase() !== "bearer") {
+		const bearer = key.toLowerCase() === "bearer";
+		if (!bearer && !isCredentialLabel(key)) {
 			if (i === start) i++;
 			continue;
 		}
@@ -203,8 +218,13 @@ export function redactOAuthDiagnostic(text: string, secrets: readonly string[] =
 		while (text[i] === "\\") i++;
 		if (text[i] === '"' || text[i] === "'") i++;
 		while (i < text.length && /\s/.test(text[i])) i++;
-		if (key.toLowerCase() !== "bearer") {
+		if (!bearer) {
 			if (text[i] !== ":" && text[i] !== "=") {
+				// Prose such as "session expired" or "invalid X-Client-Credential header" carries no value here.
+				if (!FAIL_CLOSED_FIELD.test(key)) {
+					i = keyEnd;
+					continue;
+				}
 				parts.push(text.slice(copied, keyEnd), ': "***"');
 				copied = text.length;
 				break; // Uncertain credential-bearing fragment: discard its remainder.
@@ -234,7 +254,7 @@ export function redactOAuthDiagnostic(text: string, secrets: readonly string[] =
 			if (text.slice(i, i + 7).toLowerCase() === "bearer ") i += 7;
 			while (i < text.length && !/[\s"',;}&]/.test(text[i])) i++;
 		}
-		parts.push(text.slice(copied, keyEnd), key.toLowerCase() === "bearer" ? " ***" : ': "***"');
+		parts.push(text.slice(copied, keyEnd), bearer ? " ***" : ': "***"');
 		copied = i;
 	}
 	parts.push(text.slice(copied));
@@ -257,8 +277,8 @@ export function redactOAuthDiagnosticValue(
 			value instanceof Error ? { ...value, name: value.name, message: value.message, stack: value.stack } : value;
 		return Object.fromEntries(
 			Object.entries(entries).map(([key, item]) => [
-				CREDENTIAL_FIELD.test(key) ? redactValues(key, secrets) : redactOAuthDiagnostic(key, secrets),
-				CREDENTIAL_FIELD.test(key) ? "***" : redactOAuthDiagnosticValue(item, secrets, seen),
+				isCredentialLabel(key) ? redactValues(key, secrets) : redactOAuthDiagnostic(key, secrets),
+				isCredentialLabel(key) ? "***" : redactOAuthDiagnosticValue(item, secrets, seen),
 			]),
 		);
 	} finally {

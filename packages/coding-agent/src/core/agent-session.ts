@@ -25,6 +25,7 @@ import {
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
 	type AgentToolCallOutcome,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
@@ -584,6 +585,8 @@ export class AgentSession {
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	/** Created on the first `ctx.executeTool()` call. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
+	/** Parent of each nested call, keyed by the call object the hooks receive (survives wrapping public hooks). */
+	private readonly _nestedToolParents = new WeakMap<AgentToolCall, string>();
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -771,8 +774,10 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
-		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.beforeToolCall = (context) =>
+			this._beforeToolCall(context, this._nestedToolParents.get(context.toolCall));
+		this.agent.afterToolCall = (context) =>
+			this._afterToolCall(context, this._nestedToolParents.get(context.toolCall));
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -880,12 +885,15 @@ export class AgentSession {
 						isError: true,
 					});
 				}
+				this._nestedToolParents.set(toolCall, parentId);
+				// The current public hooks, as for model-issued calls: an SDK deny or redactor installed on
+				// session.agent applies to nested calls too. The installed session hooks read the parent above.
 				return runToolCall(toolCall, {
 					tools: this._getCallableTools(),
 					assistantMessage,
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
-					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
-					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					beforeToolCall: this.agent.beforeToolCall,
+					afterToolCall: this.agent.afterToolCall,
 					signal,
 					onUpdate,
 				});
@@ -1014,7 +1022,9 @@ export class AgentSession {
 					canonicalMessages === snapshotMessages(canonicalContext.messages);
 				return { previous, context: previous?.context ?? canonicalContext, projection };
 			};
-			let { previous, context, projection } = await prepare();
+			const prepared = await prepare();
+			const { previous, projection } = prepared;
+			let context = prepared.context;
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			requestModel = model;
@@ -1050,7 +1060,14 @@ export class AgentSession {
 					this.agent.abort();
 					throw new Error(`Compaction ${outcome} before the routed assistant turn`);
 				}
-				({ previous, context } = await prepare());
+				// Do not rerun request hooks: they may consume one-shot input. Keep the accepted preparation and
+				// rebuild only proven stateless input (the canonical projection, untouched by the hooks). Otherwise
+				// the accepted context is sent as is, and admission in convertToLlm fails closed if it overflows.
+				if (canReproject) {
+					const messages = this.sessionManager.buildSessionProjection().messages;
+					canonicalMessages = snapshotMessages(messages);
+					context = { ...context, messages };
+				}
 			}
 			requestModel = route.model;
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };

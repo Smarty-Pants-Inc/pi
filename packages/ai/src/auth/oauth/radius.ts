@@ -12,7 +12,7 @@
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
-import { oauthAuthorizationError } from "./credential-response.ts";
+import { oauthAuthorizationError, readOAuthCredentialResponse } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { generatePKCE } from "./pkce.ts";
 
@@ -60,30 +60,25 @@ async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): P
 
 class OAuthResponseError extends Error {
 	readonly status: number;
+	/** Allowlisted protocol code only: the raw field can echo a submitted or issued credential. */
 	readonly oauthError?: string;
 
 	constructor(status: number, oauthError: string | undefined, message: string) {
-		// Token endpoint text can echo submitted or issued secrets, even in a code-shaped field: allowlist the code.
-		super(`${message}: ${oauthError ? oauthAuthorizationError(oauthError) : String(status)}`);
+		super(`${message}: ${oauthError ?? String(status)}`);
 		this.status = status;
 		this.oauthError = oauthError;
 	}
 }
 
 async function readOAuthResponseError(response: Response, message: string): Promise<OAuthResponseError> {
-	const text = await response.text().catch(() => "");
-	let oauthError: string | undefined;
-
-	if (text) {
-		try {
-			const data = JSON.parse(text) as { error?: unknown };
-			oauthError = typeof data.error === "string" ? data.error : undefined;
-		} catch {
-			// A non-JSON body is not shown.
-		}
-	}
-
-	return new OAuthResponseError(response.status, oauthError, message);
+	// A non-JSON or unreadable body is not shown; the raw `error` value is never retained.
+	const data = await readOAuthCredentialResponse(response, message).catch(() => undefined);
+	const error = data && typeof data === "object" ? (data as { error?: unknown }).error : undefined;
+	return new OAuthResponseError(
+		response.status,
+		typeof error === "string" ? oauthAuthorizationError(error) : undefined,
+		message,
+	);
 }
 
 async function requestOAuthToken(
@@ -110,12 +105,13 @@ async function requestOAuthToken(
 		throw await readOAuthResponseError(response, "Radius OAuth token request failed");
 	}
 
-	const data = (await response.json()) as {
+	const data = (await readOAuthCredentialResponse(response, "Radius OAuth token")) as {
 		access_token: string;
 		refresh_token: string;
 		expires_in: number;
 		scope?: string;
-	};
+	} | null;
+	if (!data || typeof data !== "object") throw new Error("Radius OAuth token response is invalid");
 
 	return {
 		type: "oauth",
@@ -201,7 +197,13 @@ async function requestDeviceAuthorization(gateway: string, signal: AbortSignal):
 		throw await readOAuthResponseError(response, "Radius OAuth device authorization failed");
 	}
 
-	const data = (await response.json()) as Partial<DeviceAuthorizationResponse>;
+	const data = (await readOAuthCredentialResponse(
+		response,
+		"Radius OAuth device authorization",
+	)) as Partial<DeviceAuthorizationResponse> | null;
+	if (!data || typeof data !== "object") {
+		throw new Error("Radius OAuth device authorization response is missing required fields");
+	}
 	if (!data.device_code || !data.user_code || !data.verification_uri || !data.expires_in) {
 		throw new Error("Radius OAuth device authorization response is missing required fields");
 	}

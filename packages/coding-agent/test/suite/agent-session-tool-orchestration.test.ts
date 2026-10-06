@@ -1,3 +1,5 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { fauxAssistantMessage, fauxToolCall, getCurrentTools, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
@@ -134,6 +136,124 @@ describe("AgentSession tool orchestration", () => {
 		const initial = await createHarness({ initialActiveToolNames: ["tool_search"], extensionFactories });
 		harnesses.push(initial);
 		expect(initial.session.getActiveToolNames()).toEqual(["tool_search"]);
+	});
+
+	// pi#150 review R1: nested calls go through the public session.agent hooks, as model-issued calls do.
+	it("applies a public deny and a public redactor to nested calls, keeping parent attribution", async () => {
+		const extensionCalls: string[] = [];
+		const harness = await createHarness({
+			initialActiveToolNames: [],
+			extensionFactories: [
+				orchestratorExtension,
+				(pi) => {
+					pi.on("tool_call", (event) => {
+						extensionCalls.push(`call ${event.toolName}:${event.parentToolCallId ?? "top"}`);
+					});
+					pi.on("tool_result", (event) => {
+						extensionCalls.push(`result ${event.toolName}:${event.parentToolCallId ?? "top"}`);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const agent = harness.session.agent;
+		const before = agent.beforeToolCall;
+		const after = agent.afterToolCall;
+		const publicCalls: string[] = [];
+		agent.beforeToolCall = async (context, signal) => {
+			publicCalls.push(`before ${context.toolCall.name}`);
+			if (context.toolCall.name === "helper") return { block: true, reason: "denied by SDK" };
+			return before?.(context, signal);
+		};
+		agent.afterToolCall = async (context, signal) => {
+			publicCalls.push(`after ${context.toolCall.name}`);
+			const inner = await after?.(context, signal);
+			if (context.toolCall.name === "echo") return { ...inner, content: [{ type: "text", text: "[redacted]" }] };
+			return inner;
+		};
+
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("run_tools", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("go");
+
+		const result = harness.session.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult",
+		);
+		if (!result) throw new Error("No tool result");
+		const text = (result.content[0] as { text: string }).text;
+		expect(text.split(" | ").slice(0, 2)).toEqual(["denied by SDK", "[redacted]"]);
+		expect(text).not.toContain("helped");
+		expect(text).not.toContain("echo: hi");
+		expect(publicCalls).toEqual([
+			"before run_tools",
+			"before helper",
+			"before echo",
+			"after echo",
+			"after run_tools",
+		]);
+		const parent = result.toolCallId;
+		expect(extensionCalls).toEqual([
+			"call run_tools:top",
+			`call echo:${parent}`,
+			`result echo:${parent}`,
+			"result run_tools:top",
+		]);
+	});
+
+	// pi#150 review R6: tool results are left out of the summary prose, but their nested calls name files.
+	it("keeps the files of nested read, edit and write calls in a branch summary", async () => {
+		const harness = await createHarness({
+			initialActiveToolNames: ["read", "edit", "write"],
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "files",
+						label: "files",
+						description: "Touches files through other tools.",
+						parameters: Type.Object({}),
+						execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+							const outcomes = [
+								await ctx.executeTool("read", { path: "nested-read.txt" }),
+								await ctx.executeTool("edit", {
+									path: "nested-edit.txt",
+									edits: [{ oldText: "old", newText: "new" }],
+								}),
+								await ctx.executeTool("write", { path: "nested-write.txt", content: "written" }),
+							];
+							const failed = outcomes.filter((outcome) => outcome.isError).length;
+							return { content: [{ type: "text", text: `failed: ${failed}` }], details: {} };
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		writeFileSync(join(harness.tempDir, "nested-read.txt"), "read me");
+		writeFileSync(join(harness.tempDir, "nested-edit.txt"), "old");
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("files", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+			fauxAssistantMessage("## Goal\nexplored files"),
+		]);
+		await harness.session.prompt("go");
+		const result = harness.session.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult",
+		);
+		expect(result?.content).toEqual([{ type: "text", text: "failed: 0" }]);
+
+		const firstUser = harness.sessionManager
+			.getBranch()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		if (!firstUser) throw new Error("No user entry");
+		const navigation = await harness.session.navigateTree(firstUser.id, { summarize: true });
+		expect(navigation.summaryEntry?.details).toMatchObject({
+			readFiles: ["nested-read.txt"],
+			modifiedFiles: expect.arrayContaining(["nested-edit.txt", "nested-write.txt"]),
+		});
 	});
 
 	it("leaves results without nested calls unchanged", async () => {

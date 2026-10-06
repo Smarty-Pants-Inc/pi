@@ -256,6 +256,60 @@ describe("AgentSession virtual models", () => {
 		expect(dispatched().at(-1)).toBe("faux/small:off");
 	});
 
+	// pi#150 review R5: routed compaction must not rerun request hooks (they may consume one-shot input).
+	it.each([
+		["a stateless hook", false],
+		["a one-shot hook that supplies its own context", true],
+	])(
+		"runs prepareRequest once for a routed request that crosses the compaction threshold (%s)",
+		async (_, ownContext) => {
+			let prepares = 0;
+			const oneShot = {
+				role: "custom",
+				customType: "one-shot",
+				content: "one-shot input",
+				display: false,
+				timestamp: 0,
+			};
+			const { harness, dispatched } = await createRoutedHarness(defaultRoute, {
+				settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
+				prepareRequest: (request) => {
+					prepares++;
+					if (!ownContext || prepares !== 2) return undefined;
+					// Consumed on first use: a rerun would lose it.
+					return {
+						context: { ...request.context, messages: [...request.context.messages.slice(-1), oneShot] },
+					} as Awaited<ReturnType<NonNullable<HarnessOptions["prepareRequest"]>>>;
+				},
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_before_compact", async ({ preparation: { firstKeptEntryId, tokensBefore } }) => ({
+							compaction: { summary: "compacted", firstKeptEntryId, tokensBefore },
+						}));
+					},
+				],
+			});
+			const sent: string[] = [];
+			harness.setResponses([
+				fauxAssistantMessage("y".repeat(8000)),
+				(context) => {
+					sent.push(JSON.stringify(context.messages));
+					return fauxAssistantMessage("small answer");
+				},
+			]);
+			await harness.session.prompt("hello");
+			harness.session.setThinkingLevel("low");
+			await harness.session.prompt("next");
+
+			expect(harness.eventsOfType("compaction_start").map((event) => event.reason)).toEqual(["threshold"]);
+			expect(prepares).toBe(2);
+			expect(dispatched().at(-1)).toBe("faux/small:off");
+			// Stateless input is rebuilt from the compacted projection; a hook's own context is kept as accepted.
+			expect(sent[0]).toContain(ownContext ? "one-shot input" : "compacted");
+			expect(sent[0]).not.toContain("y".repeat(100));
+		},
+	);
+
 	it("compacts between turns of a run when the next request is routed to a smaller window", async () => {
 		const route: Route = (request, ctx) =>
 			request.reason === "continuation"

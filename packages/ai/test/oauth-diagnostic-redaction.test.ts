@@ -105,6 +105,39 @@ describe("OAuth diagnostic redaction", () => {
 		},
 	);
 
+	// pi#150 security round 3: one label set classifies headers and masks labels.
+	it("redacts an X-Client-Credential value reflected in an error under its label", () => {
+		const secret = "FAKE_CLIENT_CREDENTIAL_150";
+		const secrets = getRequestDiagnosticSecrets({ headers: { "X-Client-Credential": secret } }, undefined);
+		expect(secrets).toContain(secret);
+		const reflected = `401 {"error":"rejected","X-Client-Credential":"${secret}"} X-Client-Credential: ${secret}`;
+		expect(redactOAuthDiagnostic(reflected, secrets)).not.toContain(secret);
+		// Without the live value, label masking still hides a short one.
+		const labelOnly = redactOAuthDiagnostic('401 {"X-Client-Credential":"c1"} x-client-credential=c2; code=bad');
+		expect(labelOnly).not.toContain("c1");
+		expect(labelOnly).not.toContain("c2");
+		expect(labelOnly).toContain("code=bad");
+		expect(redactOAuthDiagnosticValue({ "X-Client-Credential": "c3" })).toEqual({ "X-Client-Credential": "***" });
+	});
+
+	it.each(["X-Cred", "X-Amz-Signature", "X-Jwt", "X-Bearer", "X-Private-Id", "X-Passwd"])(
+		"treats %s as a credential header and label",
+		(header) => {
+			const secret = "FAKE_HEADER_VALUE_150";
+			expect(getRequestDiagnosticSecrets({ headers: { [header]: secret } }, undefined)).toContain(secret);
+			expect(redactOAuthDiagnostic(`${header}: v1`)).not.toContain("v1");
+		},
+	);
+
+	it("keeps prose and usage counts that only mention a credential word", () => {
+		for (const text of [
+			"Your session expired; invalid X-Client-Credential header. max_tokens: 4096, input_tokens=12",
+			"401 Unauthorized: Token expired (unauthorized)",
+			"Limit used up. Add credit: https://billing.example/checkout",
+		])
+			expect(redactOAuthDiagnostic(text)).toBe(text);
+	});
+
 	it.each(["api_key", "apiKey", "api-key", "x-api-key", "x-goog-api-key"])(
 		"redacts a short value under the API-key label %s",
 		(label) => {

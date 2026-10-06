@@ -5,7 +5,7 @@
 import { GITHUB_COPILOT_MODELS } from "../../providers/github-copilot.models.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
-import { oauthAuthorizationError } from "./credential-response.ts";
+import { oauthAuthorizationError, readOAuthCredentialResponse } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 const decode = (s: string) => atob(s);
@@ -193,7 +193,10 @@ async function fetchGitHubCopilotModels(
 		await response.body?.cancel().catch(() => undefined);
 		throw new Error(`${response.status} ${response.statusText}`);
 	}
-	return parseGitHubCopilotModelCatalog(await response.json(), allowPolicyFallback);
+	return parseGitHubCopilotModelCatalog(
+		await readOAuthCredentialResponse(response, "GitHub Copilot model catalog"),
+		allowPolicyFallback,
+	);
 }
 
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
@@ -203,7 +206,8 @@ async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 		await response.body?.cancel().catch(() => undefined);
 		throw new Error(`${response.status} ${response.statusText}`);
 	}
-	return response.json();
+	// A parser or body-reader error can quote the issued token: value-free reader.
+	return readOAuthCredentialResponse(response, "GitHub Copilot OAuth");
 }
 
 async function startDeviceFlow(domain: string, signal: AbortSignal): Promise<DeviceCodeResponse> {
