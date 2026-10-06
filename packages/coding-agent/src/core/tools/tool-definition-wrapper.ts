@@ -16,7 +16,7 @@ export function wrapToolDefinition<TDetails = unknown>(
 		parameters: definition.parameters,
 		outputSchema: definition.outputSchema,
 		constrainedSampling: definition.constrainedSampling,
-		prepareArguments: definition.prepareArguments,
+		prepareArguments: definition.prepareArguments?.bind(definition),
 		executionMode: definition.executionMode,
 		execute: (toolCallId, params, signal, onUpdate, ctx?: ExtensionToolContext) =>
 			definition.execute(
@@ -51,7 +51,7 @@ export function createToolDefinitionFromAgentTool(tool: AgentTool<any>): ToolDef
 		parameters: tool.parameters as any,
 		outputSchema: tool.outputSchema,
 		constrainedSampling: tool.constrainedSampling,
-		prepareArguments: tool.prepareArguments,
+		prepareArguments: tool.prepareArguments?.bind(tool),
 		executionMode: tool.executionMode,
 		execute: async (toolCallId, params, signal, onUpdate) => tool.execute(toolCallId, params, signal, onUpdate),
 	};
