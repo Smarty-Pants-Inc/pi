@@ -23,7 +23,7 @@ function draft(customType: string): CustomMessageEntryDraft {
 // pi#145 SR145-1/2: selection and continuation effects cannot move first receipt facts.
 describe.each(["turn_end", "agent_before_settle"] as const)("%s first receipts", (boundary) => {
 	it.each(
-		(["entries", "length", "continue"] as const).flatMap((effect) =>
+		(["entries", "length", "continue", "throwing entries", "invalid length"] as const).flatMap((effect) =>
 			[false, true].map((mixed) => ({ effect, mixed })),
 		),
 	)("survives a delayed $effect getter (mixed=$mixed)", async ({ effect, mixed }) => {
@@ -49,17 +49,21 @@ describe.each(["turn_end", "agent_before_settle"] as const)("%s first receipts",
 									throw new Error("flag failed");
 								},
 							};
-						if (effect === "entries")
+						if (effect === "entries" || effect === "throwing entries")
 							return {
 								get entries() {
 									vi.setSystemTime(later);
+									if (effect === "throwing entries") throw new Error("selection failed");
 									return event.entries;
 								},
 							};
 						return {
 							entries: new Proxy(event.entries, {
 								get(target, key, receiver) {
-									if (key === "length") vi.setSystemTime(later);
+									if (key === "length") {
+										vi.setSystemTime(later);
+										if (effect === "invalid length") return -1;
+									}
 									return Reflect.get(target, key, receiver);
 								},
 							}),

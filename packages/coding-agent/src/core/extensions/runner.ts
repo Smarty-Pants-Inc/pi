@@ -1020,12 +1020,13 @@ export class ExtensionRunner {
 				const previousReceipts = entryReceipts;
 				const slots = boundaryReceiptSlots(event.entries, entryReceipts);
 				let receivedSelection = false;
+				let observed: TurnReceipt | undefined;
 				try {
 					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
 						| BoundaryResult
 						| undefined;
 					signal?.throwIfAborted();
-					const observed = captureTerminalTurnReceipt();
+					observed = captureTerminalTurnReceipt();
 					const returnedEntries = handlerResult?.entries;
 					const received = receiveBoundaryEntries(
 						returnedEntries !== undefined ? returnedEntries : event.entries,
@@ -1042,7 +1043,11 @@ export class ExtensionRunner {
 					// Existing semantics retain drafts mutated before a handler throws.
 					// A secondary flag failure cannot discard a successfully received selection.
 					if (!receivedSelection) {
-						const retained = receiveBoundaryEntries(event.entries, slots, captureTerminalTurnReceipt());
+						const retained = receiveBoundaryEntries(
+							event.entries,
+							slots,
+							observed ?? captureTerminalTurnReceipt(),
+						);
 						entries = retained.entries;
 						entryReceipts = retained.receipts;
 					}

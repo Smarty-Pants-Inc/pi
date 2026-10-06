@@ -9,8 +9,10 @@ export interface ModeInputPlan {
 const plans = new WeakMap<object, ModeInputPlan>();
 
 function receiveMessages(messages: readonly string[]): ReceivedInput[] {
-	const inputs = new Array<ReceivedInput>(messages.length);
-	for (let index = 0, length = messages.length; index < length; index++) {
+	// One length read: a changing length must not allocate slots the loop never fills (pi#145 Astra r3).
+	const length = messages.length;
+	const inputs = new Array<ReceivedInput>(length);
+	for (let index = 0; index < length; index++) {
 		if (index in messages) inputs[index] = receiveInput(messages[index]);
 	}
 	return inputs;
