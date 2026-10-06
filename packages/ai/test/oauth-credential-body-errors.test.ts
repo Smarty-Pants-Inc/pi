@@ -168,5 +168,37 @@ describe("OAuth credential body errors", () => {
 			expect((error as Error).message).toBe("GitHub Copilot OAuth response is invalid JSON");
 			expect(serialized(error)).not.toContain(SECRET_PREFIX);
 		});
+
+		// pi#150 Astra P1: an echoing endpoint can put a token in the HTTP reason phrase.
+		it("a token endpoint failure reports only the numeric status, never statusText", async () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async () => new Response(null, { status: 401, statusText: SECRET })),
+			);
+			const error = await rejectionOf(
+				githubCopilotOAuth.refresh({ type: "oauth", access: "old", refresh: "ghu_refresh", expires: 0 }, signal),
+			);
+			expect((error as Error).message).toBe("HTTP 401");
+			expect(serialized(error)).not.toContain(SECRET_PREFIX);
+		});
+
+		it("a model catalog failure reports only the numeric status, never statusText", async () => {
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (input: unknown) =>
+					urlOf(input).endsWith("/models")
+						? new Response(null, { status: 403, statusText: SECRET })
+						: jsonResponse({
+								token: "tid=1;proxy-ep=proxy.individual.githubcopilot.com",
+								expires_at: 4102444800,
+							}),
+				),
+			);
+			const error = await rejectionOf(
+				githubCopilotOAuth.refresh({ type: "oauth", access: "old", refresh: "ghu_refresh", expires: 0 }, signal),
+			);
+			expect((error as Error).message).toBe("HTTP 403");
+			expect(serialized(error)).not.toContain(SECRET_PREFIX);
+		});
 	});
 });

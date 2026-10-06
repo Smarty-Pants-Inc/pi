@@ -189,9 +189,9 @@ async function fetchGitHubCopilotModels(
 		retryPolicy,
 	);
 	if (!response.ok) {
-		// Authenticated request: its error body can echo the bearer token.
+		// Authenticated request: its error body and reason phrase can echo the bearer token.
 		await response.body?.cancel().catch(() => undefined);
-		throw new Error(`${response.status} ${response.statusText}`);
+		throw new Error(`HTTP ${response.status}`);
 	}
 	return parseGitHubCopilotModelCatalog(
 		await readOAuthCredentialResponse(response, "GitHub Copilot model catalog"),
@@ -202,9 +202,9 @@ async function fetchGitHubCopilotModels(
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 	const response = await fetch(url, init);
 	if (!response.ok) {
-		// Device and token endpoints can echo submitted codes or tokens.
+		// Device and token endpoints can echo submitted codes or tokens, in the body or reason phrase.
 		await response.body?.cancel().catch(() => undefined);
-		throw new Error(`${response.status} ${response.statusText}`);
+		throw new Error(`HTTP ${response.status}`);
 	}
 	// A parser or body-reader error can quote the issued token: value-free reader.
 	return readOAuthCredentialResponse(response, "GitHub Copilot OAuth");
@@ -410,7 +410,7 @@ async function enableGitHubCopilotModel(
 	}
 	if (response.status === 429) {
 		await response.body?.cancel().catch(() => undefined);
-		throw new Error(`${response.status} ${response.statusText}`);
+		throw new Error(`HTTP ${response.status}`);
 	}
 	return response.ok;
 }
