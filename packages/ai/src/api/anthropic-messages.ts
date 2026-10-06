@@ -581,72 +581,23 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	context: TranscriptContext,
 	options?: AnthropicOptions,
 ): AssistantMessageEventStream => {
-	// Cloning may bind new authentication, but must not lower the original client's diagnostic policy.
-	const bindClientDiagnostics = (client: Anthropic) => {
-		const clientOptions = (client as unknown as { _options?: ClientOptions })._options;
-		const secrets = getOAuthDiagnosticSecrets(
-			client.apiKey ?? undefined,
-			{},
-			getOAuthDiagnosticSecrets(client.authToken ?? undefined),
-		);
-		const collectHeaders = (headers: unknown, name = "x-api-key"): void => {
-			if (typeof headers === "string") {
-				secrets.push(...getOAuthDiagnosticSecrets(headers, { [name]: headers }));
-			} else if (headers instanceof Headers) {
-				headers.forEach((value, key) => {
-					collectHeaders(value, key);
-				});
-			} else if (Array.isArray(headers)) {
-				for (const value of headers) {
-					if (Array.isArray(value) && typeof value[0] === "string") collectHeaders(value[1], value[0]);
-					else collectHeaders(value, name);
-				}
-			} else if (headers && typeof headers === "object") {
-				for (const [key, value] of Object.entries(headers)) collectHeaders(value, key);
-			}
-		};
-		collectHeaders(clientOptions?.defaultHeaders);
-		// Dynamic/custom authentication cannot be completely captured before dispatch.
-		const unboundAuth =
-			Object.getPrototypeOf(client) !== Anthropic.prototype ||
-			!clientOptions ||
-			typeof clientOptions.apiKey === "function" ||
-			Boolean(client.credentials) ||
-			Boolean(clientOptions.middleware?.length) ||
-			Boolean(client.middleware?.length) ||
-			secrets.length === 0;
-		return { secrets, withhold: Boolean(client.authToken) || secrets.some(isOAuthToken) || unboundAuth };
-	};
+	// Request formatting may inspect public auth fields; publication is always owned.
 	let suppliedClient = options?.client;
-	const originalDiagnostics = suppliedClient ? bindClientDiagnostics(suppliedClient) : undefined;
 	let suppliedClientFailure: { error: unknown } | undefined;
+	let suppliedClientOAuth = false;
 	if (suppliedClient) {
 		try {
 			suppliedClient =
 				typeof suppliedClient.withOptions === "function"
 					? suppliedClient.withOptions({ logLevel: "off", logger: oauthDiagnosticLogger })
 					: suppliedClient;
+			suppliedClientOAuth =
+				model.provider !== "github-copilot" &&
+				((typeof suppliedClient.authToken === "string" && isOAuthToken(suppliedClient.authToken)) ||
+					(typeof suppliedClient.apiKey === "string" && isOAuthToken(suppliedClient.apiKey)));
 		} catch (error) {
 			suppliedClientFailure = { error };
 		}
-	}
-	let suppliedClientOAuth = false;
-	if (options?.client && suppliedClient) {
-		const cloneDiagnostics = bindClientDiagnostics(suppliedClient);
-		suppliedClientOAuth = model.provider !== "github-copilot" && cloneDiagnostics.secrets.some(isOAuthToken);
-		options = {
-			...options,
-			diagnosticSecrets: [
-				...(options.diagnosticSecrets ?? []),
-				...(originalDiagnostics?.secrets ?? []),
-				...cloneDiagnostics.secrets,
-			],
-			oauthDiagnostics:
-				options.oauthDiagnostics === true ||
-				Boolean(suppliedClientFailure) ||
-				originalDiagnostics?.withhold === true ||
-				cloneDiagnostics.withhold,
-		};
 	}
 	const stream = new AssistantMessageEventStream(model, options);
 	const normalizedContext = resolveTranscript(context, getAnthropicCompat(model).supportsMidConvoSystemMessages);

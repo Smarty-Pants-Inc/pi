@@ -306,8 +306,8 @@ it.each(["opaqueProxyExplicitWithholding", "transparentProxyMutableHeader", "opa
 		expect(actual).toBe(key);
 		expect(output.stopReason).toBe("error");
 		for (const surface of [JSON.stringify(published), JSON.stringify(output), jsonl]) {
-			if (kind === "transparentProxyMutableHeader") expect(surface).toContain(key);
-			else expect(surface).not.toContain(key);
+			// smarty-dev#5822 / T-R2-03: mutable headers cannot select a rich publication policy.
+			expect(surface).not.toContain(key);
 		}
 	},
 );
