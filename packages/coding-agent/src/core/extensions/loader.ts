@@ -37,8 +37,8 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
-	UserMessageRenderer,
 	ToolRendererResolver,
+	UserMessageRenderer,
 } from "./types.ts";
 
 const require = createRequire(import.meta.url);
