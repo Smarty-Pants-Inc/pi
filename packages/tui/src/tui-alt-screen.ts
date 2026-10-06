@@ -13,6 +13,7 @@ import {
 	getScrollbarGeometry,
 	getScrollViewBox,
 	getScrollViewsAt,
+	type LayoutBox,
 	type LayoutFrame,
 	renderLayoutFrame,
 	type ScrollbarGeometry,
@@ -201,6 +202,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private lastDocument: string[] = [];
 	private previousScreenWidth = 0;
 	private previousScreenHeight = 0;
+	private previousCursorPosition: { row: number; col: number } | null = null;
 	private layoutRoot: Component | undefined;
 	private currentLayout: LayoutFrame | undefined;
 	private readonly implicitDocument: Component;
@@ -1658,6 +1660,68 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return result;
 	}
 
+	protected override renderAnimation(component: Component): boolean {
+		const width = this.terminal.columns;
+		const height = this.terminal.rows;
+		const layout = this.currentLayout;
+		if (
+			!layout ||
+			this.lastLinesHaveImages ||
+			this.hasOverlayEntries ||
+			this.activeSearch ||
+			this.getSelectionBounds() ||
+			this.flashes.render(width).length > 0 ||
+			this.previousScreenWidth !== width ||
+			this.previousScreenHeight !== height
+		)
+			return false;
+		const find = (box: LayoutBox): { box: LayoutBox; row: number; height: number } | undefined => {
+			// Scroll content, partial-width boxes, and clipped rows need the normal compositor.
+			if (box.scrollView) return undefined;
+			if (box.lines && box.rect.x === 0 && box.rect.width === width) {
+				const range =
+					box.component === component
+						? { row: 0, height: box.lines.length }
+						: box.component instanceof Container && box.component.render === Container.prototype.render
+							? box.component.getRenderedComponentRange(component, width)
+							: undefined;
+				if (range) return { box, ...range };
+			}
+			for (const child of box.children) {
+				const match = find(child);
+				if (match) return match;
+			}
+			return undefined;
+		};
+		const match = find(layout.root);
+		if (!match) return false;
+		const row = match.box.rect.y + match.row - (match.box.lineOffset ?? 0);
+		if (
+			row < Math.max(0, match.box.clip.y) ||
+			row + match.height >
+				Math.min(height, match.box.clip.y + match.box.clip.height, match.box.rect.y + match.box.rect.height)
+		)
+			return false;
+		const cursor = this.previousCursorPosition;
+		const lines = this.getAnimationLines(
+			component,
+			width,
+			match.height,
+			cursor && cursor.row >= row && cursor.row < row + match.height
+				? { row: cursor.row - row, col: cursor.col }
+				: undefined,
+		);
+		if (!lines || lines.some((_, i) => isImageLine(this.previousScreen[row + i] ?? ""))) return false;
+		let buffer = "";
+		for (let i = 0; i < lines.length; i++) {
+			if (lines[i] === this.previousScreen[row + i]) continue;
+			buffer += `\x1b[${row + i + 1};1H\x1b[2K${lines[i]}`;
+			this.previousScreen[row + i] = lines[i];
+		}
+		if (buffer) this.terminal.write(`${BEGIN_SYNCHRONIZED_OUTPUT}\x1b7${buffer}\x1b8${END_SYNCHRONIZED_OUTPUT}`);
+		return true;
+	}
+
 	protected override doRender(): void {
 		if (this.stopped || !this.altScreenActive) return;
 		const width = Math.max(1, this.terminal.columns);
@@ -1676,6 +1740,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		screen = this.compositeFlashes(screen, width, height);
 
 		const cursorPos = this.extractCursorPosition(screen, height);
+		this.previousCursorPosition = cursorPos;
 		screen = this.applyLineResets(screen).map((line) => {
 			if (isImageLine(line) || visibleWidth(line) <= width) return line;
 			return sliceByColumn(line, 0, width, true);

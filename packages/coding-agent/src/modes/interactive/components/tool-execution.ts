@@ -136,9 +136,10 @@ export class ToolExecutionComponent extends Container {
 		return {
 			args: this.args,
 			toolCallId: this.toolCallId,
-			invalidate: () => {
+			invalidate: (options) => {
 				this.invalidate();
-				this.ui.requestRender();
+				if (options?.animation && this.ui.requestAnimationRender) this.ui.requestAnimationRender(this);
+				else this.ui.requestRender(false, options?.animation);
 			},
 			lastComponent,
 			state: this.rendererState,

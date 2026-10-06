@@ -148,7 +148,7 @@ export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, a
 		renderResult(result, options, _theme, context) {
 			const state = context.state;
 			if (state.startedAt !== undefined && options.isPartial && !state.interval) {
-				state.interval = setInterval(() => context.invalidate(), 1000);
+				state.interval = setInterval(() => context.invalidate({ animation: true }), 1000);
 			}
 			if (!options.isPartial || context.isError) {
 				state.endedAt ??= Date.now();
