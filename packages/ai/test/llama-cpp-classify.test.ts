@@ -325,7 +325,7 @@ describe("llama.cpp classifier", () => {
 	it("passes completion payloads and responses through the request hooks", async () => {
 		const server = fakeServer();
 		const payloads: unknown[] = [];
-		const statuses: number[] = [];
+		const statuses: (number | undefined)[] = [];
 		const options: ClassifierOptions = {
 			fetch: server.fetch,
 			onPayload: (payload) => {

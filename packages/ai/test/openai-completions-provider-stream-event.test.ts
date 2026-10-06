@@ -55,7 +55,7 @@ describe("openai-completions provider stream events", () => {
 	});
 
 	// Regression test for #9784.
-	it("exposes provider chunks including OpenRouter metadata", async () => {
+	it("notifies without exposing provider chunks or OpenRouter metadata", async () => {
 		const firstChunk = {
 			id: "chatcmpl-1",
 			model: "anthropic/claude-sonnet-4.6",
@@ -89,6 +89,9 @@ describe("openai-completions provider stream events", () => {
 		);
 
 		expect(message.content).toEqual([{ type: "text", text: "hello" }]);
-		expect(events).toEqual([firstChunk, finalChunk]);
+		expect(events).toEqual([{ type: "provider_stream_event" }, { type: "provider_stream_event" }]);
+		expect(message.usage.input).toBe(10);
+		expect(message.usage.output).toBe(2);
+		expect(message.stopReason).toBe("stop");
 	});
 });

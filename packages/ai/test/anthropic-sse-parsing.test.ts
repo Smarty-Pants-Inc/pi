@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { transformMessages } from "../src/api/transform-messages.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Model, ToolCall } from "../src/types.ts";
+import type { Model, ToolCall } from "../src/types.ts";
 
 function createSseResponse(events: Array<{ event: string; data: string }>): Response {
 	const body = events.map(({ event, data }) => `event: ${event}\ndata: ${data}\n`).join("\n");
@@ -114,30 +114,30 @@ describe("Anthropic raw SSE parsing", () => {
 	it("forwards parsed provider stream events in order", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
 		const providerEvents: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const eventModels: unknown[] = [];
 		const result = await streamAnthropic(
 			model,
 			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
 			{
 				client: createFakeAnthropicClient(createSseResponse(minimalAnthropicEvents)),
-				onProviderStreamEvent: async (event, eventModel) => {
+				onProviderStreamEvent: async (event, ...rest: unknown[]) => {
 					await Promise.resolve();
 					providerEvents.push(event);
-					eventModels.push(eventModel);
+					eventModels.push(rest[0]);
 				},
 			},
 		).result();
 
 		expect(result.stopReason).toBe("stop");
 		expect(providerEvents.map((event) => (event as { type: string }).type)).toEqual([
-			"message_start",
-			"content_block_start",
-			"content_block_delta",
-			"content_block_stop",
-			"message_delta",
-			"message_stop",
+			"provider_stream_event",
+			"provider_stream_event",
+			"provider_stream_event",
+			"provider_stream_event",
+			"provider_stream_event",
+			"provider_stream_event",
 		]);
-		expect(eventModels).toEqual([model, model, model, model, model, model]);
+		expect(eventModels).toEqual([undefined, undefined, undefined, undefined, undefined, undefined]);
 	});
 
 	it("keeps signed thinking replayable when a proxy relabels the model", async () => {

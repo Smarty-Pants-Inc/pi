@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAzureOpenAIResponses } from "../src/api/azure-openai-responses.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Context, Model } from "../src/types.ts";
+import type { Context, Model } from "../src/types.ts";
 
 interface CapturedAzureClientOptions {
 	apiKey: string;
@@ -242,21 +242,21 @@ describe("azure-openai-responses provider stream events", () => {
 		];
 		const model = getModel("azure-openai-responses", "gpt-4o-mini");
 		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const eventModels: unknown[] = [];
 		const result = await streamAzureOpenAIResponses(model, normalizeContext(context), {
 			apiKey: "test-api-key",
 			azureBaseUrl: "https://my-resource.openai.azure.com",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (event, ...rest: unknown[]) => {
 				await Promise.resolve();
 				received.push(event);
-				eventModels.push(eventModel);
+				eventModels.push(rest[0]);
 			},
 		}).result();
 
-		expect(received).toEqual(azureMock.streamEvents);
-		expect(received[0]).toBe(azureMock.streamEvents[0]);
-		expect(received[1]).toBe(azureMock.streamEvents[1]);
-		expect(eventModels).toEqual([model, model]);
+		expect(received).toEqual(azureMock.streamEvents.map(() => ({ type: "provider_stream_event" })));
+		expect(received[0]).not.toBe(azureMock.streamEvents[0]);
+		expect(received[1]).not.toBe(azureMock.streamEvents[1]);
+		expect(eventModels).toEqual([undefined, undefined]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("resp_azure");
 	});

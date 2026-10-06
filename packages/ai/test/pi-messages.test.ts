@@ -176,43 +176,43 @@ describe("pi-messages", () => {
 		const { baseUrl } = await startServer({ events: wireEvents });
 		const model = createModel(baseUrl);
 		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const eventModels: unknown[] = [];
 		const message = await streamSimple(model, normalizeContext(context), {
 			apiKey: "test-key",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (event, ...rest: unknown[]) => {
 				await Promise.resolve();
 				received.push(event);
-				eventModels.push(eventModel);
+				eventModels.push(rest[0]);
 			},
 		}).result();
 
-		expect(received).toEqual(wireEvents);
-		expect(eventModels).toEqual(wireEvents.map(() => model));
+		expect(received).toEqual(wireEvents.map(() => ({ type: "provider_stream_event" })));
+		expect(eventModels).toEqual(wireEvents.map(() => undefined));
 		expect(message.stopReason).toBe("stop");
 		expect(message.responseId).toBe("resp_1");
 		expect(message.content).toEqual([{ type: "text", text: "Hello", textSignature: undefined }]);
 	});
 
-	it("appends debug=1 and reports response headers via onResponse", async () => {
+	it("appends debug=1 and reports only response status via onResponse", async () => {
 		const { baseUrl, requests } = await startServer({
 			headers: { "x-pi-gateway-upstream-provider": "anthropic" },
 			events: [{ type: "done", reason: "stop", usage }],
 		});
 		const model = createModel(baseUrl);
 
-		let observedHeaders: Record<string, string> | undefined;
+		let observedResponse: unknown;
 		const options = {
 			apiKey: "test-key",
 			debug: true,
 			onResponse: (response) => {
-				observedHeaders = response.headers;
+				observedResponse = response;
 			},
 		} satisfies PiMessagesOptions;
 		const message = await streamSimple(model, normalizeContext(context), options).result();
 
 		expect(message.stopReason).toBe("stop");
 		expect(requests[0].url).toBe("/v1/messages?debug=1");
-		expect(observedHeaders?.["x-pi-gateway-upstream-provider"]).toBe("anthropic");
+		expect(observedResponse).toEqual({ status: 200 });
 	});
 
 	it("surfaces backend error responses with diagnostics", async () => {

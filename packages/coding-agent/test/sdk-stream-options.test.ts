@@ -104,13 +104,13 @@ describe("createAgentSession stream options", () => {
 		modelRegistry.registerProvider(model.provider, {
 			api,
 			headers: { "x-provider": "provider" },
-			streamSimple: (requestModel, _context, providerOptions) => {
+			streamSimple: (_requestModel, _context, providerOptions) => {
 				capturedOptions = providerOptions;
 				if (providerEvent === undefined) return createDoneStream(api);
 
 				const stream = createAssistantMessageEventStream();
 				void (async () => {
-					await providerOptions?.onProviderStreamEvent?.(providerEvent, requestModel);
+					await providerOptions?.onProviderStreamEvent?.({ type: "provider_stream_event" });
 					stream.end(createDoneMessage(api));
 				})();
 				return stream;
@@ -288,11 +288,7 @@ describe("createAgentSession stream options", () => {
 		expect(options?.onProviderStreamEvent).toEqual(expect.any(Function));
 		expect(extensionEvents).toEqual([
 			{
-				data: providerEvent,
 				type: "provider_stream_event",
-				provider: "capture-provider",
-				api: "openai-completions",
-				model: "capture-model",
 			},
 		]);
 	});

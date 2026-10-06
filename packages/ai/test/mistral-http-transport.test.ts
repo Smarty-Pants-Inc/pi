@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { stream as streamMistral } from "../src/api/mistral-conversations.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, FetchFunction, Model, ProviderResponse } from "../src/types.ts";
+import type { FetchFunction, ProviderResponse } from "../src/types.ts";
 
 const PI_USER_AGENT = `pi (${platform()} ${release()}; ${arch()})`;
 
@@ -118,7 +118,6 @@ describe("Mistral HTTP transport", () => {
 		expect(callbackPayload?.promptCacheKey).toBe("session-1");
 		expect(callbackResponse).toEqual({
 			status: 200,
-			headers: { "content-type": "text/event-stream", "x-request-id": "request-1" },
 		});
 
 		const wirePayload = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
@@ -382,19 +381,19 @@ describe("Mistral HTTP transport", () => {
 			},
 		];
 		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const eventModels: unknown[] = [];
 		const result = await streamMistral(model, context, {
 			apiKey: "test",
 			fetch: async () => createSseResponse(events),
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (event, ...rest: unknown[]) => {
 				await Promise.resolve();
 				received.push(event);
-				eventModels.push(eventModel);
+				eventModels.push(rest[0]);
 			},
 		}).result();
 
-		expect(received).toEqual(events);
-		expect(eventModels).toEqual([model, model]);
+		expect(received).toEqual(events.map(() => ({ type: "provider_stream_event" })));
+		expect(eventModels).toEqual([undefined, undefined]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});

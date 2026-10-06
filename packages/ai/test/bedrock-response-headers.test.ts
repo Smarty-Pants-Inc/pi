@@ -34,7 +34,7 @@ async function startBedrockResponseServer(): Promise<string> {
 }
 
 describe("bedrock response headers", () => {
-	it("forwards raw Smithy response headers to onResponse", async () => {
+	it("observes status without forwarding raw Smithy response headers", async () => {
 		const baseModel = getModel("amazon-bedrock", MODEL_ID) as Model<"bedrock-converse-stream">;
 		const model = { ...baseModel, baseUrl: await startBedrockResponseServer() };
 		const responses: ProviderResponse[] = [];
@@ -56,8 +56,8 @@ describe("bedrock response headers", () => {
 		expect(result.stopReason).toBe("error");
 		expect(responses).toHaveLength(1);
 		expect(responses[0].status).toBe(200);
-		expect(responses[0].headers["x-amzn-requestid"]).toBe("req-123");
-		expect(responses[0].headers["x-bifrost-provider"]).toBe("bedrock");
-		expect(responses[0].headers["x-bifrost-resolved-model"]).toBe(MODEL_ID);
+		expect(responses[0]).not.toHaveProperty("headers");
+		expect(responses[0]).not.toHaveProperty("headers.x-bifrost-provider");
+		expect(responses[0]).not.toHaveProperty("headers.x-bifrost-resolved-model");
 	});
 });

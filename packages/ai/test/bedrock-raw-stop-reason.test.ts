@@ -57,7 +57,6 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 
 import { stream as streamBedrock } from "../src/api/bedrock-converse-stream.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Model } from "../src/types.ts";
 
 beforeEach(() => {
 	bedrockMock.streamEvents = undefined;
@@ -77,19 +76,19 @@ describe("Bedrock provider stream events", () => {
 			{ metadata: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } },
 		];
 		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const eventModels: unknown[] = [];
 		const result = await streamBedrock(model, context, {
 			cacheRetention: "none",
-			onProviderStreamEvent: async (item, eventModel) => {
+			onProviderStreamEvent: async (item, ...rest: unknown[]) => {
 				await Promise.resolve();
 				received.push(item);
-				eventModels.push(eventModel);
+				eventModels.push(rest[0]);
 			},
 		}).result();
 
-		expect(received).toEqual(bedrockMock.streamEvents);
-		for (const [index, item] of received.entries()) expect(item).toBe(bedrockMock.streamEvents[index]);
-		expect(eventModels).toEqual([model, model, model, model]);
+		expect(received).toEqual(bedrockMock.streamEvents!.map(() => ({ type: "provider_stream_event" })));
+		for (const [index, item] of received.entries()) expect(item).not.toBe(bedrockMock.streamEvents[index]);
+		expect(eventModels).toEqual([undefined, undefined, undefined, undefined]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});
@@ -105,7 +104,7 @@ describe("Bedrock provider stream events", () => {
 			},
 		}).result();
 
-		expect(received).toEqual(bedrockMock.streamEvents);
+		expect(received).toEqual(bedrockMock.streamEvents!.map(() => ({ type: "provider_stream_event" })));
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("bedrock stream failed");
 	});
