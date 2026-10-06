@@ -284,11 +284,12 @@ export class AgentSessionRuntime {
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		await raceWithAbortSignal(
-			emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-				type: "session_shutdown",
-				reason,
-				targetSessionFile,
-			}),
+			// The dispatch itself carries terminal revocation, so no later observer starts after it (#132 R4-2).
+			emitSessionShutdownEvent(
+				outgoing.session.extensionRunner,
+				{ type: "session_shutdown", reason, targetSessionFile },
+				this.terminalCancellation.signal,
+			),
 			this.terminalCancellation.signal,
 		);
 		this.#assertCurrent(outgoing);

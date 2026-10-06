@@ -1006,6 +1006,7 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
 				// A failed proposal remains visible so a later handler can replace it.
+				const before = entries;
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
 				if (hadEntries) {
@@ -1030,7 +1031,12 @@ export class ExtensionRunner {
 					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
 				} catch (err) {
 					signal?.throwIfAborted();
-					entries = structuredClone(event.entries);
+					try {
+						entries = structuredClone(event.entries);
+					} catch {
+						// A poisoned in-place draft cannot be committed; keep the detached pre-handler proposal (#132 R4-10).
+						entries = before;
+					}
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1492,8 +1498,10 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
+		cancellation?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult> {
-		const signal = this.dispatchSignal("before_agent_start");
+		// The originating admission's revocation stops the loop, not only the caller's wait (#132 R4-12).
+		const signal = this.dispatchSignal("before_agent_start", cancellation);
 		signal?.throwIfAborted();
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);

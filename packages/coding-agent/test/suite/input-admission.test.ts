@@ -854,6 +854,78 @@ describe("native input admission v1", () => {
 		},
 	);
 
+	// pi#132 R4-2: terminal disposal revokes the replacement session_shutdown dispatch, not only its outer wait.
+	it("terminal disposal stops later replacement shutdown observers after an actual late return", async () => {
+		const entered = gate(),
+			held = gate();
+		let first: Promise<void> | undefined;
+		const second = vi.fn();
+		const h = await setup([
+			(pi) => {
+				pi.on("session_shutdown", (event) => {
+					if (event.reason === "quit") return;
+					first = (async () => {
+						entered.release();
+						await held.promise;
+					})();
+					return first;
+				});
+				pi.on("session_shutdown", (event) => {
+					if (event.reason !== "quit") second();
+				});
+			},
+		]);
+		const runtime = await runtimeFor(h);
+		const replacement = runtime.newSession().catch((error: unknown) => error);
+		await entered.promise;
+		const disposal = runtime.dispose({ terminal: true, rejectQueuedInput: () => {} });
+		await replacement;
+		held.release();
+		await first;
+		await disposal.catch(() => undefined);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(second).not.toHaveBeenCalled();
+	});
+
+	// pi#132 R4-12: an aborted prompt's before_agent_start dispatch starts no later handler and mutates no loadout.
+	it("ordinary abort stops later before_agent_start handlers after an actual late return", async () => {
+		const entered = gate(),
+			held = gate();
+		let first: Promise<void> | undefined;
+		let lateSetter: unknown;
+		const second = vi.fn();
+		const h = await setup([
+			(pi) => {
+				pi.on("before_agent_start", () => {
+					first = (async () => {
+						entered.release();
+						await held.promise;
+						try {
+							pi.setActiveTools([]);
+						} catch (error) {
+							lateSetter = error;
+						}
+					})();
+					return first;
+				});
+				pi.on("before_agent_start", second);
+			},
+		]);
+		h.setResponses([fauxAssistantMessage("fresh reply")]);
+		const tools = h.session.getActiveToolNames();
+		const prompt = h.session.prompt("aborted input").catch((error: unknown) => error);
+		await entered.promise;
+		await h.session.abort();
+		expect(await prompt).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+		held.release();
+		await first;
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(second).not.toHaveBeenCalled();
+		expect(lateSetter).toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+		expect(h.session.getActiveToolNames()).toEqual(tools);
+		expect(h.eventsOfType("agent_start")).toHaveLength(0);
+	});
+
 	// pi#132 R1-S3: an unrelated SDK compact() cannot abort or compact a fenced (replacing) session.
 	it.each(["held-replacement", "fence-during-join"] as const)(
 		"external compaction refuses the lifecycle fence (%s)",

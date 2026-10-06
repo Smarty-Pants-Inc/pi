@@ -2644,7 +2644,12 @@ export class AgentSession {
 			// selection determines the resize profile used for the request and history.
 			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
 			const result = await this._awaitInput(
-				this._extensionRunner.emitBeforeAgentStart(expandedText, currentImages, this._baseSystemPromptOptions),
+				this._extensionRunner.emitBeforeAgentStart(
+					expandedText,
+					currentImages,
+					this._baseSystemPromptOptions,
+					this._inheritedCancellation(),
+				),
 			);
 			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 			// which updates the live loadout instead. An explicit edit wins; otherwise the live

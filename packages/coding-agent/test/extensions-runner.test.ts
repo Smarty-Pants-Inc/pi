@@ -1001,6 +1001,50 @@ describe("ExtensionRunner", () => {
 			expect(result.valid).toBe(true);
 		});
 
+		// pi#132 R4-10: an uncloneable in-place draft is reported and isolated; a later handler can still repair.
+		it("isolates an uncloneable in-place draft and lets a later handler repair", async () => {
+			const runtime = createExtensionRuntime();
+			const poison = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						event.entries.push({ type: "custom", customType: "poison", data: () => undefined });
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:poison>",
+			);
+			let repairSaw: number | undefined;
+			const repair = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						repairSaw = event.entries.length;
+						return { entries: [{ type: "custom", customType: "repaired" }] };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:repair>",
+			);
+			const runner = new ExtensionRunner([poison, repair], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const result = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" }, () => ({
+				contextEntries: [],
+				contextMessages: [],
+				llmMessages: [],
+				pendingMessages: [],
+				canContinue: false,
+			}));
+
+			expect(errors).toHaveLength(1);
+			expect(repairSaw).toBe(0);
+			expect(result.entries).toMatchObject([{ type: "custom", customType: "repaired" }]);
+		});
+
 		it("keeps shared mutations made before a handler throws", async () => {
 			const runtime = createExtensionRuntime();
 			const extension = await loadExtensionFromFactory(
