@@ -2110,6 +2110,32 @@ describe("native input admission v1", () => {
 		expect(getUserTexts(h)).toContain("held TUI input");
 	});
 
+	// pi#132 R4-11: refused untransferred startup text and images return as editable input, merged with newer drafts.
+	it("TUI startup refusal restores the original text and images to the editor without enqueue", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		const mode = Object.assign(createMode(h, runtime), {
+			recoveryText: Reflect.get(InteractiveMode.prototype, "recoveryText"),
+		});
+		const submitStartupInput = Reflect.get(InteractiveMode.prototype, "submitStartupInput") as (
+			this: unknown,
+			message: string,
+			images?: ImageContent[],
+		) => Promise<void>;
+		const image: ImageContent = { type: "image", data: "startup-image", mimeType: "image/png" };
+		mode.editor.setText("newer draft");
+		const release = await h.session.fenceInputs();
+		await submitStartupInput.call(mode, "startup text", [image]);
+		release();
+		expect(mode.showError).toHaveBeenCalledWith(expect.stringContaining("INPUT_ADMISSION_FENCED"));
+		const restored = mode.editor.getText();
+		expect(restored.startsWith("newer draft\nstartup text\n[recovered image ")).toBe(true);
+		const recovered = mode.prepareRecoveredInput.call(mode, restored);
+		expect(recovered.images).toEqual([image]);
+		expect(h.session.pendingMessageCount).toBe(0);
+		expect(getUserTexts(h)).toEqual([]);
+	});
+
 	it("TUI submit after the replacement fence stays in the editor with explicit rejection", async () => {
 		const h = await setup();
 		const runtime = await runtimeFor(h);

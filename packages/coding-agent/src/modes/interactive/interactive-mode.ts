@@ -1223,28 +1223,9 @@ export class InteractiveMode {
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
 		// Process initial messages
-		if (initialMessage) {
-			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-			} finally {
-				await this.checkShutdownRequested();
-			}
-		}
-
+		if (initialMessage) await this.submitStartupInput(initialMessage, initialImages);
 		if (initialMessages) {
-			for (const message of initialMessages) {
-				try {
-					await this.session.prompt(message);
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
-				} finally {
-					await this.checkShutdownRequested();
-				}
-			}
+			for (const message of initialMessages) await this.submitStartupInput(message);
 		}
 
 		// Main interactive loop
@@ -4612,6 +4593,33 @@ export class InteractiveMode {
 		}
 		this.updatePendingMessagesDisplay();
 		this.ui.requestRender();
+	}
+
+	private async submitStartupInput(message: string, images?: ImageContent[]): Promise<void> {
+		let transferred = false;
+		try {
+			await this.session.prompt(message, {
+				images,
+				onInputTransferred: () => {
+					transferred = true;
+				},
+			});
+		} catch (error: unknown) {
+			this.showError(error instanceof Error ? error.message : "Unknown error occurred");
+			// Refused, untransferred startup input returns to the editor with its images (#132 R4-11).
+			if (!transferred)
+				this.restoreRejectedInput(
+					this.recoveryText([
+						{
+							role: "user",
+							content: [{ type: "text", text: message }, ...(images ?? [])],
+							timestamp: Date.now(),
+						},
+					]),
+				);
+		} finally {
+			await this.checkShutdownRequested();
+		}
 	}
 
 	private restoreRejectedInput(text: string): void {
