@@ -1624,7 +1624,8 @@ export class ExtensionRunner {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
-						images: currentImages,
+						// Handlers get detached images: a late in-place edit cannot change retained or recovered originals (#132 R4-6).
+						images: currentImages?.map((image) => ({ ...image })),
 						source,
 						streamingBehavior,
 					};
@@ -1633,7 +1634,7 @@ export class ExtensionRunner {
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
-						currentImages = result.images ?? currentImages;
+						currentImages = result.images?.map((image) => ({ ...image })) ?? currentImages;
 					}
 				} catch (err) {
 					signal?.throwIfAborted();

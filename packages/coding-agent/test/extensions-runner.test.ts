@@ -6,6 +6,7 @@ import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
@@ -999,6 +1000,33 @@ describe("ExtensionRunner", () => {
 			expect(errors).toContain("Invalid boundary entries: Entry missing not found");
 			expect(result.entries).toEqual([]);
 			expect(result.valid).toBe(true);
+		});
+
+		// pi#132 R4-6: input handlers see detached images; a late in-place edit leaves the caller's originals intact.
+		it("detaches input images from handlers before exposure and at transform acceptance", async () => {
+			const runtime = createExtensionRuntime();
+			let seen: ImageContent[] | undefined;
+			let returned: ImageContent[] | undefined;
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("input", (event) => {
+						seen = event.images;
+						returned = [{ type: "image", data: "transformed", mimeType: "image/png" }];
+						return { action: "transform", text: event.text, images: returned };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const original: ImageContent = { type: "image", data: "original", mimeType: "image/png" };
+			const result = await runner.emitInput("text", [original], "interactive");
+			seen![0]!.data = "late edit";
+			seen![0]!.mimeType = "image/gif";
+			returned![0]!.data = "late transform edit";
+			expect(original).toEqual({ type: "image", data: "original", mimeType: "image/png" });
+			expect(result).toMatchObject({ action: "transform", images: [{ data: "transformed" }] });
 		});
 
 		// pi#132 R4-10: an uncloneable in-place draft is reported and isolated; a later handler can still repair.

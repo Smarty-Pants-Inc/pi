@@ -4568,7 +4568,7 @@ export class InteractiveMode {
 		for (const [marker, image] of this.recoveredImages) {
 			if (!text.includes(marker)) continue;
 			text = text.replaceAll(marker, "");
-			images.push(image);
+			images.push({ ...image }); // The recovery map keeps its immutable original (#132 R4-6).
 			markers.push(marker);
 		}
 		return {
