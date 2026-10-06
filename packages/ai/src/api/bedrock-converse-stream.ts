@@ -26,14 +26,13 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BuildMiddleware, DeserializeMiddleware, DocumentType, HttpResponse, MetadataBearer } from "@smithy/types";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
+import { getOAuthDiagnosticSecrets, oauthRecoveryDecision, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
 	AssistantMessage,
 	CacheRetention,
 	ImageContent,
-	JsonObject,
 	JsonValue,
 	Model,
 	ProviderEnv,
@@ -51,8 +50,8 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
-import { normalizeProviderError } from "../utils/error-body.ts";
-import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { type NormalizedProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { AssistantMessageEventStream, recordAssistantMessageError } from "../utils/event-stream.ts";
 import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
@@ -262,10 +261,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			config.authSchemePreference = ["httpBearerAuth"];
 		}
 
-		// Kept outside the try so the catch can still correlate a mid-stream failure:
-		// exceptions delivered as stream events carry no HTTP metadata of their own.
-		let responseRequestId: string | undefined;
-
+		let hasResponseRequestId = false;
 		try {
 			const supportsStrictMode = model.compat?.supportsStrictMode ?? false;
 			const client = new BedrockRuntimeClient(config);
@@ -306,7 +302,9 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			const command = new ConverseStreamCommand(commandInput);
 
 			const response = await client.send(command, { abortSignal: options.signal });
-			responseRequestId = normalizeDiagnosticValue(response.$metadata.requestId);
+			const requestId = response.$metadata.requestId;
+			hasResponseRequestId =
+				typeof requestId === "string" && requestId.trim().length > 0 && requestId.trim().length <= 200;
 			if (!observedRawResponse && response.$metadata.httpStatusCode !== undefined) {
 				await options?.onResponse?.(providerResponseObservation(response.$metadata.httpStatusCode));
 			}
@@ -366,9 +364,24 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				finalizeStreamingBlock(block as Block);
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatBedrockError(error);
-			if (output.stopReason === "error") {
-				appendBedrockFailureDiagnostic(output, error, responseRequestId);
+			const normalized = normalizeProviderError(error);
+			const classification = formatBedrockError(error, normalized, output);
+			output.oauthRecovery = oauthRecoveryDecision(
+				safeOAuthError({ status: normalized.status, message: classification }, true),
+			);
+			recordAssistantMessageError(output, { status: normalized.status });
+			const metadata = (error as { $metadata?: { httpStatusCode?: unknown; requestId?: unknown } } | null)
+				?.$metadata;
+			const requestId = metadata?.requestId;
+			const hasErrorRequestId =
+				typeof requestId === "string" && requestId.trim().length > 0 && requestId.trim().length <= 200;
+			const hasErrorCode =
+				error instanceof Error && error.name.endsWith("Exception") && error.name.trim().length <= 200;
+			if (
+				output.stopReason === "error" &&
+				(typeof metadata?.httpStatusCode === "number" || hasErrorCode || hasErrorRequestId || hasResponseRequestId)
+			) {
+				appendAssistantMessageDiagnostic(output, { type: "bedrock_response_failure", timestamp: Date.now() });
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -397,8 +410,6 @@ const BEDROCK_ERROR_PREFIXES: Record<string, string> = {
  * (e.g. "data retention mode 'default' is not available for this model"). Point
  * users at the AWS docs explaining how to configure a supported mode.
  */
-const BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html";
-
 /**
  * Format a Bedrock error with a human-readable prefix.
  * AWS SDK exceptions (both from `client.send()` and from stream event items)
@@ -406,8 +417,7 @@ const BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/lat
  * human-readable prefix so downstream consumers (retry logic, context-overflow
  * detection) can distinguish error categories via simple string matching.
  */
-function formatBedrockError(error: unknown): string {
-	const norm = normalizeProviderError(error);
+function formatBedrockError(error: unknown, norm: NormalizedProviderError, output: AssistantMessage): string {
 	// Surface the raw HTTP body (with status) when the SDK did not fold it into
 	// the message; otherwise fall back to the message. This is what stops a
 	// gateway 403 from collapsing to `Unknown: UnknownError`.
@@ -415,62 +425,12 @@ function formatBedrockError(error: unknown): string {
 		!norm.messageCarriesBody && norm.status !== undefined && norm.body !== undefined
 			? `${norm.status}: ${norm.body}`
 			: norm.message;
-	const dataRetentionHint = /data retention mode/i.test(core)
-		? ` See ${BEDROCK_DATA_RETENTION_DOCS_URL} for supported data retention modes.`
-		: "";
+	if (/data retention mode/i.test(core)) output.diagnosticHint = "bedrock_data_retention";
 	if (error instanceof BedrockRuntimeServiceException) {
 		const prefix = BEDROCK_ERROR_PREFIXES[error.name] ?? error.name;
-		return `${prefix}: ${core}${dataRetentionHint}`;
+		return `${prefix}: ${core}`;
 	}
-	return `${core}${dataRetentionHint}`;
-}
-
-type SdkErrorMetadata = { $metadata?: { httpStatusCode?: unknown; requestId?: unknown } };
-
-/** Over-long header values are dropped rather than truncated: a truncated request id is not a request id. */
-const MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS = 200;
-
-function normalizeDiagnosticValue(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const trimmed = value.trim();
-	if (trimmed.length === 0 || trimmed.length > MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS) return undefined;
-	return trimmed;
-}
-
-/**
- * The SDK puts the modeled code on `error.name` for service exceptions and unmodeled stream errors alike, so
- * do not narrow to `BedrockRuntimeServiceException`. Modeled Bedrock errors all end in `Exception`, unlike
- * transport names such as `TimeoutError`.
- */
-function extractBedrockErrorCode(error: unknown): string | undefined {
-	if (!(error instanceof Error) || !error.name.endsWith("Exception")) return undefined;
-	return normalizeDiagnosticValue(error.name);
-}
-
-/**
- * Structured metadata alongside `errorMessage`, which stays byte-identical because `isRetryableAssistantError`
- * matches against it. Unknown fields are omitted, never guessed: a modeled mid-stream exception reaches us as
- * a bare object literal, leaving only `fallbackRequestId`. `details` only, as the throw is not always `Error`.
- */
-function appendBedrockFailureDiagnostic(
-	output: AssistantMessage,
-	error: unknown,
-	fallbackRequestId: string | undefined,
-): void {
-	const metadata = (error as SdkErrorMetadata)?.$metadata;
-	const details: JsonObject = {};
-
-	if (typeof metadata?.httpStatusCode === "number") details.status = metadata.httpStatusCode;
-
-	const errorCode = extractBedrockErrorCode(error);
-	if (errorCode !== undefined) details.errorCode = errorCode;
-
-	const requestId = normalizeDiagnosticValue(metadata?.requestId) ?? fallbackRequestId;
-	if (requestId !== undefined) details.requestId = requestId;
-
-	if (Object.keys(details).length === 0) return;
-
-	appendAssistantMessageDiagnostic(output, { type: "bedrock_response_failure", timestamp: Date.now(), details });
+	return core;
 }
 
 /**

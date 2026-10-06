@@ -12,7 +12,7 @@ export class ModelsError extends Error {
 	}
 }
 
-const SETUP_MESSAGES = Object.freeze({
+export const SETUP_MESSAGES = Object.freeze({
 	auth: "Provider is not configured",
 	provider: "Unknown provider",
 	stream: "Provider has no API implementation",

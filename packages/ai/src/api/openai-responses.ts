@@ -1,6 +1,11 @@
 import OpenAI, { type ClientOptions } from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
-import { getOAuthDiagnosticSecrets, redactOAuthDiagnosticValue } from "../auth/oauth/credential-response.ts";
+import {
+	getOAuthDiagnosticSecrets,
+	oauthRecoveryDecision,
+	redactOAuthDiagnosticValue,
+	safeOAuthError,
+} from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -17,7 +22,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
-import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { AssistantMessageEventStream, recordAssistantMessageError } from "../utils/event-stream.ts";
 import { providerResponseObservation } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
@@ -33,7 +38,6 @@ import { buildBaseOptions } from "./simple-options.ts";
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 // OpenAI Responses rejects max_output_tokens below 16: https://github.com/earendil-works/pi/issues/6265
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
-const CHATGPT_USAGE_URL = "https://chatgpt.com/settings/usage";
 
 /**
  * OpenAI API keys start with `sk-`; a different credential sent directly to OpenAI
@@ -240,9 +244,18 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
-			output.errorMessage = errorMessage.includes("subscription_sharing_usage_limit_exceeded")
-				? `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`
-				: errorMessage;
+			if (errorMessage.includes("subscription_sharing_usage_limit_exceeded")) {
+				output.diagnosticHint = "chatgpt_usage";
+				output.oauthRecovery ??= oauthRecoveryDecision(
+					safeOAuthError({ status: normalizedError.status, message: errorMessage }, true),
+				);
+				recordAssistantMessageError(output, {
+					status: normalizedError.status,
+					error: (error as { error?: unknown } | null)?.error,
+				});
+			} else {
+				output.errorMessage = errorMessage;
+			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

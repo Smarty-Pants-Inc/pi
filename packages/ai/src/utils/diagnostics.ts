@@ -12,7 +12,7 @@ export interface DiagnosticErrorInfo {
 	name?: string;
 	message: string;
 	stack?: string;
-	code?: string | number;
+	code?: string;
 }
 
 export interface AssistantMessageDiagnostic {
@@ -30,29 +30,26 @@ export function formatThrownValue(value: unknown): string {
 
 export function extractDiagnosticError(
 	error: unknown,
-	secrets: readonly string[] = [],
+	_secrets: readonly string[] = [],
 	oauthDiagnostics = false,
 ): DiagnosticErrorInfo {
-	if (oauthDiagnostics) {
-		const safe = safeOAuthError(error);
-		return { name: safe.name, message: redactOAuthDiagnostic(safe.message, secrets), code: safe.code };
-	}
-	if (!(error instanceof Error))
-		return { name: "ThrownValue", message: redactOAuthDiagnostic(formatThrownValue(error), secrets) };
-	const code = (error as Error & { code?: unknown }).code;
-	return {
-		name: error.name ? redactOAuthDiagnostic(error.name, secrets) : undefined,
-		message: redactOAuthDiagnostic(error.message || error.name, secrets),
-		stack: error.stack === undefined ? undefined : redactOAuthDiagnostic(error.stack, secrets),
-		code:
-			typeof code === "string" ? redactOAuthDiagnostic(code, secrets) : typeof code === "number" ? code : undefined,
+	const safe = safeOAuthError(error);
+	if (oauthDiagnostics) return { name: safe.name, message: safe.message, code: safe.code };
+	const codes: Record<OAuthDiagnosticCode, string> = {
+		oauth_request_failed: "provider_request_failed",
+		oauth_invalid_response: "provider_invalid_response",
+		oauth_authorization_failed: "provider_authorization_failed",
+		oauth_stream_failed: "provider_stream_failed",
+		oauth_transport_failed: "provider_transport_failed",
 	};
+	const code = codes[safe.code];
+	return { name: "ProviderDiagnosticError", message: safe.message.replace(safe.code, code), code };
 }
 
 export function createAssistantMessageDiagnostic(
 	type: string,
 	error: unknown,
-	details?: JsonObject,
+	_details?: JsonObject,
 	secrets: readonly string[] = [],
 	oauthDiagnostics = false,
 ): AssistantMessageDiagnostic {
@@ -60,7 +57,6 @@ export function createAssistantMessageDiagnostic(
 		type,
 		timestamp: Date.now(),
 		error: extractDiagnosticError(error, secrets, oauthDiagnostics),
-		details: oauthDiagnostics ? undefined : (redactOAuthDiagnosticValue(details, secrets) as JsonObject | undefined),
 	};
 }
 

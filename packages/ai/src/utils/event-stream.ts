@@ -1,6 +1,8 @@
-import { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
+import { getOAuthDiagnosticSecrets, oauthRecoveryDecision, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent, ProviderHeaders, StreamOptions } from "../types.ts";
-import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
+import { extractDiagnosticError, projectAssistantMessageDiagnostics } from "./diagnostics.ts";
+import { SETUP_MESSAGES } from "./models-error.ts";
+import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 class FifoQueue<T> {
 	private incoming: T[] = [];
@@ -91,6 +93,82 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 }
 
 const diagnosticPolicies = new WeakMap<AssistantMessageEventStream, { secrets: readonly string[]; oauth: boolean }>();
+const ownedErrorMessages = new WeakMap<AssistantMessage, string>();
+const hintMessages = {
+	bedrock_data_retention:
+		"Configure a supported Bedrock data retention mode. See https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html",
+	chatgpt_usage: "Check your ChatGPT usage: https://chatgpt.com/settings/usage",
+};
+
+/** Retain only a constructor-validated owned message, never the original error. */
+export function recordAssistantMessageError(message: AssistantMessage, error: unknown): void {
+	const info = extractDiagnosticError(error);
+	message.errorMessage = info.message;
+	ownedErrorMessages.set(message, info.message);
+}
+
+/** The producer's kind is authoritative: a producer error can never become done. */
+function projectTerminalEvent(
+	kind: "done" | "error",
+	message: AssistantMessage,
+	policy?: { secrets: readonly string[]; oauth: boolean },
+): Extract<AssistantMessageEvent, { type: "done" | "error" }> {
+	if (kind === "error") {
+		const reason = message.stopReason === "aborted" ? "aborted" : "error";
+		const error: AssistantMessage = {
+			...message,
+			content: structuredClone(message.content),
+			usage: structuredClone(message.usage),
+			stopReason: reason,
+		};
+		delete error.deferred;
+		delete error.responseId;
+		delete error.responseModel;
+		delete error.providerThinkingLevel;
+		const priorOwned = ownedErrorMessages.get(message);
+		if (priorOwned !== undefined) error.errorMessage = priorOwned;
+		// Model-less producers and the proxy have no adapter diagnostic policy.
+		// Classify original text before replacing it; retain the owned decision on re-publication.
+		if (!policy || (message.stopReason !== "error" && message.stopReason !== "aborted")) {
+			const decision = oauthRecoveryDecision(safeOAuthError({ message: message.errorMessage }, true));
+			if (isProviderContextOverflow(message.errorMessage ?? "", message.provider))
+				decision.recovery = "context_length_exceeded";
+			error.oauthRecovery ??= decision;
+			const ownedSetup = Object.values(SETUP_MESSAGES).some((value) => value === message.errorMessage);
+			error.errorMessage =
+				priorOwned ??
+				(ownedSetup ? message.errorMessage : extractDiagnosticError(new Error(message.errorMessage ?? "")).message);
+		}
+		let baseMessage = error.errorMessage;
+		if (error.diagnosticHint === "bedrock_data_retention" || error.diagnosticHint === "chatgpt_usage") {
+			baseMessage = priorOwned ?? extractDiagnosticError(new Error(message.errorMessage ?? "")).message;
+			error.errorMessage = `${baseMessage} ${hintMessages[error.diagnosticHint]}`;
+		} else {
+			delete error.diagnosticHint;
+		}
+		if (
+			(priorOwned !== undefined ||
+				error.diagnosticHint !== undefined ||
+				!policy ||
+				policy.oauth ||
+				(message.stopReason !== "error" && message.stopReason !== "aborted")) &&
+			typeof baseMessage === "string"
+		) {
+			ownedErrorMessages.set(error, baseMessage);
+		}
+		return { type: "error", reason, error };
+	}
+	switch (message.stopReason) {
+		case "stop":
+		case "length":
+		case "toolUse":
+			return { type: "done", reason: message.stopReason, message };
+		case "deferred":
+			if (typeof message.deferred?.id === "string") return { type: "done", reason: "deferred", message };
+			break;
+	}
+	return projectTerminalEvent("error", message);
+}
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
 	constructor(model?: { headers?: ProviderHeaders }, options?: StreamOptions) {
@@ -129,12 +207,18 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 							: undefined;
 			if (message) projectAssistantMessageDiagnostics(message, policy.secrets, policy.oauth);
 		}
-		super.push(event);
+		if (event.type === "error") super.push(projectTerminalEvent("error", event.error, policy));
+		else if (event.type === "done") super.push(projectTerminalEvent("done", event.message, policy));
+		else super.push(event);
 	}
 
 	override end(result?: AssistantMessage): void {
 		const policy = diagnosticPolicies.get(this);
 		if (result && policy) projectAssistantMessageDiagnostics(result, policy.secrets, policy.oauth);
+		if (result?.stopReason === "error" || result?.stopReason === "aborted") {
+			const event = projectTerminalEvent("error", result, policy);
+			if (event.type === "error") result = event.error;
+		}
 		super.end(result);
 	}
 }

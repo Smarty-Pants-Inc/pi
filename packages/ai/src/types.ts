@@ -572,6 +572,8 @@ export interface AssistantMessage {
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	/** Recovery authority is structured; errorMessage is display text only. */
 	oauthRecovery?: OAuthRecoveryDecision;
+	/** Pi-owned remedy code; its text and URL are rendered from a closed source list. */
+	diagnosticHint?: "bedrock_data_retention" | "chatgpt_usage";
 	usage: Usage;
 	stopReason: StopReason;
 	deferred?: DeferredHandle;
