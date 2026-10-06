@@ -558,21 +558,21 @@ export async function runRpcMode(
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
 					source: "rpc",
-					preflightResult: (didSucceed) => {
-						if (didSucceed && !transportCancellation.signal.aborted) respond(success(id, "prompt"));
+					preflightResult: (disposition) => {
+						if (!transportCancellation.signal.aborted) respond(success(id, "prompt", { disposition }));
 					},
 				});
 				return undefined;
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images, { source: "rpc" });
-				return success(id, "steer");
+				const disposition = await session.steer(command.message, command.images, { source: "rpc" });
+				return success(id, "steer", { disposition });
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images, { source: "rpc" });
-				return success(id, "follow_up");
+				const disposition = await session.followUp(command.message, command.images, { source: "rpc" });
+				return success(id, "follow_up", { disposition });
 			}
 
 			case "abort": {
