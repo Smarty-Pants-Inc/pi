@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, UserBashEvent, UserBashEventResult } from "../../../src/core/extensions/types.ts";
+import type { ReceivedInput } from "../../../src/core/received-input.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { runRpcMode } from "../../../src/modes/rpc/rpc-mode.ts";
 import { createHarness, type Harness } from "../harness.ts";
@@ -124,6 +125,7 @@ type InteractiveBashContext = {
 	pendingMessagesContainer: { addChild(component: unknown): void };
 	pendingBashComponents: unknown[];
 	isBashMode: boolean;
+	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
 	showError(message: string): void;
 	updateEditorBorderColor(): void;
@@ -131,6 +133,7 @@ type InteractiveBashContext = {
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as {
 	setupEditorSubmitHandler(this: InteractiveBashContext): void;
+	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(this: InteractiveBashContext, command: string, excludeFromContext?: boolean): Promise<void>;
 };
 
@@ -246,6 +249,7 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			pendingMessagesContainer: { addChild: vi.fn() },
 			pendingBashComponents: [],
 			isBashMode: true,
+			dispatchEditorInput: interactiveModePrototype.dispatchEditorInput,
 			handleBashCommand: interactiveModePrototype.handleBashCommand,
 			showError: vi.fn(),
 			updateEditorBorderColor: vi.fn(),

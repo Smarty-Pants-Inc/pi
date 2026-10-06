@@ -125,6 +125,7 @@ import { assertOriginalCompactionAttempt, type OriginalCompactionAttempt } from 
 import { assertOrdinaryRuntime, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
 import { createOrdinaryToolDefinitions } from "./ordinary-tools.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
+import { bindReceivedInputSession, getInputReceipt, type ReceivedInput, receiveInput } from "./received-input.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import {
@@ -137,6 +138,7 @@ import {
 	type SessionEntry,
 	SessionManager,
 } from "./session-manager.ts";
+import { appendReceivedCustomMessage, appendReceivedMessage } from "./session-turn-appender.ts";
 import type { CacheWarmingMode, SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -150,6 +152,7 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
+import { captureTerminalTurnReceipt, type TurnReceipt } from "./turn-receipts.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
 
 const appendOriginalCompaction = SessionManager.prototype.appendCompaction;
@@ -450,6 +453,8 @@ export class AgentSession {
 	private _pendingCustomMessages: CustomMessage[] = [];
 	/** FIFO entry IDs keyed by live message objects for the active capture epoch. */
 	private _messageEntryIds: WeakMap<AgentMessage, string[]> | undefined;
+	/** Receipt associations last only until this publication succeeds. */
+	readonly #receivedMessageReceipts = new WeakMap<AgentMessage, TurnReceipt>();
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -463,7 +468,7 @@ export class AgentSession {
 	private _modelSwitchAdmissionWait: Promise<void> = Promise.resolve();
 	private _resolveModelSwitchAdmissionWait: (() => void) | undefined;
 	/** External admission waiters remain pending until dispatch or explicit retention takes ownership. */
-	private readonly _modelSwitchDispatches = new Map<CustomMessage, "steer" | "followUp" | undefined>();
+	private readonly _modelSwitchDispatches = new Map<CustomMessage, { deliverAs?: "steer" | "followUp" }>();
 	/** Compaction hooks may await message acceptance, but must not await their enclosing switch. */
 	private readonly _compactionHookScope = new AsyncLocalStorage<boolean>();
 
@@ -559,6 +564,13 @@ export class AgentSession {
 		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		bindReceivedInputSession(this, {
+			prompt: (input, options) => this._promptReceived(input, options),
+			steer: (input, source) =>
+				this._queueUserInput(input.text, input.images, "steer", source ?? "interactive", getInputReceipt(input)),
+			followUp: (input, source) =>
+				this._queueUserInput(input.text, input.images, "followUp", source ?? "interactive", getInputReceipt(input)),
+		});
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -886,7 +898,7 @@ export class AgentSession {
 					toolResultEntryIds,
 					outcome: this._lastActivityOutcome,
 				},
-				(entries) => this._buildBoundaryContext(entries, "turn_end"),
+				(entries, receipts) => this._buildBoundaryContext(entries, "turn_end", receipts),
 				() => this._getPendingBoundaryMessages(),
 				this._shutdownCancellation.signal,
 			);
@@ -895,7 +907,7 @@ export class AgentSession {
 			throw error;
 		}
 		if (this._shutdownCancellation.signal.aborted) return false;
-		if (boundary.entries.length > 0) this._commitBoundaryDrafts(boundary.entries);
+		if (boundary.entries.length > 0) this._commitBoundaryDrafts(boundary.entries, boundary.entryReceipts);
 		// Carry captured-manager changes into agent state even if continuation is requested later.
 		else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
 		if (boundary.continue && !this._buildBoundaryContext([], "turn_end").canContinue) {
@@ -985,20 +997,27 @@ export class AgentSession {
 		this.agent.state.messages = projection.messages;
 	}
 
-	private _applyBoundaryDrafts(manager: SessionManager, drafts: SessionBoundaryDraft[]): SessionEntry[] {
+	private _applyBoundaryDrafts(
+		manager: SessionManager,
+		drafts: SessionBoundaryDraft[],
+		receipts?: (TurnReceipt | undefined)[],
+	): SessionEntry[] {
 		const appended: SessionEntry[] = [];
-		for (const draft of drafts) {
+		for (let index = 0, length = drafts.length; index < length; index++) {
+			const draft = drafts[index];
 			let entryId: string;
 			switch (draft.type) {
 				case "custom":
 					entryId = manager.appendCustomEntry(draft.customType, draft.data);
 					break;
 				case "custom_message":
-					entryId = manager.appendCustomMessageEntry(
+					entryId = appendReceivedCustomMessage(
+						manager,
 						draft.customType,
 						draft.content,
 						draft.display,
 						draft.details,
+						receipts?.[index],
 					);
 					break;
 				case "context_edit":
@@ -1026,11 +1045,14 @@ export class AgentSession {
 		return appended;
 	}
 
-	private _createBoundaryPreviewManager(drafts: SessionBoundaryDraft[]): SessionManager {
+	private _createBoundaryPreviewManager(
+		drafts: SessionBoundaryDraft[],
+		receipts?: (TurnReceipt | undefined)[],
+	): SessionManager {
 		const header = this.sessionManager.getHeader();
 		if (!header) throw new Error("Session header is missing");
 		const manager = SessionManager.inMemory(this._cwd, undefined, [header, ...this.sessionManager.getBranch()]);
-		this._applyBoundaryDrafts(manager, drafts);
+		this._applyBoundaryDrafts(manager, drafts, receipts);
 		return manager;
 	}
 
@@ -1041,11 +1063,12 @@ export class AgentSession {
 	private _buildBoundaryContext(
 		drafts: SessionBoundaryDraft[],
 		boundary: "turn_end" | "agent_before_settle",
+		receipts?: (TurnReceipt | undefined)[],
 	): BoundaryContextPreview {
 		const projection =
 			drafts.length === 0
 				? this.sessionManager.buildSessionProjection()
-				: this._createBoundaryPreviewManager(drafts).buildSessionProjection();
+				: this._createBoundaryPreviewManager(drafts, receipts).buildSessionProjection();
 		const pendingMessages = this._getPendingBoundaryMessages();
 		const llmMessages = convertToLlm(projection.messages);
 		const finalRole = llmMessages[llmMessages.length - 1]?.role;
@@ -1066,8 +1089,8 @@ export class AgentSession {
 		};
 	}
 
-	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[]): void {
-		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts);
+	private _commitBoundaryDrafts(drafts: SessionBoundaryDraft[], receipts: (TurnReceipt | undefined)[]): void {
+		const appended = this._applyBoundaryDrafts(this.sessionManager, drafts, receipts);
 		this._refreshFinalizedContext();
 		for (const entry of appended) this._emit({ type: "entry_appended", entry });
 	}
@@ -1192,6 +1215,15 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (
+			(event.type === "message_start" || event.type === "message_end") &&
+			(event.message.role === "user" || event.message.role === "custom") &&
+			!this.#receivedMessageReceipts.has(event.message)
+		) {
+			// Raw Agent APIs have no admission callback: this is FIRST HARNESS OBSERVATION,
+			// not raw enqueue time, and never derives from the caller's timestamp (#2867).
+			this.#receivedMessageReceipts.set(event.message, captureTerminalTurnReceipt());
+		}
 		// Synthetic run failures publish another message_start, but not a new turn_start.
 		if (event.type === "turn_start") this._assistantOutputObserved = false;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
@@ -1245,6 +1277,7 @@ export class AgentSession {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
+			const receipt = this.#receivedMessageReceipts.get(event.message);
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -1255,13 +1288,17 @@ export class AgentSession {
 							event.message.content,
 							event.message.display,
 							event.message.details,
+							receipt,
 						)
-					: this.sessionManager.appendCustomMessageEntry(
+					: appendReceivedCustomMessage(
+							this.sessionManager,
 							event.message.customType,
 							event.message.content,
 							event.message.display,
 							event.message.details,
+							receipt,
 						);
+				this.#receivedMessageReceipts.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1275,8 +1312,9 @@ export class AgentSession {
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				entryId = this.#ordinaryOwner
-					? await appendOwnedTerminalMessage(this.sessionManager, event.message)
-					: this.sessionManager.appendMessage(event.message);
+					? await appendOwnedTerminalMessage(this.sessionManager, event.message, receipt)
+					: appendReceivedMessage(this.sessionManager, event.message, receipt);
+				this.#receivedMessageReceipts.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -2059,12 +2097,12 @@ export class AgentSession {
 			const revision = this.sessionManager.revision();
 			const result = await this._extensionRunner.emitBoundary(
 				{ type: "agent_before_settle", outcome: this._lastActivityOutcome },
-				(entries) => this._buildBoundaryContext(entries, "agent_before_settle"),
+				(entries, receipts) => this._buildBoundaryContext(entries, "agent_before_settle", receipts),
 				() => this._getPendingBoundaryMessages(),
 				this._shutdownCancellation.signal,
 			);
 			if (this._shutdownCancellation.signal.aborted) return false;
-			if (result.entries.length > 0) this._commitBoundaryDrafts(result.entries);
+			if (result.entries.length > 0) this._commitBoundaryDrafts(result.entries, result.entryReceipts);
 			// Captured SDK managers can append context without proposing any drafts.
 			// Agent.continue() checks agent state before request preparation can refresh it.
 			else if (this.sessionManager.revision() !== revision) this._refreshFinalizedContext();
@@ -2137,12 +2175,24 @@ export class AgentSession {
 	 * @throws Error if no model selected or no API key available (when not streaming)
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
+		return this._promptAdmitted(text, options, captureTerminalTurnReceipt());
+	}
+
+	private _promptReceived(input: ReceivedInput, options?: PromptOptions): Promise<void> {
+		return this._promptAdmitted(input.text, { ...options, images: input.images }, getInputReceipt(input));
+	}
+
+	private async _promptAdmitted(
+		text: string,
+		options: PromptOptions | undefined,
+		receipt: TurnReceipt,
+	): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
 		if (this._isEmittingAgentSettled) {
 			const completion = new Promise<void>((resolve, reject) => {
 				this._deferredSettledActions.push(async () => {
 					try {
-						await this.prompt(text, options);
+						await this._promptAdmitted(text, options, receipt);
 						resolve();
 					} catch (error) {
 						reject(error);
@@ -2162,7 +2212,7 @@ export class AgentSession {
 			}
 			return completion;
 		}
-		if (!this.#ordinaryOwner) return this._prompt(text, options);
+		if (!this.#ordinaryOwner) return this._prompt(text, options, undefined, undefined, receipt);
 		this.#ordinaryOwner.assertSessionStart(this);
 		this.#ordinaryOwner.assertCompactionIdle();
 		this.#ordinaryPreflights++;
@@ -2176,7 +2226,9 @@ export class AgentSession {
 			}
 		};
 		try {
-			await this.#ordinaryOwner.requestProvenance.prompt((token) => this._prompt(text, options, release, token));
+			await this.#ordinaryOwner.requestProvenance.prompt((token) =>
+				this._prompt(text, options, release, token, receipt),
+			);
 		} finally {
 			release();
 		}
@@ -2187,6 +2239,7 @@ export class AgentSession {
 		options?: PromptOptions,
 		releasePreflight?: () => void,
 		promptToken?: object,
+		receipt = captureTerminalTurnReceipt(),
 	): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
@@ -2260,9 +2313,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, receipt);
 				} else {
-					await this._queueSteer(expandedText, currentImages);
+					await this._queueSteer(expandedText, currentImages, receipt);
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
@@ -2308,8 +2361,8 @@ export class AgentSession {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
-					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
-					else await this._queueSteer(expandedText, currentImages);
+					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, receipt);
+					else await this._queueSteer(expandedText, currentImages, receipt);
 					// Input already queued behind this prompt is retained with it, and so are
 					// triggered messages held during this preflight: the stop holds for them too.
 					this._inputQueuedBehindPreflight = false;
@@ -2347,11 +2400,9 @@ export class AgentSession {
 			messages = [];
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
 			userContent.push(...normalized.images);
-			messages.push({
-				role: "user",
-				content: userContent,
-				timestamp: Date.now(),
-			});
+			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
+			this.#receivedMessageReceipts.set(userMessage, receipt);
+			messages.push(userMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
 			for (const msg of this._pendingNextTurnMessages) {
@@ -2359,8 +2410,8 @@ export class AgentSession {
 			}
 			this._pendingNextTurnMessages = [];
 
-			for (const msg of result.messages) {
-				messages.push({
+			for (const [index, msg] of result.messages.entries()) {
+				const message: CustomMessage = {
 					role: "custom",
 					customType: msg.customType,
 					// Untyped extensions can pass null/missing content; normalize at ingestion.
@@ -2368,7 +2419,9 @@ export class AgentSession {
 					display: msg.display,
 					details: msg.details,
 					timestamp: Date.now(),
-				});
+				};
+				this.#receivedMessageReceipts.set(message, result.messageReceipts[index]);
+				messages.push(message);
 			}
 			const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
 			this._runSystemPromptOptions = result.systemPromptOptions;
@@ -2547,6 +2600,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		receipt: TurnReceipt,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
@@ -2555,7 +2609,7 @@ export class AgentSession {
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source);
+			await this._prepareQueuedInput(text, images, behavior, source, receipt);
 		} finally {
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
@@ -2569,6 +2623,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
 		source: InputSource,
+		receipt: TurnReceipt,
 	): Promise<void> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
@@ -2586,9 +2641,9 @@ export class AgentSession {
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 
 		if (behavior === "steer") {
-			await this._queueSteer(expandedText, processedInput.images);
+			await this._queueSteer(expandedText, processedInput.images, receipt);
 		} else {
-			await this._queueFollowUp(expandedText, processedInput.images);
+			await this._queueFollowUp(expandedText, processedInput.images, receipt);
 		}
 	}
 
@@ -2602,7 +2657,8 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive");
+		const receipt = captureTerminalTurnReceipt();
+		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive", receipt);
 	}
 
 	/**
@@ -2614,13 +2670,14 @@ export class AgentSession {
 	 * @throws Error if text is an extension command
 	 */
 	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
-		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive");
+		const receipt = captureTerminalTurnReceipt();
+		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive", receipt);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueSteer(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
 		this._emitQueueUpdate();
@@ -2628,17 +2685,15 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.steer({
-			role: "user",
-			content,
-			timestamp: Date.now(),
-		});
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this.#receivedMessageReceipts.set(message, receipt);
+		this.agent.steer(message);
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
 		this._emitQueueUpdate();
@@ -2646,7 +2701,9 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		this.#receivedMessageReceipts.set(message, receipt);
+		this.agent.followUp(message);
 	}
 
 	/**
@@ -2682,6 +2739,7 @@ export class AgentSession {
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		const receipt = captureTerminalTurnReceipt();
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
@@ -2693,6 +2751,16 @@ export class AgentSession {
 			details: message.details,
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
+		this.#receivedMessageReceipts.set(appMessage, receipt);
+		return this._deliverCustomMessage(appMessage, options);
+	}
+
+	private async _deliverCustomMessage(
+		appMessage: CustomMessage,
+		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+	): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
+		this.#ordinaryOwner?.assertCompactionIdle();
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
 		} else if (this.isStreaming && options?.triggerTurn !== false) {
@@ -2702,7 +2770,7 @@ export class AgentSession {
 				this.agent.steer(appMessage);
 			}
 		} else if (options?.triggerTurn) {
-			// Waiting releases admission. Re-enter the public dispatch so a prompt or
+			// Waiting releases admission. Re-enter delivery of this same occurrence so a prompt or
 			// earlier triggered message that acquired the run owns settlement; preserve
 			// this message's requested queue rather than starting another run owner.
 			if (this._modelSwitchCompactionPending) {
@@ -2713,16 +2781,16 @@ export class AgentSession {
 					this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
 					return;
 				}
-				this._modelSwitchDispatches.set(appMessage, options.deliverAs);
+				const ticket = { deliverAs: options.deliverAs };
+				this._modelSwitchDispatches.set(appMessage, ticket);
 				try {
 					while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
 					const dispatch = async () => {
 						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
-						if (!this._modelSwitchDispatches.has(appMessage)) return;
-						const delivery = this.sendCustomMessage(appMessage, options);
-						// Re-entry synchronously transfers ownership to a run, held queue, or another switch.
+						if (this._modelSwitchDispatches.get(appMessage) !== ticket) return;
+						// Remove only this ticket before re-entry can acquire another switch ticket.
 						this._modelSwitchDispatches.delete(appMessage);
-						await delivery;
+						await this._deliverCustomMessage(appMessage, options);
 					};
 					if (this._isEmittingAgentSettled) {
 						// External callers can await delivery; unlike hooks, they do not own this settlement.
@@ -2739,13 +2807,14 @@ export class AgentSession {
 						});
 					} else await dispatch();
 				} finally {
-					this._modelSwitchDispatches.delete(appMessage);
+					if (this._modelSwitchDispatches.get(appMessage) === ticket)
+						this._modelSwitchDispatches.delete(appMessage);
 					this._resolveIdleWaitIfIdle();
 				}
 				return;
 			}
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this.sendCustomMessage(appMessage, options));
+				this._deferredSettledActions.push(async () => await this._deliverCustomMessage(appMessage, options));
 				return;
 			}
 			if (this._promptPreflights.size > 0) {
@@ -2763,18 +2832,24 @@ export class AgentSession {
 			// to the end of the turn. Nothing is emitted yet: message events must not
 			// describe messages the session tree does not contain.
 			this._pendingCustomMessages.push(appMessage);
+		} else if (this.#ordinaryOwner) {
+			this._pendingCustomMessages.push(appMessage);
+			await this.#ordinaryOwner.owner.terminal(() => this._flushPendingCustomMessagesOwnedTerminal());
 		} else {
 			this._appendCustomMessage(appMessage);
 		}
 	}
 
 	private _appendCustomMessage(appMessage: CustomMessage): void {
-		const entryId = this.sessionManager.appendCustomMessageEntry(
+		const entryId = appendReceivedCustomMessage(
+			this.sessionManager,
 			appMessage.customType,
 			appMessage.content,
 			appMessage.display,
 			appMessage.details,
+			this.#receivedMessageReceipts.get(appMessage),
 		);
+		this.#receivedMessageReceipts.delete(appMessage);
 		this._recordMessageEntryId(appMessage, entryId);
 		this._entryIdsByMessage.set(appMessage, entryId);
 		this._refreshFinalizedContext();
@@ -2803,7 +2878,9 @@ export class AgentSession {
 					message.content,
 					message.display,
 					message.details,
+					this.#receivedMessageReceipts.get(message),
 				);
+				this.#receivedMessageReceipts.delete(message);
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
 					this._pendingCustomMessages.shift();
@@ -2856,6 +2933,7 @@ export class AgentSession {
 		content: string | (TextContent | ImageContent)[],
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void> {
+		const receipt = captureTerminalTurnReceipt();
 		// Normalize content to text string + optional images
 		let text: string;
 		let images: ImageContent[] | undefined;
@@ -2876,7 +2954,7 @@ export class AgentSession {
 			if (images.length === 0) images = undefined;
 		}
 
-		await this.prompt(text, {
+		await this._promptReceived(receiveInput(text, images, receipt), {
 			expandPromptTemplates: options?.expandPromptTemplates ?? false,
 			streamingBehavior: options?.deliverAs,
 			images,
@@ -2982,7 +3060,7 @@ export class AgentSession {
 	}
 
 	private _retainModelSwitchDispatches(): void {
-		for (const [message, deliverAs] of this._modelSwitchDispatches) {
+		for (const [message, { deliverAs }] of this._modelSwitchDispatches) {
 			if (deliverAs === "followUp") this.agent.followUp(message);
 			else this.agent.steer(message);
 		}

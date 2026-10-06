@@ -94,6 +94,7 @@ import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
+import { type ModeInputPlan, takeModeInputPlan } from "../../core/mode-turn-receipts.ts";
 import {
 	defaultModelPerProvider,
 	findExactModelReferenceMatch,
@@ -103,6 +104,13 @@ import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
 import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
+import {
+	followUpReceived,
+	promptReceived,
+	type ReceivedInput,
+	receiveInput,
+	steerReceived,
+} from "../../core/received-input.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
 import {
@@ -240,7 +248,7 @@ class ExpandableText extends Text implements Expandable {
 }
 
 type CompactionQueuedMessage = {
-	text: string;
+	input: ReceivedInput;
 	mode: "steer" | "followUp";
 };
 
@@ -429,6 +437,7 @@ export class InteractiveMode {
 	private statusContainer: Container;
 	private defaultEditor: CustomEditor;
 	private editor: EditorComponent;
+	private ordinaryEditorSubmit: EditorComponent["onSubmit"];
 	private editorComponentFactory: EditorFactory | undefined;
 	private autocompleteProvider: AutocompleteProvider | undefined;
 	private autocompleteProviderWrappers: AutocompleteProviderFactory[] = [];
@@ -444,8 +453,9 @@ export class InteractiveMode {
 	private keybindings: KeybindingsManager;
 	private version: string;
 	private isInitialized = false;
-	private onInputCallback?: (text: string) => void;
-	private pendingUserInputs: string[] = [];
+	private onInputCallback?: (input: ReceivedInput) => void;
+	private pendingUserInputs: ReceivedInput[] = [];
+	private readonly inputPlan: ModeInputPlan;
 	private userInputInFlight = false;
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -575,6 +585,12 @@ export class InteractiveMode {
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
 		this.options = { ...options, tuiMode };
+		this.inputPlan = takeModeInputPlan(
+			options,
+			options.initialMessage,
+			options.initialImages,
+			options.initialMessages ?? [],
+		);
 		this.autoTrustOnReloadCwd = options.autoTrustOnReloadCwd;
 		this.runtimeHost.setBeforeSessionInvalidate(() => {
 			if (this.compactionQueueTransfers > 0) throw new Error("OWNER_TUI_TRANSFER_PENDING");
@@ -1164,14 +1180,7 @@ export class InteractiveMode {
 		}
 
 		// Show startup warnings
-		const {
-			migratedProviders,
-			startupDiagnostics,
-			modelFallbackMessage,
-			initialMessage,
-			initialImages,
-			initialMessages,
-		} = this.options;
+		const { migratedProviders, startupDiagnostics, modelFallbackMessage } = this.options;
 
 		for (const diagnostic of startupDiagnostics ?? []) {
 			if (diagnostic.type === "error") {
@@ -1207,31 +1216,29 @@ export class InteractiveMode {
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
 		// Process initial messages
-		if (initialMessage) {
+		if (this.inputPlan.initial) {
 			try {
-				await this.session.prompt(initialMessage, { images: initialImages });
+				await promptReceived(this.session, this.inputPlan.initial);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
 			}
 		}
 
-		if (initialMessages) {
-			for (const message of initialMessages) {
-				try {
-					await this.session.prompt(message);
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
-				}
+		for (const input of this.inputPlan.remaining) {
+			try {
+				await promptReceived(this.session, input);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
 			}
 		}
 
 		// Main interactive loop
 		while (true) {
-			const userInput = await this.getUserInput();
+			const userInput = await this.getReceivedUserInput();
 			try {
-				const prompt = this.session.prompt(userInput);
+				const prompt = promptReceived(this.session, userInput);
 				// Original session preflight owns the input before TUI staging clears.
 				this.userInputInFlight = false;
 				this.stagingAudit?.("input-transferred");
@@ -3214,202 +3221,212 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
+			await this.dispatchEditorInput(receiveInput(text));
+		};
+		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;
+	}
 
-			// Handle commands
-			if (text === "/settings") {
-				this.showSettingsSelector();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/scoped-models") {
-				this.editor.setText("");
-				await this.showModelsSelector();
-				return;
-			}
-			if (text === "/model" || text.startsWith("/model ")) {
-				const searchTerm = text.startsWith("/model ") ? text.slice(7).trim() : undefined;
-				this.editor.setText("");
-				await this.handleModelCommand(searchTerm);
-				return;
-			}
-			if (text === "/thinking" || text.startsWith("/thinking ")) {
-				const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
-				this.editor.setText("");
-				this.handleThinkingCommand(searchTerm);
-				return;
-			}
-			if (text === "/export" || text.startsWith("/export ")) {
-				await this.handleExportCommand(text);
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/import" || text.startsWith("/import ")) {
-				await this.handleImportCommand(text);
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/share") {
-				await this.handleShareCommand();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/bug" || text.startsWith("/bug ")) {
-				const hint = text.slice("/bug".length).trim();
-				this.editor.setText("");
-				await this.handleBugCommand(hint ? hint : undefined);
-				return;
-			}
-			if (text === "/copy") {
-				await this.handleCopyCommand();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/name" || text.startsWith("/name ")) {
-				this.handleNameCommand(text);
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/session") {
-				this.handleSessionCommand();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/changelog") {
-				this.handleChangelogCommand();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/hotkeys") {
-				this.handleHotkeysCommand();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/fork") {
-				this.showUserMessageSelector();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/clone") {
-				this.editor.setText("");
-				await this.handleCloneCommand();
-				return;
-			}
-			if (text === "/tree") {
-				this.showTreeSelector();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/trust") {
-				this.showTrustSelector();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/login" || text.startsWith("/login ")) {
-				const providerRef = text.startsWith("/login ") ? text.slice(7).trim() : undefined;
-				this.editor.setText("");
-				await this.handleLoginCommand(providerRef);
-				return;
-			}
-			if (text === "/logout") {
-				this.showOAuthSelector("logout");
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/new") {
-				this.editor.setText("");
-				await this.handleClearCommand();
-				return;
-			}
-			if (text === "/compact" || text.startsWith("/compact ")) {
-				const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
-				this.editor.setText("");
-				await this.handleCompactCommand(customInstructions);
-				return;
-			}
-			if (text === "/reload") {
-				this.editor.setText("");
-				await this.handleReloadCommand();
-				return;
-			}
-			if (text === "/debug") {
-				this.handleDebugCommand();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/arminsayshi") {
-				this.handleArminSaysHi();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/dementedelves") {
-				this.handleDementedDelves();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/resume") {
-				this.showSessionSelector();
-				this.editor.setText("");
-				return;
-			}
-			if (text === "/quit") {
-				this.editor.setText("");
-				await this.shutdown();
-				return;
-			}
+	/** Dispatch commands or transfer the same admitted envelope to ordinary prompt handling. */
+	private async dispatchEditorInput(input: ReceivedInput): Promise<void> {
+		const text = input.text;
 
-			// Handle bash command (! for normal, !! for excluded from context)
-			if (text.startsWith("!")) {
-				const isExcluded = text.startsWith("!!");
-				const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
-				if (command) {
-					if (this.session.isBashRunning) {
-						this.showWarning("A bash command is already running. Press Esc to cancel it first.");
-						this.editor.setText(text);
-						return;
-					}
-					this.editor.addToHistory?.(text);
-					await this.handleBashCommand(command, isExcluded);
-					this.isBashMode = false;
-					this.updateEditorBorderColor();
+		// Handle commands
+		if (text === "/settings") {
+			this.showSettingsSelector();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/scoped-models") {
+			this.editor.setText("");
+			await this.showModelsSelector();
+			return;
+		}
+		if (text === "/model" || text.startsWith("/model ")) {
+			const searchTerm = text.startsWith("/model ") ? text.slice(7).trim() : undefined;
+			this.editor.setText("");
+			await this.handleModelCommand(searchTerm);
+			return;
+		}
+		if (text === "/thinking" || text.startsWith("/thinking ")) {
+			const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
+			this.editor.setText("");
+			this.handleThinkingCommand(searchTerm);
+			return;
+		}
+		if (text === "/export" || text.startsWith("/export ")) {
+			await this.handleExportCommand(text);
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/import" || text.startsWith("/import ")) {
+			await this.handleImportCommand(text);
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/share") {
+			await this.handleShareCommand();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/bug" || text.startsWith("/bug ")) {
+			const hint = text.slice("/bug".length).trim();
+			this.editor.setText("");
+			await this.handleBugCommand(hint ? hint : undefined);
+			return;
+		}
+		if (text === "/copy") {
+			await this.handleCopyCommand();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/name" || text.startsWith("/name ")) {
+			this.handleNameCommand(text);
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/session") {
+			this.handleSessionCommand();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/changelog") {
+			this.handleChangelogCommand();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/hotkeys") {
+			this.handleHotkeysCommand();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/fork") {
+			this.showUserMessageSelector();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/clone") {
+			this.editor.setText("");
+			await this.handleCloneCommand();
+			return;
+		}
+		if (text === "/tree") {
+			this.showTreeSelector();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/trust") {
+			this.showTrustSelector();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/login" || text.startsWith("/login ")) {
+			const providerRef = text.startsWith("/login ") ? text.slice(7).trim() : undefined;
+			this.editor.setText("");
+			await this.handleLoginCommand(providerRef);
+			return;
+		}
+		if (text === "/logout") {
+			this.showOAuthSelector("logout");
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/new") {
+			this.editor.setText("");
+			await this.handleClearCommand();
+			return;
+		}
+		if (text === "/compact" || text.startsWith("/compact ")) {
+			const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
+			this.editor.setText("");
+			await this.handleCompactCommand(customInstructions);
+			return;
+		}
+		if (text === "/reload") {
+			this.editor.setText("");
+			await this.handleReloadCommand();
+			return;
+		}
+		if (text === "/debug") {
+			this.handleDebugCommand();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/arminsayshi") {
+			this.handleArminSaysHi();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/dementedelves") {
+			this.handleDementedDelves();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/resume") {
+			this.showSessionSelector();
+			this.editor.setText("");
+			return;
+		}
+		if (text === "/quit") {
+			this.editor.setText("");
+			await this.shutdown();
+			return;
+		}
+
+		// Handle bash command (! for normal, !! for excluded from context)
+		if (text.startsWith("!")) {
+			const isExcluded = text.startsWith("!!");
+			const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
+			if (command) {
+				if (this.session.isBashRunning) {
+					this.showWarning("A bash command is already running. Press Esc to cancel it first.");
+					this.editor.setText(text);
 					return;
 				}
-			}
-
-			// Queue input during compaction (extension commands execute immediately)
-			if (this.session.isCompacting) {
-				if (this.isExtensionCommand(text)) {
-					this.editor.addToHistory?.(text);
-					this.editor.setText("");
-					await this.session.prompt(text);
-				} else {
-					this.queueCompactionMessage(text, "steer");
-				}
+				this.editor.addToHistory?.(text);
+				await this.handleBashCommand(command, isExcluded);
+				this.isBashMode = false;
+				this.updateEditorBorderColor();
 				return;
 			}
+		}
 
-			// If streaming, use prompt() with steer behavior
-			// This handles extension commands (execute immediately), prompt template expansion, and queueing
-			if (this.session.isStreaming) {
+		// Queue input during compaction (extension commands execute immediately)
+		if (this.session.isCompacting) {
+			if (this.isExtensionCommand(text)) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
-				return;
-			}
-
-			// Normal message submission
-			// First, move any pending bash components to chat
-			this.flushPendingBashComponents();
-
-			if (this.onInputCallback) {
-				this.onInputCallback(text);
+				await this.session.prompt(text);
 			} else {
-				this.pendingUserInputs.push(text);
-				this.stagingAudit?.("input-enqueued");
+				this.queueCompactionMessage(input, "steer");
 			}
+			return;
+		}
+
+		// If streaming, use prompt() with steer behavior
+		// This handles extension commands (execute immediately), prompt template expansion, and queueing
+		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
-		};
+			this.editor.setText("");
+			await promptReceived(this.session, input, { streamingBehavior: "steer" });
+			this.updatePendingMessagesDisplay();
+			this.ui.requestRender();
+			return;
+		}
+
+		// Normal message submission
+		this.submitEditorInput(input);
+	}
+
+	/** Shared idle submission path; the caller owns admission before any editor effects. */
+	private submitEditorInput(input: ReceivedInput): void {
+		this.flushPendingBashComponents();
+		if (this.onInputCallback) {
+			this.onInputCallback(input);
+		} else {
+			this.pendingUserInputs.push(input);
+			this.stagingAudit?.("input-enqueued");
+		}
+		this.editor.addToHistory?.(input.text);
 	}
 
 	private subscribeToAgent(): void {
@@ -4246,7 +4263,7 @@ export class InteractiveMode {
 		);
 	}
 
-	async getUserInput(): Promise<string> {
+	private async getReceivedUserInput(): Promise<ReceivedInput> {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
 			this.userInputInFlight = true;
@@ -4255,13 +4272,17 @@ export class InteractiveMode {
 		}
 
 		return new Promise((resolve) => {
-			this.onInputCallback = (text: string) => {
+			this.onInputCallback = (input: ReceivedInput) => {
 				this.onInputCallback = undefined;
 				this.userInputInFlight = true;
 				this.stagingAudit?.("input-delivered");
-				resolve(text);
+				resolve(input);
 			};
 		});
+	}
+
+	async getUserInput(): Promise<string> {
+		return (await this.getReceivedUserInput()).text;
 	}
 
 	private rebuildChatFromMessages(): void {
@@ -4488,7 +4509,7 @@ export class InteractiveMode {
 				this.editor.setText("");
 				await this.session.prompt(text);
 			} else {
-				this.queueCompactionMessage(text, "followUp");
+				this.queueCompactionMessage(receiveInput(text), "followUp");
 			}
 			return;
 		}
@@ -4496,16 +4517,23 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
+			const input = receiveInput(text);
 			this.editor.addToHistory?.(text);
 			this.editor.setText("");
-			await this.session.prompt(text, { streamingBehavior: "followUp" });
+			await promptReceived(this.session, input, { streamingBehavior: "followUp" });
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
 		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
 		else if (this.editor.onSubmit) {
-			this.editor.setText("");
-			this.editor.onSubmit(text);
+			if (this.editor.onSubmit !== this.ordinaryEditorSubmit) {
+				this.editor.setText("");
+				await this.editor.onSubmit(text);
+			} else {
+				const input = receiveInput(text);
+				this.editor.setText("");
+				await this.dispatchEditorInput(input);
+			}
 		}
 	}
 
@@ -4703,11 +4731,11 @@ export class InteractiveMode {
 		return {
 			steering: [
 				...this.session.getSteeringMessages(),
-				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.text),
+				...this.compactionQueuedMessages.filter((msg) => msg.mode === "steer").map((msg) => msg.input.text),
 			],
 			followUp: [
 				...this.session.getFollowUpMessages(),
-				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.text),
+				...this.compactionQueuedMessages.filter((msg) => msg.mode === "followUp").map((msg) => msg.input.text),
 			],
 		};
 	}
@@ -4720,10 +4748,10 @@ export class InteractiveMode {
 		const { steering, followUp } = this.session.clearQueue();
 		const compactionSteering = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "steer")
-			.map((msg) => msg.text);
+			.map((msg) => msg.input.text);
 		const compactionFollowUp = this.compactionQueuedMessages
 			.filter((msg) => msg.mode === "followUp")
-			.map((msg) => msg.text);
+			.map((msg) => msg.input.text);
 		this.compactionQueuedMessages = [];
 		this.stagingAudit?.("queues-cleared");
 		return {
@@ -4772,10 +4800,10 @@ export class InteractiveMode {
 		return allQueued.length;
 	}
 
-	private queueCompactionMessage(text: string, mode: "steer" | "followUp"): void {
-		this.compactionQueuedMessages.push({ text, mode });
+	private queueCompactionMessage(input: ReceivedInput, mode: "steer" | "followUp"): void {
+		this.compactionQueuedMessages.push({ input, mode });
 		this.stagingAudit?.("compaction-enqueued");
-		this.editor.addToHistory?.(text);
+		this.editor.addToHistory?.(input.text);
 		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
 		this.showStatus("Queued message for after compaction");
@@ -4833,16 +4861,16 @@ export class InteractiveMode {
 			if (options?.willRetry) {
 				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
-					if (this.isExtensionCommand(message.text)) {
-						await session.prompt(message.text, {
+					if (this.isExtensionCommand(message.input.text)) {
+						await promptReceived(session, message.input, {
 							onInputTransferred: () => {
 								pending.delete(message);
 							},
 						});
 					} else if (message.mode === "followUp") {
-						await session.followUp(message.text);
+						await followUpReceived(session, message.input);
 					} else {
-						await session.steer(message.text);
+						await steerReceived(session, message.input);
 					}
 					pending.delete(message);
 				}
@@ -4851,11 +4879,11 @@ export class InteractiveMode {
 			}
 
 			// Find first non-extension-command message to use as prompt
-			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.text));
+			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.input.text));
 			if (firstPromptIndex === -1) {
 				// All extension commands - execute them all
 				for (const message of queuedMessages) {
-					await session.prompt(message.text, {
+					await promptReceived(session, message.input, {
 						onInputTransferred: () => {
 							pending.delete(message);
 						},
@@ -4871,7 +4899,7 @@ export class InteractiveMode {
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
 
 			for (const message of preCommands) {
-				await session.prompt(message.text, {
+				await promptReceived(session, message.input, {
 					onInputTransferred: () => {
 						pending.delete(message);
 					},
@@ -4881,7 +4909,7 @@ export class InteractiveMode {
 
 			// Start a prompt when idle, or queue it into a run still finishing compaction.
 			let firstTransferred = false;
-			const started = session.prompt(firstPrompt.text, {
+			const started = promptReceived(session, firstPrompt.input, {
 				streamingBehavior: firstPrompt.mode,
 				onInputTransferred: () => {
 					firstTransferred = true;
@@ -4903,16 +4931,16 @@ export class InteractiveMode {
 
 			// Queue remaining messages
 			for (const message of rest) {
-				if (this.isExtensionCommand(message.text)) {
-					await session.prompt(message.text, {
+				if (this.isExtensionCommand(message.input.text)) {
+					await promptReceived(session, message.input, {
 						onInputTransferred: () => {
 							pending.delete(message);
 						},
 					});
 				} else if (message.mode === "followUp") {
-					await session.followUp(message.text);
+					await followUpReceived(session, message.input);
 				} else {
-					await session.steer(message.text);
+					await steerReceived(session, message.input);
 				}
 				pending.delete(message);
 			}
