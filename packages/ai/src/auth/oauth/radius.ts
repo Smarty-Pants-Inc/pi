@@ -12,6 +12,7 @@
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { generatePKCE } from "./pkce.ts";
 
@@ -62,9 +63,8 @@ class OAuthResponseError extends Error {
 	readonly oauthError?: string;
 
 	constructor(status: number, oauthError: string | undefined, message: string) {
-		// Token endpoint text can echo submitted or issued secrets: show only a protocol-shaped error code.
-		const code = oauthError && /^[a-z_]{1,64}$/.test(oauthError) ? oauthError : undefined;
-		super(`${message}: ${code ?? String(status)}`);
+		// Token endpoint text can echo submitted or issued secrets, even in a code-shaped field: allowlist the code.
+		super(`${message}: ${oauthError ? oauthAuthorizationError(oauthError) : String(status)}`);
 		this.status = status;
 		this.oauthError = oauthError;
 	}

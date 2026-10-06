@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { redactOAuthDiagnostic, redactOAuthDiagnosticValue } from "../src/auth/oauth/credential-response.ts";
+import {
+	getRequestDiagnosticSecrets,
+	redactOAuthDiagnostic,
+	redactOAuthDiagnosticValue,
+} from "../src/auth/oauth/credential-response.ts";
 import { createAssistantMessageDiagnostic } from "../src/utils/diagnostics.ts";
 import { MAX_PROVIDER_ERROR_BODY_CHARS, normalizeProviderError } from "../src/utils/error-body.ts";
 
@@ -86,4 +90,28 @@ describe("OAuth diagnostic redaction", () => {
 			createAssistantMessageDiagnostic("provider_error", error, { refresh_token: secret }, [secret]).details,
 		).toEqual({ refresh_token: "***" });
 	});
+
+	// pi#150 security round 2: custom credential headers have no fixed name.
+	it.each(["X-Portkey-Api-Key", "X-Custom-Token", "X-Client-Secret", "Cookie", "X-Session-Id", "X-Auth"])(
+		"redacts the value of the custom sensitive header %s",
+		(header) => {
+			const secret = "FAKE_CUSTOM_HEADER_150";
+			const secrets = getRequestDiagnosticSecrets(
+				{ headers: { [header]: `Token ${secret}` } },
+				{ headers: { "Content-Type": "application/json" } },
+			);
+			expect(secrets).not.toContain("application/json");
+			expect(redactOAuthDiagnostic(`401 rejected ${secret}`, secrets)).toBe("401 rejected ***");
+		},
+	);
+
+	it.each(["api_key", "apiKey", "api-key", "x-api-key", "x-goog-api-key"])(
+		"redacts a short value under the API-key label %s",
+		(label) => {
+			const result = redactOAuthDiagnostic(`401 server_error {"${label}":"sk-1"} ${label}=sk-2, code=bad`);
+			expect(result).not.toContain("sk-1");
+			expect(result).not.toContain("sk-2");
+			expect(result).toContain("code=bad");
+		},
+	);
 });

@@ -5,6 +5,7 @@
 import { GITHUB_COPILOT_MODELS } from "../../providers/github-copilot.models.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 const decode = (s: string) => atob(s);
@@ -34,7 +35,6 @@ type DeviceTokenSuccessResponse = {
 
 type DeviceTokenErrorResponse = {
 	error: string;
-	error_description?: string;
 	interval?: number;
 };
 
@@ -295,7 +295,7 @@ async function pollForGitHubAccessToken(
 			}
 
 			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
-				const { error, error_description: description, interval } = raw as DeviceTokenErrorResponse;
+				const { error, interval } = raw as DeviceTokenErrorResponse;
 				if (error === "authorization_pending") {
 					return { status: "pending" };
 				}
@@ -304,8 +304,8 @@ async function pollForGitHubAccessToken(
 					return { status: "slow_down", intervalSeconds: typeof interval === "number" ? interval : undefined };
 				}
 
-				const descriptionSuffix = description ? `: ${description}` : "";
-				return { status: "failed", message: `Device flow failed: ${error}${descriptionSuffix}` };
+				// The token endpoint can echo the submitted device code: keep only a protocol code, never error_description.
+				return { status: "failed", message: `Device flow failed: ${oauthAuthorizationError(error)}` };
 			}
 
 			return { status: "failed", message: "Invalid device token response" };

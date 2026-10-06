@@ -7,8 +7,11 @@ export async function readOAuthCredentialResponse(response: Response, operation:
 	}
 }
 
+// API-key labels include prefixed header names such as x-api-key and x-goog-api-key.
 const CREDENTIAL_FIELD =
-	/^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]id|authorization)$/i;
+	/^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]id|authorization|(?:[a-z0-9]+[_-])*api[_-]?key)$/i;
+// ponytail: name-based, so a custom credential header needs no registration; a false match only masks a value.
+const SENSITIVE_HEADER = /key|token|secret|auth|cookie|session|password|account[_-]?id/i;
 /** Include the active JWT account claim even when a native error echoes it without a field label. */
 export function getOAuthDiagnosticSecrets(
 	token: string | undefined,
@@ -19,25 +22,11 @@ export function getOAuthDiagnosticSecrets(
 	if (token) secrets.push(token, `Bearer ${token}`);
 	for (const [key, value] of Object.entries(headers)) {
 		if (!value) continue;
-		const name = key.toLowerCase();
-		if (
-			[
-				"authorization",
-				"proxy-authorization",
-				"cf-aig-authorization",
-				"x-api-key",
-				"x-goog-api-key",
-				"api-key",
-				"chatgpt-account-id",
-				"account-id",
-			].includes(name)
-		) {
-			secrets.push(value);
-			if (name.endsWith("authorization")) {
-				const separator = value.search(/\s/);
-				if (separator >= 0) secrets.push(value.slice(separator).trim());
-			}
-		}
+		if (!SENSITIVE_HEADER.test(key)) continue;
+		secrets.push(value);
+		// "Bearer x", "Basic x", "Token x": the credential part can be echoed alone.
+		const separator = value.search(/\s/);
+		if (separator >= 0) secrets.push(value.slice(separator).trim());
 	}
 	if (!token) return secrets;
 	try {

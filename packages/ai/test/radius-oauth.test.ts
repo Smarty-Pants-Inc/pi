@@ -116,6 +116,23 @@ describe("Radius OAuth", () => {
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
+	// pi#150 security round 2: a code-shaped error field can still be an echoed secret.
+	it("does not reflect an echoed lowercase secret in the error code", async () => {
+		const secret = "leaked_refresh_secret";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ error: secret, error_description: secret }, 400)),
+		);
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+		const message = await oauth
+			.refresh({ type: "oauth", access: "old-access", refresh: secret, expires: 0 }, new AbortController().signal)
+			.then(
+				() => "",
+				(error: Error) => error.message,
+			);
+		expect(message).toBe("Radius OAuth token request failed: authorization_error");
+	});
+
 	it("discovers only the interactive browser authorization endpoint", async () => {
 		const fetchMock = vi.fn(async (input: unknown) => {
 			expect(requestUrl(input)).toBe(`${GATEWAY}/v1/oauth`);
