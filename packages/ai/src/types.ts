@@ -138,8 +138,6 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	/** Explicit parent context for telemetry produced by this logical request. */
 	telemetryContext?: TelemetryContext;
 	apiKey?: string;
-	/** Live credential values to redact at diagnostic sinks; never sent to the provider. */
-	diagnosticSecrets?: readonly string[];
 	/** Fixed-code diagnostics only for OAuth-authenticated requests. */
 	oauthDiagnostics?: boolean;
 	/**

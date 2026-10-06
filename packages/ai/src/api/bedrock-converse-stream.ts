@@ -25,7 +25,7 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BuildMiddleware, DeserializeMiddleware, DocumentType, HttpResponse, MetadataBearer } from "@smithy/types";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { getOAuthDiagnosticSecrets, sdkDiagnosticLoggerOff } from "../auth/oauth/credential-response.ts";
+import { sdkDiagnosticLoggerOff } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -142,15 +142,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				(Boolean(getProviderEnvValue("AWS_PROFILE", options.env) || options.profile) ||
 					!getProviderEnvValue("AWS_ACCESS_KEY_ID", options.env) ||
 					!getProviderEnvValue("AWS_SECRET_ACCESS_KEY", options.env))),
-		diagnosticSecrets: [
-			...(options.diagnosticSecrets ?? []),
-			...getOAuthDiagnosticSecrets(bearerToken),
-			...getOAuthDiagnosticSecrets(options.bearerToken),
-			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_BEARER_TOKEN_BEDROCK", options.env)),
-			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_ACCESS_KEY_ID", options.env)),
-			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_SECRET_ACCESS_KEY", options.env)),
-			...getOAuthDiagnosticSecrets(getProviderEnvValue("AWS_SESSION_TOKEN", options.env)),
-		],
 	};
 	const stream = new AssistantMessageEventStream(model, options);
 	// Bedrock has no mid-conversation system messages; fold them into the leading prompt.

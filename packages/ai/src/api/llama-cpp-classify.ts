@@ -1,4 +1,3 @@
-import { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import type {
 	ClassifierAnswer,
 	ClassifierApi,
@@ -291,10 +290,6 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 			maxRetries: options?.maxRetries ?? 2,
 			maxRetryDelayMs: options?.maxRetryDelayMs,
 			signal: request.signal,
-			diagnosticSecrets: getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
-				...(options?.diagnosticSecrets ?? []),
-				...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
-			]),
 			oauthDiagnostics: options?.oauthDiagnostics,
 		},
 	);
@@ -494,14 +489,7 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		output.answers = {};
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(
-				error,
-				getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
-					...(options?.diagnosticSecrets ?? []),
-					...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
-				]),
-				options?.oauthDiagnostics,
-			),
+			normalizeProviderError(error, [], options?.oauthDiagnostics),
 			`${LABEL} error`,
 		);
 		return output;

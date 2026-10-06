@@ -17,8 +17,6 @@ import { OAuthDiagnosticError, oauthRecoveryDecision, safeOAuthError } from "../
 import type { OAuthRecoveryDecision } from "../types.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
-export { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
-
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
 export interface NormalizedProviderError {
@@ -27,12 +25,8 @@ export interface NormalizedProviderError {
 	diagnosticHint?: "bedrock_data_retention";
 	/** HTTP status code, when one could be extracted from the SDK error object. */
 	status?: number;
-	/** Raw HTTP body reason, already trimmed and truncated to the cap. */
-	body?: string;
-	/** `error.message`, or `safeJsonStringify(error)` for a non-`Error` throw. */
+	/** Pi-owned diagnostic text only. */
 	message: string;
-	/** True when `message` already contains the body (no separate body to add). */
-	messageCarriesBody: boolean;
 }
 
 type SdkErrorShape = Error & {
@@ -70,7 +64,6 @@ export function normalizeProviderError(
 		return {
 			status: safe.status,
 			message: oauthDiagnostics ? safe.message : safe.message.replace(/^oauth_/, "provider_"),
-			messageCarriesBody: true,
 			oauthRecovery: decision,
 			...(/data retention mode/i.test(text) && provider === "amazon-bedrock"
 				? { diagnosticHint: "bedrock_data_retention" as const }
@@ -80,7 +73,6 @@ export function normalizeProviderError(
 		const safe = safeOAuthError(undefined, true);
 		return {
 			message: oauthDiagnostics ? safe.message : safe.message.replace(/^oauth_/, "provider_"),
-			messageCarriesBody: true,
 			oauthRecovery: oauthRecoveryDecision(safe),
 		};
 	}
@@ -148,12 +140,9 @@ function isPlainNonEmptyObject(value: unknown): boolean {
  * - prefix:    `"<prefix> (<status>): <body>"`
  */
 export function formatProviderError(norm: NormalizedProviderError, prefix?: string): string {
-	if (norm.messageCarriesBody || norm.status === undefined || norm.body === undefined) {
-		return prefix !== undefined && norm.status !== undefined
-			? `${prefix} (${norm.status}): ${norm.message}`
-			: norm.message;
-	}
-	return prefix !== undefined ? `${prefix} (${norm.status}): ${norm.body}` : `${norm.status}: ${norm.body}`;
+	return prefix !== undefined && norm.status !== undefined
+		? `${prefix} (${norm.status}): ${norm.message}`
+		: norm.message;
 }
 
 /** Diagnostic type marking a provider plan/usage limit refusal; the agent must not retry it. */

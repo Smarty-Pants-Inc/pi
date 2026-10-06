@@ -143,7 +143,7 @@ describe("F03 Anthropic", () => {
 		};
 		const output = await anthropicStream({ ...chat, api: "anthropic-messages" }, normalizeContext({ messages: [] }), {
 			apiKey: "fake-active",
-			diagnosticSecrets: [plainSecret],
+
 			fetch,
 			maxRetries: 0,
 		}).result();
@@ -179,7 +179,7 @@ describe("F03 completions", () => {
 		const output = await completionsStream(
 			{ ...chat, api: "openai-completions" },
 			normalizeContext({ messages: [] }),
-			{ apiKey: "fake-active", diagnosticSecrets: [plainSecret], fetch, maxRetries: 0 },
+			{ apiKey: "fake-active", fetch, maxRetries: 0 },
 		).result();
 		expect(output.stopReason).toBe("error");
 		privateDiagnostic(output);
@@ -194,7 +194,7 @@ describe.each(["system", "llama"] as const)("F03 %s classifier", (kind) => {
 			if (branch === "transport") throw new Error(plainSecret);
 			return new Response(plainSecret, { status: 400 });
 		};
-		const options = { apiKey: "fake-active", diagnosticSecrets: [plainSecret], fetch, maxRetries: 0 };
+		const options = { apiKey: "fake-active", fetch, maxRetries: 0 };
 		const output =
 			kind === "system"
 				? await systemClassify({ ...classifier, api: "typesafe-system-one" }, context, options)
@@ -230,7 +230,7 @@ it.each(["override", "transform"])("F05 protects actual Responses %s errors and 
 	const output = await models.complete(model, normalizeContext({ messages: [] }), {
 		headers: branch === "override" ? { Authorization: `Bearer ${plainSecret}` } : undefined,
 		transformHeaders: branch === "transform" ? async () => ({ Authorization: `Bearer ${plainSecret}` }) : undefined,
-		diagnosticSecrets: [secret],
+
 		maxRetries: 0,
 		fetch: async () => Response.json({ error: { message: `${plainSecret} ${echo}` } }, { status: 400 }),
 	});
@@ -715,7 +715,7 @@ it.each(["anthropic", "completions"] as const)("F03 %s SDK log sink is independe
 			logs.push(args);
 		});
 	const fetch = async () => Response.json({ error: { message: plainSecret } }, { status: 400 });
-	const options = { apiKey: "fake-active", diagnosticSecrets: [plainSecret], fetch, maxRetries: 0 };
+	const options = { apiKey: "fake-active", fetch, maxRetries: 0 };
 	if (kind === "anthropic")
 		await anthropicStream(
 			{ ...chat, api: "anthropic-messages" },
@@ -732,7 +732,7 @@ it.each(["anthropic", "completions"] as const)("F03 %s SDK log sink is independe
 });
 it.each(["system", "llama"] as const)("F03 %s classifier parser error is safe", async (kind) => {
 	const fetch = async () => new Response(`invalid-json-${plainSecret}`);
-	const options = { apiKey: "fake-active", diagnosticSecrets: [plainSecret], fetch, maxRetries: 0 };
+	const options = { apiKey: "fake-active", fetch, maxRetries: 0 };
 	const output =
 		kind === "system"
 			? await systemClassify({ ...classifier, api: "typesafe-system-one" }, context, options)
@@ -879,7 +879,7 @@ it("F03 injected Anthropic SDK client logging is safe without mutating caller cl
 	});
 	const result = await anthropicStream({ ...chat, api: "anthropic-messages" }, normalizeContext({ messages: [] }), {
 		client,
-		diagnosticSecrets: [plainSecret],
+
 		maxRetries: 0,
 	}).result();
 	expect(client.logLevel).toBe("debug");

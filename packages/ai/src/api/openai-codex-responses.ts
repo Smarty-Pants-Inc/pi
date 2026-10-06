@@ -7,11 +7,9 @@ import type {
 } from "openai/resources/responses/responses.js";
 
 import {
-	getOAuthDiagnosticSecrets,
 	OAuthDiagnosticError,
 	oauthResponseError,
 	oauthStopReason,
-	redactOAuthDiagnostic,
 	safeOAuthError,
 } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
@@ -262,12 +260,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			stopReason: "pending",
 			timestamp: Date.now(),
 		};
-
-		const diagnosticSecrets = getOAuthDiagnosticSecrets(
-			options?.apiKey,
-			{ ...model.headers, ...options?.headers },
-			options?.diagnosticSecrets,
-		);
 		try {
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
@@ -275,7 +267,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			}
 
 			const accountId = extractAccountId(apiKey);
-			diagnosticSecrets.push(accountId);
 			const grammarToolInputProperties = createGrammarToolInputProperties(
 				getDeclaredTools(normalizedContext.messages),
 				model.compat?.supportsOpenAIGrammarTools ?? false,
@@ -332,7 +323,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							cacheSessionId,
 							accountId,
 							grammarToolInputProperties,
-							diagnosticSecrets,
 							options,
 						);
 
@@ -364,20 +354,15 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						}
 						appendAssistantMessageDiagnostic(
 							output,
-							createAssistantMessageDiagnostic(
-								"provider_transport_failure",
-								safeOAuthError(error),
-								{
-									configuredTransport: transport,
-									...(websocketStarted ? {} : { fallbackTransport: "sse" }),
-									eventsEmitted: websocketStarted,
-									phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-									requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-								},
-								diagnosticSecrets,
-							),
+							createAssistantMessageDiagnostic("provider_transport_failure", safeOAuthError(error), {
+								configuredTransport: transport,
+								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
+								eventsEmitted: websocketStarted,
+								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+							}),
 						);
-						recordWebSocketFailure(cacheSessionId, error, diagnosticSecrets);
+						recordWebSocketFailure(cacheSessionId, error);
 						if (websocketStarted) {
 							throw error;
 						}
@@ -478,7 +463,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				startEmitted = true;
 				stream.push({ type: "start", partial: output });
 			}
-			await processStream(response, output, stream, model, grammarToolInputProperties, diagnosticSecrets, options);
+			await processStream(response, output, stream, model, grammarToolInputProperties, options);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -494,7 +479,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const normalizedError = normalizeProviderError(error, diagnosticSecrets, true);
+			const normalizedError = normalizeProviderError(error, [], true);
 			output.oauthRecovery = normalizedError.oauthRecovery;
 			output.errorMessage = formatProviderError(normalizedError);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -671,16 +656,14 @@ async function processStream(
 	stream: AssistantMessageEventStream,
 	model: Model<"openai-codex-responses">,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
-	diagnosticSecrets: readonly string[],
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	await processResponsesStream(
-		mapCodexEvents(parseSSE(response, options?.signal), output, model, options, diagnosticSecrets),
+		mapCodexEvents(parseSSE(response, options?.signal), output, model, options),
 		output,
 		stream,
 		model,
 		{
-			diagnosticSecrets,
 			oauthDiagnostics: true,
 			serviceTier: options?.serviceTier,
 			grammarToolInputProperties,
@@ -756,7 +739,6 @@ async function* mapCodexEvents(
 	output: AssistantMessage,
 	model: Model<"openai-codex-responses">,
 	options: OpenAICodexResponsesOptions | undefined,
-	diagnosticSecrets: readonly string[],
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		try {
@@ -765,13 +747,7 @@ async function* mapCodexEvents(
 			// The final assistant error must retain this non-transport origin for outer retry callers.
 			appendAssistantMessageDiagnostic(
 				output,
-				createAssistantMessageDiagnostic(
-					"provider_stream_observer_error",
-					error,
-					undefined,
-					diagnosticSecrets,
-					true,
-				),
+				createAssistantMessageDiagnostic("provider_stream_observer_error", error, undefined, [], true),
 			);
 			// Retain terminal usage even when the observer prevents shared normalization.
 			if (
@@ -810,10 +786,7 @@ async function* mapCodexEvents(
 				resolveServiceTier: resolveCodexServiceTier,
 				applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 			});
-			output.rawStopReason =
-				response?.status === undefined
-					? undefined
-					: redactOAuthDiagnostic(oauthStopReason(response.status), diagnosticSecrets);
+			output.rawStopReason = response?.status === undefined ? undefined : oauthStopReason(response.status);
 			const code = response?.error?.code;
 			const message = response?.error?.message;
 			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
@@ -1023,17 +996,13 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-function recordWebSocketFailure(
-	sessionId: string | undefined,
-	error: unknown,
-	diagnosticSecrets: readonly string[],
-): void {
+function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
 	if (!sessionId) return;
 	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	stats.lastWebSocketError = redactOAuthDiagnostic(safeOAuthError(error).message, diagnosticSecrets);
+	stats.lastWebSocketError = safeOAuthError(error).message;
 	stats.websocketFallbackActive = true;
 }
 
@@ -1555,7 +1524,6 @@ async function processWebSocketStream(
 	cacheSessionId: string | undefined,
 	accountId: string,
 	grammarToolInputProperties: ReadonlyMap<string, string>,
-	diagnosticSecrets: readonly string[],
 	options?: OpenAICodexResponsesOptions,
 ): Promise<void> {
 	const { socket, entry, reused, release } = await acquireWebSocket(
@@ -1595,20 +1563,13 @@ async function processWebSocketStream(
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
-				mapCodexEvents(
-					parseWebSocket(socket, options?.signal, idleTimeoutMs),
-					output,
-					model,
-					options,
-					diagnosticSecrets,
-				),
+				mapCodexEvents(parseWebSocket(socket, options?.signal, idleTimeoutMs), output, model, options),
 				onStart,
 			),
 			output,
 			stream,
 			model,
 			{
-				diagnosticSecrets,
 				oauthDiagnostics: true,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,

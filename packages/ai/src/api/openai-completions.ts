@@ -12,11 +12,9 @@ import type {
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
 import {
-	getOAuthDiagnosticSecrets,
 	oauthDiagnosticError,
 	oauthDiagnosticLogger,
 	recordAssistantMessageThrottleWait,
-	redactOAuthDiagnostic,
 } from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
@@ -345,11 +343,6 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				block.thinkingSignature = JSON.stringify(streamedReasoningDetails);
 			}
 		};
-
-		const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
-			...(options?.diagnosticSecrets ?? []),
-			...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
-		]);
 		try {
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
 			const compat = getCompat(model);
@@ -368,7 +361,6 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				cacheSessionId,
 				compat,
 				options?.oauthDiagnostics,
-				diagnosticSecrets,
 			);
 			let params = buildParams(
 				model,
@@ -393,7 +385,6 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
-					diagnosticSecrets,
 					oauthDiagnostics: options?.oauthDiagnostics,
 				},
 			);
@@ -747,41 +738,13 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const rawLimitMessage = options?.oauthDiagnostics ? undefined : smartyLimitMessage(error);
-			const limitMessage =
-				rawLimitMessage === undefined ? undefined : redactOAuthDiagnostic(rawLimitMessage, diagnosticSecrets);
-			if (limitMessage !== undefined) {
-				// Show the credential-safe gateway limit message and mark it final so generic retry does not retry it.
-				// A throttled limit with a short Retry-After carries the wait for the agent's one-shot retry.
-				output.errorMessage = limitMessage;
-				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
-				if (retryAfterSeconds !== undefined) recordAssistantMessageThrottleWait(output, retryAfterSeconds);
-				appendAssistantMessageDiagnostic(output, {
-					type: PROVIDER_LIMIT_DIAGNOSTIC,
-					timestamp: Date.now(),
-					details:
-						retryAfterSeconds === undefined
-							? { code: "smarty_limit" }
-							: {
-									code: "smarty_limit",
-									retryAfterSeconds,
-									waitMessage:
-										limitMessage === "smarty_limit" ? "Flash runs one request at a time" : limitMessage,
-								},
-				});
-			} else {
-				output.errorMessage = formatProviderError(
-					normalizeProviderError(error, diagnosticSecrets, options?.oauthDiagnostics),
-				);
-				// Some providers via OpenRouter give additional information in this field.
-				// normalizeProviderError already stringifies the parsed body (error.error)
-				// into errorMessage, so only append the raw metadata when it is not already
-				// present to avoid double-printing it.
-				const rawMetadata = (error as { error?: { metadata?: { raw?: unknown } } })?.error?.metadata?.raw;
-				if (!options?.oauthDiagnostics && rawMetadata) {
-					const safeMetadata = redactOAuthDiagnostic(String(rawMetadata), diagnosticSecrets);
-					if (!output.errorMessage.includes(safeMetadata)) output.errorMessage += `\n${safeMetadata}`;
-				}
+			const normalized = normalizeProviderError(error, [], options?.oauthDiagnostics, model.provider);
+			output.oauthRecovery = normalized.oauthRecovery;
+			output.errorMessage = formatProviderError(normalized);
+			if (smartyLimitMessage(error) !== undefined) {
+				const seconds = smartyThrottleRetryAfterSeconds(error);
+				if (seconds !== undefined) recordAssistantMessageThrottleWait(output, seconds);
+				appendAssistantMessageDiagnostic(output, { type: PROVIDER_LIMIT_DIAGNOSTIC, timestamp: Date.now() });
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -821,7 +784,6 @@ function createClient(
 	sessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
 	_oauthDiagnostics = false,
-	diagnosticSecrets: string[] = [],
 ) {
 	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
 	if (model.provider === "github-copilot") {
@@ -855,7 +817,6 @@ function createClient(
 	for (const [key, value] of Object.entries(headers)) {
 		if (value !== null) headers[key] = value.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
 	}
-	diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));
 
 	return new OpenAI({
 		logLevel: "off",

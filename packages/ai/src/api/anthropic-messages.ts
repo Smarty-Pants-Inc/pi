@@ -10,11 +10,7 @@ import type {
 	BetaRawMessageStreamEvent as RawMessageStreamEvent,
 	BetaRefusalStopDetails as RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
-import {
-	getOAuthDiagnosticSecrets,
-	oauthDiagnosticError,
-	oauthDiagnosticLogger,
-} from "../auth/oauth/credential-response.ts";
+import { oauthDiagnosticError, oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
 import {
 	ANTHROPIC_FEDERATION_RULE_ID_ENV,
 	ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
@@ -626,10 +622,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 		const oauthDiagnostics =
 			options?.oauthDiagnostics === true || (options?.apiKey !== undefined && isOAuthToken(options.apiKey));
-		const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
-			...(options?.diagnosticSecrets ?? []),
-			...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
-		]);
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -686,7 +678,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
-					diagnosticSecrets,
 					oauthDiagnostics,
 				},
 			);
@@ -922,13 +913,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				appendAssistantMessageDiagnostic(output, {
 					type: "anthropic_input_transformations",
 					timestamp: Date.now(),
-					details: {
-						transformations: inputTransformations.map((transformation) => ({
-							type: transformation.type ?? undefined,
-							path: transformation.path ?? undefined,
-							reason: transformation.reason ?? undefined,
-						})),
-					},
 				});
 			}
 
@@ -941,7 +925,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const normalized = normalizeProviderError(error, diagnosticSecrets, oauthDiagnostics);
+			const normalized = normalizeProviderError(error, [], oauthDiagnostics);
 			output.oauthRecovery = normalized.oauthRecovery;
 			output.errorMessage = formatProviderError(normalized);
 			stream.push({ type: "error", reason: output.stopReason, error: output });

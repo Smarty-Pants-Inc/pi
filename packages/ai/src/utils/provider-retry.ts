@@ -7,7 +7,6 @@ interface ProviderRetryOptions {
 	maxRetries?: number;
 	maxRetryDelayMs?: number;
 	signal?: AbortSignal;
-	diagnosticSecrets?: readonly string[];
 	oauthDiagnostics?: boolean;
 }
 

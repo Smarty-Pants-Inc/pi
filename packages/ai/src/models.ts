@@ -1,7 +1,7 @@
 import { lazyStream, requestSetupError, SafeSetupError } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
-import { getOAuthDiagnosticSecrets, isOAuthCancellation, safeOAuthError } from "./auth/oauth/credential-response.ts";
+import { isOAuthCancellation, safeOAuthError } from "./auth/oauth/credential-response.ts";
 import { type AuthResolutionOverrides, ModelsError, resolveProviderAuth } from "./auth/resolve.ts";
 import type {
 	AuthCheck,
@@ -887,21 +887,13 @@ class ModelsImpl implements MutableModels {
 			// Explicit request options win per-field; the Models-only transform runs last.
 			const apiKey = options?.apiKey ?? auth.apiKey;
 			let headers = mergeHeaders(auth.headers, options?.headers);
-			const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey, headers, [
-				...(resolution.diagnosticSecrets ?? []),
-				...(options?.diagnosticSecrets ?? []),
-				...getOAuthDiagnosticSecrets(auth.apiKey, auth.headers),
-			]);
 			if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
-			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers));
 			const env =
 				resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
 			const requestModel: TModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 			const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
 			const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
 				ProviderRequestOptions<TModel>;
-
-			requestOptions.diagnosticSecrets = diagnosticSecrets;
 			requestOptions.oauthDiagnostics = resolution.source === "OAuth" || options?.oauthDiagnostics === true;
 			return { requestModel, requestOptions };
 		} catch (error) {

@@ -6,7 +6,7 @@ import type {
 	ChatCompletionContentPartText,
 	ChatCompletionCreateParamsNonStreaming,
 } from "openai/resources/chat/completions.js";
-import { getOAuthDiagnosticSecrets, oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
+import { oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantImages,
 	ImageApi,
@@ -53,11 +53,6 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		stopReason: "stop",
 		timestamp: Date.now(),
 	};
-
-	const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
-		...(options?.diagnosticSecrets ?? []),
-		...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
-	]);
 	try {
 		const apiKey = options?.apiKey;
 		if (!apiKey) {
@@ -83,7 +78,6 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 				maxRetries: options?.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs,
 				signal: options?.signal,
-				diagnosticSecrets,
 				oauthDiagnostics: options?.oauthDiagnostics,
 			},
 		);
@@ -118,9 +112,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		return output;
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, diagnosticSecrets, options?.oauthDiagnostics),
-		);
+		output.errorMessage = formatProviderError(normalizeProviderError(error, [], options?.oauthDiagnostics));
 		return output;
 	}
 };

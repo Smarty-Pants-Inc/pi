@@ -1,4 +1,3 @@
-import { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	ClassifierAnswer,
@@ -196,10 +195,6 @@ export async function classifySystemOne(
 		Number.isFinite(timeoutMs) && timeoutMs > 0
 			? setTimeout(() => controller.abort(timeoutError(timeoutMs)), timeoutMs)
 			: undefined;
-	const diagnosticSecrets = getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
-		...(options?.diagnosticSecrets ?? []),
-		...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
-	]);
 	try {
 		if (!timer) throw new Error("Timeout must be a positive finite number");
 		signal.throwIfAborted();
@@ -231,7 +226,6 @@ export async function classifySystemOne(
 				maxRetries: options.maxRetries ?? 2,
 				maxRetryDelayMs: options.maxRetryDelayMs,
 				signal,
-				diagnosticSecrets,
 				oauthDiagnostics: options.oauthDiagnostics,
 			},
 		);
@@ -245,7 +239,7 @@ export async function classifySystemOne(
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, diagnosticSecrets, options?.oauthDiagnostics),
+			normalizeProviderError(error, [], options?.oauthDiagnostics),
 			`${transport.label} error`,
 		);
 		return output;

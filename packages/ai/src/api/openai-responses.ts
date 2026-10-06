@@ -1,11 +1,6 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
-import {
-	getOAuthDiagnosticSecrets,
-	oauthDiagnosticLogger,
-	oauthRecoveryDecision,
-	safeOAuthError,
-} from "../auth/oauth/credential-response.ts";
+import { oauthDiagnosticLogger, oauthRecoveryDecision, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -159,11 +154,6 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 		};
 
 		const oauthDiagnostics = options?.oauthDiagnostics === true || isChatGPTSignIn(model, options?.apiKey);
-		const diagnosticSecrets = getOAuthDiagnosticSecrets(
-			options?.apiKey,
-			{ ...model.headers, ...options?.headers },
-			options?.diagnosticSecrets,
-		);
 		try {
 			// Create OpenAI client
 			const apiKey = getClientApiKey(model.provider, options?.apiKey, options?.headers);
@@ -178,7 +168,6 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				model,
 				normalizedContext,
 				apiKey,
-				diagnosticSecrets,
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
@@ -200,7 +189,6 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
 					signal: options?.signal,
-					diagnosticSecrets,
 					oauthDiagnostics,
 				},
 			);
@@ -209,7 +197,6 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 
 			await processResponsesStream(withResponsesEvidence(response, openaiStream), output, stream, model, {
 				onProviderStreamEvent: options?.onProviderStreamEvent,
-				diagnosticSecrets,
 				oauthDiagnostics,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,
@@ -237,7 +224,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const normalizedError = normalizeProviderError(error, diagnosticSecrets, oauthDiagnostics);
+			const normalizedError = normalizeProviderError(error, [], oauthDiagnostics);
 			output.oauthRecovery = normalizedError.oauthRecovery;
 			const errorMessage = formatProviderError(
 				normalizedError,
@@ -288,7 +275,6 @@ function createClient(
 	model: Model<"openai-responses">,
 	context: TranscriptContext,
 	apiKey: string,
-	_diagnosticSecrets: readonly string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,

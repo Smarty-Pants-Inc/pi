@@ -68,14 +68,14 @@ describe.each([refresh, idToken])("F04 direct %s", (secret) => {
 	});
 });
 
-// PR #131 F04/F05: preserve stored, full/bare override, and transformed values before/after transform.
-it("F04 forwards the full stored/pre/post-transform secret set", async () => {
+// smarty-dev#5822: credentials remain request auth, never diagnostic-secret side channels.
+it("F04 does not forward a stored/pre/post-transform diagnostic secret set", async () => {
 	const models = await runtime();
 	const provider = models.getProvider("openai")!;
 	const model = provider.getModels()[0];
 	let received: readonly string[] | undefined;
 	vi.spyOn(provider, "streamSimple").mockImplementation((_model, _context, options) => {
-		received = options?.diagnosticSecrets;
+		received = (options as { diagnosticSecrets?: readonly string[] } | undefined)?.diagnosticSecrets;
 		throw new Error("captured safely");
 	});
 	await models.completeSimple(
@@ -83,21 +83,10 @@ it("F04 forwards the full stored/pre/post-transform secret set", async () => {
 		{ messages: [] },
 		{
 			headers: { Authorization: `Bearer ${override}` },
-			diagnosticSecrets: [opaque],
 			transformHeaders: async () => ({ Authorization: `Bearer ${transformed}` }),
 		},
 	);
-	expect(received).toEqual(
-		expect.arrayContaining([
-			refresh,
-			idToken,
-			opaque,
-			override,
-			`Bearer ${override}`,
-			transformed,
-			`Bearer ${transformed}`,
-		]),
-	);
+	expect(received).toBeUndefined();
 });
 
 // PR #131 F04: the SDK really routes agent dispatch through ModelRuntime, with no deleting suite cleanup.

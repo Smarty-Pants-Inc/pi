@@ -103,8 +103,6 @@ export interface AuthContext {
 /** Result of resolving auth for a model. */
 export interface AuthResult {
 	auth: ModelAuth;
-	/** Live credential values used only to mask request diagnostics. */
-	diagnosticSecrets?: readonly string[];
 	/** Provider-scoped environment/config values resolved from credentials and ambient context. */
 	env?: ProviderEnv;
 	/** Human-readable label for status UI: "ANTHROPIC_API_KEY", "OAuth", "~/.aws/credentials". */

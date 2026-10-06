@@ -1,226 +1,115 @@
-// Unit tests for the shared provider error-body normalizer.
-//
-// See issues/provider-error-body-passthrough. These cover one synthesized error
-// object per SDK shape (Mistral, openai APIError, @google/genai ApiError, AWS
-// Bedrock ServiceException), plus the non-Error fallback, truncation, the empty
-// parsed-body edge case, and the formatProviderError compose helper.
-
+// smarty-dev#5822: SDK body text is private classifier input, never a rich display contract.
 import { describe, expect, it } from "vitest";
-import { formatProviderError, MAX_PROVIDER_ERROR_BODY_CHARS, normalizeProviderError } from "../src/utils/error-body.ts";
+import { formatProviderError, normalizeProviderError } from "../src/utils/error-body.ts";
 
-describe("normalizeProviderError", () => {
-	it("extracts status and body from a Mistral-shaped error", () => {
-		const error = Object.assign(new Error("Mistral request failed"), {
-			statusCode: 403,
-			body: '{"error":"blocked by gateway WAF"}',
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.status).toBe(403);
-		expect(norm.body).toBe('{"error":"blocked by gateway WAF"}');
-		expect(norm.messageCarriesBody).toBe(false);
-	});
-
-	it("reads the parsed body off an openai APIError when the message is opaque", () => {
-		// makeMessage(status, error, message) yields "<status> status code (no body)"
-		// when the parsed body is unparsed, while the body stays on error.error.
-		const error = Object.assign(new Error("403 status code (no body)"), {
-			status: 403,
-			error: { error: "blocked by gateway WAF" },
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.status).toBe(403);
-		expect(norm.body).toBe('{"error":"blocked by gateway WAF"}');
-		expect(norm.messageCarriesBody).toBe(false);
-	});
-
-	it("preserves the message when @google/genai already folds the body into it", () => {
-		const body = { error: { code: 403, message: "Permission denied" } };
-		const error = Object.assign(new Error(JSON.stringify(body)), {
-			status: 403,
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.status).toBe(403);
-		expect(norm.messageCarriesBody).toBe(true);
-		expect(norm.message).toBe(JSON.stringify(body));
-	});
-
-	it("extracts status and body from a Bedrock-shaped ServiceException", () => {
-		const error = Object.assign(new Error("UnknownError"), {
+const privateText = "SYNTHETIC_ERROR_BODY_5822";
+class SdkHttpResponseBody {
+	locked = false;
+	state = { storedError: undefined };
+}
+class SdkInnerError {
+	code = "EPROTO";
+	internalState = {};
+}
+const shapes = [
+	{ name: "Mistral body", error: { message: privateText, statusCode: 403, body: privateText }, status: 403 },
+	{
+		name: "OpenAI parsed body",
+		error: { message: "403 status code (no body)", status: 403, error: { error: privateText } },
+		status: 403,
+	},
+	{
+		name: "Google folded body",
+		error: { message: JSON.stringify({ error: { code: 403, message: privateText } }), status: 403 },
+		status: 403,
+	},
+	{
+		name: "Bedrock response body",
+		error: {
 			name: "UnknownError",
+			message: privateText,
 			$metadata: { httpStatusCode: 403 },
-			$response: { statusCode: 403, body: '{"message":"blocked by gateway WAF"}' },
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.status).toBe(403);
-		expect(norm.body).toBe('{"message":"blocked by gateway WAF"}');
-		expect(norm.messageCarriesBody).toBe(false);
-	});
-
-	it("ignores a Bedrock response stream instead of serializing its internals", () => {
-		const error = Object.assign(
-			new Error("Invocation of model ID anthropic.claude-opus-5 with on-demand throughput isn't supported."),
-			{
-				name: "ValidationException",
-				$metadata: { httpStatusCode: 400 },
-				$response: {
-					statusCode: 400,
-					body: { pipe: () => undefined, _events: { close: [null, null] } },
-				},
-			},
-		);
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.status).toBe(400);
-		expect(norm.body).toBeUndefined();
-		expect(norm.message).toContain("on-demand throughput isn't supported");
-		expect(norm.messageCarriesBody).toBe(true);
-	});
-
-	it("ignores a class-instance response body without a pipe method instead of serializing it", () => {
-		// Not every SDK response wrapper is a node stream: web ReadableStreams
-		// and SDK-specific wrapper classes have no `pipe`, but serializing them
-		// still yields internals-noise that would replace the real message.
-		class SdkHttpResponseBody {
-			locked = false;
-			state = { storedError: undefined };
-		}
-		const error = Object.assign(new Error("Input is too long for requested model."), {
-			name: "ValidationException",
+			$response: { statusCode: 403, body: privateText },
+		},
+		status: 403,
+	},
+	{
+		name: "Bedrock stream",
+		error: {
+			message: privateText,
 			$metadata: { httpStatusCode: 400 },
-			$response: { statusCode: 400, body: new SdkHttpResponseBody() },
-		});
+			$response: { statusCode: 400, body: { pipe: () => undefined, _events: { close: [null] } } },
+		},
+		status: 400,
+	},
+	{
+		name: "SDK class response",
+		error: {
+			message: `Input is too long for requested model. ${privateText}`,
+			$metadata: { httpStatusCode: 400 },
+			$response: { body: new SdkHttpResponseBody() },
+		},
+		status: 400,
+	},
+	{
+		name: "SDK class error",
+		error: { message: `TLS handshake failed ${privateText}`, status: 502, error: new SdkInnerError() },
+		status: 502,
+	},
+	{
+		name: "plain parsed body",
+		error: { message: "400 status code (no body)", status: 400, error: { message: privateText, field: "tools[0]" } },
+		status: 400,
+	},
+	{ name: "non-Error value", error: { reason: privateText }, status: undefined },
+	{ name: "empty body", error: { message: privateText, status: 403, error: {} }, status: 403 },
+	{ name: "long body", error: { message: privateText, statusCode: 500, body: privateText.repeat(500) }, status: 500 },
+	{
+		name: "body already in message",
+		error: { message: `500: ${privateText}`, statusCode: 500, body: privateText },
+		status: 500,
+	},
+];
 
-		const norm = normalizeProviderError(error);
-
-		expect(norm.status).toBe(400);
-		expect(norm.body).toBeUndefined();
-		expect(norm.message).toContain("Input is too long");
-		expect(norm.messageCarriesBody).toBe(true);
+describe("normalizeProviderError owned projection", () => {
+	it.each(shapes)("keeps status but drops text and body for $name", ({ error, status }) => {
+		const normalized = normalizeProviderError(error);
+		expect(normalized.status).toBe(status);
+		expect(normalized.message).toMatch(/^provider_request_failed \(HTTP (unknown|[1-5]\d\d)\)$/);
+		expect(Object.keys(normalized).sort()).toEqual(["message", "oauthRecovery", "status"]);
+		expect(JSON.stringify(normalized)).not.toContain(privateText);
 	});
-
-	it("ignores a class-instance `error` field instead of serializing it", () => {
-		class SdkInnerError {
-			code = "EPROTO";
-			internalState = {};
-		}
-		const error = Object.assign(new Error("TLS handshake failed"), {
-			status: 502,
-			error: new SdkInnerError(),
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.body).toBeUndefined();
-		expect(norm.message).toBe("TLS handshake failed");
-		expect(norm.messageCarriesBody).toBe(true);
+	it("classifies original text even when the response body is an SDK class", () => {
+		const normalized = normalizeProviderError(shapes[5].error);
+		expect(normalized.oauthRecovery?.recovery).toBe("context_length_exceeded");
 	});
-
-	it("still surfaces a plain parsed JSON body object", () => {
-		const error = Object.assign(new Error("400 status code (no body)"), {
+	it.each(["body", "error", "$response"])("reads private %s for context overflow", (field) => {
+		const body = `maximum context length exceeded ${privateText}`;
+		const error = {
 			status: 400,
-			error: { message: "schema validation failed", field: "tools[0]" },
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.body).toBe('{"message":"schema validation failed","field":"tools[0]"}');
-		expect(norm.messageCarriesBody).toBe(false);
+			[field]: field === "$response" ? { body } : field === "error" ? { message: body } : body,
+		};
+		const normalized = normalizeProviderError(error);
+		expect(normalized.oauthRecovery?.recovery).toBe("context_length_exceeded");
+		expect(JSON.stringify(normalized)).not.toContain(privateText);
 	});
-
-	it("JSON-stringifies a non-Error thrown value", () => {
-		const norm = normalizeProviderError({ reason: "boom" });
-
-		expect(norm.status).toBeUndefined();
-		expect(norm.body).toBeUndefined();
-		expect(norm.message).toBe('{"reason":"boom"}');
-		expect(norm.messageCarriesBody).toBe(false);
-	});
-
-	it("treats an empty parsed body object as no body", () => {
-		const error = Object.assign(new Error("403 status code (no body)"), {
-			status: 403,
-			error: {},
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.body).toBeUndefined();
-		expect(norm.messageCarriesBody).toBe(true);
-	});
-
-	it("truncates the body at the cap", () => {
-		const longBody = "x".repeat(MAX_PROVIDER_ERROR_BODY_CHARS + 50);
-		const error = Object.assign(new Error("failed"), {
-			statusCode: 500,
-			body: longBody,
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.body).toContain("... [truncated 50 chars]");
-		expect(norm.body?.length).toBeLessThan(longBody.length);
-	});
-
-	it("sets messageCarriesBody when the message already contains the extracted body", () => {
-		const error = Object.assign(new Error("500: upstream exploded"), {
-			statusCode: 500,
-			body: "upstream exploded",
-		});
-
-		const norm = normalizeProviderError(error);
-
-		expect(norm.messageCarriesBody).toBe(true);
+	it.each([99, 600, 401.5, "401"])("rejects invalid status %s", (status) => {
+		expect(normalizeProviderError({ status, code: 401 }).status).toBeUndefined();
 	});
 });
 
 describe("formatProviderError", () => {
-	it("surfaces status and body without a prefix", () => {
-		const norm = normalizeProviderError(
-			Object.assign(new Error("403 status code (no body)"), {
-				status: 403,
-				error: { error: "blocked by gateway WAF" },
-			}),
-		);
-
-		const formatted = formatProviderError(norm);
-
-		expect(formatted).toContain("403");
-		expect(formatted).toContain("blocked by gateway WAF");
-		expect(formatted).not.toBe("403 status code (no body)");
+	it("returns owned text without a prefix", () => {
+		expect(formatProviderError(normalizeProviderError(shapes[1].error))).toBe("provider_request_failed (HTTP 403)");
 	});
-
-	it("applies a provider prefix with status and body", () => {
-		const norm = normalizeProviderError(
-			Object.assign(new Error("403 status code (no body)"), {
-				status: 403,
-				error: { error: "blocked by gateway WAF" },
-			}),
-		);
-
-		expect(formatProviderError(norm, "OpenAI API error")).toBe(
-			'OpenAI API error (403): {"error":"blocked by gateway WAF"}',
+	it("applies locally supplied prefix only to owned text", () => {
+		expect(formatProviderError(normalizeProviderError(shapes[1].error), "OpenAI API error")).toBe(
+			"OpenAI API error (403): provider_request_failed (HTTP 403)",
 		);
 	});
-
-	it("preserves the message (with prefix + status) when it already carries the body", () => {
-		const body = JSON.stringify({ error: { message: "Permission denied" } });
-		const norm = normalizeProviderError(Object.assign(new Error(body), { status: 403 }));
-
-		expect(formatProviderError(norm, "OpenAI API error")).toBe(`OpenAI API error (403): ${body}`);
-	});
-
-	it("returns the bare message for a non-Error value", () => {
-		const norm = normalizeProviderError({ reason: "boom" });
-
-		expect(formatProviderError(norm)).toBe('{"reason":"boom"}');
+	it("does not publish a non-Error value", () => {
+		expect(formatProviderError(normalizeProviderError({ reason: privateText }))).toBe(
+			"provider_request_failed (HTTP unknown)",
+		);
 	});
 });

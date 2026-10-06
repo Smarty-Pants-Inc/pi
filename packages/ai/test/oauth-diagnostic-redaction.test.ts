@@ -24,7 +24,7 @@ describe("OAuth diagnostic redaction", () => {
 				status: 503,
 				body: JSON.stringify({ [field]: secret.repeat(MAX_PROVIDER_ERROR_BODY_CHARS) }),
 			});
-			expect(normalizeProviderError(error).body).not.toContain(secret);
+			expect(JSON.stringify(normalizeProviderError(error))).not.toContain(secret);
 		},
 	);
 
