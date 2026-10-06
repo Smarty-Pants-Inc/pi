@@ -7,7 +7,7 @@ describe("S3 numeric diagnostic boundary", () => {
 		const error = Object.assign(new Error("synthetic provider failure"), { code });
 		const extracted = extractDiagnosticError(error);
 		expect(extracted.code).not.toBe(code);
-		expect(extracted.code).toBe("oauth_request_failed");
+		expect(extracted.code).toBe("provider_request_failed");
 		expect(extracted).not.toHaveProperty("stack");
 		expect(extracted.message).not.toContain("synthetic provider failure");
 	});

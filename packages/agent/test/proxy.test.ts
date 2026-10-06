@@ -113,6 +113,7 @@ describe("streamProxy", () => {
 
 		expect(events.map((event) => event.type)).toEqual(["start", "error"]);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("Connection closed by proxy server");
+		expect(result.errorMessage).toContain("provider_request_failed");
+		expect(result.oauthRecovery?.retryable).toBe(false);
 	});
 });

@@ -71,7 +71,7 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.content).toEqual([]);
 		expect(calls).toBe(outputTokens > 0 ? 1 : 3);
-		expect(result.responseId).toBe("resp_failed_usage");
+		expect(result).not.toHaveProperty("responseId");
 		expect(result.rawStopReason).toBe(terminal === "incomplete" ? "incomplete.server_error" : "failed");
 		expect(result.usage).toMatchObject({
 			input: 17,
@@ -142,7 +142,7 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain(api === "codex" ? "oauth_request_failed" : "fetch failed");
 		expect(result.content).toEqual([]);
-		expect(result.responseId).toBe("resp_observer_usage");
+		expect(result).not.toHaveProperty("responseId");
 		expect(result.usage).toMatchObject({ input: 17, cacheRead: 3, output: 1, reasoning: 1, totalTokens: 21 });
 		expect(result.usage.cost.output).toBeGreaterThan(0);
 		expect(isRetryableAssistantError(result)).toBe(false);
@@ -194,8 +194,11 @@ describe("Responses terminal usage replay barrier", () => {
 			);
 		};
 		let rejections = 0;
-		const onProviderStreamEvent = async (event: unknown) => {
-			if ((event as { type: string }).type === rejectType) {
+		let observations = 0;
+		const rejectAt = shape === "function" || shape === "custom" ? 2 : 3;
+		const onProviderStreamEvent = async () => {
+			// #5822: the observer now gets an owned notification, not a wire event name.
+			if (++observations === rejectAt) {
 				rejections++;
 				await Promise.resolve();
 				throw new Error("fetch failed");
