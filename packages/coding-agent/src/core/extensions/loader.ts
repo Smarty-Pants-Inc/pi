@@ -38,6 +38,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
+	UserMessageRenderer,
 } from "./types.ts";
 
 const require = createRequire(import.meta.url);
@@ -381,6 +382,11 @@ function createExtensionAPI(
 		registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
 			assertActive();
 			extension.messageRenderers.set(customType, renderer as MessageRenderer);
+		},
+
+		registerUserMessageRenderer(renderer: UserMessageRenderer): void {
+			assertActive();
+			extension.userMessageRenderer = renderer;
 		},
 
 		registerMarkdownTransformer(transformer: MarkdownTransformer): void {
