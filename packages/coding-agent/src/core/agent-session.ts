@@ -344,6 +344,8 @@ export interface PromptOptions {
 export interface ModelMutationOptions {
 	/** Persist the new value to global defaults. Defaults to session-only. */
 	persist?: boolean;
+	/** Caller cancellation (e.g. an RPC transport); checked after auth and before commit. */
+	signal?: AbortSignal;
 }
 
 /** Result from cycleModel() */
@@ -3472,12 +3474,24 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+		// Capture the origin's cancellation before auth; a late auth cannot commit after refusal or retirement (#132 R4-8).
+		const inherited = this._inheritedCancellation();
+		const signals = [inherited, options.signal].filter((item): item is AbortSignal => item !== undefined);
+		const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+		const assertLive = () => {
+			signal?.throwIfAborted();
+			if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "model was not changed");
+		};
+		assertLive();
+		const auth = this._modelRuntime.checkAuth(model.provider);
+		if (!(await (signal ? raceWithAbortSignal(auth, signal) : auth))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
+		assertLive();
 
 		const previousModel = this.model;
 		await this._compactForModelSwitch(model, () => {
+			assertLive();
 			const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 			this.agent.state.model = model;
 			this.sessionManager.appendModelChange(model.provider, model.id);

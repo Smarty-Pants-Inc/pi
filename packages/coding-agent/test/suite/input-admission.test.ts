@@ -926,6 +926,47 @@ describe("native input admission v1", () => {
 		expect(h.eventsOfType("agent_start")).toHaveLength(0);
 	});
 
+	// pi#132 R4-8: a held model auth cannot commit after its caller's cancellation or the origin's retirement.
+	it.each(["caller-signal", "disposed-origin"] as const)(
+		"late model auth does not commit after %s",
+		async (variant) => {
+			const held = gate();
+			const h = await createHarness({
+				models: [
+					{ id: "faux-1", contextWindow: 1_000_000, maxTokens: 100 },
+					{ id: "faux-2", contextWindow: 1_000_000, maxTokens: 100 },
+				],
+			});
+			harnesses.push(h);
+			const target = h.getModel("faux-2")!;
+			const original = h.session.model;
+			const checkAuth = h.session.modelRuntime.checkAuth.bind(h.session.modelRuntime);
+			let entered = false;
+			vi.spyOn(h.session.modelRuntime, "checkAuth").mockImplementation(async (provider) => {
+				entered = true;
+				await held.promise;
+				return checkAuth(provider);
+			});
+			const history = structuredClone(h.sessionManager.getEntries());
+			const controller = new AbortController();
+			const switching = h.session
+				.setModel(target, variant === "caller-signal" ? { signal: controller.signal } : {})
+				.catch((error: unknown) => error);
+			await vi.waitFor(() => expect(entered).toBe(true));
+			if (variant === "caller-signal") controller.abort(new Error("transport cancelled"));
+			else h.session.dispose();
+			held.release();
+			expect(await switching).toBeInstanceOf(Error);
+			expect(h.session.model).toBe(original);
+			expect(h.sessionManager.getEntries()).toEqual(history);
+			if (variant === "caller-signal") {
+				vi.mocked(h.session.modelRuntime.checkAuth).mockRestore();
+				await h.session.setModel(target);
+				expect(h.session.model?.id).toBe("faux-2");
+			}
+		},
+	);
+
 	// pi#132 R1-S3: an unrelated SDK compact() cannot abort or compact a fenced (replacing) session.
 	it.each(["held-replacement", "fence-during-join"] as const)(
 		"external compaction refuses the lifecycle fence (%s)",

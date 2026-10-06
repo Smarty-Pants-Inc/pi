@@ -647,7 +647,7 @@ export async function runRpcMode(
 				if (!model) {
 					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
 				}
-				await session.setModel(model);
+				await session.setModel(model, { signal: transportCancellation.signal });
 				return success(id, "set_model", model);
 			}
 
