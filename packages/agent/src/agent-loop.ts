@@ -930,11 +930,15 @@ async function finalizeExecutedToolCall(
 			if (afterResult) {
 				// Structured content not replaced along with the content may no longer match it.
 				const structuredContent =
-					afterResult.structuredContent ?? (afterResult.content ? undefined : result.structuredContent);
+					afterResult.structuredContent !== undefined
+						? afterResult.structuredContent
+						: afterResult.content !== undefined
+							? undefined
+							: result.structuredContent;
 				result = {
 					...result,
 					content: afterResult.content ?? result.content,
-					details: afterResult.details ?? result.details,
+					details: afterResult.details === undefined ? result.details : afterResult.details,
 					usage: afterResult.usage ?? result.usage,
 					terminate: afterResult.terminate ?? result.terminate,
 				};
