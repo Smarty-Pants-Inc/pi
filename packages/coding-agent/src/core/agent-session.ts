@@ -333,8 +333,9 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
-	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
-	preflightResult?: (success: boolean) => void;
+	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection,
+	 * and whether accepted input was handled without a run, queued, or started a run. */
+	preflightResult?: (success: boolean, disposition?: "handled" | "queued" | "run") => void;
 	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
 	 * Unlike preflight acceptance, this remains true if the operation later fails. */
 	onInputTransferred?: () => void;
@@ -2521,7 +2522,7 @@ export class AgentSession {
 				if (handled) {
 					// Extension command executed, no prompt to send
 					onInputTransferred?.();
-					preflightResult?.(true);
+					preflightResult?.(true, "handled");
 					return;
 				}
 			}
@@ -2557,7 +2558,7 @@ export class AgentSession {
 			);
 			if (!processedInput) {
 				onInputTransferred?.();
-				preflightResult?.(true);
+				preflightResult?.(true, "handled");
 				return;
 			}
 			const { text: currentText, images: currentImages } = processedInput;
@@ -2585,7 +2586,7 @@ export class AgentSession {
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
-				preflightResult?.(true);
+				preflightResult?.(true, "queued");
 				return;
 			}
 
@@ -2728,7 +2729,7 @@ export class AgentSession {
 			undefined,
 			() => {
 				onInputTransferred?.();
-				preflightResult?.(true);
+				preflightResult?.(true, "run");
 			},
 			admission,
 		);

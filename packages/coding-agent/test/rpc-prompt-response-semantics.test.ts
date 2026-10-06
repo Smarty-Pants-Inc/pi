@@ -569,6 +569,35 @@ describe("RPC prompt response semantics", () => {
 		},
 	);
 
+	// pi#132 R5-S3: the success response carries whether a run (and so agent_settled) follows.
+	it("reports the handled or run disposition on the prompt response", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event) => (event.text === "consume" ? { action: "handled" } : undefined));
+				},
+			],
+		});
+		try {
+			lineHandler(JSON.stringify({ id: "h1", type: "prompt", message: "consume" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "h1")).toEqual([
+					expect.objectContaining({ success: true, data: { disposition: "handled" } }),
+				]),
+			);
+			lineHandler(JSON.stringify({ id: "r1", type: "prompt", message: "Hello" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "r1")).toEqual([
+					expect.objectContaining({ success: true, data: { disposition: "run" } }),
+				]),
+			);
+		} finally {
+			await cleanup();
+		}
+	});
+
 	it("emits one success response when prompt preflight succeeds", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
 

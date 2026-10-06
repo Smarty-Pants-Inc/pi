@@ -628,7 +628,10 @@ export class RpcClient {
 		// A timeout may fire while prompt admission is still pending. Observe it immediately.
 		void collector.promise.catch(() => {});
 		try {
-			await this.prompt(message, images);
+			const response = await this.send({ type: "prompt", message, images });
+			// Handled input owes no agent_settled; complete now instead of timing out (#132 R5-S3).
+			if (response.command === "prompt" && response.success && response.data?.disposition === "handled")
+				collector.cancel();
 			return await collector.promise;
 		} finally {
 			collector.cancel();

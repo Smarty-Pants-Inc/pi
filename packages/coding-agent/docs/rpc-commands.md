@@ -34,10 +34,10 @@ If the agent is streaming and no `streamingBehavior` is specified, the command r
 
 Response:
 ```json
-{"id": "req-1", "type": "response", "command": "prompt", "success": true}
+{"id": "req-1", "type": "response", "command": "prompt", "success": true, "data": {"disposition": "run"}}
 ```
 
-`success: true` means the prompt was accepted, queued, or handled immediately. `success: false` means the prompt was rejected before acceptance. Failures after acceptance are reported through the normal event and message stream, not as a second `response` for the same request id.
+`success: true` means the prompt was accepted, queued, or handled immediately. `data.disposition` says which: `"run"` (a run started; `agent_settled` follows), `"queued"` (delivered with the current run), or `"handled"` (consumed by an extension command or input handler; no `agent_settled` is owed for it). `success: false` means the prompt was rejected before acceptance. Failures after acceptance are reported through the normal event and message stream, not as a second `response` for the same request id.
 
 The `images` field is optional. Each image uses `ImageContent` format: `{"type": "image", "data": "base64-encoded-data", "mimeType": "image/png"}`.
 

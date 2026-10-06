@@ -576,8 +576,10 @@ export async function runRpcMode(
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
 					source: "rpc",
-					preflightResult: (didSucceed) => {
-						if (didSucceed && !transportCancellation.signal.aborted) respond(success(id, "prompt"));
+					preflightResult: (didSucceed, disposition) => {
+						// The disposition tells clients whether agent_settled is owed (#132 R5-S3).
+						if (didSucceed && !transportCancellation.signal.aborted)
+							respond(success(id, "prompt", disposition ? { disposition } : undefined));
 					},
 				});
 				return undefined;

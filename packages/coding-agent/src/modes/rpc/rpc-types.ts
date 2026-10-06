@@ -157,7 +157,14 @@ export type RpcFatalErrorResponse = {
 // Success responses with data
 export type RpcResponse =
 	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true }
+	| {
+			id?: string;
+			type: "response";
+			command: "prompt";
+			success: true;
+			/** "handled": consumed without a run, so no agent_settled follows. */
+			data?: { disposition: "handled" | "queued" | "run" };
+	  }
 	| { id?: string; type: "response"; command: "steer"; success: true }
 	| { id?: string; type: "response"; command: "follow_up"; success: true }
 	| { id?: string; type: "response"; command: "abort"; success: true }
