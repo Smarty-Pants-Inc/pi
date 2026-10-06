@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { type PiMessagesOptions, stream, streamSimple } from "../src/api/pi-messages.ts";
+import { getApiProvider } from "../src/compat.ts";
 import type { Api, AssistantMessageEvent, Context, Model, StopReason } from "../src/types.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
@@ -91,7 +92,7 @@ const usage = {
 	cacheRead: 0,
 	cacheWrite: 0,
 	totalTokens: 15,
-	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.1 + 0.2 },
 };
 
 describe("pi-messages", () => {
@@ -142,7 +143,7 @@ describe("pi-messages", () => {
 		expect(partialStopReasons[0]).toBe("pending");
 		expect(message.stopReason).toBe("toolUse");
 		expect(message.usage).toEqual(usage);
-		expect(message.responseId).toBe("resp_1");
+		expect(message.responseId).toBeUndefined();
 		expect(message.providerThinkingLevel).toBe("high");
 		expect(message.model).toBe("auto");
 		expect(message.provider).toBe("radius");
@@ -189,7 +190,7 @@ describe("pi-messages", () => {
 		expect(received).toEqual(wireEvents.map(() => ({ type: "provider_stream_event" })));
 		expect(eventModels).toEqual(wireEvents.map(() => undefined));
 		expect(message.stopReason).toBe("stop");
-		expect(message.responseId).toBe("resp_1");
+		expect(message.responseId).toBeUndefined();
 		expect(message.content).toEqual([{ type: "text", text: "Hello", textSignature: undefined }]);
 	});
 
@@ -226,10 +227,9 @@ describe("pi-messages", () => {
 
 		expect(message.stopReason).toBe("error");
 		expect(message.errorMessage).toContain("401");
-		expect(message.errorMessage).toContain("Token expired");
-		expect(message.errorMessage).toContain("unauthorized");
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP 401)");
 		expect(message.diagnostics?.[0]?.type).toBe("pi_messages_response_failure");
-		expect(message.diagnostics?.[0]?.details?.status).toBe(401);
+		expect(message.diagnostics?.[0]).not.toHaveProperty("details");
 	});
 
 	it("propagates server-sent error events", async () => {
@@ -241,7 +241,7 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "test-key" }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe("Upstream failed");
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP unknown)");
 		expect(message.usage).toEqual(usage);
 	});
 
@@ -251,7 +251,7 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context)).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toContain("No API key provided");
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP unknown)");
 	});
 
 	it("errors when the stream ends without a terminal event", async () => {
@@ -267,13 +267,12 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "test-key" }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toContain("stream ended without a terminal event");
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP unknown)");
 	});
 });
 
 describe("pi-messages api registration", () => {
 	it("is registered as a builtin api provider", async () => {
-		const { getApiProvider } = await import("../src/compat.ts");
 		expect(getApiProvider("pi-messages")).toBeDefined();
 	});
 

@@ -3,7 +3,13 @@ import {
 	safeOAuthError,
 	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
-import type { AssistantMessage, AssistantMessageEvent, ProviderHeaders, StreamOptions } from "../types.ts";
+import type {
+	AssistantMessage,
+	AssistantMessageEvent,
+	ProviderHeaders,
+	StreamOptions,
+	ThinkingLevelMap,
+} from "../types.ts";
 import { extractDiagnosticError, projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 import { SETUP_MESSAGES } from "./models-error.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
@@ -175,7 +181,9 @@ function projectTerminalEvent(
 }
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor(_model?: { headers?: ProviderHeaders }, _options?: StreamOptions) {
+	private projectionModel?: { headers?: ProviderHeaders; thinkingLevelMap?: ThinkingLevelMap };
+
+	constructor(model?: { headers?: ProviderHeaders; thinkingLevelMap?: ThinkingLevelMap }, _options?: StreamOptions) {
 		super(
 			(event) => event.type === "done" || event.type === "error",
 			(event) => {
@@ -187,28 +195,51 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new Error("Unexpected event type for final result");
 			},
 		);
+		this.projectionModel = model;
 	}
 
 	override push(event: AssistantMessageEvent): void {
 		if (event.type === "error" || event.type === "done") {
 			const message = event.type === "error" ? event.error : event.message;
-			const projected = projectAssistantMessageDiagnostics(message);
+			const projected = projectAssistantMessageDiagnostics(message, [], false, false, this.projectionModel);
 			const owned = ownedErrorMessages.get(message);
 			if (owned !== undefined) ownedErrorMessages.set(projected, owned);
 			super.push(projectTerminalEvent(event.type, projected, { secrets: [], oauth: true }));
 		} else {
-			const partial = projectAssistantMessageDiagnostics(event.partial, [], false, true);
-			super.push(
-				event.type === "toolcall_end"
-					? { ...event, partial, toolCall: structuredClone(event.toolCall) }
-					: { ...event, partial },
-			);
+			const partial = projectAssistantMessageDiagnostics(event.partial, [], false, true, this.projectionModel);
+			switch (event.type) {
+				case "start":
+					super.push({ type: event.type, partial });
+					break;
+				case "text_start":
+				case "thinking_start":
+				case "toolcall_start":
+					super.push({ type: event.type, contentIndex: event.contentIndex, partial });
+					break;
+				case "text_delta":
+				case "thinking_delta":
+				case "toolcall_delta":
+					super.push({ type: event.type, contentIndex: event.contentIndex, delta: event.delta, partial });
+					break;
+				case "text_end":
+				case "thinking_end":
+					super.push({ type: event.type, contentIndex: event.contentIndex, content: event.content, partial });
+					break;
+				case "toolcall_end":
+					super.push({
+						type: event.type,
+						contentIndex: event.contentIndex,
+						toolCall: structuredClone(event.toolCall),
+						partial,
+					});
+					break;
+			}
 		}
 	}
 
 	override end(result?: AssistantMessage): void {
 		if (result) {
-			const projected = projectAssistantMessageDiagnostics(result);
+			const projected = projectAssistantMessageDiagnostics(result, [], false, false, this.projectionModel);
 			const owned = ownedErrorMessages.get(result);
 			if (owned !== undefined) ownedErrorMessages.set(projected, owned);
 			const event = projectTerminalEvent("done", projected, { secrets: [], oauth: true });

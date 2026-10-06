@@ -562,12 +562,12 @@ export interface AssistantMessage {
 	provider: ProviderId;
 	model: string;
 	responseModel?: string; // Concrete model reported by the provider when different from the requested `model`
-	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
-	/** Exact provider-native effort level used for this response. Absent for legacy or unmanaged responses. */
+	responseId?: string; // Adapter-private protocol receipt; omitted from every published message
+	/** Successful effort from Pi's declared effort set or the bound model's thinkingLevelMap; absent on partial/error output. */
 	providerThinkingLevel?: string;
 	/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
 	thinkingLevel?: ModelThinkingLevel;
-	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
+	diagnostics?: AssistantMessageDiagnostic[]; // Reconstructed Pi-owned diagnostics for failures and recoveries.
 	/** Recovery authority is structured; errorMessage is display text only. */
 	oauthRecovery?: OAuthRecoveryDecision;
 	/** Pi-owned remedy code; its text and URL are rendered from a closed source list. */
@@ -773,8 +773,7 @@ export type TranscriptContext = {
  * Direct `streamSimple()` calls throw synchronously when request auth is missing.
  * Updates and `done` must never appear before `start`.
  *
- * `partial` is the shared live response-so-far helper, not an event-time
- * snapshot. Text and thinking blocks are empty when their `*_start` event is
+ * `partial` is an immutable publication snapshot of the response-so-far. Text and thinking blocks are empty when their `*_start` event is
  * emitted and grow only through their corresponding `*_delta` events until the
  * authoritative `*_end`. Redacted thinking may be complete at start and emit no
  * deltas. Tool-call arguments at `toolcall_start` are provider-specific;

@@ -6,7 +6,7 @@ import {
 	safeOAuthError,
 	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
-import type { AssistantMessage, JsonObject, Usage } from "../types.ts";
+import type { AssistantMessage, JsonObject, ThinkingLevelMap, Usage } from "../types.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 export interface DiagnosticErrorInfo {
@@ -163,12 +163,21 @@ export function projectAssistantMessageDiagnostics(
 	_secrets: readonly string[] = [],
 	oauthDiagnostics = false,
 	partial = false,
+	model?: { thinkingLevelMap?: ThinkingLevelMap },
 ): AssistantMessage {
 	const projected: AssistantMessage = {
 		...message,
 		content: structuredClone(message.content),
-		usage: structuredClone(message.usage),
+		usage: projectUsage(message.usage),
 	};
+	delete projected.responseId;
+	if (
+		message.providerThinkingLevel !== undefined &&
+		!["low", "medium", "high", "xhigh", "max"].includes(message.providerThinkingLevel) &&
+		!Object.values(model?.thinkingLevelMap ?? {}).includes(message.providerThinkingLevel)
+	) {
+		delete projected.providerThinkingLevel;
+	}
 	if (message.errorMessage !== undefined) {
 		const decision = oauthRecoveryDecision(safeOAuthError({ message: message.errorMessage }, true));
 		if (isProviderContextOverflow(message.errorMessage, message.provider))

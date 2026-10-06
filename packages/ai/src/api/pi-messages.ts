@@ -9,13 +9,11 @@
  * models.json custom provider with `"api": "pi-messages"`.
  */
 
-import { oauthRecoveryDecision, oauthResponseError, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import { OAuthDiagnosticError, oauthResponseError } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	CacheRetention,
-	JsonObject,
-	JsonValue,
 	Model,
 	ProviderEnv,
 	SimpleStreamOptions,
@@ -26,6 +24,7 @@ import type {
 	TranscriptContext,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -87,73 +86,11 @@ export type PiMessagesEvent =
 			rewrite?: PiMessagesRewriteImpact;
 	  };
 
-type PiMessagesErrorBody = {
-	error?: {
-		message?: unknown;
-		code?: unknown;
-		details?: unknown;
-		[key: string]: unknown;
-	};
-};
-
-export class PiMessagesResponseError extends Error {
-	code?: string;
-	readonly diagnosticDetails: JsonObject;
-
-	constructor(message: string, code: string | undefined, diagnosticDetails: JsonObject) {
-		super(message);
-		this.name = "PiMessagesResponseError";
-		this.code = code;
-		this.diagnosticDetails = diagnosticDetails;
+// HTTP failure bodies are classified privately by the bounded response helper.
+export class PiMessagesResponseError extends OAuthDiagnosticError {
+	constructor(error: OAuthDiagnosticError) {
+		super(error.code, error.status, error.providerCode, error.recovery, error.retryable);
 	}
-}
-
-function parsePiMessagesErrorBody(body: string): PiMessagesErrorBody | undefined {
-	try {
-		const parsed = JSON.parse(body) as PiMessagesErrorBody | null;
-		const error = parsed?.error;
-		return parsed && typeof error === "object" && error !== null && !Array.isArray(error) ? parsed : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function truncateDiagnosticString(value: string): string {
-	const maxLength = 8192;
-	return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
-}
-
-function formatPiMessagesResponseError(
-	response: Response,
-	body: string,
-	errorBody: PiMessagesErrorBody | undefined,
-): string {
-	const message = typeof errorBody?.error?.message === "string" ? errorBody.error.message : undefined;
-	const code = typeof errorBody?.error?.code === "string" ? errorBody.error.code : undefined;
-	const suffix = message ?? body;
-	const codeSuffix = code ? ` (${code})` : "";
-	return `${response.status} ${response.statusText}: ${suffix}${codeSuffix}`;
-}
-
-function createPiMessagesResponseError(
-	model: Model<"pi-messages">,
-	url: URL,
-	response: Response,
-	body: string,
-): PiMessagesResponseError {
-	const errorBody = parsePiMessagesErrorBody(body);
-	const code = typeof errorBody?.error?.code === "string" ? errorBody.error.code : undefined;
-	return new PiMessagesResponseError(formatPiMessagesResponseError(response, body, errorBody), code, {
-		version: 1,
-		provider: model.provider,
-		model: model.id,
-		url: url.toString(),
-		status: response.status,
-		statusText: response.statusText,
-		...(errorBody?.error === undefined ? {} : { error: errorBody.error as JsonValue }),
-		...(errorBody ? {} : { body: truncateDiagnosticString(body) }),
-		timestampMs: Date.now(),
-	});
 }
 
 function createEmptyUsage(): PiMessagesUsage {
@@ -167,33 +104,6 @@ function createEmptyUsage(): PiMessagesUsage {
 	};
 }
 
-/** The cast wire event is untrusted: rebuild terminal-error accounting without provider metadata. */
-function projectErrorUsage(value: unknown): PiMessagesUsage {
-	const usage = createEmptyUsage();
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return usage;
-	const fields = value as Record<string, unknown>;
-	for (const key of [
-		"input",
-		"output",
-		"cacheRead",
-		"cacheWrite",
-		"totalTokens",
-		"cacheWrite1h",
-		"reasoning",
-	] as const) {
-		const number = fields[key];
-		if (typeof number === "number" && Number.isFinite(number)) usage[key] = number;
-	}
-	if (typeof fields.cost === "object" && fields.cost !== null && !Array.isArray(fields.cost)) {
-		const cost = fields.cost as Record<string, unknown>;
-		for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
-			const number = cost[key];
-			if (typeof number === "number" && Number.isFinite(number)) usage.cost[key] = number;
-		}
-	}
-	return usage;
-}
-
 function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesRewriteImpact | undefined): void {
 	if (!rewrite) {
 		return;
@@ -201,11 +111,10 @@ function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesR
 	appendAssistantMessageDiagnostic(message, {
 		type: "pi_messages_rewrite",
 		timestamp: Date.now(),
-		details: { ...rewrite },
 	});
 }
 
-function createEventConverter(model: Model<"pi-messages">, oauthDiagnostics = false) {
+function createEventConverter(model: Model<"pi-messages">) {
 	const partial: AssistantMessage = {
 		role: "assistant",
 		content: [],
@@ -229,24 +138,22 @@ function createEventConverter(model: Model<"pi-messages">, oauthDiagnostics = fa
 				if (event.providerThinkingLevel !== undefined) {
 					partial.providerThinkingLevel = event.providerThinkingLevel;
 				}
-				if (!oauthDiagnostics) appendRewriteDiagnostic(partial, event.rewrite);
+				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "done", reason: event.reason, message: partial };
 			case "error": {
 				const reason = event.reason === "aborted" ? "aborted" : "error";
-				const safe = oauthDiagnostics
-					? safeOAuthError({ message: event.errorMessage }, true, "oauth_stream_failed")
-					: undefined;
+				const normalized = normalizeProviderError({ message: event.errorMessage }, [], false, model.provider);
 				Object.assign(partial, {
 					stopReason: reason,
-					usage: oauthDiagnostics ? projectErrorUsage(event.usage) : event.usage,
-					errorMessage: safe ? safe.message : event.errorMessage,
-					oauthRecovery: safe ? oauthRecoveryDecision(safe) : undefined,
+					usage: event.usage,
+					errorMessage: normalized.message,
+					oauthRecovery: normalized.oauthRecovery,
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
 					partial.providerThinkingLevel = event.providerThinkingLevel;
 				}
-				if (!oauthDiagnostics) appendRewriteDiagnostic(partial, event.rewrite);
+				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "error", reason, error: partial };
 			}
 			case "start":
@@ -364,18 +271,18 @@ function createErrorEvent(
 ): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
 	// Local callbacks cannot supply transport status or recovery authority.
-	const diagnosticError = callbackError && oauthDiagnostics ? undefined : error;
-	const safe = oauthDiagnostics ? safeOAuthError(diagnosticError) : undefined;
+	const diagnosticError = callbackError ? undefined : error;
+	const normalized = normalizeProviderError(diagnosticError, [], false, model.provider);
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
-		content: callbackError ? (partial?.content ?? []) : [],
+		content: partial?.content ?? [],
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
-		usage: callbackError ? (partial?.usage ?? createEmptyUsage()) : createEmptyUsage(),
+		usage: partial?.usage ?? createEmptyUsage(),
 		stopReason: reason,
-		oauthRecovery: callbackError ? { retryable: false } : safe ? oauthRecoveryDecision(safe) : undefined,
-		errorMessage: safe ? safe.message : error instanceof Error ? error.message : String(error),
+		oauthRecovery: callbackError ? { retryable: false } : normalized.oauthRecovery,
+		errorMessage: normalized.message,
 		timestamp: Date.now(),
 	};
 
@@ -394,13 +301,7 @@ function createErrorEvent(
 	if (!callbackError && !aborted && error instanceof PiMessagesResponseError) {
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
-			createAssistantMessageDiagnostic(
-				"pi_messages_response_failure",
-				error,
-				error.diagnosticDetails,
-				[],
-				oauthDiagnostics,
-			),
+			createAssistantMessageDiagnostic("pi_messages_response_failure", error, undefined, [], oauthDiagnostics),
 		);
 	}
 
@@ -421,7 +322,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	options?: PiMessagesOptions,
 ): AssistantMessageEventStream => {
 	const eventStream = new AssistantMessageEventStream(model, options);
-	const convertEvent = createEventConverter(model, options?.oauthDiagnostics);
+	const convertEvent = createEventConverter(model);
 	let callbackError = false;
 	let partial: AssistantMessage | undefined;
 
@@ -473,9 +374,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 			callbackError = false;
 
 			if (!response.ok) {
-				if (options?.oauthDiagnostics) throw await oauthResponseError(response, true);
-				const body = await response.text();
-				throw createPiMessagesResponseError(model, url, response, body);
+				throw new PiMessagesResponseError(await oauthResponseError(response, true));
 			}
 			if (!response.body) {
 				throw new Error(`${model.provider} response has no body`);
