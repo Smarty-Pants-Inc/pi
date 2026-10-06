@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AssistantMessage, AssistantMessageEvent, StopReason } from "../src/types.ts";
 import { createAssistantMessageEventStream } from "../src/utils/event-stream.ts";
+import { isContextOverflow } from "../src/utils/overflow.ts";
 
 const reasons = ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred", "synthetic"] as const;
 function message(reason: string): AssistantMessage {
@@ -29,6 +30,20 @@ function message(reason: string): AssistantMessage {
 			: {}),
 	};
 }
+
+// smarty-dev#5822 / T-C3: suppressing text must preserve Cerebras's bodyless overflow control.
+describe("T-C3 bodyless Cerebras control", () => {
+	it.each([400, 413])("retains bodyless HTTP %s overflow", async (status) => {
+		const original = { ...message("error"), provider: "cerebras", errorMessage: `${status} status code (no body)` };
+		const stream = createAssistantMessageEventStream();
+		stream.push({ type: "error", reason: "error", error: original });
+		stream.end();
+		const result = await stream.result();
+		expect(result.oauthRecovery?.recovery).toBe("context_length_exceeded");
+		expect(isContextOverflow(result)).toBe(true);
+		expect(result.errorMessage).toContain("provider_request_failed");
+	});
+});
 
 // smarty-dev#5822 / R5 N1: a producer error cannot authorize successful completion.
 describe("T-F6-error-kind model-less", () => {

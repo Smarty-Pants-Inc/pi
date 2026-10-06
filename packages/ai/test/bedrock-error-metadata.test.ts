@@ -52,6 +52,7 @@ import { stream as streamBedrock } from "../src/api/bedrock-converse-stream.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
 import type { AssistantMessage, Model } from "../src/types.ts";
 import type { AssistantMessageDiagnostic } from "../src/utils/diagnostics.ts";
+import { isRetryableAssistantError } from "../src/utils/retry.ts";
 
 const DIAGNOSTIC_TYPE = "bedrock_response_failure";
 const VALIDATION_MESSAGE = "The provided model identifier is invalid.";
@@ -112,9 +113,15 @@ describe("bedrock failure diagnostics", () => {
 		const diagnostic = findDiagnostic(message);
 
 		expect(message.stopReason).toBe("error");
-		expect(diagnostic?.details).toEqual({ status: 400, errorCode: "ValidationException", requestId: REQUEST_ID });
+		expect(diagnostic?.details).toBeUndefined();
+		expect(diagnostic?.type).toBe(DIAGNOSTIC_TYPE);
+		expect(message.errorMessage).toContain("HTTP 400");
 		expect(diagnostic?.error).toBeUndefined();
-		expect(Object.keys(diagnostic ?? {}).sort()).toEqual(["details", "timestamp", "type"]);
+		expect(
+			Object.keys(diagnostic ?? {})
+				.filter((key) => diagnostic?.[key as keyof AssistantMessageDiagnostic] !== undefined)
+				.sort(),
+		).toEqual(["timestamp", "type"]);
 	});
 
 	it("leaves errorMessage untouched so retry classification is unaffected", async () => {
@@ -126,7 +133,9 @@ describe("bedrock failure diagnostics", () => {
 			}),
 		};
 
-		expect((await runBedrock()).errorMessage).toBe(`Validation error: ${VALIDATION_MESSAGE}`);
+		const message = await runBedrock();
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP 400)");
+		expect(isRetryableAssistantError(message)).toBe(false);
 	});
 
 	it("reports only the request id for a modeled mid-stream exception", async () => {
@@ -136,7 +145,8 @@ describe("bedrock failure diagnostics", () => {
 		const message = await runBedrock();
 
 		expect(message.stopReason).toBe("error");
-		expect(findDiagnostic(message)?.details).toEqual({ requestId: REQUEST_ID });
+		expect(findDiagnostic(message)?.details).toBeUndefined();
+		expect(findDiagnostic(message)?.type).toBe(DIAGNOSTIC_TYPE);
 	});
 
 	it("captures the error code for an unmodeled mid-stream error", async () => {
@@ -145,10 +155,10 @@ describe("bedrock failure diagnostics", () => {
 		unmodeled.name = "ModelStreamErrorException";
 		bedrockMock.send = respondWithFailingStream(unmodeled);
 
-		expect(findDiagnostic(await runBedrock())?.details).toEqual({
-			errorCode: "ModelStreamErrorException",
-			requestId: REQUEST_ID,
-		});
+		const message = await runBedrock();
+		expect(findDiagnostic(message)?.details).toBeUndefined();
+		expect(findDiagnostic(message)?.type).toBe(DIAGNOSTIC_TYPE);
+		expect(isRetryableAssistantError(message)).toBe(true);
 	});
 
 	it("does not report a transport failure name as a provider error code", async () => {
@@ -157,7 +167,10 @@ describe("bedrock failure diagnostics", () => {
 		timeout.name = "TimeoutError";
 		bedrockMock.send = respondWithFailingStream(timeout);
 
-		expect(findDiagnostic(await runBedrock())?.details).toEqual({ requestId: REQUEST_ID });
+		const message = await runBedrock();
+		expect(findDiagnostic(message)?.details).toBeUndefined();
+		expect(findDiagnostic(message)?.type).toBe(DIAGNOSTIC_TYPE);
+		expect(isRetryableAssistantError(message)).toBe(true);
 	});
 
 	it("emits no diagnostic when the failure carries no provider metadata", async () => {
@@ -166,7 +179,8 @@ describe("bedrock failure diagnostics", () => {
 		const message = await runBedrock();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe("socket hang up");
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP unknown)");
+		expect(isRetryableAssistantError(message)).toBe(true);
 		expect(findDiagnostic(message)).toBeUndefined();
 	});
 
@@ -194,7 +208,10 @@ describe("bedrock failure diagnostics", () => {
 			}),
 		};
 
-		expect(findDiagnostic(await runBedrock())?.details).toEqual({ status: 400 });
+		const message = await runBedrock();
+		expect(findDiagnostic(message)?.details).toBeUndefined();
+		expect(findDiagnostic(message)?.type).toBe(DIAGNOSTIC_TYPE);
+		expect(message.errorMessage).toContain("HTTP 400");
 	});
 
 	it("omits the SDK's Unknown placeholder instead of reporting it as a code", async () => {
@@ -204,9 +221,9 @@ describe("bedrock failure diagnostics", () => {
 			error: makeServiceException("Unknown", { $metadata: { httpStatusCode: 403, requestId: REQUEST_ID } }),
 		};
 
-		expect(findDiagnostic(await runBedrock())?.details).toEqual({
-			status: 403,
-			requestId: REQUEST_ID,
-		});
+		const message = await runBedrock();
+		expect(findDiagnostic(message)?.details).toBeUndefined();
+		expect(findDiagnostic(message)?.type).toBe(DIAGNOSTIC_TYPE);
+		expect(message.errorMessage).toContain("HTTP 403");
 	});
 });

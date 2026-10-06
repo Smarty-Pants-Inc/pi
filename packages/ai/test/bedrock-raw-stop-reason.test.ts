@@ -106,7 +106,8 @@ describe("Bedrock provider stream events", () => {
 
 		expect(received).toEqual(bedrockMock.streamEvents!.map(() => ({ type: "provider_stream_event" })));
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("bedrock stream failed");
+		expect(result.errorMessage).toBe("provider_request_failed (HTTP unknown)");
+		expect(result.oauthRecovery?.retryable).toBe(false);
 	});
 });
 
@@ -128,6 +129,7 @@ describe("Bedrock raw stop reasons", () => {
 
 		expect(message.stopReason).toBe("error");
 		expect(message.rawStopReason).toBe("guardrail_intervened");
-		expect(message.errorMessage).toBe("Provider stopped with: guardrail_intervened");
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP unknown)");
+		expect(message.oauthRecovery?.retryable).toBe(false);
 	});
 });

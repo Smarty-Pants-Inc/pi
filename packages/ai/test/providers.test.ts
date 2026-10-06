@@ -812,7 +812,9 @@ describe("fauxProvider", () => {
 		const failedSubmission = await models.completeSimple(model, context, { deferred: true });
 		if (!failedSubmission.deferred) throw new Error("Faux response did not include a deferred handle");
 		const failed = await models.fetchDeferred(model, failedSubmission.deferred);
-		expect(failed).toMatchObject({ stopReason: "error", errorMessage: "deferred failed" });
+		// smarty-dev#5822: a deferred provider's raw failure is not a public diagnostic.
+		expect(failed).toMatchObject({ stopReason: "error", errorMessage: "provider_request_failed (HTTP unknown)" });
+		expect(failed.oauthRecovery?.retryable).toBe(false);
 
 		const cancelledSubmission = await models.completeSimple(model, context, { deferred: true });
 		if (!cancelledSubmission.deferred) throw new Error("Faux response did not include a deferred handle");
@@ -821,7 +823,7 @@ describe("fauxProvider", () => {
 		const cancelled = await models.fetchDeferred(model, cancelledSubmission.deferred);
 		expect(cancelled).toMatchObject({
 			stopReason: "error",
-			errorMessage: expect.stringContaining("was cancelled"),
+			errorMessage: "provider_request_failed (HTTP unknown)",
 		});
 	});
 });
