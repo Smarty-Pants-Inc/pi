@@ -1,4 +1,4 @@
-import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import { assistantMessageThrottleWait, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage } from "../types.ts";
 import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
 
@@ -166,11 +166,7 @@ export async function retryAssistantCall(
  */
 export function throttledLimitWait(message: AssistantMessage): { delayMs: number; waitMessage: string } | undefined {
 	if (message.stopReason !== "error") return undefined;
-	const details = message.diagnostics?.find((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)?.details;
-	const seconds = details?.retryAfterSeconds;
-	const waitMessage = details?.waitMessage;
-	if (typeof seconds !== "number" || typeof waitMessage !== "string") return undefined;
-	return { delayMs: seconds * 1000, waitMessage };
+	return assistantMessageThrottleWait(message);
 }
 
 /**

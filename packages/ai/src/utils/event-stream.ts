@@ -1,4 +1,8 @@
-import { getOAuthDiagnosticSecrets, oauthRecoveryDecision, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import {
+	oauthRecoveryDecision,
+	safeOAuthError,
+	transferAssistantMessagePrivateDecisions,
+} from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent, ProviderHeaders, StreamOptions } from "../types.ts";
 import { extractDiagnosticError, projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 import { SETUP_MESSAGES } from "./models-error.ts";
@@ -92,7 +96,6 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	}
 }
 
-const diagnosticPolicies = new WeakMap<AssistantMessageEventStream, { secrets: readonly string[]; oauth: boolean }>();
 const ownedErrorMessages = new WeakMap<AssistantMessage, string>();
 const hintMessages = {
 	bedrock_data_retention:
@@ -121,6 +124,7 @@ function projectTerminalEvent(
 			usage: structuredClone(message.usage),
 			stopReason: reason,
 		};
+		transferAssistantMessagePrivateDecisions(message, error);
 		delete error.deferred;
 		delete error.responseId;
 		delete error.responseModel;
@@ -171,7 +175,7 @@ function projectTerminalEvent(
 }
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor(model?: { headers?: ProviderHeaders }, options?: StreamOptions) {
+	constructor(_model?: { headers?: ProviderHeaders }, _options?: StreamOptions) {
 		super(
 			(event) => event.type === "done" || event.type === "error",
 			(event) => {
@@ -183,41 +187,32 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new Error("Unexpected event type for final result");
 			},
 		);
-		if (model) {
-			diagnosticPolicies.set(this, {
-				secrets: getOAuthDiagnosticSecrets(options?.apiKey, model.headers, [
-					...(options?.diagnosticSecrets ?? []),
-					...getOAuthDiagnosticSecrets(options?.apiKey, options?.headers),
-				]),
-				oauth: options?.oauthDiagnostics === true || options?.apiKey?.includes("sk-ant-oat") === true,
-			});
-		}
 	}
 
 	override push(event: AssistantMessageEvent): void {
-		const policy = diagnosticPolicies.get(this);
-		if (policy) {
-			const message =
-				"partial" in event
-					? event.partial
-					: event.type === "done"
-						? event.message
-						: event.type === "error"
-							? event.error
-							: undefined;
-			if (message) projectAssistantMessageDiagnostics(message, policy.secrets, policy.oauth);
+		if (event.type === "error" || event.type === "done") {
+			const message = event.type === "error" ? event.error : event.message;
+			const projected = projectAssistantMessageDiagnostics(message);
+			const owned = ownedErrorMessages.get(message);
+			if (owned !== undefined) ownedErrorMessages.set(projected, owned);
+			super.push(projectTerminalEvent(event.type, projected, { secrets: [], oauth: true }));
+		} else {
+			const partial = projectAssistantMessageDiagnostics(event.partial, [], false, true);
+			super.push(
+				event.type === "toolcall_end"
+					? { ...event, partial, toolCall: structuredClone(event.toolCall) }
+					: { ...event, partial },
+			);
 		}
-		if (event.type === "error") super.push(projectTerminalEvent("error", event.error, policy));
-		else if (event.type === "done") super.push(projectTerminalEvent("done", event.message, policy));
-		else super.push(event);
 	}
 
 	override end(result?: AssistantMessage): void {
-		const policy = diagnosticPolicies.get(this);
-		if (result && policy) projectAssistantMessageDiagnostics(result, policy.secrets, policy.oauth);
-		if (result?.stopReason === "error" || result?.stopReason === "aborted") {
-			const event = projectTerminalEvent("error", result, policy);
-			if (event.type === "error") result = event.error;
+		if (result) {
+			const projected = projectAssistantMessageDiagnostics(result);
+			const owned = ownedErrorMessages.get(result);
+			if (owned !== undefined) ownedErrorMessages.set(projected, owned);
+			const event = projectTerminalEvent("done", projected, { secrets: [], oauth: true });
+			result = event.type === "error" ? event.error : event.message;
 		}
 		super.end(result);
 	}

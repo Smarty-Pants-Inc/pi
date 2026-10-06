@@ -15,6 +15,7 @@ import {
 	getOAuthDiagnosticSecrets,
 	oauthDiagnosticError,
 	oauthDiagnosticLogger,
+	recordAssistantMessageThrottleWait,
 	redactOAuthDiagnostic,
 } from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
@@ -754,6 +755,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				// A throttled limit with a short Retry-After carries the wait for the agent's one-shot retry.
 				output.errorMessage = limitMessage;
 				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
+				if (retryAfterSeconds !== undefined) recordAssistantMessageThrottleWait(output, retryAfterSeconds);
 				appendAssistantMessageDiagnostic(output, {
 					type: PROVIDER_LIMIT_DIAGNOSTIC,
 					timestamp: Date.now(),
@@ -818,7 +820,7 @@ function createClient(
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
 	compat: ResolvedOpenAICompletionsCompat = getCompat(model),
-	oauthDiagnostics = false,
+	_oauthDiagnostics = false,
 	diagnosticSecrets: string[] = [],
 ) {
 	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
@@ -857,7 +859,7 @@ function createClient(
 
 	return new OpenAI({
 		logLevel: "off",
-		logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
+		logger: oauthDiagnosticLogger,
 		apiKey,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,

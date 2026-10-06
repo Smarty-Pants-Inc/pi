@@ -13,8 +13,9 @@
 // Anthropic / `@google/genai` happy path where the SDK already folded the body
 // into the message, so providers can preserve it without double-printing.
 
-import { oauthRecoveryDecision, redactOAuthDiagnostic, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import { OAuthDiagnosticError, oauthRecoveryDecision, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import type { OAuthRecoveryDecision } from "../types.ts";
+import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 export { getOAuthDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 
@@ -23,6 +24,7 @@ export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 export interface NormalizedProviderError {
 	/** Present only when the OAuth projection classified the untrusted error before suppression. */
 	oauthRecovery?: OAuthRecoveryDecision;
+	diagnosticHint?: "bedrock_data_retention";
 	/** HTTP status code, when one could be extracted from the SDK error object. */
 	status?: number;
 	/** Raw HTTP body reason, already trimmed and truncated to the cap. */
@@ -40,38 +42,48 @@ type SdkErrorShape = Error & {
 	error?: unknown;
 	$metadata?: { httpStatusCode?: unknown };
 	$response?: { statusCode?: unknown; body?: unknown };
+	code?: unknown;
 };
 
 export function normalizeProviderError(
 	error: unknown,
-	secrets: readonly string[] = [],
+	_secrets: readonly string[] = [],
 	oauthDiagnostics = false,
+	provider?: string,
 ): NormalizedProviderError {
-	if (oauthDiagnostics) {
-		const safe = safeOAuthError(error, true);
+	try {
+		const sdkError = (typeof error === "object" && error !== null ? error : {}) as SdkErrorShape;
+		const status = extractStatus(sdkError);
+		const prefix =
+			sdkError.name === "ThrottlingException"
+				? "Throttling error: "
+				: sdkError.name === "ServiceUnavailableException"
+					? "Service unavailable: "
+					: "";
+		const text = `${prefix}${typeof sdkError.message === "string" ? sdkError.message : typeof error === "string" ? error : ""} ${pickBodyText(sdkError) ?? ""}`;
+		const safe =
+			error instanceof OAuthDiagnosticError
+				? safeOAuthError(error, true)
+				: safeOAuthError({ status, message: text, error: sdkError.error, code: sdkError.code }, true);
+		const decision = oauthRecoveryDecision(safe);
+		if (isProviderContextOverflow(text, provider)) decision.recovery = "context_length_exceeded";
 		return {
 			status: safe.status,
-			message: redactOAuthDiagnostic(safe.message, secrets),
+			message: oauthDiagnostics ? safe.message : safe.message.replace(/^oauth_/, "provider_"),
+			messageCarriesBody: true,
+			oauthRecovery: decision,
+			...(/data retention mode/i.test(text) && provider === "amazon-bedrock"
+				? { diagnosticHint: "bedrock_data_retention" as const }
+				: {}),
+		};
+	} catch {
+		const safe = safeOAuthError(undefined, true);
+		return {
+			message: oauthDiagnostics ? safe.message : safe.message.replace(/^oauth_/, "provider_"),
 			messageCarriesBody: true,
 			oauthRecovery: oauthRecoveryDecision(safe),
 		};
 	}
-	if (!(error instanceof Error)) {
-		return { message: redactOAuthDiagnostic(safeJsonStringify(error), secrets), messageCarriesBody: false };
-	}
-
-	const sdkError = error as SdkErrorShape;
-	const status = extractStatus(sdkError);
-	const body = extractBody(sdkError, secrets);
-	const message = redactOAuthDiagnostic(error.message, secrets);
-	const messageCarriesBody = body === undefined || message.includes(body);
-
-	return {
-		status,
-		body,
-		message,
-		messageCarriesBody,
-	} satisfies NormalizedProviderError;
 }
 
 /**
@@ -80,26 +92,15 @@ export function normalizeProviderError(
  * `$metadata.httpStatusCode` (Bedrock) → `$response.statusCode` (Bedrock).
  */
 function extractStatus(error: SdkErrorShape): number | undefined {
-	if (typeof error.statusCode === "number") return error.statusCode;
-	if (typeof error.status === "number") return error.status;
-	if (typeof error.$metadata?.httpStatusCode === "number") return error.$metadata.httpStatusCode;
-	if (typeof error.$response?.statusCode === "number") return error.$response.statusCode;
+	for (const status of [
+		error.statusCode,
+		error.status,
+		error.$metadata?.httpStatusCode,
+		error.$response?.statusCode,
+	]) {
+		if (typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599) return status;
+	}
 	return undefined;
-}
-
-/**
- * Probe the raw body reason, first usable hit wins, in SDK-field order:
- * `body` string (Mistral) → `error` parsed JSON body object (`openai` SDK's
- * `this.error`) → `$response.body` (Bedrock). Empty objects and unread response
- * streams are treated as no body so they do not surface as `"{}"` or serialized
- * stream internals. The chosen body is truncated to the cap.
- */
-function extractBody(error: SdkErrorShape, secrets: readonly string[]): string | undefined {
-	const bodyText = pickBodyText(error);
-	if (bodyText === undefined) return undefined;
-	const trimmed = redactOAuthDiagnostic(bodyText, secrets).trim();
-	if (trimmed.length === 0) return undefined;
-	return truncateErrorText(trimmed, MAX_PROVIDER_ERROR_BODY_CHARS);
 }
 
 function pickBodyText(error: SdkErrorShape): string | undefined {

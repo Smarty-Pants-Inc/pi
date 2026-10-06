@@ -1,9 +1,9 @@
-import OpenAI, { type ClientOptions } from "openai";
+import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
 import {
 	getOAuthDiagnosticSecrets,
+	oauthDiagnosticLogger,
 	oauthRecoveryDecision,
-	redactOAuthDiagnosticValue,
 	safeOAuthError,
 } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
@@ -288,11 +288,11 @@ function createClient(
 	model: Model<"openai-responses">,
 	context: TranscriptContext,
 	apiKey: string,
-	diagnosticSecrets: readonly string[],
+	_diagnosticSecrets: readonly string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
-	oauthDiagnostics = false,
+	_oauthDiagnostics = false,
 ) {
 	const compat = getCompat(model);
 	const headers: ProviderHeaders = { "User-Agent": getPiUserAgent(), ...model.headers };
@@ -321,20 +321,10 @@ function createClient(
 		Object.assign(headers, optionsHeaders);
 	}
 
-	const redactArgs = (message: string, args: unknown[]) =>
-		oauthDiagnostics
-			? ["oauth_sdk_diagnostic (HTTP unknown)"]
-			: [message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, diagnosticSecrets));
-	// OAuth credentials can also be used with a caller-configured endpoint; never gate log safety on the URL.
-	const logger: ClientOptions["logger"] = {
-		error: (message, ...args) => console.error(...redactArgs(message, args)),
-		warn: (message, ...args) => console.warn(...redactArgs(message, args)),
-		info: (message, ...args) => console.info(...redactArgs(message, args)),
-		debug: (message, ...args) => console.debug(...redactArgs(message, args)),
-	};
 	return new OpenAI({
 		apiKey,
-		logger,
+		logLevel: "off",
+		logger: oauthDiagnosticLogger,
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,

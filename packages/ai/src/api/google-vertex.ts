@@ -301,7 +301,9 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			const normalized = normalizeProviderError(error);
+			output.oauthRecovery = normalized.oauthRecovery;
+			output.errorMessage = formatProviderError(normalized);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

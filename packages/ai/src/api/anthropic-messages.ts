@@ -14,9 +14,6 @@ import {
 	getOAuthDiagnosticSecrets,
 	oauthDiagnosticError,
 	oauthDiagnosticLogger,
-	oauthRecoveryDecision,
-	redactOAuthDiagnostic,
-	safeOAuthError,
 } from "../auth/oauth/credential-response.ts";
 import {
 	ANTHROPIC_FEDERATION_RULE_ID_ENV,
@@ -993,11 +990,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const safe = oauthDiagnostics ? safeOAuthError(error, true) : undefined;
-			output.oauthRecovery = safe ? oauthRecoveryDecision(safe) : undefined;
-			output.errorMessage = safe
-				? redactOAuthDiagnostic(safe.message, diagnosticSecrets)
-				: formatProviderError(normalizeProviderError(error, diagnosticSecrets));
+			const normalized = normalizeProviderError(error, diagnosticSecrets, oauthDiagnostics);
+			output.oauthRecovery = normalized.oauthRecovery;
+			output.errorMessage = formatProviderError(normalized);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -1093,13 +1088,13 @@ function createClient(
 	dynamicHeaders?: Record<string, string>,
 	sessionId?: string,
 	federation?: AnthropicFederationConfig,
-	oauthDiagnostics = false,
+	_oauthDiagnostics = false,
 ): { client: Anthropic; isOAuthToken: boolean } {
 	// Copilot: Bearer auth.
 	if (model.provider === "github-copilot") {
 		const client = new PiAnthropic({
 			logLevel: "off",
-			logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
+			logger: oauthDiagnosticLogger,
 			apiKey: null,
 			authToken: apiKey ?? null,
 			baseURL: model.baseUrl,
@@ -1123,7 +1118,7 @@ function createClient(
 	if (apiKey && isOAuthToken(apiKey)) {
 		const client = new PiAnthropic({
 			logLevel: "off",
-			logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
+			logger: oauthDiagnosticLogger,
 			apiKey: null,
 			authToken: apiKey,
 			baseURL: model.baseUrl,
@@ -1165,7 +1160,7 @@ function createClient(
 		if (federationClient?.key !== key || federationClient.fetch !== fetch) {
 			const client = new PiAnthropic({
 				logLevel: "off",
-				logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
+				logger: oauthDiagnosticLogger,
 				apiKey: null,
 				authToken: null,
 				config: federation,
@@ -1180,7 +1175,7 @@ function createClient(
 
 	const client = new PiAnthropic({
 		logLevel: "off",
-		logger: oauthDiagnostics ? oauthDiagnosticLogger : undefined,
+		logger: oauthDiagnosticLogger,
 		apiKey: apiKey ?? null,
 		authToken: null,
 		baseURL: model.baseUrl,

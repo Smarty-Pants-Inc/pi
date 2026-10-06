@@ -2,11 +2,12 @@ import {
 	type OAuthDiagnosticCode,
 	oauthDiagnosticError,
 	oauthRecoveryDecision,
-	redactOAuthDiagnostic,
-	redactOAuthDiagnosticValue,
 	safeOAuthError,
+	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, JsonObject } from "../types.ts";
+import { SETUP_MESSAGES } from "./models-error.ts";
+import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 export interface DiagnosticErrorInfo {
 	name?: string;
@@ -60,76 +61,121 @@ export function createAssistantMessageDiagnostic(
 	};
 }
 
-/** Reconstruct owned OAuth text; an arbitrary prefix, suffix or cause is never retained. */
-function projectOAuthDiagnosticText(text: string): string {
+const OWNED_DIAGNOSTIC_TYPES = new Set([
+	"provider_limit",
+	"provider_stream_observer_error",
+	"pi_messages_response_failure",
+	"bedrock_response_failure",
+	"pi_messages_rewrite",
+	"anthropic_input_transformations",
+	"provider_transport_fallback",
+	"provider_stream_recovery",
+]);
+const OWNED_STOP_REASONS = new Set([
+	"stop",
+	"length",
+	"tool_calls",
+	"end_turn",
+	"max_tokens",
+	"tool_use",
+	"refusal",
+	"pause_turn",
+	"stop_sequence",
+	"sensitive",
+	"completed",
+	"incomplete",
+	"failed",
+	"cancelled",
+	"in_progress",
+	"queued",
+	"incomplete.max_output_tokens",
+	"incomplete.content_filter",
+	"end",
+	"function_call",
+	"content_filter",
+	"network_error",
+	"STOP",
+	"MAX_TOKENS",
+	"SAFETY",
+	"RECITATION",
+	"OTHER",
+	"BLOCKLIST",
+	"PROHIBITED_CONTENT",
+	"SPII",
+	"MALFORMED_FUNCTION_CALL",
+]);
+
+/** Rebuild owned text. A provider prefix or suffix never becomes authority. */
+function projectDiagnosticText(text: string, oauth: boolean): string {
+	if (Object.values(SETUP_MESSAGES).some((value) => value === text)) return text;
 	const owned =
-		/(?:^|: )(oauth_(?:request_failed|invalid_response|authorization_failed|stream_failed|transport_failed)) \(HTTP (unknown|[1-5]\d\d)\)(?: provider_error=([a-z_]+))?$/.exec(
+		/(?:^|: )((?:oauth|provider)_(?:request_failed|invalid_response|authorization_failed|stream_failed|transport_failed)) \(HTTP (unknown|[1-5]\d\d)\)(?: provider_error=([a-z_]+))?$/.exec(
 			text,
 		);
-	if (owned) {
-		return oauthDiagnosticError(
-			owned[1] as OAuthDiagnosticCode,
-			owned[2] === "unknown" ? undefined : Number(owned[2]),
-			owned[3],
-		).message;
-	}
-	const status = /(?:^|API error \()([1-5]\d\d)(?:\)|:| )/.exec(text);
-	return safeOAuthError({ message: text, status: status ? Number(status[1]) : undefined }, true).message;
+	const status = owned
+		? owned[2] === "unknown"
+			? undefined
+			: Number(owned[2])
+		: /(?:^|API error \()([1-5]\d\d)(?:\)|:| )/.exec(text)?.[1];
+	const safe = owned
+		? oauthDiagnosticError(
+				owned[1].replace(/^provider_/, "oauth_") as OAuthDiagnosticCode,
+				typeof status === "number" ? status : undefined,
+				owned[3],
+			)
+		: safeOAuthError({ status: typeof status === "string" ? Number(status) : undefined });
+	return extractDiagnosticError(safe, [], owned ? owned[1].startsWith("oauth_") : oauth).message;
 }
 
-/** Single publication boundary for diagnostic fields, not generated assistant content or usage. */
+/** One unconditional, copy-returning boundary. Credentials are never needed to project diagnostics. */
 export function projectAssistantMessageDiagnostics(
 	message: AssistantMessage,
-	secrets: readonly string[],
-	oauthDiagnostics: boolean,
-): void {
+	_secrets: readonly string[] = [],
+	oauthDiagnostics = false,
+	partial = false,
+): AssistantMessage {
+	const projected: AssistantMessage = {
+		...message,
+		content: structuredClone(message.content),
+		usage: structuredClone(message.usage),
+	};
 	if (message.errorMessage !== undefined) {
-		if (oauthDiagnostics && message.oauthRecovery === undefined) {
-			message.oauthRecovery = oauthRecoveryDecision(safeOAuthError({ message: message.errorMessage }, true));
-		}
-		message.errorMessage = oauthDiagnostics
-			? projectOAuthDiagnosticText(message.errorMessage)
-			: redactOAuthDiagnostic(message.errorMessage, secrets);
+		const decision = oauthRecoveryDecision(safeOAuthError({ message: message.errorMessage }, true));
+		if (isProviderContextOverflow(message.errorMessage, message.provider))
+			decision.recovery = "context_length_exceeded";
+		projected.oauthRecovery = message.oauthRecovery ? { ...message.oauthRecovery } : decision;
+		projected.errorMessage = projectDiagnosticText(message.errorMessage, oauthDiagnostics);
 	}
-	if (message.rawStopReason !== undefined) {
-		message.rawStopReason = oauthDiagnostics
-			? [
-					"stop",
-					"length",
-					"tool_calls",
-					"end_turn",
-					"max_tokens",
-					"tool_use",
-					"refusal",
-					"pause_turn",
-					"stop_sequence",
-					"sensitive",
-					"completed",
-					"incomplete",
-					"failed",
-					"cancelled",
-					"in_progress",
-					"queued",
-					"incomplete.max_output_tokens",
-					"incomplete.content_filter",
-				].includes(message.rawStopReason)
-				? message.rawStopReason
-				: "unknown"
-			: redactOAuthDiagnostic(message.rawStopReason, secrets);
-	}
+	if (message.rawStopReason !== undefined)
+		projected.rawStopReason = OWNED_STOP_REASONS.has(message.rawStopReason) ? message.rawStopReason : "unknown";
 	if (message.diagnostics) {
-		message.diagnostics = message.diagnostics.map((diagnostic) =>
-			oauthDiagnostics
-				? {
-						type: redactOAuthDiagnostic(diagnostic.type, secrets),
-						timestamp: diagnostic.timestamp,
-						error: diagnostic.error
-							? { name: "OAuthDiagnosticError", message: projectOAuthDiagnosticText(diagnostic.error.message) }
-							: undefined,
-					}
-				: (redactOAuthDiagnosticValue(diagnostic, secrets) as AssistantMessageDiagnostic),
-		);
+		projected.diagnostics = message.diagnostics
+			.filter((diagnostic) => OWNED_DIAGNOSTIC_TYPES.has(diagnostic.type))
+			.map((diagnostic) => ({
+				type: diagnostic.type,
+				timestamp: Date.now(),
+				...(diagnostic.error
+					? {
+							error: {
+								name: oauthDiagnostics ? "OAuthDiagnosticError" : "ProviderDiagnosticError",
+								message: projectDiagnosticText(diagnostic.error.message, oauthDiagnostics),
+							},
+						}
+					: {}),
+			}));
 	}
+	if (
+		partial ||
+		message.stopReason === "pending" ||
+		message.stopReason === "error" ||
+		message.stopReason === "aborted"
+	) {
+		delete projected.responseId;
+		delete projected.responseModel;
+		delete projected.providerThinkingLevel;
+	}
+	transferAssistantMessagePrivateDecisions(message, projected);
+	return projected;
 }
 
 export function appendAssistantMessageDiagnostic<T extends { diagnostics?: AssistantMessageDiagnostic[] }>(

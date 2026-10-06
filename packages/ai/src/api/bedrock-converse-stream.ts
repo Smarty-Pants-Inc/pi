@@ -2,7 +2,6 @@ import type { Agent as HttpsAgent } from "node:https";
 import {
 	BedrockRuntimeClient,
 	type BedrockRuntimeClientConfig,
-	BedrockRuntimeServiceException,
 	StopReason as BedrockStopReason,
 	type Tool as BedrockTool,
 	CachePointType,
@@ -26,7 +25,7 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BuildMiddleware, DeserializeMiddleware, DocumentType, HttpResponse, MetadataBearer } from "@smithy/types";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
-import { getOAuthDiagnosticSecrets, oauthRecoveryDecision, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import { getOAuthDiagnosticSecrets, sdkDiagnosticLoggerOff } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -50,7 +49,7 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
-import { type NormalizedProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream, recordAssistantMessageError } from "../utils/event-stream.ts";
 import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -185,6 +184,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 		// `credentials` is not set on the client config. See #6957.
 		const optionsProfile = options.profile || options.env?.AWS_PROFILE;
 		const config: BedrockRuntimeClientConfig = {
+			logger: sdkDiagnosticLoggerOff,
 			profile: optionsProfile || getProviderEnvValue("AWS_PROFILE", options.env),
 		};
 		const configuredRegion = getConfiguredBedrockRegion(options);
@@ -364,11 +364,9 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				finalizeStreamingBlock(block as Block);
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			const normalized = normalizeProviderError(error);
-			const classification = formatBedrockError(error, normalized, output);
-			output.oauthRecovery = oauthRecoveryDecision(
-				safeOAuthError({ status: normalized.status, message: classification }, true),
-			);
+			const normalized = normalizeProviderError(error, [], false, model.provider);
+			output.diagnosticHint = normalized.diagnosticHint;
+			output.oauthRecovery = normalized.oauthRecovery;
 			recordAssistantMessageError(output, { status: normalized.status });
 			const metadata = (error as { $metadata?: { httpStatusCode?: unknown; requestId?: unknown } } | null)
 				?.$metadata;
@@ -390,48 +388,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 
 	return stream;
 };
-
-/**
- * Human-readable prefixes for Bedrock SDK exception names.
- * The downstream retry logic in agent-session matches patterns like
- * `server.?error` and `service.?unavailable`, so we preserve the legacy
- * prefix format rather than using the raw SDK exception name.
- */
-const BEDROCK_ERROR_PREFIXES: Record<string, string> = {
-	InternalServerException: "Internal server error",
-	ModelStreamErrorException: "Model stream error",
-	ValidationException: "Validation error",
-	ThrottlingException: "Throttling error",
-	ServiceUnavailableException: "Service unavailable",
-};
-
-/**
- * Some models reject the account/profile's configured Bedrock data retention mode
- * (e.g. "data retention mode 'default' is not available for this model"). Point
- * users at the AWS docs explaining how to configure a supported mode.
- */
-/**
- * Format a Bedrock error with a human-readable prefix.
- * AWS SDK exceptions (both from `client.send()` and from stream event items)
- * extend BedrockRuntimeServiceException. We map the `.name` to a stable
- * human-readable prefix so downstream consumers (retry logic, context-overflow
- * detection) can distinguish error categories via simple string matching.
- */
-function formatBedrockError(error: unknown, norm: NormalizedProviderError, output: AssistantMessage): string {
-	// Surface the raw HTTP body (with status) when the SDK did not fold it into
-	// the message; otherwise fall back to the message. This is what stops a
-	// gateway 403 from collapsing to `Unknown: UnknownError`.
-	const core =
-		!norm.messageCarriesBody && norm.status !== undefined && norm.body !== undefined
-			? `${norm.status}: ${norm.body}`
-			: norm.message;
-	if (/data retention mode/i.test(core)) output.diagnosticHint = "bedrock_data_retention";
-	if (error instanceof BedrockRuntimeServiceException) {
-		const prefix = BEDROCK_ERROR_PREFIXES[error.name] ?? error.name;
-		return `${prefix}: ${core}`;
-	}
-	return core;
-}
 
 /**
  * Header keys that must never be overwritten by caller-supplied headers.

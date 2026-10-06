@@ -1,4 +1,4 @@
-import type { OAuthRecoveryDecision } from "../../types.ts";
+import type { AssistantMessage, OAuthRecoveryDecision } from "../../types.ts";
 import { fetchOAuthResponse, ResponseBodyError } from "../../utils/bounded-response.ts";
 import {
 	isPrematureProviderError,
@@ -6,6 +6,27 @@ import {
 	isRetryableProviderError,
 } from "../../utils/provider-error-classification.ts";
 import type { OAuthAuth } from "../types.ts";
+
+const throttleWaits = new WeakMap<AssistantMessage, number>();
+
+/** Only request preparation can register a validated live gateway delay; wire diagnostics are not receipts. */
+export function recordAssistantMessageThrottleWait(message: AssistantMessage, seconds: number): void {
+	if (Number.isInteger(seconds) && seconds >= 0 && seconds <= 30) throttleWaits.set(message, seconds);
+}
+
+export function assistantMessageThrottleWait(
+	message: AssistantMessage,
+): { delayMs: number; waitMessage: string } | undefined {
+	const seconds = throttleWaits.get(message);
+	return seconds === undefined
+		? undefined
+		: { delayMs: seconds * 1000, waitMessage: "Flash runs one request at a time" };
+}
+
+export function transferAssistantMessagePrivateDecisions(source: AssistantMessage, target: AssistantMessage): void {
+	const seconds = throttleWaits.get(source);
+	if (seconds !== undefined) throttleWaits.set(target, seconds);
+}
 
 export function isOAuthCancellation(error: unknown): boolean {
 	try {
@@ -50,6 +71,14 @@ export const oauthDiagnosticLogger = {
 	debug: (_message: string, ..._args: unknown[]) => console.debug("oauth_sdk_diagnostic (HTTP unknown)"),
 };
 
+/** SDKs without a log-level option receive this shared off logger. */
+export const sdkDiagnosticLoggerOff = {
+	error: (..._args: unknown[]) => {},
+	warn: (..._args: unknown[]) => {},
+	info: (..._args: unknown[]) => {},
+	debug: (..._args: unknown[]) => {},
+	trace: (..._args: unknown[]) => {},
+};
 const PROVIDER_ERROR_CODES = new Set([
 	"access_denied",
 	"authorization_denied",
