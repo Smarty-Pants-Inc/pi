@@ -9,6 +9,7 @@ import {
 	getCurrentTools,
 	getToolStateChanges,
 	normalizeContext,
+	projectUsage,
 	type SystemMessage,
 	type ToolResultMessage,
 	type ToolStateChanges,
@@ -917,6 +918,9 @@ type ExecutedToolCallOutcome = Pick<AgentToolCallOutcome, "result" | "isError" |
 
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
 
+// Authority is the fulfilled captured execute() call, not a public result field or hook claim.
+const acceptedToolResults = new WeakMap<FinalizedToolCallOutcome, AgentToolResult<unknown>>();
+
 /** The `beforeToolCall` and `afterToolCall` hooks of {@link AgentLoopConfig}. */
 export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall" | "getCurrentTools">;
 
@@ -925,7 +929,13 @@ type ToolUpdateSink = (partialResult: AgentToolResult<any>) => Promise<void> | v
 type FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>);
 
 function shouldTerminateToolBatch(finalizedCalls: FinalizedToolCallOutcome[]): boolean {
-	return finalizedCalls.length > 0 && finalizedCalls.every((finalized) => finalized.result.terminate === true);
+	return (
+		finalizedCalls.length > 0 &&
+		finalizedCalls.every(
+			(finalized) =>
+				(finalized.publicationFailure ? acceptedToolResults.get(finalized) : finalized.result)?.terminate === true,
+		)
+	);
 }
 
 function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall): AgentToolCall {
@@ -1068,19 +1078,7 @@ export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallO
 	}
 	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}));
 	const finalized = await finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
-	if (!finalized.publicationFailure) return finalized;
-	// Direct callers still receive a tool error, but the accepted effect and its accounting
-	// remain available independently. Model-issued calls journal the native result first.
-	const error = finalized.publicationFailure.error;
-	return {
-		...finalized,
-		completedResult: finalized.result,
-		result: {
-			...finalized.result,
-			content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
-		},
-		isError: true,
-	};
+	return finalized;
 }
 
 async function executePreparedToolCall(
@@ -1175,18 +1173,29 @@ async function finalizeExecutedToolCall(
 				isError = afterResult.isError ?? isError;
 			}
 		} catch (error) {
-			result = completedResult;
-			isError = executed.isError;
 			publicationFailure ??= { error };
 		}
 	}
 
-	return {
-		toolCall: prepared.toolCall,
-		result,
-		isError,
-		publicationFailure,
-	};
+	// Failure is not permission to publish the raw native result or the failed hook's thrown value.
+	if (publicationFailure) {
+		let usage: AgentToolResult<unknown>["usage"];
+		try {
+			if (completedResult.usage) usage = projectUsage(completedResult.usage);
+		} catch {
+			/* Unknown accounting is omitted, never echoed. */
+		}
+		result = {
+			content: [{ type: "text", text: "tool_result_withheld (after_policy_failed)" }],
+			details: undefined,
+			...(usage ? { usage } : {}),
+		};
+		isError = true;
+		publicationFailure = { error: new Error("tool_result_withheld (after_policy_failed)") };
+	}
+	const finalized = { toolCall: prepared.toolCall, result, isError, publicationFailure };
+	acceptedToolResults.set(finalized, completedResult);
+	return finalized;
 }
 
 function createErrorToolResult(message: string): AgentToolResult<any> {

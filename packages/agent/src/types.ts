@@ -455,10 +455,8 @@ export interface AgentToolCallOutcome {
 	toolCall: AgentToolCall;
 	result: AgentToolResult<any>;
 	isError: boolean;
-	/** Update observer or post-tool hook failure, separate from the completed native result. */
+	/** Owned publication failure, separate from the module-private accepted native receipt. */
 	publicationFailure?: { error: unknown };
-	/** Native result retained when runToolCall reports a publication failure as a tool error. */
-	completedResult?: AgentToolResult<unknown>;
 }
 
 /**

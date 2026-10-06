@@ -27,7 +27,7 @@ const usage = {
 	cacheRead: 0,
 	cacheWrite: 0,
 	totalTokens: 9,
-	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.1 + 0.2 },
 };
 type NativeFact = (Error | RegExp) & { receipt: { id: string }; completedStatus: string };
 
@@ -81,8 +81,11 @@ for (const kind of ["error", "regexp"] as const) {
 					assistantMessage,
 					afterToolCall,
 				});
-				expect(outcome.publicationFailure?.error).toBe(failure);
-				retained = outcome.completedResult;
+				expect(outcome.publicationFailure?.error).toMatchObject({
+					message: "tool_result_withheld (after_policy_failed)",
+				});
+				retained = outcome.result;
+				expect(outcome).not.toHaveProperty("completedResult");
 			} else {
 				const journal: ToolResultMessage[] = [];
 				await expect(
@@ -107,9 +110,9 @@ for (const kind of ["error", "regexp"] as const) {
 							return stream;
 						},
 					),
-				).rejects.toBe(failure);
+				).rejects.toThrow("tool_result_withheld (after_policy_failed)");
 				expect(journal).toHaveLength(1);
-				expect(journal[0].isError).toBe(false);
+				expect(journal[0].isError).toBe(true);
 				retained = journal[0];
 			}
 			expect(executions).toBe(1);
@@ -119,7 +122,10 @@ for (const kind of ["error", "regexp"] as const) {
 			expect(observedReceipt).toEqual(fact.receipt);
 			expect(observedFact).not.toBe(fact);
 			expect(observedFact?.receipt).not.toBe(fact.receipt);
-			expect(JSON.parse(JSON.stringify(retained))).toMatchObject(expected);
+			// smarty-dev#5822: publication is withheld, while source facts and isolated hook observations remain intact.
+			expect(retained?.details).toBeUndefined();
+			expect(retained?.usage).toEqual(usage);
+			expect(retained?.content).toEqual([{ type: "text", text: "tool_result_withheld (after_policy_failed)" }]);
 			expect(JSON.parse(JSON.stringify(result))).toEqual(expected);
 		});
 	}
@@ -160,9 +166,10 @@ it.each(["error", "regexp"] as const)("preserves %s metadata through containers 
 			throw failure;
 		},
 	});
-	expect(outcome.publicationFailure?.error).toBe(failure);
-	const retained = outcome.completedResult?.details as typeof details;
-	for (const copy of [retained, workingDetails]) {
+	expect(outcome.publicationFailure?.error).toMatchObject({ message: "tool_result_withheld (after_policy_failed)" });
+	expect(outcome).not.toHaveProperty("completedResult");
+	expect(outcome.result.details).toBeUndefined();
+	for (const copy of [workingDetails]) {
 		if (!copy) throw new Error("Missing isolated native detail snapshot");
 		expect(copy.fact).toBeInstanceOf(kind === "error" ? Error : RegExp);
 		expect(copy.fact.receipt).toEqual(fact.receipt);
@@ -175,8 +182,8 @@ it.each(["error", "regexp"] as const)("preserves %s metadata through containers 
 		expect((copy.fact as typeof fact & { cycle: typeof cycle }).cycle).toBe(copy.cycle);
 		expect(Object.getOwnPropertyDescriptor(copy.fact, "__proto__")?.value).toEqual({ receipt: "own-metadata" });
 	}
-	expect(workingDetails?.fact).not.toBe(retained.fact);
-	expect(workingDetails?.fact.receipt).not.toBe(retained.fact.receipt);
+	expect(workingDetails?.fact).not.toBe(details.fact);
+	expect(workingDetails?.fact.receipt).not.toBe(details.fact.receipt);
 });
 
 // pi#141: if native metadata cannot be isolated, retain facts and report transformation failure without invoking the hook.
@@ -206,8 +213,9 @@ it.each(["error", "regexp"] as const)("refuses lossy %s metadata snapshots", asy
 		},
 	});
 	expect(hooks).toBe(0);
-	expect(outcome.completedResult).toBe(result);
+	expect(outcome).not.toHaveProperty("completedResult");
 	expect(outcome.publicationFailure).toBeDefined();
-	expect(outcome.completedResult?.details).toEqual({ fact });
-	expect(outcome.completedResult?.usage).toEqual(usage);
+	expect(outcome.result.details).toBeUndefined();
+	expect(outcome.result.usage).toEqual(usage);
+	expect(result.details).toEqual({ fact });
 });

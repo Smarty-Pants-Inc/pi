@@ -6,7 +6,7 @@ import {
 	safeOAuthError,
 	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
-import type { AssistantMessage, JsonObject } from "../types.ts";
+import type { AssistantMessage, JsonObject, Usage } from "../types.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 export interface DiagnosticErrorInfo {
@@ -126,6 +126,35 @@ function projectDiagnosticText(text: string, oauth: boolean): string {
 			)
 		: safeOAuthError({ status: typeof status === "string" ? Number(status) : undefined });
 	return extractDiagnosticError(safe, [], owned ? owned[1].startsWith("oauth_") : oauth).message;
+}
+
+export const MAX_USAGE_TOKENS = 1_000_000_000;
+export const MAX_USAGE_COST = 1_000_000;
+
+/** Closed accounting shape shared by provider publication and accepted tool accounting. */
+export function projectUsage(usage: Usage): Usage {
+	const count = (value: unknown): number =>
+		typeof value === "number" && Number.isInteger(value) && value >= 0 ? Math.min(value, MAX_USAGE_TOKENS) : 0;
+	const cost = (value: unknown): number =>
+		typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.min(value, MAX_USAGE_COST) : 0;
+	const input = cost(usage?.cost?.input),
+		output = cost(usage?.cost?.output),
+		cacheRead = cost(usage?.cost?.cacheRead),
+		cacheWrite = cost(usage?.cost?.cacheWrite);
+	return {
+		input: count(usage?.input),
+		output: count(usage?.output),
+		cacheRead: count(usage?.cacheRead),
+		cacheWrite: count(usage?.cacheWrite),
+		totalTokens: count(usage?.totalTokens),
+		...(typeof usage?.cacheWrite1h === "number" && Number.isInteger(usage.cacheWrite1h) && usage.cacheWrite1h >= 0
+			? { cacheWrite1h: count(usage.cacheWrite1h) }
+			: {}),
+		...(typeof usage?.reasoning === "number" && Number.isInteger(usage.reasoning) && usage.reasoning >= 0
+			? { reasoning: count(usage.reasoning) }
+			: {}),
+		cost: { input, output, cacheRead, cacheWrite, total: input + output + cacheRead + cacheWrite },
+	};
 }
 
 /** One unconditional, copy-returning boundary. Credentials are never needed to project diagnostics. */

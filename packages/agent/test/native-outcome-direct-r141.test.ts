@@ -18,7 +18,7 @@ it.each(["update", "afterToolCall", "mutatingAfterToolCall"] as const)(
 				cacheRead: 0,
 				cacheWrite: 0,
 				totalTokens: 9,
-				cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+				cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.1 + 0.2 },
 			},
 		};
 		let executions = 0;
@@ -62,11 +62,15 @@ it.each(["update", "afterToolCall", "mutatingAfterToolCall"] as const)(
 		expect(executions).toBe(1);
 		expect(outcome.isError).toBe(true);
 		expect(outcome.result).toMatchObject({
-			details: result.details,
+			details: undefined,
 			usage: result.usage,
-			content: [{ type: "text", text: failure.message }],
+			content: [{ type: "text", text: "tool_result_withheld (after_policy_failed)" }],
 		});
-		expect(outcome.completedResult).toEqual(result);
-		expect(outcome.publicationFailure?.error).toBe(failure);
+		// smarty-dev#5822: accepted receipts stay private, never on the direct API result.
+		expect(outcome).not.toHaveProperty("completedResult");
+		expect(outcome.publicationFailure?.error).toMatchObject({
+			message: "tool_result_withheld (after_policy_failed)",
+		});
+		expect(result.details.receipt).toBe("synthetic-receipt");
 	},
 );

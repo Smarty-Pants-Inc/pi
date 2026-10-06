@@ -25,7 +25,7 @@ const usage = {
 	cacheRead: 0,
 	cacheWrite: 0,
 	totalTokens: 9,
-	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.1 + 0.2 },
 };
 // pi#141 / P2-AUDIT-NATIVE: completed receipts and usage survive publication failures, including mutating hooks.
 it.each(
@@ -129,10 +129,11 @@ it.each(
 	);
 	expect(outcomes).toHaveLength(1);
 	expect(outcomes[0]?.message).toMatchObject({
-		content: [{ type: "text", text: "accepted:own-accepted" }],
-		details: { receipt: "own-accepted" },
+		// smarty-dev#5822: only bounded accounting leaves; accepted content/receipt is private.
+		content: [{ type: "text", text: "tool_result_withheld (after_policy_failed)" }],
 		usage,
-		isError: false,
+		isError: true,
 	});
-	expect(agent.state.errorMessage).toBeTruthy();
+	expect(outcomes[0]?.message?.details).toBeUndefined();
+	expect(agent.state.errorMessage).toBe("tool_result_withheld (after_policy_failed)");
 });

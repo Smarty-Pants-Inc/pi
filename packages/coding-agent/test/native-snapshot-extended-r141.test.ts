@@ -30,7 +30,7 @@ const usage = {
 	cacheRead: 0,
 	cacheWrite: 0,
 	totalTokens: 9,
-	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 },
+	cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.1 + 0.2 },
 };
 const symbol = Symbol("completed-receipt");
 const variants = {
@@ -51,6 +51,7 @@ for (const [kind, make] of Object.entries(variants)) {
 	for (const mode of ["direct", "sequential", "parallel"] as const) {
 		it.each([false, true])(`retains ${kind} state in ${mode} (rejecting mutation: %s)`, async (reject) => {
 			const fact = make();
+			const expectedDescriptors = Object.getOwnPropertyDescriptors(fact);
 			const result: AgentToolResult<unknown> = {
 				content: [{ type: "text", text: "accepted" }],
 				details: { fact },
@@ -95,9 +96,14 @@ for (const [kind, make] of Object.entries(variants)) {
 					assistantMessage,
 					afterToolCall,
 				});
-				expect(outcome.publicationFailure?.error).toBe(reject ? failure : undefined);
+				if (reject)
+					expect(outcome.publicationFailure?.error).toMatchObject({
+						message: "tool_result_withheld (after_policy_failed)",
+					});
+				else expect(outcome.publicationFailure).toBeUndefined();
 				expect(outcome.isError).toBe(reject);
-				retained = reject ? outcome.completedResult : outcome.result;
+				retained = outcome.result;
+				expect(outcome).not.toHaveProperty("completedResult");
 			} else {
 				const published: ToolResultMessage[] = [];
 				const agent = new Agent({
@@ -116,13 +122,19 @@ for (const [kind, make] of Object.entries(variants)) {
 				});
 				await agent.prompt("synthetic");
 				expect(published).toHaveLength(1);
-				expect(published[0].isError).toBe(false);
+				expect(published[0].isError).toBe(reject);
 				retained = published[0];
 			}
 			expect(executions).toBe(1);
 			expect(hooks).toBe(1);
 			expect(workingFact).not.toBe(fact);
 			expect(retained?.usage).toEqual(usage);
+			// smarty-dev#5822: rejected hooks cannot publish native metadata, but cannot mutate the accepted source.
+			if (reject) {
+				expect(retained?.details).toBeUndefined();
+				expect(Object.getOwnPropertyDescriptors(fact)).toMatchObject(expectedDescriptors);
+				return;
+			}
 			const actual = (retained?.details as { fact: typeof fact }).fact;
 			expect(actual).not.toBe(fact);
 			expect(Object.getOwnPropertyDescriptors(actual)).toMatchObject(Object.getOwnPropertyDescriptors(fact));
