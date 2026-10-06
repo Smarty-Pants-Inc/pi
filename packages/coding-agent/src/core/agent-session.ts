@@ -107,6 +107,7 @@ import {
 	type SessionCompactFailedEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
+	type SubmitUserMessageOptions,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
@@ -114,6 +115,7 @@ import {
 	type ToolInfo,
 	type TreePreparation,
 	type TurnStartEvent,
+	type UserMessageReceipt,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
@@ -151,6 +153,7 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import { type UserMessageAdmission, UserMessageIngress } from "./user-message-ingress.ts";
 
 const appendOriginalCompaction = SessionManager.prototype.appendCompaction;
 const originalCompactionSessions = new WeakMap<
@@ -422,6 +425,9 @@ export class AgentSession {
 	#ordinaryPreflights = 0;
 	#pendingModeInput?: () => boolean;
 	private readonly _shutdownCancellation = new AbortController();
+	private readonly _userMessageIngress = new UserMessageIngress(this._shutdownCancellation.signal);
+	private readonly _userMessageAdmissions = new WeakMap<PromptOptions, UserMessageAdmission>();
+	private readonly _ingressQueuedMessages = new Map<AgentMessage, { text: string; displayIndex: number }>();
 	private _settlementCompletion?: Promise<void>;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
@@ -576,6 +582,50 @@ export class AgentSession {
 		if (this._initialActiveToolNames === undefined) this._restoreToolsFromTranscript();
 		this.#ordinaryOwner?.bindSessionAdmission(this, (recheck, enroll) => this.#requestOrdinaryWake(recheck, enroll));
 		this.#auditState("session_attached");
+	}
+
+	get userMessageSessionGeneration(): string {
+		return this._userMessageIngress.generation;
+	}
+
+	/** @internal Fence pending ingress before replacement/reload can await extension hooks. */
+	beginUserMessageSessionReplacement(): void {
+		try {
+			this._userMessageIngress.suspend();
+			this._cancelIngressQueuedMessages();
+		} catch (error) {
+			// Begin acquired its suspension before cancellation publication could throw.
+			// Callers own only a successfully returned begin; failed entry stays closed.
+			this._userMessageIngress.setRuntimeAvailable(false);
+			this._userMessageIngress.resume();
+			throw error;
+		}
+	}
+
+	/** @internal A cancelled replacement leaves this session usable with a fresh generation. */
+	endUserMessageSessionReplacement(failed = false): void {
+		if (failed) this._userMessageIngress.setRuntimeAvailable(false);
+		this._userMessageIngress.resume();
+	}
+
+	private _cancelIngressQueuedMessages(): void {
+		if (this._ingressQueuedMessages.size === 0) return;
+		const messages = new Set(this._ingressQueuedMessages.keys());
+		const positions = [...this._ingressQueuedMessages.values()]
+			.map(({ displayIndex }) => displayIndex)
+			.sort((a, b) => b - a);
+		for (const index of positions) this._removeFollowUpDisplay(index);
+		this._ingressQueuedMessages.clear();
+		// Commit display/tag cancellation before native lifecycle publication can reenter or throw.
+		this.#originalAgent.removeQueuedMessages((message) => messages.has(message));
+		this._emitQueueUpdate();
+	}
+
+	private _removeFollowUpDisplay(index: number): void {
+		this._followUpMessages.splice(index, 1);
+		for (const entry of this._ingressQueuedMessages.values()) {
+			if (entry.displayIndex > index) entry.displayIndex--;
+		}
 	}
 
 	get modelRuntime(): ModelRuntime {
@@ -1208,19 +1258,28 @@ export class AgentSession {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
+			const ingress = this._ingressQueuedMessages.get(event.message);
+			this._ingressQueuedMessages.delete(event.message);
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
-			if (messageText) {
+			if (messageText || ingress) {
 				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
+				const steeringIndex = ingress ? -1 : this._steeringMessages.indexOf(messageText);
 				if (steeringIndex !== -1) {
 					this._steeringMessages.splice(steeringIndex, 1);
 					this._emitQueueUpdate();
 				} else {
 					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
+					const ingressPositions = new Set(
+						[...this._ingressQueuedMessages.values()].map(({ displayIndex }) => displayIndex),
+					);
+					const followUpIndex =
+						ingress?.displayIndex ??
+						this._followUpMessages.findIndex(
+							(text, index) => text === messageText && !ingressPositions.has(index),
+						);
 					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
+						this._removeFollowUpDisplay(followUpIndex);
 						this._emitQueueUpdate();
 					}
 				}
@@ -1516,27 +1575,33 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
-		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
+		this._userMessageIngress.invalidate("no_session", true);
 		try {
-			this.abortRetry();
-			this.abortCompaction();
-			this.abortBranchSummary();
-			this.abortBash();
-			this.#originalAgent.abort();
-		} catch {
-			// Dispose must succeed even if an abort hook throws.
-		}
+			this._cancelIngressQueuedMessages();
+		} finally {
+			// Cancellation observers must not skip the existing terminal cleanup.
+			this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
+			try {
+				this.abortRetry();
+				this.abortCompaction();
+				this.abortBranchSummary();
+				this.abortBash();
+				this.#originalAgent.abort();
+			} catch {
+				// Dispose must succeed even if an abort hook throws.
+			}
 
-		this._extensionRunner.invalidate(
-			"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
-		);
-		this._disconnectFromAgent();
-		this._eventListeners = [];
-		if (this._cacheWarmer) {
-			this._cacheWarmer.onWarmed = undefined;
-			this._cacheWarmer.cancel();
+			this._extensionRunner.invalidate(
+				"This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload(). For newSession, fork, and switchSession, move post-replacement work into withSession and use the ctx passed to withSession. For reload, do not use the old ctx after await ctx.reload().",
+			);
+			this._disconnectFromAgent();
+			this._eventListeners = [];
+			if (this._cacheWarmer) {
+				this._cacheWarmer.onWarmed = undefined;
+				this._cacheWarmer.cancel();
+			}
+			cleanupSessionResources(this.sessionId);
 		}
-		cleanupSessionResources(this.sessionId);
 	}
 
 	// =========================================================================
@@ -1884,7 +1949,9 @@ export class AgentSession {
 		promptToken?: object,
 		automaticEnrollment?: OriginalAutomaticEnrollment,
 		onInputTransferred?: () => void,
+		admission?: UserMessageAdmission,
 	): Promise<void> {
+		admission?.check();
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
 		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
@@ -1896,9 +1963,15 @@ export class AgentSession {
 			this.#ordinaryOwner?.assertSessionStart(this);
 			if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 			// No await or external callback may separate this check from dispatch.
+			if (!continuation) admission?.check();
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
-			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
+			const run =
+				continuation || !messages
+					? agent.continue({ fromQueuedMessages })
+					: admission
+						? agent.prompt(messages, undefined, () => admission.accept("accepted"))
+						: agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
 			} catch (cause) {
@@ -2090,12 +2163,13 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
+		signal?: AbortSignal,
 	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
 		if (!this._extensionRunner.hasHandlers("input")) {
 			return { text, images };
 		}
 
-		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior, signal);
 		if (inputResult.action === "handled") {
 			return undefined;
 		}
@@ -2138,7 +2212,7 @@ export class AgentSession {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
-		if (this._isEmittingAgentSettled) {
+		if (this._isEmittingAgentSettled && !(options && this._userMessageAdmissions.has(options))) {
 			const completion = new Promise<void>((resolve, reject) => {
 				this._deferredSettledActions.push(async () => {
 					try {
@@ -2191,10 +2265,12 @@ export class AgentSession {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
 		const onInputTransferred = options?.onInputTransferred;
+		const admission = options ? this._userMessageAdmissions.get(options) : undefined;
 		const preflightToken = {};
 		let messages: AgentMessage[] | undefined;
 
 		try {
+			admission?.check();
 			// Handle extension commands first (execute immediately, even during streaming)
 			// Extension commands manage their own LLM interaction via pi.sendMessage()
 			if (expandPromptTemplates && text.startsWith("/")) {
@@ -2225,18 +2301,25 @@ export class AgentSession {
 			this._promptPreflights.add(preflightToken);
 			const mustQueue = () =>
 				this.isStreaming ||
+				(admission !== undefined && this._isEmittingAgentSettled) ||
 				this._modelSwitchCompactionPending ||
 				(options?.streamingBehavior !== undefined &&
 					this._promptPreflights.values().next().value !== preflightToken);
 
 			// Emit input event for extension interception (before skill/template expansion)
-			const processedInput = await this._runInputHandlers(
-				text,
-				options?.images,
-				options?.source ?? "interactive",
-				mustQueue() ? options?.streamingBehavior : undefined,
+			const processedInput = await raceWithAbortSignal(
+				this._runInputHandlers(
+					text,
+					options?.images,
+					options?.source ?? "interactive",
+					mustQueue() ? options?.streamingBehavior : undefined,
+					admission?.signal,
+				),
+				admission?.signal,
 			);
+			admission?.check();
 			if (!processedInput) {
+				admission?.refuse("admission_refused");
 				onInputTransferred?.();
 				preflightResult?.(true);
 				return;
@@ -2251,7 +2334,10 @@ export class AgentSession {
 			}
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
-			while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+			while (this._modelSwitchCompactionPending) {
+				await raceWithAbortSignal(this._modelSwitchAdmissionWait, admission?.signal);
+			}
+			admission?.check();
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
 			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
@@ -2260,7 +2346,7 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages);
+					await this._queueFollowUp(expandedText, currentImages, admission);
 				} else {
 					await this._queueSteer(expandedText, currentImages);
 				}
@@ -2286,7 +2372,9 @@ export class AgentSession {
 
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				(await raceWithAbortSignal(this._modelRuntime.checkAuth(this.model.provider), admission?.signal)) !==
+					undefined;
+			admission?.check();
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -2304,11 +2392,15 @@ export class AgentSession {
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
 				const outcome = await this._checkCompaction(lastAssistant, false);
+				admission?.check();
 				if (outcome === "failed" || outcome === "aborted") {
+					// Refused receipt ingress cannot leave runnable input behind. Ordinary
+					// prompt callers still retain their input in the existing queue below.
+					if (admission) throw new Error(`Prompt not admitted: compaction ${outcome}`);
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
-					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages);
+					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, admission);
 					else await this._queueSteer(expandedText, currentImages);
 					// Input already queued behind this prompt is retained with it, and so are
 					// triggered messages held during this preflight: the stop holds for them too.
@@ -2326,11 +2418,16 @@ export class AgentSession {
 			// Emit before_agent_start before normalizing images so extension-driven model
 			// selection determines the resize profile used for the request and history.
 			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-			const result = await this._extensionRunner.emitBeforeAgentStart(
-				expandedText,
-				currentImages,
-				this._baseSystemPromptOptions,
+			const result = await raceWithAbortSignal(
+				this._extensionRunner.emitBeforeAgentStart(
+					expandedText,
+					currentImages,
+					this._baseSystemPromptOptions,
+					admission?.signal,
+				),
+				admission?.signal,
 			);
+			admission?.check();
 			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 			// which updates the live loadout instead. An explicit edit wins; otherwise the live
 			// loadout is authoritative, so a setActiveTools() call is not undone here.
@@ -2340,6 +2437,7 @@ export class AgentSession {
 			if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
 			const normalized = await this._normalizePromptImages(currentImages);
+			admission?.check();
 			const userText =
 				normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
@@ -2392,7 +2490,18 @@ export class AgentSession {
 		// A switch can also begin during before_agent_start or image normalization.
 		// Keep this prompt's admission token until its run can start, so triggered
 		// messages still queue behind it instead of acquiring a competing run.
-		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+		try {
+			while (this._modelSwitchCompactionPending) {
+				await raceWithAbortSignal(this._modelSwitchAdmissionWait, admission?.signal);
+			}
+			admission?.check();
+		} catch (error) {
+			this._promptPreflights.delete(preflightToken);
+			preflightResult?.(false);
+			this._runTriggeredBehindPreflight();
+			this._runInputQueuedBehindPreflight();
+			throw error;
+		}
 		preflightResult?.(true);
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
@@ -2400,7 +2509,7 @@ export class AgentSession {
 		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
 		// run active synchronously, so later prompts still queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
-		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
+		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred, admission);
 		releasePreflight?.();
 		await run;
 	}
@@ -2638,15 +2747,33 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images?: ImageContent[],
+		admission?: UserMessageAdmission,
+	): Promise<void> {
+		admission?.check();
 		this.#ordinaryOwner?.assertCompactionIdle();
-		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
+		if (!admission) {
+			this._followUpMessages.push(text);
+			this._emitQueueUpdate();
+		}
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
 		}
-		this.agent.followUp({ role: "user", content, timestamp: Date.now() });
+		admission?.check();
+		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		if (admission) {
+			this.agent.followUp(message, () => {
+				// Native insertion owns the message now. Commit tracking and receipt before
+				// a lifecycle observer can throw, reload, or cancel the admitted queue.
+				this._ingressQueuedMessages.set(message, { text, displayIndex: this._followUpMessages.length });
+				this._followUpMessages.push(text);
+				admission.accept("queued");
+			});
+			this._emitQueueUpdate();
+		} else this.agent.followUp(message);
 	}
 
 	/**
@@ -2884,6 +3011,23 @@ export class AgentSession {
 		});
 	}
 
+	/** Submit literal input with a session-bound at-most-once admission receipt. */
+	submitUserMessage(request: SubmitUserMessageOptions): Promise<UserMessageReceipt> {
+		return this._userMessageIngress.submit(request, async (input, admission) => {
+			const options: PromptOptions = {
+				expandPromptTemplates: false,
+				streamingBehavior: "followUp",
+				source: "extension",
+			};
+			this._userMessageAdmissions.set(options, admission);
+			try {
+				await this.prompt(input.text, options);
+			} finally {
+				this._userMessageAdmissions.delete(options);
+			}
+		});
+	}
+
 	/**
 	 * Clear all queued messages and return them.
 	 * Useful for restoring to editor when user aborts.
@@ -2896,6 +3040,7 @@ export class AgentSession {
 		this._followUpMessages = [];
 		this._triggeredBehindPreflight.splice(0);
 		this._modelSwitchDispatches.clear();
+		this._ingressQueuedMessages.clear();
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		this._resolveIdleWaitIfIdle();
@@ -2923,8 +3068,14 @@ export class AgentSession {
 
 	/** @internal Permanently stop extension dispatch waits before a terminal shutdown join. */
 	cancelForShutdown(): void {
-		this._shutdownCancellation.abort(new DOMException("Operation cancelled for terminal shutdown", "AbortError"));
-		this.abortBash();
+		this._userMessageIngress.invalidate("shutting_down", true);
+		try {
+			this._cancelIngressQueuedMessages();
+		} finally {
+			// Cancellation observers must not leave terminal dispatch or bash waits live.
+			this._shutdownCancellation.abort(new DOMException("Operation cancelled for terminal shutdown", "AbortError"));
+			this.abortBash();
+		}
 	}
 
 	/** @internal Shared terminal signal for provider and extension dispatch. */
@@ -4273,6 +4424,7 @@ export class AgentSession {
 						});
 					});
 				},
+				submitUserMessage: (request) => this.submitUserMessage(request),
 				appendEntry: (customType, data) => {
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
@@ -4303,6 +4455,7 @@ export class AgentSession {
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
 			},
 			{
+				getUserMessageSessionGeneration: () => this.userMessageSessionGeneration,
 				getModel: () => this.model,
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
@@ -4505,29 +4658,52 @@ export class AgentSession {
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: reload requires separate receiving");
-		const oldRunner = this._extensionRunner;
-		const previousFlagValues = oldRunner.getFlagValues();
-		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
-		oldRunner.invalidate();
-		await this.settingsManager.reload();
-		this.syncQueueModesFromSettings();
-		resetApiProviders();
-		await this._resourceLoader.reload();
-		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
-			flagValues: previousFlagValues,
-			includeAllExtensionTools: true,
-		});
+		let suspended = false;
+		try {
+			this.beginUserMessageSessionReplacement();
+			suspended = true;
+			this._userMessageIngress.setRuntimeAvailable(false);
+			const oldRunner = this._extensionRunner;
+			const previousFlagValues = oldRunner.getFlagValues();
+			await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+			oldRunner.invalidate();
+			await this.settingsManager.reload();
+			this.syncQueueModesFromSettings();
+			resetApiProviders();
+			await this._resourceLoader.reload();
+			this._shutdownCancellation.signal.throwIfAborted();
+			this._userMessageIngress.assertOpen();
+			// A concurrent reload may have installed a runner while this loader was awaiting.
+			this._extensionRunner.invalidate();
+			this._buildRuntime({
+				activeToolNames: this.getActiveToolNames(),
+				flagValues: previousFlagValues,
+				includeAllExtensionTools: true,
+			});
 
-		const hasBindings =
-			this._extensionUIContext ||
-			this._extensionCommandContextActions ||
-			this._extensionShutdownHandler ||
-			this._extensionErrorListener;
-		if (hasBindings) {
-			await options?.beforeSessionStart?.();
-			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
-			await this.extendResourcesFromExtensions("reload");
+			// Preserve admission from session_start, but release only this reload's suspension.
+			this._userMessageIngress.setRuntimeAvailable(true);
+			this.endUserMessageSessionReplacement();
+			suspended = false;
+			const hasBindings =
+				this._extensionUIContext ||
+				this._extensionCommandContextActions ||
+				this._extensionShutdownHandler ||
+				this._extensionErrorListener;
+			if (hasBindings) {
+				await options?.beforeSessionStart?.();
+				await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+				await this.extendResourcesFromExtensions("reload");
+			}
+		} catch (error) {
+			// A retry may recover, but neither the old nor a partially bound runtime can admit input.
+			this._userMessageIngress.setRuntimeAvailable(false);
+			this._userMessageIngress.invalidate("session_changed");
+			this._extensionRunner.invalidate();
+			this._cancelIngressQueuedMessages();
+			throw error;
+		} finally {
+			if (suspended) this.endUserMessageSessionReplacement();
 		}
 	}
 

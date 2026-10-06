@@ -151,6 +151,71 @@ Register every tool first, keep optional tools inactive, and use `pi.setActiveTo
 
 Pi records the initial prompt and tool set in the transcript's first system message, then appends tool and prompt changes before the next model request. Providers that cannot represent the transition receive a complete transcript checkpoint, which can invalidate the cached prefix.
 
+### Correlated user-message admission
+
+Use `pi.submitUserMessage()` when an external channel needs an admission receipt rather than a fire-and-forget send:
+
+```typescript
+const receipt = await pi.submitUserMessage({
+  registrationEpoch: channelEpoch,
+  requestId: deliveryId,
+  sessionGeneration: ctx.userMessageSessionGeneration,
+  text: receivedText,
+  deliverAs: "followUp",
+  expandPromptTemplates: false,
+});
+```
+
+`SubmitUserMessageOptions` and `UserMessageReceipt` are exported types. The receipt contains
+`status: "accepted" | "queued" | "rejected"` and `sessionGeneration: string`, with optional
+`duplicate: true`, `admittedSessionGeneration`, and `reason`. `sessionGeneration` always echoes
+the caller's request generation, including on `session_changed`; read the context again for the
+current generation. Rejection reasons are `no_session`, `session_changed`,
+`payload_mismatch`, `shutting_down`, `admission_refused`, and `unsupported`.
+
+`accepted` means an idle turn actually started; `queued` means the input entered that session's
+follow-up queue, including during preflight or settlement. Neither promises model completion.
+Input hooks still run and may transform the input. A hook returning `handled` produces
+`rejected/admission_refused`; thrown hook errors retain their existing isolated/continue behavior.
+Text is not trimmed or expanded as an extension command, skill command, or prompt template.
+V1 supports only `deliverAs: "followUp"` and `expandPromptTemplates: false`.
+
+Capture `ctx.userMessageSessionGeneration` when receiving input. Reload and session replacement
+rotate it and cancel pending admissions and undelivered ingress follow-ups, without deleting
+ordinary/custom queued messages. New admissions are refused while replacement or reload is
+underway; a cancelled replacement leaves the same session usable with its fresh generation.
+Previously started turns remain started. Shutdown permanently closes ingress.
+
+The idempotency key is `(registrationEpoch, requestId)` within one live session. The same key and
+original text returns the first status and reason with `duplicate: true`, even after reload or
+generation rotation; it never submits again. `sessionGeneration` echoes the retry's generation.
+Only duplicates of accepted or queued receipts also include `admittedSessionGeneration`, the
+first admission's generation. Changed text returns `rejected/payload_mismatch`. Duplicate lookup
+precedes generation validation, so an old receipt is not evidence of a new admission. Bounded
+correlation keys are reserved before lifecycle, size, or aggregate-budget refusal. Reservations,
+including rejected admission attempts, survive extension reloads but not process restart or
+creation of a different session runtime. Malformed requests and oversized correlation fields
+cannot establish a reservation. Loader-level `no_session`, `unsupported`, and stale-runtime
+fallbacks outside a session admission do not enter this session-owned ledger.
+
+The ledger retains at most **1024 keys**, never evicts, and refuses unseen keys with
+`admission_refused` when full. These exhaustion refusals are not reserved, but because capacity
+is never reclaimed, their keys cannot later submit in that session. Existing duplicates remain
+readable when full. Admission limits remain **64 KiB UTF-8 text**, **256 UTF-8 bytes each** for
+epoch and request ID, and an **8 MiB aggregate original text/epoch/ID payload budget** per live
+session. A reservation within the size and aggregate limits consumes that budget even if a
+lifecycle fence or input hook refuses it; oversized or aggregate-refused payloads do not consume
+it and cannot later become admissions under the same key. Exceeding a limit returns
+`admission_refused`. The ledger stores a **32-byte native SHA-256 fingerprint** of the original
+text's exact UTF-16 code units rather than retaining the text, including for oversized or
+budget-refused text. Each retained outcome contains only the historical status/rejection reason
+and, for accepted or queued admissions, the actual **36-byte ASCII admission-generation UUID**.
+The unchecked caller generation is never retained in that outcome: each returned receipt echoes
+its own request generation without truncation, including first refusals and duplicates. Key,
+fingerprint, and outcome metadata are byte-bounded per entry as well as by the 1024-key capacity;
+this does not bound caller-owned requests or returned receipts. `pi.sendUserMessage()` keeps its
+existing behavior and return type.
+
 <a id="extensioncontext"></a>
 <a id="extensioncommandcontext"></a>
 <a id="use-extension-context"></a>

@@ -325,7 +325,33 @@ export interface CompactOptions {
  */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
+export interface SubmitUserMessageOptions {
+	registrationEpoch: string;
+	requestId: string;
+	sessionGeneration: string;
+	text: string;
+	deliverAs: "followUp";
+	expandPromptTemplates: false;
+}
+
+export interface UserMessageReceipt {
+	status: "accepted" | "queued" | "rejected";
+	sessionGeneration: string;
+	duplicate?: true;
+	/** First admission generation, only on duplicates of accepted or queued receipts. */
+	admittedSessionGeneration?: string;
+	reason?:
+		| "no_session"
+		| "session_changed"
+		| "payload_mismatch"
+		| "shutting_down"
+		| "admission_refused"
+		| "unsupported";
+}
+
 export interface ExtensionContext {
+	/** Generation of the active user-message session, for external ingress binding. */
+	readonly userMessageSessionGeneration: string;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
@@ -1559,6 +1585,9 @@ export interface ExtensionAPI {
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): void;
 
+	/** Submit a caller-correlated literal user message and receive its admission receipt. */
+	submitUserMessage(options: SubmitUserMessageOptions): Promise<UserMessageReceipt>;
+
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
 
@@ -1854,6 +1883,8 @@ export type SendUserMessageHandler = (
 	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 ) => void;
 
+export type SubmitUserMessageHandler = (options: SubmitUserMessageOptions) => Promise<UserMessageReceipt>;
+
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
@@ -1917,6 +1948,8 @@ export interface ExtensionRuntimeState {
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
+	/** Hosts without receipt ingress may omit this; submitUserMessage then rejects as unsupported. */
+	submitUserMessage?: SubmitUserMessageHandler;
 	appendEntry: AppendEntryHandler;
 	setSessionName: SetSessionNameHandler;
 	getSessionName: GetSessionNameHandler;
@@ -1936,6 +1969,7 @@ export interface ExtensionActions {
  * Required by all modes.
  */
 export interface ExtensionContextActions {
+	getUserMessageSessionGeneration?: () => string;
 	getModel: () => Model<any> | undefined;
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;

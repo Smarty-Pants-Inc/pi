@@ -114,7 +114,9 @@ export type {
 	InlineExtension,
 	SlashCommandInfo,
 	SlashCommandSource,
+	SubmitUserMessageOptions,
 	ToolDefinition,
+	UserMessageReceipt,
 } from "./extensions/index.ts";
 export type { PromptTemplate } from "./prompt-templates.ts";
 export type { Skill } from "./skills.ts";
