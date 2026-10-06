@@ -26,7 +26,6 @@ const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
 const CALLBACK_HOST = getProviderEnvValue("PI_OAUTH_CALLBACK_HOST") || "127.0.0.1";
 const CALLBACK_PORT = 53692;
 const CALLBACK_PATH = "/callback";
-const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}${CALLBACK_PATH}`;
 const COPY_CODE_REDIRECT_URI = "https://platform.claude.com/oauth/code/callback";
 const ANTHROPIC_BROWSER_LOGIN_METHOD = "browser";
 const ANTHROPIC_COPY_CODE_LOGIN_METHOD = "copy_code";
@@ -137,26 +136,34 @@ async function exchangeAuthorizationCode(
 
 async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
 	const { verifier, challenge } = await generatePKCE();
+	// The public state nonce is independent of the private PKCE verifier.
+	const expectedState = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
 	const callback = await startOAuthCallbackServer({
 		providerName: "Anthropic",
 		host: CALLBACK_HOST,
 		port: CALLBACK_PORT,
 		path: CALLBACK_PATH,
-		state: verifier,
+		redirectHost: "localhost",
+		state: expectedState,
 		complete: async (code) => code,
 		signal: interaction.signal,
-	}).catch(() => undefined);
+	}).catch((error: unknown) => {
+		// Never advertise a redirect to a listener this attempt does not own.
+		throw safeOAuthError(error);
+	});
 
 	try {
 		const authParams = new URLSearchParams({
 			code: "true",
 			client_id: CLIENT_ID,
 			response_type: "code",
-			redirect_uri: REDIRECT_URI,
+			redirect_uri: callback.redirectUri,
 			scope: SCOPES,
 			code_challenge: challenge,
 			code_challenge_method: "S256",
-			state: verifier,
+			state: expectedState,
 		});
 		interaction.notify({
 			type: "auth_url",
@@ -167,29 +174,33 @@ async function loginAnthropic(interaction: ProviderAuthInteraction): Promise<OAu
 
 		const result = await waitForCallbackOrManualInput(interaction, callback, {
 			message: "Complete login in your browser, or paste the authorization code / redirect URL here:",
-			placeholder: REDIRECT_URI,
+			placeholder: callback.redirectUri,
 		});
 		let code: string | undefined;
-		let state = verifier;
+		let state = expectedState;
 		if (result.type === "callback") {
 			code = result.value;
 		} else {
 			const parsed = parseAuthorizationInput(result.input);
-			if (parsed.state && parsed.state !== verifier) throw new Error("OAuth state mismatch");
+			if (parsed.state && parsed.state !== expectedState) throw new Error("OAuth state mismatch");
 			code = parsed.code;
-			state = parsed.state ?? verifier;
+			state = parsed.state ?? expectedState;
 		}
 
 		if (!code) throw new Error("Missing authorization code");
 		interaction.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
-		return await exchangeAuthorizationCode(code, state, verifier, REDIRECT_URI, interaction.signal);
+		return await exchangeAuthorizationCode(code, state, verifier, callback.redirectUri, interaction.signal);
 	} finally {
-		callback?.close();
+		callback.close();
 	}
 }
 
 async function loginAnthropicCopyCode(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
 	const { verifier, challenge } = await generatePKCE();
+	// The public state nonce is independent of the private PKCE verifier.
+	const expectedState = Array.from(crypto.getRandomValues(new Uint8Array(32)), (byte) =>
+		byte.toString(16).padStart(2, "0"),
+	).join("");
 	const authParams = new URLSearchParams({
 		code: "true",
 		client_id: CLIENT_ID,
@@ -198,7 +209,7 @@ async function loginAnthropicCopyCode(interaction: ProviderAuthInteraction): Pro
 		scope: SCOPES,
 		code_challenge: challenge,
 		code_challenge_method: "S256",
-		state: verifier,
+		state: expectedState,
 	});
 	interaction.notify({
 		type: "auth_url",
@@ -213,12 +224,12 @@ async function loginAnthropicCopyCode(interaction: ProviderAuthInteraction): Pro
 		signal: interaction.signal,
 	});
 	const parsed = parseAuthorizationInput(input);
-	if (parsed.state && parsed.state !== verifier) throw new Error("OAuth state mismatch");
+	if (parsed.state && parsed.state !== expectedState) throw new Error("OAuth state mismatch");
 	if (!parsed.code) throw new Error("Missing authorization code");
 	interaction.notify({ type: "progress", message: "Exchanging authorization code for tokens..." });
 	return await exchangeAuthorizationCode(
 		parsed.code,
-		parsed.state ?? verifier,
+		parsed.state ?? expectedState,
 		verifier,
 		COPY_CODE_REDIRECT_URI,
 		interaction.signal,
