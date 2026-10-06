@@ -1,4 +1,9 @@
-import type { ProviderHeaders } from "../types.ts";
+import type { ProviderHeaders, ProviderResponse } from "../types.ts";
+
+/** Response observations never contain provider headers or identifiers. */
+export function providerResponseObservation(status: unknown): ProviderResponse {
+	return typeof status === "number" && Number.isInteger(status) && status >= 100 && status <= 599 ? { status } : {};
+}
 
 export function headersToRecord(headers: Headers): Record<string, string> {
 	const result: Record<string, string> = {};

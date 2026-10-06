@@ -446,25 +446,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		await raceWithAbortSignal(
 			runner.emit({
 				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
+				...(typeof response.status === "number" &&
+				Number.isInteger(response.status) &&
+				response.status >= 100 &&
+				response.status <= 599
+					? { status: response.status }
+					: {}),
 			}),
 			shutdownSignal,
 		);
 	};
-	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
-		data,
-		model,
-	) => {
+	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async () => {
 		const runner = extensionRunnerRef.current;
 		if (!runner?.hasHandlers("provider_stream_event")) return;
-		await runner.emit({
-			data,
-			type: "provider_stream_event",
-			provider: model.provider,
-			api: model.api,
-			model: model.id,
-		});
+		await runner.emit({ type: "provider_stream_event" });
 	};
 
 	const agent = new Agent({

@@ -13,6 +13,6 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("after_provider_response", (event, ctx) => {
 		const logFile = join(ctx.cwd, CONFIG_DIR_NAME, "provider-payload.log");
-		appendFileSync(logFile, `[${event.status}] ${JSON.stringify(event.headers)}\n\n`, "utf8");
+		appendFileSync(logFile, `[${event.status ?? "unknown"}]\n\n`, "utf8");
 	});
 }

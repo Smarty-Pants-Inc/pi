@@ -12,7 +12,7 @@ import type {
 } from "../types.ts";
 import { fetchBoundedResponse } from "../utils/bounded-response.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
 /**
@@ -299,7 +299,7 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 		},
 	);
 	if (observe) {
-		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+		await options?.onResponse?.(providerResponseObservation(response.status));
 	}
 	return json;
 }

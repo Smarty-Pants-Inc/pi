@@ -34,7 +34,6 @@ import type {
 	Provider,
 	ProviderClassifier,
 	ProviderHeaders,
-	ProviderId,
 	ProviderImages,
 	RefreshModelsContext,
 	SimpleStreamOptions,
@@ -916,17 +915,12 @@ export interface BeforeProviderHeadersEvent {
 /** Fired after a provider response is received and before the response stream is consumed. */
 export interface AfterProviderResponseEvent {
 	type: "after_provider_response";
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
 }
 
-/** Fired for a parsed provider stream event before Pi normalizes it. */
+/** Pi-owned notification before normalization; no raw provider data or model is published. */
 export interface ProviderStreamEvent {
 	type: "provider_stream_event";
-	provider: ProviderId;
-	api: Api;
-	model: string;
-	data: unknown;
 }
 
 /** Fired after user submits prompt but before agent loop. */
@@ -1932,8 +1926,8 @@ export interface ProviderConfig {
 	 * Implementations must invoke `options.onPayload` before sending the provider request and use any
 	 * returned replacement payload. They must invoke `options.onResponse` after receiving the response
 	 * and before consuming its body, matching built-in providers. Implementations may invoke
-	 * `options.onProviderStreamEvent(data, model)` with parsed stream events before normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
+	 * `options.onProviderStreamEvent({type: "provider_stream_event"})` before normalization.
+	 * Response callbacks expose only a validated status; no provider headers or model argument.
 	 */
 	streamSimple?: (
 		model: Model<Api>,

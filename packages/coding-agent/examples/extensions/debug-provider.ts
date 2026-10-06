@@ -1,5 +1,5 @@
 /**
- * Raw provider event viewer.
+ * Pi-owned provider notification viewer.
  *
  * Usage: /debug-provider [on|off]
  * With no argument, the command toggles capture. Captured events are persisted
@@ -45,7 +45,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("debug-provider", {
-		description: "Toggle capture of raw provider stream events",
+		description: "Toggle capture of provider stream notifications",
 		handler: async (args, ctx) => {
 			const requestedState = args.trim().toLowerCase();
 			if (requestedState !== "" && requestedState !== "on" && requestedState !== "off") {
@@ -68,7 +68,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("provider_stream_event", (event) => {
-		activeEvents?.push(structuredClone(event.data));
+		activeEvents?.push({ type: event.type });
 	});
 
 	pi.on("message_end", (event) => {

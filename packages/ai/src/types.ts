@@ -124,8 +124,12 @@ export type FetchFunction = typeof globalThis.fetch;
 export type SessionAffinityFormat = "openai" | "openai-nosession" | "openrouter";
 
 export interface ProviderResponse {
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
+}
+
+/** Pi-owned notification only; provider data stays private to the adapter. */
+export interface ProviderStreamNotification {
+	type: "provider_stream_event";
 }
 
 /** Authentication, HTTP transport, and lifecycle callbacks shared by provider requests. */
@@ -158,7 +162,7 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	/**
 	 * Optional callback invoked after an HTTP response is received.
 	 */
-	onResponse?: (response: ProviderResponse, model: TModel) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
 	 * Optional custom HTTP headers to include in API requests.
 	 * Merged with provider defaults; caller values override default headers.
@@ -193,13 +197,13 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * Optional callback invoked after an HTTP response is received and before
 	 * its body stream is consumed.
 	 */
-	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
-	 * Optional observer for each parsed provider stream event before Pi normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
+	 * Optional Pi-owned notification for each parsed provider stream event before normalization.
+	 * No provider data or model object is exposed. Callback timing and awaiting are unchanged.
 	 * Adapter support is explicit; unsupported adapters do not invoke it.
 	 */
-	onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void | Promise<void>;
+	onProviderStreamEvent?: (notification: ProviderStreamNotification) => void | Promise<void>;
 	temperature?: number;
 	/**
 	 * Arbitrary sampling parameters merged into the request body as-is, after the named request

@@ -12,7 +12,7 @@ import type {
 } from "../types.ts";
 import { fetchBoundedResponse } from "../utils/bounded-response.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
 /** TypeSafe System One request body without the transport-specific envelope. */
@@ -235,7 +235,7 @@ export async function classifySystemOne(
 				oauthDiagnostics: options.oauthDiagnostics,
 			},
 		);
-		await options.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+		await options.onResponse?.(providerResponseObservation(response.status));
 		const result = transport.output(body);
 		// Set before parsing answers: a request with malformed answers was still billed.
 		const usage = parseUsage(result.usage, model);

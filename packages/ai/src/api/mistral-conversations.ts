@@ -15,7 +15,7 @@ import type {
 } from "../types.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { headersToRecord } from "../utils/headers.ts";
+import { providerResponseObservation } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
@@ -313,7 +313,7 @@ async function requestMistralStream(
 		signal,
 	});
 
-	await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+	await options?.onResponse?.(providerResponseObservation(response.status));
 
 	if (!response.ok) {
 		const body = await response.text();
@@ -594,7 +594,7 @@ async function consumeChatStream(
 
 	for await (const event of mistralStream) {
 		const chunk = event.data;
-		await onProviderStreamEvent?.(chunk, model);
+		await onProviderStreamEvent?.({ type: "provider_stream_event" });
 		// Mistral's streamed CompletionChunk carries an id field. Keep the first non-empty one,
 		// mirroring how OpenAI-style streaming exposes a stable response identifier per stream.
 		output.responseId ||= chunk.id;

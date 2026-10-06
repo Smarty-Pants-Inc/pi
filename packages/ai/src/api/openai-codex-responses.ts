@@ -36,7 +36,7 @@ import {
 } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { headersToRecord } from "../utils/headers.ts";
+import { headersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { isRetryableProviderError } from "../utils/provider-error-classification.ts";
@@ -425,10 +425,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					} finally {
 						combinedSignal.cleanup();
 					}
-					await options?.onResponse?.(
-						{ status: response.status, headers: headersToRecord(response.headers) },
-						model,
-					);
+					await options?.onResponse?.(providerResponseObservation(response.status));
 
 					if (response.ok) {
 						break;
@@ -763,7 +760,7 @@ async function* mapCodexEvents(
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		try {
-			await options?.onProviderStreamEvent?.(event, model);
+			await options?.onProviderStreamEvent?.({ type: "provider_stream_event" });
 		} catch (error) {
 			// The final assistant error must retain this non-transport origin for outer retry callers.
 			appendAssistantMessageDiagnostic(

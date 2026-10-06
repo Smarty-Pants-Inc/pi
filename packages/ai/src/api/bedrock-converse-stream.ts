@@ -53,7 +53,7 @@ import type {
 import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
@@ -271,7 +271,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			const client = new BedrockRuntimeClient(config);
 			let observedRawResponse = false;
 			if (options.onResponse) {
-				addResponseHeadersMiddleware(client, options.onResponse, model, () => {
+				addResponseObservationMiddleware(client, options.onResponse, () => {
 					observedRawResponse = true;
 				});
 			}
@@ -308,15 +308,11 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			const response = await client.send(command, { abortSignal: options.signal });
 			responseRequestId = normalizeDiagnosticValue(response.$metadata.requestId);
 			if (!observedRawResponse && response.$metadata.httpStatusCode !== undefined) {
-				const responseHeaders: Record<string, string> = {};
-				if (response.$metadata.requestId) {
-					responseHeaders["x-amzn-requestid"] = response.$metadata.requestId;
-				}
-				await options?.onResponse?.({ status: response.$metadata.httpStatusCode, headers: responseHeaders }, model);
+				await options?.onResponse?.(providerResponseObservation(response.$metadata.httpStatusCode));
 			}
 
 			for await (const item of response.stream!) {
-				await options.onProviderStreamEvent?.(item, model);
+				await options.onProviderStreamEvent?.({ type: "provider_stream_event" });
 				if (item.messageStart) {
 					if (item.messageStart.role !== ConversationRole.ASSISTANT) {
 						throw new Error("Unexpected assistant message start but got user message start instead");
@@ -521,19 +517,16 @@ function isSmithyHttpResponse(response: unknown): response is HttpResponse {
 
 function toProviderResponse(response: unknown): ProviderResponse | undefined {
 	if (!isSmithyHttpResponse(response)) return undefined;
-	return { status: response.statusCode, headers: { ...response.headers } };
+	return providerResponseObservation(response.statusCode);
 }
 
 /**
- * Bedrock's modeled `$metadata` only preserves selected HTTP metadata (for example
- * requestId), so custom gateway headers are otherwise lost before callers see
- * `onResponse`. Capture the raw Smithy HTTP response at the deserialize step,
- * after the SDK receives the response but before the event stream is consumed.
+ * Observe a validated HTTP status at the deserialize step, before the event
+ * stream is consumed. Smithy response headers remain private to the SDK.
  */
-function addResponseHeadersMiddleware(
+function addResponseObservationMiddleware(
 	client: BedrockRuntimeClient,
 	onResponse: NonNullable<BedrockOptions["onResponse"]>,
-	model: Model<"bedrock-converse-stream">,
 	onObserved: () => void,
 ): void {
 	const middleware: DeserializeMiddleware<object, MetadataBearer> = (next) => async (args) => {
@@ -541,11 +534,11 @@ function addResponseHeadersMiddleware(
 		const providerResponse = toProviderResponse(result.response);
 		if (providerResponse) {
 			onObserved();
-			await onResponse(providerResponse, model);
+			await onResponse(providerResponse);
 		}
 		return result;
 	};
-	client.middlewareStack.add(middleware, { step: "deserialize", name: "pi-ai-response-headers" });
+	client.middlewareStack.add(middleware, { step: "deserialize", name: "pi-ai-response-observation" });
 }
 
 export const streamSimple: StreamFunction<"bedrock-converse-stream", SimpleStreamOptions> = (

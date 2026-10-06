@@ -27,7 +27,7 @@ import type {
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 
@@ -469,7 +469,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 			});
 
 			callbackError = true;
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponseObservation(response.status));
 			callbackError = false;
 
 			if (!response.ok) {
@@ -483,7 +483,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			for await (const piEvent of readPiMessagesEvents(response.body)) {
 				callbackError = true;
-				await options?.onProviderStreamEvent?.(piEvent, model);
+				await options?.onProviderStreamEvent?.({ type: "provider_stream_event" });
 				callbackError = false;
 				const event = convertEvent(piEvent);
 				if ("partial" in event) partial = event.partial;

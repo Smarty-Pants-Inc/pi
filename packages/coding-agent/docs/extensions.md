@@ -108,9 +108,9 @@ Events cover resource discovery, sessions, agent and message lifecycle, provider
 
 <a id="provider_stream_event"></a>
 
-`provider_stream_event` fires for each parsed provider stream event before Pi normalizes it. The event identifies the provider, API, and model; `event.data` is the earliest structured value available to Pi, not necessarily the original HTTP bytes or SSE frame. Treat it as read-only because mutation can affect normalization. The event is notification-only and is not persisted.
+`provider_stream_event` fires before each supported parsed provider stream event is normalized. It exposes only `{type: "provider_stream_event"}`: no raw data, provider, API, or model fields. `after_provider_response` exposes only its owned type and an optional validated HTTP status (integer 100–599), never response headers. These are intentional API changes, with no raw-debug option. The stream event remains notification-only and is not persisted.
 
-Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported without changing the provider response. See [`debug-provider.ts`](../examples/extensions/debug-provider.ts) for an opt-in viewer that groups raw events by assistant message.
+Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported without changing the provider response. See [`debug-provider.ts`](../examples/extensions/debug-provider.ts) for an opt-in viewer that groups owned notifications by assistant message.
 
 <a id="context_with_system"></a>
 

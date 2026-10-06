@@ -630,7 +630,7 @@ export async function processResponsesStream<TApi extends Api>(
 
 	for await (const event of openaiStream) {
 		try {
-			await options?.onProviderStreamEvent?.(event, model);
+			await options?.onProviderStreamEvent?.({ type: "provider_stream_event" });
 		} catch (error) {
 			// Preserve observer origin even when it rejects before the first output is normalized.
 			appendAssistantMessageDiagnostic(
