@@ -29,6 +29,11 @@ class WorkflowLoader(yaml.SafeLoader):
         # magnitude remove or overwrite a possible runner row (pi#138).
         if base == 16 and number > 0x7fffffff:
             raise ValueError(f"unsupported hexadecimal integer: {value}")
+        # Actions converts octal with Convert.ToInt32(..., 8), which also
+        # treats the high bit as a sign. Fail closed before matrix filtering
+        # can hide a possible runner row (smarty-dev#5550 / pi#138).
+        if base == 8 and not 0 <= number <= 0o17777777777:
+            raise ValueError(f"unsupported octal integer: {value}")
         return number
 
     def construct_mapping(self, node, deep=False):
