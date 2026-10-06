@@ -180,6 +180,6 @@ describe("OAuth diagnostic redaction", () => {
 		expect(result).not.toBe(value);
 		expect(
 			createAssistantMessageDiagnostic("provider_error", error, { refresh_token: secret }, [secret]).details,
-		).toEqual({ refresh_token: "***" });
+		).toBeUndefined();
 	});
 });
