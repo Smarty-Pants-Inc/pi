@@ -211,6 +211,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				}
 			}
 		}
+		// Successful output joins a slow but live reader without the forced-shutdown drain budget (#132 R4-9).
+		// A signal still runs disposeRuntime() with its bounded drainage.
+		await flushRawStdout();
 	} catch (error: unknown) {
 		console.error(error instanceof Error ? error.message : String(error));
 		exitCode = 1;
