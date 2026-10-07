@@ -446,7 +446,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					if (info.friendlyMessage) throw new Error(info.friendlyMessage);
+					// Keep the message for the retry checks below; status and raw body go to formatProviderError.
+					throw Object.assign(new Error(info.message), { status: response.status, body: errorText });
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -496,7 +498,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			// HTTP errors carry `status` and `body` (see above), so they read `<provider> API error (<status>): <body>`
+			// like the other Responses providers; errors without a status keep their message unchanged.
+			output.errorMessage = formatProviderError(normalizeProviderError(error), `${model.provider} API error`);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

@@ -2693,4 +2693,84 @@ describe("openai-codex streaming", () => {
 		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
 		expect(codexRequests).toBe(4);
 	});
+
+	it("keeps the SSE error status and JSON body in errorMessage", async () => {
+		const body = JSON.stringify({
+			error: { message: "m", type: "invalid_request_error", code: "compaction_affinity_missing" },
+		});
+		const fetchMock = vi.fn(
+			async () => new Response(body, { status: 409, headers: { "content-type": "application/json" } }),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context = normalizeContext({
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		});
+
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: mockToken(),
+			transport: "sse",
+			maxRetries: 0,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("(409):");
+		expect(result.errorMessage).toContain(body);
+		expect(result.errorMessage).toBe(`openai-codex API error (409): ${body}`);
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps the friendly SSE usage-limit message without a status", async () => {
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({ error: { code: "usage_limit_reached", message: "limit", plan_type: "PLUS" } }),
+					{
+						status: 403,
+						headers: { "content-type": "application/json" },
+					},
+				),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context = normalizeContext({
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		});
+
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: mockToken(),
+			transport: "sse",
+			maxRetries: 3,
+		}).result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("You have hit your ChatGPT usage limit (plus plan).");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
 });
