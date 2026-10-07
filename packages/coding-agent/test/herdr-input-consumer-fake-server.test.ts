@@ -23,6 +23,8 @@ interface Scenario {
 	trustRoot: "trusted" | "none";
 	tty?: (real: TtyId) => TtyId;
 	badMac?: boolean;
+	/** Run Pi's startup bootstrap (fixtures/herdr-bootstrap-child.ts) in this mode instead. */
+	bootstrap?: "exit" | "handoff";
 }
 
 const cleanup: (() => void)[] = [];
@@ -30,7 +32,9 @@ afterEach(() => {
 	for (const step of cleanup.splice(0)) step();
 });
 
-async function run(scenario: Scenario): Promise<{ result: Record<string, any>; cutRequests: number }> {
+async function run(
+	scenario: Scenario,
+): Promise<{ result: Record<string, any>; cutRequests: number; methods: string[] }> {
 	const dir = mkdtempSync(join(tmpdir(), "pi-herdr-f1-"));
 	const socketPath = join(dir, "herdr.sock");
 	const pubPath = join(dir, "server.pub");
@@ -40,11 +44,12 @@ async function run(scenario: Scenario): Promise<{ result: Record<string, any>; c
 	const host = spawn("python3", [
 		join(fixtures, "herdr-pty-host.py"),
 		process.execPath,
-		join(fixtures, "herdr-pty-child.ts"),
+		join(fixtures, scenario.bootstrap ? "herdr-bootstrap-child.ts" : "herdr-pty-child.ts"),
 		socketPath,
 		paneId,
 		scenario.trustRoot === "none" ? "none" : pubPath,
 		out,
+		...(scenario.bootstrap ? [scenario.bootstrap] : []),
 	]);
 	cleanup.push(() => {
 		host.kill("SIGKILL");
@@ -54,6 +59,8 @@ async function run(scenario: Scenario): Promise<{ result: Record<string, any>; c
 	const lines = createInterface({ input: host.stdout });
 	let slave = "";
 	let cutRequests = 0;
+	const methods: string[] = [];
+	const closed: Promise<void>[] = [];
 	const exited = new Promise<void>((resolve) => {
 		lines.on("line", (line) => {
 			const message = JSON.parse(line) as { slave?: string; exit?: number };
@@ -66,11 +73,13 @@ async function run(scenario: Scenario): Promise<{ result: Record<string, any>; c
 		let buffered = "";
 		// The child exits right after its answer; a reset of the fake's side is expected.
 		socket.on("error", () => {});
+		closed.push(new Promise((resolve) => socket.on("close", () => resolve())));
 		socket.on("data", (data) => {
 			buffered += data.toString("utf8");
 			for (let at = buffered.indexOf("\n"); at >= 0; at = buffered.indexOf("\n")) {
 				const request = JSON.parse(buffered.slice(0, at));
 				buffered = buffered.slice(at + 1);
+				methods.push(request.method);
 				const reply = (result: object) => socket.write(`${JSON.stringify({ id: request.id, result })}\n`);
 				if (request.method === "pane.input_consumer.enroll") {
 					const stat = statSync(slave, { bigint: true });
@@ -115,7 +124,9 @@ async function run(scenario: Scenario): Promise<{ result: Record<string, any>; c
 	await new Promise<void>((resolve) => server.listen(socketPath, resolve));
 	cleanup.push(() => server.close());
 	await exited;
-	return { result: JSON.parse(readFileSync(out, "utf8")), cutRequests };
+	// Everything the child wrote before it exited has arrived once its sockets close.
+	await Promise.all(closed);
+	return { result: JSON.parse(readFileSync(out, "utf8")), cutRequests, methods };
 }
 
 describe("herdr input consumer against a fake server on a real PTY (smarty-dev#2636 F1)", () => {
@@ -154,6 +165,25 @@ describe("herdr input consumer against a fake server on a real PTY (smarty-dev#2
 		expect(result.reason).toBe("bad-mac");
 		expect(result.record.channel).toBe("terminal");
 		expect(result.record.principal).toBeUndefined();
+	});
+
+	// pi#160 review P1: `pi --help`, `--list-models` or a startup error exits after enrollment but
+	// before InteractiveMode.init() hands the input off.
+	it("restores the tty mode and releases the epoch when Pi exits before the TUI takes the input", async () => {
+		const { result, methods } = await run({ signWith: trusted.privateKey, trustRoot: "trusted", bootstrap: "exit" });
+		expect(result).toMatchObject({ rawBefore: false, attested: true, rawAfterEnroll: true, rawAtExit: false });
+		expect(methods).toEqual(["pane.input_consumer.enroll", "pane.input_consumer.release"]);
+	});
+
+	it("keeps the epoch for the TUI after the hand-off (counterexample)", async () => {
+		const { result, methods } = await run({
+			signWith: trusted.privateKey,
+			trustRoot: "trusted",
+			bootstrap: "handoff",
+		});
+		expect(result).toMatchObject({ attested: true, rawAtExit: false });
+		expect(result.record).toMatchObject({ channel: "keyboard", principal: { id: "paul" } });
+		expect(methods).toEqual(["pane.input_consumer.enroll", "pane.input_consumer.cut"]);
 	});
 
 	it("enrolls nothing without a trust root", async () => {

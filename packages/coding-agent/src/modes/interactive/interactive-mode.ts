@@ -990,9 +990,10 @@ export class InteractiveMode {
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		const herdrInput = this.options.herdrInput;
 		if (herdrInput && this.ui.terminal instanceof ProcessTerminal) {
-			this.ui.terminal.setInputMeter(herdrInput.meter);
+			// Bytes outside the epoch (typed before the marker) are not attested: they taint the draft (pi#160).
+			this.ui.terminal.setInputMeter(herdrInput.meter, () => this.defaultEditor.markDraftTainted());
 			herdrInput.handOff();
-		}
+		} else herdrInput?.shutdown();
 		this.ui.start();
 		this.isInitialized = true;
 

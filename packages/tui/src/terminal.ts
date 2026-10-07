@@ -148,6 +148,7 @@ export class ProcessTerminal implements Terminal {
 	private stdinDataHandler?: (data: Buffer | string) => void;
 	private meteredInput?: MeteredInput;
 	private inputMeter?: InputByteMeter;
+	private onUnmeteredInput?: () => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
@@ -172,9 +173,10 @@ export class ProcessTerminal implements Terminal {
 	 * Attach the byte meter of an attested input epoch (smarty-dev#2636). Stopping the terminal ends it:
 	 * stdin then belongs to another process, so later bytes cannot be counted.
 	 */
-	setInputMeter(meter: InputByteMeter | undefined): void {
+	setInputMeter(meter: InputByteMeter | undefined, onUnmetered?: () => void): void {
 		this.inputMeter = meter;
-		if (this.meteredInput) this.meteredInput.setMeter(meter);
+		this.onUnmeteredInput = onUnmetered;
+		if (this.meteredInput) this.meteredInput.setMeter(meter, onUnmetered);
 	}
 
 	/** Epoch byte offset of all input handled so far (the current sequence's end while it is dispatched). */
@@ -254,7 +256,7 @@ export class ProcessTerminal implements Terminal {
 		// Handler that pipes stdin data through the buffer, counting epoch bytes when metered
 		const input = new MeteredInput((text) => this.stdinBuffer?.process(text));
 		this.meteredInput = input;
-		input.setMeter(this.inputMeter);
+		input.setMeter(this.inputMeter, this.onUnmeteredInput);
 		this.stdinDataHandler = (data: Buffer | string) => input.write(data);
 	}
 
@@ -460,6 +462,7 @@ export class ProcessTerminal implements Terminal {
 		this.meteredInput?.setMeter(undefined);
 		this.meteredInput = undefined;
 		this.inputMeter = undefined;
+		this.onUnmeteredInput = undefined;
 
 		// Clean up StdinBuffer
 		if (this.stdinBuffer) {

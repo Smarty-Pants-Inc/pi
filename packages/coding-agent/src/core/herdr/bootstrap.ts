@@ -5,6 +5,7 @@
  * up to 2 s for the marker. Held bytes are handed to the TUI's terminal through the meter, so nothing
  * typed during startup is lost. Any failed precondition means no epoch: every turn stays `terminal`.
  */
+import type { KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { InputByteMeter } from "@earendil-works/pi-tui";
 import { EpochByteCounter, type PushResult } from "./epoch-bytes.ts";
@@ -19,8 +20,17 @@ export interface HerdrInputBootstrap {
 	readonly meter: InputByteMeter;
 	/** Undefined when enrollment failed: held input is still replayed, but nothing is attested. */
 	readonly attestor?: SubmitAttestor;
-	/** Call synchronously right before the TUI's terminal starts: it restores the pre-Pi tty mode. */
+	/**
+	 * Call synchronously right before the TUI's terminal starts: it restores the pre-Pi tty mode, and the
+	 * terminal (through `meter`) then owns the epoch.
+	 */
 	handOff(): void;
+	/**
+	 * Undo enrollment when no TUI takes the input: restore the tty mode and release the epoch. Runs on
+	 * process exit until `handOff`, so `pi --help`, `--list-models` and startup errors cannot leave the
+	 * tty raw or the epoch held (pi#160 review). No-op after `handOff`.
+	 */
+	shutdown(): void;
 }
 
 function sysctl(path: string): number | undefined {
@@ -45,14 +55,23 @@ function concat(parts: PushResult[]): PushResult {
 	};
 }
 
+/** Host checks; tests substitute them, since the real trust root must be root-owned. */
+export interface HerdrHostChecks {
+	hardened(): boolean;
+	trustRoot(): KeyObject | undefined;
+}
+
+const HOST_CHECKS: HerdrHostChecks = { hardened: preconditionsHold, trustRoot: () => loadServerTrustRoot() };
+
 export async function startHerdrInputConsumer(
 	env: NodeJS.ProcessEnv = process.env,
+	host: HerdrHostChecks = HOST_CHECKS,
 ): Promise<HerdrInputBootstrap | undefined> {
 	const socketPath = env.HERDR_SOCKET_PATH;
 	const paneId = env.HERDR_PANE_ID;
 	const stdin = process.stdin;
-	if (process.platform !== "linux" || !socketPath || !paneId || !stdin.isTTY || !preconditionsHold()) return undefined;
-	const trustRoot = loadServerTrustRoot();
+	if (process.platform !== "linux" || !socketPath || !paneId || !stdin.isTTY || !host.hardened()) return undefined;
+	const trustRoot = host.trustRoot();
 	if (!trustRoot) return undefined;
 
 	const wasRaw = stdin.isRaw;
@@ -88,9 +107,25 @@ export async function startHerdrInputConsumer(
 		return {
 			meter: { push: (chunk) => counter.push(chunk), takePending: () => concat(pending.splice(0)), end: () => {} },
 			handOff: () => {},
+			shutdown: () => {},
 		};
 	}
 	const epoch = enrolled.epoch;
+	let owned = true;
+	const disown = (): boolean => {
+		if (!owned) return false;
+		owned = false;
+		process.off("exit", shutdown);
+		stdin.setRawMode(wasRaw);
+		return true;
+	};
+	const shutdown = () => {
+		if (!disown()) return;
+		counter.end();
+		// At exit the release request is still written: a Unix socket write is attempted synchronously.
+		epoch.release();
+	};
+	process.on("exit", shutdown);
 	return {
 		meter: {
 			push: (chunk) => counter.push(chunk),
@@ -101,6 +136,9 @@ export async function startHerdrInputConsumer(
 			},
 		},
 		attestor: new SubmitAttestor(counter, epoch),
-		handOff: () => stdin.setRawMode(wasRaw),
+		handOff: () => {
+			disown();
+		},
+		shutdown,
 	};
 }

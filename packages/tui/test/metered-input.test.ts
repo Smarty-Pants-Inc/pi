@@ -69,6 +69,19 @@ describe("MeteredInput", () => {
 		assert.deepEqual(events, [{ seq: "é", end: undefined }]);
 	});
 
+	// pi#160 review: bytes held from before the marker are in no attested interval.
+	it("signals pre-epoch bytes before the parser sees them, and only those", () => {
+		const parser = new StdinBuffer();
+		const log: string[] = [];
+		const input = new MeteredInput((text) => parser.process(text));
+		parser.on("data", (seq) => log.push(seq));
+		const pending = { preEpoch: Buffer.from("x"), epoch: Buffer.from("hi"), epochStart: 0 };
+		input.setMeter({ ...openMeter(), takePending: () => pending }, () => log.push("unmetered"));
+		input.write(Buffer.from("\r"));
+		parser.destroy();
+		assert.deepEqual(log, ["unmetered", "x", "h", "i", "\r"]);
+	});
+
 	it("ends the meter and stops reporting offsets when detached", () => {
 		const meter = openMeter();
 		const { input, events, parser } = harness(meter);

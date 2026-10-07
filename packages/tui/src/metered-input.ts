@@ -22,6 +22,7 @@ export class MeteredInput {
 	private readonly decoder = new StringDecoder("utf8");
 	private readonly feed: (text: string) => void;
 	private meter: InputByteMeter | undefined;
+	private onUnmetered: (() => void) | undefined;
 	private fed: number | undefined;
 
 	constructor(feed: (text: string) => void) {
@@ -33,7 +34,12 @@ export class MeteredInput {
 		return this.fed;
 	}
 
-	setMeter(meter: InputByteMeter | undefined): void {
+	/**
+	 * `onUnmetered` runs before `preEpoch` bytes reach the parser while a meter is attached: those bytes
+	 * are in no attested interval, so the caller taints the draft they land in (pi#160 review).
+	 */
+	setMeter(meter: InputByteMeter | undefined, onUnmetered?: () => void): void {
+		this.onUnmetered = onUnmetered;
 		if (this.meter === meter) return;
 		this.meter?.end();
 		this.meter = meter;
@@ -54,6 +60,7 @@ export class MeteredInput {
 
 	private deliver(result: { preEpoch: Buffer; epoch: Buffer; epochStart: number }): void {
 		if (result.preEpoch.length) {
+			this.onUnmetered?.();
 			const text = this.decoder.write(result.preEpoch);
 			if (text) this.feed(text);
 		}

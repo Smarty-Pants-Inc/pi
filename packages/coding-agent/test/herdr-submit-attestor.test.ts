@@ -3,6 +3,7 @@
  * 1 s. Only an untainted submit that Herdr attests to a mapped principal is keyboard.
  */
 import { createHash } from "node:crypto";
+import { Editor, MeteredInput, StdinBuffer, type TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { EpochByteCounter, epochMarker } from "../src/core/herdr/epoch-bytes.ts";
 import type { HerdrEpoch } from "../src/core/herdr/input-consumer.ts";
@@ -30,6 +31,59 @@ function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer
 	};
 	return { attestor: new SubmitAttestor(counter, epoch, 50), requests };
 }
+
+/**
+ * The interactive path: held stdin bytes, the marker, the TUI's metered parser, the default editor and
+ * its submit handler, wired as InteractiveMode wires them.
+ */
+async function submitThroughEditor(beforeMarker: string, afterMarker: string): Promise<Record<string, unknown>> {
+	const counter = new EpochByteCounter();
+	counter.hold();
+	const pending = [counter.push(Buffer.from(beforeMarker)), counter.arm(NONCE)];
+	pending.push(counter.push(Buffer.concat([epochMarker(NONCE), Buffer.from(afterMarker)])));
+	const epoch: HerdrEpoch = { epoch: "e1", nonce: NONCE, cut: async () => PAUL, release: () => {} };
+	const attestor = new SubmitAttestor(counter, epoch, 50);
+	const editor = new Editor({ requestRender: () => {} } as unknown as TUI, {
+		borderColor: (s) => s,
+		selectList: {} as never,
+	});
+	const parser = new StdinBuffer();
+	const input = new MeteredInput((text) => parser.process(text));
+	parser.on("data", (sequence) => editor.handleInput(sequence));
+	let receipt: ReturnType<SubmitAttestor["capture"]> | undefined;
+	editor.onSubmit = () => {
+		receipt = attestor.capture(input.offset, { tainted: editor.lastSubmitTainted, kind: "submit" });
+	};
+	input.setMeter(
+		{
+			push: (chunk) => counter.push(chunk),
+			takePending: () => ({
+				preEpoch: Buffer.concat(pending.map((part) => part.preEpoch)),
+				epoch: Buffer.concat(pending.map((part) => part.epoch)),
+				epochStart: 0,
+			}),
+			end: () => counter.end(),
+		},
+		() => editor.markDraftTainted(),
+	);
+	parser.destroy();
+	expect(receipt).toBeDefined();
+	return receiptRecord(await receipt!);
+}
+
+describe("held pre-marker input on the editor path (pi#160 review P1)", () => {
+	it("never labels a draft that holds bytes typed before the marker", async () => {
+		// `x` is outside the epoch, so Herdr's attestation of `hi\r` does not cover the draft `xhi`.
+		expect((await submitThroughEditor("x", "hi\r")).channel).toBe("terminal");
+	});
+
+	it("still labels a draft typed entirely inside the epoch (counterexample)", async () => {
+		expect(await submitThroughEditor("", "hi\r")).toMatchObject({
+			channel: "keyboard",
+			principal: { id: "paul" },
+		});
+	});
+});
 
 describe("SubmitAttestor", () => {
 	it("labels an untainted submit that Herdr attests, with the cut and token it sent", async () => {

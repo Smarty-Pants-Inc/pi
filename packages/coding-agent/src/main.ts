@@ -971,8 +971,12 @@ export async function main(args: string[], options?: MainOptions) {
 		};
 	};
 	time("createRuntime");
-	// smarty-dev#2636: enroll as Herdr's input consumer before any extension loads.
-	const herdrInput = appMode === "interactive" ? await startHerdrInputConsumer() : undefined;
+	// smarty-dev#2636: enroll as Herdr's input consumer before any extension loads. --help and
+	// --list-models exit before the TUI starts, so they never enroll (pi#160 review).
+	const herdrInput =
+		appMode === "interactive" && !parsed.help && parsed.listModels === undefined
+			? await startHerdrInputConsumer()
+			: undefined;
 	const runtime = await createAgentSessionRuntime(createRuntime, {
 		cwd: sessionManager.getCwd(),
 		agentDir,
