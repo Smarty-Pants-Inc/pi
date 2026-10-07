@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+
 interface StdoutTakeoverState {
 	rawStdoutWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
 	rawStderrWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
@@ -100,6 +102,38 @@ export async function waitForRawStdoutBackpressure(): Promise<void> {
 			return;
 		}
 	}
+}
+
+/**
+ * Write final exit output without letting the stdout consumer block this process.
+ * A synchronous TTY or pipe write to an unread terminal blocks the event loop forever,
+ * so a child process owns the blocking write and this process only waits `timeoutMs`.
+ * Returns "incomplete" when the consumer did not take all bytes in time (pi#132 R4-5).
+ */
+export async function writeStdoutBounded(text: string, timeoutMs: number): Promise<"complete" | "incomplete"> {
+	await waitForRawStdoutBackpressure();
+	// ponytail: `cat` isolates the blocking write on POSIX. Windows consoles keep the direct
+	// write; revisit if a Windows console can stall unread at exit.
+	if (process.platform === "win32") {
+		process.stdout.write(text);
+		return "complete";
+	}
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = (result: "complete" | "incomplete") => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (result === "incomplete") child.kill("SIGKILL");
+			resolve(result);
+		};
+		const child = spawn("cat", [], { stdio: ["pipe", "inherit", "ignore"] });
+		const timer = setTimeout(() => finish("incomplete"), timeoutMs);
+		child.on("error", () => finish("incomplete"));
+		child.on("close", (code) => finish(code === 0 ? "complete" : "incomplete"));
+		child.stdin.on("error", () => finish("incomplete"));
+		child.stdin.end(text);
+	});
 }
 
 export async function flushRawStdout(): Promise<void> {

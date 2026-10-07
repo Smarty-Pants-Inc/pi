@@ -107,7 +107,7 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
 import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
-import { flushRawStdout } from "../../core/output-guard.ts";
+import { writeStdoutBounded } from "../../core/output-guard.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import type { ResourceDiagnostic } from "../../core/resource-loader.ts";
 import { formatMissingSessionCwdPrompt, MissingSessionCwdError } from "../../core/session-cwd.ts";
@@ -271,6 +271,9 @@ function isUsageSessionEntry(item: RenderSessionItem): item is Extract<SessionEn
 }
 
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN"]);
+/** Finite wait for the exit recovery receipt; an unread terminal gets the incomplete exit code. */
+const RECOVERY_OUTPUT_TIMEOUT_MS = 2000;
+const RECOVERY_OUTPUT_INCOMPLETE_EXIT_CODE = 75;
 
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
@@ -4349,10 +4352,12 @@ export class InteractiveMode {
 						const images = [...this.recoveredImages]
 							.filter(([marker]) => draft.includes(marker))
 							.map(([, image]) => image);
-						process.stdout.write(
+						const delivery = await writeStdoutBounded(
 							`INPUT_ADMISSION_SHUTDOWN: recovered draft ${JSON.stringify({ text: draft, images })}\n`,
+							RECOVERY_OUTPUT_TIMEOUT_MS,
 						);
-						await flushRawStdout();
+						// An unread terminal did not take the recovery receipt: exit nonzero, never hang.
+						if (delivery === "incomplete") process.exit(RECOVERY_OUTPUT_INCOMPLETE_EXIT_CODE);
 					}
 				} else {
 					const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
