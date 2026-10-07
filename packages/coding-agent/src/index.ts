@@ -220,6 +220,7 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export { HOST_CAPABILITIES, type HostCapabilities } from "./core/host-capabilities.ts";
+export { InputAdmissionError, type InputAdmissionErrorCode } from "./core/input-admission.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
@@ -443,6 +444,7 @@ export {
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
 	type RpcExtensionUIResponseBody,
+	type RpcInputRejectedEvent,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,

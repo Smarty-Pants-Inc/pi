@@ -268,9 +268,10 @@ export type ShutdownHandler = () => void;
 export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
+		await extensionRunner.emit(event, signal);
 		return true;
 	}
 	return false;
@@ -448,6 +449,7 @@ export class ExtensionRunner {
 		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.refreshTools = actions.refreshTools;
+		this.runtime.inheritedCancellation = actions.inheritedCancellation;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
@@ -583,7 +585,22 @@ export class ExtensionRunner {
 	}
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		const wrapped = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		// A caller may capture ui or an individual method before replacement. Check
+		// lifetime at invocation too, not only when ctx.ui is first read.
+		this.uiContext = uiContext
+			? new Proxy(wrapped, {
+					get: (target, key, receiver) => {
+						this.assertActive();
+						const value: unknown = Reflect.get(target, key, receiver);
+						if (typeof value !== "function") return value;
+						return (...args: unknown[]) => {
+							this.assertActive();
+							return Reflect.apply(value, target, args);
+						};
+					},
+				})
+			: noOpUIContext;
 		this.mode = mode;
 	}
 
@@ -1143,6 +1160,7 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
 				// A failed proposal remains visible so a later handler can replace it.
+				const before = entries;
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
 				if (hadEntries) {
@@ -1184,13 +1202,19 @@ export class ExtensionRunner {
 					// Existing semantics retain drafts mutated before a handler throws.
 					// A secondary flag failure cannot discard a successfully received selection.
 					if (!receivedSelection) {
-						const retained = receiveBoundaryEntries(
-							event.entries,
-							slots,
-							observed ?? captureTerminalTurnReceipt(),
-						);
-						entries = retained.entries;
-						entryReceipts = retained.receipts;
+						try {
+							const retained = receiveBoundaryEntries(
+								event.entries,
+								slots,
+								observed ?? captureTerminalTurnReceipt(),
+							);
+							entries = retained.entries;
+							entryReceipts = retained.receipts;
+						} catch {
+							// A poisoned in-place draft cannot be committed; keep the detached pre-handler proposal (#132 R4-10).
+							entries = before;
+							entryReceipts = previousReceipts;
+						}
 					}
 					this.emitError({
 						extensionPath: ext.path,
@@ -1703,8 +1727,10 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
+		cancellation?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult> {
-		const signal = this.dispatchSignal("before_agent_start");
+		// The originating admission's revocation stops the loop, not only the caller's wait (#132 R4-12).
+		const signal = this.dispatchSignal("before_agent_start", cancellation);
 		signal?.throwIfAborted();
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
@@ -1838,7 +1864,8 @@ export class ExtensionRunner {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
-						images: currentImages,
+						// Handlers get detached images: a late in-place edit cannot change retained or recovered originals (#132 R4-6).
+						images: currentImages?.map((image) => ({ ...image })),
 						source,
 						streamingBehavior,
 					};
@@ -1847,7 +1874,7 @@ export class ExtensionRunner {
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
-						currentImages = result.images ?? currentImages;
+						currentImages = result.images?.map((image) => ({ ...image })) ?? currentImages;
 					}
 				} catch (err) {
 					signal?.throwIfAborted();

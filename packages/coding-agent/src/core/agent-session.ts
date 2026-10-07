@@ -127,6 +127,8 @@ import {
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { HOST_CAPABILITIES } from "./host-capabilities.ts";
+import { InputAdmissionError } from "./input-admission.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
@@ -386,6 +388,8 @@ export interface PromptOptions {
 export interface ModelMutationOptions {
 	/** Persist the new value to global defaults. Defaults to session-only. */
 	persist?: boolean;
+	/** Caller cancellation (e.g. an RPC transport); checked after auth and before commit. */
+	signal?: AbortSignal;
 }
 
 /** Result from cycleModel() */
@@ -438,6 +442,21 @@ const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, bas
 // a skipped check or successful compaction with nothing queued.
 type CompactionOutcome = boolean | "failed" | "aborted";
 
+interface InputFenceScope {
+	fence: object;
+	active: boolean;
+}
+
+interface InputAdmission {
+	controller: AbortController;
+	/** Own cancellation combined with inherited dispatch revocation. */
+	signal: AbortSignal;
+	/** Inherited dispatch revocation alone, without this admission's own cancellation. */
+	parent: AbortSignal | undefined;
+	fenceScope: InputFenceScope | undefined;
+	release(): void;
+}
+
 function startCompactionDeadline(controller: AbortController): ReturnType<typeof setTimeout> {
 	return setTimeout(() => {
 		controller.abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
@@ -465,8 +484,19 @@ export class AgentSession {
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	#ordinaryPreflights = 0;
 	#pendingModeInput?: () => boolean;
+	readonly capabilities = HOST_CAPABILITIES;
+	private readonly _inputAdmissions = new Set<InputAdmission>();
+	private readonly _inputAdmissionScope = new AsyncLocalStorage<InputAdmission>();
+	/** Cancellation lineage survives handoff and detachment from settlement scheduling. */
+	private readonly _dispatchCancellationScope = new AsyncLocalStorage<AbortSignal | undefined>();
+	private _inputFence: object | undefined;
+	private readonly _inputFenceScope = new AsyncLocalStorage<InputFenceScope | undefined>();
 	private readonly _shutdownCancellation = new AbortController();
+	/** Ordinary retirement, unlike a failed recoverable receipt, permanently revokes auxiliary work. */
+	private readonly _disposalCancellation = new AbortController();
+	private _settlementCancellation = new AbortController();
 	private _settlementCompletion?: Promise<void>;
+	private _inputsDisposed = false;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -512,6 +542,8 @@ export class AgentSession {
 	private readonly _modelSwitchDispatches = new Map<CustomMessage, { deliverAs?: "steer" | "followUp" }>();
 	/** Compaction hooks may await message acceptance, but must not await their enclosing switch. */
 	private readonly _compactionHookScope = new AsyncLocalStorage<boolean>();
+	/** In-flight compaction hook dispatches; abortCompaction() revokes them with their operation. */
+	private readonly _compactionHooks = new Set<AbortController>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -1356,25 +1388,67 @@ export class AgentSession {
 	private async _emitCompactionHook(
 		event: SessionBeforeCompactEvent | SessionCompactEvent | SessionCompactFailedEvent,
 		signal?: AbortSignal,
+		beforeDispatch?: () => void,
 	): Promise<SessionBeforeCompactResult | undefined> {
-		// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
-		return this._compactionHookScope.run(true, () => raceWithAbortSignal(this._extensionRunner.emit(event), signal));
+		// A signal argument is not ancestry: install operation and inherited revocation so abandoned hook
+		// descendants cannot start fresh native work (PR #117 R6-1). Failure observers run after the
+		// operation's controller is cleared, so abortCompaction() also revokes this hook's own controller.
+		const hook = new AbortController();
+		const inherited = this._dispatchCancellationScope.getStore();
+		const ancestry = AbortSignal.any(
+			[signal, inherited, hook.signal].filter((item): item is AbortSignal => item !== undefined),
+		);
+		// ponytail: a compaction that already ended cancelled still notifies its failure observers
+		// (aborted: true), as before; they only run under revoked ancestry and cannot start new work.
+		const dispatchSignal = signal?.aborted
+			? AbortSignal.any([hook.signal, ...(inherited ? [inherited] : [])])
+			: ancestry;
+		this._compactionHooks.add(hook);
+		let dispatched = false;
+		try {
+			// Reserve notification custody before clearing operation state or publishing public completion.
+			// Reentrant disposal/abort must revoke the next observer too (pi#132 R1-1).
+			beforeDispatch?.();
+			// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
+			const dispatch = this._compactionHookScope.run(true, () =>
+				this._dispatchCancellationScope.run(ancestry, () => this._extensionRunner.emit(event, dispatchSignal)),
+			);
+			dispatched = true;
+			// An already-aborted operation ends the outer wait before notification dispatch settles.
+			// Keep its separately cancellable runner lifetime tracked until that dispatch actually settles.
+			void dispatch.then(
+				() => this._compactionHooks.delete(hook),
+				() => this._compactionHooks.delete(hook),
+			);
+			return await raceWithAbortSignal(dispatch, ancestry);
+		} catch (error) {
+			// Cancelling a notification alone does not replace the compaction's own outcome.
+			if (event.type === "session_compact_failed" && hook.signal.aborted && error === hook.signal.reason) return;
+			throw error;
+		} finally {
+			if (!dispatched) this._compactionHooks.delete(hook);
+		}
 	}
 
 	private async _emitSessionCompactFailed(
 		event: Omit<SessionCompactFailedEvent, "type">,
 		signal?: AbortSignal,
 		preserveDistinctFailure = false,
+		beforeNotification?: () => void,
 	): Promise<void> {
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
+			let notified = !beforeNotification;
 			try {
-				await this._emitCompactionHook({ type: "session_compact_failed", ...event }, signal);
+				await this._emitCompactionHook({ type: "session_compact_failed", ...event }, signal, () => {
+					beforeNotification?.();
+					notified = true;
+				});
 			} catch (error) {
 				// A terminal notification cannot extend an expired compaction or
 				// replace its failed/aborted outcome. Its promise stays observed.
-				if (!signal?.aborted || (preserveDistinctFailure && error !== signal.reason)) throw error;
+				if (!notified || !signal?.aborted || (preserveDistinctFailure && error !== signal.reason)) throw error;
 			}
-		}
+		} else beforeNotification?.();
 	}
 
 	private _getIdleWaitPromise(): Promise<void> {
@@ -1402,29 +1476,44 @@ export class AgentSession {
 		this.#auditState("session_run_settled");
 		this._isEmittingAgentSettled = true;
 		const scope = { active: true };
+		const cancellation = this._settlementCancellation;
+		const inheritedCancellation = this._dispatchCancellationScope.getStore();
+		const signal = inheritedCancellation
+			? AbortSignal.any([inheritedCancellation, cancellation.signal])
+			: cancellation.signal;
 		let completed!: () => void;
 		this._settlementCompletion = new Promise<void>((resolve) => {
 			completed = resolve;
 		});
+		// Run every removed ticket before propagating the first refusal, so none is orphaned (#132 R1-S6).
+		const failures: unknown[] = [];
 		try {
 			try {
-				await this._agentSettledScope.run(scope, () =>
-					this._extensionRunner.emit({ type: "agent_settled", outcome }),
+				await raceWithAbortSignal(
+					this._dispatchCancellationScope.run(signal, () =>
+						this._agentSettledScope.run(scope, () =>
+							this._extensionRunner.emit({ type: "agent_settled", outcome }, signal),
+						),
+					),
+					signal,
 				);
 			} catch (error) {
-				if (!this._shutdownCancellation.signal.aborted) throw error;
+				if (!signal.aborted) throw error;
 			}
-			this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome }));
+			this._dispatchCancellationScope.run(signal, () =>
+				this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome })),
+			);
 		} finally {
+			// Detached descendants of finished/cancelled handlers cannot own delivery.
 			scope.active = false;
 			this._isEmittingAgentSettled = false;
 			try {
 				for (const action of this._deferredSettledActions.splice(0)) {
 					const actionScope = { active: true };
 					try {
-						await this._settlementActionScope.run(actionScope, action).catch((error: unknown) => {
-							if (!this._shutdownCancellation.signal.aborted) throw error;
-						});
+						await this._settlementActionScope.run(actionScope, action);
+					} catch (error) {
+						if (!this._shutdownCancellation.signal.aborted) failures.push(error);
 					} finally {
 						actionScope.active = false;
 					}
@@ -1434,6 +1523,7 @@ export class AgentSession {
 				completed();
 			}
 		}
+		if (failures.length > 0) throw failures[0];
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -1478,31 +1568,31 @@ export class AgentSession {
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
+			// Empty text is valid for image-only queued input. Delivery is not truthiness.
+			// Check steering queue first
+			const steeringIndex = this._steeringMessages.indexOf(messageText);
+			if (steeringIndex !== -1) {
+				this._steeringMessages.splice(steeringIndex, 1);
+				this._emitQueueUpdate();
+			} else {
+				// Check follow-up queue
+				const followUpIndex = this._followUpMessages.indexOf(messageText);
+				if (followUpIndex !== -1) {
+					this._followUpMessages.splice(followUpIndex, 1);
 					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
 				}
 			}
 		}
 
-		// Terminal cancellation releases extension waits, not final event publication/persistence.
+		// Emit to extensions first, then notify public listeners.
 		if (!this._shutdownCancellation.signal.aborted) {
 			try {
-				await this._emitExtensionEvent(event);
+				await raceWithAbortSignal(this._emitExtensionEvent(event), this._shutdownCancellation.signal);
 			} catch (error) {
 				if (!this._shutdownCancellation.signal.aborted) throw error;
 			}
 		}
+		// Cancellation releases extension waits, not final event publication/persistence.
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
@@ -1790,6 +1880,14 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		if (this._inputsDisposed) return;
+		this._assertInputsDrained();
+		if (!this.isIdle || this.isSettling)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "abort and settle the active operation before disposal");
+		this._inputsDisposed = true;
+		this._disposalCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "auxiliary operation cancelled by disposal"),
+		);
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
 		try {
 			this.abortRetry();
@@ -1864,6 +1962,7 @@ export class AgentSession {
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
 		return (
+			this._inputAdmissions.size === 0 &&
 			!this._isAgentRunActive &&
 			!this.isCompacting &&
 			!this._modelSwitchCompactionPending &&
@@ -1882,7 +1981,7 @@ export class AgentSession {
 
 	/** Whether a prompt is in preflight (input handlers, `before_agent_start`) and its run has not started. */
 	get isPromptPending(): boolean {
-		return this._promptPreflights.size > 0;
+		return this._inputAdmissions.size > 0 || this._promptPreflights.size > 0;
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
@@ -1935,6 +2034,7 @@ export class AgentSession {
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
+		this._inheritedCancellation();
 		const previous = this.getActiveToolNames();
 		this._setActiveTools(toolNames);
 		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
@@ -1943,6 +2043,7 @@ export class AgentSession {
 		if (previous.some((name) => !active.has(name))) this._pendingToolNames.clear();
 	}
 
+	/** Internal restoration and registry refresh; public mutation entries check revocation first. */
 	private _setActiveTools(toolNames: string[]): void {
 		const tools = this._applyToolLoadout(toolNames);
 		for (const tool of tools) this._pendingToolNames.delete(tool.name);
@@ -2289,13 +2390,15 @@ export class AgentSession {
 		promptToken?: object,
 		automaticEnrollment?: OriginalAutomaticEnrollment,
 		onInputTransferred?: () => void,
+		transferringAdmission?: InputAdmission,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
-		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 		const dispatch = async (continuation = false, fromQueuedMessages = false) => {
+			if (!continuation) this._checkInputAdmission();
 			this.#ordinaryOwner?.assertCompactionIdle();
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
@@ -2303,9 +2406,17 @@ export class AgentSession {
 			// No await or external callback may separate this check from dispatch.
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
+			// Only this run's user input transfers admission. A nested custom dispatch may
+			// inherit another input's scope, but must leave that held input cancellable.
+			// No yield between ending admission and the original synchronous run entry.
+			if (!continuation) {
+				transferringAdmission?.signal.throwIfAborted();
+				transferringAdmission?.release();
+			}
 			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
+				if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 			} catch (cause) {
 				// A failing observer must not detach the already-started original run.
 				try {
@@ -2498,6 +2609,178 @@ export class AgentSession {
 		}
 	}
 
+	/** Inputs awaiting native handoff, including every extension input handler. */
+	get inputAdmissionCount(): number {
+		return this._inputAdmissions.size;
+	}
+
+	get isDisposed(): boolean {
+		return this._inputsDisposed;
+	}
+
+	get inputsFenced(): boolean {
+		return this._inputFence !== undefined || this._inputsDisposed;
+	}
+
+	private _assertInputsOpen(): void {
+		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "input was not accepted");
+		const scope = this._inputFenceScope.getStore();
+		if (this._inputFence && !(scope?.active && scope.fence === this._inputFence))
+			throw new InputAdmissionError(
+				"INPUT_ADMISSION_FENCED",
+				"input was not accepted; retry against the current session",
+			);
+	}
+
+	private _assertInputsDrained(): void {
+		if (
+			this._inputAdmissions.size > 0 ||
+			this.isSettling ||
+			this.#pendingModeInput?.() ||
+			this.agent.hasQueuedMessages() ||
+			this._steeringMessages.length > 0 ||
+			this._followUpMessages.length > 0 ||
+			this._triggeredBehindPreflight.length > 0 ||
+			this._modelSwitchDispatches.size > 0 ||
+			this._deferredSettledActions.length > 0
+		)
+			throw new InputAdmissionError(
+				"INPUT_ADMISSION_BUSY",
+				"settle admitted input or recover queued input before replacement/disposal",
+			);
+	}
+
+	/**
+	 * Close input admission synchronously, before any lifecycle hook can yield.
+	 * Refuses immediately (bounded, no implicit replay) when input is still owned by
+	 * preflight, the mode, or queues. On success keep the returned release function
+	 * until replacement finishes, or call it when replacement is cancelled/failed.
+	 * Disposal stays permanently closed even after release.
+	 */
+	async fenceInputs(options?: { rejectQueuedInput?: (messages: AgentMessage[]) => void }): Promise<() => void> {
+		if (!options?.rejectQueuedInput) this._shutdownCancellation.signal.throwIfAborted();
+		this._assertInputsOpen();
+		const fence = {};
+		this._inputFence = fence;
+		try {
+			if (options?.rejectQueuedInput) {
+				// Orderly shutdown may reject input instead of refusing disposal. Admission is
+				// already closed before abort yields, including input from extension handlers.
+				// Cancel the wait, observe the abandoned hook, and join native settlement.
+				// Arbitrary extension promises cannot be forced to resolve. The fence prevents
+				// their late descendants from admitting input into the retiring session.
+				this._settlementCancellation.abort(
+					new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
+				);
+				this.abortBash();
+				await this.abort();
+				await this._settlementCompletion;
+				const messages = this.agent.getQueuedMessages();
+				if (messages.length > 0) {
+					options.rejectQueuedInput(messages);
+					this.clearQueue();
+				}
+			}
+			this._assertInputsDrained();
+		} catch (error) {
+			this._inputFence = undefined;
+			// Only the cancellation owner may replace its controller. A BUSY refusal
+			// must leave the still-running settlement's controller attached.
+			if (
+				this._settlementCancellation.signal.aborted &&
+				!this.isSettling &&
+				!this._shutdownCancellation.signal.aborted
+			)
+				this._settlementCancellation = new AbortController();
+			throw error;
+		}
+		return () => {
+			if (this._inputFence === fence) {
+				this._inputFence = undefined;
+				// A settlement may have started while this successfully acquired fence was held.
+				// Its live controller remains the cancellation owner until that settlement finishes.
+				if (
+					!this._inputsDisposed &&
+					this._settlementCancellation.signal.aborted &&
+					!this.isSettling &&
+					!this._shutdownCancellation.signal.aborted
+				)
+					this._settlementCancellation = new AbortController();
+			}
+		};
+	}
+
+	/** @internal Allow only awaited lifecycle callbacks to submit to their fenced receiving session. */
+	async withFencedInput<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		const fence = this._inputFence;
+		if (!fence) return operation();
+		const scope = { fence, active: true };
+		try {
+			return await raceWithAbortSignal(this._inputFenceScope.run(scope, operation), signal);
+		} finally {
+			scope.active = false;
+		}
+	}
+
+	private _admitInput(): InputAdmission {
+		// Neither cancelled input nor cancelled dispatch descendants may acquire fresh authority.
+		this._checkInputAdmission();
+		this._shutdownCancellation.signal.throwIfAborted();
+		const controller = new AbortController();
+		const cancellation = this._dispatchCancellationScope.getStore();
+		const admission: InputAdmission = {
+			controller,
+			signal: cancellation ? AbortSignal.any([controller.signal, cancellation]) : controller.signal,
+			parent: cancellation,
+			fenceScope: this._inputFenceScope.getStore(),
+			release: () => {
+				if (!this._inputAdmissions.delete(admission)) return;
+				this._inputAdmissionScope.exit(() => this._runInputQueuedBehindPreflight());
+				this._resolveIdleWaitIfIdle();
+			},
+		};
+		this._inputAdmissions.add(admission);
+		return admission;
+	}
+
+	private async _withInputAdmission<T>(admission: InputAdmission, operation: () => Promise<T>): Promise<T> {
+		try {
+			return await this._dispatchCancellationScope.run(admission.signal, () =>
+				this._inputFenceScope.run(admission.fenceScope, () => this._inputAdmissionScope.run(admission, operation)),
+			);
+		} finally {
+			admission.release();
+		}
+	}
+
+	private _checkInputAdmission(): void {
+		this._dispatchCancellationScope.getStore()?.throwIfAborted();
+		this._inputAdmissionScope.getStore()?.signal.throwIfAborted();
+		this._assertInputsOpen();
+	}
+
+	/**
+	 * Effectful native entries (bash, compaction, tree, model/loadout/history mutation) refuse cancelled
+	 * dispatch or input descendants, and return the inherited revocation to compose into their own work.
+	 */
+	private _inheritedCancellation(): AbortSignal | undefined {
+		const signals = [this._dispatchCancellationScope.getStore(), this._inputAdmissionScope.getStore()?.signal].filter(
+			(signal): signal is AbortSignal => signal !== undefined,
+		);
+		for (const signal of signals) signal.throwIfAborted();
+		return signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+	}
+
+	private async _awaitInput<T>(operation: Promise<T>): Promise<T> {
+		const admission = this._inputAdmissionScope.getStore();
+		const result = await raceWithAbortSignal(
+			operation,
+			this._dispatchCancellationScope.getStore() ?? admission?.signal,
+		);
+		if (!admission || this._inputAdmissions.has(admission)) this._checkInputAdmission();
+		return result;
+	}
+
 	private async _runInputHandlers(
 		text: string,
 		images: ImageContent[] | undefined,
@@ -2508,7 +2791,15 @@ export class AgentSession {
 			return { text, images };
 		}
 
-		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		const inputResult = await this._awaitInput(
+			this._extensionRunner.emitInput(
+				text,
+				images,
+				source,
+				streamingBehavior,
+				this._inputAdmissionScope.getStore()?.signal,
+			),
+		);
 		if (inputResult.action === "handled") {
 			return undefined;
 		}
@@ -2563,31 +2854,53 @@ export class AgentSession {
 		receipt: TurnReceipt,
 	): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, () => this._promptInAdmission(text, options, admission, receipt));
+	}
+
+	private async _promptInAdmission(
+		text: string,
+		options: PromptOptions | undefined,
+		admission: InputAdmission,
+		receipt: TurnReceipt,
+	): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
+		this._checkInputAdmission();
+		const originalTransfer = options?.onInputTransferred;
+		options = {
+			...options,
+			onInputTransferred: () => {
+				if (this._inputAdmissions.has(admission)) this._checkInputAdmission();
+				admission.release();
+				originalTransfer?.();
+			},
+		};
 		if (this._isEmittingAgentSettled) {
-			const completion = new Promise<void>((resolve, reject) => {
-				this._deferredSettledActions.push(async () => {
-					try {
-						await this._promptAdmitted(text, options, receipt);
-						resolve();
-					} catch (error) {
-						reject(error);
-					}
-				});
-			});
-			// A settlement handler can await acceptance, not its own deferred delivery.
 			if (this._agentSettledScope.getStore()?.active) {
-				void completion.catch((error: unknown) => {
-					this._extensionRunner.emitError({
-						extensionPath: "<settlement>",
-						event: "prompt",
-						error: error instanceof Error ? error.message : String(error),
-					});
-				});
-				return;
+				throw new InputAdmissionError(
+					"INPUT_ADMISSION_BUSY",
+					"SDK input cannot await its own agent_settled handler; submit after settlement",
+				);
 			}
-			return completion;
+			// Scheduling is not acceptance. Keep the result and admission pending until the
+			// deferred action runs, or reject cancellation without waiting for held handlers.
+			await this._awaitInput(
+				new Promise<void>((resolve, reject) => {
+					this._deferredSettledActions.push(async () => {
+						try {
+							await this._withInputAdmission(admission, () =>
+								this._promptInAdmission(text, options, admission, receipt),
+							);
+							resolve();
+						} catch (error) {
+							reject(error);
+						}
+					});
+				}),
+			);
+			return;
 		}
-		if (!this.#ordinaryOwner) return this._prompt(text, options, undefined, undefined, receipt);
+		if (!this.#ordinaryOwner) return this._prompt(text, options, undefined, undefined, admission, receipt);
 		this.#ordinaryOwner.assertSessionStart(this);
 		this.#ordinaryOwner.assertCompactionIdle();
 		this.#ordinaryPreflights++;
@@ -2601,8 +2914,10 @@ export class AgentSession {
 			}
 		};
 		try {
-			await this.#ordinaryOwner.requestProvenance.prompt((token) =>
-				this._prompt(text, options, release, token, receipt),
+			await this._awaitInput(
+				this.#ordinaryOwner.requestProvenance.prompt((token) =>
+					this._prompt(text, options, release, token, admission, receipt),
+				),
 			);
 		} finally {
 			release();
@@ -2614,6 +2929,7 @@ export class AgentSession {
 		options?: PromptOptions,
 		releasePreflight?: () => void,
 		promptToken?: object,
+		admission?: InputAdmission,
 		receipt = captureTerminalTurnReceipt(),
 	): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
@@ -2679,7 +2995,7 @@ export class AgentSession {
 			}
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
-			while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+			while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
 			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
@@ -2714,7 +3030,7 @@ export class AgentSession {
 
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				(await this._awaitInput(this._modelRuntime.checkAuth(this.model.provider))) !== undefined;
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -2731,7 +3047,7 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				const outcome = await this._checkCompaction(lastAssistant, false);
+				const outcome = await this._awaitInput(this._checkCompaction(lastAssistant, false));
 				if (outcome === "failed" || outcome === "aborted") {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
@@ -2754,10 +3070,13 @@ export class AgentSession {
 			// Emit before_agent_start before normalizing images so extension-driven model
 			// selection determines the resize profile used for the request and history.
 			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-			const result = await this._extensionRunner.emitBeforeAgentStart(
-				expandedText,
-				currentImages,
-				this._baseSystemPromptOptions,
+			const result = await this._awaitInput(
+				this._extensionRunner.emitBeforeAgentStart(
+					expandedText,
+					currentImages,
+					this._baseSystemPromptOptions,
+					this._inheritedCancellation(),
+				),
 			);
 			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 			// which updates the live loadout instead. An explicit edit wins; otherwise the live
@@ -2767,7 +3086,7 @@ export class AgentSession {
 				result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
 			if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
-			const normalized = await this._normalizePromptImages(currentImages);
+			const normalized = await this._awaitInput(this._normalizePromptImages(currentImages));
 			const userText =
 				normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
@@ -2817,15 +3136,24 @@ export class AgentSession {
 		// A switch can also begin during before_agent_start or image normalization.
 		// Keep this prompt's admission token until its run can start, so triggered
 		// messages still queue behind it instead of acquiring a competing run.
-		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
-		preflightResult?.("started");
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
+		this._checkInputAdmission();
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
 		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
 		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
 		// run active synchronously, so later prompts still queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
-		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
+		const run = this._runAgentPrompt(
+			messages,
+			promptToken,
+			undefined,
+			() => {
+				onInputTransferred?.();
+				preflightResult?.("started");
+			},
+			admission,
+		);
 		releasePreflight?.();
 		await run;
 	}
@@ -2919,6 +3247,9 @@ export class AgentSession {
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
 
+		// Commands own their input once dispatched; they may replace their session.
+		this._checkInputAdmission();
+		this._inputAdmissionScope.getStore()?.release();
 		try {
 			this._shutdownCancellation.signal.throwIfAborted();
 			await raceWithAbortSignal(Promise.resolve(command.handler(args, ctx)), this._shutdownCancellation.signal);
@@ -2968,6 +3299,19 @@ export class AgentSession {
 	}
 
 	private async _queueUserInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		behavior: "steer" | "followUp",
+		source: InputSource,
+		receipt: TurnReceipt,
+	): Promise<QueuedInputDisposition> {
+		const admission = this._admitInput();
+		return await this._withInputAdmission(admission, () =>
+			this._queueAdmittedInput(text, images, behavior, source, receipt),
+		);
+	}
+
+	private async _queueAdmittedInput(
 		text: string,
 		images: ImageContent[] | undefined,
 		behavior: "steer" | "followUp",
@@ -3059,9 +3403,9 @@ export class AgentSession {
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
+		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3069,15 +3413,17 @@ export class AgentSession {
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this.#receivedMessageReceipts.set(message, receipt);
 		this.agent.steer(message);
+		this._inputAdmissionScope.getStore()?.release();
+		this._emitQueueUpdate();
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
+		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3085,6 +3431,8 @@ export class AgentSession {
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this.#receivedMessageReceipts.set(message, receipt);
 		this.agent.followUp(message);
+		this._inputAdmissionScope.getStore()?.release();
+		this._emitQueueUpdate();
 	}
 
 	/**
@@ -3121,6 +3469,8 @@ export class AgentSession {
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		const receipt = captureTerminalTurnReceipt();
+		// Covers direct append, streaming queues and next-turn delivery from cancelled descendants.
+		this._checkInputAdmission();
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
@@ -3140,6 +3490,14 @@ export class AgentSession {
 		appMessage: CustomMessage,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		// Deferred delivery retains the submitter's permission and cancellation, not the drainer's scope.
+		const fenceScope = this._inputFenceScope.getStore();
+		const inheritedAdmission = this._inputAdmissionScope.getStore();
+		const cancellation = this._dispatchCancellationScope.getStore();
+		// Covers direct append, streaming queues and next-turn delivery from cancelled descendants.
+		cancellation?.throwIfAborted();
+		inheritedAdmission?.signal.throwIfAborted();
+		this._assertInputsOpen();
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		if (options?.deliverAs === "nextTurn") {
@@ -3165,13 +3523,21 @@ export class AgentSession {
 				const ticket = { deliverAs: options.deliverAs };
 				this._modelSwitchDispatches.set(appMessage, ticket);
 				try {
-					while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+					while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 					const dispatch = async () => {
 						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
 						if (this._modelSwitchDispatches.get(appMessage) !== ticket) return;
 						// Remove only this ticket before re-entry can acquire another switch ticket.
 						this._modelSwitchDispatches.delete(appMessage);
-						await this._deliverCustomMessage(appMessage, options);
+						// Re-entry keeps the submitter's permission and cancellation, not the drainer's scope.
+						await this._dispatchCancellationScope.run(cancellation, () =>
+							this._inputFenceScope.run(fenceScope, () => {
+								const deliver = () => this._deliverCustomMessage(appMessage, options);
+								return inheritedAdmission
+									? this._inputAdmissionScope.run(inheritedAdmission, deliver)
+									: this._inputAdmissionScope.exit(deliver);
+							}),
+						);
 					};
 					if (this._isEmittingAgentSettled) {
 						// External callers can await delivery; unlike hooks, they do not own this settlement.
@@ -3195,7 +3561,35 @@ export class AgentSession {
 				return;
 			}
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this._deliverCustomMessage(appMessage, options));
+				const dispatch = () =>
+					this._dispatchCancellationScope.run(cancellation, () =>
+						this._inputFenceScope.run(fenceScope, () => {
+							const deliver = () => this._deliverCustomMessage(appMessage, options);
+							return inheritedAdmission
+								? this._inputAdmissionScope.run(inheritedAdmission, deliver)
+								: this._inputAdmissionScope.exit(deliver);
+						}),
+					);
+				if (this._agentSettledScope.getStore()?.active) {
+					// Only a handler owning settlement must schedule without joining itself.
+					this._deferredSettledActions.push(dispatch);
+					return;
+				}
+				await this._awaitInput(
+					raceWithAbortSignal(
+						new Promise<void>((resolve, reject) => {
+							this._deferredSettledActions.push(async () => {
+								try {
+									await dispatch();
+									resolve();
+								} catch (error) {
+									reject(error);
+								}
+							});
+						}),
+						this._shutdownCancellation.signal,
+					),
+				);
 				return;
 			}
 			if (this._promptPreflights.size > 0) {
@@ -3315,31 +3709,41 @@ export class AgentSession {
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void> {
 		const receipt = captureTerminalTurnReceipt();
-		// Normalize content to text string + optional images
-		let text: string;
-		let images: ImageContent[] | undefined;
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, async () => {
+			// Normalize content to text string + optional images
+			let text: string;
+			let images: ImageContent[] | undefined;
 
-		if (typeof content === "string") {
-			text = content;
-		} else {
-			const textParts: string[] = [];
-			images = [];
-			for (const part of content) {
-				if (part.type === "text") {
-					textParts.push(part.text);
-				} else {
-					images.push(part);
+			if (typeof content === "string") {
+				text = content;
+			} else {
+				const textParts: string[] = [];
+				images = [];
+				for (const part of content) {
+					if (part.type === "text") {
+						textParts.push(part.text);
+					} else {
+						images.push(part);
+					}
 				}
+				text = textParts.join("\n");
+				if (images.length === 0) images = undefined;
 			}
-			text = textParts.join("\n");
-			if (images.length === 0) images = undefined;
-		}
 
-		await this._promptReceived(receiveInput(text, images, receipt), {
-			expandPromptTemplates: options?.expandPromptTemplates ?? false,
-			streamingBehavior: options?.deliverAs,
-			images,
-			source: "extension",
+			// The admitted envelope keeps the caller's receipt (received-input semantics).
+			const input = receiveInput(text, images, receipt);
+			await this._promptInAdmission(
+				input.text,
+				{
+					expandPromptTemplates: options?.expandPromptTemplates ?? false,
+					streamingBehavior: options?.deliverAs,
+					images: input.images,
+					source: "extension",
+				},
+				admission,
+				getInputReceipt(input),
+			);
 		});
 	}
 
@@ -3363,7 +3767,7 @@ export class AgentSession {
 
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
-		return this._steeringMessages.length + this._followUpMessages.length;
+		return this._inputAdmissions.size + this._steeringMessages.length + this._followUpMessages.length;
 	}
 
 	/** Get pending steering messages (read-only) */
@@ -3380,21 +3784,27 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	/** @internal Permanently stop extension dispatch waits before a terminal shutdown join. */
+	/** @internal Permanently retire process-owned work before a terminal shutdown join. */
 	cancelForShutdown(): void {
-		this._shutdownCancellation.abort(new DOMException("Operation cancelled for terminal shutdown", "AbortError"));
+		this._shutdownCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "operation cancelled for shutdown"),
+		);
+		this._settlementCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
+		);
 		this.abortBash();
 	}
 
-	/** @internal Shared terminal signal for provider and extension dispatch. */
+	/** @internal Cancellation for host-owned startup, command and lifecycle work. */
 	get shutdownSignal(): AbortSignal {
 		return this._shutdownCancellation.signal;
 	}
 
-	/**
-	 * Abort current operation and wait for agent to become idle.
-	 */
+	/** Abort current operation and wait for agent to become idle. */
 	async abort(): Promise<void> {
+		for (const admission of this._inputAdmissions) {
+			admission.controller.abort(new InputAdmissionError("INPUT_ADMISSION_ABORTED", "input was not transferred"));
+		}
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_ABORTED"));
 		this.#ordinaryOwner?.stopAutomatic();
 		if (this._isAgentRunActive) this._agentRunAbortRequested = true;
@@ -3448,7 +3858,12 @@ export class AgentSession {
 		this._modelSwitchDispatches.clear();
 	}
 
-	private async _compactForModelSwitch(model: Model<any>, commit: () => void): Promise<void> {
+	private async _compactForModelSwitch(model: Model<any>, guardedCommit: () => void): Promise<void> {
+		this._inheritedCancellation();
+		const commit = () => {
+			this._inheritedCancellation();
+			guardedCommit();
+		};
 		if (this._modelSwitchCompactionPending)
 			throw new Error("Model switch refused: another model switch compaction is in progress.");
 		if (
@@ -3528,12 +3943,24 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+		// Capture the origin's cancellation before auth; a late auth cannot commit after refusal or retirement (#132 R4-8).
+		const inherited = this._inheritedCancellation();
+		const signals = [inherited, options.signal].filter((item): item is AbortSignal => item !== undefined);
+		const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+		const assertLive = () => {
+			signal?.throwIfAborted();
+			if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "model was not changed");
+		};
+		assertLive();
+		const auth = this._modelRuntime.checkAuth(model.provider);
+		if (!(await (signal ? raceWithAbortSignal(auth, signal) : auth))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
+		assertLive();
 
 		const previousModel = this.model;
 		await this._compactForModelSwitch(model, () => {
+			assertLive();
 			const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 			this.agent.state.model = model;
 			this.sessionManager.appendModelChange(model.provider, model.id);
@@ -3664,6 +4091,7 @@ export class AgentSession {
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		this._inheritedCancellation();
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -3845,16 +4273,45 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		// Refuse a cancelled descendant before it can abort unrelated work or request a summary.
+		const admission = this._inputAdmissionScope.getStore();
+		const ownsHeldAdmission = admission !== undefined && this._inputAdmissions.has(admission);
+		const inherited = this._inheritedCancellation();
+		const dispatch = this._dispatchCancellationScope.getStore();
+		// An unrelated caller must not abort or compact a session whose lifecycle a replacement fence owns (#132 R1-S3).
+		this._assertInputsOpen();
 		await this.abort();
+		// abort() itself ends a caller's held admission (an extension command calling ctx.compact()). Only that
+		// self-abort is exempt: keep the admission's independently inherited revocation (PR #117 R6-2).
+		const revocation = ownsHeldAdmission ? (dispatch === admission.signal ? admission.parent : dispatch) : inherited;
+		revocation?.throwIfAborted();
+		// The abort join can let an idle observer retire this session before any compaction controller exists.
+		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "compaction was not started");
+		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
-		return this.#compactSession(customInstructions);
+		// A fence acquired during the abort join refuses both branches.
+		this._assertInputsOpen();
+		if (!ownsHeldAdmission) return this.#compactSession(customInstructions, undefined, revocation);
+		// Hooks and their descendants inherit that revocation, not the admission this call ended itself.
+		return this._inputAdmissionScope.exit(() =>
+			this._dispatchCancellationScope.run(revocation, () =>
+				this.#compactSession(customInstructions, undefined, revocation),
+			),
+		);
 	}
 
 	/** Same session implementation; manual cancellation stays in its entry wrapper. */
-	async #compactSession(customInstructions?: string, attempt?: OriginalCompactionAttempt): Promise<CompactionResult> {
+	async #compactSession(
+		customInstructions?: string,
+		attempt?: OriginalCompactionAttempt,
+		inherited?: AbortSignal,
+	): Promise<CompactionResult> {
 		const controller = new AbortController();
 		this._compactionAbortController = controller;
-		const signal = attempt ? AbortSignal.any([controller.signal, attempt.signal]) : controller.signal;
+		const signals = [controller.signal, attempt?.signal, inherited].filter(
+			(item): item is AbortSignal => item !== undefined,
+		);
+		const signal = signals.length > 1 ? AbortSignal.any(signals) : controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let fromExtension = false;
 		let cancelledByExtension = false;
@@ -4039,27 +4496,29 @@ export class AgentSession {
 					errors.push(cleanup);
 				}
 				try {
-					clearManualState();
-				} catch (cleanup) {
-					errors.push(cleanup);
-				}
-				try {
-					this._emit({
-						type: "compaction_end",
-						reason: "manual",
-						result: undefined,
-						aborted,
-						willRetry: false,
-						errorMessage,
-					});
-				} catch (cleanup) {
-					errors.push(cleanup);
-				}
-				try {
 					await this._emitSessionCompactFailed(
 						{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
 						signal,
 						true,
+						() => {
+							try {
+								clearManualState();
+							} catch (cleanup) {
+								errors.push(cleanup);
+							}
+							try {
+								this._emit({
+									type: "compaction_end",
+									reason: "manual",
+									result: undefined,
+									aborted,
+									willRetry: false,
+									errorMessage,
+								});
+							} catch (cleanup) {
+								errors.push(cleanup);
+							}
+						},
 					);
 				} catch (cleanup) {
 					errors.push(cleanup);
@@ -4071,18 +4530,21 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = cancelledByExtension || isCompactionCancelled(signal);
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
-			clearManualState();
-			this._emit({
-				type: "compaction_end",
-				reason: "manual",
-				result: undefined,
-				aborted,
-				willRetry: false,
-				errorMessage,
-			});
 			await this._emitSessionCompactFailed(
 				{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
 				signal,
+				false,
+				() => {
+					clearManualState();
+					this._emit({
+						type: "compaction_end",
+						reason: "manual",
+						result: undefined,
+						aborted,
+						willRetry: false,
+						errorMessage,
+					});
+				},
 			);
 			throw aborted ? new Error("Compaction cancelled", { cause: error }) : error;
 		} finally {
@@ -4165,13 +4627,17 @@ export class AgentSession {
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+		for (const hook of this._compactionHooks) hook.abort();
 	}
 
 	/**
 	 * Cancel in-progress branch summarization.
 	 */
 	abortBranchSummary(): void {
-		this._branchSummaryAbortController?.abort();
+		// The reason is also the refusal that abandoned tree-hook descendants observe.
+		this._branchSummaryAbortController?.abort(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "tree navigation cancelled"),
+		);
 	}
 
 	/**
@@ -4271,21 +4737,20 @@ export class AgentSession {
 				const errorMessage = contextOverflow
 					? "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
 					: "Truncated response recovery failed after one compact-and-retry attempt.";
-				this._emit({
-					type: "compaction_end",
-					reason: "overflow",
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage,
-				});
-				await this._emitSessionCompactFailed({
-					reason: "overflow",
-					errorMessage,
-					aborted: false,
-					willRetry: false,
-					fromExtension: false,
-				});
+				await this._emitSessionCompactFailed(
+					{ reason: "overflow", errorMessage, aborted: false, willRetry: false, fromExtension: false },
+					undefined,
+					false,
+					() =>
+						this._emit({
+							type: "compaction_end",
+							reason: "overflow",
+							result: undefined,
+							aborted: false,
+							willRetry: false,
+							errorMessage,
+						}),
+				);
 				return "failed";
 			}
 
@@ -4480,10 +4945,19 @@ export class AgentSession {
 					? `Context overflow recovery failed: ${message}`
 					: `Auto-compaction failed: ${message}`;
 			if (started || signal.aborted) {
-				this._emit({ type: "compaction_end", reason, result: undefined, aborted, willRetry: false, errorMessage });
 				await this._emitSessionCompactFailed(
 					{ reason, errorMessage, aborted, willRetry: false, fromExtension },
 					signal,
+					false,
+					() =>
+						this._emit({
+							type: "compaction_end",
+							reason,
+							result: undefined,
+							aborted,
+							willRetry: false,
+							errorMessage,
+						}),
 				);
 			}
 			return aborted ? "aborted" : "failed";
@@ -4699,15 +5173,19 @@ export class AgentSession {
 					});
 				},
 				sendUserMessage: (content, options) => {
-					this.sendUserMessage(content, options).catch((err) => {
-						runner.emitError({
-							extensionPath: "<runtime>",
-							event: "send_user_message",
-							error: err instanceof Error ? err.message : String(err),
+					// Detach scheduling to avoid an SDK self-join, but keep the separately captured cancellation lineage.
+					this._agentSettledScope
+						.exit(() => this.sendUserMessage(content, options))
+						.catch((err) => {
+							runner.emitError({
+								extensionPath: "<runtime>",
+								event: "send_user_message",
+								error: err instanceof Error ? err.message : String(err),
+							});
 						});
-					});
 				},
 				appendEntry: (customType, data) => {
+					this._inheritedCancellation();
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
@@ -4721,6 +5199,7 @@ export class AgentSession {
 					return this.sessionManager.getSessionName();
 				},
 				setLabel: (entryId, label) => {
+					this._inheritedCancellation();
 					this.sessionManager.appendLabelChange(entryId, label);
 				},
 				getActiveTools: () => this.getActiveToolNames(),
@@ -4728,6 +5207,7 @@ export class AgentSession {
 				getSettings: () => this.settingsManager.getSettings(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
+				inheritedCancellation: () => this._inheritedCancellation(),
 				getCommands,
 				setModel: async (model) => {
 					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
@@ -5245,8 +5725,13 @@ export class AgentSession {
 		},
 	): Promise<BashResult> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
+		const inherited = this._inheritedCancellation();
+		this._assertInputsOpen();
+		this._shutdownCancellation.signal.throwIfAborted();
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
+		// Later revocation kills the spawned command; recordBashResult rechecks before history append.
+		const signal = inherited ? AbortSignal.any([abortController.signal, inherited]) : abortController.signal;
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -5263,12 +5748,13 @@ export class AgentSession {
 						onChunk?.(delta);
 						this._emit({ type: "bash_execution_update", id: options?.id, delta });
 					},
-					signal: abortController.signal,
+					signal,
 				},
 			);
 
 			options?.beforeRecord?.();
-			this.recordBashResult(command, result, options);
+			// Already-started work keeps its (possibly cancelled) receipt after in-flight revocation (#132 R1-S4).
+			this._appendBashResult(command, result, options);
 			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
@@ -5280,6 +5766,13 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		this._inheritedCancellation();
+		this._appendBashResult(command, result, options);
+	}
+
+	private _appendBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		if (this._inputsDisposed)
+			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash result was not recorded");
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -5343,6 +5836,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
+		this._inheritedCancellation();
 		this.sessionManager.appendSessionInfo(name);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
@@ -5369,6 +5863,7 @@ export class AgentSession {
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: tree requires separate receiving");
+		const inherited = this._inheritedCancellation();
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
@@ -5423,7 +5918,13 @@ export class AgentSession {
 		const navigationSignal = AbortSignal.any([
 			this._branchSummaryAbortController.signal,
 			this._shutdownCancellation.signal,
+			...(inherited ? [inherited] : []),
 		]);
+		// A signal in event data is not ancestry: install it so abandoned hook descendants stay revoked.
+		const emitTreeHook = (event: Parameters<ExtensionRunner["emit"]>[0]) =>
+			this._dispatchCancellationScope.run(navigationSignal, () =>
+				this._extensionRunner.emit(event, navigationSignal),
+			);
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -5431,14 +5932,11 @@ export class AgentSession {
 
 			// Emit session_before_tree event
 			if (this._extensionRunner.hasHandlers("session_before_tree")) {
-				const result = (await this._extensionRunner.emit(
-					{
-						type: "session_before_tree",
-						preparation,
-						signal: navigationSignal,
-					},
-					navigationSignal,
-				)) as SessionBeforeTreeResult | undefined;
+				const result = (await emitTreeHook({
+					type: "session_before_tree",
+					preparation,
+					signal: navigationSignal,
+				})) as SessionBeforeTreeResult | undefined;
 
 				if (result?.cancel) {
 					return { cancelled: true };
@@ -5555,16 +6053,13 @@ export class AgentSession {
 
 			// Navigation is already committed. Cancel its observer without claiming rollback.
 			try {
-				await this._extensionRunner.emit(
-					{
-						type: "session_tree",
-						newLeafId: this.sessionManager.getLeafId(),
-						oldLeafId,
-						summaryEntry,
-						fromExtension: summaryText ? fromExtension : undefined,
-					},
-					navigationSignal,
-				);
+				await emitTreeHook({
+					type: "session_tree",
+					newLeafId: this.sessionManager.getLeafId(),
+					oldLeafId,
+					summaryEntry,
+					fromExtension: summaryText ? fromExtension : undefined,
+				});
 			} catch (cause) {
 				if (!navigationSignal.aborted || cause !== navigationSignal.reason) throw cause;
 			}
@@ -5761,15 +6256,26 @@ export class AgentSession {
 	 * Used when the user declines to share the transcript itself.
 	 */
 	async summarizeForBugReport(options: { hint?: string; signal: AbortSignal }): Promise<string> {
+		// A revoked descendant cannot start an auxiliary provider request (PR #117 R6-3).
+		const inherited = this._inheritedCancellation();
+		this._disposalCancellation.signal.throwIfAborted();
+		const signal = AbortSignal.any(
+			[options.signal, this._shutdownCancellation.signal, this._disposalCancellation.signal, inherited].filter(
+				(item): item is AbortSignal => item !== undefined,
+			),
+		);
+		signal.throwIfAborted();
 		const model = this.model;
 		if (!model) {
 			throw new Error("No model selected");
 		}
+		const auth = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
+		signal.throwIfAborted();
 		return generateBugReportSummary({
-			...(await this._getSummarizationRequestAuth(model, options.signal)),
+			...auth,
 			messages: this.messages,
 			hint: options.hint,
-			signal: options.signal,
+			signal,
 			streamFn: this.agent.streamFunction,
 			retry: this.settingsManager.getRetrySettings(),
 			sessionId: this.sessionId,

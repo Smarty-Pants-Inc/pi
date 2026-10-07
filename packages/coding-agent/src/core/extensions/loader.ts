@@ -449,7 +449,13 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			return execute(command, args, options?.cwd ?? cwd, options);
+			// A revoked callback refuses here; a live one composes its lineage into the command (#132 R1-S7).
+			const inherited = runtime.inheritedCancellation?.();
+			const signal =
+				inherited && options?.signal
+					? AbortSignal.any([inherited, options.signal])
+					: (inherited ?? options?.signal);
+			return execute(command, args, options?.cwd ?? cwd, { ...options, signal });
 		},
 
 		getActiveTools(): string[] {

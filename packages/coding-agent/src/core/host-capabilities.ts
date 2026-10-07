@@ -9,7 +9,9 @@ export const HOST_CAPABILITIES = Object.freeze({
 	 * `before_agent_start`) waits for that prompt instead of starting a competing run.
 	 */
 	triggeredMessageQueuesBehindPreflight: true as boolean,
-	/** `ctx.isPromptPending()` reports a prompt in preflight, while `ctx.isIdle()` is still true. */
+	/** Version 1: synchronous user-input accounting and fail-closed native replacement/disposal fences. */
+	inputAdmission: 1,
+	/** `ctx.isPromptPending()` reports user input awaiting handoff; such input makes `ctx.isIdle()` false. */
 	promptPendingVisible: true as boolean,
 	/** `bash_spawn` is emitted immediately before the built-in bash executor runs. */
 	bashSpawnEvent: true as boolean,

@@ -33,7 +33,9 @@ describe("deferred turn receipts", () => {
 					pi.on("agent_settled", async () => {
 						if (queued) return;
 						queued = true;
-						await h.session.prompt("deferred user");
+						// #3048: SDK prompt() refuses inside its own agent_settled handler; the detached
+						// extension API schedules the same deferred user occurrence.
+						pi.sendUserMessage("deferred user");
 						await h.session.sendCustomMessage(
 							{ customType: "settled", content: "deferred custom", display: false },
 							{ triggerTurn: true },
