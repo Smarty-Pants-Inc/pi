@@ -6,6 +6,7 @@ import {
 	ResourceScope,
 	type ThinkingConfig,
 } from "@google/genai";
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -70,7 +71,8 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 	context: TranscriptContext,
 	options?: GoogleVertexOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = collapseSystemMessages(context);
 
 	(async () => {
@@ -301,7 +303,7 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

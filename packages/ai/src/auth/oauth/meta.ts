@@ -14,6 +14,7 @@
  */
 
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 // Muse Code CLI client id.
@@ -46,12 +47,9 @@ async function readJson(response: Response): Promise<Record<string, unknown> | n
 	}
 }
 
+/** Credential endpoint text can echo submitted or issued secrets: keep only the protocol error code. */
 function errorDetail(json: Record<string, unknown> | null): string {
-	for (const key of ["error_description", "detail", "message", "error"]) {
-		const value = json?.[key];
-		if (typeof value === "string" && value.trim()) return `: ${value.trim()}`;
-	}
-	return "";
+	return typeof json?.error === "string" ? `: ${oauthAuthorizationError(json.error)}` : "";
 }
 
 /** The verification URI is opened in the user's browser; only http(s) URLs are trusted. */
@@ -88,7 +86,9 @@ async function startDeviceAuthorization(signal: AbortSignal): Promise<DeviceAuth
 	const userCode = json?.user_code;
 	const verificationUri = trustedHttpUrl(json?.verification_uri_complete) ?? trustedHttpUrl(json?.verification_uri);
 	if (typeof deviceCode !== "string" || !deviceCode || typeof userCode !== "string" || !userCode || !verificationUri) {
-		throw new Error(`Invalid Meta device authorization response: ${JSON.stringify(json)}`);
+		throw new Error(
+			"Invalid Meta device authorization response: missing or invalid device_code, user_code or verification_uri",
+		);
 	}
 	return {
 		deviceCode,
