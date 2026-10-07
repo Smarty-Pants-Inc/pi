@@ -58,7 +58,7 @@ async function captureGooglePayload(
 		},
 	}).result();
 
-	expect(result.errorMessage).toContain("payload captured");
+	expect(result.errorMessage).toContain("provider_request_failed");
 	if (!payload) throw new Error("Google payload was not captured");
 	return payload;
 }
@@ -79,7 +79,7 @@ async function captureVertexPayload(
 		},
 	}).result();
 
-	expect(result.errorMessage).toContain("payload captured");
+	expect(result.errorMessage).toContain("provider_request_failed");
 	if (!payload) throw new Error("Vertex payload was not captured");
 	return payload;
 }
