@@ -113,9 +113,11 @@ describe("ProviderRequestOptions.telemetryContext", () => {
 		await models.stream(model, context, { telemetryContext }).result();
 		await models.streamSimple(model, context, { telemetryContext }).result();
 		await models.fetchDeferred(model, handle, { telemetryContext });
-		await models.cancelDeferred(model, handle, { telemetryContext });
+		await expect(models.cancelDeferred(model, handle, { telemetryContext })).rejects.toThrow(
+			"oauth_invalid_response",
+		);
 
-		expect(observed).toHaveLength(8);
+		expect(observed).toHaveLength(6);
 		expect(observed.every((value) => value === telemetryContext)).toBe(true);
 	});
 
