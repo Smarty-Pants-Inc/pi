@@ -442,7 +442,7 @@ describe("OpenAI Responses terminal event handling", () => {
 		const stream = new AssistantMessageEventStream();
 
 		await expect(processResponsesStream(createFailedEvents(), output, stream, model)).rejects.toThrow(
-			"server_error: boom",
+			"oauth_stream_failed (HTTP unknown)",
 		);
 		expect(output.rawStopReason).toBe("failed");
 	});
