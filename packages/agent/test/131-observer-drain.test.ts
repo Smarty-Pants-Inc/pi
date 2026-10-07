@@ -54,7 +54,7 @@ it("observes rejected updates immediately and drains every accepted update", asy
 	expect(earlySettlement).toBe(false);
 	expect(outcome).toMatchObject({
 		isError: true,
-		result: { content: [{ type: "text", text: "first update failed" }] },
+		result: { content: [{ type: "text", text: "tool_result_withheld (after_policy_failed)" }] },
 	});
 });
 
