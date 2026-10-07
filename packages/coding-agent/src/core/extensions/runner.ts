@@ -3,7 +3,7 @@
  */
 
 import { isDeepStrictEqual } from "node:util";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
@@ -27,6 +27,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
 import { captureTerminalTurnReceipt, type TurnReceipt } from "../turn-receipts.ts";
+import type { VirtualModelDefinition } from "../virtual-models.ts";
 import { boundaryReceiptSlots, receiveBoundaryEntries } from "./boundary-receipts.ts";
 import type {
 	AgentBeforeSettleEvent,
@@ -44,6 +45,7 @@ import type {
 	ContextUsage,
 	ContextWithSystemEvent,
 	EntryRenderer,
+	ExecuteToolOptions,
 	Extension,
 	ExtensionActions,
 	ExtensionCommandContext,
@@ -56,6 +58,7 @@ import type {
 	ExtensionMode,
 	ExtensionRuntime,
 	ExtensionShortcut,
+	ExtensionToolContext,
 	ExtensionUIContext,
 	InputEvent,
 	InputEventResult,
@@ -83,6 +86,7 @@ import type {
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
+	ToolRenderers,
 	ToolResultEvent,
 	ToolResultEventResult,
 	TurnEndEvent,
@@ -382,6 +386,12 @@ export class ExtensionRunner {
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
+	private executeToolFn: ExtensionContextActions["executeTool"];
+	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
+	/** Admission and joining are per call, not per session or captured context. */
+	private readonly toolScopes = new Map<string, { closed: boolean; pending: Set<Promise<unknown>> }>();
+	/** Registered MCP servers already reported as unhandled. */
+	private readonly reportedMcpServers = new Set<string>();
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -419,6 +429,8 @@ export class ExtensionRunner {
 			registerProvider?: (name: string, config: ProviderConfig) => void;
 			registerNativeProvider?: (provider: Provider) => void;
 			unregisterProvider?: (name: string) => void;
+			registerVirtualModel?: (definition: VirtualModelDefinition) => void;
+			unregisterVirtualModel?: (provider: string, id: string) => void;
 		},
 	): void {
 		// Copy actions into the shared runtime (all extension APIs reference this)
@@ -430,12 +442,14 @@ export class ExtensionRunner {
 		this.runtime.setLabel = actions.setLabel;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
+		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.refreshTools = actions.refreshTools;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.createContext = () => this.createContext();
 
 		// Context actions (required)
 		this.getModel = contextActions.getModel;
@@ -453,6 +467,15 @@ export class ExtensionRunner {
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
 		this.getSystemPromptOptionsFn =
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
+		this.executeToolFn = contextActions.executeTool;
+		this.getCallableToolsFn = contextActions.getCallableTools ?? (() => []);
+
+		// Servers registered from now on reach the extension that connects them right away. Servers
+		// registered during loading are read on session_start.
+		this.runtime.mcpServers.setChangeListener(() => {
+			void this.emit({ type: "mcp_servers_change", servers: this.runtime.mcpServers.list() });
+			this.reportUnhandledMcpServers();
+		});
 
 		// Flush provider registrations queued during extension loading
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
@@ -489,6 +512,23 @@ export class ExtensionRunner {
 			}
 		}
 		this.runtime.pendingNativeProviderRegistrations = [];
+		const registerVirtualModel = (definition: VirtualModelDefinition) => {
+			if (providerActions?.registerVirtualModel) providerActions.registerVirtualModel(definition);
+			else this.modelRegistry.registerVirtualModel(definition);
+		};
+		for (const { definition, extensionPath } of this.runtime.pendingVirtualModelRegistrations) {
+			try {
+				registerVirtualModel(definition);
+			} catch (err) {
+				this.emitError({
+					extensionPath,
+					event: "register_virtual_model",
+					error: err instanceof Error ? err.message : String(err),
+					stack: err instanceof Error ? err.stack : undefined,
+				});
+			}
+		}
+		this.runtime.pendingVirtualModelRegistrations = [];
 
 		// From this point on, provider registration/unregistration takes effect immediately
 		// without requiring a /reload.
@@ -512,6 +552,11 @@ export class ExtensionRunner {
 				return;
 			}
 			this.modelRegistry.unregisterProvider(name);
+		};
+		this.runtime.registerVirtualModel = registerVirtualModel;
+		this.runtime.unregisterVirtualModel = (provider, id) => {
+			if (providerActions?.unregisterVirtualModel) providerActions.unregisterVirtualModel(provider, id);
+			else this.modelRegistry.unregisterVirtualModel(provider, id);
 		};
 	}
 
@@ -717,6 +762,23 @@ export class ExtensionRunner {
 		}
 	}
 
+	/**
+	 * Report registered MCP servers when no extension handles `mcp_servers_change`, which means
+	 * nothing connects them (for example when another MCP extension replaced the built-in one).
+	 */
+	reportUnhandledMcpServers(): void {
+		if (this.hasHandlers("mcp_servers_change")) return;
+		for (const server of this.runtime.mcpServers.list()) {
+			if (this.reportedMcpServers.has(server.name)) continue;
+			this.reportedMcpServers.add(server.name);
+			this.emitError({
+				extensionPath: server.extensionPath,
+				event: "register_mcp_server",
+				error: `MCP server "${server.name}" is registered, but no loaded extension connects MCP servers; another extension may have replaced the built-in MCP support`,
+			});
+		}
+	}
+
 	hasHandlers(eventType: string): boolean {
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(eventType);
@@ -743,6 +805,14 @@ export class ExtensionRunner {
 
 	getMarkdownTransformers(): MarkdownTransformer[] {
 		return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
+	}
+
+	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
+	resolveToolRenderers(toolName: string, base: () => ToolRenderers | undefined): ToolRenderers | undefined {
+		const resolvers = this.extensions.flatMap((ext) => ext.toolRenderers ?? []);
+		const resolve = (index: number): ToolRenderers | undefined =>
+			index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
+		return resolve(0);
 	}
 
 	getEntryRenderer(customType: string): EntryRenderer | undefined {
@@ -911,6 +981,69 @@ export class ExtensionRunner {
 				return runner.getSystemPromptFn();
 			},
 		};
+	}
+
+	/**
+	 * Create the context for executing the tool call `toolCallId`: the extension context plus
+	 * `tools` and `executeTool()`. `signal` is the default signal of nested calls.
+	 */
+	createToolContext(toolCallId: string, signal: AbortSignal | undefined): ExtensionToolContext {
+		const runner = this;
+		let scope = this.toolScopes.get(toolCallId);
+		if (!scope) {
+			scope = { closed: false, pending: new Set() };
+			this.toolScopes.set(toolCallId, scope);
+		}
+		const callScope = scope;
+		// createContext() returns a fresh object, so adding properties does not affect other contexts.
+		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
+			tools: {
+				get() {
+					runner.assertActive();
+					return runner.getCallableToolsFn();
+				},
+			},
+			executeTool: {
+				value: async (name: string, args: unknown, options: ExecuteToolOptions = {}) => {
+					runner.assertActive();
+					if (!runner.executeToolFn) {
+						return {
+							toolCall: { type: "toolCall", id: `${toolCallId}/0`, name, arguments: {} },
+							result: {
+								content: [{ type: "text", text: "Nested tool calls are not available in this context" }],
+								details: {},
+							},
+							isError: true,
+						};
+					}
+					if (callScope.closed) throw new Error("Nested tool call scope is closed after parent settlement");
+					const signals = [signal, options.signal, runner.shutdownSignal].filter(
+						(candidate): candidate is AbortSignal => candidate !== undefined,
+					);
+					const childSignal = signals.length ? AbortSignal.any(signals) : undefined;
+					childSignal?.throwIfAborted();
+					// Register before dispatch: even fire-and-forget children belong to this call.
+					const pending = Promise.resolve().then(() => {
+						childSignal?.throwIfAborted();
+						return runner.executeToolFn!(toolCallId, name, args, { ...options, signal: childSignal });
+					});
+					callScope.pending.add(pending);
+					try {
+						return await pending;
+					} finally {
+						callScope.pending.delete(pending);
+					}
+				},
+			},
+		});
+	}
+
+	private async closeToolScope(toolCallId: string): Promise<void> {
+		const scope = this.toolScopes.get(toolCallId);
+		if (!scope) return;
+		scope.closed = true;
+		await Promise.allSettled(scope.pending);
+		this.toolScopes.delete(toolCallId);
 	}
 
 	createCommandContext(): ExtensionCommandContext {
@@ -1133,6 +1266,12 @@ export class ExtensionRunner {
 		event: TEvent,
 		operationSignal?: AbortSignal,
 	): Promise<RunnerEmitResult<TEvent>> {
+		// Join before any observer, persistence, or cancellation can skip finalization.
+		if (event.type === "tool_execution_end") {
+			await this.closeToolScope(event.toolCallId);
+		} else if (event.type === "agent_end") {
+			await Promise.all([...this.toolScopes.keys()].map((id) => this.closeToolScope(id)));
+		}
 		const signal = this.dispatchSignal(event.type, operationSignal ?? ("signal" in event ? event.signal : undefined));
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
@@ -1253,6 +1392,7 @@ export class ExtensionRunner {
 	}
 
 	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
+		await this.closeToolScope(event.toolCallId);
 		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
 		const currentEvent: ToolResultEvent = structuredClone(event);
@@ -1270,10 +1410,16 @@ export class ExtensionRunner {
 
 					if (handlerResult.content !== undefined) {
 						currentEvent.content = handlerResult.content;
+						// Structured content that is not replaced along with the content may no longer match it.
+						if (handlerResult.structuredContent === undefined) delete currentEvent.structuredContent;
 						modified = true;
 					}
 					if (handlerResult.details !== undefined) {
 						currentEvent.details = handlerResult.details;
+						modified = true;
+					}
+					if (handlerResult.structuredContent !== undefined) {
+						currentEvent.structuredContent = handlerResult.structuredContent;
 						modified = true;
 					}
 					if (handlerResult.isError !== undefined) {
@@ -1305,6 +1451,7 @@ export class ExtensionRunner {
 		return structuredClone({
 			content: currentEvent.content,
 			details: currentEvent.details,
+			structuredContent: currentEvent.structuredContent,
 			isError: currentEvent.isError,
 			usage: currentEvent.usage,
 		});

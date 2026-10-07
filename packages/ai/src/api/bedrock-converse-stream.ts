@@ -26,6 +26,7 @@ import { NodeHttpHandler } from "@smithy/node-http-handler";
 import type { BuildMiddleware, DeserializeMiddleware, DocumentType, HttpResponse, MetadataBearer } from "@smithy/types";
 import { HttpProxyAgent } from "http-proxy-agent";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -120,6 +121,8 @@ type Block = (TextContent | ThinkingContent | ToolCall) & {
 
 const EMPTY_TEXT_PLACEHOLDER = "<empty>";
 
+const THINKING_BINDING_CONTROLS_BETA = "thinking-binding-controls-2026-08-01";
+
 /** Matches the placeholder the Anthropic API path uses for redacted thinking. */
 const REDACTED_THINKING_PLACEHOLDER = "[Reasoning redacted]";
 
@@ -128,7 +131,8 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 	context: TranscriptContext,
 	options: BedrockOptions = {},
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	// Bedrock has no mid-conversation system messages; fold them into the leading prompt.
 	const normalizedContext = collapseSystemMessages(context);
 
@@ -359,7 +363,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				finalizeStreamingBlock(block as Block);
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatBedrockError(error);
+			output.errorMessage = formatBedrockError(error, diagnosticSecrets);
 			if (output.stopReason === "error") {
 				appendBedrockFailureDiagnostic(output, error, responseRequestId);
 			}
@@ -399,8 +403,8 @@ const BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/lat
  * human-readable prefix so downstream consumers (retry logic, context-overflow
  * detection) can distinguish error categories via simple string matching.
  */
-function formatBedrockError(error: unknown): string {
-	const norm = normalizeProviderError(error);
+function formatBedrockError(error: unknown, diagnosticSecrets: readonly string[]): string {
+	const norm = normalizeProviderError(error, diagnosticSecrets);
 	// Surface the raw HTTP body (with status) when the SDK did not fold it into
 	// the message; otherwise fall back to the message. This is what stops a
 	// gateway 403 from collapsing to `Unknown: UnknownError`.
@@ -787,6 +791,22 @@ function supportsAdaptiveThinking(modelId: string, modelName?: string): boolean 
 }
 
 function supportsNativeXhighEffort(model: Model<"bedrock-converse-stream">): boolean {
+	const candidates = getModelMatchCandidates(model.id, model.name);
+	return candidates.some(
+		(s) =>
+			s.includes("opus-4-7") ||
+			s.includes("opus-4-8") ||
+			s.includes("opus-5") ||
+			s.includes("sonnet-5") ||
+			s.includes("fable-5"),
+	);
+}
+
+/**
+ * Check if the model accepts `thinking.block_binding`. Opus 4.6 and Sonnet 4.6 reject it with
+ * "thinking.adaptive.block_binding: Extra inputs are not permitted".
+ */
+function supportsThinkingBlockBinding(model: Model<"bedrock-converse-stream">): boolean {
 	const candidates = getModelMatchCandidates(model.id, model.name);
 	return candidates.some(
 		(s) =>
@@ -1255,11 +1275,21 @@ function buildAdditionalModelRequestFields(
 	if (isAnthropicClaudeModel(model)) {
 		// GovCloud Bedrock currently rejects the Claude thinking.display field.
 		// Omit it there until the GovCloud Converse schema catches up.
-		const display = isGovCloudBedrockTarget(model, options) ? undefined : (options.thinkingDisplay ?? "summarized");
+		const isGovCloud = isGovCloudBedrockTarget(model, options);
+		const display = isGovCloud ? undefined : (options.thinkingDisplay ?? "summarized");
+		// Replayed signed thinking blocks are bound to the system prompt and tools they were
+		// created with. Bedrock 400s on replay after either changes unless stale blocks are
+		// dropped, matching the Anthropic provider. Skipped on GovCloud like display.
+		const useBlockBinding = !isGovCloud && supportsThinkingBlockBinding(model);
 		const result: Record<string, any> = supportsAdaptiveThinking(model.id, model.name)
 			? {
-					thinking: { type: "adaptive", ...(display !== undefined ? { display } : {}) },
+					thinking: {
+						type: "adaptive",
+						...(display !== undefined ? { display } : {}),
+						...(useBlockBinding ? { block_binding: { prefix_mismatch_behavior: "drop_block" } } : {}),
+					},
 					output_config: { effort: mapThinkingLevelToEffort(model, options.reasoning) },
+					...(useBlockBinding ? { anthropic_beta: [THINKING_BINDING_CONTROLS_BETA] } : {}),
 				}
 			: (() => {
 					const defaultBudgets: Record<ThinkingLevel, number> = {

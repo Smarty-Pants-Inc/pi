@@ -1,3 +1,4 @@
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage } from "../types.ts";
 import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
 
@@ -22,6 +23,10 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	"out of budget",
 	"quota exceeded",
 	"billing",
+
+	// Sign in with ChatGPT: the subscription's shared usage limit, which resets
+	// after hours rather than seconds.
+	"subscription_sharing_usage_limit_exceeded",
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
@@ -80,6 +85,9 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 
 	// Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
 	"http2 request did not get a response",
+	// Node ERR_HTTP2_STREAM_CANCEL: the HTTP/2 session died before the request was
+	// sent, e.g. after the Bedrock SDK's 5-minute session timeout (#10379).
+	"pending stream has been canceled",
 
 	// Provider-requested retry delay cap failures should flow through the outer
 	// retry policy so callers can surface/abort the backoff (#1123).
@@ -93,6 +101,11 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 
 	// gRPC based providers (e.g. NVIDIA NIM)
 	"ResourceExhausted",
+
+	// Sign in with ChatGPT: usage or user data temporarily unavailable. Usage
+	// failures can arrive mid-stream without an HTTP 503 in the message.
+	"subscription_sharing_usage_unavailable",
+	"subscription_sharing_user_unavailable",
 ]);
 
 const PREMATURE_STREAM_ERROR_PATTERN = buildProviderErrorPattern([
@@ -213,7 +226,10 @@ export async function retryAssistantCall(
 	let attempt = 0;
 	let lastRetry: { attempt: number; errorMessage: string } | undefined;
 	for (;;) {
-		const response = await produce();
+		const produced = await produce();
+		const errorMessage =
+			produced.errorMessage === undefined ? undefined : redactOAuthDiagnostic(produced.errorMessage);
+		const response = errorMessage === produced.errorMessage ? produced : { ...produced, errorMessage };
 
 		// Abort: terminal but not successful. Never retry an aborted message.
 		if (response.stopReason === "aborted") {

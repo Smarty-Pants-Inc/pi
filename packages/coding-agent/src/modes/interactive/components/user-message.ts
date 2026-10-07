@@ -1,4 +1,4 @@
-import { Box, Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer, UserMessageRenderer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
@@ -72,15 +72,17 @@ export class UserMessageComponent extends Container {
 				// Fall through to native rendering, as with custom-message renderers.
 			}
 		}
-		const contentBox = new Box(this.outputPad, 1, (content: string) => theme.bg("userMessageBg", content));
-		contentBox.addChild(
+		// The Markdown pads and colors its own background: a Box around it would keep a second full-width copy of every
+		// line, with identical output.
+		this.addChild(
 			new Markdown(
 				this.text,
-				0,
-				0,
+				this.outputPad,
+				1,
 				this.markdownTheme,
 				{
 					color: (content: string) => theme.fg("userMessageText", content),
+					bgColor: (content: string) => theme.bg("userMessageBg", content),
 				},
 				{
 					preserveOrderedListMarkers: true,
@@ -89,7 +91,6 @@ export class UserMessageComponent extends Container {
 				},
 			),
 		);
-		this.addChild(contentBox);
 	}
 
 	override render(width: number): string[] {

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { writePrivateAuthFile } from "./cli-auth.ts";
 import type { AuthPrompt, OAuthCredential, Provider } from "./index.ts";
 import { builtinProviders } from "./providers/all.ts";
 
@@ -25,7 +27,7 @@ function loadAuth(): Record<string, OAuthCredential> {
 }
 
 function saveAuth(auth: Record<string, OAuthCredential>): void {
-	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), "utf-8");
+	writePrivateAuthFile(AUTH_FILE, JSON.stringify(auth, null, 2));
 }
 
 async function answerPrompt(rl: ReturnType<typeof createInterface>, authPrompt: AuthPrompt): Promise<string> {
@@ -47,26 +49,30 @@ async function login(providerId: string): Promise<void> {
 	if (!provider) throw new Error(`Unknown provider: ${providerId}`);
 	const rl = createInterface({ input: process.stdin, output: process.stdout });
 	try {
-		const credential = await provider.auth.oauth.login({
-			signal: new AbortController().signal,
-			prompt: (authPrompt) => answerPrompt(rl, authPrompt),
-			notify: (event) => {
-				switch (event.type) {
-					case "auth_url":
-						console.log(`\nOpen this URL in your browser:\n${event.url}`);
-						if (event.instructions) console.log(event.instructions);
-						break;
-					case "device_code":
-						console.log(`\nOpen this URL in your browser:\n${event.verificationUri}`);
-						console.log(`Enter code: ${event.userCode}`);
-						break;
-					case "info":
-					case "progress":
-						console.log(event.message);
-						break;
-				}
+		// This dev CLI does not persist an installation ID; apps should reuse one across logins.
+		const credential = await provider.auth.oauth.login(
+			{
+				signal: new AbortController().signal,
+				prompt: (authPrompt) => answerPrompt(rl, authPrompt),
+				notify: (event) => {
+					switch (event.type) {
+						case "auth_url":
+							console.log(`\nOpen this URL in your browser:\n${event.url}`);
+							if (event.instructions) console.log(event.instructions);
+							break;
+						case "device_code":
+							console.log(`\nOpen this URL in your browser:\n${event.verificationUri}`);
+							console.log(`Enter code: ${event.userCode}`);
+							break;
+						case "info":
+						case "progress":
+							console.log(event.message);
+							break;
+					}
+				},
 			},
-		});
+			{ getDeviceId: randomUUID },
+		);
 		const auth = loadAuth();
 		auth[providerId] = credential;
 		saveAuth(auth);

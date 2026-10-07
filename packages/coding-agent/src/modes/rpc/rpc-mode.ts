@@ -12,7 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
-import type { AgentSession } from "../../core/agent-session.ts";
+import type { AgentSession, PromptDisposition } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -570,8 +570,8 @@ export async function runRpcMode(
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
 					source: "rpc" as const,
-					preflightResult: (didSucceed: boolean) => {
-						if (didSucceed && !transportCancellation.signal.aborted) respond(success(id, "prompt"));
+					preflightResult: (disposition: PromptDisposition) => {
+						if (!transportCancellation.signal.aborted) respond(success(id, "prompt", { disposition }));
 					},
 				};
 				if (input) await promptReceived(session, input, promptOptions);
@@ -580,15 +580,17 @@ export async function runRpcMode(
 			}
 
 			case "steer": {
-				if (input) await steerReceived(session, input, "rpc");
-				else await session.steer(command.message, command.images, { source: "rpc" });
-				return success(id, "steer");
+				const disposition = input
+					? await steerReceived(session, input, "rpc")
+					: await session.steer(command.message, command.images, { source: "rpc" });
+				return success(id, "steer", { disposition });
 			}
 
 			case "follow_up": {
-				if (input) await followUpReceived(session, input, "rpc");
-				else await session.followUp(command.message, command.images, { source: "rpc" });
-				return success(id, "follow_up");
+				const disposition = input
+					? await followUpReceived(session, input, "rpc")
+					: await session.followUp(command.message, command.images, { source: "rpc" });
+				return success(id, "follow_up", { disposition });
 			}
 
 			case "abort": {
