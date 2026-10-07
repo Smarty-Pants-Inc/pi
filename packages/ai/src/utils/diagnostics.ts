@@ -142,6 +142,7 @@ function projectDiagnosticText(text: string, oauth: boolean): string {
 
 export const MAX_USAGE_TOKENS = 1_000_000_000;
 export const MAX_USAGE_COST = 1_000_000;
+const projectedUsageTotals = new WeakMap<object, Usage["cost"]>();
 
 /** Closed accounting shape shared by provider publication and accepted tool accounting. */
 export function projectUsage(usage: Usage): Usage {
@@ -149,11 +150,31 @@ export function projectUsage(usage: Usage): Usage {
 		typeof value === "number" && Number.isInteger(value) && value >= 0 ? Math.min(value, MAX_USAGE_TOKENS) : 0;
 	const cost = (value: unknown): number =>
 		typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.min(value, MAX_USAGE_COST) : 0;
-	const input = cost(usage?.cost?.input),
-		output = cost(usage?.cost?.output),
-		cacheRead = cost(usage?.cost?.cacheRead),
-		cacheWrite = cost(usage?.cost?.cacheWrite);
-	return {
+	const rawCosts = [usage?.cost?.input, usage?.cost?.output, usage?.cost?.cacheRead, usage?.cost?.cacheWrite];
+	const input = cost(rawCosts[0]),
+		output = cost(rawCosts[1]),
+		cacheRead = cost(rawCosts[2]),
+		cacheWrite = cost(rawCosts[3]);
+	const incomplete = rawCosts.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0);
+	const capped = rawCosts.some((value) => typeof value === "number" && value > MAX_USAGE_COST);
+	const suppliedTotal = cost(usage?.cost?.total);
+	const componentTotal = input + output + cacheRead + cacheWrite;
+	const prior = projectedUsageTotals.get(usage as object);
+	const unchanged =
+		prior &&
+		prior.input === input &&
+		prior.output === output &&
+		prior.cacheRead === cacheRead &&
+		prior.cacheWrite === cacheWrite &&
+		prior.total === usage?.cost?.total;
+	// A partial breakdown cannot reproduce the aggregate. Preserve a validated aggregate
+	// unless a component was capped; a complete breakdown still determines its own total.
+	const total = unchanged
+		? prior.total
+		: incomplete && !capped
+			? Math.max(componentTotal, suppliedTotal)
+			: componentTotal;
+	const projected: Usage = {
 		input: count(usage?.input),
 		output: count(usage?.output),
 		cacheRead: count(usage?.cacheRead),
@@ -165,8 +186,10 @@ export function projectUsage(usage: Usage): Usage {
 		...(typeof usage?.reasoning === "number" && Number.isInteger(usage.reasoning) && usage.reasoning >= 0
 			? { reasoning: count(usage.reasoning) }
 			: {}),
-		cost: { input, output, cacheRead, cacheWrite, total: input + output + cacheRead + cacheWrite },
+		cost: { input, output, cacheRead, cacheWrite, total },
 	};
+	projectedUsageTotals.set(projected, { ...projected.cost });
+	return projected;
 }
 
 /** Shared closed image-result boundary; provider receipts never become publication fields. */
@@ -186,7 +209,11 @@ export function projectAssistantImages(result: AssistantImages): AssistantImages
 			: [],
 		...(result.usage ? { usage: projectUsage(result.usage) } : {}),
 		stopReason: result.stopReason === "stop" || result.stopReason === "aborted" ? result.stopReason : "error",
-		...(typeof result.errorMessage === "string" ? { errorMessage: result.errorMessage } : {}),
+		...(result.stopReason === "aborted"
+			? { errorMessage: "Request aborted" }
+			: typeof result.errorMessage === "string"
+				? { errorMessage: result.errorMessage }
+				: {}),
 		timestamp:
 			typeof result.timestamp === "number" && Number.isFinite(result.timestamp) ? result.timestamp : Date.now(),
 	};

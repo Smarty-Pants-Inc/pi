@@ -10,6 +10,7 @@ import {
 	type ProjectionModel,
 	projectAssistantContentBlock,
 	projectAssistantMessageDiagnostics,
+	projectUsage,
 } from "./diagnostics.ts";
 import { SETUP_MESSAGES } from "./models-error.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
@@ -127,7 +128,7 @@ function projectTerminalEvent(
 		const error: AssistantMessage = {
 			...message,
 			content: structuredClone(message.content),
-			usage: structuredClone(message.usage),
+			usage: projectUsage(message.usage),
 			stopReason: reason,
 		};
 		transferAssistantMessagePrivateDecisions(message, error);
