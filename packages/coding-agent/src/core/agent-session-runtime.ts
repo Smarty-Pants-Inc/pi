@@ -298,15 +298,16 @@ export class AgentSessionRuntime {
 		outgoing.session.dispose();
 	}
 
-	private async retireUnpublishedSession(session: AgentSession): Promise<void> {
+	private async retireUnpublishedSession(
+		session: AgentSession,
+		reject = (messages: AgentMessage[]) => {
+			if (!this.terminalRejection)
+				throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "unpublished input requires a rejection receipt");
+			this.terminalRejection(messages, session);
+		},
+	): Promise<void> {
 		session.cancelForShutdown();
-		const release = await session.fenceInputs({
-			rejectQueuedInput: (messages) => {
-				if (!this.terminalRejection)
-					throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "unpublished input requires a rejection receipt");
-				this.terminalRejection(messages, session);
-			},
-		});
+		const release = await session.fenceInputs({ rejectQueuedInput: reject });
 		try {
 			session.dispose();
 		} finally {
@@ -338,12 +339,22 @@ export class AgentSessionRuntime {
 			this.releaseReceivingInputs = await session.fenceInputs();
 			this.terminalCancellation.signal.throwIfAborted();
 		} catch (error) {
+			this.releaseReceivingInputs?.();
+			this.releaseReceivingInputs = undefined;
 			if (this.terminalCancellation.signal.aborted) {
-				this.releaseReceivingInputs?.();
-				this.releaseReceivingInputs = undefined;
 				await this.retireUnpublishedSession(session);
+				throw error;
 			}
-			throw error;
+			// The outgoing session is already torn down, so no later disposal owns the refused
+			// receiving session. Retire it now and return its input with the refusal (pi#132 R4-7).
+			const recoveredInput: AgentMessage[] = [];
+			await this.retireUnpublishedSession(session, (messages) => recoveredInput.push(...messages));
+			if (recoveredInput.length === 0) throw error;
+			throw new InputAdmissionError(
+				"INPUT_ADMISSION_BUSY",
+				"receiving session was not published; its queued input is returned, not replayed",
+				{ cause: error, recoveredInput },
+			);
 		}
 		this._session = session;
 		this._services = services;

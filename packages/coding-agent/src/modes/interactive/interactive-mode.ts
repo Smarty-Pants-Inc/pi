@@ -2137,6 +2137,10 @@ export class InteractiveMode {
 
 	private handleInputAdmissionError(error: unknown): boolean {
 		if (!(error instanceof InputAdmissionError)) return false;
+		if (error.recoveredInput) {
+			const recovered = this.recoveryText(error.recoveredInput);
+			if (recovered) this.restoreRejectedInput(recovered);
+		}
 		this.showError(error.message);
 		return true;
 	}

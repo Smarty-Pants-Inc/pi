@@ -11,6 +11,7 @@ import {
 } from "../../src/core/agent-session-runtime.ts";
 import type { BoundaryResult, ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/index.ts";
 import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
+import { InputAdmissionError } from "../../src/core/input-admission.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
@@ -1797,6 +1798,39 @@ describe("native input admission v1", () => {
 			await expect(receiving!.followUp("late")).rejects.toThrow("INPUT_ADMISSION_DISPOSED");
 		},
 	);
+
+	// pi#132 R4-7: a nonterminal publication refusal returns the receiving session's input exactly, without replay.
+	it("nonterminal publication refusal returns receiving input as an authoritative receipt", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		let receiving: AgentSession | undefined;
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			receiving = result.session;
+			await result.session.followUp("acknowledged", [
+				{ type: "image", data: "receiving-original", mimeType: "image/png" },
+			]);
+			return result;
+		});
+		const error = await runtime.newSession().then(
+			() => undefined,
+			(cause: unknown) => cause,
+		);
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).recoveredInput).toEqual([
+			expect.objectContaining({
+				role: "user",
+				content: [
+					{ type: "text", text: "acknowledged" },
+					{ type: "image", data: "receiving-original", mimeType: "image/png" },
+				],
+			}),
+		]);
+		expect(receiving?.isDisposed).toBe(true);
+		expect(receiving?.getFollowUpMessages()).toEqual([]);
+		expect(receiving?.messages.some((message) => message.role === "user")).toBe(false);
+	});
 
 	// smarty-dev#3048, PR #110 R2-1: a BUSY refusal cannot orphan the running settlement's controller.
 	it("busy replacement still permits shutdown to cancel the original settlement", async () => {
