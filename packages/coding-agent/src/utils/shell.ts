@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
-import { delimiter, join } from "node:path";
-import { spawn, spawnSync } from "child_process";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
+import { spawn } from "child_process";
 import { getBinDir } from "../config.ts";
 
 export interface ShellConfig {
@@ -21,38 +21,23 @@ function getBashShellConfig(shell: string): ShellConfig {
 	return isLegacyWslBashPath(shell) ? { shell, args: ["-s"], commandTransport: "stdin" } : { shell, args: ["-c"] };
 }
 
+/**
+ * Search PATH in-process. Discovery must not run a helper such as `where`/`which`: that helper would itself be
+ * resolved through CWD/PATH and execute before the bash_spawn gate sees the final executor.
+ * Relative and empty PATH entries (the working directory) are skipped.
+ */
 function findExecutableOnPath(executable: string): string | null {
-	if (process.platform === "win32") {
-		// Windows: Use 'where' and verify file exists (where can return non-existent paths)
+	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	for (const dir of (process.env[pathKey] ?? "").split(delimiter)) {
+		if (!dir || !isAbsolute(dir)) continue;
+		const candidate = join(dir, executable);
 		try {
-			const result = spawnSync("where", [executable], {
-				encoding: "utf-8",
-				timeout: 5000,
-				windowsHide: true,
-			});
-			if (result.status === 0 && result.stdout) {
-				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-				if (firstMatch && existsSync(firstMatch)) {
-					return firstMatch;
-				}
-			}
+			if (!statSync(candidate).isFile()) continue;
+			if (process.platform !== "win32") accessSync(candidate, constants.X_OK);
+			return candidate;
 		} catch {
-			// Ignore errors
+			// Missing or not executable: keep searching.
 		}
-		return null;
-	}
-
-	// Unix: Use 'which' and trust its output (handles Termux and special filesystems)
-	try {
-		const result = spawnSync("which", [executable], { encoding: "utf-8", timeout: 5000 });
-		if (result.status === 0 && result.stdout) {
-			const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-			if (firstMatch) {
-				return firstMatch;
-			}
-		}
-	} catch {
-		// Ignore errors
 	}
 	return null;
 }
