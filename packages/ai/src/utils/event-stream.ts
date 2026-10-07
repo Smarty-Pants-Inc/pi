@@ -1,4 +1,4 @@
-import { redactOAuthDiagnostic, redactOAuthDiagnosticValue } from "../auth/oauth/credential-response.ts";
+import { redactOAuthDiagnostic, redactOAuthDiagnosticValue, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 import type { AssistantMessageDiagnostic } from "./diagnostics.ts";
 
@@ -122,6 +122,13 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
 	if (typeof message.rawStopReason === "string")
 		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
+	// The handle id is a provider token that consumers persist and redeem: mask live values only, and
+	// replace the handle instead of rewriting the provider's own object (smarty-dev#5443 T-F6-deferred).
+	const deferred = message.deferred;
+	if (typeof deferred?.id === "string") {
+		const id = redactValues(deferred.id, secrets);
+		if (id !== deferred.id) message.deferred = { ...deferred, id };
+	}
 	const diagnostics = message.diagnostics;
 	if (!Array.isArray(diagnostics)) return;
 	for (let i = 0; i < diagnostics.length; i++) {
