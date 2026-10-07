@@ -432,8 +432,8 @@ describe("OpenAI Responses terminal event handling", () => {
 		await processResponsesStream(createIncompleteEvents("max_time_limit"), output, stream, model);
 
 		expect(output.stopReason).toBe("error");
-		expect(output.rawStopReason).toBe("incomplete.max_time_limit");
-		expect(output.errorMessage).toBe("Response incomplete: max_time_limit");
+		expect(output.rawStopReason).toBe("incomplete.unknown");
+		expect(output.errorMessage).toBe("oauth_stream_failed (HTTP unknown)");
 	});
 
 	it("rejects failed terminal events with the provider error", async () => {

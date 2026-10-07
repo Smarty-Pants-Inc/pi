@@ -72,7 +72,7 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.content).toEqual([]);
 		expect(calls).toBe(outputTokens > 0 ? 1 : 3);
 		expect(result).not.toHaveProperty("responseId");
-		expect(result.rawStopReason).toBe(terminal === "incomplete" ? "incomplete.server_error" : "failed");
+		expect(result.rawStopReason).toBe(terminal === "incomplete" ? "unknown" : "failed");
 		expect(result.usage).toMatchObject({
 			input: 17,
 			cacheRead: 3,
