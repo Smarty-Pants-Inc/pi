@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -16,7 +16,7 @@ describe.skipIf(process.platform === "win32")("writeStdoutBounded exit recovery 
 		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	});
 
-	async function run(terminal: "pipe" | "pty", read: boolean, prelude = "") {
+	async function run(terminal: "pipe" | "pty", read: boolean, prelude = "", env = process.env) {
 		const dir = mkdtempSync(join(tmpdir(), "pi-bounded-write-"));
 		dirs.push(dir);
 		const result = join(dir, "result");
@@ -34,7 +34,7 @@ process.exit(0);
 		const node = [process.execPath, "--import", resolver, entry];
 		const command =
 			terminal === "pty" ? ["script", "-qfec", node.map((arg) => `'${arg}'`).join(" "), "/dev/null"] : node;
-		const child = spawn(command[0], command.slice(1), { stdio: ["pipe", "pipe", "ignore"] });
+		const child = spawn(command[0], command.slice(1), { stdio: ["pipe", "pipe", "ignore"], env });
 		let received = 0;
 		if (read)
 			child.stdout.on("data", (chunk: Buffer) => {
@@ -81,5 +81,16 @@ process.exit(0);
 		const outcome = await run("pipe", false, `writeRawStdout("y".repeat(${size}));`);
 		expect(outcome.exited).toBe(true);
 		expect(outcome.disposition).toBe("incomplete");
+	}, 30000);
+
+	// pi#163 P2 (:130): shutdown must not run a `cat` found through PATH.
+	it("a hostile PATH entry is not used for the bounded write", async () => {
+		const hostile = mkdtempSync(join(tmpdir(), "pi-hostile-path-"));
+		dirs.push(hostile);
+		const marker = join(hostile, "ran");
+		writeFileSync(join(hostile, "cat"), `#!/bin/sh\ntouch '${marker}'\nexec /bin/cat\n`, { mode: 0o755 });
+		const outcome = await run("pipe", true, "", { ...process.env, PATH: `${hostile}:${process.env.PATH}` });
+		expect(outcome.disposition).toBe("complete");
+		expect(existsSync(marker)).toBe(false);
 	}, 30000);
 });

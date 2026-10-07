@@ -130,7 +130,8 @@ export async function writeStdoutBounded(text: string, timeoutMs: number): Promi
 			process.stdout.write(text);
 			return "complete";
 		}
-		const copier = spawn("cat", [], { stdio: ["pipe", "inherit", "ignore"] });
+		// Absolute path: a PATH lookup would let a hostile PATH entry run code at shutdown (pi#163).
+		const copier = spawn("/bin/cat", [], { stdio: ["pipe", "inherit", "ignore"] });
 		child = copier;
 		return new Promise((resolve) => {
 			copier.on("error", () => resolve("incomplete"));
