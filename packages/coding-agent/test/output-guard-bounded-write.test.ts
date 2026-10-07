@@ -16,7 +16,7 @@ describe.skipIf(process.platform === "win32")("writeStdoutBounded exit recovery 
 		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 	});
 
-	async function run(terminal: "pipe" | "pty", read: boolean) {
+	async function run(terminal: "pipe" | "pty", read: boolean, prelude = "") {
 		const dir = mkdtempSync(join(tmpdir(), "pi-bounded-write-"));
 		dirs.push(dir);
 		const result = join(dir, "result");
@@ -24,7 +24,8 @@ describe.skipIf(process.platform === "win32")("writeStdoutBounded exit recovery 
 		writeFileSync(
 			entry,
 			`import { writeFileSync } from "node:fs";
-import { writeStdoutBounded } from ${JSON.stringify(guard)};
+import { writeRawStdout, writeStdoutBounded } from ${JSON.stringify(guard)};
+${prelude}
 const result = await writeStdoutBounded("x".repeat(${size}) + "END\\n", ${read ? 10000 : 1000});
 writeFileSync(${JSON.stringify(result)}, result);
 process.exit(0);
@@ -74,4 +75,11 @@ process.exit(0);
 		},
 		30000,
 	);
+
+	// pi#163 P2 (:114): a prior raw stdout write still backpressured must share the deadline.
+	it("a backpressured prior raw write cannot hold shutdown past the deadline", async () => {
+		const outcome = await run("pipe", false, `writeRawStdout("y".repeat(${size}));`);
+		expect(outcome.exited).toBe(true);
+		expect(outcome.disposition).toBe("incomplete");
+	}, 30000);
 });
