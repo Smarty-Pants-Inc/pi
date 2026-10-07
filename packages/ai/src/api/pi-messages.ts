@@ -168,6 +168,45 @@ function createEmptyUsage(): PiMessagesUsage {
 	};
 }
 
+/** A wire count or cost: finite, non-negative and bounded, so summed totals stay finite. */
+function boundUsageNumber(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.min(value, Number.MAX_SAFE_INTEGER)
+		: 0;
+}
+
+/**
+ * Copy only the known usage fields from a terminal wire event. The backend is untrusted: a
+ * missing, negative, string or overflowing value would otherwise corrupt token and cost totals
+ * (smarty-dev#5443 T-F6-usage).
+ */
+function boundUsage(value: unknown): PiMessagesUsage {
+	const wire =
+		typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+	const wireCost =
+		typeof wire.cost === "object" && wire.cost !== null && !Array.isArray(wire.cost)
+			? (wire.cost as Record<string, unknown>)
+			: {};
+	const usage: PiMessagesUsage = {
+		input: boundUsageNumber(wire.input),
+		output: boundUsageNumber(wire.output),
+		cacheRead: boundUsageNumber(wire.cacheRead),
+		cacheWrite: boundUsageNumber(wire.cacheWrite),
+		totalTokens: boundUsageNumber(wire.totalTokens),
+		cost: {
+			input: boundUsageNumber(wireCost.input),
+			output: boundUsageNumber(wireCost.output),
+			cacheRead: boundUsageNumber(wireCost.cacheRead),
+			cacheWrite: boundUsageNumber(wireCost.cacheWrite),
+			total: boundUsageNumber(wireCost.total),
+		},
+	};
+	if (typeof wire.reasoning === "number" && wire.reasoning >= 0) usage.reasoning = boundUsageNumber(wire.reasoning);
+	if (typeof wire.cacheWrite1h === "number" && wire.cacheWrite1h >= 0)
+		usage.cacheWrite1h = boundUsageNumber(wire.cacheWrite1h);
+	return usage;
+}
+
 function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesRewriteImpact | undefined): void {
 	if (!rewrite) {
 		return;
@@ -197,7 +236,7 @@ function createEventConverter(model: Model<"pi-messages">) {
 			case "done":
 				Object.assign(partial, {
 					stopReason: event.reason,
-					usage: event.usage,
+					usage: boundUsage(event.usage),
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
@@ -208,7 +247,7 @@ function createEventConverter(model: Model<"pi-messages">) {
 			case "error":
 				Object.assign(partial, {
 					stopReason: event.reason,
-					usage: event.usage,
+					usage: boundUsage(event.usage),
 					errorMessage: event.errorMessage,
 					responseId: event.responseId,
 				});
