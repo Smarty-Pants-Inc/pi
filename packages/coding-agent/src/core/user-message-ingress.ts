@@ -115,6 +115,13 @@ export class UserMessageIngress {
 		}
 		// Capture plain data before a hook can mutate the caller's object.
 		request = { ...request };
+		// Refuse oversized text before it is scanned (byteLength) or hashed (fingerprint), so a huge
+		// payload costs O(1). UTF-8 bytes >= UTF-16 code units, so more than MAX_TEXT_BYTES code units is
+		// always more than MAX_TEXT_BYTES bytes. This refusal precedes the key lookup and reservation:
+		// the key is NOT reserved, a later retry with the same key and valid text is admitted as a new
+		// request, and a retry with oversized text is refused the same way again. Text whose code units
+		// fit but whose UTF-8 bytes do not is still refused below by the exact byte check, after reservation.
+		if (request.text.length > MAX_TEXT_BYTES) return rejected("admission_refused");
 		const textBytes = Buffer.byteLength(request.text, "utf8");
 		const epochBytes = Buffer.byteLength(request.registrationEpoch, "utf8");
 		const idBytes = Buffer.byteLength(request.requestId, "utf8");

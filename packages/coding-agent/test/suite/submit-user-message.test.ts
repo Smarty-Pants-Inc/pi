@@ -1,8 +1,9 @@
+import { Hash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { getApiProvider, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSessionRuntime, type CreateAgentSessionRuntimeFactory } from "../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, ExtensionFactory, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
@@ -563,6 +564,58 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 		});
 		expect(inputs).toEqual([]);
 		expect(getUserTexts(harness)).toEqual([]);
+		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	// #5533 PR #149 review: code-unit-oversized text is refused before byteLength, hashing, or reservation.
+	it("refuses text over the code-unit limit without scanning, hashing, or reserving its key", async () => {
+		const { harness, api, request, inputs } = await setup();
+		const ingress = (harness.session as unknown as { _userMessageIngress: { reservations: Map<string, unknown> } })
+			._userMessageIngress;
+		const reservedBefore = ingress.reservations.size;
+		const submission = request("x".repeat(65537), "oversized-code-units");
+		const byteLength = vi.spyOn(Buffer, "byteLength");
+		const hashUpdate = vi.spyOn(Hash.prototype, "update");
+		try {
+			const first = await within(api().submitUserMessage(submission));
+			expect(first).toEqual({
+				status: "rejected",
+				reason: "admission_refused",
+				sessionGeneration: submission.sessionGeneration,
+			});
+			expect(byteLength.mock.calls.some(([value]) => value === submission.text)).toBe(false);
+			expect(hashUpdate.mock.calls.some(([value]) => value === submission.text)).toBe(false);
+			// Idempotent refusal: the same oversized retry is refused again, not reported as a duplicate.
+			expect(await within(api().submitUserMessage(submission))).toEqual(first);
+		} finally {
+			byteLength.mockRestore();
+			hashUpdate.mockRestore();
+		}
+		expect(ingress.reservations.size).toBe(reservedBefore);
+		expect(inputs).toEqual([]);
+		expect(getUserTexts(harness)).toEqual([]);
+
+		// The refused attempt had no effect: a valid retry under the same key is a new admission.
+		const retry = await within(api().submitUserMessage({ ...submission, text: "valid retry" }));
+		expect(retry.status).toBe("accepted");
+		expect(retry.duplicate).toBeUndefined();
+		expect(ingress.reservations.size).toBe(reservedBefore + 1);
+	});
+
+	// #5533 PR #149 review: text within the code-unit limit but over 64 KiB UTF-8 still hits the exact byte check.
+	it("refuses multibyte text whose code units fit but whose UTF-8 bytes do not", async () => {
+		const { harness, api, request, inputs } = await setup();
+		const submission = request("é".repeat(65536), "oversized-utf8-bytes");
+		expect(submission.text.length).toBe(65536);
+		expect(Buffer.byteLength(submission.text, "utf8")).toBe(131072);
+		const first = await within(api().submitUserMessage(submission));
+		expect(first).toEqual({
+			status: "rejected",
+			reason: "admission_refused",
+			sessionGeneration: submission.sessionGeneration,
+		});
+		expect(await within(api().submitUserMessage(submission))).toEqual(duplicateReceipt(first));
+		expect(inputs).toEqual([]);
 		expect(harness.faux.state.callCount).toBe(0);
 	});
 

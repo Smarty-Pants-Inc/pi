@@ -195,7 +195,10 @@ precedes generation validation, so an old receipt is not evidence of a new admis
 correlation keys are reserved before lifecycle, size, or aggregate-budget refusal. Reservations,
 including rejected admission attempts, survive extension reloads but not process restart or
 creation of a different session runtime. Malformed requests and oversized correlation fields
-cannot establish a reservation. Loader-level `no_session`, `unsupported`, and stale-runtime
+cannot establish a reservation. Text longer than 65,536 UTF-16 code units is refused with
+`admission_refused` before any duplicate lookup, hashing, or reservation (even under a key that is
+already reserved), so its key is not reserved: a later retry with the same key and valid text is
+admitted as a new request, and repeating the oversized text is refused the same way again. Loader-level `no_session`, `unsupported`, and stale-runtime
 fallbacks outside a session admission do not enter this session-owned ledger.
 
 The ledger retains at most **1024 keys**, never evicts, and refuses unseen keys with
@@ -204,11 +207,12 @@ is never reclaimed, their keys cannot later submit in that session. Existing dup
 readable when full. Admission limits remain **64 KiB UTF-8 text**, **256 UTF-8 bytes each** for
 epoch and request ID, and an **8 MiB aggregate original text/epoch/ID payload budget** per live
 session. A reservation within the size and aggregate limits consumes that budget even if a
-lifecycle fence or input hook refuses it; oversized or aggregate-refused payloads do not consume
-it and cannot later become admissions under the same key. Exceeding a limit returns
+lifecycle fence or input hook refuses it; aggregate-refused payloads, and text over 64 KiB UTF-8
+that fits within 65,536 code units, do not consume it and cannot later become admissions under the
+same key. Exceeding a limit returns
 `admission_refused`. The ledger stores a **32-byte native SHA-256 fingerprint** of the original
-text's exact UTF-16 code units rather than retaining the text, including for oversized or
-budget-refused text. Each retained outcome contains only the historical status/rejection reason
+text's exact UTF-16 code units rather than retaining the text, including for budget-refused text
+and text within 65,536 code units but over 64 KiB UTF-8. Each retained outcome contains only the historical status/rejection reason
 and, for accepted or queued admissions, the actual **36-byte ASCII admission-generation UUID**.
 The unchecked caller generation is never retained in that outcome: each returned receipt echoes
 its own request generation without truncation, including first refusals and duplicates. Key,
