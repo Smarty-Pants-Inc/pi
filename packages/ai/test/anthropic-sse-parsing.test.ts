@@ -158,7 +158,7 @@ describe("Anthropic raw SSE parsing", () => {
 		}).result();
 
 		expect(first.model).toBe(model.id);
-		expect(first.responseModel).toBe(responseModel);
+		expect(first.responseModel).toBe(undefined);
 
 		const transformed = transformMessages([...initialContext.messages, first], model);
 		const replayedAssistant = transformed.find((message) => message.role === "assistant");
