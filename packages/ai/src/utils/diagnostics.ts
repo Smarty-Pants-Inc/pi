@@ -9,7 +9,16 @@ import {
 	safeOAuthError,
 	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
-import type { Api, AssistantMessage, JsonObject, Model, ThinkingLevelMap, Usage } from "../types.ts";
+import type {
+	Api,
+	AssistantImages,
+	AssistantMessage,
+	ImagesOutputContent,
+	JsonObject,
+	Model,
+	ThinkingLevelMap,
+	Usage,
+} from "../types.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 export interface DiagnosticErrorInfo {
@@ -157,6 +166,29 @@ export function projectUsage(usage: Usage): Usage {
 			? { reasoning: count(usage.reasoning) }
 			: {}),
 		cost: { input, output, cacheRead, cacheWrite, total: input + output + cacheRead + cacheWrite },
+	};
+}
+
+/** Shared closed image-result boundary; provider receipts never become publication fields. */
+export function projectAssistantImages(result: AssistantImages): AssistantImages {
+	return {
+		api: result.api,
+		provider: result.provider,
+		model: result.model,
+		output: Array.isArray(result.output)
+			? result.output.flatMap<ImagesOutputContent>((block) => {
+					if (block?.type === "text" && typeof block.text === "string")
+						return [{ type: "text" as const, text: block.text }];
+					if (block?.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string")
+						return [{ type: "image" as const, data: block.data, mimeType: block.mimeType }];
+					return [];
+				})
+			: [],
+		...(result.usage ? { usage: projectUsage(result.usage) } : {}),
+		stopReason: result.stopReason === "stop" || result.stopReason === "aborted" ? result.stopReason : "error",
+		...(typeof result.errorMessage === "string" ? { errorMessage: result.errorMessage } : {}),
+		timestamp:
+			typeof result.timestamp === "number" && Number.isFinite(result.timestamp) ? result.timestamp : Date.now(),
 	};
 }
 

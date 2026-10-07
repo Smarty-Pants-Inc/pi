@@ -147,6 +147,7 @@ export class OrdinaryOperationalAudit {
 	#exposureBytes = 0;
 	#exposureLost = false;
 	readonly #notified = new Set<string>();
+	readonly #publicResponseIds = new Map<string, string>();
 	#exposureOperation?: {
 		ticket: object;
 		clockTicket: object;
@@ -582,7 +583,7 @@ export class OrdinaryOperationalAudit {
 				if (this.#lost) break;
 				if (!receipt.nativeAccepted || this.#notified.has(receipt.requestId)) continue;
 				this.#notified.add(receipt.requestId);
-				publishOrdinaryRequest(this, receipt);
+				publishOrdinaryRequest(this, this.publishedRequest(receipt.requestId));
 			}
 		} catch (cause) {
 			this.#lost = true;
@@ -940,6 +941,38 @@ export class OrdinaryOperationalAudit {
 
 	requests() {
 		return [...this.#requests.values()].map((request) => this.#requestRow(request));
+	}
+
+	/** Closed public receipt view. Raw IDs remain exclusively in retained join evidence. */
+	publishedRequest(requestId: string) {
+		const request = [...this.#requests.values()].find((value) => value.reservation.requestId === requestId);
+		if (!request) throw new Error("OWNER_AUDIT_REQUEST");
+		const row = this.#requestRow(request);
+		const ownedId = (raw: string | null): string | null => {
+			if (raw === null) return null;
+			let ordinal = this.#publicResponseIds.get(raw);
+			if (ordinal === undefined) {
+				ordinal = `provider-response-${this.#publicResponseIds.size + 1}`;
+				this.#publicResponseIds.set(raw, ordinal);
+			}
+			return ordinal;
+		};
+		return {
+			...row,
+			providerResponseId: ownedId(row.providerResponseId),
+			absenceOfViewAudit: row.absenceOfViewAudit
+				? { ...row.absenceOfViewAudit, providerResponseId: ownedId(row.absenceOfViewAudit.providerResponseId) }
+				: null,
+			native: row.native
+				? {
+						...row.native,
+						receipt: {
+							...row.native.receipt,
+							providerResponseId: ownedId(row.native.receipt.providerResponseId),
+						},
+					}
+				: null,
+		};
 	}
 
 	#requestRow(request: RequestAudit) {

@@ -18,6 +18,7 @@ import type {
 	ProviderHeaders,
 	TextContent,
 } from "../types.ts";
+import { projectAssistantImages, projectUsage } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
@@ -108,13 +109,11 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 				} satisfies ImageContent);
 			}
 		}
-
-		return output;
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(normalizeProviderError(error, [], options?.oauthDiagnostics));
-		return output;
 	}
+	return projectAssistantImages(output);
 };
 
 function createClient(
@@ -175,13 +174,21 @@ function parseUsage(
 	},
 	model: ImageModel<ImageApi>,
 ) {
-	const promptTokens = rawUsage.prompt_tokens || 0;
-	const reportedCachedTokens = rawUsage.prompt_tokens_details?.cached_tokens || 0;
-	const cacheWriteTokens = rawUsage.prompt_tokens_details?.cache_write_tokens || 0;
+	const counts = projectUsage({
+		input: rawUsage.prompt_tokens ?? 0,
+		output: rawUsage.completion_tokens ?? 0,
+		cacheRead: rawUsage.prompt_tokens_details?.cached_tokens ?? 0,
+		cacheWrite: rawUsage.prompt_tokens_details?.cache_write_tokens ?? 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	});
+	const promptTokens = counts.input;
+	const reportedCachedTokens = counts.cacheRead;
+	const cacheWriteTokens = counts.cacheWrite;
 	const cacheReadTokens =
 		cacheWriteTokens > 0 ? Math.max(0, reportedCachedTokens - cacheWriteTokens) : reportedCachedTokens;
 	const input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
-	const output = rawUsage.completion_tokens || 0;
+	const output = counts.output;
 	const usage = {
 		input,
 		output,

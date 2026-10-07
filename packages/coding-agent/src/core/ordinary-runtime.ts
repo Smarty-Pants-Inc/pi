@@ -23,7 +23,7 @@ import {
 import type { TokenSettlement } from "./ordinary-token-budget.ts";
 
 export interface OriginalOperationalCollector {
-	request(row: ReturnType<OrdinaryOperationalAudit["requests"]>[number]): void;
+	request(row: ReturnType<OrdinaryOperationalAudit["publishedRequest"]>): void;
 	exposure(frame: OrdinaryExposureFrame, receipt: OrdinaryExposureReceipt): void;
 	usage(receipt: TokenSettlement): void;
 	readonly hooks: Readonly<OrdinaryOperationalHooks>;
@@ -196,12 +196,12 @@ export function abortOrdinaryExposure(owner: object, ticket: object, cause: unkn
  * methods come from the same authenticated Sense receiver during attachment. */
 export function publishOrdinaryRequest(
 	audit: OrdinaryOperationalAudit,
-	row: ReturnType<OrdinaryOperationalAudit["requests"]>[number],
+	row: ReturnType<OrdinaryOperationalAudit["publishedRequest"]>,
 ): void {
 	const original = auditCompositions.get(audit);
 	if (!original) return;
 	checkComposition(original);
-	original.collector?.request(row);
+	original.collector?.request(audit.publishedRequest(row.requestId));
 }
 export function publishOrdinaryExposure(
 	audit: OrdinaryOperationalAudit,

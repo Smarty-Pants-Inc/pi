@@ -1,4 +1,5 @@
 import type { AssistantImages, ImageApi, ImageModel, ImagesContext, ImagesFunction, ImagesOptions } from "./types.ts";
+import { projectAssistantImages } from "./utils/diagnostics.ts";
 
 export type ImagesApiFunction = (
 	model: ImageModel<ImageApi>,
@@ -27,11 +28,11 @@ function wrapGenerateImages<TOptions extends ImagesOptions>(
 	api: ImageApi,
 	generateImages: ImagesFunction<TOptions>,
 ): ImagesApiFunction {
-	return (model, context, options) => {
+	return async (model, context, options) => {
 		if (model.api !== api) {
 			throw new Error(`Mismatched api: ${model.api} expected ${api}`);
 		}
-		return generateImages(model, context, options as TOptions);
+		return projectAssistantImages(await generateImages(model, context, options as TOptions));
 	};
 }
 

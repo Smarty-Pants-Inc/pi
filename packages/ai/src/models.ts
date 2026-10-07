@@ -51,6 +51,7 @@ import type {
 	Usage,
 } from "./types.ts";
 import { operationSignal, raceWithAbortSignal } from "./utils/abort.ts";
+import { projectAssistantImages } from "./utils/diagnostics.ts";
 import {
 	assertChatModel,
 	assertClassifierModel,
@@ -993,7 +994,7 @@ class ModelsImpl implements MutableModels {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
 			}
 			const { requestModel, requestOptions } = await this.applyAuth(model, options);
-			return await provider.generateImages(requestModel, context, requestOptions);
+			return projectAssistantImages(await provider.generateImages(requestModel, context, requestOptions));
 		} catch (error) {
 			return imageErrorResult(model, error, options?.signal?.aborted);
 		}
@@ -1188,7 +1189,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 					),
 				);
 			}
-			return implementation.generateImages(model, context, options);
+			return projectAssistantImages(await implementation.generateImages(model, context, options));
 		};
 	}
 	if (classifiers && classifierImplementations.length > 0) {

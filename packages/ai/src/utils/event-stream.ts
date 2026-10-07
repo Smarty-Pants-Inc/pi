@@ -200,10 +200,46 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 
 	override push(event: AssistantMessageEvent): void {
 		if (this.done) return;
-		if (event.type === "toolcall_end" && event.toolCall?.type !== "toolCall") {
+		// Runtime producer types are not a wire-schema check. Refuse malformed
+		// progress before copying either its envelope or its partial snapshot.
+		const progress = event.type !== "start" && event.type !== "done" && event.type !== "error";
+		const invalidProgress =
+			progress &&
+			(!("contentIndex" in event) ||
+				!Number.isSafeInteger(event.contentIndex) ||
+				event.contentIndex < 0 ||
+				event.contentIndex >= 65_536 ||
+				!Array.isArray(event.partial?.content) ||
+				event.contentIndex >= event.partial.content.length ||
+				(["text_delta", "thinking_delta", "toolcall_delta"].includes(event.type) &&
+					(!("delta" in event) || typeof event.delta !== "string")) ||
+				(["text_end", "thinking_end"].includes(event.type) &&
+					(!("content" in event) || typeof event.content !== "string")));
+		if (invalidProgress || (event.type === "toolcall_end" && event.toolCall?.type !== "toolCall")) {
 			const failure = oauthDiagnosticError("oauth_invalid_response", undefined, undefined, undefined, false);
+			const source: AssistantMessage =
+				"partial" in event && event.partial
+					? event.partial
+					: {
+							role: "assistant",
+							api: this.projectionModel?.api ?? "unknown",
+							provider: this.projectionModel?.provider ?? "provider",
+							model: this.projectionModel?.id ?? "unknown",
+							content: [],
+							usage: {
+								input: 0,
+								output: 0,
+								cacheRead: 0,
+								cacheWrite: 0,
+								totalTokens: 0,
+								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+							},
+							stopReason: "error",
+							timestamp: Date.now(),
+						};
 			const error: AssistantMessage = {
-				...event.partial,
+				...source,
+				content: [],
 				stopReason: "error",
 				errorMessage: extractDiagnosticError(failure).message,
 				oauthRecovery: oauthRecoveryDecision(failure),
