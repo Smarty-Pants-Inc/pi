@@ -168,7 +168,7 @@ describe("openai-completions provider retries", () => {
 
 		expect(mockState.requestOptions).toHaveLength(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe(message);
+		expect(result.errorMessage).toBe("provider_request_failed (HTTP 429)");
 		expect(isRetryableAssistantError(result)).toBe(false);
 	});
 
@@ -197,12 +197,10 @@ describe("openai-completions provider retries", () => {
 			const result = await consume({ maxRetries: 2 });
 
 			expect(mockState.requestOptions).toHaveLength(1);
-			expect(result.errorMessage).toBe(message || "smarty_limit");
+			expect(result.errorMessage).toBe("provider_request_failed (HTTP 429)");
 			expect(isRetryableAssistantError(result)).toBe(false);
 			expect(throttledLimitWait(result)).toEqual(
-				wait === undefined
-					? undefined
-					: { delayMs: wait, waitMessage: message || "Flash runs one request at a time" },
+				wait === undefined ? undefined : { delayMs: wait, waitMessage: "Flash runs one request at a time" },
 			);
 		},
 	);
