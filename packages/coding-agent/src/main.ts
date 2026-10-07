@@ -49,6 +49,7 @@ import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
 import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
+import { startHerdrInputConsumer } from "./core/herdr/bootstrap.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import { captureCliInputPlan, finalizeCliInputPlan, handoffModeInputPlan } from "./core/mode-turn-receipts.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
@@ -970,6 +971,8 @@ export async function main(args: string[], options?: MainOptions) {
 		};
 	};
 	time("createRuntime");
+	// smarty-dev#2636: enroll as Herdr's input consumer before any extension loads.
+	const herdrInput = appMode === "interactive" ? await startHerdrInputConsumer() : undefined;
 	const runtime = await createAgentSessionRuntime(createRuntime, {
 		cwd: sessionManager.getCwd(),
 		agentDir,
@@ -1071,6 +1074,7 @@ export async function main(args: string[], options?: MainOptions) {
 			verbose: parsed.verbose,
 			tuiMode: parsed.tuiMode,
 			initialThemeSetting: parsed.useTheme,
+			herdrInput,
 		};
 		handoffModeInputPlan(parsed, interactiveOptions);
 		const interactiveMode = new InteractiveMode(runtime, interactiveOptions);

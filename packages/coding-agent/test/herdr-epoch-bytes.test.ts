@@ -11,6 +11,7 @@ import {
 	captureSiblingTerminalTurnReceipt,
 	captureTerminalSubmitReceipt,
 	receiptRecord,
+	withoutAttribution,
 } from "../src/core/turn-receipts.ts";
 
 const NONCE = "0123456789abcdef";
@@ -96,6 +97,15 @@ describe("submit receipt issuers", () => {
 		expect(() => captureKeyboardTurnReceipt("**Paul (in Herdr):**", token, at)).toThrow();
 		expect(() => captureKeyboardTurnReceipt("paul", "not-a-token", at)).toThrow();
 		expect(() => captureTerminalSubmitReceipt("x".repeat(32))).toThrow();
+	});
+
+	it("drops attribution, keeping turn and token, when a hook or template changed the text", () => {
+		const keyboard = captureKeyboardTurnReceipt("paul", token, at);
+		const before = receiptRecord(keyboard);
+		const after = receiptRecord(withoutAttribution(keyboard));
+		expect(after).toEqual({ v: 1, turnId: before.turnId, receivedAt: at, channel: "terminal", submissionToken: token });
+		const terminal = captureTerminalSubmitReceipt(token);
+		expect(withoutAttribution(terminal)).toBe(terminal);
 	});
 
 	it("never gives a hook-created sibling the keyboard attribution", () => {

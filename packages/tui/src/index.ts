@@ -75,11 +75,12 @@ export {
 } from "./keys.ts";
 // LaTeX rendering
 export { type RenderLatexOptions, renderLatex } from "./latex.ts";
+// Terminal interface and implementations
+export { type InputByteMeter, MeteredInput } from "./metered-input.ts";
 // Native platform integration
 export { getNativeClipboard, type NativeClipboard } from "./native-platform.ts";
 // Input buffering for batch splitting
 export { StdinBuffer, type StdinBufferEventMap, type StdinBufferOptions } from "./stdin-buffer.ts";
-// Terminal interface and implementations
 export { ProcessTerminal, type Terminal } from "./terminal.ts";
 // Terminal colors
 export {

@@ -365,6 +365,23 @@ export class Editor implements Component, Focusable {
 	private undoStack = new UndoStack<EditorSnapshot>();
 
 	public onSubmit?: (text: string) => void;
+	/**
+	 * True when the draft holds text that was not typed or pasted through the terminal: history recall,
+	 * kill-ring yank, undo, autocomplete, `setText`, `insertTextAtCursor` or `markDraftTainted()`.
+	 * Such a submit is never attributed to the typing client (smarty-dev#2636). Cleared by each submit.
+	 */
+	private draftTainted = false;
+	private submitTainted = false;
+
+	/** Whether the draft being submitted (read inside `onSubmit`) was tainted. */
+	get lastSubmitTainted(): boolean {
+		return this.submitTainted;
+	}
+
+	/** Mark the open draft as not purely typed (synthetic paste, input rewrite, external editor). */
+	markDraftTainted(): void {
+		this.draftTainted = true;
+	}
 	public onChange?: (text: string) => void;
 	public disableSubmit: boolean = false;
 
@@ -456,6 +473,7 @@ export class Editor implements Component, Focusable {
 
 		const newIndex = this.historyIndex - direction; // Up(-1) increases index, Down(1) decreases
 		if (newIndex < -1 || newIndex >= this.history.length) return;
+		this.draftTainted = true;
 
 		// Capture state when first entering history browsing mode
 		if (this.historyIndex === -1 && newIndex >= 0) {
@@ -768,6 +786,7 @@ export class Editor implements Component, Focusable {
 				if (selected && this.autocompleteProvider) {
 					this.pushUndoSnapshot();
 					this.lastAction = null;
+					this.draftTainted = true;
 					const result = this.autocompleteProvider.applyCompletion(
 						this.state.lines,
 						this.state.cursorLine,
@@ -789,6 +808,7 @@ export class Editor implements Component, Focusable {
 				if (selected && this.autocompleteProvider) {
 					this.pushUndoSnapshot();
 					this.lastAction = null;
+					this.draftTainted = true;
 					const result = this.autocompleteProvider.applyCompletion(
 						this.state.lines,
 						this.state.cursorLine,
@@ -1120,6 +1140,7 @@ export class Editor implements Component, Focusable {
 		}
 		this.pastes.clear();
 		this.pasteCounter = 0;
+		if (normalized) this.draftTainted = true;
 		this.setTextInternal(normalized);
 	}
 
@@ -1130,6 +1151,7 @@ export class Editor implements Component, Focusable {
 	 */
 	insertTextAtCursor(text: string): void {
 		if (!text) return;
+		this.draftTainted = true;
 		this.cancelAutocomplete();
 		this.pushUndoSnapshot();
 		this.lastAction = null;
@@ -1360,6 +1382,9 @@ export class Editor implements Component, Focusable {
 
 	private submitValue(): void {
 		this.cancelAutocomplete();
+		// Captured before the draft is cleared: onSubmit reads it (smarty-dev#2636).
+		this.submitTainted = this.draftTainted;
+		this.draftTainted = false;
 		const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
 
 		this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
@@ -1994,6 +2019,7 @@ export class Editor implements Component, Focusable {
 	 */
 	private yank(): void {
 		if (this.killRing.length === 0) return;
+		this.draftTainted = true;
 
 		this.pushUndoSnapshot();
 
@@ -2010,6 +2036,7 @@ export class Editor implements Component, Focusable {
 	private yankPop(): void {
 		// Only works if we just yanked and have more than one entry
 		if (this.lastAction !== "yank" || this.killRing.length <= 1) return;
+		this.draftTainted = true;
 
 		this.pushUndoSnapshot();
 
@@ -2118,6 +2145,7 @@ export class Editor implements Component, Focusable {
 		this.exitHistoryBrowsing();
 		const snapshot = this.undoStack.pop();
 		if (!snapshot) return;
+		this.draftTainted = true;
 		Object.assign(this.state, snapshot.state);
 		this.pastes = snapshot.pastes;
 		this.pasteCounter = snapshot.pasteCounter;
@@ -2240,6 +2268,7 @@ export class Editor implements Component, Focusable {
 			if (!this.autocompleteProvider) return;
 			this.pushUndoSnapshot();
 			this.lastAction = null;
+			this.draftTainted = true;
 			const result = this.autocompleteProvider.applyCompletion(
 				this.state.lines,
 				this.state.cursorLine,
@@ -2391,6 +2420,7 @@ export class Editor implements Component, Focusable {
 			const item = suggestions.items[0]!;
 			this.pushUndoSnapshot();
 			this.lastAction = null;
+			this.draftTainted = true;
 			const result = this.autocompleteProvider.applyCompletion(
 				this.state.lines,
 				this.state.cursorLine,

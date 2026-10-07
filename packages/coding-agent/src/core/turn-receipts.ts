@@ -65,6 +65,18 @@ export function captureSiblingTerminalTurnReceipt(observed: TurnReceipt): TurnRe
 	// A sibling is a turn the hook created, not the attested keystrokes: never keyboard.
 	return issue({ v: 1, turnId: randomUUID(), receivedAt: record.receivedAt, channel: "terminal" });
 }
+/** The same submission without its attribution (hook transform, template expansion). */
+export function withoutAttribution(receipt: TurnReceipt): TurnReceipt {
+	const record = records.get(receipt);
+	if (!record || record.channel !== "keyboard") return receipt;
+	return issue({
+		v: 1,
+		turnId: record.turnId,
+		receivedAt: record.receivedAt,
+		channel: "terminal",
+		...(record.submissionToken ? { submissionToken: record.submissionToken } : {}),
+	});
+}
 export function receiptRecord(receipt?: TurnReceipt): ReceiptRecord {
 	return (receipt && records.get(receipt)) ?? records.get(captureTerminalTurnReceipt())!;
 }

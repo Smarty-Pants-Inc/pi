@@ -322,10 +322,12 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer += str;
 
 		if (this.pasteMode) {
+			// Search only where the end marker can newly appear: input may arrive one byte at a time.
+			const searchFrom = Math.max(0, this.pasteBuffer.length - BRACKETED_PASTE_END.length + 1);
 			this.pasteBuffer += this.buffer;
 			this.buffer = "";
 
-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
+			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END, searchFrom);
 			if (endIndex !== -1) {
 				const pastedContent = this.pasteBuffer.slice(0, endIndex);
 				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
