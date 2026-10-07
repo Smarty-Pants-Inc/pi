@@ -101,4 +101,59 @@ describe("edit not-found errors", () => {
 			"nearest match at line 2:",
 		);
 	});
+
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#3240: hint work is bounded for large inputs.
+	describe("large inputs", () => {
+		const skipped =
+			"nearest match search skipped: the file is too large to compare with this oldText; re-read the file and copy the exact text";
+		const content = `#!/bin/sh\n${"line of text\n".repeat(400_000)}`;
+		const missingBlock = Array.from({ length: 500 }, (_, i) => `missing block line ${i}`).join("\n");
+
+		function timeFailure(edits: { oldText: string; newText: string }[]): { message: string; ms: number } {
+			const start = performance.now();
+			let message = "";
+			try {
+				applyEditsToNormalizedContent(content, edits, "big.sh");
+			} catch (error) {
+				message = (error as Error).message;
+			}
+			return { message, ms: performance.now() - start };
+		}
+
+		it("skips the hint for a 500-line oldText against a 400,000-line file in a single edit", () => {
+			const { message, ms } = timeFailure([{ oldText: missingBlock, newText: "changed" }]);
+			expect(message).toBe(
+				`Could not find the exact text in big.sh. The old text must match exactly including all whitespace and newlines. No edits were applied.\n${skipped}`,
+			);
+			expect(ms).toBeLessThan(1000);
+			expect(findNearestLine(content, missingBlock)).toBeUndefined();
+		});
+
+		it("skips the hint for each 500-line oldText against a 400,000-line file in a batch", () => {
+			const { message, ms } = timeFailure([
+				{ oldText: "#!/bin/sh", newText: "#!/bin/bash" },
+				{ oldText: missingBlock, newText: "changed" },
+				{ oldText: `${missingBlock}\nmore`, newText: "changed" },
+			]);
+			expect(message).toBe(
+				`Could not find 2 of 3 edits in big.sh. Each oldText must match exactly including all whitespace and newlines. No edits were applied.\n- edits[1]: ${skipped}\n- edits[2]: ${skipped}`,
+			);
+			expect(ms).toBeLessThan(1000);
+		});
+
+		it("still hints a one-line oldText in a large file, but one budget covers every missing edit", () => {
+			const { message, ms } = timeFailure([
+				{ oldText: "#!/bin/sh", newText: "#!/bin/bash" },
+				{ oldText: "line of texx", newText: "a" },
+				{ oldText: "line of tezt", newText: "b" },
+			]);
+			expect(
+				message.endsWith(
+					"\n- edits[1]: nearest match at line 2:\n  2: line of text\n  3: line of text\n  4: line of text\n- edits[2]: " +
+						skipped,
+				),
+			).toBe(true);
+			expect(ms).toBeGreaterThanOrEqual(0);
+		});
+	});
 });

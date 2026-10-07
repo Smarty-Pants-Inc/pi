@@ -194,6 +194,32 @@ describe("edit/write atomic and sequential (smarty-dev#977)", () => {
 		expect(readdirSync(dir)).toEqual(["big.sh"]);
 	});
 
+	// Regression coverage for Smarty-Pants-Inc/smarty-dev#3240: a large failed edit returns promptly and changes nothing.
+	it.each([1, 2])("a failed %i-edit call with a 500-line oldText on a 400,000-line file is fast", async (count) => {
+		const file = join(dir, "big.sh");
+		const original = `#!/bin/sh\n${"line of text\n".repeat(400_000)}`;
+		writeFileSync(file, original);
+		const missing = {
+			oldText: Array.from({ length: 500 }, (_, i) => `missing block line ${i}`).join("\n"),
+			newText: "changed",
+		};
+		const edits = count === 1 ? [missing] : [{ oldText: "#!/bin/sh", newText: "#!/bin/bash" }, missing];
+		const skipped =
+			"skipped: the file is too large to compare with this oldText; re-read the file and copy the exact text";
+		let start = performance.now();
+		await expect(createEditTool(dir).execute("e", { path: file, edits })).rejects.toThrow(skipped);
+		expect(performance.now() - start).toBeLessThan(1000);
+		start = performance.now();
+		const preview =
+			count === 1
+				? await computeEditDiff(file, missing.oldText, missing.newText, dir)
+				: await computeEditsDiff(file, edits, dir);
+		expect(performance.now() - start).toBeLessThan(1000);
+		expect(preview).toEqual({ error: expect.stringContaining(skipped) });
+		expect(readFileSync(file, "utf-8")).toBe(original);
+		expect(readdirSync(dir)).toEqual(["big.sh"]);
+	});
+
 	it("write creates a new file and leaves no temp file", async () => {
 		const file = join(dir, "sub", "new.txt");
 		await createWriteTool(dir).execute("w", { path: file, content: "hello" });
