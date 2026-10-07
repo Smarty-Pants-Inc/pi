@@ -1,6 +1,7 @@
 import {
 	assistantMessageDeferredHandle,
 	isBuiltinCatalogModel,
+	isOwnedLocalErrorText,
 	type OAuthDiagnosticCode,
 	oauthDiagnosticError,
 	oauthRecoveryDecision,
@@ -107,6 +108,8 @@ const OWNED_STOP_REASONS = new Set([
 	"function_call",
 	"content_filter",
 	"network_error",
+	"error",
+	"model_length",
 	"STOP",
 	"MAX_TOKENS",
 	"SAFETY",
@@ -118,9 +121,17 @@ const OWNED_STOP_REASONS = new Set([
 	"MALFORMED_FUNCTION_CALL",
 ]);
 
+/** Pi's stop templates are owned when the stop value is a member of the closed stop list. */
+export function isOwnedStopText(text: unknown): text is string {
+	if (typeof text !== "string") return false;
+	const stop = /^(?:Provider stopped with|Provider finish_reason|Response incomplete): (\S+)$/.exec(text);
+	return stop !== null && OWNED_STOP_REASONS.has(stop[1]);
+}
+
 /** Rebuild owned text. A provider prefix or suffix never becomes authority. */
 function projectDiagnosticText(text: string, oauth: boolean): string {
 	if (Object.values(SETUP_MESSAGES).some((value) => value === text)) return text;
+	if (isOwnedLocalErrorText(text) || isOwnedStopText(text)) return text;
 	const owned =
 		/(?:^|: )((?:oauth|provider)_(?:request_failed|invalid_response|authorization_failed|stream_failed|transport_failed|retry_delay_exceeded)) \(HTTP (unknown|[1-5]\d\d)\)(?: provider_error=([a-z_]+))?$/.exec(
 			text,
@@ -143,6 +154,12 @@ function projectDiagnosticText(text: string, oauth: boolean): string {
 export const MAX_USAGE_TOKENS = 1_000_000_000;
 export const MAX_USAGE_COST = 1_000_000;
 const projectedUsageTotals = new WeakMap<object, Usage["cost"]>();
+// Pi-produced aggregates that a complete breakdown cannot reproduce, keyed by the published
+// numbers. A copy of a projected usage is then projected to the same total (identity is lost).
+const projectedAggregateKeys = new Set<string>();
+const MAX_PROJECTED_AGGREGATE_KEYS = 4096;
+const aggregateKey = (counts: readonly number[], cost: Usage["cost"]): string =>
+	[...counts, cost.input, cost.output, cost.cacheRead, cost.cacheWrite, cost.total].join("|");
 
 /** Closed accounting shape shared by provider publication and accepted tool accounting. */
 export function projectUsage(usage: Usage): Usage {
@@ -169,11 +186,27 @@ export function projectUsage(usage: Usage): Usage {
 		prior.total === usage?.cost?.total;
 	// A partial breakdown cannot reproduce the aggregate. Preserve a validated aggregate
 	// unless a component was capped; a complete breakdown still determines its own total.
+	const counts = [usage?.input, usage?.output, usage?.cacheRead, usage?.cacheWrite, usage?.totalTokens].map(count);
+	const copiedAggregate =
+		!incomplete &&
+		suppliedTotal !== componentTotal &&
+		projectedAggregateKeys.has(
+			aggregateKey(counts, { input, output, cacheRead, cacheWrite, total: usage?.cost?.total as number }),
+		);
 	const total = unchanged
 		? prior.total
-		: incomplete && !capped
-			? Math.max(componentTotal, suppliedTotal)
-			: componentTotal;
+		: copiedAggregate
+			? suppliedTotal
+			: incomplete && !capped
+				? Math.max(componentTotal, suppliedTotal)
+				: componentTotal;
+	if (total !== componentTotal) {
+		if (projectedAggregateKeys.size >= MAX_PROJECTED_AGGREGATE_KEYS) {
+			const oldest = projectedAggregateKeys.values().next().value;
+			if (oldest !== undefined) projectedAggregateKeys.delete(oldest);
+		}
+		projectedAggregateKeys.add(aggregateKey(counts, { input, output, cacheRead, cacheWrite, total }));
+	}
 	const projected: Usage = {
 		input: count(usage?.input),
 		output: count(usage?.output),
