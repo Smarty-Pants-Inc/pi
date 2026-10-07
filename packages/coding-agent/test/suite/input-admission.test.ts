@@ -1827,9 +1827,27 @@ describe("native input admission v1", () => {
 				],
 			}),
 		]);
-		expect(receiving?.isDisposed).toBe(true);
 		expect(receiving?.getFollowUpMessages()).toEqual([]);
 		expect(receiving?.messages.some((message) => message.role === "user")).toBe(false);
+	});
+
+	// pi#163 P2: a receiving fencing refusal must not leave the runtime on the disposed outgoing session.
+	it("receiving fencing refusal keeps a live current session that admits follow-up input", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		const outgoing = runtime.session;
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			await result.session.followUp("acknowledged");
+			return result;
+		});
+		await expect(runtime.newSession()).rejects.toBeInstanceOf(InputAdmissionError);
+		expect(outgoing.isDisposed).toBe(true);
+		expect(runtime.session).not.toBe(outgoing);
+		expect(runtime.session.isDisposed).toBe(false);
+		await runtime.session.followUp("after refusal");
+		expect(runtime.session.getFollowUpMessages()).toEqual(["after refusal"]);
 	});
 
 	// smarty-dev#3048, PR #110 R2-1: a BUSY refusal cannot orphan the running settlement's controller.

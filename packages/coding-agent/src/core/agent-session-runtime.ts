@@ -332,10 +332,12 @@ export class AgentSessionRuntime {
 			receiving,
 			this.terminalCancellation.signal,
 		);
+		let fencing = false;
 		try {
 			outgoing.session.shutdownSignal?.throwIfAborted();
 			this.#assertCurrent(outgoing);
 			assertUnownedSessionManager(session.sessionManager);
+			fencing = true;
 			this.releaseReceivingInputs = await session.fenceInputs();
 			this.terminalCancellation.signal.throwIfAborted();
 		} catch (error) {
@@ -345,9 +347,26 @@ export class AgentSessionRuntime {
 				await this.retireUnpublishedSession(session);
 				throw error;
 			}
-			// The outgoing session is already torn down, so no later disposal owns the refused
-			// receiving session. Retire it now and return its input with the refusal (pi#132 R4-7).
 			const recoveredInput: AgentMessage[] = [];
+			if (fencing && !this.terminalCancellation.signal.aborted) {
+				// The outgoing session is already disposed. Take the receiving session's queued input
+				// back and publish the session, so the runtime never keeps a disposed session (pi#163).
+				const release = await session
+					.fenceInputs({ rejectQueuedInput: (messages) => recoveredInput.push(...messages) })
+					.catch(() => undefined);
+				if (release) {
+					this.releaseReceivingInputs = release;
+					this.#publish(session, services, diagnostics, modelFallbackMessage);
+					await this.finishSessionReplacement();
+					if (recoveredInput.length === 0) throw error;
+					throw new InputAdmissionError(
+						"INPUT_ADMISSION_BUSY",
+						"receiving session refused its queued input; it is returned, not replayed",
+						{ cause: error, recoveredInput },
+					);
+				}
+			}
+			// No usable receiving session: retire it and return its input with the refusal (pi#132 R4-7).
 			await this.retireUnpublishedSession(session, (messages) => recoveredInput.push(...messages));
 			if (recoveredInput.length === 0) throw error;
 			throw new InputAdmissionError(
@@ -356,6 +375,15 @@ export class AgentSessionRuntime {
 				{ cause: error, recoveredInput },
 			);
 		}
+		this.#publish(session, services, diagnostics, modelFallbackMessage);
+	}
+
+	#publish(
+		session: AgentSession,
+		services: AgentSessionServices,
+		diagnostics: AgentSessionRuntimeDiagnostic[],
+		modelFallbackMessage: string | undefined,
+	): void {
 		this._session = session;
 		this._services = services;
 		this._diagnostics = diagnostics;
