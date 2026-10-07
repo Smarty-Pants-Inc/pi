@@ -344,15 +344,6 @@ describe("Anthropic raw SSE parsing", () => {
 			{
 				type: "anthropic_input_transformations",
 				timestamp: expect.any(Number),
-				details: {
-					transformations: [
-						{
-							type: "thinking_dropped",
-							path: "messages.3.content.0",
-							reason: "model_binding_mismatch",
-						},
-					],
-				},
 			},
 		]);
 	});

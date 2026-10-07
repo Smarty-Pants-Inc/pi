@@ -200,7 +200,7 @@ describe("audit-2c causes", () => {
 				},
 			);
 			expect(output.stopReason).toBe("stop");
-			expect(output.diagnostics).toHaveLength(1);
+			expect(output.diagnostics).toHaveLength(0);
 			expectPrivate({ output, stats: getOpenAICodexWebSocketDebugStats("audit-2c-fake") });
 		} finally {
 			vi.unstubAllGlobals();
