@@ -1850,6 +1850,50 @@ describe("native input admission v1", () => {
 		expect(runtime.session.getFollowUpMessages()).toEqual(["after refusal"]);
 	});
 
+	// pi#163 P2: input taken back by the recovery fence must survive a later abort or completion failure.
+	async function recoveryRefusal(runtime: AgentSessionRuntime, afterRecoveryFence?: () => void) {
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			const fenceInputs = result.session.fenceInputs.bind(result.session);
+			result.session.fenceInputs = async (fenceOptions) => {
+				const release = await fenceInputs(fenceOptions);
+				if (fenceOptions?.rejectQueuedInput) afterRecoveryFence?.();
+				return release;
+			};
+			await result.session.followUp("acknowledged");
+			return result;
+		});
+		const error = await runtime.newSession().then(
+			() => undefined,
+			(cause: unknown) => cause,
+		);
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).recoveredInput).toEqual([
+			expect.objectContaining({ role: "user", content: [{ type: "text", text: "acknowledged" }] }),
+		]);
+	}
+
+	it("terminal abort during the recovery fence still returns the captured input", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		runtime.setRebindSession(async () => {});
+		let shutdown: Promise<void> | undefined;
+		await recoveryRefusal(runtime, () => {
+			shutdown = runtime.dispose({ terminal: true, rejectQueuedInput: () => {} });
+		});
+		await shutdown;
+	});
+
+	it("a rejected replacement completion after publication still returns the captured input", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		runtime.setRebindSession(async () => {
+			throw new Error("rebind failed");
+		});
+		await recoveryRefusal(runtime);
+	});
+
 	// smarty-dev#3048, PR #110 R2-1: a BUSY refusal cannot orphan the running settlement's controller.
 	it("busy replacement still permits shutdown to cancel the original settlement", async () => {
 		const entered = gate(),

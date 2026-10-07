@@ -354,10 +354,23 @@ export class AgentSessionRuntime {
 				const release = await session
 					.fenceInputs({ rejectQueuedInput: (messages) => recoveredInput.push(...messages) })
 					.catch(() => undefined);
-				if (release) {
+				// Terminal shutdown may abort while this fence is pending. Then retire the session below
+				// instead of publishing it, so the captured input still reaches the shutdown receipt.
+				if (release && this.terminalCancellation.signal.aborted) release();
+				else if (release) {
 					this.releaseReceivingInputs = release;
 					this.#publish(session, services, diagnostics, modelFallbackMessage);
-					await this.finishSessionReplacement();
+					try {
+						await this.finishSessionReplacement();
+					} catch (finishError) {
+						// The input is already removed from the queue; a later rejection must still return it.
+						if (recoveredInput.length === 0) throw finishError;
+						throw new InputAdmissionError(
+							"INPUT_ADMISSION_BUSY",
+							"receiving session refused its queued input; it is returned, not replayed",
+							{ cause: finishError, recoveredInput },
+						);
+					}
 					if (recoveredInput.length === 0) throw error;
 					throw new InputAdmissionError(
 						"INPUT_ADMISSION_BUSY",
@@ -367,12 +380,18 @@ export class AgentSessionRuntime {
 				}
 			}
 			// No usable receiving session: retire it and return its input with the refusal (pi#132 R4-7).
-			await this.retireUnpublishedSession(session, (messages) => recoveredInput.push(...messages));
+			let cause = error;
+			try {
+				await this.retireUnpublishedSession(session, (messages) => recoveredInput.push(...messages));
+			} catch (retireError) {
+				if (recoveredInput.length === 0) throw retireError;
+				cause = retireError;
+			}
 			if (recoveredInput.length === 0) throw error;
 			throw new InputAdmissionError(
 				"INPUT_ADMISSION_BUSY",
 				"receiving session was not published; its queued input is returned, not replayed",
-				{ cause: error, recoveredInput },
+				{ cause, recoveredInput },
 			);
 		}
 		this.#publish(session, services, diagnostics, modelFallbackMessage);
