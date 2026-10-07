@@ -1,6 +1,7 @@
 import { Container } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import type { AgentSessionRuntimeDiagnostic } from "../../../src/core/agent-session-services.ts";
+import type { ReceivedInput } from "../../../src/core/received-input.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness } from "../harness.ts";
@@ -27,6 +28,7 @@ describe("issue #7829 invalid settings warning", () => {
 			const context = {
 				init: vi.fn(async () => {}),
 				options: { startupDiagnostics },
+				inputPlan: { remaining: [] },
 				chatContainer,
 				outputPad: 1,
 				ui: { requestRender: vi.fn() },
@@ -36,7 +38,7 @@ describe("issue #7829 invalid settings warning", () => {
 				checkForPackageUpdates: vi.fn().mockResolvedValue([]),
 				checkTmuxKeyboardSetup: vi.fn().mockResolvedValue(undefined),
 				maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
-				getUserInput: vi.fn(() => new Promise<string>(() => {})),
+				getReceivedUserInput: vi.fn(() => new Promise<ReceivedInput>(() => {})),
 			};
 			const run = (InteractiveMode.prototype as unknown as { run(this: typeof context): Promise<void> }).run;
 
