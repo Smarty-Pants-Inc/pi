@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, type ImageContent, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, type PromptOptions } from "../../src/core/agent-session.ts";
@@ -2094,6 +2094,7 @@ describe("native input admission v1", () => {
 		const recover = Reflect.get(InteractiveMode.prototype, "handleInputAdmissionError") as (
 			this: unknown,
 			error: unknown,
+			original?: string,
 		) => boolean;
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		let editorText = "";
@@ -2153,8 +2154,8 @@ describe("native input admission v1", () => {
 			isTerminalRuntimeCancellation(error: unknown): boolean {
 				return terminalCancellation.call(this, error);
 			},
-			handleInputAdmissionError(error: unknown): boolean {
-				return recover.call(this, error);
+			handleInputAdmissionError(error: unknown, original?: string): boolean {
+				return recover.call(this, error, original);
 			},
 			themeController: { disableAutoSync: vi.fn() },
 			ui: { requestRender: vi.fn(), terminal: { drainInput: vi.fn(async () => {}) } },
@@ -2231,6 +2232,39 @@ describe("native input admission v1", () => {
 		expect(h.session.pendingMessageCount).toBe(0);
 		expect(getUserTexts(h)).toEqual([]);
 	});
+
+	// pi#163 P2: a returned receipt replaces the submitted text in the editor, exactly once, without replay.
+	it.each(["main loop", "editor submit"] as const)(
+		"TUI %s restores the recovered input receipt once instead of the submitted text",
+		async (site) => {
+			const h = await setup();
+			const runtime = await runtimeFor(h);
+			const image: ImageContent = { type: "image", data: "returned-image", mimeType: "image/png" };
+			const recoveredInput: AgentMessage[] = [
+				{ role: "user", content: [{ type: "text", text: "returned" }, image], timestamp: Date.now() },
+			];
+			const mode = Object.assign(createMode(h, runtime), {
+				recoveryText: Reflect.get(InteractiveMode.prototype, "recoveryText"),
+				promptWithRecoveredImages: vi.fn(async () => {
+					throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "refused", { recoveredInput });
+				}),
+			});
+			if (site === "main loop") {
+				const submitUserInput = Reflect.get(InteractiveMode.prototype, "submitUserInput") as (
+					this: unknown,
+					text: string,
+				) => Promise<void>;
+				await submitUserInput.call(mode, "/replace");
+			} else {
+				await mode.submitEditorPrompt("/replace");
+			}
+			const restored = mode.editor.getText();
+			expect(restored.startsWith("returned\n[recovered image ")).toBe(true);
+			expect(restored).not.toContain("/replace");
+			expect(mode.prepareRecoveredInput.call(mode, restored).images).toEqual([image]);
+			expect(mode.promptWithRecoveredImages).toHaveBeenCalledTimes(1);
+		},
+	);
 
 	it("TUI submit after the replacement fence stays in the editor with explicit rejection", async () => {
 		const h = await setup();

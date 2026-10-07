@@ -1232,23 +1232,23 @@ export class InteractiveMode {
 		}
 
 		// Main interactive loop
-		while (true) {
-			const userInput = await this.getUserInput();
-			try {
-				const prompt = this.promptWithRecoveredImages(userInput);
-				// Original session preflight owns the input before TUI staging clears.
-				this.userInputInFlight = false;
-				this.stagingAudit?.("input-transferred");
-				await prompt;
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-				if (error instanceof InputAdmissionError) this.restoreRejectedInput(userInput);
-			} finally {
-				this.userInputInFlight = false;
-				this.stagingAudit?.("input-settled");
-				await this.checkShutdownRequested();
-			}
+		while (true) await this.submitUserInput(await this.getUserInput());
+	}
+
+	private async submitUserInput(userInput: string): Promise<void> {
+		try {
+			const prompt = this.promptWithRecoveredImages(userInput);
+			// Original session preflight owns the input before TUI staging clears.
+			this.userInputInFlight = false;
+			this.stagingAudit?.("input-transferred");
+			await prompt;
+		} catch (error: unknown) {
+			if (!this.handleInputAdmissionError(error, userInput))
+				this.showError(error instanceof Error ? error.message : "Unknown error occurred");
+		} finally {
+			this.userInputInFlight = false;
+			this.stagingAudit?.("input-settled");
+			await this.checkShutdownRequested();
 		}
 	}
 
@@ -2135,12 +2135,14 @@ export class InteractiveMode {
 		);
 	}
 
-	private handleInputAdmissionError(error: unknown): boolean {
+	/**
+	 * The one admission-recovery path: an authoritative `recoveredInput` receipt is restored exactly
+	 * once and replaces the submitted `original`, which is restored only when no receipt exists.
+	 */
+	private handleInputAdmissionError(error: unknown, original?: string): boolean {
 		if (!(error instanceof InputAdmissionError)) return false;
-		if (error.recoveredInput) {
-			const recovered = this.recoveryText(error.recoveredInput);
-			if (recovered) this.restoreRejectedInput(recovered);
-		}
+		const recovered = error.recoveredInput ? this.recoveryText(error.recoveredInput) : original;
+		if (recovered) this.restoreRejectedInput(recovered);
 		this.showError(error.message);
 		return true;
 	}
@@ -4611,8 +4613,7 @@ export class InteractiveMode {
 		try {
 			await this.promptWithRecoveredImages(text, { streamingBehavior });
 		} catch (error) {
-			if (!this.handleInputAdmissionError(error)) throw error;
-			this.restoreRejectedInput(text);
+			if (!this.handleInputAdmissionError(error, text)) throw error;
 		} finally {
 			await this.checkShutdownRequested();
 		}
