@@ -31,6 +31,8 @@ import type { VirtualModelDefinition } from "../virtual-models.ts";
 import { boundaryReceiptSlots, receiveBoundaryEntries } from "./boundary-receipts.ts";
 import type {
 	AgentBeforeSettleEvent,
+	BashSpawnEvent,
+	BashSpawnEventResult,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderHeadersEvent,
@@ -182,6 +184,7 @@ interface BeforeAgentStartCombinedResult {
 type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
 	| ToolCallEvent
+	| BashSpawnEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
 	| UserBashEvent
@@ -956,6 +959,11 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSignalFn();
 			},
+			get emitBashSpawn() {
+				runner.assertActive();
+				if (!runner.hasHandlers("bash_spawn")) return undefined;
+				return (event: BashSpawnEvent, signal?: AbortSignal) => runner.emitBashSpawn(event, signal);
+			},
 			abort: () => {
 				runner.assertActive();
 				runner.abortFn();
@@ -1478,6 +1486,37 @@ export class ExtensionRunner {
 		}
 
 		return result;
+	}
+
+	async emitBashSpawn(event: BashSpawnEvent, signal?: AbortSignal): Promise<BashSpawnEventResult | undefined> {
+		this.assertActive();
+		signal = this.dispatchSignal(event.type, signal);
+		signal?.throwIfAborted();
+		const ctx = this.createContext();
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "bash_spawn")) {
+			for (const handler of handlers) {
+				try {
+					// Attestation cannot rewrite the executor or another handler's view.
+					const result = (await this.dispatchHandler(handler, structuredClone(event), ctx, signal)) as
+						| BashSpawnEventResult
+						| undefined;
+					if (result?.block) return { block: true, reason: result.reason ?? "Bash spawn blocked" };
+				} catch (err) {
+					signal?.throwIfAborted();
+					const message = err instanceof Error ? err.message : String(err);
+					this.emitError({
+						extensionPath: ext.path,
+						event: "bash_spawn",
+						error: message,
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+					return { block: true, reason: `bash_spawn handler failed: ${message}` };
+				}
+			}
+		}
+
+		return undefined;
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
