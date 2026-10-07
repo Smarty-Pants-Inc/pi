@@ -14,6 +14,7 @@ import {
 	oauthDiagnosticError,
 	oauthRecoveryDecision,
 	oauthResponseError,
+	safeOAuthError,
 } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantMessage,
@@ -288,7 +289,11 @@ function createErrorEvent(
 		stopReason: reason,
 		oauthRecovery: callbackError
 			? oauthRecoveryDecision(oauthDiagnosticError("oauth_request_failed", undefined, undefined, undefined, false))
-			: normalized.oauthRecovery,
+			: oauthDiagnostics
+				? // Base (98c6f900) OAuth retry contract: only owned HTTP decisions carry recovery; transport
+					// and early-EOF failures stay unclassified (Radius scope cut, smarty-dev#4790).
+					oauthRecoveryDecision(safeOAuthError(diagnosticError))
+				: normalized.oauthRecovery,
 		errorMessage: normalized.message,
 		timestamp: Date.now(),
 	};
