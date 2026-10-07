@@ -328,6 +328,44 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionName"
 >;
 
+const READONLY_SESSION_METHODS = [
+	"getCwd",
+	"getSessionDir",
+	"getSessionId",
+	"getSessionFile",
+	"getLeafId",
+	"getLeafEntry",
+	"getEntry",
+	"getLabel",
+	"getBranch",
+	"buildContextEntries",
+	"buildSessionProjection",
+	"getHeader",
+	"getEntries",
+	"getTree",
+	"getSessionName",
+] as const satisfies readonly (keyof ReadonlySessionManager)[];
+const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
+
+/**
+ * Extension-facing history reads return deep-detached values, so a retained entry edited
+ * later cannot change native history, projection, revision or journal bytes (pi#132 R4-3).
+ */
+export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySessionManager {
+	let view = detachedSessionViews.get(manager);
+	if (!view) {
+		const methods: Record<string, unknown> = {};
+		for (const name of READONLY_SESSION_METHODS) {
+			const method = manager[name] as (...args: unknown[]) => unknown;
+			if (typeof method === "function")
+				methods[name] = (...args: unknown[]) => structuredClone(method.apply(manager, args));
+		}
+		view = Object.freeze(methods) as unknown as ReadonlySessionManager;
+		detachedSessionViews.set(manager, view);
+	}
+	return view;
+}
+
 function createSessionId(): string {
 	return uuidv7();
 }
