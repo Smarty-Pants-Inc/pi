@@ -114,6 +114,10 @@ export function createLocalShellOperations(
 			} catch {
 				throw new Error(`Working directory does not exist: ${cwd}\nCannot execute ${shellName} commands.`);
 			}
+			// Revocation during the asynchronous cwd check must not still spawn.
+			if (signal?.aborted) {
+				throw new Error("aborted");
+			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
 			const shellPath = shellConfig.shell;

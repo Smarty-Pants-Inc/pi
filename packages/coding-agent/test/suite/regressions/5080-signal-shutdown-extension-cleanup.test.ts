@@ -18,8 +18,17 @@ import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode
 
 type ShutdownThis = {
 	isShuttingDown: boolean;
+	terminalShutdownRequested: boolean;
+	pendingUserInputs: string[];
+	compactionQueuedMessages: { text: string }[];
+	compactionQueueWork: Set<Promise<void>>;
+	cancelUIHolds: () => void;
+	disposeActiveSelector: () => void;
+	editor: { getText: () => string };
+	recoveredImages: Map<string, never>;
 	unregisterSignalHandlers: () => void;
-	runtimeHost: { dispose: () => Promise<void> };
+	runtimeHost: { dispose: (options?: { beforeShutdown?: () => Promise<void> }) => Promise<void> };
+	handleInputAdmissionError: (error: unknown) => boolean;
 	ui: { terminal: { drainInput: (ms: number) => Promise<void> } };
 	themeController: { disableAutoSync: () => void };
 	stop: () => void;
@@ -75,9 +84,20 @@ function restoreStdoutIsTTY(): void {
 function createContext(order: string[], sessionManager = createSessionManager()): ShutdownThis {
 	return {
 		isShuttingDown: false,
+		terminalShutdownRequested: false,
+		pendingUserInputs: [],
+		compactionQueuedMessages: [],
+		compactionQueueWork: new Set<Promise<void>>(),
+		cancelUIHolds: vi.fn(),
+		disposeActiveSelector: vi.fn(),
+		editor: { getText: () => "" },
+		recoveredImages: new Map<string, never>(),
+		handleInputAdmissionError: () => false,
 		unregisterSignalHandlers: vi.fn(),
 		runtimeHost: {
-			dispose: vi.fn(async () => {
+			dispose: vi.fn(async (options) => {
+				// smarty-dev#3048: runtime fences before invoking terminal teardown.
+				await options?.beforeShutdown?.();
 				order.push("dispose");
 			}),
 		},
@@ -182,6 +202,7 @@ describe("InteractiveMode.shutdown ordering (#5080)", () => {
 		const order: string[] = [];
 		const context = createContext(order);
 		context.isShuttingDown = true;
+		context.terminalShutdownRequested = true;
 
 		await callShutdown(context, { fromSignal: true });
 

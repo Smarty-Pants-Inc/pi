@@ -56,6 +56,7 @@ async function withRpc(test: (fixture: RpcFixture) => Promise<void>): Promise<vo
 	const runtime = {
 		session: harness.session,
 		setRebindSession: () => {},
+		setLifecycleCompleteHandler: () => {},
 		dispose,
 	} as unknown as AgentSessionRuntime;
 	let runError: unknown;
