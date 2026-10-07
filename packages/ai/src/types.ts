@@ -763,8 +763,10 @@ export type TranscriptContext = {
  * Direct `streamSimple()` calls throw synchronously when request auth is missing.
  * Updates and `done` must never appear before `start`.
  *
- * `partial` is the shared live response-so-far helper, not an event-time
- * snapshot. Text and thinking blocks are empty when their `*_start` event is
+ * `partial` (and `message`/`error`/`toolCall`) is a detached snapshot taken when
+ * the event is pushed: later provider writes do not change it, and consumer
+ * writes do not reach the provider, later events or `result()`. Content blocks
+ * carry only their declared fields. Text and thinking blocks are empty when their `*_start` event is
  * emitted and grow only through their corresponding `*_delta` events until the
  * authoritative `*_end`. Redacted thinking may be complete at start and emit no
  * deltas. Tool-call arguments at `toolcall_start` are provider-specific;
