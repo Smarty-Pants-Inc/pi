@@ -13,6 +13,8 @@
 // Anthropic / `@google/genai` happy path where the SDK already folded the body
 // into the message, so providers can preserve it without double-printing.
 
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
 export interface NormalizedProviderError {
@@ -35,20 +37,21 @@ type SdkErrorShape = Error & {
 	$response?: { statusCode?: unknown; body?: unknown };
 };
 
-export function normalizeProviderError(error: unknown): NormalizedProviderError {
+export function normalizeProviderError(error: unknown, secrets: readonly string[] = []): NormalizedProviderError {
 	if (!(error instanceof Error)) {
-		return { message: safeJsonStringify(error), messageCarriesBody: false };
+		return { message: redactOAuthDiagnostic(safeJsonStringify(error), secrets), messageCarriesBody: false };
 	}
 
 	const sdkError = error as SdkErrorShape;
 	const status = extractStatus(sdkError);
-	const body = extractBody(sdkError);
-	const messageCarriesBody = body === undefined || error.message.includes(body);
+	const body = extractBody(sdkError, secrets);
+	const message = redactOAuthDiagnostic(error.message, secrets);
+	const messageCarriesBody = body === undefined || message.includes(body);
 
 	return {
 		status,
 		body,
-		message: error.message,
+		message,
 		messageCarriesBody,
 	} satisfies NormalizedProviderError;
 }
@@ -73,10 +76,10 @@ function extractStatus(error: SdkErrorShape): number | undefined {
  * streams are treated as no body so they do not surface as `"{}"` or serialized
  * stream internals. The chosen body is truncated to the cap.
  */
-function extractBody(error: SdkErrorShape): string | undefined {
+function extractBody(error: SdkErrorShape, secrets: readonly string[]): string | undefined {
 	const bodyText = pickBodyText(error);
 	if (bodyText === undefined) return undefined;
-	const trimmed = bodyText.trim();
+	const trimmed = redactOAuthDiagnostic(bodyText, secrets).trim();
 	if (trimmed.length === 0) return undefined;
 	return truncateErrorText(trimmed, MAX_PROVIDER_ERROR_BODY_CHARS);
 }

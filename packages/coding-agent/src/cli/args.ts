@@ -26,6 +26,7 @@ export interface Args {
 	name?: string;
 	noSession?: boolean;
 	noAutoCompaction?: boolean;
+	maxProviderRequests?: number;
 	session?: string;
 	sessionId?: string;
 	fork?: string;
@@ -39,6 +40,7 @@ export interface Args {
 	noBuiltinTools?: boolean;
 	extensions?: string[];
 	noExtensions?: boolean;
+	noMcp?: boolean;
 	print?: boolean;
 	export?: string;
 	noSkills?: boolean;
@@ -132,6 +134,19 @@ export function parseArgs(args: string[]): Args {
 			} else {
 				result.diagnostics.push({ type: "error", message: "--name requires a value" });
 			}
+		} else if (arg === "--max-provider-requests" || arg.startsWith("--max-provider-requests=")) {
+			const value = arg === "--max-provider-requests" ? args[i + 1] : arg.slice("--max-provider-requests=".length);
+			if (arg === "--max-provider-requests" && value !== undefined && !value.startsWith("-")) i++;
+			if (value === undefined || !/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value))) {
+				result.diagnostics.push({
+					type: "error",
+					message: "--max-provider-requests requires a positive safe integer",
+				});
+			} else if (result.maxProviderRequests !== undefined) {
+				result.diagnostics.push({ type: "error", message: "--max-provider-requests must be supplied once" });
+			} else {
+				result.maxProviderRequests = Number(value);
+			}
 		} else if (arg === "--no-auto-compaction") {
 			result.noAutoCompaction = true;
 		} else if (arg === "--no-session") {
@@ -171,7 +186,10 @@ export function parseArgs(args: string[]): Args {
 				message: "Use --owner-host-profile followed by a separate absolute path argument",
 			});
 		} else if (arg === "--models" && i + 1 < args.length) {
-			result.models = args[++i].split(",").map((s) => s.trim());
+			result.models = args[++i]
+				.split(",")
+				.map((s) => s.trim())
+				.filter((pattern) => pattern.length > 0);
 		} else if (arg === "--no-tools" || arg === "-nt") {
 			result.noTools = true;
 		} else if (arg === "--no-builtin-tools" || arg === "-nbt") {
@@ -210,6 +228,8 @@ export function parseArgs(args: string[]): Args {
 			result.extensions.push(args[++i]);
 		} else if (arg === "--no-extensions" || arg === "-ne") {
 			result.noExtensions = true;
+		} else if (arg === "--no-mcp") {
+			result.noMcp = true;
 		} else if (arg === "--skill" && i + 1 < args.length) {
 			result.skills = result.skills ?? [];
 			result.skills.push(args[++i]);
@@ -314,10 +334,11 @@ ${chalk.bold("Commands:")}
   ${APP_NAME} list                      List installed extensions from settings
   ${APP_NAME} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
   ${APP_NAME} auth <command>            Print credentials or check provider readiness
-  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
+  ${APP_NAME} mcp <command>             Check MCP servers, sign in to or out of OAuth servers
+  ${APP_NAME} <command> --help          Show help for install/remove/uninstall/update/list/config/auth/mcp
 
 ${chalk.bold("Options:")}
-  --provider <name>              Provider name (default: google)
+  --provider <name>              Provider to search for --model (requires --model)
   --model <pattern>              Model pattern or ID (supports "provider/id" and optional ":<thinking>")
   --api-key <key>                API key (defaults to env vars)
   --system-prompt <text>         System prompt (default: coding assistant prompt)
@@ -333,18 +354,20 @@ ${chalk.bold("Options:")}
   --owner-host-profile <path>    Explicit qualified Linux owner profile (absolute path; off by default)
   --no-session                   Don't save session (ephemeral)
   --no-auto-compaction           Disable automatic compaction for this run without saving settings
+  --max-provider-requests <N>     Cap all physical provider requests in print/JSON mode (default: unlimited)
   --name, -n <name>              Set session display name
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling
                                  Supports globs (anthropic/*, *sonnet*) and fuzzy matching
   --no-tools, -nt                Disable all tools by default (built-in and extension)
   --no-builtin-tools, -nbt       Disable built-in tools by default but keep extension/custom tools enabled
-  --tools, -t <tools>            Comma-separated allowlist of tool names to enable
-                                 Applies to built-in, extension, and custom tools
-  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
-                                 Applies to built-in, extension, and custom tools
+  --tools, -t <tools>            Comma-separated allowlist of tool names or patterns (*) to enable
+                                 Keeps MCP tools unless an entry starts with mcp__
+  --exclude-tools, -xt <tools>   Comma-separated denylist of tool names or patterns (*) to disable
+                                 Applies to all tools, MCP tools included
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
-  --extension, -e <path>         Load an extension file (can be used multiple times)
-  --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
+  --extension, -e <path>         Load an extension file or builtin:<name> (can be used multiple times)
+  --no-extensions, -ne           Disable extension discovery and built-in extensions (explicit -e paths still work)
+  --no-mcp                       Disable built-in MCP support: no servers connect and no MCP tools
   --skill <path>                 Load a skill file or directory (can be used multiple times)
   --no-skills, -ns               Disable skills discovery and loading
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
@@ -356,7 +379,7 @@ ${chalk.bold("Options:")}
   --export <file>                Export session file to HTML and exit
   --list-models [search]         List available models (with optional fuzzy search)
   --verbose                      Force verbose startup (overrides quietStartup setting)
-  --tui-mode <mode>              TUI mode: regular (default) or fullscreen
+  --tui-mode <mode>              TUI mode: fullscreen (default) or regular
   --approve, -a                  Trust project-local files for this run
   --no-approve, -na              Ignore project-local files for this run
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
@@ -420,6 +443,9 @@ ${chalk.bold("Examples:")}
 
   # Read-only mode (no file modifications possible)
   ${APP_NAME} --tools read,grep,find,ls -p "Review the code in src/"
+
+  # Codemode with only the tools of one MCP server
+  ${APP_NAME} --tools read,bash,codemode,'mcp__radius__*'
 
   # Disable one tool while keeping the rest available
   ${APP_NAME} --exclude-tools ask_question

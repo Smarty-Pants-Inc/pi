@@ -12,7 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
-import type { AgentSession } from "../../core/agent-session.ts";
+import type { AgentSession, PromptDisposition } from "../../core/agent-session.ts";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -27,6 +27,13 @@ import {
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
 } from "../../core/output-guard.ts";
+import {
+	followUpReceived,
+	promptReceived,
+	type ReceivedInput,
+	receiveInput,
+	steerReceived,
+} from "../../core/received-input.ts";
 import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
@@ -543,6 +550,9 @@ export async function runRpcMode(
 		}
 	};
 
+	// Parsed frames are distinct occurrences, regardless of caller IDs or claims.
+	const receivedCommands = new WeakMap<RpcCommand, ReceivedInput>();
+
 	// Handle a single command
 	const handleCommand = async (
 		command: RpcCommand,
@@ -550,6 +560,8 @@ export async function runRpcMode(
 		respond: (response: RpcResponse) => void,
 	): Promise<RpcResponse | undefined> => {
 		const id = command.id;
+		const input = receivedCommands.get(command);
+		receivedCommands.delete(command);
 		const assertCommandSession = () => {
 			transportCancellation.signal.throwIfAborted();
 			if (runtimeHost.session !== session) {
@@ -572,27 +584,31 @@ export async function runRpcMode(
 			case "prompt": {
 				// Start prompt handling immediately, but emit the authoritative response only after
 				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
-				await session.prompt(command.message, {
+				const promptOptions = {
 					images: command.images,
 					streamingBehavior: command.streamingBehavior,
-					source: "rpc",
-					preflightResult: (didSucceed, disposition) => {
-						// The disposition tells clients whether agent_settled is owed (#132 R5-S3).
-						if (didSucceed && !transportCancellation.signal.aborted)
-							respond(success(id, "prompt", disposition ? { disposition } : undefined));
+					source: "rpc" as const,
+					preflightResult: (disposition: PromptDisposition) => {
+						if (!transportCancellation.signal.aborted) respond(success(id, "prompt", { disposition }));
 					},
-				});
+				};
+				if (input) await promptReceived(session, input, promptOptions);
+				else await session.prompt(command.message, promptOptions);
 				return undefined;
 			}
 
 			case "steer": {
-				await session.steer(command.message, command.images, { source: "rpc" });
-				return success(id, "steer");
+				const disposition = input
+					? await steerReceived(session, input, "rpc")
+					: await session.steer(command.message, command.images, { source: "rpc" });
+				return success(id, "steer", { disposition });
 			}
 
 			case "follow_up": {
-				await session.followUp(command.message, command.images, { source: "rpc" });
-				return success(id, "follow_up");
+				const disposition = input
+					? await followUpReceived(session, input, "rpc")
+					: await session.followUp(command.message, command.images, { source: "rpc" });
+				return success(id, "follow_up", { disposition });
 			}
 
 			case "abort": {
@@ -1373,6 +1389,14 @@ export async function runRpcMode(
 				),
 			);
 			return;
+		}
+		if (
+			command &&
+			typeof command === "object" &&
+			(command.type === "prompt" || command.type === "steer" || command.type === "follow_up") &&
+			typeof command.message === "string"
+		) {
+			receivedCommands.set(command, receiveInput(command.message, command.images));
 		}
 
 		// Once bound, incoming commands may unblock pending startup work.

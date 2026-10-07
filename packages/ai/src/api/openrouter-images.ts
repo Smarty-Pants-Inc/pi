@@ -6,6 +6,11 @@ import type {
 	ChatCompletionContentPartText,
 	ChatCompletionCreateParamsNonStreaming,
 } from "openai/resources/chat/completions.js";
+import {
+	createRedactingSdkLogger,
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+} from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantImages,
 	ImageApi,
@@ -58,7 +63,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		if (!apiKey) {
 			throw new Error(`No API key for provider: ${model.provider}`);
 		}
-		const client = createClient(model, apiKey, options?.headers, options?.fetch);
+		const client = createClient(model, apiKey, options?.headers, options?.fetch, options?.diagnosticSecrets);
 		let params = buildParams(model, context);
 		const nextParams = await options?.onPayload?.(params, model);
 		if (nextParams !== undefined) {
@@ -77,6 +82,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 			{
 				maxRetries: options?.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs,
+				beforeProviderRequest: options?.beforeProviderRequest,
 				signal: options?.signal,
 			},
 		);
@@ -111,7 +117,9 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		return output;
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-		output.errorMessage = formatProviderError(normalizeProviderError(error));
+		output.errorMessage = formatProviderError(
+			normalizeProviderError(error, getRequestDiagnosticSecrets(model, options)),
+		);
 		return output;
 	}
 };
@@ -121,13 +129,16 @@ function createClient(
 	apiKey: string,
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
+	diagnosticSecrets?: readonly string[],
 ): OpenAI {
+	const headers = providerHeadersToRecord({ ...model.headers, ...optionsHeaders });
 	return new OpenAI({
 		apiKey,
+		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets)),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,
-		defaultHeaders: providerHeadersToRecord({ ...model.headers, ...optionsHeaders }),
+		defaultHeaders: headers,
 	});
 }
 

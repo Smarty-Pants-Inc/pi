@@ -1,0 +1,5 @@
+# Approved GitHub-hosted runner exceptions (smarty-dev#1246); scripts/ci/no-hosted-runners.sh refuses all others.
+# Format: <workflow file> <job id> <hosted runner label> <approval comment URL>
+build-binaries.yml smoke-test-binaries macos-latest https://github.com/Smarty-Pants-Inc/pi/pull/111#issuecomment-5959700156
+build-binaries.yml smoke-test-binaries windows-latest https://github.com/Smarty-Pants-Inc/pi/pull/111#issuecomment-5959700156
+build-binaries.yml publish-npm ubuntu-latest https://github.com/Smarty-Pants-Inc/pi/pull/111#issuecomment-5960968144
