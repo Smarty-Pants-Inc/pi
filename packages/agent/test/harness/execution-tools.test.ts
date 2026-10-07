@@ -84,8 +84,51 @@ describe("tool execution primitives", () => {
 		expect(providerCall.arguments).toEqual({ legacy: "prepared" });
 	});
 
-	it("returns immediate errors for unknown tools, preparation throws, and invalid arguments", () => {
-		const unknown = prepareToolCall(call(), []);
+	// smarty-dev#3240: the durable receiver must use the loop's sorted, deduplicated, capped diagnostic.
+	it.each([
+		{
+			label: "empty loadout",
+			names: [],
+			expected: "Tool missing not found. No tools are available in this session.",
+		},
+		{
+			label: "unsorted duplicate names",
+			names: ["write", "read", "bash", "read"],
+			expected: "Tool missing not found. Available tools in this session: bash, read, write",
+		},
+		{
+			label: "exactly 40 distinct names",
+			names: Array.from({ length: 40 }, (_, i) => `t${String(39 - i).padStart(2, "0")}`),
+			expected: `Tool missing not found. Available tools in this session: ${Array.from({ length: 40 }, (_, i) => `t${String(i).padStart(2, "0")}`).join(", ")}`,
+		},
+		{
+			label: "more than 40 distinct names with duplicates",
+			names: ["t00", ...Array.from({ length: 45 }, (_, i) => `t${String(44 - i).padStart(2, "0")}`), "t44"],
+			expected: `Tool missing not found. Available tools in this session: ${Array.from({ length: 40 }, (_, i) => `t${String(i).padStart(2, "0")}`).join(", ")}, ... (5 more)`,
+		},
+	])("reports available tools for $label without executing a tool", ({ names, expected }) => {
+		const execute = vi.fn(tool().execute);
+		const tools = names.map((name) => tool({ name, execute }));
+		const providerCall = { ...call(), name: "missing" };
+		const outcome = prepareToolCall(providerCall, tools);
+
+		if (!isImmediate(outcome)) throw new Error("expected immediate unknown-tool error");
+		expect(outcome).toMatchObject({ kind: "immediate", isError: true, terminate: false });
+		expect(outcome.toolCall).toBe(providerCall);
+		expect(text(outcome.result)).toBe(expected);
+		expect(outcome.result.details).toBeUndefined();
+		expect(createToolResultMessage(outcome)).toMatchObject({
+			role: "toolResult",
+			toolCallId: providerCall.id,
+			toolName: "missing",
+			content: [{ type: "text", text: expected }],
+			isError: true,
+		});
+		expect(tools.map((candidate) => candidate.name)).toEqual(names);
+		expect(execute).not.toHaveBeenCalled();
+	});
+
+	it("returns immediate errors for preparation throws and invalid arguments", () => {
 		const preparationFailure = prepareToolCall(call(), [
 			tool({
 				prepareArguments() {
@@ -95,8 +138,6 @@ describe("tool execution primitives", () => {
 		]);
 		const invalid = prepareToolCall(call({}), [tool()]);
 
-		expect(isImmediate(unknown) ? text(unknown.result) : "").toBe('Tool "echo" is unavailable');
-		expect(isImmediate(unknown) ? unknown.result.details : null).toBeUndefined();
 		expect(isImmediate(preparationFailure) ? text(preparationFailure.result) : "").toBe("cannot prepare");
 		expect(isImmediate(invalid) ? text(invalid.result) : "").toContain('Validation failed for tool "echo"');
 	});

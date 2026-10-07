@@ -250,14 +250,21 @@ function countOccurrences(content: string, oldText: string): number {
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
+function getNotFoundError(
+	path: string,
+	editIndex: number,
+	totalEdits: number,
+	content: string,
+	oldText: string,
+): Error {
+	const hint = getNearestMatchHint(createNearestMatchScan(content), oldText);
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
+			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines. No edits were applied.\n${hint}`,
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
+		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines. No edits were applied.\n- edits[${editIndex}]: ${hint}`,
 	);
 }
 
@@ -267,37 +274,97 @@ function bigrams(text: string): Set<string> {
 	return set;
 }
 
-/** Nearest line to the first non-blank line of oldText (Dice similarity on character bigrams). */
-export function findNearestLine(content: string, oldText: string): { line: number; excerpt: string } | undefined {
-	const needle = oldText
-		.split("\n")
-		.find((line) => line.trim().length > 0)
-		?.trim();
+/**
+ * Work units (bigram lookups plus line-pair visits) one failed edit call may spend on nearest-match hints.
+ * A 500-line oldText against a 400,000-line file would otherwise cost about 200 million line comparisons
+ * and block the event loop; past this budget the hint is skipped instead (smarty-dev#3240).
+ */
+const NEAREST_MATCH_WORK_BUDGET = 8_000_000;
+const NEAREST_MATCH_SKIPPED_HINT =
+	"nearest match search skipped: the file is too large to compare with this oldText; re-read the file and copy the exact text";
+
+/** File lines shared by all nearest-match searches of one failed edit call, with the remaining work budget. */
+interface NearestMatchScan {
+	lines: string[];
+	trimmed: string[];
+	/** Bigrams of each trimmed line, computed once and only after a search fits the budget. */
+	grams: Set<string>[] | undefined;
+	gramCount: number;
+	remaining: number;
+}
+
+function createNearestMatchScan(content: string): NearestMatchScan {
+	const lines = normalizeToLF(content).split("\n");
+	const trimmed = lines.map((line) => line.trim());
+	let gramCount = 0;
+	for (const line of trimmed) if (line.length > 1) gramCount += line.length - 1;
+	return { lines, trimmed, grams: undefined, gramCount, remaining: NEAREST_MATCH_WORK_BUDGET };
+}
+
+type NearestLine = { line: number; excerpt: string };
+
+function searchNearestLine(scan: NearestMatchScan, oldText: string): NearestLine | undefined | "skipped" {
+	const needle = normalizeToLF(oldText).trim();
 	if (!needle) return undefined;
-	const needleGrams = bigrams(needle);
-	let best: { line: number; excerpt: string; score: number } | undefined;
-	content.split("\n").forEach((text, index) => {
-		const trimmed = text.trim();
-		if (!trimmed) return;
-		const grams = bigrams(trimmed);
-		let shared = 0;
-		for (const gram of grams) if (needleGrams.has(gram)) shared++;
-		const score = (2 * shared) / (grams.size + needleGrams.size || 1);
-		if (!best || score > best.score) best = { line: index + 1, excerpt: trimmed, score };
+	const needleGrams = needle.split("\n").map((line) => bigrams(line.trim()));
+	const scoredLines = needleGrams.filter((grams) => grams.size > 0).length;
+	if (scoredLines === 0) return undefined;
+	// Upper bound of the loop below: every scored oldText line meets every file bigram once, plus the line-pair visits.
+	const work = scoredLines * scan.gramCount + needleGrams.length * scan.lines.length;
+	if (work > scan.remaining) return "skipped";
+	scan.remaining -= work;
+	scan.grams ??= scan.trimmed.map((line) => bigrams(line));
+	const lineGrams = scan.grams;
+	let bestIndex = -1;
+	let bestScore = 0;
+	for (let index = 0; index < lineGrams.length; index++) {
+		let score = 0;
+		for (let offset = 0; offset < needleGrams.length && index + offset < lineGrams.length; offset++) {
+			const expected = needleGrams[offset];
+			// Blank lines supply no similarity evidence (smarty-dev#3240).
+			if (expected.size === 0) continue;
+			const grams = lineGrams[index + offset];
+			let shared = 0;
+			for (const gram of grams) if (expected.has(gram)) shared++;
+			score += (2 * shared) / (grams.size + expected.size);
+		}
+		if (score > bestScore) {
+			bestIndex = index;
+			bestScore = score;
+		}
+	}
+	if (bestIndex === -1) return undefined;
+	const text = scan.trimmed[bestIndex];
+	const excerpt = text.length > 80 ? `${text.slice(0, 77)}...` : text;
+	return { line: bestIndex + 1, excerpt };
+}
+
+/**
+ * Start of the nearest block, scored using Dice similarity on corresponding lines' character bigrams.
+ * Returns undefined when nothing is similar or the search would exceed the work budget.
+ */
+export function findNearestLine(content: string, oldText: string): NearestLine | undefined {
+	const nearest = searchNearestLine(createNearestMatchScan(content), oldText);
+	return nearest === "skipped" ? undefined : nearest;
+}
+
+function getNearestMatchHint(scan: NearestMatchScan, oldText: string): string {
+	const nearest = searchNearestLine(scan, oldText);
+	if (nearest === "skipped") return NEAREST_MATCH_SKIPPED_HINT;
+	if (!nearest) return "no similar line";
+	const { lines } = scan;
+	const end = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
+	const snippet = lines.slice(nearest.line - 1, Math.min(nearest.line + 2, end)).map((text, index) => {
+		const excerpt = text.length > 80 ? `${text.slice(0, 77)}...` : text;
+		return `  ${nearest.line + index}: ${excerpt}`;
 	});
-	if (!best || best.score === 0) return undefined;
-	const excerpt = best.excerpt.length > 80 ? `${best.excerpt.slice(0, 77)}...` : best.excerpt;
-	return { line: best.line, excerpt };
+	return `nearest match at line ${nearest.line}:\n${snippet.join("\n")}`;
 }
 
 function getAllNotFoundError(path: string, content: string, edits: Edit[], missing: number[]): Error {
-	const lines = missing.map((i) => {
-		const nearest = findNearestLine(content, edits[i].oldText);
-		const hint = nearest
-			? `nearest match at line ${nearest.line}: ${JSON.stringify(nearest.excerpt)}`
-			: "no similar line";
-		return `- edits[${i}]: ${hint}`;
-	});
+	// One scan and one budget for every missing edit, so many large missing edits cannot multiply the work.
+	const scan = createNearestMatchScan(content);
+	const lines = missing.map((i) => `- edits[${i}]: ${getNearestMatchHint(scan, edits[i].oldText)}`);
 	return new Error(
 		`Could not find ${missing.length} of ${edits.length} edits in ${path}. Each oldText must match exactly including all whitespace and newlines. No edits were applied.\n${lines.join("\n")}`,
 	);
@@ -359,7 +426,7 @@ export function applyEditsToNormalizedContent(
 	const usedFuzzyMatch = initialMatches.some((match) => match.usedFuzzyMatch);
 	const replacementBaseContent = usedFuzzyMatch ? normalizeForFuzzyMatch(normalizedContent) : normalizedContent;
 
-	// Report every non-matching edit at once, each with its nearest line (smarty-dev#1528 K13).
+	// Report every non-matching edit at once, each with its nearest snippet (smarty-dev#1528 K13, #3240).
 	const missing = initialMatches.flatMap((match, i) => (match.found ? [] : [i]));
 	if (missing.length > 0 && normalizedEdits.length > 1) {
 		throw getAllNotFoundError(path, normalizedContent, normalizedEdits, missing);
@@ -370,7 +437,7 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(replacementBaseContent, edit.oldText);
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length);
+			throw getNotFoundError(path, i, normalizedEdits.length, normalizedContent, edit.oldText);
 		}
 
 		const occurrences = countOccurrences(replacementBaseContent, edit.oldText);
