@@ -371,6 +371,8 @@ export interface ExtensionContext {
 	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
 	signal: AbortSignal | undefined;
+	/** @internal Host callback used by the built-in bash tool immediately before execution. */
+	emitBashSpawn?: (event: BashSpawnEvent, signal?: AbortSignal) => Promise<BashSpawnEventResult | undefined>;
 	/** Abort the current agent operation */
 	abort(): void;
 	/** Whether there are queued messages waiting */
@@ -1178,6 +1180,28 @@ export type InputEventResult =
 // Tool Events
 // ============================================================================
 
+/** Read-only attestation of built-in bash execution; handlers receive detached snapshots. */
+export interface BashSpawnEvent {
+	type: "bash_spawn";
+	toolCallId: string;
+	/** The command after all Pi transformations, exactly as passed to the executor. */
+	command: string;
+	/** The resolved local shell path, or undefined for custom backends. */
+	shellPath?: string;
+	/** The resolved local shell arguments, or undefined for custom backends. */
+	shellArgs?: string[];
+	cwd: string;
+	/** A snapshot of the environment passed to the executor. May contain secrets. */
+	env: Readonly<Record<string, string | undefined>>;
+	backend: "local-builtin" | "custom";
+}
+
+export interface BashSpawnEventResult {
+	/** Veto execution. The first veto wins; thrown handler errors also fail closed. */
+	block?: boolean;
+	reason?: string;
+}
+
 interface ToolCallEventBase {
 	type: "tool_call";
 	/**
@@ -1422,7 +1446,8 @@ export type ExtensionEvent =
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
-	| ToolResultEvent;
+	| ToolResultEvent
+	| BashSpawnEvent;
 
 // ============================================================================
 // Event Results
@@ -1664,6 +1689,7 @@ export interface ExtensionAPI {
 	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): () => void;
 	on(event: "thinking_level_select", handler: ExtensionHandler<ThinkingLevelSelectEvent>): () => void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): () => void;
+	on(event: "bash_spawn", handler: ExtensionHandler<BashSpawnEvent, BashSpawnEventResult>): () => void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;

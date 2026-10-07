@@ -11,6 +11,8 @@ export const HOST_CAPABILITIES = Object.freeze({
 	triggeredMessageQueuesBehindPreflight: true as boolean,
 	/** `ctx.isPromptPending()` reports a prompt in preflight, while `ctx.isIdle()` is still true. */
 	promptPendingVisible: true as boolean,
+	/** `bash_spawn` is emitted immediately before the built-in bash executor runs. */
+	bashSpawnEvent: true as boolean,
 });
 
 export type HostCapabilities = typeof HOST_CAPABILITIES;
