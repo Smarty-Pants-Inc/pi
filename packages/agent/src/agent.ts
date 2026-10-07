@@ -200,6 +200,18 @@ class PendingMessageQueue {
 		this.reserved = 0;
 	}
 
+	remove(predicate: (message: AgentMessage) => boolean): void {
+		for (let index = this.messages.length - 1; index >= 0; index--) {
+			const message = this.messages[index];
+			if (!predicate(message)) continue;
+			this.messages.splice(index, 1);
+			if (index < this.reserved) this.reserved--;
+			// Keep reservation slots stable: the loop skips this slot before message_start.
+			const selectedIndex = this.selected.indexOf(message);
+			if (selectedIndex >= 0) delete this.selected[selectedIndex];
+		}
+	}
+
 	clear(): void {
 		this.messages = [];
 		this.release();
@@ -376,8 +388,12 @@ export class Agent {
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
+	followUp(
+		message: AgentMessage,
+		/** @internal Runs after insertion, before external observers. */ onEnqueued?: () => void,
+	): void {
 		this.followUpQueue.enqueue(message);
+		onEnqueued?.();
 		this.observe("queue_update");
 	}
 
@@ -397,6 +413,13 @@ export class Agent {
 	clearAllQueues(): void {
 		this.clearSteeringQueue();
 		this.clearFollowUpQueue();
+	}
+
+	/** Remove selected queued messages without releasing or retargeting other reservations. */
+	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): void {
+		this.steeringQueue.remove(predicate);
+		this.followUpQueue.remove(predicate);
+		this.observe("queue_update");
 	}
 
 	/** Returns true when either queue still contains pending messages. */
@@ -446,16 +469,24 @@ export class Agent {
 	}
 
 	/** Start a new prompt from text, a single message, or a batch of messages. */
-	async prompt(message: AgentMessage | AgentMessage[]): Promise<void>;
+	async prompt(
+		message: AgentMessage | AgentMessage[],
+		images?: undefined,
+		/** @internal Runs after run acquisition, before external observers. */ onRunAcquired?: () => void,
+	): Promise<void>;
 	async prompt(input: string, images?: ImageContent[]): Promise<void>;
-	async prompt(input: string | AgentMessage | AgentMessage[], images?: ImageContent[]): Promise<void> {
+	async prompt(
+		input: string | AgentMessage | AgentMessage[],
+		images?: ImageContent[],
+		onRunAcquired?: () => void,
+	): Promise<void> {
 		if (this.activeRun) {
 			throw new Error(
 				"Agent is already processing a prompt. Use steer() or followUp() to queue messages, or wait for completion.",
 			);
 		}
 		const messages = this.normalizePromptInput(input, images);
-		await this.runPromptMessages(messages);
+		await this.runPromptMessages(messages, {}, onRunAcquired);
 	}
 
 	/** Continue the transcript, or explicitly start from retained input after a terminal turn. */
@@ -514,6 +545,7 @@ export class Agent {
 	private async runPromptMessages(
 		messages: AgentMessage[],
 		options: { skipInitialSteeringPoll?: boolean } = {},
+		onRunAcquired?: () => void,
 	): Promise<void> {
 		await this.runWithLifecycle(async (signal) => {
 			await runAgentLoop(
@@ -524,7 +556,7 @@ export class Agent {
 				signal,
 				this.observeStream?.(this.streamFunction, signal) ?? this.streamFunction,
 			);
-		});
+		}, onRunAcquired);
 	}
 
 	private async runContinuation(): Promise<void> {
@@ -586,7 +618,10 @@ export class Agent {
 		};
 	}
 
-	private async runWithLifecycle(executor: (signal: AbortSignal) => Promise<void>): Promise<void> {
+	private async runWithLifecycle(
+		executor: (signal: AbortSignal) => Promise<void>,
+		onRunAcquired?: () => void,
+	): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing.");
 		}
@@ -603,6 +638,7 @@ export class Agent {
 		this._state.errorMessage = undefined;
 
 		try {
+			onRunAcquired?.();
 			this.observe("run_start");
 			await executor(abortController.signal);
 		} catch (error) {

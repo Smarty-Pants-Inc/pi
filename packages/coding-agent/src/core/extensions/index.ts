@@ -164,6 +164,8 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
+	SubmitUserMessageHandler,
+	SubmitUserMessageOptions,
 	TerminalInputHandler,
 	ThinkingLevelSelectEvent,
 	// Events - Tool
@@ -191,6 +193,7 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageReceipt,
 	UserMessageRenderer,
 	UserMessageRenderOptions,
 	WidgetPlacement,

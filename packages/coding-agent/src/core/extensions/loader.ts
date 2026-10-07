@@ -191,6 +191,11 @@ function createRuntime(owner: SessionOwnership | undefined, scope?: OwnedExecSco
 	const runtime: ExtensionRuntime = {
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
+		submitUserMessage: async (options) => ({
+			status: "rejected",
+			sessionGeneration: options.sessionGeneration,
+			reason: "no_session",
+		}),
 		appendEntry: notInitialized,
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
@@ -394,6 +399,17 @@ function createExtensionAPI(
 		sendUserMessage(content, options): void {
 			assertActive();
 			runtime.sendUserMessage(content, options);
+		},
+
+		async submitUserMessage(options) {
+			try {
+				assertActive();
+			} catch {
+				return { status: "rejected", sessionGeneration: options.sessionGeneration, reason: "session_changed" };
+			}
+			return runtime.submitUserMessage
+				? runtime.submitUserMessage(options)
+				: { status: "rejected", sessionGeneration: options.sessionGeneration, reason: "unsupported" };
 		},
 
 		appendEntry(customType: string, data?: unknown): void {

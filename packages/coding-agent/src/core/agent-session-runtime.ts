@@ -220,18 +220,27 @@ export class AgentSessionRuntime {
 		// results) is persisted to the outgoing session before it is replaced.
 		this.#assertCurrent(outgoing);
 		outgoing.session.shutdownSignal?.throwIfAborted();
-		await outgoing.session.abort();
-		outgoing.session.shutdownSignal?.throwIfAborted();
-		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason,
-			targetSessionFile,
-		});
-		this.#assertCurrent(outgoing);
-		this.beforeSessionInvalidate?.();
-		this.#assertCurrent(outgoing);
-		outgoing.session.dispose();
+		let suspended = false;
+		let failed = true;
+		try {
+			outgoing.session.beginUserMessageSessionReplacement();
+			suspended = true;
+			await outgoing.session.abort();
+			outgoing.session.shutdownSignal?.throwIfAborted();
+			this.#assertCurrent(outgoing);
+			await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+				type: "session_shutdown",
+				reason,
+				targetSessionFile,
+			});
+			this.#assertCurrent(outgoing);
+			this.beforeSessionInvalidate?.();
+			this.#assertCurrent(outgoing);
+			outgoing.session.dispose();
+			failed = false;
+		} finally {
+			if (suspended) outgoing.session.endUserMessageSessionReplacement(failed);
+		}
 	}
 
 	async #replace(outgoing: OutgoingSession, options: Parameters<CreateAgentSessionRuntimeFactory>[0]): Promise<void> {
@@ -260,7 +269,31 @@ export class AgentSessionRuntime {
 		}
 	}
 
-	async switchSession(
+	private async withUserMessageReplacement<T>(operation: () => Promise<T>): Promise<T> {
+		const session = this.#captureOutgoing().session;
+		let suspended = false;
+		try {
+			session.beginUserMessageSessionReplacement();
+			suspended = true;
+			return await operation();
+		} finally {
+			// teardownCurrent owns fail-closed behavior; pre-teardown errors leave the runtime usable.
+			if (suspended) session.endUserMessageSessionReplacement();
+		}
+	}
+
+	switchSession(
+		sessionPath: string,
+		options?: {
+			cwdOverride?: string;
+			withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+			projectTrustContextFactory?: (cwd: string) => ProjectTrustContext;
+		},
+	): Promise<{ cancelled: boolean }> {
+		return this.withUserMessageReplacement(() => this.switchSessionInternal(sessionPath, options));
+	}
+
+	private async switchSessionInternal(
 		sessionPath: string,
 		options?: {
 			cwdOverride?: string;
@@ -291,7 +324,15 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
-	async newSession(options?: {
+	newSession(options?: {
+		parentSession?: string;
+		setup?: (sessionManager: SessionManager) => Promise<void>;
+		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
+	}): Promise<{ cancelled: boolean }> {
+		return this.withUserMessageReplacement(() => this.newSessionInternal(options));
+	}
+
+	private async newSessionInternal(options?: {
 		parentSession?: string;
 		setup?: (sessionManager: SessionManager) => Promise<void>;
 		withSession?: (ctx: ReplacedSessionContext) => Promise<void>;
@@ -330,7 +371,14 @@ export class AgentSessionRuntime {
 		return { cancelled: false };
 	}
 
-	async fork(
+	fork(
+		entryId: string,
+		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
+	): Promise<{ cancelled: boolean; selectedText?: string }> {
+		return this.withUserMessageReplacement(() => this.forkInternal(entryId, options));
+	}
+
+	private async forkInternal(
 		entryId: string,
 		options?: { position?: "before" | "at"; withSession?: (ctx: ReplacedSessionContext) => Promise<void> },
 	): Promise<{ cancelled: boolean; selectedText?: string }> {
@@ -428,7 +476,11 @@ export class AgentSessionRuntime {
 	 * @throws {SessionImportFileNotFoundError} When the input path does not exist.
 	 * @throws {MissingSessionCwdError} When the imported session cwd cannot be resolved and no override is provided.
 	 */
-	async importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+	importFromJsonl(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
+		return this.withUserMessageReplacement(() => this.importFromJsonlInternal(inputPath, cwdOverride));
+	}
+
+	private async importFromJsonlInternal(inputPath: string, cwdOverride?: string): Promise<{ cancelled: boolean }> {
 		const outgoing = this.#captureOutgoing();
 		const resolvedPath = resolvePath(inputPath);
 		if (!existsSync(resolvedPath)) {
@@ -477,8 +529,6 @@ export class AgentSessionRuntime {
 	async dispose(): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		const outgoing = this.#captureOutgoing(true);
-		// Stop held extension dispatch before owner close or native idle joins.
-		outgoing.session.cancelForShutdown();
 		if (this.#owner) {
 			// Publish the shared task before invoking close callbacks. Sealed-owner
 			// terminal persistence checks identity, not active-owner permission.
@@ -488,41 +538,98 @@ export class AgentSessionRuntime {
 				resolve = done;
 				reject = failed;
 			});
-			try {
-				void this.#owner
-					.close({
-						stop: () => {
-							this.#assertIdentity(outgoing);
-							return outgoing.session.abort();
-						},
-						persist: async () => {
-							this.#assertIdentity(outgoing);
-							await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-								type: "session_shutdown",
-								reason: "quit",
-							});
-							this.#assertIdentity(outgoing);
-							this.beforeSessionInvalidate?.();
-							this.#assertIdentity(outgoing);
-							outgoing.session.dispose();
-						},
-					})
-					.then(resolve, reject);
-			} catch (cause) {
-				reject(cause);
-			}
+			void this.#disposeOutgoing(outgoing).then(resolve, reject);
 			return this.#ownerDisposal;
 		}
-		await outgoing.session.abort();
-		this.#assertCurrent(outgoing);
-		await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
-			type: "session_shutdown",
-			reason: "quit",
-		});
-		this.#assertCurrent(outgoing);
-		this.beforeSessionInvalidate?.();
-		this.#assertCurrent(outgoing);
-		outgoing.session.dispose();
+		return this.#disposeOutgoing(outgoing);
+	}
+
+	async #disposeOutgoing(outgoing: OutgoingSession): Promise<void> {
+		const errors: unknown[] = [];
+		let disposalAttempted = false;
+		const assertOutgoing = () => {
+			// Closing seals the owner before persistence; active-owner checks are
+			// no longer valid there, but the original session identity still is.
+			if (this.#owner) this.#assertIdentity(outgoing);
+			else this.#assertCurrent(outgoing);
+		};
+		const throwFailures = (failures: unknown[]) => {
+			if (failures.length === 1) throw failures[0];
+			if (failures.length) throw new AggregateError(failures, "Runtime disposal failed", { cause: failures[0] });
+		};
+		const disposeSession = () => {
+			assertOutgoing();
+			disposalAttempted = true;
+			outgoing.session.dispose();
+		};
+		const finishDisposal = async () => {
+			const failures: unknown[] = [];
+			try {
+				assertOutgoing();
+				try {
+					await emitSessionShutdownEvent(outgoing.session.extensionRunner, {
+						type: "session_shutdown",
+						reason: "quit",
+					});
+				} catch (cause) {
+					failures.push(cause);
+				}
+				assertOutgoing();
+				try {
+					this.beforeSessionInvalidate?.();
+				} catch (cause) {
+					failures.push(cause);
+				}
+				disposeSession();
+			} catch (cause) {
+				failures.push(cause);
+			}
+			throwFailures(failures);
+		};
+
+		// Stop held extension dispatch before owner close or native idle joins.
+		// Publication can throw after cancellation commits: still join and detach.
+		try {
+			outgoing.session.cancelForShutdown();
+		} catch (cause) {
+			errors.push(cause);
+		}
+		if (this.#owner) {
+			try {
+				await this.#owner.close({
+					stop: () => {
+						this.#assertIdentity(outgoing);
+						return outgoing.session.abort();
+					},
+					persist: finishDisposal,
+				});
+			} catch (cause) {
+				errors.push(cause);
+				// Native close may refuse terminal persistence after a drain failure.
+				// Detach the original session, without bypassing native custody guards
+				// or pretending that shutdown persistence/release succeeded.
+				if (!disposalAttempted) {
+					try {
+						disposeSession();
+					} catch (cleanup) {
+						errors.push(cleanup);
+					}
+				}
+			}
+		} else {
+			try {
+				assertOutgoing();
+				await outgoing.session.abort();
+			} catch (cause) {
+				errors.push(cause);
+			}
+			try {
+				await finishDisposal();
+			} catch (cause) {
+				errors.push(cause);
+			}
+		}
+		throwFailures(errors);
 	}
 }
 

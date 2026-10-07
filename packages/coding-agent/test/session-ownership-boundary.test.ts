@@ -119,6 +119,9 @@ function hookBoundary() {
 			hook("abort");
 		},
 		cancelForShutdown: () => {},
+		// #5533: this inert failure-path fixture participates in ingress lifecycle fencing.
+		beginUserMessageSessionReplacement: () => {},
+		endUserMessageSessionReplacement: () => {},
 		dispose,
 	} as unknown as AgentSession;
 	const runtime = new AgentSessionRuntime(
