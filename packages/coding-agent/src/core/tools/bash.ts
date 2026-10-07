@@ -98,7 +98,7 @@ type LocalShellSpawn = Omit<BashSpawnEvent, "type" | "toolCallId" | "backend">;
 /** Shared process execution used by the built-in shell tools. */
 export function createLocalShellOperations(
 	shellName: string,
-	resolveShellConfig: () => ShellConfig,
+	resolveShellConfig: (env: NodeJS.ProcessEnv) => ShellConfig,
 	beforeSpawn?: (spawn: LocalShellSpawn) => Promise<void>,
 ): BashOperations {
 	return {
@@ -107,7 +107,8 @@ export function createLocalShellOperations(
 			if (signal?.aborted) {
 				throw new Error("aborted");
 			}
-			const shellConfig = resolveShellConfig();
+			const effectiveEnv = { ...(env ?? getShellEnv()) };
+			const shellConfig = resolveShellConfig(effectiveEnv);
 			try {
 				await fsAccess(cwd, constants.F_OK);
 			} catch {
@@ -117,7 +118,6 @@ export function createLocalShellOperations(
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
 			const shellPath = shellConfig.shell;
 			const shellArgs = commandFromStdin ? [...shellConfig.args] : [...shellConfig.args, command];
-			const effectiveEnv = { ...(env ?? getShellEnv()) };
 			if (beforeSpawn) {
 				await beforeSpawn({ command, shellPath, shellArgs: [...shellArgs], cwd, env: { ...effectiveEnv } });
 			}
@@ -185,7 +185,7 @@ export function createLocalShellOperations(
  * standard local shell behavior while wrapping or rewriting commands.
  */
 export function createLocalBashOperations(options?: { shellPath?: string }): BashOperations {
-	return createLocalShellOperations("bash", () => getShellConfig(options?.shellPath));
+	return createLocalShellOperations("bash", (env) => getShellConfig(options?.shellPath, env));
 }
 
 export interface BashSpawnContext {
@@ -306,7 +306,7 @@ export function createShellToolDefinition(
 				: undefined;
 			const executionOps =
 				beforeSpawn && !customOperations
-					? createLocalShellOperations("bash", () => getShellConfig(shellPath), beforeSpawn)
+					? createLocalShellOperations("bash", (env) => getShellConfig(shellPath, env), beforeSpawn)
 					: ops;
 
 			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });

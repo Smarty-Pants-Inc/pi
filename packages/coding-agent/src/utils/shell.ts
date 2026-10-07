@@ -26,9 +26,9 @@ function getBashShellConfig(shell: string): ShellConfig {
  * resolved through CWD/PATH and execute before the bash_spawn gate sees the final executor.
  * Relative and empty PATH entries (the working directory) are skipped.
  */
-function findExecutableOnPath(executable: string): string | null {
-	const pathKey = Object.keys(process.env).find((key) => key.toLowerCase() === "path") ?? "PATH";
-	for (const dir of (process.env[pathKey] ?? "").split(delimiter)) {
+function findExecutableOnPath(executable: string, env: NodeJS.ProcessEnv = process.env): string | null {
+	const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	for (const dir of (env[pathKey] ?? "").split(delimiter)) {
 		if (!dir || !isAbsolute(dir)) continue;
 		const candidate = join(dir, executable);
 		try {
@@ -47,9 +47,10 @@ function findExecutableOnPath(executable: string): string | null {
  * Resolution order:
  * 1. User-specified shellPath
  * 2. On Windows: Git Bash in known locations, then bash on PATH
- * 3. On Unix: /bin/bash, then bash on PATH, then fallback to sh
+ * 3. On Unix: /bin/bash, then bash on PATH, then the absolute sh found on PATH (else fail closed)
+ * PATH lookups use `env`, which should be the environment the shell is spawned with.
  */
-export function getShellConfig(customShellPath?: string): ShellConfig {
+export function getShellConfig(customShellPath?: string, env: NodeJS.ProcessEnv = process.env): ShellConfig {
 	// 1. Check user-specified shell path
 	if (customShellPath) {
 		if (existsSync(customShellPath)) {
@@ -77,7 +78,7 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		}
 
 		// 3. Fallback: search bash.exe on PATH (Cygwin, MSYS2, WSL, etc.)
-		const bashOnPath = findExecutableOnPath("bash.exe");
+		const bashOnPath = findExecutableOnPath("bash.exe", env);
 		if (bashOnPath) {
 			return getBashShellConfig(bashOnPath);
 		}
@@ -96,12 +97,17 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		return getBashShellConfig("/bin/bash");
 	}
 
-	const bashOnPath = findExecutableOnPath("bash");
+	const bashOnPath = findExecutableOnPath("bash", env);
 	if (bashOnPath) {
 		return getBashShellConfig(bashOnPath);
 	}
 
-	return { shell: "sh", args: ["-c"] };
+	// Never return a bare "sh": spawn would resolve it through PATH after bash_spawn attested only the name.
+	const shOnPath = findExecutableOnPath("sh", env);
+	if (shOnPath) {
+		return { shell: shOnPath, args: ["-c"] };
+	}
+	throw new Error("No bash or sh shell found: /bin/bash is missing and PATH has no absolute bash or sh.");
 }
 
 export const POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"] as const;
