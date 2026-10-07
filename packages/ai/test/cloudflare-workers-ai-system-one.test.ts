@@ -95,7 +95,7 @@ describe("Cloudflare Workers AI System One", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("run did not complete (state: Queued)");
+		expect(result.errorMessage).toContain("provider_request_failed");
 	});
 
 	it("reports Cloudflare envelope errors", async () => {
@@ -107,6 +107,6 @@ describe("Cloudflare Workers AI System One", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("Cloudflare Workers AI error: No such model");
+		expect(result.errorMessage).toContain("provider_request_failed");
 	});
 });

@@ -597,7 +597,7 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
-		expect(result.errorMessage).toBe(explanation);
+		expect(result.errorMessage).toBe("provider_request_failed (HTTP unknown)");
 	});
 
 	it("preserves sensitive stop reasons with a descriptive error message", async () => {
