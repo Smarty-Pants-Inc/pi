@@ -142,7 +142,7 @@ describe("provider error body passthrough (per-tier regression)", () => {
 
 		expect(output.stopReason).toBe("error");
 		expect(output.errorMessage).toContain("403");
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
+		expect(output.errorMessage).toContain("provider_request_failed (HTTP 403)");
 		expect(output.errorMessage).not.toBe("403 status code (no body)");
 	});
 
@@ -158,17 +158,17 @@ describe("provider error body passthrough (per-tier regression)", () => {
 
 		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "sk-test" }));
 
-		expect(output.errorMessage).toContain("upstream WAF blocked policy XYZ");
+		expect(output.errorMessage).toContain("provider_request_failed (HTTP 403)");
 		const occurrences = output.errorMessage?.match(/upstream WAF blocked policy XYZ/g) ?? [];
-		expect(occurrences).toHaveLength(1);
+		expect(occurrences).toHaveLength(0);
 	});
 
 	it("openai-responses (status-only) keeps the prefix and surfaces the body", async () => {
 		const output = await drainResult(streamOpenAIResponses(responsesModel, context, { apiKey: "sk-test" }));
 
 		expect(output.stopReason).toBe("error");
-		expect(output.errorMessage).toContain("OpenAI API error (403)");
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
+		expect(output.errorMessage).toContain("provider_request_failed (HTTP 403)");
+		expect(output.errorMessage).not.toContain("blocked by gateway WAF");
 	});
 
 	it("bedrock (body-blind) surfaces the gateway body instead of Unknown: UnknownError", async () => {

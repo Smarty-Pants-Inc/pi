@@ -73,7 +73,7 @@ describe("provider error body passthrough", () => {
 		// The status should be surfaced.
 		expect(output.errorMessage).toContain("403");
 		// The body reason must not be swallowed by the opaque SDK message.
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
+		expect(output.errorMessage).toContain("provider_request_failed (HTTP 403)");
 		expect(output.errorMessage).not.toBe("403 status code (no body)");
 	});
 });

@@ -502,6 +502,6 @@ describe("Mistral HTTP transport", () => {
 		const message = await streamMistral(model, context, { apiKey: "test", fetch }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe('Mistral API error (403): {"message":"blocked by gateway"}');
+		expect(message.errorMessage).toBe("provider_request_failed (HTTP 403)");
 	});
 });

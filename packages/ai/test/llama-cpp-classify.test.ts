@@ -356,7 +356,7 @@ describe("llama.cpp classifier", () => {
 		});
 		expect(failing.stopReason).toBe("error");
 		expect(failing.errorMessage).toContain("llama.cpp error (400)");
-		expect(failing.errorMessage).toContain("context overflow");
+		expect(failing.errorMessage).toContain("llama.cpp returned 400");
 
 		const controller = new AbortController();
 		controller.abort();
