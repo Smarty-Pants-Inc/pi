@@ -128,8 +128,10 @@ describe.each([undefined, false, true])("pi-messages publication policy=%s", (oa
 			);
 			expect(out.stopReason).toBe("error");
 			expect(out.errorMessage).toMatch(/^(oauth|provider)_\w+ \(HTTP (unknown|503)\)$/);
-			if (kind === "json" || kind === "text" || kind === "transport")
+			if (kind === "json" || kind === "text" || (kind === "transport" && !oauthDiagnostics))
 				expect(out.oauthRecovery?.retryable).toBe(true);
+			// Cut (tracked): OAuth transport failures keep the base unclassified decision (smarty-dev#4790).
+			if (kind === "transport" && oauthDiagnostics) expect(out.oauthRecovery?.retryable).toBeUndefined();
 			if (kind === "json" || kind === "text")
 				expect(out.diagnostics?.[0]?.type).toBe("pi_messages_response_failure");
 		},
