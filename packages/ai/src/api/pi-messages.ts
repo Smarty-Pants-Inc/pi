@@ -9,6 +9,7 @@
  * models.json custom provider with `"api": "pi-messages"`.
  */
 
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -321,7 +322,12 @@ function parsePiMessagesEvent(raw: string): PiMessagesEvent | undefined {
 	return data && data !== "[DONE]" ? (JSON.parse(data) as PiMessagesEvent) : undefined;
 }
 
-function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: boolean): AssistantMessageEvent {
+function createErrorEvent(
+	model: Model<"pi-messages">,
+	error: unknown,
+	aborted: boolean,
+	diagnosticSecrets: readonly string[],
+): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
@@ -338,7 +344,12 @@ function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: 
 	if (!aborted && error instanceof PiMessagesResponseError) {
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
-			createAssistantMessageDiagnostic("pi_messages_response_failure", error, error.diagnosticDetails),
+			createAssistantMessageDiagnostic(
+				"pi_messages_response_failure",
+				error,
+				error.diagnosticDetails,
+				diagnosticSecrets,
+			),
 		);
 	}
 
@@ -358,7 +369,8 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	context: TranscriptContext,
 	options?: PiMessagesOptions,
 ): AssistantMessageEventStream => {
-	const eventStream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const eventStream = new AssistantMessageEventStream(diagnosticSecrets);
 	const convertEvent = createEventConverter(model);
 
 	void (async () => {
@@ -424,7 +436,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false));
+			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false, diagnosticSecrets));
 		}
 	})();
 

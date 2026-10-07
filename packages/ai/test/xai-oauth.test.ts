@@ -322,14 +322,15 @@ describe("xAI OAuth device flow", () => {
 		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow("Invalid xAI OAuth response field: access_token");
 	});
 
-	it("surfaces the upstream error code and description on refresh failure", async () => {
+	// pi#150: the description is untrusted endpoint text; only the protocol error code is shown.
+	it("surfaces the upstream error code, not its description, on refresh failure", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async () => jsonResponse({ error: "invalid_grant", error_description: "refresh token revoked" }, 400)),
 		);
 
 		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow(
-			"xAI OAuth token refresh failed (HTTP 400): invalid_grant: refresh token revoked",
+			/^xAI OAuth token refresh failed \(HTTP 400\): invalid_grant$/,
 		);
 	});
 });

@@ -1,3 +1,4 @@
+import { createServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openaiCodexOAuth } from "../src/auth/oauth/openai-codex.ts";
 
@@ -425,7 +426,8 @@ describe("OpenAI Codex OAuth", () => {
 		expect(pollTimes).toHaveLength(3);
 	});
 
-	it("includes the response body in OpenAI Codex device auth poll failures", async () => {
+	// pi#127: credential-bearing error bodies must not reach ordinary login diagnostics.
+	it("omits the response body in OpenAI Codex device auth poll failures", async () => {
 		vi.stubGlobal(
 			"fetch",
 			vi.fn(async (input: unknown): Promise<Response> => {
@@ -448,9 +450,7 @@ describe("OpenAI Codex OAuth", () => {
 			loginOpenAICodexDeviceCodeForTest({
 				onDeviceCode: () => {},
 			}),
-		).rejects.toThrow(
-			'OpenAI Codex device auth failed with status 500: {"error":"server_error","error_description":"try again later"}',
-		);
+		).rejects.toThrow("OpenAI Codex device auth failed with status 500");
 	});
 
 	it("does not write token refresh failures to stderr", async () => {
@@ -480,7 +480,51 @@ describe("OpenAI Codex OAuth", () => {
 				},
 				neverAbortedSignal,
 			),
-		).rejects.toThrow(/OpenAI Codex token refresh failed \(401\).*Could not validate your token/);
+		).rejects.toThrow("OpenAI Codex token refresh failed (HTTP 401)");
 		expect(consoleError).not.toHaveBeenCalled();
+	});
+
+	it("falls back to the pasted redirect URL when the fixed callback port is taken", async () => {
+		// Port 1455 is registered with OpenAI; the Codex CLI may hold it. Occupy it unless it already is.
+		const blocker = createServer();
+		await new Promise<void>((resolve) => {
+			blocker.once("error", () => resolve());
+			blocker.listen(1455, "127.0.0.1", () => resolve());
+		});
+		try {
+			let exchangeBody: URLSearchParams | undefined;
+			vi.stubGlobal(
+				"fetch",
+				vi.fn(async (input: unknown, init?: RequestInit) => {
+					expect(getUrl(input)).toBe("https://auth.openai.com/oauth/token");
+					exchangeBody = new URLSearchParams(String(init?.body));
+					return jsonResponse({
+						access_token: createAccessToken("acct"),
+						refresh_token: "refresh",
+						expires_in: 3600,
+					});
+				}),
+			);
+
+			let authUrl = "";
+			const credential = await openaiCodexOAuth.login({
+				signal: neverAbortedSignal,
+				notify: (event) => {
+					if (event.type === "auth_url") authUrl = event.url;
+				},
+				prompt: async (prompt) => {
+					if (prompt.type === "select") return "browser";
+					if (prompt.type !== "manual_code") throw new Error(`Unexpected prompt: ${prompt.type}`);
+					const state = new URL(authUrl).searchParams.get("state");
+					return `http://localhost:1455/auth/callback?code=pasted-code&state=${state}`;
+				},
+			});
+
+			expect(credential.accountId).toBe("acct");
+			expect(exchangeBody?.get("code")).toBe("pasted-code");
+			expect(exchangeBody?.get("redirect_uri")).toBe("http://localhost:1455/auth/callback");
+		} finally {
+			blocker.close();
+		}
 	});
 });
