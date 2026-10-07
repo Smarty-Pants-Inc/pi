@@ -366,3 +366,14 @@ it("does not reproject or mint deferred handles after terminal settlement", asyn
 		mint.mockRestore();
 	}
 });
+
+// smarty-dev#5822 F3: the projector, not a later envelope, owns error-phase metadata restrictions.
+it("projects error-kind phase restrictions before rebuilding the outer event", () => {
+	const original = { ...deferred(997), providerThinkingLevel: "high" };
+	const result = projectAssistantMessageDiagnostics(original, [], false, false, undefined, "error");
+	expect(result.stopReason).toBe("error");
+	expect(result).not.toHaveProperty("providerThinkingLevel");
+	expect(result).not.toHaveProperty("deferred");
+	expect(result.errorMessage).toContain("provider_request_failed");
+	expect(original.stopReason).toBe("deferred");
+});

@@ -229,11 +229,16 @@ export function projectAssistantMessageDiagnostics(
 		model: typeof model?.id === "string" ? model.id : typeof message.model === "string" ? message.model : "unknown",
 		content: Array.isArray(message.content) ? message.content.map(projectAssistantContentBlock) : [],
 		usage: projectUsage(message.usage),
-		stopReason: ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(message.stopReason)
-			? message.stopReason
-			: partial
-				? "pending"
-				: "error",
+		stopReason:
+			kind === "error"
+				? message.stopReason === "aborted"
+					? "aborted"
+					: "error"
+				: ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(message.stopReason)
+					? message.stopReason
+					: partial
+						? "pending"
+						: "error",
 		timestamp:
 			typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : Date.now(),
 		...(typeof message.endTurn === "boolean" ? { endTurn: message.endTurn } : {}),
