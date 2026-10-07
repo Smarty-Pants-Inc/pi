@@ -1,4 +1,4 @@
-import type { AssistantMessage, OAuthRecoveryDecision } from "../../types.ts";
+import type { AssistantMessage, DeferredHandle, OAuthRecoveryDecision } from "../../types.ts";
 import { fetchOAuthResponse, ResponseBodyError } from "../../utils/bounded-response.ts";
 import {
 	isPrematureProviderError,
@@ -6,6 +6,102 @@ import {
 	isRetryableProviderError,
 } from "../../utils/provider-error-classification.ts";
 import type { OAuthAuth } from "../types.ts";
+
+const ownedRecoveryDecisions = new WeakMap<OAuthRecoveryDecision, Readonly<OAuthRecoveryDecision>>();
+
+/** A producer object is not authority; only the existing validated classifier mints receipts. */
+export function ownedOAuthRecoveryDecision(
+	value: OAuthRecoveryDecision | undefined,
+): OAuthRecoveryDecision | undefined {
+	const receipt = value && ownedRecoveryDecisions.get(value);
+	if (!receipt) return undefined;
+	const decision = { ...receipt };
+	ownedRecoveryDecisions.set(decision, receipt);
+	return decision;
+}
+
+const builtinCatalogIds = new Map<string, ReadonlySet<string>>();
+
+/** Called by Pi's existing catalog loader; no generated catalog or provider barrel is imported here. */
+export function recordBuiltinModelCatalog(provider: string, modelIds: readonly string[]): void {
+	builtinCatalogIds.set(provider, new Set(modelIds));
+}
+
+export function isBuiltinCatalogModel(provider: string, modelId: string): boolean {
+	return builtinCatalogIds.get(provider)?.has(modelId) === true;
+}
+
+const deferredById = new Map<string, { original: DeferredHandle; public: DeferredHandle }>();
+const deferredByProviderHandle = new Map<string, string>();
+
+export function assistantMessageDeferredHandle(
+	message: AssistantMessage,
+	maxPollAfterMs: number,
+): DeferredHandle | undefined {
+	const handle = message.deferred;
+	if (
+		message.stopReason !== "deferred" ||
+		!handle ||
+		typeof handle !== "object" ||
+		Array.isArray(handle) ||
+		typeof handle.id !== "string"
+	)
+		return undefined;
+	if (handle.provider !== message.provider || handle.modelId !== message.model || handle.api !== message.api)
+		return undefined;
+	const prior = deferredById.get(handle.id);
+	if (prior) {
+		if (
+			prior.public.provider !== message.provider ||
+			prior.public.modelId !== message.model ||
+			prior.public.api !== message.api
+		)
+			return undefined;
+		return { ...prior.public };
+	}
+	// A serialized public token without its process-local receipt cannot be redeemed.
+	if (handle.id.startsWith("pi-deferred-")) return undefined;
+	const key = JSON.stringify([message.provider, message.model, message.api, handle.id]);
+	const existingId = deferredByProviderHandle.get(key);
+	if (existingId) return { ...deferredById.get(existingId)!.public };
+	const id = `pi-deferred-${globalThis.crypto.randomUUID()}`;
+	const pollAfterMs = handle.pollAfterMs;
+	const publicHandle: DeferredHandle = {
+		provider: message.provider,
+		modelId: message.model,
+		api: message.api,
+		id,
+		...(typeof pollAfterMs === "number" && Number.isInteger(pollAfterMs) && pollAfterMs >= 0
+			? { pollAfterMs: Math.min(pollAfterMs, maxPollAfterMs) }
+			: {}),
+	};
+	deferredById.set(id, { original: structuredClone(handle), public: publicHandle });
+	deferredByProviderHandle.set(key, id);
+	return { ...publicHandle };
+}
+
+/** Only a process-local Pi receipt may select a provider's private handle. */
+export function resolveDeferredHandle(
+	model: { provider: string; id: string; api: string },
+	handle: DeferredHandle,
+): DeferredHandle {
+	if (!handle || typeof handle !== "object" || Array.isArray(handle) || typeof handle.id !== "string") {
+		throw oauthDiagnosticError("oauth_invalid_response");
+	}
+	const entry = deferredById.get(handle.id);
+	if (
+		!entry ||
+		handle.provider !== model.provider ||
+		handle.modelId !== model.id ||
+		handle.api !== model.api ||
+		entry.public.provider !== model.provider ||
+		entry.public.modelId !== model.id ||
+		entry.public.api !== model.api
+	) {
+		throw oauthDiagnosticError("oauth_invalid_response");
+	}
+	return structuredClone(entry.original);
+}
 
 const throttleWaits = new WeakMap<AssistantMessage, number>();
 
@@ -229,7 +325,12 @@ export function safeOAuthError(
 /** Copy only validated owned decisions; never copy arbitrary provider error fields. */
 export function oauthRecoveryDecision(error: OAuthDiagnosticError): OAuthRecoveryDecision {
 	const safe = safeOAuthError(error);
-	return { recovery: safe.recovery, retryable: safe.retryable };
+	const decision: OAuthRecoveryDecision = {
+		...(safe.recovery === undefined ? {} : { recovery: safe.recovery }),
+		...(safe.retryable === undefined ? {} : { retryable: safe.retryable }),
+	};
+	ownedRecoveryDecisions.set(decision, Object.freeze({ ...decision }));
+	return decision;
 }
 
 export async function fetchOAuth(input: string | URL, init?: RequestInit): Promise<Response> {

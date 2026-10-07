@@ -1,16 +1,16 @@
 import {
+	oauthDiagnosticError,
 	oauthRecoveryDecision,
 	safeOAuthError,
 	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
-import type {
-	AssistantMessage,
-	AssistantMessageEvent,
-	ProviderHeaders,
-	StreamOptions,
-	ThinkingLevelMap,
-} from "../types.ts";
-import { extractDiagnosticError, projectAssistantMessageDiagnostics } from "./diagnostics.ts";
+import type { AssistantMessage, AssistantMessageEvent, ProviderHeaders, StreamOptions } from "../types.ts";
+import {
+	extractDiagnosticError,
+	type ProjectionModel,
+	projectAssistantContentBlock,
+	projectAssistantMessageDiagnostics,
+} from "./diagnostics.ts";
 import { SETUP_MESSAGES } from "./models-error.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
@@ -40,7 +40,7 @@ class FifoQueue<T> {
 export class EventStream<T, R = T> implements AsyncIterable<T> {
 	private queue = new FifoQueue<T>();
 	private waiting = new FifoQueue<(value: IteratorResult<T>) => void>();
-	private done = false;
+	protected done = false;
 	private finalResultPromise: Promise<R>;
 	private resolveFinalResult!: (result: R) => void;
 	private isComplete: (event: T) => boolean;
@@ -181,9 +181,9 @@ function projectTerminalEvent(
 }
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	private projectionModel?: { headers?: ProviderHeaders; thinkingLevelMap?: ThinkingLevelMap };
+	private projectionModel?: ProjectionModel & { headers?: ProviderHeaders };
 
-	constructor(model?: { headers?: ProviderHeaders; thinkingLevelMap?: ThinkingLevelMap }, _options?: StreamOptions) {
+	constructor(model?: ProjectionModel & { headers?: ProviderHeaders }, _options?: StreamOptions) {
 		super(
 			(event) => event.type === "done" || event.type === "error",
 			(event) => {
@@ -199,9 +199,28 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	}
 
 	override push(event: AssistantMessageEvent): void {
+		if (this.done) return;
+		if (event.type === "toolcall_end" && event.toolCall?.type !== "toolCall") {
+			const failure = oauthDiagnosticError("oauth_invalid_response", undefined, undefined, undefined, false);
+			const error: AssistantMessage = {
+				...event.partial,
+				stopReason: "error",
+				errorMessage: extractDiagnosticError(failure).message,
+				oauthRecovery: oauthRecoveryDecision(failure),
+			};
+			this.push({ type: "error", reason: "error", error });
+			return;
+		}
 		if (event.type === "error" || event.type === "done") {
 			const message = event.type === "error" ? event.error : event.message;
-			const projected = projectAssistantMessageDiagnostics(message, [], false, false, this.projectionModel);
+			const projected = projectAssistantMessageDiagnostics(
+				message,
+				[],
+				false,
+				false,
+				this.projectionModel,
+				event.type,
+			);
 			const owned = ownedErrorMessages.get(message);
 			if (owned !== undefined) ownedErrorMessages.set(projected, owned);
 			super.push(projectTerminalEvent(event.type, projected, { secrets: [], oauth: true }));
@@ -229,7 +248,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 					super.push({
 						type: event.type,
 						contentIndex: event.contentIndex,
-						toolCall: structuredClone(event.toolCall),
+						toolCall: projectAssistantContentBlock(event.toolCall),
 						partial,
 					});
 					break;
@@ -238,6 +257,11 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	}
 
 	override end(result?: AssistantMessage): void {
+		if (this.done) {
+			// Wake outstanding iterators, but never project an already settled result again.
+			super.end();
+			return;
+		}
 		if (result) {
 			const projected = projectAssistantMessageDiagnostics(result, [], false, false, this.projectionModel);
 			const owned = ownedErrorMessages.get(result);

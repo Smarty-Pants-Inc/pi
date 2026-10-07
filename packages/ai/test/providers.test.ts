@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { lazyApi } from "../src/api/lazy.ts";
 import { envApiKeyAuth } from "../src/auth/helpers.ts";
+import { resolveDeferredHandle } from "../src/auth/oauth/credential-response.ts";
 import type { AuthContext, AuthEvent } from "../src/auth/types.ts";
 import { getModel as getCompatModel, getModels as getCompatModels } from "../src/compat.ts";
 import { createModels, createProvider, getSupportedThinkingLevels } from "../src/models.ts";
@@ -625,14 +626,18 @@ describe("createProvider", () => {
 		let fetchedModel: Model<Api> | undefined;
 		let fetchedOptions: DeferredFetchOptions | undefined;
 		let cancelledOptions: DeferredCancelOptions | undefined;
+		let fetchedHandle: DeferredHandle | undefined;
+		let cancelledHandle: DeferredHandle | undefined;
 		const deferredModel = { ...testModel("api-a", "model-a"), provider: "deferred-provider" };
 		const streams = recordingStreams("deferred", []);
-		streams.fetchDeferred = (model, _handle, options) => {
+		streams.fetchDeferred = (model, handle, options) => {
+			fetchedHandle = handle;
 			fetchedModel = model;
 			fetchedOptions = options;
 			return streams.streamSimple(model, context);
 		};
-		streams.cancelDeferred = async (_model, _handle, options) => {
+		streams.cancelDeferred = async (_model, handle, options) => {
+			cancelledHandle = handle;
 			cancelledOptions = options;
 		};
 		const provider = createProvider({
@@ -655,12 +660,25 @@ describe("createProvider", () => {
 		});
 		const models = createModels();
 		models.setProvider(provider);
-		const handle: DeferredHandle = {
+		const providerHandle: DeferredHandle = {
 			provider: deferredModel.provider,
 			modelId: deferredModel.id,
 			api: deferredModel.api,
 			id: "response-1",
 		};
+		// smarty-dev#5822 F3: Models redeems only a handle published by Pi, then passes the private token to the provider.
+		const receiptStream = new AssistantMessageEventStream(deferredModel);
+		receiptStream.end({
+			...fauxAssistantMessage([]),
+			provider: deferredModel.provider,
+			model: deferredModel.id,
+			api: deferredModel.api,
+			stopReason: "deferred",
+			deferred: providerHandle,
+		});
+		const handle = (await receiptStream.result()).deferred;
+		if (!handle) throw new Error("Missing published deferred handle");
+		expect(handle.id).not.toBe(providerHandle.id);
 
 		await models.fetchDeferred(deferredModel, handle, {
 			wait: 50,
@@ -675,6 +693,8 @@ describe("createProvider", () => {
 			transformHeaders: (headers) => ({ ...headers, "X-Cancel": "yes" }),
 		});
 
+		expect(fetchedHandle).toEqual(providerHandle);
+		expect(cancelledHandle).toEqual(providerHandle);
 		expect(fetchedModel?.baseUrl).toBe("https://resolved.test/v1");
 		expect(fetchedOptions).toMatchObject({
 			wait: 50,
@@ -819,7 +839,8 @@ describe("fauxProvider", () => {
 		const cancelledSubmission = await models.completeSimple(model, context, { deferred: true });
 		if (!cancelledSubmission.deferred) throw new Error("Faux response did not include a deferred handle");
 		await models.cancelDeferred(model, cancelledSubmission.deferred);
-		expect(faux.state.cancelledDeferred).toEqual([cancelledSubmission.deferred]);
+		// smarty-dev#5822 F3: provider instrumentation sees its original private token, not the public Pi id.
+		expect(faux.state.cancelledDeferred).toEqual([resolveDeferredHandle(model, cancelledSubmission.deferred)]);
 		const cancelled = await models.fetchDeferred(model, cancelledSubmission.deferred);
 		expect(cancelled).toMatchObject({
 			stopReason: "error",

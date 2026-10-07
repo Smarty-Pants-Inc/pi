@@ -1,3 +1,4 @@
+import { resolveDeferredHandle } from "../auth/oauth/credential-response.ts";
 import { createProvider, type Provider } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -577,12 +578,15 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 		queueMicrotask(async () => {
 			try {
 				await fetchOptions?.onResponse?.({ status: 200 });
-				const entry = deferredResponses.get(handle.id);
+				const providerHandle = handle.id.startsWith("pi-deferred-")
+					? resolveDeferredHandle(requestModel, handle)
+					: handle;
+				const entry = deferredResponses.get(providerHandle.id);
 				if (
 					!entry ||
-					entry.handle.provider !== handle.provider ||
-					entry.handle.modelId !== handle.modelId ||
-					entry.handle.api !== handle.api
+					entry.handle.provider !== providerHandle.provider ||
+					entry.handle.modelId !== providerHandle.modelId ||
+					entry.handle.api !== providerHandle.api
 				) {
 					throw new Error(`Unknown faux deferred response: ${handle.id}`);
 				}
@@ -633,12 +637,15 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 	};
 
 	const cancelDeferred = async (
-		_requestModel: Model<string>,
+		requestModel: Model<string>,
 		handle: DeferredHandle,
 		cancelOptions?: DeferredCancelOptions,
 	): Promise<void> => {
+		const providerHandle = handle.id.startsWith("pi-deferred-")
+			? resolveDeferredHandle(requestModel, handle)
+			: handle;
 		state.cancelledDeferred.push(structuredClone(handle));
-		const entry = deferredResponses.get(handle.id);
+		const entry = deferredResponses.get(providerHandle.id);
 		if (entry) entry.cancelled = true;
 		await cancelOptions?.onResponse?.({ status: 200 });
 	};

@@ -13,7 +13,12 @@
 // Anthropic / `@google/genai` happy path where the SDK already folded the body
 // into the message, so providers can preserve it without double-printing.
 
-import { OAuthDiagnosticError, oauthRecoveryDecision, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import {
+	OAuthDiagnosticError,
+	oauthDiagnosticError,
+	oauthRecoveryDecision,
+	safeOAuthError,
+} from "../auth/oauth/credential-response.ts";
 import type { OAuthRecoveryDecision } from "../types.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
@@ -59,8 +64,18 @@ export function normalizeProviderError(
 			error instanceof OAuthDiagnosticError
 				? safeOAuthError(error, true)
 				: safeOAuthError({ status, message: text, error: sdkError.error, code: sdkError.code }, true);
-		const decision = oauthRecoveryDecision(safe);
-		if (isProviderContextOverflow(text, provider)) decision.recovery = "context_length_exceeded";
+		const decision = oauthRecoveryDecision(
+			oauthDiagnosticError(
+				safe.code,
+				safe.status,
+				safe.providerCode,
+				isProviderContextOverflow(text, provider) ||
+					(provider === "cerebras" && (status === 400 || status === 413) && text.trim() === "")
+					? "context_length_exceeded"
+					: safe.recovery,
+				safe.retryable,
+			),
+		);
 		return {
 			status: safe.status,
 			message: oauthDiagnostics ? safe.message : safe.message.replace(/^oauth_/, "provider_"),

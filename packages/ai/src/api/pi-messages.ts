@@ -9,7 +9,12 @@
  * models.json custom provider with `"api": "pi-messages"`.
  */
 
-import { OAuthDiagnosticError, oauthResponseError } from "../auth/oauth/credential-response.ts";
+import {
+	OAuthDiagnosticError,
+	oauthDiagnosticError,
+	oauthRecoveryDecision,
+	oauthResponseError,
+} from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
@@ -281,7 +286,9 @@ function createErrorEvent(
 		model: model.id,
 		usage: partial?.usage ?? createEmptyUsage(),
 		stopReason: reason,
-		oauthRecovery: callbackError ? { retryable: false } : normalized.oauthRecovery,
+		oauthRecovery: callbackError
+			? oauthRecoveryDecision(oauthDiagnosticError("oauth_request_failed", undefined, undefined, undefined, false))
+			: normalized.oauthRecovery,
 		errorMessage: normalized.message,
 		timestamp: Date.now(),
 	};

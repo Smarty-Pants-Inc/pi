@@ -1,12 +1,15 @@
 import {
+	assistantMessageDeferredHandle,
+	isBuiltinCatalogModel,
 	type OAuthDiagnosticCode,
 	oauthDiagnosticError,
 	oauthRecoveryDecision,
+	ownedOAuthRecoveryDecision,
 	SETUP_MESSAGES,
 	safeOAuthError,
 	transferAssistantMessagePrivateDecisions,
 } from "../auth/oauth/credential-response.ts";
-import type { AssistantMessage, JsonObject, ThinkingLevelMap, Usage } from "../types.ts";
+import type { Api, AssistantMessage, JsonObject, Model, ThinkingLevelMap, Usage } from "../types.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
 
 export interface DiagnosticErrorInfo {
@@ -157,43 +160,153 @@ export function projectUsage(usage: Usage): Usage {
 	};
 }
 
+export type ProjectionModel = {
+	id?: string;
+	provider?: string;
+	api?: string;
+	thinkingLevelMap?: ThinkingLevelMap;
+	compat?: Model<Api>["compat"];
+};
+
+/** Generated content and replay fields are retained, never arbitrary block metadata. */
+export function projectAssistantContentBlock<T extends AssistantMessage["content"][number]>(block: T): T {
+	let projected: AssistantMessage["content"][number];
+	if (!block || typeof block !== "object") return { type: "text", text: "" } as T;
+	switch (block.type) {
+		case "text":
+			projected = {
+				type: "text",
+				text: typeof block.text === "string" ? block.text : "",
+				...(typeof block.textSignature === "string" ? { textSignature: block.textSignature } : {}),
+			};
+			break;
+		case "thinking":
+			projected = {
+				type: "thinking",
+				thinking: typeof block.thinking === "string" ? block.thinking : "",
+				...(typeof block.thinkingSignature === "string" ? { thinkingSignature: block.thinkingSignature } : {}),
+				...(typeof block.redacted === "boolean" ? { redacted: block.redacted } : {}),
+			};
+			break;
+		case "toolCall":
+			projected = {
+				type: "toolCall",
+				id: typeof block.id === "string" ? block.id : "",
+				name: typeof block.name === "string" ? block.name : "",
+				arguments:
+					typeof block.arguments === "object" && block.arguments !== null && !Array.isArray(block.arguments)
+						? structuredClone(block.arguments)
+						: {},
+				...(typeof block.thoughtSignature === "string" ? { thoughtSignature: block.thoughtSignature } : {}),
+				...(typeof block.namespace === "string" ? { namespace: block.namespace } : {}),
+			};
+			break;
+		default:
+			projected = { type: "text", text: "" };
+	}
+	return projected as T;
+}
+
+export const MAX_DEFERRED_POLL_AFTER_MS = 3_600_000;
 /** One unconditional, copy-returning boundary. Credentials are never needed to project diagnostics. */
 export function projectAssistantMessageDiagnostics(
 	message: AssistantMessage,
 	_secrets: readonly string[] = [],
 	oauthDiagnostics = false,
 	partial = false,
-	model?: { thinkingLevelMap?: ThinkingLevelMap },
+	model?: ProjectionModel,
+	kind: "done" | "error" = "done",
 ): AssistantMessage {
 	const projected: AssistantMessage = {
-		...message,
-		content: structuredClone(message.content),
+		role: "assistant",
+		api: typeof model?.api === "string" ? model.api : typeof message.api === "string" ? message.api : "unknown",
+		provider:
+			typeof model?.provider === "string"
+				? model.provider
+				: typeof message.provider === "string"
+					? message.provider
+					: "provider",
+		model: typeof model?.id === "string" ? model.id : typeof message.model === "string" ? message.model : "unknown",
+		content: Array.isArray(message.content) ? message.content.map(projectAssistantContentBlock) : [],
 		usage: projectUsage(message.usage),
+		stopReason: ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(message.stopReason)
+			? message.stopReason
+			: partial
+				? "pending"
+				: "error",
+		timestamp:
+			typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : Date.now(),
+		...(typeof message.endTurn === "boolean" ? { endTurn: message.endTurn } : {}),
+		...(message.thinkingLevel !== undefined &&
+		["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(message.thinkingLevel)
+			? { thinkingLevel: message.thinkingLevel }
+			: {}),
+		...(message.diagnosticHint === "bedrock_data_retention" || message.diagnosticHint === "chatgpt_usage"
+			? { diagnosticHint: message.diagnosticHint }
+			: {}),
 	};
-	delete projected.responseId;
+	const responseModel = message.responseModel;
 	if (
-		message.providerThinkingLevel !== undefined &&
-		!["low", "medium", "high", "xhigh", "max"].includes(message.providerThinkingLevel) &&
-		!Object.values(model?.thinkingLevelMap ?? {}).includes(message.providerThinkingLevel)
+		typeof responseModel === "string" &&
+		(isBuiltinCatalogModel(projected.provider, responseModel) ||
+			(model?.provider === projected.provider &&
+				model.compat &&
+				"allowedFallbackModels" in model.compat &&
+				model.compat.allowedFallbackModels?.some(
+					(fallback) => fallback.provider === projected.provider && fallback.model === responseModel,
+				)))
 	) {
-		delete projected.providerThinkingLevel;
+		projected.responseModel = responseModel;
 	}
-	if (message.errorMessage !== undefined) {
-		const decision = oauthRecoveryDecision(safeOAuthError({ message: message.errorMessage }, true));
-		if (isProviderContextOverflow(message.errorMessage, message.provider))
-			decision.recovery = "context_length_exceeded";
-		projected.oauthRecovery = message.oauthRecovery ? { ...message.oauthRecovery } : decision;
-		projected.errorMessage = projectDiagnosticText(message.errorMessage, oauthDiagnostics);
+	if (
+		typeof message.providerThinkingLevel === "string" &&
+		(["low", "medium", "high", "xhigh", "max"].includes(message.providerThinkingLevel) ||
+			Object.values(model?.thinkingLevelMap ?? {}).includes(message.providerThinkingLevel))
+	) {
+		projected.providerThinkingLevel = message.providerThinkingLevel;
 	}
-	if (message.rawStopReason !== undefined)
+	const trusted = ownedOAuthRecoveryDecision(message.oauthRecovery);
+	if (trusted) projected.oauthRecovery = trusted;
+	if (
+		typeof message.errorMessage === "string" ||
+		kind === "error" ||
+		projected.stopReason === "error" ||
+		projected.stopReason === "aborted"
+	) {
+		if (!trusted) {
+			const safe = safeOAuthError({ message: message.errorMessage }, true);
+			projected.oauthRecovery = oauthRecoveryDecision(
+				oauthDiagnosticError(
+					safe.code,
+					safe.status,
+					safe.providerCode,
+					isProviderContextOverflow(
+						typeof message.errorMessage === "string" ? message.errorMessage : "",
+						projected.provider,
+					)
+						? "context_length_exceeded"
+						: safe.recovery,
+					safe.retryable,
+				),
+			);
+		}
+		projected.errorMessage = projectDiagnosticText(
+			typeof message.errorMessage === "string" ? message.errorMessage : "",
+			oauthDiagnostics,
+		);
+	}
+	if (typeof message.rawStopReason === "string")
 		projected.rawStopReason = OWNED_STOP_REASONS.has(message.rawStopReason) ? message.rawStopReason : "unknown";
-	if (message.diagnostics) {
+	if (Array.isArray(message.diagnostics)) {
 		projected.diagnostics = message.diagnostics
-			.filter((diagnostic) => OWNED_DIAGNOSTIC_TYPES.has(diagnostic.type))
+			.filter(
+				(diagnostic) =>
+					diagnostic && typeof diagnostic.type === "string" && OWNED_DIAGNOSTIC_TYPES.has(diagnostic.type),
+			)
 			.map((diagnostic) => ({
 				type: diagnostic.type,
 				timestamp: Date.now(),
-				...(diagnostic.error
+				...(diagnostic.error && typeof diagnostic.error.message === "string"
 					? {
 							error: {
 								name: oauthDiagnostics ? "OAuthDiagnosticError" : "ProviderDiagnosticError",
@@ -205,13 +318,17 @@ export function projectAssistantMessageDiagnostics(
 	}
 	if (
 		partial ||
-		message.stopReason === "pending" ||
-		message.stopReason === "error" ||
-		message.stopReason === "aborted"
+		projected.stopReason === "pending" ||
+		projected.stopReason === "error" ||
+		projected.stopReason === "aborted"
 	) {
-		delete projected.responseId;
 		delete projected.responseModel;
 		delete projected.providerThinkingLevel;
+	} else if (kind === "done" && projected.stopReason === "deferred") {
+		projected.deferred = assistantMessageDeferredHandle(
+			{ ...projected, deferred: message.deferred },
+			MAX_DEFERRED_POLL_AFTER_MS,
+		);
 	}
 	transferAssistantMessagePrivateDecisions(message, projected);
 	return projected;

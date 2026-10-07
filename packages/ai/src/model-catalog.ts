@@ -1,3 +1,4 @@
+import { recordBuiltinModelCatalog } from "./auth/oauth/credential-response.ts";
 import type {
 	Api,
 	ClassifierApi,
@@ -60,10 +61,12 @@ function flattenModelCatalog(groups: ModelGroups, type: ModelType): Record<strin
 }
 
 export function flattenChatModelCatalog<const TProvider extends ProviderId, const TGroups extends ModelGroups>(
-	_provider: TProvider,
+	provider: TProvider,
 	groups: TGroups,
 ): ChatModelCatalog<TGroups, TProvider> {
-	return flattenModelCatalog(groups, "chat") as ChatModelCatalog<TGroups, TProvider>;
+	const catalog = flattenModelCatalog(groups, "chat");
+	recordBuiltinModelCatalog(provider, Object.keys(catalog));
+	return catalog as ChatModelCatalog<TGroups, TProvider>;
 }
 
 export function flattenImageModelCatalog<const TProvider extends ProviderId, const TGroups extends ModelGroups>(

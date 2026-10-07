@@ -61,14 +61,16 @@ describe("assistant message frames", () => {
 		]);
 	});
 
-	it("preserves provider thinking level from the stream start", () => {
+	// smarty-dev#5822 F3: progress frames use the partial publication schema, not early effort receipts.
+	it("omits provider thinking level from the stream start", () => {
 		const partial = seed();
 		partial.providerThinkingLevel = "high";
 		const encoder = new AssistantMessageFrameEncoder();
 		const start = frame(encoder, { type: "start", partial });
 
-		expect(start).toMatchObject({ type: "start", partial: { providerThinkingLevel: "high" } });
-		expect(reduceAssistantMessageFrames([start])?.providerThinkingLevel).toBe("high");
+		expect(start).not.toHaveProperty("partial.providerThinkingLevel");
+		expect(reduceAssistantMessageFrames([start])?.providerThinkingLevel).toBeUndefined();
+		expect(partial.providerThinkingLevel).toBe("high");
 	});
 
 	it("preserves initial and final thinking metadata, including redaction", () => {
@@ -513,7 +515,8 @@ describe("assistant message frames", () => {
 
 	it("snapshots mutable event data and keeps reduction pure", () => {
 		const partial = seed();
-		partial.diagnostics = [{ type: "test", timestamp: 2, details: { value: "original" } }];
+		// smarty-dev#5822 F1/F3: only owned diagnostic types survive a frame snapshot.
+		partial.diagnostics = [{ type: "provider_limit", timestamp: 2, details: { value: "original" } }];
 		const encoder = new AssistantMessageFrameEncoder();
 		const start = frame(encoder, { type: "start", partial });
 		partial.diagnostics[0]!.details!.value = "mutated";
@@ -531,7 +534,8 @@ describe("assistant message frames", () => {
 		(sourceTool.arguments.nested as Record<string, unknown>).value = "mutated";
 
 		const reduced = reduceAssistantMessageFrames([start, toolStart]);
-		expect(reduced?.diagnostics?.[0]?.details?.value).toBe("original");
+		expect(reduced?.diagnostics?.[0]).toEqual({ type: "provider_limit", timestamp: expect.any(Number) });
+		expect(partial.diagnostics[0]?.details?.value).toBe("mutated");
 		expect(reduced?.usage.cost.total).toBe(0);
 		expect(reduced?.content[0]).toMatchObject({ arguments: { nested: { value: "original" } } });
 

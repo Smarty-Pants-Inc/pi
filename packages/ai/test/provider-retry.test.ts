@@ -40,9 +40,12 @@ describe("provider request retries", () => {
 	it("rejects a provider-requested retry delay above the limit", async () => {
 		const request = vi.fn<() => Promise<string>>().mockRejectedValue(providerError(429, { "retry-after": "277403" }));
 
-		await expect(retryProviderRequest(request, { maxRetries: 1, maxRetryDelayMs: 1000 })).rejects.toThrow(
-			"Server requested 277403s retry delay (max: 1s)",
-		);
+		// smarty-dev#5822: the cap still refuses the request, but its public error uses the owned diagnostic contract.
+		await expect(retryProviderRequest(request, { maxRetries: 1, maxRetryDelayMs: 1000 })).rejects.toMatchObject({
+			message: "oauth_retry_delay_exceeded (HTTP unknown)",
+			recovery: "retryable",
+			retryable: true,
+		});
 		expect(request).toHaveBeenCalledTimes(1);
 	});
 

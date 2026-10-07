@@ -357,7 +357,7 @@ export interface SimpleStreamOptions extends StreamOptions {
 	/** Provider-neutral tool selection for simple requests. When omitted, adapters use provider-specific behavior. */
 	toolChoice?: ToolChoice;
 	reasoning?: ThinkingLevel;
-	/** Ask a capable provider to return a durable handle and continue the request asynchronously. */
+	/** Ask a capable provider to return a process-local Pi handle and continue asynchronously. */
 	deferred?: boolean | { window?: "15m" | "1h" | "24h" };
 	/** Custom token budgets for thinking levels (token-based providers only) */
 	thinkingBudgets?: ThinkingBudgets;
@@ -507,11 +507,13 @@ export interface DeferredHandle {
 	provider: string;
 	modelId: string;
 	api: string;
-	/** Provider token, such as a response id or batch id plus row id. */
+	/** Public process-local Pi token. Adapters may use a provider token privately before publication. */
 	id: string;
+	/** Adapter-private expiry; never included on a published handle. */
 	expiresAt?: number;
+	/** Public nonnegative integer delay, capped at 3,600,000 ms. */
 	pollAfterMs?: number;
-	/** Provider conversion data required to reconstruct the final assistant message. */
+	/** Adapter-private conversion data; never included on a published handle. */
 	data?: JsonValue;
 }
 
@@ -549,7 +551,7 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
-/** Owned pre-suppression decisions. Set only by the OAuth diagnostic projection, never from wire metadata. */
+/** Owned pre-suppression classifier decisions for every credential source, never wire metadata. */
 export interface OAuthRecoveryDecision {
 	recovery?: "retryable" | "premature_stream" | "context_length_exceeded";
 	retryable?: boolean;
@@ -561,7 +563,7 @@ export interface AssistantMessage {
 	api: Api;
 	provider: ProviderId;
 	model: string;
-	responseModel?: string; // Concrete model reported by the provider when different from the requested `model`
+	responseModel?: string; // Successful same-provider catalog/fallback member; absent on partial/error output
 	responseId?: string; // Adapter-private protocol receipt; omitted from every published message
 	/** Successful effort from Pi's declared effort set or the bound model's thinkingLevelMap; absent on partial/error output. */
 	providerThinkingLevel?: string;

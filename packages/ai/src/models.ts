@@ -1,7 +1,7 @@
 import { lazyStream, requestSetupError, SafeSetupError } from "./api/lazy.ts";
 import { defaultProviderAuthContext as defaultAuthContext } from "./auth/context.ts";
 import { InMemoryCredentialStore } from "./auth/credential-store.ts";
-import { isOAuthCancellation, safeOAuthError } from "./auth/oauth/credential-response.ts";
+import { isOAuthCancellation, resolveDeferredHandle, safeOAuthError } from "./auth/oauth/credential-response.ts";
 import { type AuthResolutionOverrides, ModelsError, resolveProviderAuth } from "./auth/resolve.ts";
 import type {
 	AuthCheck,
@@ -953,8 +953,9 @@ class ModelsImpl implements MutableModels {
 			if (!provider.fetchDeferred) {
 				throw new SafeSetupError("deferred");
 			}
+			const providerHandle = resolveDeferredHandle(model, handle);
 			const { requestModel, requestOptions } = await this.applyAuth(model, options);
-			return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
+			return provider.fetchDeferred(requestModel, providerHandle, requestOptions as DeferredFetchOptions);
 		});
 	}
 
@@ -975,8 +976,9 @@ class ModelsImpl implements MutableModels {
 		if (!provider.cancelDeferred) {
 			throw new SafeSetupError("deferred");
 		}
+		const providerHandle = resolveDeferredHandle(model, handle);
 		const { requestModel, requestOptions } = await this.applyAuth(model, options);
-		await provider.cancelDeferred(requestModel, handle, requestOptions);
+		await provider.cancelDeferred(requestModel, providerHandle, requestOptions);
 	}
 
 	async generateImages(

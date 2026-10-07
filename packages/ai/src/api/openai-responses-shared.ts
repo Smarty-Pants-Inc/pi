@@ -14,7 +14,7 @@ import type {
 	ResponseStreamEvent,
 	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
-import { oauthStopReason, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import { oauthRecoveryDecision, oauthStopReason, safeOAuthError } from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -606,7 +606,7 @@ export async function processResponsesStream<TApi extends Api>(
 		else {
 			const safe = safeOAuthError({ message: mappedStop.errorMessage }, true, "oauth_stream_failed");
 			output.errorMessage = safe.message;
-			output.oauthRecovery = { recovery: safe.recovery, retryable: safe.retryable };
+			output.oauthRecovery = oauthRecoveryDecision(safe);
 		}
 		if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
 			output.stopReason = "toolUse";

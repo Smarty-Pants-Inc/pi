@@ -140,11 +140,13 @@ interface AssistantMessage {
 }
 ```
 
-`responseModel` records a concrete provider response model when it differs from the requested model. `responseId`, `providerThinkingLevel`, `diagnostics`, and `rawStopReason` preserve provider or runtime details.
+Published assistant messages are rebuilt from an explicit key and type schema. Unknown message and content-block fields are omitted; generated text, tool arguments and correctly typed replay signatures are preserved. `redacted` and `endTurn` must be booleans.
+
+`responseId` stays adapter-private and is never published. A successful `responseModel` is retained only if it is in the same provider's loaded Pi catalog or the bound request model's same-provider fallback list. Partial and failed messages omit `responseModel` and `providerThinkingLevel`; successful effort values must belong to Pi's effort set or the bound model's thinking-level map. Diagnostics and raw stop reasons use Pi-owned closed lists. Recovery decisions are classified before diagnostic text is suppressed; arbitrary wire `oauthRecovery` objects are not authority.
 
 `"pending"` is used for a partial assistant message while it streams. The completed message in `message_end` has a terminal stop reason, and Pi does not persist `"pending"` assistant messages in session JSONL.
 
-A `"deferred"` response has a `DeferredHandle` with the provider data needed to retrieve it:
+A `"deferred"` response has a process-local Pi handle for retrieving or cancelling it through `Models` in the same process:
 
 ```typescript
 interface DeferredHandle {
@@ -152,11 +154,13 @@ interface DeferredHandle {
   modelId: string;
   api: string;
   id: string;
-  expiresAt?: number;
   pollAfterMs?: number;
-  data?: JsonValue;
 }
 ```
+
+Pi replaces the provider token with an opaque random `id`, binds it to the message's provider/model/API, and retains the original handle privately for provider fetch/cancel. Public handles omit provider `expiresAt`, conversion `data`, and unknown keys. `pollAfterMs` must be a nonnegative integer and is capped at 3,600,000 milliseconds. Repeated pending polls return an equal public handle. Unknown or mismatched handles fail closed.
+
+This changes deferred-provider integration: callers must use a handle published by Pi, not construct a provider token themselves. Public handles cannot be redeemed after a process restart; storing their JSON does not persist the private receipt.
 
 ### ToolResultMessage
 

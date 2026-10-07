@@ -1,4 +1,5 @@
 import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
+import { projectAssistantContentBlock, projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 import { parseStreamingJson } from "./json-parse.ts";
 
 /**
@@ -46,51 +47,13 @@ type ReducerBlockState =
 	| { kind: "thinking"; ended: boolean }
 	| { kind: "toolCall"; ended: boolean; json: string };
 
-function cloneTextContent(content: TextContent): TextContent {
-	return {
-		type: "text",
-		text: content.text,
-		...(content.textSignature === undefined ? {} : { textSignature: content.textSignature }),
-	};
-}
-
-function cloneThinkingContent(content: ThinkingContent): ThinkingContent {
-	return {
-		type: "thinking",
-		thinking: content.thinking,
-		...(content.thinkingSignature === undefined ? {} : { thinkingSignature: content.thinkingSignature }),
-		...(content.redacted === undefined ? {} : { redacted: content.redacted }),
-	};
-}
-
 function cloneToolCall(toolCall: ToolCall): ToolCall {
-	return {
-		type: "toolCall",
-		id: toolCall.id,
-		name: toolCall.name,
-		arguments: structuredClone(toolCall.arguments),
-		...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
-		...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
-	};
+	return projectAssistantContentBlock(toolCall);
 }
 
 function cloneStartMessage(message: AssistantMessage): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [],
-		api: message.api,
-		provider: message.provider,
-		model: message.model,
-		...(message.responseModel === undefined ? {} : { responseModel: message.responseModel }),
-		...(message.responseId === undefined ? {} : { responseId: message.responseId }),
-		...(message.providerThinkingLevel === undefined ? {} : { providerThinkingLevel: message.providerThinkingLevel }),
-		...(message.diagnostics === undefined ? {} : { diagnostics: structuredClone(message.diagnostics) }),
-		usage: structuredClone(message.usage),
-		stopReason: "pending",
-		timestamp: message.timestamp,
-	};
+	return projectAssistantMessageDiagnostics({ ...message, content: [], stopReason: "pending" }, [], false, true);
 }
-
 function assertContentIndex(contentIndex: number): void {
 	if (!Number.isSafeInteger(contentIndex) || contentIndex < 0) {
 		throw new Error(`Invalid assistant message frame contentIndex: ${contentIndex}`);
@@ -103,7 +66,7 @@ function eventBlock(event: Exclude<AssistantMessageEvent, { type: "start" | "don
 	if (!block) {
 		throw new Error(`${event.type} event has no content block at index ${event.contentIndex}`);
 	}
-	return block;
+	return projectAssistantContentBlock(block);
 }
 
 function serializedArguments(argumentsValue: ToolCall["arguments"]): string {
@@ -171,7 +134,11 @@ export class AssistantMessageFrameEncoder {
 					coveredChars: content.text.length,
 					deltaChars: 0,
 				});
-				return { type: "text_start", contentIndex: event.contentIndex, content: cloneTextContent(content) };
+				return {
+					type: "text_start",
+					contentIndex: event.contentIndex,
+					content: projectAssistantContentBlock(content),
+				};
 			}
 			case "text_delta":
 				return this.encodeTextDelta(event.contentIndex, event.delta, "text");
@@ -201,7 +168,7 @@ export class AssistantMessageFrameEncoder {
 				return {
 					type: "thinking_start",
 					contentIndex: event.contentIndex,
-					content: cloneThinkingContent(content),
+					content: projectAssistantContentBlock(content),
 				};
 			}
 			case "thinking_delta":
@@ -269,16 +236,15 @@ export class AssistantMessageFrameEncoder {
 					throw new Error(`toolcall_end event has invalid tool call at index ${event.contentIndex}`);
 				}
 				this.endBlock(event.contentIndex, "toolCall");
+				const toolCall = cloneToolCall(event.toolCall);
 				return {
 					type: "toolcall_end",
 					contentIndex: event.contentIndex,
-					id: event.toolCall.id,
-					name: event.toolCall.name,
-					arguments: structuredClone(event.toolCall.arguments),
-					...(event.toolCall.thoughtSignature === undefined
-						? {}
-						: { thoughtSignature: event.toolCall.thoughtSignature }),
-					...(event.toolCall.namespace === undefined ? {} : { namespace: event.toolCall.namespace }),
+					id: toolCall.id,
+					name: toolCall.name,
+					arguments: toolCall.arguments,
+					...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
+					...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
 				};
 			}
 		}
@@ -486,5 +452,5 @@ export function reduceAssistantMessageFrames(frames: Iterable<AssistantMessageFr
 		block.arguments = parseStreamingJson<ToolCall["arguments"]>(state.json);
 	}
 
-	return message;
+	return projectAssistantMessageDiagnostics(message, [], false, true);
 }
