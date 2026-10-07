@@ -33,6 +33,8 @@ function context(args: Record<string, unknown>, cwd: string, state: Record<strin
 		expanded: true,
 		showImages: false,
 		isError: false,
+		durationMs: undefined,
+		outputPad: 1,
 	};
 }
 

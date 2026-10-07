@@ -24,9 +24,15 @@ export function createFileOps(): FileOperations {
 }
 
 /**
- * Extract file operations from tool calls in an assistant message.
+ * Extract file operations from tool calls in an assistant message, or from the nested calls
+ * recorded on a tool result.
  */
 export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
+	if (message.role === "toolResult") {
+		// Calls made from codemode scripts are recorded on the script's result.
+		for (const call of message.nestedCalls?.calls ?? []) addFileOp(call.name, call.arguments, fileOps);
+		return;
+	}
 	if (message.role !== "assistant") return;
 	if (!("content" in message) || !Array.isArray(message.content)) return;
 
@@ -34,25 +40,24 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 		if (typeof block !== "object" || block === null) continue;
 		if (!("type" in block) || block.type !== "toolCall") continue;
 		if (!("arguments" in block) || !("name" in block)) continue;
-
-		const args = block.arguments as Record<string, unknown> | undefined;
-		if (!args) continue;
-
-		const path = typeof args.path === "string" ? args.path : undefined;
-		if (!path) continue;
-
-		const set =
-			block.name === "read"
-				? fileOps.read
-				: block.name === "write"
-					? fileOps.written
-					: block.name === "edit"
-						? fileOps.edited
-						: undefined;
-		// Delete first so each set stays ordered from least to most recently used.
-		set?.delete(path);
-		set?.add(path);
+		addFileOp(block.name, block.arguments as Record<string, unknown> | undefined, fileOps);
 	}
+}
+
+function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
+	const path = typeof args?.path === "string" ? args.path : undefined;
+	if (!path) return;
+	const set =
+		toolName === "read"
+			? fileOps.read
+			: toolName === "write"
+				? fileOps.written
+				: toolName === "edit"
+					? fileOps.edited
+					: undefined;
+	// Delete first so each set stays ordered from least to most recently used.
+	set?.delete(path);
+	set?.add(path);
 }
 
 /**

@@ -17,8 +17,14 @@ function bindTransferFixture(session: {
 }): void {
 	bindReceivedInputSession(session as unknown as AgentSession, {
 		prompt: (input, options) => session.prompt(input.text, options),
-		steer: (input) => session.steer(input.text),
-		followUp: (input) => session.followUp(input.text),
+		steer: async (input) => {
+			await session.steer(input.text);
+			return "queued";
+		},
+		followUp: async (input) => {
+			await session.followUp(input.text);
+			return "queued";
+		},
 	});
 }
 

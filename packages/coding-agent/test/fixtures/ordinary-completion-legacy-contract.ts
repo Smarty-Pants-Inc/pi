@@ -6,8 +6,8 @@
 // calls the unchanged production observeRejectedSyncResult helper itself.
 // No implementation here is exported by the package or used by production.
 import { AsyncLocalStorage } from "node:async_hooks";
-import { createGate, type GateControl } from "@earendil-works/pi-agent-core";
 import type { ResponsesEvidence } from "@earendil-works/pi-ai/api/responses-evidence";
+import { createGate, type GateControl } from "../../src/core/effect-gate.ts";
 import {
 	beginOrdinaryClockOperation,
 	commitOrdinaryClockOperation,

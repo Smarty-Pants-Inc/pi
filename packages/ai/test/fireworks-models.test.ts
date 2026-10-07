@@ -160,6 +160,8 @@ describe("Fireworks models", () => {
 
 	// Regression for #9323: accepted aliases are not distinct native effort levels.
 	it.each([
+		["accounts/fireworks/models/glm-5p3", ["low", "high", "max"]],
+		["accounts/fireworks/routers/glm-5p3-fast", ["low", "high", "max"]],
 		["accounts/fireworks/models/kimi-k3", ["low", "high", "max"]],
 		["accounts/fireworks/routers/kimi-k3-fast", ["low", "high", "max"]],
 	] as const)("exposes distinct native effort levels for %s", (modelId, levels) => {

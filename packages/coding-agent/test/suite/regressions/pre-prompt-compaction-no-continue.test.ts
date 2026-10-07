@@ -118,7 +118,8 @@ describe("pre-prompt compaction regression", () => {
 			}),
 		).rejects.toThrow("Input is retained in the followUp queue");
 
-		expect(preflight).toHaveBeenCalledExactlyOnceWith(false);
+		// Upstream #9098: preflightResult reports only accepted prompts; a rejection is not reported.
+		expect(preflight).not.toHaveBeenCalled();
 		expect(harness.sessionManager.getEntries()).toEqual(before);
 		expect(getUserTexts(harness)).not.toContain("processed:pending input");
 		expect(harness.session.getFollowUpMessages()).toEqual(["processed:pending input"]);
