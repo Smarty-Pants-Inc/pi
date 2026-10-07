@@ -93,4 +93,17 @@ process.exit(0);
 		expect(outcome.disposition).toBe("complete");
 		expect(existsSync(marker)).toBe(false);
 	}, 30000);
+
+	// pi#163 P2 (:118): the Windows path is bounded too (runtime copier, not a direct write).
+	// The writer reports win32 so this POSIX host walks the Windows branch.
+	it.each([false, true])(
+		"Windows copier with reader=%s is bounded and reports delivery",
+		async (read) => {
+			const outcome = await run("pipe", read, `Object.defineProperty(process, "platform", { value: "win32" });`);
+			expect(outcome.exited).toBe(true);
+			expect(outcome.disposition).toBe(read ? "complete" : "incomplete");
+			if (read) expect(outcome.received).toBeGreaterThanOrEqual(size);
+		},
+		30000,
+	);
 });

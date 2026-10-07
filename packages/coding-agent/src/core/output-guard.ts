@@ -124,14 +124,16 @@ export async function writeStdoutBounded(text: string, timeoutMs: number): Promi
 	const deliver = async (): Promise<"complete" | "incomplete"> => {
 		await waitForRawStdoutBackpressure();
 		if (expired) return "incomplete";
-		// ponytail: `cat` isolates the blocking write on POSIX. Windows consoles keep the direct
-		// write; revisit if a Windows console can stall unread at exit.
-		if (process.platform === "win32") {
-			process.stdout.write(text);
-			return "complete";
-		}
-		// Absolute path: a PATH lookup would let a hostile PATH entry run code at shutdown (pi#163).
-		const copier = spawn("/bin/cat", [], { stdio: ["pipe", "inherit", "ignore"] });
+		// Absolute paths only: a PATH lookup would let a hostile PATH entry run code at shutdown (pi#163).
+		// Windows has no trusted `cat`, and its pipe and console writes can block too, so this runtime
+		// copies stdin to stdout itself; BUN_BE_BUN=1 makes a compiled Bun binary act as `bun`.
+		const copier =
+			process.platform === "win32"
+				? spawn(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], {
+						stdio: ["pipe", "inherit", "ignore"],
+						env: { ...process.env, BUN_BE_BUN: "1" },
+					})
+				: spawn("/bin/cat", [], { stdio: ["pipe", "inherit", "ignore"] });
 		child = copier;
 		return new Promise((resolve) => {
 			copier.on("error", () => resolve("incomplete"));
