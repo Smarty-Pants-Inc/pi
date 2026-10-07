@@ -13,6 +13,7 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "../types.ts";
+import { ownedLocalError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { providerResponseObservation } from "../utils/headers.ts";
@@ -171,7 +172,12 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 				delete (block as { partialArgs?: string }).partialArgs;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatMistralError(error);
+			// Timeout is a Pi-owned literal (design §1 rule 1); provider text stays withheld.
+			output.errorMessage = formatMistralError(
+				error instanceof DOMException && error.name === "TimeoutError"
+					? ownedLocalError("Mistral request timeout")
+					: error,
+			);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
