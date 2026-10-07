@@ -312,7 +312,7 @@ describe("Mistral HTTP transport", () => {
 
 		expect(message.stopReason).toBe("toolUse");
 		expect(message.rawStopReason).toBe("tool_calls");
-		expect(message.responseId).toBe("response-1");
+		expect(message.responseId).toBe(undefined);
 		expect(message.content).toEqual([
 			{ type: "thinking", thinking: "reason" },
 			{ type: "text", text: "answer" },

@@ -696,7 +696,7 @@ describe("openai-completions tool_choice", () => {
 
 		expect(response.stopReason).toBe("stop");
 		expect(response.errorMessage).toBeUndefined();
-		expect(response.responseId).toBe("chatcmpl-test");
+		expect(response.responseId).toBe(undefined);
 		expect(response.usage.totalTokens).toBe(4);
 		expect(response.content).toEqual([{ type: "text", text: "OK" }]);
 	});

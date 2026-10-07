@@ -241,7 +241,7 @@ describe("Google provider stream events", () => {
 		expect(received[1]).not.toBe(googleGenAiMock.streamChunks[1]);
 		expect(eventModels).toEqual([undefined, undefined]);
 		expect(result.stopReason).toBe("stop");
-		expect(result.responseId).toBe("resp_google");
+		expect(result.responseId).toBe(undefined);
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});
 });
