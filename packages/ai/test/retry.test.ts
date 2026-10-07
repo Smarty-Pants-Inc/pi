@@ -230,7 +230,7 @@ describe("retryAssistantCall", () => {
 		expect(res.stopReason).toBe("error");
 		expect(produce).toHaveBeenCalledTimes(4); // 1 initial + 3 retries
 		expect(onRetryScheduled).toHaveBeenCalledTimes(3);
-		expect(onRetryFinished).toHaveBeenCalledWith(false, 3, "terminated");
+		expect(onRetryFinished).toHaveBeenCalledWith(false, 3, "provider_request_failed (HTTP unknown)");
 	});
 
 	it("reports capped retry delays", async () => {
@@ -335,6 +335,6 @@ describe("retryAssistantCall", () => {
 		expect(res.stopReason).toBe("aborted");
 		expect(res.errorMessage).toBeUndefined();
 		expect(produce).toHaveBeenCalledTimes(1);
-		expect(onRetryFinished).toHaveBeenCalledWith(false, 1, "terminated");
+		expect(onRetryFinished).toHaveBeenCalledWith(false, 1, "provider_request_failed (HTTP unknown)");
 	});
 });
