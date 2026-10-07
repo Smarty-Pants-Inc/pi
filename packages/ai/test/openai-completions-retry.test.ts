@@ -134,8 +134,8 @@ describe("openai-completions provider retries", () => {
 		const result = await consume({ maxRetries: 2, maxRetryDelayMs: 1000 });
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("Server requested 277403s retry delay (max: 1s)");
-		expect(result.errorMessage).toContain("rate limited");
+		expect(result.errorMessage).toContain("provider_retry_delay_exceeded");
+		expect(result.errorMessage).not.toContain("rate limited");
 		expect(mockState.requestOptions).toEqual([expect.objectContaining({ maxRetries: 0 })]);
 	});
 
