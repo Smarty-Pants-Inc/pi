@@ -22,7 +22,7 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, ownedLocalError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
@@ -94,7 +94,7 @@ export const stream: StreamFunction<"google-vertex", GoogleVertexOptions> = (
 
 		try {
 			if (options?.fetch && options.fetch !== globalThis.fetch) {
-				throw new Error("Custom fetch is not supported by the Google Vertex adapter");
+				throw ownedLocalError("Custom fetch is not supported by the Google Vertex adapter");
 			}
 			const apiKey = resolveApiKey(options);
 			// Create the client using either a Vertex API key, if provided, or ADC with project and location

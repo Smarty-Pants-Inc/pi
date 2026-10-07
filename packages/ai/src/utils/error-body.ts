@@ -14,13 +14,17 @@
 // into the message, so providers can preserve it without double-printing.
 
 import {
+	isOwnedLocalError,
 	OAuthDiagnosticError,
 	oauthDiagnosticError,
 	oauthRecoveryDecision,
 	safeOAuthError,
 } from "../auth/oauth/credential-response.ts";
 import type { OAuthRecoveryDecision } from "../types.ts";
+import { isOwnedStopText } from "./diagnostics.ts";
 import { isProviderContextOverflow } from "./provider-error-classification.ts";
+
+export { ownedLocalError } from "../auth/oauth/credential-response.ts";
 
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
@@ -76,9 +80,15 @@ export function normalizeProviderError(
 				safe.retryable,
 			),
 		);
+		// Pi-authored local failures and closed-list stop templates are owned text; provider text is not.
+		const ownedText = isOwnedLocalError(error)
+			? error.message
+			: isOwnedStopText(sdkError.message) && status === undefined
+				? sdkError.message
+				: undefined;
 		return {
 			status: safe.status,
-			message: oauthDiagnostics ? safe.message : safe.message.replace(/^oauth_/, "provider_"),
+			message: ownedText ?? (oauthDiagnostics ? safe.message : safe.message.replace(/^oauth_/, "provider_")),
 			oauthRecovery: decision,
 			...(/data retention mode/i.test(text) && provider === "amazon-bedrock"
 				? { diagnosticHint: "bedrock_data_retention" as const }

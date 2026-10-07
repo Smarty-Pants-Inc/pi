@@ -14,7 +14,12 @@ import type {
 	ResponseStreamEvent,
 	ResponseToolSearchOutputItemParam,
 } from "openai/resources/responses/responses.js";
-import { oauthRecoveryDecision, oauthStopReason, safeOAuthError } from "../auth/oauth/credential-response.ts";
+import {
+	oauthRecoveryDecision,
+	oauthStopReason,
+	ownedLocalError,
+	safeOAuthError,
+} from "../auth/oauth/credential-response.ts";
 import { calculateCost } from "../models.ts";
 import type {
 	Api,
@@ -32,7 +37,11 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import {
+	appendAssistantMessageDiagnostic,
+	createAssistantMessageDiagnostic,
+	isOwnedStopText,
+} from "../utils/diagnostics.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -605,7 +614,7 @@ export async function processResponsesStream<TApi extends Api>(
 		if (mappedStop.errorMessage === undefined) delete output.errorMessage;
 		else {
 			const safe = safeOAuthError({ message: mappedStop.errorMessage }, true, "oauth_stream_failed");
-			output.errorMessage = safe.message;
+			output.errorMessage = isOwnedStopText(mappedStop.errorMessage) ? mappedStop.errorMessage : safe.message;
 			output.oauthRecovery = oauthRecoveryDecision(safe);
 		}
 		if (output.content.some((b) => b.type === "toolCall") && output.stopReason === "stop") {
@@ -799,7 +808,7 @@ export async function processResponsesStream<TApi extends Api>(
 		}
 	}
 	if (!sawTerminalResponseEvent) {
-		throw new Error("OpenAI Responses stream ended before a terminal response event");
+		throw ownedLocalError("OpenAI Responses stream ended before a terminal response event");
 	}
 	// The agent runs every tool call in the final message. Refuse to hand over calls whose
 	// output_item.done never arrived: their arguments may be cut off or mixed up, e.g. when a

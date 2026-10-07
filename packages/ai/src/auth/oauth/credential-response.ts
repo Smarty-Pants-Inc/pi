@@ -144,6 +144,36 @@ export const SETUP_MESSAGES = Object.freeze({
 	setup_ThrownValue: "request setup failed: ThrownValue",
 });
 
+const ownedLocalErrors = new WeakSet<Error>();
+const ownedLocalTexts = new Set<string>();
+const MAX_OWNED_LOCAL_TEXTS = 1024;
+
+/**
+ * Pi-authored local failure (request validation, timeouts, protocol state). Its text is built only
+ * from Pi source literals and caller configuration, never from provider responses or credentials,
+ * so membership in this source-owned set is publication authority for that exact text.
+ */
+export function ownedLocalError(message: string): Error {
+	const error = new Error(message);
+	ownedLocalErrors.add(error);
+	if (!ownedLocalTexts.has(message)) {
+		if (ownedLocalTexts.size >= MAX_OWNED_LOCAL_TEXTS) {
+			const oldest = ownedLocalTexts.values().next().value;
+			if (oldest !== undefined) ownedLocalTexts.delete(oldest);
+		}
+		ownedLocalTexts.add(message);
+	}
+	return error;
+}
+
+export function isOwnedLocalError(error: unknown): error is Error {
+	return error instanceof Error && ownedLocalErrors.has(error);
+}
+
+export function isOwnedLocalErrorText(text: unknown): text is string {
+	return typeof text === "string" && ownedLocalTexts.has(text);
+}
+
 export const PROVIDER_LIMIT_DIAGNOSTIC = "provider_limit";
 
 export function isOAuthCancellation(error: unknown): boolean {

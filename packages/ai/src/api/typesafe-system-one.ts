@@ -1,3 +1,4 @@
+import { ownedLocalError } from "../auth/oauth/credential-response.ts";
 import type { ClassifierFunction, ClassifierOptions } from "../types.ts";
 import { classifySystemOne, isRecord, type SystemOneTransport } from "./system-one-shared.ts";
 
@@ -11,7 +12,7 @@ const transport: SystemOneTransport = {
 	url: (model) => new URL("systemone", `${model.baseUrl.replace(/\/+$/u, "")}/`),
 	payload: (model, request) => ({ model: model.id, ...request }),
 	output: (body) => {
-		if (!isRecord(body)) throw new Error("System One API returned an unexpected response");
+		if (!isRecord(body)) throw ownedLocalError("System One API returned an unexpected response");
 		return body;
 	},
 };

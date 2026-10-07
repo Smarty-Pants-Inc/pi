@@ -10,7 +10,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { fetchBoundedResponse } from "../utils/bounded-response.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, ownedLocalError } from "../utils/error-body.ts";
 import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
@@ -41,7 +41,7 @@ interface SystemOneHttpError extends Error {
 }
 
 function httpError(label: string, response: Response, body: string): SystemOneHttpError {
-	const error = new Error(`${label} returned ${response.status}`) as SystemOneHttpError;
+	const error = ownedLocalError(`${label} returned ${response.status}`) as SystemOneHttpError;
 	error.status = response.status;
 	error.headers = response.headers;
 	error.body = body;
@@ -49,7 +49,7 @@ function httpError(label: string, response: Response, body: string): SystemOneHt
 }
 
 function timeoutError(timeoutMs: number): SystemOneHttpError {
-	const error = new Error(`Request timed out after ${timeoutMs}ms`) as SystemOneHttpError;
+	const error = ownedLocalError(`Request timed out after ${timeoutMs}ms`) as SystemOneHttpError;
 	error.name = "TimeoutError";
 	error.status = undefined;
 	error.headers = undefined;
@@ -63,13 +63,13 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 function requiredNumber(label: string, value: unknown, field: string): number {
 	if (typeof value !== "number" || !Number.isFinite(value)) {
-		throw new Error(`${label} returned an invalid ${field}`);
+		throw ownedLocalError(`${label} returned an invalid ${field}`);
 	}
 	return value;
 }
 
 function probabilities(label: string, value: unknown, id: string): Record<string, number> {
-	if (!isRecord(value)) throw new Error(`${label} returned invalid probabilities for ${id}`);
+	if (!isRecord(value)) throw ownedLocalError(`${label} returned invalid probabilities for ${id}`);
 	return Object.fromEntries(
 		Object.entries(value).map(([key, probability]) => [
 			key,
@@ -79,14 +79,14 @@ function probabilities(label: string, value: unknown, id: string): Record<string
 }
 
 function parseAnswers(label: string, value: unknown, context: ClassifierContext): Record<string, ClassifierAnswer> {
-	if (!isRecord(value)) throw new Error(`${label} returned an unexpected response`);
+	if (!isRecord(value)) throw ownedLocalError(`${label} returned an unexpected response`);
 	const answers: Array<[string, ClassifierAnswer]> = [];
 	for (const [id, question] of Object.entries(context.questions)) {
 		const answer = value[id];
-		if (!isRecord(answer)) throw new Error(`${label} did not return an answer for ${id}`);
+		if (!isRecord(answer)) throw ownedLocalError(`${label} did not return an answer for ${id}`);
 		if (question.type === "choice") {
 			if (answer.type !== "choice" || typeof answer.choice !== "string") {
-				throw new Error(`${label} did not return a choice answer for ${id}`);
+				throw ownedLocalError(`${label} did not return a choice answer for ${id}`);
 			}
 			answers.push([
 				id,
@@ -98,7 +98,7 @@ function parseAnswers(label: string, value: unknown, context: ClassifierContext)
 				},
 			]);
 		} else if (question.type === "score") {
-			if (answer.type !== "score") throw new Error(`${label} did not return a score answer for ${id}`);
+			if (answer.type !== "score") throw ownedLocalError(`${label} did not return a score answer for ${id}`);
 			answers.push([
 				id,
 				{
@@ -108,7 +108,7 @@ function parseAnswers(label: string, value: unknown, context: ClassifierContext)
 				},
 			]);
 		} else {
-			if (answer.type !== "noul") throw new Error(`${label} did not return a bool answer for ${id}`);
+			if (answer.type !== "noul") throw ownedLocalError(`${label} did not return a bool answer for ${id}`);
 			answers.push([
 				id,
 				{
@@ -196,10 +196,10 @@ export async function classifySystemOne(
 			? setTimeout(() => controller.abort(timeoutError(timeoutMs)), timeoutMs)
 			: undefined;
 	try {
-		if (!timer) throw new Error("Timeout must be a positive finite number");
+		if (!timer) throw ownedLocalError("Timeout must be a positive finite number");
 		signal.throwIfAborted();
-		if (model.api !== transport.api) throw new Error(`Unsupported classifier API: ${model.api}`);
-		if (!options?.apiKey) throw new Error(`No API key for provider: ${model.provider}`);
+		if (model.api !== transport.api) throw ownedLocalError(`Unsupported classifier API: ${model.api}`);
+		if (!options?.apiKey) throw ownedLocalError(`No API key for provider: ${model.provider}`);
 		const apiKey = options.apiKey;
 		let payload = transport.payload(model, wireRequest(context));
 		const transformed = await options.onPayload?.(payload, model);

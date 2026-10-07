@@ -10,7 +10,7 @@ import type {
 	JsonObject,
 } from "../types.ts";
 import { fetchBoundedResponse } from "../utils/bounded-response.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, ownedLocalError } from "../utils/error-body.ts";
 import { providerHeadersToRecord, providerResponseObservation } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
@@ -72,7 +72,7 @@ interface HttpError extends Error {
 }
 
 function httpError(response: Response, body: string): HttpError {
-	const error = new Error(`${LABEL} returned ${response.status}`) as HttpError;
+	const error = ownedLocalError(`${LABEL} returned ${response.status}`) as HttpError;
 	error.status = response.status;
 	error.headers = response.headers;
 	error.body = body;
@@ -80,7 +80,7 @@ function httpError(response: Response, body: string): HttpError {
 }
 
 function timeoutError(timeoutMs: number): HttpError {
-	const error = new Error(`Request timed out after ${timeoutMs}ms`) as HttpError;
+	const error = ownedLocalError(`Request timed out after ${timeoutMs}ms`) as HttpError;
 	error.name = "TimeoutError";
 	error.status = undefined;
 	error.headers = undefined;
@@ -106,13 +106,15 @@ function questionLabels(question: ClassifierQuestion): { labels: string[]; keys:
 	if (question.type === "choice") {
 		const keys = Object.keys(question.criteria);
 		if (keys.length < 2 || keys.length > CHOICE_LABELS.length) {
-			throw new Error(`A choice question needs 2 to ${CHOICE_LABELS.length} options, got ${keys.length}`);
+			throw ownedLocalError(`A choice question needs 2 to ${CHOICE_LABELS.length} options, got ${keys.length}`);
 		}
 		return { labels: CHOICE_LABELS.slice(0, keys.length), keys };
 	}
 	if (question.type === "score") {
 		if (question.criteria.length < 2 || question.criteria.length > SCORE_LABELS.length) {
-			throw new Error(`A score question needs 2 to ${SCORE_LABELS.length} levels, got ${question.criteria.length}`);
+			throw ownedLocalError(
+				`A score question needs 2 to ${SCORE_LABELS.length} levels, got ${question.criteria.length}`,
+			);
 		}
 		const labels = SCORE_LABELS.slice(0, question.criteria.length);
 		return { labels, keys: labels };
@@ -170,7 +172,7 @@ function renderOverview(context: ClassifierContext): string {
  */
 export function renderQuestion(context: ClassifierContext, id: string): LabeledQuestion {
 	const question = context.questions[id];
-	if (!question) throw new Error(`Unknown question: ${id}`);
+	if (!question) throw ownedLocalError(`Unknown question: ${id}`);
 	const { labels, keys } = questionLabels(question);
 	const state = renderState(context.state);
 	const final = `${renderTask(question, labels)}\n\n${answerInstruction(question)}`;
@@ -300,10 +302,11 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 }
 
 function tokenIds(body: unknown): number[] {
-	if (!isRecord(body) || !Array.isArray(body.tokens)) throw new Error(`${LABEL} returned an unexpected tokenization`);
+	if (!isRecord(body) || !Array.isArray(body.tokens))
+		throw ownedLocalError(`${LABEL} returned an unexpected tokenization`);
 	return body.tokens.map((token) => {
 		const id = isRecord(token) ? token.id : token;
-		if (typeof id !== "number") throw new Error(`${LABEL} returned an unexpected tokenization`);
+		if (typeof id !== "number") throw ownedLocalError(`${LABEL} returned an unexpected tokenization`);
 		return id;
 	});
 }
@@ -354,8 +357,10 @@ async function labelTokens(request: RequestContext, labels: readonly string[]): 
 	);
 	const tokens: number[] = [];
 	for (const [index, id] of ids.entries()) {
-		if (id === undefined) throw new Error(`Label "${labels[index]}" is not a single token for ${request.model.id}`);
-		if (tokens.includes(id)) throw new Error(`Labels share a token for ${request.model.id}: ${labels.join(", ")}`);
+		if (id === undefined)
+			throw ownedLocalError(`Label "${labels[index]}" is not a single token for ${request.model.id}`);
+		if (tokens.includes(id))
+			throw ownedLocalError(`Labels share a token for ${request.model.id}: ${labels.join(", ")}`);
 		tokens.push(id);
 	}
 	return tokens;
@@ -375,7 +380,7 @@ async function renderPrompt(request: RequestContext, content: string): Promise<s
 		},
 		false,
 	);
-	if (!isRecord(body) || typeof body.prompt !== "string") throw new Error(`${LABEL} did not return a prompt`);
+	if (!isRecord(body) || typeof body.prompt !== "string") throw ownedLocalError(`${LABEL} did not return a prompt`);
 	// Some templates always open a reasoning block for the reply. Closing it at once
 	// leaves an empty block, as templates with thinking disabled produce, so the next
 	// token is the answer.
@@ -406,7 +411,7 @@ async function nextTokenLogprobs(
 	const first =
 		isRecord(body) && Array.isArray(body.completion_probabilities) ? body.completion_probabilities[0] : undefined;
 	if (!isRecord(first) || !Array.isArray(first.top_logprobs)) {
-		throw new Error(`${LABEL} did not return token probabilities`);
+		throw ownedLocalError(`${LABEL} did not return token probabilities`);
 	}
 	const byToken = new Map<number, number>();
 	for (const entry of first.top_logprobs) {
@@ -429,7 +434,7 @@ async function classifyQuestion(
 		labelTokens(request, rendered.labels),
 		renderPrompt(request, rendered.content),
 	]);
-	if (!Array.isArray(tokens) || typeof prompt !== "string") throw new Error("Invalid classifier preparation");
+	if (!Array.isArray(tokens) || typeof prompt !== "string") throw ownedLocalError("Invalid classifier preparation");
 	const depths = [Math.max(MIN_READOUT_DEPTH, READOUT_DEPTH_PER_LABEL * tokens.length), ...READOUT_ESCALATION];
 	let logprobs: Array<number | undefined> = [];
 	for (const depth of depths) {
@@ -438,13 +443,13 @@ async function classifyQuestion(
 	}
 	const missing = rendered.labels.filter((_label, index) => logprobs[index] === undefined);
 	if (missing.length > 0) {
-		throw new Error(
+		throw ownedLocalError(
 			`${LABEL} did not rank labels ${missing.join(", ")} for ${id} within the top ${depths.at(-1)} tokens`,
 		);
 	}
 	const values = logprobs as number[];
 	if (values.every((logprob) => logprob <= UNDERFLOW_LOGPROB)) {
-		throw new Error(`${request.model.id} gave no probability to any answer label for ${id}`);
+		throw ownedLocalError(`${request.model.id} gave no probability to any answer label for ${id}`);
 	}
 	return answerFromProbabilities(question, rendered.keys, labelProbabilities(values, temperature));
 }
@@ -468,11 +473,11 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 			? setTimeout(() => controller.abort(timeoutError(timeoutMs)), timeoutMs)
 			: undefined;
 	try {
-		if (!timer) throw new Error("Timeout must be a positive finite number");
-		if (model.api !== "llama-cpp-classify") throw new Error(`Unsupported classifier API: ${model.api}`);
+		if (!timer) throw ownedLocalError("Timeout must be a positive finite number");
+		if (model.api !== "llama-cpp-classify") throw ownedLocalError(`Unsupported classifier API: ${model.api}`);
 		const temperature = options?.temperature ?? 1;
 		if (!(temperature > 0) || !Number.isFinite(temperature)) {
-			throw new Error(`Temperature must be a positive number, got ${temperature}`);
+			throw ownedLocalError(`Temperature must be a positive number, got ${temperature}`);
 		}
 		// Validate every question before the first request.
 		for (const id of Object.keys(context.questions)) renderQuestion(context, id);

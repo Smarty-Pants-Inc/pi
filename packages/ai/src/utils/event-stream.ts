@@ -1,4 +1,5 @@
 import {
+	isOwnedLocalErrorText,
 	oauthDiagnosticError,
 	oauthRecoveryDecision,
 	safeOAuthError,
@@ -7,6 +8,7 @@ import {
 import type { AssistantMessage, AssistantMessageEvent, ProviderHeaders, StreamOptions } from "../types.ts";
 import {
 	extractDiagnosticError,
+	isOwnedStopText,
 	type ProjectionModel,
 	projectAssistantContentBlock,
 	projectAssistantMessageDiagnostics,
@@ -145,7 +147,10 @@ function projectTerminalEvent(
 			if (isProviderContextOverflow(message.errorMessage ?? "", message.provider))
 				decision.recovery = "context_length_exceeded";
 			error.oauthRecovery ??= decision;
-			const ownedSetup = Object.values(SETUP_MESSAGES).some((value) => value === message.errorMessage);
+			const ownedSetup =
+				Object.values(SETUP_MESSAGES).some((value) => value === message.errorMessage) ||
+				isOwnedLocalErrorText(message.errorMessage) ||
+				isOwnedStopText(message.errorMessage);
 			error.errorMessage =
 				priorOwned ??
 				(ownedSetup ? message.errorMessage : extractDiagnosticError(new Error(message.errorMessage ?? "")).message);

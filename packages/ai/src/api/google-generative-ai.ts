@@ -19,7 +19,7 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, ownedLocalError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
@@ -85,7 +85,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 
 		try {
 			if (options?.fetch && options.fetch !== globalThis.fetch) {
-				throw new Error("Custom fetch is not supported by the Google Generative AI adapter");
+				throw ownedLocalError("Custom fetch is not supported by the Google Generative AI adapter");
 			}
 			const apiKey = options?.apiKey;
 			if (!apiKey) {
@@ -274,7 +274,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 			}
 
 			if (output.stopReason === "pending") {
-				throw new Error("Google stream ended without a finish reason");
+				throw ownedLocalError("Google stream ended without a finish reason");
 			}
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				const errorMessage = output.rawStopReason

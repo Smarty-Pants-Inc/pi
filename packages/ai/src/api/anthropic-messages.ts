@@ -10,7 +10,7 @@ import type {
 	BetaRawMessageStreamEvent as RawMessageStreamEvent,
 	BetaRefusalStopDetails as RefusalStopDetails,
 } from "@anthropic-ai/sdk/resources/beta/messages/messages.js";
-import { oauthDiagnosticError, oauthDiagnosticLogger } from "../auth/oauth/credential-response.ts";
+import { oauthDiagnosticError, oauthDiagnosticLogger, ownedLocalError } from "../auth/oauth/credential-response.ts";
 import {
 	ANTHROPIC_FEDERATION_RULE_ID_ENV,
 	ANTHROPIC_IDENTITY_TOKEN_FILE_ENV,
@@ -568,7 +568,7 @@ async function* iterateAnthropicEvents(
 	}
 
 	if (sawMessageStart && !sawMessageEnd) {
-		throw new Error("Anthropic stream ended before message_stop");
+		throw ownedLocalError("Anthropic stream ended before message_stop");
 	}
 }
 
@@ -716,7 +716,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				} else if (event.type === "content_block_start") {
 					if (event.content_block.type === "fallback") {
 						if (output.content.length > 0) {
-							throw new Error("Anthropic performed an unsupported mid-output model fallback");
+							throw ownedLocalError("Anthropic performed an unsupported mid-output model fallback");
 						}
 						continue;
 					}
