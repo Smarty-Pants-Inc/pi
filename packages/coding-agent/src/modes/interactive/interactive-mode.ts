@@ -3197,8 +3197,21 @@ export class InteractiveMode {
 		this.showStatus("Startup is still in progress");
 	}
 
+	/**
+	 * The editor drops onSubmit's promise, so observe it here (pi#132 R4-4). Shutdown owns exit and
+	 * cleanup: a late failure must neither crash-exit over it nor await its completion.
+	 */
+	private observeSubmitFailure(error: unknown): void {
+		if (this.isTerminalRuntimeCancellation(error)) return;
+		if (this.isShuttingDown) {
+			console.error(error);
+			return;
+		}
+		this.uncaughtCrash(error instanceof Error ? error : new Error(String(error)));
+	}
+
 	private setupEditorSubmitHandler(): void {
-		this.defaultEditor.onSubmit = async (text: string) => {
+		const submit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
 			if (this.runtimeHost.inputsFenced || this.terminalShutdownRequested) {
@@ -3396,6 +3409,9 @@ export class InteractiveMode {
 			}
 			this.editor.addToHistory?.(text);
 		};
+		// Return the observed promise so callers that await submission still see its completion.
+		this.defaultEditor.onSubmit = (text: string) =>
+			submit(text).catch((error: unknown) => this.observeSubmitFailure(error));
 	}
 
 	private subscribeToAgent(): void {
@@ -6047,34 +6063,31 @@ export class InteractiveMode {
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean }> {
 		this.clearStatusIndicator();
-		try {
-			const result = await this.runtimeHost.switchSession(sessionPath, {
+		const resume = (cwdOverride?: string) =>
+			this.runtimeHost.switchSession(sessionPath, {
+				cwdOverride,
 				withSession: options?.withSession,
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
-			if (result.cancelled) {
-				return result;
-			}
-			this.showStatus("Resumed session");
-			return result;
-		} catch (error: unknown) {
-			if (error instanceof MissingSessionCwdError) {
+		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
+		try {
+			let status = "Resumed session";
+			let result: { cancelled: boolean };
+			try {
+				result = await resume();
+			} catch (error: unknown) {
+				if (!(error instanceof MissingSessionCwdError)) throw error;
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
-					cwdOverride: selectedCwd,
-					withSession: options?.withSession,
-					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-				});
-				if (result.cancelled) {
-					return result;
-				}
-				this.showStatus("Resumed session in current cwd");
-				return result;
+				status = "Resumed session in current cwd";
+				result = await resume(selectedCwd);
 			}
+			if (!result.cancelled) this.showStatus(status);
+			return result;
+		} catch (error: unknown) {
 			if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 			if (this.handleInputAdmissionError(error)) return { cancelled: true };
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -6772,29 +6785,23 @@ export class InteractiveMode {
 			return;
 		}
 
+		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
 		try {
 			this.clearStatusIndicator();
-			const result = await this.runtimeHost.importFromJsonl(inputPath);
-			if (result.cancelled) {
-				this.showStatus("Import cancelled");
-				return;
-			}
-			this.showStatus(`Session imported from: ${inputPath}`);
-		} catch (error: unknown) {
-			if (error instanceof MissingSessionCwdError) {
+			let result: { cancelled: boolean };
+			try {
+				result = await this.runtimeHost.importFromJsonl(inputPath);
+			} catch (error: unknown) {
+				if (!(error instanceof MissingSessionCwdError)) throw error;
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
 					this.showStatus("Import cancelled");
 					return;
 				}
-				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
-				if (result.cancelled) {
-					this.showStatus("Import cancelled");
-					return;
-				}
-				this.showStatus(`Session imported from: ${inputPath}`);
-				return;
+				result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
 			}
+			this.showStatus(result.cancelled ? "Import cancelled" : `Session imported from: ${inputPath}`);
+		} catch (error: unknown) {
 			if (error instanceof SessionImportFileNotFoundError) {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
