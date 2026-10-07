@@ -122,6 +122,11 @@ export class UserMessageIngress {
 		// request, and a retry with oversized text is refused the same way again. Text whose code units
 		// fit but whose UTF-8 bytes do not is still refused below by the exact byte check, after reservation.
 		if (request.text.length > MAX_TEXT_BYTES) return rejected("admission_refused");
+		// Same bound for correlation IDs (smarty-dev#6119): more than MAX_ID_BYTES code units is always more
+		// than MAX_ID_BYTES UTF-8 bytes, so refuse before byteLength scans an arbitrarily long ID.
+		if (request.registrationEpoch.length > MAX_ID_BYTES || request.requestId.length > MAX_ID_BYTES) {
+			return rejected("admission_refused");
+		}
 		const textBytes = Buffer.byteLength(request.text, "utf8");
 		const epochBytes = Buffer.byteLength(request.registrationEpoch, "utf8");
 		const idBytes = Buffer.byteLength(request.requestId, "utf8");

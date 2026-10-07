@@ -602,6 +602,51 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 		expect(ingress.reservations.size).toBe(reservedBefore + 1);
 	});
 
+	// smarty-dev#6119: correlation IDs over the code-unit limit are refused before byteLength scans them.
+	it.each(["requestId", "registrationEpoch"] as const)(
+		"refuses a %s over the code-unit limit without scanning it, and accepts one at the limit",
+		async (field) => {
+			const { harness, api, request, inputs } = await setup();
+			const ingress = (harness.session as unknown as { _userMessageIngress: { reservations: Map<string, unknown> } })
+				._userMessageIngress;
+			const reservedBefore = ingress.reservations.size;
+			const oversized = { ...request("x".repeat(65536), "oversized-id"), [field]: "x".repeat(1_000_000) };
+			const justOver = { ...request("bounded", "just-over-id"), [field]: "x".repeat(257) };
+			const byteLength = vi.spyOn(Buffer, "byteLength");
+			const hashUpdate = vi.spyOn(Hash.prototype, "update");
+			try {
+				for (const submission of [oversized, justOver]) {
+					expect(await within(api().submitUserMessage(submission))).toEqual({
+						status: "rejected",
+						reason: "admission_refused",
+						sessionGeneration: submission.sessionGeneration,
+					});
+				}
+				// Neither the oversized ID nor the text that follows it was scanned or hashed.
+				expect(
+					byteLength.mock.calls.some(([value]) => value === oversized[field] || value === justOver[field]),
+				).toBe(false);
+				expect(byteLength.mock.calls.some(([value]) => value === oversized.text)).toBe(false);
+				expect(hashUpdate.mock.calls.some(([value]) => value === oversized.text)).toBe(false);
+			} finally {
+				byteLength.mockRestore();
+				hashUpdate.mockRestore();
+			}
+			expect(ingress.reservations.size).toBe(reservedBefore);
+			expect(inputs).toEqual([]);
+
+			// IDs at the limit, in code units or in UTF-8 bytes, are still admitted.
+			const atUnitLimit = await within(
+				api().submitUserMessage({ ...request("at unit limit"), [field]: "x".repeat(256) }),
+			);
+			expect(atUnitLimit.status).toBe("accepted");
+			const atByteLimit = await within(
+				api().submitUserMessage({ ...request("at byte limit"), [field]: "é".repeat(128) }),
+			);
+			expect(atByteLimit.status).not.toBe("rejected");
+		},
+	);
+
 	// #5533 PR #149 review: text within the code-unit limit but over 64 KiB UTF-8 still hits the exact byte check.
 	it("refuses multibyte text whose code units fit but whose UTF-8 bytes do not", async () => {
 		const { harness, api, request, inputs } = await setup();
