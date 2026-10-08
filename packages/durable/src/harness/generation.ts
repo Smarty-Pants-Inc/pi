@@ -10,7 +10,12 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
-import { isRetryableAssistantError, retryDelayMs } from "@earendil-works/pi-ai/utils/retry";
+import {
+	discardPartialReasoning,
+	isReasoningOnlyPrematureStream,
+	isRetryableAssistantError,
+	retryDelayMs,
+} from "@earendil-works/pi-ai/utils/retry";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { AssistantEntry, ResetEntry, SystemEntry, UserEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
@@ -485,7 +490,9 @@ async function classify(
 	const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
 	await runtime.commit(async (tx): Promise<Next> => {
 		const live = await tx.doc(LiveDoc, conversationId);
-		await appendAssistant(tx, conversationId, message);
+		// The restarted attempt replaces a reasoning-only premature close (smarty-dev#6730).
+		const discard = retry && isReasoningOnlyPrematureStream(message);
+		await appendAssistant(tx, conversationId, discard ? discardPartialReasoning(message) : message);
 		if (retry) {
 			live.generation = { attempt, retry: { at: until, error: message.errorMessage ?? "" } };
 			const checkpoint = {

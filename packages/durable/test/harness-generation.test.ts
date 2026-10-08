@@ -203,6 +203,36 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#6730: only a premature close after reasoning alone is restarted, and its reasoning is not kept.
+	it.each([
+		{ errorMessage: "stream closed before response.completed", content: [], retried: true },
+		{ errorMessage: "stream closed before response.completed", content: [{ type: "text", text: "a" }] },
+		{ errorMessage: "stream closed before response.completed", content: [{ type: "toolCall", id: "c", name: "t" }] },
+		{ errorMessage: "400 invalid_request_error", content: [] },
+	] as const)("restarts a reasoning-only premature close only: $errorMessage $content", async (row) => {
+		const setup = chatSetup();
+		const answer = row.content.map((block) => (block.type === "toolCall" ? { ...block, arguments: {} } : block));
+		const partial = fauxAssistantMessage([{ type: "thinking", thinking: "planning" }, ...answer], {
+			stopReason: "error",
+			errorMessage: row.errorMessage,
+		});
+		setup.faux.setResponses([partial, fauxAssistantMessage("recovered")]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		const retried = "retried" in row;
+		expect(settled.status).toBe(retried ? "done" : "unanswered");
+		expect(setup.faux.state.callCount).toBe(retried ? 2 : 1);
+		const failed = (await allEntries(root)).find(
+			(entry) => entry.kind === "pi.assistant" && (entry.model?.[0] as AssistantMessage).stopReason === "error",
+		);
+		expect(JSON.stringify(failed?.model)).toEqual(
+			retried ? expect.not.stringContaining("planning") : expect.stringContaining("planning"),
+		);
+		await harness.close(context);
+	});
+
 	it("fails with model_error once retries are exhausted", async () => {
 		const setup = chatSetup();
 		setup.faux.setResponses([ERROR_503, ERROR_503, fauxAssistantMessage("never")]);
