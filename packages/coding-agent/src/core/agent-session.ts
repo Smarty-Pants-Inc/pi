@@ -2694,6 +2694,21 @@ export class AgentSession {
 				this._settlementCancellation = new AbortController();
 			throw error;
 		}
+		return this.#inputFenceRelease(fence);
+	}
+
+	/**
+	 * @internal Close direct admission without the drain check, for a receiving session published after its
+	 * fences refused. Awaited lifecycle callbacks still submit through withFencedInput() under this gate.
+	 */
+	gateInputs(): () => void {
+		if (this._inputFence) return () => {};
+		const fence = {};
+		this._inputFence = fence;
+		return this.#inputFenceRelease(fence);
+	}
+
+	#inputFenceRelease(fence: object): () => void {
 		return () => {
 			if (this._inputFence === fence) {
 				this._inputFence = undefined;

@@ -1888,6 +1888,82 @@ describe("native input admission v1", () => {
 		expect(runtime.session.getFollowUpMessages()).toEqual(["after refusal"]);
 	});
 
+	// pi#163 security P2: a receiving session published without a fence still refuses direct input until
+	// the replacement work finishes, and terminal shutdown races its held callback as on the fenced path.
+	async function doubleRefusalRuntime(h: Harness) {
+		const runtime = await runtimeFor(h);
+		const mode = { inputPending: true };
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			await result.session.bindExtensions({ hasPendingInput: () => mode.inputPending });
+			return result;
+		});
+		return { runtime, mode };
+	}
+
+	it("double refusal gates direct receiving input until withSession completes", async () => {
+		const { runtime, mode } = await doubleRefusalRuntime(await setup());
+		const entered = gate(),
+			held = gate();
+		const replacement = runtime
+			.newSession({
+				withSession: async () => {
+					entered.release();
+					await held.promise;
+				},
+			})
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await entered.promise;
+		mode.inputPending = false;
+		const receiving = runtime.session;
+		expect(receiving.isDisposed).toBe(false);
+		expect(runtime.inputsFenced).toBe(true);
+		await expect(receiving.followUp("early follow-up")).rejects.toThrow("INPUT_ADMISSION_FENCED");
+		await expect(receiving.prompt("early prompt")).rejects.toThrow("INPUT_ADMISSION_FENCED");
+		expect(receiving.getFollowUpMessages()).toEqual([]);
+		held.release();
+		expect(await replacement).toBeInstanceOf(InputAdmissionError);
+		expect(runtime.session === receiving).toBe(true);
+		expect(runtime.inputsFenced).toBe(false);
+		await receiving.followUp("after completion");
+		expect(receiving.getFollowUpMessages()).toEqual(["after completion"]);
+	});
+
+	it("double refusal terminal shutdown cancels a held withSession and completes disposal", async () => {
+		const { runtime, mode } = await doubleRefusalRuntime(await setup());
+		const entered = gate(),
+			held = gate();
+		const replacement = runtime
+			.newSession({
+				withSession: async () => {
+					entered.release();
+					await held.promise;
+				},
+			})
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await entered.promise;
+		mode.inputPending = false;
+		const receiving = runtime.session;
+		const timeout = new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2000));
+		const shutdown = runtime.dispose({ terminal: true, rejectQueuedInput: () => {} }).then(
+			() => "disposed",
+			(error: unknown) => error,
+		);
+		expect(await Promise.race([shutdown, timeout])).toBe("disposed");
+		const error = await replacement;
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).code).toBe("INPUT_ADMISSION_SHUTDOWN");
+		expect(runtime.session === receiving).toBe(true);
+		expect(receiving.isDisposed).toBe(true);
+	});
+
 	// pi#163 review P2-2: the recovery path publishes the receiving session, so the caller's setup and
 	// withSession must run exactly once before the refusal is returned.
 	it("refusal recovery runs setup and withSession exactly once", async () => {

@@ -369,7 +369,9 @@ export class AgentSessionRuntime {
 					// If the recovery fence also refused, input is still held outside the queue (for example
 					// mode-owned input). The session stays live, so publish it unfenced rather than retiring it:
 					// retirement would refuse for the same reason and leave the disposed session published.
-					this.releaseReceivingInputs = release;
+					// Without a fence, gate direct admission until the lifecycle releases, so callbacks keep
+					// the fenced path's admission scope and terminal-cancellation race (pi#163 security P2).
+					this.releaseReceivingInputs = release ?? session.gateInputs();
 					this.#publish(session, services, diagnostics, modelFallbackMessage);
 					let cause = error;
 					try {
