@@ -6,6 +6,7 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
+import { getRequestDiagnosticSecrets, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -20,6 +21,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
 import {
 	appendAssistantMessageDiagnostic,
@@ -31,6 +33,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -244,7 +247,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 	context: TranscriptContext,
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	(async () => {
@@ -360,15 +364,20 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						}
 						appendAssistantMessageDiagnostic(
 							output,
-							createAssistantMessageDiagnostic("provider_transport_failure", error, {
-								configuredTransport: transport,
-								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
-								eventsEmitted: websocketStarted,
-								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-							}),
+							createAssistantMessageDiagnostic(
+								"provider_transport_failure",
+								error,
+								{
+									configuredTransport: transport,
+									...(websocketStarted ? {} : { fallbackTransport: "sse" }),
+									eventsEmitted: websocketStarted,
+									phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+									requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+								},
+								diagnosticSecrets,
+							),
 						);
-						recordWebSocketFailure(cacheSessionId, error);
+						recordWebSocketFailure(cacheSessionId, error, diagnosticSecrets);
 						if (websocketStarted) {
 							throw error;
 						}
@@ -397,6 +406,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					throw new Error("Request was aborted");
 				}
 
+				checkProviderRequest(options);
 				try {
 					const headerTimeoutSignal =
 						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
@@ -443,7 +453,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					if (info.friendlyMessage) throw new Error(info.friendlyMessage);
+					// Keep the message for the retry checks below; status and raw body go to formatProviderError.
+					throw Object.assign(new Error(info.message), { status: response.status, body: errorText });
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -493,7 +505,13 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			// HTTP errors carry `status` and `body` (see above), so they read `<provider> API error (<status>): <body>`
+			// like the other Responses providers; errors without a status keep their message unchanged. The body and
+			// message are redacted with the request's diagnostic secrets by normalizeProviderError.
+			output.errorMessage = formatProviderError(
+				normalizeProviderError(error, diagnosticSecrets),
+				`${model.provider} API error`,
+			);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -753,8 +771,14 @@ async function* mapCodexEvents(
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		try {
-			await options?.onProviderStreamEvent?.(event, model);
+			options?.signal?.throwIfAborted();
+			const observing = options?.onProviderStreamEvent?.(event, model);
+			if (observing) {
+				if (options?.signal) await raceWithAbortSignal(Promise.resolve(observing), options.signal);
+				else await observing;
+			}
 		} catch (error) {
+			if (options?.signal?.aborted) throw error;
 			// The final assistant error must retain this non-transport origin for outer retry callers.
 			appendAssistantMessageDiagnostic(
 				output,
@@ -1007,13 +1031,13 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
+function recordWebSocketFailure(sessionId: string | undefined, error: unknown, secrets: readonly string[]): void {
 	if (!sessionId) return;
 	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	stats.lastWebSocketError = formatThrownValue(error);
+	stats.lastWebSocketError = redactOAuthDiagnostic(formatThrownValue(error), secrets);
 	stats.websocketFallbackActive = true;
 }
 
@@ -1547,6 +1571,18 @@ async function processWebSocketStream(
 		options?.env,
 	);
 	let keepConnection = true;
+	let released = false;
+	const onAbort = () => {
+		// The parser may be suspended at a stream observer. Invalidate and close
+		// the owned connection here, without waiting for parser advancement.
+		keepConnection = false;
+		if (entry) entry.continuation = undefined;
+		if (!released) {
+			released = true;
+			release({ keep: false });
+		}
+	};
+	options?.signal?.addEventListener("abort", onAbort, { once: true });
 	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
 	// WebSocket continuation still works via connection-scoped previous_response_id state.
@@ -1571,6 +1607,7 @@ async function processWebSocketStream(
 		}
 	}
 	try {
+		checkProviderRequest(options);
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
@@ -1612,7 +1649,8 @@ async function processWebSocketStream(
 		keepConnection = false;
 		throw error;
 	} finally {
-		release({ keep: keepConnection });
+		options?.signal?.removeEventListener("abort", onAbort);
+		if (!released) release({ keep: keepConnection });
 	}
 }
 

@@ -13,6 +13,8 @@ export const HOST_CAPABILITIES = Object.freeze({
 	inputAdmission: 1,
 	/** `ctx.isPromptPending()` reports user input awaiting handoff; such input makes `ctx.isIdle()` false. */
 	promptPendingVisible: true as boolean,
+	/** `bash_spawn` is emitted immediately before the built-in bash executor runs. */
+	bashSpawnEvent: true as boolean,
 });
 
 export type HostCapabilities = typeof HOST_CAPABILITIES;

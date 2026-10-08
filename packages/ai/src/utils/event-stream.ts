@@ -1,4 +1,6 @@
+import { redactOAuthDiagnostic, redactOAuthDiagnosticValue, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
+import type { AssistantMessageDiagnostic } from "./diagnostics.ts";
 
 class FifoQueue<T> {
 	private incoming: T[] = [];
@@ -88,8 +90,59 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	}
 }
 
+interface StreamProtection {
+	secrets: string[];
+	protectedDiagnostics: WeakSet<object>;
+}
+
+// Kept outside the class: new members would break structural compatibility of custom streams.
+const streamProtections = new WeakMap<object, StreamProtection>();
+
+/**
+ * Mask the live credential values of a request (see `getRequestDiagnosticSecrets`)
+ * in every later event and the final result of `stream`, before any consumer sees
+ * them. A provider error, partial event or technical metadata field then cannot
+ * publish a reflected key or header. Call again to add values.
+ */
+export function protectAssistantMessageStream(
+	stream: AssistantMessageEventStream,
+	secrets: readonly string[] | undefined,
+): void {
+	const values = (secrets ?? []).filter((secret): secret is string => typeof secret === "string" && secret !== "");
+	if (values.length === 0) return;
+	const protection = streamProtections.get(stream);
+	if (protection) protection.secrets.push(...values);
+	else streamProtections.set(stream, { secrets: values, protectedDiagnostics: new WeakSet() });
+}
+
+/** Mask in place: providers keep mutating the same partial object between events. */
+function protectMessage(message: AssistantMessage, protection: StreamProtection): void {
+	const { secrets, protectedDiagnostics } = protection;
+	if (typeof message.errorMessage === "string")
+		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
+	if (typeof message.rawStopReason === "string")
+		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
+	// The handle id is a provider token that consumers persist and redeem: mask live values only, and
+	// replace the handle instead of rewriting the provider's own object (smarty-dev#5443 T-F6-deferred).
+	const deferred = message.deferred;
+	if (typeof deferred?.id === "string") {
+		const id = redactValues(deferred.id, secrets);
+		if (id !== deferred.id) message.deferred = { ...deferred, id };
+	}
+	const diagnostics = message.diagnostics;
+	if (!Array.isArray(diagnostics)) return;
+	for (let i = 0; i < diagnostics.length; i++) {
+		const diagnostic = diagnostics[i];
+		if (typeof diagnostic === "object" && diagnostic !== null && protectedDiagnostics.has(diagnostic)) continue;
+		const safe = redactOAuthDiagnosticValue(diagnostic, secrets) as AssistantMessageDiagnostic;
+		if (typeof safe === "object" && safe !== null) protectedDiagnostics.add(safe);
+		diagnostics[i] = safe;
+	}
+}
+
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
+	/** `diagnosticSecrets`: see `protectAssistantMessageStream`. */
+	constructor(diagnosticSecrets?: readonly string[]) {
 		super(
 			(event) => event.type === "done" || event.type === "error",
 			(event) => {
@@ -101,6 +154,23 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new Error("Unexpected event type for final result");
 			},
 		);
+		protectAssistantMessageStream(this, diagnosticSecrets);
+	}
+
+	override push(event: AssistantMessageEvent): void {
+		const protection = streamProtections.get(this);
+		if (protection) {
+			if ("partial" in event) protectMessage(event.partial, protection);
+			if (event.type === "done") protectMessage(event.message, protection);
+			if (event.type === "error") protectMessage(event.error, protection);
+		}
+		super.push(event);
+	}
+
+	override end(result?: AssistantMessage): void {
+		const protection = streamProtections.get(this);
+		if (result && protection) protectMessage(result, protection);
+		super.end(result);
 	}
 }
 

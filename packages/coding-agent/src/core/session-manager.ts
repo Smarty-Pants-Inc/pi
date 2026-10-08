@@ -52,6 +52,10 @@ import {
 	toHotEntry,
 } from "./session-lazy-entries.ts";
 
+import { bindSessionTurnAppender } from "./session-turn-appender.ts";
+import type { TurnProvenance } from "./turn-provenance.ts";
+import { receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
+
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
 const RECENT_RESIDENT_ENTRIES = 100;
 
@@ -59,12 +63,13 @@ export const CURRENT_SESSION_VERSION = 3;
 
 const ownedTerminalPersistence = new WeakMap<SessionManager, () => Promise<void>>();
 type OwnedTerminalAppender = {
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage): Promise<string>;
+	appendMessage(message: Message | CustomMessage | BashExecutionMessage, receipt?: TurnReceipt): Promise<string>;
 	appendCustomMessage<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		receipt?: TurnReceipt,
 	): Promise<string>;
 	appendCustomEntry(type: string, data?: unknown): Promise<string>;
 };
@@ -81,10 +86,11 @@ export function persistOwnedTerminalSession(manager: SessionManager): Promise<vo
 export function appendOwnedTerminalMessage(
 	manager: SessionManager,
 	message: Message | CustomMessage | BashExecutionMessage,
+	receipt?: TurnReceipt,
 ): Promise<string> {
 	const append = ownedTerminalAppenders.get(manager)?.appendMessage;
 	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(message);
+	return append(message, receipt);
 }
 
 /** Private captured route used only by the original owner's terminal callbacks. */
@@ -94,10 +100,11 @@ export function appendOwnedTerminalCustomMessage<T = unknown>(
 	content: string | (TextContent | ImageContent)[],
 	display: boolean,
 	details?: T,
+	receipt?: TurnReceipt,
 ): Promise<string> {
 	const append = ownedTerminalAppenders.get(manager)?.appendCustomMessage;
 	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(customType, content, display, details);
+	return append(customType, content, display, details, receipt);
 }
 
 /** Private captured route for non-message retained-session entries. */
@@ -131,6 +138,7 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+	provenance?: TurnProvenance;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -229,6 +237,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
+	provenance?: TurnProvenance;
 }
 
 /** Content that an append-only context edit may replace without changing message metadata. */
@@ -1136,12 +1145,17 @@ export class SessionManager {
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
 		this.#ownedJournal = ownedJournal;
+		bindSessionTurnAppender(this, {
+			appendMessage: (message, receipt) => this.#appendReceivedMessage(message, receipt),
+			appendCustomMessage: (customType, content, display, details, receipt) =>
+				this.#appendReceivedCustomMessage(customType, content, display, details, receipt),
+		});
 		if (ownedJournal) {
 			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
 			ownedTerminalAppenders.set(this, {
-				appendMessage: (message) => this.#appendMessageOwnedTerminal(message),
-				appendCustomMessage: (customType, content, display, details) =>
-					this.#appendCustomMessageOwnedTerminal(customType, content, display, details),
+				appendMessage: (message, receipt) => this.#appendMessageOwnedTerminal(message, receipt),
+				appendCustomMessage: (customType, content, display, details, receipt) =>
+					this.#appendCustomMessageOwnedTerminal(customType, content, display, details, receipt),
 				appendCustomEntry: (type, data) => this.#appendCustomEntryOwnedTerminal(type, data),
 			});
 			ownedJournal.assertActive();
@@ -1272,6 +1286,7 @@ export class SessionManager {
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
+			sealEntryProvenance(entry, !this.#ownedJournal);
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
 			if (entry.type === "label") {
@@ -1324,6 +1339,7 @@ export class SessionManager {
 				continue;
 			}
 			const rebound = toColdEntry(JSON.parse(line) as SessionEntry, location);
+			sealEntryProvenance(rebound, true);
 			this.fileEntries[i] = rebound;
 			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
 		}
@@ -1361,6 +1377,7 @@ export class SessionManager {
 			if (!location) continue;
 			const next = hot.has(entry.id) ? toHotEntry(entry) : isColdEntry(entry) ? entry : toColdEntry(entry, location);
 			if (next === entry) continue;
+			sealEntryProvenance(next, true);
 			this.fileEntries[i] = next;
 			// With duplicate ids, byId keeps the later entry (as _buildIndex does); only replace that one.
 			if (this.byId.get(next.id) === entry) this.byId.set(next.id, next);
@@ -1410,25 +1427,27 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
-	_persist(entry: SessionEntry): void {
+	/**
+	 * A new session file is created only once the session contains a user or assistant message.
+	 * Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
+	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
+	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
+	 */
+	private _hasConversation(): boolean {
+		return this.fileEntries.some(
+			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+		);
+	}
+
+	#persistEntry(entry: SessionEntry): void {
 		if (this.#ownedJournal) {
 			this.persistCurrent();
 			return;
 		}
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
-			if (this.flushed) {
-				this.#appendLine(this.sessionFile, entry);
-			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
-				this.flushed = false;
-			}
-			return;
-		}
-
 		if (!this.flushed) {
+			if (!this._hasConversation()) return;
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				this.#writeEntries(fd, this.sessionFile);
@@ -1450,6 +1469,7 @@ export class SessionManager {
 			const bytes = Buffer.concat([prefix, Buffer.from(`${JSON.stringify(admitted)}\n`)]);
 			const selected = parseOwnedSessionEntries(bytes, this.sessionId);
 			const published = selected[selected.length - 1] as SessionEntry;
+			sealEntryProvenance(published, false);
 			// Publish before changing the canonical index or acknowledging the entry.
 			this.#ownedJournal.commit(bytes);
 			this.ownedBytes = bytes;
@@ -1459,11 +1479,12 @@ export class SessionManager {
 			this.leafId = published.id;
 			return;
 		}
+		sealEntryProvenance(entry, true);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this.extendBranchProjection(entry);
-		this._persist(entry);
+		this.#persistEntry(entry);
 	}
 
 	#enqueueOwnedTerminal<T>(operation: () => Promise<T>): Promise<T> {
@@ -1477,11 +1498,16 @@ export class SessionManager {
 		return run;
 	}
 
-	#appendMessageOwnedTerminal(message: Message | CustomMessage | BashExecutionMessage): Promise<string> {
+	#appendMessageOwnedTerminal(
+		message: Message | CustomMessage | BashExecutionMessage,
+		receipt?: TurnReceipt,
+	): Promise<string> {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendMessage(message));
+		if (!isOwnedTerminalWrite(this.#ownedJournal))
+			return Promise.resolve(this.#appendReceivedMessage(message, receipt));
+		const provenance = message.role === "user" || message.role === "custom" ? receiptRecord(receipt) : undefined;
 		return this.#enqueueOwnedTerminal(async () => {
 			const entry: SessionMessageEntry = {
 				type: "message",
@@ -1489,6 +1515,7 @@ export class SessionManager {
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
 				message,
+				...(provenance ? { provenance } : {}),
 			};
 			await this.#appendEntryOwnedTerminal(entry);
 			return entry.id;
@@ -1500,12 +1527,14 @@ export class SessionManager {
 		content: string | (TextContent | ImageContent)[],
 		display: boolean,
 		details?: T,
+		receipt?: TurnReceipt,
 	): Promise<string> {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		if (!isOwnedTerminalWrite(this.#ownedJournal))
-			return Promise.resolve(this.appendCustomMessageEntry(customType, content, display, details));
+			return Promise.resolve(this.#appendReceivedCustomMessage(customType, content, display, details, receipt));
+		const provenance = receiptRecord(receipt);
 		return this.#enqueueOwnedTerminal(async () => {
 			const entry: CustomMessageEntry<T> = {
 				type: "custom_message",
@@ -1513,6 +1542,7 @@ export class SessionManager {
 				content,
 				display,
 				details,
+				provenance,
 				id: generateId(this.byId),
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
@@ -1549,6 +1579,7 @@ export class SessionManager {
 		const bytes = Buffer.concat([prefix, Buffer.from(`${JSON.stringify(admitted)}\n`)]);
 		const selected = parseOwnedSessionEntries(bytes, this.sessionId);
 		const published = selected[selected.length - 1] as SessionEntry;
+		sealEntryProvenance(published, false);
 		await this.#ownedJournal.commitTerminalAsync(bytes);
 		try {
 			this.#ownedJournal.assertWritable();
@@ -1589,8 +1620,12 @@ export class SessionManager {
 	}
 
 	private encodeOwnedEntries(): Buffer {
+		// The private ordinary fork scratch has a non-enumerable reserved serializer slot.
+		// Exclude that slot there only; owned entries still undergo full descriptor validation.
 		return Buffer.from(
-			`${this.fileEntries.map((entry) => JSON.stringify(materializeOwnedEntry(entry))).join("\n")}\n`,
+			`${this.fileEntries
+				.map((entry) => JSON.stringify(materializeOwnedEntry(this.#ownedJournal ? entry : { ...entry })))
+				.join("\n")}\n`,
 		);
 	}
 
@@ -1623,12 +1658,18 @@ export class SessionManager {
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		return this.#appendReceivedMessage(message);
+	}
+
+	#appendReceivedMessage(message: Message | CustomMessage | BashExecutionMessage, receipt?: TurnReceipt): string {
+		const provenance = message.role === "user" || message.role === "custom" ? receiptRecord(receipt) : undefined;
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
+			...(provenance ? { provenance } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1739,10 +1780,10 @@ export class SessionManager {
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
 		// Walk entries in reverse to find the latest session_info entry.
-		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
+		// Empty names explicitly clear the session title. Reads fileEntries directly: the footer
+		// calls this on every frame, and getEntries() copies the whole session.
+		for (let i = this.fileEntries.length - 1; i >= 0; i--) {
+			const entry = this.fileEntries[i];
 			if (entry.type === "session_info") {
 				return entry.name?.trim() || undefined;
 			}
@@ -1764,12 +1805,23 @@ export class SessionManager {
 		display: boolean,
 		details?: T,
 	): string {
+		return this.#appendReceivedCustomMessage(customType, content, display, details);
+	}
+
+	#appendReceivedCustomMessage<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+		receipt?: TurnReceipt,
+	): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType,
 			content,
 			display,
 			details,
+			provenance: receiptRecord(receipt),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1991,6 +2043,11 @@ export class SessionManager {
 	getHeader(): SessionHeader | null {
 		const h = this.fileEntries.find((e) => e.type === "session");
 		return this.ownedView(h ? (h as SessionHeader) : null);
+	}
+
+	/** Number of session entries (excludes header), without copying them like `getEntries()`. */
+	getEntryCount(): number {
+		return this.byId.size;
 	}
 
 	/**
@@ -2229,13 +2286,9 @@ export class SessionManager {
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Only write the file now if it contains an assistant message.
-			// Otherwise defer to _persist(), which creates the file on the
-			// first assistant response, matching the newSession() contract
-			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
+			// Use the same rule as #persistEntry(): write now if the branched path already
+			// has a conversation, otherwise let #persistEntry() create the file later.
+			if (this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
 				this.#releaseColdEntries();
@@ -2322,7 +2375,10 @@ export class SessionManager {
 
 	/** Create an in-memory session (no file persistence), optionally from entries held outside the filesystem. */
 	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions, entries?: FileEntry[]): SessionManager {
-		return new SessionManager(cwd, "", undefined, false, options, entries);
+		// Own the containers; _buildIndex detaches and seals reserved metadata.
+		// Unrelated live payloads retain their in-memory representation, not JSON wire semantics.
+		const snapshot = entries?.map((entry) => ({ ...entry }));
+		return new SessionManager(cwd, "", undefined, false, options, snapshot);
 	}
 
 	/**

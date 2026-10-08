@@ -1,8 +1,7 @@
-import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import type { WriteStream } from "node:fs";
+import { open } from "node:fs/promises";
 import { finished } from "node:stream/promises";
+import { createOutputFileStream } from "../../utils/output-files.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
 
 export interface OutputAccumulatorOptions {
@@ -17,9 +16,10 @@ export interface OutputSnapshot {
 	fullOutputPath?: string;
 }
 
-function defaultTempFilePath(prefix: string): string {
-	const id = randomBytes(8).toString("hex");
-	return join(tmpdir(), `${prefix}-${id}.log`);
+export interface FullOutput {
+	content: string;
+	/** Whether `content` omits part of the output. */
+	truncated: boolean;
 }
 
 function byteLength(text: string): number {
@@ -133,6 +133,40 @@ export class OutputAccumulator {
 		if (error) throw error;
 	}
 
+	/**
+	 * The complete output, for callers that can take more than the display snapshot. Call after
+	 * `finish()` and `closeTempFile()`. Output longer than `maxBytes` raw bytes keeps its first and
+	 * last `maxBytes / 2` bytes around an omission marker.
+	 */
+	async readFullOutput(maxBytes: number): Promise<FullOutput> {
+		if (!this.tempFilePath) {
+			return { content: new TextDecoder().decode(Buffer.concat(this.rawChunks)), truncated: false };
+		}
+		const file = await open(this.tempFilePath, "r");
+		try {
+			const size = (await file.stat()).size;
+			if (size <= maxBytes) {
+				return { content: new TextDecoder().decode(await file.readFile()), truncated: false };
+			}
+			const headBytes = Math.floor(maxBytes / 2);
+			const tailBytes = maxBytes - headBytes;
+			const head = Buffer.alloc(headBytes);
+			const tail = Buffer.alloc(tailBytes);
+			await file.read(head, 0, headBytes, 0);
+			await file.read(tail, 0, tailBytes, size - tailBytes);
+			// Cut at character boundaries: streaming decode holds back an incomplete trailing sequence,
+			// and the tail skips leading continuation bytes.
+			const headText = new TextDecoder().decode(head, { stream: true });
+			let tailStart = 0;
+			while (tailStart < tail.length && (tail[tailStart] & 0xc0) === 0x80) tailStart++;
+			const tailText = new TextDecoder().decode(tail.subarray(tailStart));
+			const omitted = size - headBytes - tailBytes;
+			return { content: `${headText}\n\n[... ${omitted} bytes omitted ...]\n\n${tailText}`, truncated: true };
+		} finally {
+			await file.close();
+		}
+	}
+
 	getLastLineBytes(): number {
 		return this.currentLineBytes;
 	}
@@ -204,8 +238,9 @@ export class OutputAccumulator {
 		if (this.tempFilePath) {
 			return;
 		}
-		this.tempFilePath = defaultTempFilePath(this.tempFilePrefix);
-		this.tempFileStream = createWriteStream(this.tempFilePath, { flags: "wx", mode: 0o600 });
+		const { path, stream } = createOutputFileStream(this.tempFilePrefix, ".log");
+		this.tempFilePath = path;
+		this.tempFileStream = stream;
 		// Capture even early open errors, then report them when the caller closes the file.
 		this.tempFileCompletion = finished(this.tempFileStream).then(
 			() => undefined,

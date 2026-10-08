@@ -5,22 +5,15 @@
  * gateway; only the interactive browser authorization endpoint is discovered.
  * Model catalog loading is owned by the Radius provider.
  *
- * NOTE: This module uses node:http for the OAuth callback server.
+ * NOTE: This module uses node:http (via callback-server.ts) for the OAuth callback server.
  * It is only intended for CLI use, not browser environments.
  */
 
-// NEVER convert to top-level imports - breaks browser/Vite builds
-let _http: typeof import("node:http") | null = null;
-if (typeof process !== "undefined" && (process.versions?.node || process.versions?.bun)) {
-	import("node:http").then((m) => {
-		_http = m;
-	});
-}
-
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { startOAuthCallbackServer } from "./callback-server.ts";
+import { oauthAuthorizationError, readOAuthCredentialResponse } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
-import { oauthErrorHtml, oauthSuccessHtml } from "./oauth-page.ts";
 import { generatePKCE } from "./pkce.ts";
 
 const CALLBACK_HOST = "127.0.0.1";
@@ -67,36 +60,25 @@ async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): P
 
 class OAuthResponseError extends Error {
 	readonly status: number;
+	/** Allowlisted protocol code only: the raw field can echo a submitted or issued credential. */
 	readonly oauthError?: string;
 
-	constructor(status: number, oauthError: string | undefined, description: string | undefined, message: string) {
-		const detail = oauthError
-			? description
-				? `${oauthError}: ${description}`
-				: oauthError
-			: description || String(status);
-		super(`${message}: ${detail}`);
+	constructor(status: number, oauthError: string | undefined, message: string) {
+		super(`${message}: ${oauthError ?? String(status)}`);
 		this.status = status;
 		this.oauthError = oauthError;
 	}
 }
 
 async function readOAuthResponseError(response: Response, message: string): Promise<OAuthResponseError> {
-	const text = await response.text().catch(() => "");
-	let oauthError: string | undefined;
-	let description: string | undefined;
-
-	if (text) {
-		try {
-			const data = JSON.parse(text) as { error?: unknown; error_description?: unknown };
-			oauthError = typeof data.error === "string" ? data.error : undefined;
-			description = typeof data.error_description === "string" ? data.error_description : undefined;
-		} catch {
-			description = text;
-		}
-	}
-
-	return new OAuthResponseError(response.status, oauthError, description, message);
+	// A non-JSON or unreadable body is not shown; the raw `error` value is never retained.
+	const data = await readOAuthCredentialResponse(response, message).catch(() => undefined);
+	const error = data && typeof data === "object" ? (data as { error?: unknown }).error : undefined;
+	return new OAuthResponseError(
+		response.status,
+		typeof error === "string" ? oauthAuthorizationError(error) : undefined,
+		message,
+	);
 }
 
 async function requestOAuthToken(
@@ -123,12 +105,13 @@ async function requestOAuthToken(
 		throw await readOAuthResponseError(response, "Radius OAuth token request failed");
 	}
 
-	const data = (await response.json()) as {
+	const data = (await readOAuthCredentialResponse(response, "Radius OAuth token")) as {
 		access_token: string;
 		refresh_token: string;
 		expires_in: number;
 		scope?: string;
-	};
+	} | null;
+	if (!data || typeof data !== "object") throw new Error("Radius OAuth token response is invalid");
 
 	return {
 		type: "oauth",
@@ -137,84 +120,6 @@ async function requestOAuthToken(
 		expires: Date.now() + data.expires_in * 1000 - TOKEN_EXPIRY_SKEW_MS,
 		scope: data.scope,
 	};
-}
-
-type OAuthCallbackServer = {
-	waitForCode(): Promise<string | null>;
-	close(): void;
-};
-
-function startOAuthCallbackServer(expectedState: string, signal: AbortSignal): Promise<OAuthCallbackServer> {
-	if (!_http) {
-		throw new Error("Radius OAuth is only available in Node.js environments");
-	}
-
-	let settle: (code: string | null) => void = () => {};
-	let settled = false;
-	const wait = new Promise<string | null>((resolve) => {
-		settle = resolve;
-	});
-	const finish = (code: string | null) => {
-		if (settled) {
-			return;
-		}
-		settled = true;
-		signal.removeEventListener("abort", onAbort);
-		settle(code);
-	};
-	const onAbort = () => finish(null);
-	signal.addEventListener("abort", onAbort, { once: true });
-
-	const sendPage = (response: import("node:http").ServerResponse, status: number, html: string) => {
-		response.statusCode = status;
-		response.setHeader("content-type", "text/html; charset=utf-8");
-		response.end(html);
-	};
-
-	const server = _http.createServer((request, response) => {
-		const url = new URL(request.url ?? "/", REDIRECT_URI);
-		if (url.pathname !== CALLBACK_PATH) {
-			sendPage(response, 404, oauthErrorHtml("Callback route not found."));
-			return;
-		}
-		if (url.searchParams.get("state") !== expectedState) {
-			sendPage(response, 400, oauthErrorHtml("OAuth state mismatch."));
-			return;
-		}
-
-		const error = url.searchParams.get("error");
-		if (error) {
-			sendPage(response, 400, oauthErrorHtml(url.searchParams.get("error_description") ?? error));
-			finish(null);
-			return;
-		}
-
-		const code = url.searchParams.get("code");
-		if (!code) {
-			sendPage(response, 400, oauthErrorHtml("Missing authorization code."));
-			return;
-		}
-
-		sendPage(response, 200, oauthSuccessHtml("Signed in to Radius. You may now close this page."));
-		finish(code);
-	});
-
-	return new Promise((resolve) => {
-		server
-			.listen(CALLBACK_PORT, CALLBACK_HOST, () => {
-				resolve({
-					waitForCode: () => wait,
-					close: () => {
-						finish(null);
-						server.close();
-					},
-				});
-			})
-			.once("error", () => {
-				finish(null);
-				resolve({ waitForCode: async () => null, close: () => {} });
-			});
-	});
 }
 
 async function loginWithBrowser(
@@ -236,7 +141,26 @@ async function loginWithBrowser(
 		state,
 	}).toString();
 
-	const callbackServer = await startOAuthCallbackServer(state, interaction.signal);
+	const callback = await startOAuthCallbackServer({
+		providerName: "Radius",
+		host: CALLBACK_HOST,
+		port: CALLBACK_PORT,
+		path: CALLBACK_PATH,
+		state,
+		complete: (code) =>
+			requestOAuthToken(
+				gateway,
+				new URLSearchParams({
+					grant_type: "authorization_code",
+					client_id: OAUTH_CLIENT_ID,
+					redirect_uri: REDIRECT_URI,
+					code,
+					code_verifier: verifier,
+				}),
+				interaction.signal,
+			),
+		signal: interaction.signal,
+	});
 	interaction.notify({ type: "progress", message: `Listening for OAuth callback on ${REDIRECT_URI}` });
 	interaction.notify({
 		type: "auth_url",
@@ -245,26 +169,11 @@ async function loginWithBrowser(
 	});
 
 	try {
-		const code = await callbackServer.waitForCode();
-		if (!code) {
-			if (interaction.signal.aborted) {
-				throw new Error("Login cancelled");
-			}
-			throw new Error("OAuth callback did not complete.");
-		}
-		return await requestOAuthToken(
-			gateway,
-			new URLSearchParams({
-				grant_type: "authorization_code",
-				client_id: OAUTH_CLIENT_ID,
-				redirect_uri: REDIRECT_URI,
-				code,
-				code_verifier: verifier,
-			}),
-			interaction.signal,
-		);
+		const credential = await callback.wait();
+		if (!credential) throw new Error("OAuth callback did not complete.");
+		return credential;
 	} finally {
-		callbackServer.close();
+		callback.close();
 	}
 }
 
@@ -288,7 +197,13 @@ async function requestDeviceAuthorization(gateway: string, signal: AbortSignal):
 		throw await readOAuthResponseError(response, "Radius OAuth device authorization failed");
 	}
 
-	const data = (await response.json()) as Partial<DeviceAuthorizationResponse>;
+	const data = (await readOAuthCredentialResponse(
+		response,
+		"Radius OAuth device authorization",
+	)) as Partial<DeviceAuthorizationResponse> | null;
+	if (!data || typeof data !== "object") {
+		throw new Error("Radius OAuth device authorization response is missing required fields");
+	}
 	if (!data.device_code || !data.user_code || !data.verification_uri || !data.expires_in) {
 		throw new Error("Radius OAuth device authorization response is missing required fields");
 	}

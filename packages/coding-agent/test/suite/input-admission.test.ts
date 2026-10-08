@@ -13,6 +13,7 @@ import type { BoundaryResult, ExtensionAPI, ExtensionFactory } from "../../src/c
 import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
 import { InputAdmissionError } from "../../src/core/input-admission.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
+import { type ReceivedInput, receiveInput } from "../../src/core/received-input.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
@@ -2100,9 +2101,17 @@ describe("native input admission v1", () => {
 		let editorText = "";
 		const submitEditorPrompt = Reflect.get(InteractiveMode.prototype, "submitEditorPrompt") as (
 			this: unknown,
-			text: string,
+			input: ReceivedInput,
 			behavior?: "steer" | "followUp",
 		) => Promise<void>;
+		const dispatchEditorInput = Reflect.get(InteractiveMode.prototype, "dispatchEditorInput") as (
+			this: unknown,
+			input: ReceivedInput,
+		) => Promise<void>;
+		const submitEditorInput = Reflect.get(InteractiveMode.prototype, "submitEditorInput") as (
+			this: unknown,
+			input: ReceivedInput,
+		) => void;
 		const restoreRejectedInput = Reflect.get(InteractiveMode.prototype, "restoreRejectedInput") as (
 			this: unknown,
 			text: string,
@@ -2112,17 +2121,22 @@ describe("native input admission v1", () => {
 		) => Promise<void>;
 		const promptWithRecoveredImages = Reflect.get(InteractiveMode.prototype, "promptWithRecoveredImages") as (
 			this: unknown,
-			text: string,
+			input: ReceivedInput,
 			options?: PromptOptions,
 		) => Promise<void>;
 		return {
 			recoveredImages: new Map<string, ImageContent>(),
 			prepareRecoveredInput: Reflect.get(InteractiveMode.prototype, "prepareRecoveredInput") as (
-				text: string,
-				images?: ImageContent[],
-			) => { text: string; images: ImageContent[] | undefined; transferred: () => void },
-			promptWithRecoveredImages(text: string, options?: PromptOptions) {
-				return promptWithRecoveredImages.call(this, text, options);
+				input: ReceivedInput,
+			) => { input: ReceivedInput; transferred: () => void },
+			promptWithRecoveredImages(input: ReceivedInput, options?: PromptOptions) {
+				return promptWithRecoveredImages.call(this, input, options);
+			},
+			dispatchEditorInput(input: ReceivedInput) {
+				return dispatchEditorInput.call(this, input);
+			},
+			submitEditorInput(input: ReceivedInput) {
+				submitEditorInput.call(this, input);
 			},
 			session: h.session,
 			runtimeHost: runtime,
@@ -2134,8 +2148,8 @@ describe("native input admission v1", () => {
 				getText: () => editorText,
 				addToHistory: vi.fn(),
 			},
-			submitEditorPrompt(text: string, behavior?: "steer" | "followUp") {
-				return submitEditorPrompt.call(this, text, behavior);
+			submitEditorPrompt(input: ReceivedInput, behavior?: "steer" | "followUp") {
+				return submitEditorPrompt.call(this, input, behavior);
 			},
 			restoreRejectedInput(text: string) {
 				restoreRejectedInput.call(this, text);
@@ -2143,7 +2157,7 @@ describe("native input admission v1", () => {
 			checkShutdownRequested() {
 				return checkShutdownRequested.call(this);
 			},
-			pendingUserInputs: [] as string[],
+			pendingUserInputs: [] as ReceivedInput[],
 			showError: vi.fn(),
 			clearStatusIndicator: vi.fn(),
 			flushPendingBashComponents: vi.fn(),
@@ -2216,19 +2230,18 @@ describe("native input admission v1", () => {
 		});
 		const submitStartupInput = Reflect.get(InteractiveMode.prototype, "submitStartupInput") as (
 			this: unknown,
-			message: string,
-			images?: ImageContent[],
+			input: ReceivedInput,
 		) => Promise<void>;
 		const image: ImageContent = { type: "image", data: "startup-image", mimeType: "image/png" };
 		mode.editor.setText("newer draft");
 		const release = await h.session.fenceInputs();
-		await submitStartupInput.call(mode, "startup text", [image]);
+		await submitStartupInput.call(mode, receiveInput("startup text", [image]));
 		release();
 		expect(mode.showError).toHaveBeenCalledWith(expect.stringContaining("INPUT_ADMISSION_FENCED"));
 		const restored = mode.editor.getText();
 		expect(restored.startsWith("newer draft\nstartup text\n[recovered image ")).toBe(true);
-		const recovered = mode.prepareRecoveredInput.call(mode, restored);
-		expect(recovered.images).toEqual([image]);
+		const recovered = mode.prepareRecoveredInput.call(mode, receiveInput(restored));
+		expect(recovered.input.images).toEqual([image]);
 		expect(h.session.pendingMessageCount).toBe(0);
 		expect(getUserTexts(h)).toEqual([]);
 	});
@@ -2252,16 +2265,16 @@ describe("native input admission v1", () => {
 			if (site === "main loop") {
 				const submitUserInput = Reflect.get(InteractiveMode.prototype, "submitUserInput") as (
 					this: unknown,
-					text: string,
+					input: ReceivedInput,
 				) => Promise<void>;
-				await submitUserInput.call(mode, "/replace");
+				await submitUserInput.call(mode, receiveInput("/replace"));
 			} else {
-				await mode.submitEditorPrompt("/replace");
+				await mode.submitEditorPrompt(receiveInput("/replace"));
 			}
 			const restored = mode.editor.getText();
 			expect(restored.startsWith("returned\n[recovered image ")).toBe(true);
 			expect(restored).not.toContain("/replace");
-			expect(mode.prepareRecoveredInput.call(mode, restored).images).toEqual([image]);
+			expect(mode.prepareRecoveredInput.call(mode, receiveInput(restored)).input.images).toEqual([image]);
 			expect(mode.promptWithRecoveredImages).toHaveBeenCalledTimes(1);
 		},
 	);
@@ -2349,7 +2362,7 @@ describe("native input admission v1", () => {
 		await mode.defaultEditor.onSubmit!("pending editor handoff");
 		await clear.call(mode);
 		expect(runtime.session).toBe(h.session);
-		expect(mode.pendingUserInputs).toEqual(["pending editor handoff"]);
+		expect(mode.pendingUserInputs.map((input) => input.text)).toEqual(["pending editor handoff"]);
 		expect(mode.showError).toHaveBeenCalledWith(expect.stringContaining("INPUT_ADMISSION_BUSY"));
 		expect(mode.handleFatalRuntimeError).not.toHaveBeenCalled();
 		mode.pendingUserInputs.length = 0;

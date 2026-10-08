@@ -89,6 +89,7 @@ describe("ExtensionRunner", () => {
 		setLabel: () => {},
 		getActiveTools: () => [],
 		getAllTools: () => [],
+		getSettings: () => ({}),
 		setActiveTools: () => {},
 		refreshTools: () => {},
 		getCommands: () => [],
@@ -111,6 +112,110 @@ describe("ExtensionRunner", () => {
 		getSystemPrompt: () => "",
 		getScopedModels: () => [],
 	};
+
+	describe("native nested parent lifetime", () => {
+		function makeRunner(executeTool: NonNullable<ExtensionContextActions["executeTool"]>) {
+			const runner = new ExtensionRunner([], createExtensionRuntime(), tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, { ...extensionContextActions, executeTool });
+			return runner;
+		}
+		const result = { content: [], details: {} };
+		const outcome = {
+			toolCall: { type: "toolCall" as const, id: "parent/1", name: "child", arguments: {} },
+			result,
+			isError: false,
+		};
+
+		it("rejects retained contexts after parent settlement even without a nested call", async () => {
+			const execute = vi.fn(async () => outcome);
+			const runner = makeRunner(execute);
+			const ctx = runner.createToolContext("parent", undefined);
+			await runner.emitToolResult({
+				type: "tool_result",
+				toolCallId: "parent",
+				toolName: "parent",
+				input: {},
+				...result,
+				isError: false,
+			});
+			await expect(ctx.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
+			expect(execute).not.toHaveBeenCalled();
+		});
+
+		it.each(["tool_execution_end", "agent_end"] as const)(
+			"closes retained contexts at %s without result hooks",
+			async (type) => {
+				const execute = vi.fn(async () => outcome);
+				const runner = makeRunner(execute);
+				const ctx = runner.createToolContext("parent", undefined);
+				if (type === "agent_end") await runner.emit({ type, messages: [] });
+				else await runner.emit({ type, toolCallId: "parent", toolName: "parent", result, isError: false });
+				await expect(ctx.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
+				expect(execute).not.toHaveBeenCalled();
+			},
+		);
+
+		it("does not let a fresh child signal bypass parent cancellation", async () => {
+			const execute = vi.fn(async () => outcome);
+			const runner = makeRunner(execute);
+			const parent = new AbortController();
+			const ctx = runner.createToolContext("parent", parent.signal);
+			parent.abort();
+			await expect(ctx.executeTool("child", {}, { signal: new AbortController().signal })).rejects.toThrow();
+			expect(execute).not.toHaveBeenCalled();
+		});
+
+		it("closes admission and drains accepted children before parent result hooks", async () => {
+			let release!: () => void;
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const execute = vi.fn(async () => {
+				await held;
+				return outcome;
+			});
+			const runner = makeRunner(execute);
+			const ctx = runner.createToolContext("parent", undefined);
+			const child = ctx.executeTool("child", {});
+			let settled = false;
+			const finalization = runner
+				.emitToolResult({
+					type: "tool_result",
+					toolCallId: "parent",
+					toolName: "parent",
+					input: {},
+					...result,
+					isError: false,
+				})
+				.then(() => {
+					settled = true;
+				});
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				expect(settled).toBe(false);
+				await expect(ctx.executeTool("late", {})).rejects.toThrow(/closed|settled/i);
+			} finally {
+				release();
+				await Promise.all([child, finalization]);
+			}
+			expect(execute).toHaveBeenCalledTimes(1);
+		});
+
+		it("composes in-flight parent and child cancellation", async () => {
+			let childSignal: AbortSignal | undefined;
+			const runner = makeRunner(async (_id, _name, _args, options) => {
+				childSignal = options.signal;
+				return outcome;
+			});
+			const parent = new AbortController();
+			const child = new AbortController();
+			const ctx = runner.createToolContext("parent", parent.signal);
+			await ctx.executeTool("child", {}, { signal: child.signal });
+			expect(childSignal?.aborted).toBe(false);
+			parent.abort();
+			expect(childSignal?.aborted).toBe(true);
+		});
+	});
 
 	describe("scopedModels", () => {
 		it("reflects the getScopedModels context action on ctx.scopedModels", async () => {
@@ -707,6 +812,47 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("message and entry renderers", () => {
+		// Refs smarty-dev#5049: user-renderer registration follows existing load order and runtime ownership.
+		it("loads a user renderer, keeps the first extension and drops it when reloaded without registration", async () => {
+			const file = path.join(extensionsDir, "a-user-renderer.ts");
+			fs.writeFileSync(file, `export default function(pi) { pi.registerUserMessageRenderer(() => undefined); }`);
+			fs.writeFileSync(
+				path.join(extensionsDir, "b-user-renderer.ts"),
+				`export default function(pi) { pi.registerUserMessageRenderer(() => undefined); }`,
+			);
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			expect(result.errors).toEqual([]);
+			expect(runner.getUserMessageRenderer()).toBe(result.extensions[0].userMessageRenderer);
+			expect(runner.getUserMessageRenderer()).not.toBe(result.extensions[1].userMessageRenderer);
+			fs.writeFileSync(file, `export default function() {}`);
+			fs.writeFileSync(path.join(extensionsDir, "b-user-renderer.ts"), `export default function() {}`);
+			const reloaded = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const next = new ExtensionRunner(
+				reloaded.extensions,
+				reloaded.runtime,
+				tempDir,
+				sessionManager,
+				modelRegistry,
+			);
+			expect(next.getUserMessageRenderer()).toBeUndefined();
+		});
+
+		it("rejects user-renderer registration after runtime invalidation", async () => {
+			const runtime = createExtensionRuntime();
+			let register: (() => void) | undefined;
+			await loadExtensionFromFactory(
+				(pi) => {
+					register = () => pi.registerUserMessageRenderer(() => undefined);
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			runtime.invalidate("stale renderer runtime");
+			expect(() => register?.()).toThrow("stale renderer runtime");
+		});
+
 		it("gets Markdown transformers in extension load order", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -887,6 +1033,30 @@ describe("ExtensionRunner", () => {
 			expect(chained.messages).toEqual([]);
 			expect(buildSystemPrompt(chained.systemPromptOptions)).toMatch(/base[\s\S]*\nfirst\nsecond$/);
 		});
+	});
+
+	// Issue #10285: the MCP extension renders calls to tools that are not registered.
+	it("resolves tool renderers in extension load order, each able to defer to the next", async () => {
+		const runtime = createExtensionRuntime();
+		const eventBus = createEventBus();
+		const renderCall = () => ({ render: () => [], invalidate: () => {} });
+		const first = await loadExtensionFromFactory(
+			(pi) => pi.registerToolRenderer((toolName, next) => (toolName === "a" ? { renderCall } : next())),
+			tempDir,
+			eventBus,
+			runtime,
+		);
+		const second = await loadExtensionFromFactory(
+			(pi) => pi.registerToolRenderer((_toolName, next) => next() ?? { renderShell: "self" }),
+			tempDir,
+			eventBus,
+			runtime,
+		);
+		const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
+
+		expect(runner.resolveToolRenderers("a", () => undefined)).toEqual({ renderCall });
+		expect(runner.resolveToolRenderers("b", () => undefined)).toEqual({ renderShell: "self" });
+		expect(runner.resolveToolRenderers("b", () => ({ renderCall }))).toEqual({ renderCall });
 	});
 
 	describe("boundary chaining", () => {

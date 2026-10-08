@@ -21,6 +21,12 @@ export type { PiMessagesEvent, PiMessagesOptions, PiMessagesRewriteImpact } from
 export * from "./auth/context.ts";
 export * from "./auth/credential-store.ts";
 export * from "./auth/helpers.ts";
+export {
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+	redactOAuthDiagnostic,
+	redactOAuthDiagnosticValue,
+} from "./auth/oauth/credential-response.ts";
 export * from "./auth/types.ts";
 export type {
 	OAuthAuthInfo,
@@ -40,6 +46,7 @@ export * from "./utils/diagnostics.ts";
 export * from "./utils/event-stream.ts";
 export * from "./utils/json-parse.ts";
 export * from "./utils/overflow.ts";
+export { ProviderRequestLimitError } from "./utils/provider-retry.ts";
 export * from "./utils/retry.ts";
 export { contentText, getSystemMessageText, renderSystemMessageUpdate } from "./utils/text.ts";
 export * from "./utils/transcript.ts";
