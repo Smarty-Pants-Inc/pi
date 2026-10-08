@@ -167,22 +167,26 @@ export function observeAssistantStreamEvent(
 }
 
 /**
- * A premature close that streamed only reasoning (smarty-dev#6730): no answer output, and either a thinking
- * block in the message or reasoning observed in the stream. Its output tokens are reasoning, so the attempt
- * can be discarded and restarted. Without `observed`, a message whose content was dropped is not
- * reasoning-only, because its reported output tokens could be answer text.
+ * A premature close that streamed only reasoning (smarty-dev#6730): no answer output, and either non-empty
+ * thinking in the message or reasoning observed in the stream. Its output tokens are reasoning, so the attempt
+ * can be discarded and restarted. Without `observed`, a message whose content is empty thinking or was
+ * dropped is not reasoning-only, because its reported output tokens could be answer text.
  */
 export function isReasoningOnlyPrematureStream(
 	message: AssistantMessage,
 	observed?: AssistantStreamObservation,
 ): boolean {
 	if (!isPrematureStreamError(message) || observed?.answer === true || hasAssistantAnswerOutput(message)) return false;
-	return observed?.reasoning === true || message.content.some((block) => block.type === "thinking");
+	return (
+		observed?.reasoning === true ||
+		message.content.some((block) => block.type === "thinking" && block.thinking.length > 0)
+	);
 }
 
 /**
  * Drop the partial reasoning of an attempt that will be restarted. Thinking blocks keep their place
- * but lose text and replay signatures, so the message stays classified as a reasoning-only close.
+ * but lose text and replay signatures. Empty thinking is no evidence of reasoning, so a caller that
+ * classifies the result again must pass an observation that recorded the original message.
  */
 export function discardPartialReasoning<T extends AssistantMessage>(message: T): T {
 	if (!message.content.some((block) => block.type === "thinking")) return message;

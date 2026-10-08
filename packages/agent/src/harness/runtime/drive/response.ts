@@ -8,6 +8,7 @@ import {
 	isReasoningOnlyPrematureStream,
 	isRecoverableLength,
 	isRetryableAssistantError,
+	observeAssistantMessage,
 	observeAssistantStreamEvent,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
@@ -96,7 +97,9 @@ export function openAssistantResponse<TContext extends object | undefined>(
 		async afterResponse(response, metadata, context) {
 			await close();
 			// smarty-dev#6730: classify first, so after_response and message_end never see reasoning that the
-			// restarted attempt discards.
+			// restarted attempt discards. Observe the terminal message first: publishResponse classifies the
+			// stripped message again, and its empty thinking alone does not prove reasoning.
+			observeAssistantMessage(observed, response);
 			const message =
 				retriesResponse(intent, response, observed, recovery) && isReasoningOnlyPrematureStream(response, observed)
 					? discardPartialReasoning(response)

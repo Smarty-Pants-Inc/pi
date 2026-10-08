@@ -12,6 +12,7 @@ import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	type ImageContent,
+	isPrematureStreamError,
 	isRetryableAssistantError,
 	type Message,
 	type Model,
@@ -2146,7 +2147,10 @@ export class InteractiveMode {
 	}
 
 	private maybeSuggestBugReport(message: AssistantMessage): void {
-		if (message.stopReason !== "error" || isRetryableAssistantError(message)) return;
+		// A premature close is a provider transport failure. A retried reasoning-only close (smarty-dev#6730) also
+		// arrives here stripped, without the stream observation that made it retryable.
+		if (message.stopReason !== "error" || isRetryableAssistantError(message) || isPrematureStreamError(message))
+			return;
 		if (/\b(?:abort(?:ed)?|cancel(?:l?ed)?)\b/i.test(message.errorMessage ?? "")) return;
 		this.suggestBugReport();
 	}

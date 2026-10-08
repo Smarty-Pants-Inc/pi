@@ -366,6 +366,33 @@ describe("runtime assistant retry wait", () => {
 		await expectProjectionRestores(fixture);
 	});
 
+	// smarty-dev#6730: publishResponse classifies the stripped message again; its empty thinking is no evidence,
+	// so reasoning carried only by the terminal message must reach the observation.
+	it("retries when only the terminal message carried the reasoning", async () => {
+		const fixture = await createFixture({ deferredSubmission: false });
+		const ready = await advanceToReady(fixture);
+		scriptStream(
+			fixture,
+			[],
+			prematureClose([{ type: "thinking", thinking: "planning", thinkingSignature: "rs_1" }]),
+		);
+
+		await runGeneration(fixture.lane, fixture.drive, ready);
+		expect(currentRun(fixture)).toMatchObject({ at: "assistant.retry_wait", nextAttempt: 2 });
+		expect(fixture.events.at(-1)).toMatchObject({ type: "retry_scheduled", attempt: 2 });
+	});
+
+	// smarty-dev#6730: empty thinking with output tokens and nothing streamed could hide dropped answer text.
+	it("does not retry empty thinking with output tokens and no streamed reasoning", async () => {
+		const fixture = await createFixture({ deferredSubmission: false });
+		const ready = await advanceToReady(fixture);
+		scriptStream(fixture, [], prematureClose([{ type: "thinking", thinking: "" }]));
+
+		await runGeneration(fixture.lane, fixture.drive, ready);
+		expect(fixture.events.map((event) => event.type)).not.toContain("retry_scheduled");
+		expect(fixture.events.at(-1)).toMatchObject({ type: "run_end", status: "failed" });
+	});
+
 	// smarty-dev#6730: after_response and message_end see the retried attempt without its reasoning.
 	it("hides discarded reasoning from after_response and message_end", async () => {
 		const fixture = await createFixture({ deferredSubmission: false });

@@ -8,6 +8,7 @@ import {
 	isPrematureStreamError,
 	isReasoningOnlyPrematureStream,
 	isRetryableAssistantError,
+	observeAssistantMessage,
 	observeAssistantStreamEvent,
 	retryAssistantCall,
 } from "../src/utils/retry.ts";
@@ -61,7 +62,11 @@ describe("premature stream retry classification", () => {
 		expect(isRetryableAssistantError(partial)).toBe(true);
 		const discarded = discardPartialReasoning(partial);
 		expect(discarded.content).toEqual([{ type: "thinking", thinking: "" }]);
-		expect(isRetryableAssistantError(discarded)).toBe(true);
+		// The stripped message keeps its output tokens; only an observation of the original proves reasoning.
+		expect(isRetryableAssistantError(discarded)).toBe(false);
+		expect(
+			isRetryableAssistantError(discarded, observeAssistantMessage(createAssistantStreamObservation(), partial)),
+		).toBe(true);
 
 		const responses = [partial, fauxAssistantMessage([fauxThinking("fresh"), { type: "text", text: "answer" }])];
 		let calls = 0;
@@ -143,6 +148,21 @@ describe("premature stream retry classification", () => {
 			expect(isRetryableAssistantError(message)).toBe(false);
 			expect(isRetryableAssistantError(message, reasoning)).toBe(true);
 			expect(isRetryableAssistantError(message, text)).toBe(false);
+		});
+
+		// smarty-dev#6730: empty thinking is no evidence that the reported output tokens were reasoning.
+		it("does not replay output tokens behind empty thinking without observed reasoning", () => {
+			const message = closed([fauxThinking("")]);
+			expect(isReasoningOnlyPrematureStream(message)).toBe(false);
+			expect(isRetryableAssistantError(message)).toBe(false);
+			expect(isReasoningOnlyPrematureStream(message, reasoning)).toBe(true);
+			expect(isRetryableAssistantError(message, reasoning)).toBe(true);
+		});
+
+		it("restarts non-empty thinking without an observation", () => {
+			const message = closed([fauxThinking("plan")]);
+			expect(isReasoningOnlyPrematureStream(message)).toBe(true);
+			expect(isRetryableAssistantError(message)).toBe(true);
 		});
 
 		it("does not replay observed reasoning on a non-premature error", () => {
