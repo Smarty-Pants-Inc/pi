@@ -7,7 +7,7 @@ import {
 	fauxToolCall,
 } from "@earendil-works/pi-ai";
 import { onTestFinished, test } from "vitest";
-import { kinds as taskKinds } from "../../../src/harness/pico3/harness.ts";
+import { applyEnvelope, kinds as taskKinds } from "../../../src/harness/pico3/harness.ts";
 import { retryDecision } from "../../../src/harness/pico3/kinds/generation.ts";
 import { effectiveTools } from "../../../src/harness/pico3/system.ts";
 import type { Models } from "../../../src/harness/pico3/types.ts";
@@ -361,6 +361,27 @@ test("afterResponse never sees the reasoning of a retried reasoning-only close",
 	const run = await runScripted([thinking], prematureClose([thinking]));
 	assert.equal(run.calls, 2);
 	assert.deepEqual(run.hooked[0]?.content, [{ type: "thinking", thinking: "" }]);
+});
+
+test("the turn view drops a retried reasoning-only attempt's reasoning during backoff", async () => {
+	const thinking = { ...fauxThinking("planning-secret"), thinkingSignature: "rs_1" };
+	const { models } = scripted([thinking], prematureClose([thinking]));
+	const env = await open({
+		models,
+		root: { rewindable: { model }, sticky: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 20 } } },
+	});
+	onTestFinished(() => env.close());
+	const watch = await env.root.watch(ctx);
+	let folded = watch.view;
+	const atRetry: string[] = [];
+	watch.start((envelope) => {
+		folded = applyEnvelope(folded, envelope);
+		const events = (envelope as unknown as { events?: { type: string }[] }).events ?? [];
+		if (events.some((e) => e.type === "generation.retrying")) atRetry.push(JSON.stringify(folded));
+	});
+	await (await env.root.send({ content: "A" }, ctx)).wait(ctx);
+	assert.equal(atRetry.length, 1);
+	assert.doesNotMatch(atRetry[0]!, /planning-secret|rs_1/);
 });
 
 test("retries exhausted → failed/retries_exhausted, inputs unanswered/failed, display-only assistant entry", async () => {

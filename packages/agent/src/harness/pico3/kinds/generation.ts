@@ -443,6 +443,8 @@ async function classify(
 		if (decision.kind === "retry") {
 			return {
 				next: (tx, current) => {
+					// The turn view must not keep reasoning that the retry discards (smarty-dev#6730 review r3).
+					if (visible !== message) tx.sticky(current.conversationId).turn.message = toStored(visible);
 					tx.appendEntry(current.conversationId, {
 						kind: "pi.usage",
 						data: {
