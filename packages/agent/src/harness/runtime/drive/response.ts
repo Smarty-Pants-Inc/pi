@@ -1,7 +1,9 @@
 import {
 	type AssistantMessageEvent,
 	AssistantMessageFrameEncoder,
+	discardPartialReasoning,
 	isContextOverflow,
+	isReasoningOnlyPrematureStream,
 	isRecoverableLength,
 	isRetryableAssistantError,
 	retryDelayMs,
@@ -279,6 +281,8 @@ export async function publishResponse<TContext extends object | undefined>(
 					(options.recovery === true || isRetryableAssistantError(response)) &&
 					current.attempt < current.generationContext.retryPolicy.maxAttempts
 				) {
+					// The restarted attempt replaces a reasoning-only premature close (smarty-dev#6730).
+					if (isReasoningOnlyPrematureStream(response)) committed = discardPartialReasoning(response);
 					settled = {
 						...scope,
 						at: "assistant.retry_wait",

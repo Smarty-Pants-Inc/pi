@@ -253,6 +253,48 @@ describe("runtime assistant retry wait", () => {
 		await expectProjectionRestores(fixture);
 	});
 
+	// smarty-dev#6730: a premature close after reasoning only is restarted and its reasoning is not committed.
+	it.each([
+		{ errorMessage: "stream closed before response.completed", retried: true },
+		{ errorMessage: "503 service unavailable", retried: false },
+	])("classifies a reasoning-only close: $errorMessage", async ({ errorMessage, retried }) => {
+		const fixture = await createFixture({ deferredSubmission: false });
+		const ready = await advanceToReady(fixture);
+		const partial = fauxAssistantMessage([{ type: "thinking", thinking: "planning", thinkingSignature: "rs_1" }], {
+			stopReason: "error",
+			errorMessage,
+			timestamp: 10,
+		});
+		fixture.faux.setResponses([partial]);
+
+		await runGeneration(fixture.lane, fixture.drive, ready);
+		const committed = [...fixture.events]
+			.reverse()
+			.find(
+				(event) =>
+					event.type === "entry_added" &&
+					event.entry.type === "message" &&
+					event.entry.message.role === "assistant",
+			);
+		const message =
+			committed?.type === "entry_added" && committed.entry.type === "message" && committed.entry.message;
+		if (!message || message.role !== "assistant") throw new Error("no response entry");
+		if (retried) {
+			expect(currentRun(fixture)).toMatchObject({ at: "assistant.retry_wait", nextAttempt: 2, errorMessage });
+			expect(message.content).toEqual([{ type: "thinking", thinking: "" }]);
+			expect(fixture.events.at(-1)).toMatchObject({ type: "retry_scheduled", attempt: 2 });
+		} else {
+			expect(fixture.events.map((event) => event.type)).not.toContain("retry_scheduled");
+			expect(message.content).toMatchObject([{ thinking: "planning", thinkingSignature: "rs_1" }]);
+		}
+		// The faux provider reports reasoning tokens; the attempt's usage is recorded once either way.
+		expect(message.usage.output).toBeGreaterThan(0);
+		expect(fixture.events.filter((event) => event.type === "usage")).toMatchObject([
+			{ row: { usage: message.usage } },
+		]);
+		await expectProjectionRestores(fixture);
+	});
+
 	it("returns a durable waiting outcome without a timer or write when local waiting is disabled", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(1_000);

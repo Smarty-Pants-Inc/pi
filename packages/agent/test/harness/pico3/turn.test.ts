@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
 import { onTestFinished, test } from "vitest";
+import { retryDecision } from "../../../src/harness/pico3/kinds/generation.ts";
 import { effectiveTools } from "../../../src/harness/pico3/system.ts";
 import { contentOf, ctx, echoScript, fake, Gate, kinds, open, sleep, tool } from "./helpers.ts";
 
@@ -256,6 +258,22 @@ test("retryable provider error: pi.usage recorded, retried, then succeeds", asyn
 	assert.equal(kinds(await env.entries()), "user system usage assistant");
 	assert.equal(models.calls, 2);
 	assert.equal(((await env.entries())[2]!.data as { attempt: number }).attempt, 1);
+});
+
+// smarty-dev#6730: only a premature close after reasoning alone is restarted; its retry records usage only.
+test("retryDecision restarts a reasoning-only premature close only", () => {
+	const cp = { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 }, attempt: 1 };
+	const decide = (content: Parameters<typeof fauxAssistantMessage>[0], errorMessage: string) => {
+		const message = fauxAssistantMessage(content, { stopReason: "error", errorMessage });
+		message.usage = { ...message.usage, output: 9 };
+		return retryDecision(cp, message, 0).kind;
+	};
+	const closed = "stream closed before response.completed";
+	assert.equal(decide([fauxThinking("plan")], closed), "retry");
+	assert.equal(decide([fauxThinking("plan"), { type: "text", text: "answer" }], closed), "fail");
+	assert.equal(decide([fauxThinking("plan"), fauxToolCall("t", {})], closed), "fail");
+	assert.equal(decide([fauxThinking("plan")], "400 invalid_request_error"), "fail");
+	assert.equal(decide([fauxThinking("plan")], "overloaded"), "fail");
 });
 
 test("retries exhausted → failed/retries_exhausted, inputs unanswered/failed, display-only assistant entry", async () => {

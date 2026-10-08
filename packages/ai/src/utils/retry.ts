@@ -120,6 +120,37 @@ export function hasAssistantOutput(message: AssistantMessage): boolean {
 	);
 }
 
+/** Answer output: non-empty text, any tool call (even partial), or any other non-reasoning block. */
+export function hasAssistantAnswerOutput(message: AssistantMessage): boolean {
+	return message.content.some((block) =>
+		block.type === "thinking" ? false : block.type === "text" ? block.text.length > 0 : true,
+	);
+}
+
+/**
+ * A premature close that streamed only reasoning (smarty-dev#6730): at least one thinking block and no
+ * answer output. Its output tokens are reasoning, so the attempt can be discarded and restarted.
+ */
+export function isReasoningOnlyPrematureStream(message: AssistantMessage): boolean {
+	return (
+		isPrematureStreamError(message) &&
+		message.content.some((block) => block.type === "thinking") &&
+		!hasAssistantAnswerOutput(message)
+	);
+}
+
+/**
+ * Drop the partial reasoning of an attempt that will be restarted. Thinking blocks keep their place
+ * but lose text and replay signatures, so the message stays classified as a reasoning-only close.
+ */
+export function discardPartialReasoning<T extends AssistantMessage>(message: T): T {
+	if (!message.content.some((block) => block.type === "thinking")) return message;
+	return {
+		...message,
+		content: message.content.map((block) => (block.type === "thinking" ? { type: "thinking", thinking: "" } : block)),
+	};
+}
+
 /**
  * Retry policy: bounded attempts with exponential backoff (`baseDelayMs * 2^(attempt-1)`).
  * `maxAgentDelayMs` caps each computed delay and defaults to 60 seconds.
@@ -278,7 +309,9 @@ export function throttledLimitWait(message: AssistantMessage): { delayMs: number
  * before restarting the assistant turn.
  */
 export function isRetryableAssistantError(message: AssistantMessage): boolean {
-	if (message.stopReason !== "error" || !message.errorMessage || hasAssistantOutput(message)) return false;
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	// Output is never replayed, except reasoning-only output on a premature close (smarty-dev#6730).
+	if (hasAssistantOutput(message) && !isReasoningOnlyPrematureStream(message)) return false;
 	// An observer can fail after receiving generated output but before normalization records it.
 	// Retrying its transient-looking error would regenerate output, not repair the observer.
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;
