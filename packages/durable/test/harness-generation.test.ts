@@ -302,6 +302,26 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#6730: empty thinking with output tokens and nothing streamed could hide dropped answer text.
+	it("does not retry empty thinking with output tokens and no streamed reasoning", async () => {
+		const base = chatSetup();
+		const setup = rewriteTerminalError(base, (error) => ({ ...error, usage: { ...error.usage, output: 9 } }));
+		base.faux.setResponses([
+			fauxAssistantMessage([{ type: "thinking", thinking: "" }], {
+				stopReason: "error",
+				errorMessage: PREMATURE_CLOSE,
+			}),
+			fauxAssistantMessage("must not replay"),
+		]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled.status).toBe("unanswered");
+		expect(base.faux.state.callCount).toBe(1);
+		await harness.close(context);
+	});
+
 	// smarty-dev#6730: afterResponse sees the retried attempt without its reasoning.
 	it("hides discarded reasoning from afterResponse", async () => {
 		const setup = chatSetup();
