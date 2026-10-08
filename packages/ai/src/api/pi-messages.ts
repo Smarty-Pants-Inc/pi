@@ -25,6 +25,7 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "../types.ts";
+import { snapshotToolCall } from "../utils/assistant-message-snapshot.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
@@ -300,7 +301,11 @@ function createEventConverter(model: Model<"pi-messages">) {
 				break;
 			}
 			case "toolcall_end":
-				Object.assign(partial.content[event.contentIndex]!, event.toolCall);
+				// The wire object is untrusted: admit only the declared ToolCall fields.
+				partial.content[event.contentIndex] = snapshotToolCall(
+					event.toolCall,
+					partial.content[event.contentIndex] as ToolCall | undefined,
+				);
 				toolJson.delete(event.contentIndex);
 				return {
 					type: "toolcall_end",

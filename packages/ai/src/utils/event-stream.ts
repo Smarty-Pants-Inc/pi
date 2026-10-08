@@ -1,5 +1,6 @@
 import { redactOAuthDiagnostic, redactOAuthDiagnosticValue, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
+import { snapshotAssistantMessage, snapshotAssistantMessageEvent } from "./assistant-message-snapshot.ts";
 import type { AssistantMessageDiagnostic } from "./diagnostics.ts";
 
 class FifoQueue<T> {
@@ -146,10 +147,11 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 		super(
 			(event) => event.type === "done" || event.type === "error",
 			(event) => {
+				// The result is its own snapshot, so it does not alias the terminal event.
 				if (event.type === "done") {
-					return event.message;
+					return snapshotAssistantMessage(event.message);
 				} else if (event.type === "error") {
-					return event.error;
+					return snapshotAssistantMessage(event.error);
 				}
 				throw new Error("Unexpected event type for final result");
 			},
@@ -164,13 +166,14 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 			if (event.type === "done") protectMessage(event.message, protection);
 			if (event.type === "error") protectMessage(event.error, protection);
 		}
-		super.push(event);
+		// Consumers get event-time snapshots, never the provider's live message.
+		super.push(snapshotAssistantMessageEvent(event));
 	}
 
 	override end(result?: AssistantMessage): void {
 		const protection = streamProtections.get(this);
 		if (result && protection) protectMessage(result, protection);
-		super.end(result);
+		super.end(result && snapshotAssistantMessage(result));
 	}
 }
 
