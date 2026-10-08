@@ -314,7 +314,15 @@ export class AgentSessionRuntime {
 			release();
 		}
 	}
-	async #replace(outgoing: OutgoingSession, options: Parameters<CreateAgentSessionRuntimeFactory>[0]): Promise<void> {
+	/**
+	 * Construct, fence and publish the receiving session, then run `finish` (the caller's post-publication
+	 * work, including withSession) exactly once on every path that publishes it.
+	 */
+	async #replace(
+		outgoing: OutgoingSession,
+		options: Parameters<CreateAgentSessionRuntimeFactory>[0],
+		finish: () => Promise<void>,
+	): Promise<void> {
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		assertUnownedSessionManager(options.sessionManager);
@@ -356,26 +364,26 @@ export class AgentSessionRuntime {
 					.catch(() => undefined);
 				// Terminal shutdown may abort while this fence is pending. Then retire the session below
 				// instead of publishing it, so the captured input still reaches the shutdown receipt.
-				if (release && this.terminalCancellation.signal.aborted) release();
-				else if (release) {
+				if (this.terminalCancellation.signal.aborted) release?.();
+				else {
+					// If the recovery fence also refused, input is still held outside the queue (for example
+					// mode-owned input). The session stays live, so publish it unfenced rather than retiring it:
+					// retirement would refuse for the same reason and leave the disposed session published.
 					this.releaseReceivingInputs = release;
 					this.#publish(session, services, diagnostics, modelFallbackMessage);
+					let cause = error;
 					try {
-						await this.finishSessionReplacement();
+						await finish();
 					} catch (finishError) {
 						// The input is already removed from the queue; a later rejection must still return it.
 						if (recoveredInput.length === 0) throw finishError;
-						throw new InputAdmissionError(
-							"INPUT_ADMISSION_BUSY",
-							"receiving session refused its queued input; it is returned, not replayed",
-							{ cause: finishError, recoveredInput },
-						);
+						cause = finishError;
 					}
 					if (recoveredInput.length === 0) throw error;
 					throw new InputAdmissionError(
 						"INPUT_ADMISSION_BUSY",
 						"receiving session refused its queued input; it is returned, not replayed",
-						{ cause: error, recoveredInput },
+						{ cause, recoveredInput },
 					);
 				}
 			}
@@ -395,6 +403,7 @@ export class AgentSessionRuntime {
 			);
 		}
 		this.#publish(session, services, diagnostics, modelFallbackMessage);
+		await finish();
 	}
 
 	#publish(
@@ -449,14 +458,17 @@ export class AgentSessionRuntime {
 			assertSessionCwdExists(sessionManager, this.cwd);
 			await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
-			await this.#replace(outgoing, {
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-				projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
-			});
-			await this.finishSessionReplacement(options?.withSession);
+			await this.#replace(
+				outgoing,
+				{
+					cwd: sessionManager.getCwd(),
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+					projectTrustContext: options?.projectTrustContextFactory?.(sessionManager.getCwd()),
+				},
+				() => this.finishSessionReplacement(options?.withSession),
+			);
 			return { cancelled: false };
 		} finally {
 			releaseInputs();
@@ -488,19 +500,27 @@ export class AgentSessionRuntime {
 
 			await this.teardownCurrent(outgoing, "new", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
-			await this.#replace(outgoing, {
-				cwd: this.cwd,
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
-			});
-			if (options?.setup) {
-				const replacement = this.#captureOutgoing();
-				await raceWithAbortSignal(options.setup(replacement.sessionManager), this.terminalCancellation.signal);
-				this.#assertCurrent(replacement);
-				replacement.session.refreshContext();
-			}
-			await this.finishSessionReplacement(options?.withSession);
+			await this.#replace(
+				outgoing,
+				{
+					cwd: this.cwd,
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "new", previousSessionFile },
+				},
+				async () => {
+					if (options?.setup) {
+						const replacement = this.#captureOutgoing();
+						await raceWithAbortSignal(
+							options.setup(replacement.sessionManager),
+							this.terminalCancellation.signal,
+						);
+						this.#assertCurrent(replacement);
+						replacement.session.refreshContext();
+					}
+					await this.finishSessionReplacement(options?.withSession);
+				},
+			);
 			return { cancelled: false };
 		} finally {
 			releaseInputs();
@@ -550,13 +570,16 @@ export class AgentSessionRuntime {
 					sessionManager.newSession({ parentSession: currentSessionFile });
 					await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
 					this.#assertCurrent(outgoing);
-					await this.#replace(outgoing, {
-						cwd: this.cwd,
-						agentDir: this.services.agentDir,
-						sessionManager,
-						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-					});
-					await this.finishSessionReplacement(options?.withSession);
+					await this.#replace(
+						outgoing,
+						{
+							cwd: this.cwd,
+							agentDir: this.services.agentDir,
+							sessionManager,
+							sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+						},
+						() => this.finishSessionReplacement(options?.withSession),
+					);
 					return { cancelled: false, selectedText };
 				}
 
@@ -570,13 +593,16 @@ export class AgentSessionRuntime {
 				}
 				await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
 				this.#assertCurrent(outgoing);
-				await this.#replace(outgoing, {
-					cwd: sessionManager.getCwd(),
-					agentDir: this.services.agentDir,
-					sessionManager,
-					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-				});
-				await this.finishSessionReplacement(options?.withSession);
+				await this.#replace(
+					outgoing,
+					{
+						cwd: sessionManager.getCwd(),
+						agentDir: this.services.agentDir,
+						sessionManager,
+						sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+					},
+					() => this.finishSessionReplacement(options?.withSession),
+				);
 				return { cancelled: false, selectedText };
 			}
 
@@ -588,13 +614,16 @@ export class AgentSessionRuntime {
 			} else {
 				sessionManager.createBranchedSession(targetLeafId);
 			}
-			await this.#replace(outgoing, {
-				cwd: this.cwd,
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
-			});
-			await this.finishSessionReplacement(options?.withSession);
+			await this.#replace(
+				outgoing,
+				{
+					cwd: this.cwd,
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "fork", previousSessionFile },
+				},
+				() => this.finishSessionReplacement(options?.withSession),
+			);
 			return { cancelled: false, selectedText };
 		} finally {
 			releaseInputs();
@@ -646,13 +675,16 @@ export class AgentSessionRuntime {
 			assertSessionCwdExists(sessionManager, this.cwd);
 			await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
-			await this.#replace(outgoing, {
-				cwd: sessionManager.getCwd(),
-				agentDir: this.services.agentDir,
-				sessionManager,
-				sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
-			});
-			await this.finishSessionReplacement();
+			await this.#replace(
+				outgoing,
+				{
+					cwd: sessionManager.getCwd(),
+					agentDir: this.services.agentDir,
+					sessionManager,
+					sessionStartEvent: { type: "session_start", reason: "resume", previousSessionFile },
+				},
+				() => this.finishSessionReplacement(),
+			);
 			return { cancelled: false };
 		} finally {
 			releaseInputs();

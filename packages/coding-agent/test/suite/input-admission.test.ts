@@ -1851,6 +1851,82 @@ describe("native input admission v1", () => {
 		expect(runtime.session.getFollowUpMessages()).toEqual(["after refusal"]);
 	});
 
+	// pi#163 review P2-1: when the recovery fence and retirement also refuse (input held outside the
+	// queue), the runtime must still publish the live receiving session, not keep the disposed outgoing one.
+	it("double receiving fence refusal publishes the live receiving session", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		const outgoing = runtime.session;
+		let receiving: AgentSession | undefined;
+		// Mode-owned input survives the recovery fence's abort, so every receiving fence refuses.
+		let modeInputPending = true;
+		const fenceRefusals: unknown[] = [];
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			receiving = result.session;
+			const fenceInputs = result.session.fenceInputs.bind(result.session);
+			result.session.fenceInputs = (fenceOptions) =>
+				fenceInputs(fenceOptions).catch((cause: unknown) => {
+					fenceRefusals.push(cause);
+					throw cause;
+				});
+			await result.session.bindExtensions({ hasPendingInput: () => modeInputPending });
+			return result;
+		});
+		const withSession = vi.fn(async () => {});
+		await expect(runtime.newSession({ withSession })).rejects.toThrow("INPUT_ADMISSION_BUSY");
+		// Initial and recovery fences both refused.
+		expect(fenceRefusals.length).toBeGreaterThanOrEqual(2);
+		expect(outgoing.isDisposed).toBe(true);
+		// Identity, not toBe: a failing toBe would render the session through the uninitialized theme.
+		expect(runtime.session === receiving).toBe(true);
+		expect(runtime.session.isDisposed).toBe(false);
+		expect(withSession).toHaveBeenCalledTimes(1);
+		modeInputPending = false;
+		await runtime.session.followUp("after refusal");
+		expect(runtime.session.getFollowUpMessages()).toEqual(["after refusal"]);
+	});
+
+	// pi#163 review P2-2: the recovery path publishes the receiving session, so the caller's setup and
+	// withSession must run exactly once before the refusal is returned.
+	it("refusal recovery runs setup and withSession exactly once", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		let receiving: AgentSession | undefined;
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			receiving = result.session;
+			await result.session.followUp("acknowledged");
+			return result;
+		});
+		const setupCalls: unknown[] = [];
+		const withSessionCalls: unknown[] = [];
+		const error = await runtime
+			.newSession({
+				setup: async (sessionManager) => {
+					setupCalls.push(sessionManager);
+				},
+				withSession: async () => {
+					withSessionCalls.push(runtime.session);
+				},
+			})
+			.then(
+				() => undefined,
+				(cause: unknown) => cause,
+			);
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).recoveredInput).toEqual([
+			expect.objectContaining({ role: "user", content: [{ type: "text", text: "acknowledged" }] }),
+		]);
+		expect(runtime.session === receiving).toBe(true);
+		expect(setupCalls.length).toBe(1);
+		expect(setupCalls[0] === receiving!.sessionManager).toBe(true);
+		expect(withSessionCalls.length).toBe(1);
+		expect(withSessionCalls[0] === receiving).toBe(true);
+	});
+
 	// pi#163 P2: input taken back by the recovery fence must survive a later abort or completion failure.
 	async function recoveryRefusal(runtime: AgentSessionRuntime, afterRecoveryFence?: () => void) {
 		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
