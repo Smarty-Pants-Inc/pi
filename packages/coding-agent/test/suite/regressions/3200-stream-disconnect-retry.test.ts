@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import {
+	type AssistantMessage,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	fauxThinking,
@@ -397,6 +398,54 @@ describe("reasoning-only premature stream recovery", () => {
 		await h.session.prompt("test");
 		expect(h.faux.state.callCount).toBe(2);
 		expect(h.session.getLastAssistantText()).toBe("recovered");
+	});
+
+	/** Rewrite the terminal error the way a provider can that drops streamed content. */
+	const rewriteTerminalError = (h: Harness, rewrite: (error: AssistantMessage) => AssistantMessage) => {
+		const original = h.session.agent.streamFunction;
+		h.session.agent.streamFunction = (model, context, options) => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(async () => {
+				for await (const event of await original(model, context, options)) {
+					stream.push(event.type === "error" ? { ...event, error: rewrite(event.error) } : event);
+				}
+				stream.end();
+			});
+			return stream;
+		};
+	};
+
+	it("restarts after streamed reasoning when the terminal error drops content but reports output tokens", async () => {
+		const h = await createHarness({ settings: { retry: { baseDelayMs: 1 } } });
+		harnesses.push(h);
+		rewriteTerminalError(h, (error) => ({ ...error, content: [], usage: { ...error.usage, output: 9 } }));
+		h.setResponses([
+			fauxAssistantMessage([reasoning], { stopReason: "error", errorMessage: disconnect }),
+			fauxAssistantMessage("recovered"),
+		]);
+		await h.session.prompt("test");
+		expect(h.faux.state.callCount).toBe(2);
+		expect(h.session.getLastAssistantText()).toBe("recovered");
+	});
+
+	it.each([
+		{ name: "answer text", block: { type: "text" as const, text: "visible answer" } },
+		{ name: "tool call", block: fauxToolCall("write", { path: "file", content: "once" }) },
+	])("never retries after streamed $name when the terminal error keeps only thinking", async ({ block }) => {
+		const h = await createHarness({ settings: { retry: { baseDelayMs: 1 } } });
+		harnesses.push(h);
+		rewriteTerminalError(h, (error) => ({
+			...error,
+			content: error.content.filter((content) => content.type === "thinking"),
+		}));
+		h.setResponses([
+			fauxAssistantMessage([reasoning, block], { stopReason: "error", errorMessage: disconnect }),
+			fauxAssistantMessage("must not replay"),
+		]);
+		await h.session.prompt("test");
+		expect(h.faux.state.callCount).toBe(1);
+		expect(h.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(h.eventsOfType("tool_execution_start")).toEqual([]);
 	});
 
 	it("keeps the final failed reasoning once retries are exhausted", async () => {

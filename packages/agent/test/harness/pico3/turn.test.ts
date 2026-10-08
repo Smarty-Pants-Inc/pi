@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
-import { fauxAssistantMessage, fauxThinking, fauxToolCall } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	fauxAssistantMessage,
+	fauxThinking,
+	fauxToolCall,
+} from "@earendil-works/pi-ai";
 import { onTestFinished, test } from "vitest";
+import { kinds as taskKinds } from "../../../src/harness/pico3/harness.ts";
 import { retryDecision } from "../../../src/harness/pico3/kinds/generation.ts";
 import { effectiveTools } from "../../../src/harness/pico3/system.ts";
+import type { Models } from "../../../src/harness/pico3/types.ts";
 import { contentOf, ctx, echoScript, fake, Gate, kinds, open, sleep, tool } from "./helpers.ts";
 
 for (const backend of ["memory", "jsonl"] as const) {
@@ -274,6 +282,85 @@ test("retryDecision restarts a reasoning-only premature close only", () => {
 	assert.equal(decide([fauxThinking("plan"), fauxToolCall("t", {})], closed), "fail");
 	assert.equal(decide([fauxThinking("plan")], "400 invalid_request_error"), "fail");
 	assert.equal(decide([fauxThinking("plan")], "overloaded"), "fail");
+});
+
+// smarty-dev#6730: the first attempt streams `streamed`, then ends with `terminal`, which may drop what was streamed.
+function scripted(streamed: AssistantMessage["content"], terminal: AssistantMessage) {
+	const base = fake({ respond: echoScript });
+	const stats = { calls: 0 };
+	const models: Models = {
+		...base,
+		stream(m, request, c) {
+			if (stats.calls++ > 0) return base.stream(m, request, c);
+			return (async function* (): AsyncIterable<AssistantMessageEvent> {
+				const partial: AssistantMessage = { ...terminal, content: [], stopReason: "pending" };
+				const snapshot = () => ({ ...partial, content: [...partial.content] });
+				yield { type: "start", partial: snapshot() };
+				for (const [contentIndex, block] of streamed.entries()) {
+					partial.content.push(block);
+					if (block.type === "text") {
+						yield { type: "text_start", contentIndex, partial: snapshot() };
+						yield { type: "text_delta", contentIndex, delta: block.text, partial: snapshot() };
+					} else if (block.type === "thinking") {
+						yield { type: "thinking_start", contentIndex, partial: snapshot() };
+						yield { type: "thinking_delta", contentIndex, delta: block.thinking, partial: snapshot() };
+					} else yield { type: "toolcall_start", contentIndex, partial: snapshot() };
+				}
+				yield { type: "error", reason: "error", error: terminal };
+			})();
+		},
+	};
+	return { models, stats };
+}
+
+function prematureClose(content: AssistantMessage["content"]): AssistantMessage {
+	const message = fauxAssistantMessage(content, {
+		stopReason: "error",
+		errorMessage: "stream closed before response.completed",
+	});
+	message.usage = { ...message.usage, output: 9 };
+	return message;
+}
+
+async function runScripted(streamed: AssistantMessage["content"], terminal: AssistantMessage) {
+	const { models, stats } = scripted(streamed, terminal);
+	const env = await open({
+		models,
+		root: { rewindable: { model }, sticky: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } } },
+	});
+	onTestFinished(() => env.close());
+	const hooked: AssistantMessage[] = [];
+	env.root.hooks(env.h.namespace("test.6730", {}), taskKinds.generation, {
+		afterResponse: (message) => {
+			hooked.push(structuredClone(message));
+		},
+	});
+	const result = await (await env.root.send({ content: "A" }, ctx)).wait(ctx);
+	return { status: result.status, calls: stats.calls, hooked };
+}
+
+for (const [name, block] of [
+	["answer text", { type: "text", text: "visible answer" }],
+	["tool call", fauxToolCall("t", {})],
+] as const) {
+	test(`premature close after streamed ${name} is not retried, though the terminal message kept only thinking`, async () => {
+		const run = await runScripted([fauxThinking("plan"), block], prematureClose([fauxThinking("plan")]));
+		assert.equal(run.calls, 1);
+		assert.notEqual(run.status, "done");
+	});
+}
+
+test("reasoning-only premature close whose terminal message dropped its content is retried", async () => {
+	const run = await runScripted([fauxThinking("plan")], prematureClose([]));
+	assert.equal(run.calls, 2);
+	assert.equal(run.status, "done");
+});
+
+test("afterResponse never sees the reasoning of a retried reasoning-only close", async () => {
+	const thinking = { ...fauxThinking("planning"), thinkingSignature: "rs_1" };
+	const run = await runScripted([thinking], prematureClose([thinking]));
+	assert.equal(run.calls, 2);
+	assert.deepEqual(run.hooked[0]?.content, [{ type: "thinking", thinking: "" }]);
 });
 
 test("retries exhausted → failed/retries_exhausted, inputs unanswered/failed, display-only assistant entry", async () => {

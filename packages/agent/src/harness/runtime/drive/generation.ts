@@ -1,4 +1,4 @@
-import type { Api, Model, Tool } from "@earendil-works/pi-ai";
+import type { Api, AssistantStreamObservation, Model, Tool } from "@earendil-works/pi-ai";
 import type { AgentMessage } from "../../../types.ts";
 import { type Context, getTelemetryContext, withAbortSignal } from "../../context.ts";
 import { type HarnessAssistantStreamConfig, streamHarnessAssistant } from "../../execution/assistant.ts";
@@ -176,10 +176,10 @@ async function performGeneration<TContext extends object | undefined>(
 	drive: Drive,
 	intent: AssistantEffectPendingOperation,
 	prepared: PreparedGeneration,
-): Promise<SettledAssistantMessage> {
-	const response = openAssistantResponse(lane, drive, intent.responseEntryId);
+): Promise<{ message: SettledAssistantMessage; observed: AssistantStreamObservation }> {
+	const response = openAssistantResponse(lane, drive, intent);
 	try {
-		return await streamHarnessAssistant(
+		const message = await streamHarnessAssistant(
 			prepared.messages,
 			{
 				model: prepared.model,
@@ -225,6 +225,7 @@ async function performGeneration<TContext extends object | undefined>(
 			},
 			drive.context,
 		);
+		return { message, observed: response.observed };
 	} finally {
 		await response.close();
 	}
@@ -297,6 +298,6 @@ export async function runGeneration<TContext extends object | undefined>(
 
 	const intent = await publishGenerationIntent(lane, drive, generation, prepared);
 	if (intent.kind === "cancel_requested") return { kind: "continue" };
-	const response = await performGeneration(lane, drive, intent.value, prepared);
-	return publishResponse(lane, drive, intent.value, response);
+	const { message, observed } = await performGeneration(lane, drive, intent.value, prepared);
+	return publishResponse(lane, drive, intent.value, message, {}, observed);
 }

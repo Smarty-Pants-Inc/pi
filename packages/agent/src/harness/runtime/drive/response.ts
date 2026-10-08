@@ -1,11 +1,14 @@
 import {
 	type AssistantMessageEvent,
 	AssistantMessageFrameEncoder,
+	type AssistantStreamObservation,
+	createAssistantStreamObservation,
 	discardPartialReasoning,
 	isContextOverflow,
 	isReasoningOnlyPrematureStream,
 	isRecoverableLength,
 	isRetryableAssistantError,
+	observeAssistantStreamEvent,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
 import type { HarnessEvent } from "../../agent-harness.ts";
@@ -37,6 +40,8 @@ import { operationCleanupWrites, operationResultRecord } from "./terminal.ts";
 
 export type AssistantResponseLifecycle = {
 	observer: AssistantStreamObserver;
+	/** What the stream showed before its terminal message; the provider may drop it from that message. */
+	observed: AssistantStreamObservation;
 	afterResponse(
 		message: SettledAssistantMessage,
 		metadata: AssistantResponseMetadata,
@@ -48,11 +53,13 @@ export type AssistantResponseLifecycle = {
 export function openAssistantResponse<TContext extends object | undefined>(
 	lane: Lane<TContext>,
 	drive: Drive,
-	responseEntryId: string,
+	intent: ResponseIntent,
 	recovery = false,
 ): AssistantResponseLifecycle {
+	const responseEntryId = intent.responseEntryId;
 	const progress = openFrameProgress(lane, drive, responseEntryId);
 	const frameEncoder = new AssistantMessageFrameEncoder();
+	const observed = createAssistantStreamObservation();
 	const eventContext = {
 		lane: lane.name,
 		runId: drive.operationId,
@@ -63,6 +70,7 @@ export function openAssistantResponse<TContext extends object | undefined>(
 		await progress.drain();
 	};
 	return {
+		observed,
 		observer: {
 			start(message, event, context) {
 				const frame = frameEncoder.encode(event);
@@ -70,6 +78,7 @@ export function openAssistantResponse<TContext extends object | undefined>(
 				return lane.emitBatch([{ type: "message_start", ...eventContext, message }], context);
 			},
 			update(message, event: AssistantMessageEvent, context) {
+				observeAssistantStreamEvent(observed, event);
 				const frame = frameEncoder.encode(event);
 				if (frame !== undefined) progress.write(frame);
 				return lane.emitBatch(
@@ -84,8 +93,14 @@ export function openAssistantResponse<TContext extends object | undefined>(
 				);
 			},
 		},
-		async afterResponse(message, metadata, context) {
+		async afterResponse(response, metadata, context) {
 			await close();
+			// smarty-dev#6730: classify first, so after_response and message_end never see reasoning that the
+			// restarted attempt discards.
+			const message =
+				retriesResponse(intent, response, observed, recovery) && isReasoningOnlyPrematureStream(response, observed)
+					? discardPartialReasoning(response)
+					: response;
 			const result = await lane.hooks.runWithGate(
 				"after_response",
 				{ lane: lane.name, runId: drive.operationId, ...metadata, message },
@@ -99,6 +114,27 @@ export function openAssistantResponse<TContext extends object | undefined>(
 }
 
 type ResponseIntent = AssistantEffectPendingOperation | DeferredEffectPendingOperation;
+
+/**
+ * Mirrors publishResponse's retry branch, so after_response can classify before it runs. Durable cancellation
+ * is not consulted.
+ */
+function retriesResponse(
+	intent: ResponseIntent,
+	response: SettledAssistantMessage,
+	observed: AssistantStreamObservation | undefined,
+	recovery: boolean,
+): boolean {
+	return (
+		intent.at === "assistant.effect_pending" &&
+		response.stopReason === "error" &&
+		!isContextOverflow(response, intent.contextWindow) &&
+		!isRecoverableLength(response, intent.intendedOutputLimit) &&
+		(recovery || isRetryableAssistantError(response, observed)) &&
+		intent.attempt < intent.generationContext.retryPolicy.maxAttempts
+	);
+}
+
 type ConfigurationFailureState = Extract<
 	OperationState,
 	{ at: "assistant.ready" | "assistant.retry_wait" | "deferred.suspended" | "deferred.effect_pending" }
@@ -187,6 +223,7 @@ export async function publishResponse<TContext extends object | undefined>(
 	intent: ResponseIntent,
 	response: SettledAssistantMessage,
 	options: { recovery?: true } = {},
+	observed?: AssistantStreamObservation,
 ): Promise<ProcedureResult> {
 	const overflow =
 		intent.at === "assistant.effect_pending" &&
@@ -278,11 +315,12 @@ export async function publishResponse<TContext extends object | undefined>(
 			} else if (response.stopReason === "error") {
 				if (
 					current.at === "assistant.effect_pending" &&
-					(options.recovery === true || isRetryableAssistantError(response)) &&
+					(options.recovery === true || isRetryableAssistantError(response, observed)) &&
 					current.attempt < current.generationContext.retryPolicy.maxAttempts
 				) {
-					// The restarted attempt replaces a reasoning-only premature close (smarty-dev#6730).
-					if (isReasoningOnlyPrematureStream(response)) committed = discardPartialReasoning(response);
+					// The restarted attempt replaces a reasoning-only premature close (smarty-dev#6730). Usually
+					// after_response already dropped the reasoning; a recovered response skips that pass.
+					if (isReasoningOnlyPrematureStream(response, observed)) committed = discardPartialReasoning(response);
 					settled = {
 						...scope,
 						at: "assistant.retry_wait",

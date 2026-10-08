@@ -3,10 +3,18 @@ import type {
 	AssistantMessage,
 	AssistantMessageEvent,
 	AssistantMessageFrame,
+	AssistantStreamObservation,
 	DeferredHandle,
 	ToolCall,
 } from "@earendil-works/pi-ai";
-import { AssistantMessageFrameEncoder, isRetryableAssistantError } from "@earendil-works/pi-ai";
+import {
+	AssistantMessageFrameEncoder,
+	createAssistantStreamObservation,
+	discardPartialReasoning,
+	isReasoningOnlyPrematureStream,
+	isRetryableAssistantError,
+	observeAssistantStreamEvent,
+} from "@earendil-works/pi-ai";
 import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import { planManagedEntry, prepareDraft, type SystemInstructionsHooks, sameSnapshot, takeSnapshot } from "../system.ts";
 import {
@@ -207,7 +215,7 @@ export const generation: CoreKind<
 				tx.checkpoint({ ...cp, phase: "requesting", attempt });
 				tx.emit({ type: "generation.started", taskId: task.id, attempt });
 			}, ctx); // before the effect
-			const { terminal, deferred } = await stream(cp, model, derived.messages, rt, ctx);
+			const { terminal, deferred, observed } = await stream(cp, model, derived.messages, rt, ctx);
 			if (deferred !== undefined) {
 				const pollAt = rt.now() + (deferred.pollAfterMs ?? 5000);
 				return {
@@ -217,7 +225,7 @@ export const generation: CoreKind<
 					},
 				};
 			}
-			return classify(task, { ...cp, attempt }, terminal!, rt, ctx);
+			return classify(task, { ...cp, attempt }, terminal!, rt, ctx, observed);
 		},
 
 		// Only reached by the scheduler after a crash: the call may have happened and there
@@ -333,8 +341,9 @@ async function stream(
 	messages: RequestMessage[],
 	rt: Rt,
 	ctx: Context,
-): Promise<{ terminal?: AssistantMessage; deferred?: DeferredHandle }> {
+): Promise<{ terminal?: AssistantMessage; deferred?: DeferredHandle; observed: AssistantStreamObservation }> {
 	const encoder = new AssistantMessageFrameEncoder();
+	const observed = createAssistantStreamObservation();
 	let pending: AssistantMessageFrame[] = [];
 	let pendingBytes = 0;
 	let lastFlush = rt.now();
@@ -383,6 +392,7 @@ async function stream(
 				terminal = event.error;
 				break;
 			}
+			observeAssistantStreamEvent(observed, event);
 			const frame = encoder.encode(event);
 			pull = iterator.next();
 			if (frame === undefined) continue;
@@ -406,18 +416,30 @@ async function stream(
 	}
 	if (pending.length > 0) await flush();
 	if (terminal === undefined && deferred === undefined) throw new Error("stream ended without a terminal message");
-	return { terminal, deferred };
+	return { terminal, deferred, observed };
 }
 
 // ---------------------------------------------------------------------------
 // Steps 3–5: classify the terminal message.
 // ---------------------------------------------------------------------------
 
-async function classify(task: G, cp: Prep, message: AssistantMessage, rt: Rt, ctx: Context): Promise<S> {
-	await rt.hooks.each(ctx, (h, api) => h.afterResponse?.(message, { ...api, attempt: cp.attempt }, ctx));
+async function classify(
+	task: G,
+	cp: Prep,
+	message: AssistantMessage,
+	rt: Rt,
+	ctx: Context,
+	observed?: AssistantStreamObservation,
+): Promise<S> {
+	const decision = message.stopReason === "error" ? retryDecision(cp, message, rt.now(), observed) : undefined;
+	// smarty-dev#6730: the retry replaces a reasoning-only premature close, so hooks never see its reasoning.
+	const visible =
+		decision?.kind === "retry" && isReasoningOnlyPrematureStream(message, observed)
+			? discardPartialReasoning(message)
+			: message;
+	await rt.hooks.each(ctx, (h, api) => h.afterResponse?.(visible, { ...api, attempt: cp.attempt }, ctx));
 
-	if (message.stopReason === "error") {
-		const decision = retryDecision(cp, message, rt.now());
+	if (decision !== undefined) {
 		if (decision.kind === "retry") {
 			return {
 				next: (tx, current) => {
@@ -573,8 +595,9 @@ export function retryDecision(
 	cp: { retry: RetryPolicy; attempt: number },
 	message: AssistantMessage | null,
 	now: number,
+	observed?: AssistantStreamObservation,
 ): RetryDecision {
-	if (message !== null && !isRetryableAssistantError(message)) return { kind: "fail", reason: "provider" };
+	if (message !== null && !isRetryableAssistantError(message, observed)) return { kind: "fail", reason: "provider" };
 	if (!cp.retry.enabled) return { kind: "fail", reason: "provider" };
 	if (cp.attempt > cp.retry.maxRetries) return { kind: "fail", reason: "retries_exhausted" };
 	const delay = cp.retry.baseDelayMs * 2 ** Math.max(0, cp.attempt - 1);

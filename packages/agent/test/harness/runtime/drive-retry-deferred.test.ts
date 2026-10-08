@@ -1,5 +1,7 @@
 import {
 	type AssistantMessage,
+	type AssistantMessageEvent,
+	createAssistantMessageEventStream,
 	type DeferredFetchOptions,
 	fauxAssistantMessage,
 	fauxProvider,
@@ -224,6 +226,44 @@ function installDrive(fixture: Fixture, options: { waitForRetry?: boolean; pollD
 	return drive;
 }
 
+/** Stream `streamed` block by block, then end with `terminal`, which may drop what was streamed. */
+function scriptStream(fixture: Fixture, streamed: AssistantMessage["content"], terminal: AssistantMessage): void {
+	vi.spyOn(fixture.models, "streamSimple").mockImplementationOnce(() => {
+		const stream = createAssistantMessageEventStream();
+		const partial: AssistantMessage = { ...terminal, content: [], stopReason: "pending" };
+		const push = (event: (partial: AssistantMessage) => AssistantMessageEvent) =>
+			stream.push(event({ ...partial, content: [...partial.content] }));
+		queueMicrotask(() => {
+			push((snapshot) => ({ type: "start", partial: snapshot }));
+			streamed.forEach((block, contentIndex) => {
+				partial.content.push(block);
+				if (block.type === "text") {
+					push((snapshot) => ({ type: "text_start", contentIndex, partial: snapshot }));
+					push((snapshot) => ({ type: "text_delta", contentIndex, delta: block.text, partial: snapshot }));
+				} else if (block.type === "thinking") {
+					push((snapshot) => ({ type: "thinking_start", contentIndex, partial: snapshot }));
+					push((snapshot) => ({ type: "thinking_delta", contentIndex, delta: block.thinking, partial: snapshot }));
+				} else {
+					push((snapshot) => ({ type: "toolcall_start", contentIndex, partial: snapshot }));
+				}
+			});
+			stream.push({ type: "error", reason: "error", error: terminal });
+			stream.end(terminal);
+		});
+		return stream;
+	});
+}
+
+function prematureClose(content: AssistantMessage["content"]): AssistantMessage {
+	const message = fauxAssistantMessage(content, {
+		stopReason: "error",
+		errorMessage: "stream closed before response.completed",
+		timestamp: 10,
+	});
+	message.usage = { ...message.usage, output: 9 };
+	return message;
+}
+
 async function expectProjectionRestores(fixture: Fixture): Promise<void> {
 	expect(fixture.lane.state).toEqual(await restoreLane(fixture.session, "main", BACKGROUND_CONTEXT));
 }
@@ -293,6 +333,62 @@ describe("runtime assistant retry wait", () => {
 			{ row: { usage: message.usage } },
 		]);
 		await expectProjectionRestores(fixture);
+	});
+
+	// smarty-dev#6730: answer output seen in the stream blocks a retry even when the terminal message dropped it.
+	it.each([
+		{ name: "answer text", streamed: [{ type: "text" as const, text: "visible answer" }] },
+		{ name: "tool call", streamed: [fauxToolCall("write", {})] },
+	])("does not retry a premature close after streamed $name", async ({ streamed }) => {
+		const fixture = await createFixture({ deferredSubmission: false });
+		const ready = await advanceToReady(fixture);
+		scriptStream(
+			fixture,
+			[{ type: "thinking", thinking: "planning" }, ...streamed],
+			prematureClose([{ type: "thinking", thinking: "planning" }]),
+		);
+
+		await runGeneration(fixture.lane, fixture.drive, ready);
+		const types = fixture.events.map((event) => event.type);
+		expect(types).not.toContain("retry_scheduled");
+		expect(fixture.events.at(-1)).toMatchObject({ type: "run_end", status: "failed" });
+	});
+
+	// smarty-dev#6730: reasoning-only stream, terminal message without content but with output tokens.
+	it("retries a reasoning-only premature close whose terminal message dropped its content", async () => {
+		const fixture = await createFixture({ deferredSubmission: false });
+		const ready = await advanceToReady(fixture);
+		scriptStream(fixture, [{ type: "thinking", thinking: "planning" }], prematureClose([]));
+
+		await runGeneration(fixture.lane, fixture.drive, ready);
+		expect(currentRun(fixture)).toMatchObject({ at: "assistant.retry_wait", nextAttempt: 2 });
+		expect(fixture.events.at(-1)).toMatchObject({ type: "retry_scheduled", attempt: 2 });
+		await expectProjectionRestores(fixture);
+	});
+
+	// smarty-dev#6730: after_response and message_end see the retried attempt without its reasoning.
+	it("hides discarded reasoning from after_response and message_end", async () => {
+		const fixture = await createFixture({ deferredSubmission: false });
+		const ready = await advanceToReady(fixture);
+		fixture.faux.setResponses([
+			prematureClose([{ type: "thinking", thinking: "planning", thinkingSignature: "rs_1" }]),
+		]);
+		const hooked: AssistantMessage[] = [];
+		fixture.hooks.on("after_response", (event) => {
+			hooked.push(structuredClone(event.message));
+			return undefined;
+		});
+
+		await runGeneration(fixture.lane, fixture.drive, ready);
+		expect(currentRun(fixture)).toMatchObject({ at: "assistant.retry_wait", nextAttempt: 2 });
+		const ended = fixture.events.flatMap((event) =>
+			event.type === "message_end" && event.message.role === "assistant" ? [event.message] : [],
+		);
+		expect([...hooked, ...ended]).toHaveLength(2);
+		for (const message of [...hooked, ...ended]) {
+			if (message.role !== "assistant") throw new Error("expected an assistant message");
+			expect(message.content).toEqual([{ type: "thinking", thinking: "" }]);
+		}
 	});
 
 	it("returns a durable waiting outcome without a timer or write when local waiting is disabled", async () => {

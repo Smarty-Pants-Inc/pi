@@ -189,7 +189,7 @@ async function performDeferredPoll<TContext extends object | undefined>(
 	intent: DeferredEffectPendingOperation,
 	recovery: boolean,
 ): Promise<SettledAssistantMessage> {
-	const response = openAssistantResponse(lane, drive, intent.responseEntryId, recovery);
+	const response = openAssistantResponse(lane, drive, intent, recovery);
 	let metadata: { status?: number; headers?: Record<string, string> } = {};
 	const admitted = withAbortSignal(drive.gate.signal, drive.context);
 	const stream = drive.gate.admit(() =>
