@@ -35,11 +35,13 @@ import {
 } from "@earendil-works/pi-agent-core";
 import {
 	contentText,
+	createAssistantStreamObservation,
 	discardPartialReasoning,
 	getCurrentSystemMessage,
-	hasAssistantAnswerOutput,
 	hasAssistantOutput,
 	isPrematureStreamError,
+	observeAssistantMessage,
+	observeAssistantStreamEvent,
 	type RetryPolicy,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
@@ -558,8 +560,8 @@ export class AgentSession {
 	private _retryFallbackInFlight = false;
 	// Sticky per assistant request: providers may discard partial content on error.
 	private _assistantOutputObserved = false;
-	/** Answer text or a tool call; unlike reasoning alone, it blocks even a premature-close restart. */
-	private _assistantAnswerObserved = false;
+	/** Streamed reasoning and answer output; answer output blocks even a premature-close restart. */
+	private _assistantStreamObserved = createAssistantStreamObservation();
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
 	/**
@@ -1544,19 +1546,18 @@ export class AgentSession {
 		// Synthetic run failures publish another message_start, but not a new turn_start.
 		if (event.type === "turn_start") {
 			this._assistantOutputObserved = false;
-			this._assistantAnswerObserved = false;
+			this._assistantStreamObserved = createAssistantStreamObservation();
 		}
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
 			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
-			this._assistantAnswerObserved ||= hasAssistantAnswerOutput(event.message);
+			observeAssistantMessage(this._assistantStreamObserved, event.message);
 		} else if (event.type === "message_update" && event.message.role === "assistant") {
 			const update = event.assistantMessageEvent;
-			const toolCall = update.type.startsWith("toolcall_");
 			const streamed =
 				("delta" in update && update.delta.length > 0) || ("content" in update && update.content.length > 0);
-			this._assistantOutputObserved ||= hasAssistantOutput(event.message) || toolCall || streamed;
-			this._assistantAnswerObserved ||=
-				hasAssistantAnswerOutput(event.message) || toolCall || (update.type.startsWith("text_") && streamed);
+			this._assistantOutputObserved ||=
+				hasAssistantOutput(event.message) || update.type.startsWith("toolcall_") || streamed;
+			observeAssistantStreamEvent(this._assistantStreamObserved, update);
 		}
 		// smarty-dev#6730: a premature close after reasoning only is restarted. Drop that reasoning before
 		// listeners, extensions and the session file see the failed attempt, so it ends like an empty close.
@@ -5521,11 +5522,12 @@ export class AgentSession {
 	private _isRetryableError(message: AssistantMessage): boolean {
 		// Never restart a request once output or a tool call has been streamed, except reasoning-only
 		// output on a premature close (smarty-dev#6730). The classifier below checks the message itself.
-		if (this._assistantAnswerObserved || (this._assistantOutputObserved && !isPrematureStreamError(message)))
-			return false;
+		// The stream observation also covers a terminal message whose streamed content the provider dropped.
+		const observed = this._assistantStreamObserved;
+		if (observed.answer || (this._assistantOutputObserved && !isPrematureStreamError(message))) return false;
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, (this._modelForMessage(message) ?? this.model)?.contextWindow ?? 0)) return false;
-		return isRetryableAssistantError(message);
+		return isRetryableAssistantError(message, observed);
 	}
 
 	/**

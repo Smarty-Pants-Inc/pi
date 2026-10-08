@@ -2,6 +2,7 @@ import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-wo
 import type {
 	Api,
 	AssistantMessage,
+	AssistantStreamObservation,
 	DeferredHandle,
 	Message,
 	Model,
@@ -11,9 +12,11 @@ import type {
 } from "@earendil-works/pi-ai";
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import {
+	createAssistantStreamObservation,
 	discardPartialReasoning,
 	isReasoningOnlyPrematureStream,
 	isRetryableAssistantError,
+	observeAssistantStreamEvent,
 	retryDelayMs,
 } from "@earendil-works/pi-ai/utils/retry";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
@@ -209,9 +212,9 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				sessionId: await ensureProviderSessionId(runtime, context),
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			};
-			const message = await streamResponse(runtime, model, messages, options, attempt, context);
+			const { message, observed } = await streamResponse(runtime, model, messages, options, attempt, context);
 			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
-			await classify(runtime, request, message, context);
+			await classify(runtime, request, message, context, observed);
 		},
 		retry: async (task, runtime, context) => {
 			const { attempt, compacted, until } = task.state.checkpoint;
@@ -373,8 +376,10 @@ async function streamResponse(
 	options: SimpleStreamOptions,
 	attempt: number,
 	context: Context,
-): Promise<AssistantMessage> {
+): Promise<{ message: AssistantMessage; observed: AssistantStreamObservation }> {
 	const interval = runtime.settings.progress.partialIntervalMs;
+	// The terminal message can drop what the stream showed (smarty-dev#6730).
+	const observed = createAssistantStreamObservation();
 	let pending: AssistantMessage | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: Promise<void> | undefined;
@@ -406,13 +411,14 @@ async function streamResponse(
 	try {
 		const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
 		for await (const event of events) {
+			observeAssistantStreamEvent(observed, event);
 			// A partial without content, such as pi-ai's opening `start` event, shows nothing; a deferred response
 			// never gets past it, so it never leaves a partial.
 			if (event.type === "done" || event.type === "error" || event.partial.content.length === 0) continue;
 			pending = event.partial;
 			if (timer === undefined && inFlight === undefined) timer = setTimeout(flush, interval);
 		}
-		return await events.result();
+		return { message: await events.result(), observed };
 	} finally {
 		stopped = true;
 		clearTimeout(timer);
@@ -426,6 +432,7 @@ async function classify(
 	request: Request,
 	message: AssistantMessage,
 	context: Context,
+	observed?: AssistantStreamObservation,
 ): Promise<void> {
 	// An abort mark or close: the abort invocation or the reopened run handles the committed state.
 	runtime.signal.throwIfAborted();
@@ -452,7 +459,22 @@ async function classify(
 		}, context);
 		return;
 	}
-	await runtime.hooks.each("afterResponse", (hook) => hook(message, runtime, context));
+	// The retry and compaction policies govern the next attempt, so they are read now rather than pinned at preparation.
+	const settings = runtime.settings;
+	const overflow = message.stopReason === "error" && isContextOverflow(message);
+	const policy = settings.retry;
+	// An overflow is never retried: only a compaction can make the next request fit.
+	const retry =
+		message.stopReason === "error" &&
+		!overflow &&
+		isRetryableAssistantError(message, observed) &&
+		policy.enabled &&
+		attempt <= policy.maxRetries;
+	// smarty-dev#6730: the retry replaces a reasoning-only premature close, so neither afterResponse nor the
+	// transcript keeps its reasoning.
+	const visible =
+		retry && isReasoningOnlyPrematureStream(message, observed) ? discardPartialReasoning(message) : message;
+	await runtime.hooks.each("afterResponse", (hook) => hook(visible, runtime, context));
 	const calls = message.content.filter((content): content is ToolCall => content.type === "toolCall");
 	if (message.stopReason === "toolUse" && calls.length > 0) {
 		return startToolRound(runtime, request, message, calls, context);
@@ -460,13 +482,9 @@ async function classify(
 	if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") {
 		return answer(runtime, message, context);
 	}
-	// The retry and compaction policies govern the next attempt, so they are read now rather than pinned at preparation.
-	const settings = runtime.settings;
-	const overflow = message.stopReason === "error" && isContextOverflow(message);
 	if (overflow && compacted === undefined && settings.compaction.enabled) {
-		const policy = settings.compaction;
 		const view = await runtime.context(conversationId, context, cutoff);
-		if (selectCut(view, policy.keepRecentTokens) !== undefined) {
+		if (selectCut(view, settings.compaction.keepRecentTokens) !== undefined) {
 			const text = message.errorMessage ?? "Context overflow";
 			await runtime.commit(async (tx): Promise<Next> => {
 				const live = await tx.doc(LiveDoc, conversationId);
@@ -479,20 +497,10 @@ async function classify(
 			return;
 		}
 	}
-	const policy = settings.retry;
-	// An overflow is never retried: only a compaction can make the next request fit.
-	const retry =
-		message.stopReason === "error" &&
-		!overflow &&
-		isRetryableAssistantError(message) &&
-		policy.enabled &&
-		attempt <= policy.maxRetries;
 	const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
 	await runtime.commit(async (tx): Promise<Next> => {
 		const live = await tx.doc(LiveDoc, conversationId);
-		// The restarted attempt replaces a reasoning-only premature close (smarty-dev#6730).
-		const discard = retry && isReasoningOnlyPrematureStream(message);
-		await appendAssistant(tx, conversationId, discard ? discardPartialReasoning(message) : message);
+		await appendAssistant(tx, conversationId, visible);
 		if (retry) {
 			live.generation = { attempt, retry: { at: until, error: message.errorMessage ?? "" } };
 			const checkpoint = {
