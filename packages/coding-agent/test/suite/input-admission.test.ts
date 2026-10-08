@@ -1933,6 +1933,42 @@ describe("native input admission v1", () => {
 		expect(receiving.getFollowUpMessages()).toEqual(["after completion"]);
 	});
 
+	it.each([false, true])(
+		"a detached withSession descendant stays refused after the fence is released (double refusal: %s)",
+		async (doubleRefusal) => {
+			const h = await setup();
+			const built = doubleRefusal ? await doubleRefusalRuntime(h) : { runtime: await runtimeFor(h), mode: undefined };
+			const { runtime } = built;
+			const timer = gate(),
+				fire = gate();
+			let late: Promise<unknown> | undefined;
+			await runtime
+				.newSession({
+					withSession: async (ctx) => {
+						// Detached: started inside the callback, runs after it returns.
+						late = fire.promise.then(() =>
+							ctx.sendUserMessage("late detached input").then(
+								() => "accepted",
+								(error: unknown) => error,
+							),
+						);
+						timer.release();
+					},
+				})
+				.catch(() => undefined);
+			await timer.promise;
+			if (built.mode) built.mode.inputPending = false;
+			expect(runtime.inputsFenced).toBe(false);
+			fire.release();
+			const outcome = await late;
+			expect(outcome).toBeInstanceOf(InputAdmissionError);
+			expect((outcome as InputAdmissionError).code).toBe("INPUT_ADMISSION_FENCED");
+			// The session itself still takes ordinary input.
+			await runtime.session.followUp("ordinary");
+			expect(runtime.session.getFollowUpMessages()).toEqual(["ordinary"]);
+		},
+	);
+
 	it("double refusal terminal shutdown cancels a held withSession and completes disposal", async () => {
 		const { runtime, mode } = await doubleRefusalRuntime(await setup());
 		const entered = gate(),

@@ -2625,7 +2625,9 @@ export class AgentSession {
 	private _assertInputsOpen(): void {
 		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "input was not accepted");
 		const scope = this._inputFenceScope.getStore();
-		if (this._inputFence && !(scope?.active && scope.fence === this._inputFence))
+		// A detached descendant of a returned withFencedInput() callback keeps its (inactive) scope
+		// after the fence is released; it must not regain admission then either (pi#163 security r3).
+		if ((scope && !scope.active) || (this._inputFence && !(scope?.active && scope.fence === this._inputFence)))
 			throw new InputAdmissionError(
 				"INPUT_ADMISSION_FENCED",
 				"input was not accepted; retry against the current session",
