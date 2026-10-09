@@ -4,6 +4,7 @@ import type {
 	Api,
 	AssistantImages,
 	ClassifierApi,
+	ClassifierContext,
 	ClassifierModel,
 	ClassifierResult,
 	ImageApi,
@@ -73,6 +74,16 @@ export function protectOperationError(error: unknown, secrets: readonly string[]
 		return safe;
 	} catch {
 		return new Error("operation failed");
+	}
+}
+
+/** Rejects classifier images for models whose catalog entry does not accept image input. */
+export function assertClassifierInputSupported(
+	model: ClassifierModel<ClassifierApi>,
+	context: ClassifierContext,
+): void {
+	if (context.images?.length && !model.input.includes("image")) {
+		throw new ModelsError("provider", `Model ${model.provider}/${model.id} does not accept image input`);
 	}
 }
 

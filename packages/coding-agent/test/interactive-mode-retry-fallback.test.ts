@@ -8,6 +8,7 @@ describe("interactive retry fallback", () => {
 		const view = {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
 			showWarning: vi.fn(),
 			ui: { requestRender: vi.fn() },
 		};

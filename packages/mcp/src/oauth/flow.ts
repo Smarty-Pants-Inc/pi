@@ -13,11 +13,13 @@ import {
 	parseWwwAuthenticate,
 	selectResource,
 } from "./discovery.ts";
+import { credentialFetch, loopback, secureEndpoint, validateOAuthEndpointOrigins } from "./endpoints.ts";
 import {
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
 	OAuthRegistrationError,
 } from "./errors.ts";
 import {
@@ -77,10 +79,21 @@ export interface OAuthFlowOptions {
 	resourceMetadataUrl?: URL;
 	/**
 	 * Authorization server metadata document to use instead of discovery, for servers that advertise a
-	 * wrong authorization server or none. It is trusted as configured. Must use https, except on loopback.
+	 * wrong authorization server or none. It is trusted as configured, so its issuer is not compared with the URL.
+	 * Must use https, except on loopback. Its endpoints must still share the origin of the issuer it names.
 	 */
 	authorizationServerMetadataUrl?: URL;
+	/**
+	 * Origins (scheme, host, port, such as `https://login.example.com`) that the authorization, token, registration,
+	 * and revocation endpoints may use besides the origin of the authorization server's issuer. Default: none, so
+	 * metadata advertising an endpoint on another origin is refused with `OAuthEndpointOriginError` before any request
+	 * to it. This applies to discovered, cached, and configured (`authorizationServerMetadataUrl`) metadata. Endpoints
+	 * on an allowed origin must still use https, except on loopback.
+	 */
+	allowedEndpointOrigins?: readonly string[];
 	fetch?: McpFetch;
+	/** Aborts every request of the flow. Requests have no time limit of their own; combine with a timeout as needed. */
+	signal?: AbortSignal;
 	skipIssuerValidation?: boolean;
 	/**
 	 * Go straight to the authorization redirect instead of refreshing stored tokens, for example when the
@@ -94,14 +107,13 @@ type ClientAuthMethod = "client_secret_basic" | "client_secret_post" | "none";
 
 export interface TokenRequestOptions {
 	metadata?: AuthorizationServerMetadata;
+	/** As in `OAuthFlowOptions`: the token endpoint must share the issuer's origin or be on one of these. */
+	allowedEndpointOrigins?: readonly string[];
 	clientInformation: OAuthClientInformationMixed;
 	resource?: string;
 	addClientAuthentication?: AddClientAuthentication;
 	fetch?: McpFetch;
-}
-
-function loopback(hostname: string): boolean {
-	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+	signal?: AbortSignal;
 }
 
 /**
@@ -115,12 +127,6 @@ function applicationType(redirectUris: readonly string[]): "native" | "web" {
 		return (url.protocol !== "http:" && url.protocol !== "https:") || loopback(url.hostname);
 	});
 	return native ? "native" : "web";
-}
-
-function secureEndpoint(value: string | URL): URL {
-	const url = new URL(value);
-	if (url.protocol !== "https:" && !loopback(url.hostname)) throw new OAuthInsecureEndpointError(url.href);
-	return url;
 }
 
 function selectClientAuthMethod(information: OAuthClientInformationMixed, supported: string[]): ClientAuthMethod {
@@ -174,17 +180,21 @@ export async function startAuthorization(
 		scope?: string;
 		state?: string;
 		resource?: string;
+		/** As in `OAuthFlowOptions`: endpoints must share the issuer's origin or be on one of these. */
+		allowedEndpointOrigins?: readonly string[];
 	},
 ): Promise<{ authorizationUrl: URL; codeVerifier: string }> {
 	refuseMcpAdmission();
 	const metadata = options.metadata;
+	// pi#173: every exported operation binds its endpoints to the issuer origin itself, not only authorizeMcp.
+	validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
 	if (metadata && !metadata.response_types_supported.includes("code")) {
 		throw new Error("Authorization server does not support authorization codes");
 	}
 	if (metadata?.code_challenge_methods_supported && !metadata.code_challenge_methods_supported.includes("S256")) {
 		throw new Error("Authorization server does not support PKCE S256");
 	}
-	const url = new URL(metadata?.authorization_endpoint ?? new URL("/authorize", authorizationServerUrl));
+	const url = secureEndpoint(metadata?.authorization_endpoint ?? new URL("/authorize", authorizationServerUrl));
 	const { verifier, challenge } = await pkce();
 	url.searchParams.set("response_type", "code");
 	url.searchParams.set("client_id", options.clientInformation.client_id);
@@ -204,6 +214,7 @@ async function tokenRequest(
 	params: URLSearchParams,
 ): Promise<OAuthTokens> {
 	refuseMcpAdmission();
+	validateOAuthEndpointOrigins(options.metadata, options.allowedEndpointOrigins);
 	const url = secureEndpoint(options.metadata?.token_endpoint ?? new URL("/token", authorizationServerUrl));
 	const headers = new Headers({ Accept: "application/json", "content-type": "application/x-www-form-urlencoded" });
 	if (options.resource) params.set("resource", options.resource);
@@ -220,7 +231,12 @@ async function tokenRequest(
 			params,
 		);
 	}
-	const response = await (options.fetch ?? globalThis.fetch)(url, { method: "POST", headers, body: params });
+	const response = await credentialFetch(options.fetch ?? globalThis.fetch, url, {
+		method: "POST",
+		headers,
+		body: params,
+		signal: options.signal,
+	});
 	const text = await response.text();
 	let value: unknown;
 	try {
@@ -245,14 +261,19 @@ export async function registerClient(
 		clientMetadata: OAuthClientMetadata;
 		scope?: string;
 		fetch?: McpFetch;
+		signal?: AbortSignal;
+		/** As in `OAuthFlowOptions`: the registration endpoint must share the issuer's origin or be on one of these. */
+		allowedEndpointOrigins?: readonly string[];
 	},
 ): Promise<OAuthClientInformationFull> {
 	refuseMcpAdmission();
+	validateOAuthEndpointOrigins(options.metadata, options.allowedEndpointOrigins);
 	const endpoint = options.metadata?.registration_endpoint;
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
-	const response = await (options.fetch ?? globalThis.fetch)(
-		new URL(endpoint ?? new URL("/register", authorizationServerUrl)),
+	const response = await credentialFetch(
+		options.fetch ?? globalThis.fetch,
+		secureEndpoint(endpoint ?? new URL("/register", authorizationServerUrl)),
 		{
 			method: "POST",
 			headers: { Accept: "application/json", "content-type": "application/json" },
@@ -262,6 +283,7 @@ export async function registerClient(
 					options.clientMetadata.application_type ?? applicationType(options.clientMetadata.redirect_uris),
 				...(options.scope ? { scope: options.scope } : {}),
 			}),
+			signal: options.signal,
 		},
 	);
 	if (!response.ok) throw new OAuthRegistrationError(response.status, await response.text());
@@ -325,6 +347,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 					(await discoverAuthorizationServerMetadata(cached.authorizationServerUrl, {
 						fetch: options.fetch,
 						skipIssuerValidation: options.skipIssuerValidation,
+						allowedEndpointOrigins: options.allowedEndpointOrigins,
+						signal: options.signal,
 					})),
 				resourceMetadata: cached.resourceMetadata,
 			}
@@ -333,7 +357,12 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 				authorizationServerMetadataUrl: metadataUrl,
 				fetch: options.fetch,
 				skipIssuerValidation: options.skipIssuerValidation,
+				allowedEndpointOrigins: options.allowedEndpointOrigins,
+				signal: options.signal,
 			});
+	secureEndpoint(discovered.authorizationServerUrl);
+	// Also covers cached metadata, which skipped discovery: no endpoint request before this check.
+	validateOAuthEndpointOrigins(discovered.authorizationServerMetadata, options.allowedEndpointOrigins);
 	if (!metadataUrl) {
 		await provider.saveDiscoveryState?.({
 			...discovered,
@@ -360,6 +389,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 			clientMetadata: provider.clientMetadata,
 			scope,
 			fetch: options.fetch,
+			signal: options.signal,
+			allowedEndpointOrigins: options.allowedEndpointOrigins,
 		});
 		await provider.saveClientInformation(client);
 	}
@@ -371,6 +402,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		resource,
 		addClientAuthentication: provider.addClientAuthentication,
 		fetch: options.fetch,
+		signal: options.signal,
+		allowedEndpointOrigins: options.allowedEndpointOrigins,
 	};
 	if (options.authorizationCode) {
 		// RFC 9207: never send a code from another authorization server to this one.
@@ -400,7 +433,12 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 			await provider.saveTokens(withScope(tokens, existing.scope));
 			return "AUTHORIZED";
 		} catch (error) {
-			if (error instanceof OAuthInsecureEndpointError) throw error;
+			if (
+				options.signal?.aborted ||
+				error instanceof OAuthInsecureEndpointError ||
+				error instanceof OAuthRedirectRefusedError
+			)
+				throw error;
 			if (error instanceof OAuthError && error.code !== "server_error") throw error;
 		}
 	}
@@ -412,6 +450,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		scope,
 		state,
 		resource,
+		allowedEndpointOrigins: options.allowedEndpointOrigins,
 	});
 	await provider.saveCodeVerifier(authorization.codeVerifier);
 	await provider.redirectToAuthorization(authorization.authorizationUrl);
