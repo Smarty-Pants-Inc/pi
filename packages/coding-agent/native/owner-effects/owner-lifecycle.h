@@ -65,7 +65,10 @@ static uint64_t lifecycle_deadline(const LifecycleTask *task) {
 }
 
 static int lifecycle_journal_boundary(const Owner *owner) {
-	if (!owner->lifecycle) return 0;
+	if (!owner->lifecycle) {
+		uint64_t deadline = atomic_load(&owner->close_deadline);
+		return deadline && check_close_deadline(deadline) < 0 ? errno : 0;
+	}
 	if (atomic_load(&owner->lifecycle->cancelled)) return ECANCELED;
 	return check_close_deadline(lifecycle_deadline(owner->lifecycle)) < 0 ? errno : 0;
 }
@@ -185,8 +188,8 @@ static void lifecycle_execute(napi_env env, void *data) {
 	}
 	if (task->action == OE_LIFECYCLE_JOURNAL) {
 		LifecycleJournal *journal = task->journal;
-		task->error = commit_journal_bytes(host, owner, journal->name,
-			journal->bytes, journal->previous_bytes, journal->bytes, journal->next_bytes, true);
+		task->error = append_journal_bytes(host, owner, journal->name,
+			journal->previous_bytes, journal->bytes, journal->next_bytes - journal->previous_bytes, true);
 		(void)lifecycle_live(task);
 		return;
 	}
@@ -386,6 +389,7 @@ static napi_value lifecycle_accept(napi_env env, napi_callback_info info) {
 			owner->active = false;
 			release_admission(env, owner);
 			free(owner->record_bytes); owner->record_bytes = NULL; owner->record_length = 0;
+			free(owner->journal_bytes); owner->journal_bytes = NULL; owner->journal_capacity = 0;
 		}
 	}
 	/* Keep the root through every failure branch, including dispatch failure.
@@ -626,28 +630,47 @@ static napi_value lifecycle_operation(napi_env env, napi_callback_info info) {
 static napi_value lifecycle_journal(napi_env env, napi_callback_info info) {
 	size_t argc = 4;
 	napi_value args[4];
-	NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, NULL));
+	void *append = NULL;
+	NAPI_CALL(env, napi_get_cb_info(env, info, &argc, args, NULL, &append));
 	LeaseRef *reference;
 	Owner *owner = argc == 4 ? get_owner(env, args[0], &reference, true) : NULL;
 	char name[192];
-	void *previous, *next;
-	size_t previous_bytes, next_bytes;
+	void *previous = NULL, *next;
+	size_t previous_bytes = 0, next_bytes;
+	double length = 0;
 	if (!owner || !get_string(env, args[1], name, sizeof(name)) || !component(name) ||
-		napi_get_buffer_info(env, args[2], &previous, &previous_bytes) != napi_ok ||
-		napi_get_buffer_info(env, args[3], &next, &next_bytes) != napi_ok)
+		napi_get_buffer_info(env, args[3], &next, &next_bytes) != napi_ok ||
+		(append ? (napi_get_value_double(env, args[2], &length) != napi_ok || length != length ||
+			length < 0 || length > reference->host->journal_limit || length != (size_t)length) :
+			napi_get_buffer_info(env, args[2], &previous, &previous_bytes) != napi_ok))
 		return failure(env, "OWNER_COMMIT_ARGUMENT", EINVAL);
-	/* Copy bytes before dispatch; the worker never borrows mutable JS buffers. */
+	if (append) previous_bytes = (size_t)length;
 	if (!owner->sealed || owner->uncertain || owner->operations || owner->launch_count ||
 		strcmp(name, owner->journal_name) || previous_bytes != owner->journal_size ||
-		!next_bytes || next_bytes > reference->host->journal_limit || next_bytes < previous_bytes ||
-		memcmp(previous, next, previous_bytes)) return failure(env, "OWNER_COMMIT_NOT_APPEND", EINVAL);
+		(previous_bytes && (!owner->journal_bytes || previous_bytes > owner->journal_capacity)))
+		return failure(env, "OWNER_COMMIT_NOT_APPEND", EINVAL);
+	size_t suffix_bytes = next_bytes;
+	const unsigned char *suffix = next;
+	if (!append) {
+		if (!next_bytes || next_bytes < previous_bytes || next_bytes > reference->host->journal_limit ||
+			(previous_bytes && (memcmp(previous, owner->journal_bytes, previous_bytes) ||
+			memcmp(previous, next, previous_bytes)))) return failure(env, "OWNER_COMMIT_NOT_APPEND", EINVAL);
+		suffix_bytes = next_bytes - previous_bytes;
+		suffix += previous_bytes;
+	}
+	if (suffix_bytes > reference->host->journal_limit - previous_bytes)
+		return failure(env, "OWNER_COMMIT_NOT_APPEND", EINVAL);
+	/* Copy only the suffix before dispatch. The worker uses native custody for
+	 * the prefix and never borrows mutable JS buffers or allocates a full image. */
 	LifecycleJournal *journal = calloc(1, sizeof(*journal));
 	if (!journal) return failure(env, "OWNER_COMMIT_MEMORY", ENOMEM);
-	journal->bytes = malloc(next_bytes);
-	if (!journal->bytes) { free(journal); return failure(env, "OWNER_COMMIT_MEMORY", ENOMEM); }
-	memcpy(journal->bytes, next, next_bytes);
+	if (suffix_bytes) {
+		journal->bytes = malloc(suffix_bytes);
+		if (!journal->bytes) { free(journal); return failure(env, "OWNER_COMMIT_MEMORY", ENOMEM); }
+		memcpy(journal->bytes, suffix, suffix_bytes);
+	}
 	memcpy(journal->name, name, strlen(name) + 1);
-	journal->previous_bytes = previous_bytes; journal->next_bytes = next_bytes;
+	journal->previous_bytes = previous_bytes; journal->next_bytes = previous_bytes + suffix_bytes;
 	return lifecycle_queue(env, args[0], reference, OE_LIFECYCLE_JOURNAL, false, NULL, NULL, journal);
 }
 

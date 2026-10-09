@@ -264,7 +264,7 @@ test("terminal append uses a captured serialized private route", () => {
 	const agent = readFileSync(new URL("../src/core/agent-session.ts", import.meta.url), "utf8");
 	expect(manager).toContain("const ownedTerminalAppenders = new WeakMap<SessionManager, OwnedTerminalAppender>()");
 	expect(manager).toContain("#ownedTerminalTail: Promise<void> = Promise.resolve();");
-	expect(manager).toContain("await this.#ownedJournal.commitTerminalAsync(bytes);");
+	expect(manager).toContain("await this.#ownedJournal.appendTerminalAsync(line);");
 	expect(manager).toContain("this.#ownedTerminalTail = run.then(() => undefined);");
 	expect(agent).toContain("await this._flushPendingBashMessagesOwnedTerminal();");
 	expect(agent).toContain("await this._flushPendingCustomMessagesOwnedTerminal();");
