@@ -687,7 +687,13 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			expired: false,
 			delivered: "",
 		},
-		{ kind: "split OSC 11 ST", parts: ["\x1b]11;#ff0000\x1b", "\\"], pending: true, expired: false, delivered: "" },
+		{
+			kind: "split OSC 11 ST",
+			parts: ["\x1b]11;rgb:ffff/0000/0000\x1b", "\\"],
+			pending: true,
+			expired: false,
+			delivered: "",
+		},
 		{ kind: "pending OSC 11 plus key", parts: [`${osc11Reply}k`], pending: true, expired: false, delivered: "k" },
 		{
 			kind: "one query with two replies",
@@ -761,8 +767,12 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 				assert.equal(component.renders - renders, recovered);
 				assert.equal(tui.fullRedraws - full, recovered);
 				assert.deepEqual(visibility, recovered ? [false, true] : [false]);
-				assert.deepEqual(inputs, recovered ? [scenario.delivered] : []);
-				assert.deepEqual(component.inputs, recovered ? [scenario.delivered] : []);
+				// A rejected buffered prefix and its continuation retain their arrival chunks.
+				const deliveredInputs =
+					scenario.kind === "partial OSC prefix diverges" ? scenario.parts : recovered ? [scenario.delivered] : [];
+				assert.deepEqual(inputs, deliveredInputs);
+				assert.deepEqual(component.inputs, deliveredInputs);
+				assert.equal(inputs.join(""), scenario.delivered);
 				assert.equal(timers.size, 0, "no hidden frame timer or delayed recovery");
 				if (!recovered) assert.equal(terminal.writes.length, writes);
 				t.diagnostic(
@@ -872,7 +882,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 					settled = true;
 					return rgb;
 				});
-				const partial = "\x1b]11;#fff";
+				const partial = "\x1b]11;rgb:ffff/";
 				terminal.input?.(partial);
 				assert.equal(timers.size, 1);
 				terminal.input?.("\x1b[O");
@@ -920,7 +930,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 		await nextTick();
 		try {
 			const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
-			const partial = "\x1b]11;#fff";
+			const partial = "\x1b]11;rgb:ffff/";
 			terminal.input?.(partial);
 			terminal.input?.("\x1b[O");
 			assert.equal(timers.size, 0);
@@ -989,8 +999,8 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			const renders = component.renders;
 			const writes = terminal.writes.length;
 			t.mock.timers.tick(2000);
-			terminal.input?.("\x1b]11;#fff");
-			terminal.input?.(`fff\x07${osc11Reply}`);
+			terminal.input?.("\x1b]11;rgb:ffff/ffff/");
+			terminal.input?.(`ffff\x07${osc11Reply}`);
 			assert.deepEqual(await first, { r: 255, g: 255, b: 255 });
 			assert.deepEqual(await second, { r: 255, g: 0, b: 0 });
 			await nextTick();
@@ -1001,6 +1011,137 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			tui.stop();
 		}
 	});
+}
+
+// smarty-dev#7403 round 6: the first byte outside the reply grammar flushes all input,
+// even a multi-character read, with no hidden timeout or key-classification heuristic.
+for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
+	for (const [kind, partial, continuation] of [
+		["multi-character printable read", "\x1b]11;r", "abc"],
+		["lone ESC", "\x1b]11;rgb:ffff/", "\x1b"],
+		["arrow", "\x1b]11;rgb:ffff/", "\x1b[A"],
+		["valid digits followed by an invalid byte", "\x1b]11;rgb:ffff/", "00gabc"],
+		["invalid ST continuation", "\x1b]11;rgb:ffff/0000/0000\x1b", "abc"],
+		["65-byte grammar-valid run", "\x1b]11;rgb:", "f".repeat(56)],
+		["64-byte partial then byte 65", `\x1b]11;rgb:${"f".repeat(55)}`, "f"],
+		["invalid read containing a reply", "\x1b]11;r", `abc${osc11Reply}`],
+		["empty channel", "\x1b]11;rgb:", "/abc"],
+		["extra separator", "\x1b]11;rgb:ffff/0000/0000", "/abc"],
+	] as const) {
+		it(`${Renderer.name} hidden OSC 11 grammar rejects ${kind} in order`, async (t) => {
+			t.mock.method(performance, "now", () => 0);
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+			const timers = trackTimers(t);
+			const terminal = new InputTerminal();
+			const tui = new Renderer(terminal);
+			const component = new CountingComponent();
+			const inputs: string[] = [];
+			const visibility: boolean[] = [];
+			tui.addChild(component);
+			tui.setFocus(component);
+			tui.addInputListener((data) => {
+				inputs.push(data);
+				return undefined;
+			});
+			tui.onVisibilityChange((visible) => visibility.push(visible));
+			tui.start();
+			tui.renderNow();
+			await nextTick();
+			visibility.length = 0;
+			try {
+				let settled = false;
+				const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 }).then((rgb) => {
+					settled = true;
+					return rgb;
+				});
+				terminal.input?.("\x1b[O");
+				const renders = component.renders;
+				const full = tui.fullRedraws;
+				const writes = terminal.writes.length;
+				terminal.input?.(partial);
+				await nextTick();
+				assert.deepEqual(inputs, []);
+				assert.deepEqual(visibility, [false]);
+				assert.equal(timers.size, 0);
+				t.mock.timers.tick(2000);
+				await nextTick();
+				assert.equal(settled, false);
+				assert.equal(component.renders, renders);
+				assert.equal(terminal.writes.length, writes);
+				terminal.input?.(continuation);
+				await nextTick();
+				assert.deepEqual(inputs, [partial, continuation]);
+				assert.equal(inputs.join(""), partial + continuation);
+				assert.deepEqual(component.inputs, inputs);
+				assert.deepEqual(visibility, [false, true]);
+				assert.equal(component.renders, renders + 1);
+				assert.equal(tui.fullRedraws, full + 1);
+				assert.equal(settled, false, "ordinary bytes must not consume the outstanding query");
+				assert.equal(timers.size, 1, "only the now-visible query timeout resumes");
+				terminal.input?.(osc11Reply);
+				assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
+				assert.equal(timers.size, 0);
+				t.diagnostic(
+					`OSC11 grammar ${Renderer.name} ${kind}: hidden 0 renders/timers; recovery 1 full frame; ordered bytes`,
+				);
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	for (const [kind, parts] of [
+		["split before BEL", ["\x1b]11;rgb:ffff/0000/0000", "\x07"]],
+		["split ST", ["\x1b]11;rgb:ffff/0000/0000\x1b", "\\"]],
+		["separate ST bytes", ["\x1b]11;rgb:ffff/0000/0000", "\x1b", "\\"]],
+		["bytewise BEL", Array.from(osc11Reply)],
+		["bytewise ST", Array.from("\x1b]11;rgb:ffff/0000/0000\x1b\\")],
+		["64-byte terminated reply", [`\x1b]11;rgb:${"f".repeat(50)}/0/0`, "\x07"]],
+	] as const) {
+		it(`${Renderer.name} hidden OSC 11 grammar consumes ${kind} without recovery`, async (t) => {
+			t.mock.method(performance, "now", () => 0);
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+			const timers = trackTimers(t);
+			const terminal = new InputTerminal();
+			const tui = new Renderer(terminal);
+			const component = new CountingComponent();
+			const inputs: string[] = [];
+			tui.addChild(component);
+			tui.setFocus(component);
+			tui.addInputListener((data) => {
+				inputs.push(data);
+				return undefined;
+			});
+			tui.start();
+			tui.renderNow();
+			await nextTick();
+			try {
+				terminal.input?.("\x1b[O");
+				const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
+				const renders = component.renders;
+				const full = tui.fullRedraws;
+				const writes = terminal.writes.length;
+				for (const part of parts) {
+					terminal.input?.(part);
+					await nextTick();
+					assert.equal(timers.size, 0);
+					assert.equal(component.renders, renders);
+					assert.equal(tui.fullRedraws, full);
+					assert.equal(terminal.writes.length, writes);
+					assert.deepEqual(inputs, []);
+					assert.deepEqual(component.inputs, []);
+				}
+				assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
+				t.mock.timers.tick(2000);
+				await nextTick();
+				assert.equal(component.renders, renders);
+				assert.equal(timers.size, 0);
+				t.diagnostic(`OSC11 grammar ${Renderer.name} ${kind}: reply consumed; hidden 0 renders/timers`);
+			} finally {
+				tui.stop();
+			}
+		});
+	}
 }
 
 // smarty-dev#7403 round 2: recovery does not require the missing CSI I or a frame timer.

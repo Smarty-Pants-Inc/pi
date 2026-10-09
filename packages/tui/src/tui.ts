@@ -144,6 +144,35 @@ type PendingOsc11BackgroundQuery = {
 	timer: NodeJS.Timeout | undefined;
 };
 
+/** Validate a fragmented OSC 11 reply, stopping at its first terminator or invalid byte. */
+function scanOsc11BackgroundReply(data: string): number | "partial" | "invalid" {
+	const prefix = "\x1b]11;rgb:";
+	let channel = 0;
+	let hasDigit = false;
+	let awaitingSt = false;
+	for (let i = 0; i < data.length; i++) {
+		// The grammar is ASCII, so a valid partial's code units are also its bytes.
+		if (i >= 64) return "invalid";
+		const byte = data[i];
+		if (i < prefix.length) {
+			if (byte !== prefix[i]) return "invalid";
+		} else if (awaitingSt) {
+			return byte === "\\" ? i + 1 : "invalid";
+		} else if ((byte >= "0" && byte <= "9") || (byte >= "a" && byte <= "f") || (byte >= "A" && byte <= "F")) {
+			hasDigit = true;
+		} else if (byte === "/" && hasDigit && channel < 2) {
+			channel++;
+			hasDigit = false;
+		} else if ((byte === "\x07" || byte === "\x1b") && hasDigit && channel === 2) {
+			if (byte === "\x07") return i + 1;
+			awaitingSt = true;
+		} else {
+			return "invalid";
+		}
+	}
+	return "partial";
+}
+
 /**
  * Interface for components that can receive focus and display a hardware cursor.
  * When focused, the component should emit CURSOR_MARKER at the cursor position
@@ -1103,17 +1132,23 @@ export abstract class TuiBase extends Container implements TUI {
 			return;
 		}
 		const buffered = this.pendingOsc11BackgroundInput;
-		if (
-			buffered &&
-			(Array.from(data).length === 1 ||
-				parseKey(data) !== undefined ||
-				data.startsWith("\x1b[") ||
-				data.startsWith("\x1bO")) &&
-			!isOsc11BackgroundColorResponse(buffered + data)
-		) {
-			// A complete user event recovers immediately, delivering older bytes first.
+		if (buffered) {
+			const combined = buffered + data;
+			const reply = scanOsc11BackgroundReply(combined);
 			this.pendingOsc11BackgroundInput = "";
-			this.dispatchTerminalInput(buffered);
+			if (reply === "invalid") {
+				// No timer or key heuristic: the first impossible byte makes the entire
+				// partial and the rest of this chunk ordinary input, in arrival order.
+				this.dispatchTerminalInput(buffered);
+				if (data) this.dispatchTerminalInput(data);
+				return;
+			}
+			if (reply === "partial") {
+				this.pendingOsc11BackgroundInput = combined;
+				return;
+			}
+			this.consumeOsc11BackgroundResponse(combined.slice(0, reply));
+			data = combined.slice(reply);
 		}
 		// Only a query we are still waiting for can remove OSC 11 bytes. Paste stays literal.
 		if (this.pendingOsc11BackgroundReplies > 0) {
@@ -1123,7 +1158,11 @@ export abstract class TuiBase extends Container implements TUI {
 				/\x1b\[200~[\s\S]*?(?:\x1b\[201~|$)|\x1b\]11;[^\x07\x1b]*(?:\x07|\x1b\\|\x1b?$)|\x1b(?:\](?:1(?:1)?)?)?$/g,
 				(response) => {
 					if (response.startsWith("\x1b[200~") || this.pendingOsc11BackgroundReplies === 0) return response;
-					if (!this.consumeOsc11BackgroundResponse(response)) this.pendingOsc11BackgroundInput = response;
+					if (response.length > 64) return response;
+					// Keep existing complete-reply formats, but retain only a grammar-valid partial.
+					if (this.consumeOsc11BackgroundResponse(response)) return "";
+					if (scanOsc11BackgroundReply(response) !== "partial") return response;
+					this.pendingOsc11BackgroundInput = response;
 					return "";
 				},
 			);

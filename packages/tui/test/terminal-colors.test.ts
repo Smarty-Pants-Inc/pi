@@ -294,7 +294,7 @@ describe("TUI.queryTerminalBackgroundColor", () => {
 				return rgb;
 			});
 			terminal.sendInput("\x1b[O");
-			const partial = "\x1b]11;#fff";
+			const partial = "\x1b]11;rgb:ffff/";
 			terminal.sendInput(partial);
 			assert.deepStrictEqual(inputs, []);
 			assert.strictEqual(visibility.at(-1), false);
