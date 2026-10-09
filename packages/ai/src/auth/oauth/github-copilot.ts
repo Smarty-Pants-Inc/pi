@@ -5,6 +5,7 @@
 import { GITHUB_COPILOT_MODELS } from "../../providers/github-copilot.models.ts";
 import { sleep } from "../../utils/sleep.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { oauthAuthorizationError, readOAuthCredentialResponse } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 const decode = (s: string) => atob(s);
@@ -34,7 +35,6 @@ type DeviceTokenSuccessResponse = {
 
 type DeviceTokenErrorResponse = {
 	error: string;
-	error_description?: string;
 	interval?: number;
 };
 
@@ -189,18 +189,25 @@ async function fetchGitHubCopilotModels(
 		retryPolicy,
 	);
 	if (!response.ok) {
-		throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
+		// Authenticated request: its error body and reason phrase can echo the bearer token.
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`HTTP ${response.status}`);
 	}
-	return parseGitHubCopilotModelCatalog(await response.json(), allowPolicyFallback);
+	return parseGitHubCopilotModelCatalog(
+		await readOAuthCredentialResponse(response, "GitHub Copilot model catalog"),
+		allowPolicyFallback,
+	);
 }
 
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 	const response = await fetch(url, init);
 	if (!response.ok) {
-		const text = await response.text();
-		throw new Error(`${response.status} ${response.statusText}: ${text}`);
+		// Device and token endpoints can echo submitted codes or tokens, in the body or reason phrase.
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`HTTP ${response.status}`);
 	}
-	return response.json();
+	// A parser or body-reader error can quote the issued token: value-free reader.
+	return readOAuthCredentialResponse(response, "GitHub Copilot OAuth");
 }
 
 async function startDeviceFlow(domain: string, signal: AbortSignal): Promise<DeviceCodeResponse> {
@@ -292,7 +299,7 @@ async function pollForGitHubAccessToken(
 			}
 
 			if (raw && typeof raw === "object" && typeof (raw as DeviceTokenErrorResponse).error === "string") {
-				const { error, error_description: description, interval } = raw as DeviceTokenErrorResponse;
+				const { error, interval } = raw as DeviceTokenErrorResponse;
 				if (error === "authorization_pending") {
 					return { status: "pending" };
 				}
@@ -301,8 +308,8 @@ async function pollForGitHubAccessToken(
 					return { status: "slow_down", intervalSeconds: typeof interval === "number" ? interval : undefined };
 				}
 
-				const descriptionSuffix = description ? `: ${description}` : "";
-				return { status: "failed", message: `Device flow failed: ${error}${descriptionSuffix}` };
+				// The token endpoint can echo the submitted device code: keep only a protocol code, never error_description.
+				return { status: "failed", message: `Device flow failed: ${oauthAuthorizationError(error)}` };
 			}
 
 			return { status: "failed", message: "Invalid device token response" };
@@ -402,7 +409,8 @@ async function enableGitHubCopilotModel(
 		return false;
 	}
 	if (response.status === 429) {
-		throw new Error(`${response.status} ${response.statusText}: ${await response.text()}`);
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`HTTP ${response.status}`);
 	}
 	return response.ok;
 }

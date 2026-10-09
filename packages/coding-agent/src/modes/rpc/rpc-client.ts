@@ -7,7 +7,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { SessionStats } from "../../core/agent-session.ts";
+import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
@@ -20,6 +20,7 @@ import type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponseBody,
 	RpcFatalErrorResponse,
+	RpcInputRejectedEvent,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -80,6 +81,7 @@ export type RpcMessageEndEvent = Extract<JsonAgentSessionEvent, { type: "message
 export type RpcAgentSessionEvent =
 	| Exclude<JsonAgentSessionEvent, { type: "message_end" }>
 	| RpcExtensionUIRequest
+	| RpcInputRejectedEvent
 	| RpcMessageEndEvent;
 
 export type RpcEventListener = (event: RpcAgentSessionEvent) => void;
@@ -90,6 +92,8 @@ export type RpcEventListener = (event: RpcAgentSessionEvent) => void;
 
 export class RpcClient {
 	private process: ChildProcess | null = null;
+	private processClosed: Promise<void> | null = null;
+	private drainError: Error | null = null;
 	private stopReadingStdout: (() => void) | null = null;
 	private eventListeners: RpcEventListener[] = [];
 	private pendingRequests: Map<string, { resolve: (response: RpcResponse) => void; reject: (error: Error) => void }> =
@@ -112,6 +116,7 @@ export class RpcClient {
 		}
 
 		this.exitError = null;
+		this.drainError = null;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -132,6 +137,29 @@ export class RpcClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.process = childProcess;
+		let drainDeadline: NodeJS.Timeout | undefined;
+		let resolveClosed: () => void = () => {};
+		this.processClosed = new Promise<void>((resolve) => {
+			resolveClosed = resolve;
+			childProcess.once("close", () => {
+				clearTimeout(drainDeadline);
+				resolve();
+			});
+		});
+		childProcess.once("exit", (code, signal) => {
+			if (this.process !== childProcess) return;
+			// Exit is known immediately, but already-written response bytes may still
+			// resolve requests. Bound that final drain even if a descendant owns a pipe.
+			this.exitError ??= this.createProcessExitError(code, signal);
+			drainDeadline = setTimeout(() => {
+				if (this.process !== childProcess) return;
+				this.drainError = new Error(`Agent process exited with incomplete output drainage. Stderr: ${this.stderr}`);
+				this.rejectPendingRequests(this.exitError!);
+				childProcess.stdout?.destroy();
+				childProcess.stderr?.destroy();
+				resolveClosed();
+			}, 1000);
+		});
 
 		// Collect stderr for debugging
 		childProcess.stderr?.on("data", (data) => {
@@ -139,7 +167,7 @@ export class RpcClient {
 			process.stderr.write(data);
 		});
 
-		childProcess.once("exit", (code, signal) => {
+		childProcess.once("close", (code, signal) => {
 			if (this.process !== childProcess) return;
 			const error = this.exitError ?? this.createProcessExitError(code, signal);
 			this.exitError = error;
@@ -184,25 +212,33 @@ export class RpcClient {
 	async stop(): Promise<void> {
 		if (!this.process) return;
 
+		// `exit` may precede the final stdout data. Keep authoritative receipts readable
+		// until `close`, including when the child has already exited before stop().
+		const childProcess = this.process;
+		if (childProcess.exitCode === null && childProcess.signalCode === null) childProcess.kill("SIGTERM");
+		// Server budgets are command cancellation (1s), cleanup (1s), and final
+		// transport drainage (1s). Leave scheduling margin before escalating.
+		const timeout = setTimeout(() => {
+			if (childProcess.exitCode === null && childProcess.signalCode === null) {
+				this.drainError = new Error(
+					`RPC shutdown incomplete: forced SIGKILL after 5000 ms. Stderr: ${this.stderr}`,
+				);
+				this.exitError ??= this.drainError;
+				childProcess.kill("SIGKILL");
+			}
+		}, 5000);
+		try {
+			await this.processClosed;
+		} finally {
+			clearTimeout(timeout);
+		}
+
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
-		this.process.kill("SIGTERM");
-
-		// Wait for process to exit
-		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => {
-				this.process?.kill("SIGKILL");
-				resolve();
-			}, 1000);
-
-			this.process?.on("exit", () => {
-				clearTimeout(timeout);
-				resolve();
-			});
-		});
-
 		this.process = null;
-		this.pendingRequests.clear();
+		this.processClosed = null;
+		this.rejectPendingRequests(this.exitError ?? new Error("RPC client stopped"));
+		if (this.drainError) throw this.drainError;
 	}
 
 	/**
@@ -257,25 +293,32 @@ export class RpcClient {
 
 	/**
 	 * Send a prompt to the agent.
-	 * Returns immediately after sending; use onEvent() to receive streaming events.
-	 * Use waitForIdle() to wait for completion.
+	 * Returns the prompt's disposition after acceptance; use onEvent() to receive streaming events.
+	 * If the disposition is "handled", no run started for this prompt, so don't wait for agent_settled.
 	 */
-	async prompt(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "prompt", message, images });
+	async prompt(
+		message: string,
+		images?: ImageContent[],
+		streamingBehavior?: "steer" | "followUp",
+	): Promise<PromptDisposition> {
+		const response = await this.send({ type: "prompt", message, images, streamingBehavior });
+		return this.getData<{ disposition: PromptDisposition }>(response).disposition;
 	}
 
 	/**
 	 * Queue a steering message to interrupt the agent mid-run.
 	 */
-	async steer(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "steer", message, images });
+	async steer(message: string, images?: ImageContent[]): Promise<QueuedInputDisposition> {
+		const response = await this.send({ type: "steer", message, images });
+		return this.getData<{ disposition: QueuedInputDisposition }>(response).disposition;
 	}
 
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 */
-	async followUp(message: string, images?: ImageContent[]): Promise<void> {
-		await this.send({ type: "follow_up", message, images });
+	async followUp(message: string, images?: ImageContent[]): Promise<QueuedInputDisposition> {
+		const response = await this.send({ type: "follow_up", message, images });
+		return this.getData<{ disposition: QueuedInputDisposition }>(response).disposition;
 	}
 
 	/**
@@ -555,7 +598,12 @@ export class RpcClient {
 	 * Collect events until agent becomes idle.
 	 */
 	collectEvents(timeout = 60000): Promise<RpcAgentSessionEvent[]> {
-		return new Promise((resolve, reject) => {
+		return this.createEventCollector(timeout).promise;
+	}
+
+	private createEventCollector(timeout: number): { promise: Promise<RpcAgentSessionEvent[]>; cancel: () => void } {
+		let cancel = () => {};
+		const promise = new Promise<RpcAgentSessionEvent[]>((resolve, reject) => {
 			const events: RpcAgentSessionEvent[] = [];
 			const timer = setTimeout(() => {
 				unsubscribe();
@@ -570,16 +618,31 @@ export class RpcClient {
 					resolve(events);
 				}
 			});
+			cancel = () => {
+				clearTimeout(timer);
+				unsubscribe();
+				resolve(events);
+			};
 		});
+		return { promise, cancel };
 	}
 
 	/**
 	 * Send prompt and wait for completion, returning all events.
 	 */
 	async promptAndWait(message: string, images?: ImageContent[], timeout = 60000): Promise<RpcAgentSessionEvent[]> {
-		const eventsPromise = this.collectEvents(timeout);
-		await this.prompt(message, images);
-		return eventsPromise;
+		const collector = this.createEventCollector(timeout);
+		// A timeout may fire while prompt admission is still pending. Observe it immediately.
+		void collector.promise.catch(() => {});
+		try {
+			const response = await this.send({ type: "prompt", message, images });
+			// Handled input owes no agent_settled; complete now instead of timing out (#132 R5-S3).
+			if (response.command === "prompt" && response.success && response.data?.disposition === "handled")
+				collector.cancel();
+			return await collector.promise;
+		} finally {
+			collector.cancel();
+		}
 	}
 
 	// =========================================================================
@@ -605,8 +668,9 @@ export class RpcClient {
 				return;
 			}
 
-			// Otherwise it's an event
-			for (const listener of this.eventListeners) {
+			// Otherwise it's an event. Iterate a snapshot so listeners that unsubscribe during dispatch
+			// do not cause later listeners to miss this event.
+			for (const listener of [...this.eventListeners]) {
 				listener(data as RpcAgentSessionEvent);
 			}
 		} catch {
@@ -657,6 +721,10 @@ export class RpcClient {
 			this.pendingRequests.set(id, {
 				resolve: (response) => {
 					clearTimeout(timeout);
+					if (!response.success) {
+						reject(new Error(response.error));
+						return;
+					}
 					resolve(response);
 				},
 				reject: (error) => {

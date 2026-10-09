@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import type { ExtensionFactory } from "../src/core/extensions/index.ts";
+import type { ExtensionFactory, LoadExtensionsResult } from "../src/core/extensions/index.ts";
 import type { ReceivedInput } from "../src/core/received-input.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
@@ -107,6 +107,7 @@ async function createRuntimeHost(options: {
 	failFirstResponse?: boolean;
 	retry?: boolean;
 	extensionFactories?: ExtensionFactory[];
+	extensionsResult?: LoadExtensionsResult;
 }): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	session: AgentSession;
@@ -114,6 +115,9 @@ async function createRuntimeHost(options: {
 	rebind: () => Promise<void>;
 	cleanup: () => Promise<void>;
 }> {
+	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
+	const previousSignals = signals.map((signal) => ({ signal, listeners: process.listeners(signal) }));
+	const previousEnd = process.stdin.listeners("end");
 	const tempDir = join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 
@@ -159,11 +163,13 @@ async function createRuntimeHost(options: {
 	if (options.withAuth) {
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 	}
-	const resourceLoader = createTestResourceLoader(
-		options.extensionFactories
-			? { extensionsResult: await createTestExtensionsResult(options.extensionFactories, tempDir) }
-			: undefined,
-	);
+	const resourceLoader = createTestResourceLoader({
+		extensionsResult:
+			options.extensionsResult ??
+			(options.extensionFactories
+				? await createTestExtensionsResult(options.extensionFactories, tempDir)
+				: undefined),
+	});
 
 	const session = new AgentSession({
 		agent,
@@ -181,6 +187,7 @@ async function createRuntimeHost(options: {
 		switchSession: vi.fn(async () => ({ cancelled: true })),
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
+		setLifecycleCompleteHandler: vi.fn(),
 		setRebindSession: (callback: () => Promise<void>) => {
 			rebindSession = callback;
 		},
@@ -197,11 +204,22 @@ async function createRuntimeHost(options: {
 			await rebindSession();
 		},
 		cleanup: async () => {
+			// Remove only listeners installed by this test's RPC host.
+			for (const { signal, listeners } of previousSignals) {
+				for (const listener of process.listeners(signal)) {
+					if (!listeners.includes(listener)) process.off(signal, listener);
+				}
+			}
+			for (const listener of process.stdin.listeners("end") as Array<Parameters<typeof process.on>[1]>) {
+				if (!previousEnd.includes(listener)) process.stdin.off("end", listener);
+			}
 			try {
 				await session.abort();
 			} catch {
 				// ignore test cleanup failures
 			}
+			// smarty-dev#3048: queued input must be explicitly recovered, never silently dropped by dispose.
+			session.clearQueue();
 			session.dispose();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true });
@@ -210,14 +228,7 @@ async function createRuntimeHost(options: {
 	};
 }
 
-async function startRpcMode(options: {
-	withAuth: boolean;
-	responseDelayMs: number;
-	model?: Model<any>;
-	failFirstResponse?: boolean;
-	retry?: boolean;
-	extensionFactories?: ExtensionFactory[];
-}): Promise<{
+async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): Promise<{
 	lineHandler: (line: string) => void;
 	session: AgentSession;
 	sessionManager: SessionManager;
@@ -431,6 +442,7 @@ describe("RPC prompt response semantics", () => {
 						type: "response",
 						command: type,
 						success: true,
+						data: { disposition: "queued" },
 					});
 				});
 			}
@@ -500,7 +512,8 @@ describe("RPC prompt response semantics", () => {
 			targetId = sessionManager.appendMessage({ role: "user", content: "history", timestamp: Date.now() });
 			sessionManager.appendMessage(createAssistantMessage("prior answer"));
 			session.agent.state.messages = sessionManager.buildSessionContext().messages;
-			vi.mocked(runtimeHost.dispose).mockImplementation(async () => {
+			vi.mocked(runtimeHost.dispose).mockImplementation(async (options) => {
+				await options?.beforeShutdown?.();
 				expect(session.isIdle).toBe(true);
 				order.push("dispose");
 			});
@@ -557,7 +570,37 @@ describe("RPC prompt response semantics", () => {
 		},
 	);
 
-	it("emits one success response when prompt preflight succeeds", async () => {
+	// pi#132 R5-S3: the success response carries whether a run (and so agent_settled) follows.
+	it("reports the handled or started disposition on the prompt response", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event) => (event.text === "consume" ? { action: "handled" } : undefined));
+				},
+			],
+		});
+		try {
+			lineHandler(JSON.stringify({ id: "h1", type: "prompt", message: "consume" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "h1")).toEqual([
+					expect.objectContaining({ success: true, data: { disposition: "handled" } }),
+				]),
+			);
+			lineHandler(JSON.stringify({ id: "r1", type: "prompt", message: "Hello" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "r1")).toEqual([
+					expect.objectContaining({ success: true, data: { disposition: "started" } }),
+				]),
+			);
+		} finally {
+			await cleanup();
+		}
+	});
+
+	// #9098: a successful prompt may start an agent run or be consumed by an extension.
+	it("emits one started response when prompt preflight succeeds", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
 
 		try {
@@ -571,6 +614,7 @@ describe("RPC prompt response semantics", () => {
 					type: "response",
 					command: "prompt",
 					success: true,
+					data: { disposition: "started" },
 				});
 			});
 		} finally {
@@ -1017,6 +1061,38 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
+	it("reports extension commands and intercepted input as handled without starting a run", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: false,
+			responseDelayMs: 0,
+			extensionsResult: await createTestExtensionsResult([
+				(pi) => {
+					pi.registerCommand("handled", { handler: async () => {} });
+					pi.on("input", (event) => {
+						if (event.text === "handled input") return { action: "handled" };
+					});
+				},
+			]),
+		});
+
+		try {
+			for (const [id, message] of [
+				["command", "/handled"],
+				["input", "handled input"],
+			]) {
+				lineHandler(JSON.stringify({ id, type: "prompt", message }));
+				await vi.waitFor(() => {
+					expect(getPromptResponses(rpcIo.outputLines, id)).toEqual([
+						{ id, type: "response", command: "prompt", success: true, data: { disposition: "handled" } },
+					]);
+				});
+			}
+			expect(parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "agent_start")).toHaveLength(0);
+		} finally {
+			await cleanup();
+		}
+	});
+
 	it("emits one success response when prompt is queued during streaming", async () => {
 		const { lineHandler, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 100 });
 
@@ -1044,10 +1120,94 @@ describe("RPC prompt response semantics", () => {
 					type: "response",
 					command: "prompt",
 					success: true,
+					data: { disposition: "queued" },
 				});
 			});
 
 			await sleep(150);
+		} finally {
+			await cleanup();
+		}
+	});
+
+	// #9803: a handler can consume A while independently queueing B; report A's outcome.
+	it.each(["steer", "follow_up"] as const)(
+		"reports %s as handled even when an extension queues another message",
+		async (type) => {
+			const { lineHandler, cleanup } = await startRpcMode({
+				withAuth: true,
+				responseDelayMs: 500,
+				extensionsResult: await createTestExtensionsResult([
+					(pi) => {
+						pi.on("input", (event) => {
+							if (event.text === "A" && event.source === "rpc") {
+								pi.sendUserMessage("B", { deliverAs: type === "steer" ? "steer" : "followUp" });
+								return { action: "handled" };
+							}
+						});
+					},
+				]),
+			});
+
+			try {
+				lineHandler(JSON.stringify({ id: "start", type: "prompt", message: "Start" }));
+				await vi.waitFor(() => expect(getPromptResponses(rpcIo.outputLines, "start")).toHaveLength(1));
+
+				lineHandler(JSON.stringify({ id: "A", type, message: "A" }));
+				await vi.waitFor(() => {
+					expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
+						id: "A",
+						type: "response",
+						command: type,
+						success: true,
+						data: { disposition: "handled" },
+					});
+					expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
+						type: "queue_update",
+						steering: type === "steer" ? ["B"] : [],
+						followUp: type === "follow_up" ? ["B"] : [],
+					});
+				});
+				await vi.waitFor(() => {
+					expect(
+						parseOutputLines(rpcIo.outputLines).filter((line) => line.type === "response" && line.id === "A"),
+					).toHaveLength(1);
+				});
+			} finally {
+				await cleanup();
+			}
+		},
+	);
+
+	it.each(["steer", "follow_up"] as const)("reports %s as queued after input transformation", async (type) => {
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: false,
+			responseDelayMs: 0,
+			extensionsResult: await createTestExtensionsResult([
+				(pi) => {
+					pi.on("input", (event) => {
+						if (event.text === "A") return { action: "transform", text: "B" };
+					});
+				},
+			]),
+		});
+
+		try {
+			lineHandler(JSON.stringify({ id: "A", type, message: "A" }));
+			await vi.waitFor(() => {
+				expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
+					id: "A",
+					type: "response",
+					command: type,
+					success: true,
+					data: { disposition: "queued" },
+				});
+				expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
+					type: "queue_update",
+					steering: type === "steer" ? ["B"] : [],
+					followUp: type === "follow_up" ? ["B"] : [],
+				});
+			});
 		} finally {
 			await cleanup();
 		}
@@ -1071,7 +1231,9 @@ describe("RPC prompt response semantics", () => {
 				}),
 			);
 			await vi.waitFor(() => {
-				expect(getPromptResponses(rpcIo.outputLines, "clear-steering")).toHaveLength(1);
+				expect(getPromptResponses(rpcIo.outputLines, "clear-steering")).toMatchObject([
+					{ data: { disposition: "queued" } },
+				]);
 			});
 
 			lineHandler(

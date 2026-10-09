@@ -172,6 +172,28 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("Request error");
 	});
 
+	// pi#132 R4-9: a progressing reader slower than the 1000 ms shutdown drain still gets complete successful output.
+	it("joins slow successful text output before the forced-shutdown drain budget", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const written: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(((
+			chunk: string | Uint8Array,
+			callback?: (error?: Error | null) => void,
+		) => {
+			written.push(String(chunk));
+			setTimeout(() => callback?.(), String(chunk).length > 0 ? 1500 : 0);
+			return true;
+		}) as typeof process.stdout.write);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "Say done",
+		});
+		expect(errorSpy).not.toHaveBeenCalled();
+		expect(exitCode).toBe(0);
+		expect(written.join("")).toBe("done\n");
+	}, 10_000);
+
 	it("emits session_shutdown and returns non-zero on assistant error", async () => {
 		const runtimeHost = createRuntimeHost(
 			createAssistantMessage({ stopReason: "error", errorMessage: "provider failure" }),

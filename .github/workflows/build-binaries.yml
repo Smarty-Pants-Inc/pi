@@ -217,6 +217,7 @@ jobs:
         run: |
           "${{ steps.binary.outputs.binary }}" --help
           "${{ steps.binary.outputs.binary }}" --version
+          # Upstream's codemode binary smoke is not run while Codemode is refused (smarty-dev#4506).
 
   stage-github-release:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -318,6 +319,8 @@ jobs:
             exit 1
           fi
 
+  # Upstream's env-daemons job (pi-env daemons on unapproved hosted runners) is not carried (smarty-dev#1246).
+
   publish-npm:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 150
@@ -359,6 +362,9 @@ jobs:
 
       - name: Check
         run: npm run check
+
+      - name: Build the pi-env daemon for tests
+        run: npm run build:daemon --workspace packages/env
 
       - name: Test
         run: npm test

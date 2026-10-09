@@ -13,13 +13,15 @@ import {
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
-import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import type { BashSpawnEvent, ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
+/** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
+const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
 function resolveTimeoutMs(timeout: number | undefined): number | undefined {
@@ -46,6 +48,20 @@ export const bashToolSystemPromptContribution = {
 } as const;
 
 export type BashToolInput = Static<typeof bashSchema>;
+
+/**
+ * Result for programmatic callers such as codemode scripts. A non-zero exit code is an error result for the model, but scripts still resolve to this value.
+ * `output` is not limited like the model-facing output: callers decide how much of it reaches the model.
+ */
+const bashOutputSchema = Type.Object({
+	output: Type.String({ description: "Combined stdout and stderr, possibly truncated" }),
+	truncated: Type.Boolean(),
+	full_output_path: Type.Optional(Type.String({ description: "Full output, when truncated" })),
+	exit_code: Type.Number(),
+	wall_time_seconds: Type.Number(),
+});
+
+export type BashToolOutput = Static<typeof bashOutputSchema>;
 
 export interface BashToolDetails {
 	truncation?: TruncationResult;
@@ -77,26 +93,43 @@ export interface BashOperations {
 	) => Promise<{ exitCode: number | null }>;
 }
 
+type LocalShellSpawn = Omit<BashSpawnEvent, "type" | "toolCallId" | "backend">;
+
 /** Shared process execution used by the built-in shell tools. */
-export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
+export function createLocalShellOperations(
+	shellName: string,
+	resolveShellConfig: (env: NodeJS.ProcessEnv) => ShellConfig,
+	beforeSpawn?: (spawn: LocalShellSpawn) => Promise<void>,
+): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			const timeoutMs = resolveTimeoutMs(timeout);
 			if (signal?.aborted) {
 				throw new Error("aborted");
 			}
-			const shellConfig = resolveShellConfig();
+			const effectiveEnv = { ...(env ?? getShellEnv()) };
+			const shellConfig = resolveShellConfig(effectiveEnv);
 			try {
 				await fsAccess(cwd, constants.F_OK);
 			} catch {
 				throw new Error(`Working directory does not exist: ${cwd}\nCannot execute ${shellName} commands.`);
 			}
+			// Revocation during the asynchronous cwd check must not still spawn.
+			if (signal?.aborted) {
+				throw new Error("aborted");
+			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
-			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+			const shellPath = shellConfig.shell;
+			const shellArgs = commandFromStdin ? [...shellConfig.args] : [...shellConfig.args, command];
+			if (beforeSpawn) {
+				await beforeSpawn({ command, shellPath, shellArgs: [...shellArgs], cwd, env: { ...effectiveEnv } });
+			}
+			if (signal?.aborted) throw new Error("aborted");
+			const child = spawn(shellPath, shellArgs, {
 				cwd,
 				detached: process.platform !== "win32",
-				env: env ?? getShellEnv(),
+				env: effectiveEnv,
 				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
 				windowsHide: true,
 			});
@@ -156,7 +189,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
  * standard local shell behavior while wrapping or rewriting commands.
  */
 export function createLocalBashOperations(options?: { shellPath?: string }): BashOperations {
-	return createLocalShellOperations("bash", () => getShellConfig(options?.shellPath));
+	return createLocalShellOperations("bash", (env) => getShellConfig(options?.shellPath, env));
 }
 
 export interface BashSpawnContext {
@@ -229,7 +262,9 @@ export function createShellToolDefinition(
 	config: ShellToolConfig,
 	options?: BashToolOptions,
 ): ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> {
-	const ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });
+	const customOperations = options?.operations;
+	const shellPath = options?.shellPath;
+	const ops = customOperations ?? createLocalBashOperations({ shellPath });
 	const commandPrefix = options?.commandPrefix;
 	const exposeSessionEnvironment = options?.exposeSessionEnvironment ?? true;
 	const spawnHook = options?.spawnHook;
@@ -240,9 +275,10 @@ export function createShellToolDefinition(
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
+		outputSchema: bashOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
-			_toolCallId,
+			toolCallId,
 			{ command, timeout }: { command: string; timeout?: number },
 			signal?: AbortSignal,
 			onUpdate?,
@@ -256,6 +292,27 @@ export function createShellToolDefinition(
 				exposeSessionEnvironment,
 				ctx,
 			);
+			// Snapshot hook output before any asynchronous handler can change a retained reference.
+			const execution: BashSpawnContext = {
+				command: spawnContext.command,
+				cwd: spawnContext.cwd,
+				env: { ...spawnContext.env },
+			};
+			const emitBashSpawn = config.name === "bash" ? ctx?.emitBashSpawn : undefined;
+			const beforeSpawn = emitBashSpawn
+				? async (spawn: LocalShellSpawn) => {
+						const result = await emitBashSpawn(
+							{ type: "bash_spawn", toolCallId, backend: "local-builtin", ...spawn },
+							signal,
+						);
+						if (result?.block) throw new Error(result.reason ?? "Bash spawn blocked");
+					}
+				: undefined;
+			const executionOps =
+				beforeSpawn && !customOperations
+					? createLocalShellOperations("bash", (env) => getShellConfig(shellPath, env), beforeSpawn)
+					: ops;
+
 			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
@@ -339,15 +396,24 @@ export function createShellToolDefinition(
 			};
 
 			const appendStatus = (text: string, status: string) => `${text ? `${text}\n\n` : ""}${status}`;
+			const startedAt = performance.now();
 
 			try {
 				let exitCode: number | null;
 				try {
-					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
+					if (customOperations && emitBashSpawn) {
+						const result = await emitBashSpawn(
+							{ type: "bash_spawn", toolCallId, backend: "custom", ...execution, env: { ...execution.env } },
+							signal,
+						);
+						if (result?.block) throw new Error(result.reason ?? "Bash spawn blocked");
+					}
+					if (signal?.aborted) throw new Error("aborted");
+					const result = await executionOps.exec(execution.command, execution.cwd, {
 						onData: handleData,
 						signal,
 						timeout,
-						env: spawnContext.env,
+						env: execution.env,
 					});
 					exitCode = result.exitCode;
 				} catch (err) {
@@ -368,10 +434,26 @@ export function createShellToolDefinition(
 				if (exitCode === null) {
 					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
 				}
+				const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
+				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
+				const structuredContent: BashToolOutput = {
+					output: fullOutput.content,
+					truncated: fullOutput.truncated,
+					...(fullOutput.truncated && snapshot.fullOutputPath
+						? { full_output_path: snapshot.fullOutputPath }
+						: {}),
+					exit_code: exitCode,
+					wall_time_seconds: wallTimeSeconds,
+				};
 				if (exitCode !== 0) {
-					throw new Error(appendStatus(outputText, `Command exited with code ${exitCode}`));
+					return {
+						content: [{ type: "text", text: appendStatus(outputText, `Command exited with code ${exitCode}`) }],
+						details,
+						structuredContent,
+						isError: true,
+					};
 				}
-				return { content: [{ type: "text", text: outputText }], details };
+				return { content: [{ type: "text", text: outputText }], details, structuredContent };
 			} finally {
 				clearUpdateTimer();
 			}

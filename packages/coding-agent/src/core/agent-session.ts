@@ -17,13 +17,20 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
+	type AfterToolCallContext,
+	type AfterToolCallResult,
 	Agent,
 	type AgentContext,
 	type AgentEvent,
 	type AgentMessage,
 	type AgentState,
 	type AgentTool,
+	type AgentToolCall,
+	type AgentToolCallOutcome,
+	type BeforeToolCallContext,
+	type BeforeToolCallResult,
 	type PrepareNextTurnContext,
+	runToolCall,
 	type ThinkingLevel,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -89,6 +96,7 @@ import {
 	type AgentActivityOutcome,
 	type BoundaryContextPreview,
 	type ContextUsage,
+	type ExecuteToolOptions,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
 	type ExtensionMode,
@@ -111,15 +119,21 @@ import {
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
 	type ToolExecutionUpdateEvent,
+	type ToolExposure,
 	type ToolInfo,
+	type ToolLoadout,
 	type TreePreparation,
 	type TurnStartEvent,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { HOST_CAPABILITIES } from "./host-capabilities.ts";
+import { InputAdmissionError } from "./input-admission.ts";
+import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
 import { type BashExecutionMessage, type CustomMessage, convertToLlm } from "./messages.ts";
 import { ModelRegistry } from "./model-registry.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
+import { NestedToolCallRunner } from "./nested-tool-calls.ts";
 import type { OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
 import { assertOriginalCompactionAttempt, type OriginalCompactionAttempt } from "./ordinary-compaction.ts";
 import { assertOrdinaryRuntime, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
@@ -137,11 +151,12 @@ import {
 	getLatestCompactionEntry,
 	type SessionEntry,
 	SessionManager,
+	type SessionProjection,
 } from "./session-manager.ts";
 import { appendReceivedCustomMessage, appendReceivedMessage } from "./session-turn-appender.ts";
-import type { CacheWarmingMode, SettingsManager } from "./settings-manager.ts";
+import { type CacheWarmingMode, DEFAULT_TOOL_NAMES, type SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
-import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
+import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
 	buildSystemPrompt,
 	buildSystemPromptSections,
@@ -153,7 +168,15 @@ import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts"
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { captureTerminalTurnReceipt, type TurnReceipt, withoutAttribution } from "./turn-receipts.ts";
-import { addUsageToTotals, createUsageTotals } from "./usage-totals.ts";
+import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
+import {
+	findLatestResponse,
+	getBranchSelection,
+	getVirtualModelState,
+	isVirtualModel,
+	VIRTUAL_MODEL_STATE_ENTRY,
+	type VirtualModelStateData,
+} from "./virtual-models.ts";
 
 const appendOriginalCompaction = SessionManager.prototype.appendCompaction;
 const originalCompactionSessions = new WeakMap<
@@ -213,9 +236,16 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 	};
 }
 
+/** Tool execution events of calls a tool made through `ctx.executeTool()` carry `parentToolCallId`. */
+type WithParentToolCallId<E> = E extends {
+	type: "tool_execution_start" | "tool_execution_update" | "tool_execution_end";
+}
+	? E & { parentToolCallId?: string }
+	: E;
+
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
-	| Exclude<AgentEvent, { type: "agent_end" }>
+	| WithParentToolCallId<Exclude<AgentEvent, { type: "agent_end" }>>
 	| {
 			type: "agent_end";
 			messages: AgentMessage[];
@@ -296,9 +326,19 @@ export interface AgentSessionConfig {
 	cacheWarmer?: Pick<CacheWarmer, "cancel" | "status" | "onAgentSettled" | "onModeChanged" | "onWarmed">;
 	/** Initial active built-in tool names. Default: [read, bash, edit, write] */
 	initialActiveToolNames?: string[];
-	/** Optional allowlist of tool names. When provided, only these tool names are exposed. */
+	/**
+	 * Whether the initial tools come from the `defaultTools` setting. When true, reload activates
+	 * tools newly added to the setting. Tools removed from it stay active.
+	 */
+	usesDefaultTools?: boolean;
+	/**
+	 * Optional allowlist of tool names or patterns (`*` matches any characters). When provided, only
+	 * matching tools are exposed. A non-empty list without `mcp__` entries also keeps MCP tools
+	 * registered for codemode and tool_search; only tool_search can declare them. An empty list
+	 * exposes no tools.
+	 */
 	allowedToolNames?: string[];
-	/** Optional denylist of tool names. When provided, these tool names are not exposed. */
+	/** Optional denylist of tool names or patterns. When provided, matching tools are not exposed. */
 	excludedToolNames?: string[];
 	/**
 	 * Override base tools (useful for custom runtimes).
@@ -324,6 +364,9 @@ export interface ExtensionBindings {
 	onError?: ExtensionErrorListener;
 }
 
+export type QueuedInputDisposition = "handled" | "queued";
+export type PromptDisposition = QueuedInputDisposition | "started";
+
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
 	/** Whether to dispatch extension commands and expand skill commands and prompt templates (default: true) */
@@ -334,8 +377,8 @@ export interface PromptOptions {
 	streamingBehavior?: "steer" | "followUp";
 	/** Source of input for extension input event handlers. Defaults to "interactive". */
 	source?: InputSource;
-	/** Internal hook used by RPC mode to observe prompt preflight acceptance or rejection. */
-	preflightResult?: (success: boolean) => void;
+	/** Internal hook used by RPC mode to observe how an accepted prompt was dispatched. Not called if the prompt is rejected. */
+	preflightResult?: (disposition: PromptDisposition) => void;
 	/** Internal TUI handoff: input was consumed, queued, or handed to the original agent.
 	 * Unlike preflight acceptance, this remains true if the operation later fails. */
 	onInputTransferred?: () => void;
@@ -345,6 +388,8 @@ export interface PromptOptions {
 export interface ModelMutationOptions {
 	/** Persist the new value to global defaults. Defaults to session-only. */
 	persist?: boolean;
+	/** Caller cancellation (e.g. an RPC transport); checked after auth and before commit. */
+	signal?: AbortSignal;
 }
 
 /** Result from cycleModel() */
@@ -397,6 +442,21 @@ const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, bas
 // a skipped check or successful compaction with nothing queued.
 type CompactionOutcome = boolean | "failed" | "aborted";
 
+interface InputFenceScope {
+	fence: object;
+	active: boolean;
+}
+
+interface InputAdmission {
+	controller: AbortController;
+	/** Own cancellation combined with inherited dispatch revocation. */
+	signal: AbortSignal;
+	/** Inherited dispatch revocation alone, without this admission's own cancellation. */
+	parent: AbortSignal | undefined;
+	fenceScope: InputFenceScope | undefined;
+	release(): void;
+}
+
 function startCompactionDeadline(controller: AbortController): ReturnType<typeof setTimeout> {
 	return setTimeout(() => {
 		controller.abort(new DOMException("Compaction exceeded its 20-minute deadline", "TimeoutError"));
@@ -424,8 +484,19 @@ export class AgentSession {
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	#ordinaryPreflights = 0;
 	#pendingModeInput?: () => boolean;
+	readonly capabilities = HOST_CAPABILITIES;
+	private readonly _inputAdmissions = new Set<InputAdmission>();
+	private readonly _inputAdmissionScope = new AsyncLocalStorage<InputAdmission>();
+	/** Cancellation lineage survives handoff and detachment from settlement scheduling. */
+	private readonly _dispatchCancellationScope = new AsyncLocalStorage<AbortSignal | undefined>();
+	private _inputFence: object | undefined;
+	private readonly _inputFenceScope = new AsyncLocalStorage<InputFenceScope | undefined>();
 	private readonly _shutdownCancellation = new AbortController();
+	/** Ordinary retirement, unlike a failed recoverable receipt, permanently revokes auxiliary work. */
+	private readonly _disposalCancellation = new AbortController();
+	private _settlementCancellation = new AbortController();
 	private _settlementCompletion?: Promise<void>;
+	private _inputsDisposed = false;
 
 	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
 
@@ -471,6 +542,8 @@ export class AgentSession {
 	private readonly _modelSwitchDispatches = new Map<CustomMessage, { deliverAs?: "steer" | "followUp" }>();
 	/** Compaction hooks may await message acceptance, but must not await their enclosing switch. */
 	private readonly _compactionHookScope = new AsyncLocalStorage<boolean>();
+	/** In-flight compaction hook dispatches; abortCompaction() revokes them with their operation. */
+	private readonly _compactionHooks = new Set<AbortController>();
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -485,6 +558,11 @@ export class AgentSession {
 	private _assistantOutputObserved = false;
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
+	/**
+	 * Failed response that the next request repeats, set by auto-retry and overflow recovery. The
+	 * retry is routed with it as `failed`, since the context no longer contains it.
+	 */
+	private _failedResponse: AssistantMessage | undefined;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -512,8 +590,21 @@ export class AgentSession {
 	private _cwd: string;
 	private _extensionRunnerRef?: { current?: ExtensionRunner };
 	private _initialActiveToolNames?: string[];
-	private _allowedToolNames?: Set<string>;
-	private _excludedToolNames?: Set<string>;
+	/**
+	 * Tools of the restored or reloaded loadout that are not registered yet, such as tools of MCP
+	 * servers that are still connecting. They are activated when they are registered, and dropped when
+	 * `setActiveToolsByName()` deactivates a tool or the next agent run starts.
+	 */
+	private _pendingToolNames = new Set<string>();
+	private _usesDefaultTools: boolean;
+	/** Matches the `--tools` entries: tool names or patterns. */
+	private _allowedTools?: (name: string) => boolean;
+	/**
+	 * Whether the allowlist filters MCP tools: it is empty (`--no-tools`) or names an MCP tool
+	 * (`mcp__*`). Otherwise it keeps MCP tools registered for codemode and tool_search.
+	 */
+	private _allowlistFiltersMcp = false;
+	private _excludedTools?: (name: string) => boolean;
 	private _baseToolsOverride?: Record<string, AgentTool>;
 	private _sessionStartEvent: SessionStartEvent;
 	private _extensionUIContext?: ExtensionUIContext;
@@ -529,6 +620,12 @@ export class AgentSession {
 
 	// Tool registry for extension getTools/setTools
 	private _toolRegistry: Map<string, AgentTool> = new Map();
+	/** Created on the first `ctx.executeTool()` call. */
+	private _nestedToolCalls: NestedToolCallRunner | undefined;
+	/** Parent of each nested call, keyed by the call object the hooks receive (survives wrapping public hooks). */
+	private readonly _nestedToolParents = new WeakMap<AgentToolCall, string>();
+	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
+	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
 	private _toolPromptSnippets: Map<string, string> = new Map();
 	private _toolPromptGuidelines: Map<string, string[]> = new Map();
@@ -560,8 +657,13 @@ export class AgentSession {
 		}
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
-		this._allowedToolNames = config.allowedToolNames ? new Set(config.allowedToolNames) : undefined;
-		this._excludedToolNames = config.excludedToolNames ? new Set(config.excludedToolNames) : undefined;
+		this._usesDefaultTools = config.usesDefaultTools ?? false;
+		if (config.allowedToolNames) {
+			this._allowedTools = createToolNameMatcher(config.allowedToolNames);
+			this._allowlistFiltersMcp =
+				config.allowedToolNames.length === 0 || config.allowedToolNames.some((entry) => entry.startsWith("mcp__"));
+		}
+		this._excludedTools = config.excludedToolNames ? createToolNameMatcher(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		bindReceivedInputSession(this, {
@@ -578,6 +680,7 @@ export class AgentSession {
 		this._installAgentToolHooks();
 		this._installAgentNextTurnRefresh();
 		this._installAgentBoundaryHooks();
+		this._installHiddenDeclarationsProjection();
 		this._installAgentForcedPromptProjection();
 		this._installAgentRequestProjection();
 
@@ -635,32 +738,75 @@ export class AgentSession {
 	}
 
 	private async _getSummarizationRequestAuth(
-		model: Model<any>,
+		selectedModel: Model<any>,
 		signal?: AbortSignal,
 	): Promise<{
 		model: Model<any>;
 		apiKey?: string;
 		headers?: Record<string, string>;
 		env?: Record<string, string>;
+		thinkingLevel: ThinkingLevel;
 	}> {
+		// Route a virtual model first: summaries size their input and output from the model they get.
+		const { model, thinkingLevel } = isVirtualModel(selectedModel)
+			? await this._modelRuntime.resolveModel(selectedModel, convertToLlm(this.messages), {
+					reason: "direct",
+					thinkingLevel: this.thinkingLevel,
+					signal,
+				})
+			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
 		if (this.agent.streamFunction === streamSimple) {
-			return this._getRequiredRequestAuth(model, signal);
+			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
 		}
 
 		try {
 			const result = await this._modelRuntime.getAuth(model, { signal });
-			if (!result) return { model };
+			if (!result) return { model, thinkingLevel };
 			const requestModel = result.auth.baseUrl ? { ...model, baseUrl: result.auth.baseUrl } : model;
 			return {
 				model: requestModel,
 				apiKey: result.auth.apiKey,
 				headers: withoutDeletedHeaders(result.auth.headers),
 				env: result.env,
+				thinkingLevel,
 			};
 		} catch (error) {
 			if (signal?.aborted) throw error;
-			return { model };
+			return { model, thinkingLevel };
 		}
+	}
+
+	/**
+	 * The model whose limits apply to `message`, or undefined when the message came from another
+	 * model. Under a virtual selection, that is the physical model that produced it.
+	 */
+	private _modelForMessage(message: AssistantMessage): Model<any> | undefined {
+		const model = this.model;
+		if (model && isVirtualModel(model)) return this._modelRuntime.getPhysicalModel(message.provider, message.model);
+		return model?.provider === message.provider && model.id === message.model ? model : undefined;
+	}
+
+	/**
+	 * Record the selection on the current branch when the branch implies another one, so a resume
+	 * restores it. Tree navigation can leave the latest `model_change` on another branch; responses
+	 * cannot record a virtual selection because they name physical models. Responses do record a
+	 * physical selection unless the branch holds a virtual one; checking a physical selection against
+	 * responses would record it on every prompt while `prepareRequest` redirects to another model.
+	 */
+	private _recordSelection(): void {
+		const model = this.model;
+		if (!model) return;
+		const getModel = (provider: string, modelId: string) => this._modelRuntime.getModel(provider, modelId);
+		const recorded = getBranchSelection(this.sessionManager.getBranch(), getModel);
+		if (!recorded || (recorded.provider === model.provider && recorded.modelId === model.id)) return;
+		const recordedModel = getModel(recorded.provider, recorded.modelId);
+		if (!isVirtualModel(model) && !(recordedModel && isVirtualModel(recordedModel))) return;
+		this.sessionManager.appendModelChange(model.provider, model.id);
+	}
+
+	/** The model whose limits apply to the conversation. */
+	private _limitsModel(): Model<any> | undefined {
+		return this.routedModel?.model ?? this.model;
 	}
 
 	/**
@@ -672,95 +818,159 @@ export class AgentSession {
 	 * happens here instead of in wrappers.
 	 */
 	private _installAgentToolHooks(): void {
-		this.agent.beforeToolCall = async ({ toolCall, args }) => {
-			const runner = this._extensionRunner;
-			if (!runner.hasHandlers("tool_call")) {
-				return undefined;
-			}
+		this.agent.beforeToolCall = (context) =>
+			this._beforeToolCall(context, this._nestedToolParents.get(context.toolCall));
+		this.agent.afterToolCall = (context) =>
+			this._afterToolCall(context, this._nestedToolParents.get(context.toolCall));
+	}
 
-			try {
-				// Terminal shutdown stops waiting on a held handler; the abandoned dispatch is
-				// observed, skips remaining handlers, and its late result is discarded.
-				const shutdown = this._shutdownCancellation.signal;
-				return await raceWithAbortSignal(
-					runner.emitToolCall(
+	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
+	private async _beforeToolCall(
+		{ toolCall, args }: BeforeToolCallContext,
+		parentToolCallId?: string,
+	): Promise<BeforeToolCallResult | undefined> {
+		const runner = this._extensionRunner;
+		if (!runner.hasHandlers("tool_call")) {
+			return undefined;
+		}
+
+		try {
+			// Terminal shutdown stops waiting on a held handler and discards its late result.
+			const shutdown = this._shutdownCancellation.signal;
+			return await raceWithAbortSignal(
+				runner.emitToolCall(
+					{
+						type: "tool_call",
+						toolName: toolCall.name,
+						toolCallId: toolCall.id,
+						...(parentToolCallId ? { parentToolCallId } : {}),
+						input: args as Record<string, unknown>,
+					},
+					shutdown,
+				),
+				shutdown,
+			);
+		} catch (err) {
+			if (err instanceof Error) {
+				throw err;
+			}
+			throw new Error(`Extension failed, blocking execution: ${String(err)}`);
+		}
+	}
+
+	/** `tool_result` handlers and image normalization. `parentToolCallId` is set for calls another tool made. */
+	private async _afterToolCall(
+		{ toolCall, args, result, isError }: AfterToolCallContext,
+		parentToolCallId?: string,
+	): Promise<AfterToolCallResult | undefined> {
+		const runner = this._extensionRunner;
+		const shutdown = this._shutdownCancellation.signal;
+		const hookResult = runner.hasHandlers("tool_result")
+			? await raceWithAbortSignal(
+					runner.emitToolResult(
 						{
-							type: "tool_call",
+							type: "tool_result",
 							toolName: toolCall.name,
 							toolCallId: toolCall.id,
+							...(parentToolCallId ? { parentToolCallId } : {}),
 							input: args as Record<string, unknown>,
+							content: result.content,
+							details: result.details,
+							...(result.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+							isError,
+							usage: result.usage,
 						},
 						shutdown,
 					),
 					shutdown,
-				);
-			} catch (err) {
-				if (err instanceof Error) {
-					throw err;
-				}
-				throw new Error(`Extension failed, blocking execution: ${String(err)}`);
-			}
+				)
+			: undefined;
+
+		const content = hookResult?.content ?? result.content ?? [];
+		// Runs after the extension hook so images injected or replaced by extensions are normalized too.
+		this.#ordinaryOwner?.assertActive();
+		const resizeOptions = this._limitsModel()?.inputLimits?.images?.resize;
+		const normalizedContent = this.#ordinaryOwner
+			? content
+			: await normalizeToolResultImages(content, {
+					autoResizeImages: this.settingsManager.getImageAutoResize(),
+					...(resizeOptions ? { resizeOptions } : {}),
+				});
+
+		if (!hookResult && normalizedContent === content) {
+			return undefined;
+		}
+
+		return {
+			content: normalizedContent,
+			details: hookResult?.details,
+			structuredContent: hookResult ? hookResult.structuredContent : result.structuredContent,
+			isError: hookResult?.isError ?? isError,
+			usage: hookResult?.usage,
 		};
+	}
 
-		this.agent.afterToolCall = async ({ toolCall, args, result, isError }) => {
-			const runner = this._extensionRunner;
-			const shutdown = this._shutdownCancellation.signal;
-			// Terminal shutdown rejects here; the loop finalizes an error tool result instead.
-			const hookResult = runner.hasHandlers("tool_result")
-				? await raceWithAbortSignal(
-						runner.emitToolResult(
-							{
-								type: "tool_result",
-								toolName: toolCall.name,
-								toolCallId: toolCall.id,
-								input: args as Record<string, unknown>,
-								content: result.content,
-								details: result.details,
-								isError,
-								usage: result.usage,
-							},
-							shutdown,
-						),
-						shutdown,
-					)
-				: undefined;
-
-			const content = hookResult?.content ?? result.content ?? [];
-			// Runs after the extension hook so images injected or replaced by extensions are normalized too.
-			this.#ordinaryOwner?.assertActive();
-			const resizeOptions = this.model?.inputLimits?.images?.resize;
-			const normalizedContent = this.#ordinaryOwner
-				? content
-				: await normalizeToolResultImages(content, {
-						autoResizeImages: this.settingsManager.getImageAutoResize(),
-						...(resizeOptions ? { resizeOptions } : {}),
+	/** Run a call made through `ctx.executeTool()` through the session's tool pipeline. */
+	private async _executeNestedToolCall(
+		parentToolCallId: string,
+		name: string,
+		args: unknown,
+		options: ExecuteToolOptions,
+	): Promise<AgentToolCallOutcome> {
+		this._nestedToolCalls ??= new NestedToolCallRunner({
+			getTools: () => this._getCallableTools(),
+			isSequential: () => this.agent.toolExecution === "sequential",
+			runToolCall: (toolCall, parentId, signal, onUpdate) => {
+				const assistantMessage = this._findLastAssistantMessage();
+				if (!assistantMessage) {
+					return Promise.resolve({
+						toolCall,
+						result: { content: [{ type: "text", text: "No assistant message issued this call" }], details: {} },
+						isError: true,
 					});
+				}
+				this._nestedToolParents.set(toolCall, parentId);
+				// The current public hooks, as for model-issued calls: an SDK deny or redactor installed on
+				// session.agent applies to nested calls too. The installed session hooks read the parent above.
+				return runToolCall(toolCall, {
+					tools: this._getCallableTools(),
+					assistantMessage,
+					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
+					beforeToolCall: this.agent.beforeToolCall,
+					afterToolCall: this.agent.afterToolCall,
+					signal,
+					onUpdate,
+				});
+			},
+			emit: async (event) => {
+				await this._extensionRunner.emit(event);
+				this._emit(event);
+			},
+		});
+		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+	}
 
-			if (!hookResult && normalizedContent === content) {
-				return undefined;
-			}
-
-			return {
-				content: normalizedContent,
-				details: hookResult?.details,
-				isError: hookResult?.isError ?? isError,
-				usage: hookResult?.usage,
-			};
-		};
+	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
+	private _exceedsCompactionThreshold(model: Model<any>, projection: SessionProjection): boolean {
+		if (model.contextWindow <= 0) return false;
+		return shouldCompact(
+			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
+			model.contextWindow,
+			this.settingsManager.getCompactionSettings(this.model),
+		);
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		this.#ordinaryOwner?.assertNativeTokenReservation();
-		const model = this.model;
-		const settings = this.settingsManager.getCompactionSettings(model);
 		const projection = this.sessionManager.buildSessionProjection();
-		if (!model || model.contextWindow <= 0) return { ...context, messages: projection.messages };
-		const tokens = estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens;
-		const overflow = tokens > model.contextWindow;
-		if (!shouldCompact(tokens, model.contextWindow, settings)) {
+		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
+		const model = this.model;
+		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
 			return { ...context, messages: projection.messages };
 		}
 
+		const overflow =
+			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens > model.contextWindow;
 		const outcome = await this._runAutoCompaction("threshold", false);
 		if (outcome === "failed" || outcome === "aborted") {
 			// Stop this run rather than sending unchanged oversized context or
@@ -828,35 +1038,83 @@ export class AgentSession {
 			}
 		};
 		this.agent.prepareRequest = async (request, signal) => {
-			const canonicalContext = {
-				...request.context,
-				messages: this.sessionManager.buildSessionProjection().messages,
-				// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
-				tools: this.agent.state.tools.slice(),
+			const failed = this._failedResponse;
+			this._failedResponse = undefined;
+			const prepare = async () => {
+				const projection = this.sessionManager.buildSessionProjection();
+				const canonicalContext = {
+					...request.context,
+					messages: projection.messages,
+					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
+					tools: this.agent.state.tools.slice(),
+				};
+				canonicalMessages = snapshotMessages(canonicalContext.messages);
+				const previous = await previousPrepareRequest?.(
+					{
+						...request,
+						context: canonicalContext,
+						model: this.agent.state.model,
+						thinkingLevel: this.agent.state.thinkingLevel,
+					},
+					signal,
+				);
+				// Snapshot before preparation and context transforms. Identity alone misses
+				// in-place edits, and opaque input is safe only when the final request fits.
+				canReproject =
+					(previous?.context === undefined || previous.context === canonicalContext) &&
+					canonicalMessages !== undefined &&
+					canonicalMessages === snapshotMessages(canonicalContext.messages);
+				return { previous, context: previous?.context ?? canonicalContext, projection };
 			};
-			canonicalMessages = snapshotMessages(canonicalContext.messages);
-			const previous = await previousPrepareRequest?.(
-				{
-					...request,
-					context: canonicalContext,
-					model: this.agent.state.model,
-					thinkingLevel: this.agent.state.thinkingLevel,
-				},
+			const prepared = await prepare();
+			const { previous, projection } = prepared;
+			let context = prepared.context;
+			const model = previous?.model ?? this.agent.state.model;
+			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
+			requestModel = model;
+			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
+
+			// The selection stays in agent state; only this request uses the routed model. A routing
+			// failure rejects, which ends the run with an error response. Only messages the user wrote
+			// start a turn; extension messages can follow them, e.g. from before_agent_start.
+			const lastResponse = context.messages.findLastIndex((message) => message.role === "assistant");
+			const userTurn = context.messages.slice(lastResponse + 1).some((message) => message.role === "user");
+			const state = getVirtualModelState(this.sessionManager.getBranch(), model.provider, model.id);
+			const route = await this._modelRuntime.resolveModel(model, convertToLlm(context.messages), {
+				reason: failed ? "retry" : userTurn ? "user" : "continuation",
+				thinkingLevel,
 				signal,
-			);
-			requestModel = previous?.model ?? this.agent.state.model;
-			// Snapshot before preparation and context transforms. Identity alone misses
-			// in-place edits, and opaque input is safe only when the final request fits.
-			canReproject =
-				(previous?.context === undefined || previous.context === canonicalContext) &&
-				canonicalMessages !== undefined &&
-				canonicalMessages === snapshotMessages(canonicalContext.messages);
-			return {
-				...previous,
-				context: previous?.context ?? canonicalContext,
-				model: requestModel,
-				thinkingLevel: previous?.thinkingLevel ?? this.agent.state.thinkingLevel,
-			};
+				failed,
+				state,
+			});
+			if (route.state !== undefined && route.state !== state) {
+				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
+				const entry = this.sessionManager.getEntry(
+					this.sessionManager.appendCustomEntry(VIRTUAL_MODEL_STATE_ENTRY, data),
+				);
+				if (entry) this._emit({ type: "entry_appended", entry });
+			}
+			// The route stands: the router already decided this request. The state entry does not change
+			// the projection.
+			if (this._exceedsCompactionThreshold(route.model, projection)) {
+				const outcome = await this._runAutoCompaction("threshold", false);
+				if (outcome === "failed" || outcome === "aborted") {
+					this._stopAfterCompactionFailure = true;
+					this._compactionStopOutcome = outcome === "aborted" ? "aborted" : "error";
+					this.agent.abort();
+					throw new Error(`Compaction ${outcome} before the routed assistant turn`);
+				}
+				// Do not rerun request hooks: they may consume one-shot input. Keep the accepted preparation and
+				// rebuild only proven stateless input (the canonical projection, untouched by the hooks). Otherwise
+				// the accepted context is sent as is, and admission in convertToLlm fails closed if it overflows.
+				if (canReproject) {
+					const messages = this.sessionManager.buildSessionProjection().messages;
+					canonicalMessages = snapshotMessages(messages);
+					context = { ...context, messages };
+				}
+			}
+			requestModel = route.model;
+			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}
 
@@ -941,10 +1199,7 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-			const context = await this._compactBeforeNextAssistantResponse({
-				...turn.context,
-				messages: this.sessionManager.buildSessionProjection().messages,
-			});
+			const context = await this._compactBeforeNextAssistantResponse(turn.context);
 			const previousSnapshot = await previousPrepareNextTurnWithContext?.({ ...turn, context }, signal);
 			const nextContext = previousSnapshot?.context ?? context;
 			const runOptions = this._runSystemPromptOptions ?? this._baseSystemPromptOptions;
@@ -1133,25 +1388,67 @@ export class AgentSession {
 	private async _emitCompactionHook(
 		event: SessionBeforeCompactEvent | SessionCompactEvent | SessionCompactFailedEvent,
 		signal?: AbortSignal,
+		beforeDispatch?: () => void,
 	): Promise<SessionBeforeCompactResult | undefined> {
-		// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
-		return this._compactionHookScope.run(true, () => raceWithAbortSignal(this._extensionRunner.emit(event), signal));
+		// A signal argument is not ancestry: install operation and inherited revocation so abandoned hook
+		// descendants cannot start fresh native work (PR #117 R6-1). Failure observers run after the
+		// operation's controller is cleared, so abortCompaction() also revokes this hook's own controller.
+		const hook = new AbortController();
+		const inherited = this._dispatchCancellationScope.getStore();
+		const ancestry = AbortSignal.any(
+			[signal, inherited, hook.signal].filter((item): item is AbortSignal => item !== undefined),
+		);
+		// ponytail: a compaction that already ended cancelled still notifies its failure observers
+		// (aborted: true), as before; they only run under revoked ancestry and cannot start new work.
+		const dispatchSignal = signal?.aborted
+			? AbortSignal.any([hook.signal, ...(inherited ? [inherited] : [])])
+			: ancestry;
+		this._compactionHooks.add(hook);
+		let dispatched = false;
+		try {
+			// Reserve notification custody before clearing operation state or publishing public completion.
+			// Reentrant disposal/abort must revoke the next observer too (pi#132 R1-1).
+			beforeDispatch?.();
+			// Scope follows the handler's async calls, not unrelated SDK dispatch while a hook is awaiting.
+			const dispatch = this._compactionHookScope.run(true, () =>
+				this._dispatchCancellationScope.run(ancestry, () => this._extensionRunner.emit(event, dispatchSignal)),
+			);
+			dispatched = true;
+			// An already-aborted operation ends the outer wait before notification dispatch settles.
+			// Keep its separately cancellable runner lifetime tracked until that dispatch actually settles.
+			void dispatch.then(
+				() => this._compactionHooks.delete(hook),
+				() => this._compactionHooks.delete(hook),
+			);
+			return await raceWithAbortSignal(dispatch, ancestry);
+		} catch (error) {
+			// Cancelling a notification alone does not replace the compaction's own outcome.
+			if (event.type === "session_compact_failed" && hook.signal.aborted && error === hook.signal.reason) return;
+			throw error;
+		} finally {
+			if (!dispatched) this._compactionHooks.delete(hook);
+		}
 	}
 
 	private async _emitSessionCompactFailed(
 		event: Omit<SessionCompactFailedEvent, "type">,
 		signal?: AbortSignal,
 		preserveDistinctFailure = false,
+		beforeNotification?: () => void,
 	): Promise<void> {
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
+			let notified = !beforeNotification;
 			try {
-				await this._emitCompactionHook({ type: "session_compact_failed", ...event }, signal);
+				await this._emitCompactionHook({ type: "session_compact_failed", ...event }, signal, () => {
+					beforeNotification?.();
+					notified = true;
+				});
 			} catch (error) {
 				// A terminal notification cannot extend an expired compaction or
 				// replace its failed/aborted outcome. Its promise stays observed.
-				if (!signal?.aborted || (preserveDistinctFailure && error !== signal.reason)) throw error;
+				if (!notified || !signal?.aborted || (preserveDistinctFailure && error !== signal.reason)) throw error;
 			}
-		}
+		} else beforeNotification?.();
 	}
 
 	private _getIdleWaitPromise(): Promise<void> {
@@ -1179,29 +1476,44 @@ export class AgentSession {
 		this.#auditState("session_run_settled");
 		this._isEmittingAgentSettled = true;
 		const scope = { active: true };
+		const cancellation = this._settlementCancellation;
+		const inheritedCancellation = this._dispatchCancellationScope.getStore();
+		const signal = inheritedCancellation
+			? AbortSignal.any([inheritedCancellation, cancellation.signal])
+			: cancellation.signal;
 		let completed!: () => void;
 		this._settlementCompletion = new Promise<void>((resolve) => {
 			completed = resolve;
 		});
+		// Run every removed ticket before propagating the first refusal, so none is orphaned (#132 R1-S6).
+		const failures: unknown[] = [];
 		try {
 			try {
-				await this._agentSettledScope.run(scope, () =>
-					this._extensionRunner.emit({ type: "agent_settled", outcome }),
+				await raceWithAbortSignal(
+					this._dispatchCancellationScope.run(signal, () =>
+						this._agentSettledScope.run(scope, () =>
+							this._extensionRunner.emit({ type: "agent_settled", outcome }, signal),
+						),
+					),
+					signal,
 				);
 			} catch (error) {
-				if (!this._shutdownCancellation.signal.aborted) throw error;
+				if (!signal.aborted) throw error;
 			}
-			this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome }));
+			this._dispatchCancellationScope.run(signal, () =>
+				this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome })),
+			);
 		} finally {
+			// Detached descendants of finished/cancelled handlers cannot own delivery.
 			scope.active = false;
 			this._isEmittingAgentSettled = false;
 			try {
 				for (const action of this._deferredSettledActions.splice(0)) {
 					const actionScope = { active: true };
 					try {
-						await this._settlementActionScope.run(actionScope, action).catch((error: unknown) => {
-							if (!this._shutdownCancellation.signal.aborted) throw error;
-						});
+						await this._settlementActionScope.run(actionScope, action);
+					} catch (error) {
+						if (!this._shutdownCancellation.signal.aborted) failures.push(error);
 					} finally {
 						actionScope.active = false;
 					}
@@ -1211,6 +1523,7 @@ export class AgentSession {
 				completed();
 			}
 		}
+		if (failures.length > 0) throw failures[0];
 	}
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
@@ -1237,36 +1550,49 @@ export class AgentSession {
 				("content" in update && update.content.length > 0);
 		}
 
+		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
+		if (this._nestedToolCalls) {
+			if (event.type === "message_start" && event.message.role === "toolResult") {
+				const message = event.message;
+				const summary = this._nestedToolCalls.takeRecord(message.toolCallId);
+				if (summary?.calls) message.nestedCalls = summary.calls;
+				if (summary?.usage) {
+					message.usage = message.usage ? combineUsage(message.usage, summary.usage) : summary.usage;
+				}
+			} else if (event.type === "agent_end") {
+				this._nestedToolCalls.clear();
+			}
+		}
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
-			if (messageText) {
-				// Check steering queue first
-				const steeringIndex = this._steeringMessages.indexOf(messageText);
-				if (steeringIndex !== -1) {
-					this._steeringMessages.splice(steeringIndex, 1);
+			// Empty text is valid for image-only queued input. Delivery is not truthiness.
+			// Check steering queue first
+			const steeringIndex = this._steeringMessages.indexOf(messageText);
+			if (steeringIndex !== -1) {
+				this._steeringMessages.splice(steeringIndex, 1);
+				this._emitQueueUpdate();
+			} else {
+				// Check follow-up queue
+				const followUpIndex = this._followUpMessages.indexOf(messageText);
+				if (followUpIndex !== -1) {
+					this._followUpMessages.splice(followUpIndex, 1);
 					this._emitQueueUpdate();
-				} else {
-					// Check follow-up queue
-					const followUpIndex = this._followUpMessages.indexOf(messageText);
-					if (followUpIndex !== -1) {
-						this._followUpMessages.splice(followUpIndex, 1);
-						this._emitQueueUpdate();
-					}
 				}
 			}
 		}
 
-		// Terminal cancellation releases extension waits, not final event publication/persistence.
+		// Emit to extensions first, then notify public listeners.
 		if (!this._shutdownCancellation.signal.aborted) {
 			try {
-				await this._emitExtensionEvent(event);
+				await raceWithAbortSignal(this._emitExtensionEvent(event), this._shutdownCancellation.signal);
 			} catch (error) {
 				if (!this._shutdownCancellation.signal.aborted) throw error;
 			}
 		}
+		// Cancellation releases extension waits, not final event publication/persistence.
 		this._emit(event.type === "agent_end" ? { ...event, willRetry: this._willRetryAfterAgentEnd(event) } : event);
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
@@ -1554,6 +1880,14 @@ export class AgentSession {
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
+		if (this._inputsDisposed) return;
+		this._assertInputsDrained();
+		if (!this.isIdle || this.isSettling)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "abort and settle the active operation before disposal");
+		this._inputsDisposed = true;
+		this._disposalCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "auxiliary operation cancelled by disposal"),
+		);
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_DISPOSED"));
 		try {
 			this.abortRetry();
@@ -1612,6 +1946,14 @@ export class AgentSession {
 		return this.agent.state.thinkingLevel;
 	}
 
+	/** Under a virtual selection, the physical model and thinking level of the latest successful response. */
+	get routedModel(): { model: Model<any>; thinkingLevel?: ThinkingLevel } | undefined {
+		if (!this.model || !isVirtualModel(this.model)) return undefined;
+		const latest = findLatestResponse(this.agent.state.messages);
+		const model = latest && this._modelRuntime.getPhysicalModel(latest.provider, latest.model);
+		return model && { model, thinkingLevel: latest?.thinkingLevel };
+	}
+
 	/** Whether the session is currently processing an agent run or post-run continuation. */
 	get isStreaming(): boolean {
 		return this._isAgentRunActive;
@@ -1620,6 +1962,7 @@ export class AgentSession {
 	/** Whether the session has no active agent run, compaction, branch summary, retry, or queued continuation. */
 	get isIdle(): boolean {
 		return (
+			this._inputAdmissions.size === 0 &&
 			!this._isAgentRunActive &&
 			!this.isCompacting &&
 			!this._modelSwitchCompactionPending &&
@@ -1638,7 +1981,7 @@ export class AgentSession {
 
 	/** Whether a prompt is in preflight (input handlers, `before_agent_start`) and its run has not started. */
 	get isPromptPending(): boolean {
-		return this._promptPreflights.size > 0;
+		return this._inputAdmissions.size > 0 || this._promptPreflights.size > 0;
 	}
 
 	/** Current effective system prompt, including changes not yet sent to the model. */
@@ -1652,11 +1995,16 @@ export class AgentSession {
 	}
 
 	/**
-	 * Get the names of currently active tools.
-	 * Returns the names of tools currently set on the agent.
+	 * Get the names of currently active tools, which are the tools declared to the model.
+	 * Tools with `codemode` or `deferred` exposure are callable from other tools without being active.
 	 */
 	getActiveToolNames(): string[] {
 		return this.agent.state.tools.map((t) => t.name);
+	}
+
+	/** Get the names of the tools that tools can call through `ctx.executeTool()`. */
+	getCallableToolNames(): string[] {
+		return this._getCallableTools().map((t) => t.name);
 	}
 
 	/**
@@ -1668,6 +2016,9 @@ export class AgentSession {
 			description: definition.description,
 			parameters: definition.parameters,
 			promptGuidelines: definition.promptGuidelines,
+			exposure: this._getToolExposure(definition.name),
+			...(definition.namespace ? { namespace: definition.namespace } : {}),
+			...(definition.annotations ? { annotations: { ...definition.annotations } } : {}),
 			sourceInfo,
 		}));
 	}
@@ -1678,22 +2029,114 @@ export class AgentSession {
 
 	/**
 	 * Set active tools by name.
-	 * Only tools in the registry can be enabled. Unknown tool names are ignored.
+	 * Only tools in the registry can be enabled. Unknown and hidden tool names are ignored.
 	 * Also rebuilds the system prompt to reflect the new tool set.
 	 * Changes take effect on the next agent turn.
 	 */
 	setActiveToolsByName(toolNames: string[]): void {
-		const tools: AgentTool[] = [];
-		const validToolNames: string[] = [];
-		for (const name of toolNames) {
+		this._inheritedCancellation();
+		const previous = this.getActiveToolNames();
+		this._setActiveTools(toolNames);
+		// A loadout that deactivates a tool replaces the restored one, whose pending tools are dropped.
+		// One that only adds tools, like activating tool_search, keeps them.
+		const active = new Set(this.getActiveToolNames());
+		if (previous.some((name) => !active.has(name))) this._pendingToolNames.clear();
+	}
+
+	/** Internal restoration and registry refresh; public mutation entries check revocation first. */
+	private _setActiveTools(toolNames: string[]): void {
+		const tools = this._applyToolLoadout(toolNames);
+		for (const tool of tools) this._pendingToolNames.delete(tool.name);
+		this._rebuildSystemPrompt(tools.map((tool) => tool.name));
+	}
+
+	/**
+	 * Whether `--tools` and `--exclude-tools` keep the tool registered. MCP tools stay registered
+	 * unless the allowlist filters them (see `_allowlistFiltersMcp`).
+	 */
+	private _isAllowedTool(name: string): boolean {
+		if (this._excludedTools?.(name)) return false;
+		if (!this._allowedTools || this._allowedTools(name)) return true;
+		return !this._allowlistFiltersMcp && isMcpToolName(name);
+	}
+
+	/**
+	 * Whether the tool may be active, which declares it to the model. MCP tools the allowlist keeps
+	 * without matching them are only for codemode and tool_search: they may be declared only when
+	 * tool_search can load them (non-`direct` exposure and tool_search registered). This also applies
+	 * to tools restored from the transcript or set by extensions.
+	 */
+	private _isActivatable(name: string): boolean {
+		if (!this._allowedTools || this._allowedTools(name) || !isMcpToolName(name)) return true;
+		return this._getToolExposure(name) !== "direct" && this._toolRegistry.has("tool_search");
+	}
+
+	private _getToolExposure(name: string): ToolExposure {
+		return this._toolDefinitions.get(name)?.definition.exposure ?? "direct";
+	}
+
+	/**
+	 * Tools callable through `ctx.executeTool()`: the active `direct` tools and every registered
+	 * `codemode` or `deferred` tool.
+	 */
+	private _getCallableTools(active: ReadonlySet<string> = new Set(this.getActiveToolNames())): AgentTool[] {
+		return [...this._toolRegistry.values()].filter((tool) => {
+			const exposure = this._getToolExposure(tool.name);
+			return exposure === "codemode" || exposure === "deferred" || (exposure === "direct" && active.has(tool.name));
+		});
+	}
+
+	/**
+	 * Set the agent's tools for the given active tool names and return them. The active tools are
+	 * the registered, non-hidden ones; they are declared to the model. Active tools with a
+	 * `prepareLoadout` hook can change the declared descriptions and hide declarations from
+	 * requests (see {@link _installHiddenDeclarationsProjection}).
+	 */
+	private _applyToolLoadout(toolNames: string[]): AgentTool[] {
+		const tools = [...new Set(toolNames)].flatMap((name) => {
 			const tool = this._toolRegistry.get(name);
-			if (tool) {
-				tools.push(tool);
-				validToolNames.push(name);
+			return tool && this._getToolExposure(name) !== "hidden" && this._isActivatable(name) ? [tool] : [];
+		});
+		const hooks = tools.flatMap((tool) => {
+			const entry = this._toolDefinitions.get(tool.name);
+			return entry?.definition.prepareLoadout ? [entry] : [];
+		});
+		const hidden = new Set<string>();
+		let declared = tools;
+		if (hooks.length > 0) {
+			const loadout: ToolLoadout = {
+				declared: tools,
+				callable: this._getCallableTools(new Set(tools.map((tool) => tool.name))),
+				registered: [...this._toolRegistry.values()],
+				getExposure: (name) => this._getToolExposure(name),
+				getNamespace: (name) => this._toolDefinitions.get(name)?.definition.namespace,
+				getPromptGuidelines: (name) => this._toolPromptGuidelines.get(name) ?? [],
+			};
+			const descriptions = new Map<string, string>();
+			for (const { definition, sourceInfo } of hooks) {
+				try {
+					const changes = definition.prepareLoadout?.(loadout);
+					for (const [name, description] of Object.entries(changes?.descriptions ?? {})) {
+						descriptions.set(name, description);
+					}
+					for (const name of changes?.hiddenDeclarations ?? []) hidden.add(name);
+				} catch (error) {
+					this._extensionRunner.emitError({
+						extensionPath: sourceInfo.path,
+						event: "prepare_loadout",
+						error: error instanceof Error ? error.message : String(error),
+						stack: error instanceof Error ? error.stack : undefined,
+					});
+				}
 			}
+			declared = tools.map((tool) => {
+				const description = descriptions.get(tool.name);
+				return description === undefined ? tool : { ...tool, description };
+			});
 		}
-		this.agent.state.tools = tools;
-		this._rebuildSystemPrompt(validToolNames);
+		this._hiddenDeclarations = hidden;
+		this.agent.state.tools = declared;
+		return declared;
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -1825,6 +2268,7 @@ export class AgentSession {
 		const toolSnippets: Record<string, string> = {};
 		for (const name of this._toolRegistry.keys()) {
 			const snippet = this._toolPromptSnippets.get(name);
+			// Tools without a snippet are not listed.
 			if (snippet) toolSnippets[name] = snippet;
 		}
 
@@ -1841,6 +2285,7 @@ export class AgentSession {
 			customPrompt: loaderSystemPrompt,
 			appendSystemPrompt,
 			selectedTools: validToolNames,
+			hiddenTools: [...this._hiddenDeclarations],
 			toolSnippets,
 			toolGuidelines: Object.fromEntries(this._toolPromptGuidelines),
 		});
@@ -1860,11 +2305,9 @@ export class AgentSession {
 		options: NormalizedBuildSystemPromptOptions,
 		messages: AgentMessage[] = this.agent.state.messages,
 	): SystemMessage | undefined {
-		options.selectedTools = [...new Set(options.selectedTools)].filter((name) => this._toolRegistry.has(name));
-		this.agent.state.tools = options.selectedTools.flatMap((name) => {
-			const tool = this._toolRegistry.get(name);
-			return tool ? [tool] : [];
-		});
+		options.selectedTools = this._applyToolLoadout(options.selectedTools).map((tool) => tool.name);
+		// The tool list and rules must match the declarations the request carries.
+		options.hiddenTools = [...this._hiddenDeclarations];
 		const sections = diffSystemPromptSections(
 			getCurrentSystemMessage(messages)?.sections ?? {},
 			buildSystemPromptSections(options),
@@ -1882,6 +2325,31 @@ export class AgentSession {
 	 * collapse into one head holding the forced text and the current tools. Runs after the
 	 * `context` extension handlers.
 	 */
+	/**
+	 * Remove the declarations that `prepareLoadout` hooks hide from every request. The whole
+	 * transcript is filtered with the current set, so the projected declarations stay consistent
+	 * across requests and only change when the loadout does.
+	 */
+	private _installHiddenDeclarationsProjection(): void {
+		const previousTransformContext = this.agent.transformContext;
+		this.agent.transformContext = async (messages, signal) => {
+			const transformed = previousTransformContext ? await previousTransformContext(messages, signal) : messages;
+			const hidden = this._hiddenDeclarations;
+			if (hidden.size === 0) return transformed;
+			return transformed.map((message) => {
+				if (message.role !== "system" || (!message.toolsAdded && !message.toolsRemoved)) return message;
+				const { toolsAdded, toolsRemoved, ...rest } = message;
+				const added = toolsAdded?.filter((tool) => !hidden.has(tool.name)) ?? [];
+				const removed = toolsRemoved?.filter((tool) => !hidden.has(tool.name)) ?? [];
+				return {
+					...rest,
+					...(added.length > 0 ? { toolsAdded: added } : {}),
+					...(removed.length > 0 ? { toolsRemoved: removed } : {}),
+				};
+			});
+		};
+	}
+
 	private _installAgentForcedPromptProjection(): void {
 		const previousTransformContext = this.agent.transformContext;
 		this.agent.transformContext = async (messages, signal) => {
@@ -1899,18 +2367,18 @@ export class AgentSession {
 		};
 	}
 
-	/** Restore the active tool loadout declared by the session transcript, if it declares one. */
+	/**
+	 * Restore the active tool loadout declared by the session transcript, if it declares one.
+	 * Tools reachable only from other tools are never declared, but they do not depend on the active
+	 * set, so the transcript's declarations are the whole loadout.
+	 */
 	private _restoreToolsFromTranscript(): void {
+		this._pendingToolNames.clear();
 		const current = getCurrentSystemMessage(this.sessionManager.buildSessionContext().messages);
 		if (!current) return;
-		const toolNames = (current.toolsAdded ?? [])
-			.map((tool) => tool.name)
-			.filter((name) => this._toolRegistry.has(name));
-		this.agent.state.tools = toolNames.flatMap((name) => {
-			const registered = this._toolRegistry.get(name);
-			return registered ? [registered] : [];
-		});
-		this._rebuildSystemPrompt(toolNames);
+		const names = (current.toolsAdded ?? []).map((tool) => tool.name);
+		this._pendingToolNames = new Set(names.filter((name) => this._isAllowedTool(name)));
+		this._setActiveTools(names);
 	}
 
 	// =========================================================================
@@ -1922,13 +2390,15 @@ export class AgentSession {
 		promptToken?: object,
 		automaticEnrollment?: OriginalAutomaticEnrollment,
 		onInputTransferred?: () => void,
+		transferringAdmission?: InputAdmission,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
-		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 		const agent = this.#originalAgent;
 		if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 		const dispatch = async (continuation = false, fromQueuedMessages = false) => {
+			if (!continuation) this._checkInputAdmission();
 			this.#ordinaryOwner?.assertCompactionIdle();
 			this.#ordinaryOwner?.assertSubmission();
 			this.#ordinaryOwner?.assertSessionStart(this);
@@ -1936,9 +2406,17 @@ export class AgentSession {
 			// No await or external callback may separate this check from dispatch.
 			if (originalAgentSignal.call(agent)) throw new Error("OWNER_AGENT_BUSY_BEFORE_TRANSFER");
 			// Without messages, the run starts from queued input.
+			// Only this run's user input transfers admission. A nested custom dispatch may
+			// inherit another input's scope, but must leave that held input cancellable.
+			// No yield between ending admission and the original synchronous run entry.
+			if (!continuation) {
+				transferringAdmission?.signal.throwIfAborted();
+				transferringAdmission?.release();
+			}
 			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
 			try {
 				if (!continuation) onInputTransferred?.();
+				if (this.agent !== agent) throw new Error("OWNER_RUNTIME_AGENT_CHANGED");
 			} catch (cause) {
 				// A failing observer must not detach the already-started original run.
 				try {
@@ -1953,6 +2431,12 @@ export class AgentSession {
 		this._stopAfterCompactionFailure = false;
 		this._compactionStopOutcome = undefined;
 		this._agentRunAbortRequested = false;
+		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
+		this._failedResponse = undefined;
+		this._recordSelection();
+		// The run records the loadout in the transcript; restored tools that did not register by now
+		// are dropped, so a tool that never registers does not stay pending.
+		this._pendingToolNames.clear();
 		this._abortDuringBeforeSettle = false;
 		this._lastActivityOutcome = "completed";
 		this._inputQueuedBehindPreflight = false;
@@ -1981,6 +2465,7 @@ export class AgentSession {
 			throw error;
 		} finally {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._failedResponse = undefined;
 			this._runSystemPromptOptions = undefined;
 			const persist = async () => {
 				if (this.#ordinaryOwner) {
@@ -2051,6 +2536,7 @@ export class AgentSession {
 		}
 		if (retrying) {
 			if (this._agentRunAbortRequested) this._finishCancelledRetry();
+			this._failedResponse = message;
 			return !this._agentRunAbortRequested;
 		}
 		if (this._agentRunAbortRequested) {
@@ -2123,6 +2609,178 @@ export class AgentSession {
 		}
 	}
 
+	/** Inputs awaiting native handoff, including every extension input handler. */
+	get inputAdmissionCount(): number {
+		return this._inputAdmissions.size;
+	}
+
+	get isDisposed(): boolean {
+		return this._inputsDisposed;
+	}
+
+	get inputsFenced(): boolean {
+		return this._inputFence !== undefined || this._inputsDisposed;
+	}
+
+	private _assertInputsOpen(): void {
+		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "input was not accepted");
+		const scope = this._inputFenceScope.getStore();
+		if (this._inputFence && !(scope?.active && scope.fence === this._inputFence))
+			throw new InputAdmissionError(
+				"INPUT_ADMISSION_FENCED",
+				"input was not accepted; retry against the current session",
+			);
+	}
+
+	private _assertInputsDrained(): void {
+		if (
+			this._inputAdmissions.size > 0 ||
+			this.isSettling ||
+			this.#pendingModeInput?.() ||
+			this.agent.hasQueuedMessages() ||
+			this._steeringMessages.length > 0 ||
+			this._followUpMessages.length > 0 ||
+			this._triggeredBehindPreflight.length > 0 ||
+			this._modelSwitchDispatches.size > 0 ||
+			this._deferredSettledActions.length > 0
+		)
+			throw new InputAdmissionError(
+				"INPUT_ADMISSION_BUSY",
+				"settle admitted input or recover queued input before replacement/disposal",
+			);
+	}
+
+	/**
+	 * Close input admission synchronously, before any lifecycle hook can yield.
+	 * Refuses immediately (bounded, no implicit replay) when input is still owned by
+	 * preflight, the mode, or queues. On success keep the returned release function
+	 * until replacement finishes, or call it when replacement is cancelled/failed.
+	 * Disposal stays permanently closed even after release.
+	 */
+	async fenceInputs(options?: { rejectQueuedInput?: (messages: AgentMessage[]) => void }): Promise<() => void> {
+		if (!options?.rejectQueuedInput) this._shutdownCancellation.signal.throwIfAborted();
+		this._assertInputsOpen();
+		const fence = {};
+		this._inputFence = fence;
+		try {
+			if (options?.rejectQueuedInput) {
+				// Orderly shutdown may reject input instead of refusing disposal. Admission is
+				// already closed before abort yields, including input from extension handlers.
+				// Cancel the wait, observe the abandoned hook, and join native settlement.
+				// Arbitrary extension promises cannot be forced to resolve. The fence prevents
+				// their late descendants from admitting input into the retiring session.
+				this._settlementCancellation.abort(
+					new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
+				);
+				this.abortBash();
+				await this.abort();
+				await this._settlementCompletion;
+				const messages = this.agent.getQueuedMessages();
+				if (messages.length > 0) {
+					options.rejectQueuedInput(messages);
+					this.clearQueue();
+				}
+			}
+			this._assertInputsDrained();
+		} catch (error) {
+			this._inputFence = undefined;
+			// Only the cancellation owner may replace its controller. A BUSY refusal
+			// must leave the still-running settlement's controller attached.
+			if (
+				this._settlementCancellation.signal.aborted &&
+				!this.isSettling &&
+				!this._shutdownCancellation.signal.aborted
+			)
+				this._settlementCancellation = new AbortController();
+			throw error;
+		}
+		return () => {
+			if (this._inputFence === fence) {
+				this._inputFence = undefined;
+				// A settlement may have started while this successfully acquired fence was held.
+				// Its live controller remains the cancellation owner until that settlement finishes.
+				if (
+					!this._inputsDisposed &&
+					this._settlementCancellation.signal.aborted &&
+					!this.isSettling &&
+					!this._shutdownCancellation.signal.aborted
+				)
+					this._settlementCancellation = new AbortController();
+			}
+		};
+	}
+
+	/** @internal Allow only awaited lifecycle callbacks to submit to their fenced receiving session. */
+	async withFencedInput<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		const fence = this._inputFence;
+		if (!fence) return operation();
+		const scope = { fence, active: true };
+		try {
+			return await raceWithAbortSignal(this._inputFenceScope.run(scope, operation), signal);
+		} finally {
+			scope.active = false;
+		}
+	}
+
+	private _admitInput(): InputAdmission {
+		// Neither cancelled input nor cancelled dispatch descendants may acquire fresh authority.
+		this._checkInputAdmission();
+		this._shutdownCancellation.signal.throwIfAborted();
+		const controller = new AbortController();
+		const cancellation = this._dispatchCancellationScope.getStore();
+		const admission: InputAdmission = {
+			controller,
+			signal: cancellation ? AbortSignal.any([controller.signal, cancellation]) : controller.signal,
+			parent: cancellation,
+			fenceScope: this._inputFenceScope.getStore(),
+			release: () => {
+				if (!this._inputAdmissions.delete(admission)) return;
+				this._inputAdmissionScope.exit(() => this._runInputQueuedBehindPreflight());
+				this._resolveIdleWaitIfIdle();
+			},
+		};
+		this._inputAdmissions.add(admission);
+		return admission;
+	}
+
+	private async _withInputAdmission<T>(admission: InputAdmission, operation: () => Promise<T>): Promise<T> {
+		try {
+			return await this._dispatchCancellationScope.run(admission.signal, () =>
+				this._inputFenceScope.run(admission.fenceScope, () => this._inputAdmissionScope.run(admission, operation)),
+			);
+		} finally {
+			admission.release();
+		}
+	}
+
+	private _checkInputAdmission(): void {
+		this._dispatchCancellationScope.getStore()?.throwIfAborted();
+		this._inputAdmissionScope.getStore()?.signal.throwIfAborted();
+		this._assertInputsOpen();
+	}
+
+	/**
+	 * Effectful native entries (bash, compaction, tree, model/loadout/history mutation) refuse cancelled
+	 * dispatch or input descendants, and return the inherited revocation to compose into their own work.
+	 */
+	private _inheritedCancellation(): AbortSignal | undefined {
+		const signals = [this._dispatchCancellationScope.getStore(), this._inputAdmissionScope.getStore()?.signal].filter(
+			(signal): signal is AbortSignal => signal !== undefined,
+		);
+		for (const signal of signals) signal.throwIfAborted();
+		return signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+	}
+
+	private async _awaitInput<T>(operation: Promise<T>): Promise<T> {
+		const admission = this._inputAdmissionScope.getStore();
+		const result = await raceWithAbortSignal(
+			operation,
+			this._dispatchCancellationScope.getStore() ?? admission?.signal,
+		);
+		if (!admission || this._inputAdmissions.has(admission)) this._checkInputAdmission();
+		return result;
+	}
+
 	private async _runInputHandlers(
 		text: string,
 		images: ImageContent[] | undefined,
@@ -2133,7 +2791,15 @@ export class AgentSession {
 			return { text, images };
 		}
 
-		const inputResult = await this._extensionRunner.emitInput(text, images, source, streamingBehavior);
+		const inputResult = await this._awaitInput(
+			this._extensionRunner.emitInput(
+				text,
+				images,
+				source,
+				streamingBehavior,
+				this._inputAdmissionScope.getStore()?.signal,
+			),
+		);
 		if (inputResult.action === "handled") {
 			return undefined;
 		}
@@ -2153,7 +2819,7 @@ export class AgentSession {
 		for (const image of images) {
 			const processed = await processImage(Buffer.from(image.data, "base64"), image.mimeType, {
 				autoResizeImages: this.settingsManager.getImageAutoResize(),
-				resizeOptions: this.model?.inputLimits?.images?.resize,
+				resizeOptions: this._limitsModel()?.inputLimits?.images?.resize,
 			});
 			if (!processed.ok) {
 				hints.push(processed.message);
@@ -2188,31 +2854,53 @@ export class AgentSession {
 		receipt: TurnReceipt,
 	): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, () => this._promptInAdmission(text, options, admission, receipt));
+	}
+
+	private async _promptInAdmission(
+		text: string,
+		options: PromptOptions | undefined,
+		admission: InputAdmission,
+		receipt: TurnReceipt,
+	): Promise<void> {
+		this._shutdownCancellation.signal.throwIfAborted();
+		this._checkInputAdmission();
+		const originalTransfer = options?.onInputTransferred;
+		options = {
+			...options,
+			onInputTransferred: () => {
+				if (this._inputAdmissions.has(admission)) this._checkInputAdmission();
+				admission.release();
+				originalTransfer?.();
+			},
+		};
 		if (this._isEmittingAgentSettled) {
-			const completion = new Promise<void>((resolve, reject) => {
-				this._deferredSettledActions.push(async () => {
-					try {
-						await this._promptAdmitted(text, options, receipt);
-						resolve();
-					} catch (error) {
-						reject(error);
-					}
-				});
-			});
-			// A settlement handler can await acceptance, not its own deferred delivery.
 			if (this._agentSettledScope.getStore()?.active) {
-				void completion.catch((error: unknown) => {
-					this._extensionRunner.emitError({
-						extensionPath: "<settlement>",
-						event: "prompt",
-						error: error instanceof Error ? error.message : String(error),
-					});
-				});
-				return;
+				throw new InputAdmissionError(
+					"INPUT_ADMISSION_BUSY",
+					"SDK input cannot await its own agent_settled handler; submit after settlement",
+				);
 			}
-			return completion;
+			// Scheduling is not acceptance. Keep the result and admission pending until the
+			// deferred action runs, or reject cancellation without waiting for held handlers.
+			await this._awaitInput(
+				new Promise<void>((resolve, reject) => {
+					this._deferredSettledActions.push(async () => {
+						try {
+							await this._withInputAdmission(admission, () =>
+								this._promptInAdmission(text, options, admission, receipt),
+							);
+							resolve();
+						} catch (error) {
+							reject(error);
+						}
+					});
+				}),
+			);
+			return;
 		}
-		if (!this.#ordinaryOwner) return this._prompt(text, options, undefined, undefined, receipt);
+		if (!this.#ordinaryOwner) return this._prompt(text, options, undefined, undefined, admission, receipt);
 		this.#ordinaryOwner.assertSessionStart(this);
 		this.#ordinaryOwner.assertCompactionIdle();
 		this.#ordinaryPreflights++;
@@ -2226,8 +2914,10 @@ export class AgentSession {
 			}
 		};
 		try {
-			await this.#ordinaryOwner.requestProvenance.prompt((token) =>
-				this._prompt(text, options, release, token, receipt),
+			await this._awaitInput(
+				this.#ordinaryOwner.requestProvenance.prompt((token) =>
+					this._prompt(text, options, release, token, admission, receipt),
+				),
 			);
 		} finally {
 			release();
@@ -2239,6 +2929,7 @@ export class AgentSession {
 		options?: PromptOptions,
 		releasePreflight?: () => void,
 		promptToken?: object,
+		admission?: InputAdmission,
 		receipt = captureTerminalTurnReceipt(),
 	): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
@@ -2255,7 +2946,7 @@ export class AgentSession {
 				if (handled) {
 					// Extension command executed, no prompt to send
 					onInputTransferred?.();
-					preflightResult?.(true);
+					preflightResult?.("handled");
 					return;
 				}
 			}
@@ -2291,7 +2982,7 @@ export class AgentSession {
 			);
 			if (!processedInput) {
 				onInputTransferred?.();
-				preflightResult?.(true);
+				preflightResult?.("handled");
 				return;
 			}
 			const { text: currentText, images: currentImages } = processedInput;
@@ -2306,7 +2997,7 @@ export class AgentSession {
 			if (processedInput.transformed || expandedText !== text) receipt = withoutAttribution(receipt);
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
-			while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+			while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
 			if (mustQueue()) {
 				if (!options?.streamingBehavior) {
@@ -2321,7 +3012,7 @@ export class AgentSession {
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
-				preflightResult?.(true);
+				preflightResult?.("queued");
 				return;
 			}
 
@@ -2341,7 +3032,7 @@ export class AgentSession {
 
 			const hasConfiguredAuth =
 				this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
-				(await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+				(await this._awaitInput(this._modelRuntime.checkAuth(this.model.provider))) !== undefined;
 			if (!hasConfiguredAuth) {
 				const isOAuth = this._modelRuntime.isUsingOAuth(this.model.provider);
 				if (isOAuth) {
@@ -2358,7 +3049,7 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				const outcome = await this._checkCompaction(lastAssistant, false);
+				const outcome = await this._awaitInput(this._checkCompaction(lastAssistant, false));
 				if (outcome === "failed" || outcome === "aborted") {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
@@ -2381,10 +3072,13 @@ export class AgentSession {
 			// Emit before_agent_start before normalizing images so extension-driven model
 			// selection determines the resize profile used for the request and history.
 			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-			const result = await this._extensionRunner.emitBeforeAgentStart(
-				expandedText,
-				currentImages,
-				this._baseSystemPromptOptions,
+			const result = await this._awaitInput(
+				this._extensionRunner.emitBeforeAgentStart(
+					expandedText,
+					currentImages,
+					this._baseSystemPromptOptions,
+					this._inheritedCancellation(),
+				),
 			);
 			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
 			// which updates the live loadout instead. An explicit edit wins; otherwise the live
@@ -2394,7 +3088,7 @@ export class AgentSession {
 				result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
 			if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
 
-			const normalized = await this._normalizePromptImages(currentImages);
+			const normalized = await this._awaitInput(this._normalizePromptImages(currentImages));
 			const userText =
 				normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
 
@@ -2430,7 +3124,6 @@ export class AgentSession {
 			if (updateMessage) messages.unshift(updateMessage);
 		} catch (error) {
 			this._promptPreflights.delete(preflightToken);
-			preflightResult?.(false);
 			throw error;
 		} finally {
 			if (!messages) {
@@ -2440,22 +3133,29 @@ export class AgentSession {
 			}
 		}
 
-		if (!messages) {
-			return;
-		}
+		if (!messages) return;
 
 		// A switch can also begin during before_agent_start or image normalization.
 		// Keep this prompt's admission token until its run can start, so triggered
 		// messages still queue behind it instead of acquiring a competing run.
-		while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
-		preflightResult?.(true);
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
+		this._checkInputAdmission();
 		// Triggered messages held during this preflight join its run, in the queue they asked for.
 		this._queueTriggeredBehindPreflight();
 		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
 		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
 		// run active synchronously, so later prompts still queue through isStreaming.
 		this._promptPreflights.delete(preflightToken);
-		const run = this._runAgentPrompt(messages, promptToken, undefined, onInputTransferred);
+		const run = this._runAgentPrompt(
+			messages,
+			promptToken,
+			undefined,
+			() => {
+				onInputTransferred?.();
+				preflightResult?.("started");
+			},
+			admission,
+		);
 		releasePreflight?.();
 		await run;
 	}
@@ -2549,6 +3249,9 @@ export class AgentSession {
 		// Get command context from extension runner (includes session control methods)
 		const ctx = this._extensionRunner.createCommandContext();
 
+		// Commands own their input once dispatched; they may replace their session.
+		this._checkInputAdmission();
+		this._inputAdmissionScope.getStore()?.release();
 		try {
 			this._shutdownCancellation.signal.throwIfAborted();
 			await raceWithAbortSignal(Promise.resolve(command.handler(args, ctx)), this._shutdownCancellation.signal);
@@ -2603,7 +3306,20 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 		receipt: TurnReceipt,
-	): Promise<void> {
+	): Promise<QueuedInputDisposition> {
+		const admission = this._admitInput();
+		return await this._withInputAdmission(admission, () =>
+			this._queueAdmittedInput(text, images, behavior, source, receipt),
+		);
+	}
+
+	private async _queueAdmittedInput(
+		text: string,
+		images: ImageContent[] | undefined,
+		behavior: "steer" | "followUp",
+		source: InputSource,
+		receipt: TurnReceipt,
+	): Promise<QueuedInputDisposition> {
 		this.#ordinaryOwner?.assertSessionStart(this);
 		this.#ordinaryOwner?.assertCompactionIdle();
 		if (this.#ordinaryOwner) {
@@ -2611,7 +3327,7 @@ export class AgentSession {
 			this.#auditState("queued_preflight_start");
 		}
 		try {
-			await this._prepareQueuedInput(text, images, behavior, source, receipt);
+			return await this._prepareQueuedInput(text, images, behavior, source, receipt);
 		} finally {
 			if (this.#ordinaryOwner) {
 				this.#ordinaryPreflights--;
@@ -2626,7 +3342,7 @@ export class AgentSession {
 		behavior: "steer" | "followUp",
 		source: InputSource,
 		receipt: TurnReceipt,
-	): Promise<void> {
+	): Promise<QueuedInputDisposition> {
 		if (text.startsWith("/")) {
 			this._throwIfExtensionCommand(text);
 		}
@@ -2637,7 +3353,7 @@ export class AgentSession {
 			source,
 			this.isStreaming ? behavior : undefined,
 		);
-		if (!processedInput) return;
+		if (!processedInput) return "handled";
 
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
@@ -2647,6 +3363,7 @@ export class AgentSession {
 		} else {
 			await this._queueFollowUp(expandedText, processedInput.images, receipt);
 		}
+		return "queued";
 	}
 
 	/**
@@ -2658,9 +3375,13 @@ export class AgentSession {
 	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
 	 */
-	async steer(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
+	async steer(
+		text: string,
+		images?: ImageContent[],
+		options?: { source?: InputSource },
+	): Promise<QueuedInputDisposition> {
 		const receipt = captureTerminalTurnReceipt();
-		await this._queueUserInput(text, images, "steer", options?.source ?? "interactive", receipt);
+		return this._queueUserInput(text, images, "steer", options?.source ?? "interactive", receipt);
 	}
 
 	/**
@@ -2671,18 +3392,22 @@ export class AgentSession {
 	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
 	 */
-	async followUp(text: string, images?: ImageContent[], options?: { source?: InputSource }): Promise<void> {
+	async followUp(
+		text: string,
+		images?: ImageContent[],
+		options?: { source?: InputSource },
+	): Promise<QueuedInputDisposition> {
 		const receipt = captureTerminalTurnReceipt();
-		await this._queueUserInput(text, images, "followUp", options?.source ?? "interactive", receipt);
+		return this._queueUserInput(text, images, "followUp", options?.source ?? "interactive", receipt);
 	}
 
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
 	private async _queueSteer(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
+		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -2690,15 +3415,17 @@ export class AgentSession {
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this.#receivedMessageReceipts.set(message, receipt);
 		this.agent.steer(message);
+		this._inputAdmissionScope.getStore()?.release();
+		this._emitQueueUpdate();
 	}
 
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
 	private async _queueFollowUp(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
+		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
-		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -2706,6 +3433,8 @@ export class AgentSession {
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this.#receivedMessageReceipts.set(message, receipt);
 		this.agent.followUp(message);
+		this._inputAdmissionScope.getStore()?.release();
+		this._emitQueueUpdate();
 	}
 
 	/**
@@ -2742,6 +3471,8 @@ export class AgentSession {
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
 		const receipt = captureTerminalTurnReceipt();
+		// Covers direct append, streaming queues and next-turn delivery from cancelled descendants.
+		this._checkInputAdmission();
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		const appMessage = {
@@ -2761,6 +3492,14 @@ export class AgentSession {
 		appMessage: CustomMessage,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 	): Promise<void> {
+		// Deferred delivery retains the submitter's permission and cancellation, not the drainer's scope.
+		const fenceScope = this._inputFenceScope.getStore();
+		const inheritedAdmission = this._inputAdmissionScope.getStore();
+		const cancellation = this._dispatchCancellationScope.getStore();
+		// Covers direct append, streaming queues and next-turn delivery from cancelled descendants.
+		cancellation?.throwIfAborted();
+		inheritedAdmission?.signal.throwIfAborted();
+		this._assertInputsOpen();
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		if (options?.deliverAs === "nextTurn") {
@@ -2786,13 +3525,21 @@ export class AgentSession {
 				const ticket = { deliverAs: options.deliverAs };
 				this._modelSwitchDispatches.set(appMessage, ticket);
 				try {
-					while (this._modelSwitchCompactionPending) await this._modelSwitchAdmissionWait;
+					while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 					const dispatch = async () => {
 						// Abort, refusal or clearQueue already disposed of this dispatch ticket.
 						if (this._modelSwitchDispatches.get(appMessage) !== ticket) return;
 						// Remove only this ticket before re-entry can acquire another switch ticket.
 						this._modelSwitchDispatches.delete(appMessage);
-						await this._deliverCustomMessage(appMessage, options);
+						// Re-entry keeps the submitter's permission and cancellation, not the drainer's scope.
+						await this._dispatchCancellationScope.run(cancellation, () =>
+							this._inputFenceScope.run(fenceScope, () => {
+								const deliver = () => this._deliverCustomMessage(appMessage, options);
+								return inheritedAdmission
+									? this._inputAdmissionScope.run(inheritedAdmission, deliver)
+									: this._inputAdmissionScope.exit(deliver);
+							}),
+						);
 					};
 					if (this._isEmittingAgentSettled) {
 						// External callers can await delivery; unlike hooks, they do not own this settlement.
@@ -2816,7 +3563,35 @@ export class AgentSession {
 				return;
 			}
 			if (this._isEmittingAgentSettled) {
-				this._deferredSettledActions.push(async () => await this._deliverCustomMessage(appMessage, options));
+				const dispatch = () =>
+					this._dispatchCancellationScope.run(cancellation, () =>
+						this._inputFenceScope.run(fenceScope, () => {
+							const deliver = () => this._deliverCustomMessage(appMessage, options);
+							return inheritedAdmission
+								? this._inputAdmissionScope.run(inheritedAdmission, deliver)
+								: this._inputAdmissionScope.exit(deliver);
+						}),
+					);
+				if (this._agentSettledScope.getStore()?.active) {
+					// Only a handler owning settlement must schedule without joining itself.
+					this._deferredSettledActions.push(dispatch);
+					return;
+				}
+				await this._awaitInput(
+					raceWithAbortSignal(
+						new Promise<void>((resolve, reject) => {
+							this._deferredSettledActions.push(async () => {
+								try {
+									await dispatch();
+									resolve();
+								} catch (error) {
+									reject(error);
+								}
+							});
+						}),
+						this._shutdownCancellation.signal,
+					),
+				);
 				return;
 			}
 			if (this._promptPreflights.size > 0) {
@@ -2936,31 +3711,41 @@ export class AgentSession {
 		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 	): Promise<void> {
 		const receipt = captureTerminalTurnReceipt();
-		// Normalize content to text string + optional images
-		let text: string;
-		let images: ImageContent[] | undefined;
+		const admission = this._admitInput();
+		await this._withInputAdmission(admission, async () => {
+			// Normalize content to text string + optional images
+			let text: string;
+			let images: ImageContent[] | undefined;
 
-		if (typeof content === "string") {
-			text = content;
-		} else {
-			const textParts: string[] = [];
-			images = [];
-			for (const part of content) {
-				if (part.type === "text") {
-					textParts.push(part.text);
-				} else {
-					images.push(part);
+			if (typeof content === "string") {
+				text = content;
+			} else {
+				const textParts: string[] = [];
+				images = [];
+				for (const part of content) {
+					if (part.type === "text") {
+						textParts.push(part.text);
+					} else {
+						images.push(part);
+					}
 				}
+				text = textParts.join("\n");
+				if (images.length === 0) images = undefined;
 			}
-			text = textParts.join("\n");
-			if (images.length === 0) images = undefined;
-		}
 
-		await this._promptReceived(receiveInput(text, images, receipt), {
-			expandPromptTemplates: options?.expandPromptTemplates ?? false,
-			streamingBehavior: options?.deliverAs,
-			images,
-			source: "extension",
+			// The admitted envelope keeps the caller's receipt (received-input semantics).
+			const input = receiveInput(text, images, receipt);
+			await this._promptInAdmission(
+				input.text,
+				{
+					expandPromptTemplates: options?.expandPromptTemplates ?? false,
+					streamingBehavior: options?.deliverAs,
+					images: input.images,
+					source: "extension",
+				},
+				admission,
+				getInputReceipt(input),
+			);
 		});
 	}
 
@@ -2984,7 +3769,7 @@ export class AgentSession {
 
 	/** Number of pending messages (includes both steering and follow-up) */
 	get pendingMessageCount(): number {
-		return this._steeringMessages.length + this._followUpMessages.length;
+		return this._inputAdmissions.size + this._steeringMessages.length + this._followUpMessages.length;
 	}
 
 	/** Get pending steering messages (read-only) */
@@ -3001,21 +3786,27 @@ export class AgentSession {
 		return this._resourceLoader;
 	}
 
-	/** @internal Permanently stop extension dispatch waits before a terminal shutdown join. */
+	/** @internal Permanently retire process-owned work before a terminal shutdown join. */
 	cancelForShutdown(): void {
-		this._shutdownCancellation.abort(new DOMException("Operation cancelled for terminal shutdown", "AbortError"));
+		this._shutdownCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "operation cancelled for shutdown"),
+		);
+		this._settlementCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
+		);
 		this.abortBash();
 	}
 
-	/** @internal Shared terminal signal for provider and extension dispatch. */
+	/** @internal Cancellation for host-owned startup, command and lifecycle work. */
 	get shutdownSignal(): AbortSignal {
 		return this._shutdownCancellation.signal;
 	}
 
-	/**
-	 * Abort current operation and wait for agent to become idle.
-	 */
+	/** Abort current operation and wait for agent to become idle. */
 	async abort(): Promise<void> {
+		for (const admission of this._inputAdmissions) {
+			admission.controller.abort(new InputAdmissionError("INPUT_ADMISSION_ABORTED", "input was not transferred"));
+		}
 		this.#ordinaryOwner?.interruptAutomaticCapture(new Error("OWNER_REQUEST_CAPTURE_ABORTED"));
 		this.#ordinaryOwner?.stopAutomatic();
 		if (this._isAgentRunActive) this._agentRunAbortRequested = true;
@@ -3069,7 +3860,12 @@ export class AgentSession {
 		this._modelSwitchDispatches.clear();
 	}
 
-	private async _compactForModelSwitch(model: Model<any>, commit: () => void): Promise<void> {
+	private async _compactForModelSwitch(model: Model<any>, guardedCommit: () => void): Promise<void> {
+		this._inheritedCancellation();
+		const commit = () => {
+			this._inheritedCancellation();
+			guardedCommit();
+		};
 		if (this._modelSwitchCompactionPending)
 			throw new Error("Model switch refused: another model switch compaction is in progress.");
 		if (
@@ -3149,12 +3945,24 @@ export class AgentSession {
 	 * @throws Error if no auth is configured for the model
 	 */
 	async setModel(model: Model<any>, options: ModelMutationOptions = {}): Promise<void> {
-		if (!(await this._modelRuntime.checkAuth(model.provider))) {
+		// Capture the origin's cancellation before auth; a late auth cannot commit after refusal or retirement (#132 R4-8).
+		const inherited = this._inheritedCancellation();
+		const signals = [inherited, options.signal].filter((item): item is AbortSignal => item !== undefined);
+		const signal = signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+		const assertLive = () => {
+			signal?.throwIfAborted();
+			if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "model was not changed");
+		};
+		assertLive();
+		const auth = this._modelRuntime.checkAuth(model.provider);
+		if (!(await (signal ? raceWithAbortSignal(auth, signal) : auth))) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
 		}
+		assertLive();
 
 		const previousModel = this.model;
 		await this._compactForModelSwitch(model, () => {
+			assertLive();
 			const thinkingLevel = this._getThinkingLevelForModelSwitch(model);
 			this.agent.state.model = model;
 			this.sessionManager.appendModelChange(model.provider, model.id);
@@ -3285,6 +4093,7 @@ export class AgentSession {
 	 * Persists the requested level to global defaults only when options.persist is true.
 	 */
 	setThinkingLevel(level: ThinkingLevel, options: ModelMutationOptions = {}): void {
+		this._inheritedCancellation();
 		const availableLevels = this.getAvailableThinkingLevels();
 		const effectiveLevel = availableLevels.includes(level) ? level : this._clampThinkingLevel(level, availableLevels);
 
@@ -3393,16 +4202,15 @@ export class AgentSession {
 	/** Generate Pi's built-in compaction summary for manual and automatic compaction. */
 	async #runDefaultCompaction(
 		preparation: CompactionPreparation,
-		requestModel: Model<any>,
-		apiKey: string | undefined,
-		headers: Record<string, string> | undefined,
+		model: Model<any>,
 		customInstructions: string | undefined,
 		signal: AbortSignal,
-		env: Record<string, string> | undefined,
 		reason: "manual" | "threshold" | "overflow",
 		attempt?: OriginalCompactionAttempt,
 	): Promise<CompactionResult> {
 		this.#ordinaryOwner?.requestProvenance.interrupt(new Error("OWNER_REQUEST_CAPTURE_AUXILIARY"));
+		// Resolve only for Pi's own summary, within the operation-wide deadline.
+		const request = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
 		const callbacks = this._summarizationRetryCallbacks({ source: "compaction", reason });
 		const stream = this.agent.streamFunction;
 		const summaryStream: typeof stream = attempt ? (...args) => attempt.request(() => stream(...args)) : stream;
@@ -3411,14 +4219,14 @@ export class AgentSession {
 			return await raceWithAbortSignal(
 				compact(
 					preparation,
-					requestModel,
-					apiKey,
-					headers,
+					request.model,
+					request.apiKey,
+					request.headers,
 					customInstructions,
 					signal,
-					this.thinkingLevel,
+					request.thinkingLevel,
 					summaryStream,
-					env,
+					request.env,
 					COMPACTION_RETRY_POLICY,
 					callbacks,
 					undefined, // sessionId
@@ -3467,16 +4275,45 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		// Refuse a cancelled descendant before it can abort unrelated work or request a summary.
+		const admission = this._inputAdmissionScope.getStore();
+		const ownsHeldAdmission = admission !== undefined && this._inputAdmissions.has(admission);
+		const inherited = this._inheritedCancellation();
+		const dispatch = this._dispatchCancellationScope.getStore();
+		// An unrelated caller must not abort or compact a session whose lifecycle a replacement fence owns (#132 R1-S3).
+		this._assertInputsOpen();
 		await this.abort();
+		// abort() itself ends a caller's held admission (an extension command calling ctx.compact()). Only that
+		// self-abort is exempt: keep the admission's independently inherited revocation (PR #117 R6-2).
+		const revocation = ownsHeldAdmission ? (dispatch === admission.signal ? admission.parent : dispatch) : inherited;
+		revocation?.throwIfAborted();
+		// The abort join can let an idle observer retire this session before any compaction controller exists.
+		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "compaction was not started");
+		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertCompactionIdle();
-		return this.#compactSession(customInstructions);
+		// A fence acquired during the abort join refuses both branches.
+		this._assertInputsOpen();
+		if (!ownsHeldAdmission) return this.#compactSession(customInstructions, undefined, revocation);
+		// Hooks and their descendants inherit that revocation, not the admission this call ended itself.
+		return this._inputAdmissionScope.exit(() =>
+			this._dispatchCancellationScope.run(revocation, () =>
+				this.#compactSession(customInstructions, undefined, revocation),
+			),
+		);
 	}
 
 	/** Same session implementation; manual cancellation stays in its entry wrapper. */
-	async #compactSession(customInstructions?: string, attempt?: OriginalCompactionAttempt): Promise<CompactionResult> {
+	async #compactSession(
+		customInstructions?: string,
+		attempt?: OriginalCompactionAttempt,
+		inherited?: AbortSignal,
+	): Promise<CompactionResult> {
 		const controller = new AbortController();
 		this._compactionAbortController = controller;
-		const signal = attempt ? AbortSignal.any([controller.signal, attempt.signal]) : controller.signal;
+		const signals = [controller.signal, attempt?.signal, inherited].filter(
+			(item): item is AbortSignal => item !== undefined,
+		);
+		const signal = signals.length > 1 ? AbortSignal.any(signals) : controller.signal;
 		const timeout = startCompactionDeadline(controller);
 		let fromExtension = false;
 		let cancelledByExtension = false;
@@ -3495,13 +4332,6 @@ export class AgentSession {
 			}
 
 			const settings = this.settingsManager.getCompactionSettings(model);
-			const {
-				model: requestModel,
-				apiKey,
-				headers,
-				env,
-			} = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
-
 			const pathEntries = this.sessionManager.getBranch();
 
 			const preparation = prepareCompaction(pathEntries, settings);
@@ -3560,12 +4390,9 @@ export class AgentSession {
 				// Shared default summary generator, also used by automatic compaction.
 				const result = await this.#runDefaultCompaction(
 					preparation,
-					requestModel,
-					apiKey,
-					headers,
+					model,
 					customInstructions,
 					signal,
-					env,
 					"manual",
 					attempt,
 				);
@@ -3671,27 +4498,29 @@ export class AgentSession {
 					errors.push(cleanup);
 				}
 				try {
-					clearManualState();
-				} catch (cleanup) {
-					errors.push(cleanup);
-				}
-				try {
-					this._emit({
-						type: "compaction_end",
-						reason: "manual",
-						result: undefined,
-						aborted,
-						willRetry: false,
-						errorMessage,
-					});
-				} catch (cleanup) {
-					errors.push(cleanup);
-				}
-				try {
 					await this._emitSessionCompactFailed(
 						{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
 						signal,
 						true,
+						() => {
+							try {
+								clearManualState();
+							} catch (cleanup) {
+								errors.push(cleanup);
+							}
+							try {
+								this._emit({
+									type: "compaction_end",
+									reason: "manual",
+									result: undefined,
+									aborted,
+									willRetry: false,
+									errorMessage,
+								});
+							} catch (cleanup) {
+								errors.push(cleanup);
+							}
+						},
 					);
 				} catch (cleanup) {
 					errors.push(cleanup);
@@ -3703,18 +4532,21 @@ export class AgentSession {
 			const message = error instanceof Error ? error.message : String(error);
 			const aborted = cancelledByExtension || isCompactionCancelled(signal);
 			const errorMessage = aborted ? undefined : `Compaction failed: ${message}`;
-			clearManualState();
-			this._emit({
-				type: "compaction_end",
-				reason: "manual",
-				result: undefined,
-				aborted,
-				willRetry: false,
-				errorMessage,
-			});
 			await this._emitSessionCompactFailed(
 				{ reason: "manual", errorMessage, aborted, willRetry: false, fromExtension },
 				signal,
+				false,
+				() => {
+					clearManualState();
+					this._emit({
+						type: "compaction_end",
+						reason: "manual",
+						result: undefined,
+						aborted,
+						willRetry: false,
+						errorMessage,
+					});
+				},
 			);
 			throw aborted ? new Error("Compaction cancelled", { cause: error }) : error;
 		} finally {
@@ -3797,13 +4629,17 @@ export class AgentSession {
 	abortCompaction(): void {
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+		for (const hook of this._compactionHooks) hook.abort();
 	}
 
 	/**
 	 * Cancel in-progress branch summarization.
 	 */
 	abortBranchSummary(): void {
-		this._branchSummaryAbortController?.abort();
+		// The reason is also the refusal that abandoned tree-hook descendants observe.
+		this._branchSummaryAbortController?.abort(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "tree navigation cancelled"),
+		);
 	}
 
 	/**
@@ -3838,14 +4674,14 @@ export class AgentSession {
 		// Skip if message was aborted (user cancelled) - unless skipAbortedCheck is false
 		if (skipAbortedCheck && assistantMessage.stopReason === "aborted") return false;
 
-		const contextWindow = this.model?.contextWindow ?? 0;
-
 		// Skip overflow check if the message came from a different model.
 		// This handles the case where user switched from a smaller-context model (e.g. opus)
 		// to a larger-context model (e.g. codex) - the overflow error from the old model
-		// shouldn't trigger compaction for the new model.
-		const sameModel =
-			this.model && assistantMessage.provider === this.model.provider && assistantMessage.model === this.model.id;
+		// shouldn't trigger compaction for the new model. Under a virtual selection, the
+		// physical model that produced the message supplies the limits.
+		const messageModel = this._modelForMessage(assistantMessage);
+		const sameModel = messageModel !== undefined;
+		const contextWindow = (messageModel ?? this.model)?.contextWindow ?? 0;
 
 		// Skip compaction checks if this assistant message is older than the latest
 		// compaction boundary. This prevents a stale pre-compaction usage/error
@@ -3889,7 +4725,7 @@ export class AgentSession {
 			((explicitOverflow && assistantRetainedForExplicitRecovery) ||
 				(assistantUsageMatchesProjection && isContextOverflow(assistantMessage, contextWindow)));
 		const recoverableLength =
-			sameModel && assistantIsProjected && isRecoverableLength(assistantMessage, this.model?.maxTokens ?? 0);
+			sameModel && assistantIsProjected && isRecoverableLength(assistantMessage, messageModel.maxTokens);
 		if (contextOverflow || recoverableLength) {
 			const willRetry = assistantMessage.stopReason !== "stop";
 
@@ -3903,28 +4739,29 @@ export class AgentSession {
 				const errorMessage = contextOverflow
 					? "Context overflow recovery failed after one compact-and-retry attempt. Try reducing context or switching to a larger-context model."
 					: "Truncated response recovery failed after one compact-and-retry attempt.";
-				this._emit({
-					type: "compaction_end",
-					reason: "overflow",
-					result: undefined,
-					aborted: false,
-					willRetry: false,
-					errorMessage,
-				});
-				await this._emitSessionCompactFailed({
-					reason: "overflow",
-					errorMessage,
-					aborted: false,
-					willRetry: false,
-					fromExtension: false,
-				});
+				await this._emitSessionCompactFailed(
+					{ reason: "overflow", errorMessage, aborted: false, willRetry: false, fromExtension: false },
+					undefined,
+					false,
+					() =>
+						this._emit({
+							type: "compaction_end",
+							reason: "overflow",
+							result: undefined,
+							aborted: false,
+							willRetry: false,
+							errorMessage,
+						}),
+				);
 				return "failed";
 			}
 
 			// Persistently omit the selected final attempt before post-run recovery compaction.
 			this._overflowRecoveryAttempted = true;
 			this._omitRecoveryAttempt(assistantMessage, toolResults);
-			return await this._runAutoCompaction("overflow", willRetry);
+			const retry = await this._runAutoCompaction("overflow", willRetry);
+			if (retry === true) this._failedResponse = assistantMessage;
+			return retry;
 		}
 
 		// Case 3: threshold compaction without retry.
@@ -4004,14 +4841,6 @@ export class AgentSession {
 			this._emit({ type: "compaction_start", reason });
 			signal.throwIfAborted();
 
-			const {
-				model: requestModel,
-				apiKey,
-				headers,
-				env,
-			} = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
-			signal.throwIfAborted();
-
 			let extensionCompaction: CompactionResult | undefined;
 
 			if (this._extensionRunner.hasHandlers("session_before_compact")) {
@@ -4055,16 +4884,7 @@ export class AgentSession {
 				details = extensionCompaction.details;
 			} else {
 				// Shared default summary generator, also used by manual compaction.
-				const compactResult = await this.#runDefaultCompaction(
-					preparation,
-					requestModel,
-					apiKey,
-					headers,
-					undefined,
-					signal,
-					env,
-					reason,
-				);
+				const compactResult = await this.#runDefaultCompaction(preparation, model, undefined, signal, reason);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
 				tokensBefore = compactResult.tokensBefore;
@@ -4127,10 +4947,19 @@ export class AgentSession {
 					? `Context overflow recovery failed: ${message}`
 					: `Auto-compaction failed: ${message}`;
 			if (started || signal.aborted) {
-				this._emit({ type: "compaction_end", reason, result: undefined, aborted, willRetry: false, errorMessage });
 				await this._emitSessionCompactFailed(
 					{ reason, errorMessage, aborted, willRetry: false, fromExtension },
 					signal,
+					false,
+					() =>
+						this._emit({
+							type: "compaction_end",
+							reason,
+							result: undefined,
+							aborted,
+							willRetry: false,
+							errorMessage,
+						}),
 				);
 			}
 			return aborted ? "aborted" : "failed";
@@ -4224,6 +5053,7 @@ export class AgentSession {
 
 		this._applyExtensionBindings(this._extensionRunner);
 		await raceWithAbortSignal(this._extensionRunner.emit(this._sessionStartEvent), this._shutdownCancellation.signal);
+		this._extensionRunner.reportUnhandledMcpServers();
 		await raceWithAbortSignal(
 			this.extendResourcesFromExtensions(this._sessionStartEvent.reason === "reload" ? "reload" : "startup"),
 			this._shutdownCancellation.signal,
@@ -4261,7 +5091,7 @@ export class AgentSession {
 	}> {
 		return entries.map((entry) => {
 			const source = this.getExtensionSourceLabel(entry.extensionPath);
-			const baseDir = entry.extensionPath.startsWith("<") ? undefined : dirname(entry.extensionPath);
+			const baseDir = isSyntheticPath(entry.extensionPath) ? undefined : dirname(entry.extensionPath);
 			return {
 				path: entry.path,
 				metadata: {
@@ -4275,7 +5105,7 @@ export class AgentSession {
 	}
 
 	private getExtensionSourceLabel(extensionPath: string): string {
-		if (extensionPath.startsWith("<")) {
+		if (isSyntheticPath(extensionPath)) {
 			return `extension:${extensionPath.replace(/[<>]/g, "")}`;
 		}
 		const base = basename(extensionPath);
@@ -4345,15 +5175,19 @@ export class AgentSession {
 					});
 				},
 				sendUserMessage: (content, options) => {
-					this.sendUserMessage(content, options).catch((err) => {
-						runner.emitError({
-							extensionPath: "<runtime>",
-							event: "send_user_message",
-							error: err instanceof Error ? err.message : String(err),
+					// Detach scheduling to avoid an SDK self-join, but keep the separately captured cancellation lineage.
+					this._agentSettledScope
+						.exit(() => this.sendUserMessage(content, options))
+						.catch((err) => {
+							runner.emitError({
+								extensionPath: "<runtime>",
+								event: "send_user_message",
+								error: err instanceof Error ? err.message : String(err),
+							});
 						});
-					});
 				},
 				appendEntry: (customType, data) => {
+					this._inheritedCancellation();
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
 					const entry = this.sessionManager.getEntry(entryId);
 					if (entry) {
@@ -4367,12 +5201,15 @@ export class AgentSession {
 					return this.sessionManager.getSessionName();
 				},
 				setLabel: (entryId, label) => {
+					this._inheritedCancellation();
 					this.sessionManager.appendLabelChange(entryId, label);
 				},
 				getActiveTools: () => this.getActiveToolNames(),
 				getAllTools: () => this.getAllTools(),
+				getSettings: () => this.settingsManager.getSettings(),
 				setActiveTools: (toolNames) => this.setActiveToolsByName(toolNames),
 				refreshTools: () => this._refreshToolRegistry(),
+				inheritedCancellation: () => this._inheritedCancellation(),
 				getCommands,
 				setModel: async (model) => {
 					if (!this._modelRuntime.hasConfiguredAuth(model.provider)) return false;
@@ -4415,6 +5252,8 @@ export class AgentSession {
 				},
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
+				executeTool: (callerId, name, args, options) => this._executeNestedToolCall(callerId, name, args, options),
+				getCallableTools: () => this._getCallableTools(),
 			},
 			{
 				registerProvider: (name, config) => {
@@ -4429,17 +5268,26 @@ export class AgentSession {
 					this._modelRuntime.unregisterProvider(name);
 					this._refreshCurrentModelFromRegistry();
 				},
+				registerVirtualModel: (definition) => {
+					this._modelRuntime.registerVirtualModel(definition);
+					this._refreshCurrentModelFromRegistry();
+				},
+				unregisterVirtualModel: (provider, id) => {
+					this._modelRuntime.unregisterVirtualModel(provider, id);
+					this._refreshCurrentModelFromRegistry();
+				},
 			},
 		);
 	}
 
 	private _refreshToolRegistry(options?: { activeToolNames?: string[]; includeAllExtensionTools?: boolean }): void {
-		const previousRegistryNames = new Set(this._toolRegistry.keys());
+		// Tools that were already activated on registration. A tool whose exposure changes to
+		// `direct` or `model-only` (for example from `hidden`) is activated like a new tool.
+		const previousActivatedOnRegistration = new Set(
+			[...this._toolRegistry.keys()].filter((name) => this._isActivatedOnRegistration(name)),
+		);
 		const previousActiveToolNames = this.getActiveToolNames();
-		const allowedToolNames = this._allowedToolNames;
-		const excludedToolNames = this._excludedToolNames;
-		const isAllowedTool = (name: string): boolean =>
-			(!allowedToolNames || allowedToolNames.has(name)) && !excludedToolNames?.has(name);
+		const allowedTools = this._allowedTools;
 
 		const registeredTools = this._extensionRunner.getAllRegisteredTools();
 		const allCustomTools = [
@@ -4448,15 +5296,15 @@ export class AgentSession {
 				definition,
 				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
 			})),
-		].filter((tool) => isAllowedTool(tool.definition.name));
+		].filter((tool) => this._isAllowedTool(tool.definition.name));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
 			Array.from(this._baseToolDefinitions.entries())
-				.filter(([name]) => isAllowedTool(name))
+				.filter(([name]) => this._isAllowedTool(name))
 				.map(([name, definition]) => [
 					name,
 					{
 						definition,
-						sourceInfo: createSyntheticSourceInfo(`<builtin:${name}>`, { source: "builtin" }),
+						sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${name}`, { source: "builtin" }),
 					},
 				]),
 		);
@@ -4487,10 +5335,12 @@ export class AgentSession {
 		const wrappedExtensionTools = wrapRegisteredTools(allCustomTools, runner);
 		const wrappedBuiltInTools = wrapRegisteredTools(
 			Array.from(this._baseToolDefinitions.values())
-				.filter((definition) => isAllowedTool(definition.name))
+				.filter((definition) => this._isAllowedTool(definition.name))
 				.map((definition) => ({
 					definition,
-					sourceInfo: createSyntheticSourceInfo(`<builtin:${definition.name}>`, { source: "builtin" }),
+					sourceInfo: createSyntheticSourceInfo(`${BUILTIN_PATH_PREFIX}${definition.name}`, {
+						source: "builtin",
+					}),
 				})),
 			runner,
 		);
@@ -4503,27 +5353,42 @@ export class AgentSession {
 
 		const nextActiveToolNames = (
 			options?.activeToolNames ? [...options.activeToolNames] : [...previousActiveToolNames]
-		).filter((name) => isAllowedTool(name));
+		).filter((name) => this._isAllowedTool(name));
 
-		if (allowedToolNames) {
+		if (allowedTools) {
 			for (const toolName of this._toolRegistry.keys()) {
-				if (allowedToolNames.has(toolName)) {
+				// Naming or matching a tool activates it even when it is not active by default. MCP tools
+				// kept registered without being named stay inactive.
+				if (allowedTools(toolName) && this._isDeclarable(toolName)) {
 					nextActiveToolNames.push(toolName);
 				}
 			}
 		} else if (options?.includeAllExtensionTools) {
 			for (const tool of wrappedExtensionTools) {
-				nextActiveToolNames.push(tool.name);
+				if (this._isActivatedOnRegistration(tool.name)) nextActiveToolNames.push(tool.name);
 			}
 		} else if (!options?.activeToolNames) {
 			for (const toolName of this._toolRegistry.keys()) {
-				if (!previousRegistryNames.has(toolName)) {
+				if (!previousActivatedOnRegistration.has(toolName) && this._isActivatedOnRegistration(toolName)) {
 					nextActiveToolNames.push(toolName);
 				}
 			}
 		}
+		// Pending tools that are registered now become active.
+		nextActiveToolNames.push(...this._pendingToolNames);
 
-		this.setActiveToolsByName([...new Set(nextActiveToolNames)]);
+		this._setActiveTools([...new Set(nextActiveToolNames)]);
+	}
+
+	/** Whether activating the tool declares it to the model. */
+	private _isDeclarable(name: string): boolean {
+		const exposure = this._getToolExposure(name);
+		return exposure === "direct" || exposure === "model-only";
+	}
+
+	/** Whether registering the tool activates it, which declares it to the model. */
+	private _isActivatedOnRegistration(name: string): boolean {
+		return this._isDeclarable(name) && this._toolDefinitions.get(name)?.definition.defaultActive !== false;
 	}
 
 	private _buildRuntime(options: {
@@ -4589,12 +5454,24 @@ export class AgentSession {
 		const previousFlagValues = oldRunner.getFlagValues();
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
 		oldRunner.invalidate();
+		const previousDefaultTools = new Set(
+			this._usesDefaultTools ? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES) : [],
+		);
 		await this.settingsManager.reload();
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();
+		// Activate tools newly added to defaultTools. Removed ones stay active, and tools disabled
+		// during the session stay disabled unless the setting newly adds them.
+		const addedDefaultTools = this._usesDefaultTools
+			? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES).filter(
+					(name) => !previousDefaultTools.has(name),
+				)
+			: [];
+		// Tools the new extensions register later, such as MCP tools, are pending until then.
+		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
 		this._buildRuntime({
-			activeToolNames: this.getActiveToolNames(),
+			activeToolNames: [...this.getActiveToolNames(), ...addedDefaultTools],
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
 		});
@@ -4607,6 +5484,7 @@ export class AgentSession {
 		if (hasBindings) {
 			await options?.beforeSessionStart?.();
 			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+			this._extensionRunner.reportUnhandledMcpServers();
 			await this.extendResourcesFromExtensions("reload");
 		}
 	}
@@ -4623,7 +5501,7 @@ export class AgentSession {
 		// Never restart a request once output or a tool call has been streamed.
 		if (this._assistantOutputObserved) return false;
 		// Context overflow is handled by compaction, not retry.
-		if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;
+		if (isContextOverflow(message, (this._modelForMessage(message) ?? this.model)?.contextWindow ?? 0)) return false;
 		return isRetryableAssistantError(message);
 	}
 
@@ -4849,8 +5727,13 @@ export class AgentSession {
 		},
 	): Promise<BashResult> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROCESS_SCOPE_REQUIRED");
+		const inherited = this._inheritedCancellation();
+		this._assertInputsOpen();
+		this._shutdownCancellation.signal.throwIfAborted();
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
+		// Later revocation kills the spawned command; recordBashResult rechecks before history append.
+		const signal = inherited ? AbortSignal.any([abortController.signal, inherited]) : abortController.signal;
 
 		// Apply command prefix if configured (e.g., "shopt -s expand_aliases" for alias support)
 		const prefix = this.settingsManager.getShellCommandPrefix();
@@ -4867,12 +5750,13 @@ export class AgentSession {
 						onChunk?.(delta);
 						this._emit({ type: "bash_execution_update", id: options?.id, delta });
 					},
-					signal: abortController.signal,
+					signal,
 				},
 			);
 
 			options?.beforeRecord?.();
-			this.recordBashResult(command, result, options);
+			// Already-started work keeps its (possibly cancelled) receipt after in-flight revocation (#132 R1-S4).
+			this._appendBashResult(command, result, options);
 			return result;
 		} finally {
 			this._bashAbortControllers.delete(abortController);
@@ -4884,6 +5768,13 @@ export class AgentSession {
 	 * Used by executeBash and by extensions that handle bash execution themselves.
 	 */
 	recordBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		this._inheritedCancellation();
+		this._appendBashResult(command, result, options);
+	}
+
+	private _appendBashResult(command: string, result: BashResult, options?: { excludeFromContext?: boolean }): void {
+		if (this._inputsDisposed)
+			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash result was not recorded");
 		const bashMessage: BashExecutionMessage = {
 			role: "bashExecution",
 			command,
@@ -4947,6 +5838,7 @@ export class AgentSession {
 	 * Set a display name for the current session.
 	 */
 	setSessionName(name: string): void {
+		this._inheritedCancellation();
 		this.sessionManager.appendSessionInfo(name);
 		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
 		this._emit(event);
@@ -4973,6 +5865,7 @@ export class AgentSession {
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
 	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: tree requires separate receiving");
+		const inherited = this._inheritedCancellation();
 		if (this.isStreaming) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
@@ -5027,7 +5920,13 @@ export class AgentSession {
 		const navigationSignal = AbortSignal.any([
 			this._branchSummaryAbortController.signal,
 			this._shutdownCancellation.signal,
+			...(inherited ? [inherited] : []),
 		]);
+		// A signal in event data is not ancestry: install it so abandoned hook descendants stay revoked.
+		const emitTreeHook = (event: Parameters<ExtensionRunner["emit"]>[0]) =>
+			this._dispatchCancellationScope.run(navigationSignal, () =>
+				this._extensionRunner.emit(event, navigationSignal),
+			);
 
 		try {
 			let extensionSummary: { summary: string; details?: unknown; usage?: Usage } | undefined;
@@ -5035,14 +5934,11 @@ export class AgentSession {
 
 			// Emit session_before_tree event
 			if (this._extensionRunner.hasHandlers("session_before_tree")) {
-				const result = (await this._extensionRunner.emit(
-					{
-						type: "session_before_tree",
-						preparation,
-						signal: navigationSignal,
-					},
-					navigationSignal,
-				)) as SessionBeforeTreeResult | undefined;
+				const result = (await emitTreeHook({
+					type: "session_before_tree",
+					preparation,
+					signal: navigationSignal,
+				})) as SessionBeforeTreeResult | undefined;
 
 				if (result?.cancel) {
 					return { cancelled: true };
@@ -5070,14 +5966,12 @@ export class AgentSession {
 			let summaryDetails: unknown;
 			let summaryUsage: Usage | undefined;
 			if (options.summarize && entriesToSummarize.length > 0 && !extensionSummary) {
-				const model = this.model!;
-				const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
 				const branchSummarySettings = this.settingsManager.getBranchSummarySettings();
 				const result = await generateBranchSummary(entriesToSummarize, {
-					model: requestModel,
-					apiKey,
-					headers,
-					env,
+					...(await raceWithAbortSignal(
+						this._getSummarizationRequestAuth(this.model!, navigationSignal),
+						navigationSignal,
+					)),
 					signal: navigationSignal,
 					customInstructions,
 					replaceInstructions,
@@ -5161,16 +6055,13 @@ export class AgentSession {
 
 			// Navigation is already committed. Cancel its observer without claiming rollback.
 			try {
-				await this._extensionRunner.emit(
-					{
-						type: "session_tree",
-						newLeafId: this.sessionManager.getLeafId(),
-						oldLeafId,
-						summaryEntry,
-						fromExtension: summaryText ? fromExtension : undefined,
-					},
-					navigationSignal,
-				);
+				await emitTreeHook({
+					type: "session_tree",
+					newLeafId: this.sessionManager.getLeafId(),
+					oldLeafId,
+					summaryEntry,
+					fromExtension: summaryText ? fromExtension : undefined,
+				});
 			} catch (cause) {
 				if (!navigationSignal.aborted || cause !== navigationSignal.reason) throw cause;
 			}
@@ -5269,7 +6160,7 @@ export class AgentSession {
 	}
 
 	getContextUsage(): ContextUsage | undefined {
-		const model = this.model;
+		const model = this._limitsModel();
 		if (!model) return undefined;
 
 		const contextWindow = model.contextWindow ?? 0;
@@ -5338,7 +6229,8 @@ export class AgentSession {
 
 		// Create tool renderer if we have an extension runner (for custom tool HTML rendering)
 		const toolRenderer: ToolHtmlRenderer = createToolHtmlRenderer({
-			getToolDefinition: (name) => this.getToolDefinition(name),
+			getToolRenderers: (name) =>
+				this._extensionRunner.resolveToolRenderers(name, () => this.getToolDefinition(name)),
 			theme,
 			cwd: this.sessionManager.getCwd(),
 		});
@@ -5366,20 +6258,26 @@ export class AgentSession {
 	 * Used when the user declines to share the transcript itself.
 	 */
 	async summarizeForBugReport(options: { hint?: string; signal: AbortSignal }): Promise<string> {
+		// A revoked descendant cannot start an auxiliary provider request (PR #117 R6-3).
+		const inherited = this._inheritedCancellation();
+		this._disposalCancellation.signal.throwIfAborted();
+		const signal = AbortSignal.any(
+			[options.signal, this._shutdownCancellation.signal, this._disposalCancellation.signal, inherited].filter(
+				(item): item is AbortSignal => item !== undefined,
+			),
+		);
+		signal.throwIfAborted();
 		const model = this.model;
 		if (!model) {
 			throw new Error("No model selected");
 		}
-		const { model: requestModel, apiKey, headers, env } = await this._getSummarizationRequestAuth(model);
+		const auth = await raceWithAbortSignal(this._getSummarizationRequestAuth(model, signal), signal);
+		signal.throwIfAborted();
 		return generateBugReportSummary({
+			...auth,
 			messages: this.messages,
 			hint: options.hint,
-			model: requestModel,
-			apiKey,
-			headers,
-			env,
-			signal: options.signal,
-			thinkingLevel: this.thinkingLevel,
+			signal,
 			streamFn: this.agent.streamFunction,
 			retry: this.settingsManager.getRetrySettings(),
 			sessionId: this.sessionId,

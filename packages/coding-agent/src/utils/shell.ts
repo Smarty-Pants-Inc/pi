@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
-import { delimiter, join } from "node:path";
-import { spawn, spawnSync } from "child_process";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
+import { spawn } from "child_process";
 import { getBinDir } from "../config.ts";
 
 export interface ShellConfig {
@@ -21,38 +21,23 @@ function getBashShellConfig(shell: string): ShellConfig {
 	return isLegacyWslBashPath(shell) ? { shell, args: ["-s"], commandTransport: "stdin" } : { shell, args: ["-c"] };
 }
 
-function findExecutableOnPath(executable: string): string | null {
-	if (process.platform === "win32") {
-		// Windows: Use 'where' and verify file exists (where can return non-existent paths)
+/**
+ * Search PATH in-process. Discovery must not run a helper such as `where`/`which`: that helper would itself be
+ * resolved through CWD/PATH and execute before the bash_spawn gate sees the final executor.
+ * Relative and empty PATH entries (the working directory) are skipped.
+ */
+function findExecutableOnPath(executable: string, env: NodeJS.ProcessEnv = process.env): string | null {
+	const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path") ?? "PATH";
+	for (const dir of (env[pathKey] ?? "").split(delimiter)) {
+		if (!dir || !isAbsolute(dir)) continue;
+		const candidate = join(dir, executable);
 		try {
-			const result = spawnSync("where", [executable], {
-				encoding: "utf-8",
-				timeout: 5000,
-				windowsHide: true,
-			});
-			if (result.status === 0 && result.stdout) {
-				const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-				if (firstMatch && existsSync(firstMatch)) {
-					return firstMatch;
-				}
-			}
+			if (!statSync(candidate).isFile()) continue;
+			if (process.platform !== "win32") accessSync(candidate, constants.X_OK);
+			return candidate;
 		} catch {
-			// Ignore errors
+			// Missing or not executable: keep searching.
 		}
-		return null;
-	}
-
-	// Unix: Use 'which' and trust its output (handles Termux and special filesystems)
-	try {
-		const result = spawnSync("which", [executable], { encoding: "utf-8", timeout: 5000 });
-		if (result.status === 0 && result.stdout) {
-			const firstMatch = result.stdout.trim().split(/\r?\n/)[0];
-			if (firstMatch) {
-				return firstMatch;
-			}
-		}
-	} catch {
-		// Ignore errors
 	}
 	return null;
 }
@@ -62,9 +47,10 @@ function findExecutableOnPath(executable: string): string | null {
  * Resolution order:
  * 1. User-specified shellPath
  * 2. On Windows: Git Bash in known locations, then bash on PATH
- * 3. On Unix: /bin/bash, then bash on PATH, then fallback to sh
+ * 3. On Unix: /bin/bash, then bash on PATH, then the absolute sh found on PATH (else fail closed)
+ * PATH lookups use `env`, which should be the environment the shell is spawned with.
  */
-export function getShellConfig(customShellPath?: string): ShellConfig {
+export function getShellConfig(customShellPath?: string, env: NodeJS.ProcessEnv = process.env): ShellConfig {
 	// 1. Check user-specified shell path
 	if (customShellPath) {
 		if (existsSync(customShellPath)) {
@@ -92,7 +78,7 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		}
 
 		// 3. Fallback: search bash.exe on PATH (Cygwin, MSYS2, WSL, etc.)
-		const bashOnPath = findExecutableOnPath("bash.exe");
+		const bashOnPath = findExecutableOnPath("bash.exe", env);
 		if (bashOnPath) {
 			return getBashShellConfig(bashOnPath);
 		}
@@ -111,12 +97,17 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 		return getBashShellConfig("/bin/bash");
 	}
 
-	const bashOnPath = findExecutableOnPath("bash");
+	const bashOnPath = findExecutableOnPath("bash", env);
 	if (bashOnPath) {
 		return getBashShellConfig(bashOnPath);
 	}
 
-	return { shell: "sh", args: ["-c"] };
+	// Never return a bare "sh": spawn would resolve it through PATH after bash_spawn attested only the name.
+	const shOnPath = findExecutableOnPath("sh", env);
+	if (shOnPath) {
+		return { shell: shOnPath, args: ["-c"] };
+	}
+	throw new Error("No bash or sh shell found: /bin/bash is missing and PATH has no absolute bash or sh.");
 }
 
 export const POWERSHELL_ARGS = ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"] as const;
@@ -153,40 +144,11 @@ export function getShellEnv(): NodeJS.ProcessEnv {
  * Sanitize binary output for display/storage.
  * Removes characters that crash string-width or cause display issues:
  * - Control characters (except tab, newline, carriage return)
- * - Lone surrogates
- * - Unicode Format characters (crash string-width due to a bug)
- * - Characters with undefined code points
+ * - Unicode interlinear annotation characters U+FFF9..U+FFFB (crash string-width due to a bug)
  */
 export function sanitizeBinaryOutput(str: string): string {
-	// Use Array.from to properly iterate over code points (not code units)
-	// This handles surrogate pairs correctly and catches edge cases where
-	// codePointAt() might return undefined
-	return Array.from(str)
-		.filter((char) => {
-			// Filter out characters that cause string-width to crash
-			// This includes:
-			// - Unicode format characters
-			// - Lone surrogates (already filtered by Array.from)
-			// - Control chars except \t \n \r
-			// - Characters with undefined code points
-
-			const code = char.codePointAt(0);
-
-			// Skip if code point is undefined (edge case with invalid strings)
-			if (code === undefined) return false;
-
-			// Allow tab, newline, carriage return
-			if (code === 0x09 || code === 0x0a || code === 0x0d) return true;
-
-			// Filter out control characters (0x00-0x1F, except 0x09, 0x0a, 0x0x0d)
-			if (code <= 0x1f) return false;
-
-			// Filter out Unicode format characters
-			if (code >= 0xfff9 && code <= 0xfffb) return false;
-
-			return true;
-		})
-		.join("");
+	// All removed characters are single UTF-16 code units, so surrogate pairs are never split.
+	return str.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\uFFF9-\uFFFB]/g, "");
 }
 
 /**

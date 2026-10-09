@@ -6,6 +6,7 @@ import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
@@ -88,6 +89,7 @@ describe("ExtensionRunner", () => {
 		setLabel: () => {},
 		getActiveTools: () => [],
 		getAllTools: () => [],
+		getSettings: () => ({}),
 		setActiveTools: () => {},
 		refreshTools: () => {},
 		getCommands: () => [],
@@ -110,6 +112,110 @@ describe("ExtensionRunner", () => {
 		getSystemPrompt: () => "",
 		getScopedModels: () => [],
 	};
+
+	describe("native nested parent lifetime", () => {
+		function makeRunner(executeTool: NonNullable<ExtensionContextActions["executeTool"]>) {
+			const runner = new ExtensionRunner([], createExtensionRuntime(), tempDir, sessionManager, modelRegistry);
+			runner.bindCore(extensionActions, { ...extensionContextActions, executeTool });
+			return runner;
+		}
+		const result = { content: [], details: {} };
+		const outcome = {
+			toolCall: { type: "toolCall" as const, id: "parent/1", name: "child", arguments: {} },
+			result,
+			isError: false,
+		};
+
+		it("rejects retained contexts after parent settlement even without a nested call", async () => {
+			const execute = vi.fn(async () => outcome);
+			const runner = makeRunner(execute);
+			const ctx = runner.createToolContext("parent", undefined);
+			await runner.emitToolResult({
+				type: "tool_result",
+				toolCallId: "parent",
+				toolName: "parent",
+				input: {},
+				...result,
+				isError: false,
+			});
+			await expect(ctx.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
+			expect(execute).not.toHaveBeenCalled();
+		});
+
+		it.each(["tool_execution_end", "agent_end"] as const)(
+			"closes retained contexts at %s without result hooks",
+			async (type) => {
+				const execute = vi.fn(async () => outcome);
+				const runner = makeRunner(execute);
+				const ctx = runner.createToolContext("parent", undefined);
+				if (type === "agent_end") await runner.emit({ type, messages: [] });
+				else await runner.emit({ type, toolCallId: "parent", toolName: "parent", result, isError: false });
+				await expect(ctx.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
+				expect(execute).not.toHaveBeenCalled();
+			},
+		);
+
+		it("does not let a fresh child signal bypass parent cancellation", async () => {
+			const execute = vi.fn(async () => outcome);
+			const runner = makeRunner(execute);
+			const parent = new AbortController();
+			const ctx = runner.createToolContext("parent", parent.signal);
+			parent.abort();
+			await expect(ctx.executeTool("child", {}, { signal: new AbortController().signal })).rejects.toThrow();
+			expect(execute).not.toHaveBeenCalled();
+		});
+
+		it("closes admission and drains accepted children before parent result hooks", async () => {
+			let release!: () => void;
+			const held = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const execute = vi.fn(async () => {
+				await held;
+				return outcome;
+			});
+			const runner = makeRunner(execute);
+			const ctx = runner.createToolContext("parent", undefined);
+			const child = ctx.executeTool("child", {});
+			let settled = false;
+			const finalization = runner
+				.emitToolResult({
+					type: "tool_result",
+					toolCallId: "parent",
+					toolName: "parent",
+					input: {},
+					...result,
+					isError: false,
+				})
+				.then(() => {
+					settled = true;
+				});
+			try {
+				await new Promise((resolve) => setTimeout(resolve, 10));
+				expect(settled).toBe(false);
+				await expect(ctx.executeTool("late", {})).rejects.toThrow(/closed|settled/i);
+			} finally {
+				release();
+				await Promise.all([child, finalization]);
+			}
+			expect(execute).toHaveBeenCalledTimes(1);
+		});
+
+		it("composes in-flight parent and child cancellation", async () => {
+			let childSignal: AbortSignal | undefined;
+			const runner = makeRunner(async (_id, _name, _args, options) => {
+				childSignal = options.signal;
+				return outcome;
+			});
+			const parent = new AbortController();
+			const child = new AbortController();
+			const ctx = runner.createToolContext("parent", parent.signal);
+			await ctx.executeTool("child", {}, { signal: child.signal });
+			expect(childSignal?.aborted).toBe(false);
+			parent.abort();
+			expect(childSignal?.aborted).toBe(true);
+		});
+	});
 
 	describe("scopedModels", () => {
 		it("reflects the getScopedModels context action on ctx.scopedModels", async () => {
@@ -929,6 +1035,30 @@ describe("ExtensionRunner", () => {
 		});
 	});
 
+	// Issue #10285: the MCP extension renders calls to tools that are not registered.
+	it("resolves tool renderers in extension load order, each able to defer to the next", async () => {
+		const runtime = createExtensionRuntime();
+		const eventBus = createEventBus();
+		const renderCall = () => ({ render: () => [], invalidate: () => {} });
+		const first = await loadExtensionFromFactory(
+			(pi) => pi.registerToolRenderer((toolName, next) => (toolName === "a" ? { renderCall } : next())),
+			tempDir,
+			eventBus,
+			runtime,
+		);
+		const second = await loadExtensionFromFactory(
+			(pi) => pi.registerToolRenderer((_toolName, next) => next() ?? { renderShell: "self" }),
+			tempDir,
+			eventBus,
+			runtime,
+		);
+		const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
+
+		expect(runner.resolveToolRenderers("a", () => undefined)).toEqual({ renderCall });
+		expect(runner.resolveToolRenderers("b", () => undefined)).toEqual({ renderShell: "self" });
+		expect(runner.resolveToolRenderers("b", () => ({ renderCall }))).toEqual({ renderCall });
+	});
+
 	describe("boundary chaining", () => {
 		it("chains shared draft proposals and preserves omitted result fields", async () => {
 			const runtime = createExtensionRuntime();
@@ -1040,6 +1170,77 @@ describe("ExtensionRunner", () => {
 			expect(errors).toContain("Invalid boundary entries: Entry missing not found");
 			expect(result.entries).toEqual([]);
 			expect(result.valid).toBe(true);
+		});
+
+		// pi#132 R4-6: input handlers see detached images; a late in-place edit leaves the caller's originals intact.
+		it("detaches input images from handlers before exposure and at transform acceptance", async () => {
+			const runtime = createExtensionRuntime();
+			let seen: ImageContent[] | undefined;
+			let returned: ImageContent[] | undefined;
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("input", (event) => {
+						seen = event.images;
+						returned = [{ type: "image", data: "transformed", mimeType: "image/png" }];
+						return { action: "transform", text: event.text, images: returned };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const original: ImageContent = { type: "image", data: "original", mimeType: "image/png" };
+			const result = await runner.emitInput("text", [original], "interactive");
+			seen![0]!.data = "late edit";
+			seen![0]!.mimeType = "image/gif";
+			returned![0]!.data = "late transform edit";
+			expect(original).toEqual({ type: "image", data: "original", mimeType: "image/png" });
+			expect(result).toMatchObject({ action: "transform", images: [{ data: "transformed" }] });
+		});
+
+		// pi#132 R4-10: an uncloneable in-place draft is reported and isolated; a later handler can still repair.
+		it("isolates an uncloneable in-place draft and lets a later handler repair", async () => {
+			const runtime = createExtensionRuntime();
+			const poison = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						event.entries.push({ type: "custom", customType: "poison", data: () => undefined });
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:poison>",
+			);
+			let repairSaw: number | undefined;
+			const repair = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						repairSaw = event.entries.length;
+						return { entries: [{ type: "custom", customType: "repaired" }] };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:repair>",
+			);
+			const runner = new ExtensionRunner([poison, repair], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const result = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" }, () => ({
+				contextEntries: [],
+				contextMessages: [],
+				llmMessages: [],
+				pendingMessages: [],
+				canContinue: false,
+			}));
+
+			expect(errors).toHaveLength(1);
+			expect(repairSaw).toBe(0);
+			expect(result.entries).toMatchObject([{ type: "custom", customType: "repaired" }]);
 		});
 
 		it("keeps shared mutations made before a handler throws", async () => {

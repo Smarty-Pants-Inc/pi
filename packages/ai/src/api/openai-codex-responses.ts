@@ -6,6 +6,7 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
+import { getRequestDiagnosticSecrets, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -246,7 +247,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 	context: TranscriptContext,
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	(async () => {
@@ -362,15 +364,20 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						}
 						appendAssistantMessageDiagnostic(
 							output,
-							createAssistantMessageDiagnostic("provider_transport_failure", error, {
-								configuredTransport: transport,
-								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
-								eventsEmitted: websocketStarted,
-								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-							}),
+							createAssistantMessageDiagnostic(
+								"provider_transport_failure",
+								error,
+								{
+									configuredTransport: transport,
+									...(websocketStarted ? {} : { fallbackTransport: "sse" }),
+									eventsEmitted: websocketStarted,
+									phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
+									requestBytes: new TextEncoder().encode(bodyJson).byteLength,
+								},
+								diagnosticSecrets,
+							),
 						);
-						recordWebSocketFailure(cacheSessionId, error);
+						recordWebSocketFailure(cacheSessionId, error, diagnosticSecrets);
 						if (websocketStarted) {
 							throw error;
 						}
@@ -446,7 +453,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					if (info.friendlyMessage) throw new Error(info.friendlyMessage);
+					// Keep the message for the retry checks below; status and raw body go to formatProviderError.
+					throw Object.assign(new Error(info.message), { status: response.status, body: errorText });
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -496,7 +505,13 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			// HTTP errors carry `status` and `body` (see above), so they read `<provider> API error (<status>): <body>`
+			// like the other Responses providers; errors without a status keep their message unchanged. The body and
+			// message are redacted with the request's diagnostic secrets by normalizeProviderError.
+			output.errorMessage = formatProviderError(
+				normalizeProviderError(error, diagnosticSecrets),
+				`${model.provider} API error`,
+			);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -1016,13 +1031,13 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
+function recordWebSocketFailure(sessionId: string | undefined, error: unknown, secrets: readonly string[]): void {
 	if (!sessionId) return;
 	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	stats.lastWebSocketError = formatThrownValue(error);
+	stats.lastWebSocketError = redactOAuthDiagnostic(formatThrownValue(error), secrets);
 	stats.websocketFallbackActive = true;
 }
 

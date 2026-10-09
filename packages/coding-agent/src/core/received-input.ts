@@ -1,5 +1,5 @@
 import type { ImageContent } from "@earendil-works/pi-ai";
-import type { AgentSession, PromptOptions } from "./agent-session.ts";
+import type { AgentSession, PromptOptions, QueuedInputDisposition } from "./agent-session.ts";
 import type { InputSource } from "./extensions/types.ts";
 import { captureTerminalTurnReceipt, receiptRecord, type TurnReceipt } from "./turn-receipts.ts";
 
@@ -12,8 +12,8 @@ export interface ReceivedInput {
 const receipts = new WeakMap<ReceivedInput, TurnReceipt>();
 interface ReceivedInputActions {
 	prompt(input: ReceivedInput, options?: PromptOptions): Promise<void>;
-	steer(input: ReceivedInput, source?: InputSource): Promise<void>;
-	followUp(input: ReceivedInput, source?: InputSource): Promise<void>;
+	steer(input: ReceivedInput, source?: InputSource): Promise<QueuedInputDisposition>;
+	followUp(input: ReceivedInput, source?: InputSource): Promise<QueuedInputDisposition>;
 }
 const sessions = new WeakMap<AgentSession, ReceivedInputActions>();
 
@@ -45,14 +45,22 @@ export function promptReceived(session: AgentSession, input: ReceivedInput, opti
 	return actions.prompt(input, options);
 }
 
-export function steerReceived(session: AgentSession, input: ReceivedInput, source?: InputSource): Promise<void> {
+export function steerReceived(
+	session: AgentSession,
+	input: ReceivedInput,
+	source?: InputSource,
+): Promise<QueuedInputDisposition> {
 	getInputReceipt(input);
 	const actions = sessions.get(session);
 	if (!actions) throw new Error("Received input session is not bound");
 	return actions.steer(input, source);
 }
 
-export function followUpReceived(session: AgentSession, input: ReceivedInput, source?: InputSource): Promise<void> {
+export function followUpReceived(
+	session: AgentSession,
+	input: ReceivedInput,
+	source?: InputSource,
+): Promise<QueuedInputDisposition> {
 	getInputReceipt(input);
 	const actions = sessions.get(session);
 	if (!actions) throw new Error("Received input session is not bound");

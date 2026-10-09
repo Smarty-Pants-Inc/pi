@@ -7,9 +7,10 @@
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
-import type { SessionStats } from "../../core/agent-session.ts";
+import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { HostCapabilities } from "../../core/host-capabilities.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 
@@ -108,6 +109,11 @@ export interface RpcSlashCommand {
 // ============================================================================
 
 export interface RpcSessionState {
+	capabilities: HostCapabilities;
+	inputAdmissionCount: number;
+	inputsFenced: boolean;
+	isIdle: boolean;
+	isPromptPending: boolean;
 	model?: Model<any>;
 	thinkingLevel: ThinkingLevel;
 	isStreaming: boolean;
@@ -122,6 +128,16 @@ export interface RpcSessionState {
 	readonly autoCompactionDisabledForProcess: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+}
+
+/** Terminal receipt for previously acknowledged queued input that shutdown could not deliver. */
+export interface RpcInputRejectedEvent {
+	type: "input_rejected";
+	reason: "shutdown";
+	sessionId: string;
+	error: string;
+	/** Complete original queued messages, including image attachments. No implicit replay. */
+	messages: AgentMessage[];
 }
 
 // ============================================================================
@@ -140,10 +156,16 @@ export type RpcFatalErrorResponse = {
 
 // Success responses with data
 export type RpcResponse =
-	// Prompting (async - events follow)
-	| { id?: string; type: "response"; command: "prompt"; success: true }
-	| { id?: string; type: "response"; command: "steer"; success: true }
-	| { id?: string; type: "response"; command: "follow_up"; success: true }
+	// Prompting
+	| { id?: string; type: "response"; command: "prompt"; success: true; data: { disposition: PromptDisposition } }
+	| { id?: string; type: "response"; command: "steer"; success: true; data: { disposition: QueuedInputDisposition } }
+	| {
+			id?: string;
+			type: "response";
+			command: "follow_up";
+			success: true;
+			data: { disposition: QueuedInputDisposition };
+	  }
 	| { id?: string; type: "response"; command: "abort"; success: true }
 	| {
 			id?: string;
