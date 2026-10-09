@@ -13,7 +13,13 @@ import {
 	parseWwwAuthenticate,
 	selectResource,
 } from "./discovery.ts";
-import { credentialFetch, loopback, secureEndpoint, validateOAuthEndpointOrigins } from "./endpoints.ts";
+import {
+	credentialFetch,
+	loopback,
+	secureEndpoint,
+	validateOAuthEndpointOrigins,
+	validateOAuthServerMetadata,
+} from "./endpoints.ts";
 import {
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
@@ -187,7 +193,7 @@ export async function startAuthorization(
 	refuseMcpAdmission();
 	const metadata = options.metadata;
 	// pi#173: every exported operation binds its endpoints to the issuer origin itself, not only authorizeMcp.
-	validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
+	validateOAuthServerMetadata(authorizationServerUrl, metadata, options.allowedEndpointOrigins);
 	if (metadata && !metadata.response_types_supported.includes("code")) {
 		throw new Error("Authorization server does not support authorization codes");
 	}
@@ -214,7 +220,7 @@ async function tokenRequest(
 	params: URLSearchParams,
 ): Promise<OAuthTokens> {
 	refuseMcpAdmission();
-	validateOAuthEndpointOrigins(options.metadata, options.allowedEndpointOrigins);
+	validateOAuthServerMetadata(authorizationServerUrl, options.metadata, options.allowedEndpointOrigins);
 	const url = secureEndpoint(options.metadata?.token_endpoint ?? new URL("/token", authorizationServerUrl));
 	const headers = new Headers({ Accept: "application/json", "content-type": "application/x-www-form-urlencoded" });
 	if (options.resource) params.set("resource", options.resource);
@@ -267,7 +273,7 @@ export async function registerClient(
 	},
 ): Promise<OAuthClientInformationFull> {
 	refuseMcpAdmission();
-	validateOAuthEndpointOrigins(options.metadata, options.allowedEndpointOrigins);
+	validateOAuthServerMetadata(authorizationServerUrl, options.metadata, options.allowedEndpointOrigins);
 	const endpoint = options.metadata?.registration_endpoint;
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
@@ -370,6 +376,9 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		});
 	}
 	const metadata = discovered.authorizationServerMetadata;
+	// The exported operations bind the issuer to this URL (smarty-dev#7638). With skipIssuerValidation the caller
+	// accepted a different issuer at discovery, so the operations are bound to that issuer instead.
+	const serverUrl = options.skipIssuerValidation && metadata ? metadata.issuer : discovered.authorizationServerUrl;
 	const resource = selectResource(options.serverUrl, discovered.resourceMetadata);
 	// `||`, not `??`: an empty scope (for example from `scopes_supported: []`) falls through to the next source.
 	const scope =
@@ -384,7 +393,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 	if (!client) {
 		if (options.authorizationCode) throw new Error("OAuth client information is missing during code exchange");
 		if (!provider.saveClientInformation) throw new Error("OAuth client information cannot be persisted");
-		client = await registerClient(discovered.authorizationServerUrl, {
+		client = await registerClient(serverUrl, {
 			metadata,
 			clientMetadata: provider.clientMetadata,
 			scope,
@@ -411,7 +420,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		if (metadata && (iss !== undefined || metadata.authorization_response_iss_parameter_supported)) {
 			if (iss !== metadata.issuer) throw new OAuthIssuerMismatchError(metadata.issuer, iss);
 		}
-		const tokens = await exchangeAuthorizationCode(discovered.authorizationServerUrl, {
+		const tokens = await exchangeAuthorizationCode(serverUrl, {
 			...tokenOptions,
 			code: options.authorizationCode,
 			codeVerifier: await provider.codeVerifier(),
@@ -425,7 +434,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 	const existing = options.skipRefresh ? undefined : await provider.tokens();
 	if (existing?.refresh_token) {
 		try {
-			const tokens = await refreshAuthorization(discovered.authorizationServerUrl, {
+			const tokens = await refreshAuthorization(serverUrl, {
 				...tokenOptions,
 				refreshToken: existing.refresh_token,
 			});
@@ -443,7 +452,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		}
 	}
 	const state = await provider.state?.();
-	const authorization = await startAuthorization(discovered.authorizationServerUrl, {
+	const authorization = await startAuthorization(serverUrl, {
 		metadata,
 		clientInformation: client,
 		redirectUrl,

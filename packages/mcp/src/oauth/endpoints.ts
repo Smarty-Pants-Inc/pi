@@ -1,5 +1,10 @@
 import type { McpFetch } from "../auth-provider.ts";
-import { OAuthEndpointOriginError, OAuthInsecureEndpointError, OAuthRedirectRefusedError } from "./errors.ts";
+import {
+	OAuthEndpointOriginError,
+	OAuthInsecureEndpointError,
+	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
+} from "./errors.ts";
 import type { AuthorizationServerMetadata } from "./types.ts";
 
 export function loopback(hostname: string): boolean {
@@ -113,4 +118,23 @@ export function validateOAuthEndpointOrigins(
 		if (origin !== issuer && !allowed.has(origin))
 			throw new OAuthEndpointOriginError(field, endpoint, metadata.issuer);
 	}
+}
+
+/**
+ * For the exported token operations, which take metadata from their caller: besides the endpoint origins, bind the
+ * metadata's issuer to the authorization server the caller names (smarty-dev#7638). Metadata whose issuer and endpoints
+ * are both on another origin is refused before any request, unless that origin is in `allowedEndpointOrigins`.
+ */
+export function validateOAuthServerMetadata(
+	authorizationServerUrl: string | URL,
+	metadata: AuthorizationServerMetadata | undefined,
+	allowedEndpointOrigins: readonly string[] = [],
+): void {
+	validateOAuthEndpointOrigins(metadata, allowedEndpointOrigins);
+	if (!metadata) return;
+	const expected = secureEndpoint(authorizationServerUrl).origin;
+	const issuer = new URL(metadata.issuer).origin;
+	if (issuer === expected) return;
+	if (allowedEndpointOrigins.some((value) => URL.canParse(value) && new URL(value).origin === issuer)) return;
+	throw new OAuthIssuerMismatchError(expected, metadata.issuer);
 }
