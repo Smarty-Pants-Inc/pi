@@ -1717,6 +1717,7 @@ describe("TuiAltScreen", () => {
 
 		tui.flash("First", 80);
 		tui.flash("Second", 500);
+		tui.renderNow(); // smarty-dev#7403: show the 80 ms flash before the next capped frame.
 		await terminal.waitForRender();
 		let viewport = terminal.getViewport();
 		assert.ok(viewport[0]?.endsWith(" First "));
