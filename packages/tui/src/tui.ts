@@ -927,6 +927,8 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		this.queryCellSize();
 		this.requestRender();
+		// stop() cancels the timer but retains pending requests; resume their latest state.
+		this.scheduleRender();
 	}
 
 	addInputListener(listener: TuiInputListener): () => void {
