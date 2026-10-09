@@ -13,6 +13,7 @@ import {
 	parseWwwAuthenticate,
 	selectResource,
 } from "./discovery.ts";
+import { loopback, secureEndpoint, validateOAuthEndpoints } from "./endpoints.ts";
 import {
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
@@ -103,10 +104,6 @@ export interface TokenRequestOptions {
 	signal?: AbortSignal;
 }
 
-function loopback(hostname: string): boolean {
-	return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
-}
-
 /**
  * The OpenID Connect `application_type` for `redirect_uris` (MCP SEP-837). Without one, OpenID Connect servers
  * assume `web`, which rejects http loopback redirect URIs. Loopback hosts and custom schemes are native (RFC 8252).
@@ -118,12 +115,6 @@ function applicationType(redirectUris: readonly string[]): "native" | "web" {
 		return (url.protocol !== "http:" && url.protocol !== "https:") || loopback(url.hostname);
 	});
 	return native ? "native" : "web";
-}
-
-function secureEndpoint(value: string | URL): URL {
-	const url = new URL(value);
-	if (url.protocol !== "https:" && !loopback(url.hostname)) throw new OAuthInsecureEndpointError(url.href);
-	return url;
 }
 
 function selectClientAuthMethod(information: OAuthClientInformationMixed, supported: string[]): ClientAuthMethod {
@@ -181,13 +172,14 @@ export async function startAuthorization(
 ): Promise<{ authorizationUrl: URL; codeVerifier: string }> {
 	refuseMcpAdmission();
 	const metadata = options.metadata;
+	validateOAuthEndpoints(metadata);
 	if (metadata && !metadata.response_types_supported.includes("code")) {
 		throw new Error("Authorization server does not support authorization codes");
 	}
 	if (metadata?.code_challenge_methods_supported && !metadata.code_challenge_methods_supported.includes("S256")) {
 		throw new Error("Authorization server does not support PKCE S256");
 	}
-	const url = new URL(metadata?.authorization_endpoint ?? new URL("/authorize", authorizationServerUrl));
+	const url = secureEndpoint(metadata?.authorization_endpoint ?? new URL("/authorize", authorizationServerUrl));
 	const { verifier, challenge } = await pkce();
 	url.searchParams.set("response_type", "code");
 	url.searchParams.set("client_id", options.clientInformation.client_id);
@@ -207,6 +199,7 @@ async function tokenRequest(
 	params: URLSearchParams,
 ): Promise<OAuthTokens> {
 	refuseMcpAdmission();
+	validateOAuthEndpoints(options.metadata);
 	const url = secureEndpoint(options.metadata?.token_endpoint ?? new URL("/token", authorizationServerUrl));
 	const headers = new Headers({ Accept: "application/json", "content-type": "application/x-www-form-urlencoded" });
 	if (options.resource) params.set("resource", options.resource);
@@ -257,11 +250,12 @@ export async function registerClient(
 	},
 ): Promise<OAuthClientInformationFull> {
 	refuseMcpAdmission();
+	validateOAuthEndpoints(options.metadata);
 	const endpoint = options.metadata?.registration_endpoint;
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
 	const response = await (options.fetch ?? globalThis.fetch)(
-		new URL(endpoint ?? new URL("/register", authorizationServerUrl)),
+		secureEndpoint(endpoint ?? new URL("/register", authorizationServerUrl)),
 		{
 			method: "POST",
 			headers: { Accept: "application/json", "content-type": "application/json" },
@@ -346,6 +340,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 				skipIssuerValidation: options.skipIssuerValidation,
 				signal: options.signal,
 			});
+	secureEndpoint(discovered.authorizationServerUrl);
+	validateOAuthEndpoints(discovered.authorizationServerMetadata);
 	if (!metadataUrl) {
 		await provider.saveDiscoveryState?.({
 			...discovered,

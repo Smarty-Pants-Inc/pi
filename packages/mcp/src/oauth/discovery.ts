@@ -7,7 +7,8 @@
 import type { McpFetch } from "../auth-provider.ts";
 import { LATEST_PROTOCOL_VERSION } from "../protocol/types.ts";
 import { refuseMcpAdmission } from "../security-admission.ts";
-import { OAuthIssuerMismatchError } from "./errors.ts";
+import { secureEndpoint } from "./endpoints.ts";
+import { OAuthInsecureEndpointError, OAuthIssuerMismatchError } from "./errors.ts";
 import {
 	type AuthorizationServerMetadata,
 	type OAuthChallenge,
@@ -62,7 +63,7 @@ async function fetchMetadata(
 	protocolVersion: string,
 	signal: AbortSignal | undefined,
 ): Promise<Response> {
-	return fetch(url, {
+	return fetch(secureEndpoint(url), {
 		headers: { Accept: "application/json", "MCP-Protocol-Version": protocolVersion },
 		signal,
 	});
@@ -108,7 +109,7 @@ export async function discoverProtectedResourceMetadata(
 export function buildAuthorizationServerDiscoveryUrls(
 	authorizationServerUrl: string | URL,
 ): { url: URL; type: "oauth" | "oidc" }[] {
-	const issuer = new URL(authorizationServerUrl);
+	const issuer = secureEndpoint(authorizationServerUrl);
 	const path = pathSuffix(issuer.pathname);
 	const urls: { url: URL; type: "oauth" | "oidc" }[] = [
 		{ url: new URL(`/.well-known/oauth-authorization-server${path}`, issuer.origin), type: "oauth" },
@@ -168,7 +169,7 @@ export async function discoverOAuthServerInfo(
 			signal: options.signal,
 		});
 	} catch (error) {
-		if (error instanceof TypeError) throw error;
+		if (error instanceof TypeError || error instanceof OAuthInsecureEndpointError) throw error;
 	}
 	if (options.authorizationServerMetadataUrl) {
 		const url = options.authorizationServerMetadataUrl;
