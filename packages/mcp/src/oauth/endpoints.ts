@@ -96,15 +96,17 @@ export function validateOAuthEndpointOrigins(
 	metadata: AuthorizationServerMetadata | undefined,
 	allowedEndpointOrigins: readonly string[] = [],
 ): void {
-	if (!metadata) return;
-	validateOAuthEndpoints(metadata);
 	const allowed = new Set(
 		allowedEndpointOrigins.map((value) => {
-			const origin = URL.canParse(value) ? new URL(value).origin : "null";
-			if (origin === "null") throw new TypeError(`Invalid allowedEndpointOrigins entry ${JSON.stringify(value)}`);
-			return origin;
+			// Check the input before URL normalization can erase userinfo, paths, or empty query/fragment markers.
+			if (value !== value.trim() || !/^https?:\/\/[^/?#@\\\s]+\/?$/i.test(value) || !URL.canParse(value)) {
+				throw new TypeError(`Invalid allowedEndpointOrigins entry ${JSON.stringify(value)}`);
+			}
+			return secureEndpoint(value).origin;
 		}),
 	);
+	if (!metadata) return;
+	validateOAuthEndpoints(metadata);
 	const issuer = new URL(metadata.issuer).origin;
 	for (const field of [
 		"authorization_endpoint",
