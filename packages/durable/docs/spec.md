@@ -1766,7 +1766,9 @@ commits around one effect, but each durable checkpoint is a full replacement.
 `TaskRuntime.commit()` rereads and gates the current durable task on the Session
 line before invoking its callback. It rejects when the invocation has ended, the
 Harness is closing, the task is terminal, or a run invocation's task carries an
-abort mark. Its `tx.createTask()` defaults to the task's conversation, and every
+abort mark. No handler commit passes an abort mark; the only write under one is
+the scheduler's internal live partial write of a generation (section 8.3).
+Its `tx.createTask()` defaults to the task's conversation, and every
 entry it appends records the task as `byTaskId`. When the
 callback returns a state, the runtime replaces the task's state in the same
 commit, so the checkpoint or outcome is atomic with the callback's entries,
@@ -3532,8 +3534,18 @@ The run's inputs live in `pi.live.run`, not in the task input.
 - `afterResponse` observes every terminal message, from `request` or `poll`,
   before classification; a still deferred result is not terminal.
 - Before classifying, the handler stops the partial throttle and awaits any
-  partial commit in flight, so no stale partial lands after the outcome. The
-  terminal message is classified in one commit that also clears the partial:
+  partial commit in flight, so no stale partial lands after the outcome. Unless
+  the stream completed normally without an abort, it then commits a pending
+  partial with answer output. After an abort mark, that commit, or a retry of a
+  regular one the mark rejected, takes the scheduler's internal live partial
+  write: the one write that passes the mark. It is not part of `TaskRuntime` or
+  the package exports, is refused for any task other than a run invocation of a
+  `pi.generation` that owns `pi.live.run`, writes only
+  `pi.live.generation.message` with an assistant message, and never changes
+  the task's state. The abort handler then converts the partial. Every error
+  entry below whose terminal message dropped the answer output of the committed
+  answer-bearing partial takes that partial's content. The terminal message is
+  classified in one commit that also clears the partial:
   - `stop`/`length`: before the commit, the `onYield` chain runs; the first
     `{ continue }` wins. The commit appends the answer and applies the final
     boundary (section 6). With a continuation and no selected user item or

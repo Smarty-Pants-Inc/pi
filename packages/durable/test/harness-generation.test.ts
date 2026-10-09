@@ -278,6 +278,41 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#7480: a short stream errors inside the partial interval and its terminal message drops the answer
+	// output; the final entry keeps what the stream showed, without a resend.
+	it.each([
+		{ name: "answer text", block: { type: "text" as const, text: "visible answer" } },
+		{ name: "tool call", block: fauxToolCall("t", { x: 1 }) },
+	])("keeps streamed $name in the final entry when the terminal error drops it", async ({ block }) => {
+		const base = chatSetup();
+		const setup = rewriteTerminalError(base, (error) => ({
+			...error,
+			content: error.content.filter((content) => content.type === "thinking"),
+		}));
+		const thinking = { type: "thinking" as const, thinking: "planning" };
+		base.faux.setResponses([
+			fauxAssistantMessage([thinking, block], { stopReason: "error", errorMessage: PREMATURE_CLOSE }),
+			fauxAssistantMessage("must not replay"),
+		]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error" });
+		expect(base.faux.state.callCount).toBe(1);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({
+			stopReason: "error",
+			errorMessage: PREMATURE_CLOSE,
+			content: [thinking, block],
+		});
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
 	// smarty-dev#6730: reasoning-only stream, terminal message without content but with output tokens.
 	it("retries a reasoning-only premature close whose terminal message dropped its content", async () => {
 		const base = chatSetup();
@@ -452,6 +487,267 @@ describe("generation", () => {
 		expect(textOf(converted)!.startsWith(textOf(partial as Message)!)).toBe(true);
 		expect(await live(harness, root)).toEqual({});
 		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		await harness.close(context);
+	});
+
+	// smarty-dev#7428: a task abort inside the partial interval must not lose the answer output streamed so far.
+	it("converts the uncommitted answer partial of a stream aborted within the partial interval", async () => {
+		const base = chatSetup();
+		const text = { type: "text" as const, text: "short answer" };
+		const streamed = Promise.withResolvers<void>();
+		let calls = 0;
+		const setup = {
+			...base,
+			models: withStream(base.models, (_model, _request, options) => {
+				calls++;
+				const signal = options!.signal!;
+				const events = async function* () {
+					const partial = fauxAssistantMessage([text], { stopReason: "pending" });
+					yield { type: "text_delta", contentIndex: 0, delta: text.text, partial };
+					streamed.resolve();
+					if (!signal.aborted) await new Promise((resolve) => signal.addEventListener("abort", resolve));
+				};
+				// The terminal message of an aborted stream may drop what it showed.
+				const final = fauxAssistantMessage([], { stopReason: "aborted", errorMessage: "aborted" });
+				return { [Symbol.asyncIterator]: events, result: async () => final } as unknown as ReturnType<
+					Models["streamSimple"]
+				>;
+			}),
+		};
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		await streamed.promise;
+		expect((await live(harness, root))?.generation?.message).toBeUndefined();
+		expect(await harness.abortTask(taskId, context)).toBe("marked");
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		expect(calls).toBe(1);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "aborted", content: [text] });
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
+	// smarty-dev#7428 (pi#174 review): the abort mark lands after the finalizer checked the signal, so its regular commit
+	// of the partial is rejected; the finalizer retries it once under the mark and the abort handler converts it.
+	it("converts the answer partial when the abort mark lands between the finalizer's check and its commit", async () => {
+		const base = chatSetup();
+		const text = { type: "text" as const, text: "raced answer" };
+		const release = Promise.withResolvers<void>();
+		const streamed = Promise.withResolvers<void>();
+		let abortOnResult: (() => Promise<unknown>) | undefined;
+		let aborting: Promise<unknown> | undefined;
+		let signalledAtResult: boolean | undefined;
+		let calls = 0;
+		const setup = {
+			...base,
+			models: withStream(base.models, (_model, _request, options) => {
+				calls++;
+				const events = async function* () {
+					const partial = fauxAssistantMessage([text], { stopReason: "pending" });
+					yield { type: "text_delta", contentIndex: 0, delta: text.text, partial };
+					streamed.resolve();
+					await release.promise;
+				};
+				// The stream ends with an error that drops the answer; the mark is requested as the stream ends, so it lands
+				// after the finalizer found the signal clear.
+				const final = fauxAssistantMessage([], { stopReason: "error", errorMessage: PREMATURE_CLOSE });
+				const result = async () => {
+					signalledAtResult = options!.signal!.aborted;
+					aborting = abortOnResult!();
+					return final;
+				};
+				return { [Symbol.asyncIterator]: events, result } as unknown as ReturnType<Models["streamSimple"]>;
+			}),
+		};
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		await streamed.promise;
+		abortOnResult = () => harness.abortTask(taskId, context);
+		release.resolve();
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect(await aborting).toBe("marked");
+		expect(signalledAtResult).toBe(false);
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		expect(calls).toBe(1);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "aborted", content: [text] });
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
+	// pi#174 (security review): a short answer completes normally before the partial throttle fires, so its answer is
+	// only in the pending partial. The abort mark commits after the finalizer's signal check and before the
+	// classification commit, which it rejects; the pending partial is committed under the mark and converted.
+	it("converts the answer of a normal completion whose classification commit an abort mark rejected", async () => {
+		const setup = chatSetup();
+		setup.faux.setResponses([fauxAssistantMessage("short answer")]);
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		let harnessRef: Harness | undefined;
+		let aborting: Promise<unknown> | undefined;
+		let signalledAtHook: boolean | undefined;
+		let partialAtHook: unknown;
+		addHooks(setup.registry, GenerationTask, {
+			// Runs after the finalizer's signal check and before the classification commit.
+			afterResponse: async (_message, api) => {
+				const signal = (api as unknown as { readonly signal: AbortSignal }).signal;
+				signalledAtHook = signal.aborted;
+				partialAtHook = (await harnessRef!.snapshot(LiveDoc, api.conversationId, context))?.generation?.message;
+				// The mark commits and signals the run before the hook returns, so it precedes the classification commit.
+				aborting = harnessRef!.abortTask(api.taskId, context);
+				if (!signal.aborted) {
+					await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+				}
+			},
+		});
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harnessRef = harness;
+		const values = livePublications(harness);
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect(await aborting).toBe("marked");
+		expect(signalledAtHook).toBe(false);
+		expect(partialAtHook).toBeUndefined();
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		const converted = entries[1]!.model![0] as AssistantMessage;
+		expect(converted.stopReason).toBe("aborted");
+		expect(textOf(converted)).toBe("short answer");
+		// Exactly one partial commit: the one under the mark.
+		expect(values.filter((value) => value.generation?.message !== undefined)).toHaveLength(1);
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
+	// pi#174: without an abort, a normal completion inside the partial interval commits no partial; the classification
+	// commit records the answer.
+	it("commits no partial for a normal completion within the partial interval", async () => {
+		const setup = chatSetup();
+		setup.faux.setResponses([fauxAssistantMessage("short answer")]);
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		const values = livePublications(harness);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled.status).toBe("done");
+		expect(values.length).toBeGreaterThan(0);
+		expect(values.filter((value) => value.generation?.message !== undefined)).toEqual([]);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "stop" });
+		expect(textOf(entries[1]!.model![0])).toBe("short answer");
+		await harness.close(context);
+	});
+
+	// smarty-dev#7428 (pi#174): the abort-mark writer is private to the scheduler's request phase dispatch. A hook holds
+	// the real runtime, yet no function reachable from it, nor the generation's own phase, writes under the mark.
+	it("lets no afterResponse hook write under the abort mark through any reachable function", async () => {
+		const setup = chatSetup();
+		setup.faux.setResponses([fauxAssistantMessage("answer")]);
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const planted = fauxAssistantMessage("planted", { stopReason: "pending" });
+		const outcomes: Record<string, string> = {};
+		let harnessRef: Harness | undefined;
+		let aborting: Promise<unknown> | undefined;
+		addHooks(setup.registry, GenerationTask, {
+			afterResponse: async (_message, api) => {
+				const runtime = api as unknown as Record<string, unknown> & { readonly signal: AbortSignal };
+				aborting = harnessRef!.abortTask(api.taskId, context);
+				if (!runtime.signal.aborted) {
+					await new Promise((resolve) => runtime.signal.addEventListener("abort", resolve, { once: true }));
+				}
+				const write = async (tx: {
+					doc: (doc: typeof LiveDoc, id: typeof api.conversationId) => Promise<LiveState>;
+				}) => {
+					const state = await tx.doc(LiveDoc, api.conversationId);
+					state.generation = { attempt: 1, message: planted } as LiveState["generation"];
+					return undefined;
+				};
+				// The test's uncancelled context, not the hook's signalled one, so only the abort mark can refuse.
+				const ctx = context;
+				const attempt = async (name: string, call: () => unknown) => {
+					try {
+						const result = call();
+						const timeout = new Promise((resolve) => setTimeout(() => resolve("timeout"), 20));
+						await Promise.race([result, timeout]);
+						outcomes[name] = "resolved";
+					} catch (error) {
+						outcomes[name] = (error as Error).message;
+					}
+				};
+				await attempt("commit", () => (runtime.commit as (...args: unknown[]) => unknown)(write, ctx));
+				await attempt("memo", () => api.memo("planted", planted as never, ctx));
+				// Every other function on the runtime, its hook runner, and its registry snapshot, called with a writer.
+				const holders: [string, Record<string, unknown>][] = [
+					["runtime", runtime],
+					["hooks", runtime.hooks as Record<string, unknown>],
+				];
+				for (const [prefix, holder] of holders) {
+					for (const key of Object.keys(holder)) {
+						if (prefix === "runtime" && (key === "commit" || key === "memo")) continue;
+						const value = holder[key];
+						if (typeof value !== "function") continue;
+						await attempt(`${prefix}.${key}`, () => (value as (...args: unknown[]) => unknown)(write, ctx));
+					}
+				}
+				// The generation's own request phase, run with the hook's runtime: it gets no writer from a caller.
+				const definition = (runtime.registry as RegistrySnapshot).task("pi.generation")!.definition;
+				expect(definition).toBe(GenerationTask.definition);
+				const fakeTask = {
+					state: {
+						checkpoint: {
+							phase: "request",
+							attempt: 1,
+							model: { provider: "faux", modelId: "faux-1" },
+							thinkingLevel: "off",
+							streamOptions: {},
+							cutoff: "missing",
+						},
+					},
+				};
+				const request = definition.phases.request as (...args: unknown[]) => Promise<void>;
+				await attempt("phases.request", () => request(fakeTask, runtime, ctx));
+				// The phase cannot be replaced to capture the writer the scheduler passes it.
+				await attempt("replace request", () => {
+					(definition.phases as Record<string, unknown>).request = async () => {};
+				});
+			},
+		});
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harnessRef = harness;
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		const mark = `Task ${taskId} has a durable abort mark`;
+		expect(await aborting).toBe("marked");
+		expect(outcomes.commit).toBe(mark);
+		expect(outcomes.memo).toBe(mark);
+		expect(outcomes["phases.request"]).toBe(mark);
+		expect(outcomes["replace request"]).toMatch(/read only|read-only|Cannot assign/);
+		expect(Object.keys(outcomes).length).toBeGreaterThan(10);
+		// Nothing planted reached the live document or the transcript. The mark rejected the classification commit of the
+		// normally completed answer, so the generation's own answer partial is converted (pi#174).
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "aborted" });
+		expect(textOf(entries[1]!.model![0])).toBe("answer");
+		expect(await live(harness, root)).toEqual({});
 		await harness.close(context);
 	});
 
