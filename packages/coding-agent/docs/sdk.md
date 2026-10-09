@@ -67,6 +67,19 @@ A prompt sent while the session is already streaming must specify whether it sho
 
 A steering message enters after the current assistant turn and its tool calls. A follow-up enters after the current run finishes its pending work. `steer()` and `followUp()` expose those behaviors directly and return `"queued"` if the input was queued (including after an extension transformed it), or `"handled"` if an extension consumed it.
 
+`sendUserMessage(content, { metadata })` uses the same input handlers, compaction checks, `before_agent_start`, and image normalization as an ordinary prompt. Metadata must be a plain JSON object. Pi copies and deeply freezes it before asynchronous dispatch, keeps each queued input separate, and stores it as `SessionMessageEntry.metadata`, outside model-visible messages.
+
+```typescript
+const receipt = await session.sendUserMessage("Continue", {
+  metadata: { source: "scheduler", inputId: "wake-42" },
+  deliverAs: "followUp",
+});
+// { status: "turnStarted", entryId: "...", metadata: { ... } }
+// or { status: "handled", entryId: null, metadata: { ... } }
+```
+
+The metadata overload resolves exactly once when the user entry is persisted or an input handler consumes the input. It does not wait for the assistant response. A handled input creates no user entry. Calls without metadata keep their existing `Promise<void>` behavior. A receipt for queued input stays pending until delivery; do not await it inside a handler that must return before delivery can proceed. Invalid metadata or failed admission rejects the promise. Clearing an undelivered queue rejects its pending receipt.
+
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
 ## Subscribing to events

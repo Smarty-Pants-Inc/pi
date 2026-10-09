@@ -55,6 +55,7 @@ import {
 import { bindSessionTurnAppender } from "./session-turn-appender.ts";
 import type { TurnProvenance } from "./turn-provenance.ts";
 import { receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
+import type { UserMessageMetadata } from "./user-message-metadata.ts";
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
 const RECENT_RESIDENT_ENTRIES = 100;
@@ -63,7 +64,11 @@ export const CURRENT_SESSION_VERSION = 3;
 
 const ownedTerminalPersistence = new WeakMap<SessionManager, () => Promise<void>>();
 type OwnedTerminalAppender = {
-	appendMessage(message: Message | CustomMessage | BashExecutionMessage, receipt?: TurnReceipt): Promise<string>;
+	appendMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		receipt?: TurnReceipt,
+		metadata?: UserMessageMetadata,
+	): Promise<string>;
 	appendCustomMessage<T = unknown>(
 		customType: string,
 		content: string | (TextContent | ImageContent)[],
@@ -87,10 +92,11 @@ export function appendOwnedTerminalMessage(
 	manager: SessionManager,
 	message: Message | CustomMessage | BashExecutionMessage,
 	receipt?: TurnReceipt,
+	metadata?: UserMessageMetadata,
 ): Promise<string> {
 	const append = ownedTerminalAppenders.get(manager)?.appendMessage;
 	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(message, receipt);
+	return append(message, receipt, metadata);
 }
 
 /** Private captured route used only by the original owner's terminal callbacks. */
@@ -139,6 +145,8 @@ export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
 	provenance?: TurnProvenance;
+	/** Opaque per-input metadata from sendUserMessage; excluded from model context. */
+	readonly metadata?: UserMessageMetadata;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -1108,14 +1116,14 @@ export class SessionManager {
 		this.persist = persist;
 		this.#ownedJournal = ownedJournal;
 		bindSessionTurnAppender(this, {
-			appendMessage: (message, receipt) => this.#appendReceivedMessage(message, receipt),
+			appendMessage: (message, receipt, metadata) => this.#appendReceivedMessage(message, receipt, metadata),
 			appendCustomMessage: (customType, content, display, details, receipt) =>
 				this.#appendReceivedCustomMessage(customType, content, display, details, receipt),
 		});
 		if (ownedJournal) {
 			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
 			ownedTerminalAppenders.set(this, {
-				appendMessage: (message, receipt) => this.#appendMessageOwnedTerminal(message, receipt),
+				appendMessage: (message, receipt, metadata) => this.#appendMessageOwnedTerminal(message, receipt, metadata),
 				appendCustomMessage: (customType, content, display, details, receipt) =>
 					this.#appendCustomMessageOwnedTerminal(customType, content, display, details, receipt),
 				appendCustomEntry: (type, data) => this.#appendCustomEntryOwnedTerminal(type, data),
@@ -1463,12 +1471,13 @@ export class SessionManager {
 	#appendMessageOwnedTerminal(
 		message: Message | CustomMessage | BashExecutionMessage,
 		receipt?: TurnReceipt,
+		metadata?: UserMessageMetadata,
 	): Promise<string> {
 		if (this.#terminalIndexFailure)
 			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		if (!isOwnedTerminalWrite(this.#ownedJournal))
-			return Promise.resolve(this.#appendReceivedMessage(message, receipt));
+			return Promise.resolve(this.#appendReceivedMessage(message, receipt, metadata));
 		const provenance = message.role === "user" || message.role === "custom" ? receiptRecord(receipt) : undefined;
 		return this.#enqueueOwnedTerminal(async () => {
 			const entry: SessionMessageEntry = {
@@ -1478,6 +1487,7 @@ export class SessionManager {
 				timestamp: new Date().toISOString(),
 				message,
 				...(provenance ? { provenance } : {}),
+				...(message.role === "user" && metadata !== undefined ? { metadata } : {}),
 			};
 			await this.#appendEntryOwnedTerminal(entry);
 			return entry.id;
@@ -1623,7 +1633,11 @@ export class SessionManager {
 		return this.#appendReceivedMessage(message);
 	}
 
-	#appendReceivedMessage(message: Message | CustomMessage | BashExecutionMessage, receipt?: TurnReceipt): string {
+	#appendReceivedMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		receipt?: TurnReceipt,
+		metadata?: UserMessageMetadata,
+	): string {
 		const provenance = message.role === "user" || message.role === "custom" ? receiptRecord(receipt) : undefined;
 		const entry: SessionMessageEntry = {
 			type: "message",
@@ -1632,6 +1646,7 @@ export class SessionManager {
 			timestamp: new Date().toISOString(),
 			message,
 			...(provenance ? { provenance } : {}),
+			...(message.role === "user" && metadata !== undefined ? { metadata } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;

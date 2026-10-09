@@ -87,6 +87,8 @@ Its `outcome` is `aborted` when the run was cancelled: by a user abort (also dur
 | Add terminal rendering | Renderer registration and `ctx.ui` |
 | Communicate with another extension | `pi.events` |
 
+`pi.sendUserMessage(content, { metadata })` returns a promise for one admission receipt: `{ status: "turnStarted", entryId, metadata }` after the user entry is persisted, or `{ status: "handled", entryId: null, metadata }` when an input handler consumes it. Metadata is a plain JSON object, copied and deeply frozen before preflight and preserved per queued input. It is stored on the session entry, never in model content. Calls without metadata remain fire-and-forget. Do not await a queued receipt from an event handler whose return is required for delivery; attach a `.then()` handler instead. See [SDK prompting](sdk.md#prompting).
+
 Use the exported declarations in [`extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) for exact event, context, tool, and result types.
 
 ## Follow the extension contracts

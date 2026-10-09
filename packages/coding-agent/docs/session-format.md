@@ -91,6 +91,12 @@ A message in the conversation. The `message` field contains an `AgentMessage`. S
 
 Sessions created before system messages existed have no leading system message; the first request declares the current prompt as a later system message, which replays the same way.
 
+User entries created by `sendUserMessage(content, { metadata })` also carry an optional `metadata` object at the entry root. It is opaque application data, not a trusted provenance claim, and is excluded from model context. The receipt's `entryId` identifies this exact entry. Handled input creates no entry.
+
+```json
+{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Continue","timestamp":1733234401000},"metadata":{"inputId":"wake-42"}}
+```
+
 ```json
 {"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello","timestamp":1733234401000}}
 {"type":"message","id":"b2c3d4e5","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{...},"stopReason":"stop","timestamp":1733234402000}}
