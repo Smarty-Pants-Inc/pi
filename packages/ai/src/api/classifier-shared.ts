@@ -3,6 +3,12 @@ import type { ClassifierApi, ClassifierModel, ClassifierOptions, ProviderHeaders
 import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
+// Classifier replies are small JSON records. 4 MiB leaves ample room for large answer sets while
+// bounding both success and error bodies, including decompressed bytes. Each attempt, including
+// body consumption, has a 60-second deadline unless the caller supplies timeoutMs.
+const MAX_CLASSIFIER_RESPONSE_BYTES = 4 * 1024 * 1024;
+const DEFAULT_CLASSIFIER_TIMEOUT_MS = 60_000;
+
 /** An HTTP failure in the shape `retryProviderRequest` and `normalizeProviderError` understand. */
 export interface ClassifierHttpError extends Error {
 	status: number | undefined;
@@ -25,6 +31,44 @@ function timeoutError(timeoutMs: number): ClassifierHttpError {
 	error.headers = undefined;
 	error.body = "";
 	return error;
+}
+
+async function readClassifierBody(label: string, response: Response, signal: AbortSignal): Promise<string> {
+	if (!response.body) {
+		signal.throwIfAborted();
+		return "";
+	}
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	const parts: string[] = [];
+	let bytes = 0;
+	// Custom fetch implementations may not propagate the request signal to their body stream.
+	const onAbort = () => {
+		void reader.cancel(signal.reason).catch(() => {});
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		for (;;) {
+			signal.throwIfAborted();
+			const { done, value } = await reader.read();
+			signal.throwIfAborted();
+			if (done) break;
+			bytes += value.byteLength;
+			if (bytes > MAX_CLASSIFIER_RESPONSE_BYTES) {
+				// A plain Error is terminal: provider retries must not repeat an oversized response.
+				throw new Error(`${label} response body exceeds ${MAX_CLASSIFIER_RESPONSE_BYTES} byte limit`);
+			}
+			parts.push(decoder.decode(value, { stream: true }));
+		}
+		parts.push(decoder.decode());
+		return parts.join("");
+	} catch (error) {
+		void reader.cancel(error).catch(() => {});
+		throw error;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		reader.releaseLock();
+	}
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,7 +98,8 @@ function requestHeaders(
 
 /**
  * Posts one JSON classifier request with bearer auth, `onPayload`/`onResponse` hooks, a fresh
- * timeout per attempt, and provider retries. Returns the parsed response body; throws on failure.
+ * timeout per attempt (60 seconds by default, including body reads), and provider retries. Bodies
+ * above 4 MiB fail without retry. Returns the parsed response body; throws on failure.
  * `noRetryStatuses` lists HTTP statuses that fail at once although they are normally retried.
  */
 export async function postClassifierRequest(
@@ -73,11 +118,10 @@ export async function postClassifierRequest(
 	const requestFetch = options.fetch ?? globalThis.fetch;
 	const { response, json } = await retryProviderRequest(
 		async () => {
-			const timeoutSignal = options.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
-			const signal =
-				options.signal && timeoutSignal
-					? AbortSignal.any([options.signal, timeoutSignal])
-					: (options.signal ?? timeoutSignal);
+			const controller = new AbortController();
+			const timeoutMs = options.timeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS;
+			const timeout = setTimeout(() => controller.abort(timeoutError(timeoutMs)), timeoutMs);
+			const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 			try {
 				const next = await requestFetch(url, {
 					method: "POST",
@@ -85,11 +129,16 @@ export async function postClassifierRequest(
 					body: JSON.stringify(payload),
 					signal,
 				});
-				if (!next.ok) throw httpError(label, next, await next.text());
-				return { response: next, json: (await next.json()) as unknown };
+				const text = await readClassifierBody(label, next, signal);
+				if (!next.ok) throw httpError(label, next, text);
+				return { response: next, json: JSON.parse(text) as unknown };
 			} catch (error) {
-				if (timeoutSignal?.aborted && !options.signal?.aborted) throw timeoutError(options.timeoutMs!);
+				const timedOut = controller.signal.aborted && !options.signal?.aborted;
+				controller.abort(error);
+				if (timedOut) throw controller.signal.reason;
 				throw error;
+			} finally {
+				clearTimeout(timeout);
 			}
 		},
 		{
