@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, parse } from "node:path";
 import test from "node:test";
@@ -14,6 +14,58 @@ function writePackage(directory, manifest, files) {
 		writeFileSync(join(directory, path), contents);
 	}
 }
+
+// pi#173 security review: force must not traverse symlinked roots or parent components.
+for (const location of ["artifacts root", "output root", "parent component", "dangling output root"]) {
+	test(`refuses a symlinked ${location} before forced cleanup`, (t) => {
+		const temporaryRoot = mkdtempSync(join(tmpdir(), "pi-artifact-symlink-test-"));
+		t.after(() => rmSync(temporaryRoot, { recursive: true, force: true }));
+		const repoRoot = join(temporaryRoot, "repo");
+		const outside = join(temporaryRoot, "outside");
+		mkdirSync(repoRoot);
+		mkdirSync(join(outside, "set"), { recursive: true });
+		const sentinel = join(outside, "set", "keep.txt");
+		writeFileSync(sentinel, "outside survives");
+		let outDir;
+		if (location === "artifacts root") {
+			symlinkSync(outside, join(repoRoot, ".artifacts"), "dir");
+			outDir = join(repoRoot, ".artifacts", "set");
+		} else {
+			mkdirSync(join(repoRoot, ".artifacts"));
+			const link = join(repoRoot, ".artifacts", "link");
+			symlinkSync(location === "dangling output root" ? join(outside, "missing") : outside, link, "dir");
+			outDir = location === "parent component" ? join(link, "set") : link;
+		}
+		assert.throws(() => produceArtifactSet({ repoRoot, outDir, build: false, force: true }), /real director/);
+		assert.equal(readFileSync(sentinel, "utf8"), "outside survives");
+	});
+}
+
+// pi#173: internal symlinks are removed themselves; their external targets must survive.
+test("forced cleanup removes nested symlinks without following them", (t) => {
+	const temporaryRoot = mkdtempSync(join(tmpdir(), "pi-artifact-symlink-test-"));
+	t.after(() => rmSync(temporaryRoot, { recursive: true, force: true }));
+	const repoRoot = join(temporaryRoot, "repo");
+	const outDir = join(repoRoot, ".artifacts", "set");
+	const outside = join(temporaryRoot, "outside");
+	mkdirSync(join(repoRoot, "packages"), { recursive: true });
+	mkdirSync(join(outDir, "nested"), { recursive: true });
+	mkdirSync(outside);
+	const sentinel = join(outside, "keep.txt");
+	writeFileSync(sentinel, "outside survives");
+	const link = join(outDir, "nested", "outside-link");
+	symlinkSync(outside, link, "dir");
+	symlinkSync(sentinel, join(outDir, "file-link"), "file");
+	symlinkSync(join(outside, "missing"), join(outDir, "dangling-link"), "file");
+	assert.equal(lstatSync(link).isSymbolicLink(), true);
+	const artifactSet = produceArtifactSet({ repoRoot, outDir, build: false, force: true, source: { commit: "fixture", dirty: false } });
+	assert.deepEqual(artifactSet.packages, []);
+	assert.equal(lstatSync(link, { throwIfNoEntry: false }), undefined);
+	assert.equal(lstatSync(join(outDir, "file-link"), { throwIfNoEntry: false }), undefined);
+	assert.equal(lstatSync(join(outDir, "dangling-link"), { throwIfNoEntry: false }), undefined);
+	assert.equal(readFileSync(sentinel, "utf8"), "outside survives");
+	assert.equal(lstatSync(outside).isDirectory(), true);
+});
 
 test("produces a verified, content-addressed artifact set", (t) => {
 	const temporaryRoot = mkdtempSync(join(tmpdir(), "pi-package-artifacts-test-"));

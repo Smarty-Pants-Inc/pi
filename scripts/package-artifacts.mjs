@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { getPublicWorkspacePackages } from "./release-packages.mjs";
 import { execNpmSync } from "./npm-command.mjs";
 
@@ -55,6 +55,43 @@ function packPackages(packages, tarballDirectory) {
 	return packedPackages;
 }
 
+// Check every component, including dangling symlinks, before creating or deleting output.
+// Lexical containment alone does not protect .artifacts when a parent points outside the repo.
+function prepareRealParentDirectory(directory) {
+	const root = parse(directory).root;
+	let current = root;
+	for (const component of relative(root, directory).split(sep).filter(Boolean)) {
+		current = join(current, component);
+		let stat = lstatSync(current, { throwIfNoEntry: false });
+		if (!stat) {
+			mkdirSync(current);
+			stat = lstatSync(current);
+		}
+		if (stat.isSymbolicLink() || !stat.isDirectory()) {
+			throw new Error(`Artifact output path must contain only real directories, not symlinks: ${current}`);
+		}
+	}
+	return realpathSync(directory);
+}
+
+function removeArtifactDirectory(directory, trustedRoot) {
+	const stat = lstatSync(directory);
+	if (stat.isSymbolicLink() || !stat.isDirectory() || !isInsidePath(realpathSync(directory), trustedRoot)) {
+		throw new Error(`Artifact output root must be a real directory inside ${trustedRoot}: ${directory}`);
+	}
+	for (const entry of readdirSync(directory)) {
+		const entryPath = join(directory, entry);
+		const entryStat = lstatSync(entryPath);
+		if (entryStat.isDirectory() && !entryStat.isSymbolicLink()) {
+			removeArtifactDirectory(entryPath, trustedRoot);
+		} else {
+			// rmSync on a symlink removes only the link, never the directory it points at.
+			rmSync(entryPath, { force: true });
+		}
+	}
+	rmdirSync(directory);
+}
+
 function prepareOutputDirectory(outDir, options) {
 	const repoRoot = resolve(options.repoRoot);
 	if (!outDir) return mkdtempSync(join(tmpdir(), "pi-package-artifacts-"));
@@ -65,11 +102,17 @@ function prepareOutputDirectory(outDir, options) {
 	if (isInsidePath(outputDirectory, repoRoot) && !isInsidePath(outputDirectory, join(repoRoot, ".artifacts"))) {
 		throw new Error(`Repository-local output directory must be inside ${join(repoRoot, ".artifacts")}: ${outputDirectory}`);
 	}
-	if (existsSync(outputDirectory)) {
+	const canonicalParent = prepareRealParentDirectory(dirname(outputDirectory));
+	const trustedRoot = isInsidePath(outputDirectory, repoRoot) ? join(realpathSync(repoRoot), ".artifacts") : canonicalParent;
+	const stat = lstatSync(outputDirectory, { throwIfNoEntry: false });
+	if (stat) {
+		if (stat.isSymbolicLink() || !stat.isDirectory() || !isInsidePath(realpathSync(outputDirectory), trustedRoot)) {
+			throw new Error(`Artifact output root must be a real directory inside ${trustedRoot}: ${outputDirectory}`);
+		}
 		if (!options.force) throw new Error(`Output directory already exists. Use --force to replace it: ${outputDirectory}`);
-		rmSync(outputDirectory, { force: true, recursive: true });
+		removeArtifactDirectory(outputDirectory, trustedRoot);
 	}
-	mkdirSync(outputDirectory, { recursive: true });
+	mkdirSync(outputDirectory);
 	return outputDirectory;
 }
 
