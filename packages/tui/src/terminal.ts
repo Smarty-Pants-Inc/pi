@@ -88,6 +88,12 @@ export interface Terminal {
 	/** Optional render lifecycle hook for terminals awaiting a requested frame. */
 	onRenderPending?(pending: boolean): void;
 
+	/** Enable/re-request focus reports, with terminal-owned exit cleanup. */
+	setFocusReporting?(enabled: boolean): void;
+
+	/** Pause terminal-owned cosmetic timers when the pane is hidden. */
+	setVisible?(visible: boolean): void;
+
 	// Get terminal dimensions
 	get columns(): number;
 	get rows(): number;
@@ -140,6 +146,9 @@ export class ProcessTerminal implements Terminal {
 	private wasRaw = false;
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
+	private focusReportingEnabled = false;
+	private readonly cleanupFocusReporting = () => this.setFocusReporting(false);
+	private readonly focusSignalHandlers = new Map<NodeJS.Signals, () => void>();
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
 	private keyboardProtocolPushed = false;
@@ -148,6 +157,8 @@ export class ProcessTerminal implements Terminal {
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
+	private progressActive = false;
+	private visible = true;
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
 		if (!env) return "";
@@ -188,6 +199,8 @@ export class ProcessTerminal implements Terminal {
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.resizeHandler);
+		// stdout only emits resize when dimensions change; attach can send SIGWINCH without a size change.
+		if (process.platform !== "win32") process.on("SIGWINCH", this.resizeHandler);
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
 		// (SIGWINCH is lost while process is stopped). Unix only, best-effort.
@@ -421,10 +434,46 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
-	stop(): void {
-		if (this.clearProgressInterval()) {
-			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+	setFocusReporting(enabled: boolean): void {
+		if (enabled) {
+			if (!this.focusReportingEnabled) {
+				this.focusReportingEnabled = true;
+				process.prependListener("exit", this.cleanupFocusReporting);
+				// Monitor does not swallow the exception or change Node's crash semantics.
+				process.prependListener("uncaughtExceptionMonitor", this.cleanupFocusReporting);
+				const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
+				if (process.platform !== "win32") signals.push("SIGHUP");
+				for (const signal of signals) {
+					const handler = () => {
+						this.setFocusReporting(false);
+						// Leave app shutdown handlers in charge; otherwise retain default signal termination.
+						if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+					};
+					this.focusSignalHandlers.set(signal, handler);
+					process.prependListener(signal, handler);
+				}
+			}
+			// Re-enabling ?1004h requests current focus from supporting terminals.
+			this.write("\x1b[?1004h");
+			return;
 		}
+		if (!this.focusReportingEnabled) return;
+		this.focusReportingEnabled = false;
+		process.off("exit", this.cleanupFocusReporting);
+		process.off("uncaughtExceptionMonitor", this.cleanupFocusReporting);
+		for (const [signal, handler] of this.focusSignalHandlers) process.off(signal, handler);
+		this.focusSignalHandlers.clear();
+		// Exit listeners cannot await stdout's buffered writes. Dead terminals are best-effort.
+		try {
+			fs.writeSync(process.stdout.fd, "\x1b[?1004l");
+		} catch {}
+	}
+
+	stop(): void {
+		this.setFocusReporting(false);
+		this.clearProgressInterval();
+		if (this.progressActive) process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+		this.progressActive = false;
 
 		// Disable bracketed paste mode
 		process.stdout.write("\x1b[?2004l");
@@ -455,6 +504,7 @@ export class ProcessTerminal implements Terminal {
 		this.inputHandler = undefined;
 		if (this.resizeHandler) {
 			process.stdout.removeListener("resize", this.resizeHandler);
+			if (process.platform !== "win32") process.off("SIGWINCH", this.resizeHandler);
 			this.resizeHandler = undefined;
 		}
 
@@ -524,7 +574,23 @@ export class ProcessTerminal implements Terminal {
 		process.stdout.write(`\x1b]0;${title}\x07`);
 	}
 
+	setVisible(visible: boolean): void {
+		if (this.visible === visible) return;
+		this.visible = visible;
+		if (!visible) this.clearProgressInterval();
+		else if (this.progressActive) this.setProgress(true);
+	}
+
 	setProgress(active: boolean): void {
+		const wasActive = this.progressActive;
+		this.progressActive = active;
+		if (!this.visible) {
+			this.clearProgressInterval();
+			// A hidden pane still clears progress it had shown (pi#177): otherwise the terminal keeps
+			// an active indicator after the turn ends. No keepalive restarts while hidden.
+			if (!active && wasActive) process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+			return;
+		}
 		if (active) {
 			// OSC 9;4;3 - indeterminate progress
 			process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);

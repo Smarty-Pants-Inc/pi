@@ -59,7 +59,8 @@ describe("TUI cell size responses", () => {
 		});
 	});
 
-	it("consumes cell size responses and still forwards later user input", () => {
+	// smarty-dev#7403: only pending OSC 11 replies are stripped from input.
+	it("updates cell dimensions without stripping cell size input", () => {
 		withImageTerminal(() => {
 			setCellDimensions({ widthPx: 9, heightPx: 18 });
 
@@ -71,11 +72,11 @@ describe("TUI cell size responses", () => {
 			tui.start();
 
 			terminal.sendInput("\x1b[6;20;10t");
-			assert.deepStrictEqual(recorder.inputs, []);
+			assert.deepStrictEqual(recorder.inputs, ["\x1b[6;20;10t"]);
 			assert.deepStrictEqual(getCellDimensions(), { widthPx: 10, heightPx: 20 });
 
 			terminal.sendInput("q");
-			assert.deepStrictEqual(recorder.inputs, ["q"]);
+			assert.deepStrictEqual(recorder.inputs, ["\x1b[6;20;10t", "q"]);
 			tui.stop();
 		});
 	});

@@ -58,6 +58,7 @@ export class DaxnutsComponent implements Component {
 	private ui: TUI;
 	private image: string[];
 	private interval: ReturnType<typeof setInterval> | null = null;
+	private unsubscribeVisibility?: () => void;
 	private tick = 0;
 	private maxTicks = 25; // ~2 seconds at 80ms
 	private cachedLines: string[] = [];
@@ -67,7 +68,10 @@ export class DaxnutsComponent implements Component {
 	constructor(ui: TUI) {
 		this.ui = ui;
 		this.image = buildImage();
-		this.startAnimation();
+		this.unsubscribeVisibility = ui.onVisibilityChange((visible) => {
+			if (visible && this.tick < this.maxTicks) this.startAnimation();
+			else this.pauseAnimation();
+		});
 	}
 
 	invalidate(): void {
@@ -75,6 +79,7 @@ export class DaxnutsComponent implements Component {
 	}
 
 	private startAnimation(): void {
+		if (this.interval) return;
 		this.interval = setInterval(() => {
 			this.tick++;
 			if (this.tick >= this.maxTicks) {
@@ -86,6 +91,12 @@ export class DaxnutsComponent implements Component {
 	}
 
 	private stopAnimation(): void {
+		this.pauseAnimation();
+		this.unsubscribeVisibility?.();
+		this.unsubscribeVisibility = undefined;
+	}
+
+	private pauseAnimation(): void {
 		if (this.interval) {
 			clearInterval(this.interval);
 			this.interval = null;

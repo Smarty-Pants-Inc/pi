@@ -37,6 +37,7 @@ export class ScrollView extends Container {
 	private transientScrollbarVisible = false;
 	private scrollbarActive = false;
 	private scrollbarHideTimer: NodeJS.Timeout | undefined;
+	private paneVisible = true;
 
 	constructor(component: Component, options: ScrollViewOptions = {}) {
 		super();
@@ -94,7 +95,14 @@ export class ScrollView extends Container {
 		return this.scrollbar === "always" && width > 1 ? width - 1 : width;
 	}
 
+	/** Cancel cosmetic timers while the containing pane is hidden. */
+	setVisible(visible: boolean): void {
+		this.paneVisible = visible;
+		if (!visible) this.hideTransientScrollbar();
+	}
+
 	private markScrollbarActivity(): void {
+		if (!this.paneVisible) return;
 		if (this.scrollbar !== "auto" || this.contentHeight <= this.currentViewportHeight) return;
 		this.transientScrollbarVisible = true;
 		if (this.scrollbarHideTimer) {
