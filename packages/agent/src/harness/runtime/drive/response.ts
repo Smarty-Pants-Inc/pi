@@ -4,6 +4,7 @@ import {
 	type AssistantStreamObservation,
 	createAssistantStreamObservation,
 	discardPartialReasoning,
+	hasAssistantAnswerOutput,
 	isContextOverflow,
 	isReasoningOnlyPrematureStream,
 	isRecoverableLength,
@@ -133,9 +134,21 @@ function retriesResponse(
 		response.stopReason === "error" &&
 		!isContextOverflow(response, intent.contextWindow) &&
 		!isRecoverableLength(response, intent.intendedOutputLimit) &&
-		(recovery || isRetryableAssistantError(response, observed)) &&
+		retryable(response, observed, recovery) &&
 		intent.attempt < intent.generationContext.retryPolicy.maxAttempts
 	);
+}
+
+/**
+ * A crash-recovered response is retried unless its committed frames hold answer text or a tool call: the
+ * retry would repeat that output (smarty-dev#6730 sec P2). Reasoning-only or empty frames may still retry.
+ */
+function retryable(
+	response: SettledAssistantMessage,
+	observed: AssistantStreamObservation | undefined,
+	recovery: boolean,
+): boolean {
+	return recovery ? !hasAssistantAnswerOutput(response) : isRetryableAssistantError(response, observed);
 }
 
 type ConfigurationFailureState = Extract<
@@ -318,7 +331,7 @@ export async function publishResponse<TContext extends object | undefined>(
 			} else if (response.stopReason === "error") {
 				if (
 					current.at === "assistant.effect_pending" &&
-					(options.recovery === true || isRetryableAssistantError(response, observed)) &&
+					retryable(response, observed, options.recovery === true) &&
 					current.attempt < current.generationContext.retryPolicy.maxAttempts
 				) {
 					// The restarted attempt replaces a reasoning-only premature close (smarty-dev#6730). Usually

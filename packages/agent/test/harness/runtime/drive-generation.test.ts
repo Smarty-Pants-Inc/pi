@@ -1,5 +1,6 @@
 import {
 	type AssistantMessage,
+	type AssistantMessageFrame,
 	createAssistantMessageEventStream,
 	createModels,
 	fauxAssistantMessage,
@@ -758,6 +759,93 @@ describe("runtime assistant generation", () => {
 		).toEqual(["message_start", "message_end", "entry_added"]);
 		await expectProjectionRestores(fixture);
 	});
+
+	// smarty-dev#6730 sec P2: a recovered retry must not repeat committed answer text or a tool call.
+	for (const [name, frames, retried] of [
+		[
+			"reasoning-only",
+			[
+				{ type: "thinking_start", contentIndex: 0, content: { type: "thinking", thinking: "" } },
+				{ type: "thinking_delta", contentIndex: 0, delta: "plan" },
+			],
+			true,
+		],
+		[
+			"partial answer text",
+			[
+				{ type: "thinking_start", contentIndex: 0, content: { type: "thinking", thinking: "" } },
+				{ type: "thinking_delta", contentIndex: 0, delta: "plan" },
+				{ type: "text_start", contentIndex: 1, content: { type: "text", text: "" } },
+				{ type: "text_delta", contentIndex: 1, delta: "visible" },
+			],
+			false,
+		],
+		[
+			"partial tool call",
+			[
+				{
+					type: "toolcall_start",
+					contentIndex: 0,
+					toolCall: { type: "toolCall", id: "call_1", name: "write", arguments: {} },
+				},
+				{ type: "toolcall_delta", contentIndex: 0, delta: '{"path":' },
+			],
+			false,
+		],
+	] as const satisfies readonly (readonly [string, readonly AssistantMessageFrame[], boolean])[]) {
+		it(`recovers an orphan with ${name} frames ${retried ? "into a retry wait" : "as a failed run"}`, async () => {
+			const fixture = await createFixture();
+			const ready = await advanceToReady(fixture);
+			const responseEntryId = "01950000-0000-7000-8000-000000000032";
+			const pending: AssistantEffectPendingOperation = {
+				...operationScopeOf(ready),
+				at: "assistant.effect_pending",
+				generationContext: {
+					...ready.generationContext,
+					retryPolicy: { maxAttempts: 2, baseDelayMs: 1, maxAgentDelayMs: 30_000 },
+				},
+				attempt: 1,
+				responseEntryId,
+				usageId: "01950000-0000-7000-8000-000000000033",
+				intendedOutputLimit: 100,
+				contextWindow: 1_000,
+			};
+			const start: AssistantMessageFrame = {
+				type: "start",
+				partial: { ...fauxAssistantMessage([], { timestamp: 6 }), stopReason: "pending" },
+			};
+			await fixture.lane.command((state) => {
+				const operation = state.operation;
+				if (operation === null) throw new Error("missing operation");
+				return {
+					kind: "commit",
+					writes: [
+						storedValues.setValue(storedValues.operationState(operationId), pending),
+						...[start, ...frames].map((frame) =>
+							storedValues.appendList(storedValues.pendingAssistantFrames(operationId, responseEntryId), frame),
+						),
+					],
+					next: { ...state, operation: { meta: operation.meta, state: pending } },
+					materialize: () => undefined,
+				};
+			}, BACKGROUND_CONTEXT);
+
+			const result = await recoverAssistantGeneration(fixture.lane, fixture.drive, pending);
+
+			expect(fixture.faux.state.callCount).toBe(0);
+			if (retried) {
+				expect(result).toEqual({ kind: "continue" });
+				expect(currentRun(fixture.lane)).toMatchObject({ at: "assistant.retry_wait", nextAttempt: 2 });
+			} else {
+				expect(result).toMatchObject({
+					kind: "settled",
+					outcome: { operationId, kind: "run", status: "failed", tipId: responseEntryId },
+				});
+				expect(fixture.lane.state.operation).toBeNull();
+			}
+			await expectProjectionRestores(fixture);
+		});
+	}
 
 	it("finishes the no-tool run with terminal cleanup and an immutable result record", async () => {
 		const fixture = await createFixture();

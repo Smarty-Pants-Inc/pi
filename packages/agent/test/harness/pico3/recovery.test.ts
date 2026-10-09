@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import type { Context } from "@earendil-works/chord";
+import {
+	type AssistantMessage,
+	type AssistantMessageEvent,
+	fauxAssistantMessage,
+	fauxThinking,
+	fauxToolCall,
+} from "@earendil-works/pi-ai";
 import { onTestFinished, test } from "vitest";
 import { kinds as kindsOf } from "../../../src/harness/pico3/harness.ts";
-import type { RequestMessage } from "../../../src/harness/pico3/types.ts";
+import type { Models, RequestMessage } from "../../../src/harness/pico3/types.ts";
 import {
 	contentOf,
 	ctx,
@@ -41,6 +48,51 @@ test("crash in generation@requesting → pi.usage{interrupted}, retry, complete"
 	assert.deepEqual((await env.entries())[2]!.data, { attempt: 1, error: "interrupted" });
 	assert.equal(models2.calls, 1);
 });
+
+// smarty-dev#6730 sec P2: a crash after committed answer text or a tool call must not retry and repeat it.
+for (const [name, streamed, retried] of [
+	["reasoning only", [fauxThinking("plan")], true],
+	["partial answer text", [fauxThinking("plan"), { type: "text", text: "visible" }], false],
+	["a partial tool call", [fauxToolCall("write", {})], false],
+] as const satisfies readonly (readonly [string, AssistantMessage["content"], boolean])[]) {
+	test(`crash in generation@requesting after ${name} → ${retried ? "retry" : "failed, no retry"}`, async () => {
+		const hang = new Gate();
+		const models: Models = {
+			...fake({ respond: echoScript }),
+			async *stream(_m, _request, c): AsyncIterable<AssistantMessageEvent> {
+				const partial: AssistantMessage = { ...fauxAssistantMessage([]), stopReason: "pending" };
+				const snapshot = () => ({ ...partial, content: [...partial.content] });
+				yield { type: "start", partial: snapshot() };
+				for (const [contentIndex, block] of streamed.entries()) {
+					partial.content.push(block);
+					if (block.type === "text") {
+						yield { type: "text_start", contentIndex, partial: snapshot() };
+						yield { type: "text_delta", contentIndex, delta: block.text, partial: snapshot() };
+					} else if (block.type === "thinking") {
+						yield { type: "thinking_start", contentIndex, partial: snapshot() };
+						yield { type: "thinking_delta", contentIndex, delta: block.thinking, partial: snapshot() };
+					} else yield { type: "toolcall_start", contentIndex, partial: snapshot() };
+				}
+				await hang.wait(c); // the process dies mid-stream
+			},
+		};
+		let env = await open({ backend: "jsonl", models });
+		onTestFinished(() => env.close());
+		const a = await env.root.send({ content: "A" }, ctx);
+		await untilPhase(env, "pi.generation", "requesting");
+		await hang.arrivals(1);
+		for (const t0 = Date.now(); (await env.root.sticky(ctx)).turn.message?.content.length !== streamed.length; ) {
+			if (Date.now() - t0 > 2000) throw new Error("partial was not committed");
+			await sleep(5);
+		}
+		await env.crash();
+		const models2 = fake({ respond: echoScript });
+		env = await open({ dir: env.dir, backend: "jsonl", models: models2 });
+		await env.root.waitForIdle(ctx);
+		assert.equal(models2.calls, retried ? 1 : 0);
+		assert.equal((await env.input(a.id))?.status, retried ? "done" : "unanswered");
+	});
+}
 
 test("crash in generation@prepared (blocked in beforeRequest) → hooks rerun, no duplicate system entry", async () => {
 	const gate = new Gate();

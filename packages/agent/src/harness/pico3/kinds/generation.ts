@@ -11,6 +11,7 @@ import {
 	AssistantMessageFrameEncoder,
 	createAssistantStreamObservation,
 	discardPartialReasoning,
+	hasAssistantAnswerOutput,
 	isReasoningOnlyPrematureStream,
 	isRetryableAssistantError,
 	observeAssistantStreamEvent,
@@ -229,9 +230,20 @@ export const generation: CoreKind<
 		},
 
 		// Only reached by the scheduler after a crash: the call may have happened and there
-		// is no result lookup. Count it as a failed attempt and retry per policy.
-		async requesting(task, rt) {
+		// is no result lookup. Count it as a failed attempt and retry per policy, unless the committed partial
+		// already holds answer text or a tool call: a retry would repeat that output (smarty-dev#6730 sec P2).
+		async requesting(task, rt, ctx) {
 			const cp = task.checkpoint;
+			const partial = (await rt.sticky(task.conversationId, ctx)).turn.message as AssistantMessage | undefined;
+			if (partial !== undefined && hasAssistantAnswerOutput(partial))
+				return {
+					done: terminalError(
+						task,
+						cp,
+						{ ...partial, stopReason: "error", errorMessage: "interrupted" },
+						"provider",
+					),
+				};
 			const decision = retryDecision(cp, null, rt.now());
 			if (decision.kind === "fail") return failStep(task, decision.reason, "interrupted");
 			return {
