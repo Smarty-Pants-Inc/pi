@@ -1,5 +1,10 @@
 import type { McpFetch } from "../auth-provider.ts";
-import { OAuthEndpointOriginError, OAuthInsecureEndpointError, OAuthRedirectRefusedError } from "./errors.ts";
+import {
+	OAuthEndpointOriginError,
+	OAuthInsecureEndpointError,
+	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
+} from "./errors.ts";
 import type { AuthorizationServerMetadata } from "./types.ts";
 
 export function loopback(hostname: string): boolean {
@@ -113,4 +118,23 @@ export function validateOAuthEndpointOrigins(
 		if (origin !== issuer && !allowed.has(origin))
 			throw new OAuthEndpointOriginError(field, endpoint, metadata.issuer);
 	}
+}
+
+/**
+ * For the exported token operations, which take metadata from their caller: besides the endpoint origins, bind the
+ * metadata to the authorization server the caller names (smarty-dev#7638). As in discovery (RFC 8414 §3.3), the issuer
+ * must be identical to that identifier: the same origin is not enough (tenants share origins), and neither
+ * `allowedEndpointOrigins` nor any other option waives it. A server whose metadata names another issuer is configured
+ * with `authorizationServerMetadataUrl`, whose issuer is then the identifier.
+ */
+export function validateOAuthServerMetadata(
+	authorizationServerUrl: string | URL,
+	metadata: AuthorizationServerMetadata | undefined,
+	allowedEndpointOrigins: readonly string[] = [],
+): void {
+	validateOAuthEndpointOrigins(metadata, allowedEndpointOrigins);
+	if (!metadata) return;
+	secureEndpoint(authorizationServerUrl);
+	const expected = String(authorizationServerUrl);
+	if (metadata.issuer !== expected) throw new OAuthIssuerMismatchError(expected, metadata.issuer);
 }
