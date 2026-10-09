@@ -41,7 +41,6 @@ import { assignJson } from "./json.ts";
 import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
 import { ensureProviderSessionId } from "./provider.ts";
-import { commitLivePartialUnderAbortMark } from "./scheduler.ts";
 import { appendToolResult, harnessError, ToolTask, type ToolTaskResult } from "./tool.ts";
 import type {
 	CompactionPolicy,
@@ -102,6 +101,13 @@ export type GenerationCheckpoint =
 export type GenerationResult = { entryId: EntryId };
 
 type Runtime = TaskRuntime<GenerationInput, GenerationCheckpoint, GenerationResult, GenerationHooks>;
+
+/**
+ * The scheduler's one-shot write of the run's live partial past the task's abort mark (smarty-dev#7428, pi#174). The
+ * scheduler passes it only to its own dispatch of this task's `request` phase, never through the runtime or a hook, and
+ * accepts one call before the phase returns.
+ */
+export type AbortMarkPartialWriter = (message: AssistantMessage, context: Context) => Promise<void>;
 type Next = NextTaskState<GenerationCheckpoint, GenerationResult>;
 
 /** What classification needs from the request that produced a message. */
@@ -191,7 +197,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				return { status: "running", checkpoint: { phase: "request", ...request } };
 			}, context);
 		},
-		request: async (task, runtime, context) => {
+		request: async (task, runtime, context, writeUnderAbortMark?: AbortMarkPartialWriter) => {
 			const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
 			const conversationId = runtime.conversationId;
 			let interrupted = false;
@@ -230,7 +236,15 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				sessionId: await ensureProviderSessionId(runtime, context),
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			};
-			const { message, observed } = await streamResponse(runtime, model, messages, options, attempt, context);
+			const { message, observed } = await streamResponse(
+				runtime,
+				model,
+				messages,
+				options,
+				attempt,
+				context,
+				writeUnderAbortMark,
+			);
 			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
 			await classify(runtime, request, message, context, observed);
 		},
@@ -306,6 +320,11 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 		}, context);
 	},
 });
+
+// pi#174: the scheduler hands `request` its abort-mark writer, so no code may replace the phase to capture it.
+Object.freeze(GenerationTask.definition.phases);
+Object.freeze(GenerationTask.definition);
+Object.freeze(GenerationTask);
 
 /** The calls `callIds` of the assistant entry, in the given order. */
 async function readCalls(
@@ -396,6 +415,7 @@ async function streamResponse(
 	options: SimpleStreamOptions,
 	attempt: number,
 	context: Context,
+	writeUnderAbortMark: AbortMarkPartialWriter | undefined,
 ): Promise<{ message: AssistantMessage; observed: AssistantStreamObservation }> {
 	const interval = runtime.settings.progress.partialIntervalMs;
 	// The terminal message can drop what the stream showed (smarty-dev#6730).
@@ -411,13 +431,16 @@ async function streamResponse(
 	let completed = false;
 	/**
 	 * Whether the partial committed. `underAbortMark` is only for the abort path's final commit: it takes the scheduler's
-	 * internal live partial write, the one write that passes the abort mark.
+	 * one-shot writer, the one write that passes the abort mark; without it (a dispatch other than the scheduler's) the
+	 * commit is refused.
 	 */
 	const commitPartial = (partial: AssistantMessage, underAbortMark = false): Promise<boolean> => {
 		// Copy synchronously: the provider keeps mutating its partial.
 		const message = copyJson(partial, { omitUndefinedProperties: true });
 		const committed = underAbortMark
-			? commitLivePartialUnderAbortMark(runtime, message, context)
+			? writeUnderAbortMark === undefined
+				? Promise.reject(new Error(`Task ${runtime.taskId} has no abort-mark writer`))
+				: writeUnderAbortMark(message as unknown as AssistantMessage, context)
 			: runtime.commit(async (tx) => {
 					const live = await tx.doc(LiveDoc, runtime.conversationId);
 					live.generation ??= { attempt };

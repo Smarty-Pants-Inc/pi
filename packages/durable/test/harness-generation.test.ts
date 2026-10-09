@@ -586,6 +586,100 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#7428 (pi#174): the abort-mark writer is private to the scheduler's request phase dispatch. A hook holds
+	// the real runtime, yet no function reachable from it, nor the generation's own phase, writes under the mark.
+	it("lets no afterResponse hook write under the abort mark through any reachable function", async () => {
+		const setup = chatSetup();
+		setup.faux.setResponses([fauxAssistantMessage("answer")]);
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const planted = fauxAssistantMessage("planted", { stopReason: "pending" });
+		const outcomes: Record<string, string> = {};
+		let harnessRef: Harness | undefined;
+		let aborting: Promise<unknown> | undefined;
+		addHooks(setup.registry, GenerationTask, {
+			afterResponse: async (_message, api) => {
+				const runtime = api as unknown as Record<string, unknown> & { readonly signal: AbortSignal };
+				aborting = harnessRef!.abortTask(api.taskId, context);
+				if (!runtime.signal.aborted) {
+					await new Promise((resolve) => runtime.signal.addEventListener("abort", resolve, { once: true }));
+				}
+				const write = async (tx: {
+					doc: (doc: typeof LiveDoc, id: typeof api.conversationId) => Promise<LiveState>;
+				}) => {
+					const state = await tx.doc(LiveDoc, api.conversationId);
+					state.generation = { attempt: 1, message: planted } as LiveState["generation"];
+					return undefined;
+				};
+				// The test's uncancelled context, not the hook's signalled one, so only the abort mark can refuse.
+				const ctx = context;
+				const attempt = async (name: string, call: () => unknown) => {
+					try {
+						const result = call();
+						const timeout = new Promise((resolve) => setTimeout(() => resolve("timeout"), 20));
+						await Promise.race([result, timeout]);
+						outcomes[name] = "resolved";
+					} catch (error) {
+						outcomes[name] = (error as Error).message;
+					}
+				};
+				await attempt("commit", () => (runtime.commit as (...args: unknown[]) => unknown)(write, ctx));
+				await attempt("memo", () => api.memo("planted", planted as never, ctx));
+				// Every other function on the runtime, its hook runner, and its registry snapshot, called with a writer.
+				const holders: [string, Record<string, unknown>][] = [
+					["runtime", runtime],
+					["hooks", runtime.hooks as Record<string, unknown>],
+				];
+				for (const [prefix, holder] of holders) {
+					for (const key of Object.keys(holder)) {
+						if (prefix === "runtime" && (key === "commit" || key === "memo")) continue;
+						const value = holder[key];
+						if (typeof value !== "function") continue;
+						await attempt(`${prefix}.${key}`, () => (value as (...args: unknown[]) => unknown)(write, ctx));
+					}
+				}
+				// The generation's own request phase, run with the hook's runtime: it gets no writer from a caller.
+				const definition = (runtime.registry as RegistrySnapshot).task("pi.generation")!.definition;
+				expect(definition).toBe(GenerationTask.definition);
+				const fakeTask = {
+					state: {
+						checkpoint: {
+							phase: "request",
+							attempt: 1,
+							model: { provider: "faux", modelId: "faux-1" },
+							thinkingLevel: "off",
+							streamOptions: {},
+							cutoff: "missing",
+						},
+					},
+				};
+				const request = definition.phases.request as (...args: unknown[]) => Promise<void>;
+				await attempt("phases.request", () => request(fakeTask, runtime, ctx));
+				// The phase cannot be replaced to capture the writer the scheduler passes it.
+				await attempt("replace request", () => {
+					(definition.phases as Record<string, unknown>).request = async () => {};
+				});
+			},
+		});
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harnessRef = harness;
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		const mark = `Task ${taskId} has a durable abort mark`;
+		expect(await aborting).toBe("marked");
+		expect(outcomes.commit).toBe(mark);
+		expect(outcomes.memo).toBe(mark);
+		expect(outcomes["phases.request"]).toBe(mark);
+		expect(outcomes["replace request"]).toMatch(/read only|read-only|Cannot assign/);
+		expect(Object.keys(outcomes).length).toBeGreaterThan(10);
+		// Nothing planted reached the live document or the transcript.
+		expect((await allEntries(root)).map((entry) => entry.kind)).toEqual(["pi.user"]);
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
 	it("cancels a deferred response when aborted during polling", async () => {
 		const setup = chatSetup({ deferred: { pendingFetches: 100, pollAfterMs: 60_000 } });
 		setup.faux.setResponses([fauxAssistantMessage("never")]);

@@ -20,7 +20,7 @@ import {
 	type TaskRuntime,
 } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
-import { commitLivePartialUnderAbortMark } from "../src/harness/scheduler.ts";
+import * as schedulerModule from "../src/harness/scheduler.ts";
 import { addHooks, addTask, addTool, user } from "./harness-support.ts";
 import { ControlledStorage, context, flush } from "./session-support.ts";
 import { aborted, abortedWith, completed, deferred, eventually, openTasks, settled } from "./task-support.ts";
@@ -909,9 +909,9 @@ describe("task abort", () => {
 		await harness.close(context);
 	});
 
-	// smarty-dev#7428 (pi#174 review): no task handler can pass its abort mark. The only write under the mark is the
-	// scheduler's internal live partial write of a generation run, which refuses every other task, invocation, and value.
-	it("lets no handler commit under its abort mark; the internal live partial write refuses other writes", async () => {
+	// smarty-dev#7428 (pi#174): no task handler can pass its abort mark. The only write under the mark is a one-shot
+	// closure the scheduler hands its dispatch of the built-in generation's request phase; no module exports it.
+	it("lets no handler commit under its abort mark; no module exports an abort-mark writer", async () => {
 		const Notes = defineDoc<{ lines: string[] }>({
 			kind: "test.marked-notes",
 			version: 1,
@@ -921,7 +921,6 @@ describe("task abort", () => {
 		const reached = deferred();
 		const errors: string[] = [];
 		let seen: unknown;
-		const partial = { role: "assistant", content: [{ type: "text", text: "partial" }] };
 		const record = (attempt: Promise<unknown>) =>
 			attempt.then(
 				() => errors.push("committed"),
@@ -929,7 +928,7 @@ describe("task abort", () => {
 			);
 		const Marked = oneStep(
 			"test.marked-write",
-			async (task, runtime, ctx) => {
+			async (task, runtime) => {
 				reached.resolve();
 				await aborted(runtime.signal).catch(() => {});
 				const write = async (tx: Parameters<Parameters<typeof runtime.commit>[0]>[0]) => {
@@ -937,12 +936,9 @@ describe("task abort", () => {
 				};
 				// @ts-expect-error The handler-facing commit takes no abort mark option.
 				await record(runtime.commit(write, context, { underAbortMark: true }));
-				await record(commitLivePartialUnderAbortMark(runtime, partial, ctx));
-				await record(commitLivePartialUnderAbortMark(runtime, { role: "user", content: "x" }, ctx));
-				await record(commitLivePartialUnderAbortMark({ commit: runtime.commit }, partial, ctx));
+				await record(runtime.memo("planted", 1, context));
 			},
 			async (runtime, ctx) => {
-				await record(commitLivePartialUnderAbortMark(runtime, partial, ctx));
 				await runtime.commit(async (tx) => {
 					seen = [...(await tx.doc(Notes, runtime.taskId)).lines];
 					return abortedWith("mark");
@@ -956,16 +952,10 @@ describe("task abort", () => {
 		expect(await harness.abortTask(id, context)).toBe("marked");
 		expect((await harness.waitForTask(id, context)).state.outcome).toEqual({ status: "aborted", reason: "mark" });
 		expect(seen).toEqual([]);
-		const refused = `Task ${id} cannot write a live partial under its abort mark`;
-		expect(errors).toEqual([
-			`Task ${id} has a durable abort mark`,
-			`Task ${id} is not a generation`,
-			`${refused}: not an assistant message`,
-			"Not a task runtime",
-			`${refused}: not a run invocation`,
-		]);
+		expect(errors).toEqual([`Task ${id} has a durable abort mark`, `Task ${id} has a durable abort mark`]);
 		expect(await harness.snapshot(LiveDoc, root.id, context)).toEqual({});
 		expect(Object.keys(durable)).not.toContain("commitLivePartialUnderAbortMark");
+		expect(Object.keys(schedulerModule)).toEqual(["TaskScheduler"]);
 		await harness.close(context);
 	});
 

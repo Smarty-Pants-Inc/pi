@@ -24,6 +24,7 @@ import type {
 } from "../types.ts";
 import { agentHooks } from "./agent.ts";
 import { readContext } from "./context.ts";
+import { type AbortMarkPartialWriter, GenerationTask } from "./generation.ts";
 import { assignJson } from "./json.ts";
 import { LiveDoc } from "./live.ts";
 import type {
@@ -39,28 +40,13 @@ import type {
 } from "./types.ts";
 import { closedError, scanAll, Waiters } from "./util.ts";
 
-/**
- * The internal live partial writer of each handler-facing runtime (smarty-dev#7428). Kept out of the runtime object and
- * out of the package exports, so no task handler can pass its task's abort mark; only `commitLivePartialUnderAbortMark`
- * reaches it.
- */
-const livePartialWriters = new WeakMap<object, (message: JsonValue, context: Context) => Promise<void>>();
-
-/**
- * Internal to the generation kind: commit `message` as the run's live partial, `pi.live` `generation.message` of the
- * runtime's conversation, past the task's abort mark and the cancellation of `context` the mark signalled, so the abort
- * handler converts the answer output the mark interrupted. Only a run invocation of a `pi.generation` task that owns the
- * conversation's run, while its live generation exists, may write, and only an assistant message. It writes nothing
- * else and never changes the task's state; the abort handler decides the outcome. It still rejects once the invocation
- * ended or the Harness is closing.
- */
-export function commitLivePartialUnderAbortMark(runtime: object, message: JsonValue, context: Context): Promise<void> {
-	const write = livePartialWriters.get(runtime);
-	if (write === undefined) return Promise.reject(new Error("Not a task runtime"));
-	return write(message, context);
-}
-
-const GENERATION_TASK_KIND = "pi.generation";
+/** The built-in generation's `request` phase, dispatched with its private abort-mark writer as a fourth argument. */
+type RequestPhaseWithWriter = (
+	task: ErasedRunningTask,
+	runtime: ErasedRuntime,
+	context: Context,
+	writer: AbortMarkPartialWriter,
+) => Promise<void>;
 
 type AnyTaskRecord = TaskRecord<JsonValue, JsonValue, JsonValue>;
 /** A record that can still run code: pending, running, or waiting. */
@@ -888,8 +874,21 @@ export class TaskScheduler {
 			const checkpoint = current.state.checkpoint;
 			// Each phase handler resolves its agent afresh, at first use.
 			phase.agent = undefined;
+			const handler = erased(state.task).phases[checkpoint.phase]!;
 			try {
-				await erased(state.task).phases[checkpoint.phase]!(current, runtime, invocation.context);
+				if (state.task === GenerationTask && checkpoint.phase === "request") {
+					// smarty-dev#7428 (pi#174): the one write past the abort mark is a one-shot closure handed only to this
+					// dispatch of the built-in generation's request phase. It is on no runtime, hook argument, or module
+					// export, and is revoked when the phase returns.
+					const grant = this.#livePartialGrant(invocation);
+					try {
+						await (handler as RequestPhaseWithWriter)(current, runtime, invocation.context, grant.write);
+					} finally {
+						grant.revoke();
+					}
+				} else {
+					await handler(current, runtime, invocation.context);
+				}
 				previous = { checkpoint };
 			} catch (error) {
 				previous = { checkpoint, failure: { error } };
@@ -1203,11 +1202,38 @@ export class TaskScheduler {
 				this.#report(error);
 			},
 		};
-		livePartialWriters.set(runtime, (message, context) => this.#commitLivePartial(invocation, message, context));
 		return runtime;
 	}
 
-	/** See `commitLivePartialUnderAbortMark`: the one write a run invocation may make under its task's abort mark. */
+	/** A single-use writer of `#commitLivePartial` for one request phase dispatch; `revoke` disables it. */
+	#livePartialGrant(invocation: Invocation): { readonly write: AbortMarkPartialWriter; readonly revoke: () => void } {
+		let open = true;
+		return {
+			write: (message, context) => {
+				if (!open) {
+					return Promise.reject(
+						new Error(
+							`Task ${invocation.taskId} cannot write a live partial under its abort mark: used or revoked`,
+						),
+					);
+				}
+				open = false;
+				return this.#commitLivePartial(invocation, message as unknown as JsonValue, context);
+			},
+			revoke: () => {
+				open = false;
+			},
+		};
+	}
+
+	/**
+	 * The one write a run invocation may make under its task's abort mark (smarty-dev#7428), reached only through
+	 * `#livePartialGrant`: commit `message` as the run's live partial, `pi.live` `generation.message` of the invocation's
+	 * conversation, past the abort mark and the cancellation of `context` the mark signalled, so the abort handler converts
+	 * the answer output the mark interrupted. Only while the generation owns the conversation's run and its live
+	 * generation exists, and only an assistant message. It writes nothing else and never changes the task's state; the
+	 * abort handler decides the outcome. It still rejects once the invocation ended or the Harness is closing.
+	 */
 	#commitLivePartial(invocation: Invocation, message: JsonValue, context: Context): Promise<void> {
 		const refuse = (why: string) =>
 			Promise.reject(
@@ -1220,7 +1246,9 @@ export class TaskScheduler {
 		return this.#gated(
 			invocation,
 			async (tx, current) => {
-				if (current.kind !== GENERATION_TASK_KIND) throw new Error(`Task ${invocation.taskId} is not a generation`);
+				if (current.kind !== GenerationTask.definition.name) {
+					throw new Error(`Task ${invocation.taskId} is not a generation`);
+				}
 				const live = await tx.doc(LiveDoc, invocation.conversationId);
 				if (live.run?.taskId !== invocation.taskId) {
 					throw new Error(`Task ${invocation.taskId} does not own the run of its conversation`);
