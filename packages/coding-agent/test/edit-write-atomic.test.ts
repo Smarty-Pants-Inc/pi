@@ -21,7 +21,7 @@ import {
 	type AgentTool,
 	agentLoop,
 } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, type Model } from "@earendil-works/pi-ai";
+import { type AssistantMessage, createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createEditTool } from "../src/core/tools/edit.ts";
@@ -80,13 +80,7 @@ async function runBatch(tools: AgentTool<any>[], toolCalls: AssistantMessage["co
 	const prompt: AgentMessage = { role: "user", content: "go", timestamp: Date.now() };
 	let call = 0;
 	const stream = agentLoop([prompt], context, { model, convertToLlm: (m) => m as never }, undefined, () => {
-		const s = new EventStream<AssistantMessageEvent, AssistantMessage>(
-			(e) => e.type === "done" || e.type === "error",
-			(e) => {
-				if (e.type === "done") return e.message;
-				throw new Error("unexpected event");
-			},
-		);
+		const s = createAssistantMessageEventStream();
 		const message =
 			call++ === 0 ? assistant(toolCalls, "toolUse") : assistant([{ type: "text", text: "ok" }], "stop");
 		queueMicrotask(() => s.push({ type: "done", reason: message.stopReason as "stop", message }));
