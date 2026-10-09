@@ -1709,8 +1709,9 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
-	// pi#175 / smarty-dev#7403: flashes that expire inside the 100 ms window are coalesced away.
-	it("renders the latest flash stack at the trailing edge and collapses expired messages", async (t) => {
+	// pi#175 / smarty-dev#7403: every flash stays up for at least two render windows, so even an 80 ms
+	// flash added just after a frame appears in the trailing frame instead of being coalesced away.
+	it("shows a short flash in the trailing frame and collapses expired messages", async (t) => {
 		let now = 1000;
 		t.mock.method(performance, "now", () => now);
 		t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -1748,9 +1749,10 @@ describe("TuiAltScreen", () => {
 			await advance(1);
 			assert.strictEqual(renders.mock.calls.length, 2, "exactly one trailing frame at t=100");
 			let frame = lastFrame();
-			assert.ok(!frame.includes("First"));
+			assert.ok(frame.includes(" First "), "an 80 ms flash is still visible in the trailing frame");
 			assert.ok(frame.includes(" Second "));
 			assert.ok(frame.includes(" Third "));
+			assert.ok(frame.indexOf(" First ") < frame.indexOf(" Second "));
 			assert.ok(frame.indexOf(" Second ") < frame.indexOf(" Third "));
 
 			await advance(105);
@@ -1758,6 +1760,7 @@ describe("TuiAltScreen", () => {
 			assert.strictEqual(renders.mock.calls.length, 3);
 			frame = lastFrame();
 			assert.ok(frame.includes(" Third "));
+			assert.ok(!frame.includes("First"));
 			assert.ok(!frame.includes("Second"));
 			await advance(300);
 			await advance(0);
