@@ -236,7 +236,7 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				sessionId: await ensureProviderSessionId(runtime, context),
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			};
-			const { message, observed } = await streamResponse(
+			const { message, observed, saveKeptPartial } = await streamResponse(
 				runtime,
 				model,
 				messages,
@@ -246,7 +246,15 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				writeUnderAbortMark,
 			);
 			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
-			await classify(runtime, request, message, context, observed);
+			try {
+				await classify(runtime, request, message, context, observed);
+			} catch (error) {
+				// pi#174: an abort mark that landed after the finalizer's signal check rejected the classification commit. The
+				// kept partial of a normal completion is then the only copy of its answer output; it commits under the mark
+				// now, before the phase returns and the writer is revoked, so the abort handler converts it.
+				if (runtime.signal.aborted) await saveKeptPartial();
+				throw error;
+			}
 		},
 		retry: async (task, runtime, context) => {
 			const { attempt, compacted, until } = task.state.checkpoint;
@@ -406,7 +414,8 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
  * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle, awaits that
  * commit, and, unless the stream completed normally without an abort, commits a still pending partial with answer
  * output, so no stale partial lands after the outcome and recovery from a crash before classification, or the abort
- * handler, sees every answer output streamed.
+ * handler, sees every answer output streamed. A normal completion keeps its pending answer partial uncommitted;
+ * `saveKeptPartial` commits it under the abort mark when an abort mark rejects the classification commit.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -416,7 +425,11 @@ async function streamResponse(
 	attempt: number,
 	context: Context,
 	writeUnderAbortMark: AbortMarkPartialWriter | undefined,
-): Promise<{ message: AssistantMessage; observed: AssistantStreamObservation }> {
+): Promise<{
+	message: AssistantMessage;
+	observed: AssistantStreamObservation;
+	saveKeptPartial: () => Promise<void>;
+}> {
 	const interval = runtime.settings.progress.partialIntervalMs;
 	// The terminal message can drop what the stream showed (smarty-dev#6730).
 	const observed = createAssistantStreamObservation();
@@ -425,6 +438,8 @@ async function streamResponse(
 	const retry = runtime.settings.retry;
 	const holdReasoning = retry.enabled && attempt <= retry.maxRetries;
 	let pending: AssistantMessage | undefined;
+	// The answer partial a normal completion left uncommitted, for `saveKeptPartial`.
+	let kept: AssistantMessage | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
@@ -485,7 +500,12 @@ async function streamResponse(
 		}
 		const message = await events.result();
 		completed = message.stopReason !== "error" && message.stopReason !== "aborted";
-		return { message, observed };
+		const saveKeptPartial = async (): Promise<void> => {
+			const partial = kept;
+			kept = undefined;
+			if (partial !== undefined) await commitPartial(partial, true);
+		};
+		return { message, observed, saveKeptPartial };
 	} finally {
 		stopped = true;
 		clearTimeout(timer);
@@ -502,6 +522,10 @@ async function streamResponse(
 			const saved = await commitPartial(pending, signalled);
 			// An abort mark that landed after the check above rejected the regular commit; retry once under the mark.
 			if (!saved && !signalled && runtime.signal.aborted) await commitPartial(pending, true);
+		} else if (pending !== undefined && hasAssistantAnswerOutput(pending)) {
+			// pi#174: a normal completion, the signal clear; its classification commit records the answer, unless an abort
+			// mark lands first.
+			kept = pending;
 		}
 	}
 }

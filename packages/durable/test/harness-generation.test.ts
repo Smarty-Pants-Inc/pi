@@ -586,6 +586,73 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// pi#174 (security review): a short answer completes normally before the partial throttle fires, so its answer is
+	// only in the pending partial. The abort mark commits after the finalizer's signal check and before the
+	// classification commit, which it rejects; the pending partial is committed under the mark and converted.
+	it("converts the answer of a normal completion whose classification commit an abort mark rejected", async () => {
+		const setup = chatSetup();
+		setup.faux.setResponses([fauxAssistantMessage("short answer")]);
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		let harnessRef: Harness | undefined;
+		let aborting: Promise<unknown> | undefined;
+		let signalledAtHook: boolean | undefined;
+		let partialAtHook: unknown;
+		addHooks(setup.registry, GenerationTask, {
+			// Runs after the finalizer's signal check and before the classification commit.
+			afterResponse: async (_message, api) => {
+				const signal = (api as unknown as { readonly signal: AbortSignal }).signal;
+				signalledAtHook = signal.aborted;
+				partialAtHook = (await harnessRef!.snapshot(LiveDoc, api.conversationId, context))?.generation?.message;
+				// The mark commits and signals the run before the hook returns, so it precedes the classification commit.
+				aborting = harnessRef!.abortTask(api.taskId, context);
+				if (!signal.aborted) {
+					await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+				}
+			},
+		});
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harnessRef = harness;
+		const values = livePublications(harness);
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect(await aborting).toBe("marked");
+		expect(signalledAtHook).toBe(false);
+		expect(partialAtHook).toBeUndefined();
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		const converted = entries[1]!.model![0] as AssistantMessage;
+		expect(converted.stopReason).toBe("aborted");
+		expect(textOf(converted)).toBe("short answer");
+		// Exactly one partial commit: the one under the mark.
+		expect(values.filter((value) => value.generation?.message !== undefined)).toHaveLength(1);
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
+	// pi#174: without an abort, a normal completion inside the partial interval commits no partial; the classification
+	// commit records the answer.
+	it("commits no partial for a normal completion within the partial interval", async () => {
+		const setup = chatSetup();
+		setup.faux.setResponses([fauxAssistantMessage("short answer")]);
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		const values = livePublications(harness);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled.status).toBe("done");
+		expect(values.length).toBeGreaterThan(0);
+		expect(values.filter((value) => value.generation?.message !== undefined)).toEqual([]);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "stop" });
+		expect(textOf(entries[1]!.model![0])).toBe("short answer");
+		await harness.close(context);
+	});
+
 	// smarty-dev#7428 (pi#174): the abort-mark writer is private to the scheduler's request phase dispatch. A hook holds
 	// the real runtime, yet no function reachable from it, nor the generation's own phase, writes under the mark.
 	it("lets no afterResponse hook write under the abort mark through any reachable function", async () => {
@@ -674,8 +741,12 @@ describe("generation", () => {
 		expect(outcomes["phases.request"]).toBe(mark);
 		expect(outcomes["replace request"]).toMatch(/read only|read-only|Cannot assign/);
 		expect(Object.keys(outcomes).length).toBeGreaterThan(10);
-		// Nothing planted reached the live document or the transcript.
-		expect((await allEntries(root)).map((entry) => entry.kind)).toEqual(["pi.user"]);
+		// Nothing planted reached the live document or the transcript. The mark rejected the classification commit of the
+		// normally completed answer, so the generation's own answer partial is converted (pi#174).
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "aborted" });
+		expect(textOf(entries[1]!.model![0])).toBe("answer");
 		expect(await live(harness, root)).toEqual({});
 		await harness.close(context);
 	});
