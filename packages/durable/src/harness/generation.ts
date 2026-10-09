@@ -2,6 +2,7 @@ import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-wo
 import type {
 	Api,
 	AssistantMessage,
+	AssistantStreamObservation,
 	DeferredHandle,
 	Message,
 	Model,
@@ -10,7 +11,15 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
-import { isRetryableAssistantError, retryDelayMs } from "@earendil-works/pi-ai/utils/retry";
+import {
+	createAssistantStreamObservation,
+	discardPartialReasoning,
+	hasAssistantAnswerOutput,
+	isReasoningOnlyPrematureStream,
+	isRetryableAssistantError,
+	observeAssistantStreamEvent,
+	retryDelayMs,
+} from "@earendil-works/pi-ai/utils/retry";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { AssistantEntry, ResetEntry, SystemEntry, UserEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
@@ -184,12 +193,28 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 		request: async (task, runtime, context) => {
 			const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
 			const conversationId = runtime.conversationId;
-			await runtime.commit(async (tx) => {
+			let interrupted = false;
+			await runtime.commit(async (tx): Promise<Next | undefined> => {
 				const live = await tx.doc(LiveDoc, conversationId);
+				// A committed partial means this phase crashed mid-stream and its stream observation is gone. The partial is
+				// everything durable observers saw, so it stands in for the observation: answer text or a tool call (even
+				// partial) fails the run instead of resending, which would repeat that output (smarty-dev#6730, pi#171).
+				// Reasoning-only partials are still resent.
+				const partial = live.generation?.message as AssistantMessage | undefined;
+				interrupted = partial !== undefined && hasAssistantAnswerOutput(partial);
 				await convertPartial(tx, live, conversationId);
+				if (interrupted) {
+					const text = "Model response was interrupted after answer output";
+					endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "model_error", detail: text });
+					return {
+						status: "terminal",
+						outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } },
+					};
+				}
 				live.generation = { attempt };
 				return undefined;
 			}, context);
+			if (interrupted) return;
 			const model = runtime.models.getModel(ref.provider, ref.modelId);
 			if (model === undefined) return failNoModel(runtime, ref, context);
 			const view = await runtime.context(conversationId, context, cutoff);
@@ -204,9 +229,9 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				sessionId: await ensureProviderSessionId(runtime, context),
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			};
-			const message = await streamResponse(runtime, model, messages, options, attempt, context);
+			const { message, observed } = await streamResponse(runtime, model, messages, options, attempt, context);
 			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
-			await classify(runtime, request, message, context);
+			await classify(runtime, request, message, context, observed);
 		},
 		retry: async (task, runtime, context) => {
 			const { attempt, compacted, until } = task.state.checkpoint;
@@ -358,8 +383,9 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
 
 /**
  * Stream one request and return the terminal message. Partials commit as trailing writes at most every
- * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle and awaits that
- * commit, so no stale partial lands after the outcome.
+ * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle, awaits that
+ * commit, and, unless the stream completed normally, commits a still pending partial with answer output, so no stale
+ * partial lands after the outcome and recovery from a crash before classification sees every answer output streamed.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -368,50 +394,68 @@ async function streamResponse(
 	options: SimpleStreamOptions,
 	attempt: number,
 	context: Context,
-): Promise<AssistantMessage> {
+): Promise<{ message: AssistantMessage; observed: AssistantStreamObservation }> {
 	const interval = runtime.settings.progress.partialIntervalMs;
+	// The terminal message can drop what the stream showed (smarty-dev#6730).
+	const observed = createAssistantStreamObservation();
+	// smarty-dev#6730: a premature close before answer output is retried and its reasoning dropped, so a partial
+	// without answer output is held until answer output arrives. The terminal commit records it otherwise.
+	const retry = runtime.settings.retry;
+	const holdReasoning = retry.enabled && attempt <= retry.maxRetries;
 	let pending: AssistantMessage | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
+	let completed = false;
+	const commitPartial = (partial: AssistantMessage): Promise<void> => {
+		// Copy synchronously: the provider keeps mutating its partial.
+		const message = copyJson(partial, { omitUndefinedProperties: true });
+		return runtime
+			.commit(async (tx) => {
+				const live = await tx.doc(LiveDoc, runtime.conversationId);
+				live.generation ??= { attempt };
+				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
+				return undefined;
+			}, context)
+			.catch((error: unknown) => {
+				// Rejections after an abort mark or close are expected; the committed state stays consistent.
+				if (!runtime.signal.aborted) runtime.report(error);
+			});
+	};
 	const flush = (): void => {
 		timer = undefined;
 		const partial = pending;
 		pending = undefined;
 		if (partial === undefined || stopped) return;
-		inFlight = (async () => {
-			// Copy synchronously: the provider keeps mutating its partial.
-			const message = copyJson(partial, { omitUndefinedProperties: true });
-			await runtime.commit(async (tx) => {
-				const live = await tx.doc(LiveDoc, runtime.conversationId);
-				live.generation ??= { attempt };
-				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
-				return undefined;
-			}, context);
-		})()
-			.catch((error: unknown) => {
-				// Rejections after an abort mark or close are expected; the committed state stays consistent.
-				if (!runtime.signal.aborted) runtime.report(error);
-			})
-			.finally(() => {
-				inFlight = undefined;
-				if (pending !== undefined && !stopped) timer = setTimeout(flush, interval);
-			});
+		inFlight = commitPartial(partial).finally(() => {
+			inFlight = undefined;
+			if (pending !== undefined && !stopped) timer = setTimeout(flush, interval);
+		});
 	};
 	try {
 		const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
 		for await (const event of events) {
+			observeAssistantStreamEvent(observed, event);
 			// A partial without content, such as pi-ai's opening `start` event, shows nothing; a deferred response
 			// never gets past it, so it never leaves a partial.
 			if (event.type === "done" || event.type === "error" || event.partial.content.length === 0) continue;
 			pending = event.partial;
+			if (holdReasoning && !observed.answer) continue;
 			if (timer === undefined && inFlight === undefined) timer = setTimeout(flush, interval);
 		}
-		return await events.result();
+		const message = await events.result();
+		completed = message.stopReason !== "error" && message.stopReason !== "aborted";
+		return { message, observed };
 	} finally {
 		stopped = true;
 		clearTimeout(timer);
 		await inFlight;
+		// pi#171: an abnormal end before the throttle fires (an error, a premature close, an abort, or a thrown stream)
+		// still makes streamed answer output durable before classification, so a crash before the classification commit
+		// recovers it instead of resending. A normal completion commits nothing extra: its classification commit records
+		// the final message. A partial without answer output is left to the classification commit, so the reasoning of a
+		// retried attempt stays held.
+		if (!completed && pending !== undefined && hasAssistantAnswerOutput(pending)) await commitPartial(pending);
 	}
 }
 
@@ -421,6 +465,7 @@ async function classify(
 	request: Request,
 	message: AssistantMessage,
 	context: Context,
+	observed?: AssistantStreamObservation,
 ): Promise<void> {
 	// An abort mark or close: the abort invocation or the reopened run handles the committed state.
 	runtime.signal.throwIfAborted();
@@ -447,7 +492,22 @@ async function classify(
 		}, context);
 		return;
 	}
-	await runtime.hooks.each("afterResponse", (hook) => hook(message, runtime, context));
+	// The retry and compaction policies govern the next attempt, so they are read now rather than pinned at preparation.
+	const settings = runtime.settings;
+	const overflow = message.stopReason === "error" && isContextOverflow(message);
+	const policy = settings.retry;
+	// An overflow is never retried: only a compaction can make the next request fit.
+	const retry =
+		message.stopReason === "error" &&
+		!overflow &&
+		isRetryableAssistantError(message, observed) &&
+		policy.enabled &&
+		attempt <= policy.maxRetries;
+	// smarty-dev#6730: the retry replaces a reasoning-only premature close, so neither afterResponse nor the
+	// transcript keeps its reasoning.
+	const visible =
+		retry && isReasoningOnlyPrematureStream(message, observed) ? discardPartialReasoning(message) : message;
+	await runtime.hooks.each("afterResponse", (hook) => hook(visible, runtime, context));
 	const calls = message.content.filter((content): content is ToolCall => content.type === "toolCall");
 	if (message.stopReason === "toolUse" && calls.length > 0) {
 		return startToolRound(runtime, request, message, calls, context);
@@ -455,13 +515,9 @@ async function classify(
 	if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") {
 		return answer(runtime, message, context);
 	}
-	// The retry and compaction policies govern the next attempt, so they are read now rather than pinned at preparation.
-	const settings = runtime.settings;
-	const overflow = message.stopReason === "error" && isContextOverflow(message);
 	if (overflow && compacted === undefined && settings.compaction.enabled) {
-		const policy = settings.compaction;
 		const view = await runtime.context(conversationId, context, cutoff);
-		if (selectCut(view, policy.keepRecentTokens) !== undefined) {
+		if (selectCut(view, settings.compaction.keepRecentTokens) !== undefined) {
 			const text = message.errorMessage ?? "Context overflow";
 			await runtime.commit(async (tx): Promise<Next> => {
 				const live = await tx.doc(LiveDoc, conversationId);
@@ -474,18 +530,10 @@ async function classify(
 			return;
 		}
 	}
-	const policy = settings.retry;
-	// An overflow is never retried: only a compaction can make the next request fit.
-	const retry =
-		message.stopReason === "error" &&
-		!overflow &&
-		isRetryableAssistantError(message) &&
-		policy.enabled &&
-		attempt <= policy.maxRetries;
 	const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
 	await runtime.commit(async (tx): Promise<Next> => {
 		const live = await tx.doc(LiveDoc, conversationId);
-		await appendAssistant(tx, conversationId, message);
+		await appendAssistant(tx, conversationId, visible);
 		if (retry) {
 			live.generation = { attempt, retry: { at: until, error: message.errorMessage ?? "" } };
 			const checkpoint = {

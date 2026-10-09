@@ -1,5 +1,5 @@
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
-import type { AssistantMessage } from "../types.ts";
+import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
 
 function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
@@ -131,6 +131,82 @@ export function hasAssistantOutput(message: AssistantMessage): boolean {
 			block.type === "thinking" ? block.thinking.length > 0 : block.type === "text" ? block.text.length > 0 : true,
 		)
 	);
+}
+
+/** Answer output: non-empty text, any tool call (even partial), or any other non-reasoning block. */
+export function hasAssistantAnswerOutput(message: AssistantMessage): boolean {
+	return message.content.some((block) =>
+		block.type === "thinking" ? false : block.type === "text" ? block.text.length > 0 : true,
+	);
+}
+
+/**
+ * What a stream consumer saw before the terminal message. A provider can drop streamed content from its
+ * terminal error message, so the message alone under-reports what consumers already received.
+ */
+export interface AssistantStreamObservation {
+	/** Non-empty reasoning was streamed. */
+	reasoning: boolean;
+	/** Answer text, a tool call or another non-reasoning block was streamed. */
+	answer: boolean;
+}
+
+export function createAssistantStreamObservation(): AssistantStreamObservation {
+	return { reasoning: false, answer: false };
+}
+
+/** Record the content of a (partial) assistant message into `observation`. */
+export function observeAssistantMessage(
+	observation: AssistantStreamObservation,
+	message: AssistantMessage,
+): AssistantStreamObservation {
+	observation.answer ||= hasAssistantAnswerOutput(message);
+	observation.reasoning ||= message.content.some((block) => block.type === "thinking" && block.thinking.length > 0);
+	return observation;
+}
+
+/** Record one stream event, including its partial message, into `observation`. */
+export function observeAssistantStreamEvent(
+	observation: AssistantStreamObservation,
+	event: AssistantMessageEvent,
+): AssistantStreamObservation {
+	const streamed = ("delta" in event && event.delta.length > 0) || ("content" in event && event.content.length > 0);
+	observation.answer ||= event.type.startsWith("toolcall_") || (event.type.startsWith("text_") && streamed);
+	observation.reasoning ||= event.type.startsWith("thinking_") && streamed;
+	return observeAssistantMessage(
+		observation,
+		event.type === "done" ? event.message : event.type === "error" ? event.error : event.partial,
+	);
+}
+
+/**
+ * A premature close that streamed only reasoning (smarty-dev#6730): no answer output, and either non-empty
+ * thinking in the message or reasoning observed in the stream. Its output tokens are reasoning, so the attempt
+ * can be discarded and restarted. Without `observed`, a message whose content is empty thinking or was
+ * dropped is not reasoning-only, because its reported output tokens could be answer text.
+ */
+export function isReasoningOnlyPrematureStream(
+	message: AssistantMessage,
+	observed?: AssistantStreamObservation,
+): boolean {
+	if (!isPrematureStreamError(message) || observed?.answer === true || hasAssistantAnswerOutput(message)) return false;
+	return (
+		observed?.reasoning === true ||
+		message.content.some((block) => block.type === "thinking" && block.thinking.length > 0)
+	);
+}
+
+/**
+ * Drop the partial reasoning of an attempt that will be restarted. Thinking blocks keep their place
+ * but lose text and replay signatures. Empty thinking is no evidence of reasoning, so a caller that
+ * classifies the result again must pass an observation that recorded the original message.
+ */
+export function discardPartialReasoning<T extends AssistantMessage>(message: T): T {
+	if (!message.content.some((block) => block.type === "thinking")) return message;
+	return {
+		...message,
+		content: message.content.map((block) => (block.type === "thinking" ? { type: "thinking", thinking: "" } : block)),
+	};
 }
 
 /**
@@ -292,9 +368,16 @@ export function throttledLimitWait(message: AssistantMessage): { delayMs: number
  * This does not implement retry policy. Callers should first handle context
  * overflow separately, then apply their own retry budget, backoff, and reporting
  * before restarting the assistant turn.
+ *
+ * Stream consumers should pass what they observed: output seen in the stream blocks a retry even when the
+ * terminal message dropped it, and observed reasoning lets a premature close whose content was dropped be
+ * restarted.
  */
-export function isRetryableAssistantError(message: AssistantMessage): boolean {
-	if (message.stopReason !== "error" || !message.errorMessage || hasAssistantOutput(message)) return false;
+export function isRetryableAssistantError(message: AssistantMessage, observed?: AssistantStreamObservation): boolean {
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	// Output is never replayed, except reasoning-only output on a premature close (smarty-dev#6730).
+	const output = hasAssistantOutput(message) || observed?.answer === true || observed?.reasoning === true;
+	if (output && !isReasoningOnlyPrematureStream(message, observed)) return false;
 	// An observer can fail after receiving generated output but before normalization records it.
 	// Retrying its transient-looking error would regenerate output, not repair the observer.
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;
