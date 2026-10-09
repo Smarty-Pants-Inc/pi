@@ -12,6 +12,12 @@ import {
 import { getEditorTheme, initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
+// These small fixtures model a visible TUI, including its event subscription contract.
+const visibleTui = (listener: (visible: boolean) => void) => {
+	listener(true);
+	return () => {};
+};
+
 describe("status indicators", () => {
 	afterEach(() => {
 		vi.useRealTimers();
@@ -28,6 +34,7 @@ describe("status indicators", () => {
 	it("keeps the top border unchanged unless the editor opts in", () => {
 		initTheme("dark");
 		const tui = {
+			onVisibilityChange: visibleTui,
 			requestRender: vi.fn(),
 			terminal: { rows: 10 },
 		} as unknown as TUI;
@@ -45,6 +52,7 @@ describe("status indicators", () => {
 	it("embeds the working indicator when the editor opts in", () => {
 		initTheme("dark");
 		const tui = {
+			onVisibilityChange: visibleTui,
 			requestRender: vi.fn(),
 			terminal: { rows: 10 },
 		} as unknown as TUI;
@@ -66,7 +74,7 @@ describe("status indicators", () => {
 	it("embeds compaction, summary, and retry labels within the border width", () => {
 		initTheme("dark");
 		vi.useFakeTimers();
-		const tui = { requestRender: vi.fn(), terminal: { rows: 10 } } as unknown as TUI;
+		const tui = { onVisibilityChange: visibleTui, requestRender: vi.fn(), terminal: { rows: 10 } } as unknown as TUI;
 		const editor = new CustomEditor(tui, getEditorTheme(), KeybindingsManager.create(), {
 			embedWorkingStatus: true,
 		});
@@ -99,7 +107,7 @@ describe("status indicators", () => {
 		initTheme("dark");
 		vi.useFakeTimers();
 		const requestRender = vi.fn();
-		const tui = { requestRender } as unknown as TUI;
+		const tui = { onVisibilityChange: visibleTui, requestRender } as unknown as TUI;
 		const indicator = new RetryStatusIndicator(tui, 1, 3, 1000);
 		const callsBeforeDispose = requestRender.mock.calls.length;
 

@@ -65,7 +65,14 @@ describe("shareSession", () => {
 					}
 				},
 			},
-			ui: { setFocus() {}, requestRender() {} },
+			ui: {
+				setFocus() {},
+				requestRender() {},
+				onVisibilityChange: (listener: (visible: boolean) => void) => {
+					listener(true);
+					return () => {};
+				},
+			},
 			editorContainer: { clear() {}, addChild() {} },
 			editor: {},
 			showStatus() {},
