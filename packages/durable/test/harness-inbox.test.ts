@@ -171,13 +171,24 @@ describe("inbox", () => {
 		const first = gated(answer("first"));
 		setup.faux.setResponses([first.step, answer("both")]);
 		const yielded = deferred();
-		addHooks(setup.registry, GenerationTask, { onYield: () => void yielded.resolve() });
+		const responded = deferred();
+		const classify = deferred();
+		addHooks(setup.registry, GenerationTask, {
+			// The stream's answer partial is committed by now (pi#171); classification waits for the test.
+			afterResponse: async () => {
+				responded.resolve();
+				await classify.promise;
+			},
+			onYield: () => void yielded.resolve(),
+		});
 		const storage = new ControlledStorage();
 		const { harness, root } = await openChat(storage, setup);
 		await root.submit({ type: "input", content: "a" }, context);
 		await first.reached;
 		const f1 = await root.submit({ type: "input", content: "f1" }, context);
 		const f2 = await root.submit({ type: "input", content: "f2" }, context);
+		first.release();
+		await responded.promise;
 		// Occupy the line, let the answer queue its boundary commit behind it, then change the mode.
 		const held = storage.holdCommits();
 		const Marker = defineDoc<{ n: number }>({
@@ -188,7 +199,7 @@ describe("inbox", () => {
 		});
 		const occupying = root.commit(async (tx) => void (await tx.doc(Marker)).n++, context);
 		await held.entered;
-		first.release();
+		classify.resolve();
 		await yielded.promise;
 		await flush();
 		setup.settings.followUpMode = "all";

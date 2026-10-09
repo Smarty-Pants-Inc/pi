@@ -10,14 +10,17 @@ import {
 	fauxThinking,
 	fauxToolCall,
 	type Message,
+	type Models,
 } from "@earendil-works/pi-ai";
-import { AssistantEntry, type Harness, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
+import { AssistantEntry, GenerationTask, type Harness, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, textOf, unanswered, waitFor } from "./chat-support.ts";
-import { addSection } from "./harness-support.ts";
+import { addHooks, addSection } from "./harness-support.ts";
 import { context } from "./session-support.ts";
 import { aborted, deferred } from "./task-support.ts";
+
+const PREMATURE_CLOSE = "stream closed before response.completed";
 
 const directories = new Set<string>();
 
@@ -240,6 +243,72 @@ describe("generation recovery", () => {
 		expect(textOf(converted)).toBe(partial);
 		expect(await opened.harness.snapshot(LiveDoc, opened.root.id, context)).toEqual({});
 		await opened.harness.close(context);
+	});
+
+	// pi#171 review: an error before the partial throttle fires must not leave the streamed answer only in memory.
+	it("commits the answer partial of a stream that errors within the partial interval before classifying it", async () => {
+		const path = await sqlitePath();
+		const thinking = { type: "thinking" as const, thinking: "planning" };
+		const text = { type: "text" as const, text: "streamed answer" };
+		const base = chatSetup();
+		// Answer text, then at once a premature close whose terminal message dropped it (smarty-dev#6730).
+		const streamSimple: Models["streamSimple"] = () => {
+			const events = async function* () {
+				const reasoning = fauxAssistantMessage([thinking], { stopReason: "pending" });
+				yield { type: "thinking_delta", contentIndex: 0, delta: thinking.thinking, partial: reasoning };
+				const answered = fauxAssistantMessage([thinking, text], { stopReason: "pending" });
+				yield { type: "text_delta", contentIndex: 1, delta: text.text, partial: answered };
+			};
+			const final = fauxAssistantMessage([thinking], { stopReason: "error", errorMessage: PREMATURE_CLOSE });
+			return { [Symbol.asyncIterator]: events, result: async () => final } as unknown as ReturnType<
+				Models["streamSimple"]
+			>;
+		};
+		const models = new Proxy(base.models, {
+			get: (target, property) => {
+				if (property === "streamSimple") return streamSimple;
+				const value = Reflect.get(target, property, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+		const crashing: ChatSetup = { ...base, models };
+		crashing.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		// The process dies during classification, before its commit.
+		const reached = deferred();
+		addHooks(crashing.registry, GenerationTask, {
+			afterResponse: async (_message, _api, ctx) => {
+				reached.resolve();
+				await aborted(ctx.abortSignal!);
+			},
+		});
+		let opened = await open(path, crashing);
+		opened.harness.resume();
+		const id = (await opened.root.submit({ type: "input", content: "hi" }, context)).id;
+		await reached.promise;
+		const committed = await opened.harness.snapshot(LiveDoc, opened.root.id, context);
+		expect((committed?.generation?.message as AssistantMessage | undefined)?.content).toEqual([thinking, text]);
+		await opened.harness.close(context);
+
+		const setup = chatSetup();
+		setup.settings.retry = crashing.settings.retry;
+		const sent: string[][] = [];
+		setup.faux.setResponses([
+			(request) => {
+				sent.push(request.messages.map((message) => message.role));
+				return fauxAssistantMessage("answer");
+			},
+		]);
+		opened = await open(path, setup);
+		opened.harness.resume();
+		const settled = await (await opened.harness.submission(id, context))!.wait(context);
+		const entries = await allEntries(opened.root);
+		await opened.harness.close(context);
+		// Recovery sees the answer output: no reasoning-only resend.
+		expect(sent).toEqual([]);
+		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error" });
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		const converted = entries[1]!.model![0] as AssistantMessage;
+		expect(converted).toMatchObject({ stopReason: "aborted", content: [thinking, text] });
 	});
 
 	it("resumes a retry backoff after reopen", async () => {

@@ -383,8 +383,9 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
 
 /**
  * Stream one request and return the terminal message. Partials commit as trailing writes at most every
- * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle and awaits that
- * commit, so no stale partial lands after the outcome.
+ * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle, awaits that
+ * commit, and then commits a still pending partial with answer output, so no stale partial lands after the outcome and
+ * classification (or recovery from a crash before it) sees every answer output the stream produced.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -405,29 +406,30 @@ async function streamResponse(
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
+	const commitPartial = (partial: AssistantMessage): Promise<void> => {
+		// Copy synchronously: the provider keeps mutating its partial.
+		const message = copyJson(partial, { omitUndefinedProperties: true });
+		return runtime
+			.commit(async (tx) => {
+				const live = await tx.doc(LiveDoc, runtime.conversationId);
+				live.generation ??= { attempt };
+				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
+				return undefined;
+			}, context)
+			.catch((error: unknown) => {
+				// Rejections after an abort mark or close are expected; the committed state stays consistent.
+				if (!runtime.signal.aborted) runtime.report(error);
+			});
+	};
 	const flush = (): void => {
 		timer = undefined;
 		const partial = pending;
 		pending = undefined;
 		if (partial === undefined || stopped) return;
-		inFlight = (async () => {
-			// Copy synchronously: the provider keeps mutating its partial.
-			const message = copyJson(partial, { omitUndefinedProperties: true });
-			await runtime.commit(async (tx) => {
-				const live = await tx.doc(LiveDoc, runtime.conversationId);
-				live.generation ??= { attempt };
-				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
-				return undefined;
-			}, context);
-		})()
-			.catch((error: unknown) => {
-				// Rejections after an abort mark or close are expected; the committed state stays consistent.
-				if (!runtime.signal.aborted) runtime.report(error);
-			})
-			.finally(() => {
-				inFlight = undefined;
-				if (pending !== undefined && !stopped) timer = setTimeout(flush, interval);
-			});
+		inFlight = commitPartial(partial).finally(() => {
+			inFlight = undefined;
+			if (pending !== undefined && !stopped) timer = setTimeout(flush, interval);
+		});
 	};
 	try {
 		const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
@@ -445,6 +447,11 @@ async function streamResponse(
 		stopped = true;
 		clearTimeout(timer);
 		await inFlight;
+		// pi#171: an outcome that arrives before the throttle fires (an error, a premature close, an abort, or completion)
+		// still makes streamed answer output durable before classification, so a crash before the classification commit
+		// recovers it instead of resending. A partial without answer output is left to the classification commit, so the
+		// reasoning of a retried attempt stays held.
+		if (pending !== undefined && hasAssistantAnswerOutput(pending)) await commitPartial(pending);
 	}
 }
 

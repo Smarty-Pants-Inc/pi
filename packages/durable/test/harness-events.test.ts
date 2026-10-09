@@ -373,8 +373,8 @@ describe("agent events", () => {
 		await followUp.wait(context);
 		await drained();
 		const boundary = batches.find((batch) => batch.some((event) => event.type === "run_end"))!;
+		// The answer's message_start came with its partial, committed before classification (pi#171).
 		expect(boundary.map((event) => event.type)).toEqual([
-			"message_start",
 			"message_end",
 			"message_start",
 			"message_end",
