@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { McpClient, StreamableHttpTransport } from "../src/index.ts";
+import { registerClient } from "../src/oauth/flow.ts";
 import {
 	adaptOAuthProvider,
 	authorizeMcp,
@@ -13,10 +14,10 @@ import {
 	type OAuthClientInformationMixed,
 	type OAuthClientProvider,
 	type OAuthDiscoveryState,
+	OAuthEndpointOriginError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
 	type OAuthTokens,
-	registerClient,
 } from "../src/oauth/index.ts";
 import { closeServers, listen, readBody } from "./helpers.ts";
 
@@ -293,7 +294,7 @@ describe.skip("MCP OAuth", () => {
 				response.setHeader("content-type", "application/json");
 				response.end(
 					JSON.stringify({
-						// Issuer without the trailing slash that URL parsing adds to the fallback server URL.
+						// The fallback issuer is the server origin, compared exactly (RFC 8414 §3.3).
 						issuer: serverOrigin,
 						authorization_endpoint: `${serverOrigin}/authorize`,
 						token_endpoint: `${serverOrigin}/token`,
@@ -452,7 +453,7 @@ describe.skip("MCP OAuth", () => {
 	});
 
 	// #10172
-	it("uses a configured authorization server metadata document as is", async () => {
+	it("uses a configured authorization server metadata document, with endpoints bound to its issuer origin", async () => {
 		const origin = await listen(async (request, response, serverOrigin) => {
 			const url = new URL(request.url ?? "/", serverOrigin);
 			response.setHeader("content-type", "application/json");
@@ -480,7 +481,10 @@ describe.skip("MCP OAuth", () => {
 			serverUrl: `${origin}/mcp`,
 			authorizationServerMetadataUrl: new URL(`${origin}/idp/metadata.json`),
 		};
-		expect(await authorizeMcp(provider, options)).toBe("REDIRECT");
+		// pi#173 review: the endpoints are not on the origin of the issuer the document names.
+		await expect(authorizeMcp(provider, options)).rejects.toBeInstanceOf(OAuthEndpointOriginError);
+		expect(provider.authorizationUrl).toBeUndefined();
+		expect(await authorizeMcp(provider, { ...options, allowedEndpointOrigins: [origin] })).toBe("REDIRECT");
 		const authorizationUrl = provider.authorizationUrl as URL;
 		expect(`${authorizationUrl.origin}${authorizationUrl.pathname}`).toBe(`${origin}/idp/authorize`);
 		expect(authorizationUrl.searchParams.get("resource")).toBe(`${origin}/mcp`);
@@ -520,6 +524,46 @@ describe.skip("MCP OAuth", () => {
 		// Servers that do not promise the parameter may omit it.
 		expect(await exchange("omitted", undefined, false)).toBe("AUTHORIZED");
 		expect(codes).toEqual(["matching", "omitted"]);
+	});
+
+	// #10565
+	it("stops when its signal aborts, without falling back to a redirect", async () => {
+		const stalled: string[] = [];
+		// Accepts every request and never answers.
+		const origin = await listen(async (request, _response, serverOrigin) => {
+			stalled.push(new URL(request.url ?? "/", serverOrigin).pathname);
+		});
+		const run = async (provider: TestOAuthProvider) => {
+			const controller = new AbortController();
+			const count = stalled.length;
+			const flow = authorizeMcp(provider, { serverUrl: `${origin}/mcp`, signal: controller.signal });
+			const settled = flow.catch((error: unknown) => error);
+			await expect.poll(() => stalled.length).toBe(count + 1);
+			controller.abort();
+			expect(await settled).toMatchObject({ name: "AbortError" });
+			expect(provider.authorizationUrl).toBeUndefined();
+			return stalled.at(-1);
+		};
+
+		// Discovery.
+		expect(await run(new TestOAuthProvider("http://127.0.0.1/callback"))).toBe(
+			"/.well-known/oauth-protected-resource/mcp",
+		);
+
+		// A failed refresh otherwise falls back to a new authorization.
+		const refreshing = new TestOAuthProvider("http://127.0.0.1/callback");
+		refreshing.client = { client_id: "client" };
+		refreshing.tokenSet = { access_token: "a1", refresh_token: "r1", token_type: "Bearer" };
+		refreshing.discovery = {
+			authorizationServerUrl: origin,
+			authorizationServerMetadata: {
+				issuer: origin,
+				authorization_endpoint: `${origin}/authorize`,
+				token_endpoint: `${origin}/token`,
+				response_types_supported: ["code"],
+			},
+		};
+		expect(await run(refreshing)).toBe("/token");
 	});
 });
 
