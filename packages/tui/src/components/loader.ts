@@ -4,22 +4,21 @@ import { Text } from "./text.ts";
 export interface LoaderIndicatorOptions {
 	/** Animation frames. Use an empty array to hide the indicator. */
 	frames?: string[];
-	/** Frame interval in milliseconds for animated indicators. */
+	/** Frame interval in milliseconds for animated indicators (minimum 100 ms). */
 	intervalMs?: number;
 }
 
 const DEFAULT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const DEFAULT_INTERVAL_MS = 80;
+const DEFAULT_INTERVAL_MS = 100;
 
-/**
- * Loader component that updates with an optional spinning animation.
- */
+/** Loader component with an animation that runs only while its pane is visible. */
 export class Loader extends Text {
 	private frames = [...DEFAULT_FRAMES];
 	private intervalMs = DEFAULT_INTERVAL_MS;
 	private currentFrame = 0;
 	private intervalId: NodeJS.Timeout | null = null;
-	private ui: TUI | null = null;
+	private unsubscribeVisibility?: () => void;
+	private ui: TUI;
 	private renderIndicatorVerbatim = false;
 	private spinnerColorFn: (str: string) => string;
 	private messageColorFn: (str: string) => string;
@@ -45,11 +44,25 @@ export class Loader extends Text {
 	}
 
 	start(): void {
+		this.stop();
 		this.updateDisplay();
-		this.restartAnimation();
+		this.unsubscribeVisibility = this.ui.onVisibilityChange((visible) => {
+			this.pauseAnimation();
+			if (!visible || this.frames.length <= 1) return;
+			this.intervalId = setInterval(() => {
+				this.currentFrame = (this.currentFrame + 1) % this.frames.length;
+				this.updateDisplay();
+			}, this.intervalMs);
+		});
 	}
 
 	stop(): void {
+		this.pauseAnimation();
+		this.unsubscribeVisibility?.();
+		this.unsubscribeVisibility = undefined;
+	}
+
+	private pauseAnimation(): void {
 		if (this.intervalId) {
 			clearInterval(this.intervalId);
 			this.intervalId = null;
@@ -57,6 +70,7 @@ export class Loader extends Text {
 	}
 
 	setMessage(message: string): void {
+		if (message === this.message) return;
 		this.message = message;
 		this.updateDisplay();
 	}
@@ -69,20 +83,13 @@ export class Loader extends Text {
 	setIndicator(indicator?: LoaderIndicatorOptions): void {
 		this.renderIndicatorVerbatim = indicator !== undefined;
 		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : [...DEFAULT_FRAMES];
-		this.intervalMs = indicator?.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : DEFAULT_INTERVAL_MS;
+		const interval = indicator?.intervalMs;
+		this.intervalMs =
+			typeof interval === "number" && Number.isFinite(interval)
+				? Math.min(2_147_483_647, Math.max(DEFAULT_INTERVAL_MS, interval))
+				: DEFAULT_INTERVAL_MS;
 		this.currentFrame = 0;
 		this.start();
-	}
-
-	private restartAnimation(): void {
-		this.stop();
-		if (this.frames.length <= 1) {
-			return;
-		}
-		this.intervalId = setInterval(() => {
-			this.currentFrame = (this.currentFrame + 1) % this.frames.length;
-			this.updateDisplay();
-		}, this.intervalMs);
 	}
 
 	protected getRenderedIndicator(): string {
@@ -94,8 +101,6 @@ export class Loader extends Text {
 		const renderedFrame = this.getRenderedIndicator();
 		const indicator = renderedFrame.length > 0 ? `${renderedFrame} ` : "";
 		this.setText(`${indicator}${this.messageColorFn(this.message)}`);
-		if (this.ui) {
-			this.ui.requestRender();
-		}
+		this.ui.requestRender();
 	}
 }

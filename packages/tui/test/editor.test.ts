@@ -2136,7 +2136,11 @@ describe("Editor component", () => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			for (const before of ["查看，", "\u3000", ..."，．：；！？（）［］｛｝“”‘’…—。、「」『』《》【】"]) {
 				for (const trigger of ["@", "#", "$", "-"]) {
-					const editor = new Editor(createTestTUI(), defaultEditorTheme);
+					// smarty-dev#7403: this fake-clock debounce test does not render a TUI.
+					// Stop its unused renderer so frame timers cannot interfere with 20 ms ticks.
+					const tui = createTestTUI();
+					tui.stop();
+					const editor = new Editor(tui, defaultEditorTheme);
 					const requests: string[] = [];
 					editor.setAutocompleteProvider({
 						triggerCharacters: ["$", "-"],

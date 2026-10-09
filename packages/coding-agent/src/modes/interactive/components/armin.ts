@@ -60,6 +60,8 @@ function buildFinalGrid(): string[][] {
 export class ArminComponent implements Component {
 	private ui: TUI;
 	private interval: ReturnType<typeof setInterval> | null = null;
+	private unsubscribeVisibility?: () => void;
+	private animationDone = false;
 	private effect: Effect;
 	private finalGrid: string[][];
 	private currentGrid: string[][];
@@ -76,7 +78,10 @@ export class ArminComponent implements Component {
 		this.currentGrid = this.createEmptyGrid();
 
 		this.initEffect();
-		this.startAnimation();
+		this.unsubscribeVisibility = ui.onVisibilityChange((visible) => {
+			if (visible && !this.animationDone) this.startAnimation();
+			else this.pauseAnimation();
+		});
 	}
 
 	invalidate(): void {
@@ -178,18 +183,28 @@ export class ArminComponent implements Component {
 	}
 
 	private startAnimation(): void {
-		const fps = this.effect === "glitch" ? 60 : 30;
+		if (this.interval) return;
 		this.interval = setInterval(() => {
-			const done = this.tickEffect();
+			// Preserve effect duration without 30/60 fps render requests.
+			const steps = this.effect === "glitch" ? 6 : 3;
+			let done = false;
+			for (let step = 0; step < steps && !done; step++) done = this.tickEffect();
 			this.updateDisplay();
 			this.ui.requestRender();
 			if (done) {
+				this.animationDone = true;
 				this.stopAnimation();
 			}
-		}, 1000 / fps);
+		}, 100);
 	}
 
 	private stopAnimation(): void {
+		this.pauseAnimation();
+		this.unsubscribeVisibility?.();
+		this.unsubscribeVisibility = undefined;
+	}
+
+	private pauseAnimation(): void {
 		if (this.interval) {
 			clearInterval(this.interval);
 			this.interval = null;

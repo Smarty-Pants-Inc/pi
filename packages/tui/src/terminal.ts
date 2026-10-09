@@ -86,6 +86,12 @@ export interface Terminal {
 	// Write output to terminal
 	write(data: string): void;
 
+	/** Optional frame-lifecycle observer, including frames with no output changes. */
+	onRenderPending?(pending: boolean): void;
+
+	/** Pause terminal-owned cosmetic timers when the pane is hidden. */
+	setVisible?(visible: boolean): void;
+
 	// Get terminal dimensions
 	get columns(): number;
 	get rows(): number;
@@ -146,6 +152,8 @@ export class ProcessTerminal implements Terminal {
 	private stdinBuffer?: StdinBuffer;
 	private stdinDataHandler?: (data: string) => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
+	private progressActive = false;
+	private visible = true;
 	private writeLogPath = (() => {
 		const env = process.env.PI_TUI_WRITE_LOG || "";
 		if (!env) return "";
@@ -420,9 +428,9 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	stop(): void {
-		if (this.clearProgressInterval()) {
-			process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
-		}
+		this.clearProgressInterval();
+		if (this.progressActive) process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
+		this.progressActive = false;
 
 		// Disable bracketed paste mode
 		process.stdout.write("\x1b[?2004l");
@@ -522,7 +530,19 @@ export class ProcessTerminal implements Terminal {
 		process.stdout.write(`\x1b]0;${title}\x07`);
 	}
 
+	setVisible(visible: boolean): void {
+		if (this.visible === visible) return;
+		this.visible = visible;
+		if (!visible) this.clearProgressInterval();
+		else if (this.progressActive) this.setProgress(true);
+	}
+
 	setProgress(active: boolean): void {
+		this.progressActive = active;
+		if (!this.visible) {
+			this.clearProgressInterval();
+			return;
+		}
 		if (active) {
 			// OSC 9;4;3 - indeterminate progress
 			process.stdout.write(TERMINAL_PROGRESS_ACTIVE_SEQUENCE);

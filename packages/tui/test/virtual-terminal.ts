@@ -12,6 +12,8 @@ export class VirtualTerminal implements Terminal {
 	private xterm: XtermTerminalType;
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
+	private renderWaiter?: () => void;
+	private pendingRender?: Promise<void>;
 	private _columns: number;
 	private _rows: number;
 
@@ -209,10 +211,21 @@ export class VirtualTerminal implements Terminal {
 		};
 	}
 
-	/** Wait for TUI's throttled render pipeline to settle. */
+	onRenderPending(pending: boolean): void {
+		if (pending) {
+			this.pendingRender ??= new Promise<void>((resolve) => {
+				this.renderWaiter = resolve;
+			});
+		} else {
+			this.renderWaiter?.();
+			this.renderWaiter = undefined;
+			this.pendingRender = undefined;
+		}
+	}
+
+	/** Await the requested frame (even unchanged output), then flush xterm. No timing assumptions. */
 	async waitForRender(): Promise<void> {
-		await new Promise<void>((resolve) => process.nextTick(resolve));
-		await new Promise<void>((resolve) => setTimeout(resolve, 20));
+		await this.pendingRender;
 		await this.flush();
 	}
 }

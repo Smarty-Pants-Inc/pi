@@ -3,7 +3,7 @@
  */
 
 import { performance } from "node:perf_hooks";
-import { isKeyRelease, matchesKey } from "./keys.ts";
+import { isKeyRelease, matchesKey, parseKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	isOsc11BackgroundColorResponse,
@@ -443,6 +443,8 @@ export interface TUI extends Component {
 	stop(options?: TuiStopOptions): void;
 	renderNow(force?: boolean): void;
 	requestRender(force?: boolean): void;
+	/** Subscribe to pane visibility (and stop/start). Called immediately with the current state. */
+	onVisibilityChange(listener: (visible: boolean) => void): () => void;
 	addInputListener(listener: TuiInputListener): () => void;
 	removeInputListener(listener: TuiInputListener): void;
 	onTerminalColorSchemeChange(listener: (scheme: TerminalColorScheme) => void): () => void;
@@ -474,7 +476,19 @@ export abstract class TuiBase extends Container implements TUI {
 	private immediateRenderScheduled = false;
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
-	private static readonly MIN_RENDER_INTERVAL_MS = 16;
+	// ponytail: stream/spinner frames share a cheap cap; input and forced renders bypass it.
+	private static readonly MIN_RENDER_INTERVAL_MS = 100;
+	// Focus state and subscriptions belong to the terminal, including across renderer swaps/suspend.
+	private static readonly visibilityByTerminal = new WeakMap<
+		Terminal,
+		{ focused: boolean; listeners: Set<(visible: boolean) => void> }
+	>();
+	private readonly terminalVisibility: { focused: boolean; listeners: Set<(visible: boolean) => void> };
+	private readonly visibilityListeners: Set<(visible: boolean) => void>;
+
+	protected get terminalFocused(): boolean {
+		return this.terminalVisibility.focused;
+	}
 	private showHardwareCursor = false;
 	private clearOnShrink = false;
 	protected fullRedrawCount = 0;
@@ -499,6 +513,9 @@ export abstract class TuiBase extends Container implements TUI {
 	constructor(terminal: Terminal, showHardwareCursor?: boolean, logDirectory?: string) {
 		super();
 		this.terminal = terminal;
+		this.terminalVisibility = TuiBase.visibilityByTerminal.get(terminal) ?? { focused: true, listeners: new Set() };
+		TuiBase.visibilityByTerminal.set(terminal, this.terminalVisibility);
+		this.visibilityListeners = this.terminalVisibility.listeners;
 		this.logDirectory = logDirectory;
 		if (showHardwareCursor !== undefined) {
 			this.showHardwareCursor = showHardwareCursor;
@@ -516,6 +533,10 @@ export abstract class TuiBase extends Container implements TUI {
 	protected beforeTerminalStop(_options: TuiStopOptions): void {}
 
 	protected afterTerminalStop(_options: TuiStopOptions): void {}
+
+	protected onTerminalFocusOut(): void {}
+
+	protected onPaneVisibilityChange(_visible: boolean): void {}
 
 	get fullRedraws(): number {
 		return this.fullRedrawCount;
@@ -877,18 +898,46 @@ export abstract class TuiBase extends Container implements TUI {
 
 	start(): void {
 		this.stopped = false;
+		this.terminal.setVisible?.(this.terminalFocused);
+		this.onPaneVisibilityChange(this.terminalFocused);
+		for (const listener of this.visibilityListeners) listener(this.terminalFocused);
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
 			() => this.requestRender(),
 		);
 		this.afterTerminalStart();
+		this.terminal.write("\x1b[?1004h");
 		this.terminal.hideCursor();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031h");
 		}
 		this.queryCellSize();
-		this.requestRender();
+		this.requestImmediateRender();
+	}
+
+	onVisibilityChange(listener: (visible: boolean) => void): () => void {
+		const listeners = this.visibilityListeners;
+		listeners.add(listener);
+		listener(!this.stopped && this.terminalFocused);
+		return () => listeners.delete(listener);
+	}
+
+	private setTerminalFocused(focused: boolean): void {
+		if (this.terminalFocused === focused) return;
+		this.terminalVisibility.focused = focused;
+		this.terminal.setVisible?.(focused && !this.stopped);
+		if (!focused) {
+			this.cancelRenderTimer();
+			this.terminal.onRenderPending?.(false);
+			this.onTerminalFocusOut();
+		} else {
+			// Hidden state can have changed without a single frame or timer.
+			this.resetRenderState();
+			this.requestImmediateRender();
+		}
+		this.onPaneVisibilityChange(focused && !this.stopped);
+		for (const listener of this.visibilityListeners) listener(focused && !this.stopped);
 	}
 
 	addInputListener(listener: TuiInputListener): () => void {
@@ -932,6 +981,11 @@ export abstract class TuiBase extends Container implements TUI {
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
 		this.cancelRenderTimer();
+		this.terminal.onRenderPending?.(false);
+		this.terminal.setVisible?.(false);
+		this.onPaneVisibilityChange(false);
+		for (const listener of this.visibilityListeners) listener(false);
+		this.terminal.write("\x1b[?1004l");
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
@@ -942,14 +996,30 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	renderNow(force = false): void {
+		if (!this.terminalFocused) {
+			this.renderRequested = true;
+			return;
+		}
 		if (force) this.resetRenderState();
+		if (this.stopped || !this.terminalFocused) {
+			this.renderRequested = true;
+			return;
+		}
 		this.renderRequested = false;
 		this.cancelRenderTimer();
 		this.lastRenderAt = performance.now();
-		this.doRender();
+		try {
+			this.doRender();
+		} finally {
+			this.terminal.onRenderPending?.(this.renderRequested && this.terminalFocused && !this.stopped);
+		}
 	}
 
 	requestRender(force = false): void {
+		if (!this.terminalFocused) {
+			this.renderRequested = true;
+			return;
+		}
 		if (force) {
 			this.resetRenderState();
 			this.requestImmediateRender();
@@ -957,23 +1027,24 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		if (this.renderRequested) return;
 		this.renderRequested = true;
-		process.nextTick(() => this.scheduleRender());
+		if (!this.stopped && this.terminalFocused) {
+			this.terminal.onRenderPending?.(true);
+			process.nextTick(() => this.scheduleRender());
+		}
 	}
 
 	private requestImmediateRender(): void {
 		this.cancelRenderTimer();
 		this.renderRequested = true;
-		if (this.immediateRenderScheduled) return;
+		if (this.stopped || !this.terminalFocused || this.immediateRenderScheduled) return;
 		this.immediateRenderScheduled = true;
+		this.terminal.onRenderPending?.(true);
 		process.nextTick(() => {
 			this.immediateRenderScheduled = false;
-			if (this.stopped || !this.renderRequested) return;
+			if (this.stopped || !this.terminalFocused || !this.renderRequested) return;
 			// A previously queued scheduleRender() can create a timer before this
 			// callback runs. User input must preempt that throttled frame.
-			this.cancelRenderTimer();
-			this.renderRequested = false;
-			this.lastRenderAt = performance.now();
-			this.doRender();
+			this.renderNow();
 		});
 	}
 
@@ -984,19 +1055,17 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private scheduleRender(): void {
-		if (this.stopped || this.renderTimer || !this.renderRequested) {
+		if (this.stopped || !this.terminalFocused || this.renderTimer || !this.renderRequested) {
 			return;
 		}
 		const elapsed = performance.now() - this.lastRenderAt;
-		const delay = Math.max(0, TuiBase.MIN_RENDER_INTERVAL_MS - elapsed);
+		const delay = Math.max(0, Math.ceil(TuiBase.MIN_RENDER_INTERVAL_MS - elapsed));
 		this.renderTimer = setTimeout(() => {
 			this.renderTimer = undefined;
-			if (this.stopped || !this.renderRequested) {
+			if (this.stopped || !this.terminalFocused || !this.renderRequested) {
 				return;
 			}
-			this.renderRequested = false;
-			this.lastRenderAt = performance.now();
-			this.doRender();
+			this.renderNow();
 			if (this.renderRequested) {
 				this.scheduleRender();
 			}
@@ -1004,11 +1073,30 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private handleTerminalInput(data: string): void {
+		if (data === "\x1b[I") {
+			this.setTerminalFocused(true);
+			return;
+		}
+		if (data === "\x1b[O") {
+			this.setTerminalFocused(false);
+			return;
+		}
 		if (this.consumeOsc11BackgroundResponse(data)) {
 			return;
 		}
 		if (this.consumeTerminalColorSchemeReport(data)) {
 			return;
+		}
+
+		// Viewport shortcuts and extension listeners can consume keys before component input.
+		const keyboardInput =
+			!isKeyRelease(data) &&
+			(parseKey(data) !== undefined ||
+				data.startsWith("\x1b[200~") ||
+				(data.length > 0 && !data.startsWith("\x1b")));
+		if (keyboardInput) {
+			this.setTerminalFocused(true);
+			this.requestImmediateRender();
 		}
 
 		if (this.inputListeners.size > 0) {
@@ -1075,9 +1163,9 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			this.focusedComponent.handleInput(data);
-			// Keyboard input is latency-sensitive. Avoid the throttled timer path,
-			// where even setTimeout(0) can take a full 16 ms tick on Windows.
-			this.requestImmediateRender();
+			// Only keyboard input bypasses the cap, not mouse/protocol events.
+			if (keyboardInput) this.requestImmediateRender();
+			else this.requestRender();
 		}
 	}
 

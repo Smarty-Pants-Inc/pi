@@ -1542,7 +1542,8 @@ describe("TuiAltScreen", () => {
 		terminal.sendInput("\x1b[O");
 		terminal.sendInput("\x1b[I");
 		await terminal.waitForRender();
-		assert.strictEqual(writeCount(), idleWriteCount);
+		// smarty-dev#7403: focus-in renders once even when no document rows change.
+		assert.strictEqual(writeCount(), idleWriteCount + 1);
 
 		// A completed click leaves a zero-width anchor, but later orphaned drag/release events must not extend it.
 		terminal.sendInput("\x1b[<0;1;1M");
@@ -1559,7 +1560,7 @@ describe("TuiAltScreen", () => {
 		terminal.sendInput("\x1b[O");
 		terminal.sendInput("\x1b[I");
 		await terminal.waitForRender();
-		assert.strictEqual(writeCount(), pressedWriteCount);
+		assert.strictEqual(writeCount(), pressedWriteCount + 1);
 		terminal.sendInput("\x1b[<32;4;2M");
 		terminal.sendInput("\x1b[<0;4;2m");
 		await terminal.waitForRender();
@@ -1615,7 +1616,7 @@ describe("TuiAltScreen", () => {
 		terminal.sendInput("\x1b[O");
 		terminal.sendInput("\x1b[I");
 		await terminal.waitForRender();
-		assert.strictEqual(terminal.events.filter((event) => event.type === "write").length, completedWriteCount);
+		assert.strictEqual(terminal.events.filter((event) => event.type === "write").length, completedWriteCount + 1);
 
 		const redrawEventCount = terminal.events.length;
 		tui.renderNow(true);
@@ -1630,27 +1631,30 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
-	it("stacks flash messages and collapses them as they expire", async () => {
-		const terminal = new VirtualTerminal(20, 4);
+	it("stacks flash messages and collapses them as they expire", (t) => {
+		// smarty-dev#7403: advance flash timers independently of the capped frame/xterm pipeline.
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const terminal = new RecordingTerminal(20, 4);
 		const tui = new TuiAltScreen(terminal);
 		tui.addChild(new Text("one\ntwo\nthree\nfour", 0, 0));
 		tui.start();
-		await terminal.waitForRender();
+		tui.renderNow();
+		try {
+			tui.flash("First", 80);
+			tui.flash("Second", 500);
+			tui.renderNow();
+			const firstFrame = terminal.events.filter((event) => event.type === "write").at(-1)?.data ?? "";
+			assert.ok(firstFrame.includes(" First "));
+			assert.ok(firstFrame.includes(" Second "));
 
-		tui.flash("First", 80);
-		tui.flash("Second", 500);
-		await terminal.waitForRender();
-		let viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.endsWith(" First "));
-		assert.ok(viewport[1]?.endsWith(" Second "));
-
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		await terminal.waitForRender();
-		viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.endsWith(" Second "));
-		assert.ok(!viewport.some((line) => line.includes("First")));
-
-		tui.stop();
+			t.mock.timers.tick(100);
+			tui.renderNow();
+			const secondFrame = terminal.events.filter((event) => event.type === "write").at(-1)?.data ?? "";
+			assert.ok(secondFrame.includes(" Second "));
+			assert.ok(!secondFrame.includes("First"));
+		} finally {
+			tui.stop();
+		}
 	});
 
 	it("auto-scrolls and extends a drag selection held at the viewport edge", async () => {
