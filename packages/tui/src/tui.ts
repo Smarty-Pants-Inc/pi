@@ -1087,6 +1087,20 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private handleTerminalInput(data: string): void {
+		// Strip replies before visibility recovery, including batched/late replies. Keep paste literal.
+		// Queries: OSC 11, CSI 16t, CSI ?996n, and ProcessTerminal's Kitty/DA negotiation.
+		// Also ignore CPR, DA2, DSR/DECRQM and XTVERSION reports from the terminal.
+		data = data.replace(
+			/\x1b\[200~[\s\S]*?(?:\x1b\[201~|$)|\x1b\]11;[^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[(?:[?>][\d;]*c|\?\d*u|\??\d+;\d+(?:;\d+)?R|\??\d+(?:;\d+)*n|\??\d+;\d+\$y|6;\d+;\d+t)|\x1bP>\|[^\x1b]*\x1b\\/g,
+			(response) => {
+				if (response.startsWith("\x1b[200~")) return response;
+				if (!this.consumeOsc11BackgroundResponse(response) && !this.consumeTerminalColorSchemeReport(response)) {
+					this.consumeCellSizeResponse(response);
+				}
+				return "";
+			},
+		);
+		if (data.length === 0) return;
 		if (data === "\x1b[I") {
 			this.setTerminalFocused(true);
 			return;
@@ -1095,15 +1109,9 @@ export abstract class TuiBase extends Container implements TUI {
 			this.setTerminalFocused(false);
 			return;
 		}
-		// Any non-focus input confirms visibility, even mouse, paste, release or unknown bytes.
-		// Do this before listeners/protocol consumers, which may swallow the event.
-		if (data.length > 0) this.setTerminalFocused(true);
-		if (this.consumeOsc11BackgroundResponse(data)) {
-			return;
-		}
-		if (this.consumeTerminalColorSchemeReport(data)) {
-			return;
-		}
+		// Remaining user input confirms visibility, even mouse, paste, release or unknown bytes.
+		// Do this before listeners, which may swallow the event.
+		this.setTerminalFocused(true);
 
 		// Viewport shortcuts and extension listeners can consume keys before component input.
 		const keyboardInput =
@@ -1130,11 +1138,6 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			data = current;
-		}
-
-		// Consume terminal cell size responses without blocking unrelated input.
-		if (this.consumeCellSizeResponse(data)) {
-			return;
 		}
 
 		// Global debug key handler (Shift+Ctrl+D)

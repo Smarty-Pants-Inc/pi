@@ -642,6 +642,130 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 	});
 }
 
+// smarty-dev#7403 round 3: terminal replies are not evidence of user-visible focus.
+const terminalReplies = [
+	["OSC 11 BEL", "\x1b]11;rgb:ffff/0000/0000\x07"],
+	["OSC 11 ST", "\x1b]11;rgb:ffff/0000/0000\x1b\\"],
+	["late OSC 11", "\x1b]11;rgb:ffff/0000/0000\x07"],
+	["unsolicited OSC 11", "\x1b]11;rgb:ffff/0000/0000\x07"],
+	["CPR", "\x1b[12;34R"],
+	["DEC CPR", "\x1b[?12;34;1R"],
+	["DA1", "\x1b[?1;2c"],
+	["DA2", "\x1b[>0;276;0c"],
+	["DSR", "\x1b[0n"],
+	["private DSR", "\x1b[?10n"],
+	["DECRQM", "\x1b[?1004;1$y"],
+	["Kitty flags", "\x1b[?7u"],
+	["Kitty query", "\x1b[?u"],
+	["XTVERSION", "\x1bP>|XTerm(276)\x1b\\"],
+	["color scheme", "\x1b[?997;2n"],
+	["cell size", "\x1b[6;20;10t"],
+] as const;
+
+for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
+	for (const [kind, reply] of terminalReplies) {
+		for (const key of ["", "k"]) {
+			it(`${Renderer.name} hidden ${kind}${key ? " plus key recovers once" : " stays hidden"}`, async (t) => {
+				t.mock.method(performance, "now", () => 0);
+				t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+				const timers = trackTimers(t);
+				const terminal = new InputTerminal();
+				const tui = new Renderer(terminal);
+				const component = new CountingComponent();
+				const inputs: string[] = [];
+				const visibility: boolean[] = [];
+				tui.addChild(component);
+				tui.setFocus(component);
+				tui.addInputListener((data) => {
+					inputs.push(data);
+					return undefined;
+				});
+				tui.onVisibilityChange((visible) => visibility.push(visible));
+				tui.start();
+				tui.renderNow();
+				await nextTick();
+				visibility.length = 0;
+				try {
+					const background =
+						reply.startsWith("\x1b]11;") && kind !== "unsolicited OSC 11"
+							? tui.queryTerminalBackgroundColor({ timeoutMs: 1000 })
+							: undefined;
+					const scheme = kind === "color scheme" ? tui.queryTerminalColorScheme({ timeoutMs: 1000 }) : undefined;
+					terminal.input?.("\x1b[O");
+					component.text = "latest hidden state";
+					tui.requestRender();
+					await nextTick();
+					if (kind === "late OSC 11") {
+						t.mock.timers.tick(1000);
+						assert.equal(await background, undefined);
+					}
+					const renders = component.renders;
+					const full = tui.fullRedraws;
+					const writes = terminal.writes.length;
+					terminal.input?.(reply + key);
+					await nextTick();
+					if (background && kind !== "late OSC 11") {
+						assert.deepEqual(await background, { r: 255, g: 0, b: 0 });
+					}
+					if (scheme) assert.equal(await scheme, "light");
+					assert.equal(component.renders - renders, key ? 1 : 0);
+					assert.equal(tui.fullRedraws - full, key ? 1 : 0);
+					assert.deepEqual(visibility, key ? [false, true] : [false]);
+					assert.deepEqual(inputs, key ? [key] : []);
+					assert.deepEqual(component.inputs, key ? [key] : []);
+					assert.equal(timers.size, 0, "replies must not schedule hidden frames or delay recovery");
+					if (!key) assert.equal(terminal.writes.length, writes);
+					t.diagnostic(
+						`terminal-reply ${Renderer.name} ${kind}${key ? "+key" : ""}: ${component.renders - renders} renders, ${tui.fullRedraws - full} full redraws, ${timers.size} timers, visible=${visibility.at(-1)}`,
+					);
+				} finally {
+					tui.stop();
+				}
+			});
+		}
+	}
+
+	for (const [kind, input] of [
+		["mouse", "\x1b[<35;1;1M"],
+		["Kitty key", "\x1b[97;1u"],
+		["paste with literal replies", `\x1b[200~${terminalReplies.map(([, reply]) => reply).join("")}\x1b[201~`],
+	] as const) {
+		it(`${Renderer.name} strips batched replies but preserves ${kind}`, async (t) => {
+			t.mock.method(performance, "now", () => 0);
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+			const timers = trackTimers(t);
+			const terminal = new InputTerminal();
+			const tui = new Renderer(terminal);
+			const component = new CountingComponent();
+			const inputs: string[] = [];
+			tui.addChild(component);
+			tui.addInputListener((data) => {
+				inputs.push(data);
+				return { consume: true };
+			});
+			tui.start();
+			tui.renderNow();
+			await nextTick();
+			try {
+				terminal.input?.("\x1b[O");
+				const renders = component.renders;
+				const full = tui.fullRedraws;
+				const replies = terminalReplies.map(([, reply]) => reply).join("");
+				terminal.input?.(replies + input + replies);
+				await nextTick();
+				// Fullscreen's built-in viewport listener consumes mouse before extension listeners.
+				assert.deepEqual(inputs, Renderer === TuiAltScreen && kind === "mouse" ? [] : [input]);
+				assert.equal(component.renders - renders, 1);
+				assert.equal(tui.fullRedraws - full, 1);
+				assert.equal(timers.size, 0);
+				t.diagnostic(`terminal-reply ${Renderer.name} batched+${kind}: 1 render, 1 full redraw, 0 timers`);
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+}
+
 // smarty-dev#7403 round 2: recovery does not require the missing CSI I or a frame timer.
 for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 	for (const [kind, data] of [
