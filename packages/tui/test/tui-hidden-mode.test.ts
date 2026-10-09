@@ -6,6 +6,7 @@ import { ScrollView } from "../src/components/scroll-view.ts";
 import { Text } from "../src/components/text.ts";
 import { StdinBuffer } from "../src/stdin-buffer.ts";
 import type { Terminal } from "../src/terminal.ts";
+import { getCellDimensions, setCellDimensions } from "../src/terminal-image.ts";
 import type { Component } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
@@ -840,6 +841,126 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			}
 		});
 	}
+
+	// pi#177 review: the carry is bounded; digits past the report grammar are released as input.
+	it(`${Renderer.name} hidden cell-size prefix then typed digits releases them once the limit passes`, async (t) => {
+		t.mock.method(performance, "now", () => 0);
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const inputs: string[] = [];
+		const visibility: boolean[] = [];
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.onVisibilityChange((visible) => visibility.push(visible));
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		try {
+			terminal.input?.("\x1b[O");
+			await nextTick();
+			visibility.length = 0;
+			terminal.input?.("\x1b[6;");
+			for (const digit of "12345") {
+				terminal.input?.(digit);
+				await nextTick();
+			}
+			assert.deepEqual(inputs, [], "five digits still fit the cell-size grammar");
+			terminal.input?.("6");
+			await nextTick();
+			assert.deepEqual(inputs, ["\x1b[6;123456"], "the sixth digit releases everything, once, in order");
+			assert.deepEqual(visibility, [true]);
+			assert.equal(timers.size, 0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it(`${Renderer.name} hidden split reports update scheme and cell dimensions without recovering`, async (t) => {
+		t.mock.method(performance, "now", () => 0);
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const schemes: string[] = [];
+		const visibility: boolean[] = [];
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.onTerminalColorSchemeChange((scheme) => schemes.push(scheme));
+		tui.onVisibilityChange((visible) => visibility.push(visible));
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		setCellDimensions({ widthPx: 9, heightPx: 18 });
+		try {
+			terminal.input?.("\x1b[O");
+			await nextTick();
+			visibility.length = 0;
+			const renders = component.renders;
+			terminal.input?.("\x1b[?99");
+			terminal.input?.("7;2n");
+			await nextTick();
+			assert.deepEqual(schemes, ["light"]);
+			terminal.input?.("\x1b[6;2");
+			terminal.input?.("0;10t");
+			await nextTick();
+			assert.deepEqual(getCellDimensions(), { widthPx: 10, heightPx: 20 });
+			assert.equal(component.renders, renders);
+			assert.deepEqual(visibility, []);
+			assert.equal(timers.size, 0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it(`${Renderer.name} hidden shared ESC: pending OSC 11 prefix then a cell-size report does not recover`, async (t) => {
+		t.mock.method(performance, "now", () => 0);
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const inputs: string[] = [];
+		const visibility: boolean[] = [];
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.onVisibilityChange((visible) => visibility.push(visible));
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		try {
+			const query = tui.queryTerminalBackgroundColor({ timeoutMs: 1000 });
+			terminal.input?.("\x1b[O");
+			await nextTick();
+			visibility.length = 0;
+			const renders = component.renders;
+			// The ESC is held as a possible OSC 11 reply; it turns out to start a cell-size report.
+			terminal.input?.("\x1b");
+			await nextTick();
+			terminal.input?.("[6;20;10t");
+			await nextTick();
+			assert.deepEqual(inputs, ["\x1b[6;20;10t"], "the report arrives whole");
+			assert.equal(component.renders, renders);
+			assert.deepEqual(visibility, []);
+			assert.equal(timers.size, 0);
+			// The OSC 11 query is still outstanding and its real reply still works.
+			terminal.input?.("\x1b]11;rgb:ffff/0000/0000\x07");
+			assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
+		} finally {
+			tui.stop();
+		}
+	});
 
 	it(`${Renderer.name} hidden key sharing a report prefix arrives whole and recovers once`, async (t) => {
 		t.mock.method(performance, "now", () => 0);

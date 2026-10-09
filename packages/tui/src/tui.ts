@@ -493,11 +493,18 @@ export function isTerminalStateReport(data: string): boolean {
  * A hidden pane carries it to the next read and decides at the first impossible byte (smarty-dev#7648).
  */
 export function isTerminalStateReportPrefix(data: string): boolean {
+	// Finite grammar, so a carry is at most 16 bytes and typed digits are released (pi#177 review):
+	// the two exact color-scheme reports, and cell size with at most 5 digits per field.
+	if (data.length === 0 || data.length > MAX_TERMINAL_REPORT_CARRY) return false;
 	return (
-		/^\x1b(?:\[(?:\?(?:9(?:9(?:7(?:;\d*)?)?)?)?)?)?$/.test(data) ||
-		/^\x1b(?:\[(?:6(?:;(?:\d+(?:;\d*)?)?)?)?)?$/.test(data)
+		("\x1b[?997;1n".startsWith(data) && data !== "\x1b[?997;1n") ||
+		("\x1b[?997;2n".startsWith(data) && data !== "\x1b[?997;2n") ||
+		/^\x1b(?:\[(?:6(?:;(?:\d{1,5}(?:;\d{0,5})?)?)?)?)?$/.test(data)
 	);
 }
+
+/** Longest proper report prefix, `ESC [ 6 ; 99999 ; 99999` (16 bytes). */
+const MAX_TERMINAL_REPORT_CARRY = 16;
 
 export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
 
@@ -1154,18 +1161,24 @@ export abstract class TuiBase extends Container implements TUI {
 			const reply = scanOsc11BackgroundReply(combined);
 			this.pendingOsc11BackgroundInput = "";
 			if (reply === "invalid") {
-				// No timer or key heuristic: the first impossible byte makes the entire
-				// partial and the rest of this chunk ordinary input, in arrival order.
-				this.dispatchTerminalInput(buffered);
-				if (data) this.dispatchTerminalInput(data);
-				return;
-			}
-			if (reply === "partial") {
+				if (!this.terminalFocused && (isTerminalStateReport(combined) || isTerminalStateReportPrefix(combined))) {
+					// Shared ESC: the held OSC 11 prefix starts a terminal report instead. While hidden,
+					// the report carry below decides on the combined bytes; the ESC alone must not recover.
+					data = combined;
+				} else {
+					// No timer or key heuristic: the first impossible byte makes the entire
+					// partial and the rest of this chunk ordinary input, in arrival order.
+					this.dispatchTerminalInput(buffered);
+					if (data) this.dispatchTerminalInput(data);
+					return;
+				}
+			} else if (reply === "partial") {
 				this.pendingOsc11BackgroundInput = combined;
 				return;
+			} else {
+				this.consumeOsc11BackgroundResponse(combined.slice(0, reply));
+				data = combined.slice(reply);
 			}
-			this.consumeOsc11BackgroundResponse(combined.slice(0, reply));
-			data = combined.slice(reply);
 		}
 		// Only a query we are still waiting for can remove OSC 11 bytes. Paste stays literal.
 		if (this.pendingOsc11BackgroundReplies > 0) {

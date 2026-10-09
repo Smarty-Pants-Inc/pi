@@ -64,3 +64,31 @@ it("clears active progress when deactivated while hidden", (t) => {
 		process.stdout.write = previousWrite;
 	}
 });
+
+// pi#177 review P2: progress set active only after hiding, then cleared while still hidden.
+it("clears progress activated while hidden and cleared before focus-in", (t) => {
+	t.mock.timers.enable({ apis: ["setInterval"] });
+	const interval = t.mock.method(globalThis, "setInterval");
+	const writes: string[] = [];
+	const previousWrite = process.stdout.write;
+	process.stdout.write = ((chunk: string | Uint8Array) => {
+		writes.push(String(chunk));
+		return true;
+	}) as typeof process.stdout.write;
+	const terminal = new ProcessTerminal();
+	try {
+		terminal.setVisible(false);
+		terminal.setProgress(true);
+		assert.deepEqual(writes, [], "hidden activation writes nothing");
+		assert.equal(interval.mock.calls.length, 0, "no hidden keepalive");
+		terminal.setProgress(false);
+		assert.deepEqual(writes, ["\x1b]9;4;0\x07"], "clear is written even though activation was never shown");
+		terminal.setVisible(true);
+		t.mock.timers.tick(5000);
+		assert.deepEqual(writes, ["\x1b]9;4;0\x07"], "focus-in keeps progress inactive");
+		assert.equal(interval.mock.calls.length, 0);
+	} finally {
+		terminal.setProgress(false);
+		process.stdout.write = previousWrite;
+	}
+});
