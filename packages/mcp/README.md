@@ -111,6 +111,8 @@ await connected;
 
 Inject `McpOAuthStateStore` into `McpOAuthProvider` for durable credentials. The package does not open a browser or choose where credentials are stored.
 
+Authorization server metadata must name the expected issuer (RFC 8414), and its authorization, token, registration, and revocation endpoints must share the issuer's origin (scheme, host, port). This also applies to a document configured with `authorizationServerMetadataUrl`. For an authorization server that serves endpoints from another origin, pass that origin in `authorizeMcp(provider, { allowedEndpointOrigins: ["https://login.example.com"] })`; otherwise the flow fails with `OAuthEndpointOriginError` before any request to the endpoint. Every endpoint must use https, except on loopback.
+
 The OAuth implementation is adapted from the MIT-licensed Model Context Protocol TypeScript SDK v1.29.0. Its license is included under `LICENSES/`.
 
 An MCP transport owns framing and I/O. It delivers individual JSON-RPC messages to `McpClient`; the client owns request correlation, initialization, timeouts, cancellation, server requests, and protocol-level helpers.

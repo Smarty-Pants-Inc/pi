@@ -38,6 +38,26 @@ export class OAuthResourceMismatchError extends Error {
 	}
 }
 
+/**
+ * Authorization server metadata advertises an endpoint outside its issuer's origin (scheme, host, port), and that
+ * origin is not in `allowedEndpointOrigins`.
+ */
+export class OAuthEndpointOriginError extends Error {
+	readonly field: string;
+	readonly endpoint: string;
+	readonly issuer: string;
+
+	constructor(field: string, endpoint: string, issuer: string) {
+		super(
+			`Refusing OAuth ${field} ${endpoint}: its origin ${new URL(endpoint).origin} is not the origin of issuer ${issuer} and is not in allowedEndpointOrigins`,
+		);
+		this.name = "OAuthEndpointOriginError";
+		this.field = field;
+		this.endpoint = endpoint;
+		this.issuer = issuer;
+	}
+}
+
 export class OAuthInsecureEndpointError extends Error {
 	readonly endpoint: string;
 

@@ -7,6 +7,7 @@ import {
 	discoverProtectedResourceMetadata,
 } from "../src/oauth/discovery.ts";
 import {
+	OAuthEndpointOriginError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
 	OAuthRedirectRefusedError,
@@ -401,6 +402,196 @@ describe("OAuth endpoint transport security (pi#173)", () => {
 			const prm = { resource: "https://resource.test/mcp", authorization_servers: ["https://oauth.test"] };
 			const fetch = vi.fn(async () => Response.json(prm));
 			expect(await discoverProtectedResourceMetadata("https://resource.test/mcp", { fetch })).toEqual(prm);
+		});
+	});
+
+	describe("endpoint origin binding (pi#173 review)", () => {
+		const tokens = { access_token: "synthetic-token", token_type: "Bearer" };
+
+		/** Provider with a refresh token, so a flow that got this far would POST it to the token endpoint. */
+		function refreshingProvider(cached?: AuthorizationServerMetadata) {
+			const provider = {
+				redirectUrl: clientMetadata.redirect_uris[0]!,
+				clientMetadata,
+				clientInformation: () => clientInformation,
+				tokens: () => ({ access_token: "old", token_type: "Bearer", refresh_token: "synthetic-refresh" }),
+				saveTokens: vi.fn(),
+				saveCodeVerifier: () => {},
+				codeVerifier: () => "synthetic",
+				redirectToAuthorization: vi.fn(),
+				saveDiscoveryState: vi.fn(),
+				discoveryState: () =>
+					cached && { authorizationServerUrl: cached.issuer, authorizationServerMetadata: cached },
+			} satisfies OAuthClientProvider;
+			return provider;
+		}
+
+		/** Fetch that routes by host and counts requests per host. */
+		function hosts(routes: Record<string, (url: URL) => Response>) {
+			const requests: Record<string, string[]> = {};
+			const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+				const url = new URL(String(input));
+				requests[url.host] = [...(requests[url.host] ?? []), `${init?.method ?? "GET"} ${url.pathname}`];
+				return routes[url.host]?.(url) ?? new Response(null, { status: 404 });
+			});
+			return { fetch, requests };
+		}
+
+		const prm = { resource: "https://resource.test/mcp", authorization_servers: ["https://oauth.test"] };
+		// Claims the original issuer, as a hostile redirect target would, but advertises its own endpoints.
+		const hostile = { ...metadata("https://attacker.test"), issuer: "https://oauth.test" };
+
+		it.each([
+			["protected resource metadata", "resource.test", "https://attacker.test/prm"],
+			[
+				"authorization server metadata",
+				"oauth.test",
+				"https://attacker.test/.well-known/oauth-authorization-server",
+			],
+		])(
+			"a discovery 307 for %s to another https host never reaches that host's token endpoint",
+			async (_kind, redirecting, location) => {
+				const { fetch, requests } = hosts({
+					"resource.test": (url) =>
+						redirecting === "resource.test"
+							? new Response(null, { status: 307, headers: { location } })
+							: url.pathname.startsWith("/.well-known/oauth-protected-resource")
+								? Response.json(prm)
+								: new Response(null, { status: 404 }),
+					"oauth.test": () =>
+						redirecting === "oauth.test"
+							? new Response(null, { status: 307, headers: { location } })
+							: Response.json(metadata()),
+					"attacker.test": (url) =>
+						url.pathname === "/token"
+							? Response.json(tokens)
+							: url.pathname === "/prm"
+								? Response.json({ ...prm, authorization_servers: ["https://attacker.test"] })
+								: Response.json(hostile),
+				});
+				const provider = refreshingProvider();
+				await expect(
+					authorizeMcp(provider, { serverUrl: "https://resource.test/mcp", fetch }),
+				).rejects.toBeInstanceOf(OAuthRedirectRefusedError);
+				expect(requests["attacker.test"]).toBeUndefined();
+				expect(requests[redirecting]).toHaveLength(1);
+				expect(provider.saveTokens).not.toHaveBeenCalled();
+				expect(provider.saveDiscoveryState).not.toHaveBeenCalled();
+				expect(provider.redirectToAuthorization).not.toHaveBeenCalled();
+			},
+		);
+
+		it.each(["authorization_endpoint", "token_endpoint", "registration_endpoint", "revocation_endpoint"] as const)(
+			"refuses metadata with the right issuer but %s on another origin",
+			async (field) => {
+				const crossOrigin = { ...metadata(), [field]: "https://attacker.test/endpoint" };
+				const fetch = vi.fn(async () => Response.json(crossOrigin));
+				const error = await discoverAuthorizationServerMetadata("https://oauth.test", { fetch }).catch(
+					(caught: unknown) => caught,
+				);
+				expect(error).toBeInstanceOf(OAuthEndpointOriginError);
+				expect((error as OAuthEndpointOriginError).field).toBe(field);
+				expect((error as Error).message).toContain("allowedEndpointOrigins");
+			},
+		);
+
+		it.each(["https://oauth.test:8443", "http://oauth.test", "https://login.oauth.test"])(
+			"treats %s as another origin than issuer https://oauth.test",
+			async (origin) => {
+				const fetch = vi.fn(async () => Response.json({ ...metadata(), token_endpoint: `${origin}/token` }));
+				await expect(discoverAuthorizationServerMetadata("https://oauth.test", { fetch })).rejects.toThrow(
+					origin.startsWith("http:") ? OAuthInsecureEndpointError : OAuthEndpointOriginError,
+				);
+			},
+		);
+
+		it("a token_endpoint on another origin is refused in the flow before any request to it, and accepted when allowlisted", async () => {
+			const crossOrigin = { ...metadata(), token_endpoint: "https://tokens.test/token" };
+			const route = () =>
+				hosts({
+					"resource.test": () => Response.json(prm),
+					"oauth.test": () => Response.json(crossOrigin),
+					"tokens.test": () => Response.json(tokens),
+				});
+
+			const refused = route();
+			const provider = refreshingProvider();
+			await expect(
+				authorizeMcp(provider, { serverUrl: "https://resource.test/mcp", fetch: refused.fetch }),
+			).rejects.toBeInstanceOf(OAuthEndpointOriginError);
+			expect(refused.requests["tokens.test"]).toBeUndefined();
+			expect(provider.saveTokens).not.toHaveBeenCalled();
+			expect(provider.saveDiscoveryState).not.toHaveBeenCalled();
+
+			const accepted = route();
+			expect(
+				await authorizeMcp(provider, {
+					serverUrl: "https://resource.test/mcp",
+					fetch: accepted.fetch,
+					allowedEndpointOrigins: ["https://tokens.test"],
+				}),
+			).toBe("AUTHORIZED");
+			expect(accepted.requests["tokens.test"]).toEqual(["POST /token"]);
+			expect(provider.saveTokens).toHaveBeenCalledOnce();
+		});
+
+		it("binds cached metadata too", async () => {
+			const crossOrigin = { ...metadata(), token_endpoint: "https://tokens.test/token" };
+			const { fetch, requests } = hosts({ "tokens.test": () => Response.json(tokens) });
+			const provider = refreshingProvider(crossOrigin);
+			await expect(authorizeMcp(provider, { serverUrl: "https://resource.test/mcp", fetch })).rejects.toBeInstanceOf(
+				OAuthEndpointOriginError,
+			);
+			expect(requests).toEqual({});
+			expect(
+				await authorizeMcp(provider, {
+					serverUrl: "https://resource.test/mcp",
+					fetch,
+					allowedEndpointOrigins: ["https://tokens.test/"],
+				}),
+			).toBe("AUTHORIZED");
+			expect(requests).toEqual({ "tokens.test": ["POST /token"] });
+		});
+
+		it("binds a configured authorizationServerMetadataUrl document to the issuer it names", async () => {
+			// The configured document's issuer is trusted as configured; its endpoints must still share that origin.
+			const configured = { ...metadata("https://idp.test"), token_endpoint: "https://tokens.test/token" };
+			const { fetch, requests } = hosts({
+				"resource.test": () => Response.json(prm),
+				"config.test": () => Response.json(configured),
+				"tokens.test": () => Response.json(tokens),
+			});
+			const options = {
+				serverUrl: "https://resource.test/mcp",
+				authorizationServerMetadataUrl: new URL("https://config.test/metadata.json"),
+				fetch,
+			};
+			await expect(discoverOAuthServerInfo(options.serverUrl, options)).rejects.toBeInstanceOf(
+				OAuthEndpointOriginError,
+			);
+			await expect(authorizeMcp(refreshingProvider(), options)).rejects.toBeInstanceOf(OAuthEndpointOriginError);
+			expect(requests["tokens.test"]).toBeUndefined();
+			expect(
+				await authorizeMcp(refreshingProvider(), { ...options, allowedEndpointOrigins: ["https://tokens.test"] }),
+			).toBe("AUTHORIZED");
+			expect(requests["tokens.test"]).toEqual(["POST /token"]);
+		});
+
+		it("keeps the HTTPS/loopback rule for allowlisted origins and rejects malformed entries", async () => {
+			const fetch = vi.fn(async () => Response.json({ ...metadata(), token_endpoint: "http://tokens.test/token" }));
+			await expect(
+				discoverAuthorizationServerMetadata("https://oauth.test", {
+					fetch,
+					allowedEndpointOrigins: ["http://tokens.test"],
+				}),
+			).rejects.toBeInstanceOf(OAuthInsecureEndpointError);
+			const valid = vi.fn(async () => Response.json(metadata()));
+			await expect(
+				discoverAuthorizationServerMetadata("https://oauth.test", {
+					fetch: valid,
+					allowedEndpointOrigins: ["tokens.test"],
+				}),
+			).rejects.toBeInstanceOf(TypeError);
 		});
 	});
 

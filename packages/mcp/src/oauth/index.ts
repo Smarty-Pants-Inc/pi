@@ -15,6 +15,7 @@ export {
 } from "./discovery.ts";
 export {
 	McpOAuthAuthorizationRequiredError,
+	OAuthEndpointOriginError,
 	OAuthError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,

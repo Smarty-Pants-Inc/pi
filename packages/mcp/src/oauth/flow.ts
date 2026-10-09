@@ -13,7 +13,13 @@ import {
 	parseWwwAuthenticate,
 	selectResource,
 } from "./discovery.ts";
-import { credentialFetch, loopback, secureEndpoint, validateOAuthEndpoints } from "./endpoints.ts";
+import {
+	credentialFetch,
+	loopback,
+	secureEndpoint,
+	validateOAuthEndpointOrigins,
+	validateOAuthEndpoints,
+} from "./endpoints.ts";
 import {
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
@@ -79,9 +85,18 @@ export interface OAuthFlowOptions {
 	resourceMetadataUrl?: URL;
 	/**
 	 * Authorization server metadata document to use instead of discovery, for servers that advertise a
-	 * wrong authorization server or none. It is trusted as configured. Must use https, except on loopback.
+	 * wrong authorization server or none. It is trusted as configured, so its issuer is not compared with the URL.
+	 * Must use https, except on loopback. Its endpoints must still share the origin of the issuer it names.
 	 */
 	authorizationServerMetadataUrl?: URL;
+	/**
+	 * Origins (scheme, host, port, such as `https://login.example.com`) that the authorization, token, registration,
+	 * and revocation endpoints may use besides the origin of the authorization server's issuer. Default: none, so
+	 * metadata advertising an endpoint on another origin is refused with `OAuthEndpointOriginError` before any request
+	 * to it. This applies to discovered, cached, and configured (`authorizationServerMetadataUrl`) metadata. Endpoints
+	 * on an allowed origin must still use https, except on loopback.
+	 */
+	allowedEndpointOrigins?: readonly string[];
 	fetch?: McpFetch;
 	/** Aborts every request of the flow. Requests have no time limit of their own; combine with a timeout as needed. */
 	signal?: AbortSignal;
@@ -331,6 +346,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 					(await discoverAuthorizationServerMetadata(cached.authorizationServerUrl, {
 						fetch: options.fetch,
 						skipIssuerValidation: options.skipIssuerValidation,
+						allowedEndpointOrigins: options.allowedEndpointOrigins,
 						signal: options.signal,
 					})),
 				resourceMetadata: cached.resourceMetadata,
@@ -340,10 +356,12 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 				authorizationServerMetadataUrl: metadataUrl,
 				fetch: options.fetch,
 				skipIssuerValidation: options.skipIssuerValidation,
+				allowedEndpointOrigins: options.allowedEndpointOrigins,
 				signal: options.signal,
 			});
 	secureEndpoint(discovered.authorizationServerUrl);
-	validateOAuthEndpoints(discovered.authorizationServerMetadata);
+	// Also covers cached metadata, which skipped discovery: no endpoint request before this check.
+	validateOAuthEndpointOrigins(discovered.authorizationServerMetadata, options.allowedEndpointOrigins);
 	if (!metadataUrl) {
 		await provider.saveDiscoveryState?.({
 			...discovered,

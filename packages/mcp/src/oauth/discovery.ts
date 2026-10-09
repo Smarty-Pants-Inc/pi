@@ -7,7 +7,7 @@
 import type { McpFetch } from "../auth-provider.ts";
 import { LATEST_PROTOCOL_VERSION } from "../protocol/types.ts";
 import { refuseMcpAdmission } from "../security-admission.ts";
-import { metadataFetch, secureEndpoint } from "./endpoints.ts";
+import { metadataFetch, secureEndpoint, validateOAuthEndpointOrigins } from "./endpoints.ts";
 import {
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
@@ -129,7 +129,14 @@ export function buildAuthorizationServerDiscoveryUrls(
 
 export async function discoverAuthorizationServerMetadata(
 	authorizationServerUrl: string | URL,
-	options: { fetch?: McpFetch; protocolVersion?: string; skipIssuerValidation?: boolean; signal?: AbortSignal } = {},
+	options: {
+		fetch?: McpFetch;
+		protocolVersion?: string;
+		skipIssuerValidation?: boolean;
+		/** See `OAuthFlowOptions.allowedEndpointOrigins`. */
+		allowedEndpointOrigins?: readonly string[];
+		signal?: AbortSignal;
+	} = {},
 ): Promise<AuthorizationServerMetadata | undefined> {
 	refuseMcpAdmission();
 	const fetch = options.fetch ?? globalThis.fetch;
@@ -151,6 +158,8 @@ export async function discoverAuthorizationServerMetadata(
 		if (!options.skipIssuerValidation && metadata.issuer !== expected) {
 			throw new OAuthIssuerMismatchError(expected, metadata.issuer);
 		}
+		// The endpoints must then live on the issuer's origin, so the issuer check also covers where credentials go.
+		validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
 		return metadata;
 	}
 	return undefined;
@@ -160,10 +169,15 @@ export async function discoverOAuthServerInfo(
 	serverUrl: string | URL,
 	options: {
 		resourceMetadataUrl?: URL;
-		/** Metadata document to use instead of discovery. It is trusted as configured, so its issuer is not checked. */
+		/**
+		 * Metadata document to use instead of discovery. It is trusted as configured, so its issuer is not checked,
+		 * but its endpoints must still share the origin of the issuer it names (see `allowedEndpointOrigins`).
+		 */
 		authorizationServerMetadataUrl?: URL;
 		fetch?: McpFetch;
 		skipIssuerValidation?: boolean;
+		/** See `OAuthFlowOptions.allowedEndpointOrigins`. */
+		allowedEndpointOrigins?: readonly string[];
 		signal?: AbortSignal;
 	} = {},
 ): Promise<OAuthServerInfo> {
@@ -197,6 +211,7 @@ export async function discoverOAuthServerInfo(
 			throw new Error(`HTTP ${response.status} loading authorization server metadata from ${url}`);
 		}
 		const metadata = parseAuthorizationServerMetadata(await response.json());
+		validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
 		return { authorizationServerUrl: metadata.issuer, authorizationServerMetadata: metadata, resourceMetadata };
 	}
 	// Without resource metadata the issuer is the server origin, which has no trailing slash.
@@ -206,6 +221,7 @@ export async function discoverOAuthServerInfo(
 		authorizationServerMetadata: await discoverAuthorizationServerMetadata(authorizationServerUrl, {
 			fetch: options.fetch,
 			skipIssuerValidation: options.skipIssuerValidation,
+			allowedEndpointOrigins: options.allowedEndpointOrigins,
 			signal: options.signal,
 		}),
 		resourceMetadata,

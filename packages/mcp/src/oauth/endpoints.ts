@@ -1,5 +1,5 @@
 import type { McpFetch } from "../auth-provider.ts";
-import { OAuthInsecureEndpointError, OAuthRedirectRefusedError } from "./errors.ts";
+import { OAuthEndpointOriginError, OAuthInsecureEndpointError, OAuthRedirectRefusedError } from "./errors.ts";
 import type { AuthorizationServerMetadata } from "./types.ts";
 
 export function loopback(hostname: string): boolean {
@@ -79,5 +79,38 @@ export function validateOAuthEndpoints(metadata: AuthorizationServerMetadata | u
 		metadata.revocation_endpoint,
 	]) {
 		if (endpoint !== undefined) secureEndpoint(endpoint);
+	}
+}
+
+/**
+ * Bind the advertised endpoints to the issuer, after the issuer itself was validated. Metadata that names the right
+ * issuer but sends codes, refresh tokens, or client secrets to another origin is refused unless that origin is in
+ * `allowedEndpointOrigins`. The HTTPS/loopback rule of `validateOAuthEndpoints` applies as well, allowlisted or not.
+ */
+export function validateOAuthEndpointOrigins(
+	metadata: AuthorizationServerMetadata | undefined,
+	allowedEndpointOrigins: readonly string[] = [],
+): void {
+	if (!metadata) return;
+	validateOAuthEndpoints(metadata);
+	const allowed = new Set(
+		allowedEndpointOrigins.map((value) => {
+			const origin = URL.canParse(value) ? new URL(value).origin : "null";
+			if (origin === "null") throw new TypeError(`Invalid allowedEndpointOrigins entry ${JSON.stringify(value)}`);
+			return origin;
+		}),
+	);
+	const issuer = new URL(metadata.issuer).origin;
+	for (const field of [
+		"authorization_endpoint",
+		"token_endpoint",
+		"registration_endpoint",
+		"revocation_endpoint",
+	] as const) {
+		const endpoint = metadata[field];
+		if (endpoint === undefined) continue;
+		const origin = new URL(endpoint).origin;
+		if (origin !== issuer && !allowed.has(origin))
+			throw new OAuthEndpointOriginError(field, endpoint, metadata.issuer);
 	}
 }

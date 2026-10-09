@@ -13,6 +13,7 @@ import {
 	type OAuthClientInformationMixed,
 	type OAuthClientProvider,
 	type OAuthDiscoveryState,
+	OAuthEndpointOriginError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
 	type OAuthTokens,
@@ -452,7 +453,7 @@ describe.skip("MCP OAuth", () => {
 	});
 
 	// #10172
-	it("uses a configured authorization server metadata document as is", async () => {
+	it("uses a configured authorization server metadata document, with endpoints bound to its issuer origin", async () => {
 		const origin = await listen(async (request, response, serverOrigin) => {
 			const url = new URL(request.url ?? "/", serverOrigin);
 			response.setHeader("content-type", "application/json");
@@ -480,7 +481,10 @@ describe.skip("MCP OAuth", () => {
 			serverUrl: `${origin}/mcp`,
 			authorizationServerMetadataUrl: new URL(`${origin}/idp/metadata.json`),
 		};
-		expect(await authorizeMcp(provider, options)).toBe("REDIRECT");
+		// pi#173 review: the endpoints are not on the origin of the issuer the document names.
+		await expect(authorizeMcp(provider, options)).rejects.toBeInstanceOf(OAuthEndpointOriginError);
+		expect(provider.authorizationUrl).toBeUndefined();
+		expect(await authorizeMcp(provider, { ...options, allowedEndpointOrigins: [origin] })).toBe("REDIRECT");
 		const authorizationUrl = provider.authorizationUrl as URL;
 		expect(`${authorizationUrl.origin}${authorizationUrl.pathname}`).toBe(`${origin}/idp/authorize`);
 		expect(authorizationUrl.searchParams.get("resource")).toBe(`${origin}/mcp`);
