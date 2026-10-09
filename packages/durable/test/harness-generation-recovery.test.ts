@@ -1,7 +1,16 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type AssistantMessage, createModels, fauxAssistantMessage, type Message } from "@earendil-works/pi-ai";
+import {
+	type AssistantMessage,
+	createModels,
+	type FauxContentBlock,
+	fauxAssistantMessage,
+	fauxText,
+	fauxThinking,
+	fauxToolCall,
+	type Message,
+} from "@earendil-works/pi-ai";
 import { AssistantEntry, type Harness, LiveDoc, type TaskId } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it } from "vitest";
 import { openNodeSqliteStorage } from "../src/storage/sqlite/node.ts";
@@ -121,7 +130,76 @@ describe("generation recovery", () => {
 		await opened.harness.close(context);
 	});
 
-	it("converts a committed partial into an aborted entry and resends the same messages", async () => {
+	/**
+	 * Stream `content` slowly, close the Harness once a committed partial satisfies `committed`, and reopen it with a
+	 * provider that records each resent request.
+	 */
+	async function crashWithPartial(
+		content: FauxContentBlock[],
+		committed: (message: AssistantMessage) => boolean,
+		retry?: ChatSetup["settings"]["retry"],
+	) {
+		const path = await sqlitePath();
+		const slow = chatSetup({ tokensPerSecond: 20, tokenSize: { min: 1, max: 1 } });
+		slow.faux.setResponses([fauxAssistantMessage(content)]);
+		if (retry !== undefined) slow.settings.retry = retry;
+		let opened = await open(path, slow);
+		opened.harness.resume();
+		const id = (await opened.root.submit({ type: "input", content: "hi" }, context)).id;
+		await waitFor(async () => {
+			const live = await opened.harness.snapshot(LiveDoc, opened.root.id, context);
+			const message = live?.generation?.message as AssistantMessage | undefined;
+			return message !== undefined && committed(message);
+		});
+		await opened.harness.close(context);
+
+		const setup = chatSetup();
+		if (retry !== undefined) setup.settings.retry = retry;
+		const sent: string[][] = [];
+		setup.faux.setResponses([
+			(request) => {
+				sent.push(request.messages.map((message) => message.role));
+				return fauxAssistantMessage("answer");
+			},
+		]);
+		opened = await open(path, setup);
+		const stored = (await opened.harness.snapshot(LiveDoc, opened.root.id, context))?.generation?.message;
+		opened.harness.resume();
+		const settled = await (await opened.harness.submission(id, context))!.wait(context);
+		const entries = await allEntries(opened.root);
+		await opened.harness.close(context);
+		return { stored: stored as AssistantMessage | undefined, settled, sent, entries };
+	}
+
+	it("fails without resending when the committed partial holds a partial tool call", async () => {
+		const { stored, settled, sent, entries } = await crashWithPartial(
+			[fauxThinking("plan"), fauxToolCall("echo", { text: "y".repeat(400) })],
+			(message) => message.content.some((block) => block.type === "toolCall"),
+		);
+		expect(stored!.content.map((block) => block.type)).toEqual(["thinking", "toolCall"]);
+		expect(sent).toEqual([]);
+		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error" });
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect((entries[1]!.model![0] as AssistantMessage).stopReason).toBe("aborted");
+	});
+
+	it("resends when the committed partial holds only reasoning", async () => {
+		// Retry disabled: reasoning-only partials are committed instead of held.
+		const { stored, settled, sent, entries } = await crashWithPartial(
+			[fauxThinking("r".repeat(400)), fauxText("late")],
+			(message) => message.content.some((block) => block.type === "thinking" && block.thinking.length > 0),
+			{ enabled: false },
+		);
+		expect(stored!.content.map((block) => block.type)).toEqual(["thinking"]);
+		expect(sent).toEqual([["user"]]);
+		expect(settled.status).toBe("done");
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant", "pi.assistant"]);
+		expect((entries[1]!.model![0] as AssistantMessage).stopReason).toBe("aborted");
+		expect(textOf(entries[2]!.model![0])).toBe("answer");
+	});
+
+	// smarty-dev#6730 (pi#171 review): a crash loses the stream observation, so the committed partial stands in for it.
+	it("converts a committed answer partial into an aborted entry and fails without resending", async () => {
 		const path = await sqlitePath();
 		const slow = chatSetup({ tokensPerSecond: 20, tokenSize: { min: 1, max: 1 } });
 		slow.faux.setResponses([fauxAssistantMessage("z".repeat(400))]);
@@ -150,10 +228,13 @@ describe("generation recovery", () => {
 		// Everything observers saw before the crash is durable.
 		expect(partial.startsWith(watched!)).toBe(true);
 		opened.harness.resume();
-		expect((await (await opened.harness.submission(id, context))!.wait(context)).status).toBe("done");
-		expect(sent).toEqual([["user"]]);
+		expect(await (await opened.harness.submission(id, context))!.wait(context)).toMatchObject({
+			status: "unanswered",
+			reason: "model_error",
+		});
+		expect(sent).toEqual([]);
 		const entries = await allEntries(opened.root);
-		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant", "pi.assistant"]);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
 		const converted = entries[1]!.model![0] as AssistantMessage;
 		expect(converted.stopReason).toBe("aborted");
 		expect(textOf(converted)).toBe(partial);

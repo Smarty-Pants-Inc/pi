@@ -14,6 +14,7 @@ import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
 import {
 	createAssistantStreamObservation,
 	discardPartialReasoning,
+	hasAssistantAnswerOutput,
 	isReasoningOnlyPrematureStream,
 	isRetryableAssistantError,
 	observeAssistantStreamEvent,
@@ -192,12 +193,28 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 		request: async (task, runtime, context) => {
 			const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
 			const conversationId = runtime.conversationId;
-			await runtime.commit(async (tx) => {
+			let interrupted = false;
+			await runtime.commit(async (tx): Promise<Next | undefined> => {
 				const live = await tx.doc(LiveDoc, conversationId);
+				// A committed partial means this phase crashed mid-stream and its stream observation is gone. The partial is
+				// everything durable observers saw, so it stands in for the observation: answer text or a tool call (even
+				// partial) fails the run instead of resending, which would repeat that output (smarty-dev#6730, pi#171).
+				// Reasoning-only partials are still resent.
+				const partial = live.generation?.message as AssistantMessage | undefined;
+				interrupted = partial !== undefined && hasAssistantAnswerOutput(partial);
 				await convertPartial(tx, live, conversationId);
+				if (interrupted) {
+					const text = "Model response was interrupted after answer output";
+					endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "model_error", detail: text });
+					return {
+						status: "terminal",
+						outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } },
+					};
+				}
 				live.generation = { attempt };
 				return undefined;
 			}, context);
+			if (interrupted) return;
 			const model = runtime.models.getModel(ref.provider, ref.modelId);
 			if (model === undefined) return failNoModel(runtime, ref, context);
 			const view = await runtime.context(conversationId, context, cutoff);
