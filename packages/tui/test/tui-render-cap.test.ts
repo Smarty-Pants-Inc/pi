@@ -727,14 +727,18 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			visibility.length = 0;
 			try {
 				const query = scenario.pending ? tui.queryTerminalBackgroundColor({ timeoutMs: 1000 }) : undefined;
-				terminal.input?.("\x1b[O");
-				component.text = "latest hidden state";
-				tui.requestRender();
-				await nextTick();
+				// Expiration is possible only while visible; hidden queries remain outstanding.
 				if (scenario.expired) {
 					t.mock.timers.tick(1000);
 					assert.equal(await query, undefined);
 				}
+				terminal.input?.("\x1b[O");
+				component.text = "latest hidden state";
+				tui.requestRender();
+				await nextTick();
+				assert.equal(timers.size, 0, "focus-out must cancel every pending OSC 11 timeout");
+				t.mock.timers.tick(2000);
+				await nextTick();
 				const renders = component.renders;
 				const full = tui.fullRedraws;
 				const writes = terminal.writes.length;
@@ -828,6 +832,172 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			assert.deepEqual(inputs, [paste]);
 		} finally {
 			buffer.destroy();
+			tui.stop();
+		}
+	});
+}
+
+// smarty-dev#7403 round 5: partial input cannot cause hidden timer-driven recovery.
+for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
+	for (const [kind, input] of [
+		["key", "k"],
+		["Unicode key", "\u{1f642}"],
+		["mouse", "\x1b[<35;1;1M"],
+		["paste", "\x1b[200~literal\x1b]11;#fff\x07\x1b[201~"],
+		["release", "\x1b[97;1:3u"],
+		["unknown", "\x1b[999z"],
+	] as const) {
+		it(`${Renderer.name} hidden buffered OSC 11 waits for a real ${kind}`, async (t) => {
+			t.mock.method(performance, "now", () => 0);
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+			const timers = trackTimers(t);
+			const terminal = new InputTerminal();
+			const tui = new Renderer(terminal);
+			const component = new CountingComponent();
+			const inputs: string[] = [];
+			const visibility: boolean[] = [];
+			tui.addChild(component);
+			tui.addInputListener((data) => {
+				inputs.push(data);
+				return { consume: true };
+			});
+			tui.onVisibilityChange((visible) => visibility.push(visible));
+			tui.start();
+			tui.renderNow();
+			await nextTick();
+			visibility.length = 0;
+			try {
+				let settled = false;
+				const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 }).then((rgb) => {
+					settled = true;
+					return rgb;
+				});
+				const partial = "\x1b]11;#fff";
+				terminal.input?.(partial);
+				assert.equal(timers.size, 1);
+				terminal.input?.("\x1b[O");
+				assert.equal(timers.size, 0, "hide preserves the buffer but cancels its timeout");
+				const renders = component.renders;
+				const writes = terminal.writes.length;
+				t.mock.timers.tick(2000);
+				await nextTick();
+				assert.equal(settled, false);
+				assert.deepEqual(visibility, [false]);
+				assert.equal(component.renders, renders);
+				assert.equal(terminal.writes.length, writes);
+				assert.deepEqual(inputs, []);
+				assert.equal(timers.size, 0);
+				terminal.input?.(input);
+				await nextTick();
+				// Fullscreen's built-in viewport listener owns SGR mouse input.
+				assert.deepEqual(inputs, kind === "mouse" && Renderer === TuiAltScreen ? [partial] : [partial, input]);
+				assert.deepEqual(visibility, [false, true]);
+				assert.equal(component.renders, renders + 1);
+				assert.equal(timers.size, 1, "only the resumed visible query timeout");
+				terminal.input?.(osc11Reply);
+				assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
+				assert.equal(timers.size, 0);
+				t.diagnostic(
+					`OSC11 partial ${Renderer.name} ${kind}: hidden 0 renders/timers; recovery 1 frame; bytes in order`,
+				);
+			} finally {
+				tui.stop();
+			}
+		});
+	}
+
+	it(`${Renderer.name} focus-in re-arms a retained partial query timeout only while visible`, async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const inputs: string[] = [];
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return { consume: true };
+		});
+		tui.start();
+		await nextTick();
+		try {
+			const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
+			const partial = "\x1b]11;#fff";
+			terminal.input?.(partial);
+			terminal.input?.("\x1b[O");
+			assert.equal(timers.size, 0);
+			t.mock.timers.tick(2000);
+			terminal.input?.("\x1b[I");
+			await nextTick();
+			assert.deepEqual(inputs, [], "focus-in itself must not dispatch partial protocol bytes");
+			assert.equal(timers.size, 1);
+			tui.stop({ preserveScreen: true });
+			assert.equal(timers.size, 0, "stop cancels a resumed query timer");
+			tui.start();
+			await nextTick();
+			assert.equal(timers.size, 1, "visible restart resumes the retained timeout");
+			t.mock.timers.tick(9);
+			assert.deepEqual(inputs, []);
+			t.mock.timers.tick(1);
+			assert.equal(await query, undefined);
+			assert.deepEqual(inputs, [partial]);
+			assert.equal(timers.size, 0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it(`${Renderer.name} resumes multiple hidden OSC 11 query timeouts independently`, async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		tui.start();
+		await nextTick();
+		try {
+			terminal.input?.("\x1b[O");
+			const first = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
+			const second = tui.queryTerminalBackgroundColor({ timeoutMs: 20 });
+			assert.equal(timers.size, 0);
+			t.mock.timers.tick(2000);
+			terminal.input?.("\x1b[I");
+			await nextTick();
+			assert.equal(timers.size, 2);
+			t.mock.timers.tick(10);
+			assert.equal(await first, undefined);
+			assert.equal(timers.size, 1);
+			terminal.input?.(osc11Reply);
+			assert.deepEqual(await second, { r: 255, g: 0, b: 0 });
+			assert.equal(timers.size, 0);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it(`${Renderer.name} hidden-created OSC 11 queries use no timers and consume replies silently`, async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		tui.addChild(component);
+		tui.start();
+		await nextTick();
+		try {
+			terminal.input?.("\x1b[O");
+			const first = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
+			const second = tui.queryTerminalBackgroundColor({ timeoutMs: 20 });
+			assert.equal(timers.size, 0);
+			const renders = component.renders;
+			const writes = terminal.writes.length;
+			t.mock.timers.tick(2000);
+			terminal.input?.("\x1b]11;#fff");
+			terminal.input?.(`fff\x07${osc11Reply}`);
+			assert.deepEqual(await first, { r: 255, g: 255, b: 255 });
+			assert.deepEqual(await second, { r: 255, g: 0, b: 0 });
+			await nextTick();
+			assert.equal(component.renders, renders);
+			assert.equal(terminal.writes.length, writes);
+			assert.equal(timers.size, 0);
+		} finally {
 			tui.stop();
 		}
 	});

@@ -76,8 +76,10 @@ class TestTerminal implements Terminal {
 
 class InputRecorder implements Component {
 	readonly inputs: string[] = [];
+	renders = 0;
 
 	render(_width: number): string[] {
+		this.renders++;
 		return [];
 	}
 
@@ -265,32 +267,55 @@ describe("TUI.queryTerminalBackgroundColor", () => {
 		}
 	});
 
-	// smarty-dev#7403: buffer a partial OSC 11 only while a query is outstanding.
-	it("releases a partial OSC 11 as input when the last query times out", async (t) => {
+	// smarty-dev#7403 round 5: a timeout must never recover a hidden pane.
+	it("keeps a partial OSC 11 timer-free while hidden until a key recovers it", async (t) => {
 		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const scheduled = t.mock.method(globalThis, "setTimeout");
+		const cancelled = t.mock.method(globalThis, "clearTimeout");
 		const terminal = new TestTerminal();
 		const tui = new TuiMainScreen(terminal);
 		const inputs: string[] = [];
 		const visibility: boolean[] = [];
+		const component = new InputRecorder();
+		tui.addChild(component);
+		tui.setFocus(component);
 		tui.addInputListener((data) => {
 			inputs.push(data);
 			return undefined;
 		});
 		tui.onVisibilityChange((visible) => visibility.push(visible));
 		tui.start();
+		tui.renderNow();
+		await new Promise<void>((resolve) => process.nextTick(resolve));
 		try {
-			const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
+			let settled = false;
+			const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 }).then((rgb) => {
+				settled = true;
+				return rgb;
+			});
 			terminal.sendInput("\x1b[O");
 			const partial = "\x1b]11;#fff";
 			terminal.sendInput(partial);
 			assert.deepStrictEqual(inputs, []);
 			assert.strictEqual(visibility.at(-1), false);
-			t.mock.timers.tick(10);
-			assert.strictEqual(await query, undefined);
-			assert.deepStrictEqual(inputs, [partial]);
+			const renders = component.renders;
+			const writes = terminal.writes.length;
+			t.mock.timers.tick(1000);
+			await new Promise<void>((resolve) => process.nextTick(resolve));
+			assert.strictEqual(settled, false);
+			assert.strictEqual(visibility.at(-1), false);
+			assert.strictEqual(component.renders, renders);
+			assert.strictEqual(terminal.writes.length, writes);
+			assert.strictEqual(scheduled.mock.calls.length - cancelled.mock.calls.length, 0, "no active timeout");
+			assert.deepStrictEqual(inputs, []);
+			terminal.sendInput("k");
+			await new Promise<void>((resolve) => process.nextTick(resolve));
 			assert.strictEqual(visibility.at(-1), true);
-			terminal.sendInput("normal input");
-			assert.deepStrictEqual(inputs, [partial, "normal input"]);
+			assert.strictEqual(component.renders, renders + 1);
+			assert.deepStrictEqual(inputs, [partial, "k"]);
+			assert.deepStrictEqual(component.inputs, inputs);
+			terminal.sendInput("\x1b]11;#ffffff\x07");
+			assert.deepStrictEqual(await query, { r: 255, g: 255, b: 255 });
 		} finally {
 			tui.stop();
 		}

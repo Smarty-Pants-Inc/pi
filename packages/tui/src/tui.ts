@@ -139,6 +139,7 @@ export type TuiInputListenerResult = { consume?: boolean; data?: string } | unde
 export type TuiInputListener = (data: string) => TuiInputListenerResult;
 type PendingOsc11BackgroundQuery = {
 	settled: boolean;
+	timeoutMs: number;
 	resolve: ((rgb: RgbColor | undefined) => void) | undefined;
 	timer: NodeJS.Timeout | undefined;
 };
@@ -899,6 +900,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	start(): void {
 		this.stopped = false;
+		for (const query of this.pendingOsc11BackgroundQueries) this.armOsc11BackgroundTimeout(query);
 		this.terminal.setVisible?.(this.terminalFocused);
 		this.onPaneVisibilityChange(this.terminalFocused);
 		for (const listener of this.visibilityListeners) listener(this.terminalFocused);
@@ -943,10 +945,12 @@ export abstract class TuiBase extends Container implements TUI {
 		this.terminalVisibility.focused = focused;
 		this.terminal.setVisible?.(focused && !this.stopped);
 		if (!focused) {
+			this.cancelOsc11BackgroundTimeouts();
 			this.cancelRenderTimer();
 			this.terminal.onRenderPending?.(false);
 			this.onTerminalFocusOut();
 		} else {
+			for (const query of this.pendingOsc11BackgroundQueries) this.armOsc11BackgroundTimeout(query);
 			// Hidden state can have changed without a single frame or timer.
 			this.resetRenderState();
 			this.requestImmediateRender();
@@ -995,6 +999,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
+		this.cancelOsc11BackgroundTimeouts();
 		this.cancelRenderTimer();
 		this.terminal.onRenderPending?.(false);
 		this.terminal.setVisible?.(false);
@@ -1088,6 +1093,28 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private handleTerminalInput(data: string): void {
+		// Focus reports are independent of a buffered, unterminated OSC 11 reply.
+		if (data === "\x1b[I") {
+			this.setTerminalFocused(true);
+			return;
+		}
+		if (data === "\x1b[O") {
+			this.setTerminalFocused(false);
+			return;
+		}
+		const buffered = this.pendingOsc11BackgroundInput;
+		if (
+			buffered &&
+			(Array.from(data).length === 1 ||
+				parseKey(data) !== undefined ||
+				data.startsWith("\x1b[") ||
+				data.startsWith("\x1bO")) &&
+			!isOsc11BackgroundColorResponse(buffered + data)
+		) {
+			// A complete user event recovers immediately, delivering older bytes first.
+			this.pendingOsc11BackgroundInput = "";
+			this.dispatchTerminalInput(buffered);
+		}
 		// Only a query we are still waiting for can remove OSC 11 bytes. Paste stays literal.
 		if (this.pendingOsc11BackgroundReplies > 0) {
 			data = this.pendingOsc11BackgroundInput + data;
@@ -1102,14 +1129,10 @@ export abstract class TuiBase extends Container implements TUI {
 			);
 		}
 		if (data.length === 0) return;
-		if (data === "\x1b[I") {
-			this.setTerminalFocused(true);
-			return;
-		}
-		if (data === "\x1b[O") {
-			this.setTerminalFocused(false);
-			return;
-		}
+		this.dispatchTerminalInput(data);
+	}
+
+	private dispatchTerminalInput(data: string): void {
 		// Keep exact color/cell reports functional, but do not strip their bytes as replies.
 		this.consumeTerminalColorSchemeReport(data);
 		this.consumeCellSizeResponse(data);
@@ -1531,6 +1554,31 @@ export abstract class TuiBase extends Container implements TUI {
 		return null;
 	}
 
+	private cancelOsc11BackgroundTimeouts(): void {
+		for (const query of this.pendingOsc11BackgroundQueries) {
+			if (query.timer) clearTimeout(query.timer);
+			query.timer = undefined;
+		}
+	}
+
+	private armOsc11BackgroundTimeout(query: PendingOsc11BackgroundQuery): void {
+		if (query.settled || query.timer || this.stopped || !this.terminalFocused) return;
+		query.timer = setTimeout(() => {
+			query.timer = undefined;
+			if (query.settled || this.stopped || !this.terminalFocused) return;
+			query.settled = true;
+			query.resolve?.(undefined);
+			query.resolve = undefined;
+			this.pendingOsc11BackgroundQueries.splice(this.pendingOsc11BackgroundQueries.indexOf(query), 1);
+			this.pendingOsc11BackgroundReplies -= 1;
+			if (this.pendingOsc11BackgroundReplies === 0 && this.pendingOsc11BackgroundInput) {
+				const input = this.pendingOsc11BackgroundInput;
+				this.pendingOsc11BackgroundInput = "";
+				this.handleTerminalInput(input);
+			}
+		}, query.timeoutMs);
+	}
+
 	/**
 	 * Query the terminal's default background color with OSC 11 (`ESC ] 11 ; ? BEL`).
 	 * @param timeoutMs Query timeout in milliseconds.
@@ -1540,28 +1588,14 @@ export abstract class TuiBase extends Container implements TUI {
 		return new Promise((resolve) => {
 			const query: PendingOsc11BackgroundQuery = {
 				settled: false,
+				timeoutMs,
 				resolve,
 				timer: undefined,
 			};
 
-			query.timer = setTimeout(() => {
-				if (query.settled) {
-					return;
-				}
-				query.settled = true;
-				query.timer = undefined;
-				query.resolve?.(undefined);
-				query.resolve = undefined;
-				this.pendingOsc11BackgroundQueries.splice(this.pendingOsc11BackgroundQueries.indexOf(query), 1);
-				this.pendingOsc11BackgroundReplies -= 1;
-				if (this.pendingOsc11BackgroundReplies === 0 && this.pendingOsc11BackgroundInput) {
-					const input = this.pendingOsc11BackgroundInput;
-					this.pendingOsc11BackgroundInput = "";
-					this.handleTerminalInput(input);
-				}
-			}, timeoutMs);
 			this.pendingOsc11BackgroundQueries.push(query);
 			this.pendingOsc11BackgroundReplies += 1;
+			this.armOsc11BackgroundTimeout(query);
 			this.terminal.write("\x1b]11;?\x07");
 		});
 	}
