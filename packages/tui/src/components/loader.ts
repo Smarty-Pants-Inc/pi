@@ -9,7 +9,7 @@ export interface LoaderIndicatorOptions {
 }
 
 const DEFAULT_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const DEFAULT_INTERVAL_MS = 80;
+const DEFAULT_INTERVAL_MS = 100;
 
 /**
  * Loader component that updates with an optional spinning animation.
@@ -69,7 +69,11 @@ export class Loader extends Text {
 	setIndicator(indicator?: LoaderIndicatorOptions): void {
 		this.renderIndicatorVerbatim = indicator !== undefined;
 		this.frames = indicator?.frames !== undefined ? [...indicator.frames] : [...DEFAULT_FRAMES];
-		this.intervalMs = indicator?.intervalMs && indicator.intervalMs > 0 ? indicator.intervalMs : DEFAULT_INTERVAL_MS;
+		const interval = indicator?.intervalMs;
+		this.intervalMs =
+			typeof interval === "number" && Number.isFinite(interval)
+				? Math.min(2_147_483_647, Math.max(DEFAULT_INTERVAL_MS, interval))
+				: DEFAULT_INTERVAL_MS;
 		this.currentFrame = 0;
 		this.start();
 	}
