@@ -48,6 +48,8 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 		tui.addChild(text);
 		tui.start();
 		tui.renderNow();
+		// smarty-dev#7403: drain the immediate start/recovery callback before measuring stream frames.
+		await nextTick();
 		for (let token = 0; token < 200; token++) {
 			text.setText(`token ${token}`);
 			tui.requestRender();

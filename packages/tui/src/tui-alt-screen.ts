@@ -62,11 +62,10 @@ const ENTER_ALT_SCREEN = "\x1b[?1049h";
 const EXIT_ALT_SCREEN = "\x1b[?1049l";
 const DISABLE_AUTOWRAP = "\x1b[?7l";
 const ENABLE_AUTOWRAP = "\x1b[?7h";
-const ENABLE_BUTTON_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1004h\x1b[?1006h";
-const ENABLE_ALL_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1004h\x1b[?1006h";
-const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
-const FOCUS_IN = "\x1b[I";
-const FOCUS_OUT = "\x1b[O";
+// Focus reporting belongs to TuiBase/Terminal, not mouse tracking.
+const ENABLE_BUTTON_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const ENABLE_ALL_MOTION_MOUSE = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h";
+const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const BEGIN_SYNCHRONIZED_OUTPUT = "\x1b[?2026h";
 const END_SYNCHRONIZED_OUTPUT = "\x1b[?2026l";
 const OSC133_ZONE_PREFIX = /^(?:\x1b\]133;[ABC](?:\x07|\x1b\\))+/;
@@ -206,6 +205,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	private readonly implicitDocument: Component;
 	private readonly implicitScrollView: ScrollView;
 	private readonly flashes: AltScreenFlashContainer;
+	private paneVisible = true;
 	private altScreenActive = false;
 	private imageProtocol: ImageProtocol = null;
 	private savedCapabilities?: TerminalCapabilities;
@@ -307,6 +307,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	setLayoutRoot(component: Component | undefined): void {
 		if (this.layoutRoot === component) return;
 		this.layoutRoot = component;
+		if (component) this.setScrollViewsVisible(component);
 		this.currentLayout = undefined;
 		this.requestRender();
 	}
@@ -317,6 +318,20 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override getMountedRoots(): readonly Component[] {
 		return this.layoutRoot ? [this.layoutRoot] : this.children;
+	}
+
+	protected override onPaneVisibilityChange(visible: boolean): void {
+		this.paneVisible = visible;
+		this.flashes.setVisible(visible);
+		this.setScrollViewsVisible(this.implicitScrollView);
+		for (const root of this.getMountedRoots()) this.setScrollViewsVisible(root);
+	}
+
+	private setScrollViewsVisible(component: Component): void {
+		if (component instanceof ScrollView) component.setVisible(this.paneVisible);
+		if (component instanceof Container) {
+			for (const child of component.children) this.setScrollViewsVisible(child);
+		}
 	}
 
 	private getPrimaryScrollView(): ScrollView {
@@ -383,7 +398,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	protected override afterTerminalStop(options: TuiStopOptions): void {
 		if (!this.altScreenActive) return;
 		this.altScreenActive = false;
-		if (options.preserveScreen) {
+		if (options.preserveScreen || !this.terminalFocused) {
 			this.terminal.write(`${BEGIN_SYNCHRONIZED_OUTPUT}${EXIT_ALT_SCREEN}\x1b[?25h${END_SYNCHRONIZED_OUTPUT}`);
 		} else {
 			const width = Math.max(1, this.terminal.columns);
@@ -655,31 +670,31 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.mousePressMoved = false;
 	}
 
-	private handleViewportInput(data: string): { consume?: boolean } | undefined {
-		if (data === FOCUS_OUT) {
-			const hadActiveSelection = this.selectionPressActive;
-			const hadNonEmptyActiveSelection = hadActiveSelection && this.getSelectionBounds() !== undefined;
-			this.selectionPressActive = false;
-			this.stopSelectionAutoScroll();
-			this.stopScrollbarHover();
-			if (this.activeSearch?.component.setHoveredNavigationDirection(undefined)) this.requestRender();
-			this.stopScrollbarDrag();
-			this.pressedUrl = undefined;
-			this.selectionDragged = false;
-			this.clearComponentMouseGesture();
-			this.lastComponentClick = undefined;
-			if (hadActiveSelection) {
-				this.selectionAnchor = undefined;
-				this.selectionFocus = undefined;
-				this.selectionGranularity = "character";
-				this.selectionInitialRange = undefined;
-				if (hadNonEmptyActiveSelection) this.requestRender();
-			}
-			this.lastClick = undefined;
-			return { consume: true };
+	protected override onTerminalFocusOut(): void {
+		const hadActiveSelection = this.selectionPressActive;
+		const hadNonEmptyActiveSelection = hadActiveSelection && this.getSelectionBounds() !== undefined;
+		this.selectionPressActive = false;
+		this.stopSelectionAutoScroll();
+		this.stopScrollbarHover();
+		if (this.activeSearch?.component.setHoveredNavigationDirection(undefined)) this.requestRender();
+		this.stopScrollbarDrag();
+		this.pressedUrl = undefined;
+		this.selectionDragged = false;
+		this.clearComponentMouseGesture();
+		this.lastComponentClick = undefined;
+		if (hadActiveSelection) {
+			this.selectionAnchor = undefined;
+			this.selectionFocus = undefined;
+			this.selectionGranularity = "character";
+			this.selectionInitialRange = undefined;
+			if (hadNonEmptyActiveSelection) this.requestRender();
 		}
-		if (data === FOCUS_IN) return { consume: true };
+		this.lastClick = undefined;
+	}
 
+	private handleViewportInput(data: string): { consume?: boolean } | undefined {
+		// TuiBase recovers visibility on input before routing here; stopped panes cannot animate.
+		if (!this.paneVisible) return { consume: true };
 		const wheelEvent = this.parseWheelEvent(data);
 		if (wheelEvent) {
 			const event = this.createMouseEvent("wheel", wheelEvent.button, wheelEvent.x, wheelEvent.y, {

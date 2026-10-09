@@ -139,9 +139,39 @@ export type TuiInputListenerResult = { consume?: boolean; data?: string } | unde
 export type TuiInputListener = (data: string) => TuiInputListenerResult;
 type PendingOsc11BackgroundQuery = {
 	settled: boolean;
+	timeoutMs: number;
 	resolve: ((rgb: RgbColor | undefined) => void) | undefined;
 	timer: NodeJS.Timeout | undefined;
 };
+
+/** Validate a fragmented OSC 11 reply, stopping at its first terminator or invalid byte. */
+function scanOsc11BackgroundReply(data: string): number | "partial" | "invalid" {
+	const prefix = "\x1b]11;rgb:";
+	let channel = 0;
+	let digits = 0;
+	let awaitingSt = false;
+	for (let i = 0; i < data.length; i++) {
+		// The grammar is ASCII, so a valid partial's code units are also its bytes.
+		if (i >= 64) return "invalid";
+		const byte = data[i];
+		if (i < prefix.length) {
+			if (byte !== prefix[i]) return "invalid";
+		} else if (awaitingSt) {
+			return byte === "\\" ? i + 1 : "invalid";
+		} else if ((byte >= "0" && byte <= "9") || (byte >= "a" && byte <= "f") || (byte >= "A" && byte <= "F")) {
+			if (++digits > 4) return "invalid";
+		} else if (byte === "/" && digits > 0 && channel < 2) {
+			channel++;
+			digits = 0;
+		} else if ((byte === "\x07" || byte === "\x1b") && digits > 0 && channel === 2) {
+			if (byte === "\x07") return i + 1;
+			awaitingSt = true;
+		} else {
+			return "invalid";
+		}
+	}
+	return "partial";
+}
 
 /**
  * Interface for components that can receive focus and display a hardware cursor.
@@ -443,6 +473,8 @@ export interface TUI extends Component {
 	stop(options?: TuiStopOptions): void;
 	renderNow(force?: boolean): void;
 	requestRender(force?: boolean): void;
+	/** Subscribe to pane visibility (and stop/start). Called immediately with the current state. */
+	onVisibilityChange(listener: (visible: boolean) => void): () => void;
 	addInputListener(listener: TuiInputListener): () => void;
 	removeInputListener(listener: TuiInputListener): void;
 	onTerminalColorSchemeChange(listener: (scheme: TerminalColorScheme) => void): () => void;
@@ -475,11 +507,23 @@ export abstract class TuiBase extends Container implements TUI {
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 100;
+	// Focus state and subscriptions belong to the terminal, including across renderer swaps/suspend.
+	private static readonly visibilityByTerminal = new WeakMap<
+		Terminal,
+		{ focused: boolean; listeners: Set<(visible: boolean) => void> }
+	>();
+	private readonly terminalVisibility: { focused: boolean; listeners: Set<(visible: boolean) => void> };
+	private readonly visibilityListeners: Set<(visible: boolean) => void>;
+
+	protected get terminalFocused(): boolean {
+		return this.terminalVisibility.focused;
+	}
 	private showHardwareCursor = false;
 	private clearOnShrink = false;
 	protected fullRedrawCount = 0;
 	protected stopped = false;
 	private pendingOsc11BackgroundReplies = 0;
+	private pendingOsc11BackgroundInput = "";
 	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
@@ -499,6 +543,9 @@ export abstract class TuiBase extends Container implements TUI {
 	constructor(terminal: Terminal, showHardwareCursor?: boolean, logDirectory?: string) {
 		super();
 		this.terminal = terminal;
+		this.terminalVisibility = TuiBase.visibilityByTerminal.get(terminal) ?? { focused: true, listeners: new Set() };
+		TuiBase.visibilityByTerminal.set(terminal, this.terminalVisibility);
+		this.visibilityListeners = this.terminalVisibility.listeners;
 		this.logDirectory = logDirectory;
 		if (showHardwareCursor !== undefined) {
 			this.showHardwareCursor = showHardwareCursor;
@@ -516,6 +563,10 @@ export abstract class TuiBase extends Container implements TUI {
 	protected beforeTerminalStop(_options: TuiStopOptions): void {}
 
 	protected afterTerminalStop(_options: TuiStopOptions): void {}
+
+	protected onTerminalFocusOut(): void {}
+
+	protected onPaneVisibilityChange(_visible: boolean): void {}
 
 	get fullRedraws(): number {
 		return this.fullRedrawCount;
@@ -877,18 +928,63 @@ export abstract class TuiBase extends Container implements TUI {
 
 	start(): void {
 		this.stopped = false;
+		for (const query of this.pendingOsc11BackgroundQueries) this.armOsc11BackgroundTimeout(query);
+		this.terminal.setVisible?.(this.terminalFocused);
+		this.onPaneVisibilityChange(this.terminalFocused);
+		for (const listener of this.visibilityListeners) listener(this.terminalFocused);
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
-			() => this.requestRender(),
+			() => {
+				if (this.stopped) return;
+				this.setFocusReporting(true);
+				// Visible resize retains renderer policy (including Termux height-only changes).
+				if (this.terminalFocused) this.requestImmediateRender();
+				else this.setTerminalFocused(true);
+			},
 		);
 		this.afterTerminalStart();
+		this.setFocusReporting(true);
 		this.terminal.hideCursor();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031h");
 		}
 		this.queryCellSize();
-		this.requestRender();
+		this.requestImmediateRender();
+	}
+
+	onVisibilityChange(listener: (visible: boolean) => void): () => void {
+		const listeners = this.visibilityListeners;
+		listeners.add(listener);
+		listener(!this.stopped && this.terminalFocused);
+		return () => listeners.delete(listener);
+	}
+
+	private setFocusReporting(enabled: boolean): void {
+		if (this.terminal.setFocusReporting) this.terminal.setFocusReporting(enabled);
+		else this.terminal.write(enabled ? "\x1b[?1004h" : "\x1b[?1004l");
+	}
+
+	// ponytail: no visibility polling or hidden redraws. A lost CSI I with no input/resize
+	// leaves the pane stale until one arrives, by design. Herdr sends CSI I on view (verified)
+	// and resizes on attach; resize re-requests ?1004h so supporting terminals report current focus.
+	private setTerminalFocused(focused: boolean): void {
+		if (this.terminalFocused === focused) return;
+		this.terminalVisibility.focused = focused;
+		this.terminal.setVisible?.(focused && !this.stopped);
+		if (!focused) {
+			this.cancelOsc11BackgroundTimeouts();
+			this.cancelRenderTimer();
+			this.terminal.onRenderPending?.(false);
+			this.onTerminalFocusOut();
+		} else {
+			for (const query of this.pendingOsc11BackgroundQueries) this.armOsc11BackgroundTimeout(query);
+			// Hidden state can have changed without a single frame or timer.
+			this.resetRenderState();
+			this.requestImmediateRender();
+		}
+		this.onPaneVisibilityChange(focused && !this.stopped);
+		for (const listener of this.visibilityListeners) listener(focused && !this.stopped);
 	}
 
 	addInputListener(listener: TuiInputListener): () => void {
@@ -931,8 +1027,13 @@ export abstract class TuiBase extends Container implements TUI {
 
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
+		this.cancelOsc11BackgroundTimeouts();
 		this.cancelRenderTimer();
 		this.terminal.onRenderPending?.(false);
+		this.terminal.setVisible?.(false);
+		this.onPaneVisibilityChange(false);
+		for (const listener of this.visibilityListeners) listener(false);
+		this.setFocusReporting(false);
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
@@ -943,18 +1044,30 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	renderNow(force = false): void {
+		if (!this.terminalFocused) {
+			this.renderRequested = true;
+			return;
+		}
 		if (force) this.resetRenderState();
+		if (this.stopped || !this.terminalFocused) {
+			this.renderRequested = true;
+			return;
+		}
 		this.renderRequested = false;
 		this.cancelRenderTimer();
 		this.lastRenderAt = performance.now();
 		try {
 			this.doRender();
 		} finally {
-			this.terminal.onRenderPending?.(this.renderRequested && !this.stopped);
+			this.terminal.onRenderPending?.(this.renderRequested && this.terminalFocused && !this.stopped);
 		}
 	}
 
 	requestRender(force = false): void {
+		if (!this.terminalFocused) {
+			this.renderRequested = true;
+			return;
+		}
 		if (force) {
 			this.resetRenderState();
 			this.requestImmediateRender();
@@ -962,19 +1075,21 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		if (this.renderRequested) return;
 		this.renderRequested = true;
-		if (!this.stopped) this.terminal.onRenderPending?.(true);
-		process.nextTick(() => this.scheduleRender());
+		if (!this.stopped && this.terminalFocused) {
+			this.terminal.onRenderPending?.(true);
+			process.nextTick(() => this.scheduleRender());
+		}
 	}
 
 	private requestImmediateRender(): void {
 		this.cancelRenderTimer();
 		this.renderRequested = true;
-		if (this.immediateRenderScheduled) return;
+		if (this.stopped || !this.terminalFocused || this.immediateRenderScheduled) return;
 		this.immediateRenderScheduled = true;
-		if (!this.stopped) this.terminal.onRenderPending?.(true);
+		this.terminal.onRenderPending?.(true);
 		process.nextTick(() => {
 			this.immediateRenderScheduled = false;
-			if (this.stopped || !this.renderRequested) return;
+			if (this.stopped || !this.terminalFocused || !this.renderRequested) return;
 			// A previously queued scheduleRender() can create a timer before this
 			// callback runs. User input must preempt that throttled frame.
 			this.renderNow();
@@ -988,14 +1103,14 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private scheduleRender(): void {
-		if (this.stopped || this.renderTimer || !this.renderRequested) {
+		if (this.stopped || !this.terminalFocused || this.renderTimer || !this.renderRequested) {
 			return;
 		}
 		const elapsed = performance.now() - this.lastRenderAt;
 		const delay = Math.max(0, Math.ceil(TuiBase.MIN_RENDER_INTERVAL_MS - elapsed));
 		this.renderTimer = setTimeout(() => {
 			this.renderTimer = undefined;
-			if (this.stopped || !this.renderRequested) {
+			if (this.stopped || !this.terminalFocused || !this.renderRequested) {
 				return;
 			}
 			this.renderNow();
@@ -1006,12 +1121,62 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private handleTerminalInput(data: string): void {
-		if (this.consumeOsc11BackgroundResponse(data)) {
+		// Focus reports are independent of a buffered, unterminated OSC 11 reply.
+		if (data === "\x1b[I") {
+			this.setTerminalFocused(true);
 			return;
 		}
-		if (this.consumeTerminalColorSchemeReport(data)) {
+		if (data === "\x1b[O") {
+			this.setTerminalFocused(false);
 			return;
 		}
+		const buffered = this.pendingOsc11BackgroundInput;
+		if (buffered) {
+			const combined = buffered + data;
+			const reply = scanOsc11BackgroundReply(combined);
+			this.pendingOsc11BackgroundInput = "";
+			if (reply === "invalid") {
+				// No timer or key heuristic: the first impossible byte makes the entire
+				// partial and the rest of this chunk ordinary input, in arrival order.
+				this.dispatchTerminalInput(buffered);
+				if (data) this.dispatchTerminalInput(data);
+				return;
+			}
+			if (reply === "partial") {
+				this.pendingOsc11BackgroundInput = combined;
+				return;
+			}
+			this.consumeOsc11BackgroundResponse(combined.slice(0, reply));
+			data = combined.slice(reply);
+		}
+		// Only a query we are still waiting for can remove OSC 11 bytes. Paste stays literal.
+		if (this.pendingOsc11BackgroundReplies > 0) {
+			data = this.pendingOsc11BackgroundInput + data;
+			this.pendingOsc11BackgroundInput = "";
+			data = data.replace(
+				/\x1b\[200~[\s\S]*?(?:\x1b\[201~|$)|\x1b\]11;[^\x07\x1b]*(?:\x07|\x1b\\|\x1b?$)|\x1b(?:\](?:1(?:1)?)?)?$/g,
+				(response) => {
+					if (response.startsWith("\x1b[200~") || this.pendingOsc11BackgroundReplies === 0) return response;
+					if (response.length > 64) return response;
+					// Keep existing complete-reply formats, but retain only a grammar-valid partial.
+					if (this.consumeOsc11BackgroundResponse(response)) return "";
+					if (scanOsc11BackgroundReply(response) !== "partial") return response;
+					this.pendingOsc11BackgroundInput = response;
+					return "";
+				},
+			);
+		}
+		if (data.length === 0) return;
+		this.dispatchTerminalInput(data);
+	}
+
+	private dispatchTerminalInput(data: string): void {
+		// Keep exact color/cell reports functional, but do not strip their bytes as replies.
+		this.consumeTerminalColorSchemeReport(data);
+		this.consumeCellSizeResponse(data);
+		// Remaining user input confirms visibility, even mouse, paste, release or unknown bytes.
+		// Do this before listeners, which may swallow the event.
+		this.setTerminalFocused(true);
 
 		// Listener-consumed shortcuts are latency-sensitive too.
 		const keyboardInput =
@@ -1036,11 +1201,6 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			data = current;
-		}
-
-		// Consume terminal cell size responses without blocking unrelated input.
-		if (this.consumeCellSizeResponse(data)) {
-			return;
 		}
 
 		// Global debug key handler (Shift+Ctrl+D)
@@ -1429,6 +1589,31 @@ export abstract class TuiBase extends Container implements TUI {
 		return null;
 	}
 
+	private cancelOsc11BackgroundTimeouts(): void {
+		for (const query of this.pendingOsc11BackgroundQueries) {
+			if (query.timer) clearTimeout(query.timer);
+			query.timer = undefined;
+		}
+	}
+
+	private armOsc11BackgroundTimeout(query: PendingOsc11BackgroundQuery): void {
+		if (query.settled || query.timer || this.stopped || !this.terminalFocused) return;
+		query.timer = setTimeout(() => {
+			query.timer = undefined;
+			if (query.settled || this.stopped || !this.terminalFocused) return;
+			query.settled = true;
+			query.resolve?.(undefined);
+			query.resolve = undefined;
+			this.pendingOsc11BackgroundQueries.splice(this.pendingOsc11BackgroundQueries.indexOf(query), 1);
+			this.pendingOsc11BackgroundReplies -= 1;
+			if (this.pendingOsc11BackgroundReplies === 0 && this.pendingOsc11BackgroundInput) {
+				const input = this.pendingOsc11BackgroundInput;
+				this.pendingOsc11BackgroundInput = "";
+				this.handleTerminalInput(input);
+			}
+		}, query.timeoutMs);
+	}
+
 	/**
 	 * Query the terminal's default background color with OSC 11 (`ESC ] 11 ; ? BEL`).
 	 * @param timeoutMs Query timeout in milliseconds.
@@ -1438,21 +1623,14 @@ export abstract class TuiBase extends Container implements TUI {
 		return new Promise((resolve) => {
 			const query: PendingOsc11BackgroundQuery = {
 				settled: false,
+				timeoutMs,
 				resolve,
 				timer: undefined,
 			};
 
-			query.timer = setTimeout(() => {
-				if (query.settled) {
-					return;
-				}
-				query.settled = true;
-				query.timer = undefined;
-				query.resolve?.(undefined);
-				query.resolve = undefined;
-			}, timeoutMs);
 			this.pendingOsc11BackgroundQueries.push(query);
 			this.pendingOsc11BackgroundReplies += 1;
+			this.armOsc11BackgroundTimeout(query);
 			this.terminal.write("\x1b]11;?\x07");
 		});
 	}

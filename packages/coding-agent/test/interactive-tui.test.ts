@@ -379,7 +379,13 @@ const interactiveModePrototype = InteractiveMode.prototype as unknown as Interac
 describe("clear-on-shrink status spacing", () => {
 	it.each([true, false])("routes every status through the editor opt-in (%s)", (embedWorkingStatus) => {
 		initTheme("dark");
-		const tui = { requestRender: vi.fn() } as unknown as TUI;
+		const tui = {
+			requestRender: vi.fn(),
+			onVisibilityChange: (listener: (visible: boolean) => void) => {
+				listener(true);
+				return () => {};
+			},
+		} as unknown as TUI;
 		const editor: StatusEditor = { embedWorkingStatus, setWorkingStatusIndicator: vi.fn() };
 		const context: ClearStatusContext = {
 			activeStatusIndicator: undefined,
