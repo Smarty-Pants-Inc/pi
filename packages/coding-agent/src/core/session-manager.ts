@@ -2174,7 +2174,10 @@ export class SessionManager {
 		if (leafId === null) {
 			selected = [validateOwnedSessionHeader(header, journal.sessionId)];
 		} else {
-			const scratch = SessionManager.inMemory(this.cwd, undefined, this.fileEntries.map(materializeOwnedEntry));
+			// An explicit fork imports committed history, not caller-mutable presentation indices.
+			const bytes = this.#ownedJournal.read();
+			const entries = bytes.length > 0 ? parseOwnedSessionEntries(bytes, this.#ownedJournal.sessionId) : undefined;
+			const scratch = SessionManager.inMemory(this.cwd, undefined, entries);
 			scratch.selectBranchedSession(leafId, header);
 			selected = parseOwnedSessionEntries(scratch.encodeOwnedEntries(), journal.sessionId);
 		}

@@ -86,6 +86,14 @@ function journal(): JournalFixture {
 	return Reflect.construct(OwnedJournal, []) as JournalFixture;
 }
 
+function childJournal(): JournalFixture {
+	const storage = journal();
+	Reflect.set(storage, "sessionId", "child");
+	Reflect.set(storage, "file", "/synthetic/child.jsonl");
+	storage.initialHeader.id = "child";
+	return storage;
+}
+
 function appendRaw(manager: SessionManager, entry: unknown): void {
 	const append = Reflect.get(manager, "_appendEntry") as (entry: SessionEntry) => void;
 	append.call(manager, entry as SessionEntry);
@@ -200,6 +208,154 @@ describe("plain session append-only persistence", () => {
 				.getEntries()
 				.map((entry) => entry.id),
 		).toEqual([retained, next]);
+	});
+});
+
+// smarty-dev#6719: explicit forks select committed bytes, never caller-mutable source indices.
+describe("owned fork committed selection", () => {
+	it("restores a mutated system role and rejects child context edits", () => {
+		const storage = journal();
+		const manager = SessionManager.openOwned("/synthetic", storage);
+		const first = manager.appendMessage({ role: "system", content: "committed system", timestamp: 1 });
+		const before = storage.read();
+		const indexed = (Reflect.get(manager, "byId") as Map<string, SessionEntry>).get(first)!;
+		if (indexed.type !== "message") throw new Error("fixture message required");
+		Reflect.set(indexed.message, "role", "user");
+		const childStorage = childJournal();
+		const child = manager.forkSelected(first, childStorage);
+		expect(child.getEntry(first)).toMatchObject({ message: { role: "system", content: "committed system" } });
+		const childBefore = childStorage.read();
+		expect(() => child.appendContextEdit(first, null)).toThrow("does not contribute editable model content");
+		expect(childStorage.read()).toEqual(childBefore);
+		expect(storage.read()).toEqual(before);
+	});
+
+	it.each([false, true])(
+		"rejects injected uncommitted history with committed parent=%s before child publish",
+		(committed) => {
+			const storage = journal();
+			const manager = SessionManager.openOwned("/synthetic", storage);
+			const parentId = committed ? manager.appendMessage(userMessage("committed")) : null;
+			const before = storage.read();
+			(Reflect.get(manager, "fileEntries") as Array<SessionEntry | SessionHeader>).push({
+				type: "message",
+				id: "ghost",
+				parentId,
+				timestamp: storage.initialHeader.timestamp,
+				message: userMessage("never committed"),
+			});
+			(Reflect.get(manager, "_buildIndex") as () => void).call(manager);
+			const childStorage = childJournal();
+			expect(() => manager.forkSelected("ghost", childStorage)).toThrow("Entry ghost not found");
+			expect(childStorage.read()).toHaveLength(0);
+			expect(childStorage.commits).toHaveLength(0);
+			expect(childStorage.suffixes).toHaveLength(0);
+			expect(storage.read()).toEqual(before);
+		},
+	);
+
+	it.each(["system", "user"] as const)("preserves normal %s fork editability", (role) => {
+		const storage = journal();
+		const manager = SessionManager.openOwned("/synthetic", storage);
+		const first = manager.appendMessage({ role, content: "original", timestamp: 1 });
+		const before = storage.read();
+		const childStorage = childJournal();
+		const child = manager.forkSelected(first, childStorage);
+		expect(child.getEntry(first)).toMatchObject({ message: { role } });
+		expect(child.getHeader()?.parentSession).toBe(storage.file);
+		if (role === "system") expect(() => child.appendContextEdit(first, null)).toThrow("editable model content");
+		else {
+			child.appendContextEdit(first, { content: "edited child" });
+			expect(childStorage.suffixes).toHaveLength(1);
+		}
+		expect(parseOwnedSessionEntries(childStorage.read(), "child")).toHaveLength(role === "system" ? 2 : 3);
+		expect(storage.read()).toEqual(before);
+	});
+
+	it("preserves committed ancestors, payloads, branch selection and resolved labels", () => {
+		const storage = journal();
+		const manager = SessionManager.openOwned("/synthetic", storage);
+		const root = manager.appendMessage(userMessage("root"));
+		manager.appendMessage(userMessage("abandoned"));
+		manager.branch(root);
+		const selected = manager.appendMessage(userMessage("selected"));
+		manager.appendLabelChange(root, "old");
+		manager.appendLabelChange(root, "resolved");
+		const before = storage.read();
+		const indexed = (Reflect.get(manager, "byId") as Map<string, SessionEntry>).get(selected)!;
+		if (indexed.type !== "message") throw new Error("fixture message required");
+		Reflect.set(indexed.message, "content", "forged payload");
+		indexed.parentId = null;
+		(Reflect.get(manager, "labelsById") as Map<string, string>).set(root, "forged label");
+		const read = vi.spyOn(storage, "read");
+		const childStorage = childJournal();
+		const child = manager.forkSelected(selected, childStorage);
+		expect(read).toHaveBeenCalledTimes(1);
+		read.mockRestore();
+		expect(
+			child
+				.getEntries()
+				.filter((entry) => entry.type === "message")
+				.map((entry) => entry.id),
+		).toEqual([root, selected]);
+		expect(child.getEntry(selected)).toMatchObject({ parentId: root, message: { content: "selected" } });
+		expect(child.getLabel(root)).toBe("resolved");
+		expect(child.getEntries().filter((entry) => entry.type === "label")).toHaveLength(1);
+		expect(parseOwnedSessionEntries(childStorage.read(), "child")).toHaveLength(4);
+		expect(storage.read()).toEqual(before);
+	});
+
+	it.each([false, true])("preserves header-only null fork with flushed source=%s", (flushed) => {
+		const storage = journal();
+		const manager = SessionManager.openOwned("/synthetic", storage);
+		if (flushed) manager.persistCurrent();
+		const before = storage.read();
+		const childStorage = childJournal();
+		const child = manager.forkSelected(null, childStorage);
+		expect(child.getEntries()).toEqual([]);
+		expect(child.getHeader()?.parentSession).toBe(storage.file);
+		expect(parseOwnedSessionEntries(childStorage.read(), "child")).toHaveLength(1);
+		expect(storage.read()).toEqual(before);
+	});
+
+	it.each([false, true])("keeps missing leaf not-found with flushed source=%s", (flushed) => {
+		const storage = journal();
+		const manager = SessionManager.openOwned("/synthetic", storage);
+		if (flushed) manager.persistCurrent();
+		const before = storage.read();
+		const childStorage = childJournal();
+		expect(() => manager.forkSelected("missing", childStorage)).toThrow("Entry missing not found");
+		expect(childStorage.commits).toHaveLength(0);
+		expect(childStorage.read()).toHaveLength(0);
+		expect(storage.read()).toEqual(before);
+	});
+
+	it("fails source integrity reads before child commit", () => {
+		const storage = journal();
+		const manager = SessionManager.openOwned("/synthetic", storage);
+		const first = manager.appendMessage(userMessage("committed"));
+		const childStorage = childJournal();
+		const read = vi.spyOn(storage, "read").mockImplementationOnce(() => {
+			throw new Error("source tamper read failure");
+		});
+		expect(() => manager.forkSelected(first, childStorage)).toThrow("source tamper read failure");
+		read.mockRestore();
+		expect(childStorage.commits).toHaveLength(0);
+		expect(childStorage.suffixes).toHaveLength(0);
+		expect(childStorage.read()).toHaveLength(0);
+	});
+
+	it.each(["sessionId", "file", "nonempty"])("retains fresh child rejection for %s", (kind) => {
+		const storage = journal();
+		const manager = SessionManager.openOwned("/synthetic", storage);
+		const first = manager.appendMessage(userMessage("committed"));
+		const childStorage = childJournal();
+		if (kind === "nonempty") childStorage.commits.push(Buffer.from("occupied"));
+		else Reflect.set(childStorage, kind, Reflect.get(storage, kind));
+		const before = childStorage.read();
+		expect(() => manager.forkSelected(first, childStorage)).toThrow("OWNER_FRESH_CHILD_REQUIRED");
+		expect(childStorage.read()).toEqual(before);
+		expect(childStorage.suffixes).toHaveLength(0);
 	});
 });
 
