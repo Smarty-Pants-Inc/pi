@@ -23,7 +23,7 @@ import type {
 	TaskState,
 } from "../types.ts";
 import { agentHooks } from "./agent.ts";
-import { readContext } from "./context.ts";
+import { type ContextRange, readContextFrom } from "./context.ts";
 import { type AbortMarkPartialWriter, GenerationTask } from "./generation.ts";
 import { assignJson } from "./json.ts";
 import { LiveDoc } from "./live.ts";
@@ -197,6 +197,12 @@ export class TaskScheduler {
 	readonly #conversation: TaskSchedulerOptions["conversation"];
 	readonly #context: Context;
 	readonly #live = new Map<TaskId, AnyTaskRecord>();
+	/**
+	 * Context range last read through a task runtime, per conversation: a later read, by any of its tasks, scans only
+	 * newer entries. `idleSince` is the Harness time it was first seen idle. Derived and never persisted; dropped at the
+	 * next task/read event after `settings.contextRetentionMs` of idleness, and at close. No idle timer wakes the host.
+	 */
+	readonly #contexts = new Map<ConversationId, { range: ContextRange; idleSince: number | undefined }>();
 	readonly #invocations = new Map<TaskId, Invocation>();
 	readonly #taskWaiters = new Waiters<TaskId, SettledTask<JsonValue>>();
 	/** Idle waiters by conversation; `undefined` waits for the whole Harness. */
@@ -425,13 +431,40 @@ export class TaskScheduler {
 		// Also retries, with the next commit of any kind, a cascade whose commit failed.
 		if (this.#cascadePending) this.#scheduleReconcile();
 		if (!changed) return;
-		this.#resolveIdleWaiters();
+		this.#settleIdle();
 		this.#kick();
 	}
 
-	#resolveIdleWaiters(): void {
+	/**
+	 * `settings.contextRetentionMs`, or 0 when the host's settings throw. Kept contexts are only a cache, so dropping them
+	 * is safe, while a throw here would escape commit listeners, reconciliation, and context reads.
+	 */
+	#contextRetentionMs(): number {
+		try {
+			return this.#settings().contextRetentionMs;
+		} catch (error) {
+			this.#report(error);
+			return 0;
+		}
+	}
+
+	/** Resolve idle waiters, and drop each kept context whose conversation has been idle for the retention period. */
+	#settleIdle(): void {
 		for (const conversationId of this.#idleWaiters.keys()) {
 			if (this.#idle(conversationId)) this.#idleWaiters.resolve(conversationId);
+		}
+		const now = this.#now();
+		const retention = this.#contextRetentionMs();
+		for (const [conversationId, kept] of this.#contexts) {
+			if (kept.idleSince !== undefined && now - kept.idleSince >= retention) {
+				this.#contexts.delete(conversationId);
+			} else if (!this.#idle(conversationId)) {
+				kept.idleSince = undefined;
+			} else if (retention > 0) {
+				kept.idleSince ??= now;
+			} else {
+				this.#contexts.delete(conversationId);
+			}
 		}
 	}
 
@@ -487,7 +520,7 @@ export class TaskScheduler {
 			for (const id of checks) this.#failFastChecks.add(id);
 			if (!this.#closing) this.#report(error);
 		}
-		this.#resolveIdleWaiters();
+		this.#settleIdle();
 	}
 
 	/** Whether any of `ids` holds or ended with an outcome other than `completed`. */
@@ -680,6 +713,7 @@ export class TaskScheduler {
 		const error = closedError();
 		this.#taskWaiters.rejectAll(error);
 		this.#idleWaiters.rejectAll(error);
+		this.#contexts.clear();
 		for (const invocation of this.#invocations.values()) invocation.controller.abort();
 	}
 
@@ -1191,8 +1225,35 @@ export class TaskScheduler {
 					return token === undefined || entry?.kind === token.kind ? entry : undefined;
 				});
 			}) as ErasedRuntime["entry"],
-			context: (conversationId, context, at) =>
-				this.#read(invocation, () => readContext(this.#session, this.#storage, conversationId, context, at)),
+			context: (conversationId, context, options) =>
+				this.#read(invocation, async () => {
+					// ponytail: expire idle caches only on real task/read events, never on a timed wake.
+					this.#settleIdle();
+					const { view, range } = await readContextFrom(
+						this.#session,
+						this.#storage,
+						conversationId,
+						context,
+						options?.at,
+						this.#contexts.get(conversationId)?.range,
+					);
+					// Keep it unless the invocation ended or a concurrent read already kept a newer range.
+					const kept = this.#contexts.get(conversationId);
+					if (
+						range !== undefined &&
+						!this.#closing &&
+						!invocation.ended &&
+						(kept === undefined || kept.range.bounds.tail <= range.bounds.tail)
+					) {
+						// A read of another, idle conversation starts or continues its retention period.
+						if (!this.#idle(conversationId)) {
+							this.#contexts.set(conversationId, { range, idleSince: undefined });
+						} else if (this.#contextRetentionMs() > 0) {
+							this.#contexts.set(conversationId, { range, idleSince: kept?.idleSince ?? this.#now() });
+						}
+					}
+					return view;
+				}),
 			now: () => {
 				if (invocation.ended) throw endedError(invocation);
 				return this.#now();

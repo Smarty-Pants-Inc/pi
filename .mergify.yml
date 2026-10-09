@@ -13,7 +13,12 @@ queue_rules:
     checks_timeout: 180 min
     merge_method: merge
     queue_conditions:
-      - base = main
+      # release/runtime-a2 (smarty-dev#7403, chief-of-staff): the temporary landed home of the fleet's a2 runtime
+      # line (716a6046 + reviewed commits), with main's conditions; Mergify keeps one queue per base. Every commit
+      # on it is also on main. Retired when v1.1.0 is installed fleet-wide.
+      - or:
+          - base = main
+          - base = release/runtime-a2
       - -draft
       - -label = hold
       - -title ~= (?i)do not land

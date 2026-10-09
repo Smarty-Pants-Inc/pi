@@ -786,6 +786,7 @@ function supportsAdaptiveThinking(modelId: string, modelName?: string): boolean 
 			s.includes("opus-5") ||
 			s.includes("sonnet-4-6") ||
 			s.includes("sonnet-5") ||
+			s.includes("haiku-5") ||
 			s.includes("fable-5"),
 	);
 }
@@ -798,6 +799,7 @@ function supportsNativeXhighEffort(model: Model<"bedrock-converse-stream">): boo
 			s.includes("opus-4-8") ||
 			s.includes("opus-5") ||
 			s.includes("sonnet-5") ||
+			s.includes("haiku-5") ||
 			s.includes("fable-5"),
 	);
 }
@@ -814,6 +816,7 @@ function supportsThinkingBlockBinding(model: Model<"bedrock-converse-stream">): 
 			s.includes("opus-4-8") ||
 			s.includes("opus-5") ||
 			s.includes("sonnet-5") ||
+			s.includes("haiku-5") ||
 			s.includes("fable-5"),
 	);
 }
@@ -893,8 +896,13 @@ function supportsPromptCaching(model: Model<"bedrock-converse-stream">, env?: Pr
 		if (getProviderEnvValue("AWS_BEDROCK_FORCE_CACHE", env) === "1") return true;
 		return false;
 	}
-	// Claude 5 models (fable-5, opus-5, sonnet-5)
-	if (candidates.some((s) => s.includes("fable-5") || s.includes("opus-5") || s.includes("sonnet-5"))) return true;
+	// Claude 5 models (fable-5, opus-5, sonnet-5, haiku-5)
+	if (
+		candidates.some(
+			(s) => s.includes("fable-5") || s.includes("opus-5") || s.includes("sonnet-5") || s.includes("haiku-5"),
+		)
+	)
+		return true;
 	// Claude 4.x models (opus-4, sonnet-4, haiku-4)
 	if (candidates.some((s) => s.includes("-4-"))) return true;
 	// Claude 3.7 Sonnet
@@ -1321,8 +1329,44 @@ function buildAdditionalModelRequestFields(
 		return result;
 	}
 
+	const candidates = getModelMatchCandidates(model.id, model.name);
+
+	if (candidates.some((s) => s.includes("gpt-oss"))) {
+		return { reasoning_effort: OPENAI_GPT_OSS_EFFORT[options.reasoning] };
+	}
+
+	if (candidates.some((s) => s.includes("gpt-"))) {
+		const mapped = model.thinkingLevelMap?.[options.reasoning];
+		return {
+			reasoning: { effort: typeof mapped === "string" ? mapped : OPENAI_GPT_EFFORT[options.reasoning] },
+		};
+	}
+
 	return undefined;
 }
+
+type OpenAIGptEffort = "low" | "medium" | "high" | "xhigh" | "max";
+type OpenAIGptOssEffort = "low" | "medium" | "high";
+
+/** OpenAI GPT models (GPT-5.x, GPT-6) take a nested `reasoning.effort` and reject `minimal`. */
+const OPENAI_GPT_EFFORT: Record<ThinkingLevel, OpenAIGptEffort> = {
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "xhigh",
+	max: "max",
+};
+
+/** gpt-oss takes a flat `reasoning_effort` and only accepts low, medium and high. */
+const OPENAI_GPT_OSS_EFFORT: Record<ThinkingLevel, OpenAIGptOssEffort> = {
+	minimal: "low",
+	low: "low",
+	medium: "medium",
+	high: "high",
+	xhigh: "high",
+	max: "high",
+};
 
 function createImageBlock(mimeType: string, data: string) {
 	let format: ImageFormat;

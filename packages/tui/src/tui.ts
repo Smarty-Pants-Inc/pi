@@ -3,7 +3,7 @@
  */
 
 import { performance } from "node:perf_hooks";
-import { isKeyRelease, matchesKey } from "./keys.ts";
+import { isKeyRelease, matchesKey, parseKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	parseOscColorResponse,
@@ -502,9 +502,10 @@ export abstract class TuiBase extends Container implements TUI {
 	public onDebug?: () => void;
 	private renderRequested = false;
 	private immediateRenderScheduled = false;
+	private renderGeneration = 0;
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
-	private static readonly MIN_RENDER_INTERVAL_MS = 16;
+	private static readonly MIN_RENDER_INTERVAL_MS = 100;
 	private showHardwareCursor = false;
 	private clearOnShrink = false;
 	protected fullRedrawCount = 0;
@@ -970,6 +971,11 @@ export abstract class TuiBase extends Container implements TUI {
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
 		this.cancelRenderTimer();
+		this.renderRequested = false;
+		this.immediateRenderScheduled = false;
+		// Queued nextTick callbacks from this run must not render after a restart.
+		this.renderGeneration++;
+		this.terminal.onRenderPending?.(false);
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
@@ -984,10 +990,15 @@ export abstract class TuiBase extends Container implements TUI {
 		this.renderRequested = false;
 		this.cancelRenderTimer();
 		this.lastRenderAt = performance.now();
-		this.doRender();
+		try {
+			this.doRender();
+		} finally {
+			this.terminal.onRenderPending?.(this.renderRequested && !this.stopped);
+		}
 	}
 
 	requestRender(force = false): void {
+		if (this.stopped) return;
 		if (force) {
 			this.resetRenderState();
 			this.requestImmediateRender();
@@ -995,7 +1006,11 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		if (this.renderRequested) return;
 		this.renderRequested = true;
-		process.nextTick(() => this.scheduleRender());
+		if (!this.stopped) this.terminal.onRenderPending?.(true);
+		const generation = this.renderGeneration;
+		process.nextTick(() => {
+			if (generation === this.renderGeneration) this.scheduleRender();
+		});
 	}
 
 	private requestImmediateRender(): void {
@@ -1003,15 +1018,15 @@ export abstract class TuiBase extends Container implements TUI {
 		this.renderRequested = true;
 		if (this.immediateRenderScheduled) return;
 		this.immediateRenderScheduled = true;
+		if (!this.stopped) this.terminal.onRenderPending?.(true);
+		const generation = this.renderGeneration;
 		process.nextTick(() => {
+			if (generation !== this.renderGeneration) return;
 			this.immediateRenderScheduled = false;
 			if (this.stopped || !this.renderRequested) return;
 			// A previously queued scheduleRender() can create a timer before this
 			// callback runs. User input must preempt that throttled frame.
-			this.cancelRenderTimer();
-			this.renderRequested = false;
-			this.lastRenderAt = performance.now();
-			this.doRender();
+			this.renderNow();
 		});
 	}
 
@@ -1026,15 +1041,13 @@ export abstract class TuiBase extends Container implements TUI {
 			return;
 		}
 		const elapsed = performance.now() - this.lastRenderAt;
-		const delay = Math.max(0, TuiBase.MIN_RENDER_INTERVAL_MS - elapsed);
+		const delay = Math.max(0, Math.ceil(TuiBase.MIN_RENDER_INTERVAL_MS - elapsed));
 		this.renderTimer = setTimeout(() => {
 			this.renderTimer = undefined;
 			if (this.stopped || !this.renderRequested) {
 				return;
 			}
-			this.renderRequested = false;
-			this.lastRenderAt = performance.now();
-			this.doRender();
+			this.renderNow();
 			if (this.renderRequested) {
 				this.scheduleRender();
 			}
@@ -1048,6 +1061,14 @@ export abstract class TuiBase extends Container implements TUI {
 		if (this.consumeTerminalColorSchemeReport(data)) {
 			return;
 		}
+
+		// Listener-consumed shortcuts are latency-sensitive too.
+		const keyboardInput =
+			!isKeyRelease(data) &&
+			(parseKey(data) !== undefined ||
+				data.startsWith("\x1b[200~") ||
+				(data.length > 0 && !data.startsWith("\x1b")));
+		if (keyboardInput) this.requestImmediateRender();
 
 		if (this.inputListeners.size > 0) {
 			let current = data;
@@ -1113,9 +1134,8 @@ export abstract class TuiBase extends Container implements TUI {
 				return;
 			}
 			this.focusedComponent.handleInput(data);
-			// Keyboard input is latency-sensitive. Avoid the throttled timer path,
-			// where even setTimeout(0) can take a full 16 ms tick on Windows.
-			this.requestImmediateRender();
+			if (keyboardInput) this.requestImmediateRender();
+			else this.requestRender();
 		}
 	}
 
