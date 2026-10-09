@@ -91,10 +91,10 @@ A message in the conversation. The `message` field contains an `AgentMessage`. S
 
 Sessions created before system messages existed have no leading system message; the first request declares the current prompt as a later system message, which replays the same way.
 
-User entries created by `sendUserMessage(content, { metadata })` also carry an optional `metadata` object at the entry root. It is opaque application data, not a trusted provenance claim, and is excluded from model context. The receipt's `entryId` identifies this exact entry. Handled input creates no entry.
+User entries created by `sendUserMessage(content, { metadata })` also carry an optional `metadata` object at the entry root, with a Pi-stamped `metadataSource`: `{ kind: "sdk" }` for direct SDK calls or `{ kind: "extension", extensionPath }` bound by the loader to the executing extension's async context. Borrowed APIs cannot confer another extension's identity; an SDK caller invoking a captured extension API outside that context is stamped `sdk`. Both are excluded from model context and compaction summary input. Metadata is opaque application data, not a trusted provenance claim: consumers must require the expected source (Fabric must require its own extension's path) before trusting it. Caller-supplied source fields in options or metadata do not override the root stamp. The source does not authenticate session-file edits or remote participants. Metadata is bounded as described in [SDK prompting](sdk.md#prompting). The receipt returns the same source and its `entryId` identifies this exact entry. Handled input creates no entry.
 
 ```json
-{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Continue","timestamp":1733234401000},"metadata":{"inputId":"wake-42"}}
+{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Continue","timestamp":1733234401000},"metadata":{"inputId":"wake-42"},"metadataSource":{"kind":"sdk"}}
 ```
 
 ```json

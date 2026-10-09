@@ -3,7 +3,12 @@ import { setImmediate } from "node:timers/promises";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import type { SessionMessageEntry } from "../../../src/core/session-manager.ts";
-import type { ExtensionAPI, SendUserMessageResult, UserMessageMetadata } from "../../../src/index.ts";
+import type {
+	ExtensionAPI,
+	SendUserMessageResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
+} from "../../../src/index.ts";
 import { createHarness, getMessageText, type Harness } from "../harness.ts";
 
 function gate(): { promise: Promise<void>; release: () => void } {
@@ -24,14 +29,21 @@ function userEntries(harness: Harness): SessionMessageEntry[] {
 		.filter((entry): entry is SessionMessageEntry => entry.type === "message" && entry.message.role === "user");
 }
 
-function expectRootMetadata(harness: Harness, result: unknown, metadata: UserMessageMetadata): SessionMessageEntry {
-	expect(result).toEqual({ status: "turnStarted", entryId: expect.any(String), metadata });
+function expectRootMetadata(
+	harness: Harness,
+	result: unknown,
+	metadata: UserMessageMetadata,
+	metadataSource: UserMessageMetadataSource = { kind: "sdk" },
+): SessionMessageEntry {
+	expect(result).toEqual({ status: "turnStarted", entryId: expect.any(String), metadata, metadataSource });
 	const entryId = (result as { entryId: string }).entryId;
 	const matches = userEntries(harness).filter((entry) => entry.id === entryId);
 	expect(matches).toHaveLength(1);
 	const entry = matches[0]!;
 	if (entry.message.role !== "user") throw new Error("Receipt did not identify a user entry");
 	expect(metadataOf(entry)).toEqual(metadata);
+	expect(entry.metadataSource).toEqual(metadataSource);
+	expect(Object.isFrozen(entry.metadataSource)).toBe(true);
 	expect(Object.isFrozen(metadataOf(entry))).toBe(true);
 	expect(entry.message).not.toHaveProperty("metadata");
 	if (Array.isArray(entry.message.content)) {
@@ -293,7 +305,7 @@ describe("#7883 sendUserMessage metadata receipts", () => {
 			observations++;
 			return value;
 		});
-		expect(result).toEqual({ status: "handled", entryId: null, metadata });
+		expect(result).toEqual({ status: "handled", entryId: null, metadata, metadataSource: { kind: "sdk" } });
 		expect(observations).toBe(1);
 		expect(Object.isFrozen(result.metadata)).toBe(true);
 		expect(laterInput).toBe(0);
@@ -488,7 +500,8 @@ describe("#7883 sendUserMessage metadata receipts", () => {
 			await entered.promise;
 			await setImmediate();
 			expect(results).toHaveLength(1);
-			expectRootMetadata(harness, results[0], metadata);
+			// The SDK host invokes a captured API outside extension execution, so it cannot borrow its identity.
+			expectRootMetadata(harness, results[0], metadata, { kind: "sdk" });
 			expect(harness.eventsOfType("agent_settled")).toEqual([]);
 		} finally {
 			release.release();

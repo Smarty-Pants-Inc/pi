@@ -197,6 +197,7 @@ export type {
 	UserBashEvent,
 	UserBashEventResult,
 	UserMessageMetadata,
+	UserMessageMetadataSource,
 	UserMessageRenderer,
 	UserMessageRenderOptions,
 	WidgetPlacement,
@@ -414,6 +415,7 @@ export {
 	type TurnSender,
 	type TurnSenderKind,
 } from "./core/turn-provenance.ts";
+export { UserMessageMetadataError, type UserMessageMetadataErrorCode } from "./core/user-message-metadata.ts";
 export {
 	type ModelRoute,
 	type ModelRouteReason,

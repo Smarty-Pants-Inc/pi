@@ -269,7 +269,9 @@ test("terminal append uses a captured serialized private route", () => {
 	expect(agent).toContain("await this._flushPendingBashMessagesOwnedTerminal();");
 	expect(agent).toContain("await this._flushPendingCustomMessagesOwnedTerminal();");
 	// #7883: per-input metadata uses the same captured owned terminal appender.
-	expect(agent).toContain("await appendOwnedTerminalMessage(this.sessionManager, event.message, receipt, metadata)");
+	expect(agent).toMatch(
+		/await appendOwnedTerminalMessage\(\s*this\.sessionManager,\s*event\.message,\s*receipt,\s*metadata,\s*metadataSource,?\s*\)/,
+	);
 	expect(agent).toContain("await appendOwnedTerminalCustomMessage(");
 	expect(agent).toContain("Leave the failed message and suffix retained");
 	expect(manager).toContain("nativeWriteAccepted: true");

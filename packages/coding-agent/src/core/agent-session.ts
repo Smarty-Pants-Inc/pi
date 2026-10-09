@@ -179,10 +179,12 @@ import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapp
 import { captureTerminalTurnReceipt, type TurnReceipt } from "./turn-receipts.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
+	getUserMessageMetadataSource,
 	type SendUserMessageOptions,
 	type SendUserMessageResult,
 	snapshotUserMessageMetadata,
 	type UserMessageMetadata,
+	type UserMessageMetadataSource,
 } from "./user-message-metadata.ts";
 import {
 	findLatestResponse,
@@ -465,6 +467,7 @@ type CompactionOutcome = boolean | "failed" | "aborted";
 /** One opt-in submission, carried explicitly until its live user message exists. */
 interface UserMessageSubmission {
 	readonly metadata: UserMessageMetadata;
+	readonly metadataSource: UserMessageMetadataSource;
 	message?: AgentMessage;
 	resolve(result: SendUserMessageResult): void;
 	reject(error: unknown): void;
@@ -1689,6 +1692,7 @@ export class AgentSession {
 				submission.reject(new Error("User message was replaced without persisting a user entry"));
 			}
 			const metadata = event.message.role === "user" ? submission?.metadata : undefined;
+			const metadataSource = metadata === undefined ? undefined : submission?.metadataSource;
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -1724,14 +1728,25 @@ export class AgentSession {
 				// Regular LLM message - persist as SessionMessageEntry
 				try {
 					entryId = this.#ordinaryOwner
-						? await appendOwnedTerminalMessage(this.sessionManager, event.message, receipt, metadata)
-						: appendReceivedMessage(this.sessionManager, event.message, receipt, metadata);
+						? await appendOwnedTerminalMessage(
+								this.sessionManager,
+								event.message,
+								receipt,
+								metadata,
+								metadataSource,
+							)
+						: appendReceivedMessage(this.sessionManager, event.message, receipt, metadata, metadataSource);
 				} catch (error) {
 					submission?.reject(error);
 					throw error;
 				}
 				if (submission && event.message.role === "user") {
-					submission.resolve({ status: "turnStarted", entryId, metadata: submission.metadata });
+					submission.resolve({
+						status: "turnStarted",
+						entryId,
+						metadata: submission.metadata,
+						metadataSource: submission.metadataSource,
+					});
 					this._userMessageSubmissions.delete(event.message);
 				}
 				this.#receivedMessageReceipts.delete(event.message);
@@ -1984,9 +1999,9 @@ export class AgentSession {
 		if (!this.isIdle || this.isSettling)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "abort and settle the active operation before disposal");
 		this._inputsDisposed = true;
-		for (const submission of this._pendingUserMessageSubmissions) {
-			submission.reject(new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "user message was not persisted"));
-		}
+		this._rejectPendingUserMessageSubmissions(
+			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "user message was not persisted"),
+		);
 		this._disposalCancellation.abort(
 			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "auxiliary operation cancelled by disposal"),
 		);
@@ -3050,7 +3065,12 @@ export class AgentSession {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
-					submission?.resolve({ status: "handled", entryId: null, metadata: submission.metadata });
+					submission?.resolve({
+						status: "handled",
+						entryId: null,
+						metadata: submission.metadata,
+						metadataSource: submission.metadataSource,
+					});
 					onInputTransferred?.();
 					preflightResult?.("handled");
 					return;
@@ -3087,7 +3107,12 @@ export class AgentSession {
 				mustQueue() ? options?.streamingBehavior : undefined,
 			);
 			if (!processedInput) {
-				submission?.resolve({ status: "handled", entryId: null, metadata: submission.metadata });
+				submission?.resolve({
+					status: "handled",
+					entryId: null,
+					metadata: submission.metadata,
+					metadataSource: submission.metadataSource,
+				});
 				onInputTransferred?.();
 				preflightResult?.("handled");
 				return;
@@ -3851,9 +3876,10 @@ export class AgentSession {
 		options?: SendUserMessageOptions,
 		// biome-ignore lint/suspicious/noConfusingVoidType: Legacy core sends retain Promise<void> while metadata sends return receipts.
 	): Promise<void | SendUserMessageResult> {
-		const receipt = captureTerminalTurnReceipt();
-		// Snapshot before admission or any extension hook can yield or mutate caller-owned values.
+		// Validate and snapshot before issuing a receipt, admitting input, or running extension hooks.
 		const metadata = options?.metadata === undefined ? undefined : snapshotUserMessageMetadata(options.metadata);
+		const metadataSource = getUserMessageMetadataSource(options);
+		const receipt = captureTerminalTurnReceipt();
 		const admission = this._admitInput();
 		let submission: UserMessageSubmission | undefined;
 		const result =
@@ -3862,13 +3888,15 @@ export class AgentSession {
 				: new Promise<SendUserMessageResult>((resolve, reject) => {
 						const context: UserMessageSubmission = {
 							metadata,
+							metadataSource,
 							resolve: (value) => {
 								if (!this._pendingUserMessageSubmissions.delete(context)) return;
 								resolve(value);
 							},
 							reject: (error) => {
 								if (!this._pendingUserMessageSubmissions.delete(context)) return;
-								if (context.message) this._userMessageSubmissions.delete(context.message);
+								// Abort/reload retain queues. Keep occurrence-local metadata until that
+								// input is persisted or explicitly cleared, even though its receipt ended.
 								reject(error);
 							},
 						};
@@ -3914,7 +3942,7 @@ export class AgentSession {
 		if (!result) return await operation;
 		void operation.catch((error: unknown) => {
 			// Compaction failure transfers the exact input into a retained queue. Its receipt
-			// remains pending until recovery persists it or clearQueue explicitly rejects it.
+			// remains pending until recovery persists it or clear/abort/reload/disposal rejects it.
 			if (!submission?.message || !this.agent.getQueuedMessages().includes(submission.message)) {
 				submission?.reject(error);
 			}
@@ -3981,8 +4009,17 @@ export class AgentSession {
 		return this._shutdownCancellation.signal;
 	}
 
+	private _rejectPendingUserMessageSubmissions(error: InputAdmissionError): void {
+		for (const submission of this._pendingUserMessageSubmissions) submission.reject(error);
+	}
+
 	/** Abort current operation and wait for agent to become idle. */
 	async abort(): Promise<void> {
+		// Queued inputs have already released admission. Cancel their receipts too,
+		// including inputs retained by failed compaction, without dropping the queues.
+		this._rejectPendingUserMessageSubmissions(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "user message was not persisted before abort"),
+		);
 		for (const admission of this._inputAdmissions) {
 			admission.controller.abort(new InputAdmissionError("INPUT_ADMISSION_ABORTED", "input was not transferred"));
 		}
@@ -5363,10 +5400,10 @@ export class AgentSession {
 					};
 					// Detach scheduling to avoid an SDK self-join, but keep the separately captured cancellation lineage.
 					if (options?.metadata !== undefined) {
-						const metadata = options.metadata;
-						const result = this._agentSettledScope.exit(() =>
-							this.sendUserMessage(content, { ...options, metadata }),
-						);
+						// Preserve the loader-owned options identity, which carries a private
+						// source binding. No public option can select or override that source.
+						const metadataOptions = options as SendUserMessageOptions & { metadata: UserMessageMetadata };
+						const result = this._agentSettledScope.exit(() => this.sendUserMessage(content, metadataOptions));
 						void result.catch(reportError);
 						return result;
 					}
@@ -5645,7 +5682,15 @@ export class AgentSession {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: reload requires separate receiving");
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
+		const rejection = new InputAdmissionError(
+			"INPUT_ADMISSION_ABORTED",
+			"user message was not persisted before reload",
+		);
+		// End existing receipts before shutdown hooks can yield. Input stays recoverable.
+		this._rejectPendingUserMessageSubmissions(rejection);
 		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+		// Shutdown hooks can submit more input; none may outlive its originating runtime.
+		this._rejectPendingUserMessageSubmissions(rejection);
 		oldRunner.invalidate();
 		const getDefaultTools = () =>
 			this._usesDefaultTools

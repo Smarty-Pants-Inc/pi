@@ -207,6 +207,7 @@ export type {
 	UserBashEvent,
 	UserBashEventResult,
 	UserMessageMetadata,
+	UserMessageMetadataSource,
 	UserMessageRenderer,
 	UserMessageRenderOptions,
 	WidgetPlacement,

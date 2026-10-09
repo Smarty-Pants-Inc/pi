@@ -115,6 +115,7 @@ export type {
 	SendUserMessageOptions,
 	SendUserMessageResult,
 	UserMessageMetadata,
+	UserMessageMetadataSource,
 } from "../user-message-metadata.ts";
 export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
@@ -1804,6 +1805,9 @@ export interface ExtensionAPI {
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
 	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
 	 * With metadata, returns one receipt when the input is handled or its user entry is persisted.
+	 * Pi stamps metadataSource from this extension's loader path and execution context.
+	 * Borrowed APIs cannot confer another extension's identity; SDK invocations stay sdk.
+	 * Consumers must trust metadata only from the source they expect.
 	 * Metadata is snapshotted and deeply frozen before preflight, stored on the entry, and never sent to the model.
 	 * Do not await a queued receipt inside a handler that must return before that input can be delivered.
 	 */

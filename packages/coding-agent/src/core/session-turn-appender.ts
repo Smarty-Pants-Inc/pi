@@ -2,13 +2,14 @@ import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
 import type { BashExecutionMessage, CustomMessage } from "./messages.ts";
 import type { SessionManager } from "./session-manager.ts";
 import type { TurnReceipt } from "./turn-receipts.ts";
-import type { UserMessageMetadata } from "./user-message-metadata.ts";
+import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-message-metadata.ts";
 
 interface ReceivedAppenders {
 	appendMessage(
 		message: Message | CustomMessage | BashExecutionMessage,
 		receipt?: TurnReceipt,
 		metadata?: UserMessageMetadata,
+		metadataSource?: UserMessageMetadataSource,
 	): string;
 	appendCustomMessage(
 		customType: string,
@@ -31,10 +32,11 @@ export function appendReceivedMessage(
 	message: Message | CustomMessage | BashExecutionMessage,
 	receipt?: TurnReceipt,
 	metadata?: UserMessageMetadata,
+	metadataSource?: UserMessageMetadataSource,
 ): string {
 	const actions = appenders.get(manager);
 	if (!actions) throw new Error("SESSION_TURN_APPENDER_REQUIRED");
-	return actions.appendMessage(message, receipt, metadata);
+	return actions.appendMessage(message, receipt, metadata, metadataSource);
 }
 
 export function appendReceivedCustomMessage(
