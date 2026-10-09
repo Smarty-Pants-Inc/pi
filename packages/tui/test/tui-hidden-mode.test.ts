@@ -668,6 +668,8 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			pending: false,
 			expired: false,
 			delivered: input,
+			// pi#177: terminal-originated reports are delivered but never recover a hidden pane.
+			recovers: kind !== "color scheme" && kind !== "cell size",
 		})),
 		{ kind: "unsolicited OSC 11", parts: [osc11Reply], pending: false, expired: false, delivered: osc11Reply },
 		{ kind: "expired OSC 11", parts: [osc11Reply], pending: true, expired: true, delivered: osc11Reply },
@@ -763,13 +765,17 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 					}
 					assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
 				}
-				const recovered = scenario.delivered ? 1 : 0;
+				const recovered = scenario.delivered && !("recovers" in scenario && !scenario.recovers) ? 1 : 0;
 				assert.equal(component.renders - renders, recovered);
 				assert.equal(tui.fullRedraws - full, recovered);
 				assert.deepEqual(visibility, recovered ? [false, true] : [false]);
 				// A rejected buffered prefix and its continuation retain their arrival chunks.
 				const deliveredInputs =
-					scenario.kind === "partial OSC prefix diverges" ? scenario.parts : recovered ? [scenario.delivered] : [];
+					scenario.kind === "partial OSC prefix diverges"
+						? scenario.parts
+						: scenario.delivered
+							? [scenario.delivered]
+							: [];
 				assert.deepEqual(inputs, deliveredInputs);
 				assert.deepEqual(component.inputs, deliveredInputs);
 				assert.equal(inputs.join(""), scenario.delivered);

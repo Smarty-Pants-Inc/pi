@@ -36,6 +36,7 @@ import {
 	CURSOR_MARKER,
 	compositeTuiLine,
 	dispatchMouseEvent,
+	isTerminalStateReport,
 	type OverlayHandle,
 	retargetMouseEvent,
 	TuiBase,
@@ -694,7 +695,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	private handleViewportInput(data: string): { consume?: boolean } | undefined {
 		// TuiBase recovers visibility on input before routing here; stopped panes cannot animate.
-		if (!this.paneVisible) return { consume: true };
+		// Terminal state reports do not recover visibility (pi#177) and still reach components.
+		if (!this.paneVisible) return isTerminalStateReport(data) ? undefined : { consume: true };
 		const wheelEvent = this.parseWheelEvent(data);
 		if (wheelEvent) {
 			const event = this.createMouseEvent("wheel", wheelEvent.button, wheelEvent.x, wheelEvent.y, {

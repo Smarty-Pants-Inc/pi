@@ -483,6 +483,11 @@ export interface TUI extends Component {
 	queryTerminalColorScheme(options: { timeoutMs: number }): Promise<TerminalColorScheme | undefined>;
 }
 
+/** An exact terminal-originated color-scheme or cell-size report: never user input or visibility. */
+export function isTerminalStateReport(data: string): boolean {
+	return parseTerminalColorSchemeReport(data) !== undefined || /^\x1b\[6;\d+;\d+t$/.test(data);
+}
+
 export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
 
 export interface ViewportTUI extends TUI {
@@ -1172,11 +1177,13 @@ export abstract class TuiBase extends Container implements TUI {
 
 	private dispatchTerminalInput(data: string): void {
 		// Keep exact color/cell reports functional, but do not strip their bytes as replies.
-		this.consumeTerminalColorSchemeReport(data);
-		this.consumeCellSizeResponse(data);
+		// They come from the terminal, not the user: a delayed cell-size reply or a color-scheme
+		// notification after focus-out must not recover a hidden pane (pi#177 review).
+		const colorSchemeReport = this.consumeTerminalColorSchemeReport(data);
+		const cellSizeReport = this.consumeCellSizeResponse(data);
 		// Remaining user input confirms visibility, even mouse, paste, release or unknown bytes.
 		// Do this before listeners, which may swallow the event.
-		this.setTerminalFocused(true);
+		if (!colorSchemeReport && !cellSizeReport) this.setTerminalFocused(true);
 
 		// Listener-consumed shortcuts are latency-sensitive too.
 		const keyboardInput =
