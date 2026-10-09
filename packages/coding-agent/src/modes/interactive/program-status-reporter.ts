@@ -97,7 +97,7 @@ export class ProgramStatusReporter {
 		const key = JSON.stringify(status);
 		if (key === this.lastReport) return;
 		this.lastReport = key;
-		this.getTerminal().setProgramStatus(status);
+		this.getTerminal().setProgramStatus?.(status);
 	}
 
 	private currentStatus(): ProgramStatus {

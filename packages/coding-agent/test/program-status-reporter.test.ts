@@ -48,6 +48,40 @@ const compactionEnd = (
 
 // #10607
 describe("ProgramStatusReporter", () => {
+	// pi#173: reporting is an optional capability of existing downstream terminals.
+	it("tolerates a Terminal without setProgramStatus throughout its lifecycle", () => {
+		const terminal: Terminal = {
+			start: () => {},
+			stop: () => {},
+			drainInput: async () => {},
+			write: () => {},
+			columns: 80,
+			rows: 24,
+			kittyProtocolActive: false,
+			moveBy: () => {},
+			hideCursor: () => {},
+			showCursor: () => {},
+			clearLine: () => {},
+			clearFromCursor: () => {},
+			clearScreen: () => {},
+			setTitle: () => {},
+			setProgress: () => {},
+		};
+		const reporter = new ProgramStatusReporter(
+			() => terminal,
+			() => "Legacy session",
+		);
+		expect(() => {
+			reporter.report();
+			reporter.handleEvent({ type: "agent_start" });
+			reporter.setBlocked("dialog", { kind: "question", message: "Continue?" });
+			reporter.setBlocked("dialog", undefined);
+			reporter.handleEvent(assistantEnd("stop"));
+			reporter.handleEvent(settled);
+			reporter.reset();
+		}).not.toThrow();
+	});
+
 	it("reports idle, working during a run, and done once it settles", () => {
 		const { reporter, reports, send, last } = setup("Fix login");
 		reporter.report();
