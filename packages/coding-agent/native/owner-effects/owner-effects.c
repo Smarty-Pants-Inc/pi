@@ -122,6 +122,8 @@ typedef struct {
 	/* One nonrenewable seal-to-release budget, not a syscall preemption guarantee. */
 	atomic_uint_fast64_t close_deadline;
 	uint64_t journal_size;
+	unsigned char *journal_bytes;
+	size_t journal_capacity;
 	uint64_t journal_device;
 	uint64_t journal_inode;
 	char lock_name[192];
@@ -750,12 +752,23 @@ static void cleanup_host(void *data) {
 	host->cleanup_registered = false;
 	pthread_mutex_lock(&host->gate);
 	host->closing = true;
-	for (unsigned i = 0; i < host->owner_limit; i++) if (host->owners[i].active) quarantine_owner(&host->owners[i]);
+	for (unsigned i = 0; i < host->owner_limit; i++) {
+		Owner *owner = &host->owners[i];
+		if (owner->active) quarantine_owner(owner);
+		/* An in-flight worker owns its snapshot until original completion. */
+		if (!owner->lifecycle) {
+			free(owner->journal_bytes); owner->journal_bytes = NULL; owner->journal_capacity = 0;
+		}
+	}
 	pthread_mutex_unlock(&host->gate);
 }
 
 static void close_host_files(Host *host) {
 	if (host->closed) return;
+	for (unsigned i = 0; i < host->owner_limit; i++) {
+		free(host->owners[i].journal_bytes);
+		host->owners[i].journal_bytes = NULL; host->owners[i].journal_capacity = 0;
+	}
 	close(host->cgroup); close(host->storage); close(host->tools); close(host->bubblewrap); close_sandbox(host);
 	host->closed = host->closing = true;
 	atomic_store(&host_registered, false);
@@ -896,7 +909,7 @@ static napi_value validate_host(napi_env env, napi_callback_info info) {
 	host->boot[strcspn(host->boot, "\n")] = 0;
 	if (strlen(host->boot) != 36) { free(host); return failure(env, "OWNER_HOST_BOOT", EPROTO); }
 	snprintf(host->invocation, sizeof(host->invocation), "%s", invocation);
-	snprintf(host->cgroup_path, sizeof(host->cgroup_path), "%s", cgroup_path);
+	memcpy(host->cgroup_path, cgroup_path, strlen(cgroup_path) + 1);
 	host->close_timeout = close_timeout; host->process_timeout = process_timeout; host->record_limit = record_limit; host->argv_limit = argv_limit;
 	host->memory_limit = memory; host->pids_limit = pids; host->cpu_quota = cpu_quota; host->cpu_period = cpu_period;
 	host->disk_limit = disk_limit; host->inode_limit = inode_limit;
@@ -1159,7 +1172,8 @@ static napi_value acquire(napi_env env, napi_callback_info info) {
 		pthread_mutex_unlock(&host->gate); free(reference);
 		return failure(env, "OWNER_RECORD_NAME", EINVAL);
 	}
-	snprintf(owner->record_name, sizeof(owner->record_name), "%s.owner", name);
+	memcpy(owner->record_name, name, strlen(name));
+	memcpy(owner->record_name + strlen(name), ".owner", sizeof(".owner"));
 	struct stat previous_record, storage_identity;
 	int found = fstatat(owner->directory, owner->record_name, &previous_record, AT_SYMLINK_NOFOLLOW);
 	int record_error = 0;
@@ -1222,90 +1236,7 @@ static napi_value check(napi_env env, napi_callback_info info) {
 
 static int lifecycle_journal_boundary(const Owner *owner);
 
-/* Shared journal body: caller owns exclusive original-owner serialization.
- * No N-API, mutex or JSON encoding is performed here. */
-static int commit_journal_bytes(Host *host, Owner *owner, const char *name,
-	const unsigned char *previous, size_t previous_bytes, const unsigned char *next, size_t next_bytes,
-	bool terminal_mode) {
-	if (next_bytes > host->journal_limit || next_bytes < previous_bytes || next_bytes == 0 ||
-		memcmp(previous, next, previous_bytes) != 0) return EINVAL;
-	if ((owner->sealed && !terminal_mode) || owner->uncertain || host->failed ||
-		(terminal_mode && (!owner->sealed || owner->launch_count != 0 || owner->operations != 0))) return ESTALE;
-	if (strcmp(name, owner->journal_name) || previous_bytes != owner->journal_size) return ESTALE;
-	int boundary = lifecycle_journal_boundary(owner);
-	if (boundary) return boundary;
-	unsigned char *snapshot = malloc(next_bytes);
-	if (!snapshot) return ENOMEM;
-	owner->mutation_flags |= OE_RECORD_WRITE_PENDING;
-	if (publish_owner_record(host, owner) < 0) {
-		owner->uncertain = owner->sealed = true;
-		int error = errno;
-		free(snapshot);
-		return error;
-	}
-	boundary = lifecycle_journal_boundary(owner);
-	if (boundary) { free(snapshot); return boundary; }
-	int flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW;
-	if (previous_bytes == 0) flags |= O_CREAT | O_EXCL;
-	int fd = openat(owner->directory, name, flags, 0600);
-	int error = fd < 0 ? errno : 0;
-	bool touched = false;
-	struct stat st;
-	if (!error && fstat(fd, &st) < 0) error = errno;
-	if (!error && (!S_ISREG(st.st_mode) || st.st_nlink != 1 || st.st_uid != getuid() ||
-		(st.st_mode & 0077) || st.st_size != (off_t)previous_bytes ||
-		(previous_bytes && ((uint64_t)st.st_dev != owner->journal_device || (uint64_t)st.st_ino != owner->journal_inode)))) error = ESTALE;
-	if (!error && previous_bytes > 0) {
-		size_t used = 0;
-		while (used < previous_bytes) {
-			if ((error = lifecycle_journal_boundary(owner))) break;
-			ssize_t n = pread(fd, snapshot + used, previous_bytes - used, (off_t)used);
-			if (n < 0 && errno == EINTR) continue;
-			if (n <= 0) { error = n < 0 ? errno : EIO; break; }
-			used += (size_t)n;
-		}
-		if (!error && memcmp(snapshot, previous, previous_bytes) != 0) error = ESTALE;
-	}
-	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error && lseek(fd, (off_t)previous_bytes, SEEK_SET) < 0) error = errno;
-	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error) {
-		touched = true;
-		if (write_all(fd, next + previous_bytes, next_bytes - previous_bytes) < 0) error = errno;
-	}
-	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error && fsync(fd) < 0) error = errno;
-	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error && fsync(owner->directory) < 0) error = errno;
-	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error) {
-		size_t used = 0;
-		while (used < next_bytes) {
-			if ((error = lifecycle_journal_boundary(owner))) break;
-			ssize_t n = pread(fd, snapshot + used, next_bytes - used, (off_t)used);
-			if (n < 0 && errno == EINTR) continue;
-			if (n <= 0) { error = n < 0 ? errno : EIO; break; }
-			used += (size_t)n;
-		}
-		struct stat after, path_stat;
-		if (!error && (fstat(fd, &after) < 0 || fstatat(owner->directory, name, &path_stat, AT_SYMLINK_NOFOLLOW) < 0)) error = errno;
-		if (!error && (after.st_size != (off_t)next_bytes || after.st_dev != path_stat.st_dev ||
-			after.st_ino != path_stat.st_ino || after.st_nlink != 1 || memcmp(snapshot, next, next_bytes) != 0)) error = ESTALE;
-	}
-	if (fd >= 0 && close(fd) < 0 && !error) error = errno;
-	/* No unknown write is promoted merely because a reopened journal parses. */
-	if (!error) error = lifecycle_journal_boundary(owner);
-	if (!error) {
-		owner->journal_size = next_bytes;
-		owner->journal_device = (uint64_t)st.st_dev; owner->journal_inode = (uint64_t)st.st_ino;
-		owner->mutation_flags &= ~OE_RECORD_WRITE_PENDING;
-		if (publish_owner_record(host, owner) < 0) error = errno;
-		if (!error) error = lifecycle_journal_boundary(owner);
-	}
-	if (error && (touched || previous_bytes == 0 || error == ESTALE || owner->record_bytes)) owner->uncertain = owner->sealed = true;
-	free(snapshot);
-	return error;
-}
+#include "owner-journal.h"
 
 /* Existing synchronous append API remains durable; it does not acknowledge
  * speculative queued writes. Terminal callers use the private async entry. */
@@ -1363,9 +1294,14 @@ static napi_value read_journal(napi_env env, napi_callback_info info) {
 	}
 	struct stat after, named;
 	if (!error && (fstat(fd, &after) < 0 || fstatat(owner->directory, name, &named, AT_SYMLINK_NOFOLLOW) < 0)) error = errno;
-	if (!error && (after.st_size != st.st_size || after.st_ino != named.st_ino || after.st_dev != named.st_dev || after.st_nlink != 1)) error = ESTALE;
-	close(fd);
+	if (!error && (!journal_stat_matches(&after, &st, bytes) || !journal_stat_matches(&named, &st, bytes) ||
+		after.st_mtim.tv_sec != st.st_mtim.tv_sec || after.st_mtim.tv_nsec != st.st_mtim.tv_nsec ||
+		after.st_ctim.tv_sec != st.st_ctim.tv_sec || after.st_ctim.tv_nsec != st.st_ctim.tv_nsec ||
+		(owner->journal_bytes && (owner->journal_capacity < bytes || memcmp(buffer, owner->journal_bytes, bytes))))) error = ESTALE;
+	if (close(fd) < 0 && !error) error = errno;
+	if (!error) error = reserve_journal_bytes(reference->host, owner, bytes);
 	if (error) { free(buffer); owner->uncertain = owner->sealed = true; return failure(env, "OWNER_READ_UNCERTAIN", error); }
+	memcpy(owner->journal_bytes, buffer, bytes);
 	napi_status status = napi_create_buffer_copy(env, bytes, buffer, NULL, &result);
 	free(buffer);
 	NAPI_CALL(env, status);
@@ -2268,6 +2204,9 @@ static napi_value init(napi_env env, napi_value exports) {
 		{"beginClose", NULL, seal, NULL, NULL, NULL, napi_default, (void *)3},
 		{"readJournal", NULL, read_journal, NULL, NULL, NULL, napi_default, NULL},
 		{"commitJournal", NULL, commit_journal, NULL, NULL, NULL, napi_default, NULL},
+		{"appendJournal", NULL, append_journal, NULL, NULL, NULL, napi_default, NULL},
+		{"appendTerminalJournal", NULL, append_journal, NULL, NULL, NULL, napi_default, (void *)2},
+		{"verifyJournal", NULL, append_journal, NULL, NULL, NULL, napi_default, (void *)1},
 		{"prepareLaunch", NULL, prepare_launch, NULL, NULL, NULL, napi_default, NULL},
 		{"dispatchLaunch", NULL, dispatch_launch, NULL, NULL, NULL, napi_default, NULL},
 		{"stopLaunch", NULL, stop_launch, NULL, NULL, NULL, napi_default, NULL},
@@ -2290,6 +2229,7 @@ static napi_value init(napi_env env, napi_value exports) {
 		{"associateLaunch", NULL, associate_launch, NULL, NULL, NULL, napi_default, NULL},
 		{"commitTerminalJournal", NULL, commit_journal, NULL, NULL, NULL, napi_default, (void *)1},
 		{"commitTerminalJournalAsync", NULL, lifecycle_journal, NULL, NULL, NULL, napi_default, NULL},
+		{"appendTerminalJournalAsync", NULL, lifecycle_journal, NULL, NULL, NULL, napi_default, (void *)1},
 		{"releaseOwner", NULL, release_owner, NULL, NULL, NULL, napi_default, NULL},
 	};
 	NAPI_CALL(env, napi_define_properties(env, exports, sizeof(properties) / sizeof(properties[0]), properties));
