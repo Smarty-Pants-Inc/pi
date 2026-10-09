@@ -100,6 +100,11 @@ export interface OAuthFlowOptions {
 	fetch?: McpFetch;
 	/** Aborts every request of the flow. Requests have no time limit of their own; combine with a timeout as needed. */
 	signal?: AbortSignal;
+	/**
+	 * Lets discovery return metadata whose issuer differs from the authorization server identifier. The flow still
+	 * refuses to register, redirect or request tokens with it (`OAuthIssuerMismatchError`, smarty-dev#7638); configure
+	 * such a server with `authorizationServerMetadataUrl` instead.
+	 */
 	skipIssuerValidation?: boolean;
 	/**
 	 * Go straight to the authorization redirect instead of refreshing stored tokens, for example when the
@@ -376,9 +381,8 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		});
 	}
 	const metadata = discovered.authorizationServerMetadata;
-	// The exported operations bind the issuer to this URL (smarty-dev#7638). With skipIssuerValidation the caller
-	// accepted a different issuer at discovery, so the operations are bound to that issuer instead.
-	const serverUrl = options.skipIssuerValidation && metadata ? metadata.issuer : discovered.authorizationServerUrl;
+	// The exported operations bind the metadata issuer to this identifier (smarty-dev#7638).
+	const serverUrl = discovered.authorizationServerUrl;
 	const resource = selectResource(options.serverUrl, discovered.resourceMetadata);
 	// `||`, not `??`: an empty scope (for example from `scopes_supported: []`) falls through to the next source.
 	const scope =

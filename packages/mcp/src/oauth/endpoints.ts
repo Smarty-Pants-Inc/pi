@@ -122,8 +122,10 @@ export function validateOAuthEndpointOrigins(
 
 /**
  * For the exported token operations, which take metadata from their caller: besides the endpoint origins, bind the
- * metadata's issuer to the authorization server the caller names (smarty-dev#7638). Metadata whose issuer and endpoints
- * are both on another origin is refused before any request, unless that origin is in `allowedEndpointOrigins`.
+ * metadata to the authorization server the caller names (smarty-dev#7638). As in discovery (RFC 8414 §3.3), the issuer
+ * must be identical to that identifier: the same origin is not enough (tenants share origins), and neither
+ * `allowedEndpointOrigins` nor any other option waives it. A server whose metadata names another issuer is configured
+ * with `authorizationServerMetadataUrl`, whose issuer is then the identifier.
  */
 export function validateOAuthServerMetadata(
 	authorizationServerUrl: string | URL,
@@ -132,9 +134,7 @@ export function validateOAuthServerMetadata(
 ): void {
 	validateOAuthEndpointOrigins(metadata, allowedEndpointOrigins);
 	if (!metadata) return;
-	const expected = secureEndpoint(authorizationServerUrl).origin;
-	const issuer = new URL(metadata.issuer).origin;
-	if (issuer === expected) return;
-	if (allowedEndpointOrigins.some((value) => URL.canParse(value) && new URL(value).origin === issuer)) return;
-	throw new OAuthIssuerMismatchError(expected, metadata.issuer);
+	secureEndpoint(authorizationServerUrl);
+	const expected = String(authorizationServerUrl);
+	if (metadata.issuer !== expected) throw new OAuthIssuerMismatchError(expected, metadata.issuer);
 }

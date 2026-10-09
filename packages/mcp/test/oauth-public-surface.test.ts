@@ -138,12 +138,79 @@ describe("each exported operation binds the metadata issuer to the authorization
 	);
 
 	it.each(Object.keys(foreign) as (keyof typeof foreign)[])(
-		"%s accepts that issuer when allowlisted",
+		"%s refuses that issuer even when its origin is allowlisted, with no request",
 		async (name) => {
-			const fetch = vi.fn(async () =>
-				Response.json({ client_id: "x", redirect_uris: [], access_token: "t", token_type: "bearer" }),
+			const fetch = vi.fn(async () => Response.json({ client_id: "x", access_token: "t", token_type: "bearer" }));
+			await expect(foreign[name](["https://attacker.test"], fetch)).rejects.toBeInstanceOf(
+				oauth.OAuthIssuerMismatchError,
 			);
-			await expect(foreign[name](["https://attacker.test"], fetch)).resolves.toBeDefined();
+			expect(fetch).not.toHaveBeenCalled();
 		},
 	);
+
+	it("refuses another issuer on the same origin (another tenant), with no request", async () => {
+		const fetch = vi.fn(async () => Response.json({ access_token: "t", token_type: "bearer" }));
+		const tenant = (path: string): AuthorizationServerMetadata => ({
+			issuer: `https://oauth.test/${path}`,
+			authorization_endpoint: `https://oauth.test/${path}/authorize`,
+			token_endpoint: `https://oauth.test/${path}/token`,
+			response_types_supported: ["code"],
+		});
+		await expect(
+			oauth.refreshAuthorization("https://oauth.test/tenant-a", {
+				metadata: tenant("tenant-b"),
+				clientInformation: client,
+				refreshToken: "refresh",
+				fetch,
+			}),
+		).rejects.toBeInstanceOf(oauth.OAuthIssuerMismatchError);
+		expect(fetch).not.toHaveBeenCalled();
+		await expect(
+			oauth.refreshAuthorization("https://oauth.test/tenant-a", {
+				metadata: tenant("tenant-a"),
+				clientInformation: client,
+				refreshToken: "refresh",
+				fetch,
+			}),
+		).resolves.toBeDefined();
+	});
+});
+
+describe("authorizeMcp with skipIssuerValidation", () => {
+	it("still refuses to use metadata whose issuer differs: no registration, token request or redirect", async () => {
+		const requests: string[] = [];
+		const fetch = vi.fn(async (input: string | URL | Request) => {
+			const url = new URL(input instanceof Request ? input.url : String(input));
+			requests.push(`${url.host}${url.pathname}`);
+			if (url.pathname.startsWith("/.well-known/oauth-protected-resource"))
+				return Response.json({
+					resource: "https://resource.test/mcp",
+					authorization_servers: ["https://oauth.test"],
+				});
+			if (url.pathname.startsWith("/.well-known/"))
+				return Response.json({ ...foreignIssuer(), code_challenge_methods_supported: ["S256"] });
+			return Response.json({ client_id: "x", access_token: "t", token_type: "bearer" });
+		});
+		const provider = {
+			redirectUrl: "http://127.0.0.1/callback",
+			clientMetadata: { redirect_uris: ["http://127.0.0.1/callback"] },
+			clientInformation: async () => undefined,
+			saveClientInformation: vi.fn(async () => {}),
+			tokens: async () => undefined,
+			saveTokens: vi.fn(async () => {}),
+			redirectToAuthorization: vi.fn(async () => {}),
+			saveCodeVerifier: async () => {},
+			codeVerifier: async () => "verifier",
+		};
+		await expect(
+			oauth.authorizeMcp(provider as never, {
+				serverUrl: "https://resource.test/mcp",
+				fetch: fetch as never,
+				skipIssuerValidation: true,
+			}),
+		).rejects.toBeInstanceOf(oauth.OAuthIssuerMismatchError);
+		expect(requests.filter((r) => r.startsWith("attacker.test"))).toEqual([]);
+		expect(provider.saveClientInformation).not.toHaveBeenCalled();
+		expect(provider.redirectToAuthorization).not.toHaveBeenCalled();
+	});
 });
