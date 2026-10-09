@@ -503,7 +503,7 @@ export function isTerminalStateReportPrefix(data: string): boolean {
 	);
 }
 
-/** Longest proper report prefix, `ESC [ 6 ; 99999 ; 99999` (16 bytes). */
+/** Defensive total cap; the longest proper prefix, `ESC [ 6 ; 99999 ; 99999`, is 15 bytes. */
 const MAX_TERMINAL_REPORT_CARRY = 16;
 
 export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
@@ -1161,7 +1161,17 @@ export abstract class TuiBase extends Container implements TUI {
 			const reply = scanOsc11BackgroundReply(combined);
 			this.pendingOsc11BackgroundInput = "";
 			if (reply === "invalid") {
-				if (!this.terminalFocused && (isTerminalStateReport(combined) || isTerminalStateReportPrefix(combined))) {
+				const report = !this.terminalFocused
+					? combined.match(/^(?:\x1b\[\?997;[12]n|\x1b\[6;\d+;\d+t)/)?.[0]
+					: undefined;
+				if (report) {
+					// Shared ESC with coalesced input: update the leading report while still hidden,
+					// then handle the suffix normally so only its user bytes can recover visibility.
+					this.dispatchTerminalInput(report);
+					this.handleTerminalInput(combined.slice(report.length));
+					return;
+				}
+				if (!this.terminalFocused && isTerminalStateReportPrefix(combined)) {
 					// Shared ESC: the held OSC 11 prefix starts a terminal report instead. While hidden,
 					// the report carry below decides on the combined bytes; the ESC alone must not recover.
 					data = combined;
