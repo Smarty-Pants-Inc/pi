@@ -89,6 +89,9 @@ export interface Terminal {
 	/** Optional frame-lifecycle observer, including frames with no output changes. */
 	onRenderPending?(pending: boolean): void;
 
+	/** Enable/re-request focus reports, with terminal-owned exit cleanup. */
+	setFocusReporting?(enabled: boolean): void;
+
 	/** Pause terminal-owned cosmetic timers when the pane is hidden. */
 	setVisible?(visible: boolean): void;
 
@@ -144,6 +147,9 @@ export class ProcessTerminal implements Terminal {
 	private wasRaw = false;
 	private inputHandler?: (data: string) => void;
 	private resizeHandler?: () => void;
+	private focusReportingEnabled = false;
+	private readonly cleanupFocusReporting = () => this.setFocusReporting(false);
+	private readonly focusSignalHandlers = new Map<NodeJS.Signals, () => void>();
 	private _kittyProtocolActive = false;
 	private _modifyOtherKeysActive = false;
 	private keyboardProtocolPushed = false;
@@ -194,6 +200,8 @@ export class ProcessTerminal implements Terminal {
 
 		// Set up resize handler immediately
 		process.stdout.on("resize", this.resizeHandler);
+		// stdout only emits resize when dimensions change; attach can send SIGWINCH without a size change.
+		if (process.platform !== "win32") process.on("SIGWINCH", this.resizeHandler);
 
 		// Refresh terminal dimensions - they may be stale after suspend/resume
 		// (SIGWINCH is lost while process is stopped). Unix only, best-effort.
@@ -427,7 +435,43 @@ export class ProcessTerminal implements Terminal {
 		}
 	}
 
+	setFocusReporting(enabled: boolean): void {
+		if (enabled) {
+			if (!this.focusReportingEnabled) {
+				this.focusReportingEnabled = true;
+				process.prependListener("exit", this.cleanupFocusReporting);
+				// Monitor does not swallow the exception or change Node's crash semantics.
+				process.prependListener("uncaughtExceptionMonitor", this.cleanupFocusReporting);
+				const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM"];
+				if (process.platform !== "win32") signals.push("SIGHUP");
+				for (const signal of signals) {
+					const handler = () => {
+						this.setFocusReporting(false);
+						// Leave app shutdown handlers in charge; otherwise retain default signal termination.
+						if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+					};
+					this.focusSignalHandlers.set(signal, handler);
+					process.prependListener(signal, handler);
+				}
+			}
+			// Re-enabling ?1004h requests current focus from supporting terminals.
+			this.write("\x1b[?1004h");
+			return;
+		}
+		if (!this.focusReportingEnabled) return;
+		this.focusReportingEnabled = false;
+		process.off("exit", this.cleanupFocusReporting);
+		process.off("uncaughtExceptionMonitor", this.cleanupFocusReporting);
+		for (const [signal, handler] of this.focusSignalHandlers) process.off(signal, handler);
+		this.focusSignalHandlers.clear();
+		// Exit listeners cannot await stdout's buffered writes. Dead terminals are best-effort.
+		try {
+			fs.writeSync(process.stdout.fd, "\x1b[?1004l");
+		} catch {}
+	}
+
 	stop(): void {
+		this.setFocusReporting(false);
 		this.clearProgressInterval();
 		if (this.progressActive) process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 		this.progressActive = false;
@@ -461,6 +505,7 @@ export class ProcessTerminal implements Terminal {
 		this.inputHandler = undefined;
 		if (this.resizeHandler) {
 			process.stdout.removeListener("resize", this.resizeHandler);
+			if (process.platform !== "win32") process.off("SIGWINCH", this.resizeHandler);
 			this.resizeHandler = undefined;
 		}
 

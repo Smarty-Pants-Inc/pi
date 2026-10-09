@@ -904,10 +904,16 @@ export abstract class TuiBase extends Container implements TUI {
 		this.beforeTerminalStart();
 		this.terminal.start(
 			(data) => this.handleTerminalInput(data),
-			() => this.requestRender(),
+			() => {
+				if (this.stopped) return;
+				this.setFocusReporting(true);
+				// Visible resize retains renderer policy (including Termux height-only changes).
+				if (this.terminalFocused) this.requestImmediateRender();
+				else this.setTerminalFocused(true);
+			},
 		);
 		this.afterTerminalStart();
-		this.terminal.write("\x1b[?1004h");
+		this.setFocusReporting(true);
 		this.terminal.hideCursor();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031h");
@@ -923,6 +929,14 @@ export abstract class TuiBase extends Container implements TUI {
 		return () => listeners.delete(listener);
 	}
 
+	private setFocusReporting(enabled: boolean): void {
+		if (this.terminal.setFocusReporting) this.terminal.setFocusReporting(enabled);
+		else this.terminal.write(enabled ? "\x1b[?1004h" : "\x1b[?1004l");
+	}
+
+	// ponytail: no visibility polling or hidden redraws. A lost CSI I with no input/resize
+	// leaves the pane stale until one arrives, by design. Herdr sends CSI I on view (verified)
+	// and resizes on attach; resize re-requests ?1004h so supporting terminals report current focus.
 	private setTerminalFocused(focused: boolean): void {
 		if (this.terminalFocused === focused) return;
 		this.terminalVisibility.focused = focused;
@@ -985,7 +999,7 @@ export abstract class TuiBase extends Container implements TUI {
 		this.terminal.setVisible?.(false);
 		this.onPaneVisibilityChange(false);
 		for (const listener of this.visibilityListeners) listener(false);
-		this.terminal.write("\x1b[?1004l");
+		this.setFocusReporting(false);
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
 		}
@@ -1081,6 +1095,9 @@ export abstract class TuiBase extends Container implements TUI {
 			this.setTerminalFocused(false);
 			return;
 		}
+		// Any non-focus input confirms visibility, even mouse, paste, release or unknown bytes.
+		// Do this before listeners/protocol consumers, which may swallow the event.
+		if (data.length > 0) this.setTerminalFocused(true);
 		if (this.consumeOsc11BackgroundResponse(data)) {
 			return;
 		}
@@ -1095,7 +1112,6 @@ export abstract class TuiBase extends Container implements TUI {
 				data.startsWith("\x1b[200~") ||
 				(data.length > 0 && !data.startsWith("\x1b")));
 		if (keyboardInput) {
-			this.setTerminalFocused(true);
 			this.requestImmediateRender();
 		}
 

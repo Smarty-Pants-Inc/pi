@@ -171,11 +171,10 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 					component.text = `token ${token}`;
 					loader.setMessage(component.text);
 					tui.requestRender();
-					// Forced, direct, and resize paths must not override hidden visibility.
+					// Forced and direct renders alone must not override hidden visibility.
 					if (token % 25 === 0) {
 						tui.requestRender(true);
 						tui.renderNow(true);
-						terminal.resize?.();
 					}
 					await nextTick();
 					now += 10;
@@ -501,8 +500,6 @@ it("fullscreen focus-out cancels flash/scrollbar/drag timers; hidden mutations c
 	await nextTick();
 	tui.flash("current", 500);
 	view.scrollBy(-1);
-	terminal.input?.("\x1b[<0;1;1M");
-	terminal.input?.("\x1b[<32;1;24M");
 	await nextTick();
 	assert.equal(timers.size, 0);
 	const fullRedraws = tui.fullRedraws;
@@ -553,28 +550,195 @@ it("VirtualTerminal waits for capped and unchanged frames without sleeping 20 ms
 	}
 });
 
-it("splits batched/fragmented focus reports and never delivers them to input listeners", async () => {
-	const terminal = new InputTerminal();
-	const tui = new TuiMainScreen(terminal);
-	const component = new CountingComponent();
-	const inputs: string[] = [];
-	tui.addChild(component);
-	tui.setFocus(component);
-	tui.addInputListener((data) => {
-		inputs.push(data);
-		return undefined;
-	});
-	tui.start();
-	const buffer = new StdinBuffer();
-	buffer.on("data", (data) => terminal.input?.(data));
-	try {
-		buffer.process("\x1b[");
-		buffer.process("Ox\x1b[Iy");
+// smarty-dev#7403: only exact, fully assembled CSI focus reports control visibility.
+for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
+	it(`${Renderer.name} parses split focus reports, Alt-O and literal focus bytes in paste`, async () => {
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const inputs: string[] = [];
+		const visibility: boolean[] = [];
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.onVisibilityChange((visible) => visibility.push(visible));
+		tui.start();
+		tui.renderNow();
 		await nextTick();
-		assert.deepEqual(component.inputs, ["x", "y"]);
-		assert.deepEqual(inputs, ["x", "y"]);
-	} finally {
-		buffer.destroy();
-		tui.stop();
+		visibility.length = 0;
+		const buffer = new StdinBuffer();
+		buffer.on("data", (data) => terminal.input?.(data));
+		buffer.on("paste", (content) => terminal.input?.(`\x1b[200~${content}\x1b[201~`));
+		try {
+			// Each byte arrives on a separate read; prefixes must not be mistaken for focus.
+			buffer.process("\x1b");
+			buffer.process("[");
+			assert.deepEqual(visibility, []);
+			buffer.process("O");
+			assert.deepEqual(visibility, [false]);
+			const renders = component.renders;
+			component.text = "latest after fragmented focus";
+			tui.requestRender();
+			await nextTick();
+			assert.equal(component.renders, renders);
+			buffer.process("\x1b");
+			buffer.process("[");
+			assert.deepEqual(visibility, [false]);
+			buffer.process("I");
+			await nextTick();
+			assert.deepEqual(visibility, [false, true]);
+			assert.equal(component.renders, renders + 1);
+			assert.equal(component.lastRendered, "latest after fragmented focus");
+			assert.deepEqual(inputs, []);
+			assert.deepEqual(component.inputs, []);
+
+			buffer.process("\x1b");
+			buffer.process("O");
+			// ESC O is an incomplete SS3 prefix until timeout, then remains a key, not CSI O.
+			for (const data of buffer.flush()) terminal.input?.(data);
+			await nextTick();
+			assert.equal(component.inputs.at(-1), "\x1bO");
+			assert.deepEqual(visibility, [false, true], "Alt-O must never hide the pane");
+			buffer.process("\x1b[200~literal\x1b");
+			buffer.process("[O and \x1b[I");
+			buffer.process("\x1b[201~");
+			await nextTick();
+			assert.equal(component.inputs.at(-1), "\x1b[200~literal\x1b[O and \x1b[I\x1b[201~");
+			assert.deepEqual(visibility, [false, true], "focus bytes in paste must remain text");
+
+			buffer.process("\x1b[Ox\x1b[Iy");
+			await nextTick();
+			assert.deepEqual(component.inputs.slice(-2), ["x", "y"]);
+			assert.deepEqual(inputs.slice(-2), ["x", "y"]);
+			assert.deepEqual(visibility, [false, true, false, true]);
+		} finally {
+			buffer.destroy();
+			tui.stop();
+		}
+	});
+}
+
+// smarty-dev#7403: a resize already being dispatched must not re-enable focus after stop.
+for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
+	it(`${Renderer.name} ignores a stale resize callback after stop`, async () => {
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		tui.addChild(component);
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		const resize = terminal.resize;
+		tui.stop({ preserveScreen: true });
+		const writes = terminal.writes.length;
+		const renders = component.renders;
+		resize?.();
+		await nextTick();
+		assert.equal(terminal.writes.length, writes, "do not re-enable ?1004h on exit");
+		assert.equal(component.renders, renders);
+	});
+}
+
+// smarty-dev#7403 round 2: recovery does not require the missing CSI I or a frame timer.
+for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
+	for (const [kind, data] of [
+		["keypress", "k"],
+		["mouse", "\x1b[<35;1;1M"],
+		["paste", "\x1b[200~pasted\x1b[201~"],
+		["key release", "\x1b[97;1:3u"],
+		["unknown bytes", "\x1b[999z"],
+	] as const) {
+		it(`${Renderer.name} lost CSI I + streaming + ${kind} draws latest state once`, async (t) => {
+			t.mock.method(performance, "now", () => 0);
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+			const timers = trackTimers(t);
+			const terminal = new InputTerminal();
+			const tui = new Renderer(terminal);
+			const component = new CountingComponent();
+			tui.addChild(component);
+			// Recovery must precede even a listener that consumes all input.
+			tui.addInputListener(() => ({ consume: true }));
+			tui.start();
+			tui.renderNow();
+			await nextTick();
+			try {
+				terminal.input?.("\x1b[O");
+				const renders = component.renders;
+				const full = tui.fullRedraws;
+				for (let token = 0; token < 200; token++) {
+					component.text = `token ${token}`;
+					tui.requestRender();
+					await nextTick();
+					t.mock.timers.tick(10);
+				}
+				assert.equal(component.renders, renders);
+				assert.equal(timers.size, 0);
+				terminal.input?.(data);
+				await nextTick();
+				assert.equal(component.renders, renders + 1);
+				assert.equal(tui.fullRedraws, full + 1);
+				assert.equal(component.lastRendered, "token 199");
+				assert.ok(terminal.writes.at(-1)?.includes("token 199"));
+				assert.equal(timers.size, 0, "recovery must not wait for a timer");
+				t.diagnostic(
+					`lost-focus ${Renderer.name} ${kind}: hidden 0 renders/2000ms, 0 timers; recovery 1 full render, token 199`,
+				);
+			} finally {
+				tui.stop();
+			}
+		});
 	}
-});
+
+	it(`${Renderer.name} hidden resize requests fresh focus and draws latest state once`, async (t) => {
+		t.mock.method(performance, "now", () => 0);
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		tui.addChild(component);
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		try {
+			terminal.input?.("\x1b[O");
+			component.text = "latest on attach";
+			tui.requestRender();
+			await nextTick();
+			const renders = component.renders;
+			const full = tui.fullRedraws;
+			const focusRequests = terminal.writes.filter((write) => write === "\x1b[?1004h").length;
+			terminal.resize?.();
+			terminal.resize?.(); // duplicate stdout resize/SIGWINCH callbacks coalesce
+			await nextTick();
+			assert.equal(terminal.writes.filter((write) => write === "\x1b[?1004h").length, focusRequests + 2);
+			assert.equal(component.renders, renders + 1);
+			assert.equal(tui.fullRedraws, full + 1);
+			assert.equal(component.lastRendered, "latest on attach");
+			assert.equal(timers.size, 0);
+			terminal.input?.("\x1b[I"); // current-state report does not cause a second draw
+			await nextTick();
+			assert.equal(component.renders, renders + 1);
+			// A fresh hidden report still cancels the pending recovery frame.
+			terminal.resize?.();
+			terminal.input?.("\x1b[O");
+			await nextTick();
+			assert.equal(component.renders, renders + 1);
+			assert.equal(timers.size, 0);
+			component.text = "latest from report";
+			tui.requestRender();
+			terminal.input?.("\x1b[I");
+			await nextTick();
+			assert.equal(component.renders, renders + 2);
+			assert.equal(component.lastRendered, "latest from report");
+			t.diagnostic(
+				`resize ${Renderer.name}: 1 full render, latest on attach; duplicate focus-in 0 renders; fresh focus-out 0 renders`,
+			);
+		} finally {
+			tui.stop();
+		}
+	});
+}
