@@ -92,6 +92,8 @@ export interface Terminal {
 
 	// Write output to terminal
 	write(data: string): void;
+	/** Optional render lifecycle hook for terminals awaiting a requested frame. */
+	onRenderPending?(pending: boolean): void;
 
 	// Get terminal dimensions
 	get columns(): number;
