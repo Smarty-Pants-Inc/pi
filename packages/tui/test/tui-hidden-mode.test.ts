@@ -7,7 +7,7 @@ import { Text } from "../src/components/text.ts";
 import { StdinBuffer } from "../src/stdin-buffer.ts";
 import type { Terminal } from "../src/terminal.ts";
 import { getCellDimensions, setCellDimensions } from "../src/terminal-image.ts";
-import type { Component } from "../src/tui.ts";
+import { type Component, isTerminalStateReportPrefix } from "../src/tui.ts";
 import { TuiAltScreen } from "../src/tui-alt-screen.ts";
 import { TuiMainScreen } from "../src/tui-main-screen.ts";
 import { VirtualTerminal } from "./virtual-terminal.ts";
@@ -842,45 +842,83 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 		});
 	}
 
-	// pi#177 review: the carry is bounded; digits past the report grammar are released as input.
-	it(`${Renderer.name} hidden cell-size prefix then typed digits releases them once the limit passes`, async (t) => {
-		t.mock.method(performance, "now", () => 0);
-		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-		const timers = trackTimers(t);
-		const terminal = new InputTerminal();
-		const tui = new Renderer(terminal);
-		const component = new CountingComponent();
-		const inputs: string[] = [];
-		const visibility: boolean[] = [];
-		tui.addChild(component);
-		tui.setFocus(component);
-		tui.addInputListener((data) => {
-			inputs.push(data);
-			return undefined;
-		});
-		tui.onVisibilityChange((visible) => visibility.push(visible));
-		tui.start();
-		tui.renderNow();
-		await nextTick();
-		try {
-			terminal.input?.("\x1b[O");
+	// smarty-dev#7648 / pi#177 review: overflow releases either field, including the total-cap edge.
+	for (const [field, prefix, overflow] of [
+		["first field", "\x1b[6;", "6"],
+		["second field", "\x1b[6;20;", "6"],
+		["second field at the 16-byte cap", "\x1b[6;99999;", "6"],
+		["second field beyond the 16-byte cap", "\x1b[6;99999;", "67"],
+	] as const) {
+		it(`${Renderer.name} hidden cell-size ${field} overflow releases bytes once`, async (t) => {
+			t.mock.method(performance, "now", () => 0);
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+			const timers = trackTimers(t);
+			const terminal = new InputTerminal();
+			const tui = new Renderer(terminal);
+			const component = new CountingComponent();
+			const inputs: string[] = [];
+			const visibility: boolean[] = [];
+			const dimensions = { ...getCellDimensions() };
+			tui.addChild(component);
+			tui.setFocus(component);
+			tui.addInputListener((data) => {
+				inputs.push(data);
+				return undefined;
+			});
+			tui.onVisibilityChange((visible) => visibility.push(visible));
+			tui.start();
+			tui.renderNow();
 			await nextTick();
-			visibility.length = 0;
-			terminal.input?.("\x1b[6;");
-			for (const digit of "12345") {
-				terminal.input?.(digit);
+			try {
+				terminal.input?.("\x1b[O");
 				await nextTick();
+				visibility.length = 0;
+				const renders = component.renders;
+				const full = tui.fullRedraws;
+				const writes = terminal.writes.length;
+				terminal.input?.(prefix);
+				for (const digit of "12345") {
+					terminal.input?.(digit);
+					await nextTick();
+					assert.deepEqual(inputs, [], "five digits still fit the cell-size grammar");
+					assert.deepEqual(component.inputs, []);
+					assert.deepEqual(visibility, []);
+					assert.equal(component.renders, renders);
+					assert.equal(terminal.writes.length, writes);
+					assert.equal(timers.size, 0);
+				}
+				if (field.includes("16-byte cap")) {
+					assert.equal(`${prefix}12345`.length, 15);
+					assert.equal(`${prefix}12345${overflow}`.length, overflow.length === 1 ? 16 : 17);
+				}
+				terminal.input?.(overflow);
+				await nextTick();
+				assert.deepEqual(
+					inputs,
+					[`${prefix}12345${overflow}`],
+					"the sixth digit releases everything, once, in order",
+				);
+				assert.deepEqual(component.inputs, inputs);
+				assert.deepEqual(getCellDimensions(), dimensions, "overflow must not update dimensions");
+				assert.deepEqual(visibility, [true]);
+				assert.equal(component.renders, renders + 1);
+				assert.equal(tui.fullRedraws, full + 1);
+				terminal.input?.("t");
+				await nextTick();
+				assert.deepEqual(
+					inputs,
+					[`${prefix}12345${overflow}`, "t"],
+					"later bytes do not replay the released prefix",
+				);
+				assert.deepEqual(component.inputs, inputs);
+				assert.deepEqual(getCellDimensions(), dimensions);
+				assert.deepEqual(visibility, [true]);
+				assert.equal(timers.size, 0);
+			} finally {
+				tui.stop();
 			}
-			assert.deepEqual(inputs, [], "five digits still fit the cell-size grammar");
-			terminal.input?.("6");
-			await nextTick();
-			assert.deepEqual(inputs, ["\x1b[6;123456"], "the sixth digit releases everything, once, in order");
-			assert.deepEqual(visibility, [true]);
-			assert.equal(timers.size, 0);
-		} finally {
-			tui.stop();
-		}
-	});
+		});
+	}
 
 	it(`${Renderer.name} hidden split reports update scheme and cell dimensions without recovering`, async (t) => {
 		t.mock.method(performance, "now", () => 0);
@@ -961,6 +999,161 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			tui.stop();
 		}
 	});
+
+	// smarty-dev#7648: both five-digit maxima fill a 15-byte prefix; byte 16 completes the report.
+	it(`${Renderer.name} hidden cell-size maxima complete at the 16-byte cap without recovery`, async (t) => {
+		t.mock.method(performance, "now", () => 0);
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const inputs: string[] = [];
+		const visibility: boolean[] = [];
+		const dimensions = { ...getCellDimensions() };
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.onVisibilityChange((visible) => visibility.push(visible));
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		setCellDimensions({ widthPx: 9, heightPx: 18 });
+		try {
+			terminal.input?.("\x1b[O");
+			await nextTick();
+			visibility.length = 0;
+			const renders = component.renders;
+			const full = tui.fullRedraws;
+			const writes = terminal.writes.length;
+			const prefix = "\x1b[6;99999;99999";
+			assert.equal(prefix.length, 15);
+			assert.equal(`${prefix}t`.length, 16);
+			assert.equal(isTerminalStateReportPrefix(prefix), true);
+			assert.equal(isTerminalStateReportPrefix(`${prefix}t`), false, "byte 16 completes, not carries");
+			assert.equal(isTerminalStateReportPrefix(`${prefix}6`), false, "overflow is rejected at byte 16");
+			assert.equal(isTerminalStateReportPrefix(`${prefix}67`), false, "byte 17 exceeds the total cap");
+			for (const byte of prefix) {
+				terminal.input?.(byte);
+				await nextTick();
+				assert.deepEqual(inputs, [], "all 15 prefix bytes stay held");
+				assert.deepEqual(component.inputs, []);
+				assert.deepEqual(getCellDimensions(), { widthPx: 9, heightPx: 18 });
+				assert.equal(component.renders, renders);
+				assert.equal(terminal.writes.length, writes);
+				assert.deepEqual(visibility, []);
+				assert.equal(timers.size, 0);
+			}
+			terminal.input?.("t");
+			await nextTick();
+			assert.deepEqual(getCellDimensions(), { widthPx: 99999, heightPx: 99999 });
+			assert.deepEqual(inputs, [`${prefix}t`], "the 16-byte complete report is delivered once");
+			assert.deepEqual(component.inputs, inputs);
+			assert.equal(component.renders, renders);
+			assert.equal(tui.fullRedraws, full);
+			assert.equal(terminal.writes.length, writes);
+			assert.deepEqual(visibility, []);
+			assert.equal(timers.size, 0);
+		} finally {
+			tui.stop();
+			setCellDimensions(dimensions);
+		}
+	});
+
+	// smarty-dev#7648 P2: a shared ESC report must be split from coalesced trailing bytes.
+	for (const [kind, report] of [
+		["color scheme", "\x1b[?997;2n"],
+		["cell size", "\x1b[6;20;10t"],
+	] as const) {
+		for (const [suffixKind, suffix] of [
+			["key", "k"],
+			["OSC 11 reply", osc11Reply],
+		] as const) {
+			it(`${Renderer.name} hidden shared ESC ${kind} with coalesced ${suffixKind} updates state first`, async (t) => {
+				t.mock.method(performance, "now", () => 0);
+				t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+				const timers = trackTimers(t);
+				const terminal = new InputTerminal();
+				const tui = new Renderer(terminal);
+				const component = new CountingComponent();
+				const inputs: string[] = [];
+				const schemes: string[] = [];
+				const visibility: boolean[] = [];
+				const inputVisibility: boolean[] = [];
+				const dimensions = { ...getCellDimensions() };
+				let visible = true;
+				tui.addChild(component);
+				tui.setFocus(component);
+				tui.onTerminalColorSchemeChange((scheme) => schemes.push(scheme));
+				tui.onVisibilityChange((state) => {
+					visible = state;
+					visibility.push(state);
+				});
+				tui.addInputListener((data) => {
+					inputs.push(data);
+					inputVisibility.push(visible);
+					assert.deepEqual(schemes, kind === "color scheme" ? ["light"] : []);
+					assert.deepEqual(
+						getCellDimensions(),
+						kind === "cell size" ? { widthPx: 10, heightPx: 20 } : { widthPx: 9, heightPx: 18 },
+					);
+					if (data === report) assert.equal(timers.size, 0, "report dispatch is still hidden");
+					return undefined;
+				});
+				tui.start();
+				tui.renderNow();
+				await nextTick();
+				setCellDimensions({ widthPx: 9, heightPx: 18 });
+				try {
+					let settled = false;
+					const query = tui.queryTerminalBackgroundColor({ timeoutMs: 1000 }).then((rgb) => {
+						settled = true;
+						return rgb;
+					});
+					terminal.input?.("\x1b[O");
+					await nextTick();
+					visibility.length = 0;
+					const renders = component.renders;
+					const full = tui.fullRedraws;
+					const writes = terminal.writes.length;
+					terminal.input?.("\x1b");
+					await nextTick();
+					assert.deepEqual(inputs, []);
+					assert.deepEqual(visibility, []);
+					assert.equal(component.renders, renders);
+					assert.equal(timers.size, 0);
+					terminal.input?.(report.slice(1) + suffix);
+					await nextTick();
+					const recovers = suffixKind === "key";
+					assert.deepEqual(
+						inputs,
+						recovers ? [report, suffix] : [report],
+						"report precedes the suffix, neither duplicated nor lost",
+					);
+					assert.deepEqual(component.inputs, inputs);
+					assert.deepEqual(inputVisibility, recovers ? [false, true] : [false]);
+					assert.deepEqual(visibility, recovers ? [true] : []);
+					assert.equal(component.renders, renders + Number(recovers));
+					assert.equal(tui.fullRedraws, full + Number(recovers));
+					assert.equal(timers.size, Number(recovers), "only a recovered pane re-arms its pending query");
+					if (recovers) {
+						assert.equal(settled, false, "the report and key leave OSC 11 outstanding");
+						terminal.input?.(osc11Reply);
+					} else {
+						assert.equal(terminal.writes.length, writes);
+					}
+					assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
+					assert.equal(timers.size, 0);
+				} finally {
+					tui.stop();
+					setCellDimensions(dimensions);
+				}
+			});
+		}
+	}
 
 	it(`${Renderer.name} hidden key sharing a report prefix arrives whole and recovers once`, async (t) => {
 		t.mock.method(performance, "now", () => 0);
