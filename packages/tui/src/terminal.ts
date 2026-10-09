@@ -582,9 +582,13 @@ export class ProcessTerminal implements Terminal {
 	}
 
 	setProgress(active: boolean): void {
+		const wasActive = this.progressActive;
 		this.progressActive = active;
 		if (!this.visible) {
 			this.clearProgressInterval();
+			// A hidden pane still clears progress it had shown (pi#177): otherwise the terminal keeps
+			// an active indicator after the turn ends. No keepalive restarts while hidden.
+			if (!active && wasActive) process.stdout.write(TERMINAL_PROGRESS_CLEAR_SEQUENCE);
 			return;
 		}
 		if (active) {
