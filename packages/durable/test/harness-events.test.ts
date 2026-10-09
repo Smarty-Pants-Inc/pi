@@ -264,41 +264,55 @@ describe("agent events", () => {
 	});
 
 	it("rebuilds every committed partial of thinking, text, and tool-call arguments from message changes", async () => {
-		const setup = chatSetup({ tokensPerSecond: 150, tokenSize: { min: 1, max: 1 } });
-		const message = fauxAssistantMessage(
-			[
-				fauxThinking("thinking about it ".repeat(10)),
-				fauxText("some text ".repeat(10)),
-				fauxToolCall("missing", { path: "a/long/path/".repeat(10), note: "x".repeat(60) }, { id: "c1" }),
-			],
-			{ stopReason: "toolUse" },
-		);
-		setup.faux.setResponses([message, fauxAssistantMessage([fauxText("done")])]);
-		const { harness, root } = await openChat(new MemoryStorage(), setup);
-		const partials = partialsOf(harness);
-		const { stream, events } = await listen(harness, root);
-		await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
-		await drained();
-		const rebuilt: AssistantMessage[] = [];
-		let current: AssistantMessage | undefined;
-		// The streamed tool-calling message, up to its end; the short final answer commits no partial.
-		for (const event of events()) {
-			if (event.type === "message_end" && event.entry?.kind === "pi.assistant") break;
-			if (event.type === "message_start" && event.message.role === "assistant") current = event.message;
-			else if (event.type === "message_update") current = applyChanges(current!, event.changes);
-			else continue;
-			rebuilt.push(current!);
-		}
-		expect(partials.length).toBeGreaterThan(2);
-		expect(rebuilt.map((partial) => partial.content)).toEqual(partials.map((partial) => partial.content));
-		const types = new Set(
-			events()
-				.flatMap((event) => (event.type === "message_update" ? event.changes : []))
-				.map((c) => c.type),
-		);
-		expect(types.has("thinking_delta") || types.has("text_delta")).toBe(true);
-		await stream.stop();
-		await harness.close(context);
+		const run = async (retry: boolean) => {
+			const setup = chatSetup({ tokensPerSecond: 150, tokenSize: { min: 1, max: 1 } });
+			setup.settings.retry = { enabled: retry };
+			const message = fauxAssistantMessage(
+				[
+					fauxThinking("thinking about it ".repeat(10)),
+					fauxText("some text ".repeat(10)),
+					fauxToolCall("missing", { path: "a/long/path/".repeat(10), note: "x".repeat(60) }, { id: "c1" }),
+				],
+				{ stopReason: "toolUse" },
+			);
+			setup.faux.setResponses([message, fauxAssistantMessage([fauxText("done")])]);
+			const { harness, root } = await openChat(new MemoryStorage(), setup);
+			const partials = partialsOf(harness);
+			const { stream, events } = await listen(harness, root);
+			await (await root.submit({ type: "input", content: "go" }, context)).wait(context);
+			await drained();
+			const rebuilt: AssistantMessage[] = [];
+			let current: AssistantMessage | undefined;
+			// The streamed tool-calling message, up to its end; the short final answer commits no partial.
+			for (const event of events()) {
+				if (event.type === "message_end" && event.entry?.kind === "pi.assistant") break;
+				if (event.type === "message_start" && event.message.role === "assistant") current = event.message;
+				else if (event.type === "message_update") current = applyChanges(current!, event.changes);
+				else continue;
+				rebuilt.push(current!);
+			}
+			expect(rebuilt.map((partial) => partial.content)).toEqual(partials.map((partial) => partial.content));
+			const types = new Set(
+				events()
+					.flatMap((event) => (event.type === "message_update" ? event.changes : []))
+					.map((c) => c.type),
+			);
+			await stream.stop();
+			await harness.close(context);
+			return { partials, types };
+		};
+		// Without retry nothing is held: reasoning-only partials commit and thinking deltas rebuild them.
+		const unheld = await run(false);
+		expect(unheld.partials.length).toBeGreaterThan(2);
+		expect(unheld.partials[0]!.content.map((block) => block.type)).toEqual(["thinking"]);
+		expect(unheld.types.has("thinking_delta")).toBe(true);
+		// smarty-dev#6730: while the attempt is retryable, partials without answer output are held, so the first committed
+		// partial already carries the text after the thinking; the later text and tool-call partials still rebuild.
+		const held = await run(true);
+		expect(held.partials.length).toBeGreaterThan(1);
+		expect(held.partials[0]!.content.slice(0, 2).map((block) => block.type)).toEqual(["thinking", "text"]);
+		expect(held.partials.every((partial) => partial.content.some((block) => block.type !== "thinking"))).toBe(true);
+		expect(held.types.has("text_delta") || held.types.has("toolcall_delta")).toBe(true);
 	});
 
 	it("rebuilds a sliding tail window from output trims and appends", async () => {
@@ -373,8 +387,8 @@ describe("agent events", () => {
 		await followUp.wait(context);
 		await drained();
 		const boundary = batches.find((batch) => batch.some((event) => event.type === "run_end"))!;
-		// The answer's message_start came with its partial, committed before classification (pi#171).
 		expect(boundary.map((event) => event.type)).toEqual([
+			"message_start",
 			"message_end",
 			"message_start",
 			"message_end",

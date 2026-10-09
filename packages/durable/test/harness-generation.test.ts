@@ -734,18 +734,16 @@ describe("generation", () => {
 	it("commits partials no more often than progress.partialIntervalMs", async () => {
 		const shortStream = (): ReturnType<Models["streamSimple"]> => {
 			const events = async function* () {
-				for (const text of ["partial", "partial more"]) {
-					yield { type: "start", partial: fauxAssistantMessage(text, { stopReason: "pending" }) };
-					// Longer than the default 100 ms, shorter than the configured interval.
-					await new Promise((resolve) => setTimeout(resolve, 300));
-				}
+				yield { type: "start", partial: fauxAssistantMessage("partial", { stopReason: "pending" }) };
+				// Longer than the default 100 ms, shorter than the configured interval.
+				await new Promise((resolve) => setTimeout(resolve, 300));
 			};
 			const final = fauxAssistantMessage("final");
 			return { [Symbol.asyncIterator]: events, result: async () => final } as unknown as ReturnType<
 				Models["streamSimple"]
 			>;
 		};
-		const publishedPartials = async (settings: ChatSetup["settings"]): Promise<(string | undefined)[]> => {
+		const publishedPartial = async (settings: ChatSetup["settings"]): Promise<boolean> => {
 			const base = chatSetup();
 			const setup: ChatSetup = { ...base, settings, models: withStream(base.models, shortStream) };
 			const { harness, root } = await openChat(new MemoryStorage(), setup);
@@ -754,12 +752,10 @@ describe("generation", () => {
 			const submission = await root.submit({ type: "input", content: "hi" }, context);
 			expect(await submission.wait(context)).toMatchObject({ status: "done" });
 			await harness.close(context);
-			const texts = values.map((value) => textOf(value.generation?.message as Message));
-			return texts.filter((text, index) => text !== undefined && text !== texts[index - 1]);
+			return values.some((value) => textOf(value.generation?.message as Message) === "partial");
 		};
-		expect(await publishedPartials({})).toEqual(["partial", "partial more"]);
-		// The throttle skips the first partial; the outcome commits the newest one before classification (pi#171).
-		expect(await publishedPartials({ progress: { partialIntervalMs: 5000 } })).toEqual(["partial more"]);
+		expect(await publishedPartial({})).toBe(true);
+		expect(await publishedPartial({ progress: { partialIntervalMs: 5000 } })).toBe(false);
 	});
 
 	it("renders sections that read conversation documents through input.read", async () => {

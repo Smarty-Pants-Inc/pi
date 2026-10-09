@@ -131,8 +131,6 @@ describe("pi.live deltas", () => {
 			[["s", ["run"], { taskId: firstGeneration, inputs: [expect.any(Number)] }]],
 			// request
 			[["s", ["generation"], { attempt: 1 }]],
-			// the stream's outcome commits its pending tool-call partial before classification (pi#171)
-			[["s", ["generation", "message"], expect.objectContaining({ stopReason: "pending" })]],
 			// the generation starts its tool round and keeps the run
 			expect.arrayContaining([
 				["d", ["generation"]],
@@ -151,16 +149,15 @@ describe("pi.live deltas", () => {
 				["s", ["run", "taskId"], secondGeneration],
 			]),
 			[["s", ["generation"], { attempt: 1 }]],
-			[["s", ["generation", "message"], expect.objectContaining({ stopReason: "pending" })]],
 			// the answer ends the run
 			expect.arrayContaining([
 				["d", ["run"]],
 				["d", ["generation"]],
 			]),
 		]);
-		expect(commits[3]).toHaveLength(2);
+		expect(commits[2]).toHaveLength(2);
+		expect(commits[4]).toHaveLength(2);
 		expect(commits[5]).toHaveLength(2);
-		expect(commits[6]).toHaveLength(2);
 		await harness.close(context);
 	});
 

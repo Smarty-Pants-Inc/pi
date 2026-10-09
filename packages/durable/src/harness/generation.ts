@@ -384,8 +384,8 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
 /**
  * Stream one request and return the terminal message. Partials commit as trailing writes at most every
  * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle, awaits that
- * commit, and then commits a still pending partial with answer output, so no stale partial lands after the outcome and
- * classification (or recovery from a crash before it) sees every answer output the stream produced.
+ * commit, and, unless the stream completed normally, commits a still pending partial with answer output, so no stale
+ * partial lands after the outcome and recovery from a crash before classification sees every answer output streamed.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -406,6 +406,7 @@ async function streamResponse(
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
+	let completed = false;
 	const commitPartial = (partial: AssistantMessage): Promise<void> => {
 		// Copy synchronously: the provider keeps mutating its partial.
 		const message = copyJson(partial, { omitUndefinedProperties: true });
@@ -442,16 +443,19 @@ async function streamResponse(
 			if (holdReasoning && !observed.answer) continue;
 			if (timer === undefined && inFlight === undefined) timer = setTimeout(flush, interval);
 		}
-		return { message: await events.result(), observed };
+		const message = await events.result();
+		completed = message.stopReason !== "error" && message.stopReason !== "aborted";
+		return { message, observed };
 	} finally {
 		stopped = true;
 		clearTimeout(timer);
 		await inFlight;
-		// pi#171: an outcome that arrives before the throttle fires (an error, a premature close, an abort, or completion)
+		// pi#171: an abnormal end before the throttle fires (an error, a premature close, an abort, or a thrown stream)
 		// still makes streamed answer output durable before classification, so a crash before the classification commit
-		// recovers it instead of resending. A partial without answer output is left to the classification commit, so the
-		// reasoning of a retried attempt stays held.
-		if (pending !== undefined && hasAssistantAnswerOutput(pending)) await commitPartial(pending);
+		// recovers it instead of resending. A normal completion commits nothing extra: its classification commit records
+		// the final message. A partial without answer output is left to the classification commit, so the reasoning of a
+		// retried attempt stays held.
+		if (!completed && pending !== undefined && hasAssistantAnswerOutput(pending)) await commitPartial(pending);
 	}
 }
 
