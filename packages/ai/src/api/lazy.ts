@@ -42,7 +42,7 @@ function setupErrorText(error: unknown): string {
 	return requestSetupError(error).message;
 }
 
-function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMessage {
+function createSetupErrorMessage(model: Model<Api>, error: unknown, timestamp: number): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [],
@@ -59,7 +59,7 @@ function createSetupErrorMessage(model: Model<Api>, error: unknown): AssistantMe
 		},
 		stopReason: "error",
 		errorMessage: setupErrorText(error),
-		timestamp: Date.now(),
+		timestamp,
 	};
 }
 
@@ -88,6 +88,7 @@ export function lazyStream(
 	model: Model<Api>,
 	setup: (outer: AssistantMessageEventStream) => Promise<AsyncIterable<AssistantMessageEvent>>,
 ): AssistantMessageEventStream {
+	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
 
 	// Setup can call `protectAssistantMessageStream(outer, ...)` once it has resolved request credentials,
@@ -95,7 +96,7 @@ export function lazyStream(
 	setup(outer)
 		.then((inner) => forwardStream(outer, inner))
 		.catch((error) => {
-			const message = createSetupErrorMessage(model, error);
+			const message = createSetupErrorMessage(model, error, startedAt);
 			outer.push({ type: "error", reason: "error", error: message });
 			outer.end(message);
 		});

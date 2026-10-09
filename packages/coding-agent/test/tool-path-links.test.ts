@@ -28,6 +28,8 @@ function context(args: Record<string, unknown>, cwd: string, state: Record<strin
 		state,
 		cwd,
 		executionStarted: true,
+		durationMs: undefined,
+		outputPad: 0,
 		argsComplete: true,
 		isPartial: false,
 		expanded: true,

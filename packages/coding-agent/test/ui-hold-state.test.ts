@@ -47,6 +47,7 @@ function createMode(tuiMode: "regular" | "fullscreen" = "regular"): Mode {
 		editorContainer,
 		uiHolds: new Set<{ reason: "custom" | "editor"; cancel?: () => void }>(),
 		keybindings: new KeybindingsManager(),
+		programStatus: { setBlocked: vi.fn() },
 		runtimeHost: {
 			session: {
 				settingsManager: { getExternalEditorCommand: () => "fake-editor", getDefaultThinkingLevel: () => "off" },

@@ -44,6 +44,7 @@ function modeFor(h: Harness): PrivateMode {
 		clearScreen: () => {},
 		setTitle: () => {},
 		setProgress: () => {},
+		setProgramStatus: () => {},
 	};
 	const runtime = new AgentSessionRuntime(
 		h.session,

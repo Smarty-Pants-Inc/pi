@@ -41,6 +41,7 @@ function modeFor(h: Harness, initialMessages: string[] = []): InteractiveMode {
 		clearScreen: () => {},
 		setTitle: () => {},
 		setProgress: () => {},
+		setProgramStatus: () => {},
 	};
 	const runtime = new AgentSessionRuntime(
 		h.session,
