@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import {
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	fauxThinking,
@@ -485,4 +486,102 @@ describe("reasoning-only premature stream recovery", () => {
 			});
 		},
 	);
+});
+
+// smarty-dev#6730 (pi#171 review): reasoning of an attempt that is retried never reaches extensions or listeners.
+describe("reasoning updates of a retried attempt", () => {
+	const harnesses: Harness[] = [];
+	afterEach(() => {
+		while (harnesses.length) harnesses.pop()?.cleanup();
+	});
+
+	/** A harness whose extension and listener record assistant update kinds and thinking text, in order. */
+	const recordingHarness = async (maxRetries = 3) => {
+		const extension: string[] = [];
+		const record = (log: string[], update: AssistantMessageEvent) => {
+			if (update.type === "thinking_delta") log.push(`thinking:${update.delta}`);
+			else if (update.type === "text_delta") log.push(`text:${update.delta}`);
+		};
+		const h = await createHarness({
+			settings: { retry: { baseDelayMs: 1, maxRetries } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("message_update", (event) => record(extension, event.assistantMessageEvent));
+				},
+			],
+		});
+		harnesses.push(h);
+		const listener = () => {
+			const log: string[] = [];
+			for (const event of h.eventsOfType("message_update")) record(log, event.assistantMessageEvent);
+			return log;
+		};
+		return { h, extension, listener };
+	};
+	const joined = (log: string[], kind: string) =>
+		log
+			.filter((entry) => entry.startsWith(`${kind}:`))
+			.map((entry) => entry.slice(kind.length + 1))
+			.join("");
+
+	it("drops the reasoning updates of a reasoning-only premature close", async () => {
+		const { h, extension, listener } = await recordingHarness();
+		h.setResponses([
+			fauxAssistantMessage([fauxThinking("planning the luna answer")], {
+				stopReason: "error",
+				errorMessage: disconnect,
+			}),
+			fauxAssistantMessage([fauxThinking("fresh reasoning"), { type: "text", text: "recovered" }]),
+		]);
+		await h.session.prompt("test");
+		expect(h.faux.state.callCount).toBe(2);
+		for (const log of [extension, listener()]) {
+			expect(joined(log, "thinking")).toBe("fresh reasoning");
+			expect(joined(log, "text")).toBe("recovered");
+		}
+	});
+
+	it("delivers reasoning before the answer, in order, for a completed stream", async () => {
+		const { h, extension, listener } = await recordingHarness();
+		const thinking = "first step, second step, third step";
+		h.setResponses([fauxAssistantMessage([fauxThinking(thinking), { type: "text", text: "answer" }])]);
+		await h.session.prompt("test");
+		for (const log of [extension, listener()]) {
+			expect(joined(log, "thinking")).toBe(thinking);
+			expect(joined(log, "text")).toBe("answer");
+			expect(log.findLastIndex((entry) => entry.startsWith("thinking:"))).toBeLessThan(
+				log.findIndex((entry) => entry.startsWith("text:")),
+			);
+		}
+	});
+
+	it("delivers reasoning of a premature close after answer output, which is not retried", async () => {
+		const { h, extension, listener } = await recordingHarness();
+		h.setResponses([
+			fauxAssistantMessage([fauxThinking("planning the luna answer"), { type: "text", text: "partial" }], {
+				stopReason: "error",
+				errorMessage: disconnect,
+			}),
+			fauxAssistantMessage("must not replay"),
+		]);
+		await h.session.prompt("test");
+		expect(h.faux.state.callCount).toBe(1);
+		for (const log of [extension, listener()]) {
+			expect(joined(log, "thinking")).toBe("planning the luna answer");
+			expect(joined(log, "text")).toBe("partial");
+		}
+	});
+
+	it("delivers the reasoning of a final reasoning-only close once retries are exhausted", async () => {
+		const { h, extension, listener } = await recordingHarness(0);
+		h.setResponses([
+			fauxAssistantMessage([fauxThinking("planning the luna answer")], {
+				stopReason: "error",
+				errorMessage: disconnect,
+			}),
+		]);
+		await h.session.prompt("test");
+		expect(h.faux.state.callCount).toBe(1);
+		for (const log of [extension, listener()]) expect(joined(log, "thinking")).toBe("planning the luna answer");
+	});
 });

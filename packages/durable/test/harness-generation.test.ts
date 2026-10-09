@@ -650,6 +650,87 @@ describe("generation", () => {
 		});
 	});
 
+	// smarty-dev#6730 (pi#171 review): reasoning of an attempt that is retried never becomes durable progress.
+	describe("reasoning partials", () => {
+		const thinking = { type: "thinking" as const, thinking: "planning" };
+		const text = { type: "text" as const, text: "visible answer" };
+		/** A first attempt that streams each content prefix for longer than the partial interval, then ends with `final`. */
+		const slowSetup = (contents: AssistantMessage["content"][], final: AssistantMessage): ChatSetup => {
+			const base = chatSetup();
+			base.faux.setResponses([fauxAssistantMessage("recovered")]);
+			let calls = 0;
+			const streamSimple: Models["streamSimple"] = (model, request, options) => {
+				if (calls++ > 0) return base.models.streamSimple(model, request, options);
+				const events = async function* () {
+					for (const content of contents) {
+						const partial = fauxAssistantMessage(content, { stopReason: "pending" });
+						const index = content.length - 1;
+						const block = content[index]!;
+						yield block.type === "thinking"
+							? { type: "thinking_delta", contentIndex: index, delta: block.thinking, partial }
+							: {
+									type: "text_delta",
+									contentIndex: index,
+									delta: block.type === "text" ? block.text : "",
+									partial,
+								};
+						// Longer than the default 100 ms partial interval.
+						await new Promise((resolve) => setTimeout(resolve, 300));
+					}
+				};
+				return { [Symbol.asyncIterator]: events, result: async () => final } as unknown as ReturnType<
+					Models["streamSimple"]
+				>;
+			};
+			const setup: ChatSetup = { ...base, models: withStream(base.models, streamSimple) };
+			setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+			return setup;
+		};
+		const run = async (setup: ChatSetup) => {
+			const { harness, root } = await openChat(new MemoryStorage(), setup);
+			const values = livePublications(harness);
+			harness.resume();
+			const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+			const entries = await allEntries(root);
+			await harness.close(context);
+			return { settled, published: JSON.stringify(values), entries: JSON.stringify(entries) };
+		};
+
+		it("commits no reasoning partial of a reasoning-only premature close that is retried", async () => {
+			const { settled, published, entries } = await run(
+				slowSetup(
+					[[thinking]],
+					fauxAssistantMessage([thinking], { stopReason: "error", errorMessage: PREMATURE_CLOSE }),
+				),
+			);
+			expect(settled.status).toBe("done");
+			expect(entries).toContain("recovered");
+			expect(published).not.toContain("planning");
+			expect(entries).not.toContain("planning");
+		});
+
+		it("commits held reasoning before the answer once answer output arrives", async () => {
+			const { settled, published, entries } = await run(
+				slowSetup([[thinking], [thinking, text]], fauxAssistantMessage([thinking, text])),
+			);
+			expect(settled.status).toBe("done");
+			expect(published).toContain(JSON.stringify([thinking, text]));
+			expect(entries).toContain(JSON.stringify([thinking, text]));
+		});
+
+		it("commits reasoning of a premature close after answer output, which is not retried", async () => {
+			const { settled, published, entries } = await run(
+				slowSetup(
+					[[thinking], [thinking, text]],
+					fauxAssistantMessage([thinking, text], { stopReason: "error", errorMessage: PREMATURE_CLOSE }),
+				),
+			);
+			expect(settled.status).toBe("unanswered");
+			expect(published).toContain(JSON.stringify([thinking, text]));
+			expect(entries).toContain("planning");
+		});
+	});
+
 	it("commits partials no more often than progress.partialIntervalMs", async () => {
 		const shortStream = (): ReturnType<Models["streamSimple"]> => {
 			const events = async function* () {

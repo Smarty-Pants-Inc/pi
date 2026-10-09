@@ -380,6 +380,10 @@ async function streamResponse(
 	const interval = runtime.settings.progress.partialIntervalMs;
 	// The terminal message can drop what the stream showed (smarty-dev#6730).
 	const observed = createAssistantStreamObservation();
+	// smarty-dev#6730: a premature close before answer output is retried and its reasoning dropped, so a partial
+	// without answer output is held until answer output arrives. The terminal commit records it otherwise.
+	const retry = runtime.settings.retry;
+	const holdReasoning = retry.enabled && attempt <= retry.maxRetries;
 	let pending: AssistantMessage | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: Promise<void> | undefined;
@@ -416,6 +420,7 @@ async function streamResponse(
 			// never gets past it, so it never leaves a partial.
 			if (event.type === "done" || event.type === "error" || event.partial.content.length === 0) continue;
 			pending = event.partial;
+			if (holdReasoning && !observed.answer) continue;
 			if (timer === undefined && inFlight === undefined) timer = setTimeout(flush, interval);
 		}
 		return { message: await events.result(), observed };
