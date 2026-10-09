@@ -879,20 +879,25 @@ describe("usage", () => {
 		setup.faux.setResponses([answer("first"), answer("x".repeat(400)), answer("again")]);
 		let opened = await openChat(await openNodeSqliteStorage(path), setup);
 		await (await opened.root.submit({ type: "input", content: "a" }, context)).wait(context);
-		await opened.root.submit({ type: "input", content: "b" }, context);
+		const second = await opened.root.submit({ type: "input", content: "b" }, context);
 		const live = opened.harness;
 		await waitFor(
 			async () => (await live.snapshot(LiveDoc, opened.root.id, context))?.generation?.message !== undefined,
 		);
-		// Closing mid-stream keeps the committed partial; the reopened request converts it into an aborted entry.
+		// Closing mid-stream keeps the committed partial; the reopened request converts it into an aborted entry. The
+		// partial holds answer text, so the run fails instead of resending it (pi#171).
 		await opened.harness.close(context);
 		opened = await openChat(await openNodeSqliteStorage(path), setup);
 		opened.harness.resume();
 		await opened.harness.waitForIdle(context);
+		const settled = await (await opened.harness.submission(second.id, context))!.wait(context);
+		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error" });
+		expect(setup.faux.getPendingResponseCount()).toBe(1);
 		const assistants = (await allEntries(opened.root)).flatMap((entry) =>
 			entry.kind === "pi.assistant" ? [entry.model![0] as AssistantMessage] : [],
 		);
-		expect(assistants.map((message) => message.stopReason)).toEqual(["stop", "aborted", "stop"]);
+		expect(assistants.map((message) => message.stopReason)).toEqual(["stop", "aborted"]);
+		expect(assistants[1]!.usage.output).toBeGreaterThan(0);
 		const total = (await opened.harness.usage(context)).models["faux/faux-1"]!;
 		const sum = (field: "input" | "output" | "totalTokens") =>
 			assistants.reduce((value, message) => value + message.usage[field], 0);
