@@ -6,7 +6,12 @@ import {
 	discoverOAuthServerInfo,
 	discoverProtectedResourceMetadata,
 } from "../src/oauth/discovery.ts";
-import { OAuthInsecureEndpointError, OAuthRedirectRefusedError } from "../src/oauth/errors.ts";
+import {
+	OAuthInsecureEndpointError,
+	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
+	OAuthResourceMismatchError,
+} from "../src/oauth/errors.ts";
 import {
 	authorizeMcp,
 	exchangeAuthorizationCode,
@@ -246,19 +251,45 @@ describe("OAuth endpoint transport security (pi#173)", () => {
 			expect(redirectToAuthorization).not.toHaveBeenCalled();
 		});
 
-		it("discovery 302 -> https is followed after validation", async () => {
+		it("discovery 302 -> same-origin https is followed after validation", async () => {
 			const configured = metadata();
 			const fetch = vi.fn(async (url: string | URL, _init?: RequestInit) =>
-				new URL(String(url)).hostname === "oauth.test"
-					? redirect(302, "https://cdn.oauth.test/metadata.json")
+				new URL(String(url)).pathname.startsWith("/.well-known/")
+					? redirect(302, "/static/metadata.json")
 					: Response.json(configured),
 			);
 			expect(await discoverAuthorizationServerMetadata("https://oauth.test", { fetch })).toEqual(configured);
 			expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([
 				"https://oauth.test/.well-known/oauth-authorization-server",
-				"https://cdn.oauth.test/metadata.json",
+				"https://oauth.test/static/metadata.json",
 			]);
 			for (const [, init] of fetch.mock.calls) expect(init?.redirect).toBe("manual");
+		});
+
+		// pi#173 review: the redirect target could claim the original issuer and advertise its own endpoints.
+		it.each([
+			"https://attacker.test/.well-known/oauth-authorization-server",
+			"https://cdn.oauth.test/metadata.json",
+			"https://oauth.test:8443/metadata.json",
+		])("discovery 302 -> cross-origin %s is refused without a second request", async (location) => {
+			const fetch = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+				new URL(String(url)).hostname === "oauth.test" && new URL(String(url)).port === ""
+					? redirect(302, location)
+					: Response.json({ ...metadata("https://attacker.test"), issuer: "https://oauth.test" }),
+			);
+			await expect(discoverAuthorizationServerMetadata("https://oauth.test", { fetch })).rejects.toBeInstanceOf(
+				OAuthRedirectRefusedError,
+			);
+			expect(fetch).toHaveBeenCalledOnce();
+
+			const prm = vi.fn(async (_url: string | URL, _init?: RequestInit) => redirect(302, location));
+			await expect(
+				discoverOAuthServerInfo("https://oauth.test/mcp", {
+					resourceMetadataUrl: new URL("https://oauth.test/prm"),
+					fetch: prm,
+				}),
+			).rejects.toBeInstanceOf(OAuthRedirectRefusedError);
+			expect(prm).toHaveBeenCalledOnce();
 		});
 
 		it("discovery 302 -> http is refused before following", async () => {
@@ -315,6 +346,61 @@ describe("OAuth endpoint transport security (pi#173)", () => {
 			} finally {
 				await new Promise((resolve) => server.close(resolve));
 			}
+		});
+	});
+
+	describe("metadata identity (pi#173 review)", () => {
+		it.each(["https://attacker.test", "https://oauth.test/", "https://oauth.test/tenant"])(
+			"refuses authorization server metadata whose issuer is %s instead of https://oauth.test",
+			async (issuer) => {
+				const fetch = vi.fn(async () => Response.json({ ...metadata(), issuer }));
+				await expect(discoverAuthorizationServerMetadata("https://oauth.test", { fetch })).rejects.toBeInstanceOf(
+					OAuthIssuerMismatchError,
+				);
+			},
+		);
+
+		it("accepts authorization server metadata whose issuer matches exactly", async () => {
+			const configured = metadata("https://oauth.test/tenant");
+			const fetch = vi.fn(async (_url: string | URL) => Response.json(configured));
+			expect(await discoverAuthorizationServerMetadata("https://oauth.test/tenant", { fetch })).toEqual(configured);
+			expect(String(fetch.mock.calls[0]?.[0])).toBe(
+				"https://oauth.test/.well-known/oauth-authorization-server/tenant",
+			);
+		});
+
+		it("checks the issuer of the server-origin fallback exactly", async () => {
+			const fetch = vi.fn(async (url: string | URL) =>
+				new URL(String(url)).pathname.startsWith("/.well-known/oauth-protected-resource")
+					? new Response(null, { status: 404 })
+					: Response.json(metadata("https://resource.test")),
+			);
+			const info = await discoverOAuthServerInfo("https://resource.test/mcp", { fetch });
+			expect(info.authorizationServerUrl).toBe("https://resource.test");
+			expect(info.authorizationServerMetadata?.issuer).toBe("https://resource.test");
+		});
+
+		it.each(["https://attacker.test/mcp", "https://resource.test/other"])(
+			"refuses protected resource metadata for resource %s before using its authorization servers",
+			async (resource) => {
+				const fetch = vi.fn(async () =>
+					Response.json({ resource, authorization_servers: ["https://attacker.test"] }),
+				);
+				await expect(
+					discoverProtectedResourceMetadata("https://resource.test/mcp", { fetch }),
+				).rejects.toBeInstanceOf(OAuthResourceMismatchError);
+				fetch.mockClear();
+				await expect(discoverOAuthServerInfo("https://resource.test/mcp", { fetch })).rejects.toBeInstanceOf(
+					OAuthResourceMismatchError,
+				);
+				expect(fetch).toHaveBeenCalledOnce();
+			},
+		);
+
+		it("accepts protected resource metadata for the MCP server", async () => {
+			const prm = { resource: "https://resource.test/mcp", authorization_servers: ["https://oauth.test"] };
+			const fetch = vi.fn(async () => Response.json(prm));
+			expect(await discoverProtectedResourceMetadata("https://resource.test/mcp", { fetch })).toEqual(prm);
 		});
 	});
 

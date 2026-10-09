@@ -42,8 +42,10 @@ export async function credentialFetch(fetch: McpFetch, url: URL, init: RequestIn
 }
 
 /**
- * GET a discovery or metadata document. Redirects are followed manually, at most MAX_DISCOVERY_REDIRECTS times,
- * and each Location must pass the same HTTPS/loopback rule as the initial URL.
+ * GET a discovery or metadata document. Redirects are followed manually, at most MAX_DISCOVERY_REDIRECTS times.
+ * Each Location must pass the same HTTPS/loopback rule as the initial URL and stay on its origin (scheme, host,
+ * port): a cross-origin target could serve metadata that claims the original issuer while advertising its own
+ * authorization and token endpoints.
  */
 export async function metadataFetch(fetch: McpFetch, url: URL, init: RequestInit): Promise<Response> {
 	let current = secureEndpoint(url);
@@ -58,7 +60,11 @@ export async function metadataFetch(fetch: McpFetch, url: URL, init: RequestInit
 		if (redirects >= MAX_DISCOVERY_REDIRECTS) {
 			throw new OAuthRedirectRefusedError(current.href, response.status, "too many redirects");
 		}
-		current = secureEndpoint(new URL(location, current));
+		const next = secureEndpoint(new URL(location, current));
+		if (next.origin !== current.origin) {
+			throw new OAuthRedirectRefusedError(current.href, response.status, `cross-origin redirect to ${next.origin}`);
+		}
+		current = next;
 	}
 }
 

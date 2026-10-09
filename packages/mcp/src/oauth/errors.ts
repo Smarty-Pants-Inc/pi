@@ -25,6 +25,19 @@ export class OAuthIssuerMismatchError extends Error {
 	}
 }
 
+/** Protected resource metadata names a resource other than the MCP server it was discovered for (RFC 9728 §3.3). */
+export class OAuthResourceMismatchError extends Error {
+	readonly expected: string;
+	readonly received: string;
+
+	constructor(expected: string, received: string) {
+		super(`Protected resource ${received} does not match MCP server ${expected}`);
+		this.name = "OAuthResourceMismatchError";
+		this.expected = expected;
+		this.received = received;
+	}
+}
+
 export class OAuthInsecureEndpointError extends Error {
 	readonly endpoint: string;
 

@@ -20,6 +20,7 @@ export {
 	OAuthIssuerMismatchError,
 	OAuthRedirectRefusedError,
 	OAuthRegistrationError,
+	OAuthResourceMismatchError,
 } from "./errors.ts";
 export {
 	type AddClientAuthentication,

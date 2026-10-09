@@ -293,7 +293,7 @@ describe.skip("MCP OAuth", () => {
 				response.setHeader("content-type", "application/json");
 				response.end(
 					JSON.stringify({
-						// Issuer without the trailing slash that URL parsing adds to the fallback server URL.
+						// The fallback issuer is the server origin, compared exactly (RFC 8414 §3.3).
 						issuer: serverOrigin,
 						authorization_endpoint: `${serverOrigin}/authorize`,
 						token_endpoint: `${serverOrigin}/token`,
