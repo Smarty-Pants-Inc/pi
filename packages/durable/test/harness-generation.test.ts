@@ -278,6 +278,41 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#7480: a short stream errors inside the partial interval and its terminal message drops the answer
+	// output; the final entry keeps what the stream showed, without a resend.
+	it.each([
+		{ name: "answer text", block: { type: "text" as const, text: "visible answer" } },
+		{ name: "tool call", block: fauxToolCall("t", { x: 1 }) },
+	])("keeps streamed $name in the final entry when the terminal error drops it", async ({ block }) => {
+		const base = chatSetup();
+		const setup = rewriteTerminalError(base, (error) => ({
+			...error,
+			content: error.content.filter((content) => content.type === "thinking"),
+		}));
+		const thinking = { type: "thinking" as const, thinking: "planning" };
+		base.faux.setResponses([
+			fauxAssistantMessage([thinking, block], { stopReason: "error", errorMessage: PREMATURE_CLOSE }),
+			fauxAssistantMessage("must not replay"),
+		]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled).toMatchObject({ status: "unanswered", reason: "model_error" });
+		expect(base.faux.state.callCount).toBe(1);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({
+			stopReason: "error",
+			errorMessage: PREMATURE_CLOSE,
+			content: [thinking, block],
+		});
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
 	// smarty-dev#6730: reasoning-only stream, terminal message without content but with output tokens.
 	it("retries a reasoning-only premature close whose terminal message dropped its content", async () => {
 		const base = chatSetup();

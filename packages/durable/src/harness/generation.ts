@@ -533,7 +533,7 @@ async function classify(
 	const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
 	await runtime.commit(async (tx): Promise<Next> => {
 		const live = await tx.doc(LiveDoc, conversationId);
-		await appendAssistant(tx, conversationId, visible);
+		await appendAssistant(tx, conversationId, withPartialAnswer(visible, live));
 		if (retry) {
 			live.generation = { attempt, retry: { at: until, error: message.errorMessage ?? "" } };
 			const checkpoint = {
@@ -551,6 +551,16 @@ async function classify(
 			outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } },
 		};
 	}, context);
+}
+
+/**
+ * smarty-dev#7480: a terminal message that dropped the answer output its stream showed takes the content of the
+ * committed answer-bearing partial, the content recovery would convert, so the transcript keeps what observers saw.
+ */
+function withPartialAnswer(message: AssistantMessage, live: Draft<LiveState>): AssistantMessage {
+	const partial = live.generation?.message as AssistantMessage | undefined;
+	if (partial === undefined || hasAssistantAnswerOutput(message) || !hasAssistantAnswerOutput(partial)) return message;
+	return { ...message, content: (copyJson(partial) as unknown as AssistantMessage).content };
 }
 
 /**
