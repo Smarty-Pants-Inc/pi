@@ -1,14 +1,17 @@
+import { createServer, type IncomingMessage } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it, vi } from "vitest";
 import {
 	discoverAuthorizationServerMetadata,
 	discoverOAuthServerInfo,
 	discoverProtectedResourceMetadata,
 } from "../src/oauth/discovery.ts";
-import { OAuthInsecureEndpointError } from "../src/oauth/errors.ts";
+import { OAuthInsecureEndpointError, OAuthRedirectRefusedError } from "../src/oauth/errors.ts";
 import {
 	authorizeMcp,
 	exchangeAuthorizationCode,
 	type OAuthClientProvider,
+	refreshAuthorization,
 	registerClient,
 	startAuthorization,
 } from "../src/oauth/flow.ts";
@@ -162,6 +165,158 @@ describe("OAuth endpoint transport security (pi#173)", () => {
 			).toBe("synthetic-token");
 		},
 	);
+
+	describe("redirects (pi#173 review)", () => {
+		function redirect(status: number, location: string): Response {
+			return new Response(null, { status, headers: { location } });
+		}
+
+		it.each([
+			[307, "http://attacker.test/token"],
+			[308, "https://other.test/token"],
+			[302, "https://oauth.test/token2"],
+		])("token endpoint %i -> %s is refused without a second request", async (status, location) => {
+			const fetch = vi.fn(async (_url: string | URL, _init?: RequestInit) => redirect(status, location));
+			const request = refreshAuthorization("https://oauth.test", {
+				metadata: metadata(),
+				clientInformation,
+				refreshToken: "synthetic-refresh",
+				fetch,
+			});
+			await expect(request).rejects.toBeInstanceOf(OAuthRedirectRefusedError);
+			expect(fetch).toHaveBeenCalledOnce();
+			expect(fetch.mock.calls[0]![1]?.redirect).toBe("manual");
+		});
+
+		it("authorization code exchange and registration never follow a redirect", async () => {
+			const fetch = vi.fn(async (_url: string | URL, _init?: RequestInit) =>
+				redirect(308, "https://oauth.test/elsewhere"),
+			);
+			await expect(
+				exchangeAuthorizationCode("https://oauth.test", {
+					metadata: metadata(),
+					clientInformation,
+					code: "synthetic",
+					codeVerifier: "synthetic",
+					redirectUrl: clientMetadata.redirect_uris[0]!,
+					fetch,
+				}),
+			).rejects.toBeInstanceOf(OAuthRedirectRefusedError);
+			await expect(
+				registerClient("https://oauth.test", { metadata: metadata(), clientMetadata, fetch }),
+			).rejects.toBeInstanceOf(OAuthRedirectRefusedError);
+			expect(fetch).toHaveBeenCalledTimes(2);
+			for (const [, init] of fetch.mock.calls) expect(init?.redirect).toBe("manual");
+		});
+
+		it("refuses an opaque redirect from a credential request", async () => {
+			const opaque = new Response(null, { status: 200 });
+			Object.defineProperty(opaque, "type", { value: "opaqueredirect" });
+			const fetch = vi.fn(async () => opaque);
+			await expect(
+				refreshAuthorization("https://oauth.test", {
+					metadata: metadata(),
+					clientInformation,
+					refreshToken: "synthetic-refresh",
+					fetch,
+				}),
+			).rejects.toBeInstanceOf(OAuthRedirectRefusedError);
+		});
+
+		it("refresh does not fall back to a new authorization after a refused redirect", async () => {
+			const redirectToAuthorization = vi.fn();
+			const provider: OAuthClientProvider = {
+				redirectUrl: clientMetadata.redirect_uris[0]!,
+				clientMetadata,
+				clientInformation: () => clientInformation,
+				tokens: () => ({ access_token: "old", token_type: "Bearer", refresh_token: "synthetic-refresh" }),
+				saveTokens: () => {},
+				saveCodeVerifier: () => {},
+				codeVerifier: () => "synthetic",
+				redirectToAuthorization,
+				discoveryState: () => ({
+					authorizationServerUrl: "https://oauth.test",
+					authorizationServerMetadata: metadata(),
+				}),
+			};
+			const fetch = vi.fn(async () => redirect(307, "http://attacker.test/token"));
+			await expect(authorizeMcp(provider, { serverUrl: "https://resource.test/mcp", fetch })).rejects.toBeInstanceOf(
+				OAuthRedirectRefusedError,
+			);
+			expect(redirectToAuthorization).not.toHaveBeenCalled();
+		});
+
+		it("discovery 302 -> https is followed after validation", async () => {
+			const configured = metadata();
+			const fetch = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+				new URL(String(url)).hostname === "oauth.test"
+					? redirect(302, "https://cdn.oauth.test/metadata.json")
+					: Response.json(configured),
+			);
+			expect(await discoverAuthorizationServerMetadata("https://oauth.test", { fetch })).toEqual(configured);
+			expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([
+				"https://oauth.test/.well-known/oauth-authorization-server",
+				"https://cdn.oauth.test/metadata.json",
+			]);
+			for (const [, init] of fetch.mock.calls) expect(init?.redirect).toBe("manual");
+		});
+
+		it("discovery 302 -> http is refused before following", async () => {
+			const fetch = vi.fn(async (url: string | URL, _init?: RequestInit) =>
+				new URL(String(url)).hostname === "oauth.test"
+					? redirect(302, "http://attacker.test/metadata.json")
+					: Response.json(metadata()),
+			);
+			await expect(discoverAuthorizationServerMetadata("https://oauth.test", { fetch })).rejects.toBeInstanceOf(
+				OAuthInsecureEndpointError,
+			);
+			await expect(
+				discoverOAuthServerInfo("https://resource.test/mcp", {
+					fetch: async (url, init) =>
+						new URL(String(url)).hostname === "resource.test"
+							? redirect(302, "http://attacker.test/prm")
+							: fetch(url, init),
+				}),
+			).rejects.toBeInstanceOf(OAuthInsecureEndpointError);
+			expect(fetch.mock.calls.every(([url]) => new URL(String(url)).hostname === "oauth.test")).toBe(true);
+		});
+
+		it("discovery stops after a bounded number of redirects", async () => {
+			const fetch = vi.fn(async () => redirect(302, "https://oauth.test/loop"));
+			await expect(discoverAuthorizationServerMetadata("https://oauth.test", { fetch })).rejects.toBeInstanceOf(
+				OAuthRedirectRefusedError,
+			);
+			expect(fetch).toHaveBeenCalledTimes(4);
+		});
+
+		it("real fetch: a loopback token endpoint answering 307 receives exactly one request", async () => {
+			const seen: string[] = [];
+			const server = createServer((req: IncomingMessage, res) => {
+				seen.push(`${req.method} ${req.url}`);
+				req.resume();
+				if (req.url === "/token") {
+					res.writeHead(307, { location: "/stolen" }).end();
+				} else {
+					res.writeHead(200, { "content-type": "application/json" });
+					res.end(JSON.stringify({ access_token: "stolen", token_type: "Bearer" }));
+				}
+			});
+			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+			try {
+				const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+				await expect(
+					refreshAuthorization(origin, {
+						metadata: metadata(origin),
+						clientInformation,
+						refreshToken: "synthetic-refresh",
+					}),
+				).rejects.toBeInstanceOf(OAuthRedirectRefusedError);
+				expect(seen).toEqual(["POST /token"]);
+			} finally {
+				await new Promise((resolve) => server.close(resolve));
+			}
+		});
+	});
 
 	it.each(["http://localhost.attacker.test", "ftp://localhost"])(
 		"refuses non-HTTP loopback exceptions and lookalike hosts: %s",

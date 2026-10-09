@@ -13,12 +13,13 @@ import {
 	parseWwwAuthenticate,
 	selectResource,
 } from "./discovery.ts";
-import { loopback, secureEndpoint, validateOAuthEndpoints } from "./endpoints.ts";
+import { credentialFetch, loopback, secureEndpoint, validateOAuthEndpoints } from "./endpoints.ts";
 import {
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
 	OAuthRegistrationError,
 } from "./errors.ts";
 import {
@@ -216,7 +217,7 @@ async function tokenRequest(
 			params,
 		);
 	}
-	const response = await (options.fetch ?? globalThis.fetch)(url, {
+	const response = await credentialFetch(options.fetch ?? globalThis.fetch, url, {
 		method: "POST",
 		headers,
 		body: params,
@@ -254,7 +255,8 @@ export async function registerClient(
 	const endpoint = options.metadata?.registration_endpoint;
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
-	const response = await (options.fetch ?? globalThis.fetch)(
+	const response = await credentialFetch(
+		options.fetch ?? globalThis.fetch,
 		secureEndpoint(endpoint ?? new URL("/register", authorizationServerUrl)),
 		{
 			method: "POST",
@@ -410,7 +412,12 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 			await provider.saveTokens(withScope(tokens, existing.scope));
 			return "AUTHORIZED";
 		} catch (error) {
-			if (options.signal?.aborted || error instanceof OAuthInsecureEndpointError) throw error;
+			if (
+				options.signal?.aborted ||
+				error instanceof OAuthInsecureEndpointError ||
+				error instanceof OAuthRedirectRefusedError
+			)
+				throw error;
 			if (error instanceof OAuthError && error.code !== "server_error") throw error;
 		}
 	}

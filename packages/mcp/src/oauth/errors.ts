@@ -35,6 +35,18 @@ export class OAuthInsecureEndpointError extends Error {
 	}
 }
 
+export class OAuthRedirectRefusedError extends Error {
+	readonly endpoint: string;
+	readonly status: number;
+
+	constructor(endpoint: string, status: number, reason: string) {
+		super(`Refusing OAuth redirect from ${endpoint} (HTTP ${status}): ${reason}`);
+		this.name = "OAuthRedirectRefusedError";
+		this.endpoint = endpoint;
+		this.status = status;
+	}
+}
+
 export class OAuthRegistrationError extends Error {
 	readonly status: number;
 	readonly body: string;

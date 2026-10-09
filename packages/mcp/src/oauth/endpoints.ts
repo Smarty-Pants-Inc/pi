@@ -1,4 +1,5 @@
-import { OAuthInsecureEndpointError } from "./errors.ts";
+import type { McpFetch } from "../auth-provider.ts";
+import { OAuthInsecureEndpointError, OAuthRedirectRefusedError } from "./errors.ts";
 import type { AuthorizationServerMetadata } from "./types.ts";
 
 export function loopback(hostname: string): boolean {
@@ -12,6 +13,53 @@ export function secureEndpoint(value: string | URL): URL {
 		throw new OAuthInsecureEndpointError(url.href);
 	}
 	return url;
+}
+
+/** Discovery GETs follow at most this many redirects, validating each target. */
+const MAX_DISCOVERY_REDIRECTS = 3;
+
+function isRedirect(response: Response): boolean {
+	// `opaqueredirect` is what browsers return for `redirect: "manual"`; Node exposes the 3xx status itself.
+	return response.type === "opaqueredirect" || [301, 302, 303, 307, 308].includes(response.status);
+}
+
+function discard(response: Response): void {
+	void response.body?.cancel().catch(() => {});
+}
+
+/**
+ * Send a credential-bearing request (token, registration, revocation). fetch follows redirects by default and
+ * would resend the body (codes, refresh tokens, client secrets) to the new target, possibly over plain HTTP.
+ * These requests never follow a redirect, whatever its target.
+ */
+export async function credentialFetch(fetch: McpFetch, url: URL, init: RequestInit): Promise<Response> {
+	const response = await fetch(secureEndpoint(url), { ...init, redirect: "manual" });
+	if (isRedirect(response)) {
+		discard(response);
+		throw new OAuthRedirectRefusedError(url.href, response.status, "credential requests never follow redirects");
+	}
+	return response;
+}
+
+/**
+ * GET a discovery or metadata document. Redirects are followed manually, at most MAX_DISCOVERY_REDIRECTS times,
+ * and each Location must pass the same HTTPS/loopback rule as the initial URL.
+ */
+export async function metadataFetch(fetch: McpFetch, url: URL, init: RequestInit): Promise<Response> {
+	let current = secureEndpoint(url);
+	for (let redirects = 0; ; redirects++) {
+		const response = await fetch(current, { ...init, method: "GET", redirect: "manual" });
+		if (!isRedirect(response)) return response;
+		discard(response);
+		const location = response.headers.get("location");
+		if (response.type === "opaqueredirect" || !location) {
+			throw new OAuthRedirectRefusedError(current.href, response.status, "redirect target is not visible");
+		}
+		if (redirects >= MAX_DISCOVERY_REDIRECTS) {
+			throw new OAuthRedirectRefusedError(current.href, response.status, "too many redirects");
+		}
+		current = secureEndpoint(new URL(location, current));
+	}
 }
 
 /** Also validate cached/configured metadata before a flow or a direct endpoint operation uses it. */

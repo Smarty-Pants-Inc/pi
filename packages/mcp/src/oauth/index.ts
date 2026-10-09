@@ -18,6 +18,7 @@ export {
 	OAuthError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
 	OAuthRegistrationError,
 } from "./errors.ts";
 export {

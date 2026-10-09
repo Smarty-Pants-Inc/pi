@@ -7,8 +7,8 @@
 import type { McpFetch } from "../auth-provider.ts";
 import { LATEST_PROTOCOL_VERSION } from "../protocol/types.ts";
 import { refuseMcpAdmission } from "../security-admission.ts";
-import { secureEndpoint } from "./endpoints.ts";
-import { OAuthInsecureEndpointError, OAuthIssuerMismatchError } from "./errors.ts";
+import { metadataFetch, secureEndpoint } from "./endpoints.ts";
+import { OAuthInsecureEndpointError, OAuthIssuerMismatchError, OAuthRedirectRefusedError } from "./errors.ts";
 import {
 	type AuthorizationServerMetadata,
 	type OAuthChallenge,
@@ -63,7 +63,7 @@ async function fetchMetadata(
 	protocolVersion: string,
 	signal: AbortSignal | undefined,
 ): Promise<Response> {
-	return fetch(secureEndpoint(url), {
+	return metadataFetch(fetch, url, {
 		headers: { Accept: "application/json", "MCP-Protocol-Version": protocolVersion },
 		signal,
 	});
@@ -169,7 +169,12 @@ export async function discoverOAuthServerInfo(
 			signal: options.signal,
 		});
 	} catch (error) {
-		if (error instanceof TypeError || error instanceof OAuthInsecureEndpointError) throw error;
+		if (
+			error instanceof TypeError ||
+			error instanceof OAuthInsecureEndpointError ||
+			error instanceof OAuthRedirectRefusedError
+		)
+			throw error;
 	}
 	if (options.authorizationServerMetadataUrl) {
 		const url = options.authorizationServerMetadataUrl;
