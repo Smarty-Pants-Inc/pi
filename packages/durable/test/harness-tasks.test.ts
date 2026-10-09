@@ -1,6 +1,7 @@
 import type { Context } from "@earendil-works/chord";
 import { withCancel } from "@earendil-works/chord/context";
 import { createModels, Type } from "@earendil-works/pi-ai";
+import * as durable from "@earendil-works/pi-durable";
 import {
 	type Conversation,
 	createRegistry,
@@ -10,6 +11,7 @@ import {
 	defineTool,
 	type EntryId,
 	Harness,
+	LiveDoc,
 	MemoryStorage,
 	type RegistryReader,
 	type RegistrySnapshot,
@@ -18,6 +20,7 @@ import {
 	type TaskRuntime,
 } from "@earendil-works/pi-durable";
 import { describe, expect, it } from "vitest";
+import * as schedulerModule from "../src/harness/scheduler.ts";
 import { addHooks, addTask, addTool, user } from "./harness-support.ts";
 import { ControlledStorage, context, flush } from "./session-support.ts";
 import { aborted, abortedWith, completed, deferred, eventually, openTasks, settled } from "./task-support.ts";
@@ -967,6 +970,56 @@ describe("task abort", () => {
 		expect(errors).toEqual([`Task ${id} has a durable abort mark`, `Task ${id} has a durable abort mark`]);
 		expect(abortRuntimes).toHaveLength(1);
 		expect(abortRuntimes[0]).not.toBe(runRuntime);
+		await harness.close(context);
+	});
+
+	// smarty-dev#7428 (pi#174): no task handler can pass its abort mark. The only write under the mark is a one-shot
+	// closure the scheduler hands its dispatch of the built-in generation's request phase; no module exports it.
+	it("lets no handler commit under its abort mark; no module exports an abort-mark writer", async () => {
+		const Notes = defineDoc<{ lines: string[] }>({
+			kind: "test.marked-notes",
+			version: 1,
+			scope: "task",
+			initial: () => ({ lines: [] }),
+		});
+		const reached = deferred();
+		const errors: string[] = [];
+		let seen: unknown;
+		const record = (attempt: Promise<unknown>) =>
+			attempt.then(
+				() => errors.push("committed"),
+				(error: unknown) => errors.push((error as Error).message),
+			);
+		const Marked = oneStep(
+			"test.marked-write",
+			async (task, runtime) => {
+				reached.resolve();
+				await aborted(runtime.signal).catch(() => {});
+				const write = async (tx: Parameters<Parameters<typeof runtime.commit>[0]>[0]) => {
+					(await tx.doc(Notes, task.id)).lines.push("interrupted");
+				};
+				// @ts-expect-error The handler-facing commit takes no abort mark option.
+				await record(runtime.commit(write, context, { underAbortMark: true }));
+				await record(runtime.memo("planted", 1, context));
+			},
+			async (runtime, ctx) => {
+				await runtime.commit(async (tx) => {
+					seen = [...(await tx.doc(Notes, runtime.taskId)).lines];
+					return abortedWith("mark");
+				}, ctx);
+			},
+		);
+		const { harness, root } = await openRoot([Marked]);
+		const id = await start(root, Marked);
+		harness.resume();
+		await reached.promise;
+		expect(await harness.abortTask(id, context)).toBe("marked");
+		expect((await harness.waitForTask(id, context)).state.outcome).toEqual({ status: "aborted", reason: "mark" });
+		expect(seen).toEqual([]);
+		expect(errors).toEqual([`Task ${id} has a durable abort mark`, `Task ${id} has a durable abort mark`]);
+		expect(await harness.snapshot(LiveDoc, root.id, context)).toEqual({});
+		expect(Object.keys(durable)).not.toContain("commitLivePartialUnderAbortMark");
+		expect(Object.keys(schedulerModule)).toEqual(["TaskScheduler"]);
 		await harness.close(context);
 	});
 
