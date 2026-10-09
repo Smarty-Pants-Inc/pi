@@ -179,6 +179,7 @@ import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapp
 import { captureTerminalTurnReceipt, type TurnReceipt } from "./turn-receipts.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
+	bindExtensionMetadataSender,
 	getUserMessageMetadataSource,
 	type SendUserMessageOptions,
 	type SendUserMessageResult,
@@ -6569,7 +6570,7 @@ export class AgentSession {
 			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext()),
 		) as ReplacedSessionContext;
 		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
-		context.sendUserMessage = this.sendUserMessage.bind(this);
+		context.sendUserMessage = bindExtensionMetadataSender(this.sendUserMessage.bind(this));
 		return context;
 	}
 

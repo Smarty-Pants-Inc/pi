@@ -471,12 +471,17 @@ describe("#7883 sendUserMessage metadata receipts", () => {
 	// #7883: the real extension loader and session action must both return, rather than discard, the promise.
 	it("returns a metadata promise through the extension API wrapper end to end", async () => {
 		let api: ExtensionAPI | undefined;
+		let delivery: Promise<SendUserMessageResult> | undefined;
+		const metadata = { request: "extension-private-7883" };
 		const entered = gate();
 		const release = gate();
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
 					api = pi;
+					pi.events.on("metadata-send", () => {
+						delivery = pi.sendUserMessage("from extension", { metadata, expandPromptTemplates: false });
+					});
 				},
 			],
 		});
@@ -489,19 +494,16 @@ describe("#7883 sendUserMessage metadata receipts", () => {
 			},
 		]);
 		if (!api) throw new Error("Extension API was not loaded");
-		const metadata = { request: "extension-private-7883" };
-		const options = { metadata, expandPromptTemplates: false };
 		const finished = onSettled(harness);
-		const delivery: Promise<SendUserMessageResult> = api.sendUserMessage("from extension", options);
+		api.events.emit("metadata-send", undefined);
 		const results: SendUserMessageResult[] = [];
 		try {
 			expect(delivery).toBeInstanceOf(Promise);
-			void Promise.resolve(delivery).then((result) => results.push(result));
+			void delivery!.then((result) => results.push(result));
 			await entered.promise;
 			await setImmediate();
 			expect(results).toHaveLength(1);
-			// The SDK host invokes a captured API outside extension execution, so it cannot borrow its identity.
-			expectRootMetadata(harness, results[0], metadata, { kind: "sdk" });
+			expectRootMetadata(harness, results[0], metadata, { kind: "extension", extensionPath: "<inline:1>" });
 			expect(harness.eventsOfType("agent_settled")).toEqual([]);
 		} finally {
 			release.release();

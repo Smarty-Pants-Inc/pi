@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { types } from "node:util";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 
 /** Opaque strict-JSON data. Pi snapshots it before dispatch and never sends it to the model. */
@@ -45,8 +46,8 @@ export function bindExtensionMetadataCallback<Args extends unknown[], Result>(
 	callback: (...args: Args) => Result,
 	isFactory = false,
 ): (...args: Args) => Result {
-	// Only the loader enters a factory's identity. A callback installed by an
-	// SDK host through a captured API remains SDK-originated when dispatched.
+	// Only the loader enters a module/factory's identity. A callback installed
+	// outside extension execution stays unbound and cannot submit extension metadata.
 	const source = isFactory ? extensionPath : extensionExecution.getStore();
 	return (...args) => extensionExecution.run(source, () => callback(...args));
 }
@@ -65,20 +66,37 @@ export function assertExtensionMetadataCaller(extensionPath: string): void {
 /** Private loader route, not exported from the SDK. Caller fields never select the source. */
 export function bindExtensionMetadataSource(
 	options: SendUserMessageOptions | undefined,
-	extensionPath: string,
+	extensionPath: string | undefined,
 ): SendUserMessageOptions | undefined {
 	if (options?.metadata === undefined) return options;
-	assertExtensionMetadataCaller(extensionPath);
 	const caller = extensionExecution.getStore();
+	if (extensionPath === undefined || caller === undefined) {
+		throw new UserMessageMetadataError(
+			"INPUT_METADATA_SOURCE_MISMATCH",
+			`Cannot submit metadata through extension "${extensionPath}"'s API without its execution context`,
+		);
+	}
+	assertExtensionMetadataCaller(extensionPath);
 	const bound: SendUserMessageOptions = {
 		metadata: options.metadata,
 		deliverAs: options.deliverAs,
 		expandPromptTemplates: options.expandPromptTemplates,
 	};
-	// An SDK host calling a captured API object is still SDK-originated. The
-	// object is shareable; only Pi-dispatched extension execution supplies identity.
-	if (caller !== undefined) extensionSources.set(bound, Object.freeze({ kind: "extension", extensionPath: caller }));
+	// Only the SDK session's direct admission route may fall back to sdk.
+	extensionSources.set(bound, Object.freeze({ kind: "extension", extensionPath: caller }));
 	return bound;
+}
+
+/** Private replacement-context route: capture its extension owner without exposing a selectable source. */
+export function bindExtensionMetadataSender<
+	Sender extends (
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+	) => Promise<unknown>,
+>(sender: Sender): Sender {
+	const extensionPath = extensionExecution.getStore();
+	return (async (content, options) =>
+		sender(content, bindExtensionMetadataSource(options, extensionPath) ?? {})) as Sender;
 }
 
 /** Private admission route; never read an options.metadataSource or metadata claim. */
@@ -104,6 +122,7 @@ export class UserMessageMetadataError extends TypeError {
 
 /** Copy and freeze strict JSON while bounding UTF-8 bytes, container depth and total keys/elements. */
 export function snapshotUserMessageMetadata(metadata: UserMessageMetadata): UserMessageMetadata {
+	if (types.isProxy(metadata)) throw new TypeError("User message metadata cannot contain Proxies");
 	if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
 		throw new TypeError("User message metadata must be a JSON-serializable object");
 	}
@@ -148,6 +167,8 @@ export function snapshotUserMessageMetadata(metadata: UserMessageMetadata): User
 				"INPUT_METADATA_TOO_DEEP",
 				"User message metadata exceeds 16 nested containers, including the root",
 			);
+		// Check before prototype, key, or property inspection: Proxy traps are executable code.
+		if (types.isProxy(value)) throw new TypeError("User message metadata cannot contain Proxies");
 		if (ancestors.has(value)) throw new TypeError("User message metadata contains cycles");
 		ancestors.add(value);
 		try {
@@ -170,6 +191,8 @@ export function snapshotUserMessageMetadata(metadata: UserMessageMetadata): User
 			if (prototype !== Object.prototype && prototype !== null)
 				throw new TypeError("User message metadata requires plain objects");
 			const keys = Reflect.ownKeys(value);
+			// Plain objects have no ownKeys traps. Refuse the complete key count before
+			// inspecting a single value, against the remaining shared container budget.
 			addItems(keys.length);
 			const result = Object.create(prototype) as Record<string, unknown>;
 			for (const [index, key] of keys.entries()) {

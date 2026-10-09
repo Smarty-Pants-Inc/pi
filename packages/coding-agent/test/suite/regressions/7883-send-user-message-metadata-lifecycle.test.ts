@@ -91,6 +91,9 @@ describe("#7883 metadata receipt lifecycle boundaries", () => {
 			extensionFactories: [
 				(pi) => {
 					api = pi;
+					pi.events.on("install-shutdown-handlers", (install) => {
+						(install as (pi: ExtensionAPI) => void)(pi);
+					});
 					pi.on("input", async (event) => {
 						if (event.text === "retained 1") {
 							entered.release();
@@ -243,14 +246,16 @@ describe("#7883 metadata receipt lifecycle boundaries", () => {
 			const held = gate();
 			releases.push(held.release);
 			const shutdownReceipts: ReturnType<typeof observeReceipt>[] = [];
-			api.on("input", async (event) => {
-				if (event.text.startsWith("shutdown input")) await held.promise;
-			});
-			api.on("session_shutdown", () => {
-				for (let index = 0; index < 3; index++)
-					shutdownReceipts.push(
-						observeReceipt(api.sendUserMessage(`shutdown input ${index}`, { metadata: { index }, deliverAs })),
-					);
+			api.events.emit("install-shutdown-handlers", (pi: ExtensionAPI) => {
+				pi.on("input", async (event) => {
+					if (event.text.startsWith("shutdown input")) await held.promise;
+				});
+				pi.on("session_shutdown", () => {
+					for (let index = 0; index < 3; index++)
+						shutdownReceipts.push(
+							observeReceipt(pi.sendUserMessage(`shutdown input ${index}`, { metadata: { index }, deliverAs })),
+						);
+				});
 			});
 			await within(harness.session.reload(), "reload with shutdown input");
 			expect(shutdownReceipts).toHaveLength(3);

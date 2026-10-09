@@ -149,7 +149,7 @@ describe("#7883 / pi#187 metadata source and bounded admission", () => {
 	});
 
 	// #7883 / pi#187 review: an SDK caller cannot borrow extension attribution from a captured API.
-	it("stamps a captured API invoked by the SDK as sdk", async () => {
+	it("rejects metadata through a captured API invoked without extension context", async () => {
 		let api: ExtensionAPI | undefined;
 		const harness = await createHarness({
 			extensionFactories: [
@@ -160,8 +160,12 @@ describe("#7883 / pi#187 metadata source and bounded admission", () => {
 			],
 		});
 		harnesses.push(harness);
-		const receipt = await api!.sendUserMessage("SDK-originated", { metadata: {} });
-		expect(receipt).toMatchObject({ status: "handled", metadataSource: { kind: "sdk" } });
+		await expect(api!.sendUserMessage("SDK-originated", { metadata: {} })).rejects.toMatchObject({
+			name: "UserMessageMetadataError",
+			code: "INPUT_METADATA_SOURCE_MISMATCH",
+		});
+		expect(harness.session.inputAdmissionCount).toBe(0);
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 
 	// #7883 / pi#187 review: registering A's code through B's API cannot launder it into B's scope.
@@ -201,7 +205,7 @@ describe("#7883 / pi#187 metadata source and bounded admission", () => {
 		expect(harness.session.hasExtensionHandlers("input")).toBe(false);
 	});
 
-	// #7883 / pi#187 review: callbacks registered by SDK code through a captured API remain SDK-originated.
+	// #7883 / pi#187 round 3: callbacks registered outside extension execution remain unbound and fail closed.
 	it("cannot install extension attribution through an SDK-registered callback", async () => {
 		let api: ExtensionAPI | undefined;
 		let result: Promise<SendUserMessageResult> | undefined;
@@ -218,7 +222,12 @@ describe("#7883 / pi#187 metadata source and bounded admission", () => {
 			result = api!.sendUserMessage("SDK callback input", { metadata: {} });
 		});
 		api!.events.emit("sdk-created-callback", undefined);
-		expect(await result).toMatchObject({ status: "handled", metadataSource: { kind: "sdk" } });
+		await expect(result).rejects.toMatchObject({
+			name: "UserMessageMetadataError",
+			code: "INPUT_METADATA_SOURCE_MISMATCH",
+		});
+		expect(harness.session.inputAdmissionCount).toBe(0);
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 
 	// #7883 / pi#187 P1: direct SDK calls cannot supply extension identity, including handled input.
@@ -338,6 +347,58 @@ describe("#7883 / pi#187 metadata source and bounded admission", () => {
 		expect(() => snapshotUserMessageMetadata(metadata)).toThrow(
 			expect.objectContaining({ code: limit === "bytes" ? "INPUT_METADATA_TOO_LARGE" : "INPUT_METADATA_TOO_DEEP" }),
 		);
+		expect(visits).toBe(0);
+	});
+
+	// #7883 / pi#187 SEC P2: Proxy traps must never run during metadata validation.
+	it.each(["root", "nested object", "nested array", "revoked"] as const)(
+		"rejects %s Proxies without invoking a trap",
+		async (location) => {
+			let traps = 0;
+			const trap = () => {
+				traps++;
+				throw new Error("Proxy trap executed");
+			};
+			const target = location === "nested array" ? [] : {};
+			const revocable = Proxy.revocable(target, {
+				getPrototypeOf: trap,
+				ownKeys: trap,
+				getOwnPropertyDescriptor: trap,
+				get: trap,
+			});
+			if (location === "revoked") revocable.revoke();
+			const metadata = location === "root" || location === "revoked" ? revocable.proxy : { value: revocable.proxy };
+			const harness = await createHarness();
+			harnesses.push(harness);
+			const before = harness.sessionManager.getEntries();
+			await expect(harness.session.sendUserMessage("proxy input", { metadata })).rejects.toThrow(
+				"cannot contain Proxies",
+			);
+			expect(traps).toBe(0);
+			expect(harness.session.inputAdmissionCount).toBe(0);
+			expect(harness.session.agent.getQueuedMessages()).toEqual([]);
+			expect(harness.sessionManager.getEntries()).toEqual(before);
+			expect(harness.faux.state.callCount).toBe(0);
+		},
+	);
+
+	// #7883 / pi#187 SEC P2: ownKeys is unavoidable for plain objects; reject its count before inspecting values.
+	it("rejects 100k plain-object keys without inspecting any values", () => {
+		const metadata = Object.fromEntries(Array.from({ length: 100_000 }, (_, index) => [String(index), null]));
+		const descriptors = vi.spyOn(Object, "getOwnPropertyDescriptor");
+		let error: unknown;
+		let visits = 0;
+		try {
+			try {
+				snapshotUserMessageMetadata(metadata);
+			} catch (cause) {
+				error = cause;
+			}
+			visits = descriptors.mock.calls.length;
+		} finally {
+			descriptors.mockRestore();
+		}
+		expect(error).toMatchObject({ code: "INPUT_METADATA_TOO_MANY_ITEMS" });
 		expect(visits).toBe(0);
 	});
 
