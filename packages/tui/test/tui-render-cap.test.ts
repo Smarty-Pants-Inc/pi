@@ -642,12 +642,10 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 	});
 }
 
-// smarty-dev#7403 round 3: terminal replies are not evidence of user-visible focus.
-const terminalReplies = [
-	["OSC 11 BEL", "\x1b]11;rgb:ffff/0000/0000\x07"],
-	["OSC 11 ST", "\x1b]11;rgb:ffff/0000/0000\x1b\\"],
-	["late OSC 11", "\x1b]11;rgb:ffff/0000/0000\x07"],
-	["unsolicited OSC 11", "\x1b]11;rgb:ffff/0000/0000\x07"],
+// smarty-dev#7403 round 4: only outstanding OSC 11 queries may remove input bytes.
+const osc11Reply = "\x1b]11;rgb:ffff/0000/0000\x07";
+const unrequestedReports = [
+	["modified F3", "\x1b[1;5R"],
 	["CPR", "\x1b[12;34R"],
 	["DEC CPR", "\x1b[?12;34;1R"],
 	["DA1", "\x1b[?1;2c"],
@@ -663,74 +661,51 @@ const terminalReplies = [
 ] as const;
 
 for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
-	for (const [kind, reply] of terminalReplies) {
-		for (const key of ["", "k"]) {
-			it(`${Renderer.name} hidden ${kind}${key ? " plus key recovers once" : " stays hidden"}`, async (t) => {
-				t.mock.method(performance, "now", () => 0);
-				t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
-				const timers = trackTimers(t);
-				const terminal = new InputTerminal();
-				const tui = new Renderer(terminal);
-				const component = new CountingComponent();
-				const inputs: string[] = [];
-				const visibility: boolean[] = [];
-				tui.addChild(component);
-				tui.setFocus(component);
-				tui.addInputListener((data) => {
-					inputs.push(data);
-					return undefined;
-				});
-				tui.onVisibilityChange((visible) => visibility.push(visible));
-				tui.start();
-				tui.renderNow();
-				await nextTick();
-				visibility.length = 0;
-				try {
-					const background =
-						reply.startsWith("\x1b]11;") && kind !== "unsolicited OSC 11"
-							? tui.queryTerminalBackgroundColor({ timeoutMs: 1000 })
-							: undefined;
-					const scheme = kind === "color scheme" ? tui.queryTerminalColorScheme({ timeoutMs: 1000 }) : undefined;
-					terminal.input?.("\x1b[O");
-					component.text = "latest hidden state";
-					tui.requestRender();
-					await nextTick();
-					if (kind === "late OSC 11") {
-						t.mock.timers.tick(1000);
-						assert.equal(await background, undefined);
-					}
-					const renders = component.renders;
-					const full = tui.fullRedraws;
-					const writes = terminal.writes.length;
-					terminal.input?.(reply + key);
-					await nextTick();
-					if (background && kind !== "late OSC 11") {
-						assert.deepEqual(await background, { r: 255, g: 0, b: 0 });
-					}
-					if (scheme) assert.equal(await scheme, "light");
-					assert.equal(component.renders - renders, key ? 1 : 0);
-					assert.equal(tui.fullRedraws - full, key ? 1 : 0);
-					assert.deepEqual(visibility, key ? [false, true] : [false]);
-					assert.deepEqual(inputs, key ? [key] : []);
-					assert.deepEqual(component.inputs, key ? [key] : []);
-					assert.equal(timers.size, 0, "replies must not schedule hidden frames or delay recovery");
-					if (!key) assert.equal(terminal.writes.length, writes);
-					t.diagnostic(
-						`terminal-reply ${Renderer.name} ${kind}${key ? "+key" : ""}: ${component.renders - renders} renders, ${tui.fullRedraws - full} full redraws, ${timers.size} timers, visible=${visibility.at(-1)}`,
-					);
-				} finally {
-					tui.stop();
-				}
-			});
-		}
-	}
-
-	for (const [kind, input] of [
-		["mouse", "\x1b[<35;1;1M"],
-		["Kitty key", "\x1b[97;1u"],
-		["paste with literal replies", `\x1b[200~${terminalReplies.map(([, reply]) => reply).join("")}\x1b[201~`],
-	] as const) {
-		it(`${Renderer.name} strips batched replies but preserves ${kind}`, async (t) => {
+	for (const scenario of [
+		...unrequestedReports.map(([kind, input]) => ({
+			kind,
+			parts: [input],
+			pending: false,
+			expired: false,
+			delivered: input,
+		})),
+		{ kind: "unsolicited OSC 11", parts: [osc11Reply], pending: false, expired: false, delivered: osc11Reply },
+		{ kind: "expired OSC 11", parts: [osc11Reply], pending: true, expired: true, delivered: osc11Reply },
+		{ kind: "pending OSC 11 BEL", parts: [osc11Reply], pending: true, expired: false, delivered: "" },
+		{ kind: "pending OSC 11 ST", parts: ["\x1b]11;#ff0000\x1b\\"], pending: true, expired: false, delivered: "" },
+		{
+			kind: "split OSC 11 payload",
+			parts: ["\x1b]11;rgb:ffff/", "0000/0000\x07"],
+			pending: true,
+			expired: false,
+			delivered: "",
+		},
+		{
+			kind: "split OSC 11 prefix",
+			parts: ["\x1b]1", "1;rgb:ffff/0000/0000\x07"],
+			pending: true,
+			expired: false,
+			delivered: "",
+		},
+		{ kind: "split OSC 11 ST", parts: ["\x1b]11;#ff0000\x1b", "\\"], pending: true, expired: false, delivered: "" },
+		{ kind: "pending OSC 11 plus key", parts: [`${osc11Reply}k`], pending: true, expired: false, delivered: "k" },
+		{
+			kind: "one query with two replies",
+			parts: [osc11Reply + osc11Reply],
+			pending: true,
+			expired: false,
+			delivered: osc11Reply,
+		},
+		{
+			kind: "partial OSC prefix diverges",
+			parts: ["\x1b]1", "0;not-a-reply\x07"],
+			pending: true,
+			expired: false,
+			delivered: "\x1b]10;not-a-reply\x07",
+		},
+		{ kind: "modified F3 during query", parts: ["\x1b[1;5R"], pending: true, expired: false, delivered: "\x1b[1;5R" },
+	]) {
+		it(`${Renderer.name} hidden ${scenario.kind}`, async (t) => {
 			t.mock.method(performance, "now", () => 0);
 			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
 			const timers = trackTimers(t);
@@ -738,32 +713,124 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			const tui = new Renderer(terminal);
 			const component = new CountingComponent();
 			const inputs: string[] = [];
+			const visibility: boolean[] = [];
 			tui.addChild(component);
+			tui.setFocus(component);
 			tui.addInputListener((data) => {
 				inputs.push(data);
-				return { consume: true };
+				return undefined;
 			});
+			tui.onVisibilityChange((visible) => visibility.push(visible));
 			tui.start();
 			tui.renderNow();
 			await nextTick();
+			visibility.length = 0;
 			try {
+				const query = scenario.pending ? tui.queryTerminalBackgroundColor({ timeoutMs: 1000 }) : undefined;
 				terminal.input?.("\x1b[O");
+				component.text = "latest hidden state";
+				tui.requestRender();
+				await nextTick();
+				if (scenario.expired) {
+					t.mock.timers.tick(1000);
+					assert.equal(await query, undefined);
+				}
 				const renders = component.renders;
 				const full = tui.fullRedraws;
-				const replies = terminalReplies.map(([, reply]) => reply).join("");
-				terminal.input?.(replies + input + replies);
-				await nextTick();
-				// Fullscreen's built-in viewport listener consumes mouse before extension listeners.
-				assert.deepEqual(inputs, Renderer === TuiAltScreen && kind === "mouse" ? [] : [input]);
-				assert.equal(component.renders - renders, 1);
-				assert.equal(tui.fullRedraws - full, 1);
-				assert.equal(timers.size, 0);
-				t.diagnostic(`terminal-reply ${Renderer.name} batched+${kind}: 1 render, 1 full redraw, 0 timers`);
+				const writes = terminal.writes.length;
+				for (const [index, part] of scenario.parts.entries()) {
+					terminal.input?.(part);
+					await nextTick();
+					if (index < scenario.parts.length - 1) {
+						assert.equal(component.renders, renders, "partial reply must not recover visibility");
+						assert.deepEqual(inputs, []);
+					}
+				}
+				if (query && !scenario.expired) {
+					// These inputs leave the query outstanding; the actual reply must still work.
+					if (scenario.kind === "partial OSC prefix diverges" || scenario.kind === "modified F3 during query") {
+						terminal.input?.(osc11Reply);
+					}
+					assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
+				}
+				const recovered = scenario.delivered ? 1 : 0;
+				assert.equal(component.renders - renders, recovered);
+				assert.equal(tui.fullRedraws - full, recovered);
+				assert.deepEqual(visibility, recovered ? [false, true] : [false]);
+				assert.deepEqual(inputs, recovered ? [scenario.delivered] : []);
+				assert.deepEqual(component.inputs, recovered ? [scenario.delivered] : []);
+				assert.equal(timers.size, 0, "no hidden frame timer or delayed recovery");
+				if (!recovered) assert.equal(terminal.writes.length, writes);
+				t.diagnostic(
+					`OSC11 ${Renderer.name} ${scenario.kind}: ${recovered} renders, ${recovered} full redraws, 0 timers`,
+				);
 			} finally {
 				tui.stop();
 			}
 		});
 	}
+
+	it(`${Renderer.name} visible modified F3 reaches listeners and components`, async () => {
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const inputs: string[] = [];
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.start();
+		try {
+			terminal.input?.("\x1b[1;5R");
+			await nextTick();
+			assert.deepEqual(inputs, ["\x1b[1;5R"]);
+			assert.deepEqual(component.inputs, inputs);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	it(`${Renderer.name} preserves OSC 11 bytes in fragmented paste while a query is pending`, async () => {
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const inputs: string[] = [];
+		const buffer = new StdinBuffer();
+		buffer.on("data", (data) => terminal.input?.(data));
+		buffer.on("paste", (content) => terminal.input?.(`\x1b[200~${content}\x1b[201~`));
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		try {
+			const query = tui.queryTerminalBackgroundColor({ timeoutMs: 1000 });
+			terminal.input?.("\x1b[O");
+			const renders = component.renders;
+			const paste = `\x1b[200~literal ${osc11Reply} and \x1b]11;unfinished\x1b[201~`;
+			buffer.process("\x1b[200~literal \x1b]11;");
+			buffer.process("rgb:ffff/0000/0000\x07 and \x1b]11;unfinished\x1b[201~");
+			await nextTick();
+			assert.equal(component.renders, renders + 1);
+			assert.deepEqual(inputs, [paste]);
+			assert.deepEqual(component.inputs, [paste]);
+			terminal.input?.("\x1b[O");
+			terminal.input?.(osc11Reply);
+			assert.deepEqual(await query, { r: 255, g: 0, b: 0 });
+			await nextTick();
+			assert.equal(component.renders, renders + 1, "paste must not consume the pending query");
+			assert.deepEqual(inputs, [paste]);
+		} finally {
+			buffer.destroy();
+			tui.stop();
+		}
+	});
 }
 
 // smarty-dev#7403 round 2: recovery does not require the missing CSI I or a frame timer.

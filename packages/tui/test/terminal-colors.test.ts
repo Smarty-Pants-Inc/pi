@@ -223,7 +223,81 @@ describe("TUI.queryTerminalBackgroundColor", () => {
 		}
 	});
 
-	it("keeps consuming a late OSC 11 reply after timeout", async () => {
+	// smarty-dev#7403: each outstanding query consumes exactly one reply, in order.
+	it("consumes only as many OSC 11 replies as outstanding queries", async () => {
+		const terminal = new TestTerminal();
+		const tui = new TuiMainScreen(terminal);
+		const inputs: string[] = [];
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.start();
+		try {
+			const first = tui.queryTerminalBackgroundColor({ timeoutMs: 1000 });
+			const second = tui.queryTerminalBackgroundColor({ timeoutMs: 1000 });
+			const white = "\x1b]11;#ffffff\x07";
+			const black = "\x1b]11;#000000\x07";
+			terminal.sendInput(white + black + white);
+			assert.deepStrictEqual(await first, { r: 255, g: 255, b: 255 });
+			assert.deepStrictEqual(await second, { r: 0, g: 0, b: 0 });
+			assert.deepStrictEqual(inputs, [white]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	// smarty-dev#7403: an expired query cannot take a later active query's reply.
+	it("removes expired queries before resolving another outstanding query", async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const terminal = new TestTerminal();
+		const tui = new TuiMainScreen(terminal);
+		tui.start();
+		try {
+			const expired = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
+			const active = tui.queryTerminalBackgroundColor({ timeoutMs: 1000 });
+			t.mock.timers.tick(10);
+			assert.strictEqual(await expired, undefined);
+			terminal.sendInput("\x1b]11;#ffffff\x07");
+			assert.deepStrictEqual(await active, { r: 255, g: 255, b: 255 });
+		} finally {
+			tui.stop();
+		}
+	});
+
+	// smarty-dev#7403: buffer a partial OSC 11 only while a query is outstanding.
+	it("releases a partial OSC 11 as input when the last query times out", async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const terminal = new TestTerminal();
+		const tui = new TuiMainScreen(terminal);
+		const inputs: string[] = [];
+		const visibility: boolean[] = [];
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.onVisibilityChange((visible) => visibility.push(visible));
+		tui.start();
+		try {
+			const query = tui.queryTerminalBackgroundColor({ timeoutMs: 10 });
+			terminal.sendInput("\x1b[O");
+			const partial = "\x1b]11;#fff";
+			terminal.sendInput(partial);
+			assert.deepStrictEqual(inputs, []);
+			assert.strictEqual(visibility.at(-1), false);
+			t.mock.timers.tick(10);
+			assert.strictEqual(await query, undefined);
+			assert.deepStrictEqual(inputs, [partial]);
+			assert.strictEqual(visibility.at(-1), true);
+			terminal.sendInput("normal input");
+			assert.deepStrictEqual(inputs, [partial, "normal input"]);
+		} finally {
+			tui.stop();
+		}
+	});
+
+	// smarty-dev#7403: a timed-out query is no longer waiting for a reply.
+	it("dispatches a late OSC 11 reply after timeout", async () => {
 		const terminal = new TestTerminal();
 		const tui: TUI = new TuiMainScreen(terminal);
 		const component = new InputRecorder();
@@ -241,10 +315,11 @@ describe("TUI.queryTerminalBackgroundColor", () => {
 
 			assert.strictEqual(await query, undefined);
 
-			terminal.sendInput("\x1b]11;#ffffff\x07");
+			const reply = "\x1b]11;#ffffff\x07";
+			terminal.sendInput(reply);
 
-			assert.deepStrictEqual(listenerInputs, []);
-			assert.deepStrictEqual(component.inputs, []);
+			assert.deepStrictEqual(listenerInputs, [reply]);
+			assert.deepStrictEqual(component.inputs, [reply]);
 		} finally {
 			tui.stop();
 		}

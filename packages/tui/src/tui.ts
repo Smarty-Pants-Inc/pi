@@ -494,6 +494,7 @@ export abstract class TuiBase extends Container implements TUI {
 	protected fullRedrawCount = 0;
 	protected stopped = false;
 	private pendingOsc11BackgroundReplies = 0;
+	private pendingOsc11BackgroundInput = "";
 	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
@@ -1087,19 +1088,19 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	private handleTerminalInput(data: string): void {
-		// Strip replies before visibility recovery, including batched/late replies. Keep paste literal.
-		// Queries: OSC 11, CSI 16t, CSI ?996n, and ProcessTerminal's Kitty/DA negotiation.
-		// Also ignore CPR, DA2, DSR/DECRQM and XTVERSION reports from the terminal.
-		data = data.replace(
-			/\x1b\[200~[\s\S]*?(?:\x1b\[201~|$)|\x1b\]11;[^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[(?:[?>][\d;]*c|\?\d*u|\??\d+;\d+(?:;\d+)?R|\??\d+(?:;\d+)*n|\??\d+;\d+\$y|6;\d+;\d+t)|\x1bP>\|[^\x1b]*\x1b\\/g,
-			(response) => {
-				if (response.startsWith("\x1b[200~")) return response;
-				if (!this.consumeOsc11BackgroundResponse(response) && !this.consumeTerminalColorSchemeReport(response)) {
-					this.consumeCellSizeResponse(response);
-				}
-				return "";
-			},
-		);
+		// Only a query we are still waiting for can remove OSC 11 bytes. Paste stays literal.
+		if (this.pendingOsc11BackgroundReplies > 0) {
+			data = this.pendingOsc11BackgroundInput + data;
+			this.pendingOsc11BackgroundInput = "";
+			data = data.replace(
+				/\x1b\[200~[\s\S]*?(?:\x1b\[201~|$)|\x1b\]11;[^\x07\x1b]*(?:\x07|\x1b\\|\x1b?$)|\x1b(?:\](?:1(?:1)?)?)?$/g,
+				(response) => {
+					if (response.startsWith("\x1b[200~") || this.pendingOsc11BackgroundReplies === 0) return response;
+					if (!this.consumeOsc11BackgroundResponse(response)) this.pendingOsc11BackgroundInput = response;
+					return "";
+				},
+			);
+		}
 		if (data.length === 0) return;
 		if (data === "\x1b[I") {
 			this.setTerminalFocused(true);
@@ -1109,6 +1110,9 @@ export abstract class TuiBase extends Container implements TUI {
 			this.setTerminalFocused(false);
 			return;
 		}
+		// Keep exact color/cell reports functional, but do not strip their bytes as replies.
+		this.consumeTerminalColorSchemeReport(data);
+		this.consumeCellSizeResponse(data);
 		// Remaining user input confirms visibility, even mouse, paste, release or unknown bytes.
 		// Do this before listeners, which may swallow the event.
 		this.setTerminalFocused(true);
@@ -1548,6 +1552,13 @@ export abstract class TuiBase extends Container implements TUI {
 				query.timer = undefined;
 				query.resolve?.(undefined);
 				query.resolve = undefined;
+				this.pendingOsc11BackgroundQueries.splice(this.pendingOsc11BackgroundQueries.indexOf(query), 1);
+				this.pendingOsc11BackgroundReplies -= 1;
+				if (this.pendingOsc11BackgroundReplies === 0 && this.pendingOsc11BackgroundInput) {
+					const input = this.pendingOsc11BackgroundInput;
+					this.pendingOsc11BackgroundInput = "";
+					this.handleTerminalInput(input);
+				}
 			}, timeoutMs);
 			this.pendingOsc11BackgroundQueries.push(query);
 			this.pendingOsc11BackgroundReplies += 1;
