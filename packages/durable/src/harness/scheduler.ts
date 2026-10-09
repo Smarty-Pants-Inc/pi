@@ -189,11 +189,9 @@ export class TaskScheduler {
 	/**
 	 * Context range last read through a task runtime, per conversation: a later read, by any of its tasks, scans only
 	 * newer entries. `idleSince` is the Harness time it was first seen idle. Derived and never persisted; dropped at the
-	 * first idle check after `settings.contextRetentionMs` of idleness, and at close.
+	 * next task/read event after `settings.contextRetentionMs` of idleness, and at close. No idle timer wakes the host.
 	 */
 	readonly #contexts = new Map<ConversationId, { range: ContextRange; idleSince: number | undefined }>();
-	/** Timer for the earliest expiry of an idle context, only where timers can be unreferenced (see `#scheduleExpiry`). */
-	#expiry: { readonly at: number; readonly timer: ReturnType<typeof setTimeout> } | undefined;
 	readonly #invocations = new Map<TaskId, Invocation>();
 	readonly #taskWaiters = new Waiters<TaskId, SettledTask<JsonValue>>();
 	/** Idle waiters by conversation; `undefined` waits for the whole Harness. */
@@ -428,7 +426,7 @@ export class TaskScheduler {
 
 	/**
 	 * `settings.contextRetentionMs`, or 0 when the host's settings throw. Kept contexts are only a cache, so dropping them
-	 * is safe, while a throw here would escape commit listeners, reconciliation, and the expiry timer.
+	 * is safe, while a throw here would escape commit listeners, reconciliation, and context reads.
 	 */
 	#contextRetentionMs(): number {
 		try {
@@ -457,40 +455,6 @@ export class TaskScheduler {
 				this.#contexts.delete(conversationId);
 			}
 		}
-		this.#scheduleExpiry();
-	}
-
-	/**
-	 * Run `#settleIdle()` when the earliest idle context expires. The timer is unreferenced, so it never keeps the process
-	 * alive. Where timers cannot be unreferenced, as in Cloudflare Workers, none is kept: a pending timer could keep a
-	 * Durable Object from being evicted, and eviction frees the contexts. There, task changes alone check expiry.
-	 */
-	#scheduleExpiry(): void {
-		const retention = this.#contextRetentionMs();
-		let at: number | undefined;
-		for (const kept of this.#contexts.values()) {
-			if (kept.idleSince !== undefined && (at === undefined || kept.idleSince + retention < at)) {
-				at = kept.idleSince + retention;
-			}
-		}
-		if (this.#expiry !== undefined && this.#expiry.at === at) return;
-		if (this.#expiry !== undefined) clearTimeout(this.#expiry.timer);
-		this.#expiry = undefined;
-		if (at === undefined || this.#closing) return;
-		const timer = setTimeout(
-			() => {
-				this.#expiry = undefined;
-				this.#settleIdle();
-			},
-			Math.min(Math.max(0, at - this.#now()), MAX_TIMER_DELAY),
-		);
-		const unref = (timer as { unref?: unknown }).unref;
-		if (typeof unref !== "function") {
-			clearTimeout(timer);
-			return;
-		}
-		unref.call(timer);
-		this.#expiry = { at, timer };
 	}
 
 	// ─── Ownership ───────────────────────────────────────────────────────────
@@ -739,8 +703,6 @@ export class TaskScheduler {
 		this.#taskWaiters.rejectAll(error);
 		this.#idleWaiters.rejectAll(error);
 		this.#contexts.clear();
-		if (this.#expiry !== undefined) clearTimeout(this.#expiry.timer);
-		this.#expiry = undefined;
 		for (const invocation of this.#invocations.values()) invocation.controller.abort();
 	}
 
@@ -1241,6 +1203,8 @@ export class TaskScheduler {
 			}) as ErasedRuntime["entry"],
 			context: (conversationId, context, options) =>
 				this.#read(invocation, async () => {
+					// ponytail: expire idle caches only on real task/read events, never on a timed wake.
+					this.#settleIdle();
 					const { view, range } = await readContextFrom(
 						this.#session,
 						this.#storage,
@@ -1262,7 +1226,6 @@ export class TaskScheduler {
 							this.#contexts.set(conversationId, { range, idleSince: undefined });
 						} else if (this.#contextRetentionMs() > 0) {
 							this.#contexts.set(conversationId, { range, idleSince: kept?.idleSince ?? this.#now() });
-							this.#scheduleExpiry();
 						}
 					}
 					return view;
