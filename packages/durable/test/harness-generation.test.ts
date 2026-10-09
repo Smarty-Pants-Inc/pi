@@ -1,6 +1,8 @@
 import {
 	type AssistantMessage,
+	createAssistantMessageEventStream,
 	fauxAssistantMessage,
+	fauxToolCall,
 	type Message,
 	type Models,
 	type SimpleStreamOptions,
@@ -29,7 +31,7 @@ import { describe, expect, it } from "vitest";
 import { resolveSettings } from "../src/harness/agent.ts";
 import type { SessionImpl } from "../src/session/session.ts";
 import { allEntries, type ChatSetup, chatSetup, openChat, textOf, unanswered, waitFor } from "./chat-support.ts";
-import { addSection } from "./harness-support.ts";
+import { addHooks, addSection } from "./harness-support.ts";
 import { ControlledStorage, context } from "./session-support.ts";
 
 const ERROR_503 = fauxAssistantMessage([], { stopReason: "error", errorMessage: "503 Service Unavailable" });
@@ -57,6 +59,23 @@ function withStream(models: Models, streamSimple: Models["streamSimple"]): Model
 		},
 	});
 }
+
+/** `setup` whose terminal error messages are rewritten, as by a provider that drops streamed content. */
+function rewriteTerminalError(setup: ChatSetup, rewrite: (error: AssistantMessage) => AssistantMessage): ChatSetup {
+	const streamSimple: Models["streamSimple"] = (model, request, options) => {
+		const source = setup.models.streamSimple(model, request, options);
+		const stream = createAssistantMessageEventStream();
+		void (async () => {
+			for await (const event of source)
+				stream.push(event.type === "error" ? { ...event, error: rewrite(event.error) } : event);
+			stream.end();
+		})();
+		return stream;
+	};
+	return { ...setup, models: withStream(setup.models, streamSimple) };
+}
+
+const PREMATURE_CLOSE = "stream closed before response.completed";
 
 /**
  * A stream that commits one partial and then ends with a final message that is not strict JSON, so the classification
@@ -200,6 +219,133 @@ describe("generation", () => {
 		expect(values.some((value) => value.generation?.retry?.error === "503 Service Unavailable")).toBe(true);
 		expect(values.some((value) => value.generation?.attempt === 2)).toBe(true);
 		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
+	// smarty-dev#6730: only a premature close after reasoning alone is restarted, and its reasoning is not kept.
+	it.each([
+		{ errorMessage: "stream closed before response.completed", content: [], retried: true },
+		{ errorMessage: "stream closed before response.completed", content: [{ type: "text", text: "a" }] },
+		{ errorMessage: "stream closed before response.completed", content: [{ type: "toolCall", id: "c", name: "t" }] },
+		{ errorMessage: "400 invalid_request_error", content: [] },
+	] as const)("restarts a reasoning-only premature close only: $errorMessage $content", async (row) => {
+		const setup = chatSetup();
+		const answer = row.content.map((block) => (block.type === "toolCall" ? { ...block, arguments: {} } : block));
+		const partial = fauxAssistantMessage([{ type: "thinking", thinking: "planning" }, ...answer], {
+			stopReason: "error",
+			errorMessage: row.errorMessage,
+		});
+		setup.faux.setResponses([partial, fauxAssistantMessage("recovered")]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		const retried = "retried" in row;
+		expect(settled.status).toBe(retried ? "done" : "unanswered");
+		expect(setup.faux.state.callCount).toBe(retried ? 2 : 1);
+		const failed = (await allEntries(root)).find(
+			(entry) => entry.kind === "pi.assistant" && (entry.model?.[0] as AssistantMessage).stopReason === "error",
+		);
+		expect(JSON.stringify(failed?.model)).toEqual(
+			retried ? expect.not.stringContaining("planning") : expect.stringContaining("planning"),
+		);
+		await harness.close(context);
+	});
+
+	// smarty-dev#6730: answer output seen in the stream blocks a retry even when the terminal message dropped it.
+	it.each([
+		{ name: "answer text", block: { type: "text" as const, text: "visible answer" } },
+		{ name: "tool call", block: fauxToolCall("t", {}) },
+	])("does not retry a premature close after streamed $name", async ({ block }) => {
+		const base = chatSetup();
+		const setup = rewriteTerminalError(base, (error) => ({
+			...error,
+			content: error.content.filter((content) => content.type === "thinking"),
+		}));
+		base.faux.setResponses([
+			fauxAssistantMessage([{ type: "thinking", thinking: "planning" }, block], {
+				stopReason: "error",
+				errorMessage: PREMATURE_CLOSE,
+			}),
+			fauxAssistantMessage("must not replay"),
+		]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled.status).toBe("unanswered");
+		expect(base.faux.state.callCount).toBe(1);
+		await harness.close(context);
+	});
+
+	// smarty-dev#6730: reasoning-only stream, terminal message without content but with output tokens.
+	it("retries a reasoning-only premature close whose terminal message dropped its content", async () => {
+		const base = chatSetup();
+		const setup = rewriteTerminalError(base, (error) => ({
+			...error,
+			content: [],
+			usage: { ...error.usage, output: 9 },
+		}));
+		base.faux.setResponses([
+			fauxAssistantMessage([{ type: "thinking", thinking: "planning" }], {
+				stopReason: "error",
+				errorMessage: PREMATURE_CLOSE,
+			}),
+			fauxAssistantMessage("recovered"),
+		]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled.status).toBe("done");
+		expect(base.faux.state.callCount).toBe(2);
+		await harness.close(context);
+	});
+
+	// smarty-dev#6730: empty thinking with output tokens and nothing streamed could hide dropped answer text.
+	it("does not retry empty thinking with output tokens and no streamed reasoning", async () => {
+		const base = chatSetup();
+		const setup = rewriteTerminalError(base, (error) => ({ ...error, usage: { ...error.usage, output: 9 } }));
+		base.faux.setResponses([
+			fauxAssistantMessage([{ type: "thinking", thinking: "" }], {
+				stopReason: "error",
+				errorMessage: PREMATURE_CLOSE,
+			}),
+			fauxAssistantMessage("must not replay"),
+		]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+		expect(settled.status).toBe("unanswered");
+		expect(base.faux.state.callCount).toBe(1);
+		await harness.close(context);
+	});
+
+	// smarty-dev#6730: afterResponse sees the retried attempt without its reasoning.
+	it("hides discarded reasoning from afterResponse", async () => {
+		const setup = chatSetup();
+		setup.faux.setResponses([
+			fauxAssistantMessage([{ type: "thinking", thinking: "planning", thinkingSignature: "rs_1" }], {
+				stopReason: "error",
+				errorMessage: PREMATURE_CLOSE,
+			}),
+			fauxAssistantMessage("recovered"),
+		]);
+		setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+		const hooked: AssistantMessage[] = [];
+		addHooks(setup.registry, GenerationTask, {
+			afterResponse: (message) => void hooked.push(structuredClone(message)),
+		});
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		expect(await (await root.submit({ type: "input", content: "hi" }, context)).wait(context)).toMatchObject({
+			status: "done",
+		});
+		expect(hooked.map((message) => message.content)).toEqual([
+			[{ type: "thinking", thinking: "" }],
+			[{ type: "text", text: "recovered" }],
+		]);
 		await harness.close(context);
 	});
 
@@ -501,6 +647,87 @@ describe("generation", () => {
 		expect(resolveSettings({ progress: { outputIntervalMs: 500 } }).progress).toEqual({
 			partialIntervalMs: 100,
 			outputIntervalMs: 500,
+		});
+	});
+
+	// smarty-dev#6730 (pi#171 review): reasoning of an attempt that is retried never becomes durable progress.
+	describe("reasoning partials", () => {
+		const thinking = { type: "thinking" as const, thinking: "planning" };
+		const text = { type: "text" as const, text: "visible answer" };
+		/** A first attempt that streams each content prefix for longer than the partial interval, then ends with `final`. */
+		const slowSetup = (contents: AssistantMessage["content"][], final: AssistantMessage): ChatSetup => {
+			const base = chatSetup();
+			base.faux.setResponses([fauxAssistantMessage("recovered")]);
+			let calls = 0;
+			const streamSimple: Models["streamSimple"] = (model, request, options) => {
+				if (calls++ > 0) return base.models.streamSimple(model, request, options);
+				const events = async function* () {
+					for (const content of contents) {
+						const partial = fauxAssistantMessage(content, { stopReason: "pending" });
+						const index = content.length - 1;
+						const block = content[index]!;
+						yield block.type === "thinking"
+							? { type: "thinking_delta", contentIndex: index, delta: block.thinking, partial }
+							: {
+									type: "text_delta",
+									contentIndex: index,
+									delta: block.type === "text" ? block.text : "",
+									partial,
+								};
+						// Longer than the default 100 ms partial interval.
+						await new Promise((resolve) => setTimeout(resolve, 300));
+					}
+				};
+				return { [Symbol.asyncIterator]: events, result: async () => final } as unknown as ReturnType<
+					Models["streamSimple"]
+				>;
+			};
+			const setup: ChatSetup = { ...base, models: withStream(base.models, streamSimple) };
+			setup.settings.retry = { enabled: true, maxRetries: 3, baseDelayMs: 1 };
+			return setup;
+		};
+		const run = async (setup: ChatSetup) => {
+			const { harness, root } = await openChat(new MemoryStorage(), setup);
+			const values = livePublications(harness);
+			harness.resume();
+			const settled = await (await root.submit({ type: "input", content: "hi" }, context)).wait(context);
+			const entries = await allEntries(root);
+			await harness.close(context);
+			return { settled, published: JSON.stringify(values), entries: JSON.stringify(entries) };
+		};
+
+		it("commits no reasoning partial of a reasoning-only premature close that is retried", async () => {
+			const { settled, published, entries } = await run(
+				slowSetup(
+					[[thinking]],
+					fauxAssistantMessage([thinking], { stopReason: "error", errorMessage: PREMATURE_CLOSE }),
+				),
+			);
+			expect(settled.status).toBe("done");
+			expect(entries).toContain("recovered");
+			expect(published).not.toContain("planning");
+			expect(entries).not.toContain("planning");
+		});
+
+		it("commits held reasoning before the answer once answer output arrives", async () => {
+			const { settled, published, entries } = await run(
+				slowSetup([[thinking], [thinking, text]], fauxAssistantMessage([thinking, text])),
+			);
+			expect(settled.status).toBe("done");
+			expect(published).toContain(JSON.stringify([thinking, text]));
+			expect(entries).toContain(JSON.stringify([thinking, text]));
+		});
+
+		it("commits reasoning of a premature close after answer output, which is not retried", async () => {
+			const { settled, published, entries } = await run(
+				slowSetup(
+					[[thinking], [thinking, text]],
+					fauxAssistantMessage([thinking, text], { stopReason: "error", errorMessage: PREMATURE_CLOSE }),
+				),
+			);
+			expect(settled.status).toBe("unanswered");
+			expect(published).toContain(JSON.stringify([thinking, text]));
+			expect(entries).toContain("planning");
 		});
 	});
 
