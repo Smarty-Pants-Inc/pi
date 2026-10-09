@@ -502,6 +502,7 @@ export abstract class TuiBase extends Container implements TUI {
 	public onDebug?: () => void;
 	private renderRequested = false;
 	private immediateRenderScheduled = false;
+	private renderGeneration = 0;
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 100;
@@ -927,8 +928,6 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 		this.queryCellSize();
 		this.requestRender();
-		// stop() cancels the timer but retains pending requests; resume their latest state.
-		this.scheduleRender();
 	}
 
 	addInputListener(listener: TuiInputListener): () => void {
@@ -972,6 +971,10 @@ export abstract class TuiBase extends Container implements TUI {
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
 		this.cancelRenderTimer();
+		this.renderRequested = false;
+		this.immediateRenderScheduled = false;
+		// Queued nextTick callbacks from this run must not render after a restart.
+		this.renderGeneration++;
 		this.terminal.onRenderPending?.(false);
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
@@ -995,6 +998,7 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	requestRender(force = false): void {
+		if (this.stopped) return;
 		if (force) {
 			this.resetRenderState();
 			this.requestImmediateRender();
@@ -1003,7 +1007,10 @@ export abstract class TuiBase extends Container implements TUI {
 		if (this.renderRequested) return;
 		this.renderRequested = true;
 		if (!this.stopped) this.terminal.onRenderPending?.(true);
-		process.nextTick(() => this.scheduleRender());
+		const generation = this.renderGeneration;
+		process.nextTick(() => {
+			if (generation === this.renderGeneration) this.scheduleRender();
+		});
 	}
 
 	private requestImmediateRender(): void {
@@ -1012,7 +1019,9 @@ export abstract class TuiBase extends Container implements TUI {
 		if (this.immediateRenderScheduled) return;
 		this.immediateRenderScheduled = true;
 		if (!this.stopped) this.terminal.onRenderPending?.(true);
+		const generation = this.renderGeneration;
 		process.nextTick(() => {
+			if (generation !== this.renderGeneration) return;
 			this.immediateRenderScheduled = false;
 			if (this.stopped || !this.renderRequested) return;
 			// A previously queued scheduleRender() can create a timer before this

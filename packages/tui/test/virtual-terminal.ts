@@ -43,6 +43,7 @@ export class VirtualTerminal implements Terminal {
 	}
 
 	stop(): void {
+		this.onRenderPending(false);
 		// Disable bracketed paste mode
 		this.xterm.write("\x1b[?2004l");
 		this.inputHandler = undefined;

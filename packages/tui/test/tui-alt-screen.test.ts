@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import { performance } from "node:perf_hooks";
 import { describe, it } from "node:test";
 import {
 	AltScreenSearchComponent,
@@ -1708,28 +1709,64 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
-	it("stacks flash messages and collapses them as they expire", async () => {
-		const terminal = new VirtualTerminal(20, 4);
+	// pi#175 / smarty-dev#7403: flashes that expire inside the 100 ms window are coalesced away.
+	it("renders the latest flash stack at the trailing edge and collapses expired messages", async (t) => {
+		let now = 1000;
+		t.mock.method(performance, "now", () => now);
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const terminal = new RecordingTerminal(20, 4);
 		const tui = new TuiAltScreen(terminal);
-		tui.addChild(new Text("one\ntwo\nthree\nfour", 0, 0));
-		tui.start();
-		await terminal.waitForRender();
+		const text = new Text("one\ntwo\nthree\nfour", 0, 0);
+		const renders = t.mock.method(text, "render");
+		const advance = async (ms: number) => {
+			now += ms;
+			t.mock.timers.tick(ms);
+			await new Promise<void>((resolve) => process.nextTick(resolve));
+		};
+		// Inspect emitted frames directly; xterm has unrelated asynchronous parser timers.
+		const lastFrame = () => {
+			const event = terminal.events.at(-1);
+			return event?.type === "write" ? event.data : "";
+		};
+		try {
+			tui.addChild(text);
+			tui.start();
+			await advance(0);
+			await advance(0);
+			assert.strictEqual(renders.mock.calls.length, 1);
 
-		tui.flash("First", 80);
-		tui.flash("Second", 500);
-		tui.renderNow(); // smarty-dev#7403: show the 80 ms flash before the next capped frame.
-		await terminal.waitForRender();
-		let viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.endsWith(" First "));
-		assert.ok(viewport[1]?.endsWith(" Second "));
+			await advance(5);
+			tui.flash("First", 80);
+			tui.flash("Second", 200);
+			tui.flash("Third", 500);
+			tui.requestRender();
+			await advance(0);
+			await advance(80);
+			assert.strictEqual(renders.mock.calls.length, 1);
+			await advance(14);
+			assert.strictEqual(renders.mock.calls.length, 1);
+			await advance(1);
+			assert.strictEqual(renders.mock.calls.length, 2, "exactly one trailing frame at t=100");
+			let frame = lastFrame();
+			assert.ok(!frame.includes("First"));
+			assert.ok(frame.includes(" Second "));
+			assert.ok(frame.includes(" Third "));
+			assert.ok(frame.indexOf(" Second ") < frame.indexOf(" Third "));
 
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		await terminal.waitForRender();
-		viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.endsWith(" Second "));
-		assert.ok(!viewport.some((line) => line.includes("First")));
-
-		tui.stop();
+			await advance(105);
+			await advance(0);
+			assert.strictEqual(renders.mock.calls.length, 3);
+			frame = lastFrame();
+			assert.ok(frame.includes(" Third "));
+			assert.ok(!frame.includes("Second"));
+			await advance(300);
+			await advance(0);
+			assert.strictEqual(renders.mock.calls.length, 4);
+			assert.ok(lastFrame().includes("one"));
+			assert.ok(!lastFrame().includes("Third"));
+		} finally {
+			tui.stop({ preserveScreen: true });
+		}
 	});
 
 	it("auto-scrolls and extends a drag selection held at the viewport edge", async () => {
