@@ -488,6 +488,17 @@ export function isTerminalStateReport(data: string): boolean {
 	return parseTerminalColorSchemeReport(data) !== undefined || /^\x1b\[6;\d+;\d+t$/.test(data);
 }
 
+/**
+ * A proper prefix of a color-scheme (`CSI ? 997 ; n n`) or cell-size (`CSI 6 ; h ; w t`) report.
+ * A hidden pane carries it to the next read and decides at the first impossible byte (smarty-dev#7648).
+ */
+export function isTerminalStateReportPrefix(data: string): boolean {
+	return (
+		/^\x1b(?:\[(?:\?(?:9(?:9(?:7(?:;\d*)?)?)?)?)?)?$/.test(data) ||
+		/^\x1b(?:\[(?:6(?:;(?:\d+(?:;\d*)?)?)?)?)?$/.test(data)
+	);
+}
+
 export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
 
 export interface ViewportTUI extends TUI {
@@ -529,6 +540,8 @@ export abstract class TuiBase extends Container implements TUI {
 	protected stopped = false;
 	private pendingOsc11BackgroundReplies = 0;
 	private pendingOsc11BackgroundInput = "";
+	/** A split terminal report held while hidden (smarty-dev#7648); never held while visible. */
+	private pendingTerminalReportInput = "";
 	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
@@ -1170,6 +1183,19 @@ export abstract class TuiBase extends Container implements TUI {
 					return "";
 				},
 			);
+		}
+		// ponytail: no timer. While hidden, a fragment that can still become a color-scheme or
+		// cell-size report waits for the next read; the first impossible byte delivers the whole
+		// fragment and the rest as one chunk, so a key sharing the prefix (e.g. CSI 6;5~) stays
+		// intact. Trade-off: a bare Escape on a pane the terminal reports hidden waits for the
+		// next byte or focus-in. A visible pane never holds input.
+		if (this.pendingTerminalReportInput) {
+			data = this.pendingTerminalReportInput + data;
+			this.pendingTerminalReportInput = "";
+		}
+		if (!this.terminalFocused && data.length > 0 && isTerminalStateReportPrefix(data)) {
+			this.pendingTerminalReportInput = data;
+			return;
 		}
 		if (data.length === 0) return;
 		this.dispatchTerminalInput(data);

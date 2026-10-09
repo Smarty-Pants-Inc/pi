@@ -790,6 +790,98 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 		});
 	}
 
+	// smarty-dev#7648: a report split across reads is carried while hidden and never recovers.
+	for (const [kind, report] of [
+		["color scheme", "\x1b[?997;2n"],
+		["cell size", "\x1b[6;20;10t"],
+	] as const) {
+		it(`${Renderer.name} hidden ${kind} split at every byte never recovers`, async (t) => {
+			t.mock.method(performance, "now", () => 0);
+			t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+			const timers = trackTimers(t);
+			for (let split = 1; split < report.length; split++) {
+				const terminal = new InputTerminal();
+				const tui = new Renderer(terminal);
+				const component = new CountingComponent();
+				const inputs: string[] = [];
+				const visibility: boolean[] = [];
+				tui.addChild(component);
+				tui.setFocus(component);
+				tui.addInputListener((data) => {
+					inputs.push(data);
+					return undefined;
+				});
+				tui.onVisibilityChange((visible) => visibility.push(visible));
+				tui.start();
+				tui.renderNow();
+				await nextTick();
+				try {
+					terminal.input?.("\x1b[O");
+					await nextTick();
+					visibility.length = 0;
+					const renders = component.renders;
+					const full = tui.fullRedraws;
+					const writes = terminal.writes.length;
+					terminal.input?.(report.slice(0, split));
+					await nextTick();
+					assert.deepEqual(inputs, [], `split ${split}: the fragment is held`);
+					terminal.input?.(report.slice(split));
+					await nextTick();
+					assert.equal(component.renders, renders, `split ${split}: no render`);
+					assert.equal(tui.fullRedraws, full, `split ${split}: no full redraw`);
+					assert.equal(terminal.writes.length, writes, `split ${split}: no write`);
+					assert.deepEqual(visibility, [], `split ${split}: stays hidden`);
+					assert.deepEqual(inputs, [report], `split ${split}: delivered once, whole`);
+					assert.deepEqual(component.inputs, [report]);
+					assert.equal(timers.size, 0, `split ${split}: no timer`);
+				} finally {
+					tui.stop();
+				}
+			}
+		});
+	}
+
+	it(`${Renderer.name} hidden key sharing a report prefix arrives whole and recovers once`, async (t) => {
+		t.mock.method(performance, "now", () => 0);
+		t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+		const timers = trackTimers(t);
+		const terminal = new InputTerminal();
+		const tui = new Renderer(terminal);
+		const component = new CountingComponent();
+		const inputs: string[] = [];
+		const visibility: boolean[] = [];
+		tui.addChild(component);
+		tui.setFocus(component);
+		tui.addInputListener((data) => {
+			inputs.push(data);
+			return undefined;
+		});
+		tui.onVisibilityChange((visible) => visibility.push(visible));
+		tui.start();
+		tui.renderNow();
+		await nextTick();
+		try {
+			terminal.input?.("\x1b[O");
+			await nextTick();
+			visibility.length = 0;
+			const renders = component.renders;
+			// Ctrl+PageDown (CSI 6;5~) shares the cell-size prefix CSI 6; until its "5~".
+			terminal.input?.("\x1b[6;");
+			await nextTick();
+			assert.deepEqual(inputs, []);
+			assert.equal(component.renders, renders);
+			terminal.input?.("5~");
+			await nextTick();
+			assert.deepEqual(inputs, ["\x1b[6;5~"]);
+			assert.deepEqual(component.inputs, ["\x1b[6;5~"]);
+			assert.deepEqual(visibility, [true]);
+			assert.equal(component.renders - renders, 1);
+			assert.equal(timers.size, 0);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it(`${Renderer.name} visible modified F3 reaches listeners and components`, async () => {
 		const terminal = new InputTerminal();
 		const tui = new Renderer(terminal);
