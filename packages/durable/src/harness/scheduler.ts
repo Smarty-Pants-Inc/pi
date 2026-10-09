@@ -1,4 +1,4 @@
-import { type Context, copyJson, type JsonValue } from "@earendil-works/chord";
+import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-works/chord";
 import { awaitWithContext, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
 import type { ExecutionEnv } from "../env/index.ts";
@@ -24,6 +24,8 @@ import type {
 } from "../types.ts";
 import { agentHooks } from "./agent.ts";
 import { readContext } from "./context.ts";
+import { assignJson } from "./json.ts";
+import { LiveDoc } from "./live.ts";
 import type {
 	Agent,
 	AnyTask,
@@ -36,6 +38,29 @@ import type {
 	TaskInspection,
 } from "./types.ts";
 import { closedError, scanAll, Waiters } from "./util.ts";
+
+/**
+ * The internal live partial writer of each handler-facing runtime (smarty-dev#7428). Kept out of the runtime object and
+ * out of the package exports, so no task handler can pass its task's abort mark; only `commitLivePartialUnderAbortMark`
+ * reaches it.
+ */
+const livePartialWriters = new WeakMap<object, (message: JsonValue, context: Context) => Promise<void>>();
+
+/**
+ * Internal to the generation kind: commit `message` as the run's live partial, `pi.live` `generation.message` of the
+ * runtime's conversation, past the task's abort mark and the cancellation of `context` the mark signalled, so the abort
+ * handler converts the answer output the mark interrupted. Only a run invocation of a `pi.generation` task that owns the
+ * conversation's run, while its live generation exists, may write, and only an assistant message. It writes nothing
+ * else and never changes the task's state; the abort handler decides the outcome. It still rejects once the invocation
+ * ended or the Harness is closing.
+ */
+export function commitLivePartialUnderAbortMark(runtime: object, message: JsonValue, context: Context): Promise<void> {
+	const write = livePartialWriters.get(runtime);
+	if (write === undefined) return Promise.reject(new Error("Not a task runtime"));
+	return write(message, context);
+}
+
+const GENERATION_TASK_KIND = "pi.generation";
 
 type AnyTaskRecord = TaskRecord<JsonValue, JsonValue, JsonValue>;
 /** A record that can still run code: pending, running, or waiting. */
@@ -1071,7 +1096,7 @@ export class TaskScheduler {
 			},
 		};
 		const settings = this.#settings;
-		return {
+		const runtime: ErasedRuntime = {
 			taskId: invocation.taskId as TaskId<JsonValue>,
 			conversationId: invocation.conversationId,
 			signal: invocation.controller.signal,
@@ -1086,21 +1111,14 @@ export class TaskScheduler {
 			get registry() {
 				return phase.snapshot();
 			},
-			commit: (change, context, options) =>
+			commit: (change, context) =>
 				this.#gated(
 					invocation,
 					async (tx, current) => {
 						const next = await change(tx, current);
-						if (next === undefined) return;
-						if (options?.underAbortMark === true) {
-							throw new Error(
-								`Task ${invocation.taskId} cannot change its state in a commit under its abort mark`,
-							);
-						}
-						await this.#commitState(tx, invocation, current, next);
+						if (next !== undefined) await this.#commitState(tx, invocation, current, next);
 					},
 					context,
-					options?.underAbortMark === true,
 				),
 			memo: ((name: string, ...rest: readonly unknown[]) => {
 				if (rest.length === 1) {
@@ -1185,6 +1203,34 @@ export class TaskScheduler {
 				this.#report(error);
 			},
 		};
+		livePartialWriters.set(runtime, (message, context) => this.#commitLivePartial(invocation, message, context));
+		return runtime;
+	}
+
+	/** See `commitLivePartialUnderAbortMark`: the one write a run invocation may make under its task's abort mark. */
+	#commitLivePartial(invocation: Invocation, message: JsonValue, context: Context): Promise<void> {
+		const refuse = (why: string) =>
+			Promise.reject(
+				new Error(`Task ${invocation.taskId} cannot write a live partial under its abort mark: ${why}`),
+			);
+		if (invocation.mode !== "run") return refuse("not a run invocation");
+		if (typeof message !== "object" || message === null || Array.isArray(message) || message.role !== "assistant") {
+			return refuse("not an assistant message");
+		}
+		return this.#gated(
+			invocation,
+			async (tx, current) => {
+				if (current.kind !== GENERATION_TASK_KIND) throw new Error(`Task ${invocation.taskId} is not a generation`);
+				const live = await tx.doc(LiveDoc, invocation.conversationId);
+				if (live.run?.taskId !== invocation.taskId) {
+					throw new Error(`Task ${invocation.taskId} does not own the run of its conversation`);
+				}
+				if (live.generation === undefined) throw new Error(`Task ${invocation.taskId} has no live generation`);
+				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
+			},
+			context,
+			true,
+		);
 	}
 
 	/** Run a committed-state read unless the invocation has ended. */
@@ -1194,9 +1240,9 @@ export class TaskScheduler {
 	}
 
 	/**
-	 * Commit after rereading the task on the line and gating the invocation. `underAbortMark` lets a run invocation's
-	 * commit pass the task's abort mark and the cancellation of `context` the mark signalled; the invocation must still
-	 * be live and the Harness open.
+	 * Commit after rereading the task on the line and gating the invocation. `underAbortMark`, used only by
+	 * `#commitLivePartial`, lets a run invocation's commit pass the task's abort mark and the cancellation of `context`
+	 * the mark signalled; the invocation must still be live and the Harness open.
 	 */
 	#gated<T>(
 		invocation: Invocation,

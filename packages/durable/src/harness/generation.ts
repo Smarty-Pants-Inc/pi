@@ -41,6 +41,7 @@ import { assignJson } from "./json.ts";
 import { endRun, LiveDoc, type LiveState, type ToolSlot } from "./live.ts";
 import { planSystemEntries, renderSections, replaySections } from "./prompt.ts";
 import { ensureProviderSessionId } from "./provider.ts";
+import { commitLivePartialUnderAbortMark } from "./scheduler.ts";
 import { appendToolResult, harnessError, ToolTask, type ToolTaskResult } from "./tool.ts";
 import type {
 	CompactionPolicy,
@@ -408,29 +409,29 @@ async function streamResponse(
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
 	let completed = false;
-	/** Whether the partial committed; `underAbortMark` is only for the abort path's final commit. */
+	/**
+	 * Whether the partial committed. `underAbortMark` is only for the abort path's final commit: it takes the scheduler's
+	 * internal live partial write, the one write that passes the abort mark.
+	 */
 	const commitPartial = (partial: AssistantMessage, underAbortMark = false): Promise<boolean> => {
 		// Copy synchronously: the provider keeps mutating its partial.
 		const message = copyJson(partial, { omitUndefinedProperties: true });
-		return runtime
-			.commit(
-				async (tx) => {
+		const committed = underAbortMark
+			? commitLivePartialUnderAbortMark(runtime, message, context)
+			: runtime.commit(async (tx) => {
 					const live = await tx.doc(LiveDoc, runtime.conversationId);
 					live.generation ??= { attempt };
 					assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
 					return undefined;
-				},
-				context,
-				{ underAbortMark },
-			)
-			.then(
-				() => true,
-				(error: unknown) => {
-					// Rejections after an abort mark or close are expected; the committed state stays consistent.
-					if (!runtime.signal.aborted) runtime.report(error);
-					return false;
-				},
-			);
+				}, context);
+		return committed.then(
+			() => true,
+			(error: unknown) => {
+				// Rejections after an abort mark or close are expected; the committed state stays consistent.
+				if (!runtime.signal.aborted) runtime.report(error);
+				return false;
+			},
+		);
 	};
 	const flush = (): void => {
 		timer = undefined;
@@ -475,7 +476,9 @@ async function streamResponse(
 		// abort handler converts the answer output instead of losing it.
 		const signalled = runtime.signal.aborted;
 		if ((!completed || signalled) && pending !== undefined && hasAssistantAnswerOutput(pending)) {
-			await commitPartial(pending, signalled);
+			const saved = await commitPartial(pending, signalled);
+			// An abort mark that landed after the check above rejected the regular commit; retry once under the mark.
+			if (!saved && !signalled && runtime.signal.aborted) await commitPartial(pending, true);
 		}
 	}
 }
@@ -542,7 +545,8 @@ async function classify(
 			const text = message.errorMessage ?? "Context overflow";
 			await runtime.commit(async (tx): Promise<Next> => {
 				const live = await tx.doc(LiveDoc, conversationId);
-				await appendAssistant(tx, conversationId, message);
+				// smarty-dev#7480: the error entry keeps answer output the terminal message dropped.
+				await appendAssistant(tx, conversationId, withPartialAnswer(message, live));
 				delete live.generation;
 				const child = await createCompaction(tx, conversationId, { reason: "overflow" }, runtime.taskId);
 				const checkpoint = { phase: "prepare", attempt, compacted: child, overflow: text } as const;

@@ -199,7 +199,6 @@ export interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver
 			current: RunningTask<I, S, R>,
 		) => NextTaskState<S, R> | undefined | Promise<NextTaskState<S, R> | undefined>,
 		context: Context,
-		options?: TaskCommitOptions,
 	): Promise<void>;
 	/** Read a durable memo of this task. */
 	memo<T extends JsonValue>(name: string, context: Context): Promise<T | undefined>;
@@ -228,17 +227,6 @@ export interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver
 	report(error: unknown): void;
 	/** Resolve once the Harness clock reaches `until`; rejects when the invocation or `context` is cancelled. */
 	sleep(until: number, context: Context): Promise<void>;
-}
-
-/** Options of `TaskRuntime.commit()`. */
-export interface TaskCommitOptions {
-	/**
-	 * Let a run invocation's commit pass its task's abort mark, and the cancellation of its context that the mark
-	 * signalled, so output the abort handler must see, such as a streamed partial the mark interrupted, becomes durable
-	 * before the abort invocation starts. It still rejects once the invocation ended or the Harness is closing. The
-	 * change must return no state; the abort handler decides the outcome.
-	 */
-	readonly underAbortMark?: boolean;
 }
 
 /** Executable durable state machine definition, registered in the registry by `name`. */

@@ -533,6 +533,59 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#7428 (pi#174 review): the abort mark lands after the finalizer checked the signal, so its regular commit
+	// of the partial is rejected; the finalizer retries it once under the mark and the abort handler converts it.
+	it("converts the answer partial when the abort mark lands between the finalizer's check and its commit", async () => {
+		const base = chatSetup();
+		const text = { type: "text" as const, text: "raced answer" };
+		const release = Promise.withResolvers<void>();
+		const streamed = Promise.withResolvers<void>();
+		let abortOnResult: (() => Promise<unknown>) | undefined;
+		let aborting: Promise<unknown> | undefined;
+		let signalledAtResult: boolean | undefined;
+		let calls = 0;
+		const setup = {
+			...base,
+			models: withStream(base.models, (_model, _request, options) => {
+				calls++;
+				const events = async function* () {
+					const partial = fauxAssistantMessage([text], { stopReason: "pending" });
+					yield { type: "text_delta", contentIndex: 0, delta: text.text, partial };
+					streamed.resolve();
+					await release.promise;
+				};
+				// The stream ends with an error that drops the answer; the mark is requested as the stream ends, so it lands
+				// after the finalizer found the signal clear.
+				const final = fauxAssistantMessage([], { stopReason: "error", errorMessage: PREMATURE_CLOSE });
+				const result = async () => {
+					signalledAtResult = options!.signal!.aborted;
+					aborting = abortOnResult!();
+					return final;
+				};
+				return { [Symbol.asyncIterator]: events, result } as unknown as ReturnType<Models["streamSimple"]>;
+			}),
+		};
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		await streamed.promise;
+		abortOnResult = () => harness.abortTask(taskId, context);
+		release.resolve();
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect(await aborting).toBe("marked");
+		expect(signalledAtResult).toBe(false);
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		expect(calls).toBe(1);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "aborted", content: [text] });
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
 	it("cancels a deferred response when aborted during polling", async () => {
 		const setup = chatSetup({ deferred: { pendingFetches: 100, pollAfterMs: 60_000 } });
 		setup.faux.setResponses([fauxAssistantMessage("never")]);
