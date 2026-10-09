@@ -23,18 +23,22 @@ export {
 	OAuthRegistrationError,
 	OAuthResourceMismatchError,
 } from "./errors.ts";
-// startAuthorization, registerClient, exchangeAuthorizationCode and refreshAuthorization stay internal:
-// they trust the metadata they are given, while authorizeMcp binds its endpoints to the issuer origin
-// (and allowedEndpointOrigins) first. Exporting them would let a caller skip that check (pi#173).
+// The token operations stay public (documented API since 1.0.x), and each binds its endpoints to the issuer
+// origin (and allowedEndpointOrigins) itself before any request, as authorizeMcp does (pi#173).
 export {
 	type AddClientAuthentication,
 	adaptOAuthProvider,
 	authorizeMcp,
+	exchangeAuthorizationCode,
 	type OAuthClientMetadataDocument,
 	type OAuthClientProvider,
 	type OAuthFlowOptions,
 	type OAuthFlowResult,
+	refreshAuthorization,
+	registerClient,
+	startAuthorization,
 	stepUpScope,
+	type TokenRequestOptions,
 } from "./flow.ts";
 export {
 	McpOAuthProvider,

@@ -13,13 +13,7 @@ import {
 	parseWwwAuthenticate,
 	selectResource,
 } from "./discovery.ts";
-import {
-	credentialFetch,
-	loopback,
-	secureEndpoint,
-	validateOAuthEndpointOrigins,
-	validateOAuthEndpoints,
-} from "./endpoints.ts";
+import { credentialFetch, loopback, secureEndpoint, validateOAuthEndpointOrigins } from "./endpoints.ts";
 import {
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
@@ -113,6 +107,8 @@ type ClientAuthMethod = "client_secret_basic" | "client_secret_post" | "none";
 
 export interface TokenRequestOptions {
 	metadata?: AuthorizationServerMetadata;
+	/** As in `OAuthFlowOptions`: the token endpoint must share the issuer's origin or be on one of these. */
+	allowedEndpointOrigins?: readonly string[];
 	clientInformation: OAuthClientInformationMixed;
 	resource?: string;
 	addClientAuthentication?: AddClientAuthentication;
@@ -184,11 +180,14 @@ export async function startAuthorization(
 		scope?: string;
 		state?: string;
 		resource?: string;
+		/** As in `OAuthFlowOptions`: endpoints must share the issuer's origin or be on one of these. */
+		allowedEndpointOrigins?: readonly string[];
 	},
 ): Promise<{ authorizationUrl: URL; codeVerifier: string }> {
 	refuseMcpAdmission();
 	const metadata = options.metadata;
-	validateOAuthEndpoints(metadata);
+	// pi#173: every exported operation binds its endpoints to the issuer origin itself, not only authorizeMcp.
+	validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
 	if (metadata && !metadata.response_types_supported.includes("code")) {
 		throw new Error("Authorization server does not support authorization codes");
 	}
@@ -215,7 +214,7 @@ async function tokenRequest(
 	params: URLSearchParams,
 ): Promise<OAuthTokens> {
 	refuseMcpAdmission();
-	validateOAuthEndpoints(options.metadata);
+	validateOAuthEndpointOrigins(options.metadata, options.allowedEndpointOrigins);
 	const url = secureEndpoint(options.metadata?.token_endpoint ?? new URL("/token", authorizationServerUrl));
 	const headers = new Headers({ Accept: "application/json", "content-type": "application/x-www-form-urlencoded" });
 	if (options.resource) params.set("resource", options.resource);
@@ -263,10 +262,12 @@ export async function registerClient(
 		scope?: string;
 		fetch?: McpFetch;
 		signal?: AbortSignal;
+		/** As in `OAuthFlowOptions`: the registration endpoint must share the issuer's origin or be on one of these. */
+		allowedEndpointOrigins?: readonly string[];
 	},
 ): Promise<OAuthClientInformationFull> {
 	refuseMcpAdmission();
-	validateOAuthEndpoints(options.metadata);
+	validateOAuthEndpointOrigins(options.metadata, options.allowedEndpointOrigins);
 	const endpoint = options.metadata?.registration_endpoint;
 	if (options.metadata && !endpoint)
 		throw new Error("Authorization server does not support dynamic client registration");
@@ -389,6 +390,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 			scope,
 			fetch: options.fetch,
 			signal: options.signal,
+			allowedEndpointOrigins: options.allowedEndpointOrigins,
 		});
 		await provider.saveClientInformation(client);
 	}
@@ -401,6 +403,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		addClientAuthentication: provider.addClientAuthentication,
 		fetch: options.fetch,
 		signal: options.signal,
+		allowedEndpointOrigins: options.allowedEndpointOrigins,
 	};
 	if (options.authorizationCode) {
 		// RFC 9207: never send a code from another authorization server to this one.
@@ -447,6 +450,7 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 		scope,
 		state,
 		resource,
+		allowedEndpointOrigins: options.allowedEndpointOrigins,
 	});
 	await provider.saveCodeVerifier(authorization.codeVerifier);
 	await provider.redirectToAuthorization(authorization.authorizationUrl);
