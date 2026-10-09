@@ -1015,6 +1015,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 
 // smarty-dev#7403 round 6: the first byte outside the reply grammar flushes all input,
 // even a multi-character read, with no hidden timeout or key-classification heuristic.
+// smarty-dev#7403 round 7: each xterm RGB channel allows only 1-4 hex digits.
 for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 	for (const [kind, partial, continuation] of [
 		["multi-character printable read", "\x1b]11;r", "abc"],
@@ -1022,8 +1023,10 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 		["arrow", "\x1b]11;rgb:ffff/", "\x1b[A"],
 		["valid digits followed by an invalid byte", "\x1b]11;rgb:ffff/", "00gabc"],
 		["invalid ST continuation", "\x1b]11;rgb:ffff/0000/0000\x1b", "abc"],
-		["65-byte grammar-valid run", "\x1b]11;rgb:", "f".repeat(56)],
-		["64-byte partial then byte 65", `\x1b]11;rgb:${"f".repeat(55)}`, "f"],
+		["fifth hex digit in one read", "\x1b]11;rgb:", "fffffabc"],
+		["fifth hex digit in first channel", "\x1b]11;rgb:ffff", "fabc"],
+		["fifth hex digit in second channel", "\x1b]11;rgb:ffff/0000", "ABC"],
+		["fifth hex digit in third channel", "\x1b]11;rgb:ffff/0000/ffff", "abc"],
 		["invalid read containing a reply", "\x1b]11;r", `abc${osc11Reply}`],
 		["empty channel", "\x1b]11;rgb:", "/abc"],
 		["extra separator", "\x1b]11;rgb:ffff/0000/0000", "/abc"],
@@ -1096,7 +1099,10 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 		["separate ST bytes", ["\x1b]11;rgb:ffff/0000/0000", "\x1b", "\\"]],
 		["bytewise BEL", Array.from(osc11Reply)],
 		["bytewise ST", Array.from("\x1b]11;rgb:ffff/0000/0000\x1b\\")],
-		["64-byte terminated reply", [`\x1b]11;rgb:${"f".repeat(50)}/0/0`, "\x07"]],
+		["one-digit channels BEL", ["\x1b]11;rgb:f/0/0", "\x07"]],
+		["one-digit channels ST", ["\x1b]11;rgb:f/0/0", "\x1b", "\\"]],
+		["two-digit channels", ["\x1b]11;rgb:ff/00/00", "\x07"]],
+		["three-digit channels", ["\x1b]11;rgb:fff/000/000", "\x07"]],
 	] as const) {
 		it(`${Renderer.name} hidden OSC 11 grammar consumes ${kind} without recovery`, async (t) => {
 			t.mock.method(performance, "now", () => 0);

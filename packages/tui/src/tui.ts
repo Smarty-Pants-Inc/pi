@@ -148,7 +148,7 @@ type PendingOsc11BackgroundQuery = {
 function scanOsc11BackgroundReply(data: string): number | "partial" | "invalid" {
 	const prefix = "\x1b]11;rgb:";
 	let channel = 0;
-	let hasDigit = false;
+	let digits = 0;
 	let awaitingSt = false;
 	for (let i = 0; i < data.length; i++) {
 		// The grammar is ASCII, so a valid partial's code units are also its bytes.
@@ -159,11 +159,11 @@ function scanOsc11BackgroundReply(data: string): number | "partial" | "invalid" 
 		} else if (awaitingSt) {
 			return byte === "\\" ? i + 1 : "invalid";
 		} else if ((byte >= "0" && byte <= "9") || (byte >= "a" && byte <= "f") || (byte >= "A" && byte <= "F")) {
-			hasDigit = true;
-		} else if (byte === "/" && hasDigit && channel < 2) {
+			if (++digits > 4) return "invalid";
+		} else if (byte === "/" && digits > 0 && channel < 2) {
 			channel++;
-			hasDigit = false;
-		} else if ((byte === "\x07" || byte === "\x1b") && hasDigit && channel === 2) {
+			digits = 0;
+		} else if ((byte === "\x07" || byte === "\x1b") && digits > 0 && channel === 2) {
 			if (byte === "\x07") return i + 1;
 			awaitingSt = true;
 		} else {
