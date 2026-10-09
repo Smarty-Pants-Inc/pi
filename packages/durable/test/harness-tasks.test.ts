@@ -906,6 +906,57 @@ describe("task abort", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#7428: output the mark interrupted becomes durable for the abort handler; the outcome stays its own.
+	it("lets a run's commit under its abort mark write but not change the task's state", async () => {
+		const Notes = defineDoc<{ lines: string[] }>({
+			kind: "test.marked-notes",
+			version: 1,
+			scope: "task",
+			initial: () => ({ lines: [] }),
+		});
+		const reached = deferred();
+		const errors: string[] = [];
+		let seen: unknown;
+		const Marked = oneStep(
+			"test.marked-write",
+			async (task, runtime, ctx) => {
+				reached.resolve();
+				await aborted(runtime.signal).catch(() => {});
+				// `ctx` is cancelled by the mark too.
+				await runtime.commit(
+					async (tx) => {
+						(await tx.doc(Notes, task.id)).lines.push("interrupted");
+					},
+					ctx,
+					{ underAbortMark: true },
+				);
+				for (const options of [undefined, { underAbortMark: true }]) {
+					await runtime
+						.commit(() => completed(null), context, options)
+						.catch((error: unknown) => errors.push((error as Error).message));
+				}
+			},
+			async (runtime, ctx) => {
+				await runtime.commit(async (tx) => {
+					seen = [...(await tx.doc(Notes, runtime.taskId)).lines];
+					return abortedWith("mark");
+				}, ctx);
+			},
+		);
+		const { harness, root } = await openRoot([Marked]);
+		const id = await start(root, Marked);
+		harness.resume();
+		await reached.promise;
+		expect(await harness.abortTask(id, context)).toBe("marked");
+		expect((await harness.waitForTask(id, context)).state.outcome).toEqual({ status: "aborted", reason: "mark" });
+		expect(seen).toEqual(["interrupted"]);
+		expect(errors).toEqual([
+			`Task ${id} has a durable abort mark`,
+			`Task ${id} cannot change its state in a commit under its abort mark`,
+		]);
+		await harness.close(context);
+	});
+
 	it("starts no further phase after a mark that lands during a phase with progress", async () => {
 		const reached = deferred();
 		const proceed = deferred();

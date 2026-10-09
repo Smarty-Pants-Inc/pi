@@ -1,5 +1,5 @@
 import { type Context, copyJson, type JsonValue } from "@earendil-works/chord";
-import { awaitWithContext, withAbortSignal } from "@earendil-works/chord/context";
+import { awaitWithContext, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
 import type { ExecutionEnv } from "../env/index.ts";
 import type { SessionImpl } from "../session/session.ts";
@@ -1086,14 +1086,21 @@ export class TaskScheduler {
 			get registry() {
 				return phase.snapshot();
 			},
-			commit: (change, context) =>
+			commit: (change, context, options) =>
 				this.#gated(
 					invocation,
 					async (tx, current) => {
 						const next = await change(tx, current);
-						if (next !== undefined) await this.#commitState(tx, invocation, current, next);
+						if (next === undefined) return;
+						if (options?.underAbortMark === true) {
+							throw new Error(
+								`Task ${invocation.taskId} cannot change its state in a commit under its abort mark`,
+							);
+						}
+						await this.#commitState(tx, invocation, current, next);
 					},
 					context,
+					options?.underAbortMark === true,
 				),
 			memo: ((name: string, ...rest: readonly unknown[]) => {
 				if (rest.length === 1) {
@@ -1186,11 +1193,16 @@ export class TaskScheduler {
 		return read();
 	}
 
-	/** Commit after rereading the task on the line and gating the invocation. */
+	/**
+	 * Commit after rereading the task on the line and gating the invocation. `underAbortMark` lets a run invocation's
+	 * commit pass the task's abort mark and the cancellation of `context` the mark signalled; the invocation must still
+	 * be live and the Harness open.
+	 */
 	#gated<T>(
 		invocation: Invocation,
 		change: (tx: Transaction, current: ErasedRunningTask) => T | Promise<T>,
 		context: Context,
+		underAbortMark = false,
 	): Promise<T> {
 		if (invocation.ended) return Promise.reject(endedError(invocation));
 		return this.#session.commitWith(
@@ -1201,12 +1213,12 @@ export class TaskScheduler {
 				if (found === undefined) throw new Error(`Task ${invocation.taskId} is terminal`);
 				if (found.state.status !== "running") throw new Error(`Task ${invocation.taskId} is ${found.state.status}`);
 				const current = found as ErasedRunningTask;
-				if (invocation.mode === "run" && current.abortRequested) {
+				if (invocation.mode === "run" && current.abortRequested && !underAbortMark) {
 					throw new Error(`Task ${invocation.taskId} has a durable abort mark`);
 				}
 				return change(tx, current);
 			},
-			context,
+			underAbortMark ? withoutAbortSignal(context) : context,
 			{ conversationId: invocation.conversationId, taskId: invocation.taskId },
 		);
 	}

@@ -163,6 +163,7 @@ export type {
 	SubmissionSettlement,
 	TableCommitChange,
 	Task,
+	TaskCommitOptions,
 	TaskDefinition,
 	TaskDocFamilyToken,
 	TaskDocToken,

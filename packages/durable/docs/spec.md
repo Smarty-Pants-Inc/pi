@@ -1682,6 +1682,7 @@ interface TaskRuntime<I, S, R, H extends object> extends DocumentObserver, Docum
       current: RunningTask<I, S, R>,
     ) => NextTaskState<S, R> | undefined | Promise<NextTaskState<S, R> | undefined>,
     context: Context,
+    options?: { underAbortMark?: boolean },
   ): Promise<void>;
 
   memo<T extends JsonValue>(name: string, context: Context): Promise<T | undefined>;
@@ -1750,7 +1751,11 @@ commits around one effect, but each durable checkpoint is a full replacement.
 `TaskRuntime.commit()` rereads and gates the current durable task on the Session
 line before invoking its callback. It rejects when the invocation has ended, the
 Harness is closing, the task is terminal, or a run invocation's task carries an
-abort mark. Its `tx.createTask()` defaults to the task's conversation, and every
+abort mark. With `underAbortMark`, a run invocation's commit passes the abort
+mark and the cancellation of its context the mark signalled, but its callback
+must return no state; it lets output the mark interrupted, such as a streamed
+partial, become durable for the abort handler, which still decides the outcome.
+Its `tx.createTask()` defaults to the task's conversation, and every
 entry it appends records the task as `byTaskId`. When the
 callback returns a state, the runtime replaces the task's state in the same
 commit, so the checkpoint or outcome is atomic with the callback's entries,

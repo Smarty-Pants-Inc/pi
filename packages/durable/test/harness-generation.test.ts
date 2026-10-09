@@ -490,6 +490,49 @@ describe("generation", () => {
 		await harness.close(context);
 	});
 
+	// smarty-dev#7428: a task abort inside the partial interval must not lose the answer output streamed so far.
+	it("converts the uncommitted answer partial of a stream aborted within the partial interval", async () => {
+		const base = chatSetup();
+		const text = { type: "text" as const, text: "short answer" };
+		const streamed = Promise.withResolvers<void>();
+		let calls = 0;
+		const setup = {
+			...base,
+			models: withStream(base.models, (_model, _request, options) => {
+				calls++;
+				const signal = options!.signal!;
+				const events = async function* () {
+					const partial = fauxAssistantMessage([text], { stopReason: "pending" });
+					yield { type: "text_delta", contentIndex: 0, delta: text.text, partial };
+					streamed.resolve();
+					if (!signal.aborted) await new Promise((resolve) => signal.addEventListener("abort", resolve));
+				};
+				// The terminal message of an aborted stream may drop what it showed.
+				const final = fauxAssistantMessage([], { stopReason: "aborted", errorMessage: "aborted" });
+				return { [Symbol.asyncIterator]: events, result: async () => final } as unknown as ReturnType<
+					Models["streamSimple"]
+				>;
+			}),
+		};
+		// Far beyond the stream's length: no throttled partial commit happens.
+		setup.settings.progress = { ...setup.settings.progress, partialIntervalMs: 60_000 };
+		const { harness, root } = await openChat(new MemoryStorage(), setup);
+		harness.resume();
+		const submission = await root.submit({ type: "input", content: "hi" }, context);
+		const taskId = await runTask(harness, root);
+		await streamed.promise;
+		expect((await live(harness, root))?.generation?.message).toBeUndefined();
+		expect(await harness.abortTask(taskId, context)).toBe("marked");
+		expect(await submission.wait(context)).toMatchObject({ status: "unanswered", reason: "aborted" });
+		expect((await harness.waitForTask(taskId, context)).state.outcome).toEqual({ status: "aborted" });
+		expect(calls).toBe(1);
+		const entries = await allEntries(root);
+		expect(entries.map((entry) => entry.kind)).toEqual(["pi.user", "pi.assistant"]);
+		expect(entries[1]!.model![0]).toMatchObject({ stopReason: "aborted", content: [text] });
+		expect(await live(harness, root)).toEqual({});
+		await harness.close(context);
+	});
+
 	it("cancels a deferred response when aborted during polling", async () => {
 		const setup = chatSetup({ deferred: { pendingFetches: 100, pollAfterMs: 60_000 } });
 		setup.faux.setResponses([fauxAssistantMessage("never")]);

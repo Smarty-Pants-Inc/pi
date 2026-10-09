@@ -384,8 +384,9 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
 /**
  * Stream one request and return the terminal message. Partials commit as trailing writes at most every
  * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle, awaits that
- * commit, and, unless the stream completed normally, commits a still pending partial with answer output, so no stale
- * partial lands after the outcome and recovery from a crash before classification sees every answer output streamed.
+ * commit, and, unless the stream completed normally without an abort, commits a still pending partial with answer
+ * output, so no stale partial lands after the outcome and recovery from a crash before classification, or the abort
+ * handler, sees every answer output streamed.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -407,30 +408,45 @@ async function streamResponse(
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
 	let completed = false;
-	const commitPartial = (partial: AssistantMessage): Promise<void> => {
+	/** Whether the partial committed; `underAbortMark` is only for the abort path's final commit. */
+	const commitPartial = (partial: AssistantMessage, underAbortMark = false): Promise<boolean> => {
 		// Copy synchronously: the provider keeps mutating its partial.
 		const message = copyJson(partial, { omitUndefinedProperties: true });
 		return runtime
-			.commit(async (tx) => {
-				const live = await tx.doc(LiveDoc, runtime.conversationId);
-				live.generation ??= { attempt };
-				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
-				return undefined;
-			}, context)
-			.catch((error: unknown) => {
-				// Rejections after an abort mark or close are expected; the committed state stays consistent.
-				if (!runtime.signal.aborted) runtime.report(error);
-			});
+			.commit(
+				async (tx) => {
+					const live = await tx.doc(LiveDoc, runtime.conversationId);
+					live.generation ??= { attempt };
+					assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
+					return undefined;
+				},
+				context,
+				{ underAbortMark },
+			)
+			.then(
+				() => true,
+				(error: unknown) => {
+					// Rejections after an abort mark or close are expected; the committed state stays consistent.
+					if (!runtime.signal.aborted) runtime.report(error);
+					return false;
+				},
+			);
 	};
 	const flush = (): void => {
 		timer = undefined;
+		// Once signalled, the partial waits for the commit in `finally`, the only one an abort mark lets pass.
+		if (pending === undefined || stopped || runtime.signal.aborted) return;
 		const partial = pending;
 		pending = undefined;
-		if (partial === undefined || stopped) return;
-		inFlight = commitPartial(partial).finally(() => {
-			inFlight = undefined;
-			if (pending !== undefined && !stopped) timer = setTimeout(flush, interval);
-		});
+		inFlight = commitPartial(partial)
+			.then((saved) => {
+				// An abort mark that landed first rejected it; `finally` commits it unless a newer partial replaced it.
+				if (!saved && runtime.signal.aborted) pending ??= partial;
+			})
+			.finally(() => {
+				inFlight = undefined;
+				if (pending !== undefined && !stopped) timer = setTimeout(flush, interval);
+			});
 	};
 	try {
 		const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
@@ -455,7 +471,12 @@ async function streamResponse(
 		// recovers it instead of resending. A normal completion commits nothing extra: its classification commit records
 		// the final message. A partial without answer output is left to the classification commit, so the reasoning of a
 		// retried attempt stays held.
-		if (!completed && pending !== undefined && hasAssistantAnswerOutput(pending)) await commitPartial(pending);
+		// smarty-dev#7428: after a task abort, which also skips classification, this commit passes the abort mark, so the
+		// abort handler converts the answer output instead of losing it.
+		const signalled = runtime.signal.aborted;
+		if ((!completed || signalled) && pending !== undefined && hasAssistantAnswerOutput(pending)) {
+			await commitPartial(pending, signalled);
+		}
 	}
 }
 
