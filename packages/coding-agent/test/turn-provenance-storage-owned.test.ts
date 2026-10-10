@@ -78,7 +78,8 @@ describe("owned receipt materialization and publication", () => {
 			revision: m.revision(),
 		});
 		const bytes = Buffer.from(j.bytes);
-		const clone = vi.spyOn(globalThis, "structuredClone");
+		// pi#194: snapshots are the persisted JSON form, one JSON.parse per newly seen entry.
+		const clone = vi.spyOn(JSON, "parse");
 		try {
 			const entries = view.getEntries();
 			expect(clone).toHaveBeenCalledTimes(2);
