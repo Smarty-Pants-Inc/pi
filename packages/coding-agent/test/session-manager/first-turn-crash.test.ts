@@ -331,7 +331,9 @@ for (const storage of ["plain", "owned"] as const) {
 						return;
 					}
 					const compiler = process.env.PI_APPEND_CC ?? "cc";
-					const available = spawnSync(compiler, ["--version"], { encoding: "utf8", timeout: 5000 });
+					// ponytail: loaded merge-queue runners took >30 s to compile this addon (pi#193, queue draft #196);
+					// generous bounds keep the Linux native evidence unskipped instead of flaking.
+					const available = spawnSync(compiler, ["--version"], { encoding: "utf8", timeout: 30_000 });
 					if (available.error || available.status !== 0) {
 						nativeUnavailable = `Native probe compiler unavailable: ${compiler}`;
 						return;
@@ -354,11 +356,11 @@ for (const storage of ["plain", "owned"] as const) {
 							"-o",
 							addon,
 						],
-						{ encoding: "utf8", timeout: 30_000 },
+						{ encoding: "utf8", timeout: 180_000 },
 					);
 					expect(compiled.error).toBeUndefined();
 					expect(compiled.status, compiled.stderr).toBe(0);
-				});
+				}, 240_000);
 			}
 			// smarty-code#1681 acceptance (a), (b), (c), plus the pre-delta custom-entry seam.
 			test.for(boundaries)(
