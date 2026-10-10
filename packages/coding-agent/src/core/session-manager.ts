@@ -40,7 +40,14 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
-import { materializeOwnedEntry, parseOwnedSessionEntries } from "./owned-session-entries.ts";
+import {
+	materializeOwnedEntry,
+	type OwnedSessionEntryMetadata,
+	ownedSessionEntryMetadata,
+	parseOwnedSessionEntries,
+	validateOwnedSessionEntry,
+	validateOwnedSessionHeader,
+} from "./owned-session-entries.ts";
 import { isOwnedTerminalWrite, OwnedJournal } from "./owner-effects.ts";
 import {
 	copyEntry,
@@ -1090,7 +1097,9 @@ export class SessionManager {
 	};
 	#revisionKey: { entries: FileEntry[]; length: number; leafId: string | null } | undefined;
 	readonly #ownedJournal?: OwnedJournal;
-	private ownedBytes: Buffer = Buffer.alloc(0);
+	readonly #ownedEntryIndex = new Map<string, OwnedSessionEntryMetadata>();
+	// Undefined means the trusted bootstrap was committed, regardless of public `flushed`.
+	#ownedBootstrap: Buffer | undefined;
 	#ownedTerminalTail: Promise<void> = Promise.resolve();
 	#ownedTerminalPending = 0;
 	#terminalIndexFailure?: { error: unknown; entry: SessionEntry; bytes: Buffer; nativeWriteAccepted: true };
@@ -1124,15 +1133,19 @@ export class SessionManager {
 			this.sessionFile = ownedJournal.file;
 			this.sessionId = ownedJournal.sessionId;
 			this.persist = true;
-			this.ownedBytes = ownedJournal.read();
+			const bytes = ownedJournal.read();
 			try {
 				this.fileEntries =
-					this.ownedBytes.length > 0
-						? parseOwnedSessionEntries(this.ownedBytes, this.sessionId)
-						: [materializeOwnedEntry(ownedJournal.initialHeader)];
+					bytes.length > 0
+						? parseOwnedSessionEntries(bytes, this.sessionId)
+						: [validateOwnedSessionHeader(materializeOwnedEntry(ownedJournal.initialHeader), this.sessionId)];
 				const header = this.fileEntries[0] as SessionHeader;
 				this.cwd = header.cwd;
-				this.flushed = this.ownedBytes.length > 0;
+				this.flushed = bytes.length > 0;
+				if (bytes.length === 0) this.#ownedBootstrap = Buffer.from(`${JSON.stringify(header)}\n`);
+				for (const entry of this.fileEntries) {
+					if (entry.type !== "session") this.#ownedEntryIndex.set(entry.id, ownedSessionEntryMetadata(entry));
+				}
 				this._buildIndex();
 			} catch (error) {
 				try {
@@ -1426,16 +1439,13 @@ export class SessionManager {
 		if (this.#ownedTerminalPending) throw new Error("OWNER_TERMINAL_APPEND_BUSY");
 		if (this.#ownedJournal) {
 			this.#ownedJournal.assertWritable();
-			const admitted = materializeOwnedEntry(entry);
-			const prefix = this.flushed ? this.ownedBytes : this.encodeOwnedEntries();
-			const bytes = Buffer.concat([prefix, Buffer.from(`${JSON.stringify(admitted)}\n`)]);
-			const selected = parseOwnedSessionEntries(bytes, this.sessionId);
-			const published = selected[selected.length - 1] as SessionEntry;
+			const published = validateOwnedSessionEntry(materializeOwnedEntry(entry), this.#ownedEntryIndex);
 			sealEntryProvenance(published, false);
-			// Publish before changing the canonical index or acknowledging the entry.
-			this.#ownedJournal.commit(bytes);
-			this.ownedBytes = bytes;
-			this.flushed = true;
+			const line = Buffer.from(`${JSON.stringify(published)}\n`);
+			if (this.#ownedBootstrap) this.#persistOwnedBootstrap();
+			// Publish only the admitted suffix before changing the canonical index or acknowledging the entry.
+			this.#ownedJournal.append(line);
+			this.#ownedEntryIndex.set(published.id, ownedSessionEntryMetadata(published));
 			this.fileEntries.push(published);
 			this.byId.set(published.id, published);
 			this.leafId = published.id;
@@ -1536,22 +1546,24 @@ export class SessionManager {
 	async #appendEntryOwnedTerminal(entry: SessionEntry): Promise<void> {
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		this.#ownedJournal.assertWritable();
-		const admitted = materializeOwnedEntry(entry);
-		const prefix = this.flushed ? this.ownedBytes : this.encodeOwnedEntries();
-		const bytes = Buffer.concat([prefix, Buffer.from(`${JSON.stringify(admitted)}\n`)]);
-		const selected = parseOwnedSessionEntries(bytes, this.sessionId);
-		const published = selected[selected.length - 1] as SessionEntry;
+		const published = validateOwnedSessionEntry(materializeOwnedEntry(entry), this.#ownedEntryIndex);
 		sealEntryProvenance(published, false);
-		await this.#ownedJournal.commitTerminalAsync(bytes);
+		const line = Buffer.from(`${JSON.stringify(published)}\n`);
+		if (this.#ownedBootstrap) {
+			await this.#ownedJournal.commitTerminalAsync(this.#ownedBootstrap);
+			this.#ownedJournal.assertWritable();
+			this.#ownedBootstrap = undefined;
+			this.flushed = true;
+		}
+		await this.#ownedJournal.appendTerminalAsync(line);
 		try {
 			this.#ownedJournal.assertWritable();
-			this.ownedBytes = bytes;
-			this.flushed = true;
+			this.#ownedEntryIndex.set(published.id, ownedSessionEntryMetadata(published));
 			this.fileEntries.push(published);
 			this.byId.set(published.id, published);
 			this.leafId = published.id;
 		} catch (error) {
-			this.#terminalIndexFailure ??= { error, entry: published, bytes, nativeWriteAccepted: true };
+			this.#terminalIndexFailure ??= { error, entry: published, bytes: line, nativeWriteAccepted: true };
 			try {
 				this.#ownedJournal.quarantine();
 			} catch (cleanup) {
@@ -1569,16 +1581,25 @@ export class SessionManager {
 		return this.#enqueueOwnedTerminal(async () => {
 			journal.assertWritable();
 			if (!isOwnedTerminalWrite(journal)) throw new Error("OWNER_TERMINAL_STATE");
-			// Every successful owned append already published ownedBytes. Only an
+			// Every successful owned append already published its suffix. Only an
 			// unflushed header needs a final write; never use the active-only reader.
-			if (!this.flushed) {
-				const bytes = this.encodeOwnedEntries();
-				await journal.commitTerminalAsync(bytes);
+			if (this.#ownedBootstrap) {
+				await journal.commitTerminalAsync(this.#ownedBootstrap);
 				journal.assertWritable();
-				this.ownedBytes = bytes;
+				this.#ownedBootstrap = undefined;
 				this.flushed = true;
 			}
 		});
+	}
+
+	#persistOwnedBootstrap(): { bytes: number; sha256: string } {
+		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
+		this.#ownedJournal.assertWritable();
+		if (!this.#ownedBootstrap) return this.#ownedJournal.currentReceipt();
+		const receipt = this.#ownedJournal.commit(this.#ownedBootstrap);
+		this.#ownedBootstrap = undefined;
+		this.flushed = true;
+		return receipt;
 	}
 
 	private encodeOwnedEntries(): Buffer {
@@ -1600,9 +1621,7 @@ export class SessionManager {
 		if (this.#ownedTerminalPending) throw new Error("OWNER_TERMINAL_APPEND_BUSY");
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		this.#ownedJournal.assertWritable();
-		const bytes = this.flushed ? this.ownedBytes : this.encodeOwnedEntries();
-		const receipt = this.#ownedJournal.commit(bytes);
-		this.ownedBytes = bytes;
+		const receipt = this.#persistOwnedBootstrap();
 		this.flushed = true;
 		return { sessionId: this.sessionId, file: this.#ownedJournal.file, ...receipt };
 	}
@@ -2151,15 +2170,24 @@ export class SessionManager {
 		}
 		const child = SessionManager.openOwned(this.cwd, journal);
 		const header = materializeOwnedEntry({ ...child.getHeader()!, parentSession: this.sessionFile });
+		let selected: FileEntry[];
 		if (leafId === null) {
-			child.fileEntries = [header];
+			selected = [validateOwnedSessionHeader(header, journal.sessionId)];
 		} else {
-			const scratch = SessionManager.inMemory(this.cwd, undefined, this.fileEntries.map(materializeOwnedEntry));
+			// An explicit fork imports committed history, not caller-mutable presentation indices.
+			const bytes = this.#ownedJournal.read();
+			const entries = bytes.length > 0 ? parseOwnedSessionEntries(bytes, this.#ownedJournal.sessionId) : undefined;
+			const scratch = SessionManager.inMemory(this.cwd, undefined, entries);
 			scratch.selectBranchedSession(leafId, header);
-			child.fileEntries = parseOwnedSessionEntries(scratch.encodeOwnedEntries(), journal.sessionId);
+			selected = parseOwnedSessionEntries(scratch.encodeOwnedEntries(), journal.sessionId);
+		}
+		child.#ownedBootstrap = Buffer.from(`${selected.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
+		child.#persistOwnedBootstrap();
+		child.fileEntries = selected;
+		for (const entry of selected) {
+			if (entry.type !== "session") child.#ownedEntryIndex.set(entry.id, ownedSessionEntryMetadata(entry));
 		}
 		child._buildIndex();
-		child.persistCurrent();
 		return child;
 	}
 
