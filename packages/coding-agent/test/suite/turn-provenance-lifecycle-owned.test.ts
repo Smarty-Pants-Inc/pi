@@ -31,6 +31,15 @@ vi.mock("../../src/core/owner-effects.ts", async (importOriginal) => ({
 			this.bytes = Buffer.from(bytes);
 			return { bytes: bytes.length, sha256: "synthetic" };
 		}
+		append(suffix: Buffer) {
+			this.bytes = Buffer.concat([this.bytes, suffix]);
+		}
+		async appendTerminalAsync(suffix: Buffer) {
+			this.append(suffix);
+		}
+		currentReceipt() {
+			return { bytes: this.bytes.length, sha256: "synthetic" };
+		}
 		async commitTerminalAsync(bytes: Buffer) {
 			return this.commit(bytes);
 		}
