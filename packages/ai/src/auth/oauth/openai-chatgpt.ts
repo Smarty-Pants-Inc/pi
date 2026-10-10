@@ -51,12 +51,14 @@ function randomValue(): string {
 	return randomBytes(32).toString("base64url");
 }
 
-function authorizationResultFromCallback(url: URL, expectedState: string): AuthorizationResult {
-	const code = url.searchParams.get("code");
-	if (!code) throw new Error("Missing authorization code");
+function authorizationResultFromCallback(url: URL, expectedState: string): AuthorizationResult | { error: string } {
 	const state = url.searchParams.get("state");
 	if (!state) throw new Error("Missing OAuth state");
 	if (state !== expectedState) throw new Error("OAuth state mismatch");
+	const error = url.searchParams.get("error");
+	if (error) return { error: oauthAuthorizationError(error) };
+	const code = url.searchParams.get("code");
+	if (!code) throw new Error("Missing authorization code");
 	const clientId = url.searchParams.get("client_id")?.trim();
 	if (!clientId) throw new Error("OpenAI OAuth registration callback did not contain an issued client ID");
 	return { code, clientId };
@@ -73,9 +75,9 @@ function authorizationResultFromManualInput(input: string, expectedState: string
 	if (url.origin !== expected.origin || url.pathname !== expected.pathname) {
 		throw new Error(`The pasted callback URL must start with ${REDIRECT_URI}`);
 	}
-	const error = url.searchParams.get("error");
-	if (error) throw new Error(`ChatGPT authorization failed: ${oauthAuthorizationError(error)}`);
-	return authorizationResultFromCallback(url, expectedState);
+	const result = authorizationResultFromCallback(url, expectedState);
+	if ("error" in result) throw new Error(`ChatGPT authorization failed: ${result.error}`);
+	return result;
 }
 
 function sendHtml(response: ServerResponse, status: number, body: string): void {
@@ -100,20 +102,19 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 					return;
 				}
 
-				const error = url.searchParams.get("error");
-				if (error) {
-					const code = oauthAuthorizationError(error);
-					sendHtml(response, 400, oauthErrorHtml("ChatGPT was not connected.", `Error: ${code}`));
-					rejectResult(new Error(`ChatGPT authorization failed: ${code}`));
-					return;
-				}
-
-				let authorizationResult: AuthorizationResult;
+				let authorizationResult: ReturnType<typeof authorizationResultFromCallback>;
 				try {
 					authorizationResult = authorizationResultFromCallback(url, expectedState);
 				} catch (error) {
 					const message = error instanceof Error ? error.message : "Invalid callback";
 					sendHtml(response, 400, oauthErrorHtml(message));
+					return;
+				}
+
+				if ("error" in authorizationResult) {
+					const code = authorizationResult.error;
+					sendHtml(response, 400, oauthErrorHtml("ChatGPT was not connected.", `Error: ${code}`));
+					rejectResult(new Error(`ChatGPT authorization failed: ${code}`));
 					return;
 				}
 

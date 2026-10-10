@@ -100,6 +100,32 @@ describe.sequential("OAuth callback server", () => {
 		await expect(server.wait()).rejects.toThrow("token exchange failed");
 	});
 
+	// pi#156 SEC P2: shared loopback providers must validate state before accepting an error.
+	it.each([undefined, "wrong-state"])("ignores an authorization error with invalid state %s", async (state) => {
+		const server = await start<string>();
+		let settled = false;
+		void server.wait().then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
+		const params: Record<string, string> = { error: "access_denied" };
+		if (state !== undefined) params.state = state;
+		const failure = await page(await nativeFetch(callbackUrl(server.redirectUri, params)));
+		expect(failure).toMatchObject({ status: 400, contentType: "text/html; charset=utf-8" });
+		expect(failure.body).toContain("State mismatch.");
+		expect(settled).toBe(false);
+
+		const success = await page(
+			await nativeFetch(callbackUrl(server.redirectUri, { code: "the-code", state: "expected-state" })),
+		);
+		expect(success.status).toBe(200);
+		await expect(server.wait()).resolves.toBe("completed:the-code");
+	});
+
 	it("rejects the wait when the provider redirects with an error", async () => {
 		const server = await start<string>();
 		const failure = await page(

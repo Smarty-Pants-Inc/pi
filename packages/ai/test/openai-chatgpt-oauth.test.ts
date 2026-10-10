@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { openaiChatGPTOAuth } from "../src/auth/oauth/openai-chatgpt.ts";
-import type { OAuthCredential, ProviderAuthInteraction } from "../src/auth/types.ts";
+import type { AuthPrompt, OAuthCredential, ProviderAuthInteraction } from "../src/auth/types.ts";
 
 const TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token";
 const REQUIRED_SCOPE = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct";
 const neverAbortedSignal = new AbortController().signal;
 const DEVICE_ID = "e61bbe28-07ef-466d-8e5d-a344f94ab305";
+const nativeFetch = globalThis.fetch;
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -34,6 +35,7 @@ function stubTokenEndpoint(response: unknown, inspect?: (body: URLSearchParams) 
 function loginInteraction(options?: {
 	callbackClientId?: string;
 	onAuthorize?: (url: URL) => void;
+	onCallback?: (url: URL, prompt: AuthPrompt) => Promise<string>;
 }): ProviderAuthInteraction {
 	let authorizeUrl: URL | undefined;
 	return {
@@ -50,7 +52,49 @@ function loginInteraction(options?: {
 			callback.searchParams.set("code", "authorization-code");
 			callback.searchParams.set("state", authorizeUrl.searchParams.get("state") ?? "");
 			if (options?.callbackClientId) callback.searchParams.set("client_id", options.callbackClientId);
-			return callback.toString();
+			return options?.onCallback ? options.onCallback(callback, prompt) : callback.toString();
+		},
+	};
+}
+
+async function startBrowserLogin() {
+	const ready = Promise.withResolvers<URL>();
+	const manual = Promise.withResolvers<string>();
+	const fetchMock = stubTokenEndpoint(tokenResponse());
+	let settled = false;
+	const login = openaiChatGPTOAuth.login(
+		loginInteraction({
+			callbackClientId: "oaiapp_issued",
+			onCallback: (url, prompt) => {
+				prompt.signal?.addEventListener("abort", () => manual.reject(new Error("prompt aborted")), { once: true });
+				ready.resolve(url);
+				return manual.promise;
+			},
+		}),
+		{ getDeviceId: () => DEVICE_ID },
+	);
+	void login.then(
+		() => {
+			settled = true;
+		},
+		() => {
+			settled = true;
+		},
+	);
+	const callback = await Promise.race([
+		ready.promise,
+		login.then(() => {
+			throw new Error("Expected browser callback");
+		}),
+	]);
+	return {
+		callback,
+		login,
+		fetchMock,
+		isSettled: () => settled,
+		close: async () => {
+			manual.reject(new Error("test cleanup"));
+			await login.catch(() => undefined);
 		},
 	};
 }
@@ -106,6 +150,54 @@ describe("OpenAI ChatGPT OAuth", () => {
 			clientId: "oaiapp_issued",
 			scopes: REQUIRED_SCOPE.split(" "),
 		});
+	});
+
+	// pi#156 SEC P2: unauthenticated error callbacks must not abort a pending login.
+	it.each([undefined, "wrong-state"])("ignores an authorization error with invalid state %s", async (state) => {
+		const browser = await startBrowserLogin();
+		try {
+			const errorCallback = new URL(browser.callback);
+			errorCallback.searchParams.delete("code");
+			errorCallback.searchParams.delete("client_id");
+			errorCallback.searchParams.set("error", "access_denied");
+			if (state === undefined) errorCallback.searchParams.delete("state");
+			else errorCallback.searchParams.set("state", state);
+
+			const response = await nativeFetch(errorCallback);
+			expect(response.status).toBe(400);
+			expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+			const body = await response.text();
+			expect(browser.isSettled()).toBe(false);
+			expect(body).toContain(state === undefined ? "Missing OAuth state" : "OAuth state mismatch");
+			expect(browser.fetchMock).not.toHaveBeenCalled();
+
+			const success = await nativeFetch(browser.callback);
+			expect(success.status).toBe(200);
+			await success.text();
+			await expect(browser.login).resolves.toMatchObject({ access: "access-token", clientId: "oaiapp_issued" });
+			expect(browser.fetchMock).toHaveBeenCalledTimes(1);
+		} finally {
+			await browser.close();
+		}
+	});
+
+	// pi#156 SEC P2: only an error carrying the expected state may reject the login.
+	it("rejects an authorization error with the expected state", async () => {
+		const browser = await startBrowserLogin();
+		try {
+			const errorCallback = new URL(browser.callback);
+			errorCallback.searchParams.delete("code");
+			errorCallback.searchParams.delete("client_id");
+			errorCallback.searchParams.set("error", "access_denied");
+			const rejection = expect(browser.login).rejects.toThrow("ChatGPT authorization failed: access_denied");
+			const response = await nativeFetch(errorCallback);
+			expect(response.status).toBe(400);
+			expect(await response.text()).toContain("access_denied");
+			await rejection;
+			expect(browser.fetchMock).not.toHaveBeenCalled();
+		} finally {
+			await browser.close();
+		}
 	});
 
 	it("uses the app's agent name as the name hint", async () => {
