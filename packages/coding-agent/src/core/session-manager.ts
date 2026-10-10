@@ -393,7 +393,9 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 			if (!entry) return undefined;
 			let detached = snapshots.get(entry);
 			if (!detached) {
-				detached = freezeDetached(structuredClone(entry));
+				// ponytail: match #writeEntries/#appendLine and reload's JSON form before freezing.
+				// Typed arrays cannot be frozen, and frozen Map/Set objects still allow mutation.
+				detached = freezeDetached(JSON.parse(JSON.stringify(entry)) as SessionEntry);
 				snapshots.set(entry, detached);
 			}
 			return detached;
