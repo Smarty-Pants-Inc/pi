@@ -337,24 +337,26 @@ export type ReadonlySessionManager = Pick<
 	| "getSessionName"
 >;
 
-const READONLY_SESSION_METHODS = [
-	"getCwd",
-	"getSessionDir",
-	"getSessionId",
-	"getSessionFile",
-	"getLeafId",
-	"getLeafEntry",
-	"getEntry",
-	"getLabel",
-	"getBranch",
-	"buildContextEntries",
-	"buildSessionProjection",
-	"getHeader",
-	"getEntries",
-	"getTree",
-	"getSessionName",
-] as const satisfies readonly (keyof ReadonlySessionManager)[];
+type DetachedSessionSource = Pick<
+	ReadonlySessionManager,
+	"getLeafEntry" | "getEntry" | "getBranch" | "buildContextEntries" | "getEntries" | "getTree"
+>;
+// Only the detached view may use these native readers, bypassing ownedView's full-history copies.
+const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
 const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
+
+function freezeDetached<T>(value: T): T {
+	const pending: unknown[] = [value];
+	const seen = new WeakSet<object>();
+	while (pending.length) {
+		const node = pending.pop();
+		if (node === null || typeof node !== "object" || Object.isFrozen(node) || seen.has(node)) continue;
+		seen.add(node);
+		for (const child of Object.values(node)) pending.push(child);
+		Object.freeze(node);
+	}
+	return value;
+}
 
 /**
  * Extension-facing history reads return deep-detached values, so a retained entry edited
@@ -363,13 +365,54 @@ const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
 export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySessionManager {
 	let view = detachedSessionViews.get(manager);
 	if (!view) {
-		const methods: Record<string, unknown> = {};
-		for (const name of READONLY_SESSION_METHODS) {
-			const method = manager[name] as (...args: unknown[]) => unknown;
-			if (typeof method === "function")
-				methods[name] = (...args: unknown[]) => structuredClone(method.apply(manager, args));
-		}
-		view = Object.freeze(methods) as unknown as ReadonlySessionManager;
+		const source = detachedSessionSources.get(manager) ?? manager;
+		const snapshots = new WeakMap<SessionEntry, SessionEntry>();
+		// ponytail: retain one detached payload per native entry identity, trading that memory
+		// for O(n) pointer-only reads. Labels/edits append; forks and cold/hot changes replace
+		// entries. Invalidate here if a future native path mutates a published entry in place.
+		const snapshot = (entry: SessionEntry | undefined): SessionEntry | undefined => {
+			if (!entry) return undefined;
+			let detached = snapshots.get(entry);
+			if (!detached) {
+				detached = freezeDetached(structuredClone(entry));
+				snapshots.set(entry, detached);
+			}
+			return detached;
+		};
+		const entries = (values: SessionEntry[]): SessionEntry[] => {
+			const detached = values.map((entry) => snapshot(entry)!);
+			Object.freeze(detached);
+			return detached;
+		};
+		view = Object.freeze({
+			getCwd: manager.getCwd.bind(manager),
+			getSessionDir: manager.getSessionDir.bind(manager),
+			getSessionId: manager.getSessionId.bind(manager),
+			getSessionFile: manager.getSessionFile.bind(manager),
+			getLeafId: manager.getLeafId.bind(manager),
+			getLeafEntry: () => snapshot(source.getLeafEntry()),
+			getEntry: (id: string) => snapshot(source.getEntry(id)),
+			getLabel: manager.getLabel.bind(manager),
+			getBranch: (fromId?: string) => entries(source.getBranch(fromId)),
+			buildContextEntries: () => entries(source.buildContextEntries()),
+			buildSessionProjection: () => freezeDetached(buildSessionProjection(entries(source.getBranch()))),
+			getHeader: () => freezeDetached(structuredClone(manager.getHeader())),
+			getEntries: () => entries(source.getEntries()),
+			getTree: () => {
+				const roots = source.getTree();
+				const nodes = new Map<SessionTreeNode, SessionTreeNode>();
+				const pending = [...roots];
+				while (pending.length) {
+					const node = pending.pop()!;
+					if (nodes.has(node)) continue;
+					nodes.set(node, { ...node, entry: snapshot(node.entry)!, children: [] });
+					for (const child of node.children) pending.push(child);
+				}
+				for (const [node, detached] of nodes) detached.children = node.children.map((child) => nodes.get(child)!);
+				return freezeDetached(roots.map((node) => nodes.get(node)!));
+			},
+			getSessionName: manager.getSessionName.bind(manager),
+		} satisfies ReadonlySessionManager);
 		detachedSessionViews.set(manager, view);
 	}
 	return view;
@@ -1145,6 +1188,15 @@ export class SessionManager {
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
 		this.#ownedJournal = ownedJournal;
+		detachedSessionSources.set(this, {
+			getLeafEntry: () => (this.leafId ? this.byId.get(this.leafId) : undefined),
+			getEntry: (id) => this.byId.get(id),
+			getBranch: (fromId) => this.getBranchEntries(fromId),
+			buildContextEntries: () => this.getBranchProjection().contextEntries.slice(),
+			getEntries: () => this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session"),
+			getTree: () =>
+				this.buildTree(this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session")),
+		});
 		bindSessionTurnAppender(this, {
 			appendMessage: (message, receipt) => this.#appendReceivedMessage(message, receipt),
 			appendCustomMessage: (customType, content, display, details, receipt) =>
@@ -1962,8 +2014,12 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		return this.ownedView(this.getBranchEntries(fromId));
+	}
+
+	private getBranchEntries(fromId?: string): SessionEntry[] {
 		if (fromId === undefined || fromId === this.leafId) {
-			return this.ownedView(this.getBranchProjection().path.slice());
+			return this.getBranchProjection().path.slice();
 		}
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
@@ -1973,7 +2029,7 @@ export class SessionManager {
 			current = current.parentId ? this.byId.get(current.parentId) : undefined;
 		}
 		path.reverse();
-		return this.ownedView(path);
+		return path;
 	}
 
 	/**
@@ -2065,7 +2121,10 @@ export class SessionManager {
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries();
+		return this.buildTree(this.getEntries());
+	}
+
+	private buildTree(entries: SessionEntry[]): SessionTreeNode[] {
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 

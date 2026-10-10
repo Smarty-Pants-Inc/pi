@@ -4,6 +4,7 @@ import { OwnedJournal } from "../src/core/owner-effects.ts";
 import {
 	appendOwnedTerminalCustomMessage,
 	appendOwnedTerminalMessage,
+	detachedSessionView,
 	type SessionHeader,
 	SessionManager,
 } from "../src/core/session-manager.ts";
@@ -54,6 +55,53 @@ function journal(bytes?: Buffer): JournalFixture {
 }
 
 describe("owned receipt materialization and publication", () => {
+	// pi#163 SEC/Astra P2 / pi#132 R4-3: bypass owned full-history clones without exposing native entries.
+	test("detached owned reads reuse frozen snapshots and cannot change journal bytes", () => {
+		const j = journal();
+		const m = SessionManager.openOwned("/synthetic", j);
+		const id = m.appendMessage({ role: "user", content: [{ type: "text", text: "original" }], timestamp: 1 });
+		m.appendCustomMessageEntry("custom", "visible", true, { nested: [{ value: 1 }] });
+		const view = detachedSessionView(m);
+		const before = JSON.stringify({
+			entries: m.getEntries(),
+			projection: m.buildSessionProjection(),
+			revision: m.revision(),
+		});
+		const bytes = Buffer.from(j.bytes);
+		const clone = vi.spyOn(globalThis, "structuredClone");
+		try {
+			const entries = view.getEntries();
+			expect(clone).toHaveBeenCalledTimes(2);
+			for (let i = 0; i < 100; i++) {
+				expect(view.getEntries()[0]).toBe(entries[0]);
+				expect(view.getBranch()[0]).toBe(entries[0]);
+				expect(view.buildContextEntries()[0]).toBe(entries[0]);
+				expect(view.getEntry(id)).toBe(entries[0]);
+				expect(view.getLeafEntry()).toBe(entries[1]);
+				expect(view.buildSessionProjection().entries[0].sourceEntry).toBe(entries[0]);
+				expect(view.getTree()[0].entry).toBe(entries[0]);
+			}
+			expect(clone).toHaveBeenCalledTimes(2);
+			expect(() => {
+				entries[0].parentId = "edited";
+			}).toThrow(TypeError);
+			expect(() => {
+				(view.buildSessionProjection().messages[0] as { content: { text: string }[] }).content[0].text = "edited";
+			}).toThrow(TypeError);
+			expect(
+				JSON.stringify({ entries: m.getEntries(), projection: m.buildSessionProjection(), revision: m.revision() }),
+			).toBe(before);
+			expect(j.bytes).toEqual(bytes);
+			m.appendCustomEntry("new", { value: 2 });
+			clone.mockClear();
+			expect(view.getEntries()[0]).toBe(entries[0]);
+			expect(view.getEntries()).toHaveLength(3);
+			expect(clone).toHaveBeenCalledTimes(1);
+		} finally {
+			clone.mockRestore();
+		}
+	});
+
 	test("normalizes the reserved undefined slot but preserves strict refusal of accessors and nested non-JSON", () => {
 		const m = SessionManager.inMemory();
 		const id = m.appendCustomEntry("state");
