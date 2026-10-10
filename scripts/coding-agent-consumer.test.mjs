@@ -65,12 +65,12 @@ export function consumeOrdinaryPairedInput() { throw new Error("Synthetic consum
 				"dist/core/extensions/loader.js": `
 import { captureOrdinaryRequestPair, consumeOrdinaryPairedInput } from "../../ordinary.js";
 export async function loadExtensions() {
+  // Stands in for running the probe extension, which hands back the imported references.
+  globalThis.__piOrdinaryCaptureIdentity = captureOrdinaryRequestPair;
+  globalThis.__piOrdinaryConsumeIdentity = consumeOrdinaryPairedInput;
   return {
     errors: [],
-    extensions: [{ messageRenderers: new Map([
-      ["ordinary-capture-identity", captureOrdinaryRequestPair],
-      ["ordinary-consume-identity", consumeOrdinaryPairedInput],
-    ]) }],
+    extensions: [{ messageRenderers: new Map() }],
     runtime: { invalidate() {} },
   };
 }
@@ -139,8 +139,8 @@ test("requires the ordinary export and rejects changed public or loader function
 			"captureOrdinaryRequestPair, captureOrdinaryRequestPair as consumeOrdinaryPairedInput",
 		)],
 		["dist/core/extensions/loader.js", text => text.replace(
-			'["ordinary-consume-identity", consumeOrdinaryPairedInput]',
-			'["ordinary-consume-identity", () => {}]',
+			"globalThis.__piOrdinaryConsumeIdentity = consumeOrdinaryPairedInput;",
+			"globalThis.__piOrdinaryConsumeIdentity = () => {};",
 		)],
 	];
 	for (const [path, change] of cases) {
