@@ -132,17 +132,20 @@ assert.throws(() => assertOrdinaryOwner(Object.create(OrdinaryOwnerContext.proto
 const extension = ${JSON.stringify(join(home, "ordinary-identity.ts"))};
 writeFileSync(extension, ${JSON.stringify(`import { captureOrdinaryRequestPair, consumeOrdinaryPairedInput } from "${codingAgentName}/ordinary";
 export default function(pi) {
-  pi.registerMessageRenderer("ordinary-capture-identity", captureOrdinaryRequestPair);
-  pi.registerMessageRenderer("ordinary-consume-identity", consumeOrdinaryPairedInput);
+  globalThis.__piOrdinaryCaptureIdentity = captureOrdinaryRequestPair;
+  globalThis.__piOrdinaryConsumeIdentity = consumeOrdinaryPairedInput;
 }
 `)});
 const loaded = await loadExtensions([extension], ${JSON.stringify(home)});
 try {
   assert.deepEqual(loaded.errors, []);
   assert.equal(loaded.extensions.length, 1);
-  assert.equal(loaded.extensions[0].messageRenderers.get("ordinary-capture-identity"), originalCapture);
-  assert.equal(loaded.extensions[0].messageRenderers.get("ordinary-consume-identity"), originalConsume);
+  // Registered renderers are source-bound wrappers (pi#187); the imported references come back through test globals.
+  assert.equal(globalThis.__piOrdinaryCaptureIdentity, originalCapture);
+  assert.equal(globalThis.__piOrdinaryConsumeIdentity, originalConsume);
 } finally {
+  delete globalThis.__piOrdinaryCaptureIdentity;
+  delete globalThis.__piOrdinaryConsumeIdentity;
   loaded.runtime.invalidate();
 }
 writeFileSync(${JSON.stringify(join(home, "ordinary-consumer-proof.json"))}, JSON.stringify({
