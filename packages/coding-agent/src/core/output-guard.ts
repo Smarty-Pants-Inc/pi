@@ -1,3 +1,5 @@
+import { type ChildProcess, spawn } from "node:child_process";
+
 interface StdoutTakeoverState {
 	rawStdoutWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
 	rawStderrWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
@@ -100,6 +102,50 @@ export async function waitForRawStdoutBackpressure(): Promise<void> {
 			return;
 		}
 	}
+}
+
+/**
+ * Write final exit output without letting the stdout consumer block this process.
+ * A synchronous TTY or pipe write to an unread terminal blocks the event loop forever,
+ * so a child process owns the blocking write and this process only waits `timeoutMs`.
+ * Returns "incomplete" when the consumer did not take all bytes in time (pi#132 R4-5).
+ * One deadline covers both the queued raw stdout writes and the child delivery.
+ */
+export async function writeStdoutBounded(text: string, timeoutMs: number): Promise<"complete" | "incomplete"> {
+	let expired = false;
+	let child: ChildProcess | undefined;
+	let timer: NodeJS.Timeout | undefined;
+	const deadline = new Promise<"incomplete">((resolve) => {
+		timer = setTimeout(() => {
+			expired = true;
+			resolve("incomplete");
+		}, timeoutMs);
+	});
+	const deliver = async (): Promise<"complete" | "incomplete"> => {
+		await waitForRawStdoutBackpressure();
+		if (expired) return "incomplete";
+		// Absolute paths only: a PATH lookup would let a hostile PATH entry run code at shutdown (pi#163).
+		// Windows has no trusted `cat`, and its pipe and console writes can block too, so this runtime
+		// copies stdin to stdout itself; BUN_BE_BUN=1 makes a compiled Bun binary act as `bun`.
+		const copier =
+			process.platform === "win32"
+				? spawn(process.execPath, ["-e", "process.stdin.pipe(process.stdout)"], {
+						stdio: ["pipe", "inherit", "ignore"],
+						env: { ...process.env, BUN_BE_BUN: "1" },
+					})
+				: spawn("/bin/cat", [], { stdio: ["pipe", "inherit", "ignore"] });
+		child = copier;
+		return new Promise((resolve) => {
+			copier.on("error", () => resolve("incomplete"));
+			copier.on("close", (code) => resolve(code === 0 ? "complete" : "incomplete"));
+			copier.stdin.on("error", () => resolve("incomplete"));
+			copier.stdin.end(text);
+		});
+	};
+	const result = await Promise.race([deliver(), deadline]);
+	clearTimeout(timer);
+	if (result === "incomplete") child?.kill("SIGKILL");
+	return result;
 }
 
 export async function flushRawStdout(): Promise<void> {

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { SessionImportFileNotFoundError } from "../src/core/agent-session-runtime.ts";
+import { MissingSessionCwdError } from "../src/core/session-cwd.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 
 type PathCommand = "/export" | "/import";
@@ -140,4 +141,59 @@ describe("InteractiveMode /import parsing", () => {
 		expect(showStatus).not.toHaveBeenCalled();
 		expect(handleFatalRuntimeError).not.toHaveBeenCalled();
 	});
+});
+
+// pi#132 R4-4: the missing-cwd retry and the import submit share one cancellation boundary.
+describe("InteractiveMode /import missing-cwd retry cancellation", () => {
+	const prototype = InteractiveMode.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
+
+	it.each(["cwd prompt", "retry"] as const)(
+		"shutdown cancelling the held %s settles the submit without crash or shutdown self-join",
+		async (held) => {
+			const shutdown = new AbortController();
+			const reason = new Error("SESSION_SHUTDOWN");
+			const importFromJsonl = vi.fn(async (_path: string, cwd?: string) => {
+				if (cwd === undefined)
+					throw new MissingSessionCwdError({ sessionCwd: "/gone", fallbackCwd: "/here" } as never);
+				shutdown.abort(reason);
+				throw reason;
+			});
+			const uncaughtCrash = vi.fn();
+			const handleFatalRuntimeError = vi.fn(async () => {
+				throw new Error("unexpected fatal error");
+			});
+			const context = Object.create(
+				InteractiveMode.prototype,
+				Object.getOwnPropertyDescriptors({
+					defaultEditor: {} as { onSubmit?: (text: string) => Promise<void> },
+					editor: { setText: vi.fn(), addToHistory: vi.fn() },
+					runtimeHost: { inputsFenced: false, importFromJsonl },
+					terminalShutdownRequested: false,
+					isShuttingDown: true,
+					// Delayed cleanup: shutdown has not completed and must not be awaited by the submit.
+					shutdownCompletion: new Promise<void>(() => {}),
+					session: { shutdownSignal: shutdown.signal },
+					clearStatusIndicator: vi.fn(),
+					showError: vi.fn(),
+					showStatus: vi.fn(),
+					showExtensionConfirm: vi.fn(async () => true),
+					promptForMissingSessionCwd: vi.fn(async () => {
+						if (held === "retry") return "/here";
+						shutdown.abort(reason);
+						throw reason;
+					}),
+					handleFatalRuntimeError,
+					uncaughtCrash,
+				}),
+			);
+			prototype.setupEditorSubmitHandler.call(context);
+			const settled = await Promise.race([
+				Promise.resolve(context.defaultEditor.onSubmit?.("/import /tmp/session.jsonl")).then(() => "settled"),
+				new Promise((resolve) => setTimeout(() => resolve("hung"), 1000)),
+			]);
+			expect(settled).toBe("settled");
+			expect(handleFatalRuntimeError).not.toHaveBeenCalled();
+			expect(uncaughtCrash).not.toHaveBeenCalled();
+		},
+	);
 });
