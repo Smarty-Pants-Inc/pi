@@ -1937,7 +1937,9 @@ describe("native input admission v1", () => {
 		"a detached withSession descendant stays refused after the fence is released (double refusal: %s)",
 		async (doubleRefusal) => {
 			const h = await setup();
-			const built = doubleRefusal ? await doubleRefusalRuntime(h) : { runtime: await runtimeFor(h), mode: undefined };
+			const built = doubleRefusal
+				? await doubleRefusalRuntime(h)
+				: { runtime: await runtimeFor(h), mode: undefined };
 			const { runtime } = built;
 			const timer = gate(),
 				fire = gate();
