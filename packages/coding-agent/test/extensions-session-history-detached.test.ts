@@ -7,6 +7,28 @@ import { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 
+// pi#163 post-merge P2s: extensions share immutable persisted-JSON history snapshots.
+it.each([
+	["typed-array", new Uint8Array([1, 255]), { "0": 1, "1": 255 }],
+	["map", new Map([["original", 1]]), {}],
+	["set", new Set([1]), {}],
+] as const)("extension contexts cannot poison later %s custom-entry reads", async (customType, data, expected) => {
+	const sm = SessionManager.inMemory();
+	const id = sm.appendCustomEntry(customType, data);
+	const registry = await createInMemoryModelRegistry(AuthStorage.inMemory());
+	const runners = [0, 1].map(() => new ExtensionRunner([], {} as never, process.cwd(), sm, registry));
+	const first = runners[0].createContext().sessionManager.getEntry(id);
+	if (first?.type !== "custom") throw new Error("missing custom entry");
+	expect(first.data).toEqual(expected);
+	expect(Object.getPrototypeOf(first.data)).toBe(Object.prototype);
+	expect(Object.isFrozen(first.data)).toBe(true);
+	expect(Reflect.set(first.data as object, "poisoned", true)).toBe(false);
+	const later = runners[1].createContext().sessionManager.getEntry(id);
+	expect(later).toBe(first);
+	if (later?.type !== "custom") throw new Error("missing later custom entry");
+	expect(later.data).toEqual(expected);
+});
+
 let tempDir: string | undefined;
 afterEach(() => {
 	if (tempDir) fs.rmSync(tempDir, { recursive: true, force: true });

@@ -17,7 +17,8 @@ describe.skipIf(process.platform === "win32")("writeStdoutBounded exit recovery 
 	});
 
 	async function run(terminal: "pipe" | "pty", read: boolean, prelude = "", env = process.env) {
-		const dir = mkdtempSync(join(tmpdir(), "pi-bounded-write-"));
+		// pi#163 post-merge SEC P2: PTY paths must stay literal even with shell metacharacters.
+		const dir = mkdtempSync(join(tmpdir(), "pi-bounded-write-' $;-"));
 		dirs.push(dir);
 		const result = join(dir, "result");
 		const entry = join(dir, "writer.mjs");
@@ -32,8 +33,11 @@ process.exit(0);
 `,
 		);
 		const node = [process.execPath, "--import", resolver, entry];
+		// Linux script requires a shell command; escape every argument before passing the argv array.
 		const command =
-			terminal === "pty" ? ["script", "-qfec", node.map((arg) => `'${arg}'`).join(" "), "/dev/null"] : node;
+			terminal === "pty"
+				? ["script", "-qfec", node.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(" "), "/dev/null"]
+				: node;
 		const child = spawn(command[0], command.slice(1), { stdio: ["pipe", "pipe", "ignore"], env });
 		let received = 0;
 		if (read)
