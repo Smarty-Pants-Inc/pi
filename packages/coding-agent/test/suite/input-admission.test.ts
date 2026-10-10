@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, type ImageContent, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, type PromptOptions } from "../../src/core/agent-session.ts";
@@ -11,6 +11,7 @@ import {
 } from "../../src/core/agent-session-runtime.ts";
 import type { BoundaryResult, ExtensionAPI, ExtensionFactory } from "../../src/core/extensions/index.ts";
 import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
+import { InputAdmissionError } from "../../src/core/input-admission.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import { type ReceivedInput, receiveInput } from "../../src/core/received-input.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
@@ -1799,6 +1800,291 @@ describe("native input admission v1", () => {
 		},
 	);
 
+	// pi#132 R4-7: a nonterminal publication refusal returns the receiving session's input exactly, without replay.
+	it("nonterminal publication refusal returns receiving input as an authoritative receipt", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		let receiving: AgentSession | undefined;
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			receiving = result.session;
+			await result.session.followUp("acknowledged", [
+				{ type: "image", data: "receiving-original", mimeType: "image/png" },
+			]);
+			return result;
+		});
+		const error = await runtime.newSession().then(
+			() => undefined,
+			(cause: unknown) => cause,
+		);
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).recoveredInput).toEqual([
+			expect.objectContaining({
+				role: "user",
+				content: [
+					{ type: "text", text: "acknowledged" },
+					{ type: "image", data: "receiving-original", mimeType: "image/png" },
+				],
+			}),
+		]);
+		expect(receiving?.getFollowUpMessages()).toEqual([]);
+		expect(receiving?.messages.some((message) => message.role === "user")).toBe(false);
+	});
+
+	// pi#163 P2: a receiving fencing refusal must not leave the runtime on the disposed outgoing session.
+	it("receiving fencing refusal keeps a live current session that admits follow-up input", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		const outgoing = runtime.session;
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			await result.session.followUp("acknowledged");
+			return result;
+		});
+		await expect(runtime.newSession()).rejects.toBeInstanceOf(InputAdmissionError);
+		expect(outgoing.isDisposed).toBe(true);
+		expect(runtime.session).not.toBe(outgoing);
+		expect(runtime.session.isDisposed).toBe(false);
+		await runtime.session.followUp("after refusal");
+		expect(runtime.session.getFollowUpMessages()).toEqual(["after refusal"]);
+	});
+
+	// pi#163 review P2-1: when the recovery fence and retirement also refuse (input held outside the
+	// queue), the runtime must still publish the live receiving session, not keep the disposed outgoing one.
+	it("double receiving fence refusal publishes the live receiving session", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		const outgoing = runtime.session;
+		let receiving: AgentSession | undefined;
+		// Mode-owned input survives the recovery fence's abort, so every receiving fence refuses.
+		let modeInputPending = true;
+		const fenceRefusals: unknown[] = [];
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			receiving = result.session;
+			const fenceInputs = result.session.fenceInputs.bind(result.session);
+			result.session.fenceInputs = (fenceOptions) =>
+				fenceInputs(fenceOptions).catch((cause: unknown) => {
+					fenceRefusals.push(cause);
+					throw cause;
+				});
+			await result.session.bindExtensions({ hasPendingInput: () => modeInputPending });
+			return result;
+		});
+		const withSession = vi.fn(async () => {});
+		await expect(runtime.newSession({ withSession })).rejects.toThrow("INPUT_ADMISSION_BUSY");
+		// Initial and recovery fences both refused.
+		expect(fenceRefusals.length).toBeGreaterThanOrEqual(2);
+		expect(outgoing.isDisposed).toBe(true);
+		// Identity, not toBe: a failing toBe would render the session through the uninitialized theme.
+		expect(runtime.session === receiving).toBe(true);
+		expect(runtime.session.isDisposed).toBe(false);
+		expect(withSession).toHaveBeenCalledTimes(1);
+		modeInputPending = false;
+		await runtime.session.followUp("after refusal");
+		expect(runtime.session.getFollowUpMessages()).toEqual(["after refusal"]);
+	});
+
+	// pi#163 security P2: a receiving session published without a fence still refuses direct input until
+	// the replacement work finishes, and terminal shutdown races its held callback as on the fenced path.
+	async function doubleRefusalRuntime(h: Harness) {
+		const runtime = await runtimeFor(h);
+		const mode = { inputPending: true };
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			await result.session.bindExtensions({ hasPendingInput: () => mode.inputPending });
+			return result;
+		});
+		return { runtime, mode };
+	}
+
+	it("double refusal gates direct receiving input until withSession completes", async () => {
+		const { runtime, mode } = await doubleRefusalRuntime(await setup());
+		const entered = gate(),
+			held = gate();
+		const replacement = runtime
+			.newSession({
+				withSession: async () => {
+					entered.release();
+					await held.promise;
+				},
+			})
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await entered.promise;
+		mode.inputPending = false;
+		const receiving = runtime.session;
+		expect(receiving.isDisposed).toBe(false);
+		expect(runtime.inputsFenced).toBe(true);
+		await expect(receiving.followUp("early follow-up")).rejects.toThrow("INPUT_ADMISSION_FENCED");
+		await expect(receiving.prompt("early prompt")).rejects.toThrow("INPUT_ADMISSION_FENCED");
+		expect(receiving.getFollowUpMessages()).toEqual([]);
+		held.release();
+		expect(await replacement).toBeInstanceOf(InputAdmissionError);
+		expect(runtime.session === receiving).toBe(true);
+		expect(runtime.inputsFenced).toBe(false);
+		await receiving.followUp("after completion");
+		expect(receiving.getFollowUpMessages()).toEqual(["after completion"]);
+	});
+
+	it.each([false, true])(
+		"a detached withSession descendant stays refused after the fence is released (double refusal: %s)",
+		async (doubleRefusal) => {
+			const h = await setup();
+			const built = doubleRefusal
+				? await doubleRefusalRuntime(h)
+				: { runtime: await runtimeFor(h), mode: undefined };
+			const { runtime } = built;
+			const timer = gate(),
+				fire = gate();
+			let late: Promise<unknown> | undefined;
+			await runtime
+				.newSession({
+					withSession: async (ctx) => {
+						// Detached: started inside the callback, runs after it returns.
+						late = fire.promise.then(() =>
+							ctx.sendUserMessage("late detached input").then(
+								() => "accepted",
+								(error: unknown) => error,
+							),
+						);
+						timer.release();
+					},
+				})
+				.catch(() => undefined);
+			await timer.promise;
+			if (built.mode) built.mode.inputPending = false;
+			expect(runtime.inputsFenced).toBe(false);
+			fire.release();
+			const outcome = await late;
+			expect(outcome).toBeInstanceOf(InputAdmissionError);
+			expect((outcome as InputAdmissionError).code).toBe("INPUT_ADMISSION_FENCED");
+			// The session itself still takes ordinary input.
+			await runtime.session.followUp("ordinary");
+			expect(runtime.session.getFollowUpMessages()).toEqual(["ordinary"]);
+		},
+	);
+
+	it("double refusal terminal shutdown cancels a held withSession and completes disposal", async () => {
+		const { runtime, mode } = await doubleRefusalRuntime(await setup());
+		const entered = gate(),
+			held = gate();
+		const replacement = runtime
+			.newSession({
+				withSession: async () => {
+					entered.release();
+					await held.promise;
+				},
+			})
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		await entered.promise;
+		mode.inputPending = false;
+		const receiving = runtime.session;
+		const timeout = new Promise<string>((resolve) => setTimeout(() => resolve("hung"), 2000));
+		const shutdown = runtime.dispose({ terminal: true, rejectQueuedInput: () => {} }).then(
+			() => "disposed",
+			(error: unknown) => error,
+		);
+		expect(await Promise.race([shutdown, timeout])).toBe("disposed");
+		const error = await replacement;
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).code).toBe("INPUT_ADMISSION_SHUTDOWN");
+		expect(runtime.session === receiving).toBe(true);
+		expect(receiving.isDisposed).toBe(true);
+	});
+
+	// pi#163 review P2-2: the recovery path publishes the receiving session, so the caller's setup and
+	// withSession must run exactly once before the refusal is returned.
+	it("refusal recovery runs setup and withSession exactly once", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		let receiving: AgentSession | undefined;
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			receiving = result.session;
+			await result.session.followUp("acknowledged");
+			return result;
+		});
+		const setupCalls: unknown[] = [];
+		const withSessionCalls: unknown[] = [];
+		const error = await runtime
+			.newSession({
+				setup: async (sessionManager) => {
+					setupCalls.push(sessionManager);
+				},
+				withSession: async () => {
+					withSessionCalls.push(runtime.session);
+				},
+			})
+			.then(
+				() => undefined,
+				(cause: unknown) => cause,
+			);
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).recoveredInput).toEqual([
+			expect.objectContaining({ role: "user", content: [{ type: "text", text: "acknowledged" }] }),
+		]);
+		expect(runtime.session === receiving).toBe(true);
+		expect(setupCalls.length).toBe(1);
+		expect(setupCalls[0] === receiving!.sessionManager).toBe(true);
+		expect(withSessionCalls.length).toBe(1);
+		expect(withSessionCalls[0] === receiving).toBe(true);
+	});
+
+	// pi#163 P2: input taken back by the recovery fence must survive a later abort or completion failure.
+	async function recoveryRefusal(runtime: AgentSessionRuntime, afterRecoveryFence?: () => void) {
+		const factory = Reflect.get(runtime, "createRuntime") as CreateAgentSessionRuntimeFactory;
+		Reflect.set(runtime, "createRuntime", async (options: Parameters<CreateAgentSessionRuntimeFactory>[0]) => {
+			const result = await factory(options);
+			const fenceInputs = result.session.fenceInputs.bind(result.session);
+			result.session.fenceInputs = async (fenceOptions) => {
+				const release = await fenceInputs(fenceOptions);
+				if (fenceOptions?.rejectQueuedInput) afterRecoveryFence?.();
+				return release;
+			};
+			await result.session.followUp("acknowledged");
+			return result;
+		});
+		const error = await runtime.newSession().then(
+			() => undefined,
+			(cause: unknown) => cause,
+		);
+		expect(error).toBeInstanceOf(InputAdmissionError);
+		expect((error as InputAdmissionError).recoveredInput).toEqual([
+			expect.objectContaining({ role: "user", content: [{ type: "text", text: "acknowledged" }] }),
+		]);
+	}
+
+	it("terminal abort during the recovery fence still returns the captured input", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		runtime.setRebindSession(async () => {});
+		let shutdown: Promise<void> | undefined;
+		await recoveryRefusal(runtime, () => {
+			shutdown = runtime.dispose({ terminal: true, rejectQueuedInput: () => {} });
+		});
+		await shutdown;
+	});
+
+	it("a rejected replacement completion after publication still returns the captured input", async () => {
+		const h = await setup();
+		const runtime = await runtimeFor(h);
+		runtime.setRebindSession(async () => {
+			throw new Error("rebind failed");
+		});
+		await recoveryRefusal(runtime);
+	});
+
 	// smarty-dev#3048, PR #110 R2-1: a BUSY refusal cannot orphan the running settlement's controller.
 	it("busy replacement still permits shutdown to cancel the original settlement", async () => {
 		const entered = gate(),
@@ -1999,6 +2285,7 @@ describe("native input admission v1", () => {
 		const recover = Reflect.get(InteractiveMode.prototype, "handleInputAdmissionError") as (
 			this: unknown,
 			error: unknown,
+			original?: string,
 		) => boolean;
 		const defaultEditor: { onSubmit?: (text: string) => Promise<void> } = {};
 		let editorText = "";
@@ -2071,8 +2358,8 @@ describe("native input admission v1", () => {
 			isTerminalRuntimeCancellation(error: unknown): boolean {
 				return terminalCancellation.call(this, error);
 			},
-			handleInputAdmissionError(error: unknown): boolean {
-				return recover.call(this, error);
+			handleInputAdmissionError(error: unknown, original?: string): boolean {
+				return recover.call(this, error, original);
 			},
 			themeController: { disableAutoSync: vi.fn() },
 			ui: { requestRender: vi.fn(), terminal: { drainInput: vi.fn(async () => {}) } },
@@ -2148,6 +2435,39 @@ describe("native input admission v1", () => {
 		expect(h.session.pendingMessageCount).toBe(0);
 		expect(getUserTexts(h)).toEqual([]);
 	});
+
+	// pi#163 P2: a returned receipt replaces the submitted text in the editor, exactly once, without replay.
+	it.each(["main loop", "editor submit"] as const)(
+		"TUI %s restores the recovered input receipt once instead of the submitted text",
+		async (site) => {
+			const h = await setup();
+			const runtime = await runtimeFor(h);
+			const image: ImageContent = { type: "image", data: "returned-image", mimeType: "image/png" };
+			const recoveredInput: AgentMessage[] = [
+				{ role: "user", content: [{ type: "text", text: "returned" }, image], timestamp: Date.now() },
+			];
+			const mode = Object.assign(createMode(h, runtime), {
+				recoveryText: Reflect.get(InteractiveMode.prototype, "recoveryText"),
+				promptWithRecoveredImages: vi.fn(async () => {
+					throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "refused", { recoveredInput });
+				}),
+			});
+			if (site === "main loop") {
+				const submitUserInput = Reflect.get(InteractiveMode.prototype, "submitUserInput") as (
+					this: unknown,
+					input: ReceivedInput,
+				) => Promise<void>;
+				await submitUserInput.call(mode, receiveInput("/replace"));
+			} else {
+				await mode.submitEditorPrompt(receiveInput("/replace"));
+			}
+			const restored = mode.editor.getText();
+			expect(restored.startsWith("returned\n[recovered image ")).toBe(true);
+			expect(restored).not.toContain("/replace");
+			expect(mode.prepareRecoveredInput.call(mode, receiveInput(restored)).input.images).toEqual([image]);
+			expect(mode.promptWithRecoveredImages).toHaveBeenCalledTimes(1);
+		},
+	);
 
 	it("TUI submit after the replacement fence stays in the editor with explicit rejection", async () => {
 		const h = await setup();

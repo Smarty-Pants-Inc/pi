@@ -113,7 +113,7 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
 import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
-import { flushRawStdout } from "../../core/output-guard.ts";
+import { writeStdoutBounded } from "../../core/output-guard.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import {
@@ -311,6 +311,9 @@ function isUsageSessionEntry(item: RenderSessionItem): item is Extract<SessionEn
 // EIO: tty reads/ioctls from an orphaned background process group, or writes after hangup.
 // ENOTTY: the tty was revoked (macOS) and stdin is no longer a terminal.
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN", "ENOTTY"]);
+/** Finite wait for the exit recovery receipt; an unread terminal gets the incomplete exit code. */
+const RECOVERY_OUTPUT_TIMEOUT_MS = 2000;
+const RECOVERY_OUTPUT_INCOMPLETE_EXIT_CODE = 75;
 
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
@@ -1327,23 +1330,23 @@ export class InteractiveMode {
 		}
 
 		// Main interactive loop
-		while (true) {
-			const userInput = await this.getReceivedUserInput();
-			try {
-				const prompt = this.promptWithRecoveredImages(userInput);
-				// Original session preflight owns the input before TUI staging clears.
-				this.userInputInFlight = false;
-				this.stagingAudit?.("input-transferred");
-				await prompt;
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-				if (error instanceof InputAdmissionError) this.restoreRejectedInput(userInput.text);
-			} finally {
-				this.userInputInFlight = false;
-				this.stagingAudit?.("input-settled");
-				await this.checkShutdownRequested();
-			}
+		while (true) await this.submitUserInput(await this.getReceivedUserInput());
+	}
+
+	private async submitUserInput(userInput: ReceivedInput): Promise<void> {
+		try {
+			const prompt = this.promptWithRecoveredImages(userInput);
+			// Original session preflight owns the input before TUI staging clears.
+			this.userInputInFlight = false;
+			this.stagingAudit?.("input-transferred");
+			await prompt;
+		} catch (error: unknown) {
+			if (!this.handleInputAdmissionError(error, userInput.text))
+				this.showError(error instanceof Error ? error.message : "Unknown error occurred");
+		} finally {
+			this.userInputInFlight = false;
+			this.stagingAudit?.("input-settled");
+			await this.checkShutdownRequested();
 		}
 	}
 
@@ -2233,8 +2236,14 @@ export class InteractiveMode {
 		);
 	}
 
-	private handleInputAdmissionError(error: unknown): boolean {
+	/**
+	 * The one admission-recovery path: an authoritative `recoveredInput` receipt is restored exactly
+	 * once and replaces the submitted `original`, which is restored only when no receipt exists.
+	 */
+	private handleInputAdmissionError(error: unknown, original?: string): boolean {
 		if (!(error instanceof InputAdmissionError)) return false;
+		const recovered = error.recoveredInput ? this.recoveryText(error.recoveredInput) : original;
+		if (recovered) this.restoreRejectedInput(recovered);
 		this.showError(error.message);
 		return true;
 	}
@@ -3363,8 +3372,21 @@ export class InteractiveMode {
 		this.showStatus("Startup is still in progress");
 	}
 
+	/**
+	 * The editor drops onSubmit's promise, so observe it here (pi#132 R4-4). Shutdown owns exit and
+	 * cleanup: a late failure must neither crash-exit over it nor await its completion.
+	 */
+	private observeSubmitFailure(error: unknown): void {
+		if (this.isTerminalRuntimeCancellation(error)) return;
+		if (this.isShuttingDown) {
+			console.error(error);
+			return;
+		}
+		this.uncaughtCrash(error instanceof Error ? error : new Error(String(error)));
+	}
+
 	private setupEditorSubmitHandler(): void {
-		this.defaultEditor.onSubmit = async (text: string) => {
+		const submit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
 			if (this.runtimeHost.inputsFenced || this.terminalShutdownRequested) {
@@ -3374,6 +3396,9 @@ export class InteractiveMode {
 			}
 			await this.dispatchEditorInput(receiveInput(text));
 		};
+		// Return the observed promise so callers that await submission still see its completion.
+		this.defaultEditor.onSubmit = (text: string) =>
+			submit(text).catch((error: unknown) => this.observeSubmitFailure(error));
 		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;
 	}
 
@@ -4574,10 +4599,12 @@ export class InteractiveMode {
 						const images = [...this.recoveredImages]
 							.filter(([marker]) => draft.includes(marker))
 							.map(([, image]) => image);
-						process.stdout.write(
+						const delivery = await writeStdoutBounded(
 							`INPUT_ADMISSION_SHUTDOWN: recovered draft ${JSON.stringify({ text: draft, images })}\n`,
+							RECOVERY_OUTPUT_TIMEOUT_MS,
 						);
-						await flushRawStdout();
+						// An unread terminal did not take the recovery receipt: exit nonzero, never hang.
+						if (delivery === "incomplete") process.exit(RECOVERY_OUTPUT_INCOMPLETE_EXIT_CODE);
 					}
 				} else {
 					const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
@@ -4819,8 +4846,7 @@ export class InteractiveMode {
 		try {
 			await this.promptWithRecoveredImages(input, { streamingBehavior });
 		} catch (error) {
-			if (!this.handleInputAdmissionError(error)) throw error;
-			this.restoreRejectedInput(input.text);
+			if (!this.handleInputAdmissionError(error, input.text)) throw error;
 		} finally {
 			await this.checkShutdownRequested();
 		}
@@ -6281,34 +6307,31 @@ export class InteractiveMode {
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean }> {
 		this.clearStatusIndicator();
-		try {
-			const result = await this.runtimeHost.switchSession(sessionPath, {
+		const resume = (cwdOverride?: string) =>
+			this.runtimeHost.switchSession(sessionPath, {
+				cwdOverride,
 				withSession: options?.withSession,
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
-			if (result.cancelled) {
-				return result;
-			}
-			this.showStatus("Resumed session");
-			return result;
-		} catch (error: unknown) {
-			if (error instanceof MissingSessionCwdError) {
+		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
+		try {
+			let status = "Resumed session";
+			let result: { cancelled: boolean };
+			try {
+				result = await resume();
+			} catch (error: unknown) {
+				if (!(error instanceof MissingSessionCwdError)) throw error;
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
-					cwdOverride: selectedCwd,
-					withSession: options?.withSession,
-					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-				});
-				if (result.cancelled) {
-					return result;
-				}
-				this.showStatus("Resumed session in current cwd");
-				return result;
+				status = "Resumed session in current cwd";
+				result = await resume(selectedCwd);
 			}
+			if (!result.cancelled) this.showStatus(status);
+			return result;
+		} catch (error: unknown) {
 			if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 			if (this.handleInputAdmissionError(error)) return { cancelled: true };
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -7107,29 +7130,23 @@ export class InteractiveMode {
 			return;
 		}
 
+		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
 		try {
 			this.clearStatusIndicator();
-			const result = await this.runtimeHost.importFromJsonl(inputPath);
-			if (result.cancelled) {
-				this.showStatus("Import cancelled");
-				return;
-			}
-			this.showStatus(`Session imported from: ${inputPath}`);
-		} catch (error: unknown) {
-			if (error instanceof MissingSessionCwdError) {
+			let result: { cancelled: boolean };
+			try {
+				result = await this.runtimeHost.importFromJsonl(inputPath);
+			} catch (error: unknown) {
+				if (!(error instanceof MissingSessionCwdError)) throw error;
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
 					this.showStatus("Import cancelled");
 					return;
 				}
-				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
-				if (result.cancelled) {
-					this.showStatus("Import cancelled");
-					return;
-				}
-				this.showStatus(`Session imported from: ${inputPath}`);
-				return;
+				result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
 			}
+			this.showStatus(result.cancelled ? "Import cancelled" : `Session imported from: ${inputPath}`);
+		} catch (error: unknown) {
 			if (error instanceof SessionImportFileNotFoundError) {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
