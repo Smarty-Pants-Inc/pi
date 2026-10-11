@@ -275,10 +275,25 @@ export function assistantRecovery(message: AssistantMessage): AssistantRecovery 
 }
 
 /**
- * Attach the decision to a failed message before its text can be replaced. An existing owned decision is kept
- * in its rebuilt closed form, so repeated projection never reclassifies; a malformed one is replaced.
+ * Validated one-shot waits, in seconds, keyed by the failed message. Private by construction: the delay never
+ * appears on the message, so it is never serialized, published or rebuilt from wire diagnostics (smarty-dev#5822).
  */
-export function attachRecovery(message: AssistantMessage): void {
-	if (message.stopReason !== "error") return;
-	message.recovery = assistantRecovery(message);
+const throttledLimitWaits = new WeakMap<AssistantMessage, number>();
+
+/**
+ * Record the one-shot wait of a throttled provider limit on `message`. Only an integer of 0-30 seconds is kept;
+ * anything else records nothing, so the limit stays final.
+ */
+export function recordThrottledLimitWait(message: AssistantMessage, seconds: number): void {
+	if (Number.isInteger(seconds) && seconds >= 0 && seconds <= 30) throttledLimitWaits.set(message, seconds);
+}
+
+/** Carry a recorded wait to a published copy of the message. */
+export function transferThrottledLimitWait(from: AssistantMessage, to: AssistantMessage): void {
+	const seconds = throttledLimitWaits.get(from);
+	if (seconds !== undefined) throttledLimitWaits.set(to, seconds);
+}
+
+export function recordedThrottledLimitWait(message: AssistantMessage): number | undefined {
+	return throttledLimitWaits.get(message);
 }

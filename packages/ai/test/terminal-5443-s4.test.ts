@@ -291,7 +291,9 @@ describe("T-F6-deferred: protected streams mask live secrets in deferred.id (sma
 		const handle = message.deferred;
 		stream.push({ type: "done", reason: "deferred", message });
 		const result = await stream.result();
-		expect(result.deferred).toBe(handle);
+		// smarty-dev#5822 C2: a snapshot copy, equal byte for byte, never the producer's object.
+		expect(result.deferred).toEqual(handle);
+		expect(result.deferred).not.toBe(handle);
 		expect(result.deferred?.id).toBe("resp_abc%2F123 token=x");
 	});
 });

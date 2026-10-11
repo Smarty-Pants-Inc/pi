@@ -1,7 +1,7 @@
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
-import { assistantRecovery } from "./recovery.ts";
+import { assistantRecovery, recordedThrottledLimitWait, transferThrottledLimitWait } from "./recovery.ts";
 
 /** Whether a failed stream ended before its provider's completion event (owned decision first, smarty-dev#5822). */
 export function isPrematureStreamError(message: AssistantMessage): boolean {
@@ -248,25 +248,7 @@ export async function retryAssistantCall(
 /** Owned status text while waiting out a throttled limit; the provider's wait text is never kept. */
 export const THROTTLED_LIMIT_WAIT_MESSAGE = "Flash runs one request at a time";
 
-/**
- * Validated one-shot waits, in seconds, keyed by the failed message. Private by construction: the delay never
- * appears on the message, so it is never serialized, published or rebuilt from wire diagnostics (smarty-dev#5822).
- */
-const throttledLimitWaits = new WeakMap<AssistantMessage, number>();
-
-/**
- * Record the one-shot wait of a throttled provider limit on `message`. Only an integer of 0-30 seconds is kept;
- * anything else records nothing, so the limit stays final.
- */
-export function recordThrottledLimitWait(message: AssistantMessage, seconds: number): void {
-	if (Number.isInteger(seconds) && seconds >= 0 && seconds <= 30) throttledLimitWaits.set(message, seconds);
-}
-
-/** Carry a recorded wait to a copy of the message, for producers that publish copies. */
-export function transferThrottledLimitWait(from: AssistantMessage, to: AssistantMessage): void {
-	const seconds = throttledLimitWaits.get(from);
-	if (seconds !== undefined) throttledLimitWaits.set(to, seconds);
-}
+export { recordThrottledLimitWait, transferThrottledLimitWait } from "./recovery.ts";
 
 /**
  * The one-shot wait a provider marked on a throttled limit (the Smarty gateway's `smarty_limit` with
@@ -275,7 +257,7 @@ export function transferThrottledLimitWait(from: AssistantMessage, to: Assistant
  */
 export function throttledLimitWait(message: AssistantMessage): { delayMs: number; waitMessage: string } | undefined {
 	if (message.stopReason !== "error") return undefined;
-	const seconds = throttledLimitWaits.get(message);
+	const seconds = recordedThrottledLimitWait(message);
 	return seconds === undefined ? undefined : { delayMs: seconds * 1000, waitMessage: THROTTLED_LIMIT_WAIT_MESSAGE };
 }
 

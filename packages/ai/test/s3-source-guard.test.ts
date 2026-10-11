@@ -72,12 +72,18 @@ describe("smarty-dev#5822 source guard", () => {
 
 	it("C3: the stream classifies every error before masking, for every source", () => {
 		const eventStream = source("ai/src/utils/event-stream.ts");
+		// The projector classifies the producer's original message; masking applies only to the projected copy.
+		const projector = eventStream.slice(eventStream.indexOf("function projectMessage("));
+		expect(projector.slice(0, projector.indexOf("\n}"))).toContain("assistantRecovery(message)");
 		const push = eventStream.slice(eventStream.indexOf("override push("));
-		expect(push.indexOf("attachRecovery(event.error)")).toBeGreaterThan(-1);
-		expect(push.indexOf("attachRecovery(event.error)")).toBeLessThan(push.indexOf("protectMessage("));
+		expect(push.indexOf("projectEvent(event)")).toBeGreaterThan(-1);
+		expect(push.indexOf("projectEvent(event)")).toBeLessThan(push.indexOf("protectMessage("));
 		const end = eventStream.slice(eventStream.indexOf("override end("));
-		expect(end.indexOf("attachRecovery(result)")).toBeGreaterThan(-1);
-		expect(end.indexOf("attachRecovery(result)")).toBeLessThan(end.indexOf("protectMessage("));
+		expect(end.indexOf("projectMessage(result")).toBeGreaterThan(-1);
+		expect(end.indexOf("projectMessage(result")).toBeLessThan(end.indexOf("protectMessage("));
+		// Every message-carrying event goes through the projector; nothing is published unprojected.
+		expect(push).toContain("super.push(published)");
+		expect(end).toContain("super.end(published)");
 	});
 
 	it("C3: no other assistant event stream bypasses the classifying stream", () => {
