@@ -235,3 +235,110 @@ describe("assistant message isolation contract", () => {
 		expect(result.stopReason).toBe("toolUse");
 	});
 });
+
+// pi#159: terminal snapshots must be taken after the stream masks live secrets and sets
+// `durationMs`, so the event and the result carry both and still do not alias each other.
+// Duration counterexamples (preset provider duration, timestamp predating the stream,
+// late push after completion) are covered in event-stream.test.ts and not repeated here.
+describe("assistant message terminal snapshots (pi#159)", () => {
+	const secret = "sk-live-secret-value-0123456789";
+
+	function failedMessage(): AssistantMessage {
+		return {
+			...liveMessage(),
+			content: [{ type: "text", text: "partial" }],
+			stopReason: "error",
+			errorMessage: `401 invalid key ${secret}`,
+			deferred: { provider: "radius", modelId: "auto", api: "pi-messages", id: `batch_${secret}` },
+			timestamp: Date.now(),
+		};
+	}
+
+	// pi#159: error event and result are separate snapshots of the masked, timed message.
+	it("separates the error event from the result after redaction and timing", async () => {
+		const stream = new AssistantMessageEventStream([secret]);
+		const live = failedMessage();
+		const liveDeferred = live.deferred;
+		stream.push({ type: "error", reason: "error", error: live });
+		const events = await collect(stream);
+		const result = await stream.result();
+		const event = events.at(-1);
+		if (event?.type !== "error") throw new Error("missing error event");
+
+		for (const message of [event.error, result]) {
+			expect(message.errorMessage).toBeDefined();
+			expect(message.errorMessage).not.toContain(secret);
+			expect(message.deferred?.id).toBeDefined();
+			expect(message.deferred?.id).not.toContain(secret);
+			expect(message.durationMs).toBeTypeOf("number");
+			expect(message.durationMs).toBe(live.durationMs);
+		}
+		// Main behavior: the live message is masked and timed in place; the provider's handle is replaced, not rewritten.
+		expect(live.errorMessage).not.toContain(secret);
+		expect(liveDeferred?.id).toBe(`batch_${secret}`);
+		expect(live.deferred).not.toBe(liveDeferred);
+
+		expect(event.error).not.toBe(live);
+		expect(result).not.toBe(live);
+		expect(result).not.toBe(event.error);
+		expect(result.deferred).not.toBe(event.error.deferred);
+		expect(result.content).not.toBe(event.error.content);
+
+		const resultError = result.errorMessage;
+		const resultDuration = result.durationMs;
+		event.error.errorMessage = "consumer write";
+		event.error.durationMs = -1;
+		event.error.content.length = 0;
+		if (event.error.deferred) event.error.deferred.id = "consumer";
+		live.errorMessage = "provider write";
+		live.content.push({ type: "text", text: "late" });
+		expect(result.errorMessage).toBe(resultError);
+		expect(result.durationMs).toBe(resultDuration);
+		expect(result.content).toEqual([{ type: "text", text: "partial" }]);
+		expect(result.deferred?.id).not.toBe("consumer");
+	});
+
+	// pi#159: the same ordering for a done event.
+	it("publishes durationMs on both the done event and the result without aliasing", async () => {
+		const stream = new AssistantMessageEventStream([secret]);
+		const live: AssistantMessage = { ...liveMessage(), stopReason: "stop", timestamp: Date.now() };
+		stream.push({ type: "done", reason: "stop", message: live });
+		const events = await collect(stream);
+		const result = await stream.result();
+		const event = events.at(-1);
+		if (event?.type !== "done") throw new Error("missing done event");
+		expect(event.message.durationMs).toBeTypeOf("number");
+		expect(result.durationMs).toBe(event.message.durationMs);
+		expect(result).not.toBe(event.message);
+		expect(result.usage).not.toBe(event.message.usage);
+		event.message.usage.totalTokens = 999;
+		expect(result.usage.totalTokens).toBe(0);
+	});
+
+	// pi#159: end(result) publishes a masked, timed snapshot that later writes to the argument cannot change.
+	it("snapshots the end(result) argument after redaction and timing", async () => {
+		const stream = new AssistantMessageEventStream([secret]);
+		const live = failedMessage();
+		stream.end(live);
+		const result = await stream.result();
+		expect(result).not.toBe(live);
+		expect(result.errorMessage).not.toContain(secret);
+		expect(result.deferred?.id).not.toContain(secret);
+		expect(result.durationMs).toBeTypeOf("number");
+		expect(result.durationMs).toBe(live.durationMs);
+		expect(await collect(stream)).toEqual([]);
+
+		const resultError = result.errorMessage;
+		live.errorMessage = "provider write";
+		live.durationMs = -1;
+		live.content.push({ type: "text", text: "late" });
+		live.usage.totalTokens = 999;
+		if (live.deferred) live.deferred.id = "provider";
+		expect(result.errorMessage).toBe(resultError);
+		expect(result.durationMs).toBeGreaterThanOrEqual(0);
+		expect(result.content).toEqual([{ type: "text", text: "partial" }]);
+		expect(result.usage.totalTokens).toBe(0);
+		expect(result.deferred?.id).not.toBe("provider");
+		expect(await stream.result()).toBe(result);
+	});
+});
