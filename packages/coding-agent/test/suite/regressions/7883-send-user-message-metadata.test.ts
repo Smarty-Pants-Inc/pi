@@ -607,4 +607,79 @@ describe("#7883 sendUserMessage metadata receipts", () => {
 		expect(harness.faux.state.callCount).toBeGreaterThan(0);
 		await harness.session.waitForIdle();
 	});
+
+	// #7883/#5533: read accessor-backed metadata once, so validation cannot be bypassed by a changing getter.
+	it("captures accessor-backed metadata once before validation and preserves legacy and receipt outcomes", async () => {
+		let inputCalls = 0;
+		let beforeStartCalls = 0;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", () => {
+						inputCalls++;
+					});
+					pi.on("before_agent_start", () => {
+						beforeStartCalls++;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses(
+			["absent", "explicit undefined", "undefined first", "valid first"].map((reply) => fauxAssistantMessage(reply)),
+		);
+
+		let nullReads = 0;
+		const changingNull = {
+			get metadata() {
+				return nullReads++ === 0 ? null : undefined;
+			},
+		};
+		await expect(harness.session.sendUserMessage("changing null", changingNull as never)).rejects.toThrow(
+			"User message metadata must be a JSON-serializable object",
+		);
+		expect(nullReads).toBe(1);
+		expect(inputCalls).toBe(0);
+		expect(beforeStartCalls).toBe(0);
+		expect(userEntries(harness)).toEqual([]);
+		expect(harness.faux.state.callCount).toBe(0);
+
+		await expect(harness.session.sendUserMessage("absent options")).resolves.toBeUndefined();
+		await expect(
+			harness.session.sendUserMessage("explicit undefined", { metadata: undefined }),
+		).resolves.toBeUndefined();
+
+		let undefinedReads = 0;
+		const changingUndefined = {
+			get metadata() {
+				return undefinedReads++ === 0 ? undefined : { invalid: true };
+			},
+		};
+		await expect(
+			harness.session.sendUserMessage("undefined first", changingUndefined as never),
+		).resolves.toBeUndefined();
+		expect(undefinedReads).toBe(1);
+
+		let validReads = 0;
+		const validMetadata = { request: "captured-once-7883" };
+		const changingValid = {
+			get metadata() {
+				return validReads++ === 0 ? validMetadata : null;
+			},
+		};
+		const result = await harness.session.sendUserMessage("valid first", changingValid as never);
+		expect(validReads).toBe(1);
+		expectRootMetadata(harness, result, validMetadata);
+		expect(inputCalls).toBe(4);
+		expect(beforeStartCalls).toBe(4);
+		expect(userEntries(harness).map((entry) => getMessageText(entry.message))).toEqual([
+			"absent options",
+			"explicit undefined",
+			"undefined first",
+			"valid first",
+		]);
+		expect(userEntries(harness).map(metadataOf)).toEqual([undefined, undefined, undefined, validMetadata]);
+		expect(harness.faux.state.callCount).toBeGreaterThan(0);
+		await harness.session.waitForIdle();
+	});
 });
