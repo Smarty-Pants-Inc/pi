@@ -75,6 +75,7 @@ describe("RPC model switch context admission", () => {
 				const runtime = {
 					session: h.session,
 					setRebindSession: vi.fn(),
+					setLifecycleCompleteHandler: vi.fn(),
 					dispose: vi.fn(async () => {}),
 				} as unknown as AgentSessionRuntime;
 				void runRpcMode(runtime);

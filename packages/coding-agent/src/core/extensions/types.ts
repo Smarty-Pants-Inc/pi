@@ -100,10 +100,23 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
+import type {
+	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+} from "../user-message-metadata.ts";
 import type { ModelRoute, ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions, NormalizedBuildSystemPromptOptions } from "../system-prompt.ts";
+export type {
+	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
+} from "../user-message-metadata.ts";
 export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
@@ -371,6 +384,8 @@ export interface ExtensionContext {
 	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
 	signal: AbortSignal | undefined;
+	/** @internal Host callback used by the built-in bash tool immediately before execution. */
+	emitBashSpawn?: (event: BashSpawnEvent, signal?: AbortSignal) => Promise<BashSpawnEventResult | undefined>;
 	/** Abort the current agent operation */
 	abort(): void;
 	/** Whether there are queued messages waiting */
@@ -468,8 +483,17 @@ export interface ReplacedSessionContext extends ExtensionCommandContext {
 
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options: SendUserMessageOptions & { metadata: UserMessageMetadata },
+	): Promise<SendUserMessageResult>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: Omit<SendUserMessageOptions, "metadata"> & { metadata?: undefined },
 	): Promise<void>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: optional metadata preserves legacy void results
+	): Promise<void | SendUserMessageResult>;
 }
 
 // ============================================================================
@@ -510,6 +534,13 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	showImages: boolean;
 	/** Whether the current result is an error. */
 	isError: boolean;
+	/**
+	 * Milliseconds the tool's execution took, from the final result; `undefined` while it runs, when it did not run, or
+	 * for results stored before durations were recorded.
+	 */
+	durationMs: number | undefined;
+	/** Horizontal padding configured by the outputPad setting. Renderers with `renderShell: "self"` apply it themselves. */
+	outputPad: number;
 }
 
 /**
@@ -1024,6 +1055,8 @@ export interface AgentSettledEvent {
 	 * ended on a provider, run, or compaction failure. Otherwise `completed`.
 	 */
 	outcome: AgentActivityOutcome;
+	/** Whether the run ended because it was aborted; equivalent to outcome === "aborted". */
+	aborted: boolean;
 }
 
 export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
@@ -1108,6 +1141,8 @@ export interface ToolExecutionEndEvent {
 	toolName: string;
 	result: any;
 	isError: boolean;
+	/** Milliseconds `execute()` took, measured with a monotonic clock; absent when the tool did not run. */
+	durationMs?: number;
 	/** Set when another tool (for example a codemode script) made this call. */
 	parentToolCallId?: string;
 }
@@ -1177,6 +1212,28 @@ export type InputEventResult =
 // ============================================================================
 // Tool Events
 // ============================================================================
+
+/** Read-only attestation of built-in bash execution; handlers receive detached snapshots. */
+export interface BashSpawnEvent {
+	type: "bash_spawn";
+	toolCallId: string;
+	/** The command after all Pi transformations, exactly as passed to the executor. */
+	command: string;
+	/** The resolved local shell path, or undefined for custom backends. */
+	shellPath?: string;
+	/** The resolved local shell arguments, or undefined for custom backends. */
+	shellArgs?: string[];
+	cwd: string;
+	/** A snapshot of the environment passed to the executor. May contain secrets. */
+	env: Readonly<Record<string, string | undefined>>;
+	backend: "local-builtin" | "custom";
+}
+
+export interface BashSpawnEventResult {
+	/** Veto execution. The first veto wins; thrown handler errors also fail closed. */
+	block?: boolean;
+	reason?: string;
+}
 
 interface ToolCallEventBase {
 	type: "tool_call";
@@ -1422,7 +1479,8 @@ export type ExtensionEvent =
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
-	| ToolResultEvent;
+	| ToolResultEvent
+	| BashSpawnEvent;
 
 // ============================================================================
 // Event Results
@@ -1664,6 +1722,7 @@ export interface ExtensionAPI {
 	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): () => void;
 	on(event: "thinking_level_select", handler: ExtensionHandler<ThinkingLevelSelectEvent>): () => void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): () => void;
+	on(event: "bash_spawn", handler: ExtensionHandler<BashSpawnEvent, BashSpawnEventResult>): () => void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
@@ -1745,11 +1804,27 @@ export interface ExtensionAPI {
 	 * Send a user message to the agent. Always triggers a turn.
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
 	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
+	 * With metadata, returns one receipt when the input is handled or its user entry is persisted.
+	 * Pi stamps metadataSource from this extension's loader path and execution context.
+	 * Borrowed APIs cannot confer another extension's identity; unbound metadata sends reject.
+	 * Only direct SDK session sends are stamped sdk.
+	 * Consumers must trust metadata only from the source they expect.
+	 * Metadata is snapshotted and deeply frozen before preflight, stored on the entry, and never sent to the model.
+	 * Do not await a queued receipt inside a handler that must return before that input can be delivered.
 	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options: SendUserMessageOptions & { metadata: UserMessageMetadata },
+	): Promise<SendUserMessageResult>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: Omit<SendUserMessageOptions, "metadata"> & { metadata?: undefined },
 	): void;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: optional metadata preserves legacy void results
+	): void | Promise<SendUserMessageResult>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -2113,11 +2188,6 @@ export type SendMessageHandler = <T = unknown>(
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 
-export type SendUserMessageHandler = (
-	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
-) => void;
-
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
@@ -2203,6 +2273,8 @@ export interface ExtensionActions {
 	getSettings: GetSettingsHandler;
 	setActiveTools: SetActiveToolsHandler;
 	refreshTools: RefreshToolsHandler;
+	/** Optional host hook: throws for a revoked callback, else returns its inherited cancellation (pi.exec). */
+	inheritedCancellation?: () => AbortSignal | undefined;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;

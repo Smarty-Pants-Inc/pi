@@ -4,8 +4,7 @@ import { join } from "node:path";
 import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
-	type AssistantMessageEvent,
-	EventStream,
+	createAssistantMessageEventStream,
 	getModel,
 	type Model,
 } from "@earendil-works/pi-ai/compat";
@@ -46,19 +45,6 @@ vi.mock("../src/modes/rpc/jsonl.js", () => ({
 	}),
 	serializeJsonLine: (value: unknown) => `${JSON.stringify(value)}\n`,
 }));
-
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 function createAssistantMessage(text: string, overrides?: Partial<AssistantMessage>): AssistantMessage {
 	return {
@@ -115,6 +101,9 @@ async function createRuntimeHost(options: {
 	rebind: () => Promise<void>;
 	cleanup: () => Promise<void>;
 }> {
+	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
+	const previousSignals = signals.map((signal) => ({ signal, listeners: process.listeners(signal) }));
+	const previousEnd = process.stdin.listeners("end");
 	const tempDir = join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 
@@ -132,7 +121,7 @@ async function createRuntimeHost(options: {
 			tools: [],
 		},
 		streamFn: (_model, _context, _options) => {
-			const stream = new MockAssistantStream();
+			const stream = createAssistantMessageEventStream();
 			const shouldFail = options.failFirstResponse === true && streamCount === 0;
 			streamCount++;
 			queueMicrotask(() => {
@@ -184,6 +173,7 @@ async function createRuntimeHost(options: {
 		switchSession: vi.fn(async () => ({ cancelled: true })),
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
+		setLifecycleCompleteHandler: vi.fn(),
 		setRebindSession: (callback: () => Promise<void>) => {
 			rebindSession = callback;
 		},
@@ -200,11 +190,22 @@ async function createRuntimeHost(options: {
 			await rebindSession();
 		},
 		cleanup: async () => {
+			// Remove only listeners installed by this test's RPC host.
+			for (const { signal, listeners } of previousSignals) {
+				for (const listener of process.listeners(signal)) {
+					if (!listeners.includes(listener)) process.off(signal, listener);
+				}
+			}
+			for (const listener of process.stdin.listeners("end") as Array<Parameters<typeof process.on>[1]>) {
+				if (!previousEnd.includes(listener)) process.stdin.off("end", listener);
+			}
 			try {
 				await session.abort();
 			} catch {
 				// ignore test cleanup failures
 			}
+			// smarty-dev#3048: queued input must be explicitly recovered, never silently dropped by dispose.
+			session.clearQueue();
 			session.dispose();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true });
@@ -497,7 +498,8 @@ describe("RPC prompt response semantics", () => {
 			targetId = sessionManager.appendMessage({ role: "user", content: "history", timestamp: Date.now() });
 			sessionManager.appendMessage(createAssistantMessage("prior answer"));
 			session.agent.state.messages = sessionManager.buildSessionContext().messages;
-			vi.mocked(runtimeHost.dispose).mockImplementation(async () => {
+			vi.mocked(runtimeHost.dispose).mockImplementation(async (options) => {
+				await options?.beforeShutdown?.();
 				expect(session.isIdle).toBe(true);
 				order.push("dispose");
 			});
@@ -553,6 +555,35 @@ describe("RPC prompt response semantics", () => {
 			}
 		},
 	);
+
+	// pi#132 R5-S3: the success response carries whether a run (and so agent_settled) follows.
+	it("reports the handled or started disposition on the prompt response", async () => {
+		const { lineHandler, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event) => (event.text === "consume" ? { action: "handled" } : undefined));
+				},
+			],
+		});
+		try {
+			lineHandler(JSON.stringify({ id: "h1", type: "prompt", message: "consume" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "h1")).toEqual([
+					expect.objectContaining({ success: true, data: { disposition: "handled" } }),
+				]),
+			);
+			lineHandler(JSON.stringify({ id: "r1", type: "prompt", message: "Hello" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "r1")).toEqual([
+					expect.objectContaining({ success: true, data: { disposition: "started" } }),
+				]),
+			);
+		} finally {
+			await cleanup();
+		}
+	});
 
 	// #9098: a successful prompt may start an agent run or be consumed by an extension.
 	it("emits one started response when prompt preflight succeeds", async () => {

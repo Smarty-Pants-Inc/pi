@@ -671,7 +671,7 @@ describe("Coding Agent Tools", () => {
 					onData: () => {},
 				}),
 			).rejects.toThrow("Custom shell path not found: /custom/bash");
-			expect(getShellConfigSpy).toHaveBeenCalledWith("/custom/bash");
+			expect(getShellConfigSpy).toHaveBeenCalledWith("/custom/bash", expect.any(Object));
 		});
 
 		it("should send commands over stdin when shell resolution requires it", async () => {

@@ -86,8 +86,8 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 	}
 
-	// Herdr forwards OSC 8 targets, so a click on any wrapped row opens the full URL.
-	// Herdr 0.9.0 panes set only HERDR_ENV=1; later releases also set TERM_PROGRAM=herdr.
+	// Herdr forwards OSC 8 hyperlinks. Outer terminal variables such as KITTY_WINDOW_ID can leak
+	// into its panes, so check it first and leave image protocols off. Herdr 0.9.0 sets only HERDR_ENV.
 	if (termProgram === "herdr" || process.env.HERDR_ENV === "1") {
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: true };
 	}

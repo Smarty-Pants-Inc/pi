@@ -17,7 +17,7 @@ const customTypes = (harness: Harness): string[] =>
 	);
 
 // A triggered custom message during a prompt's preflight (Smarty-Pants-Inc/pi-fabric#107 review F2):
-// the session reports idle while input handlers run, and a run started then made the prompt fail
+// the session formerly reported idle while input handlers ran, and a run started then made the prompt fail
 // with "Agent is already processing".
 describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 	const harnesses: Harness[] = [];
@@ -38,7 +38,8 @@ describe("sendMessage with triggerTurn during a prompt's preflight", () => {
 					const hold = async (ctx: { isIdle(): boolean; isPromptPending(): boolean }): Promise<boolean> => {
 						if (!gate) return false;
 						gate = false;
-						expect(ctx.isIdle()).toBe(true);
+						// smarty-dev#3048: admitted input now prevents a false-idle report.
+						expect(ctx.isIdle()).toBe(false);
 						expect(ctx.isPromptPending()).toBe(true);
 						entered.resolve();
 						await release.promise;

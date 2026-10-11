@@ -1,4 +1,4 @@
-import type { Usage } from "@earendil-works/pi-ai";
+import type { ImageContent, Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSession, PromptOptions } from "../src/core/agent-session.ts";
@@ -162,6 +162,7 @@ describe("InteractiveMode compaction events", () => {
 			const fakeThis = {
 				isInitialized: true,
 				footer: { invalidate: vi.fn() },
+				programStatus: { handleEvent: vi.fn() },
 				autoCompactionEscapeHandler: undefined as (() => void) | undefined,
 				autoCompactionLoader: undefined,
 				defaultEditor: {},
@@ -239,7 +240,8 @@ describe("InteractiveMode compaction events", () => {
 			chatContainer: new Container(),
 			compactionQueuedMessages: queued,
 			footer: { invalidate: vi.fn() },
-			autoCompactionEscapeHandler: undefined,
+			programStatus: { handleEvent: vi.fn() },
+			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
 			autoCompactionLoader: undefined,
 			defaultEditor: {},
 			statusContainer: { clear: vi.fn() },
@@ -283,6 +285,7 @@ describe("InteractiveMode compaction events", () => {
 		const fakeThis = {
 			isInitialized: true,
 			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
 			activeStatusIndicator: undefined,
 			workingVisible: true,
 			showWorkingStatusIndicator: vi.fn(),
@@ -322,6 +325,8 @@ describe("InteractiveMode compaction events", () => {
 		const fakeThis = {
 			compactionQueuedMessages: [...queued],
 			compactionQueueTransfers: 0,
+			compactionQueueWork: new Set<Promise<void>>(),
+			recoveredImages: new Map<string, ImageContent>(),
 			session: {
 				clearQueue: vi.fn(),
 				prompt: vi.fn().mockReturnValue(prompt),
@@ -338,6 +343,7 @@ describe("InteractiveMode compaction events", () => {
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
 		};
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof fakeThis,
 		) => Promise<void>;
@@ -376,6 +382,8 @@ describe("InteractiveMode compaction events", () => {
 			const fakeThis = {
 				compactionQueuedMessages: [...batch],
 				compactionQueueTransfers: 0,
+				compactionQueueWork: new Set<Promise<void>>(),
+				recoveredImages: new Map<string, ImageContent>(),
 				session: {
 					prompt: vi.fn(() => prompt),
 					clearQueue: vi.fn(),
@@ -386,6 +394,7 @@ describe("InteractiveMode compaction events", () => {
 				updatePendingMessagesDisplay: vi.fn(),
 				showError: vi.fn(),
 			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 			const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 				this: typeof fakeThis,
 			) => Promise<void>;
@@ -417,7 +426,8 @@ describe("InteractiveMode compaction events", () => {
 		const ui = {
 			clearAllQueues: () => ({ steering: [], followUp: [] }),
 			updatePendingMessagesDisplay: vi.fn(),
-			session: { abort },
+			session: { abort, agent: { getQueuedMessages: () => [] } },
+			recoveryText: () => "",
 		};
 		const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor") as (
 			this: typeof ui,
@@ -433,6 +443,8 @@ describe("InteractiveMode compaction events", () => {
 		const fakeThis = {
 			compactionQueuedMessages: [{ input: receiveInput("change direction"), mode: "steer" as const }],
 			compactionQueueTransfers: 0,
+			compactionQueueWork: new Set<Promise<void>>(),
+			recoveredImages: new Map<string, ImageContent>(),
 			session: {
 				clearQueue: vi.fn(),
 				prompt: vi.fn().mockResolvedValue(undefined),
@@ -444,6 +456,7 @@ describe("InteractiveMode compaction events", () => {
 			showError: vi.fn(),
 		};
 
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
 		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof fakeThis,
 			options?: { willRetry?: boolean },

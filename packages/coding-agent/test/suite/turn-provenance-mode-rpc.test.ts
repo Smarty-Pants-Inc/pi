@@ -73,6 +73,7 @@ it("receives repeated RPC input before a held session_start and preserves it on 
 	const runtime = {
 		session: h.session,
 		setRebindSession: () => {},
+		setLifecycleCompleteHandler: () => {},
 		dispose: async () => {},
 	} as unknown as AgentSessionRuntime;
 	void runRpcMode(runtime);
@@ -130,6 +131,7 @@ it("captures post-bind frames before the command-dispatch microtask", async () =
 	const runtime = {
 		session: h.session,
 		setRebindSession: () => {},
+		setLifecycleCompleteHandler: () => {},
 		dispose: async () => {},
 	} as unknown as AgentSessionRuntime;
 	void runRpcMode(runtime);

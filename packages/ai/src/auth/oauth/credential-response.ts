@@ -147,7 +147,11 @@ function maskAll(text: string, values: readonly string[]): { text: string; match
 	return { text, matched };
 }
 
-function redactValues(text: string, secrets: readonly string[]): string {
+/**
+ * Mask only the live values in `secrets` (raw, JSON/URI-escaped, form or base64 encoded).
+ * No label heuristics, so an opaque provider token without a live value stays byte for byte.
+ */
+export function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
 		if (typeof secret !== "string" || secret.length < MIN_DIAGNOSTIC_SECRET_LENGTH) continue;

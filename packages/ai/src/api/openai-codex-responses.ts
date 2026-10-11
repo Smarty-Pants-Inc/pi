@@ -453,7 +453,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					if (info.friendlyMessage) throw new Error(info.friendlyMessage);
+					// Keep the message for the retry checks below; status and raw body go to formatProviderError.
+					throw Object.assign(new Error(info.message), { status: response.status, body: errorText });
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -503,7 +505,13 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
+			// HTTP errors carry `status` and `body` (see above), so they read `<provider> API error (<status>): <body>`
+			// like the other Responses providers; errors without a status keep their message unchanged. The body and
+			// message are redacted with the request's diagnostic secrets by normalizeProviderError.
+			output.errorMessage = formatProviderError(
+				normalizeProviderError(error, diagnosticSecrets),
+				`${model.provider} API error`,
+			);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -1700,7 +1708,11 @@ function buildBaseCodexHeaders(
 	accountId: string,
 	token: string,
 ): Headers {
-	const headers = new Headers(initHeaders);
+	// Defaults first so model and caller headers can override them, matching the other providers.
+	const headers = new Headers({ originator: "pi", "User-Agent": getPiUserAgent() });
+	for (const [key, value] of Object.entries(initHeaders || {})) {
+		headers.set(key, value);
+	}
 	for (const [key, value] of Object.entries(additionalHeaders || {})) {
 		if (value === null) {
 			headers.delete(key);
@@ -1710,8 +1722,6 @@ function buildBaseCodexHeaders(
 	}
 	headers.set("Authorization", `Bearer ${token}`);
 	headers.set("chatgpt-account-id", accountId);
-	headers.set("originator", "pi");
-	headers.set("User-Agent", getPiUserAgent());
 	return headers;
 }
 

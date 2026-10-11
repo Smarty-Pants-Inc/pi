@@ -20,7 +20,7 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import type { SessionManager } from "../session-manager.ts";
+import { detachedSessionView, type SessionManager } from "../session-manager.ts";
 import {
 	type BuildSystemPromptOptions,
 	buildSystemPrompt,
@@ -32,6 +32,8 @@ import type { VirtualModelDefinition } from "../virtual-models.ts";
 import { boundaryReceiptSlots, receiveBoundaryEntries } from "./boundary-receipts.ts";
 import type {
 	AgentBeforeSettleEvent,
+	BashSpawnEvent,
+	BashSpawnEventResult,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderHeadersEvent,
@@ -183,6 +185,7 @@ interface BeforeAgentStartCombinedResult {
 type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
 	| ToolCallEvent
+	| BashSpawnEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
 	| UserBashEvent
@@ -266,9 +269,10 @@ export type ShutdownHandler = () => void;
 export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
+		await extensionRunner.emit(event, signal);
 		return true;
 	}
 	return false;
@@ -446,6 +450,7 @@ export class ExtensionRunner {
 		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.refreshTools = actions.refreshTools;
+		this.runtime.inheritedCancellation = actions.inheritedCancellation;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
@@ -581,7 +586,22 @@ export class ExtensionRunner {
 	}
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		const wrapped = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		// A caller may capture ui or an individual method before replacement. Check
+		// lifetime at invocation too, not only when ctx.ui is first read.
+		this.uiContext = uiContext
+			? new Proxy(wrapped, {
+					get: (target, key, receiver) => {
+						this.assertActive();
+						const value: unknown = Reflect.get(target, key, receiver);
+						if (typeof value !== "function") return value;
+						return (...args: unknown[]) => {
+							this.assertActive();
+							return Reflect.apply(value, target, args);
+						};
+					},
+				})
+			: noOpUIContext;
 		this.mode = mode;
 	}
 
@@ -919,7 +939,7 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return runner.sessionManager;
+				return detachedSessionView(runner.sessionManager);
 			},
 			get modelRegistry() {
 				runner.assertActive();
@@ -956,6 +976,11 @@ export class ExtensionRunner {
 			get signal() {
 				runner.assertActive();
 				return runner.getSignalFn();
+			},
+			get emitBashSpawn() {
+				runner.assertActive();
+				if (!runner.hasHandlers("bash_spawn")) return undefined;
+				return (event: BashSpawnEvent, signal?: AbortSignal) => runner.emitBashSpawn(event, signal);
 			},
 			abort: () => {
 				runner.assertActive();
@@ -1136,6 +1161,7 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
 				// A failed proposal remains visible so a later handler can replace it.
+				const before = entries;
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
 				if (hadEntries) {
@@ -1177,13 +1203,19 @@ export class ExtensionRunner {
 					// Existing semantics retain drafts mutated before a handler throws.
 					// A secondary flag failure cannot discard a successfully received selection.
 					if (!receivedSelection) {
-						const retained = receiveBoundaryEntries(
-							event.entries,
-							slots,
-							observed ?? captureTerminalTurnReceipt(),
-						);
-						entries = retained.entries;
-						entryReceipts = retained.receipts;
+						try {
+							const retained = receiveBoundaryEntries(
+								event.entries,
+								slots,
+								observed ?? captureTerminalTurnReceipt(),
+							);
+							entries = retained.entries;
+							entryReceipts = retained.receipts;
+						} catch {
+							// A poisoned in-place draft cannot be committed; keep the detached pre-handler proposal (#132 R4-10).
+							entries = before;
+							entryReceipts = previousReceipts;
+						}
 					}
 					this.emitError({
 						extensionPath: ext.path,
@@ -1481,6 +1513,37 @@ export class ExtensionRunner {
 		return result;
 	}
 
+	async emitBashSpawn(event: BashSpawnEvent, signal?: AbortSignal): Promise<BashSpawnEventResult | undefined> {
+		this.assertActive();
+		signal = this.dispatchSignal(event.type, signal);
+		signal?.throwIfAborted();
+		const ctx = this.createContext();
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "bash_spawn")) {
+			for (const handler of handlers) {
+				try {
+					// Attestation cannot rewrite the executor or another handler's view.
+					const result = (await this.dispatchHandler(handler, structuredClone(event), ctx, signal)) as
+						| BashSpawnEventResult
+						| undefined;
+					if (result?.block) return { block: true, reason: result.reason ?? "Bash spawn blocked" };
+				} catch (err) {
+					signal?.throwIfAborted();
+					const message = err instanceof Error ? err.message : String(err);
+					this.emitError({
+						extensionPath: ext.path,
+						event: "bash_spawn",
+						error: message,
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+					return { block: true, reason: `bash_spawn handler failed: ${message}` };
+				}
+			}
+		}
+
+		return undefined;
+	}
+
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
 		const signal = this.dispatchSignal(event.type);
 		signal?.throwIfAborted();
@@ -1665,8 +1728,10 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
+		cancellation?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult> {
-		const signal = this.dispatchSignal("before_agent_start");
+		// The originating admission's revocation stops the loop, not only the caller's wait (#132 R4-12).
+		const signal = this.dispatchSignal("before_agent_start", cancellation);
 		signal?.throwIfAborted();
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
@@ -1800,7 +1865,8 @@ export class ExtensionRunner {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
-						images: currentImages,
+						// Handlers get detached images: a late in-place edit cannot change retained or recovered originals (#132 R4-6).
+						images: currentImages?.map((image) => ({ ...image })),
 						source,
 						streamingBehavior,
 					};
@@ -1809,7 +1875,7 @@ export class ExtensionRunner {
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
-						currentImages = result.images ?? currentImages;
+						currentImages = result.images?.map((image) => ({ ...image })) ?? currentImages;
 					}
 				} catch (err) {
 					signal?.throwIfAborted();

@@ -44,6 +44,10 @@ export function wrapToolDefinitions(
  * provides plain AgentTool overrides that do not include prompt metadata or renderers.
  */
 export function createToolDefinitionFromAgentTool(tool: AgentTool<any>): ToolDefinition<any, unknown> {
+	// Built-in AgentTool wrappers accept an optional session context beyond the core's four arguments.
+	const executeWithContext: (
+		...args: [...Parameters<AgentTool["execute"]>, ctx?: ExtensionToolContext]
+	) => ReturnType<AgentTool["execute"]> = tool.execute.bind(tool);
 	return {
 		name: tool.name,
 		label: tool.label,
@@ -53,6 +57,7 @@ export function createToolDefinitionFromAgentTool(tool: AgentTool<any>): ToolDef
 		constrainedSampling: tool.constrainedSampling,
 		prepareArguments: tool.prepareArguments?.bind(tool),
 		executionMode: tool.executionMode,
-		execute: async (toolCallId, params, signal, onUpdate) => tool.execute(toolCallId, params, signal, onUpdate),
+		execute: async (toolCallId, params, signal, onUpdate, ctx) =>
+			executeWithContext(toolCallId, params, signal, onUpdate, ctx),
 	};
 }

@@ -264,11 +264,14 @@ test("terminal append uses a captured serialized private route", () => {
 	const agent = readFileSync(new URL("../src/core/agent-session.ts", import.meta.url), "utf8");
 	expect(manager).toContain("const ownedTerminalAppenders = new WeakMap<SessionManager, OwnedTerminalAppender>()");
 	expect(manager).toContain("#ownedTerminalTail: Promise<void> = Promise.resolve();");
-	expect(manager).toContain("await this.#ownedJournal.commitTerminalAsync(bytes);");
+	expect(manager).toContain("await this.#ownedJournal.appendTerminalAsync(line);");
 	expect(manager).toContain("this.#ownedTerminalTail = run.then(() => undefined);");
 	expect(agent).toContain("await this._flushPendingBashMessagesOwnedTerminal();");
 	expect(agent).toContain("await this._flushPendingCustomMessagesOwnedTerminal();");
-	expect(agent).toContain("await appendOwnedTerminalMessage(this.sessionManager, event.message, receipt)");
+	// #7883: per-input metadata uses the same captured owned terminal appender.
+	expect(agent).toMatch(
+		/await appendOwnedTerminalMessage\(\s*this\.sessionManager,\s*event\.message,\s*receipt,\s*metadata,\s*metadataSource,?\s*\)/,
+	);
 	expect(agent).toContain("await appendOwnedTerminalCustomMessage(");
 	expect(agent).toContain("Leave the failed message and suffix retained");
 	expect(manager).toContain("nativeWriteAccepted: true");

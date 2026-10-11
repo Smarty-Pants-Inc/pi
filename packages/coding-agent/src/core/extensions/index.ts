@@ -34,6 +34,8 @@ export type {
 	// App keybindings (for custom editors)
 	AppKeybinding,
 	AutocompleteProviderFactory,
+	BashSpawnEvent,
+	BashSpawnEventResult,
 	// Events - Tool (ToolCallEvent types)
 	BashToolCallEvent,
 	BashToolResultEvent,
@@ -147,6 +149,8 @@ export type {
 	ResourcesDiscoverResult,
 	SendMessageHandler,
 	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -202,6 +206,8 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
 	UserMessageRenderer,
 	UserMessageRenderOptions,
 	WidgetPlacement,

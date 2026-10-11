@@ -1,4 +1,4 @@
-import { redactOAuthDiagnostic, redactOAuthDiagnosticValue } from "../auth/oauth/credential-response.ts";
+import { redactOAuthDiagnostic, redactOAuthDiagnosticValue, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 import { snapshotAssistantMessage, snapshotAssistantMessageEvent } from "./assistant-message-snapshot.ts";
 import type { AssistantMessageDiagnostic } from "./diagnostics.ts";
@@ -29,7 +29,7 @@ class FifoQueue<T> {
 export class EventStream<T, R = T> implements AsyncIterable<T> {
 	private queue = new FifoQueue<T>();
 	private waiting = new FifoQueue<(value: IteratorResult<T>) => void>();
-	private done = false;
+	protected done = false;
 	private finalResultPromise: Promise<R>;
 	private resolveFinalResult!: (result: R) => void;
 	private isComplete: (event: T) => boolean;
@@ -123,6 +123,13 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
 	if (typeof message.rawStopReason === "string")
 		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
+	// The handle id is a provider token that consumers persist and redeem: mask live values only, and
+	// replace the handle instead of rewriting the provider's own object (smarty-dev#5443 T-F6-deferred).
+	const deferred = message.deferred;
+	if (typeof deferred?.id === "string") {
+		const id = redactValues(deferred.id, secrets);
+		if (id !== deferred.id) message.deferred = { ...deferred, id };
+	}
 	const diagnostics = message.diagnostics;
 	if (!Array.isArray(diagnostics)) return;
 	for (let i = 0; i < diagnostics.length; i++) {
@@ -134,7 +141,16 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 	}
 }
 
+/**
+ * Event stream of one assistant response. It also times the response: the final message (`done` or `error` event, or
+ * the result passed to `end()`) gets `durationMs`, measured with a monotonic clock from the stream's creation, unless
+ * the message already has one or its `timestamp` predates the stream. A stream that forwards a response which started
+ * elsewhere, such as a deferred result fetched later, therefore leaves it untimed.
+ */
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
+	readonly #startedAt = Date.now();
+	readonly #startedAtMonotonic = performance.now();
+
 	/** `diagnosticSecrets`: see `protectAssistantMessageStream`. */
 	constructor(diagnosticSecrets?: readonly string[]) {
 		super(
@@ -159,6 +175,9 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 			if (event.type === "done") protectMessage(event.message, protection);
 			if (event.type === "error") protectMessage(event.error, protection);
 		}
+
+		if (event.type === "done") this.#time(event.message);
+		else if (event.type === "error") this.#time(event.error);
 		// Consumers get event-time snapshots, never the provider's live message.
 		super.push(snapshotAssistantMessageEvent(event));
 	}
@@ -166,7 +185,13 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	override end(result?: AssistantMessage): void {
 		const protection = streamProtections.get(this);
 		if (result && protection) protectMessage(result, protection);
+		if (result !== undefined) this.#time(result);
 		super.end(result && snapshotAssistantMessage(result));
+	}
+
+	#time(message: AssistantMessage): void {
+		if (this.done || message.durationMs !== undefined || message.timestamp < this.#startedAt) return;
+		message.durationMs = Math.max(0, Math.round(performance.now() - this.#startedAtMonotonic));
 	}
 }
 

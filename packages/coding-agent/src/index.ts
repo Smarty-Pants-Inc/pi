@@ -63,6 +63,8 @@ export type {
 	AgentToolUpdateCallback,
 	AppKeybinding,
 	AutocompleteProviderFactory,
+	BashSpawnEvent,
+	BashSpawnEventResult,
 	BashToolCallEvent,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -146,6 +148,8 @@ export type {
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	SendUserMessageOptions,
+	SendUserMessageResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -192,6 +196,8 @@ export type {
 	UIPromptStartEvent,
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
 	UserMessageRenderer,
 	UserMessageRenderOptions,
 	WidgetPlacement,
@@ -218,6 +224,7 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
 export { HOST_CAPABILITIES, type HostCapabilities } from "./core/host-capabilities.ts";
+export { InputAdmissionError, type InputAdmissionErrorCode } from "./core/input-admission.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
 export { convertToLlm } from "./core/messages.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
@@ -408,6 +415,7 @@ export {
 	type TurnSender,
 	type TurnSenderKind,
 } from "./core/turn-provenance.ts";
+export { UserMessageMetadataError, type UserMessageMetadataErrorCode } from "./core/user-message-metadata.ts";
 export {
 	type ModelRoute,
 	type ModelRouteReason,
@@ -441,6 +449,7 @@ export {
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
 	type RpcExtensionUIResponseBody,
+	type RpcInputRejectedEvent,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,

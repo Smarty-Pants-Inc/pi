@@ -63,6 +63,7 @@ import {
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import {
 	assertChatModel,
+	assertClassifierInputSupported,
 	assertClassifierModel,
 	assertImageModel,
 	classifierErrorResult,
@@ -976,6 +977,7 @@ export class ModelRuntime implements Models {
 		let secrets: readonly string[] = [];
 		try {
 			assertClassifierModel(model);
+			assertClassifierInputSupported(model, context);
 			const prepared = await this.prepareRequest(model, options);
 			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.classify) {

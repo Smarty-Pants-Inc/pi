@@ -44,10 +44,9 @@ const BUDGETS = {
 	},
 	"packages/durable": {
 		".": {
-			// Tool argument validation reaches TypeBox; provider-session creation reaches pi-ai's lean UUID utility.
-			// The fork's retry error-body parser and its dependency-free credential redactor are reached by
-			// upstream durable compaction.
-			maxFiles: 64,
+			// Upstream adds the shared storage scan module to its 62-file graph; the fork adds
+			// the retry error-body parser and dependency-free credential redactor (+2).
+			maxFiles: 65,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

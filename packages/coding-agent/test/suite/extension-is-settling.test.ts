@@ -140,13 +140,13 @@ describe("ExtensionContext.isSettling", () => {
 
 		expect(harness.faux.state.callCount).toBe(4);
 		expect(observed).toEqual([
-			"before:start:idle=true:settling=false",
+			"before:start:idle=false:settling=false",
 			"settled:1:settling=true",
-			"before:A:idle=true:settling=false",
+			"before:A:idle=false:settling=false",
 			"settled:2:settling=true",
-			"before:C:idle=true:settling=false",
+			"before:C:idle=false:settling=false",
 			"settled:3:settling=true",
-			"before:B:idle=true:settling=false",
+			"before:B:idle=false:settling=false",
 			"settled:4:settling=true",
 		]);
 		expect(harness.session.isSettling).toBe(false);

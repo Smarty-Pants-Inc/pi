@@ -15,11 +15,16 @@ export {
 } from "./discovery.ts";
 export {
 	McpOAuthAuthorizationRequiredError,
+	OAuthEndpointOriginError,
 	OAuthError,
 	OAuthInsecureEndpointError,
 	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
 	OAuthRegistrationError,
+	OAuthResourceMismatchError,
 } from "./errors.ts";
+// The token operations stay public (documented API since 1.0.x), and each binds its endpoints to the issuer
+// origin (and allowedEndpointOrigins) itself before any request, as authorizeMcp does (pi#173).
 export {
 	type AddClientAuthentication,
 	adaptOAuthProvider,

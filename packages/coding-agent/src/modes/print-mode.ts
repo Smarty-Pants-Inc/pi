@@ -16,6 +16,7 @@ import { raceWithAbortSignal } from "../utils/abort.ts";
 import { killTrackedDetachedChildren } from "../utils/shell.ts";
 import { toJsonEvent } from "./json-event.ts";
 import { writeRetryNotice } from "./retry-notice.ts";
+import type { RpcInputRejectedEvent } from "./rpc/rpc-types.ts";
 
 /**
  * Options for print mode.
@@ -74,7 +75,25 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			// remains subscribed until final events have been persisted and emitted.
 			outputCancellation.abort(new Error("Print transport cancelled for terminal shutdown"));
 			try {
-				await runtimeHost.dispose();
+				await runtimeHost.dispose({
+					terminal: true,
+					rejectQueuedInput: (messages, owner) => {
+						exitCode = 1;
+						if (mode === "json") {
+							writeRawStdout(
+								`${JSON.stringify({
+									type: "input_rejected",
+									reason: "shutdown",
+									sessionId: owner.sessionId,
+									error: "INPUT_ADMISSION_SHUTDOWN: queued input was not delivered",
+									messages,
+								} satisfies RpcInputRejectedEvent)}\n`,
+							);
+						} else {
+							console.error("Print input delivery incomplete: queued input cancelled for terminal shutdown");
+						}
+					},
+				});
 				unsubscribe?.();
 				unsubscribeBackpressure?.();
 				// Persistence above must not depend on an unread pipe. Drainage gets its
@@ -236,6 +255,9 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				}
 			}
 		}
+		// Successful output joins a slow but live reader without the forced-shutdown drain budget (#132 R4-9).
+		// A signal still runs disposeRuntime() with its bounded drainage.
+		await flushRawStdout();
 	} catch (error: unknown) {
 		console.error(requestLimitError?.message ?? (error instanceof Error ? error.message : String(error)));
 		limitReported = requestLimitError !== undefined;

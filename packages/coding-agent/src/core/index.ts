@@ -40,6 +40,8 @@ export {
 	type AgentStartEvent,
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
+	type BashSpawnEvent,
+	type BashSpawnEventResult,
 	type BeforeAgentStartEvent,
 	type BeforeAgentStartEventResult,
 	type BoundaryContextPreview,

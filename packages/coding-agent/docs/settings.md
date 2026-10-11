@@ -53,9 +53,9 @@ A list of only `+name` and `-name` entries changes the inherited selection inste
 
 This replaces `bash` with `powershell` and enables `grep`: `["-bash", "+powershell", "+grep"]`. Project settings apply on top of user settings: a project list with only `+name` and `-name` entries changes the user's selection, and a project list with a plain name replaces it. In one list, plain names form the selection, and `+name` and `-name` then apply in order.
 
-`/reload` enables tools newly added to `defaultTools`. It does not disable tools removed from it or re-enable unchanged tools you turned off. `--tools`, `--no-tools`, and `--no-builtin-tools` override `defaultTools`, also on reload.
+`/reload` enables tools newly added to `defaultTools`. It does not disable tools removed from it or re-enable unchanged tools you turned off. `--tools` with plain names, `--no-tools`, and `--no-builtin-tools` override `defaultTools`, also on reload.
 
-CLI tool options override this setting for one invocation; `--tools` does not accept `+name` or `-name`. See [Command Line](cli.md#tools).
+CLI tool options override this setting for one invocation. `--tools` with only `+name` and `-name` entries changes the resolved `defaultTools` selection instead, for example `pi --tools +codemode`. On `/reload`, these entries apply to the reloaded setting too, so a tool removed with `-name` stays removed. See [Command Line](cli.md#tools).
 
 ## Sessions and context
 
@@ -97,7 +97,7 @@ See [Compaction Reference](compaction.md) for trigger, summarization, and valida
 | `fullscreenCopyOnSelect` | boolean | `true` | Copy selected text automatically in fullscreen mode. |
 | `fullscreenWheelScrollLines` | `"auto"` \| number | `"auto"` | Lines per mouse-wheel event in fullscreen mode, from 1 to 100. `"auto"` moves one line per event in local macOS terminals, which already accelerate wheel and trackpad input; elsewhere, and over SSH, it speeds up fast wheel spins to at most 6 lines per event. Alt+wheel moves five times as far. |
 | `editorPaddingX` | number | `0` | Horizontal editor padding from 0 to 3 cells. |
-| `outputPad` | `0 \| 1` | `1` | Horizontal transcript padding. |
+| `outputPad` | `0 \| 1` | `1` | Horizontal transcript padding for messages, tool output, `!` command output, and summary blocks. |
 | `autocompleteMaxVisible` | number | `5` | Visible autocomplete entries, from 3 to 20. |
 | `showHardwareCursor` | boolean | `false` | Show the terminal cursor while Pi positions it for input methods. |
 | `terminal.showImages` | boolean | `true` | Display inline images when supported. |
@@ -132,6 +132,8 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Maximum server-requested delay in milliseconds. Set to `0` to disable the limit. |
 
 Agent retries and fallback only restart requests with no output: nonempty text or reasoning, any tool-call block (including a partial call), or reported output tokens prevent recovery. Empty reasoning blocks and encrypted reasoning signatures alone do not count as output. Pi also remembers streamed deltas if a provider discards partial content in its final error.
+
+One exception: a premature stream ending (for example `stream closed before response.completed`) after reasoning only, with no answer text and no tool call, is restarted even though reasoning tokens were reported. The failed attempt's reasoning is discarded before it is shown as final or written to the session file. Other errors after reasoning stay final.
 
 Premature stream endings use at most two retries with the configured exponential backoff (by default 2s, then 4s). Lower `retry.maxRetries` values still apply, and `retry.enabled: false` disables both retry and fallback. Other transient failures keep their ordinary retry budget.
 

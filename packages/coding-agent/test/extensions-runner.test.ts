@@ -6,6 +6,7 @@ import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
@@ -1053,9 +1054,14 @@ describe("ExtensionRunner", () => {
 		);
 		const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
 
-		expect(runner.resolveToolRenderers("a", () => undefined)).toEqual({ renderCall });
+		// pi#187: returned renderer callbacks are source-bound wrappers, not the original functions.
+		const firstRenderers = runner.resolveToolRenderers("a", () => undefined);
+		expect(firstRenderers).toEqual({ renderCall: expect.any(Function) });
+		expect(firstRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
 		expect(runner.resolveToolRenderers("b", () => undefined)).toEqual({ renderShell: "self" });
-		expect(runner.resolveToolRenderers("b", () => ({ renderCall }))).toEqual({ renderCall });
+		const baseRenderers = runner.resolveToolRenderers("b", () => ({ renderCall }));
+		expect(baseRenderers).toEqual({ renderCall: expect.any(Function) });
+		expect(baseRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
 	});
 
 	describe("boundary chaining", () => {
@@ -1169,6 +1175,77 @@ describe("ExtensionRunner", () => {
 			expect(errors).toContain("Invalid boundary entries: Entry missing not found");
 			expect(result.entries).toEqual([]);
 			expect(result.valid).toBe(true);
+		});
+
+		// pi#132 R4-6: input handlers see detached images; a late in-place edit leaves the caller's originals intact.
+		it("detaches input images from handlers before exposure and at transform acceptance", async () => {
+			const runtime = createExtensionRuntime();
+			let seen: ImageContent[] | undefined;
+			let returned: ImageContent[] | undefined;
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("input", (event) => {
+						seen = event.images;
+						returned = [{ type: "image", data: "transformed", mimeType: "image/png" }];
+						return { action: "transform", text: event.text, images: returned };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const original: ImageContent = { type: "image", data: "original", mimeType: "image/png" };
+			const result = await runner.emitInput("text", [original], "interactive");
+			seen![0]!.data = "late edit";
+			seen![0]!.mimeType = "image/gif";
+			returned![0]!.data = "late transform edit";
+			expect(original).toEqual({ type: "image", data: "original", mimeType: "image/png" });
+			expect(result).toMatchObject({ action: "transform", images: [{ data: "transformed" }] });
+		});
+
+		// pi#132 R4-10: an uncloneable in-place draft is reported and isolated; a later handler can still repair.
+		it("isolates an uncloneable in-place draft and lets a later handler repair", async () => {
+			const runtime = createExtensionRuntime();
+			const poison = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						event.entries.push({ type: "custom", customType: "poison", data: () => undefined });
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:poison>",
+			);
+			let repairSaw: number | undefined;
+			const repair = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("agent_before_settle", (event) => {
+						repairSaw = event.entries.length;
+						return { entries: [{ type: "custom", customType: "repaired" }] };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+				"<inline:repair>",
+			);
+			const runner = new ExtensionRunner([poison, repair], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+
+			const result = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" }, () => ({
+				contextEntries: [],
+				contextMessages: [],
+				llmMessages: [],
+				pendingMessages: [],
+				canContinue: false,
+			}));
+
+			expect(errors).toHaveLength(1);
+			expect(repairSaw).toBe(0);
+			expect(result.entries).toMatchObject([{ type: "custom", customType: "repaired" }]);
 		});
 
 		it("keeps shared mutations made before a handler throws", async () => {
