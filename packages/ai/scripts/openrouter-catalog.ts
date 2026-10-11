@@ -1,4 +1,4 @@
-import type { ClassifierModel, ImageModel, Model, ModelCost } from "../src/types.ts";
+import type { ClassifierModel, ImageModel, Model, ModelCost, ModelCostTier } from "../src/types.ts";
 import { getOpenRouterThinkingLevelMap, type OpenRouterReasoningMetadata } from "./openrouter-reasoning-options.ts";
 
 export interface OpenRouterModelListItem {
@@ -11,6 +11,7 @@ export interface OpenRouterModelListItem {
 		completion?: string;
 		input_cache_read?: string;
 		input_cache_write?: string;
+		overrides?: OpenRouterPricingOverride[];
 	};
 	top_provider?: {
 		context_length?: number;
@@ -20,14 +21,30 @@ export interface OpenRouterModelListItem {
 	reasoning?: OpenRouterReasoningMetadata;
 }
 
+/**
+ * A conditional price. `min_prompt_tokens` selects prompt-length pricing; `utc_*` fields select
+ * time-of-day or weekday pricing. Missing rates keep the base price.
+ */
+export interface OpenRouterPricingOverride {
+	min_prompt_tokens?: number;
+	utc_start?: number;
+	utc_end?: number;
+	utc_days?: string[];
+	prompt?: string;
+	completion?: string;
+	input_cache_read?: string;
+	input_cache_write?: string;
+}
+
 export interface OpenRouterCatalog {
 	chat: Model<"anthropic-messages" | "openai-completions">[];
 	images: ImageModel<"openrouter-images">[];
 	classifiers: ClassifierModel<"typesafe-system-one">[];
 }
 
-function pricePerMillion(value: string | undefined): number {
-	const rate = Number(value ?? "0") * 1_000_000;
+function pricePerMillion(value: string | undefined, fallback = 0): number {
+	if (value === undefined) return fallback;
+	const rate = Number(value) * 1_000_000;
 	// Negative sentinel prices (e.g. routers) and invalid rates are unknown.
 	// Represent them as a zero estimate, as with missing pricing, not a credit.
 	return Number.isFinite(rate) && rate > 0 ? Number(rate.toFixed(6)) : 0;
@@ -40,13 +57,35 @@ function modalities(values: string[] | undefined): ("text" | "image")[] {
 }
 
 function cost(model: OpenRouterModelListItem): ModelCost {
-	// Convert pricing from $/token to $/million tokens
-	return {
-		input: pricePerMillion(model.pricing?.prompt),
-		output: pricePerMillion(model.pricing?.completion),
-		cacheRead: pricePerMillion(model.pricing?.input_cache_read),
-		cacheWrite: pricePerMillion(model.pricing?.input_cache_write),
+	const pricing = model.pricing;
+	const base = {
+		input: pricePerMillion(pricing?.prompt),
+		output: pricePerMillion(pricing?.completion),
+		cacheRead: pricePerMillion(pricing?.input_cache_read),
+		cacheWrite: pricePerMillion(pricing?.input_cache_write),
 	};
+	// Prompt-length overrides become request-wide tiers. Time-of-day overrides are skipped
+	// because ModelCost cannot express them.
+	const tiers = (pricing?.overrides ?? []).flatMap((override): ModelCostTier[] => {
+		if (
+			override.min_prompt_tokens === undefined ||
+			override.utc_start !== undefined ||
+			override.utc_end !== undefined ||
+			override.utc_days !== undefined
+		) {
+			return [];
+		}
+		return [
+			{
+				inputTokensAbove: override.min_prompt_tokens,
+				input: pricePerMillion(override.prompt, base.input),
+				output: pricePerMillion(override.completion, base.output),
+				cacheRead: pricePerMillion(override.input_cache_read, base.cacheRead),
+				cacheWrite: pricePerMillion(override.input_cache_write, base.cacheWrite),
+			},
+		];
+	});
+	return tiers.length > 0 ? { ...base, tiers } : base;
 }
 
 /**

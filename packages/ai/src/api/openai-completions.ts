@@ -40,7 +40,11 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import {
+	appendAssistantMessageDiagnostic,
+	closedRawStopReason,
+	createAssistantMessageDiagnostic,
+} from "../utils/diagnostics.ts";
 import {
 	formatProviderError,
 	normalizeProviderError,
@@ -50,11 +54,12 @@ import {
 } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { recordThrottledLimitWait } from "../utils/retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import {
@@ -395,7 +400,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponse(response.status));
 			stream.push({ type: "start", partial: output });
 
 			interface StreamingToolCallBlock extends ToolCall {
@@ -571,7 +576,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			};
 
 			for await (const chunk of openaiStream) {
-				await options?.onProviderStreamEvent?.(chunk, model);
+				await notifyProviderStreamEvent(options, output);
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -733,33 +738,28 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			const limitMessage = smartyLimitMessage(error);
 			if (limitMessage !== undefined) {
-				// Show the gateway's limit message as-is, and mark it final so the generic retry does not retry it.
-				// A throttled limit with a short Retry-After carries the wait for the agent's one-shot retry.
+				// Show the owned limit text (never the gateway's own message), and mark it final so the generic retry
+				// does not retry it (smarty-dev#5822, pi#202 round 3).
+				// A throttled limit with a short Retry-After records the wait privately for the agent's one-shot retry;
+				// the published diagnostic is the owned type only (smarty-dev#5822 N5682).
 				output.errorMessage = limitMessage;
+				output.recovery ??= { retryable: false };
 				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
-				appendAssistantMessageDiagnostic(output, {
-					type: PROVIDER_LIMIT_DIAGNOSTIC,
-					timestamp: Date.now(),
-					details:
-						retryAfterSeconds === undefined
-							? { code: "smarty_limit" }
-							: {
-									code: "smarty_limit",
-									retryAfterSeconds,
-									waitMessage:
-										limitMessage === "smarty_limit" ? "Flash runs one request at a time" : limitMessage,
-								},
-				});
+				if (retryAfterSeconds !== undefined) recordThrottledLimitWait(output, retryAfterSeconds);
+				appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(PROVIDER_LIMIT_DIAGNOSTIC));
 			} else {
-				output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
-				// Some providers via OpenRouter give additional information in this field.
-				// normalizeProviderError already stringifies the parsed body (error.error)
-				// into errorMessage, so only append the raw metadata when it is not already
-				// present to avoid double-printing it.
-				const rawMetadata = (error as any)?.error?.metadata?.raw;
-				if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
-					output.errorMessage += `\n${rawMetadata}`;
-				}
+				// OpenRouter's `metadata.raw` and the provider's message and body are classified privately and
+				// never published; the error text is owned (smarty-dev#5822, pi#202 round 2).
+				const rawMetadata = (error as { error?: { metadata?: { raw?: unknown } } } | undefined)?.error?.metadata
+					?.raw;
+				const norm = normalizeProviderError(
+					error,
+					model.provider,
+					rawMetadata === undefined || rawMetadata === null ? undefined : String(rawMetadata),
+					diagnosticSecrets,
+				);
+				output.recovery ??= norm.recovery;
+				output.errorMessage = formatProviderError(norm);
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -1618,7 +1618,8 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | str
 		default:
 			return {
 				stopReason: "error",
-				errorMessage: `Provider finish_reason: ${reason}`,
+				// A closed value: a provider-chosen finish_reason never reaches the text (smarty-dev#5822).
+				errorMessage: `Provider finish_reason: ${closedRawStopReason(reason)}`,
 			};
 	}
 }

@@ -21,6 +21,7 @@ import type {
 	Tool,
 	TranscriptContext,
 } from "../types.ts";
+import { ProviderDataError } from "../utils/error-body.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { collapseSystemMessages, withoutInitialSystemMessage } from "../utils/transcript.ts";
@@ -463,7 +464,8 @@ export function mapStopReason(reason: FinishReason): StopReason {
 			return "error";
 		default: {
 			const _exhaustive: never = reason;
-			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
+			// The provider's value stays private (smarty-dev#5822, pi#202 round 3).
+			throw new ProviderDataError(`Unhandled stop reason: ${_exhaustive}`);
 		}
 	}
 }

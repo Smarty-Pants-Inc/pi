@@ -13,9 +13,8 @@ import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.t
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
+	AssistantRecovery,
 	CacheRetention,
-	JsonObject,
-	JsonValue,
 	Model,
 	ProviderEnv,
 	SimpleStreamOptions,
@@ -26,11 +25,19 @@ import type {
 	TranscriptContext,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { formatProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import {
+	markProviderStreamObserverFailure,
+	PROVIDER_STREAM_OBSERVER_FAILED,
+	providerResponse,
+	providerStreamNotification,
+} from "../utils/provider-observation.ts";
 import { checkProviderRequest } from "../utils/provider-retry.ts";
+import { classifyProviderFailure, validHttpStatus } from "../utils/recovery.ts";
 
 export interface PiMessagesOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
@@ -97,15 +104,67 @@ type PiMessagesErrorBody = {
 	};
 };
 
-export class PiMessagesResponseError extends Error {
-	code?: string;
-	readonly diagnosticDetails: JsonObject;
+/**
+ * Closed categories of a pi-messages error response. A backend `error.code` contributes only through this
+ * exact allow-list; any other code is not published.
+ */
+export type PiMessagesErrorCategory =
+	| "unauthorized"
+	| "forbidden"
+	| "not_found"
+	| "rate_limited"
+	| "quota_exceeded"
+	| "overloaded"
+	| "context_length_exceeded"
+	| "invalid_request"
+	| "server_error"
+	| "timeout";
 
-	constructor(message: string, code: string | undefined, diagnosticDetails: JsonObject) {
-		super(message);
+const PI_MESSAGES_ERROR_CATEGORIES: Readonly<Record<string, PiMessagesErrorCategory>> = {
+	unauthorized: "unauthorized",
+	authentication_error: "unauthorized",
+	invalid_api_key: "unauthorized",
+	forbidden: "forbidden",
+	permission_denied: "forbidden",
+	not_found: "not_found",
+	model_not_found: "not_found",
+	rate_limited: "rate_limited",
+	rate_limit: "rate_limited",
+	rate_limit_exceeded: "rate_limited",
+	too_many_requests: "rate_limited",
+	quota_exceeded: "quota_exceeded",
+	insufficient_quota: "quota_exceeded",
+	overloaded: "overloaded",
+	busy: "overloaded",
+	server_busy: "overloaded",
+	unavailable: "overloaded",
+	context_length_exceeded: "context_length_exceeded",
+	invalid_request: "invalid_request",
+	invalid_request_error: "invalid_request",
+	bad_request: "invalid_request",
+	server_error: "server_error",
+	internal_error: "server_error",
+	api_error: "server_error",
+	timeout: "timeout",
+};
+
+/**
+ * A non-2xx pi-messages response, as owned values only (smarty-dev#5822, pi#202 round 2): the validated HTTP
+ * status, an allow-listed category and the recovery decision classified privately from the original body. The
+ * backend's message, code, body and status text are never kept on the error, its message or any diagnostic.
+ */
+export class PiMessagesResponseError extends Error {
+	readonly status: number | undefined;
+	readonly category: PiMessagesErrorCategory | undefined;
+	readonly recovery: AssistantRecovery;
+
+	constructor(status: number | undefined, category: PiMessagesErrorCategory | undefined, recovery: AssistantRecovery) {
+		const detail = [status === undefined ? undefined : `HTTP ${status}`, category].filter(Boolean).join(", ");
+		super(detail ? `Provider request failed (${detail})` : "Provider request failed");
 		this.name = "PiMessagesResponseError";
-		this.code = code;
-		this.diagnosticDetails = diagnosticDetails;
+		this.status = status;
+		this.category = category;
+		this.recovery = recovery;
 	}
 }
 
@@ -119,42 +178,28 @@ function parsePiMessagesErrorBody(body: string): PiMessagesErrorBody | undefined
 	}
 }
 
-function truncateDiagnosticString(value: string): string {
-	const maxLength = 8192;
-	return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
-}
-
-function formatPiMessagesResponseError(
-	response: Response,
-	body: string,
-	errorBody: PiMessagesErrorBody | undefined,
-): string {
-	const message = typeof errorBody?.error?.message === "string" ? errorBody.error.message : undefined;
-	const code = typeof errorBody?.error?.code === "string" ? errorBody.error.code : undefined;
-	const suffix = message ?? body;
-	const codeSuffix = code ? ` (${code})` : "";
-	return `${response.status} ${response.statusText}: ${suffix}${codeSuffix}`;
-}
-
+/**
+ * Classify a non-2xx response privately and keep only owned values. The original message, code and body are read
+ * here for classification and then dropped.
+ */
 function createPiMessagesResponseError(
 	model: Model<"pi-messages">,
-	url: URL,
 	response: Response,
 	body: string,
 ): PiMessagesResponseError {
-	const errorBody = parsePiMessagesErrorBody(body);
-	const code = typeof errorBody?.error?.code === "string" ? errorBody.error.code : undefined;
-	return new PiMessagesResponseError(formatPiMessagesResponseError(response, body, errorBody), code, {
-		version: 1,
+	const error = parsePiMessagesErrorBody(body)?.error;
+	const code = typeof error?.code === "string" ? error.code : undefined;
+	const category =
+		code !== undefined && Object.hasOwn(PI_MESSAGES_ERROR_CATEGORIES, code)
+			? PI_MESSAGES_ERROR_CATEGORIES[code]
+			: undefined;
+	const status = validHttpStatus(response.status);
+	const recovery = classifyProviderFailure({
+		text: [typeof error?.message === "string" ? error.message : undefined, code, body].filter(Boolean).join("\n"),
+		status,
 		provider: model.provider,
-		model: model.id,
-		url: url.toString(),
-		status: response.status,
-		statusText: response.statusText,
-		...(errorBody?.error === undefined ? {} : { error: errorBody.error as JsonValue }),
-		...(errorBody ? {} : { body: truncateDiagnosticString(body) }),
-		timestampMs: Date.now(),
 	});
+	return new PiMessagesResponseError(status, category, recovery);
 }
 
 function createEmptyUsage(): PiMessagesUsage {
@@ -207,15 +252,44 @@ function boundUsage(value: unknown): PiMessagesUsage {
 	return usage;
 }
 
+function isWireObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Normalize an untrusted wire `toolcall_end` tool call to the declared `ToolCall` fields. A missing or mistyped
+ * field falls back to `fallback`, the block `toolcall_start` and the deltas built. This only validates: the values
+ * come from this stream's own `JSON.parse`, and the stream's publication projector copies every published value,
+ * so no second copy is taken here.
+ */
+function normalizeWireToolCall(value: unknown, fallback: ToolCall | undefined): ToolCall {
+	const source = isWireObject(value) ? value : {};
+	const text = (key: "id" | "name" | "thoughtSignature" | "namespace"): string | undefined => {
+		const field = source[key];
+		return typeof field === "string" ? field : typeof fallback?.[key] === "string" ? fallback[key] : undefined;
+	};
+	const thoughtSignature = text("thoughtSignature");
+	const namespace = text("namespace");
+	return {
+		type: "toolCall",
+		id: text("id") ?? "",
+		name: text("name") ?? "",
+		arguments: isWireObject(source.arguments)
+			? (source.arguments as ToolCall["arguments"])
+			: isWireObject(fallback?.arguments)
+				? fallback.arguments
+				: {},
+		...(thoughtSignature === undefined ? {} : { thoughtSignature }),
+		...(namespace === undefined ? {} : { namespace }),
+	};
+}
+
 function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesRewriteImpact | undefined): void {
 	if (!rewrite) {
 		return;
 	}
-	appendAssistantMessageDiagnostic(message, {
-		type: "pi_messages_rewrite",
-		timestamp: Date.now(),
-		details: { ...rewrite },
-	});
+	// The owned type only, never the wire `rewrite` fields (smarty-dev#5822 N5682).
+	appendAssistantMessageDiagnostic(message, createAssistantMessageDiagnostic("pi_messages_rewrite"));
 }
 
 function createEventConverter(model: Model<"pi-messages">) {
@@ -244,11 +318,17 @@ function createEventConverter(model: Model<"pi-messages">) {
 				}
 				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "done", reason: event.reason, message: partial };
-			case "error":
+			case "error": {
+				// The wire error text only classifies; the published text is owned (smarty-dev#5822, pi#202 round 3).
+				const recovery = classifyProviderFailure({
+					text: typeof event.errorMessage === "string" ? event.errorMessage : undefined,
+					provider: model.provider,
+				});
 				Object.assign(partial, {
 					stopReason: event.reason,
 					usage: boundUsage(event.usage),
-					errorMessage: event.errorMessage,
+					errorMessage: formatProviderError({ recovery }),
+					recovery,
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
@@ -256,6 +336,7 @@ function createEventConverter(model: Model<"pi-messages">) {
 				}
 				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "error", reason: event.reason, error: partial };
+			}
 			case "start":
 				break;
 			case "text_start":
@@ -300,7 +381,11 @@ function createEventConverter(model: Model<"pi-messages">) {
 				break;
 			}
 			case "toolcall_end":
-				Object.assign(partial.content[event.contentIndex]!, event.toolCall);
+				// The wire object is untrusted: admit only the declared ToolCall fields.
+				partial.content[event.contentIndex] = normalizeWireToolCall(
+					event.toolCall,
+					partial.content[event.contentIndex] as ToolCall | undefined,
+				);
 				toolJson.delete(event.contentIndex);
 				return {
 					type: "toolcall_end",
@@ -361,12 +446,7 @@ function parsePiMessagesEvent(raw: string): PiMessagesEvent | undefined {
 	return data && data !== "[DONE]" ? (JSON.parse(data) as PiMessagesEvent) : undefined;
 }
 
-function createErrorEvent(
-	model: Model<"pi-messages">,
-	error: unknown,
-	aborted: boolean,
-	diagnosticSecrets: readonly string[],
-): AssistantMessageEvent {
+function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: boolean): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
@@ -381,14 +461,12 @@ function createErrorEvent(
 	};
 
 	if (!aborted && error instanceof PiMessagesResponseError) {
+		// Classified privately from the status and original body before the error was built (smarty-dev#5822 C3).
+		assistantMessage.recovery = error.recovery;
+		// The owned type only; the URL, status and body stay private (smarty-dev#5822 N5682).
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
-			createAssistantMessageDiagnostic(
-				"pi_messages_response_failure",
-				error,
-				error.diagnosticDetails,
-				diagnosticSecrets,
-			),
+			createAssistantMessageDiagnostic("pi_messages_response_failure"),
 		);
 	}
 
@@ -411,6 +489,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
 	const eventStream = new AssistantMessageEventStream(diagnosticSecrets);
 	const convertEvent = createEventConverter(model);
+	let observerFailed = false;
 
 	void (async () => {
 		try {
@@ -454,18 +533,24 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				signal: options?.signal,
 			});
 
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponse(response.status));
 
 			if (!response.ok) {
 				const body = await response.text();
-				throw createPiMessagesResponseError(model, url, response, body);
+				throw createPiMessagesResponseError(model, response, body);
 			}
 			if (!response.body) {
 				throw new Error(`${model.provider} response has no body`);
 			}
 
 			for await (const piEvent of readPiMessagesEvents(response.body)) {
-				await options?.onProviderStreamEvent?.(piEvent, model);
+				try {
+					await options?.onProviderStreamEvent?.(providerStreamNotification());
+				} catch {
+					// The observer's thrown value is dropped, not kept as `cause` (smarty-dev#5822, pi#202 round 2).
+					observerFailed = true;
+					throw new Error(PROVIDER_STREAM_OBSERVER_FAILED);
+				}
 				const event = convertEvent(piEvent);
 				eventStream.push(event);
 				if (event.type === "done" || event.type === "error") {
@@ -475,7 +560,10 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false, diagnosticSecrets));
+			const event = createErrorEvent(model, error, options?.signal?.aborted ?? false);
+			// An observer rejection is never retried, whatever its text or status (smarty-dev#5822 C1).
+			if (observerFailed && event.type === "error") markProviderStreamObserverFailure(event.error);
+			eventStream.push(event);
 		}
 	})();
 

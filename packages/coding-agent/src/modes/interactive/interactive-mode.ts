@@ -12,6 +12,7 @@ import type { AuthEvent, AuthPrompt } from "@earendil-works/pi-ai";
 import {
 	type AssistantMessage,
 	type ImageContent,
+	isPrematureStreamError,
 	isRetryableAssistantError,
 	type Message,
 	type Model,
@@ -114,7 +115,7 @@ import {
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
 import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
 import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
-import { flushRawStdout } from "../../core/output-guard.ts";
+import { writeStdoutBounded } from "../../core/output-guard.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
 import {
@@ -205,6 +206,7 @@ import { UserMessageSelectorComponent } from "./components/user-message-selector
 import { editInExternalEditor } from "./external-editor.ts";
 import { refreshModelCatalogs } from "./model-catalog-refresh.ts";
 import { getModelSearchText } from "./model-search.ts";
+import { type BlockedStatus, ProgramStatusReporter } from "./program-status-reporter.ts";
 import { shareSession } from "./session-share.ts";
 import {
 	getAvailableThemes,
@@ -312,6 +314,9 @@ function isUsageSessionEntry(item: RenderSessionItem): item is Extract<SessionEn
 // EIO: tty reads/ioctls from an orphaned background process group, or writes after hangup.
 // ENOTTY: the tty was revoked (macOS) and stdin is no longer a terminal.
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN", "ENOTTY"]);
+/** Finite wait for the exit recovery receipt; an unread terminal gets the incomplete exit code. */
+const RECOVERY_OUTPUT_TIMEOUT_MS = 2000;
+const RECOVERY_OUTPUT_INCOMPLETE_EXIT_CODE = 75;
 
 function isDeadTerminalError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("code" in error)) {
@@ -599,6 +604,12 @@ export class InteractiveMode {
 	private terminalShutdownRequested = false;
 	/** Visible recovery markers own the original image content, independent of input transforms. */
 	private readonly recoveredImages = new Map<string, ImageContent>();
+
+	/** Reports working, blocked, done, and error states to terminals that support OSC 7501. */
+	private readonly programStatus = new ProgramStatusReporter(
+		() => this.ui.terminal,
+		() => this.sessionManager.getSessionName(),
+	);
 
 	/** The `/bug` hint is shown at most once per session so error output stays readable. */
 	private bugReportHintShown = false;
@@ -1073,6 +1084,7 @@ export class InteractiveMode {
 		} else herdrInput?.shutdown();
 		this.ui.start();
 		this.isInitialized = true;
+		this.programStatus.report();
 		this.ensurePngTranscoder();
 
 		this.themeController.applyFromSettings();
@@ -1329,23 +1341,23 @@ export class InteractiveMode {
 		}
 
 		// Main interactive loop
-		while (true) {
-			const userInput = await this.getReceivedUserInput();
-			try {
-				const prompt = this.promptWithRecoveredImages(userInput);
-				// Original session preflight owns the input before TUI staging clears.
-				this.userInputInFlight = false;
-				this.stagingAudit?.("input-transferred");
-				await prompt;
-			} catch (error: unknown) {
-				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-				this.showError(errorMessage);
-				if (error instanceof InputAdmissionError) this.restoreRejectedInput(userInput.text);
-			} finally {
-				this.userInputInFlight = false;
-				this.stagingAudit?.("input-settled");
-				await this.checkShutdownRequested();
-			}
+		while (true) await this.submitUserInput(await this.getReceivedUserInput());
+	}
+
+	private async submitUserInput(userInput: ReceivedInput): Promise<void> {
+		try {
+			const prompt = this.promptWithRecoveredImages(userInput);
+			// Original session preflight owns the input before TUI staging clears.
+			this.userInputInFlight = false;
+			this.stagingAudit?.("input-transferred");
+			await prompt;
+		} catch (error: unknown) {
+			if (!this.handleInputAdmissionError(error, userInput.text))
+				this.showError(error instanceof Error ? error.message : "Unknown error occurred");
+		} finally {
+			this.userInputInFlight = false;
+			this.stagingAudit?.("input-settled");
+			await this.checkShutdownRequested();
 		}
 	}
 
@@ -2203,6 +2215,7 @@ export class InteractiveMode {
 
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.programStatus.reset();
 		this.applyRuntimeSettings();
 
 		if (options.renderBeforeBind) {
@@ -2234,8 +2247,14 @@ export class InteractiveMode {
 		);
 	}
 
-	private handleInputAdmissionError(error: unknown): boolean {
+	/**
+	 * The one admission-recovery path: an authoritative `recoveredInput` receipt is restored exactly
+	 * once and replaces the submitted `original`, which is restored only when no receipt exists.
+	 */
+	private handleInputAdmissionError(error: unknown, original?: string): boolean {
 		if (!(error instanceof InputAdmissionError)) return false;
+		const recovered = error.recoveredInput ? this.recoveryText(error.recoveredInput) : original;
+		if (recovered) this.restoreRejectedInput(recovered);
 		this.showError(error.message);
 		return true;
 	}
@@ -2304,7 +2323,10 @@ export class InteractiveMode {
 	}
 
 	private maybeSuggestBugReport(message: AssistantMessage): void {
-		if (message.stopReason !== "error" || isRetryableAssistantError(message)) return;
+		// A premature close is a provider transport failure. A retried reasoning-only close (smarty-dev#6730) also
+		// arrives here stripped, without the stream observation that made it retryable.
+		if (message.stopReason !== "error" || isRetryableAssistantError(message) || isPrematureStreamError(message))
+			return;
 		if (/\b(?:abort(?:ed)?|cancel(?:l?ed)?)\b/i.test(message.errorMessage ?? "")) return;
 		if (this.maybeShowInstallChangeWarning()) return;
 		this.suggestBugReport();
@@ -2822,6 +2844,7 @@ export class InteractiveMode {
 		title: string,
 		options: string[],
 		opts?: ExtensionUIDialogOptions,
+		blocked: BlockedStatus = { kind: "question", message: title },
 	): Promise<string | undefined> {
 		let cleanup = () => {};
 		return new Promise<string | undefined>((resolve) => {
@@ -2857,6 +2880,8 @@ export class InteractiveMode {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionSelector);
 			this.ui.setFocus(this.extensionSelector);
+			// Extension dialogs share the editor slot: opening one replaces the status of a displaced one.
+			this.programStatus.setBlocked("extension-dialog", blocked);
 			this.ui.requestRender();
 		}).catch((error) => {
 			cleanup();
@@ -2873,6 +2898,7 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionSelector = undefined;
+		this.programStatus.setBlocked("extension-dialog", undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -2885,7 +2911,10 @@ export class InteractiveMode {
 		message: string,
 		opts?: ExtensionUIDialogOptions,
 	): Promise<boolean> {
-		const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], opts);
+		const result = await this.showExtensionSelector(`${title}\n${message}`, ["Yes", "No"], opts, {
+			kind: "permission",
+			message: title,
+		});
 		return result === "Yes";
 	}
 
@@ -2939,6 +2968,7 @@ export class InteractiveMode {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionInput);
 			this.ui.setFocus(this.extensionInput);
+			this.programStatus.setBlocked("extension-dialog", { kind: "question", message: title });
 			this.ui.requestRender();
 		}).catch((error) => {
 			cleanup();
@@ -2955,6 +2985,7 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionInput = undefined;
+		this.programStatus.setBlocked("extension-dialog", undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -2985,6 +3016,7 @@ export class InteractiveMode {
 			this.editorContainer.clear();
 			this.editorContainer.addChild(this.extensionEditor);
 			this.ui.setFocus(this.extensionEditor);
+			this.programStatus.setBlocked("extension-dialog", { kind: "question", message: title });
 			this.ui.requestRender();
 		}).catch((error) => {
 			this.hideExtensionEditor();
@@ -2999,6 +3031,7 @@ export class InteractiveMode {
 		this.editorContainer.clear();
 		this.editorContainer.addChild(this.editor);
 		this.extensionEditor = undefined;
+		this.programStatus.setBlocked("extension-dialog", undefined);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
 	}
@@ -3373,8 +3406,21 @@ export class InteractiveMode {
 		this.showStatus("Startup is still in progress");
 	}
 
+	/**
+	 * The editor drops onSubmit's promise, so observe it here (pi#132 R4-4). Shutdown owns exit and
+	 * cleanup: a late failure must neither crash-exit over it nor await its completion.
+	 */
+	private observeSubmitFailure(error: unknown): void {
+		if (this.isTerminalRuntimeCancellation(error)) return;
+		if (this.isShuttingDown) {
+			console.error(error);
+			return;
+		}
+		this.uncaughtCrash(error instanceof Error ? error : new Error(String(error)));
+	}
+
 	private setupEditorSubmitHandler(): void {
-		this.defaultEditor.onSubmit = async (text: string) => {
+		const submit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
 			if (this.runtimeHost.inputsFenced || this.terminalShutdownRequested) {
@@ -3386,6 +3432,9 @@ export class InteractiveMode {
 			const attested = this.captureHerdrSubmit(text);
 			await this.dispatchEditorInput(receiveInput(text, undefined, attested ? await attested : undefined));
 		};
+		// Return the observed promise so callers that await submission still see its completion.
+		this.defaultEditor.onSubmit = (text: string) =>
+			submit(text).catch((error: unknown) => this.observeSubmitFailure(error));
 		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;
 	}
 
@@ -3599,6 +3648,7 @@ export class InteractiveMode {
 		}
 
 		this.footer.invalidate();
+		this.programStatus.handleEvent(event);
 
 		switch (event.type) {
 			case "agent_start":
@@ -3725,6 +3775,7 @@ export class InteractiveMode {
 									{
 										showImages: this.settingsManager.getShowImages(),
 										imageWidthCells: this.settingsManager.getImageWidthCells(),
+										outputPad: this.outputPad,
 									},
 									this.getRegisteredToolDefinition(content.name),
 									this.ui,
@@ -3803,6 +3854,7 @@ export class InteractiveMode {
 						{
 							showImages: this.settingsManager.getShowImages(),
 							imageWidthCells: this.settingsManager.getImageWidthCells(),
+							outputPad: this.outputPad,
 						},
 						this.getRegisteredToolDefinition(event.toolName),
 						this.ui,
@@ -3830,7 +3882,7 @@ export class InteractiveMode {
 				if (event.isError) this.maybeShowInstallChangeWarning();
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
-					component.updateResult({ ...event.result, isError: event.isError });
+					component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
 					this.pendingTools.delete(event.toolCallId);
 					this.ui.requestRender();
 				}
@@ -4048,7 +4100,7 @@ export class InteractiveMode {
 		if (!renderer) {
 			return;
 		}
-		const component = new CustomEntryComponent(entry, renderer);
+		const component = new CustomEntryComponent(entry, renderer, this.outputPad);
 		component.setExpanded(this.toolOutputExpanded);
 		if (!component.hasContent()) {
 			return;
@@ -4068,7 +4120,12 @@ export class InteractiveMode {
 	private addMessageToChat(message: AgentMessage, options?: { populateHistory?: boolean }): void {
 		switch (message.role) {
 			case "bashExecution": {
-				const component = new BashExecutionComponent(message.command, this.ui, message.excludeFromContext);
+				const component = new BashExecutionComponent(
+					message.command,
+					this.ui,
+					message.excludeFromContext,
+					this.outputPad,
+				);
 				if (message.output) {
 					component.appendOutput(message.output);
 				}
@@ -4097,14 +4154,22 @@ export class InteractiveMode {
 			}
 			case "compactionSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new CompactionSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+				const component = new CompactionSummaryMessageComponent(
+					message,
+					this.getMarkdownThemeWithSettings(),
+					this.outputPad,
+				);
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
 			}
 			case "branchSummary": {
 				this.chatContainer.addChild(new Spacer(1));
-				const component = new BranchSummaryMessageComponent(message, this.getMarkdownThemeWithSettings());
+				const component = new BranchSummaryMessageComponent(
+					message,
+					this.getMarkdownThemeWithSettings(),
+					this.outputPad,
+				);
 				component.setExpanded(this.toolOutputExpanded);
 				this.chatContainer.addChild(component);
 				break;
@@ -4123,6 +4188,7 @@ export class InteractiveMode {
 						const component = new SkillInvocationMessageComponent(
 							skillBlock,
 							this.getMarkdownThemeWithSettings(),
+							this.outputPad,
 						);
 						component.setExpanded(this.toolOutputExpanded);
 						this.chatContainer.addChild(component);
@@ -4228,6 +4294,7 @@ export class InteractiveMode {
 							{
 								showImages: this.settingsManager.getShowImages(),
 								imageWidthCells: this.settingsManager.getImageWidthCells(),
+								outputPad: this.outputPad,
 							},
 							this.getRegisteredToolDefinition(content.name),
 							this.ui,
@@ -4286,6 +4353,8 @@ export class InteractiveMode {
 		entries: SessionEntry[],
 		options: { updateFooter?: boolean; populateHistory?: boolean } = {},
 	): void {
+		// Selection coordinates point into the transcript being replaced (#9311).
+		if (this.renderer instanceof TuiAltScreen) this.renderer.resetTextSelection();
 		const items = entries.flatMap((entry): RenderSessionItem[] => {
 			if (entry.type === "custom" || (entry.type === "usage" && entry.kind === "cache_warm")) {
 				return [entry];
@@ -4327,14 +4396,7 @@ export class InteractiveMode {
 		let count = 0;
 		for (const diagnostic of message.diagnostics ?? []) {
 			if (diagnostic.type !== "anthropic_input_transformations") continue;
-			const transformations = diagnostic.details?.transformations;
-			if (!Array.isArray(transformations)) continue;
-			count += transformations.filter(
-				(transformation) =>
-					typeof transformation === "object" &&
-					transformation !== null &&
-					(transformation as Record<string, unknown>).type === "thinking_dropped",
-			).length;
+			count += diagnostic.thinkingBlocksDropped ?? 0;
 		}
 		return count;
 	}
@@ -4361,11 +4423,7 @@ export class InteractiveMode {
 		const noun = droppedCount === 1 ? "thinking block" : "thinking blocks";
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
-			new ThemedText(
-				() => theme.fg("warning", `Anthropic dropped ${droppedCount} ${noun} (details in session)`),
-				1,
-				0,
-			),
+			new ThemedText(() => theme.fg("warning", `Anthropic dropped ${droppedCount} ${noun}`), 1, 0),
 		);
 	}
 
@@ -4566,10 +4624,12 @@ export class InteractiveMode {
 						const images = [...this.recoveredImages]
 							.filter(([marker]) => draft.includes(marker))
 							.map(([, image]) => image);
-						process.stdout.write(
+						const delivery = await writeStdoutBounded(
 							`INPUT_ADMISSION_SHUTDOWN: recovered draft ${JSON.stringify({ text: draft, images })}\n`,
+							RECOVERY_OUTPUT_TIMEOUT_MS,
 						);
-						await flushRawStdout();
+						// An unread terminal did not take the recovery receipt: exit nonzero, never hang.
+						if (delivery === "incomplete") process.exit(RECOVERY_OUTPUT_INCOMPLETE_EXIT_CODE);
 					}
 				} else {
 					const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
@@ -4811,8 +4871,7 @@ export class InteractiveMode {
 		try {
 			await this.promptWithRecoveredImages(input, { streamingBehavior });
 		} catch (error) {
-			if (!this.handleInputAdmissionError(error)) throw error;
-			this.restoreRejectedInput(input.text);
+			if (!this.handleInputAdmissionError(error, input.text)) throw error;
 		} finally {
 			await this.checkShutdownRequested();
 		}
@@ -5593,23 +5652,14 @@ export class InteractiveMode {
 					onOutputPadChange: (padding) => {
 						this.settingsManager.setOutputPad(padding);
 						this.outputPad = padding;
-						if (this.streamingComponent || this.session.isStreaming) {
-							for (const child of this.chatContainer.children) {
-								if (
-									child instanceof AssistantMessageComponent ||
-									child instanceof CustomMessageComponent ||
-									child instanceof UserMessageComponent
-								) {
+						for (const container of [this.chatContainer, this.pendingMessagesContainer]) {
+							for (const child of container.children) {
+								if ("setOutputPad" in child && typeof child.setOutputPad === "function") {
 									child.setOutputPad(padding);
 								}
 							}
-							if (this.streamingComponent) {
-								this.streamingComponent.setOutputPad(padding);
-							}
-							this.ui.requestRender();
-							return;
 						}
-						this.rebuildChatFromMessages();
+						this.ui.requestRender();
 					},
 					onAutocompleteMaxVisibleChange: (maxVisible) => {
 						this.settingsManager.setAutocompleteMaxVisible(maxVisible);
@@ -6282,34 +6332,31 @@ export class InteractiveMode {
 		options?: Parameters<ExtensionCommandContext["switchSession"]>[1],
 	): Promise<{ cancelled: boolean }> {
 		this.clearStatusIndicator();
-		try {
-			const result = await this.runtimeHost.switchSession(sessionPath, {
+		const resume = (cwdOverride?: string) =>
+			this.runtimeHost.switchSession(sessionPath, {
+				cwdOverride,
 				withSession: options?.withSession,
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
-			if (result.cancelled) {
-				return result;
-			}
-			this.showStatus("Resumed session");
-			return result;
-		} catch (error: unknown) {
-			if (error instanceof MissingSessionCwdError) {
+		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
+		try {
+			let status = "Resumed session";
+			let result: { cancelled: boolean };
+			try {
+				result = await resume();
+			} catch (error: unknown) {
+				if (!(error instanceof MissingSessionCwdError)) throw error;
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
 					this.showStatus("Resume cancelled");
 					return { cancelled: true };
 				}
-				const result = await this.runtimeHost.switchSession(sessionPath, {
-					cwdOverride: selectedCwd,
-					withSession: options?.withSession,
-					projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
-				});
-				if (result.cancelled) {
-					return result;
-				}
-				this.showStatus("Resumed session in current cwd");
-				return result;
+				status = "Resumed session in current cwd";
+				result = await resume(selectedCwd);
 			}
+			if (!result.cancelled) this.showStatus(status);
+			return result;
+		} catch (error: unknown) {
 			if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
 			if (this.handleInputAdmissionError(error)) return { cancelled: true };
 			return this.handleFatalRuntimeError("Failed to resume session", error);
@@ -6753,7 +6800,7 @@ export class InteractiveMode {
 		};
 
 		try {
-			await this.loginProvider(dialog, providerId, "api_key");
+			await this.loginProvider(dialog, providerId, providerName, "api_key");
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "api_key", previousModel);
 		} catch (error: unknown) {
@@ -6846,18 +6893,24 @@ export class InteractiveMode {
 	private async loginProvider(
 		dialog: LoginDialogComponent,
 		providerId: string,
+		providerName: string,
 		method: "api_key" | "oauth",
 	): Promise<void> {
-		await this.session.modelRuntime.login(
-			providerId,
-			method,
-			{
-				signal: dialog.signal,
-				prompt: (prompt) => this.showAuthPrompt(dialog, prompt, providerId),
-				notify: (event) => this.notifyAuthDialog(dialog, event),
-			},
-			{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() },
-		);
+		this.programStatus.setBlocked("login", { kind: "auth", message: `Log in to ${providerName}` });
+		try {
+			await this.session.modelRuntime.login(
+				providerId,
+				method,
+				{
+					signal: dialog.signal,
+					prompt: (prompt) => this.showAuthPrompt(dialog, prompt, providerId),
+					notify: (event) => this.notifyAuthDialog(dialog, event),
+				},
+				{ getDeviceId: () => this.settingsManager.getOrCreateDeviceId() },
+			);
+		} finally {
+			this.programStatus.setBlocked("login", undefined);
+		}
 	}
 
 	private async showLoginDialog(providerId: string, providerName: string, onBack?: () => void): Promise<void> {
@@ -6876,7 +6929,7 @@ export class InteractiveMode {
 		};
 
 		try {
-			await this.loginProvider(dialog, providerId, "oauth");
+			await this.loginProvider(dialog, providerId, providerName, "oauth");
 			restoreEditor();
 			await this.completeProviderAuthentication(providerId, providerName, "oauth", previousModel);
 			if (providerId === RADIUS_PROVIDER_ID) this.offerRadiusMcpServer(providerId, providerName);
@@ -7102,29 +7155,23 @@ export class InteractiveMode {
 			return;
 		}
 
+		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
 		try {
 			this.clearStatusIndicator();
-			const result = await this.runtimeHost.importFromJsonl(inputPath);
-			if (result.cancelled) {
-				this.showStatus("Import cancelled");
-				return;
-			}
-			this.showStatus(`Session imported from: ${inputPath}`);
-		} catch (error: unknown) {
-			if (error instanceof MissingSessionCwdError) {
+			let result: { cancelled: boolean };
+			try {
+				result = await this.runtimeHost.importFromJsonl(inputPath);
+			} catch (error: unknown) {
+				if (!(error instanceof MissingSessionCwdError)) throw error;
 				const selectedCwd = await this.promptForMissingSessionCwd(error);
 				if (!selectedCwd) {
 					this.showStatus("Import cancelled");
 					return;
 				}
-				const result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
-				if (result.cancelled) {
-					this.showStatus("Import cancelled");
-					return;
-				}
-				this.showStatus(`Session imported from: ${inputPath}`);
-				return;
+				result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
 			}
+			this.showStatus(result.cancelled ? "Import cancelled" : `Session imported from: ${inputPath}`);
+		} catch (error: unknown) {
 			if (error instanceof SessionImportFileNotFoundError) {
 				this.showError(`Failed to import session: ${error.message}`);
 				return;
@@ -7564,7 +7611,7 @@ export class InteractiveMode {
 			const result = eventResult.result;
 
 			// Create UI component for display
-			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+			this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
 			if (this.session.isStreaming) {
 				this.pendingMessagesContainer.addChild(this.bashComponent);
 				this.pendingBashComponents.push(this.bashComponent);
@@ -7592,7 +7639,7 @@ export class InteractiveMode {
 
 		// Normal execution path (possibly with custom operations)
 		const isDeferred = this.session.isStreaming;
-		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext);
+		this.bashComponent = new BashExecutionComponent(command, this.ui, excludeFromContext, this.outputPad);
 
 		if (isDeferred) {
 			// Show in pending area when agent is streaming

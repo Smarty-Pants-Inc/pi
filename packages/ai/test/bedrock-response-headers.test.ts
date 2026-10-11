@@ -2,7 +2,7 @@ import { createServer, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
 import { stream as streamBedrock } from "../src/api/bedrock-converse-stream.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Model, ProviderResponse } from "../src/types.ts";
+import type { Model } from "../src/types.ts";
 
 const MODEL_ID = "us.anthropic.claude-haiku-4-5-20251001-v1:0";
 
@@ -33,11 +33,12 @@ async function startBedrockResponseServer(): Promise<string> {
 	return `http://127.0.0.1:${address.port}`;
 }
 
-describe("bedrock response headers", () => {
-	it("forwards raw Smithy response headers to onResponse", async () => {
+describe("bedrock response observation", () => {
+	// smarty-dev#5822 C1: the status only; gateway headers and request ids never reach callbacks.
+	it("passes only the validated status to onResponse", async () => {
 		const baseModel = getModel("amazon-bedrock", MODEL_ID) as Model<"bedrock-converse-stream">;
 		const model = { ...baseModel, baseUrl: await startBedrockResponseServer() };
-		const responses: ProviderResponse[] = [];
+		const responses: unknown[][] = [];
 
 		const result = await streamBedrock(
 			model,
@@ -45,19 +46,16 @@ describe("bedrock response headers", () => {
 			{
 				cacheRetention: "none",
 				env: { AWS_BEDROCK_FORCE_HTTP1: "1", AWS_BEDROCK_SKIP_AUTH: "1" },
-				onResponse: (response) => {
-					responses.push(response);
+				onResponse: (...args: unknown[]) => {
+					responses.push(args);
 				},
 			},
 		).result();
 
 		// The fake server intentionally returns an empty event stream; this assertion
-		// documents that the header callback still fires before stream consumption.
+		// documents that the response callback still fires before stream consumption.
 		expect(result.stopReason).toBe("error");
-		expect(responses).toHaveLength(1);
-		expect(responses[0].status).toBe(200);
-		expect(responses[0].headers["x-amzn-requestid"]).toBe("req-123");
-		expect(responses[0].headers["x-bifrost-provider"]).toBe("bedrock");
-		expect(responses[0].headers["x-bifrost-resolved-model"]).toBe(MODEL_ID);
+		expect(responses).toEqual([[{ status: 200 }]]);
+		expect(JSON.stringify(responses)).not.toContain("req-123");
 	});
 });

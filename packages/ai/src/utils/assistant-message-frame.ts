@@ -1,4 +1,5 @@
 import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
+import { cloneTextContent, cloneThinkingContent, cloneToolCall } from "./diagnostics.ts";
 import { parseStreamingJson } from "./json-parse.ts";
 
 /**
@@ -45,34 +46,6 @@ type ReducerBlockState =
 	| { kind: "text"; ended: boolean }
 	| { kind: "thinking"; ended: boolean }
 	| { kind: "toolCall"; ended: boolean; json: string };
-
-function cloneTextContent(content: TextContent): TextContent {
-	return {
-		type: "text",
-		text: content.text,
-		...(content.textSignature === undefined ? {} : { textSignature: content.textSignature }),
-	};
-}
-
-function cloneThinkingContent(content: ThinkingContent): ThinkingContent {
-	return {
-		type: "thinking",
-		thinking: content.thinking,
-		...(content.thinkingSignature === undefined ? {} : { thinkingSignature: content.thinkingSignature }),
-		...(content.redacted === undefined ? {} : { redacted: content.redacted }),
-	};
-}
-
-function cloneToolCall(toolCall: ToolCall): ToolCall {
-	return {
-		type: "toolCall",
-		id: toolCall.id,
-		name: toolCall.name,
-		arguments: structuredClone(toolCall.arguments),
-		...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
-		...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
-	};
-}
 
 function cloneStartMessage(message: AssistantMessage): AssistantMessage {
 	return {

@@ -36,18 +36,20 @@ const WORKSPACE = {
 const BUDGETS = {
 	"packages/ai": {
 		"./models": {
-			maxFiles: 15,
+			// The publication projector shares S2's dependency-free isolation utility (+1, pi#159).
+			maxFiles: 16,
 			forbid: ["providers/", "models.generated.ts", "index.ts", "utils/validation.ts", "utils/typebox-helpers.ts"],
 		},
-		// Diagnostics and operation errors also reach the shared, dependency-free credential redactor.
-		"./utils/*": { maxFiles: 4, forbid: ["providers/", "api/", "index.ts"] },
+		// Diagnostics and operation errors reach the shared credential redactor and isolation utility (pi#159).
+		"./utils/*": { maxFiles: 5, forbid: ["providers/", "api/", "index.ts"] },
 	},
 	"packages/durable": {
 		".": {
-			// Tool argument validation reaches TypeBox; provider-session creation reaches pi-ai's lean UUID utility.
-			// The fork's retry error-body parser and its dependency-free credential redactor are reached by
-			// upstream durable compaction.
-			maxFiles: 64,
+			// Upstream adds the shared storage scan module to its 62-file graph; the fork adds
+			// the retry error-body parser and dependency-free credential redactor (+2), and the recovery
+			// classifier moved out of retry/overflow (+1, smarty-dev#5822). The publication projector
+			// now shares S2's dependency-free isolation utility (+1, pi#159).
+			maxFiles: 67,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

@@ -34,7 +34,6 @@ import type {
 	Provider,
 	ProviderClassifier,
 	ProviderHeaders,
-	ProviderId,
 	ProviderImages,
 	RefreshModelsContext,
 	SimpleStreamOptions,
@@ -100,10 +99,23 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
+import type {
+	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+} from "../user-message-metadata.ts";
 import type { ModelRoute, ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions, NormalizedBuildSystemPromptOptions } from "../system-prompt.ts";
+export type {
+	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
+} from "../user-message-metadata.ts";
 export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
@@ -470,8 +482,17 @@ export interface ReplacedSessionContext extends ExtensionCommandContext {
 
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options: SendUserMessageOptions & { metadata: UserMessageMetadata },
+	): Promise<SendUserMessageResult>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: Omit<SendUserMessageOptions, "metadata"> & { metadata?: undefined },
 	): Promise<void>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: optional metadata preserves legacy void results
+	): Promise<void | SendUserMessageResult>;
 }
 
 // ============================================================================
@@ -512,6 +533,13 @@ export interface ToolRenderContext<TState = any, TArgs = any> {
 	showImages: boolean;
 	/** Whether the current result is an error. */
 	isError: boolean;
+	/**
+	 * Milliseconds the tool's execution took, from the final result; `undefined` while it runs, when it did not run, or
+	 * for results stored before durations were recorded.
+	 */
+	durationMs: number | undefined;
+	/** Horizontal padding configured by the outputPad setting. Renderers with `renderShell: "self"` apply it themselves. */
+	outputPad: number;
 }
 
 /**
@@ -915,20 +943,18 @@ export interface BeforeProviderHeadersEvent {
 	headers: ProviderHeaders;
 }
 
-/** Fired after a provider response is received and before the response stream is consumed. */
+/**
+ * Fired after a provider response is received and before the response stream is consumed. Carries only the
+ * HTTP status, when it is an integer 100-599; response headers are never exposed.
+ */
 export interface AfterProviderResponseEvent {
 	type: "after_provider_response";
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
 }
 
-/** Fired for a parsed provider stream event before Pi normalizes it. */
+/** Fired once for each parsed provider stream event, before Pi normalizes it. Carries no provider data. */
 export interface ProviderStreamEvent {
 	type: "provider_stream_event";
-	provider: ProviderId;
-	api: Api;
-	model: string;
-	data: unknown;
 }
 
 /** Fired after user submits prompt but before agent loop. */
@@ -1026,6 +1052,8 @@ export interface AgentSettledEvent {
 	 * ended on a provider, run, or compaction failure. Otherwise `completed`.
 	 */
 	outcome: AgentActivityOutcome;
+	/** Whether the run ended because it was aborted; equivalent to outcome === "aborted". */
+	aborted: boolean;
 }
 
 export type UIPromptKind = "select" | "confirm" | "input" | "editor" | "custom";
@@ -1110,6 +1138,8 @@ export interface ToolExecutionEndEvent {
 	toolName: string;
 	result: any;
 	isError: boolean;
+	/** Milliseconds `execute()` took, measured with a monotonic clock; absent when the tool did not run. */
+	durationMs?: number;
 	/** Set when another tool (for example a codemode script) made this call. */
 	parentToolCallId?: string;
 }
@@ -1771,11 +1801,27 @@ export interface ExtensionAPI {
 	 * Send a user message to the agent. Always triggers a turn.
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
 	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
+	 * With metadata, returns one receipt when the input is handled or its user entry is persisted.
+	 * Pi stamps metadataSource from this extension's loader path and execution context.
+	 * Borrowed APIs cannot confer another extension's identity; unbound metadata sends reject.
+	 * Only direct SDK session sends are stamped sdk.
+	 * Consumers must trust metadata only from the source they expect.
+	 * Metadata is snapshotted and deeply frozen before preflight, stored on the entry, and never sent to the model.
+	 * Do not await a queued receipt inside a handler that must return before that input can be delivered.
 	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options: SendUserMessageOptions & { metadata: UserMessageMetadata },
+	): Promise<SendUserMessageResult>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: Omit<SendUserMessageOptions, "metadata"> & { metadata?: undefined },
 	): void;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: optional metadata preserves legacy void results
+	): void | Promise<SendUserMessageResult>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -1977,9 +2023,9 @@ export interface ProviderConfig {
 	 * (`getCurrentSystemPrompt(context.messages)`, `getCurrentTools(context.messages)`).
 	 * Implementations must invoke `options.onPayload` before sending the provider request and use any
 	 * returned replacement payload. They must invoke `options.onResponse` after receiving the response
-	 * and before consuming its body, matching built-in providers. Implementations may invoke
-	 * `options.onProviderStreamEvent(data, model)` with parsed stream events before normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
+	 * and before consuming its body, matching built-in providers, passing only `{ status }`. Implementations may
+	 * invoke `options.onProviderStreamEvent` with `{ type: "provider_stream_event" }` once per parsed stream
+	 * event, before normalization. Neither callback receives provider data.
 	 */
 	streamSimple?: (
 		model: Model<Api>,
@@ -2137,11 +2183,6 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
 export type SendMessageHandler = <T = unknown>(
 	message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
-) => void;
-
-export type SendUserMessageHandler = (
-	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
 ) => void;
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;

@@ -35,9 +35,13 @@ import {
 } from "@earendil-works/pi-agent-core";
 import {
 	contentText,
+	createAssistantStreamObservation,
+	discardPartialReasoning,
 	getCurrentSystemMessage,
 	hasAssistantOutput,
 	isPrematureStreamError,
+	observeAssistantMessage,
+	observeAssistantStreamEvent,
 	type RetryPolicy,
 	retryDelayMs,
 } from "@earendil-works/pi-ai";
@@ -154,7 +158,12 @@ import {
 	type SessionProjection,
 } from "./session-manager.ts";
 import { appendReceivedCustomMessage, appendReceivedMessage } from "./session-turn-appender.ts";
-import { type CacheWarmingMode, DEFAULT_TOOL_NAMES, type SettingsManager } from "./settings-manager.ts";
+import {
+	applyToolModifiers,
+	type CacheWarmingMode,
+	DEFAULT_TOOL_NAMES,
+	type SettingsManager,
+} from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
@@ -169,6 +178,15 @@ import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { captureTerminalTurnReceipt, type TurnReceipt, withoutAttribution } from "./turn-receipts.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
+import {
+	bindExtensionMetadataSender,
+	getUserMessageMetadataSource,
+	type SendUserMessageOptions,
+	type SendUserMessageResult,
+	snapshotUserMessageMetadata,
+	type UserMessageMetadata,
+	type UserMessageMetadataSource,
+} from "./user-message-metadata.ts";
 import {
 	findLatestResponse,
 	getBranchSelection,
@@ -251,7 +269,7 @@ export type AgentSessionEvent =
 			messages: AgentMessage[];
 			willRetry: boolean;
 	  }
-	| { type: "agent_settled"; outcome: AgentActivityOutcome }
+	| { type: "agent_settled"; outcome: AgentActivityOutcome; aborted: boolean }
 	| {
 			type: "queue_update";
 			steering: readonly string[];
@@ -331,6 +349,11 @@ export interface AgentSessionConfig {
 	 * tools newly added to the setting. Tools removed from it stay active.
 	 */
 	usesDefaultTools?: boolean;
+	/**
+	 * `+name`/`-name` entries applied on top of the `defaultTools` setting, from `--tools`. Reload
+	 * applies them to the reloaded setting too, so a removed tool stays removed.
+	 */
+	defaultToolModifiers?: string[];
 	/**
 	 * Optional allowlist of tool names or patterns (`*` matches any characters). When provided, only
 	 * matching tools are exposed. A non-empty list without `mcp__` entries also keeps MCP tools
@@ -442,6 +465,15 @@ const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, bas
 // a skipped check or successful compaction with nothing queued.
 type CompactionOutcome = boolean | "failed" | "aborted";
 
+/** One opt-in submission, carried explicitly until its live user message exists. */
+interface UserMessageSubmission {
+	readonly metadata: UserMessageMetadata;
+	readonly metadataSource: UserMessageMetadataSource;
+	message?: AgentMessage;
+	resolve(result: SendUserMessageResult): void;
+	reject(error: unknown): void;
+}
+
 interface InputFenceScope {
 	fence: object;
 	active: boolean;
@@ -526,6 +558,9 @@ export class AgentSession {
 	private _messageEntryIds: WeakMap<AgentMessage, string[]> | undefined;
 	/** Receipt associations last only until this publication succeeds. */
 	readonly #receivedMessageReceipts = new WeakMap<AgentMessage, TurnReceipt>();
+	/** Metadata is occurrence-local, never attached to model-visible message objects. */
+	private readonly _userMessageSubmissions = new WeakMap<AgentMessage, UserMessageSubmission>();
+	private readonly _pendingUserMessageSubmissions = new Set<UserMessageSubmission>();
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -556,6 +591,13 @@ export class AgentSession {
 	private _retryFallbackInFlight = false;
 	// Sticky per assistant request: providers may discard partial content on error.
 	private _assistantOutputObserved = false;
+	/** Streamed reasoning and answer output; answer output blocks even a premature-close restart. */
+	private _assistantStreamObserved = createAssistantStreamObservation();
+	/**
+	 * smarty-dev#6730: reasoning updates of the streaming assistant message, held until it streams answer output
+	 * or ends. A premature close before answer output is retried, and its held reasoning is dropped.
+	 */
+	private _heldReasoningUpdates: AgentEvent[] = [];
 	/** A throttled-limit wait was used since the last successful assistant message; the next error is final. */
 	private _throttleWaitUsed = false;
 	/**
@@ -597,6 +639,7 @@ export class AgentSession {
 	 */
 	private _pendingToolNames = new Set<string>();
 	private _usesDefaultTools: boolean;
+	private _defaultToolModifiers: string[];
 	/** Matches the `--tools` entries: tool names or patterns. */
 	private _allowedTools?: (name: string) => boolean;
 	/**
@@ -658,6 +701,7 @@ export class AgentSession {
 		this._extensionRunnerRef = config.extensionRunnerRef;
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._usesDefaultTools = config.usesDefaultTools ?? false;
+		this._defaultToolModifiers = config.defaultToolModifiers ?? [];
 		if (config.allowedToolNames) {
 			this._allowedTools = createToolNameMatcher(config.allowedToolNames);
 			this._allowlistFiltersMcp =
@@ -1487,12 +1531,13 @@ export class AgentSession {
 		});
 		// Run every removed ticket before propagating the first refusal, so none is orphaned (#132 R1-S6).
 		const failures: unknown[] = [];
+		const aborted = outcome === "aborted";
 		try {
 			try {
 				await raceWithAbortSignal(
 					this._dispatchCancellationScope.run(signal, () =>
 						this._agentSettledScope.run(scope, () =>
-							this._extensionRunner.emit({ type: "agent_settled", outcome }, signal),
+							this._extensionRunner.emit({ type: "agent_settled", outcome, aborted }, signal),
 						),
 					),
 					signal,
@@ -1501,7 +1546,7 @@ export class AgentSession {
 				if (!signal.aborted) throw error;
 			}
 			this._dispatchCancellationScope.run(signal, () =>
-				this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome })),
+				this._agentSettledScope.run(scope, () => this._emit({ type: "agent_settled", outcome, aborted })),
 			);
 		} finally {
 			// Detached descendants of finished/cancelled handlers cannot own delivery.
@@ -1538,16 +1583,43 @@ export class AgentSession {
 			this.#receivedMessageReceipts.set(event.message, captureTerminalTurnReceipt());
 		}
 		// Synthetic run failures publish another message_start, but not a new turn_start.
-		if (event.type === "turn_start") this._assistantOutputObserved = false;
+		if (event.type === "turn_start") {
+			this._assistantOutputObserved = false;
+			this._assistantStreamObserved = createAssistantStreamObservation();
+			this._heldReasoningUpdates = [];
+		}
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
 			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
+			observeAssistantMessage(this._assistantStreamObserved, event.message);
 		} else if (event.type === "message_update" && event.message.role === "assistant") {
 			const update = event.assistantMessageEvent;
+			const streamed =
+				("delta" in update && update.delta.length > 0) || ("content" in update && update.content.length > 0);
 			this._assistantOutputObserved ||=
-				hasAssistantOutput(event.message) ||
-				update.type.startsWith("toolcall_") ||
-				("delta" in update && update.delta.length > 0) ||
-				("content" in update && update.content.length > 0);
+				hasAssistantOutput(event.message) || update.type.startsWith("toolcall_") || streamed;
+			observeAssistantStreamEvent(this._assistantStreamObserved, update);
+			if (
+				!this._assistantStreamObserved.answer &&
+				(this._heldReasoningUpdates.length > 0 || update.type.startsWith("thinking_")) &&
+				this._getRetrySettings(event.message).enabled
+			) {
+				this._heldReasoningUpdates.push(event);
+				return;
+			}
+		}
+		// smarty-dev#6730: a premature close after reasoning only is restarted. Drop its held reasoning updates and
+		// the reasoning in its message before listeners, extensions and the session file see the failed attempt, so
+		// it ends like an empty close. Answer output or any other event publishes the held updates first, in order.
+		const held = this._heldReasoningUpdates.splice(0);
+		if (
+			event.type === "message_end" &&
+			event.message.role === "assistant" &&
+			event.message.stopReason === "error" &&
+			this._willRetryAssistantMessage(event.message)
+		) {
+			this._replaceMessageInPlace(event.message, discardPartialReasoning(event.message));
+		} else {
+			for (const update of held) await this._dispatchAgentEvent(update);
 		}
 
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
@@ -1584,6 +1656,18 @@ export class AgentSession {
 			}
 		}
 
+		try {
+			await this._dispatchAgentEvent(event);
+		} catch (error) {
+			if (event.type === "message_start" || event.type === "message_end") {
+				this._userMessageSubmissions.get(event.message)?.reject(error);
+			}
+			throw error;
+		}
+	};
+
+	/** Emit an agent event to extensions, then public listeners, then persist it. */
+	private async _dispatchAgentEvent(event: AgentEvent): Promise<void> {
 		// Emit to extensions first, then notify public listeners.
 		if (!this._shutdownCancellation.signal.aborted) {
 			try {
@@ -1597,13 +1681,19 @@ export class AgentSession {
 
 		if (this.#ordinaryOwner) await this.#ordinaryOwner.owner.terminal(() => this._persistAgentEvent(event));
 		else await this._persistAgentEvent(event);
-	};
+	}
 
 	private async _persistAgentEvent(event: AgentEvent): Promise<void> {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
 			const receipt = this.#receivedMessageReceipts.get(event.message);
+			const submission = this._userMessageSubmissions.get(event.message);
+			if (submission && event.message.role !== "user") {
+				submission.reject(new Error("User message was replaced without persisting a user entry"));
+			}
+			const metadata = event.message.role === "user" ? submission?.metadata : undefined;
+			const metadataSource = metadata === undefined ? undefined : submission?.metadataSource;
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -1637,9 +1727,29 @@ export class AgentSession {
 				event.message.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
-				entryId = this.#ordinaryOwner
-					? await appendOwnedTerminalMessage(this.sessionManager, event.message, receipt)
-					: appendReceivedMessage(this.sessionManager, event.message, receipt);
+				try {
+					entryId = this.#ordinaryOwner
+						? await appendOwnedTerminalMessage(
+								this.sessionManager,
+								event.message,
+								receipt,
+								metadata,
+								metadataSource,
+							)
+						: appendReceivedMessage(this.sessionManager, event.message, receipt, metadata, metadataSource);
+				} catch (error) {
+					submission?.reject(error);
+					throw error;
+				}
+				if (submission && event.message.role === "user") {
+					submission.resolve({
+						status: "turnStarted",
+						entryId,
+						metadata: submission.metadata,
+						metadataSource: submission.metadataSource,
+					});
+					this._userMessageSubmissions.delete(event.message);
+				}
 				this.#receivedMessageReceipts.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
@@ -1691,11 +1801,15 @@ export class AgentSession {
 	}
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
-		if (this._agentRunAbortRequested) return false;
 		const message = [...event.messages].reverse().find((m) => m.role === "assistant") as AssistantMessage | undefined;
-		if (!message || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
-		if (this._assistantOutputObserved || hasAssistantOutput(message)) return false;
-		if (throttledLimitWait(message)) return true;
+		return message !== undefined && this._willRetryAssistantMessage(message);
+	}
+
+	/** Mirrors the post-run retry decision for the run's last assistant message. */
+	private _willRetryAssistantMessage(message: AssistantMessage): boolean {
+		if (this._agentRunAbortRequested || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
+		// Throttled-limit waits keep the plain output rule.
+		if (!this._assistantOutputObserved && !hasAssistantOutput(message) && throttledLimitWait(message)) return true;
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || !this._isRetryableError(message)) return false;
 		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
@@ -1845,6 +1959,7 @@ export class AgentSession {
 				toolName: event.toolName,
 				result: event.result,
 				isError: event.isError,
+				...(event.durationMs === undefined ? {} : { durationMs: event.durationMs }),
 			};
 			await this._extensionRunner.emit(extensionEvent);
 		}
@@ -1885,6 +2000,9 @@ export class AgentSession {
 		if (!this.isIdle || this.isSettling)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "abort and settle the active operation before disposal");
 		this._inputsDisposed = true;
+		this._rejectPendingUserMessageSubmissions(
+			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "user message was not persisted"),
+		);
 		this._disposalCancellation.abort(
 			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "auxiliary operation cancelled by disposal"),
 		);
@@ -2625,7 +2743,9 @@ export class AgentSession {
 	private _assertInputsOpen(): void {
 		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "input was not accepted");
 		const scope = this._inputFenceScope.getStore();
-		if (this._inputFence && !(scope?.active && scope.fence === this._inputFence))
+		// A detached descendant of a returned withFencedInput() callback keeps its (inactive) scope
+		// after the fence is released; it must not regain admission then either (pi#163 security r3).
+		if ((scope && !scope.active) || (this._inputFence && !(scope?.active && scope.fence === this._inputFence)))
 			throw new InputAdmissionError(
 				"INPUT_ADMISSION_FENCED",
 				"input was not accepted; retry against the current session",
@@ -2694,6 +2814,21 @@ export class AgentSession {
 				this._settlementCancellation = new AbortController();
 			throw error;
 		}
+		return this.#inputFenceRelease(fence);
+	}
+
+	/**
+	 * @internal Close direct admission without the drain check, for a receiving session published after its
+	 * fences refused. Awaited lifecycle callbacks still submit through withFencedInput() under this gate.
+	 */
+	gateInputs(): () => void {
+		if (this._inputFence) return () => {};
+		const fence = {};
+		this._inputFence = fence;
+		return this.#inputFenceRelease(fence);
+	}
+
+	#inputFenceRelease(fence: object): () => void {
 		return () => {
 			if (this._inputFence === fence) {
 				this._inputFence = undefined;
@@ -2863,6 +2998,7 @@ export class AgentSession {
 		options: PromptOptions | undefined,
 		admission: InputAdmission,
 		receipt: TurnReceipt,
+		submission?: UserMessageSubmission,
 	): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
 		this._checkInputAdmission();
@@ -2889,7 +3025,7 @@ export class AgentSession {
 					this._deferredSettledActions.push(async () => {
 						try {
 							await this._withInputAdmission(admission, () =>
-								this._promptInAdmission(text, options, admission, receipt),
+								this._promptInAdmission(text, options, admission, receipt, submission),
 							);
 							resolve();
 						} catch (error) {
@@ -2900,7 +3036,8 @@ export class AgentSession {
 			);
 			return;
 		}
-		if (!this.#ordinaryOwner) return this._prompt(text, options, undefined, undefined, admission, receipt);
+		if (!this.#ordinaryOwner)
+			return this._prompt(text, options, undefined, undefined, admission, receipt, submission);
 		this.#ordinaryOwner.assertSessionStart(this);
 		this.#ordinaryOwner.assertCompactionIdle();
 		this.#ordinaryPreflights++;
@@ -2916,7 +3053,7 @@ export class AgentSession {
 		try {
 			await this._awaitInput(
 				this.#ordinaryOwner.requestProvenance.prompt((token) =>
-					this._prompt(text, options, release, token, admission, receipt),
+					this._prompt(text, options, release, token, admission, receipt, submission),
 				),
 			);
 		} finally {
@@ -2931,6 +3068,7 @@ export class AgentSession {
 		promptToken?: object,
 		admission?: InputAdmission,
 		receipt = captureTerminalTurnReceipt(),
+		submission?: UserMessageSubmission,
 	): Promise<void> {
 		const expandPromptTemplates = options?.expandPromptTemplates ?? true;
 		const preflightResult = options?.preflightResult;
@@ -2945,6 +3083,12 @@ export class AgentSession {
 				const handled = await this._tryExecuteExtensionCommand(text);
 				if (handled) {
 					// Extension command executed, no prompt to send
+					submission?.resolve({
+						status: "handled",
+						entryId: null,
+						metadata: submission.metadata,
+						metadataSource: submission.metadataSource,
+					});
 					onInputTransferred?.();
 					preflightResult?.("handled");
 					return;
@@ -2981,6 +3125,12 @@ export class AgentSession {
 				mustQueue() ? options?.streamingBehavior : undefined,
 			);
 			if (!processedInput) {
+				submission?.resolve({
+					status: "handled",
+					entryId: null,
+					metadata: submission.metadata,
+					metadataSource: submission.metadataSource,
+				});
 				onInputTransferred?.();
 				preflightResult?.("handled");
 				return;
@@ -3006,9 +3156,9 @@ export class AgentSession {
 					);
 				}
 				if (options.streamingBehavior === "followUp") {
-					await this._queueFollowUp(expandedText, currentImages, receipt);
+					await this._queueFollowUp(expandedText, currentImages, receipt, submission);
 				} else {
-					await this._queueSteer(expandedText, currentImages, receipt);
+					await this._queueSteer(expandedText, currentImages, receipt, submission);
 				}
 				if (!this.isStreaming) this._inputQueuedBehindPreflight = true;
 				onInputTransferred?.();
@@ -3054,8 +3204,8 @@ export class AgentSession {
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
-					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, receipt);
-					else await this._queueSteer(expandedText, currentImages, receipt);
+					if (behavior === "followUp") await this._queueFollowUp(expandedText, currentImages, receipt, submission);
+					else await this._queueSteer(expandedText, currentImages, receipt, submission);
 					// Input already queued behind this prompt is retained with it, and so are
 					// triggered messages held during this preflight: the stop holds for them too.
 					this._inputQueuedBehindPreflight = false;
@@ -3098,6 +3248,10 @@ export class AgentSession {
 			userContent.push(...normalized.images);
 			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
 			this.#receivedMessageReceipts.set(userMessage, receipt);
+			if (submission) {
+				submission.message = userMessage;
+				this._userMessageSubmissions.set(userMessage, submission);
+			}
 			messages.push(userMessage);
 
 			// Inject any pending "nextTurn" messages as context alongside the user message
@@ -3404,7 +3558,12 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a steering message (already expanded, no extension command check).
 	 */
-	private async _queueSteer(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
+	private async _queueSteer(
+		text: string,
+		images: ImageContent[] | undefined,
+		receipt: TurnReceipt,
+		submission?: UserMessageSubmission,
+	): Promise<void> {
 		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._steeringMessages.push(text);
@@ -3414,6 +3573,10 @@ export class AgentSession {
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this.#receivedMessageReceipts.set(message, receipt);
+		if (submission) {
+			submission.message = message;
+			this._userMessageSubmissions.set(message, submission);
+		}
 		this.agent.steer(message);
 		this._inputAdmissionScope.getStore()?.release();
 		this._emitQueueUpdate();
@@ -3422,7 +3585,12 @@ export class AgentSession {
 	/**
 	 * Internal: Queue a follow-up message (already expanded, no extension command check).
 	 */
-	private async _queueFollowUp(text: string, images: ImageContent[] | undefined, receipt: TurnReceipt): Promise<void> {
+	private async _queueFollowUp(
+		text: string,
+		images: ImageContent[] | undefined,
+		receipt: TurnReceipt,
+		submission?: UserMessageSubmission,
+	): Promise<void> {
 		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
 		this._followUpMessages.push(text);
@@ -3432,6 +3600,10 @@ export class AgentSession {
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
 		this.#receivedMessageReceipts.set(message, receipt);
+		if (submission) {
+			submission.message = message;
+			this._userMessageSubmissions.set(message, submission);
+		}
 		this.agent.followUp(message);
 		this._inputAdmissionScope.getStore()?.release();
 		this._emitQueueUpdate();
@@ -3706,13 +3878,53 @@ export class AgentSession {
 	 * @param options.deliverAs Delivery mode when streaming: "steer" or "followUp"
 	 * @param options.expandPromptTemplates Whether to dispatch extension commands and expand skill commands and prompt templates. Default: false.
 	 */
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions & { metadata: UserMessageMetadata },
+	): Promise<SendUserMessageResult>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: Omit<SendUserMessageOptions, "metadata"> & { metadata?: undefined },
+	): Promise<void>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: Optional metadata variables may select either public return contract.
+	): Promise<void | SendUserMessageResult>;
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
-	): Promise<void> {
+		options?: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: Legacy core sends retain Promise<void> while metadata sends return receipts.
+	): Promise<void | SendUserMessageResult> {
+		// Validate and snapshot before issuing a receipt, admitting input, or running extension hooks.
+		const requestedMetadata = options?.metadata;
+		const metadata = requestedMetadata === undefined ? undefined : snapshotUserMessageMetadata(requestedMetadata);
+		const metadataSource = getUserMessageMetadataSource(options);
 		const receipt = captureTerminalTurnReceipt();
 		const admission = this._admitInput();
-		await this._withInputAdmission(admission, async () => {
+		let submission: UserMessageSubmission | undefined;
+		const result =
+			metadata === undefined
+				? undefined
+				: new Promise<SendUserMessageResult>((resolve, reject) => {
+						const context: UserMessageSubmission = {
+							metadata,
+							metadataSource,
+							resolve: (value) => {
+								if (!this._pendingUserMessageSubmissions.delete(context)) return;
+								resolve(value);
+							},
+							reject: (error) => {
+								if (!this._pendingUserMessageSubmissions.delete(context)) return;
+								// Abort/reload retain queues. Keep occurrence-local metadata until that
+								// input is persisted or explicitly cleared, even though its receipt ended.
+								reject(error);
+							},
+						};
+						submission = context;
+						this._pendingUserMessageSubmissions.add(context);
+					});
+		const operation = this._withInputAdmission(admission, async () => {
 			// Normalize content to text string + optional images
 			let text: string;
 			let images: ImageContent[] | undefined;
@@ -3745,8 +3957,18 @@ export class AgentSession {
 				},
 				admission,
 				getInputReceipt(input),
+				submission,
 			);
 		});
+		if (!result) return await operation;
+		void operation.catch((error: unknown) => {
+			// Compaction failure transfers the exact input into a retained queue. Its receipt
+			// remains pending until recovery persists it or clear/abort/reload/disposal rejects it.
+			if (!submission?.message || !this.agent.getQueuedMessages().includes(submission.message)) {
+				submission?.reject(error);
+			}
+		});
+		return result;
 	}
 
 	/**
@@ -3761,6 +3983,12 @@ export class AgentSession {
 		this._followUpMessages = [];
 		this._triggeredBehindPreflight.splice(0);
 		this._modelSwitchDispatches.clear();
+		for (const message of this.agent.getQueuedMessages()) {
+			this._userMessageSubmissions
+				.get(message)
+				?.reject(new InputAdmissionError("INPUT_ADMISSION_ABORTED", "queued user message was cleared"));
+			this._userMessageSubmissions.delete(message);
+		}
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		this._resolveIdleWaitIfIdle();
@@ -3802,8 +4030,17 @@ export class AgentSession {
 		return this._shutdownCancellation.signal;
 	}
 
+	private _rejectPendingUserMessageSubmissions(error: InputAdmissionError): void {
+		for (const submission of this._pendingUserMessageSubmissions) submission.reject(error);
+	}
+
 	/** Abort current operation and wait for agent to become idle. */
 	async abort(): Promise<void> {
+		// Queued inputs have already released admission. Cancel their receipts too,
+		// including inputs retained by failed compaction, without dropping the queues.
+		this._rejectPendingUserMessageSubmissions(
+			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "user message was not persisted before abort"),
+		);
 		for (const admission of this._inputAdmissions) {
 			admission.controller.abort(new InputAdmissionError("INPUT_ADMISSION_ABORTED", "input was not transferred"));
 		}
@@ -5175,16 +5412,30 @@ export class AgentSession {
 					});
 				},
 				sendUserMessage: (content, options) => {
-					// Detach scheduling to avoid an SDK self-join, but keep the separately captured cancellation lineage.
-					this._agentSettledScope
-						.exit(() => this.sendUserMessage(content, options))
-						.catch((err) => {
-							runner.emitError({
-								extensionPath: "<runtime>",
-								event: "send_user_message",
-								error: err instanceof Error ? err.message : String(err),
-							});
+					const reportError = (err: unknown) => {
+						runner.emitError({
+							extensionPath: "<runtime>",
+							event: "send_user_message",
+							error: err instanceof Error ? err.message : String(err),
 						});
+					};
+					// Detach scheduling to avoid an SDK self-join, but keep the separately captured cancellation lineage.
+					if (options?.metadata !== undefined) {
+						// Preserve the loader-owned options identity, which carries a private
+						// source binding. No public option can select or override that source.
+						const metadataOptions = options as SendUserMessageOptions & { metadata: UserMessageMetadata };
+						const result = this._agentSettledScope.exit(() => this.sendUserMessage(content, metadataOptions));
+						void result.catch(reportError);
+						return result;
+					}
+					void this._agentSettledScope
+						.exit(() =>
+							this.sendUserMessage(content, {
+								deliverAs: options?.deliverAs,
+								expandPromptTemplates: options?.expandPromptTemplates,
+							}),
+						)
+						.catch(reportError);
 				},
 				appendEntry: (customType, data) => {
 					this._inheritedCancellation();
@@ -5452,22 +5703,31 @@ export class AgentSession {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: reload requires separate receiving");
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
-		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
-		oldRunner.invalidate();
-		const previousDefaultTools = new Set(
-			this._usesDefaultTools ? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES) : [],
+		const rejection = new InputAdmissionError(
+			"INPUT_ADMISSION_ABORTED",
+			"user message was not persisted before reload",
 		);
+		// End existing receipts before shutdown hooks can yield. Input stays recoverable.
+		this._rejectPendingUserMessageSubmissions(rejection);
+		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+		// Shutdown hooks can submit more input; none may outlive its originating runtime.
+		this._rejectPendingUserMessageSubmissions(rejection);
+		oldRunner.invalidate();
+		const getDefaultTools = () =>
+			this._usesDefaultTools
+				? applyToolModifiers(
+						this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES,
+						this._defaultToolModifiers,
+					)
+				: [];
+		const previousDefaultTools = new Set(getDefaultTools());
 		await this.settingsManager.reload();
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();
 		// Activate tools newly added to defaultTools. Removed ones stay active, and tools disabled
 		// during the session stay disabled unless the setting newly adds them.
-		const addedDefaultTools = this._usesDefaultTools
-			? (this.settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES).filter(
-					(name) => !previousDefaultTools.has(name),
-				)
-			: [];
+		const addedDefaultTools = getDefaultTools().filter((name) => !previousDefaultTools.has(name));
 		// Tools the new extensions register later, such as MCP tools, are pending until then.
 		for (const name of this.getActiveToolNames()) this._pendingToolNames.add(name);
 		this._buildRuntime({
@@ -5498,11 +5758,14 @@ export class AgentSession {
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
-		// Never restart a request once output or a tool call has been streamed.
-		if (this._assistantOutputObserved) return false;
+		// Never restart a request once output or a tool call has been streamed, except reasoning-only
+		// output on a premature close (smarty-dev#6730). The classifier below checks the message itself.
+		// The stream observation also covers a terminal message whose streamed content the provider dropped.
+		const observed = this._assistantStreamObserved;
+		if (observed.answer || (this._assistantOutputObserved && !isPrematureStreamError(message))) return false;
 		// Context overflow is handled by compaction, not retry.
 		if (isContextOverflow(message, (this._modelForMessage(message) ?? this.model)?.contextWindow ?? 0)) return false;
-		return isRetryableAssistantError(message);
+		return isRetryableAssistantError(message, observed);
 	}
 
 	/**
@@ -6327,7 +6590,7 @@ export class AgentSession {
 			Object.getOwnPropertyDescriptors(this._extensionRunner.createCommandContext()),
 		) as ReplacedSessionContext;
 		context.sendMessage = (message, options) => this.sendCustomMessage(message, options);
-		context.sendUserMessage = (content, options) => this.sendUserMessage(content, options);
+		context.sendUserMessage = bindExtensionMetadataSender(this.sendUserMessage.bind(this));
 		return context;
 	}
 

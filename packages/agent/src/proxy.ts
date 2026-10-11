@@ -7,7 +7,12 @@
 import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
-	EventStream,
+	type AssistantMessageEventStream,
+	type AssistantRecovery,
+	createAssistantMessageEventStream,
+	isContextOverflow,
+	isPrematureStreamError,
+	isRetryableAssistantError,
 	type Model,
 	parseStreamingJson,
 	type SimpleStreamOptions,
@@ -15,20 +20,6 @@ import {
 	type ToolCall,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-
-// Create stream class matching ProxyMessageEventStream
-class ProxyMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
 
 /**
  * Proxy event types - server sends these with partial field stripped to reduce bandwidth.
@@ -121,8 +112,8 @@ export function streamProxy(
 	model: Model<any>,
 	context: TranscriptContext,
 	options: ProxyStreamOptions,
-): ProxyMessageEventStream {
-	const stream = new ProxyMessageEventStream();
+): AssistantMessageEventStream {
+	const stream = createAssistantMessageEventStream();
 
 	(async () => {
 		// Initialize the partial message that we'll build up from events
@@ -172,16 +163,10 @@ export function streamProxy(
 			});
 
 			if (!response.ok) {
-				let errorMessage = `Proxy error: ${response.status} ${response.statusText}`;
-				try {
-					const errorData = (await response.json()) as { error?: string };
-					if (errorData.error) {
-						errorMessage = `Proxy error: ${errorData.error}`;
-					}
-				} catch {
-					// Couldn't parse error response
-				}
-				throw new Error(errorMessage);
+				// Owned text: the status only. The proxy's status text and error body are never published
+				// (smarty-dev#5822, pi#202 round 3); the status keeps retry classification (e.g. 503).
+				const status = Number.isInteger(response.status) ? response.status : 0;
+				throw new Error(status >= 100 && status <= 599 ? `Proxy error (${status})` : "Proxy error");
 			}
 
 			reader = response.body!.getReader();
@@ -262,6 +247,29 @@ export function streamProxy(
 	})();
 
 	return stream;
+}
+
+/**
+ * The owned recovery decision for a proxy wire error, decided from its private text by the same public checks
+ * that read the published text before (overflow, premature stream, retryable), so retry behaviour is unchanged.
+ * The probe message is local and never published; it has no output, so only the text decides.
+ */
+function proxyRecovery(partial: AssistantMessage, wireText: unknown): AssistantRecovery {
+	const probe: AssistantMessage = {
+		...partial,
+		content: [],
+		usage: { ...partial.usage, output: 0 },
+		stopReason: "error",
+		errorMessage: typeof wireText === "string" ? wireText : "",
+		recovery: undefined,
+		diagnostics: undefined,
+	};
+	if (isContextOverflow(probe)) return { recovery: "context_length_exceeded", retryable: false };
+	// Quota and billing refusals win over everything else, as in the shared classifier.
+	if (!isRetryableAssistantError(probe)) return { retryable: false };
+	return isPrematureStreamError(probe)
+		? { recovery: "premature_stream", retryable: true }
+		: { recovery: "retryable", retryable: true };
 }
 
 /**
@@ -388,14 +396,19 @@ function processProxyEvent(
 			}
 			return { type: "done", reason: proxyEvent.reason, message: partial };
 
-		case "error":
-			partial.stopReason = proxyEvent.reason;
-			partial.errorMessage = proxyEvent.errorMessage;
+		case "error": {
+			// The wire text stays private: it only decides recovery, exactly as the published text used to
+			// (smarty-dev#5822, pi#202 round 4). The published text is owned, with a closed reason code.
+			const reason = proxyEvent.reason === "aborted" ? "aborted" : "error";
+			partial.stopReason = reason;
+			partial.recovery = proxyRecovery(partial, proxyEvent.errorMessage);
+			partial.errorMessage = reason === "aborted" ? "Proxy error (aborted)" : "Proxy error";
 			partial.usage = proxyEvent.usage;
 			if (proxyEvent.providerThinkingLevel !== undefined) {
 				partial.providerThinkingLevel = proxyEvent.providerThinkingLevel;
 			}
-			return { type: "error", reason: proxyEvent.reason, error: partial };
+			return { type: "error", reason, error: partial };
+		}
 
 		default: {
 			const _exhaustiveCheck: never = proxyEvent;

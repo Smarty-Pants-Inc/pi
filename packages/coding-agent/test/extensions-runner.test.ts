@@ -1054,9 +1054,14 @@ describe("ExtensionRunner", () => {
 		);
 		const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
 
-		expect(runner.resolveToolRenderers("a", () => undefined)).toEqual({ renderCall });
+		// pi#187: returned renderer callbacks are source-bound wrappers, not the original functions.
+		const firstRenderers = runner.resolveToolRenderers("a", () => undefined);
+		expect(firstRenderers).toEqual({ renderCall: expect.any(Function) });
+		expect(firstRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
 		expect(runner.resolveToolRenderers("b", () => undefined)).toEqual({ renderShell: "self" });
-		expect(runner.resolveToolRenderers("b", () => ({ renderCall }))).toEqual({ renderCall });
+		const baseRenderers = runner.resolveToolRenderers("b", () => ({ renderCall }));
+		expect(baseRenderers).toEqual({ renderCall: expect.any(Function) });
+		expect(baseRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
 	});
 
 	describe("boundary chaining", () => {
@@ -1362,6 +1367,71 @@ describe("ExtensionRunner", () => {
 				details: { source: "ext1" },
 				isError: true,
 			});
+		});
+	});
+
+	// smarty-dev#5377: hook snapshots must clone native Errors faithfully. structuredClone
+	// turned an Error subclass into a plain Error without its name or own fields.
+	describe("native Error isolation", () => {
+		class HttpError extends Error {
+			status = 429;
+			constructor(message: string) {
+				super(message);
+				this.name = "HttpError";
+			}
+		}
+
+		it("gives observer and tool_result handlers a faithful, detached Error clone", async () => {
+			const runtime = createExtensionRuntime();
+			const seen: Array<{ event: string; error: unknown }> = [];
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("tool_execution_end", (event) => {
+						seen.push({
+							event: event.type,
+							error: (event.result as { details: { error: unknown } }).details.error,
+						});
+					});
+					pi.on("tool_result", (event) => {
+						const error = (event.details as { error: HttpError }).error;
+						seen.push({ event: event.type, error });
+						error.status = 500;
+						return { details: event.details };
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: string[] = [];
+			runner.onError((error) => errors.push(error.error));
+			const error = new HttpError("rate limited");
+			const result = { content: [], details: { error } };
+
+			await runner.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "t", result, isError: true });
+			const chained = await runner.emitToolResult({
+				type: "tool_result",
+				toolCallId: "c1",
+				toolName: "t",
+				input: {},
+				...result,
+				isError: true,
+			});
+
+			expect(errors).toEqual([]);
+			expect(seen.map((entry) => entry.event)).toEqual(["tool_execution_end", "tool_result"]);
+			for (const entry of seen) {
+				expect(entry.error).not.toBe(error);
+				expect(entry.error).toBeInstanceOf(HttpError);
+				expect((entry.error as HttpError).name).toBe("HttpError");
+				expect((entry.error as HttpError).message).toBe("rate limited");
+			}
+			expect((seen[0]!.error as HttpError).status).toBe(429);
+			expect(error.status).toBe(429);
+			const returned = (chained?.details as { error: HttpError } | undefined)?.error;
+			expect(returned).toBeInstanceOf(HttpError);
+			expect(returned?.status).toBe(500);
 		});
 	});
 

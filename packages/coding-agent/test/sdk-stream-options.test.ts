@@ -84,7 +84,7 @@ describe("createAgentSession stream options", () => {
 		settings: Partial<Settings>,
 		requestOptions: SimpleStreamOptions = {},
 		extensionFactory?: ExtensionFactory,
-		providerEvent?: unknown,
+		emitProviderCallbacks = false,
 	): Promise<SimpleStreamOptions | undefined> {
 		const model = createModel(api);
 		const settingsManager = SettingsManager.inMemory(settings);
@@ -104,13 +104,18 @@ describe("createAgentSession stream options", () => {
 		modelRegistry.registerProvider(model.provider, {
 			api,
 			headers: { "x-provider": "provider" },
-			streamSimple: (requestModel, _context, providerOptions) => {
+			streamSimple: (_requestModel, _context, providerOptions) => {
 				capturedOptions = providerOptions;
-				if (providerEvent === undefined) return createDoneStream(api);
+				if (!emitProviderCallbacks) return createDoneStream(api);
 
 				const stream = createAssistantMessageEventStream();
 				void (async () => {
-					await providerOptions?.onProviderStreamEvent?.(providerEvent, requestModel);
+					try {
+						await providerOptions?.onResponse?.({ status: 200 });
+						await providerOptions?.onProviderStreamEvent?.({ type: "provider_stream_event" });
+					} catch {
+						// A failing forwarder must fail the assertions below, not hang the stream.
+					}
 					stream.end(createDoneMessage(api));
 				})();
 				return stream;
@@ -130,7 +135,7 @@ describe("createAgentSession stream options", () => {
 		});
 
 		try {
-			if (providerEvent === undefined) {
+			if (!emitProviderCallbacks) {
 				const stream = await session.agent.streamFunction(
 					model,
 					normalizeContext({ messages: [] }),
@@ -268,9 +273,8 @@ describe("createAgentSession stream options", () => {
 		expect(options?.maxRetryDelayMs).toBe(3000);
 	});
 
-	// Regression test for #9784.
-	it("forwards provider stream events to extensions", async () => {
-		const providerEvent = { openrouter_metadata: { strategy: "direct" } };
+	// Regression test for #9784; value-free shapes per smarty-dev#5822 C1.
+	it("forwards value-free provider callbacks to extensions", async () => {
 		const extensionEvents: unknown[] = [];
 
 		const options = await captureStreamOptions(
@@ -278,22 +282,20 @@ describe("createAgentSession stream options", () => {
 			{},
 			{},
 			(pi) => {
+				pi.on("after_provider_response", (event) => {
+					extensionEvents.push(event);
+				});
 				pi.on("provider_stream_event", (event) => {
 					extensionEvents.push(event);
 				});
 			},
-			providerEvent,
+			true,
 		);
 
 		expect(options?.onProviderStreamEvent).toEqual(expect.any(Function));
-		expect(extensionEvents).toEqual([
-			{
-				data: providerEvent,
-				type: "provider_stream_event",
-				provider: "capture-provider",
-				api: "openai-completions",
-				model: "capture-model",
-			},
+		expect(extensionEvents).toStrictEqual([
+			{ type: "after_provider_response", status: 200 },
+			{ type: "provider_stream_event" },
 		]);
 	});
 
