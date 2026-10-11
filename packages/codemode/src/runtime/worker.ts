@@ -58,17 +58,20 @@ async function main(data: WorkerData): Promise<void> {
 	// Over a budget, the worker reports once, posts nothing more, and interrupts the VM.
 	const budget = new BridgeBudget(data.limits);
 	let stopped = false;
-	const send = (message: WorkerToHostMessage) => {
-		if (stopped) return;
+	/** Run a budget check; false after reporting an overrun. */
+	const withinBudget = (check: () => void): boolean => {
 		try {
-			budget.charge(message);
+			check();
+			return true;
 		} catch (error) {
 			if (!(error instanceof CodemodeLimitError)) throw error;
 			stopped = true;
 			post({ type: "limit", message: error.message });
-			return;
+			return false;
 		}
-		post(message);
+	};
+	const send = (message: WorkerToHostMessage) => {
+		if (!stopped && withinBudget(() => budget.charge(message))) post(message);
 	};
 	const vm = await QuickJS.create({
 		wasm: data.wasm,
@@ -144,7 +147,7 @@ async function main(data: WorkerData): Promise<void> {
 
 	parentPort?.on("message", (message: unknown) => {
 		if (!isHostToWorkerMessage(message) || stopped) return;
-		budget.settle(0);
+		if (!withinBudget(() => budget.settle(message.payload?.length ?? 0))) return;
 		try {
 			vm.withScope(() => {
 				vm.callFunction(

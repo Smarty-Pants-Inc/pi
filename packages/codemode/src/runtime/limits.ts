@@ -75,12 +75,7 @@ export class BridgeBudget {
 
 	/** One message from the script, before it is posted or kept. */
 	charge(message: WorkerToHostMessage): void {
-		const chars = messageChars(message);
-		this.checkMessage(chars);
-		this.totalChars += chars;
-		if (this.totalChars > this.limits.maxTotalChars) {
-			throw new CodemodeLimitError(`script traffic exceeded the limit of ${this.limits.maxTotalChars} characters`);
-		}
+		this.addChars(messageChars(message));
 		if (message.type !== "call") return;
 		if (++this.calls > this.limits.maxCalls) {
 			throw new CodemodeLimitError(`script started more than ${this.limits.maxCalls} calls`);
@@ -90,17 +85,21 @@ export class BridgeBudget {
 		}
 	}
 
-	/** A call's reply of `chars` characters, before it is posted to the script. */
+	/** A call's reply of `chars` characters, before it is posted to the script. Replies count toward the total too. */
 	settle(chars: number): void {
 		this.pending--;
-		this.checkMessage(chars);
+		this.addChars(chars);
 	}
 
-	private checkMessage(chars: number): void {
+	private addChars(chars: number): void {
 		if (chars > this.limits.maxMessageChars) {
 			throw new CodemodeLimitError(
 				`a message across the sandbox bridge has ${chars} characters, more than the limit of ${this.limits.maxMessageChars}`,
 			);
+		}
+		this.totalChars += chars;
+		if (this.totalChars > this.limits.maxTotalChars) {
+			throw new CodemodeLimitError(`script traffic exceeded the limit of ${this.limits.maxTotalChars} characters`);
 		}
 	}
 }

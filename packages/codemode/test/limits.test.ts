@@ -127,6 +127,30 @@ describe("bridge budgets", () => {
 		expect(result).toMatchObject({ ok: false, error: { kind: "limit" } });
 	});
 
+	// pi#203 R4: replies count toward the total, not only the per-message limit.
+	it("fails when replies, each under the message limit, together pass the total limit", async () => {
+		const reply: CodemodeTool = { name: "t", execute: () => "y".repeat(80) };
+		const limits = { maxMessageChars: 100, maxTotalChars: 250 };
+		const result = await run([call(1), call(2), call(3), call(4)], { tools: [reply], limits });
+		expect(result).toMatchObject({ ok: false, error: { kind: "limit", message: expect.stringContaining("250") } });
+		// The same check the worker runs on each reply it receives: 3 call chars + 82 + 82, then 82 more passes 200.
+		const budget = new BridgeBudget(resolveCodemodeLimits({ maxMessageChars: 100, maxTotalChars: 200 }));
+		for (let id = 1; id <= 3; id++) budget.charge(call(id));
+		budget.settle(82);
+		budget.settle(82);
+		expect(() => budget.settle(82)).toThrow(/200 characters/);
+	});
+
+	it("passes a single reply under both limits", async () => {
+		const reply: CodemodeTool = { name: "t", execute: () => "y".repeat(80) };
+		// The stand-in worker never finishes, so the run ends at the deadline once the reply was posted.
+		const result = await run([call(1)], {
+			tools: [reply],
+			limits: { maxMessageChars: 100, maxTotalChars: 250, maxTimeoutMs: 200 },
+		});
+		expect(result).toMatchObject({ ok: false, error: { kind: "timeout" }, calls: [{ name: "t", status: "ok" }] });
+	});
+
 	it("maps a worker-side limit report to a limit error", async () => {
 		const result = await run([{ type: "limit", message: "over" }]);
 		expect(result).toMatchObject({ ok: false, error: { kind: "limit", message: "over" } });
