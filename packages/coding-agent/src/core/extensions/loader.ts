@@ -23,6 +23,11 @@ import { readPiManifest } from "../pi-manifest.ts";
 import { currentSessionOwnership, ownershipOf, type SessionOwnership } from "../session-ownership.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
+import {
+	assertExtensionMetadataCaller,
+	bindExtensionMetadataCallback,
+	bindExtensionMetadataSource,
+} from "../user-message-metadata.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
 	EntryRenderer,
@@ -132,6 +137,100 @@ function getAliases(): Record<string, string> {
 }
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
+
+type CallbackKeys<T> = {
+	[K in keyof T]-?: NonNullable<T[K]> extends (...args: never[]) => unknown ? K : never;
+}[keyof T];
+
+/** Enumerate callback fields exhaustively; preserve the original method receiver. */
+function bindExtensionMetadataMethods<T extends object>(
+	extensionPath: string,
+	value: T,
+	methods: Record<CallbackKeys<T>, true>,
+): T {
+	const bound = { ...value };
+	for (const key of Object.keys(methods) as CallbackKeys<T>[]) {
+		const callback = value[key];
+		if (typeof callback !== "function") continue;
+		Object.defineProperty(bound, key, {
+			value: bindExtensionMetadataCallback(extensionPath, callback.bind(value)),
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+	}
+	return bound;
+}
+
+function bindProviderConfig(extensionPath: string, config: ProviderConfig): ProviderConfig {
+	return {
+		...bindExtensionMetadataMethods(extensionPath, config, { streamSimple: true, refreshModels: true }),
+		images:
+			config.images &&
+			Object.fromEntries(
+				Object.entries(config.images).map(([api, implementation]) => [
+					api,
+					implementation && bindExtensionMetadataMethods(extensionPath, implementation, { generateImages: true }),
+				]),
+			),
+		classifiers:
+			config.classifiers &&
+			Object.fromEntries(
+				Object.entries(config.classifiers).map(([api, implementation]) => [
+					api,
+					implementation && bindExtensionMetadataMethods(extensionPath, implementation, { classify: true }),
+				]),
+			),
+		oauth:
+			config.oauth &&
+			bindExtensionMetadataMethods(extensionPath, config.oauth, {
+				login: true,
+				refreshToken: true,
+				getApiKey: true,
+				modifyModels: true,
+			}),
+	};
+}
+
+function bindNativeProvider(extensionPath: string, provider: Provider): Provider {
+	return {
+		...bindExtensionMetadataMethods(extensionPath, provider, {
+			getModels: true,
+			getAllModels: true,
+			refreshModels: true,
+			filterModels: true,
+			filterAllModels: true,
+			stream: true,
+			streamSimple: true,
+			fetchDeferred: true,
+			cancelDeferred: true,
+			generateImages: true,
+			classify: true,
+		}),
+		// Native providers may implement these properties with prototype getters.
+		id: provider.id,
+		name: provider.name,
+		baseUrl: provider.baseUrl,
+		headers: provider.headers,
+		auth: {
+			...provider.auth,
+			apiKey:
+				provider.auth.apiKey &&
+				bindExtensionMetadataMethods(extensionPath, provider.auth.apiKey, {
+					login: true,
+					check: true,
+					resolve: true,
+				}),
+			oauth:
+				provider.auth.oauth &&
+				bindExtensionMetadataMethods(extensionPath, provider.auth.oauth, {
+					login: true,
+					refresh: true,
+					toAuth: true,
+				}),
+		},
+	};
+}
 
 let extensionCacheCwd: string | undefined;
 let extensionCacheGeneration = 0;
@@ -289,6 +388,10 @@ function createExtensionAPI(
 		binding?.owner?.assertActive();
 		runtime.assertActive();
 	};
+	const assertRegistration = () => {
+		assertActive();
+		assertExtensionMetadataCaller(extension.path);
+	};
 	const applyRuntimeChange = (change: () => void) => {
 		if (state === "loading") pendingRuntimeChanges.push(change);
 		else change();
@@ -302,8 +405,8 @@ function createExtensionAPI(
 	const api = {
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): () => void {
-			assertActive();
-			const registeredHandler: HandlerFn = (...args) => handler(...args);
+			assertRegistration();
+			const registeredHandler = bindExtensionMetadataCallback(extension.path, handler);
 			const list = extension.handlers.get(event) ?? [];
 			list.push(registeredHandler);
 			extension.handlers.set(event, list);
@@ -319,21 +422,27 @@ function createExtensionAPI(
 		},
 
 		registerTool(tool: ToolDefinition): void {
-			assertActive();
+			assertRegistration();
 			if (typeof tool.parameters !== "object" || tool.parameters === null || Array.isArray(tool.parameters)) {
 				throw new Error(
 					`Tool "${tool.name}" registered by extension "${extension.path}" must define an object parameter schema.`,
 				);
 			}
 			extension.tools.set(tool.name, {
-				definition: tool,
+				definition: bindExtensionMetadataMethods(extension.path, tool, {
+					execute: true,
+					prepareArguments: true,
+					prepareLoadout: true,
+					renderCall: true,
+					renderResult: true,
+				}),
 				sourceInfo: extension.sourceInfo,
 			});
 			runtime.refreshTools();
 		},
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
-			assertActive();
+			assertRegistration();
 			if (typeof name !== "string" || name.length === 0) {
 				throw new Error(
 					`Command registered by extension "${extension.path}" must have a non-empty string name. Use pi.registerCommand("name", { description, handler }).`,
@@ -345,7 +454,7 @@ function createExtensionAPI(
 			extension.commands.set(name, {
 				name,
 				sourceInfo: extension.sourceInfo,
-				...options,
+				...bindExtensionMetadataMethods(extension.path, options, { handler: true, getArgumentCompletions: true }),
 			});
 		},
 
@@ -356,8 +465,13 @@ function createExtensionAPI(
 				handler: (ctx: ExtensionContext) => Promise<void> | void;
 			},
 		): void {
-			assertActive();
-			extension.shortcuts.set(shortcut, { shortcut, extensionPath: extension.path, ...options });
+			assertRegistration();
+			extension.shortcuts.set(shortcut, {
+				shortcut,
+				extensionPath: extension.path,
+				...options,
+				handler: bindExtensionMetadataCallback(extension.path, options.handler),
+			});
 		},
 
 		registerFlag(
@@ -381,30 +495,44 @@ function createExtensionAPI(
 		},
 
 		registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
-			assertActive();
-			extension.messageRenderers.set(customType, renderer as MessageRenderer);
+			assertRegistration();
+			extension.messageRenderers.set(
+				customType,
+				bindExtensionMetadataCallback(extension.path, renderer) as MessageRenderer,
+			);
 		},
 
 		registerUserMessageRenderer(renderer: UserMessageRenderer): void {
-			assertActive();
-			extension.userMessageRenderer = renderer;
+			assertRegistration();
+			extension.userMessageRenderer = bindExtensionMetadataCallback(extension.path, renderer);
 		},
 
 		registerMarkdownTransformer(transformer: MarkdownTransformer): void {
-			assertActive();
-			extension.markdownTransformer = transformer;
+			assertRegistration();
+			extension.markdownTransformer = bindExtensionMetadataCallback(extension.path, transformer);
 		},
 
 		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
-			assertActive();
+			assertRegistration();
 			extension.entryRenderers ??= new Map();
-			extension.entryRenderers.set(customType, renderer as EntryRenderer);
+			extension.entryRenderers.set(
+				customType,
+				bindExtensionMetadataCallback(extension.path, renderer) as EntryRenderer,
+			);
 		},
 
 		registerToolRenderer(resolver: ToolRendererResolver): void {
-			assertActive();
+			assertRegistration();
 			extension.toolRenderers ??= [];
-			extension.toolRenderers.push(resolver);
+			extension.toolRenderers.push(
+				bindExtensionMetadataCallback(extension.path, (toolName, next) => {
+					const renderers = resolver(toolName, next);
+					return (
+						renderers &&
+						bindExtensionMetadataMethods(extension.path, renderers, { renderCall: true, renderResult: true })
+					);
+				}),
+			);
 		},
 
 		// Flag access - checks extension registered it, reads from runtime
@@ -422,9 +550,14 @@ function createExtensionAPI(
 			runtime.sendMessage(message, options);
 		},
 
-		sendUserMessage(content, options): void {
+		sendUserMessage(content, options) {
 			assertActive();
-			runtime.sendUserMessage(content, options);
+			try {
+				return runtime.sendUserMessage(content, bindExtensionMetadataSource(options, extension.path));
+			} catch (error) {
+				if (options?.metadata !== undefined) return Promise.reject(error);
+				throw error;
+			}
 		},
 
 		appendEntry(customType: string, data?: unknown): void {
@@ -499,13 +632,15 @@ function createExtensionAPI(
 		},
 
 		registerProvider(providerOrName: Provider | string, config?: ProviderConfig) {
-			assertActive();
+			assertRegistration();
 			if (typeof providerOrName === "string") {
 				if (!config) throw new Error("Provider config is required when registering by name");
-				applyRuntimeChange(() => runtime.registerProvider(providerOrName, config, extension.path));
+				const boundConfig = bindProviderConfig(extension.path, config);
+				applyRuntimeChange(() => runtime.registerProvider(providerOrName, boundConfig, extension.path));
 				return;
 			}
-			applyRuntimeChange(() => runtime.registerNativeProvider(providerOrName, extension.path));
+			const boundProvider = bindNativeProvider(extension.path, providerOrName);
+			applyRuntimeChange(() => runtime.registerNativeProvider(boundProvider, extension.path));
 		},
 
 		unregisterProvider(name: string) {
@@ -545,12 +680,14 @@ function createExtensionAPI(
 		},
 
 		registerVirtualModel<TState>(model: ExtensionVirtualModel<TState>) {
-			assertActive();
+			assertRegistration();
 			// Routing runs after the runner binds, so the context is created per request. The state
 			// comes from the session branch that this router wrote.
 			const definition: VirtualModelDefinition = {
 				...model,
-				route: (request) => model.route(request as ModelRouteRequest<TState>, runtime.createContext()),
+				route: bindExtensionMetadataCallback(extension.path, (request) =>
+					model.route(request as ModelRouteRequest<TState>, runtime.createContext()),
+				),
 			};
 			applyRuntimeChange(() => runtime.registerVirtualModel(definition, extension.path));
 		},
@@ -566,8 +703,10 @@ function createExtensionAPI(
 				eventBus.emit(channel, data);
 			},
 			on(channel, handler) {
-				assertActive();
-				const unsubscribe = runtime.trackEventBusSubscription(eventBus.on(channel, handler));
+				assertRegistration();
+				const unsubscribe = runtime.trackEventBusSubscription(
+					eventBus.on(channel, bindExtensionMetadataCallback(extension.path, handler)),
+				);
 				if (state === "loading") loadingUnsubscribers.push(unsubscribe);
 				return unsubscribe;
 			},
@@ -669,7 +808,8 @@ async function initializeExtension(
 	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
 	const owner = runtimeOwners.get(runtime)?.owner;
 	try {
-		await (owner ? owner.within(() => factory(load.api)) : factory(load.api));
+		const invokeFactory = bindExtensionMetadataCallback(extensionPath, factory, true);
+		await (owner ? owner.within(() => invokeFactory(load.api)) : invokeFactory(load.api));
 		owner?.assertActive();
 		load.commit();
 	} catch (error) {
@@ -692,9 +832,12 @@ async function loadExtension(
 	try {
 		const owner = runtimeOwners.get(runtime)?.owner;
 		if (currentSessionOwnership() && !owner) throw new Error("OWNER_RUNTIME_OWNERSHIP");
-		const factory = await (owner
-			? owner.within(() => loadExtensionModule(resolvedPath, cacheToken))
-			: loadExtensionModule(resolvedPath, cacheToken));
+		const importModule = bindExtensionMetadataCallback(
+			extensionPath,
+			() => loadExtensionModule(resolvedPath, cacheToken),
+			true,
+		);
+		const factory = await (owner ? owner.within(importModule) : importModule());
 		owner?.assertActive();
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
@@ -731,7 +874,11 @@ export async function loadOwnedSenseExtension(context: OrdinaryOwnerContext): Pr
 	context.holdSenseCompositionModule(compositionPath);
 	// Native cache only: never fall back to another Jiti copy of the registry.
 	// Original C3 startup admission must cover this same canonical external graph.
-	const composition: unknown = nativeRequire(compositionPath);
+	const composition: unknown = bindExtensionMetadataCallback(
+		extensionPath,
+		() => nativeRequire(compositionPath),
+		true,
+	)();
 	context.checkSenseCompositionModule();
 	if (
 		!composition ||
@@ -766,12 +913,17 @@ export async function loadOwnedSenseExtension(context: OrdinaryOwnerContext): Pr
 		transformModules: [],
 		tsconfigPaths: false,
 	});
-	const loaded: unknown = context.within(() =>
-		loader.evalModule(context.readSenseEntry(), {
-			filename: extensionPath,
-			async: false,
-			forceTranspile: true,
-		}),
+	const loaded: unknown = context.within(
+		bindExtensionMetadataCallback(
+			extensionPath,
+			() =>
+				loader.evalModule(context.readSenseEntry(), {
+					filename: extensionPath,
+					async: false,
+					forceTranspile: true,
+				}),
+			true,
+		),
 	);
 	context.assertActive();
 	if (!loaded || typeof loaded !== "object") throw new Error("OWNER_SENSE_ENTRY_REQUIRED");

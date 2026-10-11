@@ -1,17 +1,19 @@
 import { expect, it } from "vitest";
 import { McpClient, StdioTransport, StreamableHttpTransport } from "../src/index.ts";
 import {
+	exchangeAuthorizationCode,
+	refreshAuthorization,
+	registerClient,
+	startAuthorization,
+} from "../src/oauth/flow.ts";
+import {
 	adaptOAuthProvider,
 	authorizeMcp,
 	discoverAuthorizationServerMetadata,
 	discoverOAuthServerInfo,
 	discoverProtectedResourceMetadata,
-	exchangeAuthorizationCode,
 	McpOAuthProvider,
 	OAuthCallbackServer,
-	refreshAuthorization,
-	registerClient,
-	startAuthorization,
 } from "../src/oauth/index.ts";
 
 const poison = new Proxy(

@@ -149,6 +149,8 @@ export type {
 	ResourcesDiscoverResult,
 	SendMessageHandler,
 	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -204,6 +206,8 @@ export type {
 	// Events - User Bash
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
 	UserMessageRenderer,
 	UserMessageRenderOptions,
 	WidgetPlacement,

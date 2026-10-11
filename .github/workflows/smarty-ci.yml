@@ -5,6 +5,8 @@ on:
   pull_request:
     branches:
       - main
+      # Temporary landed home of the fleet's a2 runtime line (smarty-dev#7403); retired with v1.1.0.
+      - release/runtime-a2
   push:
     branches:
       - main

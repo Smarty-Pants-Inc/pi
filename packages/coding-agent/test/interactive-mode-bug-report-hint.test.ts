@@ -42,6 +42,20 @@ describe("InteractiveMode bug report hints", () => {
 		expect(context.suggestBugReport).not.toHaveBeenCalled();
 	});
 
+	// smarty-dev#6730: a retried reasoning-only close arrives stripped to empty thinking with output tokens.
+	test("does not suggest reports for premature stream closes", () => {
+		const context = { suggestBugReport: vi.fn(), maybeShowInstallChangeWarning: vi.fn(() => false) };
+		const message = fauxAssistantMessage([{ type: "thinking", thinking: "" }], {
+			stopReason: "error",
+			errorMessage: "stream closed before response.completed",
+		});
+		message.usage = { ...message.usage, output: 9 };
+
+		maybeSuggestBugReport.call(context, message);
+
+		expect(context.suggestBugReport).not.toHaveBeenCalled();
+	});
+
 	test("does not suggest reports for cancellations", () => {
 		const context = { suggestBugReport: vi.fn(), maybeShowInstallChangeWarning: vi.fn(() => false) };
 
