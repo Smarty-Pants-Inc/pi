@@ -16,6 +16,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -320,6 +321,11 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 // ============================================================================
 // Types
 // ============================================================================
+
+/** User content as blocks, so `"x"` and `[{ type: "text", text: "x" }]` compare as the same text. */
+function userContentBlocks(content: string | readonly (TextContent | ImageContent)[]): unknown {
+	return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
 
 function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
 	return headers
@@ -1933,6 +1939,16 @@ export class AgentSession {
 					replacement.content == null
 						? ({ ...replacement, content: [] } as AgentMessage)
 						: replacement;
+				// smarty-dev#2636: Herdr attested the typed bytes, not text a message_end hook produced.
+				const receipt = this.#receivedMessageReceipts.get(event.message);
+				if (
+					receipt &&
+					event.message.role === "user" &&
+					(normalized.role !== "user" ||
+						!isDeepStrictEqual(userContentBlocks(event.message.content), userContentBlocks(normalized.content)))
+				) {
+					this.#receivedMessageReceipts.set(event.message, withoutAttribution(receipt));
+				}
 				this._replaceMessageInPlace(event.message, normalized);
 			}
 		} else if (event.type === "tool_execution_start") {
