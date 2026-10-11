@@ -64,8 +64,9 @@ describe("Mistral raw stop reasons", () => {
 		}).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.rawStopReason).toBe("unmapped_error");
-		expect(message.errorMessage).toBe("Provider stopped with: unmapped_error");
+		// smarty-dev#5822 (pi#202 round 2): an unknown provider value is published as the closed `other`.
+		expect(message.rawStopReason).toBe("other");
+		expect(message.errorMessage).toBe("Provider stopped with: other");
 		expect(isRetryableAssistantError(message)).toBe(false);
 	});
 });

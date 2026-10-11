@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { transformMessages } from "../src/api/transform-messages.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Model, ToolCall } from "../src/types.ts";
+import type { Model, ToolCall } from "../src/types.ts";
 
 function createSseResponse(events: Array<{ event: string; data: string }>): Response {
 	const body = events.map(({ event, data }) => `event: ${event}\ndata: ${data}\n`).join("\n");
@@ -110,33 +110,24 @@ function createResponseModelSseResponse(model: string, contentBlock: ResponseCon
 }
 
 describe("Anthropic raw SSE parsing", () => {
-	it("forwards parsed provider stream events in order", async () => {
+	// smarty-dev#5822 C1: one Pi-owned notification per parsed event, no raw event or model argument.
+	it("notifies the observer once per parsed provider stream event without provider data", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
-		const providerEvents: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const result = await streamAnthropic(
 			model,
 			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
 			{
 				client: createFakeAnthropicClient(createSseResponse(minimalAnthropicEvents)),
-				onProviderStreamEvent: async (event, eventModel) => {
+				onProviderStreamEvent: async (...args: unknown[]) => {
 					await Promise.resolve();
-					providerEvents.push(event);
-					eventModels.push(eventModel);
+					calls.push(args);
 				},
 			},
 		).result();
 
 		expect(result.stopReason).toBe("stop");
-		expect(providerEvents.map((event) => (event as { type: string }).type)).toEqual([
-			"message_start",
-			"content_block_start",
-			"content_block_delta",
-			"content_block_stop",
-			"message_delta",
-			"message_stop",
-		]);
-		expect(eventModels).toEqual([model, model, model, model, model, model]);
+		expect(calls).toEqual(Array.from({ length: 6 }, () => [{ type: "provider_stream_event" }]));
 	});
 
 	it("keeps signed thinking replayable when a proxy relabels the model", async () => {
@@ -339,20 +330,9 @@ describe("Anthropic raw SSE parsing", () => {
 			{ client: createFakeAnthropicClient(createSseResponse(events)) },
 		).result();
 
+		// smarty-dev#5822 N5682: Pi's count of the final event's drops, not the provider's paths and reasons.
 		expect(result.diagnostics).toEqual([
-			{
-				type: "anthropic_input_transformations",
-				timestamp: expect.any(Number),
-				details: {
-					transformations: [
-						{
-							type: "thinking_dropped",
-							path: "messages.3.content.0",
-							reason: "model_binding_mismatch",
-						},
-					],
-				},
-			},
+			{ type: "anthropic_input_transformations", timestamp: expect.any(Number), thinkingBlocksDropped: 1 },
 		]);
 	});
 	it("repairs malformed SSE JSON and malformed streamed tool JSON", async () => {
@@ -596,7 +576,9 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
-		expect(result.errorMessage).toBe(explanation);
+		// smarty-dev#5822 (pi#202 round 3): owned refusal text; the provider's explanation is not published.
+		expect(result.errorMessage).toBe("The model refused to complete the request");
+		expect(JSON.stringify(result)).not.toContain(explanation);
 	});
 
 	it("preserves sensitive stop reasons with a descriptive error message", async () => {

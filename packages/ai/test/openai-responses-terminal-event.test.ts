@@ -2,7 +2,7 @@ import type { ResponseStreamEvent } from "openai/resources/responses/responses.j
 import { describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
 import { processResponsesStream } from "../src/api/openai-responses-shared.ts";
-import type { Api, AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
+import type { AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
@@ -278,33 +278,26 @@ describe("OpenAI Responses terminal event handling", () => {
 		).rejects.toThrow("OpenAI Responses stream completed with an unfinished tool call: bash (call_a|fc_a)");
 	});
 
-	it("forwards parsed provider stream events in order", async () => {
+	// smarty-dev#5822 C1: one owned notification per event, never the raw event or model.
+	it("notifies once per parsed provider stream event without provider data", async () => {
 		const model = createModel();
 		const context = normalizeContext({
 			systemPrompt: "",
 			messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }],
 			tools: [],
 		});
-		const providerEvents: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const stream = streamOpenAIResponses(model, context, {
 			apiKey: "test",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				providerEvents.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		});
 
 		await stream.result();
 
-		expect(providerEvents).toHaveLength(3);
-		expect(providerEvents.map((event) => (event as ResponseStreamEvent).type)).toEqual([
-			"response.created",
-			"response.output_item.added",
-			"response.reasoning_text.delta",
-		]);
-		expect(eventModels).toEqual([model, model, model]);
+		expect(calls).toEqual(Array.from({ length: 3 }, () => [{ type: "provider_stream_event" }]));
 	});
 
 	it("emits an error final result when the wrapper stream ends before a terminal response event", async () => {
@@ -441,8 +434,9 @@ describe("OpenAI Responses terminal event handling", () => {
 		const output = createOutput(model);
 		const stream = new AssistantMessageEventStream();
 
+		// smarty-dev#5822 (pi#202 round 3): a provider error by origin, with owned text only.
 		await expect(processResponsesStream(createFailedEvents(), output, stream, model)).rejects.toThrow(
-			"server_error: boom",
+			"Provider request failed",
 		);
 		expect(output.rawStopReason).toBe("failed");
 	});
