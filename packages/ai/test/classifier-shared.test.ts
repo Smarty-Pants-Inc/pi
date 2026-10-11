@@ -146,6 +146,7 @@ describe("classifier response body limits", () => {
 			},
 		);
 		expect(result).toEqual({ answer: "café" });
-		expect(onResponse).toHaveBeenCalledWith({ status: 200, headers: { "x-receipt": "normal" } }, model);
+		// smarty-dev#5822 C1: the status only; response headers and the model are never passed.
+		expect(onResponse.mock.calls).toEqual([[{ status: 200 }]]);
 	});
 });

@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAzureOpenAIResponses } from "../src/api/azure-openai-responses.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Context, Model } from "../src/types.ts";
+import type { Context, Model } from "../src/types.ts";
 
 interface CapturedAzureClientOptions {
 	apiKey: string;
@@ -231,7 +231,8 @@ describe("azure base URL normalization", () => {
 });
 
 describe("azure provider stream events", () => {
-	it("forwards parsed events in order before normalizing the response", async () => {
+	// smarty-dev#5822 C1: owned notifications only, never the raw event or model.
+	it("notifies once per parsed event without provider data", async () => {
 		azureMock.streamEvents = [
 			{ type: "response.created", sequence_number: 0, response: { id: "resp_azure" } } as ResponseStreamEvent,
 			{
@@ -241,22 +242,17 @@ describe("azure provider stream events", () => {
 			} as ResponseStreamEvent,
 		];
 		const model = getModel("azure", "gpt-4o-mini");
-		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const result = await streamAzureOpenAIResponses(model, normalizeContext(context), {
 			apiKey: "test-api-key",
 			azureBaseUrl: "https://my-resource.openai.azure.com",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		}).result();
 
-		expect(received).toEqual(azureMock.streamEvents);
-		expect(received[0]).toBe(azureMock.streamEvents[0]);
-		expect(received[1]).toBe(azureMock.streamEvents[1]);
-		expect(eventModels).toEqual([model, model]);
+		expect(calls).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("resp_azure");
 	});

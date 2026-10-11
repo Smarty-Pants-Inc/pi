@@ -5,7 +5,7 @@ import {
 	redactOAuthDiagnosticValue,
 } from "../src/auth/oauth/credential-response.ts";
 import { createAssistantMessageDiagnostic } from "../src/utils/diagnostics.ts";
-import { MAX_PROVIDER_ERROR_BODY_CHARS, normalizeProviderError } from "../src/utils/error-body.ts";
+import { formatProviderError, normalizeProviderError } from "../src/utils/error-body.ts";
 
 // pi#127: credentials can cross multiple SDK serialization layers before reaching a diagnostic.
 describe("OAuth diagnostic redaction", () => {
@@ -22,9 +22,12 @@ describe("OAuth diagnostic redaction", () => {
 			}
 			const error = Object.assign(new Error("server_error"), {
 				status: 503,
-				body: JSON.stringify({ [field]: secret.repeat(MAX_PROVIDER_ERROR_BODY_CHARS) }),
+				body: JSON.stringify({ [field]: secret.repeat(4000) }),
 			});
-			expect(normalizeProviderError(error).body).not.toContain(secret);
+			// smarty-dev#5822: the normalized error and its owned text carry no provider body at all.
+			const norm = normalizeProviderError(error);
+			expect(JSON.stringify(norm)).not.toContain(secret);
+			expect(formatProviderError(norm)).toBe("Provider request failed (503)");
 		},
 	);
 
@@ -86,9 +89,11 @@ describe("OAuth diagnostic redaction", () => {
 		const result = redactOAuthDiagnosticValue(value, [secret]);
 		expect(JSON.stringify(result)).not.toContain(secret);
 		expect(result).not.toBe(value);
-		expect(
-			createAssistantMessageDiagnostic("provider_error", error, { refresh_token: secret }, [secret]).details,
-		).toEqual({ refresh_token: "***" });
+		// smarty-dev#5822 N5682: a diagnostic has no error or details field to carry a value at all.
+		expect(Object.keys(createAssistantMessageDiagnostic("provider_transport_failure")).sort()).toEqual([
+			"timestamp",
+			"type",
+		]);
 	});
 
 	// pi#150 security round 2: custom credential headers have no fixed name.

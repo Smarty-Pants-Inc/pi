@@ -11,7 +11,8 @@ import type {
 	JsonObject,
 } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
 /**
@@ -266,7 +267,7 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 		{ maxRetries: options?.maxRetries ?? 2, maxRetryDelayMs: options?.maxRetryDelayMs, signal: options?.signal },
 	);
 	if (observe) {
-		await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+		await options?.onResponse?.(providerResponse(response.status));
 	}
 	return json;
 }
@@ -455,7 +456,7 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		output.answers = {};
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, getRequestDiagnosticSecrets(model, options)),
+			normalizeProviderError(error, model.provider, undefined, getRequestDiagnosticSecrets(model, options)),
 			`${LABEL} error`,
 		);
 		return output;

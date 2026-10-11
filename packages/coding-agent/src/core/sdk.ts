@@ -451,28 +451,21 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
 		const runner = extensionRunnerRef.current;
 		if (!runner?.hasHandlers("after_provider_response")) return;
+		// Value-free: the validated status only, never response headers (smarty-dev#5822 C1).
 		await raceWithAbortSignal(
-			runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			}),
+			runner.emit(
+				response.status === undefined
+					? { type: "after_provider_response" }
+					: { type: "after_provider_response", status: response.status },
+			),
 			shutdownSignal,
 		);
 	};
-	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
-		data,
-		model,
-	) => {
+	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async () => {
 		const runner = extensionRunnerRef.current;
 		if (!runner?.hasHandlers("provider_stream_event")) return;
-		await runner.emit({
-			data,
-			type: "provider_stream_event",
-			provider: model.provider,
-			api: model.api,
-			model: model.id,
-		});
+		// The Pi-owned notification only: no raw provider event or model fields (smarty-dev#5822 C1).
+		await runner.emit({ type: "provider_stream_event" });
 	};
 
 	const agent = new Agent({

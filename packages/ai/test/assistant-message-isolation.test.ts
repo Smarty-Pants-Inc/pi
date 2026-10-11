@@ -174,7 +174,8 @@ describe("assistant message isolation contract", () => {
 	});
 
 	// T-C2-success-metadata: `done` metadata must not rewrite partials already published,
-	// and the published result must not alias the wire usage object.
+	// and consumer writes to an earlier event must not reach the result. S3 (smarty-dev#5822)
+	// changed the terminal policy: the result is the `done` event's message, not a second snapshot.
 	it("keeps done metadata out of earlier partials and detaches it from the wire", async () => {
 		const stream = streamPiMessages(piModel, context, {
 			apiKey: "test-key",
@@ -199,11 +200,13 @@ describe("assistant message isolation contract", () => {
 		expect(end.partial.responseId).toBeUndefined();
 		expect(done.message.usage).toEqual(wireUsage);
 		expect(done.message.responseId).toBe("resp_1");
+		expect(done.message.usage).not.toBe(end.partial.usage);
 
-		done.message.usage.cost.total = 1000;
-		done.message.content.length = 0;
+		end.partial.usage.totalTokens = 1000;
+		end.partial.content.length = 0;
 		const result = await stream.result();
-		expect(result.usage.cost.total).toBe(0.3);
+		expect(result).toBe(done.message);
+		expect(result.usage.totalTokens).toBe(15);
 		expect(result.content).toHaveLength(1);
 	});
 
@@ -234,10 +237,75 @@ describe("assistant message isolation contract", () => {
 		}
 		expect(result.stopReason).toBe("toolUse");
 	});
+
+	// T-F6-content-shape: a malformed wire toolcall_end falls back to the block toolcall_start
+	// and the deltas built; the published end tool call stays detached from the result.
+	it.each([
+		["wrong field types", '{"id":5,"arguments":[1]}'],
+		["null", "null"],
+	])("falls back to the started block for a malformed wire toolCall (%s)", async (_label, wireToolCall) => {
+		const stream = streamPiMessages(piModel, context, {
+			apiKey: "test-key",
+			fetch: sseFetch([
+				JSON.stringify({ type: "start" }),
+				JSON.stringify({ type: "toolcall_start", contentIndex: 0, id: "call_1", toolName: "read" }),
+				JSON.stringify({ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"a"}' }),
+				`{"type":"toolcall_end","contentIndex":0,"toolCall":${wireToolCall}}`,
+				JSON.stringify({ type: "done", reason: "toolUse", usage: wireUsage }),
+			]),
+		});
+		const events = await collect(stream);
+		const end = events.find((event) => event.type === "toolcall_end");
+		if (end?.type !== "toolcall_end") throw new Error("missing toolcall_end");
+		const expected = { type: "toolCall", id: "call_1", name: "read", arguments: { path: "a" } };
+		expect(end.toolCall).toStrictEqual(expected);
+		end.toolCall.arguments.path = "consumer";
+		const result = await stream.result();
+		expect(result.content[0]).toStrictEqual(expected);
+		expect(result.content[0]).not.toBe(end.toolCall);
+	});
+
+	// T-F6-content-shape counterexample: valid wire fields override the fallback and survive;
+	// unknown top-level fields, a foreign type and an own `__proto__` key stay dropped.
+	it("keeps valid wire toolCall fields over the fallback", async () => {
+		const wireToolCall =
+			'{"type":"text","id":"call_2","name":"write","arguments":{"path":"b"},"thoughtSignature":"sig","namespace":"ns","extra":1,"__proto__":{"polluted":true}}';
+		const stream = streamPiMessages(piModel, context, {
+			apiKey: "test-key",
+			fetch: sseFetch([
+				JSON.stringify({ type: "start" }),
+				JSON.stringify({ type: "toolcall_start", contentIndex: 0, id: "call_1", toolName: "read" }),
+				JSON.stringify({ type: "toolcall_delta", contentIndex: 0, delta: '{"path":"a"}' }),
+				`{"type":"toolcall_end","contentIndex":0,"toolCall":${wireToolCall}}`,
+				JSON.stringify({ type: "done", reason: "toolUse", usage: wireUsage }),
+			]),
+		});
+		const events = await collect(stream);
+		const result = await stream.result();
+		const end = events.find((event) => event.type === "toolcall_end");
+		if (end?.type !== "toolcall_end") throw new Error("missing toolcall_end");
+		const expected = {
+			type: "toolCall",
+			id: "call_2",
+			name: "write",
+			arguments: { path: "b" },
+			thoughtSignature: "sig",
+			namespace: "ns",
+		};
+		for (const block of [end.toolCall, result.content[0]]) {
+			expect(block).toStrictEqual(expected);
+			expect(Object.getPrototypeOf(block)).toBe(Object.prototype);
+			expect((block as unknown as { polluted?: unknown }).polluted).toBeUndefined();
+		}
+	});
 });
 
-// pi#159: terminal snapshots must be taken after the stream masks live secrets and sets
-// `durationMs`, so the event and the result carry both and still do not alias each other.
+// pi#159: terminal publication must happen after the stream masks live secrets and sets
+// `durationMs`, so the event and the result carry both. S3 (smarty-dev#5822) aligned contracts:
+// the projector never changes the producer's object (the copy is masked and timed, not the live
+// message), and the result is the terminal event's message (main's final-result alias policy),
+// not a separate snapshot. Before S3, S2 asserted the live message was masked and timed in place
+// and that result !== event message.
 // Duration counterexamples (preset provider duration, timestamp predating the stream,
 // late push after completion) are covered in event-stream.test.ts and not repeated here.
 describe("assistant message terminal snapshots (pi#159)", () => {
@@ -254,8 +322,8 @@ describe("assistant message terminal snapshots (pi#159)", () => {
 		};
 	}
 
-	// pi#159: error event and result are separate snapshots of the masked, timed message.
-	it("separates the error event from the result after redaction and timing", async () => {
+	// pi#159: S3: result === error event message, the masked, timed projection; the producer's object is untouched.
+	it("publishes the masked, timed error event message as the result without touching the producer", async () => {
 		const stream = new AssistantMessageEventStream([secret]);
 		const live = failedMessage();
 		const liveDeferred = live.deferred;
@@ -271,35 +339,33 @@ describe("assistant message terminal snapshots (pi#159)", () => {
 			expect(message.deferred?.id).toBeDefined();
 			expect(message.deferred?.id).not.toContain(secret);
 			expect(message.durationMs).toBeTypeOf("number");
-			expect(message.durationMs).toBe(live.durationMs);
 		}
-		// Main behavior: the live message is masked and timed in place; the provider's handle is replaced, not rewritten.
-		expect(live.errorMessage).not.toContain(secret);
+		// S3: the projector never changes the producer's object; the published copy is masked and timed.
+		expect(live.errorMessage).toContain(secret);
+		expect(live.durationMs).toBeUndefined();
+		expect(live.deferred).toBe(liveDeferred);
 		expect(liveDeferred?.id).toBe(`batch_${secret}`);
-		expect(live.deferred).not.toBe(liveDeferred);
 
 		expect(event.error).not.toBe(live);
 		expect(result).not.toBe(live);
-		expect(result).not.toBe(event.error);
-		expect(result.deferred).not.toBe(event.error.deferred);
-		expect(result.content).not.toBe(event.error.content);
+		expect(result).toBe(event.error);
+		expect(result.deferred).not.toBe(liveDeferred);
+		expect(result.content).not.toBe(live.content);
 
 		const resultError = result.errorMessage;
 		const resultDuration = result.durationMs;
-		event.error.errorMessage = "consumer write";
-		event.error.durationMs = -1;
-		event.error.content.length = 0;
-		if (event.error.deferred) event.error.deferred.id = "consumer";
 		live.errorMessage = "provider write";
+		live.durationMs = -1;
 		live.content.push({ type: "text", text: "late" });
+		if (liveDeferred) liveDeferred.id = "provider";
 		expect(result.errorMessage).toBe(resultError);
 		expect(result.durationMs).toBe(resultDuration);
 		expect(result.content).toEqual([{ type: "text", text: "partial" }]);
-		expect(result.deferred?.id).not.toBe("consumer");
+		expect(result.deferred?.id).not.toBe("provider");
 	});
 
-	// pi#159: the same ordering for a done event.
-	it("publishes durationMs on both the done event and the result without aliasing", async () => {
+	// pi#159: the same ordering for a done event. S3: result === done event message.
+	it("publishes durationMs on the done event message, which is the result, detached from the producer", async () => {
 		const stream = new AssistantMessageEventStream([secret]);
 		const live: AssistantMessage = { ...liveMessage(), stopReason: "stop", timestamp: Date.now() };
 		stream.push({ type: "done", reason: "stop", message: live });
@@ -308,10 +374,11 @@ describe("assistant message terminal snapshots (pi#159)", () => {
 		const event = events.at(-1);
 		if (event?.type !== "done") throw new Error("missing done event");
 		expect(event.message.durationMs).toBeTypeOf("number");
-		expect(result.durationMs).toBe(event.message.durationMs);
-		expect(result).not.toBe(event.message);
-		expect(result.usage).not.toBe(event.message.usage);
-		event.message.usage.totalTokens = 999;
+		expect(result).toBe(event.message);
+		expect(result).not.toBe(live);
+		expect(result.usage).not.toBe(live.usage);
+		expect(live.durationMs).toBeUndefined();
+		live.usage.totalTokens = 999;
 		expect(result.usage.totalTokens).toBe(0);
 	});
 
@@ -325,7 +392,9 @@ describe("assistant message terminal snapshots (pi#159)", () => {
 		expect(result.errorMessage).not.toContain(secret);
 		expect(result.deferred?.id).not.toContain(secret);
 		expect(result.durationMs).toBeTypeOf("number");
-		expect(result.durationMs).toBe(live.durationMs);
+		// S3: the copy is timed, the producer's object is not (S2 asserted live.durationMs equal).
+		expect(live.durationMs).toBeUndefined();
+		expect(live.errorMessage).toContain(secret);
 		expect(await collect(stream)).toEqual([]);
 
 		const resultError = result.errorMessage;

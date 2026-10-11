@@ -101,7 +101,15 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 			);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			expect(output.stopReason).toBe("error");
-			expect(output.errorMessage).toContain("server_error");
+			// smarty-dev#5822 C1: an observer failure publishes owned text, not the exception text.
+			// HTTP failures and stream error events publish owned text only (pi#202 rounds 2 and 3).
+			expect(output.errorMessage).toContain(
+				kind === "observer"
+					? "Provider stream observer failed"
+					: kind === "SSE error"
+						? "API error: network or server error"
+						: "(503)",
+			);
 			expectRedacted(output);
 		},
 	);
@@ -195,7 +203,8 @@ it("redacts WebSocket fallback message, stack, code and stats before a successfu
 	const output = await stream.result();
 	expect(output.stopReason).toBe("stop");
 	expect(events).toContain("start");
-	expect(output.diagnostics?.[0].error?.message).toContain("connection failed");
+	// smarty-dev#5822 N5682: the owned type only; the transport error text is not published.
+	expect(output.diagnostics).toEqual([{ type: "provider_transport_failure", timestamp: expect.any(Number) }]);
 	expectRedacted(getOpenAICodexWebSocketDebugStats("fake-session-127"));
 });
 
