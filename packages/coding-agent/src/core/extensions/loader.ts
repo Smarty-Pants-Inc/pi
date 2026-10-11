@@ -558,10 +558,12 @@ function createExtensionAPI(
 
 		sendUserMessage(content, options) {
 			assertActive();
+			// Read caller metadata once: binding, validation and error classification share it.
+			const metadata = options?.metadata;
 			try {
-				return runtime.sendUserMessage(content, bindExtensionMetadataSource(options, extension.path));
+				return runtime.sendUserMessage(content, bindExtensionMetadataSource(options, extension.path, metadata));
 			} catch (error) {
-				if (options?.metadata !== undefined) return Promise.reject(error);
+				if (metadata !== undefined) return Promise.reject(error);
 				throw error;
 			}
 		},
