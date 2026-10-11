@@ -137,19 +137,15 @@ describe("provider error body passthrough (per-tier regression)", () => {
 		openaiMock.parsedBody = { error: "blocked by gateway WAF" };
 	});
 
-	it("openai-completions (body-blind text) surfaces status + body", async () => {
+	// smarty-dev#5822 (pi#202 round 2): the status is surfaced as owned text; the body only classifies.
+	it("openai-completions (body-blind text) surfaces the status, not the body", async () => {
 		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "test" }));
 
 		expect(output.stopReason).toBe("error");
-		expect(output.errorMessage).toContain("403");
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
-		expect(output.errorMessage).not.toBe("403 status code (no body)");
+		expect(output.errorMessage).toBe("Provider request failed (403)");
 	});
 
-	it("openai-completions does not double-print the OpenRouter metadata.raw extra", async () => {
-		// OpenRouter returns the extra reason under error.error.metadata.raw, which
-		// is part of the parsed body normalizeProviderError already surfaces. The
-		// manual append must not duplicate it.
+	it("openai-completions never publishes the OpenRouter metadata.raw extra", async () => {
 		openaiMock.parsedBody = {
 			message: "Provider returned error",
 			code: 403,
@@ -158,20 +154,18 @@ describe("provider error body passthrough (per-tier regression)", () => {
 
 		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "test" }));
 
-		expect(output.errorMessage).toContain("upstream WAF blocked policy XYZ");
-		const occurrences = output.errorMessage?.match(/upstream WAF blocked policy XYZ/g) ?? [];
-		expect(occurrences).toHaveLength(1);
+		expect(output.errorMessage).toBe("Provider request failed (403)");
+		expect(JSON.stringify(output)).not.toContain("upstream WAF blocked policy XYZ");
 	});
 
-	it("openai-responses (status-only) keeps the prefix and surfaces the body", async () => {
+	it("openai-responses (status-only) keeps the prefix and the status", async () => {
 		const output = await drainResult(streamOpenAIResponses(responsesModel, context, { apiKey: "test" }));
 
 		expect(output.stopReason).toBe("error");
-		expect(output.errorMessage).toContain("OpenAI API error (403)");
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
+		expect(output.errorMessage).toBe("OpenAI API error (403)");
 	});
 
-	it("bedrock (body-blind) surfaces the gateway body instead of Unknown: UnknownError", async () => {
+	it("bedrock (body-blind) surfaces the status instead of Unknown: UnknownError", async () => {
 		bedrockMock.sendError = Object.assign(new Error("UnknownError"), {
 			name: "UnknownError",
 			$metadata: { httpStatusCode: 403 },
@@ -184,9 +178,7 @@ describe("provider error body passthrough (per-tier regression)", () => {
 		);
 
 		expect(output.stopReason).toBe("error");
-		expect(output.errorMessage).toContain("403");
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
-		expect(output.errorMessage).not.toContain("Unknown: UnknownError");
+		expect(output.errorMessage).toBe("Bedrock request failed (403)");
 	});
 
 	// smarty-dev#5822 C4: a Bedrock service exception publishes only its owned label and status.

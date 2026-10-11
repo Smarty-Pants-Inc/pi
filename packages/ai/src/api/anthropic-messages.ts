@@ -890,7 +890,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			// Classify first, from the SDK status and body as well as the message (smarty-dev#5822 C3).
-			output.recovery ??= normalizeProviderError(error, [], model.provider).recovery;
+			output.recovery ??= normalizeProviderError(error, model.provider).recovery;
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();

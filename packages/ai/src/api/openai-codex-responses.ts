@@ -6,7 +6,7 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
-import { getRequestDiagnosticSecrets, redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -373,7 +373,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 							output,
 							createAssistantMessageDiagnostic("provider_transport_failure"),
 						);
-						recordWebSocketFailure(cacheSessionId, error, diagnosticSecrets);
+						recordWebSocketFailure(cacheSessionId, error);
 						if (websocketStarted) {
 							throw error;
 						}
@@ -498,10 +498,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			// HTTP errors carry `status` and `body` (see above), so they read `<provider> API error (<status>): <body>`
-			// like the other Responses providers; errors without a status keep their message unchanged. The body and
-			// message are redacted with the request's diagnostic secrets by normalizeProviderError.
-			const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
+			// Owned text: `<provider> API error (HTTP <status>)`; the body and message only classify (smarty-dev#5822).
+			const norm = normalizeProviderError(error, model.provider, undefined, diagnosticSecrets);
 			output.recovery ??= norm.recovery;
 			output.errorMessage = formatProviderError(norm, `${model.provider} API error`);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
@@ -719,11 +717,10 @@ class CodexProtocolError extends Error {
 }
 
 class ProviderStreamEventCallbackError extends Error {
-	constructor(cause: unknown) {
-		// Owned text: the observer's exception text is never published (smarty-dev#5822 C1).
+	constructor() {
+		// Owned text, and no `cause`: the observer's thrown value is never kept (smarty-dev#5822 C1, pi#202 round 2).
 		super(PROVIDER_STREAM_OBSERVER_FAILED);
 		this.name = "ProviderStreamEventCallbackError";
-		this.cause = cause;
 	}
 }
 
@@ -790,7 +787,7 @@ async function* mapCodexEvents(
 				});
 			}
 			// Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
-			throw new ProviderStreamEventCallbackError(error);
+			throw new ProviderStreamEventCallbackError();
 		}
 		const type = typeof event.type === "string" ? event.type : undefined;
 		if (!type) continue;
@@ -1021,13 +1018,26 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-function recordWebSocketFailure(sessionId: string | undefined, error: unknown, secrets: readonly string[]): void {
+/** Owned category of a WebSocket failure for debug stats; the error's own text never leaves this function. */
+function webSocketErrorCategory(
+	error: unknown,
+): "api_error" | "protocol_error" | "timeout" | "connection_closed" | "network_error" {
+	if (error instanceof CodexApiError) return "api_error";
+	if (error instanceof CodexProtocolError) return "protocol_error";
+	const text = formatThrownValue(error);
+	if (/timed? ?out/i.test(text)) return "timeout";
+	if (/closed|reset|hang up/i.test(text)) return "connection_closed";
+	return "network_error";
+}
+
+function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
 	if (!sessionId) return;
 	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	stats.lastWebSocketError = redactOAuthDiagnostic(formatThrownValue(error), secrets);
+	// Debug stats publish an owned category only, never the error text (smarty-dev#5822, pi#202 round 2).
+	stats.lastWebSocketError = webSocketErrorCategory(error);
 	stats.websocketFallbackActive = true;
 }
 

@@ -174,7 +174,8 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 		{
 			name: "HTTP error status",
 			reason: "error",
-			message: /503 .*overloaded \(busy\)/,
+			// smarty-dev#5822 (pi#202 round 2): owned status and category, not the backend text.
+			message: /^Provider request failed \(HTTP 503, overloaded\)$/,
 			fetch: async () =>
 				new Response(JSON.stringify({ error: { message: "overloaded", code: "busy" } }), {
 					status: 503,

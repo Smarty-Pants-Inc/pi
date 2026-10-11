@@ -296,7 +296,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
+			const norm = normalizeProviderError(error, model.provider, undefined, diagnosticSecrets);
 			output.recovery ??= norm.recovery;
 			output.errorMessage = formatProviderError(norm);
 			stream.push({ type: "error", reason: output.stopReason, error: output });

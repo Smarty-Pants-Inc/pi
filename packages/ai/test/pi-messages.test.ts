@@ -224,9 +224,8 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "stale" }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toContain("401");
-		expect(message.errorMessage).toContain("Token expired");
-		expect(message.errorMessage).toContain("unauthorized");
+		// smarty-dev#5822 (pi#202 round 2): owned text; the backend message never reaches errorMessage.
+		expect(message.errorMessage).toBe("Provider request failed (HTTP 401, unauthorized)");
 		// smarty-dev#5822 N5682: the owned type only, without the URL, status or body.
 		expect(message.diagnostics).toEqual([{ type: "pi_messages_response_failure", timestamp: expect.any(Number) }]);
 	});

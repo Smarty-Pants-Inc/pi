@@ -40,7 +40,11 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import {
+	appendAssistantMessageDiagnostic,
+	closedRawStopReason,
+	createAssistantMessageDiagnostic,
+} from "../utils/diagnostics.ts";
 import {
 	formatProviderError,
 	normalizeProviderError,
@@ -55,7 +59,6 @@ import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
-import { classifyProviderFailure } from "../utils/recovery.ts";
 import { recordThrottledLimitWait } from "../utils/retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
@@ -744,20 +747,18 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				if (retryAfterSeconds !== undefined) recordThrottledLimitWait(output, retryAfterSeconds);
 				appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(PROVIDER_LIMIT_DIAGNOSTIC));
 			} else {
-				const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
+				// OpenRouter's `metadata.raw` and the provider's message and body are classified privately and
+				// never published; the error text is owned (smarty-dev#5822, pi#202 round 2).
+				const rawMetadata = (error as { error?: { metadata?: { raw?: unknown } } } | undefined)?.error?.metadata
+					?.raw;
+				const norm = normalizeProviderError(
+					error,
+					model.provider,
+					rawMetadata === undefined || rawMetadata === null ? undefined : String(rawMetadata),
+					diagnosticSecrets,
+				);
+				output.recovery ??= norm.recovery;
 				output.errorMessage = formatProviderError(norm);
-				// Some providers via OpenRouter give additional information in this field.
-				// normalizeProviderError already stringifies the parsed body (error.error)
-				// into errorMessage, so only append the raw metadata when it is not already
-				// present to avoid double-printing it.
-				const rawMetadata = (error as any)?.error?.metadata?.raw;
-				if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
-					output.errorMessage += `\n${rawMetadata}`;
-				}
-				// Classify first, including the raw metadata, before any text is replaced (smarty-dev#5822 C3).
-				output.recovery ??= rawMetadata
-					? classifyProviderFailure({ text: output.errorMessage, status: norm.status, provider: model.provider })
-					: norm.recovery;
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -1616,7 +1617,8 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | str
 		default:
 			return {
 				stopReason: "error",
-				errorMessage: `Provider finish_reason: ${reason}`,
+				// A closed value: a provider-chosen finish_reason never reaches the text (smarty-dev#5822).
+				errorMessage: `Provider finish_reason: ${closedRawStopReason(reason)}`,
 			};
 	}
 }

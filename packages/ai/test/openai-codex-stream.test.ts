@@ -1720,7 +1720,8 @@ describe("openai-codex streaming", () => {
 			websocketFailures: 1,
 			sseFallbacks: 1,
 			websocketFallbackActive: true,
-			lastWebSocketError: "WebSocket connect timeout after 50ms",
+			// smarty-dev#5822 (pi#202 round 2): an owned category, never the error text.
+			lastWebSocketError: "timeout",
 		});
 	});
 
@@ -2759,9 +2760,8 @@ describe("openai-codex streaming", () => {
 		}).result();
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("(409):");
-		expect(result.errorMessage).toContain(body);
-		expect(result.errorMessage).toBe(`openai-codex API error (409): ${body}`);
+		// smarty-dev#5822 (pi#202 round 2): the status only; the JSON body is classified, never published.
+		expect(result.errorMessage).toBe("openai-codex API error (409)");
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 

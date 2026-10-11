@@ -8,28 +8,27 @@
 // collapse to `"Unknown: UnknownError"`.
 //
 // `normalizeProviderError` probes the known SDK field shapes (Mistral,
-// `openai`, `@google/genai`, AWS Bedrock) and returns a struct each provider
-// composes into its display string. The `messageCarriesBody` flag captures the
-// Anthropic / `@google/genai` happy path where the SDK already folded the body
-// into the message, so providers can preserve it without double-printing.
+// `openai`, `@google/genai`, AWS Bedrock). The message and body it reads stay
+// private: they only classify the failure (smarty-dev#5822, pi#202 round 2).
+// `formatProviderError` renders owned text from the validated status and the
+// owned recovery class, never from provider text.
 
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantRecovery } from "../types.ts";
+import { ProviderRequestLimitError } from "./provider-retry.ts";
 import { classifyProviderFailure, validHttpStatus } from "./recovery.ts";
 
-export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
-
+/** Owned values of a provider error: nothing in it is provider text. */
 export interface NormalizedProviderError {
-	/** HTTP status code, when one could be extracted from the SDK error object. */
+	/** HTTP status, only from the dedicated SDK status fields and only as an integer 100-599. */
 	status?: number;
-	/** Raw HTTP body reason, already trimmed and truncated to the cap. */
-	body?: string;
-	/** `error.message`, or `safeJsonStringify(error)` for a non-`Error` throw. */
-	message: string;
-	/** True when `message` already contains the body (no separate body to add). */
-	messageCarriesBody: boolean;
-	/** Owned recovery decision, classified from the original message, body and status before redaction. */
+	/** Owned recovery decision, classified from the original message, body and status. */
 	recovery: AssistantRecovery;
+	/**
+	 * Message of a local failure: an `Error` that carries no provider response field (no status, body or parsed
+	 * error), such as Pi's own validation and timeout errors or a transport failure. Provider responses never set it.
+	 */
+	localMessage?: string;
 }
 
 type SdkErrorShape = Error & {
@@ -42,43 +41,50 @@ type SdkErrorShape = Error & {
 };
 
 /**
- * `provider` is the trusted request provider (`model.provider`); it selects provider-specific classification
- * such as Cerebras's bodyless 400/413 overflow.
+ * Classify a provider error from its private fields. `provider` is the trusted request provider
+ * (`model.provider`); it selects provider-specific classification such as Cerebras's bodyless 400/413
+ * overflow. `privateText` is further provider text to classify with it (OpenRouter's `metadata.raw`).
  */
 export function normalizeProviderError(
 	error: unknown,
-	secrets: readonly string[] = [],
 	provider?: string,
+	privateText?: string,
+	secrets: readonly string[] = [],
 ): NormalizedProviderError {
-	if (!(error instanceof Error)) {
-		const raw = safeJsonStringify(error);
-		return {
-			message: redactOAuthDiagnostic(raw, secrets),
-			messageCarriesBody: false,
-			recovery: classifyProviderFailure({ text: raw, provider }),
-		};
-	}
+	const status = error instanceof Error ? extractStatus(error as SdkErrorShape) : undefined;
+	const text = privateText ? `${providerErrorText(error)}\n${privateText}` : providerErrorText(error);
+	const recovery = classifyProviderFailure({ text, status, provider });
+	if (status !== undefined) return { status, recovery };
+	// ponytail: label-based masking stays on local text until the universal owned rendering (next slice).
+	return isLocalError(error)
+		? { recovery, localMessage: redactOAuthDiagnostic(error.message, secrets) }
+		: { recovery };
+}
 
-	const sdkError = error as SdkErrorShape;
-	const status = extractStatus(sdkError);
-	const body = extractBody(sdkError, secrets);
-	const message = redactOAuthDiagnostic(error.message, secrets);
-	const messageCarriesBody = body === undefined || message.includes(body);
-	// Classify first: the original message and body, before redaction and truncation (smarty-dev#5822 C3).
-	const rawBody = pickBodyText(sdkError);
-	const recovery = classifyProviderFailure({
-		text: rawBody === undefined ? error.message : `${error.message}\n${rawBody}`,
-		status,
-		provider,
-	});
+/** An `Error` with no provider response field: its text was written by Pi or the transport, not the provider. */
+function isLocalError(error: unknown): error is Error {
+	if (!(error instanceof Error) || !error.message) return false;
+	// Pi's own admission refusal, even after an SDK attached response metadata to it.
+	if (error instanceof ProviderRequestLimitError) return true;
+	const fields = error as SdkErrorShape;
+	return (
+		fields.statusCode === undefined &&
+		fields.status === undefined &&
+		(fields.body === undefined || fields.body === "") &&
+		fields.error === undefined &&
+		fields.$metadata === undefined &&
+		fields.$response === undefined
+	);
+}
 
-	return {
-		status,
-		body,
-		message,
-		messageCarriesBody,
-		recovery,
-	} satisfies NormalizedProviderError;
+/**
+ * The original provider message and body. PRIVATE: read it only to classify or recognize a failure; never
+ * publish it, in whole or in part.
+ */
+export function providerErrorText(error: unknown): string {
+	if (!(error instanceof Error)) return safeJsonStringify(error);
+	const body = pickBodyText(error as SdkErrorShape);
+	return body === undefined ? error.message : `${error.message}\n${body}`;
 }
 
 /**
@@ -99,17 +105,8 @@ function extractStatus(error: SdkErrorShape): number | undefined {
  * Probe the raw body reason, first usable hit wins, in SDK-field order:
  * `body` string (Mistral) → `error` parsed JSON body object (`openai` SDK's
  * `this.error`) → `$response.body` (Bedrock). Empty objects and unread response
- * streams are treated as no body so they do not surface as `"{}"` or serialized
- * stream internals. The chosen body is truncated to the cap.
+ * streams are treated as no body. Private: classification input only.
  */
-function extractBody(error: SdkErrorShape, secrets: readonly string[]): string | undefined {
-	const bodyText = pickBodyText(error);
-	if (bodyText === undefined) return undefined;
-	const trimmed = redactOAuthDiagnostic(bodyText, secrets).trim();
-	if (trimmed.length === 0) return undefined;
-	return truncateErrorText(trimmed, MAX_PROVIDER_ERROR_BODY_CHARS);
-}
-
 function pickBodyText(error: SdkErrorShape): string | undefined {
 	if (typeof error.body === "string") return error.body;
 	if (isPlainNonEmptyObject(error.error)) return safeJsonStringify(error.error);
@@ -146,21 +143,25 @@ function isPlainNonEmptyObject(value: unknown): boolean {
 }
 
 /**
- * Compose a display string from a normalized error. When the message already
- * carries the body (Anthropic / `@google/genai` happy path) or no body/status
- * was extracted, the message is returned unchanged. Otherwise the status and
- * body are surfaced, with an optional provider prefix.
+ * Owned display text for a provider error (smarty-dev#5822, pi#202 round 2): the caller's Pi-side label, the
+ * validated HTTP status and the owned recovery class, never the provider's message, body or code. The class
+ * wording keeps the text classifiable when a message without an owned decision is read back.
  *
- * - no prefix: `"<status>: <body>"`
- * - prefix:    `"<prefix> (<status>): <body>"`
+ * - `"<label> (<status>): <class>"`, with each part present only when known
+ * - a local failure (Pi's own or the transport's, never a provider response) keeps its masked message
  */
-export function formatProviderError(norm: NormalizedProviderError, prefix?: string): string {
-	if (norm.messageCarriesBody || norm.status === undefined || norm.body === undefined) {
-		return prefix !== undefined && norm.status !== undefined
-			? `${prefix} (${norm.status}): ${norm.message}`
-			: norm.message;
-	}
-	return prefix !== undefined ? `${prefix} (${norm.status}): ${norm.body}` : `${norm.status}: ${norm.body}`;
+export function formatProviderError(norm: NormalizedProviderError, label = "Provider request failed"): string {
+	if (norm.localMessage !== undefined) return norm.localMessage;
+	const status = norm.status === undefined ? "" : ` (${norm.status})`;
+	const detail =
+		norm.recovery.recovery === "context_length_exceeded"
+			? ": context length exceeded"
+			: norm.recovery.recovery === "premature_stream"
+				? ": stream ended without completing"
+				: norm.recovery.retryable && norm.status === undefined
+					? ": network or server error"
+					: "";
+	return `${label}${status}${detail}`;
 }
 
 /** Diagnostic type marking a provider plan/usage limit refusal; the agent must not retry it. */
@@ -193,11 +194,6 @@ export function smartyThrottleRetryAfterSeconds(error: unknown): number | undefi
 	if (!retryAfter || !/^\d+$/.test(retryAfter)) return undefined;
 	const seconds = Number(retryAfter);
 	return seconds <= 30 ? seconds : undefined;
-}
-
-export function truncateErrorText(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;
 }
 
 export function safeJsonStringify(value: unknown): string {

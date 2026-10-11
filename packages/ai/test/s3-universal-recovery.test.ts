@@ -92,9 +92,9 @@ describe("T-C3: universal pre-suppression recovery (smarty-dev#5822)", () => {
 	});
 
 	it("classifies Cerebras's bodyless 400 as overflow only for the trusted request provider", async () => {
-		const cerebras = normalizeProviderError(Object.assign(new Error(""), { status: 400 }), [], "cerebras");
+		const cerebras = normalizeProviderError(Object.assign(new Error(""), { status: 400 }), "cerebras");
 		expect(cerebras.recovery).toEqual(OVERFLOW);
-		const other = normalizeProviderError(Object.assign(new Error(""), { status: 400 }), [], "custom-5822");
+		const other = normalizeProviderError(Object.assign(new Error(""), { status: 400 }), "custom-5822");
 		expect(other.recovery).toEqual(FINAL);
 		expect((await published(message("400 status code (no body)", "cerebras"))).recovery).toEqual(OVERFLOW);
 	});
@@ -109,12 +109,12 @@ describe("T-C3: universal pre-suppression recovery (smarty-dev#5822)", () => {
 		],
 		["openai parsed error body", { status: 400, error: { message: "Prompt is too long" } }, OVERFLOW],
 	])("normalizeProviderError classifies the private %s fields", (_name, fields, decision) => {
-		const norm = normalizeProviderError(Object.assign(new Error("request failed"), fields), [], "custom-5822");
+		const norm = normalizeProviderError(Object.assign(new Error("request failed"), fields), "custom-5822");
 		expect(norm.recovery).toEqual(decision);
 	});
 
 	it("never treats a numeric error code as an HTTP status", () => {
-		const norm = normalizeProviderError(Object.assign(new Error("request failed"), { code: 503 }), [], "custom-5822");
+		const norm = normalizeProviderError(Object.assign(new Error("request failed"), { code: 503 }), "custom-5822");
 		expect(norm.status).toBeUndefined();
 		expect(norm.recovery).toEqual(FINAL);
 	});

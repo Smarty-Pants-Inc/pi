@@ -24,12 +24,8 @@ const AZURE_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode",
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
 
 /** Classify first, then format: the owned recovery decision comes from the original error (smarty-dev#5822). */
-function formatAzureOpenAIError(
-	error: unknown,
-	output: AssistantMessage,
-	diagnosticSecrets: readonly string[],
-): string {
-	const norm = normalizeProviderError(error, diagnosticSecrets, output.provider);
+function formatAzureOpenAIError(error: unknown, output: AssistantMessage, secrets: readonly string[]): string {
+	const norm = normalizeProviderError(error, output.provider, undefined, secrets);
 	output.recovery ??= norm.recovery;
 	return formatProviderError(norm, "Azure OpenAI API error");
 }

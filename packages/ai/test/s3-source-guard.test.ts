@@ -108,6 +108,30 @@ describe("smarty-dev#5822 source guard", () => {
 		expect(source("ai/src/utils/event-stream.ts")).not.toContain("redactOAuthDiagnosticValue");
 	});
 
+	it("P1-D: observer-failure wrappers keep no cause or thrown value (pi#202 round 2)", () => {
+		for (const file of [
+			"ai/src/utils/provider-observation.ts",
+			"ai/src/api/pi-messages.ts",
+			"ai/src/api/openai-codex-responses.ts",
+		]) {
+			const text = source(file);
+			for (const match of text.matchAll(
+				/new (?:Error\(PROVIDER_STREAM_OBSERVER_FAILED[^)]*\)|ProviderStreamEventCallbackError\([^)]*\))/g,
+			)) {
+				expect({ file, call: match[0] }).toEqual({
+					file,
+					call: match[0].startsWith("new Error")
+						? "new Error(PROVIDER_STREAM_OBSERVER_FAILED)"
+						: "new ProviderStreamEventCallbackError()",
+				});
+			}
+		}
+		const codex = source("ai/src/api/openai-codex-responses.ts");
+		const callbackError = codex.slice(codex.indexOf("class ProviderStreamEventCallbackError"));
+		expect(callbackError.slice(0, callbackError.indexOf("\n}"))).not.toContain("this.cause");
+		expect(codex).toContain("stats.lastWebSocketError = webSocketErrorCategory(error);");
+	});
+
 	it("C3: retry, premature-stream and overflow checks read the owned decision, not raw text", () => {
 		for (const file of ["ai/src/utils/retry.ts", "ai/src/utils/overflow.ts"]) {
 			const text = source(file);

@@ -68,8 +68,12 @@ export function projectAssistantMessageDiagnostics(value: unknown): AssistantMes
 		const { type, timestamp, thinkingBlocksDropped } = diagnostic as Record<string, unknown>;
 		if (typeof type !== "string" || !DIAGNOSTIC_TYPES.has(type)) continue;
 		const rebuilt = createAssistantMessageDiagnostic(type as AssistantMessageDiagnosticType);
-		if (ownedDiagnostics.has(diagnostic) && typeof timestamp === "number") rebuilt.timestamp = timestamp;
+		const owned = ownedDiagnostics.has(diagnostic);
+		if (owned && typeof timestamp === "number") rebuilt.timestamp = timestamp;
+		// The count is Pi's only when Pi created the diagnostic; a producer-supplied number could be a credential
+		// or a fragment of one, so it is dropped (smarty-dev#5822 pi#202 round 2).
 		if (
+			owned &&
 			type === "anthropic_input_transformations" &&
 			typeof thinkingBlocksDropped === "number" &&
 			Number.isSafeInteger(thinkingBlocksDropped) &&
@@ -129,6 +133,62 @@ function cloneAssistantContent(
 	}
 }
 
+/**
+ * Provider stop values Pi publishes as `rawStopReason` (smarty-dev#5822 design rule 4). Every other value,
+ * including any free-text suffix, is published as `other`.
+ */
+const KNOWN_RAW_STOP_REASONS: ReadonlySet<string> = new Set([
+	// Anthropic and Bedrock
+	"end_turn",
+	"max_tokens",
+	"stop_sequence",
+	"tool_use",
+	"pause_turn",
+	"refusal",
+	"model_context_window_exceeded",
+	"guardrail_intervened",
+	"content_filtered",
+	// OpenAI-compatible Completions and Mistral
+	"stop",
+	"length",
+	"tool_calls",
+	"function_call",
+	"content_filter",
+	"network_error",
+	"model_length",
+	"error",
+	"end",
+	"sensitive",
+	// OpenAI Responses and Codex (`status` or `status.incompleteReason`)
+	"completed",
+	"failed",
+	"cancelled",
+	"incomplete",
+	"incomplete.max_output_tokens",
+	"incomplete.content_filter",
+	"incomplete.server_error",
+	"incomplete.max_time_limit",
+	// Google Generative AI and Vertex
+	"STOP",
+	"MAX_TOKENS",
+	"SAFETY",
+	"RECITATION",
+	"LANGUAGE",
+	"OTHER",
+	"BLOCKLIST",
+	"PROHIBITED_CONTENT",
+	"SPII",
+	"MALFORMED_FUNCTION_CALL",
+	"IMAGE_SAFETY",
+	"UNEXPECTED_TOOL_CALL",
+	"FINISH_REASON_UNSPECIFIED",
+]);
+
+/** A known provider stop value, else `other`; a provider can never choose free text here. */
+export function closedRawStopReason(value: unknown): string {
+	return typeof value === "string" && KNOWN_RAW_STOP_REASONS.has(value) ? value : "other";
+}
+
 /** Publication phase of a message: in progress, completed successfully, or failed or aborted. */
 export type PublicationPhase = "partial" | "success" | "failure";
 
@@ -173,7 +233,7 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 	if (message.errorHint === "bedrock_data_retention" || message.errorHint === "chatgpt_usage") {
 		projected.errorHint = message.errorHint;
 	}
-	if (message.rawStopReason !== undefined) projected.rawStopReason = message.rawStopReason;
+	if (message.rawStopReason !== undefined) projected.rawStopReason = closedRawStopReason(message.rawStopReason);
 	if (message.endTurn !== undefined) projected.endTurn = message.endTurn;
 	if (message.durationMs !== undefined) projected.durationMs = message.durationMs;
 	return projected;

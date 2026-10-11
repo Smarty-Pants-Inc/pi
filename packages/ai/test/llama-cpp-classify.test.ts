@@ -355,8 +355,8 @@ describe("llama.cpp classifier", () => {
 			fetch: async () => new Response('{"error":{"message":"context overflow"}}', { status: 400 }),
 		});
 		expect(failing.stopReason).toBe("error");
-		expect(failing.errorMessage).toContain("llama.cpp error (400)");
-		expect(failing.errorMessage).toContain("context overflow");
+		// smarty-dev#5822 (pi#202 round 2): owned text; the server's message is not published.
+		expect(failing.errorMessage).toBe("llama.cpp error (400)");
 
 		const controller = new AbortController();
 		controller.abort();

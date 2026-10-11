@@ -48,7 +48,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, providerErrorText } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -401,12 +401,10 @@ function bedrockStreamException(name: BedrockExceptionName, exception: unknown):
  * not context overflow. Errors that are not Bedrock service exceptions (transport and Pi's own failures) keep
  * their redacted text until the universal owned-error rendering replaces it.
  */
-function formatBedrockError(error: unknown, output: AssistantMessage, diagnosticSecrets: readonly string[]): string {
-	const raw = normalizeProviderError(error, [], output.provider);
-	const core =
-		!raw.messageCarriesBody && raw.status !== undefined && raw.body !== undefined
-			? `${raw.status}: ${raw.body}`
-			: raw.message;
+function formatBedrockError(error: unknown, output: AssistantMessage, secrets: readonly string[]): string {
+	const raw = normalizeProviderError(error, output.provider, undefined, secrets);
+	// Private: read only to classify and to recognize the retention failure.
+	const core = providerErrorText(error);
 	const name = error instanceof Error ? error.name : undefined;
 	const label =
 		name !== undefined && Object.hasOwn(BEDROCK_ERROR_PREFIXES, name)
@@ -420,12 +418,8 @@ function formatBedrockError(error: unknown, output: AssistantMessage, diagnostic
 		status: raw.status,
 		provider: output.provider,
 	});
-	if (label === undefined) {
-		const norm = normalizeProviderError(error, diagnosticSecrets, output.provider);
-		return !norm.messageCarriesBody && norm.status !== undefined && norm.body !== undefined
-			? `${norm.status}: ${norm.body}`
-			: norm.message;
-	}
+	// Transport and Pi-side failures publish owned text too (smarty-dev#5822, pi#202 round 2).
+	if (label === undefined) return formatProviderError(raw, "Bedrock request failed");
 	if (/data retention mode/i.test(core)) output.errorHint = "bedrock_data_retention";
 	const status = raw.status === undefined ? "" : ` (${raw.status})`;
 	const remedy = output.errorHint === "bedrock_data_retention" ? `. ${BEDROCK_DATA_RETENTION_REMEDY}` : "";

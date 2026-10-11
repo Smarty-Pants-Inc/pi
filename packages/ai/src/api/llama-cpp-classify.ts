@@ -456,7 +456,7 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		output.answers = {};
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, getRequestDiagnosticSecrets(model, options)),
+			normalizeProviderError(error, model.provider, undefined, getRequestDiagnosticSecrets(model, options)),
 			`${LABEL} error`,
 		);
 		return output;

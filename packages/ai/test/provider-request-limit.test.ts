@@ -12,7 +12,7 @@ import { streamSimple as completions } from "../src/api/openai-completions.ts";
 import { streamSimple as responses } from "../src/api/openai-responses.ts";
 import { streamSimple as piMessages } from "../src/api/pi-messages.ts";
 import type { Api, AssistantMessageEventStream, Model, SimpleStreamOptions } from "../src/types.ts";
-import { checkProviderRequest } from "../src/utils/provider-retry.ts";
+import { checkProviderRequest, ProviderRequestLimitError } from "../src/utils/provider-retry.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 function model<T extends Api>(api: T): Model<T> {
@@ -168,9 +168,8 @@ describe("physical provider admission", () => {
 		expect(frames).toBe(1);
 		expect(fetch).toHaveBeenCalledTimes(limit === 1 ? 0 : 1);
 		if (limit !== undefined) expect(admitted).toBe(limit);
-		expect(result.errorMessage).toContain(
-			limit === 1 ? "Provider request limit reached (1/1)" : "synthetic fallback",
-		);
+		// smarty-dev#5822 (pi#202 round 2): the fallback's provider body is not published, only its status.
+		expect(result.errorMessage).toContain(limit === 1 ? "Provider request limit reached (1/1)" : "API error (400)");
 	});
 
 	it.each(["websocket_connection_limit_reached", "previous_response_not_found"])(
@@ -260,7 +259,8 @@ describe("physical provider admission", () => {
 			{
 				env: { AWS_BEDROCK_FORCE_HTTP1: "1", AWS_BEDROCK_SKIP_AUTH: "1", HTTP_PROXY: "", HTTPS_PROXY: "" },
 				beforeProviderRequest: () => {
-					if (admitted === 2) throw new Error("Provider request limit reached (2/2)");
+					// Pi's own refusal class: its owned text survives the SDK wrapping it (smarty-dev#5822).
+					if (admitted === 2) throw new ProviderRequestLimitError(2, 2);
 					admitted++;
 				},
 			},

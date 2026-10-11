@@ -119,7 +119,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, getRequestDiagnosticSecrets(model, options)),
+			normalizeProviderError(error, model.provider, undefined, getRequestDiagnosticSecrets(model, options)),
 		);
 		return output;
 	}

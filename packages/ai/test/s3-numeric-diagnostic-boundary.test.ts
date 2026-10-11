@@ -69,8 +69,8 @@ function expectOwnedDiagnostics(published: unknown, before: number): void {
 		"pi_messages_rewrite",
 		"anthropic_input_transformations",
 	]);
-	// The bounded owned count keeps its type and bound, not the planted value.
-	expect(diagnostics[2]?.thinkingBlocksDropped).toBe(100_000);
+	// A producer-supplied count is not Pi's count: it is dropped (pi#202 round 2 P1-1).
+	expect(diagnostics[2]?.thinkingBlocksDropped).toBeUndefined();
 	const json = JSON.stringify(published);
 	for (const planted of [KEY, String(CANONICAL), String(EXPONENT), "123456789012345"]) {
 		expect(json).not.toContain(planted);
@@ -147,8 +147,25 @@ describe("T-N5682: numeric values have no diagnostic output path (smarty-dev#582
 		expect(JSON.stringify(result)).not.toContain("123456789012345");
 	});
 
+	// pi#202 round 2 P1-1: a small numeric value a producer puts in the count field is not published.
+	it.each([
+		["push", "push"],
+		["end", "end"],
+	])("drops a producer-supplied thinkingBlocksDropped on %s", async (_name, via) => {
+		const stream = createAssistantMessageEventStream();
+		const source = message();
+		source.diagnostics = [
+			{ type: "anthropic_input_transformations", timestamp: FORGED_TIMESTAMP, thinkingBlocksDropped: 4242 },
+		];
+		if (via === "push") stream.push({ type: "error", reason: "error", error: source });
+		else stream.end(source);
+		const result = await stream.result();
+		expect(result.diagnostics).toEqual([{ type: "anthropic_input_transformations", timestamp: expect.any(Number) }]);
+		expect(JSON.stringify(result)).not.toContain("4242");
+	});
+
 	it("a numeric error code in 100-599 is never an HTTP status", () => {
-		const norm = normalizeProviderError(Object.assign(new Error("failed"), { code: 503 }), [], "custom-5822");
+		const norm = normalizeProviderError(Object.assign(new Error("failed"), { code: 503 }), "custom-5822");
 		expect(norm.status).toBeUndefined();
 	});
 });

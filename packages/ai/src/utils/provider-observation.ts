@@ -37,8 +37,9 @@ export async function notifyProviderStreamEvent(
 	if (!options?.onProviderStreamEvent) return;
 	try {
 		await options.onProviderStreamEvent(providerStreamNotification());
-	} catch (error) {
+	} catch {
+		// The observer's thrown value is dropped, not kept as `cause` (smarty-dev#5822, pi#202 round 2).
 		markProviderStreamObserverFailure(output);
-		throw new Error(PROVIDER_STREAM_OBSERVER_FAILED, { cause: error });
+		throw new Error(PROVIDER_STREAM_OBSERVER_FAILED);
 	}
 }

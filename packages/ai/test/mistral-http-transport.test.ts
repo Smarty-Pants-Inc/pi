@@ -488,7 +488,8 @@ describe("Mistral HTTP transport", () => {
 		expect(message.errorMessage).toMatch(/timeout/i);
 	});
 
-	it("preserves HTTP status and response bodies in errors", async () => {
+	// smarty-dev#5822 (pi#202 round 2): the status is kept; the response body is classified, never published.
+	it("keeps the HTTP status and publishes no response body", async () => {
 		const model = getModel("mistral", "mistral-large-latest");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
@@ -499,6 +500,6 @@ describe("Mistral HTTP transport", () => {
 		const message = await streamMistral(model, context, { apiKey: "test", fetch }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe('Mistral API error (403): {"message":"blocked by gateway"}');
+		expect(message.errorMessage).toBe("Mistral API error (403)");
 	});
 });

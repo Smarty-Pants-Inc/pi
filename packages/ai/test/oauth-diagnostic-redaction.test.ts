@@ -5,7 +5,7 @@ import {
 	redactOAuthDiagnosticValue,
 } from "../src/auth/oauth/credential-response.ts";
 import { createAssistantMessageDiagnostic } from "../src/utils/diagnostics.ts";
-import { MAX_PROVIDER_ERROR_BODY_CHARS, normalizeProviderError } from "../src/utils/error-body.ts";
+import { formatProviderError, normalizeProviderError } from "../src/utils/error-body.ts";
 
 // pi#127: credentials can cross multiple SDK serialization layers before reaching a diagnostic.
 describe("OAuth diagnostic redaction", () => {
@@ -22,9 +22,12 @@ describe("OAuth diagnostic redaction", () => {
 			}
 			const error = Object.assign(new Error("server_error"), {
 				status: 503,
-				body: JSON.stringify({ [field]: secret.repeat(MAX_PROVIDER_ERROR_BODY_CHARS) }),
+				body: JSON.stringify({ [field]: secret.repeat(4000) }),
 			});
-			expect(normalizeProviderError(error).body).not.toContain(secret);
+			// smarty-dev#5822: the normalized error and its owned text carry no provider body at all.
+			const norm = normalizeProviderError(error);
+			expect(JSON.stringify(norm)).not.toContain(secret);
+			expect(formatProviderError(norm)).toBe("Provider request failed (503)");
 		},
 	);
 

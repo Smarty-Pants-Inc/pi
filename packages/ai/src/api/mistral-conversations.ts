@@ -14,7 +14,8 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "../types.ts";
-import { normalizeProviderError } from "../utils/error-body.ts";
+import { closedRawStopReason } from "../utils/diagnostics.ts";
+import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -29,7 +30,6 @@ import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
 const MISTRAL_TOOL_CALL_ID_LENGTH = 9;
-const MAX_MISTRAL_ERROR_BODY_CHARS = 4000;
 
 /**
  * Provider-specific options for the Mistral API.
@@ -174,9 +174,10 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 				delete (block as { partialArgs?: string }).partialArgs;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			// Classify first, from the untruncated SDK status and body (smarty-dev#5822 C3).
-			output.recovery ??= normalizeProviderError(error, [], model.provider).recovery;
-			output.errorMessage = formatMistralError(error);
+			// Classify first, from the untruncated SDK status and body; publish owned text only (smarty-dev#5822).
+			const norm = normalizeProviderError(error, model.provider);
+			output.recovery ??= norm.recovery;
+			output.errorMessage = formatProviderError(norm, "Mistral API error");
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -269,34 +270,6 @@ function deriveMistralToolCallId(id: string, attempt: number): string {
 	return shortHash(seed)
 		.replace(/[^a-zA-Z0-9]/g, "")
 		.slice(0, MISTRAL_TOOL_CALL_ID_LENGTH);
-}
-
-function formatMistralError(error: unknown): string {
-	if (error instanceof Error) {
-		const httpError = error as Error & { statusCode?: unknown; body?: unknown };
-		const statusCode = typeof httpError.statusCode === "number" ? httpError.statusCode : undefined;
-		const bodyText = typeof httpError.body === "string" ? httpError.body.trim() : undefined;
-		if (statusCode !== undefined && bodyText) {
-			return `Mistral API error (${statusCode}): ${truncateErrorText(bodyText, MAX_MISTRAL_ERROR_BODY_CHARS)}`;
-		}
-		if (statusCode !== undefined) return `Mistral API error (${statusCode}): ${error.message}`;
-		return error.message;
-	}
-	return safeJsonStringify(error);
-}
-
-function truncateErrorText(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;
-}
-
-function safeJsonStringify(value: unknown): string {
-	try {
-		const serialized = JSON.stringify(value);
-		return serialized === undefined ? String(value) : serialized;
-	} catch {
-		return String(value);
-	}
 }
 
 async function requestMistralStream(
@@ -939,6 +912,7 @@ function mapChatStopReason(reason: string | null): { stopReason: StopReason; err
 			// Mistral reports transient server failures this way; "server error" makes the message retryable.
 			return { stopReason: "error", errorMessage: "Provider stopped with: error (server error)" };
 		default:
-			return { stopReason: "error", errorMessage: `Provider stopped with: ${reason}` };
+			// A closed value: a provider-chosen finish reason never reaches the text (smarty-dev#5822).
+			return { stopReason: "error", errorMessage: `Provider stopped with: ${closedRawStopReason(reason)}` };
 	}
 }

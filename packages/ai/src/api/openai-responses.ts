@@ -20,7 +20,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, providerErrorText } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
@@ -228,14 +228,17 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
+			const norm = normalizeProviderError(error, model.provider, undefined, diagnosticSecrets);
 			output.recovery ??= norm.recovery;
 			const errorMessage = formatProviderError(
 				norm,
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
-			if (errorMessage.includes("subscription_sharing_usage_limit_exceeded")) output.errorHint = "chatgpt_usage";
+			// Recognized privately from the provider text; only the owned hint is published.
+			if (providerErrorText(error).includes("subscription_sharing_usage_limit_exceeded")) {
+				output.errorHint = "chatgpt_usage";
+			}
 			output.errorMessage =
 				output.errorHint === "chatgpt_usage"
 					? `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`
