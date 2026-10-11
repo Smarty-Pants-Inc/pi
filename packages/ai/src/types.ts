@@ -564,6 +564,12 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/**
+ * Closed remedies Pi can name for a failed response: a Bedrock model that rejects the configured data retention
+ * mode, and an exhausted ChatGPT subscription usage limit.
+ */
+export type AssistantErrorHint = "bedrock_data_retention" | "chatgpt_usage";
+
 /** Closed recovery classes of a failed response. */
 export type AssistantRecoveryClass = "retryable" | "premature_stream" | "context_length_exceeded";
 
@@ -595,6 +601,8 @@ export interface AssistantMessage {
 	 * text is suppressed (smarty-dev#5822). Retry, premature-stream and context-overflow checks read it first.
 	 */
 	recovery?: AssistantRecovery;
+	/** Pi-owned remedy for a failure Pi recognized before suppressing provider text (smarty-dev#5822 C4). */
+	errorHint?: AssistantErrorHint;
 	rawStopReason?: string;
 	/**
 	 * Provider indication of whether the model explicitly ended its turn.

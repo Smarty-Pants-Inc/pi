@@ -103,7 +103,8 @@ describe("Bedrock provider stream events", () => {
 
 		expect(received).toEqual([{ type: "provider_stream_event" }, { type: "provider_stream_event" }]);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("bedrock stream failed");
+		// smarty-dev#5822 C4: the owned category label, not the exception text.
+		expect(result.errorMessage).toBe("Internal server error");
 	});
 });
 

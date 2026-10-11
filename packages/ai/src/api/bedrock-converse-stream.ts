@@ -33,7 +33,6 @@ import type {
 	AssistantMessage,
 	CacheRetention,
 	ImageContent,
-	JsonObject,
 	JsonValue,
 	Model,
 	ProviderEnv,
@@ -49,7 +48,6 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
@@ -246,10 +244,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			config.authSchemePreference = ["httpBearerAuth"];
 		}
 
-		// Kept outside the try so the catch can still correlate a mid-stream failure:
-		// exceptions delivered as stream events carry no HTTP metadata of their own.
-		let responseRequestId: string | undefined;
-
 		try {
 			const supportsStrictMode = model.compat?.supportsStrictMode ?? false;
 			const client = new BedrockRuntimeClient(config);
@@ -294,7 +288,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			const command = new ConverseStreamCommand(commandInput);
 
 			const response = await client.send(command, { abortSignal: options.signal });
-			responseRequestId = normalizeDiagnosticValue(response.$metadata.requestId);
 			// Status only: response headers and request ids are never passed to callbacks (smarty-dev#5822 C1).
 			await options.onResponse?.(providerResponse(response.$metadata.httpStatusCode));
 
@@ -321,15 +314,15 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				} else if (item.metadata) {
 					handleMetadata(item.metadata, model, output);
 				} else if (item.internalServerException) {
-					throw item.internalServerException;
+					throw bedrockStreamException("InternalServerException", item.internalServerException);
 				} else if (item.modelStreamErrorException) {
-					throw item.modelStreamErrorException;
+					throw bedrockStreamException("ModelStreamErrorException", item.modelStreamErrorException);
 				} else if (item.validationException) {
-					throw item.validationException;
+					throw bedrockStreamException("ValidationException", item.validationException);
 				} else if (item.throttlingException) {
-					throw item.throttlingException;
+					throw bedrockStreamException("ThrottlingException", item.throttlingException);
 				} else if (item.serviceUnavailableException) {
-					throw item.serviceUnavailableException;
+					throw bedrockStreamException("ServiceUnavailableException", item.serviceUnavailableException);
 				}
 			}
 
@@ -353,13 +346,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				finalizeStreamingBlock(block as Block);
 			}
 			output.stopReason = options.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatBedrockError(error, diagnosticSecrets);
-			// Classify first. The owned category prefix ("Throttling error:") keeps a throttle that says
-			// "Too many tokens" out of context overflow (smarty-dev#5822 C3).
-			output.recovery ??= classifyProviderFailure({ text: output.errorMessage, provider: model.provider });
-			if (output.stopReason === "error") {
-				appendBedrockFailureDiagnostic(output, error, responseRequestId);
-			}
+			output.errorMessage = formatBedrockError(error, output, diagnosticSecrets);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -374,13 +361,13 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
  * `server.?error` and `service.?unavailable`, so we preserve the legacy
  * prefix format rather than using the raw SDK exception name.
  */
-const BEDROCK_ERROR_PREFIXES: Record<string, string> = {
+const BEDROCK_ERROR_PREFIXES = {
 	InternalServerException: "Internal server error",
 	ModelStreamErrorException: "Model stream error",
 	ValidationException: "Validation error",
 	ThrottlingException: "Throttling error",
 	ServiceUnavailableException: "Service unavailable",
-};
+} as const;
 
 /**
  * Some models reject the account/profile's configured Bedrock data retention mode
@@ -389,78 +376,60 @@ const BEDROCK_ERROR_PREFIXES: Record<string, string> = {
  */
 const BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html";
 
+/** Owned remedy for the one Bedrock failure Pi recognizes in provider text (smarty-dev#5822 C4). */
+const BEDROCK_DATA_RETENTION_REMEDY = `Configure a supported Bedrock data retention mode. See ${BEDROCK_DATA_RETENTION_DOCS_URL}`;
+
+/** Owned text for a Bedrock service exception whose name is not in the closed prefix list. */
+const BEDROCK_REQUEST_FAILED = "Bedrock request failed";
+
+type BedrockExceptionName = keyof typeof BEDROCK_ERROR_PREFIXES;
+
 /**
- * Format a Bedrock error with a human-readable prefix.
- * AWS SDK exceptions (both from `client.send()` and from stream event items)
- * extend BedrockRuntimeServiceException. We map the `.name` to a stable
- * human-readable prefix so downstream consumers (retry logic, context-overflow
- * detection) can distinguish error categories via simple string matching.
+ * A modeled mid-stream exception arrives as a bare object, not an `Error`. Keep its known category as the
+ * error name, so it is formatted and classified like the same exception from `client.send()`.
  */
-function formatBedrockError(error: unknown, diagnosticSecrets: readonly string[]): string {
-	const norm = normalizeProviderError(error, diagnosticSecrets);
-	// Surface the raw HTTP body (with status) when the SDK did not fold it into
-	// the message; otherwise fall back to the message. This is what stops a
-	// gateway 403 from collapsing to `Unknown: UnknownError`.
+function bedrockStreamException(name: BedrockExceptionName, exception: unknown): Error {
+	const message = (exception as { message?: unknown } | undefined)?.message;
+	return Object.assign(new Error(typeof message === "string" ? message : ""), { name });
+}
+
+/**
+ * Format a Bedrock error as owned text (smarty-dev#5822 C4). A Bedrock service exception publishes only its
+ * closed category label, its validated HTTP status and the owned data-retention remedy; the provider's message,
+ * body, unknown exception names and request ids are read for classification and never published. The owned
+ * label ("Throttling error: ...") is part of the classified text, so a throttle that says "Too many tokens" is
+ * not context overflow. Errors that are not Bedrock service exceptions (transport and Pi's own failures) keep
+ * their redacted text until the universal owned-error rendering replaces it.
+ */
+function formatBedrockError(error: unknown, output: AssistantMessage, diagnosticSecrets: readonly string[]): string {
+	const raw = normalizeProviderError(error, [], output.provider);
 	const core =
-		!norm.messageCarriesBody && norm.status !== undefined && norm.body !== undefined
+		!raw.messageCarriesBody && raw.status !== undefined && raw.body !== undefined
+			? `${raw.status}: ${raw.body}`
+			: raw.message;
+	const name = error instanceof Error ? error.name : undefined;
+	const label =
+		name !== undefined && Object.hasOwn(BEDROCK_ERROR_PREFIXES, name)
+			? BEDROCK_ERROR_PREFIXES[name as BedrockExceptionName]
+			: error instanceof BedrockRuntimeServiceException
+				? BEDROCK_REQUEST_FAILED
+				: undefined;
+	// Classify first, from the original text and status (smarty-dev#5822 C3).
+	output.recovery ??= classifyProviderFailure({
+		text: label === undefined ? core : `${label}: ${core}`,
+		status: raw.status,
+		provider: output.provider,
+	});
+	if (label === undefined) {
+		const norm = normalizeProviderError(error, diagnosticSecrets, output.provider);
+		return !norm.messageCarriesBody && norm.status !== undefined && norm.body !== undefined
 			? `${norm.status}: ${norm.body}`
 			: norm.message;
-	const dataRetentionHint = /data retention mode/i.test(core)
-		? ` See ${BEDROCK_DATA_RETENTION_DOCS_URL} for supported data retention modes.`
-		: "";
-	if (error instanceof BedrockRuntimeServiceException) {
-		const prefix = BEDROCK_ERROR_PREFIXES[error.name] ?? error.name;
-		return `${prefix}: ${core}${dataRetentionHint}`;
 	}
-	return `${core}${dataRetentionHint}`;
-}
-
-type SdkErrorMetadata = { $metadata?: { httpStatusCode?: unknown; requestId?: unknown } };
-
-/** Over-long header values are dropped rather than truncated: a truncated request id is not a request id. */
-const MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS = 200;
-
-function normalizeDiagnosticValue(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const trimmed = value.trim();
-	if (trimmed.length === 0 || trimmed.length > MAX_BEDROCK_DIAGNOSTIC_VALUE_CHARS) return undefined;
-	return trimmed;
-}
-
-/**
- * The SDK puts the modeled code on `error.name` for service exceptions and unmodeled stream errors alike, so
- * do not narrow to `BedrockRuntimeServiceException`. Modeled Bedrock errors all end in `Exception`, unlike
- * transport names such as `TimeoutError`.
- */
-function extractBedrockErrorCode(error: unknown): string | undefined {
-	if (!(error instanceof Error) || !error.name.endsWith("Exception")) return undefined;
-	return normalizeDiagnosticValue(error.name);
-}
-
-/**
- * Structured metadata alongside `errorMessage`, which stays byte-identical because `isRetryableAssistantError`
- * matches against it. Unknown fields are omitted, never guessed: a modeled mid-stream exception reaches us as
- * a bare object literal, leaving only `fallbackRequestId`. `details` only, as the throw is not always `Error`.
- */
-function appendBedrockFailureDiagnostic(
-	output: AssistantMessage,
-	error: unknown,
-	fallbackRequestId: string | undefined,
-): void {
-	const metadata = (error as SdkErrorMetadata)?.$metadata;
-	const details: JsonObject = {};
-
-	if (typeof metadata?.httpStatusCode === "number") details.status = metadata.httpStatusCode;
-
-	const errorCode = extractBedrockErrorCode(error);
-	if (errorCode !== undefined) details.errorCode = errorCode;
-
-	const requestId = normalizeDiagnosticValue(metadata?.requestId) ?? fallbackRequestId;
-	if (requestId !== undefined) details.requestId = requestId;
-
-	if (Object.keys(details).length === 0) return;
-
-	appendAssistantMessageDiagnostic(output, { type: "bedrock_response_failure", timestamp: Date.now(), details });
+	if (/data retention mode/i.test(core)) output.errorHint = "bedrock_data_retention";
+	const status = raw.status === undefined ? "" : ` (${raw.status})`;
+	const remedy = output.errorHint === "bedrock_data_retention" ? `. ${BEDROCK_DATA_RETENTION_REMEDY}` : "";
+	return `${label}${status}${remedy}`;
 }
 
 /**

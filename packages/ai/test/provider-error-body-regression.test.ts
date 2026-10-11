@@ -189,7 +189,8 @@ describe("provider error body passthrough (per-tier regression)", () => {
 		expect(output.errorMessage).not.toContain("Unknown: UnknownError");
 	});
 
-	it("bedrock preserves the SDK validation message when the response body is a stream", async () => {
+	// smarty-dev#5822 C4: a Bedrock service exception publishes only its owned label and status.
+	it("bedrock publishes the owned validation label, not the SDK message or a stream body", async () => {
 		bedrockMock.sendError = Object.assign(
 			new Error(
 				"Invocation of model ID anthropic.claude-opus-5 with on-demand throughput isn't supported. Retry with an inference profile.",
@@ -210,8 +211,6 @@ describe("provider error body passthrough (per-tier regression)", () => {
 		);
 
 		expect(output.stopReason).toBe("error");
-		expect(output.errorMessage).toContain("on-demand throughput isn't supported");
-		expect(output.errorMessage).toContain("inference profile");
-		expect(output.errorMessage).not.toContain("_readableState");
+		expect(output.errorMessage).toBe("Validation error (400)");
 	});
 });

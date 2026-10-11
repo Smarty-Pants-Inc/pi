@@ -235,9 +235,11 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
-			output.errorMessage = errorMessage.includes("subscription_sharing_usage_limit_exceeded")
-				? `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`
-				: errorMessage;
+			if (errorMessage.includes("subscription_sharing_usage_limit_exceeded")) output.errorHint = "chatgpt_usage";
+			output.errorMessage =
+				output.errorHint === "chatgpt_usage"
+					? `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`
+					: errorMessage;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
