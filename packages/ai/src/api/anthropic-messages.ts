@@ -39,7 +39,7 @@ import type {
 	ToolResultMessage,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
-import { normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, ProviderDataError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
@@ -542,7 +542,8 @@ async function* iterateAnthropicEvents(
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
 		if (sse.event === "error") {
-			throw new Error(sse.data);
+			// A provider error by origin: its data only classifies (smarty-dev#5822, pi#202 round 3).
+			throw new ProviderDataError(sse.data);
 		}
 
 		if (!ANTHROPIC_MESSAGE_EVENTS.has(sse.event ?? "")) {
@@ -558,8 +559,9 @@ async function* iterateAnthropicEvents(
 			}
 			yield event;
 		} catch (error) {
+			// A provider error by origin: the frame and parser text only classify (smarty-dev#5822, pi#202 round 3).
 			const message = error instanceof Error ? error.message : String(error);
-			throw new Error(
+			throw new ProviderDataError(
 				`Could not parse Anthropic SSE event ${sse.event}: ${message}; data=${sse.data}; raw=${sse.raw.join("\\n")}`,
 			);
 		}
@@ -889,9 +891,16 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			// Classify first, from the SDK status and body as well as the message (smarty-dev#5822 C3).
-			output.recovery ??= normalizeProviderError(error, model.provider).recovery;
-			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+			// Classify first, from the SDK status and body as well as the message (smarty-dev#5822 C3), then publish
+			// owned text only: a provider response's message and body stay private (pi#202 round 3).
+			const norm = normalizeProviderError(
+				error,
+				model.provider,
+				undefined,
+				getRequestDiagnosticSecrets(model, options),
+			);
+			output.recovery ??= norm.recovery;
+			output.errorMessage = formatProviderError(norm, "Anthropic API error");
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -1612,7 +1621,7 @@ function convertTools(
 
 function mapStopReason(
 	reason: BetaStopReason | string,
-	stopDetails?: RefusalStopDetails | null,
+	_stopDetails?: RefusalStopDetails | null,
 ): { stopReason: StopReason; errorMessage?: string } {
 	switch (reason) {
 		case "end_turn":
@@ -1624,7 +1633,8 @@ function mapStopReason(
 		case "refusal":
 			return {
 				stopReason: "error",
-				errorMessage: stopDetails?.explanation || `The model refused to complete the request`,
+				// Owned text: the provider's refusal explanation is not published (smarty-dev#5822).
+				errorMessage: "The model refused to complete the request",
 			};
 		case "pause_turn": // Stop is good enough -> resubmit
 			return { stopReason: "stop" };
@@ -1633,7 +1643,7 @@ function mapStopReason(
 		case "sensitive": // Content flagged by safety filters (not yet in SDK types)
 			return { stopReason: "error", errorMessage: "Provider stopped with: sensitive" };
 		default:
-			// Handle unknown stop reasons gracefully (API may add new values)
-			throw new Error(`Unhandled stop reason: ${reason}`);
+			// Handle unknown stop reasons gracefully (API may add new values); the value itself stays private.
+			throw new ProviderDataError(`Unhandled stop reason: ${reason}`);
 	}
 }

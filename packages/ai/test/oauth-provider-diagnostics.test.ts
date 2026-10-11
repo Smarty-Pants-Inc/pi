@@ -102,10 +102,13 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			expect(output.stopReason).toBe("error");
 			// smarty-dev#5822 C1: an observer failure publishes owned text, not the exception text.
-			// An HTTP failure publishes owned text with its status (pi#202 round 2); a stream error event still
-			// carries its scrubbed provider text until the universal owned rendering (next slice).
+			// HTTP failures and stream error events publish owned text only (pi#202 rounds 2 and 3).
 			expect(output.errorMessage).toContain(
-				kind === "observer" ? "Provider stream observer failed" : kind === "SSE error" ? "server_error" : "(503)",
+				kind === "observer"
+					? "Provider stream observer failed"
+					: kind === "SSE error"
+						? "API error: network or server error"
+						: "(503)",
 			);
 			expectRedacted(output);
 		},

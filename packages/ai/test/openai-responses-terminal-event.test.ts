@@ -434,8 +434,9 @@ describe("OpenAI Responses terminal event handling", () => {
 		const output = createOutput(model);
 		const stream = new AssistantMessageEventStream();
 
+		// smarty-dev#5822 (pi#202 round 3): a provider error by origin, with owned text only.
 		await expect(processResponsesStream(createFailedEvents(), output, stream, model)).rejects.toThrow(
-			"server_error: boom",
+			"Provider request failed",
 		);
 		expect(output.rawStopReason).toBe("failed");
 	});

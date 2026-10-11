@@ -20,6 +20,7 @@ import type {
 	ToolCall,
 	TranscriptContext,
 } from "../types.ts";
+import { closedRawStopReason } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
@@ -281,7 +282,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 			}
 			if (output.stopReason === "aborted" || output.stopReason === "error") {
 				const errorMessage = output.rawStopReason
-					? `Provider stopped with: ${output.rawStopReason}`
+					? `Provider stopped with: ${closedRawStopReason(output.rawStopReason)}`
 					: "An unknown error occurred";
 				throw new Error(errorMessage);
 			}

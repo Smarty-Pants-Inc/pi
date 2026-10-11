@@ -205,14 +205,15 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 		{
 			name: "wire error event",
 			reason: "error",
-			message: /^upstream failed$/,
+			// smarty-dev#5822 (pi#202 round 3): owned text; the wire error text is private.
+			message: /^Provider request failed$/,
 			fetch: async () =>
 				sse([JSON.stringify({ type: "error", reason: "error", usage, errorMessage: "upstream failed" })]),
 		},
 		{
 			name: "wire aborted event",
 			reason: "aborted",
-			message: /^upstream aborted$/,
+			message: /^Provider request failed$/,
 			fetch: async () =>
 				sse([JSON.stringify({ type: "error", reason: "aborted", usage, errorMessage: "upstream aborted" })]),
 		},

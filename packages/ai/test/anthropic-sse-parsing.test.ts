@@ -576,7 +576,9 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
-		expect(result.errorMessage).toBe(explanation);
+		// smarty-dev#5822 (pi#202 round 3): owned refusal text; the provider's explanation is not published.
+		expect(result.errorMessage).toBe("The model refused to complete the request");
+		expect(JSON.stringify(result)).not.toContain(explanation);
 	});
 
 	it("preserves sensitive stop reasons with a descriptive error message", async () => {

@@ -140,11 +140,13 @@ describe("openai-completions provider retries", () => {
 	});
 
 	// smarty-dev#1723: the Node gateway's plan-limit 429. The message with and without the credit URL, so the
-	// "billing" text pattern cannot be what stops the retry.
+	// "billing" text pattern cannot be what stops the retry. smarty-dev#5822 (pi#202 round 3): the gateway's
+	// own message is never shown; Pi renders owned text from the closed window and a bounded reset time.
 	it.each([
 		"Your 5-hour limit is used up. More at 14:32Z, or add credit: https://billing.smartypants.ai/checkout",
-		"Your 5-hour limit is used up. More at 14:32Z.",
-	])("does not retry the smarty_limit 429 and shows its message as-is: %s", async (message) => {
+		"Your 5-hour limit is used up. sk-or-v1-synthetic5822 corp-eu-west-7-tenant-plum",
+	])("does not retry the smarty_limit 429 and shows owned text: %s", async (message) => {
+		const reset = new Date(Date.now() + 60 * 60 * 1000);
 		// The body the gateway sends; the openai SDK puts `body.error` in `error.error`.
 		const body = {
 			error: {
@@ -153,7 +155,7 @@ describe("openai-completions provider retries", () => {
 				message,
 				window: "5h",
 				throttled: false,
-				resets_at: "2026-09-28T14:32:00Z",
+				resets_at: reset.toISOString(),
 			},
 		};
 		mockState.requestErrors = [
@@ -168,7 +170,9 @@ describe("openai-completions provider retries", () => {
 
 		expect(mockState.requestOptions).toHaveLength(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe(message);
+		expect(result.errorMessage).toBe(`Your 5-hour limit is used up. More at ${reset.toISOString().slice(11, 16)}Z.`);
+		expect(JSON.stringify(result)).not.toContain("synthetic5822");
+		expect(JSON.stringify(result)).not.toContain("tenant-plum");
 		expect(isRetryableAssistantError(result)).toBe(false);
 	});
 
@@ -197,7 +201,10 @@ describe("openai-completions provider retries", () => {
 			const result = await consume({ maxRetries: 2 });
 
 			expect(mockState.requestOptions).toHaveLength(1);
-			expect(result.errorMessage).toBe(message || "smarty_limit");
+			// Owned text by the closed throttle flag and window, never the gateway's message.
+			expect(result.errorMessage).toBe(
+				throttled ? "Flash runs one request at a time" : "Your 5-hour limit is used up.",
+			);
 			expect(isRetryableAssistantError(result)).toBe(false);
 			// smarty-dev#5822 N5682: the wait is private and its text owned; the gateway wording is not kept.
 			expect(throttledLimitWait(result)).toEqual(

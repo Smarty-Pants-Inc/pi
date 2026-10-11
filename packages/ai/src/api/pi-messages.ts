@@ -25,6 +25,7 @@ import type {
 	TranscriptContext,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { formatProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
@@ -285,11 +286,17 @@ function createEventConverter(model: Model<"pi-messages">) {
 				}
 				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "done", reason: event.reason, message: partial };
-			case "error":
+			case "error": {
+				// The wire error text only classifies; the published text is owned (smarty-dev#5822, pi#202 round 3).
+				const recovery = classifyProviderFailure({
+					text: typeof event.errorMessage === "string" ? event.errorMessage : undefined,
+					provider: model.provider,
+				});
 				Object.assign(partial, {
 					stopReason: event.reason,
 					usage: boundUsage(event.usage),
-					errorMessage: event.errorMessage,
+					errorMessage: formatProviderError({ recovery }),
+					recovery,
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
@@ -297,6 +304,7 @@ function createEventConverter(model: Model<"pi-messages">) {
 				}
 				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "error", reason: event.reason, error: partial };
+			}
 			case "start":
 				break;
 			case "text_start":

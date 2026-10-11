@@ -239,7 +239,8 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "test-key" }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe("Upstream failed");
+		// smarty-dev#5822 (pi#202 round 3): the wire error text only classifies; the published text is owned.
+		expect(message.errorMessage).toBe("Provider request failed");
 		expect(message.usage).toEqual(usage);
 	});
 

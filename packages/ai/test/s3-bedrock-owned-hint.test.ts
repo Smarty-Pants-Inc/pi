@@ -174,6 +174,20 @@ describe("T-C4: Bedrock owned failure text and hint (smarty-dev#5822)", () => {
 		expect(isContextOverflow(message)).toBe(true);
 	});
 
+	// pi#202 round 3: an unknown provider stop reason never reaches the published text.
+	it("keeps a planted unknown stop reason private", async () => {
+		bedrockMock.send = respondWithFailingStream({
+			item: { messageStop: { stopReason: `corp-eu-west-7-tenant-plum ${SYNTHETIC}` } },
+		});
+
+		const message = await runBedrock();
+
+		expect(message.stopReason).toBe("error");
+		expect(message.rawStopReason).toBe("other");
+		expect(JSON.stringify(message)).not.toContain("tenant-plum");
+		expectNoProviderText(message);
+	});
+
 	it("labels a bare mid-stream throttle by its item, so 'Too many tokens' is not overflow", async () => {
 		bedrockMock.send = respondWithFailingStream({
 			item: { throttlingException: { message: `Too many tokens, please wait. ${SYNTHETIC}` } },

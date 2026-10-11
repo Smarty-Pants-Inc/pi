@@ -20,7 +20,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError, providerErrorText } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, providerErrorText, providerLabel } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
@@ -232,7 +232,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			output.recovery ??= norm.recovery;
 			const errorMessage = formatProviderError(
 				norm,
-				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
+				`${model.provider === "openai" ? "OpenAI" : providerLabel(model.provider)} API error`,
 			);
 			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
 			// Recognized privately from the provider text; only the owned hint is published.

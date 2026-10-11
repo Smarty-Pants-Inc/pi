@@ -115,4 +115,27 @@ describe("streamProxy", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toContain("Connection closed by proxy server");
 	});
+
+	// smarty-dev#5822 (pi#202 round 3): a non-2xx proxy response publishes its status only, never its error
+	// body or status text, which may carry a credential or a plain environment value.
+	it("publishes only the status of a non-2xx proxy response", async () => {
+		const planted = "corp-eu-west-7-tenant-plum sk-ant-api03-synthetic5822roundthree";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => Response.json({ error: planted }, { status: 503, statusText: planted })),
+		);
+
+		const stream = streamProxy(model, normalizeContext({ systemPrompt: "", messages: [] }), {
+			authToken: "test-token",
+			proxyUrl: "https://proxy.example.com",
+		});
+		const events: string[] = [];
+		for await (const event of stream) events.push(JSON.stringify(event));
+		const result = await stream.result();
+
+		expect(result.errorMessage).toBe("Proxy error (503)");
+		const published = [JSON.stringify(result), ...events].join("\n");
+		expect(published).not.toContain("tenant-plum");
+		expect(published).not.toContain("synthetic5822");
+	});
 });

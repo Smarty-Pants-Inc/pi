@@ -61,9 +61,39 @@ export function normalizeProviderError(
 		: { recovery };
 }
 
-/** An `Error` with no provider response field: its text was written by Pi or the transport, not the provider. */
+/** Private provider text of errors adapters build from provider data; never on the error object itself. */
+const providerDataTexts = new WeakMap<object, string>();
+
+/**
+ * An error an adapter builds from provider data (a stream error event, a failed response, an unparsable frame).
+ * Where it came from decides how it is published, not which fields it has: it is never a local error. Its
+ * message, name and stack are owned; the provider text is kept in a module-private map for classification only,
+ * and it has no `cause` or payload (smarty-dev#5822, pi#202 round 3).
+ */
+export class ProviderDataError extends Error {
+	readonly status?: number;
+
+	constructor(privateText: string, status?: number, name = "ProviderDataError") {
+		super("Provider request failed");
+		this.name = name;
+		const valid = validHttpStatus(status);
+		if (valid !== undefined) this.status = valid;
+		providerDataTexts.set(this, privateText);
+	}
+}
+
+/** A closed provider label for owned text: the configured id only when it is a plain slug, else `provider`. */
+export function providerLabel(provider: string): string {
+	return /^[a-z0-9-]{1,40}$/.test(provider) ? provider : "provider";
+}
+
+/**
+ * Local means only Pi's own validation and timeout errors and transport errors raised by Node or the fetch layer:
+ * an `Error` that no adapter built from provider data and that carries no provider response field.
+ */
 function isLocalError(error: unknown): error is Error {
 	if (!(error instanceof Error) || !error.message) return false;
+	if (error instanceof ProviderDataError) return false;
 	// Pi's own admission refusal, even after an SDK attached response metadata to it.
 	if (error instanceof ProviderRequestLimitError) return true;
 	const fields = error as SdkErrorShape;
@@ -83,6 +113,8 @@ function isLocalError(error: unknown): error is Error {
  */
 export function providerErrorText(error: unknown): string {
 	if (!(error instanceof Error)) return safeJsonStringify(error);
+	const dataText = providerDataTexts.get(error);
+	if (dataText !== undefined) return dataText;
 	const body = pickBodyText(error as SdkErrorShape);
 	return body === undefined ? error.message : `${error.message}\n${body}`;
 }
@@ -167,17 +199,49 @@ export function formatProviderError(norm: NormalizedProviderError, label = "Prov
 /** Diagnostic type marking a provider plan/usage limit refusal; the agent must not retry it. */
 export const PROVIDER_LIMIT_DIAGNOSTIC = "provider_limit";
 
+/** Owned names of the gateway's limit windows; any other window is called the plan limit. */
+const SMARTY_LIMIT_WINDOWS: Readonly<Record<string, string>> = {
+	"5h": "5-hour",
+	day: "daily",
+	"1d": "daily",
+	week: "weekly",
+	"7d": "weekly",
+	month: "monthly",
+};
+
+/** Owned wait text of a throttled limit (one request in flight). */
+export const SMARTY_THROTTLE_MESSAGE = "Flash runs one request at a time";
+
+/** The latest reset Pi shows; a later or invalid time is omitted. */
+const MAX_SMARTY_RESET_MS = 31 * 24 * 60 * 60 * 1000;
+
 /**
  * The Smarty Node gateway's plan-limit refusal: a 429 whose parsed body (`openai` SDK `error.error`) has
- * `code` or `type` `smarty_limit`. Returns the gateway's message to show as-is, or undefined for any other error.
- * It is final until the window resets, so neither the provider nor the agent retries it.
+ * `code` or `type` `smarty_limit`. Returns OWNED text, or undefined for any other error (smarty-dev#5822,
+ * pi#202 round 3): the gateway's own message is never published. The text uses only a closed window name and a
+ * reset time Pi formats from a bounded timestamp. It is final until the window resets, so neither the provider
+ * nor the agent retries it.
  */
 export function smartyLimitMessage(error: unknown): string | undefined {
 	const body = (error as { error?: unknown } | null | undefined)?.error;
 	if (typeof body !== "object" || body === null) return undefined;
-	const { code, type, message } = body as Record<string, unknown>;
+	const { code, type, throttled, window, resets_at: resetsAt } = body as Record<string, unknown>;
 	if (code !== "smarty_limit" && type !== "smarty_limit") return undefined;
-	return typeof message === "string" && message.length > 0 ? message : "smarty_limit";
+	if (throttled === true) return SMARTY_THROTTLE_MESSAGE;
+	const name =
+		typeof window === "string" && Object.hasOwn(SMARTY_LIMIT_WINDOWS, window) ? SMARTY_LIMIT_WINDOWS[window] : "plan";
+	const resetMs =
+		typeof resetsAt === "number" && Number.isFinite(resetsAt)
+			? resetsAt * 1000
+			: typeof resetsAt === "string"
+				? Date.parse(resetsAt)
+				: Number.NaN;
+	const now = Date.now();
+	const reset =
+		Number.isFinite(resetMs) && resetMs > now && resetMs - now <= MAX_SMARTY_RESET_MS
+			? ` More at ${new Date(resetMs).toISOString().slice(11, 16)}Z.`
+			: "";
+	return `Your ${name} limit is used up.${reset}`;
 }
 
 /**

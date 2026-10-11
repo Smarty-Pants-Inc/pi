@@ -28,7 +28,7 @@ import {
 	createAssistantMessageDiagnostic,
 	formatThrownValue,
 } from "../utils/diagnostics.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, ProviderDataError, providerLabel } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
@@ -76,6 +76,19 @@ const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+/** ChatGPT plan names Pi may show in the usage-limit message; any other value is omitted. */
+const CHATGPT_PLANS: ReadonlySet<string> = new Set([
+	"free",
+	"go",
+	"plus",
+	"pro",
+	"team",
+	"business",
+	"enterprise",
+	"edu",
+]);
+/** The longest reset wait Pi shows (one week); a longer or invalid value is omitted. */
+const MAX_USAGE_RESET_MINUTES = 7 * 24 * 60;
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -446,9 +459,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
+					// The friendly text is owned (closed plan, bounded minutes); everything else is a provider error.
 					if (info.friendlyMessage) throw new Error(info.friendlyMessage);
-					// Keep the message for the retry checks below; status and raw body go to formatProviderError.
-					throw Object.assign(new Error(info.message), { status: response.status, body: errorText });
+					throw new ProviderDataError(`${info.message}\n${errorText}`, response.status);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -501,7 +514,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			// Owned text: `<provider> API error (HTTP <status>)`; the body and message only classify (smarty-dev#5822).
 			const norm = normalizeProviderError(error, model.provider, undefined, diagnosticSecrets);
 			output.recovery ??= norm.recovery;
-			output.errorMessage = formatProviderError(norm, `${model.provider} API error`);
+			output.errorMessage = formatProviderError(norm, `${providerLabel(model.provider)} API error`);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -692,27 +705,27 @@ async function processStream(
 	);
 }
 
-class CodexApiError extends Error {
-	readonly code?: string;
-	readonly payload?: Record<string, unknown>;
+/** The two provider codes Codex acts on, as a closed kind; the provider's code itself is not kept. */
+type CodexApiErrorKind = "connection_limit" | "previous_response_not_found";
 
-	constructor(message: string, options?: { code?: string; payload?: Record<string, unknown>; cause?: unknown }) {
-		super(message);
-		this.name = "CodexApiError";
-		this.code = options?.code;
-		this.payload = options?.payload;
-		this.cause = options?.cause;
+/**
+ * A Codex error built from provider stream data. A provider error by origin: owned message, private text, no
+ * payload or cause (smarty-dev#5822, pi#202 round 3).
+ */
+class CodexApiError extends ProviderDataError {
+	readonly kind?: CodexApiErrorKind;
+
+	constructor(privateText: string, code?: unknown) {
+		super(privateText, undefined, "CodexApiError");
+		if (code === WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) this.kind = "connection_limit";
+		else if (code === PREVIOUS_RESPONSE_NOT_FOUND_CODE) this.kind = "previous_response_not_found";
 	}
 }
 
-class CodexProtocolError extends Error {
-	readonly payload?: unknown;
-
-	constructor(message: string, options?: { payload?: unknown; cause?: unknown }) {
-		super(message);
-		this.name = "CodexProtocolError";
-		this.payload = options?.payload;
-		this.cause = options?.cause;
+/** An unparsable Codex frame. A provider error by origin; the frame and parser error stay private. */
+class CodexProtocolError extends ProviderDataError {
+	constructor(privateText: string) {
+		super(privateText, undefined, "CodexProtocolError");
 	}
 }
 
@@ -733,11 +746,11 @@ function isCodexNonTransportError(error: unknown): boolean {
 }
 
 function isWebSocketConnectionLimitReachedError(error: unknown): boolean {
-	return error instanceof CodexApiError && error.code === WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE;
+	return error instanceof CodexApiError && error.kind === "connection_limit";
 }
 
 function isPreviousResponseNotFoundError(error: unknown): boolean {
-	return error instanceof CodexApiError && error.code === PREVIOUS_RESPONSE_NOT_FOUND_CODE;
+	return error instanceof CodexApiError && error.kind === "previous_response_not_found";
 }
 
 function extractCodexEventError(event: Record<string, unknown>): { code?: string; message?: string } {
@@ -794,10 +807,7 @@ async function* mapCodexEvents(
 
 		if (type === "error") {
 			const { code, message } = extractCodexEventError(event);
-			throw new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
-				code,
-				payload: event,
-			});
+			throw new CodexApiError(`${code ?? ""}\n${message || JSON.stringify(event)}`, code);
 		}
 
 		if (type === "response.failed") {
@@ -811,7 +821,7 @@ async function* mapCodexEvents(
 			output.rawStopReason = response?.status;
 			const code = response?.error?.code;
 			const message = response?.error?.message;
-			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
+			throw new CodexApiError(`${code ?? ""}\n${message || "Codex response failed"}`, code);
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
@@ -878,10 +888,7 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 						try {
 							yield JSON.parse(data) as Record<string, unknown>;
 						} catch (cause) {
-							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
-								cause,
-								payload: data,
-							});
+							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`);
 						}
 					}
 				}
@@ -1394,10 +1401,7 @@ async function* parseWebSocket(
 				queue.push(parsed);
 				wake();
 			} catch (cause) {
-				failed = new CodexProtocolError(`Invalid Codex WebSocket JSON: ${formatThrownValue(cause)}`, {
-					cause,
-					payload: text,
-				});
+				failed = new CodexProtocolError(`Invalid Codex WebSocket JSON: ${formatThrownValue(cause)}`);
 				done = true;
 				wake();
 			}
@@ -1671,11 +1675,14 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 		if (err) {
 			const code = err.code || err.type || "";
 			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
-				const plan = err.plan_type ? ` (${err.plan_type.toLowerCase()} plan)` : "";
-				const mins = err.resets_at
-					? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
-					: undefined;
-				const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
+				// Owned text only: a known plan name and a bounded whole number of minutes (smarty-dev#5822).
+				const planType = typeof err.plan_type === "string" ? err.plan_type.toLowerCase() : undefined;
+				const plan = planType && CHATGPT_PLANS.has(planType) ? ` (${planType} plan)` : "";
+				const mins =
+					typeof err.resets_at === "number" && Number.isFinite(err.resets_at)
+						? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
+						: undefined;
+				const when = mins !== undefined && mins <= MAX_USAGE_RESET_MINUTES ? ` Try again in ~${mins} min.` : "";
 				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
 			}
 			message = err.message || friendlyMessage || message;

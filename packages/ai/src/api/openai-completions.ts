@@ -738,7 +738,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			const limitMessage = smartyLimitMessage(error);
 			if (limitMessage !== undefined) {
-				// Show the gateway's limit message as-is, and mark it final so the generic retry does not retry it.
+				// Show the owned limit text (never the gateway's own message), and mark it final so the generic retry
+				// does not retry it (smarty-dev#5822, pi#202 round 3).
 				// A throttled limit with a short Retry-After records the wait privately for the agent's one-shot retry;
 				// the published diagnostic is the owned type only (smarty-dev#5822 N5682).
 				output.errorMessage = limitMessage;

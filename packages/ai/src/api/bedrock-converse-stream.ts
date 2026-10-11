@@ -48,6 +48,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { closedRawStopReason } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, providerErrorText } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
@@ -1128,7 +1129,7 @@ function mapStopReason(reason: string | undefined): { stopReason: StopReason; er
 			return { stopReason: "toolUse" };
 		default:
 			return reason
-				? { stopReason: "error", errorMessage: `Provider stopped with: ${reason}` }
+				? { stopReason: "error", errorMessage: `Provider stopped with: ${closedRawStopReason(reason)}` }
 				: { stopReason: "error" };
 	}
 }

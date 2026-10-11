@@ -159,16 +159,10 @@ export function streamProxy(
 			});
 
 			if (!response.ok) {
-				let errorMessage = `Proxy error: ${response.status} ${response.statusText}`;
-				try {
-					const errorData = (await response.json()) as { error?: string };
-					if (errorData.error) {
-						errorMessage = `Proxy error: ${errorData.error}`;
-					}
-				} catch {
-					// Couldn't parse error response
-				}
-				throw new Error(errorMessage);
+				// Owned text: the status only. The proxy's status text and error body are never published
+				// (smarty-dev#5822, pi#202 round 3); the status keeps retry classification (e.g. 503).
+				const status = Number.isInteger(response.status) ? response.status : 0;
+				throw new Error(status >= 100 && status <= 599 ? `Proxy error (${status})` : "Proxy error");
 			}
 
 			reader = response.body!.getReader();
