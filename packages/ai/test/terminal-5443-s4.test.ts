@@ -292,7 +292,9 @@ describe("T-F6-deferred: protected streams mask live secrets in deferred.id (sma
 		const handle = message.deferred;
 		stream.push({ type: "done", reason: "deferred", message });
 		const result = await stream.result();
-		expect(result.deferred).toBe(handle);
+		// pi#159: an unchanged handle stays byte-for-byte equal, but publication detaches it.
+		expect(result.deferred).toStrictEqual(handle);
+		expect(result.deferred).not.toBe(handle);
 		expect(result.deferred?.id).toBe("resp_abc%2F123 token=x");
 	});
 });
