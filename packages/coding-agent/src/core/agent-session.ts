@@ -177,7 +177,7 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { captureTerminalTurnReceipt, type TurnReceipt, withoutAttribution } from "./turn-receipts.ts";
+import { captureTerminalTurnReceipt, receiptRecord, type TurnReceipt, withoutAttribution } from "./turn-receipts.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
 	bindExtensionMetadataSender,
@@ -564,6 +564,11 @@ export class AgentSession {
 	private _messageEntryIds: WeakMap<AgentMessage, string[]> | undefined;
 	/** Receipt associations last only until this publication succeeds. */
 	readonly #receivedMessageReceipts = new WeakMap<AgentMessage, TurnReceipt>();
+	/**
+	 * Trusted snapshot of the exact content a keyboard receipt attested, as normalized blocks (pi#160).
+	 * Kept beside the receipt, never on the message, so no listener or extension can reach it.
+	 */
+	readonly #attestedUserContent = new WeakMap<AgentMessage, unknown>();
 	/** Metadata is occurrence-local, never attached to model-visible message objects. */
 	private readonly _userMessageSubmissions = new WeakMap<AgentMessage, UserMessageSubmission>();
 	private readonly _pendingUserMessageSubmissions = new Set<UserMessageSubmission>();
@@ -1577,6 +1582,16 @@ export class AgentSession {
 		if (failures.length > 0) throw failures[0];
 	}
 
+	/** Attach a receipt to a harness-built user message; a keyboard receipt also snapshots the attested content. */
+	#attachUserMessageReceipt(message: AgentMessage, receipt: TurnReceipt): void {
+		this.#receivedMessageReceipts.set(message, receipt);
+		if (message.role === "user" && receiptRecord(receipt).channel === "keyboard") {
+			this.#attestedUserContent.set(message, structuredClone(userContentBlocks(message.content)));
+		} else {
+			this.#attestedUserContent.delete(message);
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (
@@ -1693,7 +1708,22 @@ export class AgentSession {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
-			const receipt = this.#receivedMessageReceipts.get(event.message);
+			let receipt = this.#receivedMessageReceipts.get(event.message);
+			// pi#160: the persistence-boundary check is the authority for keyboard attribution. Hooks,
+			// queues, message_end replacements and public listeners can all change the live message;
+			// the per-path downgrades only make earlier, narrower decisions. Attribution persists only
+			// when the content being written is exactly the content the receipt attested.
+			const attested = this.#attestedUserContent.get(event.message);
+			if (
+				receipt &&
+				!(
+					event.message.role === "user" &&
+					attested !== undefined &&
+					isDeepStrictEqual(userContentBlocks(event.message.content), attested)
+				)
+			) {
+				receipt = withoutAttribution(receipt);
+			}
 			const submission = this._userMessageSubmissions.get(event.message);
 			if (submission && event.message.role !== "user") {
 				submission.reject(new Error("User message was replaced without persisting a user entry"));
@@ -1721,6 +1751,7 @@ export class AgentSession {
 							receipt,
 						);
 				this.#receivedMessageReceipts.delete(event.message);
+				this.#attestedUserContent.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1757,6 +1788,7 @@ export class AgentSession {
 					this._userMessageSubmissions.delete(event.message);
 				}
 				this.#receivedMessageReceipts.delete(event.message);
+				this.#attestedUserContent.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1940,6 +1972,7 @@ export class AgentSession {
 						? ({ ...replacement, content: [] } as AgentMessage)
 						: replacement;
 				// smarty-dev#2636: Herdr attested the typed bytes, not text a message_end hook produced.
+				// Earlier downgrade only; the persistence-boundary check in _persistAgentEvent is the authority.
 				const receipt = this.#receivedMessageReceipts.get(event.message);
 				if (
 					receipt &&
@@ -3263,7 +3296,7 @@ export class AgentSession {
 			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
 			userContent.push(...normalized.images);
 			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
-			this.#receivedMessageReceipts.set(userMessage, receipt);
+			this.#attachUserMessageReceipt(userMessage, receipt);
 			if (submission) {
 				submission.message = userMessage;
 				this._userMessageSubmissions.set(userMessage, submission);
@@ -3590,7 +3623,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#receivedMessageReceipts.set(message, receipt);
+		this.#attachUserMessageReceipt(message, receipt);
 		if (submission) {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
@@ -3617,7 +3650,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#receivedMessageReceipts.set(message, receipt);
+		this.#attachUserMessageReceipt(message, receipt);
 		if (submission) {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
