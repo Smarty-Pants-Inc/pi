@@ -249,6 +249,13 @@ describe("T-C4: Bedrock owned failure text and hint (smarty-dev#5822)", () => {
 		expect(message.recovery).toEqual({ retryable: false });
 	});
 
+	it("publishes only the two owned hint values", async () => {
+		const stream = createAssistantMessageEventStream();
+		const first = await runBedrock();
+		stream.end({ ...first, errorHint: SYNTHETIC as "chatgpt_usage" });
+		expect((await stream.result()).errorHint).toBeUndefined();
+	});
+
 	it("records nothing for an aborted turn", async () => {
 		const controller = new AbortController();
 		controller.abort();

@@ -169,7 +169,10 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 	if (diagnostics !== undefined) projected.diagnostics = diagnostics;
 	if (message.deferred !== undefined) projected.deferred = structuredClone(message.deferred);
 	if (message.errorMessage !== undefined) projected.errorMessage = message.errorMessage;
-	if (message.errorHint !== undefined) projected.errorHint = message.errorHint;
+	// Only the two owned hints are published; anything else a producer put there is dropped.
+	if (message.errorHint === "bedrock_data_retention" || message.errorHint === "chatgpt_usage") {
+		projected.errorHint = message.errorHint;
+	}
 	if (message.rawStopReason !== undefined) projected.rawStopReason = message.rawStopReason;
 	if (message.endTurn !== undefined) projected.endTurn = message.endTurn;
 	if (message.durationMs !== undefined) projected.durationMs = message.durationMs;
