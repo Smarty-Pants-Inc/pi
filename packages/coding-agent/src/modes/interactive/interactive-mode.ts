@@ -41,6 +41,7 @@ import {
 	linkifyUrls,
 	Markdown,
 	matchesKey,
+	ProcessTerminal,
 	Spacer,
 	setCapabilityOverrides,
 	setKeybindings,
@@ -99,6 +100,7 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import type { HerdrInputBootstrap } from "../../core/herdr/bootstrap.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { InputAdmissionError } from "../../core/input-admission.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
@@ -139,6 +141,7 @@ import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
+import type { TurnReceipt } from "../../core/turn-receipts.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
@@ -466,6 +469,8 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
  * Options for InteractiveMode initialization.
  */
 export interface InteractiveModeOptions {
+	/** Herdr input-consumer enrollment made at startup (smarty-dev#2636). */
+	herdrInput?: HerdrInputBootstrap;
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Diagnostics collected before the interactive TUI was initialized. */
@@ -1071,6 +1076,12 @@ export class InteractiveMode {
 		this.ui.setFocus(this.editor);
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+		const herdrInput = this.options.herdrInput;
+		if (herdrInput && this.ui.terminal instanceof ProcessTerminal) {
+			// Bytes outside the epoch (typed before the marker) are not attested: they taint the draft (pi#160).
+			this.ui.terminal.setInputMeter(herdrInput.meter, () => this.defaultEditor.markDraftTainted());
+			herdrInput.handOff();
+		} else herdrInput?.shutdown();
 		this.ui.start();
 		this.isInitialized = true;
 		this.programStatus.report();
@@ -2692,10 +2703,27 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private captureHerdrSubmit(text: string): Promise<TurnReceipt> | undefined {
+		const attestor = this.options.herdrInput?.attestor;
+		const terminal = this.ui.terminal;
+		if (!attestor || !(terminal instanceof ProcessTerminal)) return undefined;
+		return attestor.capture(terminal.inputOffset, {
+			// A custom editor's draft cannot be checked for taint.
+			tainted: this.defaultEditor.lastSubmitTainted || this.editor !== this.defaultEditor,
+			kind: text.startsWith("/") || text.startsWith("!") ? "discard" : "submit",
+		});
+	}
+
 	private addExtensionTerminalInputListener(
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined,
 	): () => void {
-		const subscription = { handler, unsubscribe: this.ui.addInputListener(handler) };
+		// An extension that rewrites terminal input taints the draft (smarty-dev#2636).
+		const tainting = (data: string) => {
+			const result = handler(data);
+			if (result?.data !== undefined && result.data !== data) this.defaultEditor.markDraftTainted();
+			return result;
+		};
+		const subscription = { handler: tainting, unsubscribe: this.ui.addInputListener(tainting) };
 		this.extensionTerminalInputSubscriptions.add(subscription);
 		return () => {
 			subscription.unsubscribe();
@@ -2773,7 +2801,11 @@ export class InteractiveMode {
 			setHeader: (factory) => this.setExtensionHeader(factory),
 			setTitle: (title) => this.ui.terminal.setTitle(title),
 			custom: (factory, options) => this.showExtensionCustom(factory, options),
-			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
+			pasteToEditor: (text) => {
+				// Synthetic paste: not bytes from the terminal client (smarty-dev#2636).
+				this.defaultEditor.markDraftTainted();
+				this.editor.handleInput(`\x1b[200~${text}\x1b[201~`);
+			},
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
 			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
@@ -3300,6 +3332,8 @@ export class InteractiveMode {
 		try {
 			const text = await readClipboardText();
 			if (!text || this.renderer.getFocusedComponent() !== target) return;
+			// Clipboard text is synthetic, not attested terminal bytes (pi#160).
+			if (target === this.defaultEditor) this.defaultEditor.markDraftTainted();
 			handleInput.call(target, `\x1b[200~${text}\x1b[201~`);
 			this.ui.requestRender();
 		} catch {
@@ -3394,7 +3428,9 @@ export class InteractiveMode {
 				this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
 				return;
 			}
-			await this.dispatchEditorInput(receiveInput(text));
+			// Synchronous, before any await: the cut is this Enter's byte end (smarty-dev#2636, #1515).
+			const attested = this.captureHerdrSubmit(text);
+			await this.dispatchEditorInput(receiveInput(text, undefined, attested ? await attested : undefined));
 		};
 		// Return the observed promise so callers that await submission still see its completion.
 		this.defaultEditor.onSubmit = (text: string) =>

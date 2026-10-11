@@ -176,7 +176,7 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { captureTerminalTurnReceipt, type TurnReceipt } from "./turn-receipts.ts";
+import { captureTerminalTurnReceipt, type TurnReceipt, withoutAttribution } from "./turn-receipts.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import {
 	bindExtensionMetadataSender,
@@ -2921,7 +2921,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
-	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+	): Promise<{ text: string; images: ImageContent[] | undefined; transformed?: true } | undefined> {
 		if (!this._extensionRunner.hasHandlers("input")) {
 			return { text, images };
 		}
@@ -2939,7 +2939,7 @@ export class AgentSession {
 			return undefined;
 		}
 		if (inputResult.action === "transform") {
-			return { text: inputResult.text, images: inputResult.images ?? images };
+			return { text: inputResult.text, images: inputResult.images ?? images, transformed: true };
 		}
 		return { text, images };
 	}
@@ -3143,6 +3143,8 @@ export class AgentSession {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
+			// smarty-dev#2636: Herdr attested the typed bytes, not text a hook or template produced.
+			if (processedInput.transformed || expandedText !== text) receipt = withoutAttribution(receipt);
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
 			while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
