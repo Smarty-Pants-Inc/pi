@@ -199,11 +199,11 @@ describe("openai-completions provider retries", () => {
 			expect(mockState.requestOptions).toHaveLength(1);
 			expect(result.errorMessage).toBe(message || "smarty_limit");
 			expect(isRetryableAssistantError(result)).toBe(false);
+			// smarty-dev#5822 N5682: the wait is private and its text owned; the gateway wording is not kept.
 			expect(throttledLimitWait(result)).toEqual(
-				wait === undefined
-					? undefined
-					: { delayMs: wait, waitMessage: message || "Flash runs one request at a time" },
+				wait === undefined ? undefined : { delayMs: wait, waitMessage: "Flash runs one request at a time" },
 			);
+			expect(result.diagnostics).toEqual([{ type: "provider_limit", timestamp: expect.any(Number) }]);
 		},
 	);
 });

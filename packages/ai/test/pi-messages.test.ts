@@ -227,8 +227,8 @@ describe("pi-messages", () => {
 		expect(message.errorMessage).toContain("401");
 		expect(message.errorMessage).toContain("Token expired");
 		expect(message.errorMessage).toContain("unauthorized");
-		expect(message.diagnostics?.[0]?.type).toBe("pi_messages_response_failure");
-		expect(message.diagnostics?.[0]?.details?.status).toBe(401);
+		// smarty-dev#5822 N5682: the owned type only, without the URL, status or body.
+		expect(message.diagnostics).toEqual([{ type: "pi_messages_response_failure", timestamp: expect.any(Number) }]);
 	});
 
 	it("propagates server-sent error events", async () => {

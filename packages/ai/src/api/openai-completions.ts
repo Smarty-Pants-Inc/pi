@@ -40,7 +40,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import {
 	formatProviderError,
 	normalizeProviderError,
@@ -56,6 +56,7 @@ import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { classifyProviderFailure } from "../utils/recovery.ts";
+import { recordThrottledLimitWait } from "../utils/retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import {
@@ -735,23 +736,13 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			const limitMessage = smartyLimitMessage(error);
 			if (limitMessage !== undefined) {
 				// Show the gateway's limit message as-is, and mark it final so the generic retry does not retry it.
-				// A throttled limit with a short Retry-After carries the wait for the agent's one-shot retry.
+				// A throttled limit with a short Retry-After records the wait privately for the agent's one-shot retry;
+				// the published diagnostic is the owned type only (smarty-dev#5822 N5682).
 				output.errorMessage = limitMessage;
 				output.recovery ??= { retryable: false };
 				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
-				appendAssistantMessageDiagnostic(output, {
-					type: PROVIDER_LIMIT_DIAGNOSTIC,
-					timestamp: Date.now(),
-					details:
-						retryAfterSeconds === undefined
-							? { code: "smarty_limit" }
-							: {
-									code: "smarty_limit",
-									retryAfterSeconds,
-									waitMessage:
-										limitMessage === "smarty_limit" ? "Flash runs one request at a time" : limitMessage,
-								},
-				});
+				if (retryAfterSeconds !== undefined) recordThrottledLimitWait(output, retryAfterSeconds);
+				appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(PROVIDER_LIMIT_DIAGNOSTIC));
 			} else {
 				const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
 				output.errorMessage = formatProviderError(norm);

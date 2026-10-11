@@ -38,7 +38,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
@@ -872,17 +872,12 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
 			if (inputTransformations && inputTransformations.length > 0) {
-				appendAssistantMessageDiagnostic(output, {
-					type: "anthropic_input_transformations",
-					timestamp: Date.now(),
-					details: {
-						transformations: inputTransformations.map((transformation) => ({
-							type: transformation.type ?? undefined,
-							path: transformation.path ?? undefined,
-							reason: transformation.reason ?? undefined,
-						})),
-					},
-				});
+				// Publish only Pi's count; the provider's transformation paths and reasons stay here (smarty-dev#5822).
+				const diagnostic = createAssistantMessageDiagnostic("anthropic_input_transformations");
+				diagnostic.thinkingBlocksDropped = inputTransformations.filter(
+					(transformation) => transformation.type === "thinking_dropped",
+				).length;
+				appendAssistantMessageDiagnostic(output, diagnostic);
 			}
 
 			stream.push({ type: "done", reason: output.stopReason, message: output });

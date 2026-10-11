@@ -1,6 +1,6 @@
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
-import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
+import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 import { assistantRecovery } from "./recovery.ts";
 
 /** Whether a failed stream ended before its provider's completion event (owned decision first, smarty-dev#5822). */
@@ -192,10 +192,19 @@ export async function retryAssistantCall(
 		const recovery = produced.stopReason === "error" ? assistantRecovery(produced) : produced.recovery;
 		const errorMessage =
 			produced.errorMessage === undefined ? undefined : redactOAuthDiagnostic(produced.errorMessage);
+		// A direct producer bypasses the stream projection, so rebuild its diagnostics here (smarty-dev#5822 N5682).
+		const { diagnostics: rawDiagnostics, ...rest } = produced;
+		const diagnostics = projectAssistantMessageDiagnostics(rawDiagnostics);
 		const response =
-			errorMessage === produced.errorMessage && recovery === produced.recovery
+			errorMessage === produced.errorMessage && recovery === produced.recovery && rawDiagnostics === undefined
 				? produced
-				: { ...produced, errorMessage, recovery };
+				: {
+						...rest,
+						...(errorMessage === undefined ? {} : { errorMessage }),
+						...(recovery === undefined ? {} : { recovery }),
+						...(diagnostics === undefined ? {} : { diagnostics }),
+					};
+		if (response !== produced) transferThrottledLimitWait(produced, response);
 
 		// Abort: terminal but not successful. Never retry an aborted message.
 		if (response.stopReason === "aborted") {
@@ -236,18 +245,38 @@ export async function retryAssistantCall(
 	}
 }
 
+/** Owned status text while waiting out a throttled limit; the provider's wait text is never kept. */
+export const THROTTLED_LIMIT_WAIT_MESSAGE = "Flash runs one request at a time";
+
+/**
+ * Validated one-shot waits, in seconds, keyed by the failed message. Private by construction: the delay never
+ * appears on the message, so it is never serialized, published or rebuilt from wire diagnostics (smarty-dev#5822).
+ */
+const throttledLimitWaits = new WeakMap<AssistantMessage, number>();
+
+/**
+ * Record the one-shot wait of a throttled provider limit on `message`. Only an integer of 0-30 seconds is kept;
+ * anything else records nothing, so the limit stays final.
+ */
+export function recordThrottledLimitWait(message: AssistantMessage, seconds: number): void {
+	if (Number.isInteger(seconds) && seconds >= 0 && seconds <= 30) throttledLimitWaits.set(message, seconds);
+}
+
+/** Carry a recorded wait to a copy of the message, for producers that publish copies. */
+export function transferThrottledLimitWait(from: AssistantMessage, to: AssistantMessage): void {
+	const seconds = throttledLimitWaits.get(from);
+	if (seconds !== undefined) throttledLimitWaits.set(to, seconds);
+}
+
 /**
  * The one-shot wait a provider marked on a throttled limit (the Smarty gateway's `smarty_limit` with
- * `throttled: true` and a `Retry-After` of at most 30 s): the delay and the status text to show while waiting.
- * Independent of {@link isRetryableAssistantError}, which stays false for the same message.
+ * `throttled: true` and a `Retry-After` of at most 30 s): the delay and the owned status text to show while
+ * waiting. Independent of {@link isRetryableAssistantError}, which stays false for the same message.
  */
 export function throttledLimitWait(message: AssistantMessage): { delayMs: number; waitMessage: string } | undefined {
 	if (message.stopReason !== "error") return undefined;
-	const details = message.diagnostics?.find((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)?.details;
-	const seconds = details?.retryAfterSeconds;
-	const waitMessage = details?.waitMessage;
-	if (typeof seconds !== "number" || typeof waitMessage !== "string") return undefined;
-	return { delayMs: seconds * 1000, waitMessage };
+	const seconds = throttledLimitWaits.get(message);
+	return seconds === undefined ? undefined : { delayMs: seconds * 1000, waitMessage: THROTTLED_LIMIT_WAIT_MESSAGE };
 }
 
 /**
@@ -272,7 +301,7 @@ export function isRetryableAssistantError(message: AssistantMessage, observed?: 
 	// Retrying its transient-looking error would regenerate output, not repair the observer.
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;
 	// Providers mark a limit found in the parsed error body (e.g. the Smarty gateway's `smarty_limit`).
-	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)) return false;
+	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_limit")) return false;
 	// The owned decision was classified from the original error before any text suppression (smarty-dev#5822).
 	return assistantRecovery(message).retryable;
 }

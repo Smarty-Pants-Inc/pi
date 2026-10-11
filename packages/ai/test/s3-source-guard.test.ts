@@ -89,6 +89,19 @@ describe("smarty-dev#5822 source guard", () => {
 		expect(subclasses).toEqual(["ai/src/utils/event-stream.ts"]);
 	});
 
+	it("N5682: no producer or projector forwards diagnostic details, errors or codes", () => {
+		const diagnostics = source("ai/src/utils/diagnostics.ts");
+		expect(diagnostics).not.toMatch(/\bdetails\??:/);
+		expect(diagnostics).not.toMatch(/\bcode\??:/);
+		expect(diagnostics).not.toContain("redactOAuthDiagnosticValue");
+		for (const { file, text } of sources) {
+			// Diagnostics are created only through the owned constructor, never as object literals with extra fields.
+			const literals = [...text.matchAll(/appendAssistantMessageDiagnostic\([^)]*\{/g)];
+			expect({ file, literals: literals.length }).toEqual({ file, literals: 0 });
+		}
+		expect(source("ai/src/utils/event-stream.ts")).not.toContain("redactOAuthDiagnosticValue");
+	});
+
 	it("C3: retry, premature-stream and overflow checks read the owned decision, not raw text", () => {
 		for (const file of ["ai/src/utils/retry.ts", "ai/src/utils/overflow.ts"]) {
 			const text = source(file);

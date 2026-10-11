@@ -198,7 +198,8 @@ it("redacts WebSocket fallback message, stack, code and stats before a successfu
 	const output = await stream.result();
 	expect(output.stopReason).toBe("stop");
 	expect(events).toContain("start");
-	expect(output.diagnostics?.[0].error?.message).toContain("connection failed");
+	// smarty-dev#5822 N5682: the owned type only; the transport error text is not published.
+	expect(output.diagnostics).toEqual([{ type: "provider_transport_failure", timestamp: expect.any(Number) }]);
 	expectRedacted(getOpenAICodexWebSocketDebugStats("fake-session-127"));
 });
 

@@ -22,29 +22,8 @@ const message: AssistantMessage = {
 	stopReason: "stop",
 	timestamp: 1,
 	diagnostics: [
-		{
-			type: "anthropic_input_transformations",
-			timestamp: 1,
-			details: {
-				transformations: [
-					{
-						type: "thinking_dropped",
-						path: "messages.2.content.0",
-						reason: "prefix_binding_mismatch",
-					},
-					{
-						type: "thinking_dropped",
-						path: "messages.5.content.0",
-						reason: "prefix_binding_mismatch",
-					},
-					{
-						type: "thinking_dropped",
-						path: "messages.8.content.0",
-						reason: "prefix_binding_mismatch",
-					},
-				],
-			},
-		},
+		// smarty-dev#5822 N5682: Pi's count only, not the provider's transformation paths and reasons.
+		{ type: "anthropic_input_transformations", timestamp: 1, thinkingBlocksDropped: 3 },
 	],
 };
 
@@ -69,7 +48,7 @@ describe("InteractiveMode assistant diagnostics", () => {
 		};
 		maybeShowThinkingDropNotice.call(enabled, message);
 		const output = stripAnsi(enabled.chatContainer.render(120).join("\n"));
-		expect(output).toContain("Anthropic dropped 3 thinking blocks (details in session)");
+		expect(output).toContain("Anthropic dropped 3 thinking blocks");
 
 		const disabled = {
 			chatContainer: new Container(),

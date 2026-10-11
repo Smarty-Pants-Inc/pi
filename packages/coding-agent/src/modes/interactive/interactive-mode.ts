@@ -4360,14 +4360,7 @@ export class InteractiveMode {
 		let count = 0;
 		for (const diagnostic of message.diagnostics ?? []) {
 			if (diagnostic.type !== "anthropic_input_transformations") continue;
-			const transformations = diagnostic.details?.transformations;
-			if (!Array.isArray(transformations)) continue;
-			count += transformations.filter(
-				(transformation) =>
-					typeof transformation === "object" &&
-					transformation !== null &&
-					(transformation as Record<string, unknown>).type === "thinking_dropped",
-			).length;
+			count += diagnostic.thinkingBlocksDropped ?? 0;
 		}
 		return count;
 	}
@@ -4394,11 +4387,7 @@ export class InteractiveMode {
 		const noun = droppedCount === 1 ? "thinking block" : "thinking blocks";
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(
-			new ThemedText(
-				() => theme.fg("warning", `Anthropic dropped ${droppedCount} ${noun} (details in session)`),
-				1,
-				0,
-			),
+			new ThemedText(() => theme.fg("warning", `Anthropic dropped ${droppedCount} ${noun}`), 1, 0),
 		);
 	}
 

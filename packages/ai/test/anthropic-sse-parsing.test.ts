@@ -330,20 +330,9 @@ describe("Anthropic raw SSE parsing", () => {
 			{ client: createFakeAnthropicClient(createSseResponse(events)) },
 		).result();
 
+		// smarty-dev#5822 N5682: Pi's count of the final event's drops, not the provider's paths and reasons.
 		expect(result.diagnostics).toEqual([
-			{
-				type: "anthropic_input_transformations",
-				timestamp: expect.any(Number),
-				details: {
-					transformations: [
-						{
-							type: "thinking_dropped",
-							path: "messages.3.content.0",
-							reason: "model_binding_mismatch",
-						},
-					],
-				},
-			},
+			{ type: "anthropic_input_transformations", timestamp: expect.any(Number), thinkingBlocksDropped: 1 },
 		]);
 	});
 	it("repairs malformed SSE JSON and malformed streamed tool JSON", async () => {

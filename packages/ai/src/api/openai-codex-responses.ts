@@ -368,20 +368,10 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
 							throw error;
 						}
+						// The owned type only; the transport error text stays private (smarty-dev#5822 N5682).
 						appendAssistantMessageDiagnostic(
 							output,
-							createAssistantMessageDiagnostic(
-								"provider_transport_failure",
-								error,
-								{
-									configuredTransport: transport,
-									...(websocketStarted ? {} : { fallbackTransport: "sse" }),
-									eventsEmitted: websocketStarted,
-									phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-									requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-								},
-								diagnosticSecrets,
-							),
+							createAssistantMessageDiagnostic("provider_transport_failure"),
 						);
 						recordWebSocketFailure(cacheSessionId, error, diagnosticSecrets);
 						if (websocketStarted) {

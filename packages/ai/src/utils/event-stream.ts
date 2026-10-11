@@ -1,6 +1,6 @@
-import { redactOAuthDiagnostic, redactOAuthDiagnosticValue, redactValues } from "../auth/oauth/credential-response.ts";
+import { redactOAuthDiagnostic, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
-import type { AssistantMessageDiagnostic } from "./diagnostics.ts";
+import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 import { attachRecovery } from "./recovery.ts";
 
 class FifoQueue<T> {
@@ -93,7 +93,6 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 
 interface StreamProtection {
 	secrets: string[];
-	protectedDiagnostics: WeakSet<object>;
 }
 
 // Kept outside the class: new members would break structural compatibility of custom streams.
@@ -113,12 +112,12 @@ export function protectAssistantMessageStream(
 	if (values.length === 0) return;
 	const protection = streamProtections.get(stream);
 	if (protection) protection.secrets.push(...values);
-	else streamProtections.set(stream, { secrets: values, protectedDiagnostics: new WeakSet() });
+	else streamProtections.set(stream, { secrets: values });
 }
 
 /** Mask in place: providers keep mutating the same partial object between events. */
 function protectMessage(message: AssistantMessage, protection: StreamProtection): void {
-	const { secrets, protectedDiagnostics } = protection;
+	const { secrets } = protection;
 	if (typeof message.errorMessage === "string")
 		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
 	if (typeof message.rawStopReason === "string")
@@ -130,15 +129,17 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 		const id = redactValues(deferred.id, secrets);
 		if (id !== deferred.id) message.deferred = { ...deferred, id };
 	}
-	const diagnostics = message.diagnostics;
-	if (!Array.isArray(diagnostics)) return;
-	for (let i = 0; i < diagnostics.length; i++) {
-		const diagnostic = diagnostics[i];
-		if (typeof diagnostic === "object" && diagnostic !== null && protectedDiagnostics.has(diagnostic)) continue;
-		const safe = redactOAuthDiagnosticValue(diagnostic, secrets) as AssistantMessageDiagnostic;
-		if (typeof safe === "object" && safe !== null) protectedDiagnostics.add(safe);
-		diagnostics[i] = safe;
-	}
+}
+
+/**
+ * Rebuild diagnostics from their closed owned schema on every stream, model-less ones included. Nothing in a
+ * rebuilt diagnostic is free text, so it needs no masking (smarty-dev#5822 N5682).
+ */
+function projectDiagnostics(message: AssistantMessage): void {
+	if (message.diagnostics === undefined) return;
+	const diagnostics = projectAssistantMessageDiagnostics(message.diagnostics);
+	if (diagnostics === undefined) delete message.diagnostics;
+	else message.diagnostics = diagnostics;
 }
 
 /**
@@ -171,6 +172,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 		// Universal fallback for every source, model-less streams included: classify the original error before
 		// any text is masked or replaced; a producer's owned decision is kept (smarty-dev#5822 C3).
 		if (event.type === "error") attachRecovery(event.error);
+		projectDiagnostics("partial" in event ? event.partial : event.type === "done" ? event.message : event.error);
 		const protection = streamProtections.get(this);
 		if (protection) {
 			if ("partial" in event) protectMessage(event.partial, protection);
@@ -184,7 +186,10 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	}
 
 	override end(result?: AssistantMessage): void {
-		if (result) attachRecovery(result);
+		if (result) {
+			attachRecovery(result);
+			projectDiagnostics(result);
+		}
 		const protection = streamProtections.get(this);
 		if (result && protection) protectMessage(result, protection);
 		if (result !== undefined) this.#time(result);

@@ -3,7 +3,7 @@
 // header, model object or exception text reaches them.
 
 import type { AssistantMessage, ProviderResponse, ProviderStreamNotification, StreamOptions } from "../types.ts";
-import { appendAssistantMessageDiagnostic } from "./diagnostics.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "./diagnostics.ts";
 import { validHttpStatus } from "./recovery.ts";
 
 /** Diagnostic type of a rejected stream observer. It is a control field: such a failure is never replayed. */
@@ -25,7 +25,7 @@ export function providerStreamNotification(): ProviderStreamNotification {
 
 /** Record an observer rejection by its owned type only, without exception text, and make it non-retryable. */
 export function markProviderStreamObserverFailure(output: AssistantMessage): void {
-	appendAssistantMessageDiagnostic(output, { type: PROVIDER_STREAM_OBSERVER_ERROR, timestamp: Date.now() });
+	appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(PROVIDER_STREAM_OBSERVER_ERROR));
 	output.recovery = { retryable: false };
 }
 

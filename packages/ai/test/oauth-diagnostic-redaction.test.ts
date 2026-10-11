@@ -86,9 +86,11 @@ describe("OAuth diagnostic redaction", () => {
 		const result = redactOAuthDiagnosticValue(value, [secret]);
 		expect(JSON.stringify(result)).not.toContain(secret);
 		expect(result).not.toBe(value);
-		expect(
-			createAssistantMessageDiagnostic("provider_error", error, { refresh_token: secret }, [secret]).details,
-		).toEqual({ refresh_token: "***" });
+		// smarty-dev#5822 N5682: a diagnostic has no error or details field to carry a value at all.
+		expect(Object.keys(createAssistantMessageDiagnostic("provider_transport_failure")).sort()).toEqual([
+			"timestamp",
+			"type",
+		]);
 	});
 
 	// pi#150 security round 2: custom credential headers have no fixed name.

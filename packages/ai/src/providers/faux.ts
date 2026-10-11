@@ -20,6 +20,7 @@ import type {
 } from "../types.ts";
 import { createAssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerResponse } from "../utils/provider-observation.ts";
+import { transferThrottledLimitWait } from "../utils/retry.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 
 const DEFAULT_API = "faux";
@@ -299,7 +300,7 @@ function splitStringByTokenSize(text: string, minTokenSize: number, maxTokenSize
 
 function cloneMessage(message: AssistantMessage, api: string, provider: string, modelId: string): AssistantMessage {
 	const cloned = structuredClone(message);
-	return {
+	const result: AssistantMessage = {
 		...cloned,
 		api,
 		provider,
@@ -307,6 +308,9 @@ function cloneMessage(message: AssistantMessage, api: string, provider: string, 
 		timestamp: cloned.timestamp ?? Date.now(),
 		usage: cloned.usage ?? DEFAULT_USAGE,
 	};
+	// A scripted throttled limit keeps its private one-shot wait (smarty-dev#5822).
+	transferThrottledLimitWait(message, result);
+	return result;
 }
 
 function createDeferredMessage(model: Model<string>, handle: DeferredHandle): AssistantMessage {

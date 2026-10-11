@@ -102,9 +102,10 @@ describe("R4-2: every event and result of a protected stream", () => {
 		partial.errorMessage = `unknown finish reason ${KEY}`;
 		partial.rawStopReason = KEY;
 		stream.push({ type: "text_delta", contentIndex: 0, delta: "x", partial });
+		// A foreign diagnostic is dropped by the owned-schema projection (smarty-dev#5822 N5682).
 		partial.diagnostics = [
 			{ type: "t", timestamp: 1, details: { reason: `${KEY}`, nested: [encodeURIComponent(KEY)] } },
-		];
+		] as unknown as AssistantMessage["diagnostics"];
 		stream.push({ type: "done", reason: "stop", message: partial });
 		const { events, result } = await collect(stream);
 		expect(events).toHaveLength(2);

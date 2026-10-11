@@ -218,11 +218,8 @@ function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesR
 	if (!rewrite) {
 		return;
 	}
-	appendAssistantMessageDiagnostic(message, {
-		type: "pi_messages_rewrite",
-		timestamp: Date.now(),
-		details: { ...rewrite },
-	});
+	// The owned type only, never the wire `rewrite` fields (smarty-dev#5822 N5682).
+	appendAssistantMessageDiagnostic(message, createAssistantMessageDiagnostic("pi_messages_rewrite"));
 }
 
 function createEventConverter(model: Model<"pi-messages">) {
@@ -368,12 +365,7 @@ function parsePiMessagesEvent(raw: string): PiMessagesEvent | undefined {
 	return data && data !== "[DONE]" ? (JSON.parse(data) as PiMessagesEvent) : undefined;
 }
 
-function createErrorEvent(
-	model: Model<"pi-messages">,
-	error: unknown,
-	aborted: boolean,
-	diagnosticSecrets: readonly string[],
-): AssistantMessageEvent {
+function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: boolean): AssistantMessageEvent {
 	const reason = aborted ? "aborted" : "error";
 	const assistantMessage: AssistantMessage = {
 		role: "assistant",
@@ -395,14 +387,10 @@ function createErrorEvent(
 			status: typeof status === "number" ? status : undefined,
 			provider: model.provider,
 		});
+		// The owned type only; the URL, status and body stay private (smarty-dev#5822 N5682).
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
-			createAssistantMessageDiagnostic(
-				"pi_messages_response_failure",
-				error,
-				error.diagnosticDetails,
-				diagnosticSecrets,
-			),
+			createAssistantMessageDiagnostic("pi_messages_response_failure"),
 		);
 	}
 
@@ -495,7 +483,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			const event = createErrorEvent(model, error, options?.signal?.aborted ?? false, diagnosticSecrets);
+			const event = createErrorEvent(model, error, options?.signal?.aborted ?? false);
 			// An observer rejection is never retried, whatever its text or status (smarty-dev#5822 C1).
 			if (observerFailed && event.type === "error") markProviderStreamObserverFailure(event.error);
 			eventStream.push(event);
