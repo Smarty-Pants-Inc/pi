@@ -7,13 +7,9 @@
 
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
-import { chmodSync, createWriteStream, mkdtempSync, rmSync, unlinkSync, type WriteStream } from "node:fs";
-import { chmod, rm, writeFile } from "node:fs/promises";
+import { chmodSync, createWriteStream, mkdtempSync, openSync, rmSync, unlinkSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
-/** Output can carry private data, so only the user may read the files. */
-const OUTPUT_FILE_MODE = 0o600;
 
 /** Bytes the files in the owned output directory may hold together. */
 export const MAX_OUTPUT_DIRECTORY_BYTES = 512 * 1024 * 1024;
@@ -21,6 +17,7 @@ export const MAX_OUTPUT_DIRECTORY_BYTES = 512 * 1024 * 1024;
 /**
  * Only writes through this module count toward the bound, so the owned files and directory are
  * read-only at rest: an append to a returned path, or a rename into the directory, fails with EACCES.
+ * The directory is writable only inside {@link withOpenDirectory}, which never spans an await.
  * ponytail: a tool running as the same user can chmod them back on purpose. This stops accidental
  * growth through the returned paths, not a hostile process.
  */
@@ -30,8 +27,6 @@ const OPEN_DIRECTORY_MODE = 0o700;
 
 let ownedDirectory: string | undefined;
 let ownedBytes = 0;
-/** Writes in progress; the directory is writable only while there is one. */
-let activeWrites = 0;
 
 /** Bytes counted toward {@link MAX_OUTPUT_DIRECTORY_BYTES}. Exported for tests. */
 export function getOutputDirectoryBytes(): number {
@@ -42,25 +37,18 @@ function limitError(): Error {
 	return new Error(`output files would exceed ${MAX_OUTPUT_DIRECTORY_BYTES} bytes for this session`);
 }
 
-/**
- * A new, unused path: `<owned dir>/<prefix>-<random hex><extension>`. `extension` includes the dot.
- * A prefix or extension with a path separator or `..` could leave the owned directory, so it is refused.
- */
-function createOutputFilePath(prefix: string, extension: string): string {
-	for (const part of [prefix, extension]) {
-		if (/[\\/]|\.\./.test(part)) throw new Error(`Invalid output file name part ${JSON.stringify(part)}`);
-	}
-	return join(getOutputDirectory(), `${prefix}-${randomBytes(8).toString("hex")}${extension}`);
+/** A prefix or extension that could leave the owned directory, or that the filesystem rejects. */
+function checkNamePart(part: string): void {
+	if (/[\\/\0]|\.\./.test(part)) throw new Error(`Invalid output file name part ${JSON.stringify(part)}`);
 }
 
-/** Run `fn` with the owned directory writable, unless a write in progress already opened it. */
-function withOpenDirectory<T>(fn: () => T): T {
-	const directory = getOutputDirectory();
-	if (activeWrites === 0) chmodSync(directory, OPEN_DIRECTORY_MODE);
+/** Run synchronous `fn` with the owned directory writable, and seal it again before returning. */
+function withOpenDirectory<T>(directory: string, fn: () => T): T {
+	chmodSync(directory, OPEN_DIRECTORY_MODE);
 	try {
 		return fn();
 	} finally {
-		if (activeWrites === 0) chmodSync(directory, SEALED_DIRECTORY_MODE);
+		chmodSync(directory, SEALED_DIRECTORY_MODE);
 	}
 }
 
@@ -85,8 +73,9 @@ export function removeOutputDirectory(): void {
  */
 export function getOutputDirectory(): string {
 	if (ownedDirectory === undefined) {
-		ownedDirectory = mkdtempSync(join(tmpdir(), "pi-output-"));
-		chmodSync(ownedDirectory, SEALED_DIRECTORY_MODE);
+		const directory = mkdtempSync(join(tmpdir(), "pi-output-"));
+		chmodSync(directory, SEALED_DIRECTORY_MODE);
+		ownedDirectory = directory;
 		// `exit` also runs after an uncaught error and after pi's signal and abort handlers call process.exit().
 		process.once("exit", removeOutputDirectory);
 	}
@@ -95,63 +84,48 @@ export function getOutputDirectory(): string {
 
 /**
  * Write `data` to a new output file and return its path. Throws, writing nothing, when the directory
- * would exceed {@link MAX_OUTPUT_DIRECTORY_BYTES}; a failed write leaves no partial file.
+ * would exceed {@link MAX_OUTPUT_DIRECTORY_BYTES}; a failed write leaves no file.
  */
 export async function writeOutputFile(prefix: string, extension: string, data: string | Uint8Array): Promise<string> {
 	const bytes = typeof data === "string" ? Buffer.byteLength(data) : data.byteLength;
 	if (ownedBytes + bytes > MAX_OUTPUT_DIRECTORY_BYTES) throw limitError();
-	const path = createOutputFilePath(prefix, extension);
-	const directory = getOutputDirectory();
-	ownedBytes += bytes;
-	if (activeWrites++ === 0) chmodSync(directory, OPEN_DIRECTORY_MODE);
-	try {
-		// `wx` never follows a link someone else placed at the path.
-		await writeFile(path, data, { mode: OUTPUT_FILE_MODE, flag: "wx" });
-		await chmod(path, READ_ONLY_FILE_MODE);
-	} catch (error) {
-		ownedBytes -= bytes;
-		// EEXIST means the path belongs to an earlier file, which stays.
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") await rm(path, { force: true }).catch(() => undefined);
-		throw error;
-	} finally {
-		if (--activeWrites === 0) chmodSync(directory, SEALED_DIRECTORY_MODE);
-	}
+	const { path, stream } = createOutputFileStream(prefix, extension);
+	await new Promise<void>((resolve, reject) => {
+		// Rejects after the stream's own close handler, which removes the file of a failed stream.
+		stream.on("error", () => undefined);
+		stream.once("close", () => (stream.errored ? reject(stream.errored) : resolve()));
+		stream.end(data);
+	});
 	return path;
 }
 
 /**
- * Open a new output file for streamed output. Every chunk counts toward
- * {@link MAX_OUTPUT_DIRECTORY_BYTES}; a chunk past it fails the stream with the limit error. A failed
- * stream's file is removed and its bytes are no longer counted.
+ * Open a new output file for streamed output. The file is created synchronously, so the directory is
+ * sealed again before this returns. Every chunk counts toward {@link MAX_OUTPUT_DIRECTORY_BYTES}; a
+ * chunk past it fails the stream with the limit error. A failed stream's file is removed and its
+ * bytes are no longer counted. Other failures, such as an existing file at the path, arrive on the
+ * stream like any open error.
  */
 export function createOutputFileStream(prefix: string, extension: string): { path: string; stream: WriteStream } {
+	checkNamePart(prefix);
+	checkNamePart(extension);
+	const name = `${prefix}-${randomBytes(8).toString("hex")}${extension}`;
+	let directory: string;
 	let path: string;
+	let fd: number;
 	try {
-		path = createOutputFilePath(prefix, extension);
+		directory = getOutputDirectory();
+		path = join(directory, name);
+		const target = path;
+		// Created read-only: this descriptor can write, later opens cannot. `wx` never follows a link
+		// someone else placed at the path.
+		fd = withOpenDirectory(directory, () => openSync(target, "wx", READ_ONLY_FILE_MODE));
 	} catch (error) {
-		if (error instanceof Error && error.message.startsWith("Invalid output file name")) throw error;
-		// The owned directory could not be made. Report it on the stream, like any other open error.
-		path = join(tmpdir(), `${prefix}-unavailable${extension}`);
 		const failOpen = (...args: unknown[]) => (args.at(-1) as (error: unknown) => void)(error);
+		path ??= join(tmpdir(), name);
 		return { path, stream: createWriteStream(path, { fs: { ...fs, open: failOpen } }) };
 	}
-	// The directory stays writable until the stream's asynchronous open has created the file.
-	const directory = getOutputDirectory();
-	if (activeWrites++ === 0) chmodSync(directory, OPEN_DIRECTORY_MODE);
-	let opening = true;
-	const opened = () => {
-		if (!opening) return;
-		opening = false;
-		if (--activeWrites === 0 && ownedDirectory === directory) chmodSync(directory, SEALED_DIRECTORY_MODE);
-	};
-	// Created read-only: the stream's descriptor can write, later opens cannot. `wx` never follows a
-	// link someone else placed at the path.
-	const stream = createWriteStream(path, { mode: READ_ONLY_FILE_MODE, flags: "wx" });
-	let created = false;
-	stream.once("open", () => {
-		created = true;
-		opened();
-	});
+	const stream = createWriteStream(path, { fd });
 	let counted = 0;
 	const charge = (bytes: number): Error | undefined => {
 		if (ownedBytes + bytes > MAX_OUTPUT_DIRECTORY_BYTES) return limitError();
@@ -173,13 +147,12 @@ export function createOutputFileStream(prefix: string, extension: string): { pat
 			else writev(chunks, callback);
 		};
 	}
+	const created = path;
 	stream.once("close", () => {
-		opened();
-		// Only a file this stream created is removed, never one that was already at the path.
-		if (!stream.errored || !created || ownedDirectory !== directory) return;
+		if (!stream.errored || ownedDirectory !== directory) return;
 		ownedBytes -= counted;
 		try {
-			withOpenDirectory(() => unlinkSync(path));
+			withOpenDirectory(directory, () => unlinkSync(created));
 		} catch {
 			// Already gone.
 		}

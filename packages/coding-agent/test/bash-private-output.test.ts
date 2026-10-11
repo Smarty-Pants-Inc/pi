@@ -11,7 +11,7 @@ import { removeOutputDirectory } from "../src/utils/output-files.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof nodeFs>();
-	return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) };
+	return { ...actual, createWriteStream: vi.fn(actual.createWriteStream), openSync: vi.fn(actual.openSync) };
 });
 
 // smarty-dev#2153 / #1998: both bash spill paths must ignore a permissive caller umask.
@@ -68,12 +68,13 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 		it(`${kind} reports an existing symlink without overwriting its target`, async () => {
 			const victim = join(root, "fake-victim");
 			writeFileSync(victim, "fake sentinel");
-			const createWriteStream = vi.mocked(nodeFs.createWriteStream).getMockImplementation();
-			if (!createWriteStream) throw new Error("No native createWriteStream implementation");
-			vi.mocked(nodeFs.createWriteStream).mockImplementationOnce((path, options) => {
+			// The spill file is created with a synchronous exclusive open (pi#203 R3).
+			const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
+			if (!openSync) throw new Error("No native openSync implementation");
+			vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
 				if (typeof path !== "string") throw new Error("Expected a filename");
 				symlinkSync(victim, path);
-				return createWriteStream(path, options);
+				return openSync(path, flags, mode);
 			});
 			await expect(
 				runBash(kind, {
@@ -119,13 +120,13 @@ describe("portable bash full output files", () => {
 
 	for (const kind of ["tool", "executor"]) {
 		it(`${kind} reports an existing regular file without overwriting it`, async () => {
-			const createWriteStream = vi.mocked(nodeFs.createWriteStream).getMockImplementation();
-			if (!createWriteStream) throw new Error("No native createWriteStream implementation");
-			vi.mocked(nodeFs.createWriteStream).mockImplementationOnce((path, options) => {
+			const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
+			if (!openSync) throw new Error("No native openSync implementation");
+			vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
 				if (typeof path !== "string") throw new Error("Expected a filename");
 				spillPaths.push(path);
 				writeFileSync(path, "fake sentinel");
-				return createWriteStream(path, options);
+				return openSync(path, flags, mode);
 			});
 			const operations: BashOperations = {
 				exec: async (_command, _cwd, { onData }) => {

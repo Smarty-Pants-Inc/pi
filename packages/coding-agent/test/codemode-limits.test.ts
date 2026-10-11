@@ -9,7 +9,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const fsCalls = vi.hoisted(() => ({
 	rmSync: [] as { path: string; mode: number | undefined }[],
-	rm: [] as string[],
 	unlinkSync: [] as string[],
 	failWrite: false,
 }));
@@ -26,19 +25,12 @@ vi.mock("node:fs", async (importOriginal) => {
 		unlinkSync: (path: string) => {
 			fsCalls.unlinkSync.push(path);
 		},
-	};
-});
-vi.mock("node:fs/promises", async (importOriginal) => {
-	const original = await importOriginal<typeof import("node:fs/promises")>();
-	return {
-		...original,
-		rm: async (path: string) => {
-			fsCalls.rm.push(path);
-		},
-		writeFile: async (...args: Parameters<typeof original.writeFile>) => {
-			if (!fsCalls.failWrite) return original.writeFile(...args);
-			await original.writeFile(...args);
-			throw Object.assign(new Error("no space"), { code: "ENOSPC" });
+		// With failWrite, the stream's writes fail as on a full disk.
+		createWriteStream: (path: string, options: { fd?: number }) => {
+			if (!fsCalls.failWrite) return original.createWriteStream(path, options);
+			const fail = (...args: unknown[]) =>
+				(args.at(-1) as (error: Error) => void)(Object.assign(new Error("no space"), { code: "ENOSPC" }));
+			return original.createWriteStream(path, { ...options, fs: { ...original, write: fail, writev: fail } });
 		},
 	};
 });
@@ -91,6 +83,7 @@ describe("owned output directory", () => {
 	afterEach(() => {
 		fsCalls.failWrite = false;
 		removeOutputDirectory();
+		fsCalls.unlinkSync.length = 0;
 	});
 
 	it("writes output files into a directory this process owns, read-only at rest", async () => {
@@ -154,8 +147,28 @@ describe("owned output directory", () => {
 	it("removes a partial file when a write fails", async () => {
 		fsCalls.failWrite = true;
 		await expect(writeOutputFile("pi-codemode", ".txt", "partial")).rejects.toThrow("no space");
-		expect(fsCalls.rm.at(-1)).toMatch(/pi-codemode-[0-9a-f]+\.txt$/);
-		expect(dirname(fsCalls.rm.at(-1) ?? "")).toBe(getOutputDirectory());
+		expect(fsCalls.unlinkSync.at(-1)).toMatch(/pi-codemode-[0-9a-f]+\.txt$/);
+		expect(dirname(fsCalls.unlinkSync.at(-1) ?? "")).toBe(getOutputDirectory());
+		expect(getOutputDirectoryBytes()).toBe(0);
+	});
+
+	// pi#203 R3: the directory is never left writable across an await.
+	it("seals the directory before a stream or a pending write returns", async () => {
+		const { stream } = createOutputFileStream("pi-bash", ".log");
+		expect(lstatSync(getOutputDirectory()).mode & 0o777).toBe(0o500);
+		const pending = writeOutputFile("pi-codemode", ".txt", "x".repeat(1024 * 1024));
+		expect(lstatSync(getOutputDirectory()).mode & 0o777).toBe(0o500);
+		stream.end();
+		await Promise.all([finished(stream), pending]);
+	});
+
+	// pi#203 R3: a NUL is refused before the directory is made.
+	it("refuses a NUL in a name part before touching the filesystem", async () => {
+		const count = () => readdirSync(tmpdir()).filter((name) => name.startsWith("pi-output-")).length;
+		const before = count();
+		await expect(writeOutputFile("a\0b", ".txt", "x")).rejects.toThrow(/Invalid output file name/);
+		expect(() => createOutputFileStream("a", ".log\0")).toThrow(/Invalid output file name/);
+		expect(count()).toBe(before);
 	});
 
 	// pi#203 R2 SEC P1: streamed output counts toward the same bound.
