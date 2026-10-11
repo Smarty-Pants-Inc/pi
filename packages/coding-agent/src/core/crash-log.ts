@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir, VERSION } from "../config.ts";
@@ -5,6 +6,8 @@ import type { Extension } from "./extensions/types.ts";
 import { isSyntheticPath } from "./source-info.ts";
 
 export interface CrashRecord {
+	/** Producer id `<gen>:<seq>`: a per-process UUID and a per-process counter (smarty-dev#8981). Absent on legacy records. */
+	id?: string;
 	timestamp: string;
 	version: string;
 	kind: "uncaught_exception" | "fatal_error";
@@ -17,6 +20,10 @@ export interface CrashRecord {
 
 const MAX_CRASH_RECORDS = 5;
 const MAX_AGE = 7 * 24 * 60 * 60 * 1000;
+
+// A timestamp cannot identify a record (same-millisecond crashes, clock steps), so the IT intake keys on this id.
+const PRODUCER_GENERATION = randomUUID();
+let producerSequence = 0;
 
 function crashLogPath(agentDir = getAgentDir()): string {
 	return join(agentDir, "crashes.json");
@@ -128,6 +135,7 @@ export function recordCrash(
 	try {
 		const { error } = crash;
 		const record: CrashRecord = {
+			id: `${PRODUCER_GENERATION}:${++producerSequence}`,
 			timestamp: new Date().toISOString(),
 			version: VERSION,
 			kind: crash.kind,
