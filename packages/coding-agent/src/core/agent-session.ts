@@ -3895,7 +3895,8 @@ export class AgentSession {
 		// biome-ignore lint/suspicious/noConfusingVoidType: Legacy core sends retain Promise<void> while metadata sends return receipts.
 	): Promise<void | SendUserMessageResult> {
 		// Validate and snapshot before issuing a receipt, admitting input, or running extension hooks.
-		const metadata = options?.metadata === undefined ? undefined : snapshotUserMessageMetadata(options.metadata);
+		const requestedMetadata = options?.metadata;
+		const metadata = requestedMetadata === undefined ? undefined : snapshotUserMessageMetadata(requestedMetadata);
 		const metadataSource = getUserMessageMetadataSource(options);
 		const receipt = captureTerminalTurnReceipt();
 		const admission = this._admitInput();

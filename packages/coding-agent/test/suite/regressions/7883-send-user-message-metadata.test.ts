@@ -2,9 +2,13 @@ import { readFileSync } from "node:fs";
 import { setImmediate } from "node:timers/promises";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
-import type { SessionMessageEntry } from "../../../src/core/session-manager.ts";
+import type { AgentSession } from "../../../src/core/agent-session.ts";
+import { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
+import type { ReplacedSessionContext } from "../../../src/core/extensions/types.ts";
+import type { SessionManager, SessionMessageEntry } from "../../../src/core/session-manager.ts";
 import type {
 	ExtensionAPI,
+	SendUserMessageOptions,
 	SendUserMessageResult,
 	UserMessageMetadata,
 	UserMessageMetadataSource,
@@ -561,5 +565,388 @@ describe("#7883 sendUserMessage metadata receipts", () => {
 		expect(api.sendUserMessage("legacy default options", {})).toBeUndefined();
 		await finished;
 		expect(userEntries(harness).map(metadataOf)).toEqual([undefined, undefined]);
+	});
+});
+
+// #7883 / pi#187: options.metadata may be an accessor. Every send route must read it exactly once and
+// route, validate, snapshot and stamp that single value. Reading it again lets a second value
+// pick the legacy path, replace validated metadata, or bypass the extension source binding.
+const pi187Text = "pi187 double read input";
+const pi187Marker = "pi187-double-read-private";
+const pi187Metadata = { request: pi187Marker, nested: { values: [1, { enabled: true }] } };
+const pi187ExtensionPath = "/extensions/pi187-double-read.ts";
+const pi187Source = { kind: "extension", extensionPath: pi187ExtensionPath };
+
+interface Pi187Case {
+	name: string;
+	/** Successive metadata getter values; the last repeats. Absent means no metadata property. */
+	values?: readonly unknown[];
+	expected: "reject" | "receipt" | "legacy";
+	readsOnce: boolean;
+}
+
+const pi187Cases: Pi187Case[] = [
+	{ name: "null then undefined", values: [null, undefined], expected: "reject", readsOnce: true },
+	{ name: "valid then null", values: [pi187Metadata, null], expected: "receipt", readsOnce: true },
+	{ name: "undefined then valid", values: [undefined, pi187Metadata], expected: "legacy", readsOnce: true },
+	{ name: "absent control", expected: "legacy", readsOnce: false },
+	{ name: "stable undefined control", values: [undefined], expected: "legacy", readsOnce: false },
+	{ name: "stable valid control", values: [pi187Metadata], expected: "receipt", readsOnce: false },
+];
+
+type Pi187Outcome =
+	| { status: "fulfilled"; value: unknown }
+	| { status: "rejected"; reason: unknown }
+	| { status: "pending" };
+
+interface Pi187Observation {
+	api: "pi" | "context" | "sdk";
+	returned: unknown;
+	outcome: Pi187Outcome | undefined;
+	reads: number;
+	inputs: readonly string[];
+	payloads: readonly string[];
+	session: AgentSession;
+	userEntries: SessionMessageEntry[];
+	userEntriesBefore: number;
+	providerCalls: number;
+}
+
+function pi187Options(values: readonly unknown[] | undefined): {
+	options: SendUserMessageOptions;
+	reads: () => number;
+} {
+	let reads = 0;
+	const options: SendUserMessageOptions = { expandPromptTemplates: false };
+	if (values) {
+		Object.defineProperty(options, "metadata", {
+			enumerable: true,
+			get: () => values[Math.min(reads++, values.length - 1)],
+		});
+	}
+	return { options, reads: () => reads };
+}
+
+/** Bound observation: a receipt that never settles reports pending instead of hanging the test. */
+async function pi187Settle(promise: Promise<unknown>, ms = 2_000): Promise<Pi187Outcome> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const pending = new Promise<Pi187Outcome>((resolve) => {
+		timer = setTimeout(() => resolve({ status: "pending" }), ms);
+	});
+	try {
+		return await Promise.race([
+			promise.then(
+				(value): Pi187Outcome => ({ status: "fulfilled", value }),
+				(reason: unknown): Pi187Outcome => ({ status: "rejected", reason }),
+			),
+			pending,
+		]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+function pi187Responses(payloads: string[]) {
+	return [0, 1, 2].map((index) => (context: unknown) => {
+		payloads.push(JSON.stringify(context));
+		return fauxAssistantMessage(`pi187 reply ${index}`);
+	});
+}
+
+function expectPi187Outcome(testCase: Pi187Case, observed: Pi187Observation): void {
+	if (testCase.readsOnce) expect(observed.reads, "metadata getter reads").toBe(1);
+	if (!testCase.values) expect(observed.reads).toBe(0);
+	for (const payload of observed.payloads) {
+		expect(payload).not.toContain(pi187Marker);
+		expect(payload).not.toContain('"metadata"');
+	}
+	const entries = observed.userEntries;
+	const persistedMarkers = observed.session.sessionManager
+		.getEntries()
+		.filter((entry) => JSON.stringify(entry).includes(pi187Marker));
+	if (testCase.expected === "reject") {
+		expect(observed.returned).toBeInstanceOf(Promise);
+		expect(observed.outcome?.status).toBe("rejected");
+		expect((observed.outcome as { reason: unknown }).reason).toBeInstanceOf(TypeError);
+		expect(observed.inputs).toEqual([]);
+		expect(observed.providerCalls).toBe(0);
+		expect(entries).toHaveLength(observed.userEntriesBefore);
+		expect(persistedMarkers).toEqual([]);
+		expect(observed.session.pendingMessageCount).toBe(0);
+		expect(observed.session.agent.getQueuedMessages()).toEqual([]);
+		expect(observed.session.inputAdmissionCount).toBe(0);
+		return;
+	}
+	expect(observed.inputs).toEqual([pi187Text]);
+	expect(observed.providerCalls).toBe(1);
+	expect(entries).toHaveLength(observed.userEntriesBefore + 1);
+	const entry = entries.at(-1)!;
+	expect(getMessageText(entry.message)).toBe(pi187Text);
+	expect(entry.message).not.toHaveProperty("metadata");
+	if (testCase.expected === "legacy") {
+		// Main pi API legacy returns undefined; context and SDK legacy return Promise<void>.
+		if (observed.api === "pi") expect(observed.returned).toBeUndefined();
+		else {
+			expect(observed.returned).toBeInstanceOf(Promise);
+			expect(observed.outcome).toEqual({ status: "fulfilled", value: undefined });
+		}
+		expect(metadataOf(entry)).toBeUndefined();
+		expect(entry.metadataSource).toBeUndefined();
+		expect(persistedMarkers).toEqual([]);
+		return;
+	}
+	// Direct AgentSession sends are SDK sends even when called from inside an extension callback.
+	const source = observed.api === "sdk" ? { kind: "sdk" } : pi187Source;
+	expect(observed.returned).toBeInstanceOf(Promise);
+	expect(observed.outcome).toEqual({
+		status: "fulfilled",
+		value: { status: "turnStarted", entryId: entry.id, metadata: pi187Metadata, metadataSource: source },
+	});
+	const receipt = (observed.outcome as { value: SendUserMessageResult }).value;
+	expect(receipt.metadata).not.toBe(pi187Metadata);
+	expect(Object.isFrozen(receipt.metadata)).toBe(true);
+	expect(Object.isFrozen(receipt.metadataSource)).toBe(true);
+	expect(metadataOf(entry)).toEqual(pi187Metadata);
+	expect(Object.isFrozen(metadataOf(entry))).toBe(true);
+	expect(entry.metadataSource).toEqual(source);
+	expect(persistedMarkers).toHaveLength(1);
+}
+
+describe("#7883 / pi#187 single metadata read across extension send routes", () => {
+	const harnesses: Harness[] = [];
+	afterEach(async () => {
+		for (const harness of harnesses.splice(0).reverse()) {
+			await harness.session.waitForIdle();
+			harness.cleanup();
+		}
+	});
+
+	// #7883 / pi#187: the loaded ExtensionAPI, a directly created replacement context, and the direct SDK
+	// AgentSession.sendUserMessage, all called from the owner's event handler, must route by the first
+	// metadata read only.
+	it.each(
+		pi187Cases.flatMap((testCase) =>
+			(["pi", "context", "sdk"] as const).map((api) => [api, testCase.name, testCase] as const),
+		),
+	)("%s API: metadata %s", async (api, _name, testCase) => {
+		const inputs: string[] = [];
+		const payloads: string[] = [];
+		const { options, reads } = pi187Options(testCase.values);
+		let loaded: ExtensionAPI | undefined;
+		let session: AgentSession | undefined;
+		let returned: unknown;
+		const harness = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false } },
+			extensionFactories: [
+				{
+					path: pi187ExtensionPath,
+					factory: (pi) => {
+						loaded = pi;
+						pi.on("input", (event) => {
+							if (event.text === pi187Text) inputs.push(event.text);
+						});
+						pi.events.on("pi187-double-read", () => {
+							returned =
+								api === "pi"
+									? pi.sendUserMessage(pi187Text, options)
+									: api === "context"
+										? session!.createReplacedSessionContext().sendUserMessage(pi187Text, options)
+										: session!.sendUserMessage(pi187Text, options);
+						});
+					},
+				},
+			],
+		});
+		harnesses.push(harness);
+		session = harness.session;
+		harness.setResponses(pi187Responses(payloads));
+		if (!loaded) throw new Error("Extension API was not loaded");
+		const userEntriesBefore = userEntries(harness).length;
+		const callsBefore = harness.faux.state.callCount;
+		let outcome: Pi187Outcome | undefined;
+		try {
+			loaded.events.emit("pi187-double-read", undefined);
+			if (returned instanceof Promise) outcome = await pi187Settle(returned);
+		} finally {
+			// Join any admitted run, including a legacy run started by a wrong second read.
+			await harness.session.waitForIdle();
+		}
+		expectPi187Outcome(testCase, {
+			api,
+			returned,
+			outcome,
+			reads: reads(),
+			inputs,
+			payloads,
+			session: harness.session,
+			userEntries: userEntries(harness),
+			userEntriesBefore,
+			providerCalls: harness.faux.state.callCount - callsBefore,
+		});
+	});
+
+	// #7883 / pi#187: real withSession replacement contexts (createReplacedSessionContext via the runtime)
+	// must apply the same single read for every replacement flow.
+	it.each(
+		(["newSession", "fork", "switchSession"] as const).flatMap((flow) =>
+			pi187Cases.map((testCase) => [flow, testCase.name, testCase] as const),
+		),
+	)("%s withSession context: metadata %s", async (flow, _name, testCase) => {
+		const inputs: string[] = [];
+		const payloads: string[] = [];
+		const { options, reads } = pi187Options(testCase.values);
+		let runtime: AgentSessionRuntime;
+		let originalFile = "";
+		let receivingHarness: Harness | undefined;
+		let returned: unknown;
+		let outcome: Pi187Outcome | undefined;
+		let userEntriesBefore = -1;
+		let callsBefore = 0;
+		const construct = async (sessionManager?: SessionManager): Promise<Harness> => {
+			const harness = await createHarness({
+				persistSession: true,
+				sessionManager,
+				settings: { compaction: { enabled: false } },
+				extensionFactories: [
+					{
+						path: pi187ExtensionPath,
+						factory: (pi) => {
+							pi.on("input", (event) => {
+								if (event.text === pi187Text) inputs.push(event.text);
+							});
+							pi.registerCommand("pi187-replace", {
+								handler: async (_args, ctx) => {
+									const withSession = async (receiving: ReplacedSessionContext) => {
+										userEntriesBefore = userEntries(receivingHarness!).length;
+										callsBefore = receivingHarness!.faux.state.callCount;
+										returned = receiving.sendUserMessage(pi187Text, options);
+										if (returned instanceof Promise) outcome = await pi187Settle(returned);
+									};
+									if (flow === "newSession") await ctx.newSession({ withSession });
+									else if (flow === "fork")
+										await ctx.fork(ctx.sessionManager.getLeafId()!, { position: "at", withSession });
+									else await ctx.switchSession(originalFile, { withSession });
+								},
+							});
+						},
+					},
+				],
+			});
+			harnesses.push(harness);
+			receivingHarness = harness;
+			harness.setResponses(pi187Responses(payloads));
+			return harness;
+		};
+		const initial = await construct();
+		const servicesFor = (harness: Harness) => ({
+			cwd: harness.tempDir,
+			agentDir: initial.tempDir,
+			modelRuntime: harness.session.modelRuntime,
+			settingsManager: harness.settingsManager,
+			resourceLoader: harness.session.resourceLoader,
+			diagnostics: [],
+		});
+		runtime = new AgentSessionRuntime(initial.session, servicesFor(initial), async ({ sessionManager }) => {
+			const receiving = await construct(sessionManager);
+			return {
+				session: receiving.session,
+				services: servicesFor(receiving),
+				diagnostics: [],
+				extensionsResult: receiving.session.resourceLoader.getExtensions(),
+			};
+		});
+		const rebind = async (session: AgentSession) =>
+			session.bindExtensions({
+				commandContextActions: {
+					waitForIdle: () => session.waitForIdle(),
+					newSession: (replacement) => runtime.newSession(replacement),
+					fork: (id, replacement) => runtime.fork(id, replacement),
+					switchSession: (file, replacement) => runtime.switchSession(file, replacement),
+					navigateTree: (id, navigation) => session.navigateTree(id, navigation),
+					reload: () => session.reload(),
+				},
+			});
+		runtime.setRebindSession(rebind);
+		await rebind(initial.session);
+		await initial.session.prompt("seed");
+		originalFile = initial.session.sessionFile!;
+		try {
+			await initial.session.prompt("/pi187-replace");
+		} finally {
+			// Join any admitted run in the receiving session before asserting or cleanup.
+			await runtime.session.waitForIdle();
+		}
+		expect(receivingHarness).not.toBe(initial);
+		expect(receivingHarness!.session).toBe(runtime.session);
+		expect(userEntriesBefore).toBeGreaterThanOrEqual(0);
+		expectPi187Outcome(testCase, {
+			api: "context",
+			returned,
+			outcome,
+			reads: reads(),
+			inputs,
+			payloads,
+			session: runtime.session,
+			userEntries: userEntries(receivingHarness!),
+			userEntriesBefore,
+			providerCalls: receivingHarness!.faux.state.callCount - callsBefore,
+		});
+	});
+
+	// #7883 / pi#187: a source error must not re-read caller metadata to choose between throw and reject.
+	it("rejects a borrowed-API valid then undefined send with a source mismatch after one read", async () => {
+		let a: ExtensionAPI | undefined;
+		let b: ExtensionAPI | undefined;
+		let inputs = 0;
+		let returned: unknown;
+		let thrown: unknown;
+		const { options, reads } = pi187Options([pi187Metadata, undefined]);
+		const harness = await createHarness({
+			extensionFactories: [
+				{
+					path: "/extensions/A.ts",
+					factory: (pi) => {
+						a = pi;
+						pi.on("input", () => {
+							inputs++;
+						});
+					},
+				},
+				{
+					path: "/extensions/B.ts",
+					factory: (pi) => {
+						b = pi;
+						pi.events.on("pi187-borrow", () => {
+							try {
+								returned = a!.sendUserMessage(pi187Text, options);
+							} catch (error) {
+								thrown = error;
+							}
+						});
+					},
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("unexpected reply")]);
+		const before = harness.sessionManager.getEntries();
+		let outcome: Pi187Outcome | undefined;
+		try {
+			b!.events.emit("pi187-borrow", undefined);
+			if (returned instanceof Promise) outcome = await pi187Settle(returned);
+		} finally {
+			await harness.session.waitForIdle();
+		}
+		expect(reads()).toBe(1);
+		expect(thrown).toBeUndefined();
+		expect(returned).toBeInstanceOf(Promise);
+		expect(outcome?.status).toBe("rejected");
+		expect((outcome as { reason: unknown }).reason).toMatchObject({ code: "INPUT_METADATA_SOURCE_MISMATCH" });
+		expect(inputs).toBe(0);
+		expect(harness.session.inputAdmissionCount).toBe(0);
+		expect(harness.session.agent.getQueuedMessages()).toEqual([]);
+		expect(harness.sessionManager.getEntries()).toEqual(before);
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 });
