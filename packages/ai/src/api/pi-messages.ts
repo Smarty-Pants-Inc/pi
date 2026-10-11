@@ -252,6 +252,38 @@ function boundUsage(value: unknown): PiMessagesUsage {
 	return usage;
 }
 
+function isWireObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Normalize an untrusted wire `toolcall_end` tool call to the declared `ToolCall` fields. A missing or mistyped
+ * field falls back to `fallback`, the block `toolcall_start` and the deltas built. This only validates: the values
+ * come from this stream's own `JSON.parse`, and the stream's publication projector copies every published value,
+ * so no second copy is taken here.
+ */
+function normalizeWireToolCall(value: unknown, fallback: ToolCall | undefined): ToolCall {
+	const source = isWireObject(value) ? value : {};
+	const text = (key: "id" | "name" | "thoughtSignature" | "namespace"): string | undefined => {
+		const field = source[key];
+		return typeof field === "string" ? field : typeof fallback?.[key] === "string" ? fallback[key] : undefined;
+	};
+	const thoughtSignature = text("thoughtSignature");
+	const namespace = text("namespace");
+	return {
+		type: "toolCall",
+		id: text("id") ?? "",
+		name: text("name") ?? "",
+		arguments: isWireObject(source.arguments)
+			? (source.arguments as ToolCall["arguments"])
+			: isWireObject(fallback?.arguments)
+				? fallback.arguments
+				: {},
+		...(thoughtSignature === undefined ? {} : { thoughtSignature }),
+		...(namespace === undefined ? {} : { namespace }),
+	};
+}
+
 function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesRewriteImpact | undefined): void {
 	if (!rewrite) {
 		return;
@@ -349,7 +381,11 @@ function createEventConverter(model: Model<"pi-messages">) {
 				break;
 			}
 			case "toolcall_end":
-				Object.assign(partial.content[event.contentIndex]!, event.toolCall);
+				// The wire object is untrusted: admit only the declared ToolCall fields.
+				partial.content[event.contentIndex] = normalizeWireToolCall(
+					event.toolCall,
+					partial.content[event.contentIndex] as ToolCall | undefined,
+				);
 				toolJson.delete(event.contentIndex);
 				return {
 					type: "toolcall_end",

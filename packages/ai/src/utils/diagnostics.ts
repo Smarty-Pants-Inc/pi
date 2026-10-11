@@ -6,6 +6,7 @@
 // callback or session file.
 
 import type { AssistantMessage, TextContent, ThinkingContent, ToolCall } from "../types.ts";
+import { isolateValue } from "./assistant-message-snapshot.ts";
 
 /** Diagnostic types Pi publishes. A type outside this list is dropped. */
 export const ASSISTANT_DIAGNOSTIC_TYPES = [
@@ -87,7 +88,10 @@ export function projectAssistantMessageDiagnostics(value: unknown): AssistantMes
 }
 
 // Snapshot copies of content blocks with closed key sets: adapter scratch fields (`index`, `partialJson`,
-// `partialArgs`, ...) are never copied, and later mutation of the source cannot reach the copy.
+// `partialArgs`, ...) are never copied, and later mutation of the source cannot reach the copy. Arbitrary values
+// (tool arguments, usage, deferred handles, unknown blocks) are copied with `isolateValue`, which keeps Map/Set
+// aliases and cycles, native Error classes and fields, own `__proto__` data keys and resizable buffers
+// (smarty-dev#5443, pi#159).
 
 export function cloneTextContent(content: TextContent): TextContent {
 	return {
@@ -107,29 +111,51 @@ export function cloneThinkingContent(content: ThinkingContent): ThinkingContent 
 }
 
 export function cloneToolCall(toolCall: ToolCall): ToolCall {
+	return toolCallWithArguments(toolCall, isolateValue(toolCall.arguments));
+}
+
+/** The closed `ToolCall` key set around `args`, an already isolated copy of `toolCall.arguments`. */
+function toolCallWithArguments(toolCall: ToolCall, args: ToolCall["arguments"]): ToolCall {
 	return {
 		type: "toolCall",
 		id: toolCall.id,
 		name: toolCall.name,
-		arguments: structuredClone(toolCall.arguments),
+		arguments: args,
 		...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
 		...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
 	};
 }
 
-function cloneAssistantContent(
-	block: TextContent | ThinkingContent | ToolCall,
-): TextContent | ThinkingContent | ToolCall {
+type AssistantContent = TextContent | ThinkingContent | ToolCall;
+
+/**
+ * The arbitrary value of a block that the projector copies: tool arguments, or a whole block of an unknown type.
+ * Text and thinking blocks have only closed scalar fields.
+ */
+function arbitraryContentValue(block: AssistantContent): unknown {
+	switch (block.type) {
+		case "text":
+		case "thinking":
+			return undefined;
+		case "toolCall":
+			return block.arguments;
+		default:
+			return block;
+	}
+}
+
+/** Rebuild `block` around `isolated`, its arbitrary value from the message's one isolation pass. */
+function cloneAssistantContent(block: AssistantContent, isolated: unknown): AssistantContent {
 	switch (block.type) {
 		case "text":
 			return cloneTextContent(block);
 		case "thinking":
 			return cloneThinkingContent(block);
 		case "toolCall":
-			return cloneToolCall(block);
+			return toolCallWithArguments(block, isolated as ToolCall["arguments"]);
 		default:
 			// Not an assistant block type: keep a detached snapshot rather than the live object.
-			return structuredClone(block);
+			return isolated as AssistantContent;
 	}
 }
 
@@ -209,13 +235,22 @@ export function terminalPhase(message: AssistantMessage): PublicationPhase {
  * decision and carries the private throttle wait (`AssistantMessageEventStream`).
  */
 export function projectAssistantMessage(message: AssistantMessage, phase: PublicationPhase): AssistantMessage {
+	const content = Array.isArray(message.content) ? message.content : [];
+	// One isolation pass per published message: a value reachable from two fields (two tool calls' arguments, or
+	// arguments and `deferred`) keeps one copy and its cycles, as one structuredClone of the message would. The
+	// closed-key rebuild below then picks the copies; no second snapshot is taken. `map` keeps holes.
+	const isolated = isolateValue({
+		content: content.map(arbitraryContentValue),
+		usage: message.usage,
+		deferred: message.deferred,
+	});
 	const projected: AssistantMessage = {
 		role: "assistant",
-		content: Array.isArray(message.content) ? message.content.map(cloneAssistantContent) : [],
+		content: content.map((block, index) => cloneAssistantContent(block, isolated.content[index])),
 		api: message.api,
 		provider: message.provider,
 		model: message.model,
-		usage: structuredClone(message.usage),
+		usage: isolated.usage,
 		stopReason: message.stopReason,
 		timestamp: message.timestamp,
 	};
@@ -227,7 +262,7 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 	if (message.thinkingLevel !== undefined) projected.thinkingLevel = message.thinkingLevel;
 	const diagnostics = projectAssistantMessageDiagnostics(message.diagnostics);
 	if (diagnostics !== undefined) projected.diagnostics = diagnostics;
-	if (message.deferred !== undefined) projected.deferred = structuredClone(message.deferred);
+	if (message.deferred !== undefined) projected.deferred = isolated.deferred;
 	if (message.errorMessage !== undefined) projected.errorMessage = message.errorMessage;
 	// Only the two owned hints are published; anything else a producer put there is dropped.
 	if (message.errorHint === "bedrock_data_retention" || message.errorHint === "chatgpt_usage") {
