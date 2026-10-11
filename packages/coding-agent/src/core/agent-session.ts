@@ -3511,6 +3511,8 @@ export class AgentSession {
 
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		// smarty-dev#2636: same rule as the direct path; Herdr attested the typed bytes only.
+		if (processedInput.transformed || expandedText !== text) receipt = withoutAttribution(receipt);
 
 		if (behavior === "steer") {
 			await this._queueSteer(expandedText, processedInput.images, receipt);
