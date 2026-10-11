@@ -562,4 +562,49 @@ describe("#7883 sendUserMessage metadata receipts", () => {
 		await finished;
 		expect(userEntries(harness).map(metadataOf)).toEqual([undefined, undefined]);
 	});
+
+	// #7883/#5533: null is malformed metadata, not the legacy omitted-metadata path.
+	it("rejects null SDK metadata before hooks or admission while preserving valid defaults", async () => {
+		let inputCalls = 0;
+		let beforeStartCalls = 0;
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", () => {
+						inputCalls++;
+					});
+					pi.on("before_agent_start", () => {
+						beforeStartCalls++;
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		harness.setResponses(["omitted", "undefined", "empty object"].map((reply) => fauxAssistantMessage(reply)));
+
+		await expect(harness.session.sendUserMessage("invalid null", { metadata: null } as never)).rejects.toThrow(
+			"User message metadata must be a JSON-serializable object",
+		);
+		expect(inputCalls).toBe(0);
+		expect(beforeStartCalls).toBe(0);
+		expect(userEntries(harness)).toEqual([]);
+		expect(harness.faux.state.callCount).toBe(0);
+
+		await expect(harness.session.sendUserMessage("omitted options")).resolves.toBeUndefined();
+		await expect(
+			harness.session.sendUserMessage("undefined metadata", { metadata: undefined }),
+		).resolves.toBeUndefined();
+		const result = await harness.session.sendUserMessage("empty metadata", { metadata: {} });
+		expect(result).toMatchObject({ status: "turnStarted", metadata: {}, metadataSource: { kind: "sdk" } });
+		expect(inputCalls).toBe(3);
+		expect(beforeStartCalls).toBe(3);
+		expect(userEntries(harness).map((entry) => getMessageText(entry.message))).toEqual([
+			"omitted options",
+			"undefined metadata",
+			"empty metadata",
+		]);
+		expect(userEntries(harness).map(metadataOf)).toEqual([undefined, undefined, {}]);
+		expect(harness.faux.state.callCount).toBeGreaterThan(0);
+		await harness.session.waitForIdle();
+	});
 });

@@ -97,7 +97,13 @@ export class UserMessageIngress {
 		request: SubmitUserMessageOptions,
 		run: (request: SubmitUserMessageOptions, admission: UserMessageAdmission) => Promise<void>,
 	): Promise<UserMessageReceipt> {
-		const requestGeneration = typeof request?.sessionGeneration === "string" ? request.sessionGeneration : "";
+		const sessionGeneration = request?.sessionGeneration;
+		const requestGeneration = typeof sessionGeneration === "string" ? sessionGeneration : "";
+		const registrationEpoch = request?.registrationEpoch;
+		const requestId = request?.requestId;
+		const text = request?.text;
+		const deliverAs = request?.deliverAs;
+		const expandPromptTemplates = request?.expandPromptTemplates;
 		const rejected = (reason: RejectionReason): UserMessageReceipt => ({
 			status: "rejected",
 			sessionGeneration: requestGeneration,
@@ -105,31 +111,39 @@ export class UserMessageIngress {
 		});
 		if (
 			!request ||
-			typeof request.registrationEpoch !== "string" ||
-			!request.registrationEpoch ||
-			typeof request.requestId !== "string" ||
-			!request.requestId ||
-			typeof request.sessionGeneration !== "string" ||
-			typeof request.text !== "string" ||
-			request.deliverAs !== "followUp" ||
-			request.expandPromptTemplates !== false
+			typeof registrationEpoch !== "string" ||
+			!registrationEpoch ||
+			typeof requestId !== "string" ||
+			!requestId ||
+			typeof sessionGeneration !== "string" ||
+			typeof text !== "string" ||
+			deliverAs !== "followUp" ||
+			expandPromptTemplates !== false
 		) {
 			return rejected("unsupported");
 		}
-		// Capture plain data before a hook can mutate the caller's object.
-		request = { ...request };
 		// Refuse oversized text before it is scanned (byteLength) or hashed (fingerprint), so a huge
 		// payload costs O(1). UTF-8 bytes >= UTF-16 code units, so more than MAX_TEXT_BYTES code units is
 		// always more than MAX_TEXT_BYTES bytes. This refusal precedes the key lookup and reservation:
 		// the key is NOT reserved, a later retry with the same key and valid text is admitted as a new
 		// request, and a retry with oversized text is refused the same way again. Text whose code units
 		// fit but whose UTF-8 bytes do not is still refused below by the exact byte check, after reservation.
-		if (request.text.length > MAX_TEXT_BYTES) return rejected("admission_refused");
+		if (text.length > MAX_TEXT_BYTES) return rejected("admission_refused");
 		// Same bound for correlation IDs (smarty-dev#6119): more than MAX_ID_BYTES code units is always more
 		// than MAX_ID_BYTES UTF-8 bytes, so refuse before byteLength scans an arbitrarily long ID.
-		if (request.registrationEpoch.length > MAX_ID_BYTES || request.requestId.length > MAX_ID_BYTES) {
+		if (registrationEpoch.length > MAX_ID_BYTES || requestId.length > MAX_ID_BYTES) {
 			return rejected("admission_refused");
 		}
+		// Snapshot only supported fields after O(1) length bounds and before any asynchronous hook.
+		// Do not enumerate or retain arbitrary caller-owned properties.
+		request = {
+			registrationEpoch,
+			requestId,
+			sessionGeneration,
+			text,
+			deliverAs,
+			expandPromptTemplates,
+		};
 		const textBytes = Buffer.byteLength(request.text, "utf8");
 		const epochBytes = Buffer.byteLength(request.registrationEpoch, "utf8");
 		const idBytes = Buffer.byteLength(request.requestId, "utf8");

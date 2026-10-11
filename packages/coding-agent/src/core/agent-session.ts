@@ -4012,7 +4012,8 @@ export class AgentSession {
 	): Promise<void | SendUserMessageResult> {
 		// Validate and snapshot before issuing a receipt, admitting input, or running extension hooks.
 		// This async body turns validation throws into rejected promises. Ingress always has a receipt.
-		const rawMetadata = metadataOptions?.metadata ?? (observed ? {} : undefined);
+		const rawMetadata =
+			metadataOptions?.metadata === undefined ? (observed ? {} : undefined) : metadataOptions.metadata;
 		const metadata = rawMetadata === undefined ? undefined : snapshotUserMessageMetadata(rawMetadata);
 		const metadataSource = getUserMessageMetadataSource(metadataOptions);
 		const options = deliveryOptions;

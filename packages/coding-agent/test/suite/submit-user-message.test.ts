@@ -2154,4 +2154,105 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 		await within(harness.session.waitForIdle());
 		expect(userEntrySources(harness)).toEqual([{ text: "borrowed submit", metadataSource: { kind: "sdk" } }]);
 	});
+
+	// #5533: ingress snapshots only bounded supported fields, never enumerable caller extras.
+	it("ignores unknown request properties and snapshots supported fields before async hooks", async () => {
+		const hookEntered = gate();
+		const releaseHook = gate();
+		const { harness, api, request, inputs } = await setup({
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text !== "snapshot before hook") return;
+						hookEntered.release();
+						await releaseHook.promise;
+					});
+				},
+			],
+		});
+		harness.setResponses([
+			fauxAssistantMessage("getter response"),
+			fauxAssistantMessage("proxy response"),
+			fauxAssistantMessage("snapshot response"),
+			fauxAssistantMessage("oversize retry response"),
+		]);
+
+		let getterVisited = false;
+		const getterRequest = request("unknown getter", "unknown-getter");
+		Object.defineProperty(getterRequest, "padding", {
+			enumerable: true,
+			get() {
+				getterVisited = true;
+				throw new Error("unknown getter was read");
+			},
+		});
+		expect((await within(api().submitUserMessage(getterRequest))).status).toBe("accepted");
+		expect(getterVisited).toBe(false);
+		await within(harness.session.waitForIdle());
+
+		let ownKeysVisited = false;
+		const proxyRequest = new Proxy(request("proxy ownKeys", "proxy-own-keys"), {
+			ownKeys() {
+				ownKeysVisited = true;
+				throw new Error("unknown ownKeys trap was invoked");
+			},
+		});
+		expect((await within(api().submitUserMessage(proxyRequest))).status).toBe("accepted");
+		expect(ownKeysVisited).toBe(false);
+		await within(harness.session.waitForIdle());
+
+		const snapshot = request("snapshot before hook", "snapshot-before-hook");
+		const pending = api().submitUserMessage(snapshot);
+		await within(hookEntered.promise);
+		snapshot.registrationEpoch = "mutated-epoch";
+		snapshot.requestId = "mutated-id";
+		snapshot.sessionGeneration = "mutated-generation";
+		snapshot.text = "mutated text";
+		snapshot.deliverAs = "mutated-delivery" as "followUp";
+		snapshot.expandPromptTemplates = true as false;
+		releaseHook.release();
+		expect(await within(pending)).toEqual({
+			status: "accepted",
+			sessionGeneration: harness.session.userMessageSessionGeneration,
+		});
+		await within(harness.session.waitForIdle());
+		expect(getUserTexts(harness)).toEqual(["unknown getter", "proxy ownKeys", "snapshot before hook"]);
+
+		let oversizedExtraRead = false;
+		const oversized = request("x".repeat(65537), "oversized-unknown");
+		Object.defineProperty(oversized, "padding", {
+			enumerable: true,
+			get() {
+				oversizedExtraRead = true;
+				throw new Error("oversized unknown getter was read");
+			},
+		});
+		const refusal = await within(api().submitUserMessage(oversized));
+		expect(refusal).toEqual({
+			status: "rejected",
+			reason: "admission_refused",
+			sessionGeneration: oversized.sessionGeneration,
+		});
+		expect(oversizedExtraRead).toBe(false);
+		expect(inputs.map((event) => event.text)).toEqual(["unknown getter", "proxy ownKeys", "snapshot before hook"]);
+		const retry = await within(
+			api().submitUserMessage({
+				registrationEpoch: oversized.registrationEpoch,
+				requestId: oversized.requestId,
+				sessionGeneration: oversized.sessionGeneration,
+				text: "valid oversized retry",
+				deliverAs: "followUp",
+				expandPromptTemplates: false,
+			}),
+		);
+		expect(retry).toEqual({ status: "accepted", sessionGeneration: harness.session.userMessageSessionGeneration });
+		await within(harness.session.waitForIdle());
+		expect(getUserTexts(harness)).toEqual([
+			"unknown getter",
+			"proxy ownKeys",
+			"snapshot before hook",
+			"valid oversized retry",
+		]);
+		expect(harness.faux.state.callCount).toBe(4);
+	});
 });
