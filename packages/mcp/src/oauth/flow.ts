@@ -13,13 +13,7 @@ import {
 	parseWwwAuthenticate,
 	selectResource,
 } from "./discovery.ts";
-import {
-	credentialFetch,
-	loopback,
-	secureEndpoint,
-	validateOAuthEndpointOrigins,
-	validateOAuthServerMetadata,
-} from "./endpoints.ts";
+import { credentialFetch, loopback, secureEndpoint, validateOAuthServerMetadata } from "./endpoints.ts";
 import {
 	McpOAuthAuthorizationRequiredError,
 	OAuthError,
@@ -94,16 +88,16 @@ export interface OAuthFlowOptions {
 	 * and revocation endpoints may use besides the origin of the authorization server's issuer. Default: none, so
 	 * metadata advertising an endpoint on another origin is refused with `OAuthEndpointOriginError` before any request
 	 * to it. This applies to discovered, cached, and configured (`authorizationServerMetadataUrl`) metadata. Endpoints
-	 * on an allowed origin must still use https, except on loopback.
+	 * and configured origins must still use https, except on loopback. Entries must be origins only: no userinfo,
+	 * path (except a root trailing slash), query, or fragment. Equivalent origins are normalized and deduplicated.
 	 */
 	allowedEndpointOrigins?: readonly string[];
 	fetch?: McpFetch;
 	/** Aborts every request of the flow. Requests have no time limit of their own; combine with a timeout as needed. */
 	signal?: AbortSignal;
 	/**
-	 * Lets discovery return metadata whose issuer differs from the authorization server identifier. The flow still
-	 * refuses to register, redirect or request tokens with it (`OAuthIssuerMismatchError`, smarty-dev#7638); configure
-	 * such a server with `authorizationServerMetadataUrl` instead.
+	 * @deprecated Ignored. Exact issuer identity is always required during discovery and when using cached metadata.
+	 * Configure a server that names another issuer with `authorizationServerMetadataUrl` instead.
 	 */
 	skipIssuerValidation?: boolean;
 	/**
@@ -372,8 +366,12 @@ async function runFlow(provider: OAuthClientProvider, options: OAuthFlowOptions)
 				signal: options.signal,
 			});
 	secureEndpoint(discovered.authorizationServerUrl);
-	// Also covers cached metadata, which skipped discovery: no endpoint request before this check.
-	validateOAuthEndpointOrigins(discovered.authorizationServerMetadata, options.allowedEndpointOrigins);
+	// Cached metadata must also match the exact issuer before saving state or invoking client/token callbacks.
+	validateOAuthServerMetadata(
+		discovered.authorizationServerUrl,
+		discovered.authorizationServerMetadata,
+		options.allowedEndpointOrigins,
+	);
 	if (!metadataUrl) {
 		await provider.saveDiscoveryState?.({
 			...discovered,
