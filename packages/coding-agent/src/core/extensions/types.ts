@@ -34,7 +34,6 @@ import type {
 	Provider,
 	ProviderClassifier,
 	ProviderHeaders,
-	ProviderId,
 	ProviderImages,
 	RefreshModelsContext,
 	SimpleStreamOptions,
@@ -944,20 +943,18 @@ export interface BeforeProviderHeadersEvent {
 	headers: ProviderHeaders;
 }
 
-/** Fired after a provider response is received and before the response stream is consumed. */
+/**
+ * Fired after a provider response is received and before the response stream is consumed. Carries only the
+ * HTTP status, when it is an integer 100-599; response headers are never exposed.
+ */
 export interface AfterProviderResponseEvent {
 	type: "after_provider_response";
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
 }
 
-/** Fired for a parsed provider stream event before Pi normalizes it. */
+/** Fired once for each parsed provider stream event, before Pi normalizes it. Carries no provider data. */
 export interface ProviderStreamEvent {
 	type: "provider_stream_event";
-	provider: ProviderId;
-	api: Api;
-	model: string;
-	data: unknown;
 }
 
 /** Fired after user submits prompt but before agent loop. */
@@ -2026,9 +2023,9 @@ export interface ProviderConfig {
 	 * (`getCurrentSystemPrompt(context.messages)`, `getCurrentTools(context.messages)`).
 	 * Implementations must invoke `options.onPayload` before sending the provider request and use any
 	 * returned replacement payload. They must invoke `options.onResponse` after receiving the response
-	 * and before consuming its body, matching built-in providers. Implementations may invoke
-	 * `options.onProviderStreamEvent(data, model)` with parsed stream events before normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
+	 * and before consuming its body, matching built-in providers, passing only `{ status }`. Implementations may
+	 * invoke `options.onProviderStreamEvent` with `{ type: "provider_stream_event" }` once per parsed stream
+	 * event, before normalization. Neither callback receives provider data.
 	 */
 	streamSimple?: (
 		model: Model<Api>,

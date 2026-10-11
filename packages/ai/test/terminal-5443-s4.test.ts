@@ -121,15 +121,14 @@ describe("T-F6-usage: pi-messages bounds wire usage on terminal events (smarty-d
 		expect(result.usage.cost).toEqual(zeroUsage.cost);
 	});
 
-	it("keeps valid usage exactly and does not alias the wire object", async () => {
+	it("keeps valid usage exactly and never hands the wire object to the observer", async () => {
 		const valid = { ...usage, reasoning: 3, cacheWrite1h: 1 };
 		const { result, wire } = await run(async () =>
 			sse([JSON.stringify({ type: "done", reason: "stop", usage: valid })]),
 		);
 		expect(result.usage).toEqual(valid);
-		const wireUsage = (wire.at(-1) as { usage: Usage }).usage;
-		expect(result.usage).not.toBe(wireUsage);
-		expect(result.usage.cost).not.toBe(wireUsage.cost);
+		// smarty-dev#5822 C1: the observer gets the owned notification, never the wire event.
+		expect(wire).toEqual([{ type: "provider_stream_event" }]);
 	});
 });
 

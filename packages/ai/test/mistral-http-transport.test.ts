@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { stream as streamMistral } from "../src/api/mistral-conversations.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, FetchFunction, Model, ProviderResponse } from "../src/types.ts";
+import type { FetchFunction, ProviderResponse } from "../src/types.ts";
 
 const PI_USER_AGENT = `pi (${platform()} ${release()}; ${arch()})`;
 
@@ -116,10 +116,8 @@ describe("Mistral HTTP transport", () => {
 		expect(callbackPayload?.maxTokens).toBe(123);
 		expect(callbackPayload?.promptMode).toBe("reasoning");
 		expect(callbackPayload?.promptCacheKey).toBe("session-1");
-		expect(callbackResponse).toEqual({
-			status: 200,
-			headers: { "content-type": "text/event-stream", "x-request-id": "request-1" },
-		});
+		// smarty-dev#5822 C1: the status only, never response headers.
+		expect(callbackResponse).toEqual({ status: 200 });
 
 		const wirePayload = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
 		expect(wirePayload.max_tokens).toBe(123);
@@ -364,7 +362,8 @@ describe("Mistral HTTP transport", () => {
 		]);
 	});
 
-	it("forwards each parsed SSE payload before normalizing it", async () => {
+	// smarty-dev#5822 C1: one owned notification per payload, never the payload or model.
+	it("notifies once per parsed SSE payload without provider data", async () => {
 		const model = getModel("mistral", "mistral-large-latest");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
@@ -381,20 +380,17 @@ describe("Mistral HTTP transport", () => {
 				usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
 			},
 		];
-		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const result = await streamMistral(model, context, {
 			apiKey: "test",
 			fetch: async () => createSseResponse(events),
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		}).result();
 
-		expect(received).toEqual(events);
-		expect(eventModels).toEqual([model, model]);
+		expect(calls).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});

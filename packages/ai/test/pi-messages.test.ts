@@ -165,7 +165,8 @@ describe("pi-messages", () => {
 		});
 	});
 
-	it("forwards parsed wire events in order before converting them", async () => {
+	// smarty-dev#5822 C1: one owned notification per wire event, never the event, gateway field or model.
+	it("notifies once per parsed wire event without provider data", async () => {
 		const wireEvents = [
 			{ type: "start" },
 			{ type: "text_start", contentIndex: 0 },
@@ -175,44 +176,42 @@ describe("pi-messages", () => {
 		];
 		const { baseUrl } = await startServer({ events: wireEvents });
 		const model = createModel(baseUrl);
-		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const message = await streamSimple(model, normalizeContext(context), {
 			apiKey: "test-key",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		}).result();
 
-		expect(received).toEqual(wireEvents);
-		expect(eventModels).toEqual(wireEvents.map(() => model));
+		expect(calls).toEqual(wireEvents.map(() => [{ type: "provider_stream_event" }]));
 		expect(message.stopReason).toBe("stop");
 		expect(message.responseId).toBe("resp_1");
 		expect(message.content).toEqual([{ type: "text", text: "Hello", textSignature: undefined }]);
 	});
 
-	it("appends debug=1 and reports response headers via onResponse", async () => {
+	// smarty-dev#5822 C1: gateway response headers never reach onResponse.
+	it("appends debug=1 and reports only the status via onResponse", async () => {
 		const { baseUrl, requests } = await startServer({
 			headers: { "x-pi-gateway-upstream-provider": "anthropic" },
 			events: [{ type: "done", reason: "stop", usage }],
 		});
 		const model = createModel(baseUrl);
 
-		let observedHeaders: Record<string, string> | undefined;
+		const observed: unknown[][] = [];
 		const options = {
 			apiKey: "test-key",
 			debug: true,
-			onResponse: (response) => {
-				observedHeaders = response.headers;
+			onResponse: (...args: unknown[]) => {
+				observed.push(args);
 			},
 		} satisfies PiMessagesOptions;
 		const message = await streamSimple(model, normalizeContext(context), options).result();
 
 		expect(message.stopReason).toBe("stop");
 		expect(requests[0].url).toBe("/v1/messages?debug=1");
-		expect(observedHeaders?.["x-pi-gateway-upstream-provider"]).toBe("anthropic");
+		expect(observed).toEqual([[{ status: 200 }]]);
 	});
 
 	it("surfaces backend error responses with diagnostics", async () => {

@@ -14,6 +14,8 @@
 // into the message, so providers can preserve it without double-printing.
 
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import type { AssistantRecovery } from "../types.ts";
+import { classifyProviderFailure, validHttpStatus } from "./recovery.ts";
 
 export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
 
@@ -26,6 +28,8 @@ export interface NormalizedProviderError {
 	message: string;
 	/** True when `message` already contains the body (no separate body to add). */
 	messageCarriesBody: boolean;
+	/** Owned recovery decision, classified from the original message, body and status before redaction. */
+	recovery: AssistantRecovery;
 }
 
 type SdkErrorShape = Error & {
@@ -37,9 +41,22 @@ type SdkErrorShape = Error & {
 	$response?: { statusCode?: unknown; body?: unknown };
 };
 
-export function normalizeProviderError(error: unknown, secrets: readonly string[] = []): NormalizedProviderError {
+/**
+ * `provider` is the trusted request provider (`model.provider`); it selects provider-specific classification
+ * such as Cerebras's bodyless 400/413 overflow.
+ */
+export function normalizeProviderError(
+	error: unknown,
+	secrets: readonly string[] = [],
+	provider?: string,
+): NormalizedProviderError {
 	if (!(error instanceof Error)) {
-		return { message: redactOAuthDiagnostic(safeJsonStringify(error), secrets), messageCarriesBody: false };
+		const raw = safeJsonStringify(error);
+		return {
+			message: redactOAuthDiagnostic(raw, secrets),
+			messageCarriesBody: false,
+			recovery: classifyProviderFailure({ text: raw, provider }),
+		};
 	}
 
 	const sdkError = error as SdkErrorShape;
@@ -47,26 +64,35 @@ export function normalizeProviderError(error: unknown, secrets: readonly string[
 	const body = extractBody(sdkError, secrets);
 	const message = redactOAuthDiagnostic(error.message, secrets);
 	const messageCarriesBody = body === undefined || message.includes(body);
+	// Classify first: the original message and body, before redaction and truncation (smarty-dev#5822 C3).
+	const rawBody = pickBodyText(sdkError);
+	const recovery = classifyProviderFailure({
+		text: rawBody === undefined ? error.message : `${error.message}\n${rawBody}`,
+		status,
+		provider,
+	});
 
 	return {
 		status,
 		body,
 		message,
 		messageCarriesBody,
+		recovery,
 	} satisfies NormalizedProviderError;
 }
 
 /**
- * Probe the HTTP status, first numeric hit wins, in SDK-field order:
+ * Probe the HTTP status, first integer 100-599 wins, in SDK-field order:
  * `statusCode` (Mistral) → `status` (`openai`, `@google/genai`) →
  * `$metadata.httpStatusCode` (Bedrock) → `$response.statusCode` (Bedrock).
  */
 function extractStatus(error: SdkErrorShape): number | undefined {
-	if (typeof error.statusCode === "number") return error.statusCode;
-	if (typeof error.status === "number") return error.status;
-	if (typeof error.$metadata?.httpStatusCode === "number") return error.$metadata.httpStatusCode;
-	if (typeof error.$response?.statusCode === "number") return error.$response.statusCode;
-	return undefined;
+	return (
+		validHttpStatus(error.statusCode) ??
+		validHttpStatus(error.status) ??
+		validHttpStatus(error.$metadata?.httpStatusCode) ??
+		validHttpStatus(error.$response?.statusCode)
+	);
 }
 
 /**

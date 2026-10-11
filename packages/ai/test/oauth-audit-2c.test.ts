@@ -142,7 +142,12 @@ describe("audit-2c causes", () => {
 				expectPrivate(output);
 				const records: unknown[] = [];
 				await retryAssistantCall(
-					async () => ({ ...output, errorMessage: `overloaded ${output.errorMessage}` }),
+					// smarty-dev#5822 C3: the owned decision, not rewritten text, makes a failure retryable.
+					async () => ({
+						...output,
+						errorMessage: `overloaded ${output.errorMessage}`,
+						recovery: observer ? output.recovery : { recovery: "retryable" as const, retryable: true },
+					}),
 					{ enabled: true, maxRetries: 1, baseDelayMs: 0 },
 					undefined,
 					{

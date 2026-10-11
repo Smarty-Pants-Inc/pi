@@ -24,6 +24,7 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { notifyProviderStreamEvent } from "../utils/provider-observation.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import { collapseSystemMessages, getCurrentTools, getInitialSystemMessage } from "../utils/transcript.ts";
@@ -106,7 +107,7 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 			const blocks = output.content;
 			const blockIndex = () => blocks.length - 1;
 			for await (const chunk of googleStream) {
-				await options?.onProviderStreamEvent?.(chunk, model);
+				await notifyProviderStreamEvent(options, output);
 				// @google/genai documents GenerateContentResponse.responseId as an output-only field
 				// used to identify each response. Keep the first non-empty one from the stream.
 				output.responseId ||= chunk.responseId;
@@ -295,7 +296,9 @@ export const stream: StreamFunction<"google-generative-ai", GoogleOptions> = (
 				}
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
+			const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
+			output.recovery ??= norm.recovery;
+			output.errorMessage = formatProviderError(norm);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}

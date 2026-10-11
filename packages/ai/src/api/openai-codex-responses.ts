@@ -33,6 +33,12 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import {
+	markProviderStreamObserverFailure,
+	PROVIDER_STREAM_OBSERVER_FAILED,
+	providerResponse,
+	providerStreamNotification,
+} from "../utils/provider-observation.ts";
 import { checkProviderRequest } from "../utils/provider-retry.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
@@ -426,10 +432,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					} finally {
 						combinedSignal.cleanup();
 					}
-					await options?.onResponse?.(
-						{ status: response.status, headers: headersToRecord(response.headers) },
-						model,
-					);
+					await options?.onResponse?.(providerResponse(response.status));
 
 					if (response.ok) {
 						break;
@@ -508,10 +511,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			// HTTP errors carry `status` and `body` (see above), so they read `<provider> API error (<status>): <body>`
 			// like the other Responses providers; errors without a status keep their message unchanged. The body and
 			// message are redacted with the request's diagnostic secrets by normalizeProviderError.
-			output.errorMessage = formatProviderError(
-				normalizeProviderError(error, diagnosticSecrets),
-				`${model.provider} API error`,
-			);
+			const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
+			output.recovery ??= norm.recovery;
+			output.errorMessage = formatProviderError(norm, `${model.provider} API error`);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -728,7 +730,8 @@ class CodexProtocolError extends Error {
 
 class ProviderStreamEventCallbackError extends Error {
 	constructor(cause: unknown) {
-		super(formatThrownValue(cause));
+		// Owned text: the observer's exception text is never published (smarty-dev#5822 C1).
+		super(PROVIDER_STREAM_OBSERVER_FAILED);
 		this.name = "ProviderStreamEventCallbackError";
 		this.cause = cause;
 	}
@@ -772,7 +775,7 @@ async function* mapCodexEvents(
 	for await (const event of events) {
 		try {
 			options?.signal?.throwIfAborted();
-			const observing = options?.onProviderStreamEvent?.(event, model);
+			const observing = options?.onProviderStreamEvent?.(providerStreamNotification());
 			if (observing) {
 				if (options?.signal) await raceWithAbortSignal(Promise.resolve(observing), options.signal);
 				else await observing;
@@ -780,10 +783,7 @@ async function* mapCodexEvents(
 		} catch (error) {
 			if (options?.signal?.aborted) throw error;
 			// The final assistant error must retain this non-transport origin for outer retry callers.
-			appendAssistantMessageDiagnostic(
-				output,
-				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
-			);
+			markProviderStreamObserverFailure(output);
 			// Retain terminal usage even when the observer prevents shared normalization.
 			if (
 				event.type === "response.failed" ||

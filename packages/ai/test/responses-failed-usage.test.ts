@@ -140,7 +140,8 @@ describe("Responses terminal usage replay barrier", () => {
 		);
 		expect(calls).toBe(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("fetch failed");
+		// smarty-dev#5822 C1: owned observer-failure text, never the observer's exception text.
+		expect(result.errorMessage).toBe("Provider stream observer failed");
 		expect(result.content).toEqual([]);
 		expect(result.responseId).toBe("resp_observer_usage");
 		expect(result.usage).toMatchObject({ input: 17, cacheRead: 3, output: 1, reasoning: 1, totalTokens: 21 });
@@ -194,8 +195,10 @@ describe("Responses terminal usage replay barrier", () => {
 			);
 		};
 		let rejections = 0;
-		const onProviderStreamEvent = async (event: unknown) => {
-			if ((event as { type: string }).type === rejectType) {
+		let notifications = 0;
+		// Notifications carry no event data (smarty-dev#5822 C1): reject the third, which is `rejectType`.
+		const onProviderStreamEvent = async () => {
+			if (++notifications === events.length) {
 				rejections++;
 				await Promise.resolve();
 				throw new Error("fetch failed");
@@ -221,7 +224,7 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(calls).toBe(1);
 		expect(rejections).toBe(1);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("fetch failed");
+		expect(result.errorMessage).toBe("Provider stream observer failed");
 		expect(result.usage.output).toBe(0);
 		expect(result.diagnostics).toEqual(
 			expect.arrayContaining([expect.objectContaining({ type: "provider_stream_observer_error" })]),

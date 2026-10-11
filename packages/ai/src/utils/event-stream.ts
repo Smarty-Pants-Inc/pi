@@ -1,6 +1,7 @@
 import { redactOAuthDiagnostic, redactOAuthDiagnosticValue, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 import type { AssistantMessageDiagnostic } from "./diagnostics.ts";
+import { attachRecovery } from "./recovery.ts";
 
 class FifoQueue<T> {
 	private incoming: T[] = [];
@@ -167,6 +168,9 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	}
 
 	override push(event: AssistantMessageEvent): void {
+		// Universal fallback for every source, model-less streams included: classify the original error before
+		// any text is masked or replaced; a producer's owned decision is kept (smarty-dev#5822 C3).
+		if (event.type === "error") attachRecovery(event.error);
 		const protection = streamProtections.get(this);
 		if (protection) {
 			if ("partial" in event) protectMessage(event.partial, protection);
@@ -180,6 +184,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	}
 
 	override end(result?: AssistantMessage): void {
+		if (result) attachRecovery(result);
 		const protection = streamProtections.get(this);
 		if (result && protection) protectMessage(result, protection);
 		if (result !== undefined) this.#time(result);

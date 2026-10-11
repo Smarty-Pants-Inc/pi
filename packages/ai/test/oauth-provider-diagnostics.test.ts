@@ -101,7 +101,10 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 			);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			expect(output.stopReason).toBe("error");
-			expect(output.errorMessage).toContain("server_error");
+			// smarty-dev#5822 C1: an observer failure publishes owned text, not the exception text.
+			expect(output.errorMessage).toContain(
+				kind === "observer" ? "Provider stream observer failed" : "server_error",
+			);
 			expectRedacted(output);
 		},
 	);

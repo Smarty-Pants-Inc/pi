@@ -93,7 +93,7 @@ vi.mock("@google/genai", () => {
 import { stream as streamGoogleGenerativeAi } from "../src/api/google-generative-ai.ts";
 import { stream as streamGoogleVertex } from "../src/api/google-vertex.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Model, StreamOptions } from "../src/types.ts";
+import type { StreamOptions } from "../src/types.ts";
 
 beforeEach(() => {
 	googleGenAiMock.streamChunks = undefined;
@@ -218,8 +218,9 @@ describe("Google provider stream events", () => {
 	];
 
 	it.each(adapters)(
-		"forwards each SDK chunk in order before normalizing it for $name",
-		async ({ model, createStream }) => {
+		// smarty-dev#5822 C1: one owned notification per chunk, never the chunk or model.
+		"notifies once per SDK chunk without provider data for $name",
+		async ({ createStream }) => {
 			googleGenAiMock.streamChunks = [
 				{
 					responseId: "resp_google",
@@ -230,18 +231,13 @@ describe("Google provider stream events", () => {
 					usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 },
 				},
 			];
-			const received: unknown[] = [];
-			const eventModels: Model<Api>[] = [];
-			const result = await createStream(async (chunk, eventModel) => {
+			const calls: unknown[][] = [];
+			const result = await createStream(async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(chunk);
-				eventModels.push(eventModel);
+				calls.push(args);
 			}).result();
 
-			expect(received).toEqual(googleGenAiMock.streamChunks);
-			expect(received[0]).toBe(googleGenAiMock.streamChunks[0]);
-			expect(received[1]).toBe(googleGenAiMock.streamChunks[1]);
-			expect(eventModels).toEqual([model, model]);
+			expect(calls).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
 			expect(result.stopReason).toBe("stop");
 			expect(result.responseId).toBe("resp_google");
 			expect(result.content).toEqual([{ type: "text", text: "hello" }]);

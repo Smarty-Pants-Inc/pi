@@ -1,128 +1,11 @@
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
+import { assistantRecovery } from "./recovery.ts";
 
-function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
-	return new RegExp(patterns.join("|"), "i");
-}
-
-const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
-	// OpenCode Go/free-tier limits returned as 429 JSON error types by OpenCode's
-	// Zen API. These are subscription/account limits, not transient throttles.
-	"GoUsageLimitError",
-	"FreeUsageLimitError",
-
-	// OpenCode Go subscription-limit text asks users to enable available-balance
-	// usage after rolling/weekly/monthly limits are reached.
-	"Monthly usage limit reached",
-	"available balance",
-
-	// Generic quota/budget/billing exhaustion. `insufficient_quota` is OpenAI's
-	// quota/billing error code; the other strings cover common gateway wording.
-	"insufficient_quota",
-	"out of budget",
-	"quota exceeded",
-	"billing",
-
-	// Sign in with ChatGPT: the subscription's shared usage limit, which resets
-	// after hours rather than seconds.
-	"subscription_sharing_usage_limit_exceeded",
-]);
-
-const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
-	// Generic provider load, HTTP status, and server-side transient failures.
-	"overloaded",
-	"\\bSelected model is at capacity\\. Please try a different model\\.",
-	"\\bslow_down\\b",
-	"server_busy",
-	"servers are currently busy",
-	"currently experiencing high demand",
-	"rate.?limit",
-	"too many requests",
-	"429",
-	"500",
-	"502",
-	"503",
-	"504",
-	"520",
-	"524",
-	"service.?unavailable",
-	"server.?error",
-	"internal.?error",
-
-	// Wrapper/provider text for transient upstream failures, including OpenRouter
-	// "Provider returned error" responses (#2264).
-	"provider.?returned.?error",
-	"exceeded request buffer limit while retrying upstream",
-
-	// Network, proxy, and fetch transport failures. This includes OpenAI Codex
-	// raw-fetch failures such as "upstream connect", "connection refused", and
-	// "reset before headers" (#733), plus OpenRouter connection drops (#3317).
-	"network.?error",
-	"connection.?error",
-	"connection.?refused",
-	"connection.?lost",
-	"other side closed",
-	"fetch failed",
-	"getaddrinfo",
-	"ENOTFOUND",
-	"EAI_AGAIN",
-	"upstream.?connect",
-	// A local gateway (CLIProxyAPI) mid-restart refuses or drops the socket (smarty-dev#1856).
-	"ECONNREFUSED",
-	"ECONNRESET",
-	// CLIProxyAPI answers 400 while it reloads models after a restart (smarty-dev#1856).
-	// ponytail: a truly unknown model now retries the normal budget (~14 s) before it fails.
-	"unknown provider for model",
-	"reset before headers",
-	"socket hang up",
-	"socket connection was closed",
-	"timed? out",
-	"timeout",
-	"terminated",
-
-	// WebSocket transports can report close/error text instead of HTTP/fetch text.
-	"websocket.?closed",
-	"websocket.?error",
-
-	// Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
-	"http2 request did not get a response",
-	// Node ERR_HTTP2_STREAM_CANCEL: the HTTP/2 session died before the request was
-	// sent, e.g. after the Bedrock SDK's 5-minute session timeout (#10379).
-	"pending stream has been canceled",
-
-	// Provider-requested retry delay cap failures should flow through the outer
-	// retry policy so callers can surface/abort the backoff (#1123).
-	"retry delay",
-
-	// Explicit retry guidance emitted mid-stream by OpenAI Responses and Bedrock
-	// stream exceptions (#6019).
-	"you can retry your request",
-	"try your request again",
-	"please retry your request",
-
-	// gRPC based providers (e.g. NVIDIA NIM)
-	"ResourceExhausted",
-
-	// Sign in with ChatGPT: usage or user data temporarily unavailable. Usage
-	// failures can arrive mid-stream without an HTTP 503 in the message.
-	"subscription_sharing_usage_unavailable",
-	"subscription_sharing_user_unavailable",
-]);
-
-const PREMATURE_STREAM_ERROR_PATTERN = buildProviderErrorPattern([
-	// Anthropic SDK/transport early endings (#4433), and Responses early EOF.
-	"ended without",
-	"stream ended before message_stop",
-	"stream ended before a terminal response event",
-	// CLIProxyAPI Responses streams (smarty-dev#3200).
-	"stream disconnected before completion",
-	"stream closed before response\\.completed",
-]);
-
-/** Whether a failed stream ended before its provider's completion event. */
+/** Whether a failed stream ended before its provider's completion event (owned decision first, smarty-dev#5822). */
 export function isPrematureStreamError(message: AssistantMessage): boolean {
-	return message.stopReason === "error" && PREMATURE_STREAM_ERROR_PATTERN.test(message.errorMessage ?? "");
+	return message.stopReason === "error" && assistantRecovery(message).recovery === "premature_stream";
 }
 
 /** Empty reasoning signatures are metadata, not output. Even a partial tool call is output. */
@@ -305,9 +188,14 @@ export async function retryAssistantCall(
 	let lastRetry: { attempt: number; errorMessage: string } | undefined;
 	for (;;) {
 		const produced = await produce();
+		// Classify first: the decision comes from the original text, before it is masked (smarty-dev#5822 C3).
+		const recovery = produced.stopReason === "error" ? assistantRecovery(produced) : produced.recovery;
 		const errorMessage =
 			produced.errorMessage === undefined ? undefined : redactOAuthDiagnostic(produced.errorMessage);
-		const response = errorMessage === produced.errorMessage ? produced : { ...produced, errorMessage };
+		const response =
+			errorMessage === produced.errorMessage && recovery === produced.recovery
+				? produced
+				: { ...produced, errorMessage, recovery };
 
 		// Abort: terminal but not successful. Never retry an aborted message.
 		if (response.stopReason === "aborted") {
@@ -385,7 +273,6 @@ export function isRetryableAssistantError(message: AssistantMessage, observed?: 
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;
 	// Providers mark a limit found in the parsed error body (e.g. the Smarty gateway's `smarty_limit`).
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)) return false;
-	const errorMessage = message.errorMessage;
-	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
-	return isPrematureStreamError(message) || RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+	// The owned decision was classified from the original error before any text suppression (smarty-dev#5822).
+	return assistantRecovery(message).retryable;
 }

@@ -19,6 +19,7 @@ import type {
 	Usage,
 } from "../types.ts";
 import { createAssistantMessageEventStream } from "../utils/event-stream.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 
 const DEFAULT_API = "faux";
@@ -526,7 +527,7 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 
 		queueMicrotask(async () => {
 			try {
-				await streamOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+				await streamOptions?.onResponse?.(providerResponse(200));
 				if (!step) {
 					let message = createErrorMessage(
 						new Error("No more faux responses queued"),
@@ -593,7 +594,7 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 
 		queueMicrotask(async () => {
 			try {
-				await fetchOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+				await fetchOptions?.onResponse?.(providerResponse(200));
 				const entry = deferredResponses.get(handle.id);
 				if (
 					!entry ||
@@ -650,14 +651,14 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 	};
 
 	const cancelDeferred = async (
-		requestModel: Model<string>,
+		_requestModel: Model<string>,
 		handle: DeferredHandle,
 		cancelOptions?: DeferredCancelOptions,
 	): Promise<void> => {
 		state.cancelledDeferred.push(structuredClone(handle));
 		const entry = deferredResponses.get(handle.id);
 		if (entry) entry.cancelled = true;
-		await cancelOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+		await cancelOptions?.onResponse?.(providerResponse(200));
 	};
 
 	function getModel(): Model<string>;

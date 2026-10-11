@@ -23,7 +23,8 @@ import type {
 	TextContent,
 } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 
@@ -86,7 +87,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 				signal: options?.signal,
 			},
 		);
-		await options?.onResponse?.({ status: rawResponse.status, headers: headersToRecord(rawResponse.headers) }, model);
+		await options?.onResponse?.(providerResponse(rawResponse.status));
 
 		const imageResponse = response as OpenRouterImageGenerationResponse;
 		output.responseId = imageResponse.id;

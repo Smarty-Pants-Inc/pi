@@ -27,10 +27,17 @@ import type {
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import {
+	markProviderStreamObserverFailure,
+	PROVIDER_STREAM_OBSERVER_FAILED,
+	providerResponse,
+	providerStreamNotification,
+} from "../utils/provider-observation.ts";
 import { checkProviderRequest } from "../utils/provider-retry.ts";
+import { classifyProviderFailure } from "../utils/recovery.ts";
 
 export interface PiMessagesOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
@@ -381,6 +388,13 @@ function createErrorEvent(
 	};
 
 	if (!aborted && error instanceof PiMessagesResponseError) {
+		// Classify first, from the HTTP status and the original body (smarty-dev#5822 C3).
+		const { status, error: body, body: text } = error.diagnosticDetails;
+		assistantMessage.recovery = classifyProviderFailure({
+			text: `${error.message}\n${typeof text === "string" ? text : JSON.stringify(body ?? null)}`,
+			status: typeof status === "number" ? status : undefined,
+			provider: model.provider,
+		});
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
 			createAssistantMessageDiagnostic(
@@ -411,6 +425,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
 	const eventStream = new AssistantMessageEventStream(diagnosticSecrets);
 	const convertEvent = createEventConverter(model);
+	let observerFailed = false;
 
 	void (async () => {
 		try {
@@ -454,7 +469,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				signal: options?.signal,
 			});
 
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponse(response.status));
 
 			if (!response.ok) {
 				const body = await response.text();
@@ -465,7 +480,12 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 			}
 
 			for await (const piEvent of readPiMessagesEvents(response.body)) {
-				await options?.onProviderStreamEvent?.(piEvent, model);
+				try {
+					await options?.onProviderStreamEvent?.(providerStreamNotification());
+				} catch (cause) {
+					observerFailed = true;
+					throw new Error(PROVIDER_STREAM_OBSERVER_FAILED, { cause });
+				}
 				const event = convertEvent(piEvent);
 				eventStream.push(event);
 				if (event.type === "done" || event.type === "error") {
@@ -475,7 +495,10 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false, diagnosticSecrets));
+			const event = createErrorEvent(model, error, options?.signal?.aborted ?? false, diagnosticSecrets);
+			// An observer rejection is never retried, whatever its text or status (smarty-dev#5822 C1).
+			if (observerFailed && event.type === "error") markProviderStreamObserverFailure(event.error);
+			eventStream.push(event);
 		}
 	})();
 

@@ -50,11 +50,12 @@ import {
 } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { classifyProviderFailure } from "../utils/recovery.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import {
@@ -395,7 +396,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponse(response.status));
 			stream.push({ type: "start", partial: output });
 
 			interface StreamingToolCallBlock extends ToolCall {
@@ -571,7 +572,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			};
 
 			for await (const chunk of openaiStream) {
-				await options?.onProviderStreamEvent?.(chunk, model);
+				await notifyProviderStreamEvent(options, output);
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -736,6 +737,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				// Show the gateway's limit message as-is, and mark it final so the generic retry does not retry it.
 				// A throttled limit with a short Retry-After carries the wait for the agent's one-shot retry.
 				output.errorMessage = limitMessage;
+				output.recovery ??= { retryable: false };
 				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
 				appendAssistantMessageDiagnostic(output, {
 					type: PROVIDER_LIMIT_DIAGNOSTIC,
@@ -751,7 +753,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								},
 				});
 			} else {
-				output.errorMessage = formatProviderError(normalizeProviderError(error, diagnosticSecrets));
+				const norm = normalizeProviderError(error, diagnosticSecrets, model.provider);
+				output.errorMessage = formatProviderError(norm);
 				// Some providers via OpenRouter give additional information in this field.
 				// normalizeProviderError already stringifies the parsed body (error.error)
 				// into errorMessage, so only append the raw metadata when it is not already
@@ -760,6 +763,10 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
 					output.errorMessage += `\n${rawMetadata}`;
 				}
+				// Classify first, including the raw metadata, before any text is replaced (smarty-dev#5822 C3).
+				output.recovery ??= rawMetadata
+					? classifyProviderFailure({ text: output.errorMessage, status: norm.status, provider: model.provider })
+					: norm.recovery;
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
