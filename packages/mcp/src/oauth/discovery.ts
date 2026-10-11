@@ -132,6 +132,7 @@ export async function discoverAuthorizationServerMetadata(
 	options: {
 		fetch?: McpFetch;
 		protocolVersion?: string;
+		/** @deprecated Ignored. Exact issuer identity is always required; configure a metadata URL instead. */
 		skipIssuerValidation?: boolean;
 		/** See `OAuthFlowOptions.allowedEndpointOrigins`. */
 		allowedEndpointOrigins?: readonly string[];
@@ -139,6 +140,7 @@ export async function discoverAuthorizationServerMetadata(
 	} = {},
 ): Promise<AuthorizationServerMetadata | undefined> {
 	refuseMcpAdmission();
+	validateOAuthEndpointOrigins(undefined, options.allowedEndpointOrigins);
 	const fetch = options.fetch ?? globalThis.fetch;
 	for (const { url } of buildAuthorizationServerDiscoveryUrls(authorizationServerUrl)) {
 		const response = await fetchMetadata(
@@ -153,12 +155,9 @@ export async function discoverAuthorizationServerMetadata(
 			throw new Error(`HTTP ${response.status} loading authorization server metadata from ${url}`);
 		}
 		const metadata = parseAuthorizationServerMetadata(await response.json());
-		// RFC 8414 §3.3: the issuer must be identical to the identifier the discovery URL was built from.
+		// RFC 8414 §3.3: exact issuer identity is mandatory, regardless of skipIssuerValidation.
 		const expected = String(authorizationServerUrl);
-		if (!options.skipIssuerValidation && metadata.issuer !== expected) {
-			throw new OAuthIssuerMismatchError(expected, metadata.issuer);
-		}
-		// The endpoints must then live on the issuer's origin, so the issuer check also covers where credentials go.
+		if (metadata.issuer !== expected) throw new OAuthIssuerMismatchError(expected, metadata.issuer);
 		validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
 		return metadata;
 	}
@@ -175,6 +174,7 @@ export async function discoverOAuthServerInfo(
 		 */
 		authorizationServerMetadataUrl?: URL;
 		fetch?: McpFetch;
+		/** @deprecated Ignored. Exact issuer identity is always required; configure a metadata URL instead. */
 		skipIssuerValidation?: boolean;
 		/** See `OAuthFlowOptions.allowedEndpointOrigins`. */
 		allowedEndpointOrigins?: readonly string[];
@@ -182,6 +182,7 @@ export async function discoverOAuthServerInfo(
 	} = {},
 ): Promise<OAuthServerInfo> {
 	refuseMcpAdmission();
+	validateOAuthEndpointOrigins(undefined, options.allowedEndpointOrigins);
 	let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
 	try {
 		resourceMetadata = await discoverProtectedResourceMetadata(serverUrl, {
