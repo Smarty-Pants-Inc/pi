@@ -45,8 +45,9 @@ const BUDGETS = {
 	"packages/durable": {
 		".": {
 			// Upstream adds the shared storage scan module to its 62-file graph; the fork adds
-			// the retry error-body parser and dependency-free credential redactor (+2).
-			maxFiles: 65,
+			// the retry error-body parser and dependency-free credential redactor (+2), and the recovery
+			// classifier moved out of retry/overflow (+1, smarty-dev#5822).
+			maxFiles: 66,
 			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
 		},
 	},

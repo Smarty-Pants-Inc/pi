@@ -3,6 +3,7 @@ import {
 	fauxAssistantMessage,
 	fauxThinking,
 	fauxToolCall,
+	recordThrottledLimitWait,
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
@@ -156,13 +157,9 @@ describe("stream recovery episode boundaries", () => {
 		});
 		harnesses.push(h);
 		const throttled = emptyError("one request at a time");
-		throttled.diagnostics = [
-			{
-				type: "provider_limit",
-				timestamp: Date.now(),
-				details: { code: "smarty_limit", retryAfterSeconds: 0.001, waitMessage: "Wait for capacity" },
-			},
-		];
+		throttled.diagnostics = [{ type: "provider_limit", timestamp: Date.now() }];
+		// The one-shot wait is private to Pi, never a diagnostic field (smarty-dev#5822 N5682).
+		recordThrottledLimitWait(throttled, 0);
 		h.setResponses([
 			...Array.from({ length: maxRetries + 1 }, () => emptyError()),
 			throttled,

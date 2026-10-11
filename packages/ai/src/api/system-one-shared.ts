@@ -131,7 +131,7 @@ export async function classifySystemOne(
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, getRequestDiagnosticSecrets(model, options)),
+			normalizeProviderError(error, model.provider, undefined, getRequestDiagnosticSecrets(model, options)),
 			`${transport.label} error`,
 		);
 		return output;

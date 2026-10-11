@@ -275,8 +275,8 @@ describe("OpenAI Decisions", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("OpenAI Decisions error (400)");
-		expect(result.errorMessage).toContain("Decision input exceeds the token limit.");
+		// smarty-dev#5822 (pi#202 round 2): owned text with the status; the API error body is not published.
+		expect(result.errorMessage).toBe("OpenAI Decisions error (400)");
 	});
 
 	// smarty-dev#3155: upstream's shared transport must retain the fork's physical-request admission.

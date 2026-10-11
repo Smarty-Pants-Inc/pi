@@ -129,9 +129,20 @@ export type ProviderHeaders = Record<string, string | null>;
 export type FetchFunction = typeof globalThis.fetch;
 export type SessionAffinityFormat = "openai" | "openai-nosession" | "openrouter";
 
+/**
+ * Value-free observation of a provider HTTP response (smarty-dev#5822): only the HTTP status, and only when it
+ * is an integer 100-599. Response headers and the raw response are never passed to callbacks.
+ */
 export interface ProviderResponse {
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
+}
+
+/**
+ * Pi-owned notification that an adapter parsed one provider stream event (smarty-dev#5822). It carries no
+ * provider data: no raw event, event name, payload, identifier or model.
+ */
+export interface ProviderStreamNotification {
+	readonly type: "provider_stream_event";
 }
 
 /** Authentication, HTTP transport, and lifecycle callbacks shared by provider requests. */
@@ -162,9 +173,9 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	 */
 	onPayload?: (payload: unknown, model: TModel) => unknown | undefined | Promise<unknown | undefined>;
 	/**
-	 * Optional callback invoked after an HTTP response is received.
+	 * Optional callback invoked after an HTTP response is received, with its validated status only.
 	 */
-	onResponse?: (response: ProviderResponse, model: TModel) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
 	 * Optional custom HTTP headers to include in API requests.
 	 * Merged with provider defaults; caller values override default headers.
@@ -197,15 +208,15 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	/**
 	 * Optional callback invoked after an HTTP response is received and before
-	 * its body stream is consumed.
+	 * its body stream is consumed, with its validated status only.
 	 */
-	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
-	 * Optional observer for each parsed provider stream event before Pi normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
-	 * Adapter support is explicit; unsupported adapters do not invoke it.
+	 * Optional observer called once for each parsed provider stream event, before Pi normalizes it.
+	 * It receives only the Pi-owned notification, never provider data. A rejection ends the request
+	 * with a non-retryable `provider_stream_observer_error`. Unsupported adapters do not invoke it.
 	 */
-	onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void | Promise<void>;
+	onProviderStreamEvent?: (event: ProviderStreamNotification) => void | Promise<void>;
 	temperature?: number;
 	/**
 	 * Arbitrary sampling parameters merged into the request body as-is, after the named request
@@ -553,6 +564,21 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/**
+ * Closed remedies Pi can name for a failed response: a Bedrock model that rejects the configured data retention
+ * mode, and an exhausted ChatGPT subscription usage limit.
+ */
+export type AssistantErrorHint = "bedrock_data_retention" | "chatgpt_usage";
+
+/** Closed recovery classes of a failed response. */
+export type AssistantRecoveryClass = "retryable" | "premature_stream" | "context_length_exceeded";
+
+/** Pi-owned recovery decision: a closed class and whether an outer retry may replay the request. */
+export interface AssistantRecovery {
+	recovery?: AssistantRecoveryClass;
+	retryable: boolean;
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
@@ -570,6 +596,13 @@ export interface AssistantMessage {
 	stopReason: StopReason;
 	deferred?: DeferredHandle;
 	errorMessage?: string;
+	/**
+	 * Pi-owned recovery decision for a failed response, classified from the original provider error before any
+	 * text is suppressed (smarty-dev#5822). Retry, premature-stream and context-overflow checks read it first.
+	 */
+	recovery?: AssistantRecovery;
+	/** Pi-owned remedy for a failure Pi recognized before suppressing provider text (smarty-dev#5822 C4). */
+	errorHint?: AssistantErrorHint;
 	rawStopReason?: string;
 	/**
 	 * Provider indication of whether the model explicitly ended its turn.

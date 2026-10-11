@@ -217,11 +217,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			if (!runner?.hasHandlers("after_provider_response")) {
 				return;
 			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
+			await runner.emit({ type: "after_provider_response", status: response.status });
 		},
 		transformContext: async (messages: AgentMessage[]) => {
 			const runner = extensionRunnerRef.current;
