@@ -15,7 +15,7 @@ A script may start with an options line:
 ```
 
 - `max_output_tokens` (default 10000) limits the output. Longer output keeps its start and end, and the full text is written to a temp file whose path is included in the result. A script fails when its output passes 16777216 characters of text and base64 image data or 100000 `text()`, `image()`, and `console` calls; write large data to a file with a tool instead.
-- `timeout_ms` is a hard deadline for the whole script. It is unset by default. Image generation can take minutes, so do not set a short deadline for scripts that generate images.
+- `timeout_ms` is a hard deadline for the whole script. It defaults to, and cannot exceed, 1800000 (30 minutes). Image generation can take minutes, so do not set a short deadline for scripts that generate images.
 
 The result starts with `Script completed` or `Script failed`, the wall time, and the output. Text and image items appear in order, each on its own line. When the output has more than one text item (from `text()` or `return`), each starts with a `==> text N/M <==` line. `console` calls follow in one `<console_output>` block with one line per call. A failed script keeps its partial output, followed by `Script error:` and the error. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded.
 
@@ -57,7 +57,7 @@ While `codemode` is active, `codemode.mode` in [settings](settings.md#tools) dec
 
 `store(key, value)` keeps a JSON value under a string key for later `codemode` calls; storing `undefined` deletes the key. `load(key)` returns the value, or `undefined`. Writes are kept only when the script succeeds: each successful script that stores values appends a `codemode-store` custom entry to the session, so resumed sessions keep the values and each branch sees only the values written on its path.
 
-The store is for small state such as IDs, cursors, or summaries. One value may have at most 262144 characters of JSON and all values together at most 1048576. Do not store image data; show images with `image()`, which also saves them to a temp file.
+The store is for small state such as IDs, cursors, or summaries. One value may have at most 262144 characters of JSON and all values together at most 1048576. pi checks the store as it is when the script ends, so writes that no longer fit (for example after a parallel script stored values) are not saved and the call fails. Do not store image data; show images with `image()`, which also saves them to a temp file.
 
 ## Models
 

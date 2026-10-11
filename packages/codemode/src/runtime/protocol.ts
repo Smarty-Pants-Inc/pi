@@ -1,5 +1,6 @@
 import type { CodemodeOutputItem } from "../types.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
+import type { CodemodeLimits } from "./limits.ts";
 
 /**
  * Messages between the host (main thread) and the worker. Tool arguments,
@@ -15,6 +16,8 @@ export interface WorkerData {
 	/** Compiled `quickjs-wasi` module. Structured clone shares the compiled code with the worker. */
 	wasm: CodemodeWasmModule;
 	memoryLimitBytes: number | undefined;
+	/** Bridge budgets the worker checks before it posts each message. */
+	limits: CodemodeLimits;
 	/** Snapshot for `load()`: key to JSON text. */
 	store: Record<string, string>;
 	/**
@@ -34,7 +37,9 @@ export type WorkerToHostMessage =
 	| { type: "done"; ok: true; value: string | undefined; writes: string }
 	| { type: "done"; ok: false; error: ScriptErrorJson }
 	/** The VM failed outside the script's control, for example a wasm trap. */
-	| { type: "crash"; message: string };
+	| { type: "crash"; message: string }
+	/** The script went over a bridge budget; the worker posts nothing more. */
+	| { type: "limit"; message: string };
 
 export type HostToWorkerMessage =
 	/** `payload` is the JSON result when `ok`, otherwise the error message. */
@@ -43,7 +48,7 @@ export type HostToWorkerMessage =
 export function isWorkerToHostMessage(value: unknown): value is WorkerToHostMessage {
 	if (typeof value !== "object" || value === null) return false;
 	const type = (value as { type?: unknown }).type;
-	return type === "call" || type === "output" || type === "done" || type === "crash";
+	return type === "call" || type === "output" || type === "done" || type === "crash" || type === "limit";
 }
 
 export function isHostToWorkerMessage(value: unknown): value is HostToWorkerMessage {

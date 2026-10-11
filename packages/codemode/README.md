@@ -48,7 +48,7 @@ await sandbox.close();
 - `store(key, value)` and `load(key)` read and write JSON values synchronously. See [Store](#store).
 - Nothing else: no timers, `fetch`, `process`, `require`, modules, or `WebAssembly`. `eval` and `Function` work but only produce more code inside the same VM.
 
-`timeoutMs: Infinity` disables the deadline; the script then runs until it settles or `signal` aborts it. A script that waits on a promise nothing can settle (no tool call pending, and the VM has no timers or I/O) fails right away instead of hanging.
+The deadline is always finite: a `timeoutMs` above `limits.maxTimeoutMs` (default 30 minutes), `Infinity` included, is clamped to it. `limits` also bounds the characters of each message across the sandbox bridge and of all of them together, the calls one execution may start, and the calls in flight at once (`DEFAULT_CODEMODE_LIMITS`). The worker checks each message before it posts it and the host checks again, so a script over a budget fails with `kind: "limit"` before the host keeps the data. A script that waits on a promise nothing can settle (no tool call pending, and the VM has no timers or I/O) fails right away instead of hanging.
 
 `memoryLimitBytes` caps the VM's heap. Allocations beyond it fail inside the script as `InternalError: out of memory`.
 
@@ -64,7 +64,7 @@ if (result.ok) {
 }
 ```
 
-`load` returns a copy, so mutating it does not change the store. Storing `undefined` deletes the key. A value may be at most `MAX_STORE_VALUE_CHARS` (256 Ki) characters of JSON and all values together at most `MAX_STORE_TOTAL_CHARS` (1 Mi); larger writes throw a `RangeError` inside the script.
+`load` returns a copy, so mutating it does not change the store. Storing `undefined` deletes the key. A value may be at most `MAX_STORE_VALUE_CHARS` (256 Ki) characters of JSON and all values together at most `MAX_STORE_TOTAL_CHARS` (1 Mi); larger writes throw a `RangeError` inside the script. The host checks the same quotas again on the reported writes, deletions included, and fails the execution with `kind: "limit"` when they do not fit. Before persisting, call `checkCodemodeStoreQuota(current, result.storeWrites)` against the store as it is now, with no `await` between the check and the write, so parallel executions cannot together overfill it.
 
 ## Source format
 
@@ -172,6 +172,7 @@ const codemodeTool: AgentTool = {
 | `timeout` | the deadline expired; the worker was terminated                             |
 | `aborted` | `options.signal` fired or `close()` was called; the worker was terminated   |
 | `sandbox` | the worker or VM failed, for example a wasm trap or a missing worker file   |
+| `limit`   | the script went over a `limits` budget or the store quota; the worker was terminated |
 
 `result.output` holds the text and image items in the order the script produced them, also for failed executions. The host keeps all of it until the script ends, so output is limited to `MAX_OUTPUT_CHARS` (16 Mi) characters of text and base64 image data and `MAX_OUTPUT_ITEMS` (100000) items. Past either limit the script fails with a `RangeError`, even if it catches the error. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.
 

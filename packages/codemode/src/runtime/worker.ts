@@ -14,6 +14,7 @@
 import { parentPort, workerData } from "node:worker_threads";
 import { JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
 import { refuseCodemodeAdmission } from "../security-admission.ts";
+import { BridgeBudget, CodemodeLimitError } from "./limits.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
 
@@ -54,13 +55,28 @@ function describeException(error: JSException): string {
 async function main(data: WorkerData): Promise<void> {
 	refuseCodemodeAdmission();
 	const interrupt = new Int32Array(data.interrupt);
+	// Over a budget, the worker reports once, posts nothing more, and interrupts the VM.
+	const budget = new BridgeBudget(data.limits);
+	let stopped = false;
+	const send = (message: WorkerToHostMessage) => {
+		if (stopped) return;
+		try {
+			budget.charge(message);
+		} catch (error) {
+			if (!(error instanceof CodemodeLimitError)) throw error;
+			stopped = true;
+			post({ type: "limit", message: error.message });
+			return;
+		}
+		post(message);
+	};
 	const vm = await QuickJS.create({
 		wasm: data.wasm,
 		memoryLimit: data.memoryLimitBytes,
 		// Without a guard, deep recursion overflows the wasm stack and traps instead of throwing a
 		// catchable RangeError.
 		maxStackSize: MAX_STACK_SIZE,
-		interruptHandler: () => Atomics.load(interrupt, 0) !== 0,
+		interruptHandler: () => stopped || Atomics.load(interrupt, 0) !== 0,
 		wasi: discardOutput,
 	});
 
@@ -69,7 +85,7 @@ async function main(data: WorkerData): Promise<void> {
 		switch (kind.toString()) {
 			case "call":
 			case "global":
-				post({
+				send({
 					type: "call",
 					id: a.toNumber(),
 					target: kind.toString() === "call" ? "tool" : "global",
@@ -78,7 +94,7 @@ async function main(data: WorkerData): Promise<void> {
 				});
 				break;
 			case "output":
-				post({
+				send({
 					type: "output",
 					item:
 						a.toString() === "image"
@@ -90,14 +106,14 @@ async function main(data: WorkerData): Promise<void> {
 				break;
 			case "done":
 				if (a.toBoolean()) {
-					post({
+					send({
 						type: "done",
 						ok: true,
 						value: b === undefined || b.isUndefined ? undefined : b.toString(),
 						writes: c.toString(),
 					});
 				} else {
-					post({ type: "done", ok: false, error: b.toString() });
+					send({ type: "done", ok: false, error: b.toString() });
 				}
 				break;
 		}
@@ -127,7 +143,8 @@ async function main(data: WorkerData): Promise<void> {
 	};
 
 	parentPort?.on("message", (message: unknown) => {
-		if (!isHostToWorkerMessage(message)) return;
+		if (!isHostToWorkerMessage(message) || stopped) return;
+		budget.settle(0);
 		try {
 			vm.withScope(() => {
 				vm.callFunction(
