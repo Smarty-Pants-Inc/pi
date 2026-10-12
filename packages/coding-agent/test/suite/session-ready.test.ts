@@ -334,6 +334,91 @@ describe("session_ready (smarty-dev#10453)", () => {
 		expect(ready()).toEqual([expect.objectContaining({ reason: "new", generation: current().generation() })]);
 	});
 
+	// smarty-dev#10453 (pi#218 security P3): a handler still awaiting when the next /new starts keeps its old generation.
+	it("a session_ready handler still running when the next replacement starts cannot submit into it", async () => {
+		const held = gate();
+		const secondEntered = gate();
+		const secondRelease = gate();
+		let holdSecondStart = false;
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		let continuation: Promise<UserMessageReceipt[]> | undefined;
+		let replacingSecond: Promise<{ cancelled: boolean }> | undefined;
+		try {
+			const { runtime, current, ready } = await withRuntime({
+				onReady: (event, probe) => {
+					if (continuation) return;
+					probe.harness.setResponses([fauxAssistantMessage("stale reply")]);
+					continuation = (async () => {
+						await held.promise;
+						const during = await probe
+							.api()
+							.submitUserMessage(probe.request("stale during", "stale-during-id", event.sessionGeneration));
+						secondRelease.release();
+						await within(replacingSecond!);
+						const after = await probe
+							.api()
+							.submitUserMessage(probe.request("stale after", "stale-after-id", event.sessionGeneration));
+						return [during, after];
+					})();
+				},
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", async () => {
+							if (!holdSecondStart) return;
+							holdSecondStart = false;
+							secondEntered.release();
+							await secondRelease.promise;
+						});
+					},
+				],
+			});
+
+			await within(runtime.newSession());
+			await settle();
+			const first = current();
+			const firstGeneration = first.generation();
+			expect(ready()).toEqual([expect.objectContaining({ reason: "new", generation: firstGeneration })]);
+			expect(continuation).toBeDefined();
+
+			// The first handler is still awaiting `held` when the second /new starts.
+			holdSecondStart = true;
+			replacingSecond = runtime.newSession();
+			await within(secondEntered.promise);
+			const second = current();
+			expect(second).not.toBe(first);
+			second.harness.setResponses([fauxAssistantMessage("must not run")]);
+			held.release();
+
+			const [during, after] = await within(continuation!);
+			expect(during).toEqual({ status: "rejected", reason: "session_changed", sessionGeneration: firstGeneration });
+			expect(after).toEqual({ status: "rejected", reason: "session_changed", sessionGeneration: firstGeneration });
+			await settle();
+
+			expect(runtime.session).toBe(second.harness.session);
+			expect(second.generation()).not.toBe(firstGeneration);
+			expect(ready()).toEqual([
+				expect.objectContaining({ reason: "new", generation: firstGeneration }),
+				{
+					event: "session_ready",
+					reason: "new",
+					generation: second.generation(),
+					runtimeFenced: false,
+					sessionFenced: false,
+				},
+			]);
+			await within(runtime.session.waitForIdle());
+			expect(getUserTexts(second.harness)).toEqual([]);
+			expect(getUserTexts(first.harness)).toEqual([]);
+			expect(second.harness.session.isStreaming).toBe(false);
+			await settle();
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
 	it("emits once with the right reason for /new, /resume and fork", async () => {
 		const { runtime, initial, current, ready } = await withRuntime();
 		initial.harness.setResponses([fauxAssistantMessage("baseline")]);
