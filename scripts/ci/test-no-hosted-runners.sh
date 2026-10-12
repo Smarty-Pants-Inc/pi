@@ -6,6 +6,9 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 guard="$repo_root/scripts/ci/no-hosted-runners.sh"
 fixture_dir="$(mktemp -d)"
 trap 'rm -rf -- "$fixture_dir"' EXIT
+# Probes read the checked-out approval lists (the push-to-main path) unless a
+# case sets its own trusted-base context; the CI gate step uses the real one.
+export BASE_SHA= GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main
 
 bash "$guard" "$repo_root/.github/workflows"
 echo 'PASS: real workflows'
@@ -373,4 +376,28 @@ BASE_SHA="$hosted_head_sha" bash "$base_guard" "$fixture_dir"
 echo 'PASS: hosted label approved at the base'
 BASE_SHA= bash "$base_guard" "$fixture_dir"
 echo 'PASS: push to main reads the checked-out (reviewed) hosted allowlist'
+
+# pi#138: a merge-queue push has no PR payload (empty BASE_SHA). It must read
+# the lists at the merge base with origin/main, never the queue checkout, and
+# fail closed when no base is found.
+queue_rejected() {
+  local name="$1" fixture="$2" diagnostic="$3" main_sha="$4" output
+  if [[ -n "$main_sha" ]]; then repo_git update-ref refs/remotes/origin/main "$main_sha"; else repo_git update-ref -d refs/remotes/origin/main 2>/dev/null || true; fi
+  write_fixture probe.yml "$fixture"
+  if output="$(GITHUB_REF=refs/heads/tmp-mergify/merge-queue/probe bash "$base_guard" "$fixture_dir" 2>&1)"; then
+    echo "FAIL: queue run accepted $name" >&2
+    exit 1
+  fi
+  [[ "$output" == *"$diagnostic"* ]] || { printf 'FAIL: %s\n%s\n' "$name" "$output" >&2; exit 1; }
+  echo "PASS: rejected queue run with $name"
+}
+group_job=$'jobs:\n  check:\n    runs-on: {group: fleet}'
+hosted_job=$'jobs:\n  check:\n    runs-on: ubuntu-latest'
+queue_rejected 'PR-added group' "$group_job" "$group_diagnostic" "$base_sha"
+queue_rejected 'PR-added hosted label' "$hosted_job" 'unapproved hosted runner' "$hosted_base_sha"
+queue_rejected 'PR-added group and no origin/main' "$group_job" "$group_diagnostic" ''
+queue_rejected 'PR-added hosted label and no origin/main' "$hosted_job" 'unapproved hosted runner' ''
+repo_git update-ref refs/remotes/origin/main "$hosted_head_sha"
+GITHUB_REF=refs/heads/tmp-mergify/merge-queue/probe bash "$base_guard" "$fixture_dir"
+echo 'PASS: queue run with a hosted label approved on main'
 echo 'All hosted-runner guard probes passed'
