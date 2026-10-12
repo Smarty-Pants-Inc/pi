@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	connectRpc,
 	FrameReader,
@@ -178,6 +178,86 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		expect(errors.map((e) => e.reason)).toEqual(["pending_overflow"]);
 		expect(frames).toEqual([]);
 		expect(reader.pendingBytes).toBe(0);
+	});
+
+	it("copies each byte once when a frame just under the cap arrives 1 byte at a time", () => {
+		// pi#160 review: concatenating the whole buffer per chunk copied O(n^2) bytes (about 512 GiB
+		// here). Count every byte Buffer.concat produces; a linear reader copies the frame once.
+		const prefix = '{"id":"drip","result":{"pad":"';
+		const suffix = '"}}';
+		const body = `${prefix}${"a".repeat(MAX_FRAME_BYTES - prefix.length - suffix.length)}${suffix}`;
+		const wire = Buffer.from(`${body}\nnext`);
+		expect(Buffer.byteLength(body)).toBe(MAX_FRAME_BYTES);
+		let copied = 0;
+		const concat = Buffer.concat;
+		const spy = vi.spyOn(Buffer, "concat").mockImplementation((list, totalLength) => {
+			const result = concat(list, totalLength);
+			copied += result.length;
+			return result;
+		});
+		cleanup.push(() => spy.mockRestore());
+		const errors: HerdrRpcProtocolError[] = [];
+		const frames: Record<string, unknown>[] = [];
+		const reader = new FrameReader(
+			{ maxFrameBytes: MAX_FRAME_BYTES, maxPendingBytes: MAX_PENDING_BYTES },
+			(frame) => frames.push(frame),
+			(error) => errors.push(error),
+		);
+		const started = performance.now();
+		for (let at = 0; at < wire.length; at++) {
+			reader.push(wire.subarray(at, at + 1));
+			if (at === MAX_FRAME_BYTES - 1) expect(reader.pendingBytes).toBe(MAX_FRAME_BYTES);
+		}
+		const elapsed = performance.now() - started;
+		expect(errors).toEqual([]);
+		expect(frames).toHaveLength(1);
+		expect(frames[0]).toMatchObject({ id: "drip" });
+		// The remainder after the newline is kept for the next frame.
+		expect(reader.pendingBytes).toBe(4);
+		expect(copied).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		// Generous wall-clock bound: the quadratic reader takes minutes here.
+		expect(elapsed).toBeLessThan(10_000);
+	});
+
+	it("enforces the frame cap on the running length of a dripped frame", () => {
+		const errors: HerdrRpcProtocolError[] = [];
+		const frames: unknown[] = [];
+		const reader = new FrameReader(
+			{ maxFrameBytes: 64, maxPendingBytes: 256 },
+			(frame) => frames.push(frame),
+			(error) => errors.push(error),
+		);
+		for (let i = 0; i < 64; i++) reader.push(Buffer.from("a"));
+		expect(errors).toEqual([]);
+		expect(reader.pendingBytes).toBe(64);
+		reader.push(Buffer.from("a"));
+		expect(errors.map((e) => e.reason)).toEqual(["frame_too_large"]);
+		expect(reader.pendingBytes).toBe(0);
+		reader.push(Buffer.from('{"id":"x","result":{}}\n'));
+		expect(frames).toEqual([]);
+		expect(errors).toHaveLength(1);
+	});
+
+	it("splits several frames and a remainder out of fragmented chunks", () => {
+		const errors: HerdrRpcProtocolError[] = [];
+		const frames: unknown[] = [];
+		const reader = new FrameReader(
+			{ maxFrameBytes: 64, maxPendingBytes: 256 },
+			(frame) => frames.push(frame),
+			(error) => errors.push(error),
+		);
+		reader.push(Buffer.from('{"id":'));
+		reader.push(Buffer.from('"a"'));
+		reader.push(Buffer.from('}\n{"id":"b"}\n{"id"'));
+		expect(frames).toEqual([{ id: "a" }, { id: "b" }]);
+		expect(reader.pendingBytes).toBe(5);
+		reader.push(Buffer.from(':"c"}\n'));
+		expect(frames).toEqual([{ id: "a" }, { id: "b" }, { id: "c" }]);
+		expect(reader.pendingBytes).toBe(0);
+		// A line over the cap that completes in a later chunk is still too large.
+		reader.push(Buffer.alloc(40, 0x61));
+		reader.push(Buffer.from(`${"a".repeat(30)}\n`));
+		expect(errors.map((e) => e.reason)).toEqual(["frame_too_large"]);
 	});
 
 	it("closes and rejects on a malformed JSON line", async () => {

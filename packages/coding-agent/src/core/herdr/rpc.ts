@@ -54,8 +54,15 @@ function parseFrame(line: Buffer): Record<string, unknown> | undefined {
 	return message as Record<string, unknown>;
 }
 
+/**
+ * Copies each byte once (pi#160 review): an incomplete frame is held as a list of chunks with a
+ * running length, only the newest chunk is scanned for a newline, and a frame is concatenated once
+ * when its newline arrives. Concatenating the whole buffer on every chunk instead would copy
+ * O(n^2) bytes when a peer drips a frame in tiny chunks (about 512 GiB for 1 MiB sent 1 byte at a time).
+ */
 export class FrameReader {
-	private buffer: Buffer = Buffer.alloc(0);
+	private chunks: Buffer[] = [];
+	private buffered = 0;
 	private failed = false;
 	private readonly limits: FrameLimits;
 	private readonly onFrame: (frame: Record<string, unknown>) => void;
@@ -73,29 +80,43 @@ export class FrameReader {
 
 	/** Bytes held for an incomplete frame. */
 	get pendingBytes(): number {
-		return this.buffer.length;
+		return this.buffered;
 	}
 
 	push(chunk: Buffer): void {
 		if (this.failed) return;
-		if (this.buffer.length + chunk.length > this.limits.maxPendingBytes) {
+		if (this.buffered + chunk.length > this.limits.maxPendingBytes) {
 			this.fail("pending_overflow");
 			return;
 		}
-		this.buffer = this.buffer.length === 0 ? chunk : Buffer.concat([this.buffer, chunk]);
-		for (let at = this.buffer.indexOf(0x0a); at >= 0 && !this.failed; at = this.buffer.indexOf(0x0a)) {
-			const line = this.buffer.subarray(0, at);
-			this.buffer = this.buffer.subarray(at + 1);
-			const message = line.length > this.limits.maxFrameBytes ? undefined : parseFrame(line);
+		let start = 0;
+		for (let at = chunk.indexOf(0x0a); at >= 0 && !this.failed; at = chunk.indexOf(0x0a, start)) {
+			const tail = chunk.subarray(start, at);
+			const length = this.buffered + tail.length;
+			const held = this.chunks;
+			this.chunks = [];
+			this.buffered = 0;
+			start = at + 1;
+			if (length > this.limits.maxFrameBytes) {
+				this.fail("frame_too_large");
+				break;
+			}
+			held.push(tail);
+			const line = held.length === 1 ? tail : Buffer.concat(held, length);
+			const message = parseFrame(line);
 			if (message) this.onFrame(message);
-			else this.fail(line.length > this.limits.maxFrameBytes ? "frame_too_large" : "malformed_frame");
+			else this.fail("malformed_frame");
 		}
-		if (!this.failed && this.buffer.length > this.limits.maxFrameBytes) this.fail("frame_too_large");
+		if (this.failed || start === chunk.length) return;
+		this.chunks.push(start === 0 ? chunk : chunk.subarray(start));
+		this.buffered += chunk.length - start;
+		if (this.buffered > this.limits.maxFrameBytes) this.fail("frame_too_large");
 	}
 
 	private fail(reason: HerdrRpcProtocolReason): void {
 		this.failed = true;
-		this.buffer = Buffer.alloc(0);
+		this.chunks = [];
+		this.buffered = 0;
 		this.onError(new HerdrRpcProtocolError(reason));
 	}
 }
