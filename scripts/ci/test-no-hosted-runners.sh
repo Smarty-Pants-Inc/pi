@@ -337,4 +337,33 @@ done
 write_fixture probe.yml $'env:\n  LABELS: &labels [self-hosted, smarty-linux-x64]\njobs:\n  check:\n    runs-on: {group: fleet, labels: *labels}'
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
 echo 'PASS: literal runner group with resolved labels'
+
+# pi#195: `COND && 'A' || 'B'` resolves to both labels; anything looser fails closed.
+pi195_cond="startsWith(github.head_ref || github.ref_name, 'mergify/merge-queue/')"
+cond_job() { printf 'jobs:\n  check:\n    runs-on: %s\n' "$1"; }
+write_fixture probe.yml "$(cond_job "\${{ $pi195_cond && 'smarty-priority' || 'smarty-linux-x64' }}")"
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo 'PASS: pi#195 conditional runner selection'
+expect_rejected 'hosted label as conditional A' "$(cond_job "\${{ $pi195_cond && 'ubuntu-latest' || 'smarty-linux-x64' }}")" 'unapproved hosted runner'
+expect_rejected 'hosted label as conditional B' "$(cond_job "\${{ $pi195_cond && 'smarty-priority' || 'ubuntu-latest' }}")" 'unapproved hosted runner'
+for expression in \
+  "\${{ github.event.x || 'ubuntu-latest' && 'A' || 'B' }}" \
+  "\${{ github.event.x && 'ubuntu-latest' && 'A' || 'B' }}" \
+  "\${{ startsWith(github.ref, 'x' && 'A' || 'B' }}" \
+  "\${{ startsWith(github.ref, 'x')) && 'A' || 'B' }}" \
+  "\${{ )github.ref( && 'A' || 'B' }}" \
+  "\${{ github.ref == 'x && 'A' || 'B' }}" \
+  "\${{ github.ref == 'it''s && 'A' || 'B' }}" \
+  "\${{ $pi195_cond && \"smarty-priority\" || 'smarty-linux-x64' }}" \
+  "\${{ $pi195_cond && 'smarty-priority' || \"smarty-linux-x64\" }}" \
+  "\${{ $pi195_cond && '' || 'smarty-linux-x64' }}" \
+  "\${{ $pi195_cond && 'smarty-priority' || '' }}" \
+  "\${{  && 'A' || 'B' }}" \
+  "\${{ inputs.x }}\${{ inputs.y && 'A' || 'B' }}"; do
+  expect_rejected "conditional $expression" "$(cond_job "'${expression//\'/\'\'}'")" 'unsupported/unresolved'
+done
+expect_rejected 'conditional inside a matrix value' $'jobs:\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: ["${{ inputs.x && \'smarty-priority\' || \'smarty-linux-x64\' }}"]' 'unsupported/unresolved'
+write_fixture probe.yml "$(cond_job "\${{ github.ref == 'it''s (x)' && 'smarty-priority' || 'smarty-linux-x64' }}")"
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo "PASS: conditional with '' escape and parens inside a string"
 echo 'All hosted-runner guard probes passed'
