@@ -298,8 +298,8 @@ for value in true True TRUE false False FALSE; do
 done
 
 # pi#138: a runner group may be a GitHub-hosted larger-runner group. Refuse a
-# group unless our self-hosted group list names it (empty by default) or the
-# job carries an allowlisted hosted label.
+# group unless our self-hosted group list names it (empty by default),
+# whatever labels it carries.
 group_diagnostic='runner group not on the self-hosted group allowlist'
 printf '%s\n' '# probe' fleet > "$fixture_dir/groups.txt"
 expect_rejected 'group-only runs-on' $'jobs:\n  check:\n    runs-on: {group: larger-ubuntu}' "$group_diagnostic"
@@ -315,7 +315,38 @@ echo 'PASS: listed group-only runs-on'
 write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet, labels: [self-hosted, smarty-linux-x64]}'
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt" "$fixture_dir/groups.txt"
 echo 'PASS: listed group with literal labels'
-write_fixture build-binaries.yml "$smoke_job"$'\n  publish-npm:\n    runs-on: {group: npm-publish, labels: [ubuntu-latest]}'
-bash "$guard" "$fixture_dir" "$allowlist" "$fixture_dir/empty.txt"
-echo 'PASS: unlisted group with an allowlisted hosted label'
+expect_rejected 'unlisted group with an allowlisted hosted label' "$smoke_job"$'\n  publish-npm:\n    runs-on: {group: npm-publish, labels: [ubuntu-latest]}' "$group_diagnostic" build-binaries.yml "$allowlist"
+
+# pi#138: on a pull request the group list comes from the trusted base
+# (BASE_SHA), so a change cannot list a group and use it at once.
+base_repo="$fixture_dir/repo"
+mkdir -p "$base_repo/scripts/ci"
+cp -- "$repo_root/scripts/ci/no-hosted-runners.sh" "$repo_root/scripts/ci/no-hosted-runners.py" "$base_repo/scripts/ci/"
+repo_git() { git -C "$base_repo" -c user.name=probe -c user.email=probe@invalid -c commit.gpgsign=false "$@"; }
+repo_git init -q
+repo_git add scripts/ci
+repo_git commit -q -m 'no group list'
+no_list_sha="$(repo_git rev-parse HEAD)"
+cp -- "$repo_root/scripts/ci/self-hosted-runner-groups.txt" "$base_repo/scripts/ci/"
+repo_git add scripts/ci
+repo_git commit -q -m 'empty group list'
+base_sha="$(repo_git rev-parse HEAD)"
+echo fleet >> "$base_repo/scripts/ci/self-hosted-runner-groups.txt"
+repo_git commit -q -am 'PR lists fleet'
+head_sha="$(repo_git rev-parse HEAD)"
+base_guard="$base_repo/scripts/ci/no-hosted-runners.sh"
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet}'
+for case in "base $base_sha" "base-without-list $no_list_sha" "unknown-base 0000000000000000000000000000000000000000"; do
+  read -r name sha <<< "$case"
+  if output="$(BASE_SHA="$sha" bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt" 2>&1)"; then
+    echo "FAIL: group listed only by the PR head was accepted ($name)" >&2
+    exit 1
+  fi
+  [[ "$output" == *"$group_diagnostic"* ]] || { printf 'FAIL: %s\n%s\n' "$name" "$output" >&2; exit 1; }
+  echo "PASS: rejected group listed only by the PR head ($name)"
+done
+BASE_SHA="$head_sha" bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo 'PASS: group listed at the base'
+BASE_SHA= bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo 'PASS: push to main reads the checked-out (reviewed) list'
 echo 'All hosted-runner guard probes passed'

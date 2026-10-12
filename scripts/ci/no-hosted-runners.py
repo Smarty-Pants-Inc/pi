@@ -149,8 +149,9 @@ def runner_labels(selection, row, groups, resolve=True):
 
 def check(workflow_dir, allowlist, group_allowlist):
     # A runner group can be a GitHub-hosted larger-runner group, so a group is
-    # accepted only by name from our self-hosted group list (empty by default)
-    # or with an allowlisted hosted label for that file/job (pi#138).
+    # accepted only by name from our self-hosted group list (empty by default),
+    # whatever labels it carries (pi#138). The caller supplies that list from
+    # the trusted base, not the change under test.
     allowed_groups = set()
     for number, line in enumerate(group_allowlist.read_text().splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
@@ -190,16 +191,14 @@ def check(workflow_dir, allowlist, group_allowlist):
                         raise ValueError("unsupported/unresolved job runner (including reusable workflows)")
                     for row in matrix_rows(job):
                         groups = []
-                        hosted_approved = False
                         for label in runner_labels(job["runs-on"], row, groups):
                             if re.fullmatch(r"(?:ubuntu|windows|macos)-[\w.-]+", label, re.IGNORECASE):
                                 key = (path.name, job_id, label)
                                 if key not in allowed:
                                     raise ValueError(f"unapproved hosted runner: {label}")
                                 allowed[key] += 1
-                                hosted_approved = True
                         for group in groups:
-                            if group not in allowed_groups and not hosted_approved:
+                            if group not in allowed_groups:
                                 raise ValueError(f"runner group not on the self-hosted group allowlist: {group}")
                 except ValueError as error:
                     print(f"{path}:{job_id}: {error}", file=sys.stderr)
