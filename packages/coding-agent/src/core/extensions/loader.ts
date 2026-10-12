@@ -27,6 +27,7 @@ import {
 	assertExtensionMetadataCaller,
 	bindExtensionMetadataCallback,
 	bindExtensionMetadataSource,
+	bindSubmitUserMessageSource,
 } from "../user-message-metadata.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
@@ -295,6 +296,11 @@ function createRuntime(owner: SessionOwnership | undefined, scope?: OwnedExecSco
 	const runtime: ExtensionRuntime = {
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
+		submitUserMessage: async (request) => ({
+			status: "rejected",
+			sessionGeneration: typeof request?.sessionGeneration === "string" ? request.sessionGeneration : "",
+			reason: "no_session",
+		}),
 		appendEntry: notInitialized,
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
@@ -552,12 +558,32 @@ function createExtensionAPI(
 
 		sendUserMessage(content, options) {
 			assertActive();
+			// Read caller metadata once: binding, validation and error classification share it.
+			const metadata = options?.metadata;
 			try {
-				return runtime.sendUserMessage(content, bindExtensionMetadataSource(options, extension.path));
+				return runtime.sendUserMessage(content, bindExtensionMetadataSource(options, extension.path, metadata));
 			} catch (error) {
-				if (options?.metadata !== undefined) return Promise.reject(error);
+				if (metadata !== undefined) return Promise.reject(error);
 				throw error;
 			}
+		},
+
+		async submitUserMessage(request) {
+			const sessionGeneration = typeof request?.sessionGeneration === "string" ? request.sessionGeneration : "";
+			try {
+				assertActive();
+			} catch {
+				return { status: "rejected", sessionGeneration, reason: "session_changed" };
+			}
+			if (!runtime.submitUserMessage) {
+				return { status: "rejected", sessionGeneration, reason: "unsupported" };
+			}
+			// Borrowed API: refuse before the host sees the request, so nothing is admitted or reserved.
+			const metadataOptions = bindSubmitUserMessageSource(extension.path);
+			if (!metadataOptions) {
+				return { status: "rejected", sessionGeneration, reason: "admission_refused" };
+			}
+			return runtime.submitUserMessage(request, metadataOptions);
 		},
 
 		appendEntry(customType: string, data?: unknown): void {

@@ -155,7 +155,7 @@ function errorMessage(error: unknown, secrets: readonly string[]): string {
 	if ((error as Partial<ClassifierHttpError>).status === 504) {
 		return `${LABEL} error (504): the request timed out at the gateway. Very large inputs (above roughly 600K tokens) currently exceed its time limit.`;
 	}
-	return formatProviderError(normalizeProviderError(error, secrets), `${LABEL} error`);
+	return formatProviderError(normalizeProviderError(error, undefined, undefined, secrets), `${LABEL} error`);
 }
 
 /** Classification through OpenAI's Decisions API. */

@@ -1200,22 +1200,19 @@ The callback is supported by `stream`, `complete`, `streamSimple`, and `complete
 
 ### Observing Provider Stream Events
 
-Use `onProviderStreamEvent` to inspect provider-specific fields that Pi does not include in `AssistantMessage`. The callback receives the parsed event available to the adapter before Pi normalizes it. Treat the event as read-only because mutations can affect normalization. This is not guaranteed to be the original HTTP bytes or SSE frame.
+Use `onProviderStreamEvent` to observe stream progress. Adapters call it once for each parsed provider event, before Pi normalizes it, with the Pi-owned notification `{ type: "provider_stream_event" }`. It carries no provider data: no raw event, payload, identifier, or model, so a provider response cannot leak credential values through it. `onResponse` likewise receives only `{ status }`, never response headers.
 
 ```typescript
-const openRouterModel = models.getModel('openrouter', 'openrouter/auto')!;
-const response = await models.complete(openRouterModel, context, {
-  headers: { "X-OpenRouter-Metadata": "enabled" },
-  onProviderStreamEvent: (data) => {
-    const chunk = data as Record<string, unknown>;
-    if (chunk.openrouter_metadata) {
-      console.log(chunk.openrouter_metadata);
-    }
+let events = 0;
+const response = await models.complete(model, context, {
+  onResponse: ({ status }) => console.log(`HTTP ${status}`),
+  onProviderStreamEvent: () => {
+    events++;
   },
 });
 ```
 
-Callbacks are awaited in stream order, so slow callbacks delay stream consumption and thrown errors fail the request. SDK-backed adapters can expose only fields retained by their SDK.
+Callbacks are awaited in stream order, so slow callbacks delay stream consumption. A rejected stream observer fails the request with the non-retryable `provider_stream_observer_error` diagnostic.
 
 ## Custom Providers
 

@@ -31,10 +31,12 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { closedRawStopReason } from "../utils/diagnostics.ts";
+import { ProviderDataError } from "../utils/error-body.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
+import { notifyProviderStreamEvent } from "../utils/provider-observation.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import { resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
@@ -609,13 +611,9 @@ export async function processResponsesStream<TApi extends Api>(
 
 	for await (const event of openaiStream) {
 		try {
-			await options?.onProviderStreamEvent?.(event, model);
-		} catch (error) {
 			// Preserve observer origin even when it rejects before the first output is normalized.
-			appendAssistantMessageDiagnostic(
-				output,
-				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
-			);
+			await notifyProviderStreamEvent(options, output);
+		} catch (error) {
 			// A rejecting observer must not erase provider-reported generation and permit replay.
 			if (
 				event.type === "response.failed" ||
@@ -771,7 +769,8 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			// A provider error by origin: the code and message only classify (smarty-dev#5822, pi#202 round 3).
+			throw new ProviderDataError(`${event.code ?? ""}\n${event.message ?? ""}`);
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
 			finalizeResponsesUsage(event.response, output, model, options);
@@ -783,7 +782,7 @@ export async function processResponsesStream<TApi extends Api>(
 				: details?.reason
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
-			throw new Error(msg);
+			throw new ProviderDataError(msg);
 		}
 	}
 	if (!sawTerminalResponseEvent) {
@@ -819,8 +818,9 @@ function mapStopReason(
 			}
 			return {
 				stopReason: "error",
+				// A closed reason only; a provider-chosen value is published as `other` (smarty-dev#5822).
 				errorMessage: incompleteReason
-					? `Response incomplete: ${incompleteReason}`
+					? `Response incomplete: ${closedRawStopReason(`incomplete.${incompleteReason}`).replace(/^incomplete\./, "")}`
 					: "Response incomplete without a provider reason",
 			};
 		case "failed":
@@ -832,7 +832,7 @@ function mapStopReason(
 			return { stopReason: "stop" };
 		default: {
 			const _exhaustive: never = status;
-			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
+			throw new ProviderDataError(`Unhandled stop reason: ${_exhaustive}`);
 		}
 	}
 }

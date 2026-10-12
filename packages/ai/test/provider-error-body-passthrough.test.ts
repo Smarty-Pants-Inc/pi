@@ -51,7 +51,7 @@ vi.mock("openai", () => {
 });
 
 describe("provider error body passthrough", () => {
-	it("surfaces the HTTP body reason instead of the opaque SDK message (openrouter images)", async () => {
+	it("surfaces the HTTP status as owned text instead of the opaque SDK message (openrouter images)", async () => {
 		const model: ImageModel<"openrouter-images"> = {
 			type: "image",
 			id: "black-forest-labs/flux.2-pro",
@@ -70,10 +70,7 @@ describe("provider error body passthrough", () => {
 		const output = await generateImages(model, context, { apiKey: "test" });
 
 		expect(output.stopReason).toBe("error");
-		// The status should be surfaced.
-		expect(output.errorMessage).toContain("403");
-		// The body reason must not be swallowed by the opaque SDK message.
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
-		expect(output.errorMessage).not.toBe("403 status code (no body)");
+		// smarty-dev#5822 (pi#202 round 2): the status is surfaced as owned text; the body is never published.
+		expect(output.errorMessage).toBe("Provider request failed (403)");
 	});
 });

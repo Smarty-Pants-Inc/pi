@@ -1154,13 +1154,13 @@ describe("Agent", () => {
 	it("forwards provider stream event observers through AgentOptions", async () => {
 		const providerEvents: unknown[] = [];
 		const agent = new Agent({
-			onProviderStreamEvent: (data) => {
-				providerEvents.push(data);
+			onProviderStreamEvent: (event) => {
+				providerEvents.push(event);
 			},
-			streamFn: (model, _context, options) => {
+			streamFn: (_model, _context, options) => {
 				const stream = createAssistantMessageEventStream();
 				queueMicrotask(async () => {
-					await options?.onProviderStreamEvent?.({ request_cost: 0.01 }, model);
+					await options?.onProviderStreamEvent?.({ type: "provider_stream_event" });
 					const message = createAssistantMessage("ok");
 					stream.push({ type: "done", reason: "stop", message });
 				});
@@ -1170,7 +1170,7 @@ describe("Agent", () => {
 
 		await agent.prompt("hello");
 
-		expect(providerEvents).toEqual([{ request_cost: 0.01 }]);
+		expect(providerEvents).toEqual([{ type: "provider_stream_event" }]);
 	});
 
 	it("forwards sessionId to streamFunction options", async () => {

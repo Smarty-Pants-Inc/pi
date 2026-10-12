@@ -54,8 +54,8 @@ describe("openai-completions provider stream events", () => {
 		mockState.chunks = [];
 	});
 
-	// Regression test for #9784.
-	it("exposes provider chunks including OpenRouter metadata", async () => {
+	// #9784 exposed raw chunks; smarty-dev#5822 C1 replaces them with value-free notifications.
+	it("notifies once per chunk without provider chunks or OpenRouter metadata", async () => {
 		const firstChunk = {
 			id: "chatcmpl-1",
 			model: "anthropic/claude-sonnet-4.6",
@@ -82,13 +82,14 @@ describe("openai-completions provider stream events", () => {
 			{ messages: [{ role: "user", content: "hi", timestamp: Date.now() }] },
 			{
 				apiKey: "test",
-				onProviderStreamEvent: (data) => {
-					events.push(data);
+				onProviderStreamEvent: (...args: unknown[]) => {
+					events.push(args);
 				},
 			},
 		);
 
 		expect(message.content).toEqual([{ type: "text", text: "hello" }]);
-		expect(events).toEqual([firstChunk, finalChunk]);
+		expect(events).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
+		expect(JSON.stringify(events)).not.toContain("openrouter_metadata");
 	});
 });
