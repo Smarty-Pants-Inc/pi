@@ -42,6 +42,28 @@ async function within<T>(promise: Promise<T>): Promise<T> {
 
 const settle = () => new Promise<void>((resolve) => setTimeout(resolve, 10));
 
+/** A one-shot signal raised by a handler; `reached()` waits for it, failing with `label` after 5 s. */
+function signal(label: string) {
+	let raise!: () => void;
+	const raised = new Promise<void>((resolve) => {
+		raise = resolve;
+	});
+	const reached = async () => {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				raised,
+				new Promise<never>((_resolve, reject) => {
+					timer = setTimeout(() => reject(new Error(`timed out after 5000 ms waiting for: ${label}`)), 5000);
+				}),
+			]);
+		} finally {
+			clearTimeout(timer);
+		}
+	};
+	return { raise, reached };
+}
+
 // smarty-dev#10453: session_ready fires after a replacement's input fence lifts, so the generation
 // registered in session_start can be submitted from it. Real runtime, sessions and faux turns; nothing mocked.
 describe("session_ready (smarty-dev#10453)", () => {
@@ -332,6 +354,101 @@ describe("session_ready (smarty-dev#10453)", () => {
 		await settle();
 		expect(current()).not.toBe(superseded);
 		expect(ready()).toEqual([expect.objectContaining({ reason: "new", generation: current().generation() })]);
+	});
+
+	// smarty-dev#10453 (pi#218 security P3): a handler still awaiting when the next /new starts keeps its old generation.
+	it("a session_ready handler still running when the next replacement starts cannot submit into it", async () => {
+		const held = gate();
+		const secondEntered = gate();
+		const secondRelease = gate();
+		let holdSecondStart = false;
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		const firstReady = signal("session_ready handler for the first replacement");
+		const secondReady = signal("session_ready handler for the second replacement");
+		let continuation: Promise<UserMessageReceipt[]> | undefined;
+		let replacingSecond: Promise<{ cancelled: boolean }> | undefined;
+		try {
+			const { runtime, current, ready } = await withRuntime({
+				onReady: (event, probe) => {
+					if (continuation) {
+						secondReady.raise();
+						return;
+					}
+					// Raised before the continuation awaits `held`, so the test proceeds while it is still running.
+					firstReady.raise();
+					probe.harness.setResponses([fauxAssistantMessage("stale reply")]);
+					continuation = (async () => {
+						await held.promise;
+						const during = await probe
+							.api()
+							.submitUserMessage(probe.request("stale during", "stale-during-id", event.sessionGeneration));
+						secondRelease.release();
+						await within(replacingSecond!);
+						const after = await probe
+							.api()
+							.submitUserMessage(probe.request("stale after", "stale-after-id", event.sessionGeneration));
+						return [during, after];
+					})();
+				},
+				extensionFactories: [
+					(pi) => {
+						pi.on("session_start", async () => {
+							if (!holdSecondStart) return;
+							holdSecondStart = false;
+							secondEntered.release();
+							await secondRelease.promise;
+						});
+					},
+				],
+			});
+
+			await within(runtime.newSession());
+			await firstReady.reached();
+			const first = current();
+			const firstGeneration = first.generation();
+			expect(ready()).toEqual([expect.objectContaining({ reason: "new", generation: firstGeneration })]);
+			expect(continuation).toBeDefined();
+
+			// The first handler is still awaiting `held` when the second /new starts.
+			holdSecondStart = true;
+			replacingSecond = runtime.newSession();
+			await within(secondEntered.promise);
+			const second = current();
+			expect(second).not.toBe(first);
+			second.harness.setResponses([fauxAssistantMessage("must not run")]);
+			held.release();
+
+			const [during, after] = await within(continuation!);
+			expect(during).toEqual({ status: "rejected", reason: "session_changed", sessionGeneration: firstGeneration });
+			expect(after).toEqual({ status: "rejected", reason: "session_changed", sessionGeneration: firstGeneration });
+			// The continuation awaited replacingSecond, so the second session_ready is (or is about to be) dispatched.
+			await secondReady.reached();
+
+			expect(runtime.session).toBe(second.harness.session);
+			expect(second.generation()).not.toBe(firstGeneration);
+			expect(ready()).toEqual([
+				expect.objectContaining({ reason: "new", generation: firstGeneration }),
+				{
+					event: "session_ready",
+					reason: "new",
+					generation: second.generation(),
+					runtimeFenced: false,
+					sessionFenced: false,
+				},
+			]);
+			await within(runtime.session.waitForIdle());
+			expect(getUserTexts(second.harness)).toEqual([]);
+			expect(getUserTexts(first.harness)).toEqual([]);
+			expect(second.harness.session.isStreaming).toBe(false);
+			// No positive signal exists for "no rejection went unhandled". Node reports unhandled rejections
+			// while draining the microtask queue, before the next macrotask, so one setImmediate turn suffices.
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 
 	it("emits once with the right reason for /new, /resume and fork", async () => {
