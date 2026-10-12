@@ -7,7 +7,7 @@
 
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
-import { chmodSync, createWriteStream, mkdtempSync, openSync, rmSync, unlinkSync, type WriteStream } from "node:fs";
+import { createWriteStream, mkdtempSync, openSync, rmSync, unlinkSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,15 +15,13 @@ import { join } from "node:path";
 export const MAX_OUTPUT_DIRECTORY_BYTES = 512 * 1024 * 1024;
 
 /**
- * Only writes through this module count toward the bound, so the owned files and directory are
- * read-only at rest: an append to a returned path, or a rename into the directory, fails with EACCES.
- * The directory is writable only inside {@link withOpenDirectory}, which never spans an await.
- * ponytail: a tool running as the same user can chmod them back on purpose. This stops accidental
- * growth through the returned paths, not a hostile process.
+ * Only writes through this module count toward the bound, so the owned files are read-only: an
+ * append to a returned path fails with EACCES. The directory stays 0700 so its owner (and any
+ * cleanup after a killed process, such as a test runner's rm -rf) can always remove it.
+ * ponytail: a tool running as the same user can chmod a file back or move a file in on purpose.
+ * This stops accidental growth through the returned paths, not a hostile process.
  */
 const READ_ONLY_FILE_MODE = 0o400;
-const SEALED_DIRECTORY_MODE = 0o500;
-const OPEN_DIRECTORY_MODE = 0o700;
 
 let ownedDirectory: string | undefined;
 let ownedBytes = 0;
@@ -42,25 +40,9 @@ function checkNamePart(part: string): void {
 	if (/[\\/\0]|\.\./.test(part)) throw new Error(`Invalid output file name part ${JSON.stringify(part)}`);
 }
 
-/** Run synchronous `fn` with the owned directory writable, and seal it again before returning. */
-function withOpenDirectory<T>(directory: string, fn: () => T): T {
-	chmodSync(directory, OPEN_DIRECTORY_MODE);
-	try {
-		return fn();
-	} finally {
-		chmodSync(directory, SEALED_DIRECTORY_MODE);
-	}
-}
-
 /** Remove the owned output directory. Runs on process exit; exported for tests. */
 export function removeOutputDirectory(): void {
 	if (ownedDirectory === undefined) return;
-	// The sealed directory's entries cannot be removed until it is writable again.
-	try {
-		chmodSync(ownedDirectory, OPEN_DIRECTORY_MODE);
-	} catch {
-		// Already gone; rmSync with force accepts that.
-	}
 	rmSync(ownedDirectory, { recursive: true, force: true });
 	ownedDirectory = undefined;
 	ownedBytes = 0;
@@ -69,13 +51,10 @@ export function removeOutputDirectory(): void {
 /**
  * The owned output directory, created on first use. `mkdtemp` creates it exclusively with mode 0700,
  * so other accounts cannot list it or read its files, and it is never a directory someone else made.
- * At rest it is sealed to 0500.
  */
 export function getOutputDirectory(): string {
 	if (ownedDirectory === undefined) {
-		const directory = mkdtempSync(join(tmpdir(), "pi-output-"));
-		chmodSync(directory, SEALED_DIRECTORY_MODE);
-		ownedDirectory = directory;
+		ownedDirectory = mkdtempSync(join(tmpdir(), "pi-output-"));
 		// `exit` also runs after an uncaught error and after pi's signal and abort handlers call process.exit().
 		process.once("exit", removeOutputDirectory);
 	}
@@ -100,8 +79,7 @@ export async function writeOutputFile(prefix: string, extension: string, data: s
 }
 
 /**
- * Open a new output file for streamed output. The file is created synchronously, so the directory is
- * sealed again before this returns. Every chunk counts toward {@link MAX_OUTPUT_DIRECTORY_BYTES}; a
+ * Open a new output file for streamed output. The file is created synchronously. Every chunk counts toward {@link MAX_OUTPUT_DIRECTORY_BYTES}; a
  * chunk past it fails the stream with the limit error. A failed stream's file is removed and its
  * bytes are no longer counted. Other failures, such as an existing file at the path, arrive on the
  * stream like any open error.
@@ -116,10 +94,9 @@ export function createOutputFileStream(prefix: string, extension: string): { pat
 	try {
 		directory = getOutputDirectory();
 		path = join(directory, name);
-		const target = path;
 		// Created read-only: this descriptor can write, later opens cannot. `wx` never follows a link
 		// someone else placed at the path.
-		fd = withOpenDirectory(directory, () => openSync(target, "wx", READ_ONLY_FILE_MODE));
+		fd = openSync(path, "wx", READ_ONLY_FILE_MODE);
 	} catch (error) {
 		const failOpen = (...args: unknown[]) => (args.at(-1) as (error: unknown) => void)(error);
 		path ??= join(tmpdir(), name);
@@ -152,7 +129,7 @@ export function createOutputFileStream(prefix: string, extension: string): { pat
 		if (!stream.errored || ownedDirectory !== directory) return;
 		ownedBytes -= counted;
 		try {
-			withOpenDirectory(directory, () => unlinkSync(created));
+			unlinkSync(created);
 		} catch {
 			// Already gone.
 		}

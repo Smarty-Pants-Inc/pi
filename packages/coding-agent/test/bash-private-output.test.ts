@@ -1,7 +1,7 @@
 import * as nodeFs from "node:fs";
-import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
@@ -28,7 +28,6 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
 		process.umask(previousUmask);
-		// The owned output directory is read-only at rest; its own cleanup opens it first.
 		removeOutputDirectory();
 		rmSync(root, { recursive: true, force: true });
 	});
@@ -62,6 +61,11 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 					expect(statSync(path).mode & 0o777).toBe(0o400);
 				}
 				expect(new Set(paths).size).toBe(2);
+				// pi#203 CI: a killed process never runs its exit cleanup, so the owner's plain rm -rf
+				// (test.sh, the CI runner) must be able to remove the output directory.
+				const directory = dirname(paths[0]);
+				rmSync(directory, { recursive: true, force: true });
+				expect(existsSync(directory)).toBe(false);
 			},
 		);
 

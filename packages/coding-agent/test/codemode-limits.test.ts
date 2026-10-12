@@ -2,13 +2,13 @@
  * Codemode host limits that live in coding-agent (pi#131 round-1 P1-3 and P1-4, smarty-dev#4506).
  * Codemode stays refused, so these call the internals directly.
  */
-import { appendFileSync, lstatSync, mkdtempSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const fsCalls = vi.hoisted(() => ({
-	rmSync: [] as { path: string; mode: number | undefined }[],
+	rmSync: [] as string[],
 	unlinkSync: [] as string[],
 	failWrite: false,
 }));
@@ -18,9 +18,8 @@ vi.mock("node:fs", async (importOriginal) => {
 	const original = await importOriginal<typeof import("node:fs")>();
 	return {
 		...original,
-		// Records the directory's mode at removal time, to show it was made writable first.
 		rmSync: (path: string) => {
-			fsCalls.rmSync.push({ path, mode: original.statSync(path, { throwIfNoEntry: false })?.mode });
+			fsCalls.rmSync.push(path);
 		},
 		unlinkSync: (path: string) => {
 			fsCalls.unlinkSync.push(path);
@@ -86,13 +85,14 @@ describe("owned output directory", () => {
 		fsCalls.unlinkSync.length = 0;
 	});
 
-	it("writes output files into a directory this process owns, read-only at rest", async () => {
+	it("writes read-only output files into a 0700 directory this process owns", async () => {
 		const path = await writeOutputFile("pi-codemode", ".txt", "private");
 		const directory = getOutputDirectory();
 		expect(dirname(path)).toBe(directory);
 		const stats = lstatSync(directory);
 		expect(stats.isDirectory()).toBe(true);
-		expect(stats.mode & 0o777).toBe(0o500);
+		// pi#203 CI: 0700, never a mode that blocks the owner's own cleanup.
+		expect(stats.mode & 0o777).toBe(0o700);
 		expect(stats.uid).toBe(process.getuid?.());
 		expect(lstatSync(path).mode & 0o777).toBe(0o400);
 	});
@@ -105,25 +105,10 @@ describe("owned output directory", () => {
 		expect(statSync(path).size).toBe(size);
 	});
 
-	it("rejects a rename of another file into the directory", async () => {
-		await writeOutputFile("pi-codemode", ".txt", "x");
-		const directory = getOutputDirectory();
-		const outside = join(mkdtempSync(join(tmpdir(), "pi-output-test-")), "big.bin");
-		writeFileSync(outside, "big");
-		const before = readdirSync(directory).length;
-		expect(() => renameSync(outside, join(directory, "big.bin"))).toThrow(
-			expect.objectContaining({ code: "EACCES" }),
-		);
-		expect(readdirSync(directory)).toHaveLength(before);
-	});
-
-	it("still writes new files after a rejected append and rename", async () => {
+	it("still writes new files after a rejected append", async () => {
 		const first = await writeOutputFile("pi-codemode", ".txt", "one");
 		const directory = getOutputDirectory();
 		expect(() => appendFileSync(first, "more")).toThrow();
-		const outside = join(mkdtempSync(join(tmpdir(), "pi-output-test-")), "f");
-		writeFileSync(outside, "f");
-		expect(() => renameSync(outside, join(directory, "f"))).toThrow();
 		const [second, third] = await Promise.all([
 			writeOutputFile("pi-codemode", ".txt", "two"),
 			writeOutputFile("pi-codemode", ".txt", "three"),
@@ -131,7 +116,6 @@ describe("owned output directory", () => {
 		expect(readdirSync(directory).sort()).toEqual(
 			[first, second, third].map((path) => path.slice(directory.length + 1)).sort(),
 		);
-		expect(lstatSync(directory).mode & 0o777).toBe(0o500);
 	});
 
 	it("refuses a write that would pass the size bound, writing nothing", async () => {
@@ -150,16 +134,6 @@ describe("owned output directory", () => {
 		expect(fsCalls.unlinkSync.at(-1)).toMatch(/pi-codemode-[0-9a-f]+\.txt$/);
 		expect(dirname(fsCalls.unlinkSync.at(-1) ?? "")).toBe(getOutputDirectory());
 		expect(getOutputDirectoryBytes()).toBe(0);
-	});
-
-	// pi#203 R3: the directory is never left writable across an await.
-	it("seals the directory before a stream or a pending write returns", async () => {
-		const { stream } = createOutputFileStream("pi-bash", ".log");
-		expect(lstatSync(getOutputDirectory()).mode & 0o777).toBe(0o500);
-		const pending = writeOutputFile("pi-codemode", ".txt", "x".repeat(1024 * 1024));
-		expect(lstatSync(getOutputDirectory()).mode & 0o777).toBe(0o500);
-		stream.end();
-		await Promise.all([finished(stream), pending]);
 	});
 
 	// pi#203 R3: a NUL is refused before the directory is made.
@@ -207,8 +181,6 @@ describe("owned output directory", () => {
 		const directory = getOutputDirectory();
 		expect(process.listeners("exit")).toContain(removeOutputDirectory);
 		removeOutputDirectory();
-		// Made writable again before the removal, so the read-only entries can be removed.
-		expect(fsCalls.rmSync.at(-1)).toEqual({ path: directory, mode: expect.any(Number) });
-		expect((fsCalls.rmSync.at(-1)?.mode ?? 0) & 0o777).toBe(0o700);
+		expect(fsCalls.rmSync.at(-1)).toBe(directory);
 	});
 });
