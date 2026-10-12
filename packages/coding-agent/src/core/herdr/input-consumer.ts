@@ -2,6 +2,8 @@
  * Herdr input-consumer client (smarty-dev#2636; decisions 1 and 3 B in the Pi PR).
  *
  * Talks Herdr's newline-delimited JSON API (`{id, method, params}` -> `{id, result}|{id, error}`).
+ * Herdr answers one request per connection and then closes it, so every request (enroll, each cut,
+ * release) opens its own connection. Herdr finds an epoch by (epoch, epoch_key), not by connection.
  * The epoch_key stays in this closure; nothing here is reachable from extensions or settings.
  * Fail closed: any transport error, refusal, bad signature, tty mismatch, bad MAC or malformed
  * answer gives no epoch or an `unknown` cut, which callers record as `channel: "terminal"`.
@@ -109,41 +111,50 @@ export async function enrollHerdrInputConsumer(
 			challenge: challenge.toString("hex"),
 		});
 	} catch (error) {
-		connection.close();
 		if (error instanceof HerdrRpcProtocolError) return { ok: false, reason: "malformed" };
 		return { ok: false, reason: error instanceof Error && error.message === "refused" ? "refused" : "transport" };
+	} finally {
+		connection.close();
 	}
 	const answer = parseEnroll(result);
-	if (!answer) {
-		connection.close();
-		return { ok: false, reason: "malformed" };
-	}
+	if (!answer) return { ok: false, reason: "malformed" };
 	let tty: TtyId;
 	try {
 		tty = ownTty(options.ttyFd ?? 0);
 	} catch {
-		connection.close();
 		return { ok: false, reason: "server-unauthenticated" };
 	}
 	if (!verifyEnroll(options.trustRoot, challenge, options.paneId, answer, tty)) {
-		connection.close();
 		return { ok: false, reason: "server-unauthenticated" };
 	}
-	return { ok: true, epoch: openEpoch(connection, answer) };
+	return { ok: true, epoch: openEpoch(options.socketPath, timeoutMs, answer) };
 }
 
-function openEpoch(connection: ReturnType<typeof connectRpc>, enrolled: EnrollAnswer): HerdrEpoch {
+/** One request on a fresh connection, closed after the answer (pi#160 E2E: Herdr closes it anyway). */
+async function oneRequest(
+	socketPath: string,
+	timeoutMs: number,
+	method: string,
+	params: Record<string, unknown>,
+): Promise<Record<string, unknown>> {
+	const connection = connectRpc(socketPath, timeoutMs);
+	try {
+		return await connection.rpc(method, params);
+	} finally {
+		connection.close();
+	}
+}
+
+function openEpoch(socketPath: string, timeoutMs: number, enrolled: EnrollAnswer): HerdrEpoch {
 	const epochKey = enrolled.epochKey;
 	let ended = false;
 	const end = () => {
 		if (ended) return;
 		ended = true;
-		connection
-			.rpc("pane.input_consumer.release", { epoch: enrolled.epoch, epoch_key: epochKey.toString("hex") })
-			.then(
-				() => connection.close(),
-				() => connection.close(),
-			);
+		oneRequest(socketPath, timeoutMs, "pane.input_consumer.release", {
+			epoch: enrolled.epoch,
+			epoch_key: epochKey.toString("hex"),
+		}).catch(() => {});
 	};
 	return {
 		epoch: enrolled.epoch,
@@ -154,7 +165,7 @@ function openEpoch(connection: ReturnType<typeof connectRpc>, enrolled: EnrollAn
 			const request: CutRequest = { ...partial, epoch: enrolled.epoch };
 			let result: Record<string, unknown>;
 			try {
-				result = await connection.rpc("pane.input_consumer.cut", {
+				result = await oneRequest(socketPath, timeoutMs, "pane.input_consumer.cut", {
 					epoch: request.epoch,
 					epoch_key: epochKey.toString("hex"),
 					seq: request.seq,

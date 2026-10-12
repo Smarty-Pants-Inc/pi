@@ -61,6 +61,8 @@ async function run(
 	let cutRequests = 0;
 	const methods: string[] = [];
 	const closed: Promise<void>[] = [];
+	// Like Herdr, the epoch outlives the enroll connection: a cut finds it by (epoch, epoch_key).
+	let epochKey = Buffer.alloc(0);
 	const exited = new Promise<void>((resolve) => {
 		lines.on("line", (line) => {
 			const message = JSON.parse(line) as { slave?: string; exit?: number };
@@ -68,19 +70,23 @@ async function run(
 			if (message.exit !== undefined) resolve();
 		});
 	});
+	// Like Herdr's API server (pi#160 E2E): one request per connection, answered, then the connection
+	// is closed. Anything after the first line is never read.
 	const server: Server = createServer((socket) => {
-		let epochKey = Buffer.alloc(0);
 		let buffered = "";
+		let answered = false;
 		// The child exits right after its answer; a reset of the fake's side is expected.
 		socket.on("error", () => {});
 		closed.push(new Promise((resolve) => socket.on("close", () => resolve())));
 		socket.on("data", (data) => {
+			if (answered) return;
 			buffered += data.toString("utf8");
-			for (let at = buffered.indexOf("\n"); at >= 0; at = buffered.indexOf("\n")) {
+			const at = buffered.indexOf("\n");
+			if (at >= 0) {
+				answered = true;
 				const request = JSON.parse(buffered.slice(0, at));
-				buffered = buffered.slice(at + 1);
 				methods.push(request.method);
-				const reply = (result: object) => socket.write(`${JSON.stringify({ id: request.id, result })}\n`);
+				const reply = (result: object) => socket.end(`${JSON.stringify({ id: request.id, result })}\n`);
 				if (request.method === "pane.input_consumer.enroll") {
 					const stat = statSync(slave, { bigint: true });
 					const real = { dev: stat.dev, ino: stat.ino };
@@ -139,7 +145,9 @@ describe("herdr input consumer against a fake server on a real PTY (smarty-dev#2
 	});
 
 	it("attributes the typed turn when the server signs with the trusted key (counterexample)", async () => {
-		const { result } = await run({ signWith: trusted.privateKey, trustRoot: "trusted" });
+		const { result, methods } = await run({ signWith: trusted.privateKey, trustRoot: "trusted" });
+		// pi#160 E2E: the cut reaches a server that closed the enroll connection after its answer.
+		expect(methods).toEqual(["pane.input_consumer.enroll", "pane.input_consumer.cut"]);
 		expect(result.record).toMatchObject({
 			channel: "keyboard",
 			principal: { id: "paul", binding: "herdr-client" },
@@ -169,10 +177,12 @@ describe("herdr input consumer against a fake server on a real PTY (smarty-dev#2
 
 	// pi#160 review P1: `pi --help`, `--list-models` or a startup error exits after enrollment but
 	// before InteractiveMode.init() hands the input off.
-	it("restores the tty mode and releases the epoch when Pi exits before the TUI takes the input", async () => {
+	it("restores the tty mode when Pi exits before the TUI takes the input", async () => {
 		const { result, methods } = await run({ signWith: trusted.privateKey, trustRoot: "trusted", bootstrap: "exit" });
 		expect(result).toMatchObject({ rawBefore: false, attested: true, rawAfterEnroll: true, rawAtExit: false });
-		expect(methods).toEqual(["pane.input_consumer.enroll", "pane.input_consumer.release"]);
+		// pi#160 E2E: a release at exit would need a new connection, which cannot connect inside the
+		// synchronous exit handler. Herdr ends the epoch when the consumer dies instead.
+		expect(methods).toEqual(["pane.input_consumer.enroll"]);
 	});
 
 	it("keeps the epoch for the TUI after the hand-off (counterexample)", async () => {
@@ -184,6 +194,13 @@ describe("herdr input consumer against a fake server on a real PTY (smarty-dev#2
 		expect(result).toMatchObject({ attested: true, rawAtExit: false });
 		expect(result.record).toMatchObject({ channel: "keyboard", principal: { id: "paul" } });
 		expect(methods).toEqual(["pane.input_consumer.enroll", "pane.input_consumer.cut"]);
+	});
+
+	// pi#160 E2E: a refused attestation was silent; the bootstrap now reports why, once.
+	it("reports why the bootstrap attests nothing", async () => {
+		const { result } = await run({ signWith: attacker.privateKey, trustRoot: "trusted", bootstrap: "exit" });
+		expect(result.attested).toBe(false);
+		expect(result.diagnostic).toContain("server-unauthenticated");
 	});
 
 	it("enrolls nothing without a trust root", async () => {

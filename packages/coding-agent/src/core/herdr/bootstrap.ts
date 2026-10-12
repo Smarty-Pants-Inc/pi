@@ -8,6 +8,7 @@
 import type { KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { InputByteMeter } from "@earendil-works/pi-tui";
+import type { AgentSessionRuntimeDiagnostic } from "../agent-session-services.ts";
 import { EpochByteCounter, type PushResult } from "./epoch-bytes.ts";
 import { enrollHerdrInputConsumer } from "./input-consumer.ts";
 import { loadServerTrustRoot } from "./server-auth.ts";
@@ -20,6 +21,8 @@ export interface HerdrInputBootstrap {
 	readonly meter: InputByteMeter;
 	/** Undefined when enrollment failed: held input is still replayed, but nothing is attested. */
 	readonly attestor?: SubmitAttestor;
+	/** Why nothing is attested, shown once with the startup diagnostics (e.g. `server-unauthenticated`). */
+	readonly diagnostic?: AgentSessionRuntimeDiagnostic;
 	/**
 	 * Call synchronously right before the TUI's terminal starts: it restores the pre-Pi tty mode, and the
 	 * terminal (through `meter`) then owns the epoch.
@@ -28,7 +31,7 @@ export interface HerdrInputBootstrap {
 	/**
 	 * Undo enrollment when no TUI takes the input: restore the tty mode and release the epoch. Runs on
 	 * process exit until `handOff`, so `pi --help`, `--list-models` and startup errors cannot leave the
-	 * tty raw or the epoch held (pi#160 review). No-op after `handOff`.
+	 * tty raw (pi#160 review); Herdr ends the epoch when the process dies. No-op after `handOff`.
 	 */
 	shutdown(): void;
 }
@@ -103,8 +106,13 @@ export async function startHerdrInputConsumer(
 		if (enrolled.ok) enrolled.epoch.release();
 		pending.push(counter.abandon());
 		stdin.setRawMode(wasRaw);
+		const reason = enrolled.ok ? "no-marker" : enrolled.reason;
 		// Keep what was typed during enrollment: the TUI replays it as ordinary input.
 		return {
+			diagnostic: {
+				type: "warning",
+				message: `Herdr input attestation unavailable (${reason}): typed turns are recorded as terminal.`,
+			},
 			meter: { push: (chunk) => counter.push(chunk), takePending: () => concat(pending.splice(0)), end: () => {} },
 			handOff: () => {},
 			shutdown: () => {},
@@ -122,7 +130,8 @@ export async function startHerdrInputConsumer(
 	const shutdown = () => {
 		if (!disown()) return;
 		counter.end();
-		// At exit the release request is still written: a Unix socket write is attempted synchronously.
+		// At exit the release cannot be sent: it needs a new connection, which connects asynchronously
+		// (pi#160 E2E). Herdr ends the epoch when this process dies; the call only covers a non-exit path.
 		epoch.release();
 	};
 	process.on("exit", shutdown);

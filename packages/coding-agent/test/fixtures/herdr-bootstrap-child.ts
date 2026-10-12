@@ -19,6 +19,7 @@ const bootstrap = await startHerdrInputConsumer(
 	{ hardened: () => true, trustRoot: () => createPublicKey(readFileSync(trustRootPath!)) },
 );
 report.attested = bootstrap?.attestor !== undefined;
+report.diagnostic = bootstrap?.diagnostic?.message;
 report.rawAfterEnroll = process.stdin.isRaw;
 process.on("exit", () => writeFileSync(out!, JSON.stringify({ ...report, rawAtExit: process.stdin.isRaw })));
 if (mode === "handoff" && bootstrap?.attestor) {
