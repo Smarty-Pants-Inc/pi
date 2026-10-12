@@ -8,7 +8,7 @@
  */
 import { type KeyObject, randomBytes } from "node:crypto";
 import { fstatSync } from "node:fs";
-import { connectRpc } from "./rpc.ts";
+import { connectRpc, HerdrRpcProtocolError } from "./rpc.ts";
 import {
 	type CutAnswer,
 	type CutRequest,
@@ -110,6 +110,7 @@ export async function enrollHerdrInputConsumer(
 		});
 	} catch (error) {
 		connection.close();
+		if (error instanceof HerdrRpcProtocolError) return { ok: false, reason: "malformed" };
 		return { ok: false, reason: error instanceof Error && error.message === "refused" ? "refused" : "transport" };
 	}
 	const answer = parseEnroll(result);
