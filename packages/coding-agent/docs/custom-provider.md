@@ -139,11 +139,11 @@ Content indexes refer to blocks in the assistant message. Update each block befo
 The stream must also honor request instrumentation supplied through `SimpleStreamOptions`:
 
 - Call `options.onPayload` before sending the provider request and use any replacement payload it returns.
-- Call `options.onResponse` after receiving the response but before consuming its body.
-- Await `options.onProviderStreamEvent?.(providerEvent, model)` for each parsed provider event before normalizing it.
+- Call `options.onResponse({ status })` after receiving the response but before consuming its body. Pass only the HTTP status, never response headers.
+- Await `options.onProviderStreamEvent?.({ type: "provider_stream_event" })` once for each parsed provider event before normalizing it. Never pass the provider event itself.
 - Pass through the abort signal and provider-scoped environment.
 
-These hooks power extension request inspection, response-header events, and provider-stream observation. Omitting them makes the provider behave differently from Pi’s built-in providers.
+These hooks power extension request inspection, response-status events, and provider-stream observation. Omitting them makes the provider behave differently from Pi’s built-in providers.
 
 ## Report failures and usage
 

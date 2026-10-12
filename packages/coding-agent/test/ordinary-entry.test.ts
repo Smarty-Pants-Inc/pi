@@ -33,22 +33,24 @@ test("an extension importing the public ordinary subpath receives the original c
 	const directory = await mkdtemp(join(tmpdir(), "pi-ordinary-entry-"));
 	try {
 		const entry = join(directory, "identity.ts");
-		// Use the renderer registry to return a function reference without invoking it.
+		// ponytail: registered renderers are now source-bound wrappers (pi#187), so hand the imported
+		// function reference back through a test-only global instead of the renderer registry.
 		await writeFile(
 			entry,
 			`
 import { consumeOrdinaryPairedInput } from "@earendil-works/pi-coding-agent/ordinary";
 export default function(pi) {
-	pi.registerMessageRenderer("ordinary-identity-probe", consumeOrdinaryPairedInput);
+	globalThis.__piOrdinaryIdentityProbe = consumeOrdinaryPairedInput;
 }
 `,
 		);
 		const loaded = await loadExtensions([entry], directory);
 		expect(loaded.errors).toEqual([]);
 		expect(loaded.extensions).toHaveLength(1);
-		expect(loaded.extensions[0].messageRenderers.get("ordinary-identity-probe")).toBe(originalConsume);
+		expect((globalThis as { __piOrdinaryIdentityProbe?: unknown }).__piOrdinaryIdentityProbe).toBe(originalConsume);
 		loaded.runtime.invalidate();
 	} finally {
+		delete (globalThis as { __piOrdinaryIdentityProbe?: unknown }).__piOrdinaryIdentityProbe;
 		await rm(directory, { recursive: true, force: true });
 	}
 });

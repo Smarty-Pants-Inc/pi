@@ -2,6 +2,7 @@ import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { getAgentDir, VERSION } from "../config.ts";
 import type { Extension } from "./extensions/types.ts";
+import { isSyntheticPath } from "./source-info.ts";
 
 export interface CrashRecord {
 	timestamp: string;
@@ -51,7 +52,7 @@ function normalizeStackPath(value: string): string {
 
 function stackContainsPath(stack: string, targetPath: string, includeDescendants: boolean): boolean {
 	const target = normalizeStackPath(targetPath);
-	if (!target || target.startsWith("<")) return false;
+	if (!target || isSyntheticPath(target)) return false;
 	const caseInsensitive = /^[a-z]:\//iu.test(target);
 	const haystack = caseInsensitive ? stack.toLowerCase() : stack;
 	const needle = caseInsensitive ? target.toLowerCase() : target;
@@ -142,7 +143,7 @@ export function recordCrash(
 	}
 }
 
-/** Return the newest recent crash, marking pending records as announced. */
+/** Return the newest recent crash and mark only that record as announced; older unseen crashes stay pending (smarty-dev#5271). */
 export function takeUnnotifiedCrash(path = crashLogPath(), now = Date.now()): CrashRecord | undefined {
 	const records = readCrashLog(path);
 	const crash = [...records]
@@ -151,7 +152,7 @@ export function takeUnnotifiedCrash(path = crashLogPath(), now = Date.now()): Cr
 	if (!crash) return undefined;
 	try {
 		writeCrashLog(
-			records.map((record) => (record.notified ? record : { ...record, notified: true })),
+			records.map((record) => (record === crash ? { ...record, notified: true } : record)),
 			path,
 		);
 	} catch {

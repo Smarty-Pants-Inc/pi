@@ -46,6 +46,11 @@ A `message` entry stores an [`AgentMessage`](message-types.md). Message content 
 
 Session entry timestamps are ISO 8601 strings. The nested message timestamp is a Unix timestamp in milliseconds.
 
+New user/custom message entries also carry [turn provenance](turn-provenance.md),
+with a stable turn ID and first-receipt time. Current writers emit only
+`channel: "terminal"`, which means UNKNOWN for sender attribution. Older entries
+are not backfilled.
+
 ## Entry Base
 
 All entries (except `SessionHeader`) extend `SessionEntryBase`:
@@ -86,15 +91,23 @@ A message in the conversation. The `message` field contains an `AgentMessage`. S
 
 Sessions created before system messages existed have no leading system message; the first request declares the current prompt as a later system message, which replays the same way.
 
+User entries created by `sendUserMessage(content, { metadata })` also carry an optional `metadata` object at the entry root, with a Pi-stamped `metadataSource`: `{ kind: "sdk" }` for direct SDK calls or `{ kind: "extension", extensionPath }` bound by the loader to the executing extension's async context. Borrowed APIs cannot confer another extension's identity; a metadata send through a captured extension API outside that context rejects with `INPUT_METADATA_SOURCE_MISMATCH` and is never stamped `sdk`; only direct SDK `session.sendUserMessage()` calls are stamped `sdk`. Both are excluded from model context and compaction summary input. Metadata is opaque application data, not a trusted provenance claim: consumers must require the expected source (Fabric must require its own extension's path) before trusting it. Caller-supplied source fields in options or metadata do not override the root stamp. The source does not authenticate session-file edits or remote participants. Metadata is bounded as described in [SDK prompting](sdk.md#prompting). The receipt returns the same source and its `entryId` identifies this exact entry. Handled input creates no entry.
+
+```json
+{"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Continue","timestamp":1733234401000},"metadata":{"inputId":"wake-42"},"metadataSource":{"kind":"sdk"}}
+```
+
 ```json
 {"type":"message","id":"a1b2c3d4","parentId":"prev1234","timestamp":"2024-12-03T14:00:01.000Z","message":{"role":"user","content":"Hello","timestamp":1733234401000}}
 {"type":"message","id":"b2c3d4e5","parentId":"a1b2c3d4","timestamp":"2024-12-03T14:00:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{...},"stopReason":"stop","timestamp":1733234402000}}
 {"type":"message","id":"c3d4e5f6","parentId":"b2c3d4e5","timestamp":"2024-12-03T14:00:03.000Z","message":{"role":"toolResult","toolCallId":"call_123","toolName":"bash","content":[{"type":"text","text":"output"}],"isError":false,"timestamp":1733234403000}}
 ```
 
+Assistant messages name the model that produced them. Newer messages also record `thinkingLevel`, the Pi thinking level requested for that response.
+
 ### ModelChangeEntry
 
-Emitted when the user switches models mid-session.
+Emitted when the user switches models mid-session. The latest entry is the selected model, which may be a [virtual model](virtual-models.md); assistant messages then name the physical model that answered.
 
 ```json
 {"type":"model_change","id":"d4e5f6g7","parentId":"c3d4e5f6","timestamp":"2024-12-03T14:05:00.000Z","provider":"openai","modelId":"gpt-4o"}
@@ -168,6 +181,8 @@ Extension state persistence. Does NOT participate in LLM context.
 ```
 
 Use `customType` to identify your extension's entries on reload. Interactive mode can render custom entries via `pi.registerEntryRenderer(customType, renderer)`, but they still do not participate in LLM context.
+
+Pi stores [virtual model](virtual-models.md) router state as custom entries with `customType` `pi.virtual-model-state` and `data` `{ provider, modelId, state }`.
 
 ### CustomMessageEntry
 

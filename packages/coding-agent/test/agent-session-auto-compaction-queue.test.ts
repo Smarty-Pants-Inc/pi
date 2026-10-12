@@ -49,6 +49,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 	});
 
 	afterEach(() => {
+		// smarty-dev#3048: recover deliberately retained low-level input before disposal.
+		session.clearQueue();
 		session.dispose();
 		vi.restoreAllMocks();
 		if (tempDir && existsSync(tempDir)) {

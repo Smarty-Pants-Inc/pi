@@ -25,7 +25,7 @@ export interface EntryLocation {
 
 /** Fields whose JSON is shorter than this stay resident. */
 const LAZY_FIELD_MIN_CHARS = 1024;
-const RESIDENT_KEYS = new Set(["type", "id", "parentId", "timestamp"]);
+const RESIDENT_KEYS = new Set(["type", "id", "parentId", "timestamp", "provenance"]);
 
 type Json = Record<string, unknown>;
 

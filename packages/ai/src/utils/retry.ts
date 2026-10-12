@@ -1,113 +1,11 @@
-import type { AssistantMessage } from "../types.ts";
-import { PROVIDER_LIMIT_DIAGNOSTIC } from "./error-body.ts";
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
+import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
+import { assistantRecovery, recordedThrottledLimitWait, transferThrottledLimitWait } from "./recovery.ts";
 
-function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
-	return new RegExp(patterns.join("|"), "i");
-}
-
-const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
-	// OpenCode Go/free-tier limits returned as 429 JSON error types by OpenCode's
-	// Zen API. These are subscription/account limits, not transient throttles.
-	"GoUsageLimitError",
-	"FreeUsageLimitError",
-
-	// OpenCode Go subscription-limit text asks users to enable available-balance
-	// usage after rolling/weekly/monthly limits are reached.
-	"Monthly usage limit reached",
-	"available balance",
-
-	// Generic quota/budget/billing exhaustion. `insufficient_quota` is OpenAI's
-	// quota/billing error code; the other strings cover common gateway wording.
-	"insufficient_quota",
-	"out of budget",
-	"quota exceeded",
-	"billing",
-]);
-
-const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
-	// Generic provider load, HTTP status, and server-side transient failures.
-	"overloaded",
-	"\\bSelected model is at capacity\\. Please try a different model\\.",
-	"\\bslow_down\\b",
-	"currently experiencing high demand",
-	"rate.?limit",
-	"too many requests",
-	"429",
-	"500",
-	"502",
-	"503",
-	"504",
-	"520",
-	"524",
-	"service.?unavailable",
-	"server.?error",
-	"internal.?error",
-
-	// Wrapper/provider text for transient upstream failures, including OpenRouter
-	// "Provider returned error" responses (#2264).
-	"provider.?returned.?error",
-	"exceeded request buffer limit while retrying upstream",
-
-	// Network, proxy, and fetch transport failures. This includes OpenAI Codex
-	// raw-fetch failures such as "upstream connect", "connection refused", and
-	// "reset before headers" (#733), plus OpenRouter connection drops (#3317).
-	"network.?error",
-	"connection.?error",
-	"connection.?refused",
-	"connection.?lost",
-	"other side closed",
-	"fetch failed",
-	"getaddrinfo",
-	"ENOTFOUND",
-	"EAI_AGAIN",
-	"upstream.?connect",
-	// A local gateway (CLIProxyAPI) mid-restart refuses or drops the socket (smarty-dev#1856).
-	"ECONNREFUSED",
-	"ECONNRESET",
-	// CLIProxyAPI answers 400 while it reloads models after a restart (smarty-dev#1856).
-	// ponytail: a truly unknown model now retries the normal budget (~14 s) before it fails.
-	"unknown provider for model",
-	"reset before headers",
-	"socket hang up",
-	"socket connection was closed",
-	"timed? out",
-	"timeout",
-	"terminated",
-
-	// WebSocket transports can report close/error text instead of HTTP/fetch text.
-	"websocket.?closed",
-	"websocket.?error",
-
-	// Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
-	"http2 request did not get a response",
-
-	// Provider-requested retry delay cap failures should flow through the outer
-	// retry policy so callers can surface/abort the backoff (#1123).
-	"retry delay",
-
-	// Explicit retry guidance emitted mid-stream by OpenAI Responses and Bedrock
-	// stream exceptions (#6019).
-	"you can retry your request",
-	"try your request again",
-	"please retry your request",
-
-	// gRPC based providers (e.g. NVIDIA NIM)
-	"ResourceExhausted",
-]);
-
-const PREMATURE_STREAM_ERROR_PATTERN = buildProviderErrorPattern([
-	// Anthropic SDK/transport early endings (#4433), and Responses early EOF.
-	"ended without",
-	"stream ended before message_stop",
-	"stream ended before a terminal response event",
-	// CLIProxyAPI Responses streams (smarty-dev#3200).
-	"stream disconnected before completion",
-	"stream closed before response\\.completed",
-]);
-
-/** Whether a failed stream ended before its provider's completion event. */
+/** Whether a failed stream ended before its provider's completion event (owned decision first, smarty-dev#5822). */
 export function isPrematureStreamError(message: AssistantMessage): boolean {
-	return message.stopReason === "error" && PREMATURE_STREAM_ERROR_PATTERN.test(message.errorMessage ?? "");
+	return message.stopReason === "error" && assistantRecovery(message).recovery === "premature_stream";
 }
 
 /** Empty reasoning signatures are metadata, not output. Even a partial tool call is output. */
@@ -118,6 +16,82 @@ export function hasAssistantOutput(message: AssistantMessage): boolean {
 			block.type === "thinking" ? block.thinking.length > 0 : block.type === "text" ? block.text.length > 0 : true,
 		)
 	);
+}
+
+/** Answer output: non-empty text, any tool call (even partial), or any other non-reasoning block. */
+export function hasAssistantAnswerOutput(message: AssistantMessage): boolean {
+	return message.content.some((block) =>
+		block.type === "thinking" ? false : block.type === "text" ? block.text.length > 0 : true,
+	);
+}
+
+/**
+ * What a stream consumer saw before the terminal message. A provider can drop streamed content from its
+ * terminal error message, so the message alone under-reports what consumers already received.
+ */
+export interface AssistantStreamObservation {
+	/** Non-empty reasoning was streamed. */
+	reasoning: boolean;
+	/** Answer text, a tool call or another non-reasoning block was streamed. */
+	answer: boolean;
+}
+
+export function createAssistantStreamObservation(): AssistantStreamObservation {
+	return { reasoning: false, answer: false };
+}
+
+/** Record the content of a (partial) assistant message into `observation`. */
+export function observeAssistantMessage(
+	observation: AssistantStreamObservation,
+	message: AssistantMessage,
+): AssistantStreamObservation {
+	observation.answer ||= hasAssistantAnswerOutput(message);
+	observation.reasoning ||= message.content.some((block) => block.type === "thinking" && block.thinking.length > 0);
+	return observation;
+}
+
+/** Record one stream event, including its partial message, into `observation`. */
+export function observeAssistantStreamEvent(
+	observation: AssistantStreamObservation,
+	event: AssistantMessageEvent,
+): AssistantStreamObservation {
+	const streamed = ("delta" in event && event.delta.length > 0) || ("content" in event && event.content.length > 0);
+	observation.answer ||= event.type.startsWith("toolcall_") || (event.type.startsWith("text_") && streamed);
+	observation.reasoning ||= event.type.startsWith("thinking_") && streamed;
+	return observeAssistantMessage(
+		observation,
+		event.type === "done" ? event.message : event.type === "error" ? event.error : event.partial,
+	);
+}
+
+/**
+ * A premature close that streamed only reasoning (smarty-dev#6730): no answer output, and either non-empty
+ * thinking in the message or reasoning observed in the stream. Its output tokens are reasoning, so the attempt
+ * can be discarded and restarted. Without `observed`, a message whose content is empty thinking or was
+ * dropped is not reasoning-only, because its reported output tokens could be answer text.
+ */
+export function isReasoningOnlyPrematureStream(
+	message: AssistantMessage,
+	observed?: AssistantStreamObservation,
+): boolean {
+	if (!isPrematureStreamError(message) || observed?.answer === true || hasAssistantAnswerOutput(message)) return false;
+	return (
+		observed?.reasoning === true ||
+		message.content.some((block) => block.type === "thinking" && block.thinking.length > 0)
+	);
+}
+
+/**
+ * Drop the partial reasoning of an attempt that will be restarted. Thinking blocks keep their place
+ * but lose text and replay signatures. Empty thinking is no evidence of reasoning, so a caller that
+ * classifies the result again must pass an observation that recorded the original message.
+ */
+export function discardPartialReasoning<T extends AssistantMessage>(message: T): T {
+	if (!message.content.some((block) => block.type === "thinking")) return message;
+	return {
+		...message,
+		content: message.content.map((block) => (block.type === "thinking" ? { type: "thinking", thinking: "" } : block)),
+	};
 }
 
 /**
@@ -213,7 +187,24 @@ export async function retryAssistantCall(
 	let attempt = 0;
 	let lastRetry: { attempt: number; errorMessage: string } | undefined;
 	for (;;) {
-		const response = await produce();
+		const produced = await produce();
+		// Classify first: the decision comes from the original text, before it is masked (smarty-dev#5822 C3).
+		const recovery = produced.stopReason === "error" ? assistantRecovery(produced) : produced.recovery;
+		const errorMessage =
+			produced.errorMessage === undefined ? undefined : redactOAuthDiagnostic(produced.errorMessage);
+		// A direct producer bypasses the stream projection, so rebuild its diagnostics here (smarty-dev#5822 N5682).
+		const { diagnostics: rawDiagnostics, ...rest } = produced;
+		const diagnostics = projectAssistantMessageDiagnostics(rawDiagnostics);
+		const response =
+			errorMessage === produced.errorMessage && recovery === produced.recovery && rawDiagnostics === undefined
+				? produced
+				: {
+						...rest,
+						...(errorMessage === undefined ? {} : { errorMessage }),
+						...(recovery === undefined ? {} : { recovery }),
+						...(diagnostics === undefined ? {} : { diagnostics }),
+					};
+		if (response !== produced) transferThrottledLimitWait(produced, response);
 
 		// Abort: terminal but not successful. Never retry an aborted message.
 		if (response.stopReason === "aborted") {
@@ -254,18 +245,20 @@ export async function retryAssistantCall(
 	}
 }
 
+/** Owned status text while waiting out a throttled limit; the provider's wait text is never kept. */
+export const THROTTLED_LIMIT_WAIT_MESSAGE = "Flash runs one request at a time";
+
+export { recordThrottledLimitWait, transferThrottledLimitWait } from "./recovery.ts";
+
 /**
  * The one-shot wait a provider marked on a throttled limit (the Smarty gateway's `smarty_limit` with
- * `throttled: true` and a `Retry-After` of at most 30 s): the delay and the status text to show while waiting.
- * Independent of {@link isRetryableAssistantError}, which stays false for the same message.
+ * `throttled: true` and a `Retry-After` of at most 30 s): the delay and the owned status text to show while
+ * waiting. Independent of {@link isRetryableAssistantError}, which stays false for the same message.
  */
 export function throttledLimitWait(message: AssistantMessage): { delayMs: number; waitMessage: string } | undefined {
 	if (message.stopReason !== "error") return undefined;
-	const details = message.diagnostics?.find((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)?.details;
-	const seconds = details?.retryAfterSeconds;
-	const waitMessage = details?.waitMessage;
-	if (typeof seconds !== "number" || typeof waitMessage !== "string") return undefined;
-	return { delayMs: seconds * 1000, waitMessage };
+	const seconds = recordedThrottledLimitWait(message);
+	return seconds === undefined ? undefined : { delayMs: seconds * 1000, waitMessage: THROTTLED_LIMIT_WAIT_MESSAGE };
 }
 
 /**
@@ -276,15 +269,21 @@ export function throttledLimitWait(message: AssistantMessage): { delayMs: number
  * This does not implement retry policy. Callers should first handle context
  * overflow separately, then apply their own retry budget, backoff, and reporting
  * before restarting the assistant turn.
+ *
+ * Stream consumers should pass what they observed: output seen in the stream blocks a retry even when the
+ * terminal message dropped it, and observed reasoning lets a premature close whose content was dropped be
+ * restarted.
  */
-export function isRetryableAssistantError(message: AssistantMessage): boolean {
-	if (message.stopReason !== "error" || !message.errorMessage || hasAssistantOutput(message)) return false;
+export function isRetryableAssistantError(message: AssistantMessage, observed?: AssistantStreamObservation): boolean {
+	if (message.stopReason !== "error" || !message.errorMessage) return false;
+	// Output is never replayed, except reasoning-only output on a premature close (smarty-dev#6730).
+	const output = hasAssistantOutput(message) || observed?.answer === true || observed?.reasoning === true;
+	if (output && !isReasoningOnlyPrematureStream(message, observed)) return false;
 	// An observer can fail after receiving generated output but before normalization records it.
 	// Retrying its transient-looking error would regenerate output, not repair the observer.
 	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_stream_observer_error")) return false;
 	// Providers mark a limit found in the parsed error body (e.g. the Smarty gateway's `smarty_limit`).
-	if (message.diagnostics?.some((diagnostic) => diagnostic.type === PROVIDER_LIMIT_DIAGNOSTIC)) return false;
-	const errorMessage = message.errorMessage;
-	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(errorMessage)) return false;
-	return isPrematureStreamError(message) || RETRYABLE_PROVIDER_ERROR_PATTERN.test(errorMessage);
+	if (message.diagnostics?.some((diagnostic) => diagnostic.type === "provider_limit")) return false;
+	// The owned decision was classified from the original error before any text suppression (smarty-dev#5822).
+	return assistantRecovery(message).retryable;
 }

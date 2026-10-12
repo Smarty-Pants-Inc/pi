@@ -1,86 +1,38 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type Context, createStaticFacetLoader, defineFacet, defineService } from "@earendil-works/chord";
-import { AgentHarness, BACKGROUND_CONTEXT } from "@earendil-works/pi-agent-core";
+import { createStaticFacetLoader, defineFacet } from "@earendil-works/chord";
+import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels, fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+import { createRegistry, Harness } from "@earendil-works/pi-durable";
+import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { consumeInternalProcessRole } from "../../src/experimental/process.ts";
 import { runSessionWorkerWithHarness } from "../../src/experimental/session-worker.ts";
 import { KeyedProbe } from "./keyed-service.ts";
 
-type TerminalEvent = { type: "run_end" | "run_suspend"; runId: string };
-export const TerminalPublication = defineService<{
-	hold(deferred: boolean, context: Context): Promise<void>;
-	held(context: Context): Promise<TerminalEvent>;
-	release(context: Context): Promise<void>;
-}>("test.terminal-publication");
-
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
 	const role = consumeInternalProcessRole();
 	if (role !== "session-worker") throw new Error("Faux Session worker requires a session-worker invocation");
-	void runSessionWorkerWithHarness(process.argv.slice(2), async (session, options) => {
+	void runSessionWorkerWithHarness(process.argv.slice(2), async (databasePath, options) => {
 		if (options.provider !== "anthropic" || options.model !== "claude-sonnet-4-5") {
 			throw new Error(`Unexpected faux worker model: ${options.provider}/${options.model}`);
 		}
 		const faux = fauxProvider();
-		faux.setResponses([fauxAssistantMessage("deterministic remote answer", { timestamp: 20 })]);
+		const answer = fauxAssistantMessage("deterministic remote answer", { timestamp: 20 });
+		faux.setResponses([answer, answer]);
 		const models = createModels();
 		models.setProvider(faux.provider);
-		const harness = (
-			await AgentHarness.create(
-				{
-					session,
-					models,
-					model: faux.getModel(),
-					tools: [],
-					resources: {},
-				},
-				BACKGROUND_CONTEXT,
-			)
-		).harness;
-		const lane = await harness.lane("main", BACKGROUND_CONTEXT);
-		let gate: Promise<void> | undefined;
-		let release = (): void => {};
-		let held: Promise<TerminalEvent> | undefined;
-		let reportHeld = (_event: TerminalEvent): void => {};
-		const watch = lane.watch.bind(lane);
-		lane.watch = async (context) => {
-			const opened = await watch(context);
-			const start = opened.start.bind(opened);
-			// PR #11: hold the real terminal event before Transcript publishes it,
-			// without blocking the harness event bus or fabricating a lifecycle event.
-			opened.start = (listener) =>
-				start(async (event, context) => {
-					if (gate !== undefined && (event.type === "run_end" || event.type === "run_suspend")) {
-						reportHeld({ type: event.type, runId: event.runId });
-						await gate;
-					}
-					await listener(event, context);
-				});
-			return opened;
-		};
+		const harness = await Harness.open(
+			await openNodeSqliteStorage(databasePath),
+			{ models, registry: createRegistry() },
+			BACKGROUND_CONTEXT,
+		);
+		const model = faux.getModel();
+		const conversation = await harness.root(BACKGROUND_CONTEXT, {
+			agent: { cwd: options.metadata.cwd, model: { provider: model.provider, modelId: model.id } },
+		});
 		const keyedProbeFacet = defineFacet({
 			id: "@test/keyed-probe",
 			setup(env) {
-				env.provide(TerminalPublication, {
-					async hold(deferred, context) {
-						if (gate !== undefined) throw new Error("Terminal publication is already held");
-						await harness.setStreamOptions({ deferred }, context);
-						held = new Promise((resolve) => {
-							reportHeld = resolve;
-						});
-						gate = new Promise((resolve) => {
-							release = resolve;
-						});
-					},
-					async held() {
-						if (held === undefined) throw new Error("Terminal publication is not held");
-						return held;
-					},
-					async release() {
-						release();
-						gate = undefined;
-					},
-				});
 				const probes = env.provideMany(KeyedProbe);
 				const spawn = (value: string): void => {
 					const state = env.replicatedState({ value });
@@ -104,7 +56,7 @@ if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(
 				env.onActivate(() => spawn("first"));
 			},
 		});
-		return { harness, lane, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
+		return { harness, conversation, facetLoader: createStaticFacetLoader([keyedProbeFacet]) };
 	}).catch((error: unknown) => {
 		console.error(error);
 		process.exit(1);

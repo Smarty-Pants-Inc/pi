@@ -2,6 +2,39 @@ import { describe, expect, test } from "vitest";
 import { normalizeSessionName, parseArgs } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
+	// Regression for Smarty-Pants-Inc/smarty-dev#2751.
+	describe("--max-provider-requests", () => {
+		test("parses separate and equals values, leaving prompts intact", () => {
+			expect(parseArgs(["--max-provider-requests", "2", "test"])).toMatchObject({
+				maxProviderRequests: 2,
+				messages: ["test"],
+				diagnostics: [],
+			});
+			expect(parseArgs(["--max-provider-requests=3", "test"])).toMatchObject({
+				maxProviderRequests: 3,
+				messages: ["test"],
+				diagnostics: [],
+			});
+			expect(parseArgs([]).maxProviderRequests).toBeUndefined();
+			expect(parseArgs(["--", "--max-provider-requests", "1"]).maxProviderRequests).toBeUndefined();
+		});
+		test.each(["0", "-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "1x"])(
+			"rejects invalid cap %s",
+			(value) => {
+				expect(parseArgs([`--max-provider-requests=${value}`]).diagnostics).toEqual([
+					{ type: "error", message: "--max-provider-requests requires a positive safe integer" },
+				]);
+			},
+		);
+		test("rejects missing and repeated values without consuming other flags", () => {
+			expect(parseArgs(["--max-provider-requests"]).diagnostics).toHaveLength(1);
+			expect(parseArgs(["--max-provider-requests", "--version"])).toMatchObject({
+				version: true,
+				diagnostics: [{ type: "error", message: "--max-provider-requests requires a positive safe integer" }],
+			});
+			expect(parseArgs(["--max-provider-requests", "1", "--max-provider-requests=2"]).diagnostics).toHaveLength(1);
+		});
+	});
 	describe("--no-auto-compaction", () => {
 		test("recognizes the explicit switch without consuming a prompt or forwarding an extension flag", () => {
 			const result = parseArgs(["--mode", "rpc", "--no-auto-compaction", "continue"]);
@@ -173,6 +206,12 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--models", "gpt-4o,claude-sonnet,gemini-pro"]);
 			expect(result.models).toEqual(["gpt-4o", "claude-sonnet", "gemini-pro"]);
 		});
+
+		// Issue #10334
+		test("ignores empty entries in --models", () => {
+			const result = parseArgs(["--models", "gpt-4o, ,claude-sonnet,"]);
+			expect(result.models).toEqual(["gpt-4o", "claude-sonnet"]);
+		});
 	});
 
 	// Issue #9045
@@ -301,6 +340,14 @@ describe("parseArgs", () => {
 			const result = parseArgs(["--no-extensions", "-e", "foo.ts", "-e", "bar.ts"]);
 			expect(result.noExtensions).toBe(true);
 			expect(result.extensions).toEqual(["foo.ts", "bar.ts"]);
+		});
+	});
+
+	describe("--no-mcp flag", () => {
+		test("parses --no-mcp flag", () => {
+			const result = parseArgs(["--no-mcp"]);
+			expect(result.noMcp).toBe(true);
+			expect(result.unknownFlags.size).toBe(0);
 		});
 	});
 
@@ -477,6 +524,31 @@ describe("parseArgs", () => {
 		test("parses -t shorthand", () => {
 			const result = parseArgs(["-t", "read,bash"]);
 			expect(result.tools).toEqual(["read", "bash"]);
+		});
+
+		test("parses +name and -name tool modifiers", () => {
+			const result = parseArgs(["-t", "+codemode,-write"]);
+			expect(result.tools).toEqual(["+codemode", "-write"]);
+			expect(result.diagnostics).toEqual([]);
+		});
+
+		test("rejects tool names mixed with modifiers", () => {
+			const result = parseArgs(["--tools", "read,+codemode"]);
+			expect(result.tools).toBeUndefined();
+			expect(result.diagnostics).toEqual([
+				{ type: "error", message: "--tools: tool names cannot be mixed with +name or -name entries" },
+			]);
+		});
+
+		test("rejects patterns in tool modifiers", () => {
+			const result = parseArgs(["-t", "+mcp__radius__*"]);
+			expect(result.tools).toBeUndefined();
+			expect(result.diagnostics).toEqual([
+				{
+					type: "error",
+					message: "-t: +name and -name entries take exact tool names, not patterns: +mcp__radius__*",
+				},
+			]);
 		});
 
 		test("parses --exclude-tools flag", () => {

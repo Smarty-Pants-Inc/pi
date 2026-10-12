@@ -3,6 +3,7 @@ import { createRadiusOAuth } from "../src/auth/oauth/radius.ts";
 import type { AuthEvent, ProviderAuthInteraction } from "../src/auth/types.ts";
 
 const GATEWAY = "https://radius.example";
+const nativeFetch = globalThis.fetch;
 
 function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -115,6 +116,23 @@ describe("Radius OAuth", () => {
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
+	// pi#150 security round 2: a code-shaped error field can still be an echoed secret.
+	it("does not reflect an echoed lowercase secret in the error code", async () => {
+		const secret = "leaked_refresh_secret";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ error: secret, error_description: secret }, 400)),
+		);
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+		const message = await oauth
+			.refresh({ type: "oauth", access: "old-access", refresh: secret, expires: 0 }, new AbortController().signal)
+			.then(
+				() => "",
+				(error: Error) => error.message,
+			);
+		expect(message).toBe("Radius OAuth token request failed: authorization_error");
+	});
+
 	it("discovers only the interactive browser authorization endpoint", async () => {
 		const fetchMock = vi.fn(async (input: unknown) => {
 			expect(requestUrl(input)).toBe(`${GATEWAY}/v1/oauth`);
@@ -125,5 +143,59 @@ describe("Radius OAuth", () => {
 		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
 		await expect(oauth.login(interaction("browser"))).rejects.toThrow(`Invalid Radius OAuth config from ${GATEWAY}`);
 		expect(fetchMock).toHaveBeenCalledOnce();
+	});
+
+	it("exchanges the browser callback code before showing the sign-in page", async () => {
+		let tokenStatus = 400;
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async (input: unknown, init?: RequestInit) => {
+				const url = requestUrl(input);
+				if (url === `${GATEWAY}/v1/oauth`) return jsonResponse({ authorizationEndpoint: `${GATEWAY}/authorize` });
+				if (url === `${GATEWAY}/v1/oauth/token`) {
+					const body = new URLSearchParams(String(init?.body));
+					expect(body.get("code")).toBe("browser-code");
+					return tokenStatus === 200
+						? jsonResponse({ access_token: "access", refresh_token: "refresh", expires_in: 3600 })
+						: jsonResponse({ error: "invalid_grant", error_description: "code expired" }, tokenStatus);
+				}
+				return nativeFetch(url, init);
+			}),
+		);
+
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+		const login = async () => {
+			let callbackPage: Promise<Response> | undefined;
+			const result = oauth.login({
+				...interaction("browser"),
+				notify: (event) => {
+					if (event.type !== "auth_url") return;
+					const authorize = new URL(event.url);
+					const callback = new URL(authorize.searchParams.get("redirect_uri") ?? "");
+					callback.searchParams.set("code", "browser-code");
+					callback.searchParams.set("state", authorize.searchParams.get("state") ?? "");
+					callbackPage = nativeFetch(callback);
+				},
+			});
+			const outcome = await result.then(
+				(credential) => ({ credential }),
+				(error: Error) => ({ error }),
+			);
+			const response = await callbackPage;
+			return { ...outcome, status: response?.status, page: await response?.text() };
+		};
+
+		const failed = await login();
+		// pi#150: token endpoint text can echo secrets; only the protocol error code is shown.
+		expect("error" in failed && failed.error.message).toBe("Radius OAuth token request failed: invalid_grant");
+		expect(failed.status).toBe(502);
+		expect(failed.page).toContain("invalid_grant");
+		expect(failed.page).not.toContain("code expired");
+
+		tokenStatus = 200;
+		const succeeded = await login();
+		expect("credential" in succeeded && succeeded.credential.access).toBe("access");
+		expect(succeeded.status).toBe(200);
+		expect(succeeded.page).toContain("Signed in to Radius.");
 	});
 });

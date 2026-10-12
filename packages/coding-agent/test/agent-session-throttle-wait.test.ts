@@ -3,7 +3,13 @@ import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@earendil-works/pi-ai/compat";
+import {
+	type AssistantMessage,
+	createAssistantMessageEventStream,
+	getModel,
+	recordThrottledLimitWait,
+	THROTTLED_LIMIT_WAIT_MESSAGE,
+} from "@earendil-works/pi-ai/compat";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -29,19 +35,6 @@ vi.mock("../src/utils/sleep.ts", () => ({
 	},
 }));
 
-class MockAssistantStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	constructor() {
-		super(
-			(event) => event.type === "done" || event.type === "error",
-			(event) => {
-				if (event.type === "done") return event.message;
-				if (event.type === "error") return event.error;
-				throw new Error("Unexpected event type");
-			},
-		);
-	}
-}
-
 const LIMIT = "Flash runs one request at a time. Retry in 10s.";
 
 function assistant(overrides: Partial<AssistantMessage>): AssistantMessage {
@@ -65,23 +58,22 @@ function assistant(overrides: Partial<AssistantMessage>): AssistantMessage {
 	};
 }
 
-/** What openai-completions produces for a smarty_limit 429; `retryAfterSeconds` only for throttled with Retry-After <= 30. */
+/**
+ * What openai-completions produces for a smarty_limit 429: the owned diagnostic type, and for a throttled limit
+ * with Retry-After <= 30 the private one-shot wait (smarty-dev#5822 N5682).
+ */
 function limit(retryAfterSeconds?: number): AssistantMessage {
-	return assistant({
+	const message = assistant({
 		stopReason: "error",
 		errorMessage: LIMIT,
-		diagnostics: [
-			{
-				type: "provider_limit",
-				timestamp: Date.now(),
-				details:
-					retryAfterSeconds === undefined
-						? { code: "smarty_limit" }
-						: { code: "smarty_limit", retryAfterSeconds, waitMessage: LIMIT },
-			},
-		],
+		diagnostics: [{ type: "provider_limit", timestamp: Date.now() }],
 	});
+	if (retryAfterSeconds !== undefined) recordThrottledLimitWait(message, retryAfterSeconds);
+	return message;
 }
+
+/** The owned wait text; the gateway's own wording is never shown from a diagnostic. */
+const WAIT = THROTTLED_LIMIT_WAIT_MESSAGE;
 
 const ok = () => assistant({ content: [{ type: "text", text: "OK" }] });
 const serverError = () => assistant({ stopReason: "error", errorMessage: "500 internal server error" });
@@ -121,7 +113,7 @@ describe("AgentSession throttled limit wait", () => {
 			streamFn: () => {
 				const reply = replies[Math.min(requests.count, replies.length - 1)]();
 				requests.count++;
-				const stream = new MockAssistantStream();
+				const stream = createAssistantMessageEventStream();
 				queueMicrotask(() => {
 					stream.push({ type: "start", partial: reply });
 					if (reply.stopReason === "error") stream.push({ type: "error", reason: "error", error: reply });
@@ -162,7 +154,7 @@ describe("AgentSession throttled limit wait", () => {
 		await session.prompt("Reply with only OK.");
 		expect(requests.count).toBe(2);
 		expect(sleepState.delays).toEqual([10_000]);
-		expect(events).toEqual([`wait:10000:${LIMIT}`, "end:true"]);
+		expect(events).toEqual([`wait:10000:${WAIT}`, "end:true"]);
 		expect(last(session).content).toEqual([{ type: "text", text: "OK" }]);
 	});
 
@@ -194,7 +186,7 @@ describe("AgentSession throttled limit wait", () => {
 		expect(requests.count).toBe(2);
 		expect(compact).not.toHaveBeenCalled();
 		expect(compactions).toEqual([]);
-		expect(events).toEqual([`wait:10000:${LIMIT}`, "end:false"]);
+		expect(events).toEqual([`wait:10000:${WAIT}`, "end:false"]);
 		expect(last(session)).toMatchObject({ stopReason: "error", errorMessage: "prompt is too long" });
 	});
 
@@ -239,7 +231,7 @@ describe("AgentSession throttled limit wait", () => {
 		await session.abort();
 		await prompt;
 		expect(requests.count).toBe(1);
-		expect(events).toEqual([`wait:10000:${LIMIT}`, "end:false"]);
+		expect(events).toEqual([`wait:10000:${WAIT}`, "end:false"]);
 		expect(outcomes).toEqual(["aborted"]);
 	});
 });

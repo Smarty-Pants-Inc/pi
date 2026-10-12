@@ -6,6 +6,11 @@ import type {
 	ChatCompletionContentPartText,
 	ChatCompletionCreateParamsNonStreaming,
 } from "openai/resources/chat/completions.js";
+import {
+	createRedactingSdkLogger,
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+} from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantImages,
 	ImageApi,
@@ -18,7 +23,8 @@ import type {
 	TextContent,
 } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 
@@ -58,7 +64,7 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		if (!apiKey) {
 			throw new Error(`No API key for provider: ${model.provider}`);
 		}
-		const client = createClient(model, apiKey, options?.headers, options?.fetch);
+		const client = createClient(model, apiKey, options?.headers, options?.fetch, options?.diagnosticSecrets);
 		let params = buildParams(model, context);
 		const nextParams = await options?.onPayload?.(params, model);
 		if (nextParams !== undefined) {
@@ -77,10 +83,11 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 			{
 				maxRetries: options?.maxRetries,
 				maxRetryDelayMs: options?.maxRetryDelayMs,
+				beforeProviderRequest: options?.beforeProviderRequest,
 				signal: options?.signal,
 			},
 		);
-		await options?.onResponse?.({ status: rawResponse.status, headers: headersToRecord(rawResponse.headers) }, model);
+		await options?.onResponse?.(providerResponse(rawResponse.status));
 
 		const imageResponse = response as OpenRouterImageGenerationResponse;
 		output.responseId = imageResponse.id;
@@ -111,7 +118,9 @@ export const generateImages: ImagesFunction<ImagesOptions> = async (
 		return output;
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-		output.errorMessage = formatProviderError(normalizeProviderError(error));
+		output.errorMessage = formatProviderError(
+			normalizeProviderError(error, model.provider, undefined, getRequestDiagnosticSecrets(model, options)),
+		);
 		return output;
 	}
 };
@@ -121,13 +130,16 @@ function createClient(
 	apiKey: string,
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
+	diagnosticSecrets?: readonly string[],
 ): OpenAI {
+	const headers = providerHeadersToRecord({ ...model.headers, ...optionsHeaders });
 	return new OpenAI({
 		apiKey,
+		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets)),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,
-		defaultHeaders: providerHeadersToRecord({ ...model.headers, ...optionsHeaders }),
+		defaultHeaders: headers,
 	});
 }
 

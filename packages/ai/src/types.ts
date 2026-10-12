@@ -32,7 +32,11 @@ export type KnownImageApi = "openrouter-images";
 
 export type ImageApi = KnownImageApi | (string & {});
 
-export type KnownClassifierApi = "typesafe-system-one" | "cloudflare-workers-ai-system-one";
+export type KnownClassifierApi =
+	| "typesafe-system-one"
+	| "cloudflare-workers-ai-system-one"
+	| "llama-cpp-classify"
+	| "openai-decisions";
 
 export type ClassifierApi = KnownClassifierApi | (string & {});
 
@@ -43,7 +47,7 @@ export type KnownProvider =
 	| "google"
 	| "google-vertex"
 	| "openai"
-	| "azure-openai-responses"
+	| "azure"
 	| "openai-codex"
 	| "radius"
 	| "typesafe"
@@ -85,6 +89,8 @@ export type ToolChoice = "auto" | "none";
 export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ModelThinkingLevel = "off" | ThinkingLevel;
 export type ThinkingLevelMap = Partial<Record<ModelThinkingLevel, string | null>>;
+export type SamplingParams = Record<string, unknown>;
+export type SamplingParamsByThinkingLevel = Partial<Record<ModelThinkingLevel, SamplingParams>>;
 export type ChatTemplateKwargValue =
 	| string
 	| number
@@ -123,17 +129,32 @@ export type ProviderHeaders = Record<string, string | null>;
 export type FetchFunction = typeof globalThis.fetch;
 export type SessionAffinityFormat = "openai" | "openai-nosession" | "openrouter";
 
+/**
+ * Value-free observation of a provider HTTP response (smarty-dev#5822): only the HTTP status, and only when it
+ * is an integer 100-599. Response headers and the raw response are never passed to callbacks.
+ */
 export interface ProviderResponse {
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
+}
+
+/**
+ * Pi-owned notification that an adapter parsed one provider stream event (smarty-dev#5822). It carries no
+ * provider data: no raw event, event name, payload, identifier or model.
+ */
+export interface ProviderStreamNotification {
+	readonly type: "provider_stream_event";
 }
 
 /** Authentication, HTTP transport, and lifecycle callbacks shared by provider requests. */
 export interface ProviderRequestOptions<TModel = Model<Api>> {
 	signal?: AbortSignal;
+	/** Synchronous admission check before every physical provider attempt, including retries. */
+	beforeProviderRequest?: () => void;
 	/** Explicit parent context for telemetry produced by this logical request. */
 	telemetryContext?: TelemetryContext;
 	apiKey?: string;
+	/** Live credential values to redact at diagnostic sinks; never sent to the provider. */
+	diagnosticSecrets?: readonly string[];
 	/**
 	 * Optional fetch implementation for provider HTTP requests.
 	 * Defaults to `globalThis.fetch`. Provider adapters that cannot inject a custom implementation may reject it.
@@ -152,9 +173,9 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	 */
 	onPayload?: (payload: unknown, model: TModel) => unknown | undefined | Promise<unknown | undefined>;
 	/**
-	 * Optional callback invoked after an HTTP response is received.
+	 * Optional callback invoked after an HTTP response is received, with its validated status only.
 	 */
-	onResponse?: (response: ProviderResponse, model: TModel) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
 	 * Optional custom HTTP headers to include in API requests.
 	 * Merged with provider defaults; caller values override default headers.
@@ -187,15 +208,15 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	/**
 	 * Optional callback invoked after an HTTP response is received and before
-	 * its body stream is consumed.
+	 * its body stream is consumed, with its validated status only.
 	 */
-	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
-	 * Optional observer for each parsed provider stream event before Pi normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
-	 * Adapter support is explicit; unsupported adapters do not invoke it.
+	 * Optional observer called once for each parsed provider stream event, before Pi normalizes it.
+	 * It receives only the Pi-owned notification, never provider data. A rejection ends the request
+	 * with a non-retryable `provider_stream_observer_error`. Unsupported adapters do not invoke it.
 	 */
-	onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void | Promise<void>;
+	onProviderStreamEvent?: (event: ProviderStreamNotification) => void | Promise<void>;
 	temperature?: number;
 	/**
 	 * Arbitrary sampling parameters merged into the request body as-is, after the named request
@@ -204,7 +225,7 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * `repetition_penalty`. Merged over `Model.samplingParams` per key. Only applied by
 	 * OpenAI-compatible adapters (completions, responses, Azure responses); other APIs ignore it.
 	 */
-	samplingParams?: Record<string, unknown>;
+	samplingParams?: SamplingParams;
 	maxTokens?: number;
 	/**
 	 * Preferred transport for providers that support multiple transports.
@@ -321,7 +342,14 @@ export interface ProviderClassifier {
 	): Promise<ClassifierResult>;
 }
 
-export interface ClassifierOptions extends ProviderRequestOptions<ClassifierModel<ClassifierApi>> {}
+export interface ClassifierOptions extends ProviderRequestOptions<ClassifierModel<ClassifierApi>> {
+	/**
+	 * Divides the answer logits by this value before they are normalized into probabilities.
+	 * Values above 1 soften the distribution; values below 1 sharpen it. Must be positive.
+	 * APIs that cannot apply it ignore it.
+	 */
+	temperature?: number;
+}
 
 export interface ImagesOptions extends ProviderRequestOptions<ImageModel<ImageApi>> {
 	/**
@@ -536,6 +564,21 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+/**
+ * Closed remedies Pi can name for a failed response: a Bedrock model that rejects the configured data retention
+ * mode, and an exhausted ChatGPT subscription usage limit.
+ */
+export type AssistantErrorHint = "bedrock_data_retention" | "chatgpt_usage";
+
+/** Closed recovery classes of a failed response. */
+export type AssistantRecoveryClass = "retryable" | "premature_stream" | "context_length_exceeded";
+
+/** Pi-owned recovery decision: a closed class and whether an outer retry may replay the request. */
+export interface AssistantRecovery {
+	recovery?: AssistantRecoveryClass;
+	retryable: boolean;
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
@@ -546,18 +589,56 @@ export interface AssistantMessage {
 	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
 	/** Exact provider-native effort level used for this response. Absent for legacy or unmanaged responses. */
 	providerThinkingLevel?: string;
+	/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
+	thinkingLevel?: ModelThinkingLevel;
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
 	usage: Usage;
 	stopReason: StopReason;
 	deferred?: DeferredHandle;
 	errorMessage?: string;
+	/**
+	 * Pi-owned recovery decision for a failed response, classified from the original provider error before any
+	 * text is suppressed (smarty-dev#5822). Retry, premature-stream and context-overflow checks read it first.
+	 */
+	recovery?: AssistantRecovery;
+	/** Pi-owned remedy for a failure Pi recognized before suppressing provider text (smarty-dev#5822 C4). */
+	errorHint?: AssistantErrorHint;
 	rawStopReason?: string;
 	/**
 	 * Provider indication of whether the model explicitly ended its turn.
 	 * Preserved for debugging and does not currently affect agent control flow.
 	 */
 	endTurn?: boolean;
-	timestamp: number; // Unix timestamp in milliseconds
+	/** Unix timestamp in milliseconds when the request started. */
+	timestamp: number;
+	/**
+	 * Milliseconds from `timestamp` until the response ended, measured with a monotonic clock. Set by
+	 * `AssistantMessageEventStream` on the final message of a response it saw start; absent for legacy messages and
+	 * for deferred results fetched later.
+	 */
+	durationMs?: number;
+}
+
+/** A tool call that another tool made while it ran, for example from a codemode script. */
+export interface NestedToolCallRecord {
+	id: string;
+	name: string;
+	/** Omitted when over the size limits; `argumentsBytes` then gives their size. */
+	arguments?: JsonObject;
+	/** UTF-8 size of the arguments as JSON, set when `arguments` is omitted. */
+	argumentsBytes?: number;
+	/** `unfinished`: the call was still running when the calling tool finished. */
+	status: "ok" | "error" | "unfinished";
+	durationMs?: number;
+	/** Error text, truncated. */
+	error?: string;
+}
+
+/** Bounded record of the nested calls a tool made. Results are not recorded. */
+export interface NestedToolCalls {
+	calls: NestedToolCallRecord[];
+	/** False when calls were dropped, arguments omitted, or calls had not finished. */
+	complete: boolean;
 }
 
 export type ToolResultMessage<TDetails = JsonValue> = IsJsonCompatible<TDetails> extends true
@@ -569,8 +650,13 @@ export type ToolResultMessage<TDetails = JsonValue> = IsJsonCompatible<TDetails>
 			details?: JsonRepresentation<TDetails>;
 			/** Usage from the tool execution itself, if available. Not part of main LLM context accounting. */
 			usage?: Usage;
+			/** Calls this tool made to other tools. Kept for the session record; not sent to the model. */
+			nestedCalls?: NestedToolCalls;
 			isError: boolean;
-			timestamp: number; // Unix timestamp in milliseconds
+			/** Unix timestamp in milliseconds when the result was created. */
+			timestamp: number;
+			/** Milliseconds the tool's execution took, measured with a monotonic clock. Absent for legacy results. */
+			durationMs?: number;
 		}
 	: never;
 
@@ -619,6 +705,11 @@ export type ClassifierQuestion = ClassifierChoiceQuestion | ClassifierScoreQuest
 
 export interface ClassifierContext {
 	state: JsonObject;
+	/**
+	 * Images judged together with `state`. Only models whose `input` includes `"image"` accept them;
+	 * other models return an error result.
+	 */
+	images?: ImageContent[];
 	questions: Record<string, ClassifierQuestion>;
 }
 
@@ -648,6 +739,8 @@ export interface ClassifierResult {
 	provider: ProviderId;
 	model: string;
 	answers: Record<string, ClassifierAnswer>;
+	/** Token usage and its cost at the model's catalog price, when the service reports token counts. */
+	usage?: Usage;
 	stopReason: ClassifierStopReason;
 	errorMessage?: string;
 	timestamp: number; // Unix timestamp in milliseconds
@@ -722,8 +815,10 @@ export type TranscriptContext = {
  * Direct `streamSimple()` calls throw synchronously when request auth is missing.
  * Updates and `done` must never appear before `start`.
  *
- * `partial` is the shared live response-so-far helper, not an event-time
- * snapshot. Text and thinking blocks are empty when their `*_start` event is
+ * `partial` (and `message`/`error`/`toolCall`) is a detached snapshot taken when
+ * the event is pushed: later provider writes do not change it, and consumer
+ * writes do not reach the provider, later events or `result()`. Content blocks
+ * carry only their declared fields. Text and thinking blocks are empty when their `*_start` event is
  * emitted and grow only through their corresponding `*_delta` events until the
  * authoritative `*_end`. Redacted thinking may be complete at start and emit no
  * deltas. Tool-call arguments at `toolcall_start` are provider-specific;
@@ -908,7 +1003,7 @@ export interface AnthropicMessagesCompat {
 	supportsMidConvoEffort?: boolean;
 	/** Whether the exact model accepts system-role messages inside the conversation. When false, later system messages are folded into the top-level system prompt. Default: false. */
 	supportsMidConvoSystemMessages?: boolean;
-	/** Whether the exact model accepts mid-conversation `tool_addition` and `tool_removal` blocks. Requires `supportsMidConvoSystemMessages`. Default: false. */
+	/** Whether the exact model accepts mid-conversation `tool_addition` blocks with inline tool definitions (`inline-tools-2026-09-15`) and `tool_removal` blocks. Requires `supportsMidConvoSystemMessages`. Default: false. */
 	supportsMidConvoToolChanges?: boolean;
 	/**
 	 * Models Anthropic accepts in `fallbacks` for server-side refusal fallback,
@@ -1091,7 +1186,9 @@ export interface Model<TApi extends Api> extends BaseModel<TApi> {
 	contextWindow: number;
 	maxTokens: number;
 	/** Default sampling parameters for this model. See {@link StreamOptions.samplingParams}; per-request keys override these. */
-	samplingParams?: Record<string, unknown>;
+	samplingParams?: SamplingParams;
+	/** Sampling parameter overrides selected by the effective pi thinking level. */
+	samplingParamsByThinkingLevel?: SamplingParamsByThinkingLevel;
 	/** Compatibility overrides for OpenAI-compatible APIs. If not set, auto-detected from baseUrl. */
 	compat?: TApi extends "openai-completions"
 		? OpenAICompletionsCompat

@@ -79,7 +79,7 @@ describe("Together models", () => {
 		temporaryRoots.push(root);
 		const preloadPath = join(root, "mock-catalog.mjs");
 		const outputPath = join(root, "catalog");
-		const modelId = "deepseek-ai/DeepSeek-V4-Pro";
+		const modelId = "deepseek-ai/DeepSeek-V4-Pro-0813";
 		const catalog = {
 			together: { models: { [modelId]: { id: modelId, tool_call: true, reasoning: true } } },
 		};

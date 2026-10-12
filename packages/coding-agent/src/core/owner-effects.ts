@@ -308,6 +308,15 @@ interface NativeOwnerBinding {
 	beginClose(lease: NativeLease): void;
 	readJournal(lease: NativeLease, name: string): Buffer;
 	commitJournal(lease: NativeLease, name: string, previous: Buffer, next: Buffer): number;
+	appendJournal(lease: NativeLease, name: string, previousLength: number, suffix: Buffer): number;
+	appendTerminalJournal(lease: NativeLease, name: string, previousLength: number, suffix: Buffer): number;
+	verifyJournal(lease: NativeLease, name: string, previousLength: number): number;
+	appendTerminalJournalAsync(
+		lease: NativeLease,
+		name: string,
+		previousLength: number,
+		suffix: Buffer,
+	): NativeLifecycleReceipt<number>;
 	commitTerminalJournal(lease: NativeLease, name: string, previous: Buffer, next: Buffer): number;
 	commitTerminalJournalAsync(
 		lease: NativeLease,
@@ -382,6 +391,10 @@ function binding(value: unknown): asserts value is NativeOwnerBinding {
 		"checkCredential",
 		"readJournal",
 		"commitJournal",
+		"appendJournal",
+		"appendTerminalJournal",
+		"verifyJournal",
+		"appendTerminalJournalAsync",
 		"commitTerminalJournal",
 		"commitTerminalJournalAsync",
 		"prepareLaunch",
@@ -691,7 +704,9 @@ export class OwnedJournal {
 	readonly #lease: NativeLease;
 	readonly #closeTimeout: number;
 	readonly #initialHeader?: SessionHeader;
-	#previous: Buffer;
+	#chunks: Buffer[] = [];
+	#length = 0;
+	readonly #hash = createHash("sha256");
 	#loaded: boolean;
 	#quarantined = false;
 	#quarantineFailure?: { cause: unknown };
@@ -723,7 +738,6 @@ export class OwnedJournal {
 		this.maxBytes = profile.storage.journalBytes;
 		this.#closeTimeout = profile.limits.closeTimeoutMs;
 		this.grant = grant;
-		this.#previous = Buffer.alloc(0);
 		this.#loaded = !existing;
 		this.#initialHeader = initialHeader ? Object.freeze({ ...initialHeader }) : undefined;
 		Object.freeze(this);
@@ -793,7 +807,7 @@ export class OwnedJournal {
 				if (performance.now() >= deadline) throw new Error("OWNER_RECOVERY_TIMEOUT");
 				await delay(10);
 			}
-			this.#previous = Buffer.from(this.#native.readJournal(this.#lease, basename(this.file)));
+			this.#retain(Buffer.from(this.#native.readJournal(this.#lease, basename(this.file))));
 			this.#loaded = true;
 		} catch (error) {
 			recoveryFailure = { cause: error };
@@ -823,7 +837,7 @@ export class OwnedJournal {
 
 	read(): Buffer {
 		this.assertActive();
-		return Buffer.from(this.#previous);
+		return Buffer.concat(this.#chunks, this.#length);
 	}
 
 	isTerminalSealed(): boolean {
@@ -864,51 +878,110 @@ export class OwnedJournal {
 		return this.#commit(bytes, true);
 	}
 
+	/** Explicit receipt only: ordinary appends update the running hash, not a digest. */
+	currentReceipt(): { bytes: number; sha256: string } {
+		this.assertWritable();
+		try {
+			const count = this.#native.verifyJournal(this.#lease, basename(this.file), this.#length);
+			if (count !== this.#length) throw new Error("OWNER_JOURNAL_RECEIPT");
+			return { bytes: count, sha256: this.#hash.copy().digest("hex") };
+		} catch (error) {
+			this.#failCommit(error);
+		}
+	}
+
+	/** Submit only the admitted suffix; native retains and verifies the trusted prefix. */
+	append(suffix: Buffer): void {
+		this.assertWritable();
+		if (suffix.length > this.maxBytes - this.#length) throw new Error("OWNER_JOURNAL_NOT_APPEND");
+		const retained = Buffer.from(suffix);
+		try {
+			const count = this.#sealed
+				? this.#native.appendTerminalJournal(this.#lease, basename(this.file), this.#length, retained)
+				: this.#native.appendJournal(this.#lease, basename(this.file), this.#length, retained);
+			if (count !== this.#length + retained.length) throw new Error("OWNER_JOURNAL_RECEIPT");
+			this.#retain(retained);
+		} catch (error) {
+			this.#failCommit(error);
+		}
+	}
+
+	async appendTerminalAsync(suffix: Buffer): Promise<void> {
+		await this.#commitTerminalAsync(Buffer.from(suffix), false);
+	}
+
 	async commitTerminalAsync(bytes: Buffer): Promise<{ bytes: number; sha256: string }> {
+		await this.#commitTerminalAsync(Buffer.from(bytes), true);
+		return this.currentReceipt();
+	}
+
+	async #commitTerminalAsync(bytes: Buffer, full: boolean): Promise<void> {
 		const scope = terminalWrites.getStore();
 		if (scope?.journal !== this || !scope.active || !this.#sealed || this.#quarantined || this.#releaseAttempted)
 			throw new Error("OWNER_TERMINAL_STATE");
-		const next = Buffer.from(bytes);
-		const previous = this.#previous;
-		if (
-			next.length > this.maxBytes ||
-			next.length < previous.length ||
-			!next.subarray(0, previous.length).equals(previous)
-		)
-			throw new Error("OWNER_JOURNAL_NOT_APPEND");
-		const count = await this.#lifecycle(() => {
-			if (!scope.active || this.#releaseAttempted) throw new Error("OWNER_TERMINAL_STATE");
-			return this.#native.commitTerminalJournalAsync(this.#lease, basename(this.file), previous, next);
-		});
-		if (count !== next.length) {
-			this.#quarantined = true;
-			throw new Error("OWNER_JOURNAL_RECEIPT");
+		let suffix: Buffer;
+		let expected = 0;
+		try {
+			const count = await this.#lifecycle(() => {
+				if (!scope.active || this.#releaseAttempted) throw new Error("OWNER_TERMINAL_STATE");
+				if (full) this.#assertFullAppend(bytes);
+				suffix = full ? bytes.subarray(this.#length) : bytes;
+				if (suffix.length > this.maxBytes - this.#length) throw new Error("OWNER_JOURNAL_NOT_APPEND");
+				expected = this.#length + suffix.length;
+				return full
+					? this.#native.commitTerminalJournalAsync(
+							this.#lease,
+							basename(this.file),
+							Buffer.concat(this.#chunks, this.#length),
+							bytes,
+						)
+					: this.#native.appendTerminalJournalAsync(this.#lease, basename(this.file), this.#length, suffix);
+			});
+			if (count !== expected) throw new Error("OWNER_JOURNAL_RECEIPT");
+			this.#retain(suffix!);
+		} catch (error) {
+			this.#failCommit(error);
 		}
-		this.#previous = next;
-		return { bytes: count, sha256: createHash("sha256").update(next).digest("hex") };
+	}
+
+	#assertFullAppend(bytes: Buffer): void {
+		if (bytes.length > this.maxBytes || bytes.length < this.#length) throw new Error("OWNER_JOURNAL_NOT_APPEND");
+		let offset = 0;
+		for (const chunk of this.#chunks) {
+			if (!bytes.subarray(offset, offset + chunk.length).equals(chunk)) throw new Error("OWNER_JOURNAL_NOT_APPEND");
+			offset += chunk.length;
+		}
+	}
+
+	#retain(suffix: Buffer): void {
+		if (!suffix.length) return;
+		this.#chunks.push(suffix);
+		this.#hash.update(suffix);
+		this.#length += suffix.length;
+	}
+
+	#failCommit(error: unknown): never {
+		try {
+			this.quarantine();
+		} catch (cleanup) {
+			throw new AggregateError([error, cleanup], "OWNER_JOURNAL_QUARANTINE_FAILED", { cause: error });
+		}
+		throw error;
 	}
 
 	#commit(bytes: Buffer, terminal: boolean): { bytes: number; sha256: string } {
-		if (
-			bytes.length > this.maxBytes ||
-			bytes.length < this.#previous.length ||
-			!bytes.subarray(0, this.#previous.length).equals(this.#previous)
-		)
-			throw new Error("OWNER_JOURNAL_NOT_APPEND");
+		this.#assertFullAppend(bytes);
+		const previous = Buffer.concat(this.#chunks, this.#length);
+		const next = Buffer.from(bytes);
 		try {
 			const count = terminal
-				? this.#native.commitTerminalJournal(this.#lease, basename(this.file), this.#previous, bytes)
-				: this.#native.commitJournal(this.#lease, basename(this.file), this.#previous, bytes);
-			if (count !== bytes.length) throw new Error("OWNER_JOURNAL_RECEIPT");
-			this.#previous = Buffer.from(bytes);
-			return { bytes: count, sha256: createHash("sha256").update(bytes).digest("hex") };
+				? this.#native.commitTerminalJournal(this.#lease, basename(this.file), previous, next)
+				: this.#native.commitJournal(this.#lease, basename(this.file), previous, next);
+			if (count !== next.length) throw new Error("OWNER_JOURNAL_RECEIPT");
+			this.#retain(next.subarray(this.#length));
+			return this.currentReceipt();
 		} catch (error) {
-			try {
-				this.quarantine();
-			} catch (cleanup) {
-				throw new AggregateError([error, cleanup], "OWNER_JOURNAL_QUARANTINE_FAILED");
-			}
-			throw error;
+			this.#failCommit(error);
 		}
 	}
 

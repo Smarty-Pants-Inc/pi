@@ -73,28 +73,21 @@ write_fixture build-binaries.yml "$approved_jobs"
 bash "$guard" "$fixture_dir" "$allowlist"
 echo 'PASS: all three allowlisted entries (smoke macos-latest/windows-latest; publish-npm ubuntu-latest)'
 
-# smarty-dev#3644: quoted anchors hid hosted labels from the textual guard.
-# Keep approved entries used, so the rejection is specifically the alias target.
+# smarty-dev#1246 / #3644: anchors and aliases are rejected anywhere, not
+# resolved, so none can hide a hosted label. Keep approved entries used so the
+# alias is the only failure; a self-hosted alias is rejected too.
+alias_diagnostic='YAML anchor/alias is not allowed (smarty-dev#1246)'
 hosted_anchor=$'env:\n  HOSTED_IMAGE: &image "ubuntu-latest"\n'
-for selection in '*image' '[self-hosted, *image]' $'\n      - self-hosted\n      - *image'; do
-  expect_rejected "hosted scalar/list/sequence alias $selection" "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: '"$selection" 'unapproved hosted runner' build-binaries.yml "$allowlist"
+for selection in '*image' '[self-hosted, *image]' $'\n      - self-hosted\n      - *image' '{group: fleet, labels: [*image]}'; do
+  expect_rejected "hosted alias in runs-on $selection" "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: '"$selection" "$alias_diagnostic" build-binaries.yml "$allowlist"
 done
-expect_rejected 'anchored hosted runs-on' "$approved_jobs"$'\n  check:\n    runs-on: &image ubuntu-latest' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'matrix value alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [*image]' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'matrix include alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        include:\n          - runner: *image' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'whole sequence alias' $'env:\n  LABELS: &labels [self-hosted, "ubuntu-latest"]\n'"$approved_jobs"$'\n  check:\n    runs-on: *labels' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'whole matrix alias' $'env:\n  MATRIX: &matrix {runner: ["ubuntu-latest"]}\n'"$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix: *matrix' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'whole job alias' $'env:\n  JOB: &job {runs-on: "ubuntu-latest"}\n'"$approved_jobs"$'\n  check: *job' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-
-write_fixture build-binaries.yml $'env:\n  FORGE_IMAGE: &image smarty-linux-x64\n'"$approved_jobs"$'\n  check:\n    runs-on: [self-hosted, *image]'
-bash "$guard" "$fixture_dir" "$allowlist"
-echo 'PASS: safe self-hosted alias'
-
-# smarty-dev#3644: approval belongs to the resolved file/job/label, not syntax.
-write_fixture build-binaries.yml $'env:\n  MAC: &mac macos-latest\n  WINDOWS: &windows windows-latest\n  UBUNTU: &ubuntu ubuntu-latest\njobs:\n  smoke-test-binaries:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [*mac, *windows]\n  publish-npm:\n    runs-on: *ubuntu'
-bash "$guard" "$fixture_dir" "$allowlist"
-echo 'PASS: all three approvals through aliases'
-expect_rejected 'hosted alias in group labels' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: {group: fleet, labels: [*image]}' 'unapproved hosted runner' build-binaries.yml "$allowlist"
+expect_rejected 'anchored hosted runs-on' "$approved_jobs"$'\n  check:\n    runs-on: &image ubuntu-latest' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'alias hiding smarty-linux-x64' $'env:\n  FORGE_IMAGE: &image smarty-linux-x64\n'"$approved_jobs"$'\n  check:\n    runs-on: [self-hosted, *image]' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'matrix value alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [*image]' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'matrix include alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        include:\n          - runner: *image' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'whole matrix alias' $'env:\n  MATRIX: &matrix {runner: ["ubuntu-latest"]}\n'"$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix: *matrix' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'whole job alias' $'env:\n  JOB: &job {runs-on: "ubuntu-latest"}\n'"$approved_jobs"$'\n  check: *job' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'undefined YAML alias' $'jobs:\n  check:\n    runs-on: [*missing]' "$alias_diagnostic"
 
 expect_rejected 'allowlisted smoke label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: macos-latest' 'unapproved hosted runner' build-binaries.yml "$allowlist"
 expect_rejected 'allowlisted publisher label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: ubuntu-latest' 'unapproved hosted runner' build-binaries.yml "$allowlist"
@@ -124,8 +117,6 @@ for expression in '${{ inputs.runner }}' '${{ needs.setup.outputs.runner }}' '${
 done
 expect_rejected 'dynamic matrix' $'jobs:\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix: ${{ fromJSON(inputs.matrix) }}' 'unsupported/unresolved matrix'
 expect_rejected 'duplicate runs-on key' $'jobs:\n  check:\n    runs-on: ubuntu-latest\n    runs-on: smarty-linux-x64' 'duplicate YAML key'
-expect_rejected 'undefined YAML alias' $'jobs:\n  check:\n    runs-on: [*missing]' 'undefined alias'
-expect_rejected 'recursive YAML alias' $'jobs:\n  check:\n    runs-on: &labels [*labels]' 'unsupported/unresolved'
 expect_rejected 'runner mapping without labels or group' $'jobs:\n  check:\n    runs-on: {runner: smarty-linux-x64}' 'unsupported/unresolved'
 expect_rejected 'null runner' $'jobs:\n  check:\n    runs-on: null' 'unsupported/unresolved'
 expect_rejected 'empty runner sequence' $'jobs:\n  check:\n    runs-on: []' 'unsupported/unresolved'
@@ -306,7 +297,7 @@ for value in true True TRUE false False FALSE; do
   echo "PASS: boolean matrix inclusion $value/${value,,}"
 done
 
-write_fixture probe.yml $'env:\n  LABELS: &labels [self-hosted, smarty-linux-x64]\njobs:\n  check:\n    runs-on: {group: fleet, labels: *labels}'
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet, labels: [self-hosted, smarty-linux-x64]}'
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
-echo 'PASS: literal runner group with resolved labels'
+echo 'PASS: literal runner group with literal labels'
 echo 'All hosted-runner guard probes passed'

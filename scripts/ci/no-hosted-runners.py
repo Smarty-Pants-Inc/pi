@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Inspect resolved workflow runners, not YAML source text (smarty-dev#3644)."""
+"""Inspect resolved workflow runners, not YAML source text (smarty-dev#3644).
+
+YAML anchors and aliases are rejected, not resolved (smarty-dev#1246): no
+workflow needs them, and an alias can hide a hosted label in runs-on, a
+matrix value, a whole matrix or a whole job.
+"""
 
 import itertools
 import re
@@ -158,7 +163,13 @@ def check(workflow_dir, allowlist):
     failed = False
     for path in workflows:
         try:
-            workflow = yaml.load(path.read_text(), Loader=WorkflowLoader)
+            text = path.read_text()
+            for event in yaml.parse(text, Loader=WorkflowLoader):
+                if isinstance(event, yaml.AliasEvent) or getattr(event, "anchor", None) is not None:
+                    raise ValueError(
+                        f"line {event.start_mark.line + 1}: YAML anchor/alias is not allowed (smarty-dev#1246); write the value literally"
+                    )
+            workflow = yaml.load(text, Loader=WorkflowLoader)
             if not isinstance(workflow, dict) or not isinstance(workflow.get("jobs"), dict) or not workflow["jobs"]:
                 raise ValueError("unsupported/unresolved jobs")
             for job_id, job in workflow["jobs"].items():
@@ -172,7 +183,7 @@ def check(workflow_dir, allowlist):
                                 if key not in allowed:
                                     raise ValueError(f"unapproved hosted runner: {label}")
                                 allowed[key] += 1
-                except (ValueError, RecursionError) as error:
+                except ValueError as error:
                     print(f"{path}:{job_id}: {error}", file=sys.stderr)
                     failed = True
         except (yaml.YAMLError, ValueError, TypeError, RecursionError) as error:

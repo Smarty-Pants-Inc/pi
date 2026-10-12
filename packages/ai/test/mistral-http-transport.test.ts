@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
 import { stream as streamMistral } from "../src/api/mistral-conversations.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, FetchFunction, Model, ProviderResponse } from "../src/types.ts";
+import type { FetchFunction, ProviderResponse } from "../src/types.ts";
 
 const PI_USER_AGENT = `pi (${platform()} ${release()}; ${arch()})`;
 
@@ -116,10 +116,8 @@ describe("Mistral HTTP transport", () => {
 		expect(callbackPayload?.maxTokens).toBe(123);
 		expect(callbackPayload?.promptMode).toBe("reasoning");
 		expect(callbackPayload?.promptCacheKey).toBe("session-1");
-		expect(callbackResponse).toEqual({
-			status: 200,
-			headers: { "content-type": "text/event-stream", "x-request-id": "request-1" },
-		});
+		// smarty-dev#5822 C1: the status only, never response headers.
+		expect(callbackResponse).toEqual({ status: 200 });
 
 		const wirePayload = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
 		expect(wirePayload.max_tokens).toBe(123);
@@ -322,7 +320,50 @@ describe("Mistral HTTP transport", () => {
 		expect(message.usage).toMatchObject({ input: 7, output: 4, cacheRead: 3, cacheWrite: 0, totalTokens: 14 });
 	});
 
-	it("forwards each parsed SSE payload before normalizing it", async () => {
+	// #9674: GLM models on Mistral send empty content deltas at the start, around tool calls,
+	// and sometimes mid-thinking. They must not open blocks or split thinking.
+	it("ignores empty content deltas", async () => {
+		const model = getModel("mistral", "zai-glm-5-3");
+		const context = normalizeContext({
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+		});
+		const thinking = (text: string) => ({ type: "thinking", thinking: [{ type: "text", text }] });
+		const toolCall = (args: string, first: boolean) => ({
+			index: 0,
+			...(first ? { id: "abc123456" } : {}),
+			function: { name: first ? "read" : "", arguments: args },
+		});
+		const deltas = [
+			{ content: "" },
+			{ content: [thinking("first part,")] },
+			{ content: "" },
+			{ content: [{ type: "text", text: "" }] },
+			{ content: [thinking(" second part."), { type: "text", text: "Reading." }] },
+			{ content: "", tool_calls: [toolCall("", true)] },
+			{ content: "", tool_calls: [toolCall('{"path":', false)] },
+			{ content: "", tool_calls: [toolCall('"a.txt"}', false)] },
+			{ content: "" },
+		];
+		const events = deltas.map((delta, i) => ({
+			id: "response-1",
+			model: model.id,
+			choices: [{ index: 0, finish_reason: i === deltas.length - 1 ? "tool_calls" : null, delta }],
+		}));
+
+		const message = await streamMistral(model, context, {
+			apiKey: "test",
+			fetch: async () => createSseResponse(events),
+		}).result();
+
+		expect(message.content).toEqual([
+			{ type: "thinking", thinking: "first part, second part." },
+			{ type: "text", text: "Reading." },
+			{ type: "toolCall", id: "abc123456", name: "read", arguments: { path: "a.txt" } },
+		]);
+	});
+
+	// smarty-dev#5822 C1: one owned notification per payload, never the payload or model.
+	it("notifies once per parsed SSE payload without provider data", async () => {
 		const model = getModel("mistral", "mistral-large-latest");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
@@ -339,20 +380,17 @@ describe("Mistral HTTP transport", () => {
 				usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
 			},
 		];
-		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const result = await streamMistral(model, context, {
 			apiKey: "test",
 			fetch: async () => createSseResponse(events),
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		}).result();
 
-		expect(received).toEqual(events);
-		expect(eventModels).toEqual([model, model]);
+		expect(calls).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});
@@ -450,7 +488,8 @@ describe("Mistral HTTP transport", () => {
 		expect(message.errorMessage).toMatch(/timeout/i);
 	});
 
-	it("preserves HTTP status and response bodies in errors", async () => {
+	// smarty-dev#5822 (pi#202 round 2): the status is kept; the response body is classified, never published.
+	it("keeps the HTTP status and publishes no response body", async () => {
 		const model = getModel("mistral", "mistral-large-latest");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
@@ -461,6 +500,6 @@ describe("Mistral HTTP transport", () => {
 		const message = await streamMistral(model, context, { apiKey: "test", fetch }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe('Mistral API error (403): {"message":"blocked by gateway"}');
+		expect(message.errorMessage).toBe("Mistral API error (403)");
 	});
 });
