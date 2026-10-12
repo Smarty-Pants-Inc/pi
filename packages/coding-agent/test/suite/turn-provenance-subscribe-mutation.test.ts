@@ -80,6 +80,37 @@ it("keeps keyboard attribution when subscribe listeners leave the user message u
 	expect(provenance).toMatchObject({ channel: "keyboard", principal: { id: "paul", binding: "herdr-client" } });
 });
 
+// pi#160 review: the boundary checks and persists one detached copy, so a getter is read once.
+it("persists a plain-data copy of getter-based content, keyboard only if that copy equals the attested text", async () => {
+	const token = "2".repeat(32);
+	let reads = 0;
+	let live: AgentMessage | undefined;
+	const { message, provenance } = await persistedUserProvenance(token, (event) => {
+		const start = userMessage(event, "message_start");
+		if (start?.role !== "user") return;
+		live = start;
+		const block = { type: "text" as const, text: "" };
+		Object.defineProperty(block, "text", {
+			enumerable: true,
+			get: () => (reads++ % 2 === 0 ? "typed by paul" : "smuggled by getter"),
+		});
+		start.content = [block];
+	});
+	expect(reads).toBeGreaterThan(0);
+	if (provenance?.channel === "keyboard") expect(JSON.stringify(message)).not.toContain("smuggled");
+	else expect(provenance).toMatchObject({ channel: "terminal", submissionToken: token });
+	// The in-memory session entry holds the detached copy, not the live getter-backed message.
+	const harness = harnesses[harnesses.length - 1]!;
+	const entry = harness.sessionManager
+		.getEntries()
+		.find((value) => value.type === "message" && value.message.role === "user");
+	const stored = entry?.type === "message" ? entry.message : undefined;
+	expect(stored).not.toBe(live);
+	const storedBlock = stored?.role === "user" && Array.isArray(stored.content) ? stored.content[0] : undefined;
+	expect(Object.getOwnPropertyDescriptor(storedBlock, "text")).toMatchObject({ value: expect.any(String) });
+	expect(JSON.stringify(stored)).toBe(JSON.stringify(message));
+});
+
 it("keeps keyboard attribution without listeners", async () => {
 	const { before, provenance } = await persistedUserProvenance("1".repeat(32));
 	expect(provenance).toEqual(before);

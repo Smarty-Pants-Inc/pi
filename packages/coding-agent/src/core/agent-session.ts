@@ -56,6 +56,7 @@ import type {
 	TextContent,
 	ToolResultMessage,
 	Usage,
+	UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
@@ -325,6 +326,14 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 /** User content as blocks, so `"x"` and `[{ type: "text", text: "x" }]` compare as the same text. */
 function userContentBlocks(content: string | readonly (TextContent | ImageContent)[]): unknown {
 	return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
+/**
+ * A plain-data copy of a user message for persistence. The JSON round trip reads every getter, Proxy
+ * trap and toJSON exactly once, so no live object survives: what the boundary checks is what is written.
+ */
+function detachedUserMessage(message: UserMessage): UserMessage {
+	return JSON.parse(JSON.stringify(message)) as UserMessage;
 }
 
 function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
@@ -1713,13 +1722,17 @@ export class AgentSession {
 			// queues, message_end replacements and public listeners can all change the live message;
 			// the per-path downgrades only make earlier, narrower decisions. Attribution persists only
 			// when the content being written is exactly the content the receipt attested.
+			// The owned-terminal write is queued and serializes later, after async listeners may have
+			// mutated the live message, and a getter can answer differently on each read. So the check
+			// runs on a detached copy, and that same copy (never the live message) is handed to the write.
+			const persisted = event.message.role === "user" ? detachedUserMessage(event.message) : event.message;
 			const attested = this.#attestedUserContent.get(event.message);
 			if (
 				receipt &&
 				!(
-					event.message.role === "user" &&
+					persisted.role === "user" &&
 					attested !== undefined &&
-					isDeepStrictEqual(userContentBlocks(event.message.content), attested)
+					isDeepStrictEqual(userContentBlocks(persisted.content), attested)
 				)
 			) {
 				receipt = withoutAttribution(receipt);
@@ -1758,22 +1771,16 @@ export class AgentSession {
 					this._retainTerminalPublicationFailure(error);
 				}
 			} else if (
-				event.message.role === "system" ||
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
+				persisted.role === "system" ||
+				persisted.role === "user" ||
+				persisted.role === "assistant" ||
+				persisted.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				try {
 					entryId = this.#ordinaryOwner
-						? await appendOwnedTerminalMessage(
-								this.sessionManager,
-								event.message,
-								receipt,
-								metadata,
-								metadataSource,
-							)
-						: appendReceivedMessage(this.sessionManager, event.message, receipt, metadata, metadataSource);
+						? await appendOwnedTerminalMessage(this.sessionManager, persisted, receipt, metadata, metadataSource)
+						: appendReceivedMessage(this.sessionManager, persisted, receipt, metadata, metadataSource);
 				} catch (error) {
 					submission?.reject(error);
 					throw error;
