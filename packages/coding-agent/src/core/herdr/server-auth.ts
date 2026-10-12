@@ -11,7 +11,7 @@
  * share an encoding. Any failure means "no epoch" or "unknown", never a label.
  */
 import { createHash, createHmac, createPublicKey, type KeyObject, timingSafeEqual, verify } from "node:crypto";
-import { readFileSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const SERVER_PUBLIC_KEY_PATH = "/etc/herdr/server.pub";
@@ -112,19 +112,39 @@ export function verifyCut(epochKey: Buffer, request: CutRequest, answer: CutAnsw
 	return mac.length === expected.length && timingSafeEqual(mac, expected);
 }
 
+/** A trust root key file that exists: either an accepted key or the check that rejected it. */
+export type ServerTrustRoot = { readonly key: KeyObject } | { readonly rejected: string };
+
 /**
- * The production trust root. Returns undefined unless the key file and its directory are root-owned
- * and not group- or world-writable, and the key is Ed25519; same-uid agents must not be able to swap it.
+ * The production trust root. Undefined when the key file does not exist (Herdr is not installed on
+ * this host). Otherwise the key is accepted only if the key file and its directory are root-owned and
+ * not group- or world-writable, and the key is Ed25519; same-uid agents must not be able to swap it.
  */
-export function loadServerTrustRoot(path = SERVER_PUBLIC_KEY_PATH): KeyObject | undefined {
+export function checkServerTrustRoot(path = SERVER_PUBLIC_KEY_PATH): ServerTrustRoot | undefined {
+	try {
+		lstatSync(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		return { rejected: "untrusted-trust-root" };
+	}
 	try {
 		for (const target of [path, dirname(path)]) {
 			const stat = statSync(target);
-			if (stat.uid !== 0 || (stat.mode & 0o022) !== 0) return undefined;
+			if (stat.uid !== 0 || (stat.mode & 0o022) !== 0) return { rejected: "untrusted-trust-root" };
 		}
-		const key = createPublicKey(readFileSync(path));
-		return key.asymmetricKeyType === "ed25519" ? key : undefined;
 	} catch {
-		return undefined;
+		// A dangling symlink or an unreadable directory: present, but not a key Pi can trust.
+		return { rejected: "untrusted-trust-root" };
 	}
+	try {
+		const key = createPublicKey(readFileSync(path));
+		return key.asymmetricKeyType === "ed25519" ? { key } : { rejected: "trust-root-not-ed25519" };
+	} catch {
+		return { rejected: "unparsable-trust-root" };
+	}
+}
+
+export function loadServerTrustRoot(path = SERVER_PUBLIC_KEY_PATH): KeyObject | undefined {
+	const root = checkServerTrustRoot(path);
+	return root && "key" in root ? root.key : undefined;
 }

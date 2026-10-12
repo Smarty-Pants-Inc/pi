@@ -5,13 +5,12 @@
  * up to 2 s for the marker. Held bytes are handed to the TUI's terminal through the meter, so nothing
  * typed during startup is lost. Any failed precondition means no epoch: every turn stays `terminal`.
  */
-import type { KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { InputByteMeter } from "@earendil-works/pi-tui";
 import type { AgentSessionRuntimeDiagnostic } from "../agent-session-services.ts";
 import { EpochByteCounter, type PushResult } from "./epoch-bytes.ts";
 import { enrollHerdrInputConsumer } from "./input-consumer.ts";
-import { loadServerTrustRoot } from "./server-auth.ts";
+import { checkServerTrustRoot, type ServerTrustRoot } from "./server-auth.ts";
 import { SubmitAttestor } from "./submit-attestor.ts";
 
 const MARKER_WAIT_MS = 2000;
@@ -61,10 +60,18 @@ function concat(parts: PushResult[]): PushResult {
 /** Host checks; tests substitute them, since the real trust root must be root-owned. */
 export interface HerdrHostChecks {
 	hardened(): boolean;
-	trustRoot(): KeyObject | undefined;
+	/** Undefined when no trust root is installed on this host. */
+	trustRoot(): ServerTrustRoot | undefined;
 }
 
-const HOST_CHECKS: HerdrHostChecks = { hardened: preconditionsHold, trustRoot: () => loadServerTrustRoot() };
+const HOST_CHECKS: HerdrHostChecks = { hardened: preconditionsHold, trustRoot: () => checkServerTrustRoot() };
+
+function unavailable(reason: string): AgentSessionRuntimeDiagnostic {
+	return {
+		type: "warning",
+		message: `Herdr input attestation unavailable (${reason}): typed turns are recorded as terminal.`,
+	};
+}
 
 export async function startHerdrInputConsumer(
 	env: NodeJS.ProcessEnv = process.env,
@@ -74,8 +81,20 @@ export async function startHerdrInputConsumer(
 	const paneId = env.HERDR_PANE_ID;
 	const stdin = process.stdin;
 	if (process.platform !== "linux" || !socketPath || !paneId || !stdin.isTTY || !host.hardened()) return undefined;
-	const trustRoot = host.trustRoot();
-	if (!trustRoot) return undefined;
+	const root = host.trustRoot();
+	// No key file is the expected state on hosts without Herdr's server key installed: stay silent.
+	if (!root) return undefined;
+	if ("rejected" in root) {
+		// Installed but not trustworthy: say so, and pass input through untouched (no raw mode, no hold).
+		const counter = new EpochByteCounter();
+		return {
+			diagnostic: unavailable(root.rejected),
+			meter: { push: (chunk) => counter.push(chunk), end: () => {} },
+			handOff: () => {},
+			shutdown: () => {},
+		};
+	}
+	const trustRoot = root.key;
 
 	const wasRaw = stdin.isRaw;
 	stdin.setRawMode(true);
@@ -109,10 +128,7 @@ export async function startHerdrInputConsumer(
 		const reason = enrolled.ok ? "no-marker" : enrolled.reason;
 		// Keep what was typed during enrollment: the TUI replays it as ordinary input.
 		return {
-			diagnostic: {
-				type: "warning",
-				message: `Herdr input attestation unavailable (${reason}): typed turns are recorded as terminal.`,
-			},
+			diagnostic: unavailable(reason),
 			meter: { push: (chunk) => counter.push(chunk), takePending: () => concat(pending.splice(0)), end: () => {} },
 			handOff: () => {},
 			shutdown: () => {},

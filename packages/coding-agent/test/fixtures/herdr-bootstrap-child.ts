@@ -16,7 +16,7 @@ setTimeout(() => process.exit(3), 8000).unref();
 
 const bootstrap = await startHerdrInputConsumer(
 	{ HERDR_SOCKET_PATH: socketPath, HERDR_PANE_ID: paneId },
-	{ hardened: () => true, trustRoot: () => createPublicKey(readFileSync(trustRootPath!)) },
+	{ hardened: () => true, trustRoot: () => ({ key: createPublicKey(readFileSync(trustRootPath!)) }) },
 );
 report.attested = bootstrap?.attestor !== undefined;
 report.diagnostic = bootstrap?.diagnostic?.message;
