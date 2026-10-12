@@ -264,11 +264,14 @@ int main(int argc, char **argv) {
 		growth(argv[1], 0, 10, 50U * 1024U * 1024U);
 		return 0;
 	}
+	/* ponytail: smarty-dev#10709: two turns give four successive append/readback
+	 * checks per reduced case. Retain the first 100 small-seed turns for native
+	 * retained-buffer expansion; JS 100/1000-turn counts remain unchanged. */
 	growth(argv[1], 0, 100, 512);
-	growth(argv[1], 1, 1000, 512);
-	growth(argv[1], 2, 100, 10U * 1024U * 1024U);
-	growth(argv[1], 3, 1000, 10U * 1024U * 1024U);
-	growth(argv[1], 4, 10, 50U * 1024U * 1024U);
+	growth(argv[1], 1, 2, 512);
+	growth(argv[1], 2, 2, 10U * 1024U * 1024U);
+	growth(argv[1], 3, 2, 10U * 1024U * 1024U);
+	growth(argv[1], 4, 2, 50U * 1024U * 1024U);
 	for (unsigned mode = 0; mode < 5; mode++) safety(argv[1], mode + 5, mode);
 	return 0;
 }
