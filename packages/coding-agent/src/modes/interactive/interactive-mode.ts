@@ -680,6 +680,8 @@ export class InteractiveMode {
 			void this.checkShutdownRequested().catch((cause: unknown) =>
 				this.uncaughtCrash(cause instanceof Error ? cause : new Error(String(cause))),
 			);
+			// A pending shutdown request withholds session_ready, so it cannot start a turn first.
+			return this.shutdownRequested;
 		});
 		this.runtimeHost.setRebindSession(async () => {
 			await this.rebindCurrentSession({ renderBeforeBind: true });
