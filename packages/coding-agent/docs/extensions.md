@@ -242,7 +242,7 @@ An admitted message is persisted as an ordinary user entry with empty metadata (
 
 Request fields never select the source.
 
-Capture `ctx.userMessageSessionGeneration` when receiving input. Hosts without receipt ingress report an empty string. Reload and session replacement rotate it and cancel pending admissions and undelivered ingress follow-ups, without deleting ordinary or custom queued messages. New admissions are refused while session replacement is fenced or reload rebuilds the runtime. During reload, ingress reopens after the new runtime and bindings are installed, before `session_start` runs; concurrent reloads keep it closed until their rebuild suspensions are released. A failed reload leaves ingress closed until a later reload succeeds. A cancelled replacement leaves the same session usable with its fresh generation. Previously started turns remain started. Shutdown permanently closes ingress.
+Capture `ctx.userMessageSessionGeneration` when receiving input. Hosts without receipt ingress report an empty string. Reload and session replacement rotate it and cancel pending admissions and undelivered ingress follow-ups, without deleting ordinary or custom queued messages. New admissions are refused while session replacement is fenced (including from the replacement's `session_start` handlers; use [`session_ready`](#session_ready)) or reload rebuilds the runtime. During reload, ingress reopens after the new runtime and bindings are installed, before `session_start` runs; concurrent reloads keep it closed until their rebuild suspensions are released. A failed reload leaves ingress closed until a later reload succeeds. A cancelled replacement leaves the same session usable with its fresh generation. Previously started turns remain started. Shutdown permanently closes ingress.
 
 The idempotency key is `(registrationEpoch, requestId)` within one live session. The same key and original text returns the first status and reason with `duplicate: true`, even after reload or generation rotation; it never submits again. `sessionGeneration` echoes the retry's generation. Only duplicates of accepted or queued receipts also include `admittedSessionGeneration`, the first admission's generation. Changed text returns `rejected/payload_mismatch`. Duplicate lookup precedes generation validation, so an old receipt is not evidence of a new admission. Bounded correlation keys are reserved before lifecycle, size, or aggregate-budget refusal. Reservations, including rejected admission attempts, survive extension reloads but not process restart or creation of a different session runtime. Malformed requests and oversized correlation fields cannot establish a reservation. Text longer than 65,536 UTF-16 code units is refused with `admission_refused` before any duplicate lookup, hashing, or reservation (even under a key that is already reserved), so its key is not reserved: a later retry with the same key and valid text is admitted as a new request. Loader-level `no_session`, `unsupported`, `session_changed`, and borrowed-API refusals happen outside session admission and do not enter the session-owned ledger.
 
@@ -278,6 +278,19 @@ Command handlers receive `ExtensionCommandContext`, which adds operations for wa
 These operations are command-only because calling them from lifecycle handlers can deadlock the runtime.
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
+
+<a id="session_ready"></a>
+
+`session_start` handlers of a replacement session (`/new`, `/resume`, `/import`, fork) run while its input is still fenced, so `pi.submitUserMessage()` from them, or from work they start, is refused with `session_changed`. `session_ready` fires once after that replacement finishes and the fence lifts:
+
+```typescript
+pi.on("session_ready", (event, ctx) => {
+  // event: { type: "session_ready"; reason: "new" | "resume" | "fork"; sessionGeneration: string }
+  flushPendingInput(event.sessionGeneration);
+});
+```
+
+`sessionGeneration` is the session's current `ctx.userMessageSessionGeneration`, the same value `session_start` saw. Submissions from the handler and from promises or timers it starts are admitted normally. The event is notification-only and not awaited. It does not fire on startup or reload (their `session_start` is not fenced), when `session_before_switch` or `session_before_fork` cancels, when the replacement session was never published, after shutdown or disposal begins, or when another session replacement started first.
 
 <a id="state-management"></a>
 <a id="persist-state"></a>

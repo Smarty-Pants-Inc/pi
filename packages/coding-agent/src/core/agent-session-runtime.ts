@@ -8,6 +8,7 @@ import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agen
 import type {
 	ProjectTrustContext,
 	ReplacedSessionContext,
+	SessionReadyEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "./extensions/index.ts";
@@ -104,6 +105,8 @@ export class AgentSessionRuntime {
 	private readonly terminalCancellation = new AbortController();
 	private terminalRejection?: (messages: AgentMessage[], session: AgentSession) => void;
 	private releaseReceivingInputs?: () => void;
+	/** Session the current lifecycle published, with its session_start reason, for session_ready. */
+	#published?: { session: AgentSession; reason: SessionReadyEvent["reason"] };
 
 	constructor(
 		_session: AgentSession,
@@ -145,6 +148,7 @@ export class AgentSessionRuntime {
 		if (this._disposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "runtime is disposed");
 		if (!rejectQueuedInput) this.terminalCancellation.signal.throwIfAborted();
 		this.lifecycleActive = true;
+		this.#published = undefined;
 		this.lifecycleCompletion = new Promise<void>((resolve) => {
 			this.completeLifecycle = resolve;
 		});
@@ -158,9 +162,24 @@ export class AgentSessionRuntime {
 				this.releaseReceivingInputs?.();
 				this.releaseReceivingInputs = undefined;
 				release();
+				const published = this.#published;
+				this.#published = undefined;
 				this.lifecycleActive = false;
 				this.completeLifecycle?.();
 				queueMicrotask(() => this.lifecycleCompleteHandler?.());
+				// smarty-dev#10453: announce the published replacement only once its input fence is gone.
+				// Skip it if shutdown, disposal or another lifecycle (or session) took over first.
+				if (published)
+					queueMicrotask(() => {
+						if (
+							this._disposed ||
+							this.lifecycleActive ||
+							this.terminalCancellation.signal.aborted ||
+							this._session !== published.session
+						)
+							return;
+						published.session.emitSessionReady(published.reason);
+					});
 			};
 		} catch (error) {
 			this.lifecycleActive = false;
@@ -389,7 +408,7 @@ export class AgentSessionRuntime {
 					// Without a fence, gate direct admission until the lifecycle releases, so callbacks keep
 					// the fenced path's admission scope and terminal-cancellation race (pi#163 security P2).
 					this.releaseReceivingInputs = release ?? session.gateInputs();
-					this.#publish(session, services, diagnostics, modelFallbackMessage);
+					this.#publish(session, services, diagnostics, modelFallbackMessage, options.sessionStartEvent);
 					let cause = error;
 					try {
 						await finish();
@@ -421,7 +440,7 @@ export class AgentSessionRuntime {
 				{ cause, recoveredInput },
 			);
 		}
-		this.#publish(session, services, diagnostics, modelFallbackMessage);
+		this.#publish(session, services, diagnostics, modelFallbackMessage, options.sessionStartEvent);
 		await finish();
 	}
 
@@ -430,7 +449,10 @@ export class AgentSessionRuntime {
 		services: AgentSessionServices,
 		diagnostics: AgentSessionRuntimeDiagnostic[],
 		modelFallbackMessage: string | undefined,
+		sessionStartEvent: SessionStartEvent | undefined,
 	): void {
+		const reason = sessionStartEvent?.reason;
+		if (reason === "new" || reason === "resume" || reason === "fork") this.#published = { session, reason };
 		this._session = session;
 		this._services = services;
 		this._diagnostics = diagnostics;
