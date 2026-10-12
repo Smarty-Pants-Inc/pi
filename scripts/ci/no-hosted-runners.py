@@ -112,7 +112,8 @@ def matrix_rows(job):
     return rows
 
 
-def runner_labels(selection, row, resolve=True):
+def runner_labels(selection, row, groups, resolve=True):
+    """Return the selected labels; append any runner group name to groups."""
     if isinstance(selection, BlockScalar):
         raise ValueError("block-scalar runner value is forbidden")
     if isinstance(selection, str):
@@ -125,7 +126,7 @@ def runner_labels(selection, row, resolve=True):
                 if not isinstance(value, dict) or key not in value:
                     raise ValueError(f"unsupported/unresolved runner selection: {selection}")
                 value = value[key]
-            return runner_labels(value, row, resolve=False)
+            return runner_labels(value, row, groups, resolve=False)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", selection):
             raise ValueError(f"unsupported/unresolved runner label: {selection!r}")
         return [selection]
@@ -134,18 +135,29 @@ def runner_labels(selection, row, resolve=True):
         for value in selection:
             if not isinstance(value, str):
                 raise ValueError("unsupported/unresolved runner label sequence")
-            labels.extend(runner_labels(value, row, resolve))
+            labels.extend(runner_labels(value, row, groups, resolve))
         return labels
     if isinstance(selection, dict) and selection and set(selection) <= {"group", "labels"}:
         if "group" in selection:
             group = selection["group"]
             if not isinstance(group, str) or not group.strip() or "${{" in group or isinstance(group, BlockScalar):
                 raise ValueError("unsupported/unresolved runner group")
-        return runner_labels(selection["labels"], row, resolve) if "labels" in selection else []
+            groups.append(group)
+        return runner_labels(selection["labels"], row, groups, resolve) if "labels" in selection else []
     raise ValueError("unsupported/unresolved runner selection")
 
 
-def check(workflow_dir, allowlist):
+def check(workflow_dir, allowlist, group_allowlist):
+    # A runner group can be a GitHub-hosted larger-runner group, so a group is
+    # accepted only by name from our self-hosted group list (empty by default)
+    # or with an allowlisted hosted label for that file/job (pi#138).
+    allowed_groups = set()
+    for number, line in enumerate(group_allowlist.read_text().splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if len(line.split()) != 1:
+            raise ValueError(f"{group_allowlist}:{number}: malformed runner group entry: {line}")
+        allowed_groups.add(line.strip())
     allowed = {}
     for number, line in enumerate(allowlist.read_text().splitlines(), 1):
         if not line.strip() or line.lstrip().startswith("#"):
@@ -177,12 +189,18 @@ def check(workflow_dir, allowlist):
                     if not isinstance(job_id, str) or not isinstance(job, dict) or "runs-on" not in job:
                         raise ValueError("unsupported/unresolved job runner (including reusable workflows)")
                     for row in matrix_rows(job):
-                        for label in runner_labels(job["runs-on"], row):
+                        groups = []
+                        hosted_approved = False
+                        for label in runner_labels(job["runs-on"], row, groups):
                             if re.fullmatch(r"(?:ubuntu|windows|macos)-[\w.-]+", label, re.IGNORECASE):
                                 key = (path.name, job_id, label)
                                 if key not in allowed:
                                     raise ValueError(f"unapproved hosted runner: {label}")
                                 allowed[key] += 1
+                                hosted_approved = True
+                        for group in groups:
+                            if group not in allowed_groups and not hosted_approved:
+                                raise ValueError(f"runner group not on the self-hosted group allowlist: {group}")
                 except ValueError as error:
                     print(f"{path}:{job_id}: {error}", file=sys.stderr)
                     failed = True
@@ -198,7 +216,7 @@ def check(workflow_dir, allowlist):
 
 if __name__ == "__main__":
     try:
-        sys.exit(check(Path(sys.argv[1]), Path(sys.argv[2])))
+        sys.exit(check(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])))
     except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         sys.exit(1)

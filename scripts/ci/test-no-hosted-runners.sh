@@ -19,7 +19,7 @@ write_fixture() {
 expect_rejected() {
   local name="$1" content="$2" diagnostic="$3" file="${4:-probe.yml}" output
   write_fixture "$file" "$content"
-  if output="$(bash "$guard" "$fixture_dir" "${5:-$fixture_dir/empty.txt}" 2>&1)"; then
+  if output="$(bash "$guard" "$fixture_dir" "${5:-$fixture_dir/empty.txt}" "${6:-$fixture_dir/empty.txt}" 2>&1)"; then
     echo "FAIL: $name was accepted" >&2
     exit 1
   fi
@@ -297,7 +297,25 @@ for value in true True TRUE false False FALSE; do
   echo "PASS: boolean matrix inclusion $value/${value,,}"
 done
 
+# pi#138: a runner group may be a GitHub-hosted larger-runner group. Refuse a
+# group unless our self-hosted group list names it (empty by default) or the
+# job carries an allowlisted hosted label.
+group_diagnostic='runner group not on the self-hosted group allowlist'
+printf '%s\n' '# probe' fleet > "$fixture_dir/groups.txt"
+expect_rejected 'group-only runs-on' $'jobs:\n  check:\n    runs-on: {group: larger-ubuntu}' "$group_diagnostic"
+expect_rejected 'group-only runs-on with checked-in group list' $'jobs:\n  check:\n    runs-on:\n      group: larger-ubuntu' "$group_diagnostic" probe.yml "$fixture_dir/empty.txt" "$repo_root/scripts/ci/self-hosted-runner-groups.txt"
+expect_rejected 'group with self-hosted labels only' $'jobs:\n  check:\n    runs-on: {group: larger-ubuntu, labels: [self-hosted, smarty-linux-x64]}' "$group_diagnostic"
+expect_rejected 'unlisted group next to listed group' $'jobs:\n  check:\n    runs-on: {group: larger-ubuntu}' "$group_diagnostic" probe.yml "$fixture_dir/empty.txt" "$fixture_dir/groups.txt"
+expect_rejected 'matrix-derived group-only runs-on' $'jobs:\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner:\n          - smarty-linux-x64\n          - {group: larger-ubuntu}' "$group_diagnostic"
+printf '%s\n' 'two words' > "$fixture_dir/bad-groups.txt"
+expect_rejected 'malformed group list entry' $'jobs:\n  check:\n    runs-on: smarty-linux-x64' 'malformed runner group entry' probe.yml "$fixture_dir/empty.txt" "$fixture_dir/bad-groups.txt"
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet}'
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt" "$fixture_dir/groups.txt"
+echo 'PASS: listed group-only runs-on'
 write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet, labels: [self-hosted, smarty-linux-x64]}'
-bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
-echo 'PASS: literal runner group with literal labels'
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt" "$fixture_dir/groups.txt"
+echo 'PASS: listed group with literal labels'
+write_fixture build-binaries.yml "$smoke_job"$'\n  publish-npm:\n    runs-on: {group: npm-publish, labels: [ubuntu-latest]}'
+bash "$guard" "$fixture_dir" "$allowlist" "$fixture_dir/empty.txt"
+echo 'PASS: unlisted group with an allowlisted hosted label'
 echo 'All hosted-runner guard probes passed'
