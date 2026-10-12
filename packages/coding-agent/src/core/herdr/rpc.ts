@@ -54,15 +54,25 @@ function parseFrame(line: Buffer): Record<string, unknown> | undefined {
 	return message as Record<string, unknown>;
 }
 
+/** First capacity of the pending buffer; it doubles from here as an incomplete frame grows. */
+const INITIAL_CAPACITY = 4 * 1024;
+const EMPTY = Buffer.alloc(0);
+
 /**
- * Copies each byte once (pi#160 review): an incomplete frame is held as a list of chunks with a
- * running length, only the newest chunk is scanned for a newline, and a frame is concatenated once
- * when its newline arrives. Concatenating the whole buffer on every chunk instead would copy
- * O(n^2) bytes when a peer drips a frame in tiny chunks (about 512 GiB for 1 MiB sent 1 byte at a time).
+ * Holds an incomplete frame in one growable buffer (pi#160 review). Concatenating the whole buffer
+ * on every chunk would copy O(n^2) bytes when a peer drips a frame in tiny chunks (about 512 GiB for
+ * 1 MiB sent 1 byte at a time), and keeping a list of chunks would keep one Buffer object per chunk
+ * alive (about 100 MB of heap for that drip). Instead the reader keeps one buffer and a fill length:
+ * - it scans only the new chunk for a newline;
+ * - it copies a byte in once when the byte must wait for a later chunk, and grows by doubling (from
+ *   4 KiB, never past maxPendingBytes), so growth copies fewer bytes than were appended;
+ * - a line that ends in the same chunk it started in is parsed in place, without a copy.
+ * Copying is amortized O(n) (at most 2x the bytes), memory is at most maxPendingBytes, and the
+ * reader holds O(1) objects. After a frame completes, a buffer grown past 4 KiB is released.
  */
 export class FrameReader {
-	private chunks: Buffer[] = [];
-	private buffered = 0;
+	private buffer: Buffer = EMPTY;
+	private fill = 0;
 	private failed = false;
 	private readonly limits: FrameLimits;
 	private readonly onFrame: (frame: Record<string, unknown>) => void;
@@ -80,43 +90,59 @@ export class FrameReader {
 
 	/** Bytes held for an incomplete frame. */
 	get pendingBytes(): number {
-		return this.buffered;
+		return this.fill;
 	}
 
 	push(chunk: Buffer): void {
 		if (this.failed) return;
-		if (this.buffered + chunk.length > this.limits.maxPendingBytes) {
+		if (this.fill + chunk.length > this.limits.maxPendingBytes) {
 			this.fail("pending_overflow");
 			return;
 		}
 		let start = 0;
 		for (let at = chunk.indexOf(0x0a); at >= 0 && !this.failed; at = chunk.indexOf(0x0a, start)) {
 			const tail = chunk.subarray(start, at);
-			const length = this.buffered + tail.length;
-			const held = this.chunks;
-			this.chunks = [];
-			this.buffered = 0;
 			start = at + 1;
-			if (length > this.limits.maxFrameBytes) {
+			if (this.fill + tail.length > this.limits.maxFrameBytes) {
 				this.fail("frame_too_large");
 				break;
 			}
-			held.push(tail);
-			const line = held.length === 1 ? tail : Buffer.concat(held, length);
+			if (this.fill > 0) this.append(tail);
+			const line = this.fill > 0 ? this.buffer.subarray(0, this.fill) : tail;
+			// parseFrame decodes the line before onFrame runs, so the buffer is free to reuse here.
 			const message = parseFrame(line);
+			this.fill = 0;
+			if (this.buffer.length > INITIAL_CAPACITY) this.buffer = EMPTY;
 			if (message) this.onFrame(message);
 			else this.fail("malformed_frame");
 		}
 		if (this.failed || start === chunk.length) return;
-		this.chunks.push(start === 0 ? chunk : chunk.subarray(start));
-		this.buffered += chunk.length - start;
-		if (this.buffered > this.limits.maxFrameBytes) this.fail("frame_too_large");
+		if (this.fill + chunk.length - start > this.limits.maxFrameBytes) {
+			this.fail("frame_too_large");
+			return;
+		}
+		this.append(start === 0 ? chunk : chunk.subarray(start));
+	}
+
+	/** Copies `bytes` after the fill, doubling the buffer first if it is too small. */
+	private append(bytes: Buffer): void {
+		const needed = this.fill + bytes.length;
+		if (needed > this.buffer.length) {
+			let capacity = Math.max(this.buffer.length, INITIAL_CAPACITY);
+			while (capacity < needed) capacity *= 2;
+			// needed <= maxPendingBytes: push checked fill + chunk.length against it.
+			const grown = Buffer.allocUnsafe(Math.min(capacity, this.limits.maxPendingBytes));
+			this.buffer.copy(grown, 0, 0, this.fill);
+			this.buffer = grown;
+		}
+		bytes.copy(this.buffer, this.fill);
+		this.fill = needed;
 	}
 
 	private fail(reason: HerdrRpcProtocolReason): void {
 		this.failed = true;
-		this.chunks = [];
-		this.buffered = 0;
+		this.buffer = EMPTY;
+		this.fill = 0;
 		this.onError(new HerdrRpcProtocolError(reason));
 	}
 }

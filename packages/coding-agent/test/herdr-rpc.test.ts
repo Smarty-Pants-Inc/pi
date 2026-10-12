@@ -180,22 +180,48 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		expect(reader.pendingBytes).toBe(0);
 	});
 
-	it("copies each byte once when a frame just under the cap arrives 1 byte at a time", () => {
+	it("copies amortized O(n) bytes into one buffer when a frame at the cap arrives 1 byte at a time", () => {
 		// pi#160 review: concatenating the whole buffer per chunk copied O(n^2) bytes (about 512 GiB
-		// here). Count every byte Buffer.concat produces; a linear reader copies the frame once.
+		// here), and holding a list of chunks kept about 1M Buffer objects alive. Count every byte
+		// Buffer.concat produces, Buffer#copy moves and Buffer.alloc zero-fills: appending each byte
+		// once plus doubling growth stays under 3x the frame. Buffer.allocUnsafe writes no bytes, so
+		// it is counted separately, by calls and size.
 		const prefix = '{"id":"drip","result":{"pad":"';
 		const suffix = '"}}';
 		const body = `${prefix}${"a".repeat(MAX_FRAME_BYTES - prefix.length - suffix.length)}${suffix}`;
 		const wire = Buffer.from(`${body}\nnext`);
 		expect(Buffer.byteLength(body)).toBe(MAX_FRAME_BYTES);
 		let copied = 0;
+		let allocations = 0;
+		let allocatedBytes = 0;
 		const concat = Buffer.concat;
-		const spy = vi.spyOn(Buffer, "concat").mockImplementation((list, totalLength) => {
-			const result = concat(list, totalLength);
-			copied += result.length;
-			return result;
+		const alloc = Buffer.alloc;
+		const allocUnsafe = Buffer.allocUnsafe;
+		const copy = Buffer.prototype.copy;
+		const spies = [
+			vi.spyOn(Buffer, "concat").mockImplementation((list, totalLength) => {
+				const result = concat(list, totalLength);
+				copied += result.length;
+				return result;
+			}),
+			vi.spyOn(Buffer, "alloc").mockImplementation((size, fill, encoding) => {
+				copied += size;
+				return alloc(size, fill, encoding);
+			}),
+			vi.spyOn(Buffer, "allocUnsafe").mockImplementation((size) => {
+				allocations++;
+				allocatedBytes += size;
+				return allocUnsafe(size);
+			}),
+			vi.spyOn(Buffer.prototype, "copy").mockImplementation(function (this: Buffer, target, ...rest) {
+				const moved = copy.call(this, target, ...rest);
+				copied += moved;
+				return moved;
+			}),
+		];
+		cleanup.push(() => {
+			for (const spy of spies) spy.mockRestore();
 		});
-		cleanup.push(() => spy.mockRestore());
 		const errors: HerdrRpcProtocolError[] = [];
 		const frames: Record<string, unknown>[] = [];
 		const reader = new FrameReader(
@@ -206,7 +232,17 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		const started = performance.now();
 		for (let at = 0; at < wire.length; at++) {
 			reader.push(wire.subarray(at, at + 1));
-			if (at === MAX_FRAME_BYTES - 1) expect(reader.pendingBytes).toBe(MAX_FRAME_BYTES);
+			if (at === MAX_FRAME_BYTES - 1) {
+				expect(reader.pendingBytes).toBe(MAX_FRAME_BYTES);
+				// One backing buffer and no per-chunk objects: no array, exactly one Buffer field,
+				// sized within the pending cap.
+				const fields = Object.values(reader);
+				expect(fields.filter(Array.isArray)).toEqual([]);
+				const buffers = fields.filter((field): field is Buffer => Buffer.isBuffer(field));
+				expect(buffers).toHaveLength(1);
+				expect(buffers[0].length).toBeGreaterThanOrEqual(MAX_FRAME_BYTES);
+				expect(buffers[0].length).toBeLessThanOrEqual(MAX_PENDING_BYTES);
+			}
 		}
 		const elapsed = performance.now() - started;
 		expect(errors).toEqual([]);
@@ -214,7 +250,10 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		expect(frames[0]).toMatchObject({ id: "drip" });
 		// The remainder after the newline is kept for the next frame.
 		expect(reader.pendingBytes).toBe(4);
-		expect(copied).toBeLessThanOrEqual(MAX_FRAME_BYTES);
+		expect(copied).toBeLessThanOrEqual(3 * MAX_FRAME_BYTES);
+		// Doubling from 4 KiB to 1 MiB is 9 growths; the leftover 4 bytes take one more 4 KiB buffer.
+		expect(allocations).toBeLessThanOrEqual(10);
+		expect(allocatedBytes).toBeLessThanOrEqual(2 * MAX_FRAME_BYTES + 4096);
 		// Generous wall-clock bound: the quadratic reader takes minutes here.
 		expect(elapsed).toBeLessThan(10_000);
 	});
