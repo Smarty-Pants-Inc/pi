@@ -235,11 +235,39 @@ for pair in '0x80000000|2147483648' '0xffffffff|4294967295' '0x100000000|4294967
             runner: smarty-linux-x64" 'unsupported hexadecimal integer'
 done
 
+# smarty-dev#5550 / pi#138: Actions converts octal through signed Int32.
+# Reject unsupported octal before either exclude or include can hide a hosted
+# row. Keep the issue's inclusion order and test both high-bit examples.
+for pair in '0o20000000000|2147483648' '0o37777777777|4294967295' '0o40000000000|4294967296'; do
+  IFS='|' read -r octal decimal <<< "$pair"
+  expect_rejected "unsupported octal matrix exclusion $octal/$decimal" "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [smarty-linux-x64, ubuntu-latest]
+        feature: [$octal]
+        exclude:
+          - runner: ubuntu-latest
+            feature: $decimal" 'unsupported octal integer'
+  expect_rejected "unsupported octal matrix inclusion $decimal/$octal" "jobs:
+  check:
+    runs-on: \${{ matrix.runner }}
+    strategy:
+      matrix:
+        feature: [$decimal]
+        include:
+          - feature: $octal
+            runner: ubuntu-latest
+          - feature: $decimal
+            runner: smarty-linux-x64" 'unsupported octal integer'
+done
+
 # Equal Core Schema values must still match, including decimal leading zeroes,
 # octal/hex, exponent floats, nulls and strings previously coerced by YAML 1.1.
 for pair in \
   '010|10' '+010|10' '-010|-10' '0o10|8' '0x10|16' '1e3|1000' \
-  '0x0|0' '0x7fffffff|2147483647' \
+  '0x0|0' '0x7fffffff|2147483647' '0o0|0' '0o17777777777|2147483647' \
   '1.0e3|1000' '.5|0.5' '1.|1.0' '.inf|.INF' '-.Inf|-.INF' \
   '~|null' 'Null|NULL' 'null|' '1_000|"1_000"' '1:00|"1:00"' \
   '2001-01-01|"2001-01-01"' 'tRuE|"tRuE"' 'on|"on"' 'yes|"yes"'; do
@@ -299,6 +327,35 @@ for value in true True TRUE false False FALSE; do
   bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
   echo "PASS: boolean matrix inclusion $value/${value,,}"
 done
+
+# pi#195: `COND && 'A' || 'B'` resolves to both labels; anything looser fails closed.
+pi195_cond="startsWith(github.head_ref || github.ref_name, 'mergify/merge-queue/')"
+cond_job() { printf 'jobs:\n  check:\n    runs-on: %s\n' "$1"; }
+write_fixture probe.yml "$(cond_job "\${{ $pi195_cond && 'smarty-priority' || 'smarty-linux-x64' }}")"
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo 'PASS: pi#195 conditional runner selection'
+expect_rejected 'hosted label as conditional A' "$(cond_job "\${{ $pi195_cond && 'ubuntu-latest' || 'smarty-linux-x64' }}")" 'unapproved hosted runner'
+expect_rejected 'hosted label as conditional B' "$(cond_job "\${{ $pi195_cond && 'smarty-priority' || 'ubuntu-latest' }}")" 'unapproved hosted runner'
+for expression in \
+  "\${{ github.event.x || 'ubuntu-latest' && 'A' || 'B' }}" \
+  "\${{ github.event.x && 'ubuntu-latest' && 'A' || 'B' }}" \
+  "\${{ startsWith(github.ref, 'x' && 'A' || 'B' }}" \
+  "\${{ startsWith(github.ref, 'x')) && 'A' || 'B' }}" \
+  "\${{ )github.ref( && 'A' || 'B' }}" \
+  "\${{ github.ref == 'x && 'A' || 'B' }}" \
+  "\${{ github.ref == 'it''s && 'A' || 'B' }}" \
+  "\${{ $pi195_cond && \"smarty-priority\" || 'smarty-linux-x64' }}" \
+  "\${{ $pi195_cond && 'smarty-priority' || \"smarty-linux-x64\" }}" \
+  "\${{ $pi195_cond && '' || 'smarty-linux-x64' }}" \
+  "\${{ $pi195_cond && 'smarty-priority' || '' }}" \
+  "\${{  && 'A' || 'B' }}" \
+  "\${{ inputs.x }}\${{ inputs.y && 'A' || 'B' }}"; do
+  expect_rejected "conditional $expression" "$(cond_job "'${expression//\'/\'\'}'")" 'unsupported/unresolved'
+done
+expect_rejected 'conditional inside a matrix value' $'jobs:\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: ["${{ inputs.x && \'smarty-priority\' || \'smarty-linux-x64\' }}"]' 'unsupported/unresolved'
+write_fixture probe.yml "$(cond_job "\${{ github.ref == 'it''s (x)' && 'smarty-priority' || 'smarty-linux-x64' }}")"
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo "PASS: conditional with '' escape and parens inside a string"
 
 # pi#138: a runner group may be a GitHub-hosted larger-runner group. Refuse a
 # group unless our self-hosted group list names it (empty by default),

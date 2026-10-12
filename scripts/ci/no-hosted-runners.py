@@ -34,6 +34,11 @@ class WorkflowLoader(yaml.SafeLoader):
         # magnitude remove or overwrite a possible runner row (pi#138).
         if base == 16 and number > 0x7fffffff:
             raise ValueError(f"unsupported hexadecimal integer: {value}")
+        # Actions converts octal with Convert.ToInt32(..., 8), which also
+        # treats the high bit as a sign. Fail closed before matrix filtering
+        # can hide a possible runner row (smarty-dev#5550 / pi#138).
+        if base == 8 and not 0 <= number <= 0o17777777777:
+            raise ValueError(f"unsupported octal integer: {value}")
         return number
 
     def construct_mapping(self, node, deep=False):
@@ -112,12 +117,49 @@ def matrix_rows(job):
     return rows
 
 
+LABEL = r"[A-Za-z0-9][A-Za-z0-9_.-]*"
+
+
+def plain_condition(cond):
+    # pi#195: COND in `COND && 'A' || 'B'` must have no top-level && or ||,
+    # so the expression always yields the non-empty literal A or B.
+    if not cond.strip() or "${{" in cond or "}}" in cond:
+        return False
+    depth, i = 0, 0
+    while i < len(cond):
+        char = cond[i]
+        if char == "'":
+            end = i + 1
+            while True:
+                end = cond.find("'", end)
+                if end < 0:
+                    return False
+                if cond[end + 1 : end + 2] != "'":
+                    break
+                end += 2
+            i = end + 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif depth == 0 and cond[i : i + 2] in ("&&", "||"):
+            return False
+        i += 1
+    return depth == 0
+
+
 def runner_labels(selection, row, groups, resolve=True):
     """Return the selected labels; append any runner group name to groups."""
     if isinstance(selection, BlockScalar):
         raise ValueError("block-scalar runner value is forbidden")
     if isinstance(selection, str):
         if "${{" in selection or "}}" in selection:
+            cond = re.fullmatch(rf"\$\{{\{{(.*)&&\s*'({LABEL})'\s*\|\|\s*'({LABEL})'\s*\}}\}}", selection, re.DOTALL)
+            if resolve and cond and plain_condition(cond[1]):
+                return [cond[2], cond[3]]
             match = re.fullmatch(r"\$\{\{\s*matrix\.([A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*)\s*\}\}", selection)
             if not resolve or not match:
                 raise ValueError(f"unsupported/unresolved runner selection: {selection}")
@@ -127,7 +169,7 @@ def runner_labels(selection, row, groups, resolve=True):
                     raise ValueError(f"unsupported/unresolved runner selection: {selection}")
                 value = value[key]
             return runner_labels(value, row, groups, resolve=False)
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", selection):
+        if not re.fullmatch(LABEL, selection):
             raise ValueError(f"unsupported/unresolved runner label: {selection!r}")
         return [selection]
     if isinstance(selection, list) and selection:
