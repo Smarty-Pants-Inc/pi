@@ -56,7 +56,6 @@ import type {
 	TextContent,
 	ToolResultMessage,
 	Usage,
-	UserMessage,
 } from "@earendil-works/pi-ai/compat";
 import {
 	clampThinkingLevel,
@@ -154,6 +153,7 @@ import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type ContextEditEntry,
+	freezeDetached,
 	getLatestCompactionEntry,
 	type SessionEntry,
 	SessionManager,
@@ -329,11 +329,13 @@ function userContentBlocks(content: string | readonly (TextContent | ImageConten
 }
 
 /**
- * A plain-data copy of a user message for persistence. The JSON round trip reads every getter, Proxy
- * trap and toJSON exactly once, so no live object survives: what the boundary checks is what is written.
+ * A deep-frozen plain-data copy of a message for persistence. The JSON round trip reads every getter,
+ * Proxy trap and toJSON exactly once, so no live object survives: what the boundary checks is what is
+ * written. The copy is frozen because an unowned SessionManager returns stored entries by reference
+ * (getEntries, getBranch), and a later edit would otherwise be exported with the old attribution.
  */
-function detachedUserMessage(message: UserMessage): UserMessage {
-	return JSON.parse(JSON.stringify(message)) as UserMessage;
+function detachedMessage(message: AgentMessage): AgentMessage {
+	return freezeDetached(JSON.parse(JSON.stringify(message)) as AgentMessage);
 }
 
 function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
@@ -1725,8 +1727,15 @@ export class AgentSession {
 			// The owned-terminal write is queued and serializes later, after async listeners may have
 			// mutated the live message, and a getter can answer differently on each read. So the check
 			// runs on a detached copy, and that same copy (never the live message) is handed to the write.
-			const persisted = event.message.role === "user" ? detachedUserMessage(event.message) : event.message;
+			// Every message that carries a receipt or a submission is detached BEFORE its role is read:
+			// a role getter could answer "assistant" to a live check and "user" to the write. Role and
+			// content below are read only from `persisted`.
 			const attested = this.#attestedUserContent.get(event.message);
+			const submission = this._userMessageSubmissions.get(event.message);
+			const persisted =
+				receipt !== undefined || attested !== undefined || submission !== undefined
+					? detachedMessage(event.message)
+					: event.message;
 			if (
 				receipt &&
 				!(
@@ -1737,30 +1746,29 @@ export class AgentSession {
 			) {
 				receipt = withoutAttribution(receipt);
 			}
-			const submission = this._userMessageSubmissions.get(event.message);
-			if (submission && event.message.role !== "user") {
+			if (submission && persisted.role !== "user") {
 				submission.reject(new Error("User message was replaced without persisting a user entry"));
 			}
-			const metadata = event.message.role === "user" ? submission?.metadata : undefined;
+			const metadata = persisted.role === "user" ? submission?.metadata : undefined;
 			const metadataSource = metadata === undefined ? undefined : submission?.metadataSource;
 			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
+			if (persisted.role === "custom") {
 				// Persist as CustomMessageEntry
 				entryId = this.#ordinaryOwner
 					? await appendOwnedTerminalCustomMessage(
 							this.sessionManager,
-							event.message.customType,
-							event.message.content,
-							event.message.display,
-							event.message.details,
+							persisted.customType,
+							persisted.content,
+							persisted.display,
+							persisted.details,
 							receipt,
 						)
 					: appendReceivedCustomMessage(
 							this.sessionManager,
-							event.message.customType,
-							event.message.content,
-							event.message.display,
-							event.message.details,
+							persisted.customType,
+							persisted.content,
+							persisted.display,
+							persisted.details,
 							receipt,
 						);
 				this.#receivedMessageReceipts.delete(event.message);
@@ -1785,7 +1793,7 @@ export class AgentSession {
 					submission?.reject(error);
 					throw error;
 				}
-				if (submission && event.message.role === "user") {
+				if (submission && persisted.role === "user") {
 					submission.resolve({
 						status: "turnStarted",
 						entryId,

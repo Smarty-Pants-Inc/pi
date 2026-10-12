@@ -364,7 +364,8 @@ type DetachedSessionSource = Pick<
 const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
 const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
 
-function freezeDetached<T>(value: T): T {
+/** Deep-freeze plain data (objects and arrays) in place and return it. */
+export function freezeDetached<T>(value: T): T {
 	const pending: unknown[] = [value];
 	const seen = new WeakSet<object>();
 	while (pending.length) {

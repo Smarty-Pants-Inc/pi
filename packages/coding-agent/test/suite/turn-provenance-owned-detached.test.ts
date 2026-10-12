@@ -103,7 +103,11 @@ function userMessage(event: AgentSessionEvent, type: "message_start" | "message_
 	return event.type === type && event.message.role === "user" ? event.message : undefined;
 }
 
-async function ownedUserEntry(token: string, listener: (event: AgentSessionEvent) => void | Promise<void>) {
+async function ownedUserEntry(
+	token: string,
+	listener: (event: AgentSessionEvent) => void | Promise<void>,
+	onReject?: (error: unknown) => void,
+) {
 	const journal = Reflect.construct(OwnedJournal, []) as JournalFixture;
 	const manager = SessionManager.openOwned("/synthetic", journal);
 	vi.spyOn(SessionManager, "create").mockReturnValueOnce(manager);
@@ -117,13 +121,15 @@ async function ownedUserEntry(token: string, listener: (event: AgentSessionEvent
 		captureKeyboardTurnReceipt("paul", token, new Date().toISOString()),
 	);
 	const before = receiptRecord(getInputReceipt(input));
-	await promptReceived(h.session, input);
+	if (onReject) await promptReceived(h.session, input).catch(onReject);
+	else await promptReceived(h.session, input);
 	// Reopen the journal bytes: this is what was serialized, not an in-memory object.
 	const reopenedJournal = Reflect.construct(OwnedJournal, []) as JournalFixture;
 	reopenedJournal.bytes = journal.bytes;
 	const entry = SessionManager.openOwned("/synthetic", reopenedJournal)
 		.getEntries()
-		.find((value) => value.type === "message" && value.message.role === "user");
+		// The prompt is the first non-system message entry, whatever role it was persisted with.
+		.find((value) => value.type === "message" && value.message.role !== "system");
 	const message = entry?.type === "message" ? entry.message : undefined;
 	return { before, message, provenance: getTurnProvenance(entry!) };
 }
@@ -193,4 +199,42 @@ it("a getter-based content cannot change what is persisted after the check", asy
 	// Keyboard only if the persisted text is exactly the attested text.
 	if (provenance?.channel === "keyboard") expect(JSON.stringify(message)).not.toContain("smuggled");
 	else expect(provenance).toMatchObject({ channel: "terminal", submissionToken: token });
+});
+
+// pi#160 review: detaching must not depend on a live role read. A getter that answers
+// "assistant" to the first read and "user" afterwards must still be detached and checked.
+it("a role getter that flips is still detached and checked", async () => {
+	const token = "e".repeat(32);
+	let roleReads = 0;
+	let rejected: unknown;
+	const { message, provenance } = await ownedUserEntry(
+		token,
+		async (event) => {
+			const live = userMessage(event, "message_end");
+			if (live?.role !== "user") return;
+			Object.defineProperty(live, "role", {
+				enumerable: true,
+				configurable: true,
+				get: () => (roleReads++ === 0 ? "assistant" : "user"),
+			});
+			await Promise.resolve();
+			live.content = [{ type: "text", text: "rewritten after the role flip" }];
+		},
+		(error) => {
+			rejected = error;
+		},
+	);
+	expect(roleReads).toBeGreaterThan(0);
+	expect(message).toBeDefined();
+	expect(JSON.stringify(message)).not.toContain("rewritten after the role flip");
+	// Keyboard attribution only for a persisted user message whose text is exactly the attested text.
+	if (provenance?.channel === "keyboard") {
+		expect(message).toMatchObject({ role: "user", content: [{ type: "text", text: "typed by paul" }] });
+		expect(rejected).toBeUndefined();
+	} else {
+		// The detached copy read "assistant" once and kept it: persisted without keyboard attribution.
+		expect(provenance?.channel).not.toBe("keyboard");
+		expect(JSON.stringify(provenance ?? {})).not.toContain("principal");
+		expect(message).toMatchObject({ content: [{ type: "text", text: "typed by paul" }] });
+	}
 });
