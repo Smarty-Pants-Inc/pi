@@ -1,3 +1,4 @@
+import type { CodemodeLimits } from "./runtime/limits.ts";
 import type { CodemodeWasmModule } from "./wasm.ts";
 
 export interface CodemodeToolContext {
@@ -64,7 +65,9 @@ export type CodemodeErrorKind =
 	/** The caller's signal fired or the sandbox was closed. The worker was terminated. */
 	| "aborted"
 	/** The worker or VM failed outside the script's control (for example a wasm trap or a missing worker file). */
-	| "sandbox";
+	| "sandbox"
+	/** The script went over a host budget (bridge bytes, calls, calls in flight) or the store quota. The worker was terminated. */
+	| "limit";
 
 export interface CodemodeError {
 	kind: CodemodeErrorKind;
@@ -101,11 +104,12 @@ export interface CodemodeSandboxOptions {
 	 */
 	globals?: CodemodeTool[];
 	/**
-	 * Overall deadline per execution, including time spent in tools. `Infinity` disables the
-	 * deadline; the execution then only ends when the script settles or is aborted.
-	 * Default: 300000.
+	 * Overall deadline per execution, including time spent in tools. Values above
+	 * `limits.maxTimeoutMs`, `Infinity` included, are clamped to it. Default: 300000.
 	 */
 	timeoutMs?: number;
+	/** Host budgets per execution. Default: `DEFAULT_CODEMODE_LIMITS`. Values must be positive and finite. */
+	limits?: Partial<CodemodeLimits>;
 	/**
 	 * Maximum memory the QuickJS VM may allocate. Allocations beyond it fail inside the script as
 	 * `InternalError: out of memory`. Default: no limit beyond wasm32's 4 GiB address space.
