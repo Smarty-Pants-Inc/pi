@@ -89,7 +89,7 @@ interface OutgoingSession {
  */
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
-	private lifecycleCompleteHandler?: () => void;
+	private lifecycleCompleteHandler?: () => boolean | undefined;
 	private beforeSessionInvalidate?: () => void;
 	private _session: AgentSession;
 	private _services: AgentSessionServices;
@@ -166,20 +166,24 @@ export class AgentSessionRuntime {
 				this.#published = undefined;
 				this.lifecycleActive = false;
 				this.completeLifecycle?.();
-				queueMicrotask(() => this.lifecycleCompleteHandler?.());
-				// smarty-dev#10453: announce the published replacement only once its input fence is gone.
-				// Skip it if shutdown, disposal or another lifecycle (or session) took over first.
-				if (published)
-					queueMicrotask(() => {
-						if (
-							this._disposed ||
-							this.lifecycleActive ||
-							this.terminalCancellation.signal.aborted ||
-							this._session !== published.session
-						)
-							return;
-						published.session.emitSessionReady(published.reason);
-					});
+				queueMicrotask(() => {
+					// The mode decides deferred shutdown first. Its shutdown may still be waiting for the
+					// event loop (RPC defers it a macrotask), so a pending request also withholds readiness:
+					// otherwise a session_ready handler could start a turn that the shutdown then waits for.
+					const shutdownPending = this.lifecycleCompleteHandler?.() === true;
+					// smarty-dev#10453: announce the published replacement only once its input fence is gone.
+					// Skip it if shutdown (requested or begun), disposal or another lifecycle (or session) took over.
+					if (
+						!published ||
+						shutdownPending ||
+						this._disposed ||
+						this.lifecycleActive ||
+						this.terminalCancellation.signal.aborted ||
+						this._session !== published.session
+					)
+						return;
+					published.session.emitSessionReady(published.reason);
+				});
 			};
 		} catch (error) {
 			this.lifecycleActive = false;
@@ -200,8 +204,11 @@ export class AgentSessionRuntime {
 		return this._modelFallbackMessage;
 	}
 
-	/** @internal Recheck mode-owned deferred work only after lifecycle fences release. */
-	setLifecycleCompleteHandler(handler?: () => void): void {
+	/**
+	 * @internal Recheck mode-owned deferred work only after lifecycle fences release.
+	 * Return true when the mode has a pending shutdown request: the runtime then withholds `session_ready`.
+	 */
+	setLifecycleCompleteHandler(handler?: () => boolean | undefined): void {
 		this.lifecycleCompleteHandler = handler;
 	}
 

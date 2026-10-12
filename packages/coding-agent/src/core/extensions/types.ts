@@ -819,7 +819,7 @@ export interface SessionStartEvent {
 /**
  * Fired once after a /new, /resume or fork replacement publishes its session and lifts the input fence.
  * Unlike `session_start`, `submitUserMessage()` with `sessionGeneration` is admitted here.
- * Not fired on startup, reload, a cancelled or unpublished replacement, or after shutdown begins.
+ * Not fired on startup, reload, a cancelled or unpublished replacement, or once shutdown is requested or begins.
  */
 export interface SessionReadyEvent {
 	type: "session_ready";
