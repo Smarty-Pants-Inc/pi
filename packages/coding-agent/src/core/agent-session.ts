@@ -117,6 +117,7 @@ import {
 	type SessionBoundaryDraft,
 	type SessionCompactEvent,
 	type SessionCompactFailedEvent,
+	type SessionReadyEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
 	type SubmitUserMessageOptions,
@@ -2772,6 +2773,26 @@ export class AgentSession {
 	/** Generation of this session's submitUserMessage ingress; rotated by reload, replacement and fences. */
 	get userMessageSessionGeneration(): string {
 		return this._userMessageIngress.generation;
+	}
+
+	/**
+	 * @internal Notify `session_ready` after the runtime lifted this published replacement's input fence.
+	 * Dispatch runs outside every fence, admission and dispatch-cancellation scope, so handlers and their
+	 * descendants admit input like any unscoped caller (pi#163). Fire-and-forget like other observers.
+	 */
+	emitSessionReady(reason: SessionReadyEvent["reason"]): void {
+		if (this._inputsDisposed || this._shutdownCancellation.signal.aborted || this._inputFence) return;
+		if (!this._extensionRunner.hasHandlers("session_ready")) return;
+		const event: SessionReadyEvent = {
+			type: "session_ready",
+			reason,
+			sessionGeneration: this.userMessageSessionGeneration,
+		};
+		this._inputFenceScope.exit(() =>
+			this._inputAdmissionScope.exit(() =>
+				this._dispatchCancellationScope.exit(() => void this._extensionRunner.emit(event)),
+			),
+		);
 	}
 
 	/** @internal Replacement teardown failed after it began: keep this session's ingress closed. */

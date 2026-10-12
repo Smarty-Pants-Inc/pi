@@ -162,6 +162,7 @@ export type {
 	SessionCompactEvent,
 	SessionCompactFailedEvent,
 	SessionInfoChangedEvent,
+	SessionReadyEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionTreeEvent,
