@@ -349,4 +349,28 @@ BASE_SHA="$head_sha" bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt"
 echo 'PASS: group listed at the base'
 BASE_SHA= bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt"
 echo 'PASS: push to main reads the checked-out (reviewed) list'
+
+# pi#138: the hosted-label allowlist also comes from the trusted base, so a PR
+# cannot approve its own hosted label.
+printf '%s\n' '# probe hosted allowlist' > "$base_repo/scripts/ci/hosted-runner-allowlist.txt"
+repo_git add scripts/ci
+repo_git commit -q -m 'empty hosted allowlist'
+hosted_base_sha="$(repo_git rev-parse HEAD)"
+echo 'probe.yml check ubuntu-latest https://github.com/Smarty-Pants-Inc/pi/pull/138#issuecomment-1' >> "$base_repo/scripts/ci/hosted-runner-allowlist.txt"
+repo_git commit -q -am 'PR approves its own hosted label'
+hosted_head_sha="$(repo_git rev-parse HEAD)"
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: ubuntu-latest'
+for case in "base $hosted_base_sha" "base-without-list $no_list_sha" "unknown-base 0000000000000000000000000000000000000000"; do
+  read -r name sha <<< "$case"
+  if output="$(BASE_SHA="$sha" bash "$base_guard" "$fixture_dir" 2>&1)"; then
+    echo "FAIL: hosted label approved only by the PR head was accepted ($name)" >&2
+    exit 1
+  fi
+  [[ "$output" == *'unapproved hosted runner'* ]] || { printf 'FAIL: %s\n%s\n' "$name" "$output" >&2; exit 1; }
+  echo "PASS: rejected hosted label approved only by the PR head ($name)"
+done
+BASE_SHA="$hosted_head_sha" bash "$base_guard" "$fixture_dir"
+echo 'PASS: hosted label approved at the base'
+BASE_SHA= bash "$base_guard" "$fixture_dir"
+echo 'PASS: push to main reads the checked-out (reviewed) hosted allowlist'
 echo 'All hosted-runner guard probes passed'

@@ -49,13 +49,13 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         ref: ${{ github.sha }}
-        # Depth 2 brings the PR base commit, which holds the trusted runner-group list.
+        # Depth 2 brings the PR base commit, which holds the trusted runner approval lists.
         fetch-depth: 2
         persist-credentials: false
       timeout-minutes: 5
     - name: Reject unapproved hosted runners
       env:
-        # Empty on push to main; the guard then reads the checked-out list.
+        # Empty on push to main; the guard then reads the checked-out lists.
         BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: bash scripts/ci/no-hosted-runners.sh
     - name: Test hosted-runner guard
