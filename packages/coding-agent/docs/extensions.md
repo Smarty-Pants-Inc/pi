@@ -292,6 +292,8 @@ pi.on("session_ready", (event, ctx) => {
 
 `sessionGeneration` is the session's current `ctx.userMessageSessionGeneration`, the same value `session_start` saw. Submissions from the handler and from promises or timers it starts are admitted normally. The event is notification-only and not awaited. It does not fire on startup or reload (their `session_start` is not fenced), when `session_before_switch` or `session_before_fork` cancels, when the replacement session was never published, after shutdown or disposal begins, when shutdown was requested (for example `ctx.shutdown()` from `session_start`) before the replacement finished, or when another session replacement started first.
 
+Older hosts never emit `session_ready`; detect with `pi.hostCapabilities?.sessionReadyEvent === true`.
+
 <a id="state-management"></a>
 <a id="persist-state"></a>
 

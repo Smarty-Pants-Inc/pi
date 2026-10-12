@@ -15,6 +15,8 @@ export const HOST_CAPABILITIES = Object.freeze({
 	promptPendingVisible: true as boolean,
 	/** `bash_spawn` is emitted immediately before the built-in bash executor runs. */
 	bashSpawnEvent: true as boolean,
+	/** `session_ready` is emitted once after a replacement session's input fence lifts. */
+	sessionReadyEvent: true as boolean,
 });
 
 export type HostCapabilities = typeof HOST_CAPABILITIES;

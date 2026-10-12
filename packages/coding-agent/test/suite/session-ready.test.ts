@@ -181,6 +181,11 @@ describe("session_ready (smarty-dev#10453)", () => {
 		return { runtime, initial, current: () => probes.at(-1)!, log, ready };
 	}
 
+	it("is advertised to extensions as pi.hostCapabilities.sessionReadyEvent", async () => {
+		const { initial } = await withRuntime();
+		expect(initial.api().hostCapabilities.sessionReadyEvent).toBe(true);
+	});
+
 	it("fires once, after a slow session_start handler resolves and the input fence lifts", async () => {
 		const entered = gate();
 		const release = gate();
