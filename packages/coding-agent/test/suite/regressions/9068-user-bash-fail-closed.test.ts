@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, UserBashEvent, UserBashEventResult } from "../../../src/core/extensions/types.ts";
+import type { ReceivedInput } from "../../../src/core/received-input.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { runRpcMode } from "../../../src/modes/rpc/rpc-mode.ts";
 import { createHarness, type Harness } from "../harness.ts";
@@ -81,6 +82,7 @@ function createRuntimeHost(harness: Harness): AgentSessionRuntime {
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
 		setRebindSession: vi.fn(),
+		setLifecycleCompleteHandler: vi.fn(),
 	} as unknown as AgentSessionRuntime;
 }
 
@@ -118,12 +120,14 @@ type InteractiveBashContext = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> | void };
 	editor: { addToHistory?: (text: string) => void };
 	session: Harness["session"];
+	runtimeHost: AgentSessionRuntime;
 	sessionManager: Harness["sessionManager"];
 	ui: { requestRender(): void };
 	chatContainer: { addChild(component: unknown): void };
 	pendingMessagesContainer: { addChild(component: unknown): void };
 	pendingBashComponents: unknown[];
 	isBashMode: boolean;
+	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
 	showError(message: string): void;
 	updateEditorBorderColor(): void;
@@ -131,6 +135,7 @@ type InteractiveBashContext = {
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as {
 	setupEditorSubmitHandler(this: InteractiveBashContext): void;
+	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(this: InteractiveBashContext, command: string, excludeFromContext?: boolean): Promise<void>;
 };
 
@@ -240,12 +245,14 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			defaultEditor: {},
 			editor: { addToHistory: vi.fn() },
 			session: harness.session,
+			runtimeHost: createRuntimeHost(harness),
 			sessionManager: harness.sessionManager,
 			ui: { requestRender: vi.fn() },
 			chatContainer: { addChild: vi.fn() },
 			pendingMessagesContainer: { addChild: vi.fn() },
 			pendingBashComponents: [],
 			isBashMode: true,
+			dispatchEditorInput: interactiveModePrototype.dispatchEditorInput,
 			handleBashCommand: interactiveModePrototype.handleBashCommand,
 			showError: vi.fn(),
 			updateEditorBorderColor: vi.fn(),

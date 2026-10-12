@@ -2,7 +2,7 @@ import type { ResponseStreamEvent } from "openai/resources/responses/responses.j
 import { describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAIResponses } from "../src/api/openai-responses.ts";
 import { processResponsesStream } from "../src/api/openai-responses-shared.ts";
-import type { Api, AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
+import type { AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
@@ -204,6 +204,42 @@ async function* createPhasedMessageEvents(
 	} as ResponseStreamEvent;
 }
 
+async function* createUnfinishedToolCallEvents(): AsyncIterable<ResponseStreamEvent> {
+	yield {
+		type: "response.output_item.added",
+		sequence_number: 0,
+		output_index: 0,
+		item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "bash", arguments: "" },
+	} as ResponseStreamEvent;
+	yield {
+		type: "response.function_call_arguments.delta",
+		sequence_number: 1,
+		output_index: 0,
+		item_id: "fc_1",
+		delta: '{"command":"rm -rf /tmp/build',
+	} as ResponseStreamEvent;
+	yield {
+		type: "response.completed",
+		sequence_number: 2,
+		response: { id: "resp_unfinished", status: "completed" },
+	} as ResponseStreamEvent;
+}
+
+// llama.cpp omits output_index from every event and sends both done events after all deltas.
+async function* createToolCallsWithoutOutputIndexEvents(): AsyncIterable<ResponseStreamEvent> {
+	const call = (n: string) => ({ type: "function_call", id: `fc_${n}`, call_id: `call_${n}`, name: "bash" });
+	const events = [
+		{ type: "response.output_item.added", item: { ...call("a"), arguments: "" } },
+		{ type: "response.function_call_arguments.delta", item_id: "fc_a", delta: '{"command":"echo a"}' },
+		{ type: "response.output_item.added", item: { ...call("b"), arguments: "" } },
+		{ type: "response.function_call_arguments.delta", item_id: "fc_b", delta: '{"command":"echo b"}' },
+		{ type: "response.output_item.done", item: { ...call("a"), arguments: '{"command":"echo a"}' } },
+		{ type: "response.output_item.done", item: { ...call("b"), arguments: '{"command":"echo b"}' } },
+		{ type: "response.completed", response: { id: "resp_no_output_index", status: "completed" } },
+	];
+	for (const event of events) yield event as unknown as ResponseStreamEvent;
+}
+
 describe("OpenAI Responses terminal event handling", () => {
 	it("rejects streams that end before a terminal response event", async () => {
 		const model = createModel();
@@ -215,33 +251,53 @@ describe("OpenAI Responses terminal event handling", () => {
 		);
 	});
 
-	it("forwards parsed provider stream events in order", async () => {
+	it("rejects completed streams whose tool call never received output_item.done", async () => {
+		const model = createModel();
+
+		await expect(
+			processResponsesStream(
+				createUnfinishedToolCallEvents(),
+				createOutput(model),
+				new AssistantMessageEventStream(),
+				model,
+			),
+		).rejects.toThrow("OpenAI Responses stream completed with an unfinished tool call: bash (call_1|fc_1)");
+	});
+
+	// https://github.com/earendil-works/pi/issues/9974
+	it("rejects parallel tool calls without output_index instead of running mixed-up calls", async () => {
+		const model = createModel();
+
+		await expect(
+			processResponsesStream(
+				createToolCallsWithoutOutputIndexEvents(),
+				createOutput(model),
+				new AssistantMessageEventStream(),
+				model,
+			),
+		).rejects.toThrow("OpenAI Responses stream completed with an unfinished tool call: bash (call_a|fc_a)");
+	});
+
+	// smarty-dev#5822 C1: one owned notification per event, never the raw event or model.
+	it("notifies once per parsed provider stream event without provider data", async () => {
 		const model = createModel();
 		const context = normalizeContext({
 			systemPrompt: "",
 			messages: [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: 0 }],
 			tools: [],
 		});
-		const providerEvents: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const stream = streamOpenAIResponses(model, context, {
 			apiKey: "test",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				providerEvents.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		});
 
 		await stream.result();
 
-		expect(providerEvents).toHaveLength(3);
-		expect(providerEvents.map((event) => (event as ResponseStreamEvent).type)).toEqual([
-			"response.created",
-			"response.output_item.added",
-			"response.reasoning_text.delta",
-		]);
-		expect(eventModels).toEqual([model, model, model]);
+		expect(calls).toEqual(Array.from({ length: 3 }, () => [{ type: "provider_stream_event" }]));
 	});
 
 	it("emits an error final result when the wrapper stream ends before a terminal response event", async () => {
@@ -378,8 +434,9 @@ describe("OpenAI Responses terminal event handling", () => {
 		const output = createOutput(model);
 		const stream = new AssistantMessageEventStream();
 
+		// smarty-dev#5822 (pi#202 round 3): a provider error by origin, with owned text only.
 		await expect(processResponsesStream(createFailedEvents(), output, stream, model)).rejects.toThrow(
-			"server_error: boom",
+			"Provider request failed",
 		);
 		expect(output.rawStopReason).toBe("failed");
 	});

@@ -79,11 +79,16 @@ Its `outcome` is `aborted` when the run was cancelled: by a user abort (also dur
 | Add a `/` command | `pi.registerCommand()` |
 | Add a shortcut or CLI flag | `pi.registerShortcut()` or `pi.registerFlag()` |
 | Send user or custom messages | `pi.sendUserMessage()` or `pi.sendMessage()` |
+| Admit correlated external user input with a receipt | [`pi.submitUserMessage()`](#correlated-user-message-admission) |
 | Persist non-context session data | `pi.appendEntry()` |
 | Change active tools, model, or thinking level | Session control methods on `pi` |
 | Add a model provider | `pi.registerProvider()` |
+| Add an MCP server | `pi.registerMcpServer()` |
+| Route each request to a model | [`pi.registerVirtualModel()`](virtual-models.md) |
 | Add terminal rendering | Renderer registration and `ctx.ui` |
 | Communicate with another extension | `pi.events` |
+
+`pi.sendUserMessage(content, { metadata })` returns a promise for one admission receipt: `{ status: "turnStarted", entryId, metadata, metadataSource }` after the user entry is persisted, or `{ status: "handled", entryId: null, metadata, metadataSource }` when an input handler consumes it. Metadata is a plain JSON object, copied and deeply frozen before preflight and preserved per queued input. Proxies are rejected before any trap can run; only plain objects (including null-prototype objects) and plain arrays are accepted. It is stored on the session entry, never in model content or compaction summaries. Pi stamps `metadataSource` as `{ kind: "extension", extensionPath }` using the executing extension's loader path; options and metadata cannot override it. API objects can be shared, but identity cannot be borrowed: Pi enters the registered extension's execution context for module loading, its factory, and every registered callback: lifecycle/input and shared-event handlers, tools (execution, preparation and rendering), commands (handlers and completions), shortcuts, message/user/entry renderers, Markdown transformers, tool-renderer resolvers and their returned renderers, native/legacy provider and authentication callbacks, and virtual-model routing. It preserves the context across awaits and async descendants, including timers and promises scheduled during loading or handlers. Calling another extension's API to submit metadata or register callbacks from that context rejects with `UserMessageMetadataError.code === "INPUT_METADATA_SOURCE_MISMATCH"` before admission or registration. A metadata send through an extension API without its bound execution context rejects with `INPUT_METADATA_SOURCE_MISMATCH`; it never falls back to SDK attribution. Callbacks installed outside extension execution remain unbound and cannot submit extension metadata. Fresh `withSession` contexts from `newSession`, `fork`, and `switchSession` capture the initiating extension's identity and enforce the same source checks. Only direct SDK `session.sendUserMessage()` calls are stamped `{ kind: "sdk" }`. This is attribution through supported APIs, not an in-process sandbox: extensions still have full process and filesystem permissions. Consumers must trust metadata only from the source they expect (for example, Fabric must require its own extension's path). This identifies the submitting extension, not a verified remote sender. Metadata is limited to 16 KiB of serialized UTF-8 JSON, 16 nested containers including the root, and 1,000 total object keys/array elements. Budget failures reject with `UserMessageMetadataError` before admission. Calls without metadata remain fire-and-forget. Do not await a queued receipt from an event handler whose return is required for delivery; attach a `.then()` handler instead. See [SDK prompting](sdk.md#prompting).
 
 Use the exported declarations in [`extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) for exact event, context, tool, and result types.
 
@@ -106,9 +111,9 @@ Events cover resource discovery, sessions, agent and message lifecycle, provider
 
 <a id="provider_stream_event"></a>
 
-`provider_stream_event` fires for each parsed provider stream event before Pi normalizes it. The event identifies the provider, API, and model; `event.data` is the earliest structured value available to Pi, not necessarily the original HTTP bytes or SSE frame. Treat it as read-only because mutation can affect normalization. The event is notification-only and is not persisted.
+`provider_stream_event` fires once for each parsed provider stream event before Pi normalizes it. The event is `{ type: "provider_stream_event" }` only: it carries no provider data, model fields, or raw event, so provider responses cannot leak credential values through it. `after_provider_response` likewise carries only the HTTP status, never response headers. Both events are notification-only and are not persisted.
 
-Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported without changing the provider response. See [`debug-provider.ts`](../examples/extensions/debug-provider.ts) for an opt-in viewer that groups raw events by assistant message.
+Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported without changing the provider response. See [`debug-provider.ts`](../examples/extensions/debug-provider.ts) for an opt-in viewer that counts events per assistant message.
 
 <a id="context_with_system"></a>
 
@@ -125,6 +130,12 @@ Do not assume a sibling call or result exists when another tool event runs.
 Use `ctx.signal` for nested work owned by an active turn; commands and idle session events often have no operation signal.
 
 A `user_bash` handler that returns `undefined` passes the command to the next handler and then to local execution if no handler handles it. Returning `operations` or `result` stops propagation. A handler failure blocks the command rather than falling through to local execution.
+
+### `bash_spawn`
+
+`bash_spawn` fires immediately before the built-in bash executor runs, after the command prefix, spawn hook, working directory, environment, and local shell resolution have been applied. The event includes `toolCallId`, final `command`, `cwd`, an environment snapshot, `shellPath`/`shellArgs` for the stock local backend, and `backend` (`"local-builtin"` or `"custom"`). Each handler receives a detached snapshot, so mutations cannot rewrite execution or another handler’s view. Handlers run in registration order; the first veto or thrown error fails the tool call without spawning (or calling custom `exec`). Return `{ block: true, reason }` to veto.
+
+Check `pi.hostCapabilities.bashSpawnEvent` on the running host before granting execution. For `custom`, shell details are absent and Pi makes no claim about what that backend does. This event covers the built-in bash tool, not interactive `user_bash`, arbitrary replacement tools, or `pi.exec()`. Environment snapshots may contain secrets; do not log them indiscriminately.
 
 <a id="custom-tools"></a>
 <a id="register-tools"></a>
@@ -143,13 +154,116 @@ Use sequential execution when tools share mutable in-memory state.
 File-mutating tools should wrap the complete read-modify-write operation with `withFileMutationQueue()`.
 Truncate large model-facing results and tell the model where to read the complete output.
 
+Declare `outputSchema` and return a matching `structuredContent` when the result is data. The model still receives `content`; programmatic callers such as codemode scripts receive `structuredContent` instead of the text. Tools without `outputSchema` are passed to scripts as their text content. To report a failure that still carries data, return the result with `isError: true` instead of throwing: the model sees an error, and scripts still receive `structuredContent`.
+
+A tool can run other tools with `ctx.executeTool(name, args, { signal, onUpdate })`. Nested calls go through argument validation and the `tool_call` and `tool_result` handlers like model-issued calls, and emit `tool_execution_start`, `tool_execution_update`, and `tool_execution_end`; all of these events carry `parentToolCallId`, and their `toolCallId` is assigned by pi as `<parent id>/<n>`. These ids do not appear as tool calls or tool results in the transcript. Nested calls do not add transcript entries: their results only reach the calling tool, which reports them itself, for example through `onUpdate` and `details`. The session keeps a bounded record of them (name, arguments, status, duration, error; never results) as `nestedCalls` on the calling tool's result message. It is used for compaction file lists and shown in HTML exports. Arguments over 8 KiB per call or 32 KiB per tool result are omitted, at most 256 calls are kept, and `complete: false` marks a record that lost anything. The `usage` of nested results, at every depth, is added to the calling tool's result `usage`, so a tool reports only its own usage, not that of the tools it called. `ctx.tools` lists the tools `ctx.executeTool()` can call. `tool_result` handlers that redact `content` should also replace `structuredContent`; replacing only `content` drops it.
+
 See [`hello.ts`](../examples/extensions/hello.ts), [`todo.ts`](../examples/extensions/todo.ts), [`dynamic-tools.ts`](../examples/extensions/dynamic-tools.ts), and [`truncated-tool.ts`](../examples/extensions/truncated-tool.ts).
+
+### Tool exposure
+
+`exposure` controls how the model reaches a tool. "Callable" means callable from other tools through `ctx.executeTool()` (`ctx.tools`), as the `codemode` tool's scripts do:
+
+- `direct` (default): declared to the model while active, and callable while active.
+- `model-only`: declared to the model while active, never callable. Use it for tools that orchestrate other tools or ask the user.
+- `codemode`: callable whenever registered, and listed by the `codemode` tool. Not declared to the model unless activated explicitly.
+- `deferred`: like `codemode`, but codemode tools do not list it; `tool_search` can find and activate it.
+- `hidden`: registered but unreachable. Re-register a tool with `exposure: "hidden"` to withdraw it, since tools cannot be unregistered.
+
+`namespace: { name, description, instructions }` groups related tools, as MCP servers do. Codemode tools list a namespace under one heading with its `description`. `instructions` holds longer usage guidance; it is not listed, and codemode scripts read it with `describeNamespace(name)`.
+
+Registering a `direct` or `model-only` tool activates it; the other exposures are not activated on registration. The active set (`pi.getActiveTools()`, `pi.setActiveTools()`) is the set of tools declared to the model. `pi.getAllTools()` reports each tool's `exposure`, `namespace`, and `annotations`.
+
+`annotations` are hints about what a tool does, with the meaning of MCP tool annotations: `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`. MCP tools carry the hints their server declares. Missing hints take the MCP defaults: a tool is not read-only, and may be destructive and reach an open world. The hints are not verified, but a permission extension can use them to decide which calls to confirm. This confirms the calls Codex asks approval for:
+
+```typescript
+pi.on("tool_call", async (event, ctx) => {
+  const hints = pi.getAllTools().find((tool) => tool.name === event.toolName)?.annotations;
+  const needsApproval =
+    hints?.destructiveHint === true ||
+    (!hints?.readOnlyHint && ((hints?.destructiveHint ?? true) || (hints?.openWorldHint ?? true)));
+  if (needsApproval && !(await ctx.ui.confirm("Allow tool call?", event.toolName))) {
+    return { block: true, reason: `${event.toolName} was not approved` };
+  }
+});
+```
+
+A tool that orchestrates other tools can adjust what the model sees while it is active with `prepareLoadout(loadout)`. It runs whenever the active tools change and receives the declared tools, the callable tools, and every registered tool with its exposure, namespace, and prompt guidelines. It returns replacement `descriptions` for declared tools (including its own) and `hiddenDeclarations`: active tools whose declarations requests leave out while they stay active and callable. The default system prompt leaves hidden tools out of its tool list and rules, and names no tool in the skills hint when the file reader is hidden, so the orchestrating tool should present their guidelines itself. `codemode` uses only this hook, `exposure`, and `ctx.executeTool()`, so another tool can implement the same behavior under a different name.
 
 ### Activate tools dynamically
 
 Register every tool first, keep optional tools inactive, and use `pi.setActiveTools()` from a loader tool to select the desired active tools. Names must already be registered; unknown names are ignored.
 
 Pi records the initial prompt and tool set in the transcript's first system message, then appends tool and prompt changes before the next model request. Providers that cannot represent the transition receive a complete transcript checkpoint, which can invalidate the cached prefix.
+
+<a id="correlated-user-message-admission"></a>
+
+### Correlated user-message admission
+
+Use `pi.submitUserMessage()` when an external channel (a chat bridge, webhook, or socket) delivers user text with its own delivery ID and needs an idempotent admission receipt:
+
+```typescript
+const receipt = await pi.submitUserMessage({
+  registrationEpoch: channelEpoch,
+  requestId: deliveryId,
+  sessionGeneration: ctx.userMessageSessionGeneration,
+  text: receivedText,
+  deliverAs: "followUp",
+  expandPromptTemplates: false,
+});
+```
+
+Which API to use:
+
+| Need | API |
+|---|---|
+| Fire-and-forget user message from extension code | `pi.sendUserMessage(content)` |
+| Attach JSON metadata and learn when the entry is persisted or handled | `pi.sendUserMessage(content, { metadata })` |
+| Admit external input exactly once per delivery ID, fenced to one session generation | `pi.submitUserMessage(request)` |
+
+The two receipts answer different questions. `sendUserMessage(..., { metadata })` returns a persistence receipt: `turnStarted` with the persisted `entryId`, or `handled` with `entryId: null`. `submitUserMessage()` returns an admission receipt and never an entry ID.
+
+`SubmitUserMessageOptions` and `UserMessageReceipt` are exported types. The receipt contains `status: "accepted" | "queued" | "rejected"` and `sessionGeneration: string`, with optional `duplicate: true`, `admittedSessionGeneration`, and `reason`. `sessionGeneration` always echoes the caller's request generation, including on `session_changed`; read the context again for the current generation. Rejection reasons are `no_session`, `session_changed`, `payload_mismatch`, `shutting_down`, `admission_refused`, and `unsupported`.
+
+- `no_session`: called during extension loading, before a session binds.
+- `session_changed`: the API is stale (reload or session replacement) or the request generation is not current.
+- `unsupported`: the host did not bind receipt ingress (custom SDK hosts may omit it).
+- `shutting_down`: shutdown closed ingress permanently.
+- `payload_mismatch`: the key was seen before with different text.
+- `admission_refused`: an input hook handled the input, a cap or lifecycle fence refused it, or the call came through another extension's borrowed API.
+
+`accepted` means an idle turn actually started; `queued` means the input entered that session's follow-up queue, including during preflight or settlement. Neither promises model completion. Input hooks still run and may transform the input. A hook returning `handled` produces `rejected/admission_refused`; thrown hook errors keep their isolated/continue behavior. Text is not trimmed or expanded as an extension command, skill command, or prompt template. V1 supports only `deliverAs: "followUp"` and `expandPromptTemplates: false`.
+
+An admitted message is persisted as an ordinary user entry with empty metadata (`{}`) and a Pi-stamped `metadataSource`. The source policy differs from `sendUserMessage(..., { metadata })` because submit is meant to run from external callbacks:
+
+- Inside this extension's execution context (factory, handlers, tools, commands, and timers or promises they schedule), the entry is stamped `{ kind: "extension", extensionPath }` from the loader path.
+- From a callback with no extension execution context (for example, a socket listener installed outside extension execution), the entry is stamped `{ kind: "sdk" }`. A metadata send in the same situation rejects with `INPUT_METADATA_SOURCE_MISMATCH` instead.
+- Through another extension's borrowed API, inside that other extension's execution context, the call returns `rejected/admission_refused` before the session sees it, so nothing is admitted and no key is reserved. A metadata send in the same situation rejects with `INPUT_METADATA_SOURCE_MISMATCH`.
+
+Request fields never select the source.
+
+Capture `ctx.userMessageSessionGeneration` when receiving input. Hosts without receipt ingress report an empty string. Reload and session replacement rotate it and cancel pending admissions and undelivered ingress follow-ups, without deleting ordinary or custom queued messages. New admissions are refused while session replacement is fenced or reload rebuilds the runtime. During reload, ingress reopens after the new runtime and bindings are installed, before `session_start` runs; concurrent reloads keep it closed until their rebuild suspensions are released. A failed reload leaves ingress closed until a later reload succeeds. A cancelled replacement leaves the same session usable with its fresh generation. Previously started turns remain started. Shutdown permanently closes ingress.
+
+The idempotency key is `(registrationEpoch, requestId)` within one live session. The same key and original text returns the first status and reason with `duplicate: true`, even after reload or generation rotation; it never submits again. `sessionGeneration` echoes the retry's generation. Only duplicates of accepted or queued receipts also include `admittedSessionGeneration`, the first admission's generation. Changed text returns `rejected/payload_mismatch`. Duplicate lookup precedes generation validation, so an old receipt is not evidence of a new admission. Bounded correlation keys are reserved before lifecycle, size, or aggregate-budget refusal. Reservations, including rejected admission attempts, survive extension reloads but not process restart or creation of a different session runtime. Malformed requests and oversized correlation fields cannot establish a reservation. Text longer than 65,536 UTF-16 code units is refused with `admission_refused` before any duplicate lookup, hashing, or reservation (even under a key that is already reserved), so its key is not reserved: a later retry with the same key and valid text is admitted as a new request. Loader-level `no_session`, `unsupported`, `session_changed`, and borrowed-API refusals happen outside session admission and do not enter the session-owned ledger.
+
+The ledger retains at most **1024 keys**, never evicts, and refuses unseen keys with `admission_refused` when full. These exhaustion refusals are not reserved, but because capacity is never reclaimed, their keys cannot later submit in that session. Existing duplicates remain readable when full. Admission limits are **64 KiB UTF-8 text**, **256 UTF-8 bytes each** for epoch and request ID, and an **8 MiB aggregate original text/epoch/ID payload budget** per live session. A reservation within the size and aggregate limits consumes that budget even if a lifecycle fence or input hook refuses it; aggregate-refused payloads, and text over 64 KiB UTF-8 that fits within 65,536 code units, do not consume it and cannot later become admissions under the same key. Exceeding a limit returns `admission_refused`. The ledger stores a **32-byte SHA-256 fingerprint** of the original text's exact UTF-16 code units rather than the text. Each retained outcome contains only the historical status or rejection reason and, for accepted or queued admissions, the **36-byte ASCII admission-generation UUID**; the unchecked caller generation is never retained. Key, fingerprint, and outcome metadata are byte-bounded per entry as well as by the 1024-key capacity; this does not bound caller-owned requests or returned receipts. `pi.sendUserMessage()` keeps its existing behavior and return types.
+
+### Tool rendering
+
+A tool's `renderCall` and `renderResult` draw its calls in the interactive transcript and in HTML exports. `pi.registerToolRenderer((toolName, next) => renderers)` chooses renderers for calls to any tool, including tools that are not registered yet, such as MCP tools in a resumed session before their server connected. `next()` returns what the remaining resolvers (in extension load order), then the registered tool, would use, so `next() ?? mine` only fills in.
+
+### MCP servers
+
+`pi.registerMcpServer(name, config)` adds an MCP server for the current session. `config` has the shape of an `mcpServers` entry in [`mcp.json`](mcp.md): `command`, `args`, `env`, and `cwd` for stdio servers, `url`, `headers`, and `oauth` for HTTP servers, plus `exposure`, `toolExposure`, `description`, `enabled`, and `timeout`.
+
+```typescript
+pi.registerMcpServer("jira", { url: "https://mcp.example.com/jira", exposure: "codemode" });
+pi.unregisterMcpServer("jira");
+```
+
+Servers registered while the extension loads connect when the session starts, together with the `mcp.json` servers; servers registered later connect right away, and `pi.unregisterMcpServer()` closes the connection and makes the server's tools unreachable. Registrations are not saved: register again on every load, for example based on the extension's own settings. A server in `mcp.json` with the same name takes precedence, and `/mcp` shows the override. Registering the same name again replaces the extension's earlier registration; names registered by another extension, invalid names, and invalid configs throw.
+
+The built-in MCP support connects registered servers. When nothing does, because another extension replaced it (see [MCP](mcp.md#other-mcp-extensions)), each registration is reported as an extension error. Other MCP extensions can connect registered servers too: read them with `pi.getMcpServers()` on `session_start` and handle the `mcp_servers_change` event for later changes.
 
 <a id="extensioncontext"></a>
 <a id="extensioncommandcontext"></a>
@@ -187,6 +301,27 @@ Register an entry or message renderer when custom stored content should appear i
 <a id="mode-behavior"></a>
 <a id="interact-with-the-user"></a>
 <a id="account-for-each-mode"></a>
+
+### User-message rendering
+
+`pi.registerUserMessageRenderer(renderer)` replaces the display of user text in the interactive transcript:
+
+```typescript
+import { Text } from "@earendil-works/pi-tui";
+
+pi.registerUserMessageRenderer((text, { outputPad, timestamp }, theme) => {
+  const label = theme.bold(theme.fg("accent", `YOU · ${new Date(timestamp).toLocaleTimeString()}`));
+  return new Text(`${label}\n${text}`, outputPad, 0);
+});
+```
+
+The callback receives display text, the original message timestamp in milliseconds since the Unix epoch, the `outputPad` setting, and the active `Theme`. Return a `Component` or `undefined` for Pi's exact native Markdown rendering. Callback errors also fall back to native rendering, as with custom-message renderers. The first extension registering a user renderer wins; another registration by that same extension replaces its callback.
+
+A custom component owns its background, padding, and outside spacing. Pi keeps OSC 133 prompt zones around either rendering, including custom blank lines. A component that renders zero rows falls back to native rendering without emitting orphan zones. Components must fit the available width and support `invalidate()` as described in [Terminal UI](tui.md). Pi reinvokes the callback when the user component is invalidated or its output padding changes.
+
+The hook applies to newly submitted and replayed user text. Skill invocations remain native collapsible blocks; only their trailing user text uses the hook. It does not change stored messages, images, editor history, editing/forking, or model context. Native fallback still applies Markdown transformers; custom components render the supplied text themselves. Reload replaces registrations and rebuilds the transcript. RPC, JSON, and print modes do not invoke terminal renderers.
+
+See [`user-message-renderer.ts`](../examples/extensions/user-message-renderer.ts) for a plain-text feed with a timestamp label, background, and unshaded outside spacing.
 
 ### UI and modes
 

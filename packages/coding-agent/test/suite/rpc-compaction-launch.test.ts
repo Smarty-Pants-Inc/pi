@@ -54,6 +54,7 @@ describe("RPC launch compaction provenance (faux, no process/model probe)", () =
 			const runtime = {
 				session: h.session,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 				dispose: vi.fn(async () => {}),
 			} as unknown as AgentSessionRuntime;
 			const options = { autoCompactionDisabledForProcess: applied };

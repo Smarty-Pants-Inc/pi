@@ -40,6 +40,8 @@ export {
 	type AgentStartEvent,
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
+	type BashSpawnEvent,
+	type BashSpawnEventResult,
 	type BeforeAgentStartEvent,
 	type BeforeAgentStartEventResult,
 	type BoundaryContextPreview,
@@ -84,6 +86,7 @@ export {
 	type SessionShutdownEvent,
 	type SessionStartEvent,
 	type SessionTreeEvent,
+	type SubmitUserMessageOptions,
 	type ToolCallEvent,
 	type ToolCallEventResult,
 	type ToolDefinition,
@@ -92,6 +95,9 @@ export {
 	type TurnEndEvent,
 	type TurnEndEventResult,
 	type TurnStartEvent,
+	type UserMessageReceipt,
+	type UserMessageRenderer,
+	type UserMessageRenderOptions,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";

@@ -740,4 +740,44 @@ describe("GitHub Copilot OAuth device flow", () => {
 
 		expect(accessTokenPollTimes).toEqual([startTime.getTime() + 5000, startTime.getTime() + 15000]);
 	});
+
+	// pi#150 security round 2: an HTTP-200 poll error can echo the device code or a token.
+	it.each([
+		["echoed-device-code-150", "authorization_error"],
+		["access_denied", "access_denied"],
+	])("keeps only an allowlisted code from an HTTP-200 poll error %s", async (error, shown) => {
+		vi.useFakeTimers();
+		const deviceCode = "echoed-device-code-150";
+		const fetchMock = vi.fn(async (input: unknown): Promise<Response> => {
+			const url = getUrl(input);
+			if (url.endsWith("/login/device/code")) {
+				return jsonResponse({
+					device_code: deviceCode,
+					user_code: "ABCD-EFGH",
+					verification_uri: "https://github.com/login/device",
+					interval: 1,
+					expires_in: 900,
+				});
+			}
+			if (url.endsWith("/login/oauth/access_token")) {
+				return jsonResponse({
+					error,
+					error_description: `device_code=${deviceCode} access_token=gho_LEAKED_TOKEN_150`,
+				});
+			}
+			throw new Error(`Unexpected fetch URL: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+
+		const loginPromise = loginGitHubCopilotForTest({ onDeviceCode: () => {}, onPrompt: async () => "" });
+		const outcome = loginPromise.then(
+			() => undefined,
+			(err: Error) => err.message,
+		);
+		await vi.advanceTimersByTimeAsync(1000);
+		const message = await outcome;
+		expect(message).toBe(`Device flow failed: ${shown}`);
+		expect(message).not.toContain(deviceCode);
+		expect(message).not.toContain("gho_LEAKED_TOKEN_150");
+	});
 });

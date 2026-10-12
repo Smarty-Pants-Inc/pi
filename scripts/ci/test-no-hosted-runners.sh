@@ -6,6 +6,9 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 guard="$repo_root/scripts/ci/no-hosted-runners.sh"
 fixture_dir="$(mktemp -d)"
 trap 'rm -rf -- "$fixture_dir"' EXIT
+# Probes read the checked-out approval lists (the push-to-main path) unless a
+# case sets its own trusted-base context; the CI gate step uses the real one.
+export BASE_SHA= GITHUB_EVENT_NAME=push GITHUB_REF=refs/heads/main
 
 bash "$guard" "$repo_root/.github/workflows"
 echo 'PASS: real workflows'
@@ -19,7 +22,7 @@ write_fixture() {
 expect_rejected() {
   local name="$1" content="$2" diagnostic="$3" file="${4:-probe.yml}" output
   write_fixture "$file" "$content"
-  if output="$(bash "$guard" "$fixture_dir" "${5:-$fixture_dir/empty.txt}" 2>&1)"; then
+  if output="$(bash "$guard" "$fixture_dir" "${5:-$fixture_dir/empty.txt}" "${6:-$fixture_dir/empty.txt}" 2>&1)"; then
     echo "FAIL: $name was accepted" >&2
     exit 1
   fi
@@ -73,28 +76,21 @@ write_fixture build-binaries.yml "$approved_jobs"
 bash "$guard" "$fixture_dir" "$allowlist"
 echo 'PASS: all three allowlisted entries (smoke macos-latest/windows-latest; publish-npm ubuntu-latest)'
 
-# smarty-dev#3644: quoted anchors hid hosted labels from the textual guard.
-# Keep approved entries used, so the rejection is specifically the alias target.
+# smarty-dev#1246 / #3644: anchors and aliases are rejected anywhere, not
+# resolved, so none can hide a hosted label. Keep approved entries used so the
+# alias is the only failure; a self-hosted alias is rejected too.
+alias_diagnostic='YAML anchor/alias is not allowed (smarty-dev#1246)'
 hosted_anchor=$'env:\n  HOSTED_IMAGE: &image "ubuntu-latest"\n'
-for selection in '*image' '[self-hosted, *image]' $'\n      - self-hosted\n      - *image'; do
-  expect_rejected "hosted scalar/list/sequence alias $selection" "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: '"$selection" 'unapproved hosted runner' build-binaries.yml "$allowlist"
+for selection in '*image' '[self-hosted, *image]' $'\n      - self-hosted\n      - *image' '{group: fleet, labels: [*image]}'; do
+  expect_rejected "hosted alias in runs-on $selection" "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: '"$selection" "$alias_diagnostic" build-binaries.yml "$allowlist"
 done
-expect_rejected 'anchored hosted runs-on' "$approved_jobs"$'\n  check:\n    runs-on: &image ubuntu-latest' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'matrix value alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [*image]' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'matrix include alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        include:\n          - runner: *image' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'whole sequence alias' $'env:\n  LABELS: &labels [self-hosted, "ubuntu-latest"]\n'"$approved_jobs"$'\n  check:\n    runs-on: *labels' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'whole matrix alias' $'env:\n  MATRIX: &matrix {runner: ["ubuntu-latest"]}\n'"$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix: *matrix' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-expect_rejected 'whole job alias' $'env:\n  JOB: &job {runs-on: "ubuntu-latest"}\n'"$approved_jobs"$'\n  check: *job' 'unapproved hosted runner' build-binaries.yml "$allowlist"
-
-write_fixture build-binaries.yml $'env:\n  FORGE_IMAGE: &image smarty-linux-x64\n'"$approved_jobs"$'\n  check:\n    runs-on: [self-hosted, *image]'
-bash "$guard" "$fixture_dir" "$allowlist"
-echo 'PASS: safe self-hosted alias'
-
-# smarty-dev#3644: approval belongs to the resolved file/job/label, not syntax.
-write_fixture build-binaries.yml $'env:\n  MAC: &mac macos-latest\n  WINDOWS: &windows windows-latest\n  UBUNTU: &ubuntu ubuntu-latest\njobs:\n  smoke-test-binaries:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [*mac, *windows]\n  publish-npm:\n    runs-on: *ubuntu'
-bash "$guard" "$fixture_dir" "$allowlist"
-echo 'PASS: all three approvals through aliases'
-expect_rejected 'hosted alias in group labels' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: {group: fleet, labels: [*image]}' 'unapproved hosted runner' build-binaries.yml "$allowlist"
+expect_rejected 'anchored hosted runs-on' "$approved_jobs"$'\n  check:\n    runs-on: &image ubuntu-latest' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'alias hiding smarty-linux-x64' $'env:\n  FORGE_IMAGE: &image smarty-linux-x64\n'"$approved_jobs"$'\n  check:\n    runs-on: [self-hosted, *image]' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'matrix value alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner: [*image]' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'matrix include alias' "$hosted_anchor$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        include:\n          - runner: *image' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'whole matrix alias' $'env:\n  MATRIX: &matrix {runner: ["ubuntu-latest"]}\n'"$approved_jobs"$'\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix: *matrix' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'whole job alias' $'env:\n  JOB: &job {runs-on: "ubuntu-latest"}\n'"$approved_jobs"$'\n  check: *job' "$alias_diagnostic" build-binaries.yml "$allowlist"
+expect_rejected 'undefined YAML alias' $'jobs:\n  check:\n    runs-on: [*missing]' "$alias_diagnostic"
 
 expect_rejected 'allowlisted smoke label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: macos-latest' 'unapproved hosted runner' build-binaries.yml "$allowlist"
 expect_rejected 'allowlisted publisher label in another job' "$approved_jobs"$'\n  stage:\n    runs-on: ubuntu-latest' 'unapproved hosted runner' build-binaries.yml "$allowlist"
@@ -124,8 +120,6 @@ for expression in '${{ inputs.runner }}' '${{ needs.setup.outputs.runner }}' '${
 done
 expect_rejected 'dynamic matrix' $'jobs:\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix: ${{ fromJSON(inputs.matrix) }}' 'unsupported/unresolved matrix'
 expect_rejected 'duplicate runs-on key' $'jobs:\n  check:\n    runs-on: ubuntu-latest\n    runs-on: smarty-linux-x64' 'duplicate YAML key'
-expect_rejected 'undefined YAML alias' $'jobs:\n  check:\n    runs-on: [*missing]' 'undefined alias'
-expect_rejected 'recursive YAML alias' $'jobs:\n  check:\n    runs-on: &labels [*labels]' 'unsupported/unresolved'
 expect_rejected 'runner mapping without labels or group' $'jobs:\n  check:\n    runs-on: {runner: smarty-linux-x64}' 'unsupported/unresolved'
 expect_rejected 'null runner' $'jobs:\n  check:\n    runs-on: null' 'unsupported/unresolved'
 expect_rejected 'empty runner sequence' $'jobs:\n  check:\n    runs-on: []' 'unsupported/unresolved'
@@ -334,10 +328,6 @@ for value in true True TRUE false False FALSE; do
   echo "PASS: boolean matrix inclusion $value/${value,,}"
 done
 
-write_fixture probe.yml $'env:\n  LABELS: &labels [self-hosted, smarty-linux-x64]\njobs:\n  check:\n    runs-on: {group: fleet, labels: *labels}'
-bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
-echo 'PASS: literal runner group with resolved labels'
-
 # pi#195: `COND && 'A' || 'B'` resolves to both labels; anything looser fails closed.
 pi195_cond="startsWith(github.head_ref || github.ref_name, 'mergify/merge-queue/')"
 cond_job() { printf 'jobs:\n  check:\n    runs-on: %s\n' "$1"; }
@@ -366,4 +356,105 @@ expect_rejected 'conditional inside a matrix value' $'jobs:\n  check:\n    runs-
 write_fixture probe.yml "$(cond_job "\${{ github.ref == 'it''s (x)' && 'smarty-priority' || 'smarty-linux-x64' }}")"
 bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt"
 echo "PASS: conditional with '' escape and parens inside a string"
+
+# pi#138: a runner group may be a GitHub-hosted larger-runner group. Refuse a
+# group unless our self-hosted group list names it (empty by default),
+# whatever labels it carries.
+group_diagnostic='runner group not on the self-hosted group allowlist'
+printf '%s\n' '# probe' fleet > "$fixture_dir/groups.txt"
+expect_rejected 'group-only runs-on' $'jobs:\n  check:\n    runs-on: {group: larger-ubuntu}' "$group_diagnostic"
+expect_rejected 'group-only runs-on with checked-in group list' $'jobs:\n  check:\n    runs-on:\n      group: larger-ubuntu' "$group_diagnostic" probe.yml "$fixture_dir/empty.txt" "$repo_root/scripts/ci/self-hosted-runner-groups.txt"
+expect_rejected 'group with self-hosted labels only' $'jobs:\n  check:\n    runs-on: {group: larger-ubuntu, labels: [self-hosted, smarty-linux-x64]}' "$group_diagnostic"
+expect_rejected 'unlisted group next to listed group' $'jobs:\n  check:\n    runs-on: {group: larger-ubuntu}' "$group_diagnostic" probe.yml "$fixture_dir/empty.txt" "$fixture_dir/groups.txt"
+expect_rejected 'matrix-derived group-only runs-on' $'jobs:\n  check:\n    runs-on: ${{ matrix.runner }}\n    strategy:\n      matrix:\n        runner:\n          - smarty-linux-x64\n          - {group: larger-ubuntu}' "$group_diagnostic"
+printf '%s\n' 'two words' > "$fixture_dir/bad-groups.txt"
+expect_rejected 'malformed group list entry' $'jobs:\n  check:\n    runs-on: smarty-linux-x64' 'malformed runner group entry' probe.yml "$fixture_dir/empty.txt" "$fixture_dir/bad-groups.txt"
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet}'
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt" "$fixture_dir/groups.txt"
+echo 'PASS: listed group-only runs-on'
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet, labels: [self-hosted, smarty-linux-x64]}'
+bash "$guard" "$fixture_dir" "$fixture_dir/empty.txt" "$fixture_dir/groups.txt"
+echo 'PASS: listed group with literal labels'
+expect_rejected 'unlisted group with an allowlisted hosted label' "$smoke_job"$'\n  publish-npm:\n    runs-on: {group: npm-publish, labels: [ubuntu-latest]}' "$group_diagnostic" build-binaries.yml "$allowlist"
+
+# pi#138: on a pull request the group list comes from the trusted base
+# (BASE_SHA), so a change cannot list a group and use it at once.
+base_repo="$fixture_dir/repo"
+mkdir -p "$base_repo/scripts/ci"
+cp -- "$repo_root/scripts/ci/no-hosted-runners.sh" "$repo_root/scripts/ci/no-hosted-runners.py" "$base_repo/scripts/ci/"
+repo_git() { git -C "$base_repo" -c user.name=probe -c user.email=probe@invalid -c commit.gpgsign=false "$@"; }
+repo_git init -q
+repo_git add scripts/ci
+repo_git commit -q -m 'no group list'
+no_list_sha="$(repo_git rev-parse HEAD)"
+cp -- "$repo_root/scripts/ci/self-hosted-runner-groups.txt" "$base_repo/scripts/ci/"
+repo_git add scripts/ci
+repo_git commit -q -m 'empty group list'
+base_sha="$(repo_git rev-parse HEAD)"
+echo fleet >> "$base_repo/scripts/ci/self-hosted-runner-groups.txt"
+repo_git commit -q -am 'PR lists fleet'
+head_sha="$(repo_git rev-parse HEAD)"
+base_guard="$base_repo/scripts/ci/no-hosted-runners.sh"
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: {group: fleet}'
+for case in "base $base_sha" "base-without-list $no_list_sha" "unknown-base 0000000000000000000000000000000000000000"; do
+  read -r name sha <<< "$case"
+  if output="$(BASE_SHA="$sha" bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt" 2>&1)"; then
+    echo "FAIL: group listed only by the PR head was accepted ($name)" >&2
+    exit 1
+  fi
+  [[ "$output" == *"$group_diagnostic"* ]] || { printf 'FAIL: %s\n%s\n' "$name" "$output" >&2; exit 1; }
+  echo "PASS: rejected group listed only by the PR head ($name)"
+done
+BASE_SHA="$head_sha" bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo 'PASS: group listed at the base'
+BASE_SHA= bash "$base_guard" "$fixture_dir" "$fixture_dir/empty.txt"
+echo 'PASS: push to main reads the checked-out (reviewed) list'
+
+# pi#138: the hosted-label allowlist also comes from the trusted base, so a PR
+# cannot approve its own hosted label.
+printf '%s\n' '# probe hosted allowlist' > "$base_repo/scripts/ci/hosted-runner-allowlist.txt"
+repo_git add scripts/ci
+repo_git commit -q -m 'empty hosted allowlist'
+hosted_base_sha="$(repo_git rev-parse HEAD)"
+echo 'probe.yml check ubuntu-latest https://github.com/Smarty-Pants-Inc/pi/pull/138#issuecomment-1' >> "$base_repo/scripts/ci/hosted-runner-allowlist.txt"
+repo_git commit -q -am 'PR approves its own hosted label'
+hosted_head_sha="$(repo_git rev-parse HEAD)"
+write_fixture probe.yml $'jobs:\n  check:\n    runs-on: ubuntu-latest'
+for case in "base $hosted_base_sha" "base-without-list $no_list_sha" "unknown-base 0000000000000000000000000000000000000000"; do
+  read -r name sha <<< "$case"
+  if output="$(BASE_SHA="$sha" bash "$base_guard" "$fixture_dir" 2>&1)"; then
+    echo "FAIL: hosted label approved only by the PR head was accepted ($name)" >&2
+    exit 1
+  fi
+  [[ "$output" == *'unapproved hosted runner'* ]] || { printf 'FAIL: %s\n%s\n' "$name" "$output" >&2; exit 1; }
+  echo "PASS: rejected hosted label approved only by the PR head ($name)"
+done
+BASE_SHA="$hosted_head_sha" bash "$base_guard" "$fixture_dir"
+echo 'PASS: hosted label approved at the base'
+BASE_SHA= bash "$base_guard" "$fixture_dir"
+echo 'PASS: push to main reads the checked-out (reviewed) hosted allowlist'
+
+# pi#138: a merge-queue push has no PR payload (empty BASE_SHA). It must read
+# the lists at the merge base with origin/main, never the queue checkout, and
+# fail closed when no base is found.
+queue_rejected() {
+  local name="$1" fixture="$2" diagnostic="$3" main_sha="$4" output
+  if [[ -n "$main_sha" ]]; then repo_git update-ref refs/remotes/origin/main "$main_sha"; else repo_git update-ref -d refs/remotes/origin/main 2>/dev/null || true; fi
+  write_fixture probe.yml "$fixture"
+  if output="$(GITHUB_REF=refs/heads/tmp-mergify/merge-queue/probe bash "$base_guard" "$fixture_dir" 2>&1)"; then
+    echo "FAIL: queue run accepted $name" >&2
+    exit 1
+  fi
+  [[ "$output" == *"$diagnostic"* ]] || { printf 'FAIL: %s\n%s\n' "$name" "$output" >&2; exit 1; }
+  echo "PASS: rejected queue run with $name"
+}
+group_job=$'jobs:\n  check:\n    runs-on: {group: fleet}'
+hosted_job=$'jobs:\n  check:\n    runs-on: ubuntu-latest'
+queue_rejected 'PR-added group' "$group_job" "$group_diagnostic" "$base_sha"
+queue_rejected 'PR-added hosted label' "$hosted_job" 'unapproved hosted runner' "$hosted_base_sha"
+queue_rejected 'PR-added group and no origin/main' "$group_job" "$group_diagnostic" ''
+queue_rejected 'PR-added hosted label and no origin/main' "$hosted_job" 'unapproved hosted runner' ''
+repo_git update-ref refs/remotes/origin/main "$hosted_head_sha"
+GITHUB_REF=refs/heads/tmp-mergify/merge-queue/probe bash "$base_guard" "$fixture_dir"
+echo 'PASS: queue run with a hosted label approved on main'
 echo 'All hosted-runner guard probes passed'

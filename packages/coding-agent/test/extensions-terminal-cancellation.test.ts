@@ -25,7 +25,10 @@ const cases: Array<{ event: ExtensionEvent["type"]; invoke: (runner: ExtensionRu
 		invoke: (runner) => runner.emit({ type: "after_provider_response", status: 200, headers: {} }),
 	},
 	{ event: "agent_start", invoke: (runner) => runner.emit({ type: "agent_start" }) },
-	{ event: "agent_settled", invoke: (runner) => runner.emit({ type: "agent_settled", outcome: "completed" }) },
+	{
+		event: "agent_settled",
+		invoke: (runner) => runner.emit({ type: "agent_settled", outcome: "completed", aborted: false }),
+	},
 	{
 		event: "session_before_switch",
 		invoke: (runner) => runner.emit({ type: "session_before_switch", reason: "new" }),

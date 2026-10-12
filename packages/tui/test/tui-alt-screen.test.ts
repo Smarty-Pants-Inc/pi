@@ -1,4 +1,5 @@
 import assert from "node:assert";
+import { performance } from "node:perf_hooks";
 import { describe, it } from "node:test";
 import {
 	AltScreenSearchComponent,
@@ -504,6 +505,31 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
+	// #9758: wheel line counts can change at runtime; Alt keeps its multiplier.
+	it("applies runtime wheel line count updates", async () => {
+		const terminal = new VirtualTerminal(20, 4);
+		const tui = new TuiAltScreen(terminal, undefined, undefined, { wheelScrollLines: 3 });
+		const deltas: Array<number | undefined> = [];
+		tui.addChild(
+			new MouseRegion(new Text("wheel target", 0, 0), (event) => {
+				if (event.type !== "wheel") return undefined;
+				deltas.push(event.wheelDelta);
+				return { handled: true };
+			}),
+		);
+		tui.start();
+		try {
+			await terminal.waitForRender();
+			terminal.sendInput("\x1b[<64;1;1M");
+			tui.setWheelScrollLines(2);
+			terminal.sendInput("\x1b[<65;1;1M");
+			terminal.sendInput("\x1b[<72;1;1M");
+			assert.deepStrictEqual(deltas, [-3, 2, -10]);
+		} finally {
+			tui.stop();
+		}
+	});
+
 	it("chains unused wheel delta to an outer scroll view", async () => {
 		const terminal = new VirtualTerminal(20, 4);
 		const tui = new TuiAltScreen(terminal, undefined, undefined, { wheelScrollLines: 3 });
@@ -551,14 +577,14 @@ describe("TuiAltScreen", () => {
 			["line 5", "line 6", "line 7", "line 8", "line 9", "line 10", "line 11", "line 12"],
 		);
 
-		terminal.sendInput("\x1bOH");
+		terminal.sendInput("\x1b[7^");
 		await terminal.waitForRender();
 		assert.deepStrictEqual(
 			terminal.getViewport().map((line) => line.trimEnd()),
 			["line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7", "line 8"],
 		);
 
-		terminal.sendInput("\x1bOF");
+		terminal.sendInput("\x1b[8^");
 		await terminal.waitForRender();
 		assert.deepStrictEqual(
 			terminal.getViewport().map((line) => line.trimEnd()),
@@ -873,7 +899,7 @@ describe("TuiAltScreen", () => {
 		}
 	});
 
-	it("routes Ctrl-modified viewport navigation to the focused component", async () => {
+	it("routes Home and End to the focused component and Ctrl+Home/End to the transcript", async () => {
 		const terminal = new VirtualTerminal(20, 6);
 		const tui = new TuiAltScreen(terminal);
 		const transcript = new ScrollView(
@@ -897,22 +923,34 @@ describe("TuiAltScreen", () => {
 		tui.start();
 		await terminal.waitForRender();
 
-		terminal.sendInput("\x1bOH");
+		const bottom = transcript.scrollTop;
+		assert.ok(bottom > 0);
+
+		// #10314: unmodified Home/End belong to the editor in every UI mode.
+		const editorKeys = ["\x1bOH", "\x1b[F", "\x1b[57423u", "\x1b[5;5~", "\x1b[6;5~"];
+		for (const input of editorKeys) terminal.sendInput(input);
+		await terminal.waitForRender();
+		assert.strictEqual(transcript.scrollTop, bottom);
+		assert.deepStrictEqual(editorInputs, editorKeys);
+
+		terminal.sendInput("\x1b[1;5H");
 		await terminal.waitForRender();
 		assert.strictEqual(transcript.scrollTop, 0);
-		assert.deepStrictEqual(editorInputs, []);
 
-		const modifiedInputs = ["\x1b[1;5H", "\x1b[1;5F", "\x1b[5;5~", "\x1b[6;5~", "\x1b[57423;5u"];
-		for (const input of modifiedInputs) terminal.sendInput(input);
+		terminal.sendInput("\x1b[1;5F");
+		await terminal.waitForRender();
+		assert.strictEqual(transcript.scrollTop, bottom);
+		assert.strictEqual(transcript.isFollowingEnd, true);
+
+		terminal.sendInput("\x1b[57423;5u");
 		terminal.sendInput("\x1b[57423;5:3u");
 		await terminal.waitForRender();
 		assert.strictEqual(transcript.scrollTop, 0);
-		assert.deepStrictEqual(editorInputs, modifiedInputs);
 
 		terminal.sendInput("\x1b[6~");
 		await terminal.waitForRender();
 		assert.strictEqual(transcript.scrollTop, 1);
-		assert.deepStrictEqual(editorInputs, modifiedInputs);
+		assert.deepStrictEqual(editorInputs, editorKeys);
 
 		tui.stop();
 	});
@@ -1035,6 +1073,47 @@ describe("TuiAltScreen", () => {
 		);
 
 		tui.stop();
+	});
+
+	it("redraws WezTerm Kitty images after writes to covered rows", async () => {
+		// Regression test for #10319: a scrollbar update below an unchanged image anchor erased its cells.
+		const weztermPane = process.env.WEZTERM_PANE;
+		let tui: TuiAltScreen | undefined;
+		process.env.WEZTERM_PANE = "1";
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		try {
+			const terminal = new RecordingTerminal(20, 4);
+			const imageId = 10319;
+			const imageLine = encodeKitty("AAAA", { columns: 2, rows: 3, imageId, moveCursor: false });
+			registerKittyImageMetadata({ imageId, columns: 2, rows: 3, widthPx: 100, heightPx: 100 });
+			let coveredLine = "";
+			tui = new TuiAltScreen(terminal);
+			tui.setLayoutRoot({
+				render: () => [imageLine, coveredLine, "", "after"],
+				invalidate: () => {},
+			});
+			tui.start();
+			await terminal.waitForRender();
+			const eventCount = terminal.events.length;
+
+			coveredLine = "changed";
+			tui.requestRender();
+			await terminal.waitForRender();
+			const redrawWrites = terminal.events
+				.slice(eventCount)
+				.filter((event): event is { type: "write"; data: string } => event.type === "write")
+				.map((event) => event.data)
+				.join("");
+			const placementIndex = redrawWrites.indexOf("\x1b_Ga=p,q=2");
+			assert.ok(redrawWrites.includes("\x1b_Ga=d,d=a,q=2\x1b\\"));
+			assert.ok(placementIndex > redrawWrites.indexOf("changed"));
+			assert.ok(!redrawWrites.includes("\x1b_Ga=T"));
+		} finally {
+			tui?.stop();
+			resetCapabilitiesCache();
+			if (weztermPane === undefined) delete process.env.WEZTERM_PANE;
+			else process.env.WEZTERM_PANE = weztermPane;
+		}
 	});
 
 	it("reuses moved Kitty images without dropping HStack siblings", async () => {
@@ -1630,27 +1709,67 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
-	it("stacks flash messages and collapses them as they expire", async () => {
-		const terminal = new VirtualTerminal(20, 4);
+	// pi#175 / smarty-dev#7403: every flash stays up for at least two render windows, so even an 80 ms
+	// flash added just after a frame appears in the trailing frame instead of being coalesced away.
+	it("shows a short flash in the trailing frame and collapses expired messages", async (t) => {
+		let now = 1000;
+		t.mock.method(performance, "now", () => now);
+		t.mock.timers.enable({ apis: ["setTimeout"] });
+		const terminal = new RecordingTerminal(20, 4);
 		const tui = new TuiAltScreen(terminal);
-		tui.addChild(new Text("one\ntwo\nthree\nfour", 0, 0));
-		tui.start();
-		await terminal.waitForRender();
+		const text = new Text("one\ntwo\nthree\nfour", 0, 0);
+		const renders = t.mock.method(text, "render");
+		const advance = async (ms: number) => {
+			now += ms;
+			t.mock.timers.tick(ms);
+			await new Promise<void>((resolve) => process.nextTick(resolve));
+		};
+		// Inspect emitted frames directly; xterm has unrelated asynchronous parser timers.
+		const lastFrame = () => {
+			const event = terminal.events.at(-1);
+			return event?.type === "write" ? event.data : "";
+		};
+		try {
+			tui.addChild(text);
+			tui.start();
+			await advance(0);
+			await advance(0);
+			assert.strictEqual(renders.mock.calls.length, 1);
 
-		tui.flash("First", 80);
-		tui.flash("Second", 500);
-		await terminal.waitForRender();
-		let viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.endsWith(" First "));
-		assert.ok(viewport[1]?.endsWith(" Second "));
+			await advance(5);
+			tui.flash("First", 80);
+			tui.flash("Second", 200);
+			tui.flash("Third", 500);
+			tui.requestRender();
+			await advance(0);
+			await advance(80);
+			assert.strictEqual(renders.mock.calls.length, 1);
+			await advance(14);
+			assert.strictEqual(renders.mock.calls.length, 1);
+			await advance(1);
+			assert.strictEqual(renders.mock.calls.length, 2, "exactly one trailing frame at t=100");
+			let frame = lastFrame();
+			assert.ok(frame.includes(" First "), "an 80 ms flash is still visible in the trailing frame");
+			assert.ok(frame.includes(" Second "));
+			assert.ok(frame.includes(" Third "));
+			assert.ok(frame.indexOf(" First ") < frame.indexOf(" Second "));
+			assert.ok(frame.indexOf(" Second ") < frame.indexOf(" Third "));
 
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		await terminal.waitForRender();
-		viewport = terminal.getViewport();
-		assert.ok(viewport[0]?.endsWith(" Second "));
-		assert.ok(!viewport.some((line) => line.includes("First")));
-
-		tui.stop();
+			await advance(105);
+			await advance(0);
+			assert.strictEqual(renders.mock.calls.length, 3);
+			frame = lastFrame();
+			assert.ok(frame.includes(" Third "));
+			assert.ok(!frame.includes("First"));
+			assert.ok(!frame.includes("Second"));
+			await advance(300);
+			await advance(0);
+			assert.strictEqual(renders.mock.calls.length, 4);
+			assert.ok(lastFrame().includes("one"));
+			assert.ok(!lastFrame().includes("Third"));
+		} finally {
+			tui.stop({ preserveScreen: true });
+		}
 	});
 
 	it("auto-scrolls and extends a drag selection held at the viewport edge", async () => {

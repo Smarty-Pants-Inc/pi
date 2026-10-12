@@ -4,7 +4,7 @@ import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamAzureOpenAIResponses } from "../src/api/azure-openai-responses.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Context, Model } from "../src/types.ts";
+import type { Context, Model } from "../src/types.ts";
 
 interface CapturedAzureClientOptions {
 	apiKey: string;
@@ -101,14 +101,14 @@ afterEach(() => {
 
 async function captureClientBaseUrl(baseUrl: string): Promise<string> {
 	process.env.AZURE_OPENAI_BASE_URL = baseUrl;
-	const model = getModel("azure-openai-responses", "gpt-4o-mini");
+	const model = getModel("azure", "gpt-4o-mini");
 	await streamAzureOpenAIResponses(model, normalizeContext(context), { apiKey: "test-api-key" }).result();
 	expect(azureMock.constructorCalls).toHaveLength(1);
 	return azureMock.constructorCalls[0].baseURL;
 }
 
 async function captureClientHeaders(headers?: Record<string, string>): Promise<Record<string, string>> {
-	const model = getModel("azure-openai-responses", "gpt-4o-mini");
+	const model = getModel("azure", "gpt-4o-mini");
 	await streamAzureOpenAIResponses(model, normalizeContext(context), {
 		apiKey: "test-api-key",
 		azureBaseUrl: "https://my-resource.openai.azure.com",
@@ -118,7 +118,7 @@ async function captureClientHeaders(headers?: Record<string, string>): Promise<R
 	return azureMock.constructorCalls[0].defaultHeaders ?? {};
 }
 
-describe("azure-openai-responses base URL normalization", () => {
+describe("azure base URL normalization", () => {
 	it("normalizes Cognitive Services root endpoints to /openai/v1", async () => {
 		const baseURL = await captureClientBaseUrl("https://marc-quicktests-resource.cognitiveservices.azure.com");
 		expect(baseURL).toBe("https://marc-quicktests-resource.cognitiveservices.azure.com/openai/v1");
@@ -166,7 +166,7 @@ describe("azure-openai-responses base URL normalization", () => {
 
 	it("throws on invalid URLs", async () => {
 		process.env.AZURE_OPENAI_BASE_URL = "not-a-url";
-		const model = getModel("azure-openai-responses", "gpt-4o-mini");
+		const model = getModel("azure", "gpt-4o-mini");
 		const result = await streamAzureOpenAIResponses(model, normalizeContext(context), {
 			apiKey: "test-api-key",
 		}).result();
@@ -175,7 +175,7 @@ describe("azure-openai-responses base URL normalization", () => {
 	});
 
 	it("clamps prompt_cache_key to OpenAI's 64-character limit", async () => {
-		const model = getModel("azure-openai-responses", "gpt-4o-mini");
+		const model = getModel("azure", "gpt-4o-mini");
 		await streamAzureOpenAIResponses(model, normalizeContext(context), {
 			apiKey: "test-api-key",
 			azureBaseUrl: "https://my-resource.openai.azure.com",
@@ -186,7 +186,7 @@ describe("azure-openai-responses base URL normalization", () => {
 	});
 
 	it("disables server-side response storage", async () => {
-		const model = getModel("azure-openai-responses", "gpt-4o-mini");
+		const model = getModel("azure", "gpt-4o-mini");
 		await streamAzureOpenAIResponses(model, normalizeContext(context), {
 			apiKey: "test-api-key",
 			azureBaseUrl: "https://my-resource.openai.azure.com",
@@ -196,7 +196,7 @@ describe("azure-openai-responses base URL normalization", () => {
 	});
 
 	it("honors supportsStrictMode: false", async () => {
-		const baseModel = getModel("azure-openai-responses", "gpt-4o-mini");
+		const baseModel = getModel("azure", "gpt-4o-mini");
 		const model: Model<"azure-openai-responses"> = {
 			...baseModel,
 			compat: { ...baseModel.compat, supportsStrictMode: false },
@@ -223,15 +223,16 @@ describe("azure-openai-responses base URL normalization", () => {
 
 	it("builds correct default URL from AZURE_OPENAI_RESOURCE_NAME", async () => {
 		process.env.AZURE_OPENAI_RESOURCE_NAME = "my-resource";
-		const model = getModel("azure-openai-responses", "gpt-4o-mini");
+		const model = getModel("azure", "gpt-4o-mini");
 		await streamAzureOpenAIResponses(model, normalizeContext(context), { apiKey: "test-api-key" }).result();
 		expect(azureMock.constructorCalls).toHaveLength(1);
 		expect(azureMock.constructorCalls[0].baseURL).toBe("https://my-resource.openai.azure.com/openai/v1");
 	});
 });
 
-describe("azure-openai-responses provider stream events", () => {
-	it("forwards parsed events in order before normalizing the response", async () => {
+describe("azure provider stream events", () => {
+	// smarty-dev#5822 C1: owned notifications only, never the raw event or model.
+	it("notifies once per parsed event without provider data", async () => {
 		azureMock.streamEvents = [
 			{ type: "response.created", sequence_number: 0, response: { id: "resp_azure" } } as ResponseStreamEvent,
 			{
@@ -240,29 +241,24 @@ describe("azure-openai-responses provider stream events", () => {
 				response: { id: "resp_azure", status: "completed" },
 			} as ResponseStreamEvent,
 		];
-		const model = getModel("azure-openai-responses", "gpt-4o-mini");
-		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const model = getModel("azure", "gpt-4o-mini");
+		const calls: unknown[][] = [];
 		const result = await streamAzureOpenAIResponses(model, normalizeContext(context), {
 			apiKey: "test-api-key",
 			azureBaseUrl: "https://my-resource.openai.azure.com",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		}).result();
 
-		expect(received).toEqual(azureMock.streamEvents);
-		expect(received[0]).toBe(azureMock.streamEvents[0]);
-		expect(received[1]).toBe(azureMock.streamEvents[1]);
-		expect(eventModels).toEqual([model, model]);
+		expect(calls).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
 		expect(result.stopReason).toBe("stop");
 		expect(result.responseId).toBe("resp_azure");
 	});
 });
 
-describe("azure-openai-responses user agent", () => {
+describe("azure user agent", () => {
 	it("uses pi's User-Agent by default", async () => {
 		expect((await captureClientHeaders())["User-Agent"]).toBe(PI_USER_AGENT);
 	});

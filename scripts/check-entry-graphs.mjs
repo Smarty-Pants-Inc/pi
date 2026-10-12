@@ -23,23 +23,35 @@ const WORKSPACE = {
 	"@earendil-works/pi-ai": "packages/ai/src",
 	"@earendil-works/pi-durable": "packages/durable/src",
 	"@earendil-works/pi-agent-core": "packages/agent/src",
+	"@earendil-works/pi-codemode": "packages/codemode/src",
 	"@earendil-works/pi-telemetry": "packages/telemetry/src",
+	"@earendil-works/pi-mcp": "packages/mcp/src",
 	"@earendil-works/pi-tui": "packages/tui/src",
 };
 
 /**
- * Budgets are deliberate. `.` and `./node` are batteries-included entries and stay unbounded; every
- * narrow entry states the graph it is allowed to reach.
+ * Budgets are deliberate. Entries with no budget remain unbounded; each listed entry states the
+ * graph it is allowed to reach.
  */
 const BUDGETS = {
 	"packages/ai": {
-		"./utils/*": { maxFiles: 3, forbid: ["providers/", "api/", "index.ts"] },
+		"./models": {
+			// The publication projector shares S2's dependency-free isolation utility (+1, pi#159).
+			maxFiles: 16,
+			forbid: ["providers/", "models.generated.ts", "index.ts", "utils/validation.ts", "utils/typebox-helpers.ts"],
+		},
+		// Diagnostics and operation errors reach the shared credential redactor and isolation utility (pi#159).
+		"./utils/*": { maxFiles: 5, forbid: ["providers/", "api/", "index.ts"] },
 	},
-	"packages/agent": {
-		"./harness/runtime/reducer": { maxFiles: 1 },
-		"./harness/context": { maxFiles: 6, forbid: ["harness/runtime/", "harness/execution/", "packages/ai/"] },
-		"./harness/env/nodejs": { maxFiles: 5, forbid: ["packages/ai/", "harness/runtime/"] },
-		"./harness/session": { maxFiles: 25, forbid: ["harness/runtime/", "harness/execution/", "packages/ai/src/index.ts"] },
+	"packages/durable": {
+		".": {
+			// Upstream adds the shared storage scan module to its 62-file graph; the fork adds
+			// the retry error-body parser and dependency-free credential redactor (+2), and the recovery
+			// classifier moved out of retry/overflow (+1, smarty-dev#5822). The publication projector
+			// now shares S2's dependency-free isolation utility (+1, pi#159).
+			maxFiles: 67,
+			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
+		},
 	},
 };
 

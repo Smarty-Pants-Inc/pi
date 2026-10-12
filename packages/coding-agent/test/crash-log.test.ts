@@ -1,5 +1,8 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { findExtensionStackMatches } from "../src/core/crash-log.ts";
+import { findExtensionStackMatches, readCrashLog, takeUnnotifiedCrash } from "../src/core/crash-log.ts";
 
 type StackExtension = Parameters<typeof findExtensionStackMatches>[1][number];
 
@@ -85,5 +88,38 @@ describe("extension crash attribution", () => {
 			"Error: progress 100%\n    at run (file:///Users/reporter/.pi/agent/extensions/local%20memory/worker.ts:4:2)";
 
 		expect(findExtensionStackMatches(stack, [extension])).toEqual([extension.path]);
+	});
+});
+
+describe("crash notice bookkeeping (smarty-dev#5271)", () => {
+	test("marks only the shown crash as notified; older unseen crashes stay pending", () => {
+		const dir = mkdtempSync(join(tmpdir(), "crash-log-"));
+		const path = join(dir, "crashes.json");
+		const now = Date.parse("2026-10-05T08:30:00Z");
+		const record = (timestamp: string, message: string) => ({
+			timestamp,
+			version: "test",
+			kind: "fatal_error" as const,
+			message,
+			stack: null,
+			sessionFile: null,
+		});
+		writeFileSync(
+			path,
+			JSON.stringify([
+				record("2026-10-05T08:09:00Z", "lane A"),
+				record("2026-10-05T08:09:10Z", "lane B"),
+				record("2026-10-05T08:09:20Z", "lane C"),
+			]),
+		);
+		try {
+			expect(takeUnnotifiedCrash(path, now)?.message).toBe("lane C");
+			expect(readCrashLog(path).map((r) => Boolean(r.notified))).toEqual([false, false, true]);
+			expect(takeUnnotifiedCrash(path, now)?.message).toBe("lane B");
+			expect(takeUnnotifiedCrash(path, now)?.message).toBe("lane A");
+			expect(takeUnnotifiedCrash(path, now)).toBeUndefined();
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });

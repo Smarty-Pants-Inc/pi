@@ -21,6 +21,7 @@ export type {
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcExtensionUIResponseBody,
+	RpcInputRejectedEvent,
 	RpcResponse,
 	RpcSessionState,
 } from "./rpc/rpc-types.ts";

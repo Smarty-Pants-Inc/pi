@@ -97,7 +97,8 @@ describe("openrouter images", () => {
 		expect(params.messages?.[0]?.content?.[0]).toMatchObject({ type: "text", text: "Generate a dog" });
 	});
 
-	it("passes through abort signal and returns aborted result", async () => {
+	// PR #139 / smarty-dev#2751: a pre-aborted request never reaches the SDK.
+	it("refuses pre-aborted input without dispatching and returns the established diagnostic", async () => {
 		const model: ImageModel<"openrouter-images"> = {
 			type: "image",
 			id: "black-forest-labs/flux.2-pro",
@@ -118,7 +119,8 @@ describe("openrouter images", () => {
 		const output = await generateImages(model, context, { apiKey: "test", signal: controller.signal });
 		expect(output.stopReason).toBe("aborted");
 		expect(output.errorMessage).toBe("Request aborted");
-		expect(mockState.lastRequestOptions).toMatchObject({ signal: controller.signal });
+		expect(mockState.lastRequestOptions).toBeUndefined();
+		expect(mockState.lastParams).toBeUndefined();
 	});
 
 	it("generateImages resolves the final assistant images result", async () => {

@@ -37,6 +37,7 @@ Project trust does not limit what tool calls can access or affect. After Pi star
 Pi requires a project-trust decision when it finds any of these resources from the current working directory:
 
 - `.pi/settings.json`
+- `.pi/mcp.json`
 - `.pi/extensions`, `.pi/skills`, `.pi/prompts`, or `.pi/themes`
 - `.pi/SYSTEM.md` or `.pi/APPEND_SYSTEM.md`
 - project `.agents/skills` in the current directory or an ancestor directory
@@ -46,6 +47,7 @@ A bare `.pi` directory does not require project trust.
 Granting project trust allows Pi to load:
 
 - project settings
+- project MCP servers from `.pi/mcp.json`
 - extensions, skills, prompt templates, themes, and system-prompt files under `.pi`
 - missing packages configured through project settings
 - project-local and project-package extensions
@@ -78,6 +80,10 @@ Print, JSON, and RPC modes cannot show the built-in trust prompt. If no command-
 - `defaultProjectTrust: "ask"` or `"never"` skips them.
 
 Use `--approve` or `--no-approve` when an automated run needs an explicit one-time decision.
+
+## Codemode and MCP availability
+
+This fork refuses Codemode and MCP execution and configuration mutations until their security boundaries have been reviewed. See [Codemode and MCP reviewed re-enable](security-reenable.md) for the affected entry points, refusal diagnostics, and requirements for re-enabling them.
 
 ## Reduce impact and improve recovery
 

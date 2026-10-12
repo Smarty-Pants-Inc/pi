@@ -3,10 +3,11 @@
  */
 
 import { isDeepStrictEqual } from "node:util";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
+	isolateValue,
 	type Model,
 	type Provider,
 	type ProviderHeaders,
@@ -19,15 +20,20 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import type { SessionManager } from "../session-manager.ts";
+import { detachedSessionView, type SessionManager } from "../session-manager.ts";
 import {
 	type BuildSystemPromptOptions,
 	buildSystemPrompt,
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
+import { captureTerminalTurnReceipt, type TurnReceipt } from "../turn-receipts.ts";
+import type { VirtualModelDefinition } from "../virtual-models.ts";
+import { boundaryReceiptSlots, receiveBoundaryEntries } from "./boundary-receipts.ts";
 import type {
 	AgentBeforeSettleEvent,
+	BashSpawnEvent,
+	BashSpawnEventResult,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
 	BeforeProviderHeadersEvent,
@@ -42,6 +48,7 @@ import type {
 	ContextUsage,
 	ContextWithSystemEvent,
 	EntryRenderer,
+	ExecuteToolOptions,
 	Extension,
 	ExtensionActions,
 	ExtensionCommandContext,
@@ -54,6 +61,7 @@ import type {
 	ExtensionMode,
 	ExtensionRuntime,
 	ExtensionShortcut,
+	ExtensionToolContext,
 	ExtensionUIContext,
 	InputEvent,
 	InputEventResult,
@@ -81,12 +89,14 @@ import type {
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
+	ToolRenderers,
 	ToolResultEvent,
 	ToolResultEventResult,
 	TurnEndEvent,
 	UIPromptKind,
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageRenderer,
 } from "./types.ts";
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
@@ -164,6 +174,7 @@ function isUserBashEventResult(value: unknown): value is UserBashEventResult {
 /** Combined result from all before_agent_start handlers. */
 interface BeforeAgentStartCombinedResult {
 	messages: NonNullable<BeforeAgentStartEventResult["message"]>[];
+	messageReceipts: TurnReceipt[];
 	systemPromptOptions: NormalizedBuildSystemPromptOptions;
 }
 
@@ -174,6 +185,7 @@ interface BeforeAgentStartCombinedResult {
 type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
 	| ToolCallEvent
+	| BashSpawnEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
 	| UserBashEvent
@@ -219,6 +231,7 @@ type BoundaryBaseEvent =
 
 interface BoundaryDispatchResult {
 	entries: SessionBoundaryDraft[];
+	entryReceipts: (TurnReceipt | undefined)[];
 	continue: boolean;
 	context: BoundaryContextPreview;
 	valid: boolean;
@@ -256,9 +269,10 @@ export type ShutdownHandler = () => void;
 export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
+		await extensionRunner.emit(event, signal);
 		return true;
 	}
 	return false;
@@ -362,6 +376,7 @@ export class ExtensionRunner {
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
+	private getUserMessageSessionGeneration: () => string = () => "";
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
 	private isIdleFn: () => boolean = () => true;
@@ -377,6 +392,12 @@ export class ExtensionRunner {
 	private getSystemPromptFn: () => string = () => "";
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
+	private executeToolFn: ExtensionContextActions["executeTool"];
+	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
+	/** Admission and joining are per call, not per session or captured context. */
+	private readonly toolScopes = new Map<string, { closed: boolean; pending: Set<Promise<unknown>> }>();
+	/** Registered MCP servers already reported as unhandled. */
+	private readonly reportedMcpServers = new Set<string>();
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -414,25 +435,32 @@ export class ExtensionRunner {
 			registerProvider?: (name: string, config: ProviderConfig) => void;
 			registerNativeProvider?: (provider: Provider) => void;
 			unregisterProvider?: (name: string) => void;
+			registerVirtualModel?: (definition: VirtualModelDefinition) => void;
+			unregisterVirtualModel?: (provider: string, id: string) => void;
 		},
 	): void {
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
+		this.runtime.submitUserMessage = actions.submitUserMessage;
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.setSessionName = actions.setSessionName;
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setLabel = actions.setLabel;
 		this.runtime.getActiveTools = actions.getActiveTools;
 		this.runtime.getAllTools = actions.getAllTools;
+		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.refreshTools = actions.refreshTools;
+		this.runtime.inheritedCancellation = actions.inheritedCancellation;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
 		this.runtime.setThinkingLevel = actions.setThinkingLevel;
+		this.runtime.createContext = () => this.createContext();
 
 		// Context actions (required)
+		this.getUserMessageSessionGeneration = contextActions.getUserMessageSessionGeneration ?? (() => "");
 		this.getModel = contextActions.getModel;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
@@ -448,6 +476,15 @@ export class ExtensionRunner {
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
 		this.getSystemPromptOptionsFn =
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
+		this.executeToolFn = contextActions.executeTool;
+		this.getCallableToolsFn = contextActions.getCallableTools ?? (() => []);
+
+		// Servers registered from now on reach the extension that connects them right away. Servers
+		// registered during loading are read on session_start.
+		this.runtime.mcpServers.setChangeListener(() => {
+			void this.emit({ type: "mcp_servers_change", servers: this.runtime.mcpServers.list() });
+			this.reportUnhandledMcpServers();
+		});
 
 		// Flush provider registrations queued during extension loading
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
@@ -484,6 +521,23 @@ export class ExtensionRunner {
 			}
 		}
 		this.runtime.pendingNativeProviderRegistrations = [];
+		const registerVirtualModel = (definition: VirtualModelDefinition) => {
+			if (providerActions?.registerVirtualModel) providerActions.registerVirtualModel(definition);
+			else this.modelRegistry.registerVirtualModel(definition);
+		};
+		for (const { definition, extensionPath } of this.runtime.pendingVirtualModelRegistrations) {
+			try {
+				registerVirtualModel(definition);
+			} catch (err) {
+				this.emitError({
+					extensionPath,
+					event: "register_virtual_model",
+					error: err instanceof Error ? err.message : String(err),
+					stack: err instanceof Error ? err.stack : undefined,
+				});
+			}
+		}
+		this.runtime.pendingVirtualModelRegistrations = [];
 
 		// From this point on, provider registration/unregistration takes effect immediately
 		// without requiring a /reload.
@@ -508,6 +562,11 @@ export class ExtensionRunner {
 			}
 			this.modelRegistry.unregisterProvider(name);
 		};
+		this.runtime.registerVirtualModel = registerVirtualModel;
+		this.runtime.unregisterVirtualModel = (provider, id) => {
+			if (providerActions?.unregisterVirtualModel) providerActions.unregisterVirtualModel(provider, id);
+			else this.modelRegistry.unregisterVirtualModel(provider, id);
+		};
 	}
 
 	bindCommandContext(actions?: ExtensionCommandContextActions): void {
@@ -530,7 +589,22 @@ export class ExtensionRunner {
 	}
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		const wrapped = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		// A caller may capture ui or an individual method before replacement. Check
+		// lifetime at invocation too, not only when ctx.ui is first read.
+		this.uiContext = uiContext
+			? new Proxy(wrapped, {
+					get: (target, key, receiver) => {
+						this.assertActive();
+						const value: unknown = Reflect.get(target, key, receiver);
+						if (typeof value !== "function") return value;
+						return (...args: unknown[]) => {
+							this.assertActive();
+							return Reflect.apply(value, target, args);
+						};
+					},
+				})
+			: noOpUIContext;
 		this.mode = mode;
 	}
 
@@ -712,6 +786,23 @@ export class ExtensionRunner {
 		}
 	}
 
+	/**
+	 * Report registered MCP servers when no extension handles `mcp_servers_change`, which means
+	 * nothing connects them (for example when another MCP extension replaced the built-in one).
+	 */
+	reportUnhandledMcpServers(): void {
+		if (this.hasHandlers("mcp_servers_change")) return;
+		for (const server of this.runtime.mcpServers.list()) {
+			if (this.reportedMcpServers.has(server.name)) continue;
+			this.reportedMcpServers.add(server.name);
+			this.emitError({
+				extensionPath: server.extensionPath,
+				event: "register_mcp_server",
+				error: `MCP server "${server.name}" is registered, but no loaded extension connects MCP servers; another extension may have replaced the built-in MCP support`,
+			});
+		}
+	}
+
 	hasHandlers(eventType: string): boolean {
 		for (const ext of this.extensions) {
 			const handlers = ext.handlers.get(eventType);
@@ -732,8 +823,20 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
+	getUserMessageRenderer(): UserMessageRenderer | undefined {
+		return this.extensions.find((ext) => ext.userMessageRenderer)?.userMessageRenderer;
+	}
+
 	getMarkdownTransformers(): MarkdownTransformer[] {
 		return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
+	}
+
+	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
+	resolveToolRenderers(toolName: string, base: () => ToolRenderers | undefined): ToolRenderers | undefined {
+		const resolvers = this.extensions.flatMap((ext) => ext.toolRenderers ?? []);
+		const resolve = (index: number): ToolRenderers | undefined =>
+			index < resolvers.length ? resolvers[index](toolName, () => resolve(index + 1)) : base();
+		return resolve(0);
 	}
 
 	getEntryRenderer(customType: string): EntryRenderer | undefined {
@@ -821,6 +924,10 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
+			get userMessageSessionGeneration() {
+				runner.assertActive();
+				return runner.getUserMessageSessionGeneration();
+			},
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;
@@ -839,7 +946,7 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return runner.sessionManager;
+				return detachedSessionView(runner.sessionManager);
 			},
 			get modelRegistry() {
 				runner.assertActive();
@@ -877,6 +984,11 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.getSignalFn();
 			},
+			get emitBashSpawn() {
+				runner.assertActive();
+				if (!runner.hasHandlers("bash_spawn")) return undefined;
+				return (event: BashSpawnEvent, signal?: AbortSignal) => runner.emitBashSpawn(event, signal);
+			},
 			abort: () => {
 				runner.assertActive();
 				runner.abortFn();
@@ -902,6 +1014,69 @@ export class ExtensionRunner {
 				return runner.getSystemPromptFn();
 			},
 		};
+	}
+
+	/**
+	 * Create the context for executing the tool call `toolCallId`: the extension context plus
+	 * `tools` and `executeTool()`. `signal` is the default signal of nested calls.
+	 */
+	createToolContext(toolCallId: string, signal: AbortSignal | undefined): ExtensionToolContext {
+		const runner = this;
+		let scope = this.toolScopes.get(toolCallId);
+		if (!scope) {
+			scope = { closed: false, pending: new Set() };
+			this.toolScopes.set(toolCallId, scope);
+		}
+		const callScope = scope;
+		// createContext() returns a fresh object, so adding properties does not affect other contexts.
+		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
+			tools: {
+				get() {
+					runner.assertActive();
+					return runner.getCallableToolsFn();
+				},
+			},
+			executeTool: {
+				value: async (name: string, args: unknown, options: ExecuteToolOptions = {}) => {
+					runner.assertActive();
+					if (!runner.executeToolFn) {
+						return {
+							toolCall: { type: "toolCall", id: `${toolCallId}/0`, name, arguments: {} },
+							result: {
+								content: [{ type: "text", text: "Nested tool calls are not available in this context" }],
+								details: {},
+							},
+							isError: true,
+						};
+					}
+					if (callScope.closed) throw new Error("Nested tool call scope is closed after parent settlement");
+					const signals = [signal, options.signal, runner.shutdownSignal].filter(
+						(candidate): candidate is AbortSignal => candidate !== undefined,
+					);
+					const childSignal = signals.length ? AbortSignal.any(signals) : undefined;
+					childSignal?.throwIfAborted();
+					// Register before dispatch: even fire-and-forget children belong to this call.
+					const pending = Promise.resolve().then(() => {
+						childSignal?.throwIfAborted();
+						return runner.executeToolFn!(toolCallId, name, args, { ...options, signal: childSignal });
+					});
+					callScope.pending.add(pending);
+					try {
+						return await pending;
+					} finally {
+						callScope.pending.delete(pending);
+					}
+				},
+			},
+		});
+	}
+
+	private async closeToolScope(toolCallId: string): Promise<void> {
+		const scope = this.toolScopes.get(toolCallId);
+		if (!scope) return;
+		scope.closed = true;
+		await Promise.allSettled(scope.pending);
+		this.toolScopes.delete(toolCallId);
 	}
 
 	createCommandContext(): ExtensionCommandContext {
@@ -966,7 +1141,10 @@ export class ExtensionRunner {
 
 	async emitBoundary(
 		baseEvent: BoundaryBaseEvent,
-		buildContext: (entries: SessionBoundaryDraft[]) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
+		buildContext: (
+			entries: SessionBoundaryDraft[],
+			receipts?: (TurnReceipt | undefined)[],
+		) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
 		getPendingMessages?: () => AgentMessage[],
 		signal?: AbortSignal,
 	): Promise<BoundaryDispatchResult> {
@@ -974,13 +1152,14 @@ export class ExtensionRunner {
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
+		let entryReceipts: (TurnReceipt | undefined)[] = [];
 		let shouldContinue = false;
 		// Record the state represented by the preview before the builder can yield.
 		let previewRevision = this.sessionManager.revision();
 		let previewPendingMessages = getPendingMessages?.().slice();
 		let context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
 		signal?.throwIfAborted();
-		if (!this.hasHandlers(baseEvent.type)) return { entries, continue: false, context, valid: true };
+		if (!this.hasHandlers(baseEvent.type)) return { entries, entryReceipts, continue: false, context, valid: true };
 		// One detached preview per build preserves observer sharing without exposing history.
 		context = structuredClone(context);
 		let contextSnapshot = structuredClone(context);
@@ -989,6 +1168,7 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
 				// A failed proposal remains visible so a later handler can replace it.
+				const before = entries;
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
 				if (hadEntries) {
@@ -1004,16 +1184,46 @@ export class ExtensionRunner {
 					continue: shouldContinue,
 					context,
 				} as TurnEndEvent | AgentBeforeSettleEvent;
+				const previousReceipts = entryReceipts;
+				const slots = boundaryReceiptSlots(event.entries, entryReceipts);
+				let receivedSelection = false;
+				let observed: TurnReceipt | undefined;
 				try {
 					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
 						| BoundaryResult
 						| undefined;
 					signal?.throwIfAborted();
-					entries = structuredClone(handlerResult?.entries !== undefined ? handlerResult.entries : event.entries);
-					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
+					observed = captureTerminalTurnReceipt();
+					const returnedEntries = handlerResult?.entries;
+					const received = receiveBoundaryEntries(
+						returnedEntries !== undefined ? returnedEntries : event.entries,
+						slots,
+						observed,
+					);
+					entries = received.entries;
+					entryReceipts = received.receipts;
+					receivedSelection = true;
+					const returnedContinue = handlerResult?.continue;
+					if (returnedContinue !== undefined) shouldContinue = returnedContinue;
 				} catch (err) {
 					signal?.throwIfAborted();
-					entries = structuredClone(event.entries);
+					// Existing semantics retain drafts mutated before a handler throws.
+					// A secondary flag failure cannot discard a successfully received selection.
+					if (!receivedSelection) {
+						try {
+							const retained = receiveBoundaryEntries(
+								event.entries,
+								slots,
+								observed ?? captureTerminalTurnReceipt(),
+							);
+							entries = retained.entries;
+							entryReceipts = retained.receipts;
+						} catch {
+							// A poisoned in-place draft cannot be committed; keep the detached pre-handler proposal (#132 R4-10).
+							entries = before;
+							entryReceipts = previousReceipts;
+						}
+					}
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1034,6 +1244,8 @@ export class ExtensionRunner {
 					if (
 						valid &&
 						unchangedEntries &&
+						previousReceipts.length === entryReceipts.length &&
+						previousReceipts.every((receipt, index) => receipt === entryReceipts[index]) &&
 						isDeepStrictEqual(context, contextSnapshot) &&
 						previewRevision === nextRevision &&
 						previewPendingMessages?.length === nextPendingMessages?.length &&
@@ -1044,7 +1256,9 @@ export class ExtensionRunner {
 
 					previewRevision = nextRevision;
 					previewPendingMessages = nextPendingMessages?.slice();
-					context = structuredClone(await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal));
+					context = structuredClone(
+						await raceWithAbortSignal(Promise.resolve(buildContext(entries, entryReceipts)), signal),
+					);
 					signal?.throwIfAborted();
 					contextSnapshot = structuredClone(context);
 					valid = true;
@@ -1064,11 +1278,12 @@ export class ExtensionRunner {
 		return valid
 			? {
 					entries: structuredClone(entries),
+					entryReceipts,
 					continue: shouldContinue,
 					context: structuredClone(context),
 					valid: true,
 				}
-			: { entries: [], continue: false, context, valid: false };
+			: { entries: [], entryReceipts: [], continue: false, context, valid: false };
 	}
 
 	private isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
@@ -1091,6 +1306,12 @@ export class ExtensionRunner {
 		event: TEvent,
 		operationSignal?: AbortSignal,
 	): Promise<RunnerEmitResult<TEvent>> {
+		// Join before any observer, persistence, or cancellation can skip finalization.
+		if (event.type === "tool_execution_end") {
+			await this.closeToolScope(event.toolCallId);
+		} else if (event.type === "agent_end") {
+			await Promise.all([...this.toolScopes.keys()].map((id) => this.closeToolScope(id)));
+		}
 		const signal = this.dispatchSignal(event.type, operationSignal ?? ("signal" in event ? event.signal : undefined));
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
@@ -1103,13 +1324,13 @@ export class ExtensionRunner {
 					// Keep AbortSignal identity: structured cloning cannot preserve its behavior.
 					const snapshot =
 						"signal" in event
-							? { ...structuredClone({ ...event, signal: undefined }), signal: event.signal }
-							: structuredClone(event);
+							? { ...isolateValue({ ...event, signal: undefined }), signal: event.signal }
+							: isolateValue(event);
 					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
 					signal?.throwIfAborted();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
-						result = structuredClone(handlerResult) as SessionBeforeEventResult;
+						result = isolateValue(handlerResult) as SessionBeforeEventResult;
 						if (result.cancel) {
 							return result as RunnerEmitResult<TEvent>;
 						}
@@ -1173,7 +1394,7 @@ export class ExtensionRunner {
 				try {
 					// A cancelled handler can outlive disposal. Neither its draft nor a
 					// returned replacement may alias finalized state, including nested content.
-					const draft = structuredClone(currentMessage);
+					const draft = isolateValue(currentMessage);
 					const currentEvent: MessageEndEvent = { ...event, message: draft };
 					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
 						| MessageEndEventResult
@@ -1190,7 +1411,7 @@ export class ExtensionRunner {
 					}
 
 					if (!isDeepStrictEqual(candidate, currentMessage)) {
-						currentMessage = structuredClone(candidate);
+						currentMessage = isolateValue(candidate);
 						modified = true;
 					}
 				} catch (err) {
@@ -1211,9 +1432,10 @@ export class ExtensionRunner {
 	}
 
 	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
+		await this.closeToolScope(event.toolCallId);
 		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
-		const currentEvent: ToolResultEvent = structuredClone(event);
+		const currentEvent: ToolResultEvent = isolateValue(event);
 		let modified = false;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "tool_result")) {
@@ -1228,10 +1450,16 @@ export class ExtensionRunner {
 
 					if (handlerResult.content !== undefined) {
 						currentEvent.content = handlerResult.content;
+						// Structured content that is not replaced along with the content may no longer match it.
+						if (handlerResult.structuredContent === undefined) delete currentEvent.structuredContent;
 						modified = true;
 					}
 					if (handlerResult.details !== undefined) {
 						currentEvent.details = handlerResult.details;
+						modified = true;
+					}
+					if (handlerResult.structuredContent !== undefined) {
+						currentEvent.structuredContent = handlerResult.structuredContent;
 						modified = true;
 					}
 					if (handlerResult.isError !== undefined) {
@@ -1260,9 +1488,10 @@ export class ExtensionRunner {
 			return undefined;
 		}
 
-		return structuredClone({
+		return isolateValue({
 			content: currentEvent.content,
 			details: currentEvent.details,
+			structuredContent: currentEvent.structuredContent,
 			isError: currentEvent.isError,
 			usage: currentEvent.usage,
 		});
@@ -1289,6 +1518,37 @@ export class ExtensionRunner {
 		}
 
 		return result;
+	}
+
+	async emitBashSpawn(event: BashSpawnEvent, signal?: AbortSignal): Promise<BashSpawnEventResult | undefined> {
+		this.assertActive();
+		signal = this.dispatchSignal(event.type, signal);
+		signal?.throwIfAborted();
+		const ctx = this.createContext();
+
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "bash_spawn")) {
+			for (const handler of handlers) {
+				try {
+					// Attestation cannot rewrite the executor or another handler's view.
+					const result = (await this.dispatchHandler(handler, structuredClone(event), ctx, signal)) as
+						| BashSpawnEventResult
+						| undefined;
+					if (result?.block) return { block: true, reason: result.reason ?? "Bash spawn blocked" };
+				} catch (err) {
+					signal?.throwIfAborted();
+					const message = err instanceof Error ? err.message : String(err);
+					this.emitError({
+						extensionPath: ext.path,
+						event: "bash_spawn",
+						error: message,
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+					return { block: true, reason: `bash_spawn handler failed: ${message}` };
+				}
+			}
+		}
+
+		return undefined;
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
@@ -1475,8 +1735,10 @@ export class ExtensionRunner {
 		prompt: string,
 		images: ImageContent[] | undefined,
 		systemPromptOptions: BuildSystemPromptOptions,
+		cancellation?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult> {
-		const signal = this.dispatchSignal("before_agent_start");
+		// The originating admission's revocation stops the loop, not only the caller's wait (#132 R4-12).
+		const signal = this.dispatchSignal("before_agent_start", cancellation);
 		signal?.throwIfAborted();
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
@@ -1489,6 +1751,7 @@ export class ExtensionRunner {
 			return renderCurrentSystemPrompt();
 		};
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+		const messageReceipts: TurnReceipt[] = [];
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_agent_start")) {
 			for (const handler of handlers) {
@@ -1506,8 +1769,18 @@ export class ExtensionRunner {
 					signal?.throwIfAborted();
 
 					if (handlerResult) {
+						const receipt = captureTerminalTurnReceipt();
 						const result = handlerResult as BeforeAgentStartEventResult;
-						if (result.message) messages.push(result.message);
+						const message = result.message;
+						if (message) {
+							messages.push({
+								customType: message.customType,
+								content: message.content,
+								display: message.display,
+								details: message.details,
+							});
+							messageReceipts.push(receipt);
+						}
 						if (result.systemPrompt !== undefined) {
 							currentOptions.forceSystemPrompt = result.systemPrompt;
 						}
@@ -1526,7 +1799,7 @@ export class ExtensionRunner {
 			}
 		}
 
-		return { messages, systemPromptOptions: currentOptions };
+		return { messages, messageReceipts, systemPromptOptions: currentOptions };
 	}
 
 	async emitResourcesDiscover(
@@ -1599,7 +1872,8 @@ export class ExtensionRunner {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
-						images: currentImages,
+						// Handlers get detached images: a late in-place edit cannot change retained or recovered originals (#132 R4-6).
+						images: currentImages?.map((image) => ({ ...image })),
 						source,
 						streamingBehavior,
 					};
@@ -1608,7 +1882,7 @@ export class ExtensionRunner {
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
-						currentImages = result.images ?? currentImages;
+						currentImages = result.images?.map((image) => ({ ...image })) ?? currentImages;
 					}
 				} catch (err) {
 					signal?.throwIfAborted();

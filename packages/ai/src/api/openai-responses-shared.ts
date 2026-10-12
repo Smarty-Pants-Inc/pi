@@ -31,10 +31,12 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { closedRawStopReason } from "../utils/diagnostics.ts";
+import { ProviderDataError } from "../utils/error-body.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
+import { notifyProviderStreamEvent } from "../utils/provider-observation.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import { resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
@@ -296,14 +298,13 @@ export function convertResponsesMessages<TApi extends Api>(
 					let itemId: string | undefined = itemIdRaw;
 
 					// For different-model messages, set id to undefined to avoid pairing validation.
-					// OpenAI tracks which fc_xxx IDs were paired with rs_xxx reasoning items.
+					// OpenAI tracks which item IDs were paired with rs_xxx reasoning items.
 					// By omitting the id, we avoid triggering that validation (like cross-provider does).
-					// When replaying custom-tool calls as a function_call, also drop non-fc_* ids such as
-					// ctc_* custom-tool ids because function_call item ids must be fc_*.
-					if (
-						(isDifferentModel && itemId?.startsWith("fc_")) ||
-						(customInputProperty === undefined && !itemId?.startsWith("fc_"))
-					) {
+					// Also drop ids that do not match the replayed item type: function_call ids must be fc_*
+					// and custom_tool_call ids must be ctc_*. Foreign tool call ids are normalized to fc_*, and
+					// a call can switch between the two types when grammar tool support differs.
+					const itemIdPrefix = customInputProperty === undefined ? "fc_" : "ctc_";
+					if (isDifferentModel || !itemId?.startsWith(itemIdPrefix)) {
 						itemId = undefined;
 					}
 
@@ -610,13 +611,9 @@ export async function processResponsesStream<TApi extends Api>(
 
 	for await (const event of openaiStream) {
 		try {
-			await options?.onProviderStreamEvent?.(event, model);
-		} catch (error) {
 			// Preserve observer origin even when it rejects before the first output is normalized.
-			appendAssistantMessageDiagnostic(
-				output,
-				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
-			);
+			await notifyProviderStreamEvent(options, output);
+		} catch (error) {
 			// A rejecting observer must not erase provider-reported generation and permit replay.
 			if (
 				event.type === "response.failed" ||
@@ -772,7 +769,8 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
-			throw new Error(`Error Code ${event.code}: ${event.message}` || "Unknown error");
+			// A provider error by origin: the code and message only classify (smarty-dev#5822, pi#202 round 3).
+			throw new ProviderDataError(`${event.code ?? ""}\n${event.message ?? ""}`);
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
 			finalizeResponsesUsage(event.response, output, model, options);
@@ -784,11 +782,25 @@ export async function processResponsesStream<TApi extends Api>(
 				: details?.reason
 					? `incomplete: ${details.reason}`
 					: "Unknown error (no error details in response)";
-			throw new Error(msg);
+			throw new ProviderDataError(msg);
 		}
 	}
 	if (!sawTerminalResponseEvent) {
 		throw new Error("OpenAI Responses stream ended before a terminal response event");
+	}
+	// The agent runs every tool call in the final message. Refuse to hand over calls whose
+	// output_item.done never arrived: their arguments may be cut off or mixed up, e.g. when a
+	// non-compliant server omits output_index. Finished calls have their scratch buffers removed.
+	if (output.stopReason === "toolUse") {
+		for (const block of output.content) {
+			if (block.type !== "toolCall") continue;
+			const toolCall = block as StreamingToolCall;
+			if (toolCall.partialJson !== undefined || toolCall.customInput !== undefined) {
+				throw new Error(
+					`OpenAI Responses stream completed with an unfinished tool call: ${toolCall.name} (${toolCall.id})`,
+				);
+			}
+		}
 	}
 }
 
@@ -806,8 +818,9 @@ function mapStopReason(
 			}
 			return {
 				stopReason: "error",
+				// A closed reason only; a provider-chosen value is published as `other` (smarty-dev#5822).
 				errorMessage: incompleteReason
-					? `Response incomplete: ${incompleteReason}`
+					? `Response incomplete: ${closedRawStopReason(`incomplete.${incompleteReason}`).replace(/^incomplete\./, "")}`
 					: "Response incomplete without a provider reason",
 			};
 		case "failed":
@@ -819,7 +832,7 @@ function mapStopReason(
 			return { stopReason: "stop" };
 		default: {
 			const _exhaustive: never = status;
-			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
+			throw new ProviderDataError(`Unhandled stop reason: ${_exhaustive}`);
 		}
 	}
 }

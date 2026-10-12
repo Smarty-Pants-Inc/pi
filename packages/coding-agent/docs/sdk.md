@@ -53,7 +53,7 @@ See the checked [sessions example](../examples/sdk/11-sessions.ts) for creating,
 
 `cwd` selects the workspace used for project resource discovery, context files, session grouping, and built-in tool paths. Pass it explicitly when the target differs from `process.cwd()`.
 
-`session.dispose()` aborts active work, invalidates extension contexts, disconnects from the agent, and removes event listeners. Call it when the session is no longer needed.
+`session.dispose()` invalidates extension contexts, disconnects from the agent, and removes event listeners. It refuses active, admitted or queued input rather than dropping it. First `await session.abort()`, and explicitly recover any undelivered queues before disposal. See [Native input admission](input-admission.md) for the versioned accounting and replacement-fence contract.
 
 `AgentSessionRuntime` adds `newSession()`, `switchSession()`, `fork()`, and `importFromJsonl()`. Each operation replaces the active `AgentSession` and recreates services for the target working directory.
 
@@ -65,7 +65,22 @@ After a runtime replacement, subscriptions belong to the old `AgentSession` and 
 
 A prompt sent while the session is already streaming must specify whether it should steer the current run or follow it. Calling `prompt()` without that choice rejects rather than guessing.
 
-A steering message enters after the current assistant turn and its tool calls. A follow-up enters after the current run finishes its pending work. `steer()` and `followUp()` expose those behaviors directly.
+A steering message enters after the current assistant turn and its tool calls. A follow-up enters after the current run finishes its pending work. `steer()` and `followUp()` expose those behaviors directly and return `"queued"` if the input was queued (including after an extension transformed it), or `"handled"` if an extension consumed it.
+
+`sendUserMessage(content, { metadata })` uses the same input handlers, compaction checks, `before_agent_start`, and image normalization as an ordinary prompt. Metadata must be a plain JSON object. Pi copies and deeply freezes it before asynchronous dispatch, keeps each queued input separate, and stores it as `SessionMessageEntry.metadata`, outside model-visible messages and compaction summary input. Pi also records `metadataSource` on the entry and receipt: `{ kind: "sdk" }` for direct SDK calls, or `{ kind: "extension", extensionPath }` bound by the extension loader. Callers cannot select or override it through options or metadata. Extension API objects are shareable, but Pi checks the executing extension's async callback context against the API's loader identity: borrowing another extension's API to submit metadata or register callbacks rejects with `INPUT_METADATA_SOURCE_MISMATCH` before admission or registration. Metadata sends through captured extension APIs without their execution context reject with `INPUT_METADATA_SOURCE_MISMATCH`; SDK-installed callbacks on those APIs remain unbound and cannot acquire extension attribution. Fresh `withSession` contexts capture the initiating extension's source for `newSession`, `fork`, and `switchSession`, with the same rejection for borrowed or unbound metadata sends. Only direct `session.sendUserMessage()` calls receive `sdk`. The binding covers extension module evaluation, factories, every registered callback (including renderers, tool preparation, command completions and providers), and their async descendants, not a security sandbox against arbitrary in-process code or filesystem writes. Consumers must trust metadata only from the source they expect; Fabric, for example, must require its own extension's path. The source identifies the submitter, not a verified remote sender or authenticated session-file edit.
+
+The snapshot rejects Proxies before any reflective access or trap execution, and accepts only plain objects (with `Object.prototype` or null prototype) and plain arrays. Object key counts are checked against the remaining item budget before inspecting values. It accepts at most 16 KiB of serialized UTF-8 JSON, 16 nested object/array containers including the root, and 1,000 total object keys/array elements. Pi checks these limits during copying, before admission. Over-limit input rejects with `UserMessageMetadataError.code`: `INPUT_METADATA_TOO_LARGE`, `INPUT_METADATA_TOO_DEEP`, or `INPUT_METADATA_TOO_MANY_ITEMS`, with no receipt or queue side effect.
+
+```typescript
+const receipt = await session.sendUserMessage("Continue", {
+  metadata: { source: "scheduler", inputId: "wake-42" },
+  deliverAs: "followUp",
+});
+// { status: "turnStarted", entryId: "...", metadata: { ... }, metadataSource: { kind: "sdk" } }
+// or { status: "handled", entryId: null, metadata: { ... }, metadataSource: { kind: "sdk" } }
+```
+
+The metadata overload resolves exactly once when the user entry is persisted or an input handler consumes the input. It does not wait for the assistant response. A handled input creates no user entry. Calls without metadata keep their existing `Promise<void>` behavior. A receipt for queued input stays pending until delivery; do not await it inside a handler that must return before delivery can proceed. Invalid metadata or failed admission rejects the promise. Clearing an undelivered queue, aborting, or reloading rejects every pending receipt with `INPUT_ADMISSION_ABORTED`, including input retained after failed compaction. Abort/reload retain queued content, metadata, and source for explicit recovery, but the rejected receipt cannot settle again. Orderly runtime disposal with explicit queue rejection also settles receipts before clearing queues; direct disposal and replacement still refuse undrained input. A successful direct disposal rejects any remaining receipt with `INPUT_ADMISSION_DISPOSED`.
 
 `abort()` stops the active operation and waits for the session to become idle. `waitForIdle()` waits without aborting it.
 
@@ -109,7 +124,11 @@ Use `DefaultResourceLoader` when you want standard discovery with selected overr
 
 <a id="inlineextension"></a>
 
-Inline extension factories can be supplied through `DefaultResourceLoader`. Give one an `InlineExtension` name only when it needs a stable name in diagnostics and startup output.
+Inline extension factories can be supplied through `DefaultResourceLoader`. Give one an `InlineExtension` name only when it needs a stable name in diagnostics and startup output. A named inline extension with `replaceable: true` is left out when another extension registers a tool, command, or flag with a name it registers during loading, instead of both loading with a conflict. The CLI's built-in codemode, tool search, and MCP extensions are replaceable. A named entry with `builtin: true` is not an inline extension: it supplies the code of the `builtin:<name>` extension, which loads like a configured extension file. It loads by default, is listed in `pi config`, and is disabled by `-builtin:<name>` in the `extensions` setting or by `noExtensions`; `additionalExtensionPaths: ["builtin:<name>"]` loads it explicitly. It loads after project trust is resolved, so it cannot handle `project_trust`. The CLI's built-in extensions use it.
+
+<a id="codemode-mcp"></a>
+
+The CLI loads `codemode`, `tool_search`, and MCP as built-in extensions. SDK sessions do not; add `createCodemodeExtension()`, `createToolSearchExtension()`, and `createMcpExtension()` to the `extensionFactories` of `DefaultResourceLoader`. `codemode` and `tool_search` are registered inactive: enable them through the `defaultTools` setting (`["+codemode", "+tool_search"]` keeps the other default tools), or let the MCP extension activate them: `codemode` for servers with `codemode` exposure, `tool_search` for servers with `deferred` exposure. The MCP extension connects its servers on `session_start`, so call `session.bindExtensions()`. See [Codemode and MCP](../examples/sdk/14-codemode-mcp.ts).
 
 See the focused examples for [models](../examples/sdk/02-custom-model.ts), [tools](../examples/sdk/05-tools.ts), [extensions](../examples/sdk/06-extensions.ts), and [full control](../examples/sdk/12-full-control.ts).
 
@@ -130,12 +149,13 @@ See the focused examples for [models](../examples/sdk/02-custom-model.ts), [tool
 | [Sessions](../examples/sdk/11-sessions.ts) | Control session persistence and restoration |
 | [Full control](../examples/sdk/12-full-control.ts) | Replace default discovery and state services |
 | [Session runtime](../examples/sdk/13-session-runtime.ts) | Replace the active session safely |
+| [Codemode and MCP](../examples/sdk/14-codemode-mcp.ts) | Add the `codemode`, `tool_search`, and MCP extensions |
 
 <a id="exports"></a>
 
 ## Resources
 
-- [Choose a Model](models.md) covers model selection and compatible endpoints; [Provider Authentication](providers.md) covers credentials and cloud-provider setup.
+- [Choose a Model](models.md) covers model selection and compatible endpoints; [Providers](providers.md) covers credentials and provider-specific setup.
 - [Configuration](configuration.md) explains normal discovery and settings; [Settings](settings.md) lists every setting.
 - [Sessions and Context](sessions.md) explains session behavior; [Session Format](session-format.md) defines persisted entries; [Message Types](message-types.md) defines shared transcript values.
 - [Extensions](extensions.md), [Skills](skills.md), and [Prompt Templates](prompt-templates.md) document resources supplied through a `ResourceLoader`.

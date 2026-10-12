@@ -120,6 +120,7 @@ describe("headless stream recovery notices", () => {
 			const runtime = {
 				session: h.session,
 				setRebindSession: vi.fn(),
+				setLifecycleCompleteHandler: vi.fn(),
 				dispose: vi.fn(async () => {}),
 			} as unknown as AgentSessionRuntime;
 			void runRpcMode(runtime);

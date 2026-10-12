@@ -6,6 +6,7 @@ import type {
 	ResponseStreamEvent,
 } from "openai/resources/responses/responses.js";
 
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import { registerSessionResourceCleanup } from "../session-resources.ts";
 import type {
@@ -20,17 +21,25 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
 import {
 	appendAssistantMessageDiagnostic,
 	createAssistantMessageDiagnostic,
 	formatThrownValue,
 } from "../utils/diagnostics.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, ProviderDataError, providerLabel } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import {
+	markProviderStreamObserverFailure,
+	PROVIDER_STREAM_OBSERVER_FAILED,
+	providerResponse,
+	providerStreamNotification,
+} from "../utils/provider-observation.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
 	getDeclaredTools,
@@ -67,6 +76,19 @@ const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
+/** ChatGPT plan names Pi may show in the usage-limit message; any other value is omitted. */
+const CHATGPT_PLANS: ReadonlySet<string> = new Set([
+	"free",
+	"go",
+	"plus",
+	"pro",
+	"team",
+	"business",
+	"enterprise",
+	"edu",
+]);
+/** The longest reset wait Pi shows (one week); a longer or invalid value is omitted. */
+const MAX_USAGE_RESET_MINUTES = 7 * 24 * 60;
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -244,7 +266,8 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 	context: TranscriptContext,
 	options?: OpenAICodexResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	(async () => {
@@ -358,15 +381,10 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
 							throw error;
 						}
+						// The owned type only; the transport error text stays private (smarty-dev#5822 N5682).
 						appendAssistantMessageDiagnostic(
 							output,
-							createAssistantMessageDiagnostic("provider_transport_failure", error, {
-								configuredTransport: transport,
-								...(websocketStarted ? {} : { fallbackTransport: "sse" }),
-								eventsEmitted: websocketStarted,
-								phase: websocketStarted ? "after_message_stream_start" : "before_message_stream_start",
-								requestBytes: new TextEncoder().encode(bodyJson).byteLength,
-							}),
+							createAssistantMessageDiagnostic("provider_transport_failure"),
 						);
 						recordWebSocketFailure(cacheSessionId, error);
 						if (websocketStarted) {
@@ -397,6 +415,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					throw new Error("Request was aborted");
 				}
 
+				checkProviderRequest(options);
 				try {
 					const headerTimeoutSignal =
 						httpTimeoutMs !== undefined && httpTimeoutMs > 0 ? AbortSignal.timeout(httpTimeoutMs) : undefined;
@@ -416,10 +435,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 					} finally {
 						combinedSignal.cleanup();
 					}
-					await options?.onResponse?.(
-						{ status: response.status, headers: headersToRecord(response.headers) },
-						model,
-					);
+					await options?.onResponse?.(providerResponse(response.status));
 
 					if (response.ok) {
 						break;
@@ -443,7 +459,9 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					throw new Error(info.friendlyMessage || info.message);
+					// The friendly text is owned (closed plan, bounded minutes); everything else is a provider error.
+					if (info.friendlyMessage) throw new Error(info.friendlyMessage);
+					throw new ProviderDataError(`${info.message}\n${errorText}`, response.status);
 				} catch (error) {
 					if (error instanceof Error) {
 						if (error.name === "AbortError" || error.message === "Request was aborted") {
@@ -493,7 +511,10 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
+			// Owned text: `<provider> API error (HTTP <status>)`; the body and message only classify (smarty-dev#5822).
+			const norm = normalizeProviderError(error, model.provider, undefined, diagnosticSecrets);
+			output.recovery ??= norm.recovery;
+			output.errorMessage = formatProviderError(norm, `${providerLabel(model.provider)} API error`);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -684,35 +705,35 @@ async function processStream(
 	);
 }
 
-class CodexApiError extends Error {
-	readonly code?: string;
-	readonly payload?: Record<string, unknown>;
+/** The two provider codes Codex acts on, as a closed kind; the provider's code itself is not kept. */
+type CodexApiErrorKind = "connection_limit" | "previous_response_not_found";
 
-	constructor(message: string, options?: { code?: string; payload?: Record<string, unknown>; cause?: unknown }) {
-		super(message);
-		this.name = "CodexApiError";
-		this.code = options?.code;
-		this.payload = options?.payload;
-		this.cause = options?.cause;
+/**
+ * A Codex error built from provider stream data. A provider error by origin: owned message, private text, no
+ * payload or cause (smarty-dev#5822, pi#202 round 3).
+ */
+class CodexApiError extends ProviderDataError {
+	readonly kind?: CodexApiErrorKind;
+
+	constructor(privateText: string, code?: unknown) {
+		super(privateText, undefined, "CodexApiError");
+		if (code === WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE) this.kind = "connection_limit";
+		else if (code === PREVIOUS_RESPONSE_NOT_FOUND_CODE) this.kind = "previous_response_not_found";
 	}
 }
 
-class CodexProtocolError extends Error {
-	readonly payload?: unknown;
-
-	constructor(message: string, options?: { payload?: unknown; cause?: unknown }) {
-		super(message);
-		this.name = "CodexProtocolError";
-		this.payload = options?.payload;
-		this.cause = options?.cause;
+/** An unparsable Codex frame. A provider error by origin; the frame and parser error stay private. */
+class CodexProtocolError extends ProviderDataError {
+	constructor(privateText: string) {
+		super(privateText, undefined, "CodexProtocolError");
 	}
 }
 
 class ProviderStreamEventCallbackError extends Error {
-	constructor(cause: unknown) {
-		super(formatThrownValue(cause));
+	constructor() {
+		// Owned text, and no `cause`: the observer's thrown value is never kept (smarty-dev#5822 C1, pi#202 round 2).
+		super(PROVIDER_STREAM_OBSERVER_FAILED);
 		this.name = "ProviderStreamEventCallbackError";
-		this.cause = cause;
 	}
 }
 
@@ -725,11 +746,11 @@ function isCodexNonTransportError(error: unknown): boolean {
 }
 
 function isWebSocketConnectionLimitReachedError(error: unknown): boolean {
-	return error instanceof CodexApiError && error.code === WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE;
+	return error instanceof CodexApiError && error.kind === "connection_limit";
 }
 
 function isPreviousResponseNotFoundError(error: unknown): boolean {
-	return error instanceof CodexApiError && error.code === PREVIOUS_RESPONSE_NOT_FOUND_CODE;
+	return error instanceof CodexApiError && error.kind === "previous_response_not_found";
 }
 
 function extractCodexEventError(event: Record<string, unknown>): { code?: string; message?: string } {
@@ -753,13 +774,16 @@ async function* mapCodexEvents(
 ): AsyncGenerator<ResponseStreamEvent> {
 	for await (const event of events) {
 		try {
-			await options?.onProviderStreamEvent?.(event, model);
+			options?.signal?.throwIfAborted();
+			const observing = options?.onProviderStreamEvent?.(providerStreamNotification());
+			if (observing) {
+				if (options?.signal) await raceWithAbortSignal(Promise.resolve(observing), options.signal);
+				else await observing;
+			}
 		} catch (error) {
+			if (options?.signal?.aborted) throw error;
 			// The final assistant error must retain this non-transport origin for outer retry callers.
-			appendAssistantMessageDiagnostic(
-				output,
-				createAssistantMessageDiagnostic("provider_stream_observer_error", error),
-			);
+			markProviderStreamObserverFailure(output);
 			// Retain terminal usage even when the observer prevents shared normalization.
 			if (
 				event.type === "response.failed" ||
@@ -776,17 +800,14 @@ async function* mapCodexEvents(
 				});
 			}
 			// Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
-			throw new ProviderStreamEventCallbackError(error);
+			throw new ProviderStreamEventCallbackError();
 		}
 		const type = typeof event.type === "string" ? event.type : undefined;
 		if (!type) continue;
 
 		if (type === "error") {
 			const { code, message } = extractCodexEventError(event);
-			throw new CodexApiError(`Codex error: ${message || code || JSON.stringify(event)}`, {
-				code,
-				payload: event,
-			});
+			throw new CodexApiError(`${code ?? ""}\n${message || JSON.stringify(event)}`, code);
 		}
 
 		if (type === "response.failed") {
@@ -800,7 +821,7 @@ async function* mapCodexEvents(
 			output.rawStopReason = response?.status;
 			const code = response?.error?.code;
 			const message = response?.error?.message;
-			throw new CodexApiError(message || "Codex response failed", { code, payload: event });
+			throw new CodexApiError(`${code ?? ""}\n${message || "Codex response failed"}`, code);
 		}
 
 		if (type === "response.done" || type === "response.completed" || type === "response.incomplete") {
@@ -867,10 +888,7 @@ async function* parseSSE(response: Response, signal?: AbortSignal): AsyncGenerat
 						try {
 							yield JSON.parse(data) as Record<string, unknown>;
 						} catch (cause) {
-							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`, {
-								cause,
-								payload: data,
-							});
+							throw new CodexProtocolError(`Invalid Codex SSE JSON: ${formatThrownValue(cause)}`);
 						}
 					}
 				}
@@ -1007,13 +1025,26 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
+/** Owned category of a WebSocket failure for debug stats; the error's own text never leaves this function. */
+function webSocketErrorCategory(
+	error: unknown,
+): "api_error" | "protocol_error" | "timeout" | "connection_closed" | "network_error" {
+	if (error instanceof CodexApiError) return "api_error";
+	if (error instanceof CodexProtocolError) return "protocol_error";
+	const text = formatThrownValue(error);
+	if (/timed? ?out/i.test(text)) return "timeout";
+	if (/closed|reset|hang up/i.test(text)) return "connection_closed";
+	return "network_error";
+}
+
 function recordWebSocketFailure(sessionId: string | undefined, error: unknown): void {
 	if (!sessionId) return;
 	websocketSseFallbackSessions.add(sessionId);
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	stats.lastWebSocketError = formatThrownValue(error);
+	// Debug stats publish an owned category only, never the error text (smarty-dev#5822, pi#202 round 2).
+	stats.lastWebSocketError = webSocketErrorCategory(error);
 	stats.websocketFallbackActive = true;
 }
 
@@ -1370,10 +1401,7 @@ async function* parseWebSocket(
 				queue.push(parsed);
 				wake();
 			} catch (cause) {
-				failed = new CodexProtocolError(`Invalid Codex WebSocket JSON: ${formatThrownValue(cause)}`, {
-					cause,
-					payload: text,
-				});
+				failed = new CodexProtocolError(`Invalid Codex WebSocket JSON: ${formatThrownValue(cause)}`);
 				done = true;
 				wake();
 			}
@@ -1547,6 +1575,18 @@ async function processWebSocketStream(
 		options?.env,
 	);
 	let keepConnection = true;
+	let released = false;
+	const onAbort = () => {
+		// The parser may be suspended at a stream observer. Invalidate and close
+		// the owned connection here, without waiting for parser advancement.
+		keepConnection = false;
+		if (entry) entry.continuation = undefined;
+		if (!released) {
+			released = true;
+			release({ keep: false });
+		}
+	};
+	options?.signal?.addEventListener("abort", onAbort, { once: true });
 	const useCachedContext = options?.transport === "websocket-cached" || options?.transport === "auto";
 	// ChatGPT Codex Responses rejects `store: true` ("Store must be set to false").
 	// WebSocket continuation still works via connection-scoped previous_response_id state.
@@ -1571,6 +1611,7 @@ async function processWebSocketStream(
 		}
 	}
 	try {
+		checkProviderRequest(options);
 		socket.send(JSON.stringify({ type: "response.create", ...requestBody }));
 		await processResponsesStream(
 			startWebSocketOutputOnFirstEvent(
@@ -1612,7 +1653,8 @@ async function processWebSocketStream(
 		keepConnection = false;
 		throw error;
 	} finally {
-		release({ keep: keepConnection });
+		options?.signal?.removeEventListener("abort", onAbort);
+		if (!released) release({ keep: keepConnection });
 	}
 }
 
@@ -1633,11 +1675,14 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 		if (err) {
 			const code = err.code || err.type || "";
 			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
-				const plan = err.plan_type ? ` (${err.plan_type.toLowerCase()} plan)` : "";
-				const mins = err.resets_at
-					? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
-					: undefined;
-				const when = mins !== undefined ? ` Try again in ~${mins} min.` : "";
+				// Owned text only: a known plan name and a bounded whole number of minutes (smarty-dev#5822).
+				const planType = typeof err.plan_type === "string" ? err.plan_type.toLowerCase() : undefined;
+				const plan = planType && CHATGPT_PLANS.has(planType) ? ` (${planType} plan)` : "";
+				const mins =
+					typeof err.resets_at === "number" && Number.isFinite(err.resets_at)
+						? Math.max(0, Math.round((err.resets_at * 1000 - Date.now()) / 60000))
+						: undefined;
+				const when = mins !== undefined && mins <= MAX_USAGE_RESET_MINUTES ? ` Try again in ~${mins} min.` : "";
 				friendlyMessage = `You have hit your ChatGPT usage limit${plan}.${when}`.trim();
 			}
 			message = err.message || friendlyMessage || message;
@@ -1670,7 +1715,11 @@ function buildBaseCodexHeaders(
 	accountId: string,
 	token: string,
 ): Headers {
-	const headers = new Headers(initHeaders);
+	// Defaults first so model and caller headers can override them, matching the other providers.
+	const headers = new Headers({ originator: "pi", "User-Agent": getPiUserAgent() });
+	for (const [key, value] of Object.entries(initHeaders || {})) {
+		headers.set(key, value);
+	}
 	for (const [key, value] of Object.entries(additionalHeaders || {})) {
 		if (value === null) {
 			headers.delete(key);
@@ -1680,8 +1729,6 @@ function buildBaseCodexHeaders(
 	}
 	headers.set("Authorization", `Bearer ${token}`);
 	headers.set("chatgpt-account-id", accountId);
-	headers.set("originator", "pi");
-	headers.set("User-Agent", getPiUserAgent());
 	return headers;
 }
 

@@ -2134,9 +2134,20 @@ describe("Editor component", () => {
 	describe("Autocomplete", () => {
 		it("triggers and debounces symbol completion after CJK punctuation", async (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
-			for (const before of ["查看，", "\u3000", ..."，．：；！？（）［］｛｝“”‘’…—。、「」『』《》【】"]) {
+			for (const before of [
+				"查看，",
+				"\u3000",
+				..."，．：；！？（）［］｛｝“”‘’…—。、「」『』《》【】",
+				"(",
+				"see (",
+				"`",
+				"[",
+			]) {
 				for (const trigger of ["@", "#", "$", "-"]) {
-					const editor = new Editor(createTestTUI(), defaultEditorTheme);
+					// smarty-dev#7403: unused frame timers must not interfere with the debounce clock.
+					const tui = createTestTUI();
+					tui.stop();
+					const editor = new Editor(tui, defaultEditorTheme);
 					const requests: string[] = [];
 					editor.setAutocompleteProvider({
 						triggerCharacters: ["$", "-"],
@@ -2193,6 +2204,7 @@ describe("Editor component", () => {
 				"Ａ@src",
 				"文档@备份",
 				"prefix#123",
+				"foo(@src",
 				"问题#123",
 				"查看，/path/",
 				"查看，./文档/",

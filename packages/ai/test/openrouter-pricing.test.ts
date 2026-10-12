@@ -71,6 +71,26 @@ describe("OpenRouter pricing", () => {
 		expect(calculateCost(model, routerUsage()).total).toBeCloseTo(0.000542, 10);
 	});
 
+	// smarty-dev#3155 / pi#100: apply the pricing guard to upstream prompt-length tiers too.
+	it("preserves tier fallback prices and rejects negative or invalid override prices", () => {
+		const source: OpenRouterModelListItem = {
+			...router,
+			pricing: {
+				prompt: "0.000001",
+				completion: "0.000002",
+				overrides: [
+					{ min_prompt_tokens: 1000, prompt: "-1", completion: "0.1garbage" },
+					{ min_prompt_tokens: 2000, prompt: "0.000003" },
+				],
+			},
+		};
+		const model = buildOpenRouterCatalog([source], [], []).chat[0];
+		expect(model.cost.tiers).toEqual([
+			{ inputTokensAbove: 1000, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			{ inputTokensAbove: 2000, input: 3, output: 2, cacheRead: 0, cacheWrite: 0 },
+		]);
+	});
+
 	// Regression for Smarty-Pants-Inc/pi#100: verify the committed snapshot, not just the parser.
 	it("ships nonnegative router prices in the built-in catalog", () => {
 		const model = getModel("openrouter", "typesafe/jev-router");

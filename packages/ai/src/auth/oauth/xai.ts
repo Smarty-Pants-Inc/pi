@@ -3,6 +3,7 @@
  */
 
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 
 const XAI_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828";
@@ -98,10 +99,8 @@ async function postForm(url: string, fields: Record<string, string>, signal: Abo
 }
 
 function requestFailure(action: string, response: OAuthHttpResponse): Error {
-	const error = typeof response.body.error === "string" ? response.body.error : undefined;
-	const description =
-		typeof response.body.error_description === "string" ? response.body.error_description : undefined;
-	const detail = [error, description].filter(Boolean).join(": ");
+	// OAuth endpoint text can echo submitted or issued secrets: keep only the protocol error code.
+	const detail = typeof response.body.error === "string" ? oauthAuthorizationError(response.body.error) : undefined;
 	return new Error(`xAI OAuth ${action} failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
 }
 

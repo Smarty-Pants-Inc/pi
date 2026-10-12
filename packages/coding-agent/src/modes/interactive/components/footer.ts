@@ -2,8 +2,9 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { type Component, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { AgentSession } from "../../../core/agent-session.ts";
 import { areExperimentalFeaturesEnabled } from "../../../core/experimental.ts";
+import type { ContextUsage } from "../../../core/extensions/types.ts";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.ts";
-import { addUsageToTotals, createUsageTotals } from "../../../core/usage-totals.ts";
+import { addUsageToTotals, createUsageTotals, type UsageTotals } from "../../../core/usage-totals.ts";
 import { theme } from "../theme/theme.ts";
 
 /**
@@ -43,6 +44,20 @@ export function formatCwdForFooter(cwd: string, home: string | undefined): strin
 	return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
 }
 
+interface SessionStats {
+	session: AgentSession;
+	sessionId: string;
+	leafId: string | null;
+	entryCount: number;
+	sessionManager: AgentSession["sessionManager"];
+	revision: number;
+	sessionName: string | undefined;
+	limitsModel: unknown;
+	usageTotals: UsageTotals;
+	latestCacheHitRate: number | undefined;
+	contextUsage: ContextUsage | undefined;
+}
+
 /**
  * Footer component that shows pwd, token stats, and context usage.
  * Computes token/context stats from session, gets git branch and extension statuses from provider.
@@ -79,11 +94,9 @@ function computeSessionTotals(sessionManager: AgentSession["sessionManager"]): S
 
 export class FooterComponent implements Component {
 	private autoCompactEnabled = true;
-	// The footer renders on every frame; the totals walk the whole session, so reuse them
-	// until the session changes.
-	private totalsCache: { sessionManager: object; revision: number; totals: SessionTotals } | undefined;
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
+	private sessionStats?: SessionStats;
 
 	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
 		this.session = session;
@@ -114,21 +127,56 @@ export class FooterComponent implements Component {
 		// Git watcher cleanup handled by provider
 	}
 
-	render(width: number): string[] {
-		const state = this.session.state;
-
+	/**
+	 * Usage totals and context usage scan the whole session, and the footer renders on every frame.
+	 * Entries are append-only and every append moves the leaf, so the results only change with the
+	 * session, leaf, entry count, or the model whose context window applies.
+	 */
+	private getSessionStats(): SessionStats {
 		const sessionManager = this.session.sessionManager;
 		const revision = sessionManager.revision();
-		let cache = this.totalsCache;
-		if (cache?.sessionManager !== sessionManager || cache.revision !== revision) {
-			cache = { sessionManager, revision, totals: computeSessionTotals(sessionManager) };
-			this.totalsCache = cache;
+		const entryCount = sessionManager.getEntryCount();
+		const sessionId = sessionManager.getSessionId();
+		const leafId = sessionManager.getLeafId();
+		const limitsModel = this.session.routedModel?.model ?? this.session.model;
+		const cached = this.sessionStats;
+		if (
+			cached &&
+			cached.session === this.session &&
+			cached.sessionManager === sessionManager &&
+			cached.revision === revision &&
+			cached.sessionId === sessionId &&
+			cached.leafId === leafId &&
+			cached.entryCount === entryCount &&
+			cached.limitsModel === limitsModel
+		) {
+			return cached;
 		}
-		const { usageTotals, latestCacheHitRate, sessionName } = cache.totals;
+
+		const { usageTotals, latestCacheHitRate, sessionName } = computeSessionTotals(sessionManager);
 
 		// Calculate context usage from session (handles compaction correctly).
 		// After compaction, tokens are unknown until the next LLM response.
 		const contextUsage = this.session.getContextUsage();
+		this.sessionStats = {
+			session: this.session,
+			sessionManager,
+			revision,
+			sessionName,
+			sessionId,
+			leafId,
+			entryCount,
+			limitsModel,
+			usageTotals,
+			latestCacheHitRate,
+			contextUsage,
+		};
+		return this.sessionStats;
+	}
+
+	render(width: number): string[] {
+		const state = this.session.state;
+		const { usageTotals, latestCacheHitRate, contextUsage, sessionName } = this.getSessionStats();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
 		const contextPercentValue = contextUsage?.percent ?? 0;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
@@ -207,6 +255,12 @@ export class FooterComponent implements Component {
 			const thinkingLevel = state.thinkingLevel || "off";
 			rightSideWithoutProvider =
 				thinkingLevel === "off" ? `${modelName} • thinking off` : `${modelName} • ${thinkingLevel}`;
+		}
+		// A virtual model routes each request; show where the latest response went.
+		const routed = this.session.routedModel;
+		if (routed) {
+			const level = routed.thinkingLevel ? ` • ${routed.thinkingLevel}` : "";
+			rightSideWithoutProvider += ` → ${routed.model.id}${level}`;
 		}
 
 		// Prepend the provider in parentheses if there are multiple providers and there's enough room

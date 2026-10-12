@@ -792,6 +792,11 @@ it("notifies idle after a held preflight trigger is explicitly cleared", async (
 	try {
 		h.session.clearQueue();
 		await new Promise<void>((resolve) => setImmediate(resolve));
+		// smarty-dev#3048: clearing queues cannot hide an earlier input admission.
+		expect(h.session.isIdle).toBe(false);
+		expect(notified).toBe(false);
+		inputRelease.release();
+		await prompt;
 		expect(h.session.isIdle).toBe(true);
 		expect(notified).toBe(true);
 		await idle;
