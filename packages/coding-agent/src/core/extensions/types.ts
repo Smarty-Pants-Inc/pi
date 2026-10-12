@@ -816,6 +816,19 @@ export interface SessionStartEvent {
 	previousSessionFile?: string;
 }
 
+/**
+ * Fired once after a /new, /resume or fork replacement publishes its session and lifts the input fence.
+ * Unlike `session_start`, `submitUserMessage()` with `sessionGeneration` is admitted here.
+ * Not fired on startup, reload, a cancelled or unpublished replacement, or once shutdown is requested or begins.
+ */
+export interface SessionReadyEvent {
+	type: "session_ready";
+	/** The replacement that published this session. */
+	reason: "new" | "resume" | "fork";
+	/** Current `userMessageSessionGeneration` when the event was dispatched. */
+	sessionGeneration: string;
+}
+
 /** Fired when the current session metadata changes. */
 export interface SessionInfoChangedEvent {
 	type: "session_info_changed";
@@ -917,6 +930,7 @@ export interface SessionTreeEvent {
 
 export type SessionEvent =
 	| SessionStartEvent
+	| SessionReadyEvent
 	| SessionInfoChangedEvent
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
@@ -1686,6 +1700,7 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>,
 	): () => void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): () => void;
+	on(event: "session_ready", handler: ExtensionHandler<SessionReadyEvent>): () => void;
 	on(event: "session_info_changed", handler: ExtensionHandler<SessionInfoChangedEvent>): () => void;
 	on(
 		event: "session_before_switch",
