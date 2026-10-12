@@ -376,6 +376,7 @@ export class ExtensionRunner {
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
+	private getUserMessageSessionGeneration: () => string = () => "";
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
 	private isIdleFn: () => boolean = () => true;
@@ -441,6 +442,7 @@ export class ExtensionRunner {
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
+		this.runtime.submitUserMessage = actions.submitUserMessage;
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.setSessionName = actions.setSessionName;
 		this.runtime.getSessionName = actions.getSessionName;
@@ -458,6 +460,7 @@ export class ExtensionRunner {
 		this.runtime.createContext = () => this.createContext();
 
 		// Context actions (required)
+		this.getUserMessageSessionGeneration = contextActions.getUserMessageSessionGeneration ?? (() => "");
 		this.getModel = contextActions.getModel;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
@@ -921,6 +924,10 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
+			get userMessageSessionGeneration() {
+				runner.assertActive();
+				return runner.getUserMessageSessionGeneration();
+			},
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;

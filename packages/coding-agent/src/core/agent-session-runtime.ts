@@ -280,6 +280,23 @@ export class AgentSessionRuntime {
 		// results) is persisted to the outgoing session before it is replaced.
 		this.#assertCurrent(outgoing);
 		outgoing.session.shutdownSignal?.throwIfAborted();
+		try {
+			await this.#teardownOutgoing(outgoing, reason, targetSessionFile);
+		} catch (error) {
+			// Teardown began: a failed replacement keeps the outgoing session's receipt ingress closed.
+			// The teardown failure stays the reported cause.
+			try {
+				outgoing.session.closeUserMessageIngressAfterFailedReplacement();
+			} catch {}
+			throw error;
+		}
+	}
+
+	async #teardownOutgoing(
+		outgoing: OutgoingSession,
+		reason: SessionShutdownEvent["reason"],
+		targetSessionFile?: string,
+	): Promise<void> {
 		await outgoing.session.abort();
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
@@ -736,14 +753,29 @@ export class AgentSessionRuntime {
 		beforeShutdown?: () => Promise<void>;
 		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
 	}): Promise<void> {
-		if (options?.terminal) {
-			this.terminalRejection = options.rejectQueuedInput;
-			this.terminalCancellation.abort(
-				new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
-			);
+		if (!options?.terminal) return this.#dispose(options);
+		this.terminalRejection = options.rejectQueuedInput;
+		this.terminalCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
+		);
+		// Cancellation commits before its publication can throw (#5533): still join and detach,
+		// then report the publication failure.
+		let publicationFailure: { cause: unknown } | undefined;
+		try {
 			this.session.cancelForShutdown();
-			if (this.lifecycleActive) await this.lifecycleCompletion;
+		} catch (cause) {
+			publicationFailure = { cause };
 		}
+		if (this.lifecycleActive) await this.lifecycleCompletion;
+		await this.#dispose(options);
+		if (publicationFailure) throw publicationFailure.cause;
+	}
+
+	async #dispose(options?: {
+		terminal?: boolean;
+		beforeShutdown?: () => Promise<void>;
+		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
+	}): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		if (this.lifecycleActive)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
