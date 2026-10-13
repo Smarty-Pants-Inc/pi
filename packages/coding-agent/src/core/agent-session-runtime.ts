@@ -8,6 +8,7 @@ import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agen
 import type {
 	ProjectTrustContext,
 	ReplacedSessionContext,
+	SessionReadyEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "./extensions/index.ts";
@@ -88,7 +89,7 @@ interface OutgoingSession {
  */
 export class AgentSessionRuntime {
 	private rebindSession?: (session: AgentSession) => Promise<void>;
-	private lifecycleCompleteHandler?: () => void;
+	private lifecycleCompleteHandler?: () => boolean | undefined;
 	private beforeSessionInvalidate?: () => void;
 	private _session: AgentSession;
 	private _services: AgentSessionServices;
@@ -104,6 +105,8 @@ export class AgentSessionRuntime {
 	private readonly terminalCancellation = new AbortController();
 	private terminalRejection?: (messages: AgentMessage[], session: AgentSession) => void;
 	private releaseReceivingInputs?: () => void;
+	/** Session the current lifecycle published, with its session_start reason, for session_ready. */
+	#published?: { session: AgentSession; reason: SessionReadyEvent["reason"] };
 
 	constructor(
 		_session: AgentSession,
@@ -145,6 +148,7 @@ export class AgentSessionRuntime {
 		if (this._disposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "runtime is disposed");
 		if (!rejectQueuedInput) this.terminalCancellation.signal.throwIfAborted();
 		this.lifecycleActive = true;
+		this.#published = undefined;
 		this.lifecycleCompletion = new Promise<void>((resolve) => {
 			this.completeLifecycle = resolve;
 		});
@@ -158,9 +162,28 @@ export class AgentSessionRuntime {
 				this.releaseReceivingInputs?.();
 				this.releaseReceivingInputs = undefined;
 				release();
+				const published = this.#published;
+				this.#published = undefined;
 				this.lifecycleActive = false;
 				this.completeLifecycle?.();
-				queueMicrotask(() => this.lifecycleCompleteHandler?.());
+				queueMicrotask(() => {
+					// The mode decides deferred shutdown first. Its shutdown may still be waiting for the
+					// event loop (RPC defers it a macrotask), so a pending request also withholds readiness:
+					// otherwise a session_ready handler could start a turn that the shutdown then waits for.
+					const shutdownPending = this.lifecycleCompleteHandler?.() === true;
+					// smarty-dev#10453: announce the published replacement only once its input fence is gone.
+					// Skip it if shutdown (requested or begun), disposal or another lifecycle (or session) took over.
+					if (
+						!published ||
+						shutdownPending ||
+						this._disposed ||
+						this.lifecycleActive ||
+						this.terminalCancellation.signal.aborted ||
+						this._session !== published.session
+					)
+						return;
+					published.session.emitSessionReady(published.reason);
+				});
 			};
 		} catch (error) {
 			this.lifecycleActive = false;
@@ -181,8 +204,11 @@ export class AgentSessionRuntime {
 		return this._modelFallbackMessage;
 	}
 
-	/** @internal Recheck mode-owned deferred work only after lifecycle fences release. */
-	setLifecycleCompleteHandler(handler?: () => void): void {
+	/**
+	 * @internal Recheck mode-owned deferred work only after lifecycle fences release.
+	 * Return true when the mode has a pending shutdown request: the runtime then withholds `session_ready`.
+	 */
+	setLifecycleCompleteHandler(handler?: () => boolean | undefined): void {
 		this.lifecycleCompleteHandler = handler;
 	}
 
@@ -280,6 +306,23 @@ export class AgentSessionRuntime {
 		// results) is persisted to the outgoing session before it is replaced.
 		this.#assertCurrent(outgoing);
 		outgoing.session.shutdownSignal?.throwIfAborted();
+		try {
+			await this.#teardownOutgoing(outgoing, reason, targetSessionFile);
+		} catch (error) {
+			// Teardown began: a failed replacement keeps the outgoing session's receipt ingress closed.
+			// The teardown failure stays the reported cause.
+			try {
+				outgoing.session.closeUserMessageIngressAfterFailedReplacement();
+			} catch {}
+			throw error;
+		}
+	}
+
+	async #teardownOutgoing(
+		outgoing: OutgoingSession,
+		reason: SessionShutdownEvent["reason"],
+		targetSessionFile?: string,
+	): Promise<void> {
 		await outgoing.session.abort();
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
@@ -372,7 +415,7 @@ export class AgentSessionRuntime {
 					// Without a fence, gate direct admission until the lifecycle releases, so callbacks keep
 					// the fenced path's admission scope and terminal-cancellation race (pi#163 security P2).
 					this.releaseReceivingInputs = release ?? session.gateInputs();
-					this.#publish(session, services, diagnostics, modelFallbackMessage);
+					this.#publish(session, services, diagnostics, modelFallbackMessage, options.sessionStartEvent);
 					let cause = error;
 					try {
 						await finish();
@@ -404,7 +447,7 @@ export class AgentSessionRuntime {
 				{ cause, recoveredInput },
 			);
 		}
-		this.#publish(session, services, diagnostics, modelFallbackMessage);
+		this.#publish(session, services, diagnostics, modelFallbackMessage, options.sessionStartEvent);
 		await finish();
 	}
 
@@ -413,7 +456,10 @@ export class AgentSessionRuntime {
 		services: AgentSessionServices,
 		diagnostics: AgentSessionRuntimeDiagnostic[],
 		modelFallbackMessage: string | undefined,
+		sessionStartEvent: SessionStartEvent | undefined,
 	): void {
+		const reason = sessionStartEvent?.reason;
+		if (reason === "new" || reason === "resume" || reason === "fork") this.#published = { session, reason };
 		this._session = session;
 		this._services = services;
 		this._diagnostics = diagnostics;
@@ -736,14 +782,29 @@ export class AgentSessionRuntime {
 		beforeShutdown?: () => Promise<void>;
 		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
 	}): Promise<void> {
-		if (options?.terminal) {
-			this.terminalRejection = options.rejectQueuedInput;
-			this.terminalCancellation.abort(
-				new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
-			);
+		if (!options?.terminal) return this.#dispose(options);
+		this.terminalRejection = options.rejectQueuedInput;
+		this.terminalCancellation.abort(
+			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
+		);
+		// Cancellation commits before its publication can throw (#5533): still join and detach,
+		// then report the publication failure.
+		let publicationFailure: { cause: unknown } | undefined;
+		try {
 			this.session.cancelForShutdown();
-			if (this.lifecycleActive) await this.lifecycleCompletion;
+		} catch (cause) {
+			publicationFailure = { cause };
 		}
+		if (this.lifecycleActive) await this.lifecycleCompletion;
+		await this.#dispose(options);
+		if (publicationFailure) throw publicationFailure.cause;
+	}
+
+	async #dispose(options?: {
+		terminal?: boolean;
+		beforeShutdown?: () => Promise<void>;
+		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
+	}): Promise<void> {
 		if (this.#ownerDisposal) return this.#ownerDisposal;
 		if (this.lifecycleActive)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");

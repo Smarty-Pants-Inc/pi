@@ -513,10 +513,11 @@ describe("assistant message frames", () => {
 
 	it("snapshots mutable event data and keeps reduction pure", () => {
 		const partial = seed();
-		partial.diagnostics = [{ type: "test", timestamp: 2, details: { value: "original" } }];
+		const diagnostic = { type: "anthropic_input_transformations" as const, timestamp: 2, thinkingBlocksDropped: 1 };
+		partial.diagnostics = [diagnostic];
 		const encoder = new AssistantMessageFrameEncoder();
 		const start = frame(encoder, { type: "start", partial });
-		partial.diagnostics[0]!.details!.value = "mutated";
+		diagnostic.thinkingBlocksDropped = 5;
 		partial.usage.cost.total = 99;
 
 		partial.content.push({
@@ -531,7 +532,7 @@ describe("assistant message frames", () => {
 		(sourceTool.arguments.nested as Record<string, unknown>).value = "mutated";
 
 		const reduced = reduceAssistantMessageFrames([start, toolStart]);
-		expect(reduced?.diagnostics?.[0]?.details?.value).toBe("original");
+		expect(reduced?.diagnostics?.[0]?.thinkingBlocksDropped).toBe(1);
 		expect(reduced?.usage.cost.total).toBe(0);
 		expect(reduced?.content[0]).toMatchObject({ arguments: { nested: { value: "original" } } });
 

@@ -204,6 +204,18 @@ class PendingMessageQueue {
 		this.reserved = 0;
 	}
 
+	remove(predicate: (message: AgentMessage) => boolean): void {
+		for (let index = this.messages.length - 1; index >= 0; index--) {
+			const message = this.messages[index];
+			if (!predicate(message)) continue;
+			this.messages.splice(index, 1);
+			if (index < this.reserved) this.reserved--;
+			// Keep reservation slots stable: the loop skips this slot before message_start.
+			const selectedIndex = this.selected.indexOf(message);
+			if (selectedIndex >= 0) delete this.selected[selectedIndex];
+		}
+	}
+
 	clear(): void {
 		this.messages = [];
 		this.release();
@@ -380,8 +392,12 @@ export class Agent {
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
+	followUp(
+		message: AgentMessage,
+		/** @internal Runs after insertion, before external observers. */ onEnqueued?: () => void,
+	): void {
 		this.followUpQueue.enqueue(message);
+		onEnqueued?.();
 		this.observe("queue_update");
 	}
 
@@ -401,6 +417,13 @@ export class Agent {
 	clearAllQueues(): void {
 		this.clearSteeringQueue();
 		this.clearFollowUpQueue();
+	}
+
+	/** Remove selected queued messages without releasing or retargeting other reservations. */
+	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): void {
+		this.steeringQueue.remove(predicate);
+		this.followUpQueue.remove(predicate);
+		this.observe("queue_update");
 	}
 
 	/** Returns true when either queue still contains pending messages. */

@@ -518,7 +518,7 @@ describe.skip("limits and lifetime", () => {
 		expect(performance.now() - started).toBeLessThan(5_000);
 	});
 
-	it("runs without a deadline when timeoutMs is Infinity", async () => {
+	it("runs with the host's maximum deadline when timeoutMs is Infinity", async () => {
 		const sandbox = createSandbox([
 			{ name: "wait", execute: () => new Promise((r) => setTimeout(() => r("late"), 50)) },
 		]);

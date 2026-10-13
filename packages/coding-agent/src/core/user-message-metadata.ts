@@ -63,12 +63,24 @@ export function assertExtensionMetadataCaller(extensionPath: string): void {
 	}
 }
 
-/** Private loader route, not exported from the SDK. Caller fields never select the source. */
+/**
+ * Private loader route, not exported from the SDK. Caller fields never select the source.
+ * `metadata` is the caller's `options.metadata`, read exactly once by the caller so that
+ * classification, binding and core validation all see the same value. The caller's
+ * options object never reaches the runtime; only a snapshot of declared fields does.
+ */
 export function bindExtensionMetadataSource(
 	options: SendUserMessageOptions | undefined,
 	extensionPath: string | undefined,
+	metadata: UserMessageMetadata | undefined,
 ): SendUserMessageOptions | undefined {
-	if (options?.metadata === undefined) return options;
+	if (!options) return options;
+	const bound: SendUserMessageOptions = {
+		metadata,
+		deliverAs: options.deliverAs,
+		expandPromptTemplates: options.expandPromptTemplates,
+	};
+	if (metadata === undefined) return bound;
 	const caller = extensionExecution.getStore();
 	if (extensionPath === undefined || caller === undefined) {
 		throw new UserMessageMetadataError(
@@ -77,14 +89,23 @@ export function bindExtensionMetadataSource(
 		);
 	}
 	assertExtensionMetadataCaller(extensionPath);
-	const bound: SendUserMessageOptions = {
-		metadata: options.metadata,
-		deliverAs: options.deliverAs,
-		expandPromptTemplates: options.expandPromptTemplates,
-	};
 	// Only the SDK session's direct admission route may fall back to sdk.
 	extensionSources.set(bound, Object.freeze({ kind: "extension", extensionPath: caller }));
 	return bound;
+}
+
+/**
+ * Private submitUserMessage route. Unlike send metadata, submit may run from an external callback:
+ * - no extension execution context: unbound options, so admission stamps sdk;
+ * - the API owner's own execution context: options stamped with its extension source;
+ * - another extension's execution context (borrowed API): undefined, the caller refuses before admission.
+ */
+export function bindSubmitUserMessageSource(extensionPath: string): SendUserMessageOptions | undefined {
+	const caller = extensionExecution.getStore();
+	if (caller === undefined) return { metadata: {} };
+	if (caller !== extensionPath) return undefined;
+	const metadata = {};
+	return bindExtensionMetadataSource({ metadata }, extensionPath, metadata);
 }
 
 /** Private replacement-context route: capture its extension owner without exposing a selectable source. */
@@ -96,7 +117,7 @@ export function bindExtensionMetadataSender<
 >(sender: Sender): Sender {
 	const extensionPath = extensionExecution.getStore();
 	return (async (content, options) =>
-		sender(content, bindExtensionMetadataSource(options, extensionPath) ?? {})) as Sender;
+		sender(content, bindExtensionMetadataSource(options, extensionPath, options?.metadata) ?? {})) as Sender;
 }
 
 /** Private admission route; never read an options.metadataSource or metadata claim. */

@@ -7,6 +7,7 @@ import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
+	isolateValue,
 	type Model,
 	type Provider,
 	type ProviderHeaders,
@@ -375,6 +376,7 @@ export class ExtensionRunner {
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
+	private getUserMessageSessionGeneration: () => string = () => "";
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
 	private isIdleFn: () => boolean = () => true;
@@ -440,6 +442,7 @@ export class ExtensionRunner {
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
+		this.runtime.submitUserMessage = actions.submitUserMessage;
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.setSessionName = actions.setSessionName;
 		this.runtime.getSessionName = actions.getSessionName;
@@ -457,6 +460,7 @@ export class ExtensionRunner {
 		this.runtime.createContext = () => this.createContext();
 
 		// Context actions (required)
+		this.getUserMessageSessionGeneration = contextActions.getUserMessageSessionGeneration ?? (() => "");
 		this.getModel = contextActions.getModel;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
@@ -920,6 +924,10 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
+			get userMessageSessionGeneration() {
+				runner.assertActive();
+				return runner.getUserMessageSessionGeneration();
+			},
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;
@@ -1316,13 +1324,13 @@ export class ExtensionRunner {
 					// Keep AbortSignal identity: structured cloning cannot preserve its behavior.
 					const snapshot =
 						"signal" in event
-							? { ...structuredClone({ ...event, signal: undefined }), signal: event.signal }
-							: structuredClone(event);
+							? { ...isolateValue({ ...event, signal: undefined }), signal: event.signal }
+							: isolateValue(event);
 					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
 					signal?.throwIfAborted();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
-						result = structuredClone(handlerResult) as SessionBeforeEventResult;
+						result = isolateValue(handlerResult) as SessionBeforeEventResult;
 						if (result.cancel) {
 							return result as RunnerEmitResult<TEvent>;
 						}
@@ -1386,7 +1394,7 @@ export class ExtensionRunner {
 				try {
 					// A cancelled handler can outlive disposal. Neither its draft nor a
 					// returned replacement may alias finalized state, including nested content.
-					const draft = structuredClone(currentMessage);
+					const draft = isolateValue(currentMessage);
 					const currentEvent: MessageEndEvent = { ...event, message: draft };
 					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
 						| MessageEndEventResult
@@ -1403,7 +1411,7 @@ export class ExtensionRunner {
 					}
 
 					if (!isDeepStrictEqual(candidate, currentMessage)) {
-						currentMessage = structuredClone(candidate);
+						currentMessage = isolateValue(candidate);
 						modified = true;
 					}
 				} catch (err) {
@@ -1427,7 +1435,7 @@ export class ExtensionRunner {
 		await this.closeToolScope(event.toolCallId);
 		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
-		const currentEvent: ToolResultEvent = structuredClone(event);
+		const currentEvent: ToolResultEvent = isolateValue(event);
 		let modified = false;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "tool_result")) {
@@ -1480,7 +1488,7 @@ export class ExtensionRunner {
 			return undefined;
 		}
 
-		return structuredClone({
+		return isolateValue({
 			content: currentEvent.content,
 			details: currentEvent.details,
 			structuredContent: currentEvent.structuredContent,

@@ -14,6 +14,13 @@ import type {
 } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
 import {
+	BridgeBudget,
+	CodemodeLimitError,
+	type CodemodeLimits,
+	checkCodemodeStoreQuota,
+	resolveCodemodeLimits,
+} from "./limits.ts";
+import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
 	type WorkerData,
@@ -106,13 +113,16 @@ interface PendingCall {
 	controller: AbortController;
 }
 
-interface ExecutionOptions {
+export interface ExecutionOptions {
 	code: string;
 	tools: ReadonlyMap<string, CodemodeTool>;
 	globals: ReadonlyMap<string, CodemodeTool>;
 	timeoutMs: number;
 	signal: AbortSignal | undefined;
 	memoryLimitBytes: number | undefined;
+	limits: CodemodeLimits;
+	/** The store as passed by the caller, for the host-side quota check of the script's writes. */
+	snapshot: Readonly<Record<string, unknown>>;
 	store: Record<string, string>;
 	wasm: Promise<CodemodeWasmModule>;
 	workerUrl: string | URL;
@@ -122,8 +132,9 @@ interface ExecutionOptions {
  * One script run in its own worker and QuickJS VM. A fresh worker per run keeps
  * termination simple: a runaway script, including one that only spins the
  * microtask queue, is killed with `terminate()` and cannot poison a later run.
+ * Exported for tests; use {@link CodemodeSandbox}.
  */
-class Execution {
+export class Execution {
 	readonly promise: Promise<CodemodeResult>;
 	private resolveResult!: (result: CodemodeResult) => void;
 	private worker: Worker | undefined;
@@ -131,7 +142,9 @@ class Execution {
 	private readonly tools: ReadonlyMap<string, CodemodeTool>;
 	private readonly globals: ReadonlyMap<string, CodemodeTool>;
 	private readonly signal: AbortSignal | undefined;
-	private readonly timer: NodeJS.Timeout | undefined;
+	private readonly timer: NodeJS.Timeout;
+	private readonly budget: BridgeBudget;
+	private readonly snapshot: Readonly<Record<string, unknown>>;
 	private readonly output: CodemodeOutputItem[] = [];
 	private readonly calls: CodemodeCall[] = [];
 	private readonly pending = new Map<number, PendingCall>();
@@ -144,12 +157,14 @@ class Execution {
 		this.tools = options.tools;
 		this.globals = options.globals;
 		this.signal = options.signal;
+		this.budget = new BridgeBudget(options.limits);
+		this.snapshot = options.snapshot;
 
-		if (Number.isFinite(options.timeoutMs)) {
-			this.timer = setTimeout(() => {
-				this.finish({ kind: "timeout", message: `Execution timed out after ${options.timeoutMs} ms` });
-			}, options.timeoutMs);
-		}
+		// The host owns the deadline: a longer or infinite request is clamped, so nothing waits forever.
+		const timeoutMs = Math.min(options.timeoutMs, options.limits.maxTimeoutMs);
+		this.timer = setTimeout(() => {
+			this.finish({ kind: "timeout", message: `Execution timed out after ${timeoutMs} ms` });
+		}, timeoutMs);
 
 		if (options.signal) {
 			if (options.signal.aborted) {
@@ -187,6 +202,7 @@ class Execution {
 			})),
 			wasm,
 			memoryLimitBytes: options.memoryLimitBytes,
+			limits: options.limits,
 			store: options.store,
 			interrupt: this.interrupt,
 		};
@@ -203,6 +219,10 @@ class Execution {
 			try {
 				this.handleMessage(message);
 			} catch (error) {
+				if (error instanceof CodemodeLimitError) {
+					this.finish({ kind: "limit", message: error.message });
+					return;
+				}
 				this.finish({
 					kind: "sandbox",
 					message:
@@ -236,12 +256,15 @@ class Execution {
 	private handleMessage(message: unknown): void {
 		if (this.finished) return;
 		if (!isWorkerToHostMessage(message)) throw new BridgeError("unknown message from the worker");
+		if (message.type === "call" && this.pending.has(message.id)) {
+			throw new BridgeError(`duplicate call id ${message.id}`);
+		}
+		this.budget.charge(message);
 		switch (message.type) {
 			case "output":
 				this.output.push(message.item);
 				break;
 			case "call":
-				if (this.pending.has(message.id)) throw new BridgeError(`duplicate call id ${message.id}`);
 				void this.handleCall(message);
 				break;
 			case "done":
@@ -249,6 +272,9 @@ class Execution {
 				break;
 			case "crash":
 				this.finish({ kind: "sandbox", message: message.message });
+				break;
+			case "limit":
+				this.finish({ kind: "limit", message: message.message });
 				break;
 		}
 	}
@@ -260,7 +286,9 @@ class Execution {
 			return;
 		}
 		const value = message.value === undefined ? undefined : parseBridgeJson(message.value, "return value");
-		this.finish(undefined, value, parseStoreWrites(message.writes));
+		const writes = parseStoreWrites(message.writes);
+		checkCodemodeStoreQuota(this.snapshot, writes);
+		this.finish(undefined, value, writes);
 	}
 
 	private async handleCall(message: Extract<WorkerToHostMessage, { type: "call" }>): Promise<void> {
@@ -291,6 +319,12 @@ class Execution {
 		if (record) {
 			record.status = status;
 			record.durationMs = performance.now() - pending.startedAt;
+		}
+		try {
+			this.budget.settle(reply.payload?.length ?? 0);
+		} catch (error) {
+			this.finish({ kind: "limit", message: errorMessage(error) });
+			return;
 		}
 		this.post(reply);
 	}
@@ -343,6 +377,7 @@ export class CodemodeSandbox {
 	private readonly globalsByName = new Map<string, CodemodeTool>();
 	private readonly timeoutMs: number;
 	private readonly memoryLimitBytes: number | undefined;
+	private readonly limits: CodemodeLimits;
 	private readonly wasm: CodemodeWasmModule | Promise<CodemodeWasmModule> | undefined;
 	private readonly workerUrl: string | URL;
 	private readonly running = new Set<Execution>();
@@ -352,6 +387,7 @@ export class CodemodeSandbox {
 		refuseCodemodeAdmission();
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		this.memoryLimitBytes = options.memoryLimitBytes;
+		this.limits = resolveCodemodeLimits(options.limits);
 		this.wasm = options.wasm;
 		this.workerUrl = options.workerUrl ?? defaultWorkerUrl();
 		for (const tool of options.tools ?? []) this.registerTool(tool);
@@ -402,6 +438,8 @@ export class CodemodeSandbox {
 			timeoutMs: options.timeoutMs ?? this.timeoutMs,
 			signal: options.signal,
 			memoryLimitBytes: this.memoryLimitBytes,
+			limits: this.limits,
+			snapshot: options.store ?? {},
 			store: serializeStore(options.store),
 			wasm: this.wasm === undefined ? loadQuickJSWasm() : Promise.resolve(this.wasm),
 			workerUrl: this.workerUrl,

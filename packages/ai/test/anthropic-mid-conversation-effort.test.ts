@@ -67,19 +67,37 @@ async function capture(
 	effort?: "low" | "medium" | "high" | "xhigh" | "max",
 ): Promise<{ payload: CapturedPayload; message: AssistantMessage }> {
 	let payload: CapturedPayload | undefined;
+	// Complete successfully: wire effort metadata is published only on a successful result (smarty-dev#5822 C2).
 	const result = stream(model, normalizeContext(context), {
 		apiKey: "test-key",
 		cacheRetention: "none",
 		thinkingEnabled: true,
 		effort,
+		maxRetries: 0,
 		onPayload: (value) => {
 			payload = value as CapturedPayload;
-			throw new Error("payload captured");
 		},
+		fetch: async () => completedResponse(),
 	});
 	const message = await result.result();
+	if (message.stopReason !== "stop") throw new Error(`Expected a completed response: ${message.errorMessage}`);
 	if (!payload) throw new Error("Expected payload capture");
 	return { payload, message };
+}
+
+function completedResponse(): Response {
+	const events = [
+		{
+			type: "message_start",
+			message: { id: "msg_effort", model: "claude-fable-5-1", usage: { input_tokens: 1, output_tokens: 0 } },
+		},
+		{ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+		{ type: "message_stop" },
+	];
+	return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
 }
 
 const user = (text: string, timestamp: number) => ({ role: "user" as const, content: text, timestamp });

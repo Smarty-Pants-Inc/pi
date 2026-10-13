@@ -18,8 +18,9 @@ import type {
 import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import type { ExtensionRunner, ExtensionUIContext } from "../../src/core/extensions/index.ts";
+import type { ExtensionRunner, ExtensionUIContext, SessionStartEvent } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
+import type { ModelRuntime } from "../../src/core/model-runtime.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
@@ -111,6 +112,9 @@ export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {})
 
 export interface HarnessOptions {
 	persistSession?: boolean;
+	/** Runtime replacement tests supply the destination cwd and lifecycle metadata. */
+	cwd?: string;
+	sessionStartEvent?: SessionStartEvent;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
 	tools?: AgentTool[];
@@ -131,6 +135,8 @@ export interface Harness {
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	authStorage: AuthStorage;
+	modelRuntime: ModelRuntime;
+	resourceLoader: ResourceLoader;
 	faux: FauxProviderRegistration;
 	models: [Model<string>, ...Model<string>[]];
 	getModel(): Model<string>;
@@ -161,9 +167,10 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
+	const cwd = options.cwd ?? tempDir;
 	const sessionManager =
 		options.sessionManager ??
-		(options.persistSession ? SessionManager.create(tempDir, tempDir) : SessionManager.inMemory());
+		(options.persistSession ? SessionManager.create(cwd, tempDir) : SessionManager.inMemory());
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -217,11 +224,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			if (!runner?.hasHandlers("after_provider_response")) {
 				return;
 			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
+			await runner.emit({ type: "after_provider_response", status: response.status });
 		},
 		transformContext: async (messages: AgentMessage[]) => {
 			const runner = extensionRunnerRef.current;
@@ -230,17 +233,19 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		},
 	});
 	const extensionsResult = options.extensionFactories
-		? await createTestExtensionsResult(options.extensionFactories, tempDir)
+		? await createTestExtensionsResult(options.extensionFactories, cwd)
 		: undefined;
 	const resourceLoader =
 		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
+	const modelRuntime = getModelRuntime(modelRegistry);
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settingsManager,
-		cwd: tempDir,
-		modelRuntime: getModelRuntime(modelRegistry),
+		cwd,
+		modelRuntime,
+		sessionStartEvent: options.sessionStartEvent,
 		resourceLoader,
 		baseToolsOverride: toolMap,
 		initialActiveToolNames: options.initialActiveToolNames,
@@ -259,6 +264,8 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		sessionManager,
 		settingsManager,
 		authStorage,
+		modelRuntime,
+		resourceLoader,
 		faux: fauxProvider,
 		models: fauxProvider.models,
 		getModel: fauxProvider.getModel,

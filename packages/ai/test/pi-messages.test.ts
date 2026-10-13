@@ -165,7 +165,8 @@ describe("pi-messages", () => {
 		});
 	});
 
-	it("forwards parsed wire events in order before converting them", async () => {
+	// smarty-dev#5822 C1: one owned notification per wire event, never the event, gateway field or model.
+	it("notifies once per parsed wire event without provider data", async () => {
 		const wireEvents = [
 			{ type: "start" },
 			{ type: "text_start", contentIndex: 0 },
@@ -175,44 +176,42 @@ describe("pi-messages", () => {
 		];
 		const { baseUrl } = await startServer({ events: wireEvents });
 		const model = createModel(baseUrl);
-		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const message = await streamSimple(model, normalizeContext(context), {
 			apiKey: "test-key",
-			onProviderStreamEvent: async (event, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(event);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		}).result();
 
-		expect(received).toEqual(wireEvents);
-		expect(eventModels).toEqual(wireEvents.map(() => model));
+		expect(calls).toEqual(wireEvents.map(() => [{ type: "provider_stream_event" }]));
 		expect(message.stopReason).toBe("stop");
 		expect(message.responseId).toBe("resp_1");
 		expect(message.content).toEqual([{ type: "text", text: "Hello", textSignature: undefined }]);
 	});
 
-	it("appends debug=1 and reports response headers via onResponse", async () => {
+	// smarty-dev#5822 C1: gateway response headers never reach onResponse.
+	it("appends debug=1 and reports only the status via onResponse", async () => {
 		const { baseUrl, requests } = await startServer({
 			headers: { "x-pi-gateway-upstream-provider": "anthropic" },
 			events: [{ type: "done", reason: "stop", usage }],
 		});
 		const model = createModel(baseUrl);
 
-		let observedHeaders: Record<string, string> | undefined;
+		const observed: unknown[][] = [];
 		const options = {
 			apiKey: "test-key",
 			debug: true,
-			onResponse: (response) => {
-				observedHeaders = response.headers;
+			onResponse: (...args: unknown[]) => {
+				observed.push(args);
 			},
 		} satisfies PiMessagesOptions;
 		const message = await streamSimple(model, normalizeContext(context), options).result();
 
 		expect(message.stopReason).toBe("stop");
 		expect(requests[0].url).toBe("/v1/messages?debug=1");
-		expect(observedHeaders?.["x-pi-gateway-upstream-provider"]).toBe("anthropic");
+		expect(observed).toEqual([[{ status: 200 }]]);
 	});
 
 	it("surfaces backend error responses with diagnostics", async () => {
@@ -225,11 +224,10 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "stale" }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toContain("401");
-		expect(message.errorMessage).toContain("Token expired");
-		expect(message.errorMessage).toContain("unauthorized");
-		expect(message.diagnostics?.[0]?.type).toBe("pi_messages_response_failure");
-		expect(message.diagnostics?.[0]?.details?.status).toBe(401);
+		// smarty-dev#5822 (pi#202 round 2): owned text; the backend message never reaches errorMessage.
+		expect(message.errorMessage).toBe("Provider request failed (HTTP 401, unauthorized)");
+		// smarty-dev#5822 N5682: the owned type only, without the URL, status or body.
+		expect(message.diagnostics).toEqual([{ type: "pi_messages_response_failure", timestamp: expect.any(Number) }]);
 	});
 
 	it("propagates server-sent error events", async () => {
@@ -241,7 +239,8 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "test-key" }).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toBe("Upstream failed");
+		// smarty-dev#5822 (pi#202 round 3): the wire error text only classifies; the published text is owned.
+		expect(message.errorMessage).toBe("Provider request failed");
 		expect(message.usage).toEqual(usage);
 	});
 

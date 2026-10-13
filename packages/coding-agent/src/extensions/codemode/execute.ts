@@ -19,6 +19,8 @@ import {
 	type CodemodeResult,
 	CodemodeSandbox,
 	type CodemodeTool,
+	checkCodemodeStoreQuota,
+	DEFAULT_CODEMODE_LIMITS,
 	loadQuickJSWasm,
 	parseCodemodeSource,
 	renderToolSample,
@@ -202,18 +204,39 @@ interface ModelCallResult {
 	usage?: Usage;
 }
 
-/** Runs at most `limit` calls at once, in call order. */
-function createLimiter(limit: number): <T>(run: () => Promise<T>) => Promise<T> {
+/**
+ * Runs at most `limit` calls at once, in call order. A queued call whose signal aborts leaves the
+ * queue at once and rejects, so a finished script leaves no waiter behind.
+ */
+export function createLimiter(limit: number): <T>(run: () => Promise<T>, signal: AbortSignal) => Promise<T> {
 	let active = 0;
-	const waiting: (() => void)[] = [];
-	return async (run) => {
-		if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+	const waiting = new Set<() => void>();
+	return async (run, signal) => {
+		if (active >= limit) {
+			await new Promise<void>((resolve, reject) => {
+				const onAbort = () => {
+					waiting.delete(wake);
+					reject(signal.reason);
+				};
+				const wake = () => {
+					signal.removeEventListener("abort", onAbort);
+					resolve();
+				};
+				if (signal.aborted) return reject(signal.reason);
+				waiting.add(wake);
+				signal.addEventListener("abort", onAbort, { once: true });
+			});
+		}
 		active++;
 		try {
 			return await run();
 		} finally {
 			active--;
-			waiting.shift()?.();
+			const [next] = waiting;
+			if (next) {
+				waiting.delete(next);
+				next();
+			}
 		}
 	};
 }
@@ -309,7 +332,9 @@ function formatError(result: Extract<CodemodeResult, { ok: false }>, calls: read
 				? `Script timed out: ${error.message}`
 				: error.kind === "aborted"
 					? `Script aborted: ${error.message}`
-					: `Script sandbox failed: ${error.message}`;
+					: error.kind === "limit"
+						? `Script exceeded a limit: ${error.message}`
+						: `Script sandbox failed: ${error.message}`;
 	return `${head}\n\n${formatCallSummary(calls)}`;
 }
 
@@ -481,7 +506,8 @@ export async function executeCodemode(
 				? createModelGlobals(ctx.modelRegistry, toolCallId, calls, publish, addModelUsage, addGeneratedImages)
 				: []),
 		],
-		timeoutMs: sourceOptions.timeoutMs ?? Number.POSITIVE_INFINITY,
+		// The host clamps this to its maximum, so a script cannot remove the deadline.
+		timeoutMs: sourceOptions.timeoutMs ?? DEFAULT_CODEMODE_LIMITS.maxTimeoutMs,
 		memoryLimitBytes: CODEMODE_MEMORY_LIMIT_BYTES,
 		wasm: loadQuickJSWasm(getQuickJSWasmPath()),
 		workerUrl: getCodemodeWorkerSpecifier(),
@@ -500,16 +526,25 @@ export async function executeCodemode(
 	}
 
 	const scriptOutput = [...result.output];
+	let storeError: string | undefined;
 	if (result.ok) {
 		const { set, delete: deleted } = result.storeWrites;
 		if (Object.keys(set).length > 0 || deleted.length > 0) {
-			options.appendEntry?.(CODEMODE_STORE_ENTRY_TYPE, { set, delete: deleted });
+			// Check against the store as it is now, not the snapshot the script started from: a parallel
+			// script may have written since. Nothing awaits between the check and the append.
+			try {
+				checkCodemodeStoreQuota(ctx ? readCodemodeStore(ctx.sessionManager.getBranch()) : {}, result.storeWrites);
+				options.appendEntry?.(CODEMODE_STORE_ENTRY_TYPE, { set, delete: deleted });
+			} catch (error) {
+				storeError = error instanceof Error ? error.message : String(error);
+			}
 		}
 		// pi extension: a returned value is appended like text().
 		if (result.value !== undefined) scriptOutput.push({ type: "text", text: valueText(result.value) });
 	}
 	const items = formatOutput(scriptOutput);
 	if (!result.ok) items.push({ type: "text", text: `Script error:\n${formatError(result, calls)}` });
+	if (storeError) items.push({ type: "text", text: `Store writes were not saved: ${storeError}` });
 	if (generatedImages > 0 && !items.some((item) => item.type === "image")) {
 		items.push({
 			type: "text",
@@ -532,7 +567,7 @@ export async function executeCodemode(
 		content: [{ type: "text", text: header }, ...output],
 		details,
 		...(modelUsage ? { usage: modelUsage } : {}),
-		...(result.ok ? {} : { isError: true }),
+		...(result.ok && !storeError ? {} : { isError: true }),
 	};
 }
 
@@ -645,6 +680,7 @@ function createModelGlobals(
 		[model, context]: unknown[],
 		checkContext: (context: unknown) => TContext,
 		run: (resolved: ModelTypeMap[TType], context: TContext) => Promise<TResult>,
+		signal: AbortSignal,
 	): Promise<TResult> => {
 		const listHint = `List the ${type} models you can use with models.getAvailableOfType("${type}").`;
 		if (!isRecord(model) || typeof model.provider !== "string" || typeof model.id !== "string") {
@@ -681,7 +717,7 @@ function createModelGlobals(
 		calls.push(record);
 		publish();
 		const startedAt = performance.now();
-		const result = await limit(() => run(resolved, checked));
+		const result = await limit(() => run(resolved, checked), signal);
 		record.durationMs = performance.now() - startedAt;
 		record.status = result.stopReason === "stop" ? "ok" : result.stopReason === "aborted" ? "cancelled" : "error";
 		if (result.errorMessage) record.error = truncateText(result.errorMessage, ERROR_PREVIEW_CHARS);
@@ -713,8 +749,13 @@ function createModelGlobals(
 			return model === undefined ? undefined : toModelInfo(model);
 		},
 		"models.classify": (args, { signal }) =>
-			runModelCall("models.classify", "classifier", args as unknown[], checkClassifierContext, (resolved, context) =>
-				models.classify(resolved, context, { signal }),
+			runModelCall(
+				"models.classify",
+				"classifier",
+				args as unknown[],
+				checkClassifierContext,
+				(resolved, context) => models.classify(resolved, context, { signal }),
+				signal,
 			),
 		"models.generateImages": (args, { signal }) =>
 			runModelCall(
@@ -727,6 +768,7 @@ function createModelGlobals(
 					addGeneratedImages(result.output.filter((block) => block.type === "image").length);
 					return result;
 				},
+				signal,
 			),
 	};
 	return Object.entries(implementations).map(([name, execute]) => ({ name, spread: true, execute }));

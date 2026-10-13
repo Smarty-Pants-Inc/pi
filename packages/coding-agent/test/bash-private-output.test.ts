@@ -1,16 +1,17 @@
 import * as nodeFs from "node:fs";
-import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
 import { wrapToolDefinition } from "../src/core/tools/tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES } from "../src/core/tools/truncate.ts";
+import { removeOutputDirectory } from "../src/utils/output-files.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof nodeFs>();
-	return { ...actual, createWriteStream: vi.fn(actual.createWriteStream) };
+	return { ...actual, createWriteStream: vi.fn(actual.createWriteStream), openSync: vi.fn(actual.openSync) };
 });
 
 // smarty-dev#2153 / #1998: both bash spill paths must ignore a permissive caller umask.
@@ -27,6 +28,7 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 		vi.restoreAllMocks();
 		vi.unstubAllEnvs();
 		process.umask(previousUmask);
+		removeOutputDirectory();
 		rmSync(root, { recursive: true, force: true });
 	});
 
@@ -39,34 +41,44 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 	}
 
 	for (const kind of ["tool", "executor"]) {
-		it.each(["lines", "bytes"])(`${kind} saves complete %s output with mode 0600 under umask 002`, async (limit) => {
-			const text = limit === "lines" ? "fake row\n".repeat(3000) : `${"x".repeat(DEFAULT_MAX_BYTES + 1)}\n`;
-			const paths = [];
-			for (let i = 0; i < 2; i++) {
-				const path = await runBash(kind, {
-					exec: async (_command, _cwd, { onData }) => {
-						onData(Buffer.from(text));
-						return { exitCode: 0 };
-					},
-				});
-				if (!path) throw new Error("No bash spill file");
-				paths.push(path);
-				// No polling: a completed tool must have flushed its full output.
-				expect(readFileSync(path, "utf8")).toBe(text);
-				expect(statSync(path).mode & 0o777).toBe(0o600);
-			}
-			expect(new Set(paths).size).toBe(2);
-		});
+		it.each(["lines", "bytes"])(
+			`${kind} saves complete %s output read-only (0400) under umask 002`,
+			async (limit) => {
+				const text = limit === "lines" ? "fake row\n".repeat(3000) : `${"x".repeat(DEFAULT_MAX_BYTES + 1)}\n`;
+				const paths = [];
+				for (let i = 0; i < 2; i++) {
+					const path = await runBash(kind, {
+						exec: async (_command, _cwd, { onData }) => {
+							onData(Buffer.from(text));
+							return { exitCode: 0 };
+						},
+					});
+					if (!path) throw new Error("No bash spill file");
+					paths.push(path);
+					// No polling: a completed tool must have flushed its full output.
+					expect(readFileSync(path, "utf8")).toBe(text);
+					// pi#203 R2: read-only, so later appends cannot grow the bounded output directory.
+					expect(statSync(path).mode & 0o777).toBe(0o400);
+				}
+				expect(new Set(paths).size).toBe(2);
+				// pi#203 CI: a killed process never runs its exit cleanup, so the owner's plain rm -rf
+				// (test.sh, the CI runner) must be able to remove the output directory.
+				const directory = dirname(paths[0]);
+				rmSync(directory, { recursive: true, force: true });
+				expect(existsSync(directory)).toBe(false);
+			},
+		);
 
 		it(`${kind} reports an existing symlink without overwriting its target`, async () => {
 			const victim = join(root, "fake-victim");
 			writeFileSync(victim, "fake sentinel");
-			const createWriteStream = vi.mocked(nodeFs.createWriteStream).getMockImplementation();
-			if (!createWriteStream) throw new Error("No native createWriteStream implementation");
-			vi.mocked(nodeFs.createWriteStream).mockImplementationOnce((path, options) => {
+			// The spill file is created with a synchronous exclusive open (pi#203 R3).
+			const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
+			if (!openSync) throw new Error("No native openSync implementation");
+			vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
 				if (typeof path !== "string") throw new Error("Expected a filename");
 				symlinkSync(victim, path);
-				return createWriteStream(path, options);
+				return openSync(path, flags, mode);
 			});
 			await expect(
 				runBash(kind, {
@@ -106,19 +118,19 @@ describe("portable bash full output files", () => {
 	});
 	afterEach(() => {
 		vi.restoreAllMocks();
-		for (const path of spillPaths) rmSync(path, { force: true });
+		removeOutputDirectory();
 		rmSync(root, { recursive: true, force: true });
 	});
 
 	for (const kind of ["tool", "executor"]) {
 		it(`${kind} reports an existing regular file without overwriting it`, async () => {
-			const createWriteStream = vi.mocked(nodeFs.createWriteStream).getMockImplementation();
-			if (!createWriteStream) throw new Error("No native createWriteStream implementation");
-			vi.mocked(nodeFs.createWriteStream).mockImplementationOnce((path, options) => {
+			const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
+			if (!openSync) throw new Error("No native openSync implementation");
+			vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
 				if (typeof path !== "string") throw new Error("Expected a filename");
 				spillPaths.push(path);
 				writeFileSync(path, "fake sentinel");
-				return createWriteStream(path, options);
+				return openSync(path, flags, mode);
 			});
 			const operations: BashOperations = {
 				exec: async (_command, _cwd, { onData }) => {

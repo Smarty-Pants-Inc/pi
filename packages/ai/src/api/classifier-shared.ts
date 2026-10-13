@@ -1,6 +1,7 @@
 import { calculateCost } from "../models.ts";
 import type { ClassifierApi, ClassifierModel, ClassifierOptions, ProviderHeaders, Usage } from "../types.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
 // Classifier replies are small JSON records. 4 MiB leaves ample room for large answer sets while
@@ -149,7 +150,7 @@ export async function postClassifierRequest(
 			noRetryStatuses,
 		},
 	);
-	await options.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+	await options.onResponse?.(providerResponse(response.status));
 	return json;
 }
 

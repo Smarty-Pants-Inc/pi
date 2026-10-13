@@ -121,15 +121,14 @@ describe("T-F6-usage: pi-messages bounds wire usage on terminal events (smarty-d
 		expect(result.usage.cost).toEqual(zeroUsage.cost);
 	});
 
-	it("keeps valid usage exactly and does not alias the wire object", async () => {
+	it("keeps valid usage exactly and never hands the wire object to the observer", async () => {
 		const valid = { ...usage, reasoning: 3, cacheWrite1h: 1 };
 		const { result, wire } = await run(async () =>
 			sse([JSON.stringify({ type: "done", reason: "stop", usage: valid })]),
 		);
 		expect(result.usage).toEqual(valid);
-		const wireUsage = (wire.at(-1) as { usage: Usage }).usage;
-		expect(result.usage).not.toBe(wireUsage);
-		expect(result.usage.cost).not.toBe(wireUsage.cost);
+		// smarty-dev#5822 C1: the observer gets the owned notification, never the wire event.
+		expect(wire).toEqual([{ type: "provider_stream_event" }]);
 	});
 });
 
@@ -175,7 +174,8 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 		{
 			name: "HTTP error status",
 			reason: "error",
-			message: /503 .*overloaded \(busy\)/,
+			// smarty-dev#5822 (pi#202 round 2): owned status and category, not the backend text.
+			message: /^Provider request failed \(HTTP 503, overloaded\)$/,
 			fetch: async () =>
 				new Response(JSON.stringify({ error: { message: "overloaded", code: "busy" } }), {
 					status: 503,
@@ -205,14 +205,15 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 		{
 			name: "wire error event",
 			reason: "error",
-			message: /^upstream failed$/,
+			// smarty-dev#5822 (pi#202 round 3): owned text; the wire error text is private.
+			message: /^Provider request failed$/,
 			fetch: async () =>
 				sse([JSON.stringify({ type: "error", reason: "error", usage, errorMessage: "upstream failed" })]),
 		},
 		{
 			name: "wire aborted event",
 			reason: "aborted",
-			message: /^upstream aborted$/,
+			message: /^Provider request failed$/,
 			fetch: async () =>
 				sse([JSON.stringify({ type: "error", reason: "aborted", usage, errorMessage: "upstream aborted" })]),
 		},
@@ -292,7 +293,9 @@ describe("T-F6-deferred: protected streams mask live secrets in deferred.id (sma
 		const handle = message.deferred;
 		stream.push({ type: "done", reason: "deferred", message });
 		const result = await stream.result();
-		expect(result.deferred).toBe(handle);
+		// smarty-dev#5822 C2: a snapshot copy, equal byte for byte, never the producer's object.
+		expect(result.deferred).toEqual(handle);
+		expect(result.deferred).not.toBe(handle);
 		expect(result.deferred?.id).toBe("resp_abc%2F123 token=x");
 	});
 });
