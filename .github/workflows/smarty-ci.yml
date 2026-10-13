@@ -44,14 +44,21 @@ jobs:
       timeout-minutes: 10
       run: |
         sudo apt-get update
-        sudo apt-get install -y ca-certificates curl git python3 build-essential pkg-config
+        sudo apt-get install -y ca-certificates curl git python3 python3-yaml build-essential pkg-config
     - name: Checkout exact qualification source
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         ref: ${{ github.sha }}
+        # The hosted-runner guard reads its approval lists from a trusted base: depth 2
+        # brings a PR's base commit; a merge-queue push needs full history and
+        # origin/main for the merge base (0 = all history and branches).
+        fetch-depth: ${{ (github.event_name == 'push' && github.ref != 'refs/heads/main') && '0' || '2' }}
         persist-credentials: false
       timeout-minutes: 5
     - name: Reject unapproved hosted runners
+      env:
+        # Empty on push; the guard then uses the checkout (main) or the merge base with main.
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
       run: bash scripts/ci/no-hosted-runners.sh
     - name: Test hosted-runner guard
       run: bash scripts/ci/test-no-hosted-runners.sh

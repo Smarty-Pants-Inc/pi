@@ -444,6 +444,8 @@ export async function runRpcMode(
 	});
 	runtimeHost.setLifecycleCompleteHandler(() => {
 		void checkShutdownRequested().catch(() => requestShutdown(1));
+		// Shutdown waits a macrotask; report it now so session_ready cannot start a turn first.
+		return shutdownRequested;
 	});
 
 	const rebindSession = async (receiving = runtimeHost.session): Promise<void> => {

@@ -118,8 +118,10 @@ import {
 	type SessionBoundaryDraft,
 	type SessionCompactEvent,
 	type SessionCompactFailedEvent,
+	type SessionReadyEvent,
 	type SessionStartEvent,
 	type ShutdownHandler,
+	type SubmitUserMessageOptions,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
@@ -129,6 +131,7 @@ import {
 	type ToolLoadout,
 	type TreePreparation,
 	type TurnStartEvent,
+	type UserMessageReceipt,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
@@ -180,6 +183,7 @@ import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
 import { captureTerminalTurnReceipt, receiptRecord, type TurnReceipt, withoutAttribution } from "./turn-receipts.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
+import { type UserMessageAdmission, UserMessageIngress } from "./user-message-ingress.ts";
 import {
 	bindExtensionMetadataSender,
 	getUserMessageMetadataSource,
@@ -486,6 +490,8 @@ type CompactionOutcome = boolean | "failed" | "aborted";
 interface UserMessageSubmission {
 	readonly metadata: UserMessageMetadata;
 	readonly metadataSource: UserMessageMetadataSource;
+	/** Private submitUserMessage observer at the existing admission, enqueue and run-start points. */
+	readonly ingress?: UserMessageAdmission;
 	message?: AgentMessage;
 	resolve(result: SendUserMessageResult): void;
 	reject(error: unknown): void;
@@ -504,6 +510,8 @@ interface InputAdmission {
 	parent: AbortSignal | undefined;
 	fenceScope: InputFenceScope | undefined;
 	release(): void;
+	/** Private observer: runs after admission transfers to a starting run, before native observers. */
+	transferred?: () => void;
 }
 
 function startCompactionDeadline(controller: AbortController): ReturnType<typeof setTimeout> {
@@ -583,6 +591,12 @@ export class AgentSession {
 	/** Metadata is occurrence-local, never attached to model-visible message objects. */
 	private readonly _userMessageSubmissions = new WeakMap<AgentMessage, UserMessageSubmission>();
 	private readonly _pendingUserMessageSubmissions = new Set<UserMessageSubmission>();
+	/** Session-owned submitUserMessage ledger and generation fence. */
+	private readonly _userMessageIngress = new UserMessageIngress(this._shutdownCancellation.signal, () =>
+		this._userMessageIngressBlocked(),
+	);
+	/** Undelivered ingress follow-ups and their display slot in _followUpMessages. */
+	private readonly _ingressQueuedMessages = new Map<AgentMessage, { displayIndex: number }>();
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -1670,19 +1684,26 @@ export class AgentSession {
 		// When a user message starts, check if it's from either queue and remove it BEFORE emitting
 		// This ensures the UI sees the updated queue state
 		if (event.type === "message_start" && event.message.role === "user") {
+			const ingress = this._ingressQueuedMessages.get(event.message);
+			this._ingressQueuedMessages.delete(event.message);
 			this._overflowRecoveryAttempted = false;
 			const messageText = contentText(event.message.content, "");
 			// Empty text is valid for image-only queued input. Delivery is not truthiness.
-			// Check steering queue first
-			const steeringIndex = this._steeringMessages.indexOf(messageText);
+			// Check steering queue first; ingress input is always a follow-up with an exact display slot.
+			const steeringIndex = ingress ? -1 : this._steeringMessages.indexOf(messageText);
 			if (steeringIndex !== -1) {
 				this._steeringMessages.splice(steeringIndex, 1);
 				this._emitQueueUpdate();
 			} else {
-				// Check follow-up queue
-				const followUpIndex = this._followUpMessages.indexOf(messageText);
+				// Check follow-up queue, skipping equal-text display slots owned by other ingress input.
+				const ingressPositions = new Set(
+					[...this._ingressQueuedMessages.values()].map(({ displayIndex }) => displayIndex),
+				);
+				const followUpIndex =
+					ingress?.displayIndex ??
+					this._followUpMessages.findIndex((text, index) => text === messageText && !ingressPositions.has(index));
 				if (followUpIndex !== -1) {
-					this._followUpMessages.splice(followUpIndex, 1);
+					this._removeFollowUpDisplay(followUpIndex);
 					this._emitQueueUpdate();
 				}
 			}
@@ -2064,6 +2085,13 @@ export class AgentSession {
 		if (!this.isIdle || this.isSettling)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "abort and settle the active operation before disposal");
 		this._inputsDisposed = true;
+		try {
+			// Drained above, so this only closes the ledger and releases pending ingress receipts.
+			this._userMessageIngress.invalidate("no_session", true);
+			this._cancelIngressQueuedMessages();
+		} catch {
+			// Cancellation observers must not skip the existing terminal cleanup.
+		}
 		this._rejectPendingUserMessageSubmissions(
 			new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "user message was not persisted"),
 		);
@@ -2594,6 +2622,8 @@ export class AgentSession {
 			if (!continuation) {
 				transferringAdmission?.signal.throwIfAborted();
 				transferringAdmission?.release();
+				// A run_start observer may reload synchronously; record the started turn first.
+				transferringAdmission?.transferred?.();
 			}
 			const run = continuation || !messages ? agent.continue({ fromQueuedMessages }) : agent.prompt(messages);
 			try {
@@ -2804,6 +2834,81 @@ export class AgentSession {
 		return this._inputFence !== undefined || this._inputsDisposed;
 	}
 
+	/** Generation of this session's submitUserMessage ingress; rotated by reload, replacement and fences. */
+	get userMessageSessionGeneration(): string {
+		return this._userMessageIngress.generation;
+	}
+
+	/**
+	 * @internal Notify `session_ready` after the runtime lifted this published replacement's input fence.
+	 * Dispatch runs outside every fence, admission and dispatch-cancellation scope, so handlers and their
+	 * descendants admit input like any unscoped caller (pi#163). Fire-and-forget like other observers.
+	 */
+	emitSessionReady(reason: SessionReadyEvent["reason"]): void {
+		if (this._inputsDisposed || this._shutdownCancellation.signal.aborted || this._inputFence) return;
+		if (!this._extensionRunner.hasHandlers("session_ready")) return;
+		const event: SessionReadyEvent = {
+			type: "session_ready",
+			reason,
+			sessionGeneration: this.userMessageSessionGeneration,
+		};
+		this._inputFenceScope.exit(() =>
+			this._inputAdmissionScope.exit(() =>
+				this._dispatchCancellationScope.exit(() => void this._extensionRunner.emit(event)),
+			),
+		);
+	}
+
+	/** @internal Replacement teardown failed after it began: keep this session's ingress closed. */
+	closeUserMessageIngressAfterFailedReplacement(): void {
+		this._userMessageIngress.setRuntimeAvailable(false);
+	}
+
+	private _userMessageIngressBlocked(): "no_session" | "session_changed" | undefined {
+		try {
+			this._assertInputsOpen();
+			return undefined;
+		} catch (error) {
+			return error instanceof InputAdmissionError && error.code === "INPUT_ADMISSION_DISPOSED"
+				? "no_session"
+				: "session_changed";
+		}
+	}
+
+	/** Rotate the ingress generation, cancelling held admissions and undelivered ingress follow-ups. */
+	private _invalidateUserMessageIngress(
+		reason: "session_changed" | "shutting_down" | "no_session",
+		close = false,
+	): void {
+		this._userMessageIngress.invalidate(reason, close);
+		this._cancelIngressQueuedMessages();
+	}
+
+	private _cancelIngressQueuedMessages(): void {
+		if (this._ingressQueuedMessages.size === 0) return;
+		const messages = new Set(this._ingressQueuedMessages.keys());
+		const positions = [...this._ingressQueuedMessages.values()]
+			.map(({ displayIndex }) => displayIndex)
+			.sort((a, b) => b - a);
+		for (const index of positions) this._removeFollowUpDisplay(index);
+		this._ingressQueuedMessages.clear();
+		const cancelled = new InputAdmissionError("INPUT_ADMISSION_ABORTED", "queued ingress was cancelled");
+		for (const message of messages) {
+			this._userMessageSubmissions.get(message)?.reject(cancelled);
+			this._userMessageSubmissions.delete(message);
+		}
+		// Commit display/tag cancellation before native queue publication can reenter or throw.
+		this.#originalAgent.removeQueuedMessages((message) => messages.has(message));
+		this._emitQueueUpdate();
+	}
+
+	private _removeFollowUpDisplay(index: number): void {
+		this._followUpMessages.splice(index, 1);
+		for (const entry of this._ingressQueuedMessages.values()) {
+			if (entry.displayIndex > index) entry.displayIndex--;
+		}
+	}
+
 	private _assertInputsOpen(): void {
 		if (this._inputsDisposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "input was not accepted");
 		const scope = this._inputFenceScope.getStore();
@@ -2847,6 +2952,9 @@ export class AgentSession {
 		const fence = {};
 		this._inputFence = fence;
 		try {
+			// Held ingress is cancelled with a session_changed receipt, never counted as busy input,
+			// before abort or lifecycle hooks can yield. Other held input keeps #163 semantics.
+			this._invalidateUserMessageIngress("session_changed");
 			if (options?.rejectQueuedInput) {
 				// Orderly shutdown may reject input instead of refusing disposal. Admission is
 				// already closed before abort yields, including input from extension handlers.
@@ -3075,7 +3183,8 @@ export class AgentSession {
 				originalTransfer?.();
 			},
 		};
-		if (this._isEmittingAgentSettled) {
+		// Receipt ingress queues behind settlement instead of deferring its admission (#149).
+		if (this._isEmittingAgentSettled && !submission?.ingress) {
 			if (this._agentSettledScope.getStore()?.active) {
 				throw new InputAdmissionError(
 					"INPUT_ADMISSION_BUSY",
@@ -3177,6 +3286,7 @@ export class AgentSession {
 			this._promptPreflights.add(preflightToken);
 			const mustQueue = () =>
 				this.isStreaming ||
+				(submission?.ingress !== undefined && this._isEmittingAgentSettled) ||
 				this._modelSwitchCompactionPending ||
 				(options?.streamingBehavior !== undefined &&
 					this._promptPreflights.values().next().value !== preflightToken);
@@ -3265,6 +3375,9 @@ export class AgentSession {
 			if (lastAssistant) {
 				const outcome = await this._awaitInput(this._checkCompaction(lastAssistant, false));
 				if (outcome === "failed" || outcome === "aborted") {
+					// Refused receipt ingress cannot leave runnable input behind. Ordinary
+					// prompt callers still retain their input in the existing queue below.
+					if (submission?.ingress) throw new Error(`Prompt not admitted: compaction ${outcome}`);
 					// Input handlers and expansion already ran. Retain that exact input
 					// in the existing queue, including attachments, without starting a run.
 					const behavior = options?.streamingBehavior ?? "steer";
@@ -3659,7 +3772,8 @@ export class AgentSession {
 	): Promise<void> {
 		this._checkInputAdmission();
 		this.#ordinaryOwner?.assertCompactionIdle();
-		this._followUpMessages.push(text);
+		const ingress = submission?.ingress;
+		if (!ingress) this._followUpMessages.push(text);
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
 			content.push(...images);
@@ -3670,7 +3784,15 @@ export class AgentSession {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
 		}
-		this.agent.followUp(message);
+		if (ingress) {
+			this.agent.followUp(message, () => {
+				// Native insertion owns the message now. Commit tracking and the queued receipt
+				// before a queue observer can throw, reload, or cancel the admitted queue.
+				this._ingressQueuedMessages.set(message, { displayIndex: this._followUpMessages.length });
+				this._followUpMessages.push(text);
+				ingress.accept("queued");
+			});
+		} else this.agent.followUp(message);
 		this._inputAdmissionScope.getStore()?.release();
 		this._emitQueueUpdate();
 	}
@@ -3957,17 +4079,71 @@ export class AgentSession {
 		options: SendUserMessageOptions,
 		// biome-ignore lint/suspicious/noConfusingVoidType: Optional metadata variables may select either public return contract.
 	): Promise<void | SendUserMessageResult>;
-	async sendUserMessage(
+	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
 		options?: SendUserMessageOptions,
 		// biome-ignore lint/suspicious/noConfusingVoidType: Legacy core sends retain Promise<void> while metadata sends return receipts.
 	): Promise<void | SendUserMessageResult> {
+		// Return the private async promise directly: no extra adoption tick versus a single async body.
+		return this._sendUserMessage(content, options);
+	}
+
+	/**
+	 * Shared sendUserMessage/submitUserMessage admission; ingress only observes existing points.
+	 * metadataOptions keeps the caller's options identity, which carries the private metadata source.
+	 */
+	private async _sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		deliveryOptions: SendUserMessageOptions | undefined,
+		metadataOptions: SendUserMessageOptions | undefined = deliveryOptions,
+		observed?: UserMessageAdmission,
+		// biome-ignore lint/suspicious/noConfusingVoidType: Legacy core sends retain Promise<void> while metadata sends return receipts.
+	): Promise<void | SendUserMessageResult> {
 		// Validate and snapshot before issuing a receipt, admitting input, or running extension hooks.
-		const requestedMetadata = options?.metadata;
-		const metadata = requestedMetadata === undefined ? undefined : snapshotUserMessageMetadata(requestedMetadata);
-		const metadataSource = getUserMessageMetadataSource(options);
+		// This async body turns validation throws into rejected promises. Ingress always has a receipt.
+		const requestedMetadata = metadataOptions?.metadata;
+		const metadata =
+			requestedMetadata === undefined
+				? observed
+					? snapshotUserMessageMetadata({})
+					: undefined
+				: snapshotUserMessageMetadata(requestedMetadata);
+		const metadataSource = getUserMessageMetadataSource(metadataOptions);
+		const options = deliveryOptions;
 		const receipt = captureTerminalTurnReceipt();
 		const admission = this._admitInput();
+		let ingress: UserMessageAdmission | undefined;
+		let detachObserver: (() => void) | undefined;
+		if (observed) {
+			// Ledger cancellation reaches the native admission, not only the typed receipt. Release
+			// synchronously so a lifecycle fence does not count cancelled ingress as busy input.
+			const cancel = () => {
+				admission.controller.abort(
+					new InputAdmissionError("INPUT_ADMISSION_ABORTED", "user message ingress was cancelled"),
+				);
+				admission.release();
+			};
+			const detach = () => observed.signal.removeEventListener("abort", cancel);
+			detachObserver = detach;
+			if (observed.signal.aborted) cancel();
+			else observed.signal.addEventListener("abort", cancel, { once: true });
+			admission.transferred = () => {
+				detach();
+				observed.accept("accepted");
+			};
+			ingress = {
+				signal: observed.signal,
+				check: observed.check,
+				accept: (status) => {
+					detach();
+					observed.accept(status);
+				},
+				refuse: (reason) => {
+					detach();
+					observed.refuse(reason);
+				},
+			};
+		}
 		let submission: UserMessageSubmission | undefined;
 		const result =
 			metadata === undefined
@@ -3976,6 +4152,7 @@ export class AgentSession {
 						const context: UserMessageSubmission = {
 							metadata,
 							metadataSource,
+							ingress,
 							resolve: (value) => {
 								if (!this._pendingUserMessageSubmissions.delete(context)) return;
 								resolve(value);
@@ -4026,6 +4203,9 @@ export class AgentSession {
 				submission,
 			);
 		});
+		// Handled, refused and failed operations never reach accept/refuse/transfer: drop the ledger
+		// listener once the shared operation settles. Transferred run lineage is unaffected.
+		if (detachObserver) void operation.then(detachObserver, detachObserver);
 		if (!result) return await operation;
 		void operation.catch((error: unknown) => {
 			// Compaction failure transfers the exact input into a retained queue. Its receipt
@@ -4035,6 +4215,29 @@ export class AgentSession {
 			}
 		});
 		return result;
+	}
+
+	/**
+	 * Submit literal input with a session-bound at-most-once admission receipt.
+	 * Reuses sendUserMessage admission and #187 receipts: a started turn is `accepted`, a native
+	 * follow-up insertion is `queued`, and input consumed by a hook is `rejected/admission_refused`.
+	 * @internal metadataOptions carries the loader-bound metadata source; SDK callers omit it.
+	 */
+	submitUserMessage(
+		request: SubmitUserMessageOptions,
+		metadataOptions?: SendUserMessageOptions,
+	): Promise<UserMessageReceipt> {
+		return this._userMessageIngress.submit(request, async (input, admission) => {
+			const result = await this._sendUserMessage(
+				input.text,
+				{ deliverAs: "followUp", expandPromptTemplates: false },
+				metadataOptions,
+				admission,
+			);
+			// Earlier observers settle first; settlement is once-only.
+			if (result?.status === "turnStarted") admission.accept("accepted");
+			else admission.refuse("admission_refused");
+		});
 	}
 
 	/**
@@ -4049,6 +4252,7 @@ export class AgentSession {
 		this._followUpMessages = [];
 		this._triggeredBehindPreflight.splice(0);
 		this._modelSwitchDispatches.clear();
+		this._ingressQueuedMessages.clear();
 		for (const message of this.agent.getQueuedMessages()) {
 			this._userMessageSubmissions
 				.get(message)
@@ -4082,13 +4286,18 @@ export class AgentSession {
 
 	/** @internal Permanently retire process-owned work before a terminal shutdown join. */
 	cancelForShutdown(): void {
-		this._shutdownCancellation.abort(
-			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "operation cancelled for shutdown"),
-		);
-		this._settlementCancellation.abort(
-			new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
-		);
-		this.abortBash();
+		try {
+			this._invalidateUserMessageIngress("shutting_down", true);
+		} finally {
+			// Cancellation observers must not leave terminal dispatch or bash waits live.
+			this._shutdownCancellation.abort(
+				new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "operation cancelled for shutdown"),
+			);
+			this._settlementCancellation.abort(
+				new InputAdmissionError("INPUT_ADMISSION_ABORTED", "settlement cancelled for shutdown"),
+			);
+			this.abortBash();
+		}
 	}
 
 	/** @internal Cancellation for host-owned startup, command and lifecycle work. */
@@ -5503,6 +5712,9 @@ export class AgentSession {
 						)
 						.catch(reportError);
 				},
+				// Detached from agent_settled like sendUserMessage; ingress queues behind settlement.
+				submitUserMessage: (request, metadataOptions) =>
+					this._agentSettledScope.exit(() => this.submitUserMessage(request, metadataOptions)),
 				appendEntry: (customType, data) => {
 					this._inheritedCancellation();
 					const entryId = this.sessionManager.appendCustomEntry(customType, data);
@@ -5537,6 +5749,7 @@ export class AgentSession {
 				setThinkingLevel: (level) => this.setThinkingLevel(level),
 			},
 			{
+				getUserMessageSessionGeneration: () => this.userMessageSessionGeneration,
 				getModel: () => this.model,
 				getScopedModels: () => this._scopedModels,
 				isIdle: () => this.isIdle,
@@ -5767,6 +5980,29 @@ export class AgentSession {
 
 	async reload(options?: { beforeSessionStart?: () => void | Promise<void> }): Promise<void> {
 		if (this.#ordinaryOwner) throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: reload requires separate receiving");
+		// Fence receipt ingress before hooks can yield: rotate the generation, cancel held admissions
+		// and undelivered ingress follow-ups. Ordinary/custom queues survive. Refuse new ingress until
+		// the new runtime is built; a failed reload stays closed until a later reload succeeds.
+		this._userMessageIngress.suspend();
+		const suspension = { held: true };
+		try {
+			this._cancelIngressQueuedMessages();
+			await this._reloadRuntime(suspension, options);
+		} catch (error) {
+			// Neither the old nor a partially bound runtime may admit ingress. A retry may recover.
+			this._userMessageIngress.setRuntimeAvailable(false);
+			this._extensionRunner.invalidate();
+			this._invalidateUserMessageIngress("session_changed");
+			throw error;
+		} finally {
+			if (suspension.held) this._userMessageIngress.resume();
+		}
+	}
+
+	private async _reloadRuntime(
+		suspension: { held: boolean },
+		options?: { beforeSessionStart?: () => void | Promise<void> },
+	): Promise<void> {
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
 		const rejection = new InputAdmissionError(
@@ -5791,6 +6027,11 @@ export class AgentSession {
 		this.syncQueueModesFromSettings();
 		resetApiProviders();
 		await this._resourceLoader.reload();
+		// Late loader completion cannot reopen a disposed or shut-down session.
+		this._shutdownCancellation.signal.throwIfAborted();
+		this._userMessageIngress.assertOpen();
+		// A concurrent reload may have installed a runner while this loader was awaiting.
+		this._extensionRunner.invalidate();
 		// Activate tools newly added to defaultTools. Removed ones stay active, and tools disabled
 		// during the session stay disabled unless the setting newly adds them.
 		const addedDefaultTools = getDefaultTools().filter((name) => !previousDefaultTools.has(name));
@@ -5801,6 +6042,10 @@ export class AgentSession {
 			flagValues: previousFlagValues,
 			includeAllExtensionTools: true,
 		});
+		// Admit ingress from session_start onward, releasing only this reload's suspension.
+		this._userMessageIngress.setRuntimeAvailable(true);
+		suspension.held = false;
+		this._userMessageIngress.resume();
 
 		const hasBindings =
 			this._extensionUIContext ||
