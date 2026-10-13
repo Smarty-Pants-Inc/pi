@@ -431,6 +431,16 @@ for case in "base $hosted_base_sha" "base-without-list $no_list_sha" "unknown-ba
 done
 BASE_SHA="$hosted_head_sha" bash "$base_guard" "$fixture_dir"
 echo 'PASS: hosted label approved at the base'
+
+# A shallow PR checkout (fetch-depth 2) whose BASE_SHA is no longer in the clone fetches that exact commit and
+# reads its list, instead of failing closed on a list that exists (the 10-13 pi#227 failure).
+shallow_repo="$fixture_dir/shallow"
+repo_git commit -q --allow-empty -m 'main moves on'
+repo_git commit -q --allow-empty -m 'main moves on again'
+git clone -q --depth=1 "file://$base_repo" "$shallow_repo"
+if git -C "$shallow_repo" cat-file -e "$hosted_head_sha^{commit}" 2>/dev/null; then echo 'FAIL: shallow fixture already has the base' >&2; exit 1; fi
+BASE_SHA="$hosted_head_sha" bash "$shallow_repo/scripts/ci/no-hosted-runners.sh" "$fixture_dir"
+echo 'PASS: shallow checkout fetches the base commit and reads its hosted allowlist'
 BASE_SHA= bash "$base_guard" "$fixture_dir"
 echo 'PASS: push to main reads the checked-out (reviewed) hosted allowlist'
 
