@@ -781,10 +781,11 @@ function cacheFallback(reason: string): true {
 
 /** Shared jiti cache dir from SMARTY_JITI_CACHE_DIR, or true for jiti's default cache. */
 function jitiFsCache(): string | true {
-	const dir = process.env.SMARTY_JITI_CACHE_DIR;
-	if (!dir) return true;
-	// ponytail: fall back instead of throwing so a bad env value never breaks startup.
-	if (!path.isAbsolute(dir)) return cacheFallback("relative");
+	const value = process.env.SMARTY_JITI_CACHE_DIR;
+	if (!value) return true;
+	// ponytail: bad env falls back, not errors; parents must not be writable by another UID (#10893).
+	if (!path.isAbsolute(value)) return cacheFallback("relative");
+	const dir = path.resolve(value);
 	let stat: fs.Stats;
 	try {
 		stat = fs.lstatSync(dir);

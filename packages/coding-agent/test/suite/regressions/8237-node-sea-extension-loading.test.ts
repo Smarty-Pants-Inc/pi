@@ -184,6 +184,14 @@ describe("Node SEA extension loading", () => {
 			expect(await fsCacheFor(link)).toBe(true);
 		});
 
+		// Regression test for pi#227: a trailing slash must not make lstat follow the final symlink.
+		it("falls back to true for a symlink given with a trailing slash", async () => {
+			const target = makeDir("slash-target", 0o700);
+			const link = join(root, "slash-link");
+			symlinkSync(target, link, "dir");
+			expect(await fsCacheFor(`${link}/`)).toBe(true);
+		});
+
 		it.skipIf(!posix)("falls back to true for a 0777 directory (POSIX only)", async () => {
 			expect(await fsCacheFor(makeDir("world-writable", 0o777))).toBe(true);
 		});
