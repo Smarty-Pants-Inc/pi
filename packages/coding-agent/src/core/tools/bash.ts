@@ -19,10 +19,9 @@ import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
-const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_TIMEOUT_SECONDS = 600;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
-const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
 function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 	if (timeout === undefined) return undefined;
@@ -30,11 +29,12 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 		throw new Error("Invalid timeout: must be a finite number of seconds");
 	}
 
-	const timeoutMs = timeout * 1000;
-	if (timeoutMs > MAX_TIMEOUT_MS) {
-		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+	if (timeout > MAX_TIMEOUT_SECONDS) {
+		throw new Error(
+			`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds (the value is in seconds, not milliseconds)`,
+		);
 	}
-	return timeoutMs;
+	return timeout * 1000;
 }
 
 const bashSchema = Type.Object({
@@ -43,7 +43,7 @@ const bashSchema = Type.Object({
 	timeout: Type.Optional(
 		Type.Number({
 			minimum: 0,
-			maximum: 600,
+			maximum: MAX_TIMEOUT_SECONDS,
 			description:
 				"Timeout in SECONDS, not milliseconds (max 600 = 10 min; optional, no default). For longer work run it in the background.",
 		}),
@@ -292,6 +292,7 @@ export function createShellToolDefinition(
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
+			resolveTimeoutMs(timeout);
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(
 				resolvedCommand,

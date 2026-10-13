@@ -1,9 +1,9 @@
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
-import { type BashToolInput, createBashTool } from "../src/core/tools/bash.ts";
+import { describe, expect, it, vi } from "vitest";
+import { type BashOperations, type BashToolInput, createBashTool } from "../src/core/tools/bash.ts";
 import { createPowerShellTool } from "../src/core/tools/powershell.ts";
 
-// Validation only: these tests never call execute(), so no command is spawned.
+// Schema validation never calls execute(), so no command is spawned.
 function validate(args: BashToolInput): unknown {
 	const tool = createBashTool(process.cwd());
 	return validateToolArguments(tool, { type: "toolCall", id: "call-1", name: "bash", arguments: args });
@@ -52,5 +52,27 @@ describe("bash timeout schema validation (#10913)", () => {
 		expect(() => validateToolArguments(tool, call)).toThrow(/- timeout: .*600/);
 		call.arguments.timeout = 600;
 		expect(validateToolArguments(tool, call)).toEqual(call.arguments);
+	});
+});
+
+// Regression for #10913 / pi#229: SDK, extensions, and codemode can bypass schema validation.
+describe("bash timeout direct execution (#10913)", () => {
+	it.each([601, 1e9])("rejects timeout %s before invoking command operations", async (timeout) => {
+		const exec = vi.fn<BashOperations["exec"]>(async () => ({ exitCode: 0 }));
+		const tool = createBashTool(process.cwd(), { operations: { exec } });
+		await expect(tool.execute("call-direct", { command: "echo hi", timeout })).rejects.toThrow(
+			"Invalid timeout: maximum is 600 seconds (the value is in seconds, not milliseconds)",
+		);
+		expect(exec).not.toHaveBeenCalled();
+	});
+
+	it.each([600, 2])("accepts timeout %s without changing it", async (timeout) => {
+		const exec = vi.fn<BashOperations["exec"]>(async () => ({ exitCode: 0 }));
+		const cwd = process.cwd();
+		const tool = createBashTool(cwd, { operations: { exec } });
+		await expect(tool.execute("call-direct", { command: "echo hi", timeout })).resolves.toMatchObject({
+			structuredContent: { exit_code: 0 },
+		});
+		expect(exec).toHaveBeenCalledExactlyOnceWith("echo hi", cwd, expect.objectContaining({ timeout }));
 	});
 });
