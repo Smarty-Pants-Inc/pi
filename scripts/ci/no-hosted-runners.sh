@@ -19,6 +19,11 @@ if [[ -z "$base" && "${GITHUB_EVENT_NAME:-}" == push && "${GITHUB_REF:-}" == ref
 elif [[ -z "$base" ]]; then
   base="$(git -C "$script_dir" merge-base HEAD refs/remotes/origin/main 2>/dev/null || true)"
 fi
+# A shallow PR checkout (fetch-depth 2) lacks BASE_SHA once main has moved past it: fetch exactly that commit
+# (content-addressed, so the trusted list cannot change) before reading it. A failed fetch still fails closed below.
+if [[ "$base" =~ ^[0-9a-f]{40}$ ]] && ! git -C "$script_dir" cat-file -e "$base^{commit}" 2>/dev/null; then
+  git -C "$script_dir" fetch -q --no-tags --depth=1 origin "$base" 2>/dev/null || true
+fi
 
 trusted_list() {
   local name="$1"
