@@ -526,7 +526,10 @@ describe("ExtensionRunner", () => {
 			expect(result.errors).toEqual([
 				{
 					path: extensionPath,
-					error: `Failed to load extension: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
+					// smarty-dev#10720: loader diagnostics are formatted strings including the stack.
+					error: expect.stringContaining(
+						`Failed to load extension: Error: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
+					),
 				},
 			]);
 		});

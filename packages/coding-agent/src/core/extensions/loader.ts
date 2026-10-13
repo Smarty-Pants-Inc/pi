@@ -910,7 +910,8 @@ async function loadExtension(
 
 		return { extension, error: null };
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
+		// ponytail: materialize diagnostics before caching; Error stack frames can retain sessions (#10720).
+		const message = err instanceof Error ? String(err.stack ?? err) : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
 }

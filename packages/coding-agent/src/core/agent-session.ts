@@ -14,6 +14,7 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import {
@@ -1048,7 +1049,8 @@ export class AgentSession {
 	private _installAgentRequestProjection(): void {
 		let requestModel = this.agent.state.model;
 		let canReproject = true;
-		let canonicalMessages: string | undefined;
+		// ponytail: retain only a fixed-size digest, not a second full transcript, between requests (#10720).
+		let canonicalMessagesDigest: string | undefined;
 		const previousConvertToLlm = this.agent.convertToLlm;
 		this.agent.convertToLlm = async (messages) => {
 			let converted = await previousConvertToLlm(messages);
@@ -1063,8 +1065,8 @@ export class AgentSession {
 				if (
 					!canReproject ||
 					previousConvertToLlm !== convertToLlm ||
-					canonicalMessages === undefined ||
-					canonicalMessages !== snapshotMessages(messages) ||
+					canonicalMessagesDigest === undefined ||
+					canonicalMessagesDigest !== snapshotMessages(messages) ||
 					!this.settingsManager.getCompactionSettings(requestModel).enabled
 				)
 					throw error;
@@ -1089,7 +1091,7 @@ export class AgentSession {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		const snapshotMessages = (messages: AgentMessage[]): string | undefined => {
 			try {
-				return JSON.stringify(messages);
+				return createHash("sha256").update(JSON.stringify(messages)).digest("base64");
 			} catch {
 				// SDK-only metadata may not serialize. It must not block a fitting request.
 				return undefined;
@@ -1106,7 +1108,7 @@ export class AgentSession {
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};
-				canonicalMessages = snapshotMessages(canonicalContext.messages);
+				canonicalMessagesDigest = snapshotMessages(canonicalContext.messages);
 				const previous = await previousPrepareRequest?.(
 					{
 						...request,
@@ -1120,8 +1122,8 @@ export class AgentSession {
 				// in-place edits, and opaque input is safe only when the final request fits.
 				canReproject =
 					(previous?.context === undefined || previous.context === canonicalContext) &&
-					canonicalMessages !== undefined &&
-					canonicalMessages === snapshotMessages(canonicalContext.messages);
+					canonicalMessagesDigest !== undefined &&
+					canonicalMessagesDigest === snapshotMessages(canonicalContext.messages);
 				return { previous, context: previous?.context ?? canonicalContext, projection };
 			};
 			const prepared = await prepare();
@@ -1167,7 +1169,7 @@ export class AgentSession {
 				// the accepted context is sent as is, and admission in convertToLlm fails closed if it overflows.
 				if (canReproject) {
 					const messages = this.sessionManager.buildSessionProjection().messages;
-					canonicalMessages = snapshotMessages(messages);
+					canonicalMessagesDigest = snapshotMessages(messages);
 					context = { ...context, messages };
 				}
 			}
