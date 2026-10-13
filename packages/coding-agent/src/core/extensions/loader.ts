@@ -768,6 +768,40 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
+let pendingCacheWarning: string | undefined;
+let cacheWarned = false;
+
+function cacheFallback(reason: string): true {
+	if (!cacheWarned) {
+		cacheWarned = true;
+		pendingCacheWarning = `SMARTY_JITI_CACHE_DIR ignored (${reason}); using the default jiti cache.`;
+	}
+	return true;
+}
+
+/** Shared jiti cache dir from SMARTY_JITI_CACHE_DIR, or true for jiti's default cache. */
+function jitiFsCache(): string | true {
+	const value = process.env.SMARTY_JITI_CACHE_DIR;
+	if (!value) return true;
+	// ponytail: fall back on bad env or Windows (no ACL validation); parents must not be writable by another UID (#10893).
+	if (process.platform === "win32") return cacheFallback("unsupported-platform");
+	if (!path.isAbsolute(value)) return cacheFallback("relative");
+	const dir = path.resolve(value);
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(dir);
+	} catch {
+		return cacheFallback("not a directory");
+	}
+	if (stat.isSymbolicLink()) return cacheFallback("symlink");
+	if (!stat.isDirectory()) return cacheFallback("not a directory");
+	if (typeof process.getuid === "function") {
+		if (stat.uid !== process.getuid()) return cacheFallback("foreign owner");
+		if ((stat.mode & 0o022) !== 0) return cacheFallback("group-or-other writable");
+	}
+	return dir;
+}
+
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
@@ -787,6 +821,8 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 			: { alias: getAliases() };
 	const jiti = createJitiImpl(import.meta.url, {
 		moduleCache: false,
+		// ponytail: jiti's env flag is boolean-only; pass the shared cache path explicitly.
+		fsCache: jitiFsCache(),
 		...resolutionOptions,
 	});
 
@@ -1023,6 +1059,10 @@ async function loadExtensionsInternal(
 			resolvedRuntime,
 			cacheToken,
 		);
+		if (pendingCacheWarning) {
+			warnings.push({ path: "", warning: pendingCacheWarning });
+			pendingCacheWarning = undefined;
+		}
 
 		if (error) {
 			errors.push({ path: extPath, error });
