@@ -14,7 +14,7 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
 import type { BashSpawnEvent, ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { OutputAccumulator } from "./output-accumulator.ts";
+import { MAX_FULL_OUTPUT_FILE_BYTES, OutputAccumulator } from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
@@ -64,7 +64,7 @@ export type BashToolInput = Static<typeof bashSchema>;
 const bashOutputSchema = Type.Object({
 	output: Type.String({ description: "Combined stdout and stderr, possibly truncated" }),
 	truncated: Type.Boolean(),
-	full_output_path: Type.Optional(Type.String({ description: "Full output, when truncated" })),
+	full_output_path: Type.Optional(Type.String({ description: "Saved output, capped to the first and last 4 MiB" })),
 	exit_code: Type.Number(),
 	wall_time_seconds: Type.Number(),
 });
@@ -279,7 +279,7 @@ export function createShellToolDefinition(
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, output is saved to a temp file capped at 8 MiB (first and last 4 MiB, plus an omission marker). Optionally provide a timeout in seconds.`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
@@ -399,6 +399,9 @@ export function createShellToolDefinition(
 						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
 					} else {
 						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+					}
+					if (snapshot.fullOutputTruncated) {
+						text += `\n[Saved log capped at ${MAX_FULL_OUTPUT_FILE_BYTES} bytes (first and last 4 MiB); total ${snapshot.totalRawBytes} bytes.]`;
 					}
 				}
 				return { text, details };
