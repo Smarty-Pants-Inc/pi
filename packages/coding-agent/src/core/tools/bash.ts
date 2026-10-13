@@ -19,7 +19,7 @@ import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
-const MAX_TIMEOUT_SECONDS = 600;
+const MAX_TIMEOUT_SECONDS = 300;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
 
@@ -39,13 +39,13 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
-	// ponytail: 600 seconds is a hard ceiling; the fleet's foreground limit is 5 min, and longer jobs run detached.
+	// ponytail: match the fleet's 5-minute foreground ceiling; longer jobs run detached.
 	timeout: Type.Optional(
 		Type.Number({
-			minimum: 0,
+			exclusiveMinimum: 0,
 			maximum: MAX_TIMEOUT_SECONDS,
 			description:
-				"Timeout in SECONDS, not milliseconds (max 600 = 10 min; optional, no default). For longer work run it in the background.",
+				"Timeout in SECONDS, not milliseconds (max 300 = 5 min; optional, no default). For longer work run it in the background.",
 		}),
 	),
 });
