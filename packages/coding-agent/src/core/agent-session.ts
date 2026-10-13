@@ -4153,6 +4153,8 @@ export class AgentSession {
 	 * Submit literal input with a session-bound at-most-once admission receipt.
 	 * Reuses sendUserMessage admission and #187 receipts: a started turn is `accepted`, a native
 	 * follow-up insertion is `queued`, and input consumed by a hook is `rejected/admission_refused`.
+	 * Exact trimmed `/quit` (#11043) never reaches the provider or a queue: busy is
+	 * `rejected/quit_refused_busy`, idle calls the mode shutdown hook after `accepted/quit_requested`.
 	 * @internal metadataOptions carries the loader-bound metadata source; SDK callers omit it.
 	 */
 	submitUserMessage(
@@ -4160,6 +4162,22 @@ export class AgentSession {
 		metadataOptions?: SendUserMessageOptions,
 	): Promise<UserMessageReceipt> {
 		return this._userMessageIngress.submit(request, async (input, admission) => {
+			// Classify the ingress text only; loader metadata provenance must not change this decision.
+			if (input.text.trim() === "/quit") {
+				if (this.isStreaming || this.isCompacting || this.inputAdmissionCount > 0) {
+					admission.refuse("quit_refused_busy");
+					return;
+				}
+				const shutdown = this._extensionShutdownHandler;
+				if (!shutdown) {
+					admission.refuse("unsupported");
+					return;
+				}
+				// Settle first: the mode hook may tear down the session and cancel this ingress.
+				admission.accept("accepted", "quit_requested");
+				shutdown();
+				return;
+			}
 			const result = await this._sendUserMessage(
 				input.text,
 				{ deliverAs: "followUp", expandPromptTemplates: false },

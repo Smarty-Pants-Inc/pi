@@ -1,9 +1,12 @@
 import { Hash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { AgentTool } from "@earendil-works/pi-agent-core";
+import { fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import { getApiProvider, registerApiProvider, unregisterApiProviders } from "@earendil-works/pi-ai/compat";
+import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ExtensionBindings } from "../../src/core/agent-session.ts";
 import { AgentSessionRuntime, type CreateAgentSessionRuntimeFactory } from "../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, ExtensionFactory, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
@@ -74,7 +77,7 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 		while (providerCleanups.length) providerCleanups.pop()!();
 	});
 
-	async function setup(options: HarnessOptions = {}) {
+	async function setup(options: HarnessOptions = {}, bindings: ExtensionBindings = {}) {
 		let api!: ExtensionAPI;
 		let generation = "";
 		const contexts: Array<{ event: string; generation: string }> = [];
@@ -135,7 +138,7 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 			registerApiProvider(fauxApi, fauxSource);
 			extensionsResult = await createTestExtensionsResult(factories, options.cwd ?? harness.tempDir);
 		};
-		await harness.session.bindExtensions({});
+		await harness.session.bindExtensions(bindings);
 		const request = (text: string, requestId = "request-1", registrationEpoch = "epoch-1"): Submission => ({
 			registrationEpoch,
 			requestId,
@@ -2255,4 +2258,213 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 		]);
 		expect(harness.faux.state.callCount).toBe(4);
 	});
+
+	// smarty-dev#11043: exact trimmed /quit through submitUserMessage requests mode shutdown only when idle.
+	describe("exact /quit (#11043)", () => {
+		function quitBindings() {
+			const calls = { shutdowns: 0 };
+			return { calls, bindings: { shutdownHandler: () => void calls.shutdowns++ } satisfies ExtensionBindings };
+		}
+
+		it("refuses /quit while a long tool runs, never queues it, and lets the tool result persist", async () => {
+			const toolStarted = gate();
+			const toolRelease = gate();
+			const waitTool: AgentTool = {
+				name: "wait",
+				label: "Wait",
+				description: "Wait for release",
+				parameters: Type.Object({}),
+				execute: async () => {
+					toolStarted.release();
+					await toolRelease.promise;
+					return { content: [{ type: "text", text: "long tool finished" }], details: {} };
+				},
+			};
+			const { calls, bindings } = quitBindings();
+			const { harness, api, request, generation, inputs } = await setup({ tools: [waitTool] }, bindings);
+			harness.setResponses([
+				fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+				fauxAssistantMessage("after tool"),
+			]);
+			const run = harness.session.prompt("start");
+			await within(toolStarted.promise);
+			expect(harness.session.isStreaming).toBe(true);
+			const refused: Receipt = { status: "rejected", sessionGeneration: generation(), reason: "quit_refused_busy" };
+			const submission = request("/quit", "quit-busy");
+			expect(await within(api().submitUserMessage(submission))).toEqual(refused);
+			expect(await within(api().submitUserMessage(request(" \t/quit\n", "quit-busy-trimmed")))).toEqual(refused);
+			expect(await within(api().submitUserMessage(submission))).toEqual({ ...refused, duplicate: true });
+			expect(calls.shutdowns).toBe(0);
+			expect(harness.session.getFollowUpMessages()).toEqual([]);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(inputs.map((event) => event.text)).toEqual(["start"]);
+			toolRelease.release();
+			await within(run);
+			await within(harness.session.waitForIdle());
+			expect(getToolResultTexts(harness)).toEqual(["long tool finished"]);
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.some((entry) => entry.type === "message" && entry.message.role === "toolResult"),
+			).toBe(true);
+			expect(getUserTexts(harness)).toEqual(["start"]);
+			expect(getAssistantTexts(harness).at(-1)).toBe("after tool");
+			expect(harness.faux.state.callCount).toBe(2);
+			expect(calls.shutdowns).toBe(0);
+		});
+
+		it("accepts idle /quit as quit_requested before the mode hook cancels ingress, without a provider turn", async () => {
+			let harness!: Harness;
+			let shutdowns = 0;
+			const setupResult = await setup(
+				{},
+				{
+					shutdownHandler: () => {
+						shutdowns++;
+						// A real mode hook tears the session down, which cancels in-flight ingress.
+						harness.session.cancelForShutdown();
+					},
+				},
+			);
+			harness = setupResult.harness;
+			const { api, request, generation, inputs } = setupResult;
+			const submission = request("  /quit \n", "quit-idle");
+			const receipt = await within(api().submitUserMessage(submission));
+			expect(receipt).toEqual({ status: "accepted", sessionGeneration: generation(), reason: "quit_requested" });
+			expect(shutdowns).toBe(1);
+			expect(await within(api().submitUserMessage(submission))).toEqual({
+				status: "accepted",
+				sessionGeneration: generation(),
+				reason: "quit_requested",
+				admittedSessionGeneration: generation(),
+				duplicate: true,
+			});
+			expect(await within(api().submitUserMessage({ ...submission, text: "/quit" }))).toMatchObject({
+				status: "rejected",
+				reason: "payload_mismatch",
+			});
+			expect(shutdowns).toBe(1);
+			expect(inputs).toEqual([]);
+			expect(getUserTexts(harness)).toEqual([]);
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.faux.state.callCount).toBe(0);
+		});
+
+		it("keeps non-exact /quit text and plain sendUserMessage('/quit') as literal user input", async () => {
+			const { calls, bindings } = quitBindings();
+			const { harness, api, request, generation } = await setup({}, bindings);
+			harness.setResponses([fauxAssistantMessage("quit now reply"), fauxAssistantMessage("plain reply")]);
+			expect(await within(api().submitUserMessage(request("/quit now", "quit-now")))).toEqual({
+				status: "accepted",
+				sessionGeneration: generation(),
+			});
+			await within(harness.session.waitForIdle());
+			api().sendUserMessage("/quit");
+			await within(harness.session.waitForIdle());
+			expect(calls.shutdowns).toBe(0);
+			expect(getUserTexts(harness)).toEqual(["/quit now", "/quit"]);
+			expect(harness.faux.state.callCount).toBe(2);
+		});
+
+		it("refuses /quit while another input admission is pending, then runs that input", async () => {
+			const entered = gate();
+			const release = gate();
+			const { calls, bindings } = quitBindings();
+			const { harness, api, request, generation } = await setup(
+				{
+					extensionFactories: [
+						(pi) => {
+							pi.on("input", async (event) => {
+								if (event.text !== "held input") return;
+								entered.release();
+								await release.promise;
+							});
+						},
+					],
+				},
+				bindings,
+			);
+			harness.setResponses([fauxAssistantMessage("held reply")]);
+			const run = harness.session.prompt("held input");
+			await within(entered.promise);
+			expect(harness.session.isStreaming).toBe(false);
+			expect(harness.session.inputAdmissionCount).toBeGreaterThan(0);
+			expect(await within(api().submitUserMessage(request("/quit", "quit-pending")))).toEqual({
+				status: "rejected",
+				sessionGeneration: generation(),
+				reason: "quit_refused_busy",
+			});
+			expect(calls.shutdowns).toBe(0);
+			release.release();
+			await within(run);
+			await within(harness.session.waitForIdle());
+			expect(getUserTexts(harness)).toEqual(["held input"]);
+			expect(harness.faux.state.callCount).toBe(1);
+			expect(calls.shutdowns).toBe(0);
+		});
+
+		it("refuses /quit during real manual compaction", async () => {
+			const entered = gate();
+			const release = gate();
+			const { calls, bindings } = quitBindings();
+			const { harness, api, request, generation } = await setup(
+				{
+					settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+					extensionFactories: [
+						(pi) => {
+							pi.on("session_before_compact", async (event) => {
+								entered.release();
+								await release.promise;
+								return {
+									compaction: {
+										summary: "manual summary",
+										firstKeptEntryId: event.preparation.firstKeptEntryId,
+										tokensBefore: event.preparation.tokensBefore,
+									},
+								};
+							});
+						},
+					],
+				},
+				bindings,
+			);
+			harness.setResponses([fauxAssistantMessage("first reply"), fauxAssistantMessage("second reply")]);
+			await harness.session.prompt("first");
+			await harness.session.prompt("second");
+			const compact = harness.session.compact();
+			await within(entered.promise);
+			expect(harness.session.isCompacting).toBe(true);
+			expect(await within(api().submitUserMessage(request("/quit", "quit-compacting")))).toEqual({
+				status: "rejected",
+				sessionGeneration: generation(),
+				reason: "quit_refused_busy",
+			});
+			expect(calls.shutdowns).toBe(0);
+			expect(harness.session.pendingMessageCount).toBe(0);
+			release.release();
+			await within(compact);
+			expect(getUserTexts(harness)).not.toContain("/quit");
+			expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+			expect(harness.faux.state.callCount).toBe(2);
+		});
+
+		it("rejects idle /quit as unsupported when the host bound no mode shutdown hook", async () => {
+			const { harness, api, request, generation, inputs } = await setup();
+			const submission = request("/quit", "quit-unbound");
+			const first = await within(api().submitUserMessage(submission));
+			expect(first).toEqual({ status: "rejected", sessionGeneration: generation(), reason: "unsupported" });
+			expect(await within(api().submitUserMessage(submission))).toEqual({ ...first, duplicate: true });
+			expect(inputs).toEqual([]);
+			expect(getUserTexts(harness)).toEqual([]);
+			expect(harness.session.pendingMessageCount).toBe(0);
+			expect(harness.faux.state.callCount).toBe(0);
+		});
+	});
 });
+
+function getToolResultTexts(harness: Harness): string[] {
+	return harness.session.messages
+		.filter((message) => message.role === "toolResult")
+		.map((message) => getMessageText(message));
+}

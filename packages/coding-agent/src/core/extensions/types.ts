@@ -358,7 +358,14 @@ export interface UserMessageReceipt {
 	duplicate?: true;
 	/** First admission generation, only on duplicates of accepted or queued receipts. */
 	admittedSessionGeneration?: string;
+	/**
+	 * Rejection reason, or `quit_requested` on an accepted exact `/quit` (text trimmed equal to `/quit`).
+	 * A busy session rejects exact `/quit` with `quit_refused_busy`; a host without a mode shutdown hook
+	 * rejects it with `unsupported`.
+	 */
 	reason?:
+		| "quit_requested"
+		| "quit_refused_busy"
 		| "no_session"
 		| "session_changed"
 		| "payload_mismatch"
