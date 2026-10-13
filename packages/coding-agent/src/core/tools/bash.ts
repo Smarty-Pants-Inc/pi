@@ -39,7 +39,15 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	// ponytail: 600 seconds is a hard ceiling; the fleet's foreground limit is 5 min, and longer jobs run detached.
+	timeout: Type.Optional(
+		Type.Number({
+			minimum: 0,
+			maximum: 600,
+			description:
+				"Timeout in SECONDS, not milliseconds (max 600 = 10 min; optional, no default). For longer work run it in the background.",
+		}),
+	),
 });
 
 export const bashToolSystemPromptContribution = {
