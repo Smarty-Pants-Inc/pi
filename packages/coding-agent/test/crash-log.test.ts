@@ -1,8 +1,10 @@
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
-import { findExtensionStackMatches, readCrashLog, takeUnnotifiedCrash } from "../src/core/crash-log.ts";
+import { describe, expect, test, vi } from "vitest";
+import { findExtensionStackMatches, readCrashLog, recordCrash, takeUnnotifiedCrash } from "../src/core/crash-log.ts";
+
+const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:[1-9][0-9]{0,14}$/;
 
 type StackExtension = Parameters<typeof findExtensionStackMatches>[1][number];
 
@@ -88,6 +90,36 @@ describe("extension crash attribution", () => {
 			"Error: progress 100%\n    at run (file:///Users/reporter/.pi/agent/extensions/local%20memory/worker.ts:4:2)";
 
 		expect(findExtensionStackMatches(stack, [extension])).toEqual([extension.path]);
+	});
+});
+
+describe("crash producer ids (smarty-dev#8981)", () => {
+	test("one process numbers its records <gen>:1, <gen>:2; notifying keeps the ids; a new process has a new gen", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "crash-id-"));
+		const path = join(dir, "crashes.json");
+		try {
+			const first = recordCrash({ kind: "fatal_error", error: new Error("one"), cwd: dir }, path);
+			const second = recordCrash({ kind: "fatal_error", error: new Error("two"), cwd: dir }, path);
+			expect(first?.id).toMatch(ID);
+			expect(second?.id).toMatch(ID);
+			const [gen, seq] = first!.id!.split(":");
+			expect(second!.id).toBe(`${gen}:${Number(seq) + 1}`);
+
+			expect(takeUnnotifiedCrash(path)?.id).toBe(second!.id);
+			expect(readCrashLog(path).map((r) => r.id)).toEqual([first!.id, second!.id]);
+
+			// A fresh module instance stands in for a new producer process: the gen is taken once at module load.
+			vi.resetModules();
+			const fresh = await import("../src/core/crash-log.ts");
+			fresh.recordCrash({ kind: "fatal_error", error: new Error("three"), cwd: dir }, path);
+			const third = readCrashLog(path).at(-1)!;
+			expect(third.message).toBe("three");
+			expect(third.id).toMatch(ID);
+			expect(third.id!.split(":")[0]).not.toBe(gen);
+			expect(third.id!.endsWith(":1")).toBe(true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
