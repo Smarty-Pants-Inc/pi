@@ -787,6 +787,8 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 			: { alias: getAliases() };
 	const jiti = createJitiImpl(import.meta.url, {
 		moduleCache: false,
+		// ponytail: jiti's env flag is boolean-only; pass the shared cache path explicitly.
+		fsCache: process.env.SMARTY_JITI_CACHE_DIR || true,
 		...resolutionOptions,
 	});
 
