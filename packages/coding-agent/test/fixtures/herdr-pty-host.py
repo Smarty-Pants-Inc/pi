@@ -2,7 +2,7 @@
 
 Usage: herdr-pty-host.py CMD [ARGS...]
 Runs CMD on the slave as its controlling terminal (new session). Prints one JSON line
-{"slave": path} on stdout, then writes each hex line read from stdin into the master.
+{"slave": path, "pid": child_pid} on stdout, then writes each hex line read from stdin into the master.
 Master output is drained and discarded. Prints {"exit": code} when CMD exits.
 """
 import fcntl
@@ -26,7 +26,7 @@ if pid == 0:
     os.execvp(sys.argv[1], sys.argv[1:])
 
 os.close(slave)
-print(json.dumps({"slave": slave_path}), flush=True)
+print(json.dumps({"slave": slave_path, "pid": pid}), flush=True)
 stdin_open = True
 pending = b""
 while True:

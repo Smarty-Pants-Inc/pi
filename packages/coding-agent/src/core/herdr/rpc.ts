@@ -11,9 +11,9 @@ import { createConnection, type Socket } from "node:net";
 export type Rpc = (method: string, params: Record<string, unknown>) => Promise<Record<string, unknown>>;
 
 /**
- * ponytail: the largest frame Herdr sends here is an enroll answer (64-hex epoch_key, nonce of at
- * most 128 chars, decimal dev/ino, base64 Ed25519 sig: about 400 bytes) or a cut answer (64-hex MAC,
- * principal with a display name of at most 80 chars: under 1 KiB). 1 MiB leaves three orders of
+ * ponytail: the largest frame Herdr sends here is an enroll answer (32-hex epoch, nonce of at most
+ * 128 chars, decimal dev/ino/pid/pidns, base64 Ed25519 sig: about 450 bytes) or a cut answer (base64
+ * sig, principal with a display name of at most 80 chars: under 1 KiB). 1 MiB leaves three orders of
  * magnitude of headroom while bounding what an unauthenticated peer can make Pi hold.
  */
 export const MAX_FRAME_BYTES = 1024 * 1024;

@@ -1,33 +1,42 @@
 /**
- * Herdr server authentication for the input consumer (smarty-dev#2636, decision 3 B).
+ * Herdr server authentication for the input consumer, protocol E' v2 (smarty-dev#2636).
  *
- * Problem: an agent can own a PTY master, start Pi on the slave and answer as a fake Herdr; the
- * nonce marker and a ptmx check both pass for it. So Pi trusts only answers bound to a key that
- * only the installed, setgid (non-dumpable) Herdr can read:
- * - enroll: Ed25519 signature over Pi's challenge, the epoch, SHA-256(epoch_key), the nonce, the
- *   pane id and the pane slave's dev/ino. Pi checks the key and that the tty is its own stdin.
- * - cut: HMAC-SHA256(epoch_key) over the request and the answer.
- * Every field is encoded as a u32 big-endian byte length plus UTF-8 bytes, so no two field lists
- * share an encoding. Any failure means "no epoch" or "unknown", never a label.
+ * Problem: an agent can replace Herdr's socket (it lives in the user's config directory) and answer
+ * as a fake Herdr. v1 sent an `epoch_key` bearer on every cut, so a socket replacer could MAC its own
+ * `client` answers (6b5724fd). v2 keeps no secret in Pi: Herdr signs every answer with its server key
+ * (Ed25519; only the setgid, non-dumpable Herdr can read it) over values Pi chose:
+ * - enroll: Pi's fresh challenge, the epoch, the nonce, the pane id, the pane slave's dev/ino, and
+ *   the pid and pid namespace of the peer Herdr pinned. Pi checks that the tty is its stdin and that
+ *   the pinned peer is itself; Herdr then accepts cuts for the epoch only from that process.
+ * - cut: the whole request (with its fresh per-cut token) plus the result and principal.
+ * Every field is encoded as a u32 big-endian byte length plus UTF-8 bytes, so two field lists of the
+ * same count never share an encoding, and the domain label separates enroll from cut. Any failure
+ * means "no epoch" or "unknown", never a label.
  */
-import { createHash, createHmac, createPublicKey, type KeyObject, timingSafeEqual, verify } from "node:crypto";
+import { createPublicKey, type KeyObject, verify } from "node:crypto";
 import { lstatSync, readFileSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 
 export const SERVER_PUBLIC_KEY_PATH = "/etc/herdr/server.pub";
-const ENROLL_DOMAIN = "herdr-enroll-v1";
-const CUT_DOMAIN = "herdr-cut-v1";
+const ENROLL_DOMAIN = "herdr-enroll-v2";
+const CUT_DOMAIN = "herdr-cut-answer-v2";
 
 export interface TtyId {
 	readonly dev: bigint;
 	readonly ino: bigint;
 }
 
+/** The process Herdr pinned at enroll: its pid in Herdr's pid namespace, and that namespace's inode. */
+export interface PeerId {
+	readonly pid: bigint;
+	readonly pidns: bigint;
+}
+
 export interface EnrollAnswer {
 	readonly epoch: string;
-	readonly epochKey: Buffer;
 	readonly nonce: string;
 	readonly tty: TtyId;
+	readonly peer: PeerId;
 	readonly sig: Buffer;
 }
 
@@ -46,7 +55,7 @@ export interface CutAnswer {
 	readonly principal?: { readonly smartyId: string; readonly displayName: string };
 }
 
-/** Length-prefixed field encoding shared by the signature and the MAC. */
+/** Length-prefixed field encoding shared by both signed messages. */
 export function encodeFields(fields: readonly string[]): Buffer {
 	const parts: Buffer[] = [];
 	for (const field of fields) {
@@ -63,11 +72,12 @@ export function enrollMessage(challenge: Buffer, paneId: string, answer: Omit<En
 		ENROLL_DOMAIN,
 		challenge.toString("hex"),
 		answer.epoch,
-		createHash("sha256").update(answer.epochKey).digest("hex"),
 		answer.nonce,
 		paneId,
 		answer.tty.dev.toString(),
 		answer.tty.ino.toString(),
+		answer.peer.pid.toString(),
+		answer.peer.pidns.toString(),
 	]);
 }
 
@@ -87,29 +97,33 @@ export function cutMessage(request: CutRequest, answer: CutAnswer): Buffer {
 	]);
 }
 
-export function cutMac(epochKey: Buffer, request: CutRequest, answer: CutAnswer): Buffer {
-	return createHmac("sha256", epochKey).update(cutMessage(request, answer)).digest();
-}
-
-/** True only for a valid signature by the trust root over this challenge, for this process's own tty. */
-export function verifyEnroll(
-	trustRoot: KeyObject | undefined,
-	challenge: Buffer,
-	paneId: string,
-	answer: EnrollAnswer,
-	ownTty: TtyId,
-): boolean {
-	if (!trustRoot || answer.tty.dev !== ownTty.dev || answer.tty.ino !== ownTty.ino) return false;
+function verifySig(trustRoot: KeyObject, message: Buffer, sig: Buffer): boolean {
 	try {
-		return verify(null, enrollMessage(challenge, paneId, answer), trustRoot, answer.sig);
+		return sig.length === 64 && verify(null, message, trustRoot, sig);
 	} catch {
 		return false;
 	}
 }
 
-export function verifyCut(epochKey: Buffer, request: CutRequest, answer: CutAnswer, mac: Buffer): boolean {
-	const expected = cutMac(epochKey, request, answer);
-	return mac.length === expected.length && timingSafeEqual(mac, expected);
+/**
+ * True only for a valid signature by the trust root over Pi's own challenge and pane, for this
+ * process's own tty, pinning this process (pid and pid namespace) as the epoch's peer.
+ */
+export function verifyEnroll(
+	trustRoot: KeyObject | undefined,
+	challenge: Buffer,
+	paneId: string,
+	answer: EnrollAnswer,
+	own: { readonly tty: TtyId; readonly peer: PeerId },
+): boolean {
+	if (!trustRoot) return false;
+	if (answer.tty.dev !== own.tty.dev || answer.tty.ino !== own.tty.ino) return false;
+	if (answer.peer.pid !== own.peer.pid || answer.peer.pidns !== own.peer.pidns) return false;
+	return verifySig(trustRoot, enrollMessage(challenge, paneId, answer), answer.sig);
+}
+
+export function verifyCut(trustRoot: KeyObject, request: CutRequest, answer: CutAnswer, sig: Buffer): boolean {
+	return verifySig(trustRoot, cutMessage(request, answer), sig);
 }
 
 /** A trust root key file that exists: either an accepted key or the check that rejected it. */

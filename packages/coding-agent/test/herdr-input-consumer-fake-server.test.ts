@@ -1,10 +1,11 @@
 /**
  * smarty-dev#2636 F1 (herdr-lead Luna review): an agent owns a PTY master, runs Pi on the slave and
  * answers as a fake Herdr, writing the real marker itself. Pi must label nothing unless the server
- * proves it holds the Herdr server key (decision 3 B). Real PTY, real Unix socket, fake server.
+ * proves it holds the Herdr server key (decision 3 B). Real PTY, real Unix socket, fake server
+ * running Herdr's E' v2 logic: it signs the enrolling child's real pid and pid namespace.
  */
 import { spawn } from "node:child_process";
-import { createHash, generateKeyPairSync, type KeyObject, randomBytes, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, type KeyObject, randomBytes } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -12,7 +13,8 @@ import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { afterEach, describe, expect, it } from "vitest";
 import { epochMarker } from "../src/core/herdr/epoch-bytes.ts";
-import { type CutAnswer, cutMac, enrollMessage, type TtyId } from "../src/core/herdr/server-auth.ts";
+import type { PeerId, TtyId } from "../src/core/herdr/server-auth.ts";
+import { cutRequestOf, cutResult, enrollResult } from "./fixtures/herdr-v2-answers.ts";
 
 const fixtures = join(import.meta.dirname, "fixtures");
 const trusted = generateKeyPairSync("ed25519");
@@ -22,7 +24,9 @@ interface Scenario {
 	signWith: KeyObject;
 	trustRoot: "trusted" | "none";
 	tty?: (real: TtyId) => TtyId;
-	badMac?: boolean;
+	/** The peer the fake signs; defaults to the child it pinned (its real pid and pid namespace). */
+	peer?: (real: PeerId) => PeerId;
+	badSig?: boolean;
 	/** Run Pi's startup bootstrap (fixtures/herdr-bootstrap-child.ts) in this mode instead. */
 	bootstrap?: "exit" | "handoff";
 }
@@ -58,15 +62,16 @@ async function run(
 	const type = (bytes: Buffer) => host.stdin.write(`${bytes.toString("hex")}\n`);
 	const lines = createInterface({ input: host.stdout });
 	let slave = "";
+	let childPid = 0;
 	let cutRequests = 0;
 	const methods: string[] = [];
 	const closed: Promise<void>[] = [];
-	// Like Herdr, the epoch outlives the enroll connection: a cut finds it by (epoch, epoch_key).
-	let epochKey = Buffer.alloc(0);
+	const pidns = statSync("/proc/self/ns/pid", { bigint: true }).ino;
 	const exited = new Promise<void>((resolve) => {
 		lines.on("line", (line) => {
-			const message = JSON.parse(line) as { slave?: string; exit?: number };
+			const message = JSON.parse(line) as { slave?: string; pid?: number; exit?: number };
 			if (message.slave) slave = message.slave;
+			if (message.pid) childPid = message.pid;
 			if (message.exit !== undefined) resolve();
 		});
 	});
@@ -91,21 +96,11 @@ async function run(
 					const stat = statSync(slave, { bigint: true });
 					const real = { dev: stat.dev, ino: stat.ino };
 					const tty = scenario.tty ? scenario.tty(real) : real;
-					epochKey = randomBytes(32);
-					const answer = { epoch: "e1", epochKey, nonce: randomBytes(16).toString("hex"), tty };
-					const sig = sign(
-						null,
-						enrollMessage(Buffer.from(request.params.challenge, "hex"), paneId, answer),
-						scenario.signWith,
-					);
-					reply({
-						type: "input_consumer_enrolled",
-						epoch: answer.epoch,
-						epoch_key: epochKey.toString("hex"),
-						nonce: answer.nonce,
-						tty: { dev: tty.dev.toString(), ino: tty.ino.toString() },
-						sig: sig.toString("base64"),
-					});
+					const pinned = { pid: BigInt(childPid), pidns };
+					const peer = scenario.peer ? scenario.peer(pinned) : pinned;
+					const epoch = randomBytes(16).toString("hex");
+					const answer = { epoch, nonce: randomBytes(32).toString("hex"), tty, peer };
+					reply(enrollResult(scenario.signWith, request.params.challenge, paneId, answer));
 					// The fake owns the master: it writes the real marker and types for "Paul".
 					setTimeout(() => {
 						type(Buffer.from("x"));
@@ -113,17 +108,17 @@ async function run(
 					}, 50);
 				} else if (request.method === "pane.input_consumer.cut") {
 					cutRequests++;
-					const answer: CutAnswer = { result: "client", principal: { smartyId: "paul", displayName: "Paul" } };
-					const { params } = request;
-					const mac = cutMac(epochKey, { ...params, epoch: params.epoch }, answer);
-					if (scenario.badMac) mac[0] ^= 1;
-					reply({
-						type: "input_consumer_cut",
-						result: answer.result,
+					const answer = cutResult(scenario.signWith, cutRequestOf(request.params), {
+						result: "client",
 						principal: { smarty_id: "paul", display_name: "Paul" },
-						mac: mac.toString("hex"),
 					});
-				} else reply({ type: "ok" });
+					if (scenario.badSig) {
+						const sig = Buffer.from(answer.sig as string, "base64");
+						sig[0] ^= 1;
+						answer.sig = sig.toString("base64");
+					}
+					reply(answer);
+				} else reply({});
 			}
 		});
 	});
@@ -144,6 +139,7 @@ describe("herdr input consumer against a fake server on a real PTY (smarty-dev#2
 		expect(cutRequests).toBe(0);
 	});
 
+	// E' P1: the genuine v2 signer, pinning this very child, gives `keyboard`.
 	it("attributes the typed turn when the server signs with the trusted key (counterexample)", async () => {
 		const { result, methods } = await run({ signWith: trusted.privateKey, trustRoot: "trusted" });
 		// pi#160 E2E: the cut reaches a server that closed the enroll connection after its answer.
@@ -168,9 +164,32 @@ describe("herdr input consumer against a fake server on a real PTY (smarty-dev#2
 		expect(result.record.channel).toBe("terminal");
 	});
 
-	it("records terminal when a cut answer fails its MAC", async () => {
-		const { result } = await run({ signWith: trusted.privateKey, trustRoot: "trusted", badMac: true });
-		expect(result.reason).toBe("bad-mac");
+	// E' P3 on a real PTY: Herdr pinned another process (a relay) as the epoch's peer.
+	it("refuses a valid signature that pins another process", async () => {
+		const { result, cutRequests } = await run({
+			signWith: trusted.privateKey,
+			trustRoot: "trusted",
+			peer: (real) => ({ pid: BigInt(process.pid), pidns: real.pidns }),
+		});
+		expect(result.reason).toBe("server-unauthenticated");
+		expect(result.record.channel).toBe("terminal");
+		expect(cutRequests).toBe(0);
+	});
+
+	// E' P4 on a real PTY: the right pid number, but in another pid namespace.
+	it("refuses a valid signature for another pid namespace", async () => {
+		const { result } = await run({
+			signWith: trusted.privateKey,
+			trustRoot: "trusted",
+			peer: (real) => ({ pid: real.pid, pidns: real.pidns + 1n }),
+		});
+		expect(result.reason).toBe("server-unauthenticated");
+		expect(result.record.channel).toBe("terminal");
+	});
+
+	it("records terminal when a cut answer fails its signature", async () => {
+		const { result } = await run({ signWith: trusted.privateKey, trustRoot: "trusted", badSig: true });
+		expect(result.reason).toBe("bad-signature");
 		expect(result.record.channel).toBe("terminal");
 		expect(result.record.principal).toBeUndefined();
 	});

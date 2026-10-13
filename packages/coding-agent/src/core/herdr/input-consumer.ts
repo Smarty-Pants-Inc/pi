@@ -3,18 +3,20 @@
  *
  * Talks Herdr's newline-delimited JSON API (`{id, method, params}` -> `{id, result}|{id, error}`).
  * Herdr answers one request per connection and then closes it, so every request (enroll, each cut,
- * release) opens its own connection. Herdr finds an epoch by (epoch, epoch_key), not by connection.
- * The epoch_key stays in this closure; nothing here is reachable from extensions or settings.
- * Fail closed: any transport error, refusal, bad signature, tty mismatch, bad MAC or malformed
+ * release) opens its own connection. Protocol E' v2: Pi holds no secret. Herdr finds an epoch by
+ * `epoch` and accepts its cut and release only from the process it pinned at enroll; Pi checks at
+ * enroll that the signed pin names itself, and verifies Herdr's signature on every cut answer.
+ * Fail closed: any transport error, refusal, bad signature, tty or peer mismatch, or malformed
  * answer gives no epoch or an `unknown` cut, which callers record as `channel: "terminal"`.
  */
 import { type KeyObject, randomBytes } from "node:crypto";
-import { fstatSync } from "node:fs";
+import { fstatSync, statSync } from "node:fs";
 import { connectRpc, HerdrRpcProtocolError } from "./rpc.ts";
 import {
 	type CutAnswer,
 	type CutRequest,
 	type EnrollAnswer,
+	type PeerId,
 	type TtyId,
 	verifyCut,
 	verifyEnroll,
@@ -25,7 +27,7 @@ export type EnrollFailure = "no-trust-root" | "transport" | "refused" | "server-
 export interface HerdrEpoch {
 	readonly epoch: string;
 	readonly nonce: string;
-	/** Ask who wrote the interval. Never rejects; a failed MAC also ends the epoch. */
+	/** Ask who wrote the interval. Never rejects; a bad or missing signature also ends the epoch. */
 	cut(request: Omit<CutRequest, "epoch">): Promise<CutAnswer>;
 	release(): void;
 }
@@ -39,38 +41,61 @@ export interface EnrollOptions {
 	readonly ttyFd?: number;
 }
 
-const HEX = /^[0-9a-f]+$/;
-const DECIMAL = /^[0-9]{1,20}$/;
+const EPOCH = /^[0-9a-f]{32}$/;
+const NONCE = /^[A-Za-z0-9_-]{16,128}$/;
+const DECIMAL = /^(0|[1-9][0-9]{0,19})$/;
 
-function parseEnroll(result: Record<string, unknown>): EnrollAnswer | undefined {
-	const { epoch, epoch_key, nonce, tty, sig } = result;
-	if (typeof epoch !== "string" || !epoch || typeof nonce !== "string" || !/^[A-Za-z0-9_-]{16,128}$/.test(nonce))
-		return undefined;
-	if (typeof epoch_key !== "string" || epoch_key.length !== 64 || !HEX.test(epoch_key)) return undefined;
-	if (typeof sig !== "string" || typeof tty !== "object" || tty === null) return undefined;
-	const { dev, ino } = tty as { dev?: unknown; ino?: unknown };
-	if (typeof dev !== "string" || !DECIMAL.test(dev) || typeof ino !== "string" || !DECIMAL.test(ino)) return undefined;
-	return {
-		epoch,
-		epochKey: Buffer.from(epoch_key, "hex"),
-		nonce,
-		tty: { dev: BigInt(dev), ino: BigInt(ino) },
-		sig: Buffer.from(sig, "base64"),
-	};
+type Fields = Record<string, unknown>;
+
+/** A JSON object whose keys are all in `allowed`; v2 answers carry nothing else (no `epoch_key`, no `mac`). */
+function strict(value: unknown, allowed: readonly string[]): Fields | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	return Object.keys(value).every((key) => allowed.includes(key)) ? (value as Fields) : undefined;
 }
 
-function parseCut(result: Record<string, unknown>): { answer: CutAnswer; mac: Buffer } | undefined {
-	const { result: kind, reason, principal, mac } = result;
+function decimal(value: unknown): bigint | undefined {
+	return typeof value === "string" && DECIMAL.test(value) ? BigInt(value) : undefined;
+}
+
+/** Canonical base64 of exactly 64 bytes (an Ed25519 signature), else undefined. */
+function signature(value: unknown): Buffer | undefined {
+	if (typeof value !== "string") return undefined;
+	const bytes = Buffer.from(value, "base64");
+	return bytes.length === 64 && bytes.toString("base64") === value ? bytes : undefined;
+}
+
+function parseEnroll(value: Fields): EnrollAnswer | undefined {
+	const result = strict(value, ["epoch", "nonce", "tty", "peer", "sig"]);
+	if (!result) return undefined;
+	const { epoch, nonce } = result;
+	if (typeof epoch !== "string" || !EPOCH.test(epoch) || typeof nonce !== "string" || !NONCE.test(nonce))
+		return undefined;
+	const tty = strict(result.tty, ["dev", "ino"]);
+	const peer = strict(result.peer, ["pid", "pidns"]);
+	const dev = decimal(tty?.dev);
+	const ino = decimal(tty?.ino);
+	const pid = decimal(peer?.pid);
+	const pidns = decimal(peer?.pidns);
+	const sig = signature(result.sig);
+	if (dev === undefined || ino === undefined || pid === undefined || pidns === undefined || !sig) return undefined;
+	return { epoch, nonce, tty: { dev, ino }, peer: { pid, pidns }, sig };
+}
+
+function parseCut(value: Fields): { answer: CutAnswer; sig: Buffer } | undefined {
+	const result = strict(value, ["result", "reason", "principal", "sig"]);
+	if (!result) return undefined;
+	const { result: kind, reason, principal } = result;
 	if (kind !== "client" && kind !== "api" && kind !== "mixed" && kind !== "unknown") return undefined;
-	if (typeof mac !== "string" || mac.length !== 64 || !HEX.test(mac)) return undefined;
 	if (reason !== undefined && typeof reason !== "string") return undefined;
+	const sig = signature(result.sig);
+	if (!sig) return undefined;
 	let parsed: CutAnswer["principal"];
 	if (principal !== undefined && principal !== null) {
-		const { smarty_id, display_name } = principal as { smarty_id?: unknown; display_name?: unknown };
-		if (typeof smarty_id !== "string" || typeof display_name !== "string") return undefined;
-		parsed = { smartyId: smarty_id, displayName: display_name };
+		const fields = strict(principal, ["smarty_id", "display_name"]);
+		if (typeof fields?.smarty_id !== "string" || typeof fields.display_name !== "string") return undefined;
+		parsed = { smartyId: fields.smarty_id, displayName: fields.display_name };
 	}
-	return { answer: { result: kind, reason, principal: parsed }, mac: Buffer.from(mac, "hex") };
+	return { answer: { result: kind, reason, principal: parsed }, sig };
 }
 
 const UNSAFE_NAME = /[*\\():\p{Cc}]/u;
@@ -87,9 +112,11 @@ export function attestedPrincipal(answer: CutAnswer): { smartyId: string; displa
 	return { smartyId, displayName };
 }
 
-function ownTty(fd: number): TtyId {
+/** This process as Herdr must have pinned it: the tty it reads, its pid and its active pid namespace. */
+function ownIdentity(fd: number): { tty: TtyId; peer: PeerId } {
 	const stat = fstatSync(fd, { bigint: true });
-	return { dev: stat.dev, ino: stat.ino };
+	const pidns = statSync("/proc/self/ns/pid", { bigint: true }).ino;
+	return { tty: { dev: stat.dev, ino: stat.ino }, peer: { pid: BigInt(process.pid), pidns } };
 }
 
 export async function enrollHerdrInputConsumer(
@@ -118,16 +145,16 @@ export async function enrollHerdrInputConsumer(
 	}
 	const answer = parseEnroll(result);
 	if (!answer) return { ok: false, reason: "malformed" };
-	let tty: TtyId;
+	let own: ReturnType<typeof ownIdentity>;
 	try {
-		tty = ownTty(options.ttyFd ?? 0);
+		own = ownIdentity(options.ttyFd ?? 0);
 	} catch {
 		return { ok: false, reason: "server-unauthenticated" };
 	}
-	if (!verifyEnroll(options.trustRoot, challenge, options.paneId, answer, tty)) {
+	if (!verifyEnroll(options.trustRoot, challenge, options.paneId, answer, own)) {
 		return { ok: false, reason: "server-unauthenticated" };
 	}
-	return { ok: true, epoch: openEpoch(options.socketPath, timeoutMs, answer) };
+	return { ok: true, epoch: openEpoch(options.socketPath, timeoutMs, options.trustRoot, answer) };
 }
 
 /** One request on a fresh connection, closed after the answer (pi#160 E2E: Herdr closes it anyway). */
@@ -145,16 +172,12 @@ async function oneRequest(
 	}
 }
 
-function openEpoch(socketPath: string, timeoutMs: number, enrolled: EnrollAnswer): HerdrEpoch {
-	const epochKey = enrolled.epochKey;
+function openEpoch(socketPath: string, timeoutMs: number, trustRoot: KeyObject, enrolled: EnrollAnswer): HerdrEpoch {
 	let ended = false;
 	const end = () => {
 		if (ended) return;
 		ended = true;
-		oneRequest(socketPath, timeoutMs, "pane.input_consumer.release", {
-			epoch: enrolled.epoch,
-			epoch_key: epochKey.toString("hex"),
-		}).catch(() => {});
+		oneRequest(socketPath, timeoutMs, "pane.input_consumer.release", { epoch: enrolled.epoch }).catch(() => {});
 	};
 	return {
 		epoch: enrolled.epoch,
@@ -167,7 +190,6 @@ function openEpoch(socketPath: string, timeoutMs: number, enrolled: EnrollAnswer
 			try {
 				result = await oneRequest(socketPath, timeoutMs, "pane.input_consumer.cut", {
 					epoch: request.epoch,
-					epoch_key: epochKey.toString("hex"),
 					seq: request.seq,
 					token: request.token,
 					cut: request.cut,
@@ -178,9 +200,9 @@ function openEpoch(socketPath: string, timeoutMs: number, enrolled: EnrollAnswer
 				return unknown("transport");
 			}
 			const parsed = parseCut(result);
-			if (!parsed || !verifyCut(epochKey, request, parsed.answer, parsed.mac)) {
+			if (!parsed || !verifyCut(trustRoot, request, parsed.answer, parsed.sig)) {
 				end();
-				return unknown("bad-mac");
+				return unknown("bad-signature");
 			}
 			return parsed.answer;
 		},

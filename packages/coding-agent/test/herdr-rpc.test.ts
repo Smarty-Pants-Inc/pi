@@ -77,10 +77,10 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		const enroll = JSON.stringify({
 			id: "pi-ic-99999",
 			result: {
-				epoch: "e".repeat(64),
-				epoch_key: "a".repeat(64),
+				epoch: "e".repeat(32),
 				nonce: "n".repeat(128),
 				tty: { dev: "9".repeat(20), ino: "9".repeat(20) },
+				peer: { pid: "9".repeat(20), pidns: "9".repeat(20) },
 				sig: "s".repeat(88),
 			},
 		});
@@ -90,7 +90,7 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 				result: "unknown",
 				reason: "r".repeat(64),
 				principal: { smarty_id: "i".repeat(64), display_name: "\u{1F600}".repeat(80) },
-				mac: "m".repeat(64),
+				sig: "s".repeat(88),
 			},
 		});
 		const largest = Math.max(Buffer.byteLength(enroll), Buffer.byteLength(cut));
@@ -322,11 +322,11 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 	it("still runs a normal enroll, cut and release flow (counterexample)", async () => {
 		const herdr = await fakeHerdr((socket, request) => {
 			const results: Record<string, object> = {
-				"pane.input_consumer.enroll": { epoch: "e1", epoch_key: "ab".repeat(32), nonce: "n".repeat(128) },
+				"pane.input_consumer.enroll": { epoch: "e1", nonce: "n".repeat(128) },
 				"pane.input_consumer.cut": {
 					result: "client",
 					principal: { smarty_id: "paul", display_name: "P\u00e4ul".repeat(20) },
-					mac: "cd".repeat(32),
+					sig: "cd".repeat(44),
 				},
 				"pane.input_consumer.release": {},
 			};
