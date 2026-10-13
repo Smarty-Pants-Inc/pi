@@ -12,6 +12,12 @@ export {
 export { toCodemodeIdentifier } from "./identifier.ts";
 export { CodemodeSandbox } from "./runtime/host.ts";
 export {
+	CodemodeLimitError,
+	type CodemodeLimits,
+	checkCodemodeStoreQuota,
+	DEFAULT_CODEMODE_LIMITS,
+} from "./runtime/limits.ts";
+export {
 	MAX_OUTPUT_CHARS,
 	MAX_OUTPUT_ITEMS,
 	MAX_STORE_TOTAL_CHARS,
