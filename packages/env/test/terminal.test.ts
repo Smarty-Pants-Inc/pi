@@ -87,14 +87,19 @@ describe.skipIf(process.platform === "win32")("openTerminal", () => {
 		await output.waitFor("READY");
 		expect(await terminal.foreground()).toBeUndefined();
 		terminal.write("sleep 100\n");
+		const foregroundName = process.platform === "darwin" || process.platform === "linux" ? "sleep" : undefined;
+		const deadline = Date.now() + 5_000;
 		let foreground = await terminal.foreground();
-		for (let tries = 0; !foreground && tries < 100; tries++) {
-			await new Promise((resolve) => setTimeout(resolve, 20));
+		while (
+			(!foreground || (foregroundName !== undefined && foreground.name !== foregroundName)) &&
+			Date.now() < deadline
+		) {
+			await new Promise((resolve) => setImmediate(resolve));
 			foreground = await terminal.foreground();
 		}
 		expect(foreground?.pid).toBeGreaterThan(0);
 		expect(foreground?.pid).not.toBe(terminal.pid);
-		if (process.platform === "darwin" || process.platform === "linux") expect(foreground?.name).toBe("sleep");
+		if (foregroundName !== undefined) expect(foreground?.name).toBe(foregroundName);
 		terminal.close();
 		await expect(terminal.exited).rejects.toMatchObject({ code: "aborted" });
 		await expect(terminal.foreground()).rejects.toMatchObject({ code: "EBADF" });
