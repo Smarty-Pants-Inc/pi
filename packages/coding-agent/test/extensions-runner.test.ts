@@ -526,7 +526,10 @@ describe("ExtensionRunner", () => {
 			expect(result.errors).toEqual([
 				{
 					path: extensionPath,
-					error: `Failed to load extension: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
+					// #11897: keep the loader error expectation message-only, without a stack prefix.
+					error: expect.stringContaining(
+						`Failed to load extension: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
+					),
 				},
 			]);
 		});
