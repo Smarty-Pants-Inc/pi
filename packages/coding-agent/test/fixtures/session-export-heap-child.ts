@@ -21,7 +21,11 @@ assert.ok(gc, "Expected --expose-gc");
 const KEY_COUNT = 10_000_000;
 const BUFFER_BYTES = 512 * 1024 * 1024;
 
-function heapUsed(): number {
+/**
+ * Retained heap AFTER two forced full GCs. This is not a transient peak: garbage freed
+ * during an export call is not visible here. The fixed 1 GiB old-space cap bounds peaks.
+ */
+function retainedHeapAfterGc(): number {
 	gc!();
 	gc!();
 	return process.memoryUsage().heapUsed;
@@ -30,7 +34,7 @@ function heapUsed(): number {
 /** Each refusal must leave no output file behind; a thrown error is the only acceptable outcome. */
 function expectRefused(label: string, run: () => unknown, pattern: RegExp): void {
 	assert.throws(run, pattern, label);
-	writeSync(1, `REFUSED ${label} heapUsed=${heapUsed()}\n`);
+	writeSync(1, `REFUSED ${label} retainedHeapAfterGc=${retainedHeapAfterGc()}\n`);
 }
 
 const manager = SessionManager.inMemory(scratch);
@@ -43,9 +47,9 @@ if (mode === "fixed-keys") {
 	for (let index = 0; index < KEY_COUNT; index++) payload[index] = 0;
 	manager.appendCustomEntry("heavy-keys", { payload });
 	const trailing = () => [{ type: "custom", customType: "heavy-keys-trailing", data: { payload } }];
-	const resident = heapUsed();
+	const retainedBeforeAfterGc = retainedHeapAfterGc();
 	// Synchronous output survives a fatal OOM, separating setup from export.
-	writeSync(1, `EXPORT_READY ${mode} ${KEY_COUNT} heapUsed=${resident}\n`);
+	writeSync(1, `EXPORT_READY ${mode} ${KEY_COUNT} retainedHeapAfterGc=${retainedBeforeAfterGc}\n`);
 	expectRefused("live-string", () => serializeSessionBranch(manager), /64 MiB/);
 	expectRefused("live-jsonl", () => exportSessionToJsonl(manager, join(scratch, "live-keys.jsonl")), /64 MiB/);
 	const trailingManager = SessionManager.inMemory(scratch);
@@ -58,12 +62,12 @@ if (mode === "fixed-keys") {
 	);
 	assert.ok(!existsSync(join(scratch, "live-keys.jsonl")) && !existsSync(join(scratch, "trailing-keys.jsonl")));
 	assert.ok(Object.hasOwn(payload, KEY_COUNT - 1));
-	writeSync(1, `FIXED_KEYS_REFUSED retainedGrowth=${heapUsed() - resident}\n`);
+	writeSync(1, `FIXED_KEYS_REFUSED retainedGrowthAfterGc=${retainedHeapAfterGc() - retainedBeforeAfterGc}\n`);
 } else {
 	const payload = Buffer.alloc(BUFFER_BYTES, 1);
 	manager.appendCustomEntry("heavy-buffer", { payload });
 	const trailing = () => [{ type: "custom", customType: "heavy-buffer-trailing", data: { payload } }];
-	writeSync(1, `EXPORT_READY ${mode} ${BUFFER_BYTES} heapUsed=${heapUsed()}\n`);
+	writeSync(1, `EXPORT_READY ${mode} ${BUFFER_BYTES} retainedHeapAfterGc=${retainedHeapAfterGc()}\n`);
 	if (mode === "fixed-buffer") {
 		// The Buffer brand must be refused before its toJSON hook or index enumeration runs.
 		const original = Buffer.prototype.toJSON;

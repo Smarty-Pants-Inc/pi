@@ -8,12 +8,17 @@ import { exportSessionToJsonl, serializeSessionBranch } from "../src/core/sessio
 import { copyEntry, type EntryLocation, isColdEntry, toColdEntry } from "../src/core/session-lazy-entries.ts";
 import { CURRENT_SESSION_VERSION, type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 
+/** Unmocked rmSync, captured before the mock replaces it; used only for this file's scratch root. */
+const realFs = vi.hoisted(() => ({ rmSync: undefined as typeof fs.rmSync | undefined }));
+
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof fs>();
+	realFs.rmSync = actual.rmSync;
 	return {
 		...actual,
 		closeSync: vi.fn(actual.closeSync),
-		// Deletion is observed, never executed on local files. Scratch is left for parent cleanup.
+		readSync: vi.fn(actual.readSync),
+		// Product deletion is recorded, never executed. Scratch is removed by afterEach with realFs.
 		unlinkSync: vi.fn(),
 		rmSync: vi.fn(),
 	};
@@ -256,10 +261,13 @@ describe("session export serialization", () => {
 	});
 
 	afterEach(() => {
-		// No deletion here: unlinkSync/rmSync stay mocked and the parent removes the scratch root.
 		vi.restoreAllMocks();
 		vi.clearAllMocks();
 		vi.useRealTimers();
+		// Real cleanup, confined to this test's own scratch root under the private TMPDIR.
+		expect(testRoot.startsWith(join(tmpdir(), "pi-session-export-serialization-"))).toBe(true);
+		realFs.rmSync!(testRoot, { recursive: true, force: true });
+		expect(fs.existsSync(testRoot)).toBe(false);
 	});
 
 	function directory(): string {
@@ -807,11 +815,24 @@ describe("session export serialization", () => {
 		expect(read).not.toHaveBeenCalled();
 	});
 
+	/** Bytes coldSnapshot reserves before reading a cold line: parent link plus resident primitives. */
+	function residentReserve(entry: object, parentId: string | null): number {
+		let bytes = typeof parentId === "string" ? parentId.length * 6 + 26 : 30;
+		for (const key of Object.keys(entry)) {
+			const descriptor = Object.getOwnPropertyDescriptor(entry, key)!;
+			if (key === "parentId" || !("value" in descriptor)) continue;
+			const value: unknown = descriptor.value;
+			if (value !== null && typeof value === "object") continue;
+			bytes += key.length * 6 + 26 + (typeof value === "string" ? value.length * 6 : 0);
+		}
+		return bytes;
+	}
+
 	/** Real disk journal whose first message can be replaced by a cold copy at any byte range. */
-	function coldJournal() {
+	function coldJournal(contentLength = 2048) {
 		const sessionDir = directory();
 		const writer = SessionManager.create(sessionDir, sessionDir);
-		const messageId = writer.appendMessage({ role: "user", content: "x".repeat(2048), timestamp: 1 });
+		const messageId = writer.appendMessage({ role: "user", content: "x".repeat(contentLength), timestamp: 1 });
 		writer.appendCustomEntry("later", { n: 1 });
 		const journal = writer.getSessionFile()!;
 		const journalLines = fs.readFileSync(journal, "utf8").trimEnd().split("\n");
@@ -834,6 +855,7 @@ describe("session export serialization", () => {
 		);
 		return {
 			journal,
+			journalLines,
 			line,
 			offset,
 			prefixBytes,
@@ -921,21 +943,141 @@ describe("session export serialization", () => {
 		const overCeiling = journal.cold({ length: MAX_MATERIALIZED_EXPORT_BYTES + 1 });
 		// Fits the per-entry ceiling but not what remains after the export header line.
 		const overRemaining = journal.cold({ length: MAX_MATERIALIZED_EXPORT_BYTES - journal.prefixBytes + 1 });
+		// Streaming preflight is the per-entry ceiling less the null parent link reservation (30).
+		const preflight = MAX_MATERIALIZED_EXPORT_BYTES - 1 - 30;
+		const overPreflight = journal.cold({ length: preflight + 1 });
+		const atPreflight = journal.cold({ length: preflight });
+		// The streaming final budget is the per-entry ceiling less the resident reservations (parent
+		// link, type, id, timestamp). The header line is shorter than those reservations.
+		const streamingBudget = MAX_MATERIALIZED_EXPORT_BYTES - 1 - residentReserve(overRemaining, null);
+		expect(MAX_MATERIALIZED_EXPORT_BYTES - journal.prefixBytes + 1).toBeGreaterThan(streamingBudget);
+		expect(preflight).toBeGreaterThan(streamingBudget);
 		const destination = join(directory(), "cold.jsonl");
 		const alloc = vi.spyOn(Buffer, "allocUnsafe");
 		const parse = vi.spyOn(JSON, "parse");
+		const descriptor = vi.spyOn(Object, "getOwnPropertyDescriptor");
+		const keys = vi.spyOn(Object, "keys");
+		/**
+		 * Key or accessor names read from a cold entry or its message beyond the shallow checks, the
+		 * id check and the discovery pass's parentId read.
+		 */
+		const nameReads = (entry: object, run: () => void): number => {
+			const message = Reflect.getOwnPropertyDescriptor(entry, "message")!.value as object;
+			descriptor.mockClear();
+			keys.mockClear();
+			run();
+			return (
+				descriptor.mock.calls.filter(
+					([target, key]) =>
+						target === message || (target === entry && !["id", "parentId", "toJSON"].includes(key as string)),
+				).length + keys.mock.calls.filter(([target]) => target === entry || target === message).length
+			);
+		};
 
 		journal.use(overCeiling);
-		expect(() => serializeSessionBranch(journal.sessionManager)).toThrow(/remaining export limit/);
-		expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/remaining export limit/);
+		expect(
+			nameReads(overCeiling, () =>
+				expect(() => serializeSessionBranch(journal.sessionManager)).toThrow(/remaining export limit/),
+			),
+		).toBe(0);
+		expect(
+			nameReads(overCeiling, () =>
+				expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/remaining export limit/),
+			),
+		).toBe(0);
 		journal.use(overRemaining);
-		expect(() => serializeSessionBranch(journal.sessionManager)).toThrow(/remaining export limit/);
-		// The streaming path has only the per-entry ceiling; the range check then refuses it.
-		expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/changed on disk/);
+		expect(
+			nameReads(overRemaining, () =>
+				expect(() => serializeSessionBranch(journal.sessionManager)).toThrow(/remaining export limit/),
+			),
+		).toBe(0);
+		// Passes the streaming preflight, so names are read; the final check refuses it before reading.
+		expect(
+			nameReads(overRemaining, () =>
+				expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/remaining export limit/),
+			),
+		).toBeGreaterThan(0);
+		// Exact preflight boundary: one byte over is refused before any name is read; at the boundary
+		// names are read and the final reservation check refuses it.
+		journal.use(overPreflight);
+		expect(
+			nameReads(overPreflight, () =>
+				expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/remaining export limit/),
+			),
+		).toBe(0);
+		journal.use(atPreflight);
+		expect(
+			nameReads(atPreflight, () =>
+				expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/remaining export limit/),
+			),
+		).toBeGreaterThan(0);
+		descriptor.mockRestore();
+		keys.mockRestore();
 
 		expect(alloc.mock.calls.some(([size]) => size >= 1024 * 1024)).toBe(false);
 		expect(parse).not.toHaveBeenCalled();
 		expect(fs.existsSync(destination)).toBe(false);
+	});
+
+	// smarty-dev#12074: the line is checked against the budget left after the resident reservations,
+	// not the caller's limit. A resident patch shrinks that budget to exactly the allowed line's
+	// length; a line one byte longer still fits the caller's limit but is refused before it is read.
+	it.each([
+		{
+			name: "string",
+			limit: (prefixBytes: number) => MAX_MATERIALIZED_EXPORT_BYTES - prefixBytes - 1,
+			run: (sessionManager: SessionManager) => serializeSessionBranch(sessionManager),
+		},
+		{
+			name: "streaming",
+			limit: (_prefixBytes: number) => MAX_MATERIALIZED_EXPORT_BYTES - 1,
+			run: (sessionManager: SessionManager) =>
+				fs.readFileSync(exportSessionToJsonl(sessionManager, join(directory(), "boundary.jsonl")), "utf8"),
+		},
+	])("refuses a cold line one byte over the reduced $name budget before reading it", ({ limit, run }) => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		const probe = coldJournal();
+		const callerLimit = limit(probe.prefixBytes);
+		const baseReserve = residentReserve(probe.cold(), null);
+		const reserve = baseReserve + "pad".length * 6 + 26;
+		// Reservations step by 6 bytes per pad character, so the content length absorbs the rest.
+		const free = callerLimit - reserve - Buffer.byteLength(probe.line);
+		const delta = free % 6;
+		const padLength = (free - delta) / 6;
+		const allowed = coldJournal(2048 + delta);
+		const refused = coldJournal(2048 + delta + 1);
+		const allowedBytes = Buffer.byteLength(allowed.line);
+		for (const journal of [allowed, refused]) {
+			expect(journal.prefixBytes).toBe(probe.prefixBytes);
+			expect(residentReserve(journal.cold(), null)).toBe(baseReserve);
+		}
+		// Reduced budget = caller limit - reservations (with the pad patch) = allowed line, exactly.
+		expect(callerLimit - reserve - padLength * 6).toBe(allowedBytes);
+		expect(Buffer.byteLength(refused.line)).toBe(allowedBytes + 1);
+		expect(allowedBytes + 1).toBeLessThan(callerLimit);
+		const patch = { pad: "p".repeat(padLength) };
+
+		refused.use(copyEntry(refused.cold(), patch as Partial<SessionEntry>));
+		const readCalls = vi.mocked(fs.readSync).mock.calls.length;
+		const alloc = vi.spyOn(Buffer, "allocUnsafe");
+		const parse = vi.spyOn(JSON, "parse");
+		expect(() => run(refused.sessionManager)).toThrow(/remaining export limit/);
+		expect(alloc.mock.calls.some(([size]) => size === allowedBytes + 1)).toBe(false);
+		expect(fs.readSync).toHaveBeenCalledTimes(readCalls);
+		expect(parse).not.toHaveBeenCalled();
+		alloc.mockRestore();
+		parse.mockRestore();
+
+		// Counterexample: the line at exactly the reduced budget is read and exported with its patch.
+		allowed.use(copyEntry(allowed.cold(), patch as Partial<SessionEntry>));
+		const patchedLine = JSON.stringify({ ...JSON.parse(allowed.line), ...patch });
+		const expectedTail = `${allowed.journalLines
+			.slice(1)
+			.map((line) => (line === allowed.line ? patchedLine : line))
+			.join("\n")}\n`;
+		const output = run(allowed.sessionManager);
+		expect(output.slice(output.indexOf("\n") + 1)).toBe(expectedTail);
 	});
 
 	// smarty-dev#12074: the byte range is checked against the open file, and the line must still

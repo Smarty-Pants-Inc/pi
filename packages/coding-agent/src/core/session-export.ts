@@ -19,7 +19,7 @@ import {
 	MAX_MATERIALIZED_EXPORT_BYTES,
 	prepareExportValueForJson,
 } from "./export-limits.ts";
-import { isColdEntry, toHotEntry } from "./session-lazy-entries.ts";
+import { getEntryLocation, isColdEntry, toHotEntry } from "./session-lazy-entries.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader, type SessionManager } from "./session-manager.ts";
 
 type TrailingEntries = (parentId: string | null, timestamp: string) => readonly object[];
@@ -111,15 +111,25 @@ function requireKeys(node: unknown, keys: readonly string[], format: string): vo
 
 /**
  * Cold entries hold lazy accessors, also nested in message; they are never invoked. The line is
- * reparsed from disk (refused first when longer than `limit`) and walked by the guard before any
- * patch. Resident primitive data fields, which copyEntry patches (parentId, timestamp,
- * firstKeptEntryId) may have changed, are then redefined on the snapshot by descriptor, so
+ * reparsed from disk and walked by the guard before any patch. It is refused before any key name
+ * is read when longer than `limit` less the parent link, and before it is read when longer than
+ * `limit` less all resident reservations. Resident primitive data fields, which copyEntry patches
+ * (parentId, timestamp, firstKeptEntryId) may have changed, are then redefined on the snapshot by descriptor, so
  * "__proto__" stays data. Resident objects come from disk after shallow checks.
  */
 function coldSnapshot(entry: object, parentId: string | null, format: string, limit: number): Json {
 	assertShallowPlain(entry, format);
-	if (typeof dataField(entry, "id", format) !== "string") {
+	const id = dataField(entry, "id", format);
+	if (typeof id !== "string") {
 		throw plainJsonError(format, "a session entry without a string id");
+	}
+	// Preflight before any key or accessor name is enumerated: the line must fit the caller's limit
+	// less the parent link reservation. The final check after resident reservations is in toHotEntry.
+	const parentBytes = typeof parentId === "string" ? parentId.length * 6 + 26 : 30;
+	const location = getEntryLocation(entry);
+	if (!location) throw new Error(`Session entry ${id} has no location on disk`);
+	if (!(location.length <= limit - parentBytes)) {
+		throw new Error(`Session entry ${id} exceeds the remaining export limit (${location.length} bytes)`);
 	}
 	const rootLazy = lazyKeys(entry, format);
 	const message = dataField(entry, "message", format);
@@ -131,7 +141,7 @@ function coldSnapshot(entry: object, parentId: string | null, format: string, li
 	const patches: [string, unknown][] = [["parentId", parentId]];
 	// Reserve conservative bytes for every resident replacement as well as the parsed line.
 	// A replacement can grow the line; checking each contribution separately is insufficient.
-	let remaining = limit - (typeof parentId === "string" ? parentId.length * 6 + 26 : 30);
+	let remaining = limit - parentBytes;
 	for (const key in entry) {
 		if (!Object.hasOwn(entry, key) || key === "parentId") continue;
 		const descriptor = Object.getOwnPropertyDescriptor(entry, key)!;
@@ -147,7 +157,8 @@ function coldSnapshot(entry: object, parentId: string | null, format: string, li
 		if (remaining < 0) throw new Error(`${format} export exceeds the 64 MiB materialization limit`);
 		patches.push([key, value]);
 	}
-	const hot = snapshot(toHotEntry(entry, limit), format, remaining);
+	// The line is refused against the budget left after the resident reservations, before it is read.
+	const hot = snapshot(toHotEntry(entry, remaining), format, remaining);
 	requireKeys(hot, rootLazy, format);
 	requireKeys(Object.getOwnPropertyDescriptor(hot, "message")?.value, messageLazy, format);
 	for (const [key, value] of patches) {

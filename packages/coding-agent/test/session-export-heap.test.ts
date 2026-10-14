@@ -31,13 +31,14 @@ function runChild(mode: "fixed-keys" | "fixed-buffer" | "old-buffer", scratch: s
 		stderr: result.stderr.slice(-4096),
 	});
 	expect(result.error, evidence).toBeUndefined();
-	expect(result.stdout, evidence).toMatch(new RegExp(`^EXPORT_READY ${mode} \\d+ heapUsed=\\d+$`, "m"));
+	expect(result.stdout, evidence).toMatch(new RegExp(`^EXPORT_READY ${mode} \\d+ retainedHeapAfterGc=\\d+$`, "m"));
 	console.log(`Heavy child receipt: ${JSON.stringify({ mode, status: result.status, signal: result.signal })}`);
 	return { result, evidence };
 }
 
 // smarty-dev#12074: real public exports under a fixed 1 GiB old-space cap. Opt in because
-// each child holds a 10M-key object or a 512 MiB Buffer.
+// each child holds a 10M-key object or a 512 MiB Buffer. Heap numbers in child output are
+// retained measurements AFTER forced GC, not transient peaks; the 1 GiB cap bounds peaks.
 describe("session export heap bounds (#12074)", () => {
 	test.skipIf(process.env.PI_HEAVY_TESTS !== "1")(
 		"heavy (default skipped; set PI_HEAVY_TESTS=1): refuses a 512 MiB Buffer by brand where the old JSON.stringify path exhausts a 1 GiB old-space cap",
@@ -63,7 +64,7 @@ describe("session export heap bounds (#12074)", () => {
 	);
 
 	test.skipIf(process.env.PI_HEAVY_TESTS !== "1")(
-		"heavy (default skipped; set PI_HEAVY_TESTS=1): refuses a 10M-key object in live and trailing entries without exhausting a 1 GiB old-space cap",
+		"heavy (default skipped; set PI_HEAVY_TESTS=1): refuses a 10M-key object in live and trailing entries within a 1 GiB old-space cap, retaining under 512 MiB after GC",
 		() => {
 			const scratch = mkdtempSync(join(tmpdir(), "pi-export-heap-keys-"));
 			try {
@@ -74,10 +75,13 @@ describe("session export heap bounds (#12074)", () => {
 					expect(fixed.result.stdout, fixed.evidence).toContain(`REFUSED ${label} `);
 				}
 				// Not constant-space: for...in builds the full key list (about 32 B per array-index
-				// key on Node 22.23.2 and 24.19.0) before the budget can stop the walk.
-				const growth = Number(/^FIXED_KEYS_REFUSED retainedGrowth=(-?\d+)$/m.exec(fixed.result.stdout)?.[1]);
-				expect(Number.isFinite(growth), fixed.evidence).toBe(true);
-				expect(growth, fixed.evidence).toBeLessThan(512 * 1024 * 1024);
+				// key on Node 22.23.2 and 24.19.0) before the budget can stop the walk. The transient
+				// peak is bounded only by the 1 GiB cap (exit 0 above); this asserts retained growth after GC.
+				const retainedGrowthAfterGc = Number(
+					/^FIXED_KEYS_REFUSED retainedGrowthAfterGc=(-?\d+)$/m.exec(fixed.result.stdout)?.[1],
+				);
+				expect(Number.isFinite(retainedGrowthAfterGc), fixed.evidence).toBe(true);
+				expect(retainedGrowthAfterGc, fixed.evidence).toBeLessThan(512 * 1024 * 1024);
 			} finally {
 				rmSync(scratch, { recursive: true, force: true });
 			}
