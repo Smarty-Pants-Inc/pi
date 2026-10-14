@@ -11,6 +11,7 @@ use crate::frame::{EVENT, Frame};
 use crate::output::Output;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
@@ -19,10 +20,24 @@ use std::sync::{Arc, Mutex};
 const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 /// Largest terminal size accepted, in cells.
 const MAX_CELLS: u64 = 4096;
+/// Queued input, including the write in progress, per terminal.
+const INPUT_LIMIT: usize = 1024 * 1024;
+
+struct Input {
+    bytes: Vec<u8>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl Drop for Input {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(self.bytes.len(), Ordering::SeqCst);
+    }
+}
 
 /// What `ptyWrite`, `ptyResize` and `ptyForeground` reach: the terminal of one running `pty` request.
 pub struct Terminal {
-    input: Sender<Vec<u8>>,
+    input: Sender<Input>,
+    queued: Arc<AtomicUsize>,
     #[cfg(unix)]
     master: Arc<std::fs::File>,
     /// The program's process id, which is also its process group's (it leads the terminal's session).
@@ -101,9 +116,29 @@ fn find(terminals: &Terminals, json: &Value) -> Result<Arc<Terminal>, Failure> {
 /// Queue input for the terminal; it is written in the order it arrives, without holding up other requests.
 pub fn write(terminals: &Terminals, json: &Value, payload: Vec<u8>) -> Result<Value, Failure> {
     let terminal = find(terminals, json)?;
+    // Empty writes need no queue entry; a byte budget must also bound the number of queued entries.
+    if payload.is_empty() {
+        return Ok(json!({}));
+    }
+    terminal
+        .queued
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+            queued
+                .checked_add(payload.len())
+                .filter(|total| *total <= INPUT_LIMIT)
+        })
+        .map_err(|_| {
+            Failure::new(
+                "EAGAIN",
+                "terminal input queue is full (1 MiB limit); retry after it drains",
+            )
+        })?;
     terminal
         .input
-        .send(payload)
+        .send(Input {
+            bytes: payload,
+            queued: terminal.queued.clone(),
+        })
         .map_err(|_| Failure::new("EBADF", "the terminal has ended"))?;
     Ok(json!({}))
 }
@@ -166,7 +201,7 @@ pub fn run(
     groups: &Groups,
     terminals: &Terminals,
 ) -> Result<Value, Failure> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -187,11 +222,12 @@ pub fn run(
     let master = Arc::new(master);
     let pid = child.id();
     groups.lock().unwrap().insert(pid);
-    let (input, inputs) = mpsc::channel::<Vec<u8>>();
+    let (input, inputs) = mpsc::channel::<Input>();
     terminals.lock().unwrap().insert(
         id,
         Arc::new(Terminal {
             input,
+            queued: Arc::new(AtomicUsize::new(0)),
             master: master.clone(),
             pid,
         }),
@@ -218,17 +254,18 @@ pub fn run(
             let _ = sender.send(Message::Eof(0));
         })
     };
-    {
+    let writer = {
         let master = master.clone();
         let stop = stop.clone();
         thread::spawn(move || {
-            for bytes in inputs {
-                if !unix::write_all(&master, &bytes, &stop) {
+            for input in inputs {
+                if !unix::write_all(&master, &input.bytes, &stop) {
                     return;
                 }
+                // Dropping this input releases its byte charge; dropping the receiver releases any remaining queue.
             }
-        });
-    }
+        })
+    };
     let waiter = sender.clone();
     thread::spawn(move || {
         let _ = waiter.send(match child.wait() {
@@ -301,6 +338,7 @@ pub fn run(
     // Ending the input channel ends the writer thread.
     terminals.lock().unwrap().remove(&id);
     let _ = reader.join();
+    let _ = writer.join();
     if aborted {
         return Err(Failure::new("aborted", "aborted"));
     }
@@ -376,6 +414,113 @@ mod tests {
             supervisor.unwrap().join().unwrap();
             assert!(groups.lock().unwrap().is_empty());
         }
+    }
+
+    // pi#244: every charged input must release its memory budget, including a disconnected receiver's queue.
+    #[test]
+    fn input_budget_releases_charge_on_drain_and_disconnect() {
+        let terminals = Arc::new(Mutex::new(HashMap::new()));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let (input, inputs) = std::sync::mpsc::channel();
+        terminals.lock().unwrap().insert(
+            3,
+            Arc::new(Terminal {
+                input,
+                queued: queued.clone(),
+                master: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+                pid: 0,
+            }),
+        );
+        let target = json!({ "target": 3 });
+        write(&terminals, &target, vec![0; INPUT_LIMIT]).unwrap();
+        assert_eq!(queued.load(Ordering::SeqCst), INPUT_LIMIT);
+        drop(inputs.recv().unwrap());
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+        write(&terminals, &target, vec![0; INPUT_LIMIT]).unwrap();
+        drop(inputs);
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            write(&terminals, &target, vec![1]).unwrap_err().code,
+            "EBADF"
+        );
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+        write(&terminals, &target, Vec::new()).unwrap();
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+    }
+
+    // pi#244: a child that never reads must not admit an unbounded queue of ptyWrite payloads.
+    #[test]
+    fn input_budget_rejects_writes_to_a_nonreading_child() {
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+        use std::time::Duration;
+
+        let output = Arc::new(Output::default());
+        let control = Arc::new(Control::default());
+        let groups = Arc::new(Mutex::new(Default::default()));
+        let terminals = Arc::new(Mutex::new(HashMap::new()));
+        let (mut events, mut sink) = UnixStream::pair().unwrap();
+        events
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let writer = {
+            let output = output.clone();
+            thread::spawn(move || output.run(&mut sink))
+        };
+        let worker = {
+            let output = output.clone();
+            let control = control.clone();
+            let groups = groups.clone();
+            let terminals = terminals.clone();
+            thread::spawn(move || {
+                let request = PtyRequest::from_json(&json!({
+                    "argv": ["/bin/sh", "-c", "stty raw -echo; echo ready; exec sleep 30"],
+                    "cwd": crate::sys::tmpdir(), "cols": 80, "rows": 24,
+                }))
+                .unwrap();
+                run(2, request, &output, &control, &groups, &terminals)
+            })
+        };
+        let mut text = Vec::new();
+        let ready = loop {
+            match crate::frame::read_frame(&mut events) {
+                Ok(Some(frame)) => {
+                    text.extend(frame.payload);
+                    if String::from_utf8_lossy(&text).contains("ready") {
+                        break true;
+                    }
+                }
+                _ => break false,
+            }
+        };
+        let queued = terminals.lock().unwrap().get(&2).unwrap().queued.clone();
+        let first = write(&terminals, &json!({ "target": 2 }), vec![b'a'; INPUT_LIMIT]);
+        let second = write(&terminals, &json!({ "target": 2 }), vec![b'b']);
+        let oversized = write(
+            &terminals,
+            &json!({ "target": 2 }),
+            vec![b'c'; INPUT_LIMIT + 1],
+        );
+        let within_budget = queued.load(Ordering::SeqCst) == INPUT_LIMIT
+            && (0..32).all(|_| {
+                write(&terminals, &json!({ "target": 2 }), vec![b'd'; 64 * 1024])
+                    .is_err_and(|error| error.code == "EAGAIN")
+            });
+        // Always clean up the test's child before asserting, including the fail-before run.
+        control.cancel(true);
+        let result = worker.join().unwrap();
+        output.close();
+        writer.join().unwrap();
+        assert!(ready, "PTY did not signal that raw input mode was ready");
+        assert!(first.is_ok());
+        assert_eq!(second.unwrap_err().code, "EAGAIN");
+        assert_eq!(oversized.unwrap_err().code, "EAGAIN");
+        assert!(
+            within_budget,
+            "queued bytes exceeded the per-terminal limit"
+        );
+        assert_eq!(queued.load(Ordering::SeqCst), 0);
+        assert_eq!(result.unwrap()["exitCode"], 137);
     }
 
     // pi#244: an exited leader must not leave an unsupervised background job behind.
