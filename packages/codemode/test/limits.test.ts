@@ -1,10 +1,11 @@
 /**
  * Host budgets for one execution (pi#131 round-1 P1-3 and P2-4, smarty-dev#4506). The sandbox
- * refuses to start while the Codemode switch is off, so these drive the host's Execution directly
- * with a worker that posts the messages a script could make the real worker send.
+ * refuses admission, so a test-only module mock admits only this host harness, whose fixture
+ * posts supplied messages without creating a VM or evaluating a script. Shipping admission is unchanged.
  */
-import { describe, expect, it } from "vitest";
-import { Execution } from "../src/runtime/host.ts";
+import { Worker } from "node:worker_threads";
+import { describe, expect, it, vi } from "vitest";
+import { Execution } from "../src/runtime/execution.ts";
 import {
 	BridgeBudget,
 	type CodemodeLimits,
@@ -14,7 +15,9 @@ import {
 import { MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "../src/runtime/prelude-source.ts";
 import type { WorkerToHostMessage } from "../src/runtime/protocol.ts";
 import type { CodemodeResult, CodemodeTool } from "../src/types.ts";
-import type { CodemodeWasmModule } from "../src/wasm.ts";
+
+// PR #131: this mock is confined to the non-executing host fixture; admission tests never mock it.
+vi.mock("../src/security-admission.ts", () => ({ refuseCodemodeAdmission: () => {} }));
 
 const RAW_WORKER = new URL("./fixtures/raw-worker.ts", import.meta.url);
 
@@ -27,18 +30,30 @@ function run(
 		snapshot?: Record<string, unknown>;
 	} = {},
 ): Promise<CodemodeResult> {
+	const tools = options.tools ?? [];
 	return new Execution({
 		code: JSON.stringify(messages),
-		tools: new Map((options.tools ?? []).map((tool) => [tool.name, tool])),
-		globals: new Map(),
+		tools,
+		globals: [],
+		executors: { tools: new Map(tools.map((tool) => [tool.name, tool])), globals: new Map() },
 		timeoutMs: options.timeoutMs ?? 10_000,
 		signal: undefined,
 		memoryLimitBytes: undefined,
 		limits: resolveCodemodeLimits(options.limits),
 		snapshot: options.snapshot ?? {},
 		store: {},
-		wasm: Promise.resolve({} as CodemodeWasmModule),
-		workerUrl: RAW_WORKER,
+		launch: (data, events) => {
+			const worker = new Worker(RAW_WORKER, { workerData: data });
+			worker.on("message", events.message);
+			worker.on("error", (error) => events.failure({ kind: "sandbox", message: error.message }));
+			worker.on("exit", (code) => events.failure({ kind: "sandbox", message: `Worker exited: ${code}` }));
+			return {
+				post: (message) => worker.postMessage(message),
+				stop: async () => {
+					await worker.terminate();
+				},
+			};
+		},
 	}).promise;
 }
 
@@ -68,6 +83,12 @@ describe("bridge deadline", () => {
 			error: { kind: "timeout", message: expect.stringContaining("100 ms") },
 		});
 		expect(performance.now() - started).toBeLessThan(5_000);
+	});
+
+	it("does not let options raise the hard deadline or bridge ceilings", () => {
+		const limits = resolveCodemodeLimits({ maxTimeoutMs: 60 * 60_000, maxCalls: 20_000 });
+		expect(limits.maxTimeoutMs).toBe(30 * 60_000);
+		expect(limits.maxCalls).toBe(10_000);
 	});
 
 	it("rejects limits that are not finite", () => {

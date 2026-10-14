@@ -1,9 +1,10 @@
 import { arch, platform, release } from "node:os";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { stream as streamMistral } from "../src/api/mistral-conversations.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { FetchFunction, ProviderResponse } from "../src/types.ts";
+import type { AssistantMessageEvent, FetchFunction, ProviderResponse } from "../src/types.ts";
+import { ProviderRequestLimitError } from "../src/utils/provider-retry.ts";
 
 const PI_USER_AGENT = `pi (${platform()} ${release()}; ${arch()})`;
 
@@ -465,18 +466,15 @@ describe("Mistral HTTP transport", () => {
 		expect(message.stopReason).toBe("aborted");
 	});
 
-	it("applies the request timeout while waiting for an SSE chunk", async () => {
+	it("applies the request timeout while waiting for response headers", async () => {
 		const model = getModel("mistral", "mistral-large-latest");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "hello", timestamp: 1 }],
 		});
-		const fetch: FetchFunction = async () =>
-			new Response(
-				new ReadableStream({
-					start() {},
-				}),
-				{ headers: { "content-type": "text/event-stream" } },
-			);
+		const fetch: FetchFunction = (_url, init) =>
+			new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+			});
 
 		const message = await streamMistral(model, context, {
 			apiKey: "test",
@@ -485,7 +483,123 @@ describe("Mistral HTTP transport", () => {
 		}).result();
 
 		expect(message.stopReason).toBe("error");
-		expect(message.errorMessage).toMatch(/timeout/i);
+		expect(message.errorMessage).toBe("Mistral response headers timed out after 5ms");
+	});
+
+	// Regression test for #10609: an active stream must not be cut off after timeoutMs.
+	it("does not abort an active stream that lasts longer than the request timeout", async () => {
+		const model = getModel("mistral", "mistral-large-latest");
+		const context = normalizeContext({
+			messages: [{ role: "user", content: "hello", timestamp: 1 }],
+		});
+		const encoder = new TextEncoder();
+		const thinkingEvent = {
+			choices: [{ index: 0, delta: { content: [{ type: "thinking", thinking: [{ type: "text", text: "x" }] }] } }],
+		};
+		const fetch: FetchFunction = async () =>
+			new Response(
+				new ReadableStream({
+					async start(controller) {
+						for (let i = 0; i < 5; i++) {
+							controller.enqueue(encoder.encode(`data: ${JSON.stringify(thinkingEvent)}\n\n`));
+							await new Promise((resolve) => setTimeout(resolve, 10));
+						}
+						controller.enqueue(
+							encoder.encode(`data: ${JSON.stringify(createTerminalEvent())}\n\ndata: [DONE]\n\n`),
+						);
+						controller.close();
+					},
+				}),
+				{ headers: { "content-type": "text/event-stream" } },
+			);
+
+		const message = await streamMistral(model, context, {
+			apiKey: "test",
+			fetch,
+			timeoutMs: 20,
+		}).result();
+
+		expect(message.stopReason).toBe("stop");
+		expect(message.content).toEqual([{ type: "thinking", thinking: "xxxxx" }]);
+	});
+
+	// pi#202 / pi#10609: timeout/abort transport changes must not restore wire data in public callbacks or errors.
+	it.each(["http", "malformed SSE", "wire finish reason"])("isolates canaries from %s failures", async (failure) => {
+		const canary = "mistral-private-wire-value-without-a-credential-label";
+		const model = getModel("mistral", "mistral-large-latest");
+		const context = normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 1 }] });
+		const onResponse = vi.fn();
+		const onProviderStreamEvent = vi.fn();
+		const stream = streamMistral(model, context, {
+			apiKey: "test",
+			fetch: async () => {
+				const headers = { "content-type": "text/event-stream", "x-private-wire-value": canary };
+				if (failure === "http") return new Response(canary, { status: 403, statusText: canary, headers });
+				if (failure === "malformed SSE") return new Response(`data: ${canary}\n\n`, { headers });
+				return createSseResponse([{ id: canary, choices: [{ finish_reason: canary, delta: {} }] }], headers);
+			},
+			onResponse,
+			onProviderStreamEvent,
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+		expect(result.stopReason).toBe("error");
+		expect(result.responseId).toBeUndefined();
+		expect(onResponse.mock.calls).toEqual([[{ status: failure === "http" ? 403 : 200 }]]);
+		expect(onProviderStreamEvent.mock.calls).toEqual(
+			failure === "wire finish reason" ? [[{ type: "provider_stream_event" }]] : [],
+		);
+		expect(
+			JSON.stringify({
+				events,
+				result,
+				responses: onResponse.mock.calls,
+				notices: onProviderStreamEvent.mock.calls,
+			}),
+		).not.toContain(canary);
+	});
+
+	// pi#10609: detaching the header deadline must still cancel an owned in-flight body on caller abort.
+	it("cancels the response body when the caller aborts after headers", async () => {
+		const controller = new AbortController();
+		const cancel = vi.fn();
+		const stream = streamMistral(
+			getModel("mistral", "mistral-large-latest"),
+			normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }),
+			{
+				apiKey: "test",
+				signal: controller.signal,
+				fetch: async () =>
+					new Response(new ReadableStream({ cancel }), {
+						headers: { "content-type": "text/event-stream" },
+					}),
+			},
+		);
+		const events = stream[Symbol.asyncIterator]();
+		expect((await events.next()).value?.type).toBe("start");
+		controller.abort();
+		expect((await stream.result()).stopReason).toBe("aborted");
+		expect(cancel).toHaveBeenCalledTimes(1);
+	});
+
+	// pi#202: admission still precedes the native fetch after the header-timeout merge.
+	it("does not fetch when request admission is denied", async () => {
+		const fetch = vi.fn<FetchFunction>();
+		const result = await streamMistral(
+			getModel("mistral", "mistral-large-latest"),
+			normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 1 }] }),
+			{
+				apiKey: "test",
+				fetch,
+				beforeProviderRequest: () => {
+					throw new ProviderRequestLimitError(1, 1);
+				},
+			},
+		).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Provider request limit reached (1/1); no further requests allowed");
+		expect(fetch).not.toHaveBeenCalled();
 	});
 
 	// smarty-dev#5822 (pi#202 round 2): the status is kept; the response body is classified, never published.
