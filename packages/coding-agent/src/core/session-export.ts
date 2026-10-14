@@ -158,7 +158,10 @@ function coldSnapshot(entry: object, parentId: string | null, format: string, li
 		// Primitive data only: never validate a callable's hook and then patch the raw callable.
 		if (typeof value === "function") throw plainJsonError(format, "a callable resident replacement");
 		const prepared = prepareExportValueForJson(value === undefined ? null : value, format, remaining);
-		remaining -= key.length * 6 + 26 + (typeof value === "string" ? value.length * 6 : 0);
+		remaining -=
+			key.length * 6 +
+			26 +
+			(typeof value === "string" ? value.length * 6 : typeof value === "number" ? `${value}`.length : 0);
 		if (remaining < 0) throw new Error(`${format} export exceeds the 64 MiB materialization limit`);
 		patches.push([key, value === undefined ? undefined : prepared]);
 	}
@@ -169,8 +172,10 @@ function coldSnapshot(entry: object, parentId: string | null, format: string, li
 	for (const [key, value] of patches) {
 		Object.defineProperty(hot, key, { value, enumerable: true, writable: true, configurable: true });
 	}
-	// Recheck the complete patched safe record before JSON.stringify can materialize it.
-	return snapshot(hot, format, limit);
+	// pi#247: no second walk. `hot` is already the guard's own null-prototype snapshot (its arrays
+	// have null prototypes, which a second walk would refuse as foreign), and each patch is a
+	// prepared primitive whose bytes were reserved above, so the record fits `limit`.
+	return hot;
 }
 
 /**

@@ -129,6 +129,8 @@ const refusals: RefusalCase[] = [
 			return { value: Object.setPrototypeOf([1], prototype), spies: [toJSON] };
 		},
 	},
+	// pi#247: export's own snapshots use null-prototype arrays; foreign ones stay refused.
+	{ name: "null-prototype array", create: () => ({ value: Object.setPrototypeOf([1], null) }) },
 	{
 		name: "array with a subclass prototype",
 		create: () => ({ value: Object.setPrototypeOf([1], class List extends Array {}.prototype) }),
@@ -841,12 +843,20 @@ describe("session export serialization", () => {
 
 	// smarty-dev#12074: cold entries expose large message fields as lazy accessors. Export must
 	// read them as resident plain JSON (toHotEntry) instead of refusing or invoking the accessor.
+	// pi#247: the nested content array from disk must survive resident primitive patches.
 	it("exports a cold message from a real disk journal in both paths without invoking its lazy accessor", () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
 		const sessionDir = directory();
 		const writer = SessionManager.create(sessionDir, sessionDir);
-		const messageId = writer.appendMessage({ role: "user", content: "x".repeat(2048), timestamp: 1 });
+		const messageId = writer.appendMessage({
+			role: "user",
+			content: [
+				{ type: "text", text: "x".repeat(2048) },
+				{ type: "text", text: "second block" },
+			],
+			timestamp: 1,
+		});
 		writer.appendCustomEntry("later", { n: 1 });
 		writer.appendCustomEntry("later", { n: 2 });
 		const journal = writer.getSessionFile()!;
@@ -915,7 +925,10 @@ describe("session export serialization", () => {
 			if (key === "parentId" || !("value" in descriptor)) continue;
 			const value: unknown = descriptor.value;
 			if (value !== null && typeof value === "object") continue;
-			bytes += key.length * 6 + 26 + (typeof value === "string" ? value.length * 6 : 0);
+			bytes +=
+				key.length * 6 +
+				26 +
+				(typeof value === "string" ? value.length * 6 : typeof value === "number" ? `${value}`.length : 0);
 		}
 		return bytes;
 	}
@@ -1132,7 +1145,11 @@ describe("session export serialization", () => {
 		const probe = coldJournal();
 		const callerLimit = limit(probe.prefixBytes);
 		const baseReserve = residentReserve(probe.cold(), null);
-		const reserve = baseReserve + "pad".length * 6 + 26;
+		// pi#247: primitive patches remain bounded without rewalking the safe snapshot. A long
+		// numeric representation needs its own reservation as well as the member overhead.
+		const numeric = -1.0000000000000001e-100;
+		expect(`${numeric}`.length).toBeGreaterThan(22);
+		const reserve = baseReserve + "pad".length * 6 + 26 + "numeric".length * 6 + 26 + `${numeric}`.length;
 		// Reservations step by 6 bytes per pad character, so the content length absorbs the rest.
 		const free = callerLimit - reserve - Buffer.byteLength(probe.line);
 		const delta = free % 6;
@@ -1148,7 +1165,7 @@ describe("session export serialization", () => {
 		expect(callerLimit - reserve - padLength * 6).toBe(allowedBytes);
 		expect(Buffer.byteLength(refused.line)).toBe(allowedBytes + 1);
 		expect(allowedBytes + 1).toBeLessThan(callerLimit);
-		const patch = { pad: "p".repeat(padLength) };
+		const patch = { pad: "p".repeat(padLength), numeric };
 
 		refused.use(copyEntry(refused.cold(), patch as Partial<SessionEntry>));
 		const readCalls = vi.mocked(fs.readSync).mock.calls.length;
