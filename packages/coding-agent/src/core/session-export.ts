@@ -22,6 +22,12 @@ import { CURRENT_SESSION_VERSION, type SessionHeader, type SessionManager } from
 
 type TrailingEntries = (parentId: string | null, timestamp: string) => readonly object[];
 
+function serializeEntry(entry: object): string {
+	const serialized = JSON.stringify(entry);
+	if (typeof serialized !== "string") throw new Error("Session entry did not serialize to JSON");
+	return serialized;
+}
+
 /** Walk single-entry reads rather than cloning the entire owned branch payload. */
 function* sessionBranchEntries(
 	sessionManager: SessionManager,
@@ -68,7 +74,7 @@ export function serializeSessionBranch(
 	let remaining = MAX_MATERIALIZED_EXPORT_BYTES;
 	for (const entry of sessionBranchEntries(sessionManager, createTrailingEntries)) {
 		assertExportValueSize(entry, "String JSONL", remaining);
-		const line = `${JSON.stringify(entry)}\n`;
+		const line = `${serializeEntry(entry)}\n`;
 		remaining -= Buffer.byteLength(line);
 		if (remaining < 0) throw new Error("String JSONL export exceeds the 64 MiB limit; use JSONL export instead");
 		lines.push(line);
@@ -100,7 +106,7 @@ export function exportSessionToJsonl(
 	try {
 		for (const entry of sessionBranchEntries(sessionManager, createTrailingEntries)) {
 			assertExportValueSize(entry, "JSONL entry");
-			const line = Buffer.from(`${JSON.stringify(entry)}\n`);
+			const line = Buffer.from(`${serializeEntry(entry)}\n`);
 			let offset = 0;
 			while (offset < line.length) {
 				const written = writeSync(fd, line, offset, line.length - offset);

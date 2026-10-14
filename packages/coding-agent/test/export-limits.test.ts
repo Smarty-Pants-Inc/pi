@@ -75,6 +75,56 @@ describe("bounded session exports (#11897)", () => {
 		expect(renderResult).not.toHaveBeenCalled();
 	});
 
+	it("preflights parsed entry count before SessionManager.open (#11897)", async () => {
+		const dir = directory();
+		const header = { type: "session", version: 3, id: "count", timestamp: "2026-01-01T00:00:00Z", cwd: dir };
+		const entryLine = (id: number) =>
+			JSON.stringify({
+				type: "custom",
+				id: String(id),
+				parentId: id === 1 ? null : String(id - 1),
+				timestamp: "2026-01-01T00:00:00Z",
+				customType: "count",
+				data: id,
+			});
+		const fileForCount = (count: number, name: string) => {
+			const file = join(dir, name);
+			const lines = [JSON.stringify(header), "", "not-json"];
+			for (let id = 1; id <= count; id++) lines.push(entryLine(id));
+			fs.writeFileSync(file, `${lines.join("\n")}\n`);
+			return file;
+		};
+
+		const overLimit = fileForCount(MAX_MATERIALIZED_EXPORT_ENTRIES + 1, "over-limit.jsonl");
+		const open = vi.spyOn(SessionManager, "open");
+		await expect(exportFromFile(overLimit)).rejects.toThrow(/10000 entry.*use JSONL/);
+		expect(open).not.toHaveBeenCalled();
+
+		const atLimit = fileForCount(MAX_MATERIALIZED_EXPORT_ENTRIES, "at-limit.jsonl");
+		const output = await exportFromFile(atLimit, { outputPath: join(dir, "at-limit.html") });
+		expect(open).toHaveBeenCalledTimes(1);
+		const html = fs.readFileSync(output, "utf8");
+		const dataMatch = html.match(/<script id="session-data" type="application\/json">([^<]+)<\/script>/);
+		expect(dataMatch).not.toBeNull();
+		const data = JSON.parse(Buffer.from(dataMatch![1], "base64").toString("utf8"));
+		expect(data.entries).toHaveLength(MAX_MATERIALIZED_EXPORT_ENTRIES);
+	});
+
+	// #11897: the file-entry array retains duplicates even when the ID index does not.
+	it.each(["duplicate IDs", "extra headers"])("counts %s before SessionManager.open", async (kind) => {
+		const dir = directory();
+		const header = { type: "session", version: 3, id: "count", timestamp: "2026-01-01T00:00:00Z", cwd: dir };
+		const record = kind === "extra headers" ? header : { type: "custom", id: "same", parentId: null };
+		const file = join(dir, "duplicates.jsonl");
+		fs.writeFileSync(
+			file,
+			`${JSON.stringify(header)}\n${`${JSON.stringify(record)}\n`.repeat(MAX_MATERIALIZED_EXPORT_ENTRIES + 1)}`,
+		);
+		const open = vi.spyOn(SessionManager, "open");
+		await expect(exportFromFile(file)).rejects.toThrow(/10000 entry.*use JSONL/);
+		expect(open).not.toHaveBeenCalled();
+	});
+
 	it("refuses a large input file before SessionManager.open", async () => {
 		const open = vi.spyOn(SessionManager, "open");
 		await expect(exportFromFile(oversizedFile(directory()))).rejects.toThrow(/64 MiB.*use JSONL/);

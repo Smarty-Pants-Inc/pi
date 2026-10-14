@@ -1,10 +1,16 @@
 import type { AgentState } from "@earendil-works/pi-agent-core";
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { createReadStream, existsSync, readFileSync, writeFileSync } from "fs";
 import { basename, join } from "path";
+import { createInterface } from "readline";
 import { APP_NAME, getExportTemplateDir } from "../../config.ts";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/interactive/theme/theme.ts";
 import { normalizePath, resolvePath } from "../../utils/paths.ts";
-import { assertExportFileSize, assertExportValueSize, assertMaterializedExportSize } from "../export-limits.ts";
+import {
+	assertExportFileSize,
+	assertExportValueSize,
+	assertMaterializedExportSize,
+	MAX_MATERIALIZED_EXPORT_ENTRIES,
+} from "../export-limits.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import type { SessionEntry } from "../session-manager.ts";
 import { SessionManager } from "../session-manager.ts";
@@ -285,6 +291,37 @@ export async function exportSessionToHtml(
 	return outputPath;
 }
 
+/** Bound parsed records before SessionManager retains them, excluding one session header. */
+async function preflightExportEntryCount(filePath: string): Promise<void> {
+	const input = createReadStream(filePath, { encoding: "utf8" });
+	const lines = createInterface({ input, crlfDelay: Infinity });
+	let entryCount = 0;
+	let headerSeen = false;
+	try {
+		for await (const line of lines) {
+			if (!line.trim()) continue;
+			let entry: unknown;
+			try {
+				entry = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if (!entry) continue;
+			if (!headerSeen && (entry as { type?: unknown }).type === "session") {
+				headerSeen = true;
+				continue;
+			}
+			// Duplicate IDs and extra headers still consume memory in the file-entry array.
+			if (++entryCount > MAX_MATERIALIZED_EXPORT_ENTRIES) {
+				assertMaterializedExportSize(undefined, entryCount, "HTML");
+			}
+		}
+	} finally {
+		lines.close();
+		input.destroy();
+	}
+}
+
 /**
  * Export session file to HTML (standalone, without AgentState).
  * Used by CLI for exporting arbitrary session files.
@@ -298,6 +335,7 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 	}
 
 	assertExportFileSize(resolvedInputPath, "HTML");
+	await preflightExportEntryCount(resolvedInputPath);
 	const sm = SessionManager.open(resolvedInputPath);
 	assertMaterializedExportSize(undefined, sm.getEntryCount(), "HTML");
 

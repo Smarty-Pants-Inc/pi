@@ -204,7 +204,8 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 		}
 	});
 
-	it("caches formatted inline failure stacks rather than Error objects", async () => {
+	// #11897: cached diagnostics retain only the message, not the Error or its stack.
+	it("caches inline failure messages rather than Error objects or stacks", async () => {
 		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
 		try {
 			const loader = new DefaultResourceLoader({
@@ -225,8 +226,7 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 			await loader.reload();
 			const diagnostic = loader.getExtensions().errors[0].error;
 			expect(typeof diagnostic).toBe("string");
-			expect(diagnostic).toContain("Error: cached failure");
-			expect(diagnostic).toContain("10720-pi-retainers.test.ts:");
+			expect(diagnostic).toBe("cached failure");
 		} finally {
 			harness.cleanup();
 		}

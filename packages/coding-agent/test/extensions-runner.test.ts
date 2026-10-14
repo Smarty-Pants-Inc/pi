@@ -526,9 +526,9 @@ describe("ExtensionRunner", () => {
 			expect(result.errors).toEqual([
 				{
 					path: extensionPath,
-					// smarty-dev#10720: loader diagnostics are formatted strings including the stack.
+					// #11897: keep the loader error expectation message-only, without a stack prefix.
 					error: expect.stringContaining(
-						`Failed to load extension: Error: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
+						`Failed to load extension: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
 					),
 				},
 			]);
