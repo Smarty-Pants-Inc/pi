@@ -738,7 +738,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				extension.replaceable = builtin.replaceable === true;
 				result.extensions.push(extension);
 			} catch (error) {
-				result.errors.push({ path, error: error instanceof Error ? error.message : "failed to load extension" });
+				result.errors.push({ path, error: error instanceof Error ? error.message : String(error) });
 			}
 		}
 		return result;
@@ -1145,7 +1145,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				extension.replaceable = isNamed && input.replaceable === true;
 				extensions.push(extension);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : "failed to load extension";
+				const message = error instanceof Error ? error.message : String(error);
 				errors.push({ path: extensionPath, error: message });
 			}
 		}

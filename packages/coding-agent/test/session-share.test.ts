@@ -10,6 +10,7 @@ const childProcessMocks = vi.hoisted(() => ({
 
 vi.mock("node:child_process", () => childProcessMocks);
 
+import { SessionManager } from "../src/core/session-manager.ts";
 import { shareSession } from "../src/modes/interactive/session-share.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
@@ -24,6 +25,7 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
 describe("shareSession", () => {
 	beforeAll(() => initTheme("dark"));
 
+	// Regression for #11897: exercise the real streaming export path with a complete manager.
 	it("keeps concurrent session exports isolated", async () => {
 		const uploads: string[] = [];
 		childProcessMocks.spawn.mockImplementation((_command, args: string[]) => {
@@ -47,11 +49,7 @@ describe("shareSession", () => {
 		const errors: string[] = [];
 		const context = (name: "A" | "B") => ({
 			session: {
-				sessionManager: {
-					getSessionId: () => name,
-					getCwd: () => "/tmp",
-					getBranch: () => [],
-				},
+				sessionManager: SessionManager.inMemory("/tmp", { id: name }),
 				state: { systemPrompt: name, tools: [] },
 				modelRuntime: { getProvider: () => undefined },
 				exportToHtml: async (filePath: string) => {
