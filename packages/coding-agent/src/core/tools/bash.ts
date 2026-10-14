@@ -403,16 +403,17 @@ export function createShellToolDefinition(
 			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
 				const truncation = snapshot.truncation;
 				let text = snapshot.content || emptyText;
-				const logNotice = snapshot.fullOutputError
-					? `Output log unavailable: ${snapshot.fullOutputError}`
-					: `${snapshot.fullOutputTruncation ? "Capped log" : "Full output"}: ${snapshot.fullOutputPath}`;
+				const logNotice =
+					snapshot.fullOutputError !== undefined
+						? `Output log unavailable: ${snapshot.fullOutputError}`
+						: `${snapshot.fullOutputTruncation ? "Capped log" : "Full output"}: ${snapshot.fullOutputPath}`;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
 					details = {
 						truncation,
 						fullOutputPath: snapshot.fullOutputPath,
 						...(snapshot.fullOutputTruncation ? { fullOutputTruncation: snapshot.fullOutputTruncation } : {}),
-						...(snapshot.fullOutputError ? { fullOutputError: snapshot.fullOutputError } : {}),
+						...(snapshot.fullOutputError !== undefined ? { fullOutputError: snapshot.fullOutputError } : {}),
 					};
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
@@ -428,6 +429,10 @@ export function createShellToolDefinition(
 					if (capped) {
 						text += `\n[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}]`;
 					}
+				} else if (snapshot.fullOutputError !== undefined) {
+					// Chunk-count storage limits can open a log before display truncation is needed.
+					text += `\n\n[${logNotice}]`;
+					details = { fullOutputError: snapshot.fullOutputError };
 				}
 				return { text, details };
 			};
@@ -463,7 +468,7 @@ export function createShellToolDefinition(
 						const timeoutSecs = err.message.split(":")[1];
 						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
 					}
-					if (snapshot.fullOutputError) {
+					if (snapshot.fullOutputError !== undefined) {
 						throw appendErrorNotice(err, `[Output log unavailable: ${snapshot.fullOutputError}]`);
 					}
 					const capped = snapshot.fullOutputTruncation;
@@ -491,7 +496,7 @@ export function createShellToolDefinition(
 					...(fullOutput.truncated && snapshot.fullOutputPath
 						? { full_output_path: snapshot.fullOutputPath }
 						: {}),
-					...(snapshot.fullOutputError ? { full_output_error: snapshot.fullOutputError } : {}),
+					...(snapshot.fullOutputError !== undefined ? { full_output_error: snapshot.fullOutputError } : {}),
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};

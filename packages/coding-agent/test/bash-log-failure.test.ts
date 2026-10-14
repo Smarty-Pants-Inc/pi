@@ -1,10 +1,15 @@
 import type * as nodeFs from "node:fs";
 import { tmpdir } from "node:os";
-import { describe, expect, it, vi } from "vitest";
+import type { TUI } from "@earendil-works/pi-tui";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { executeBashWithOperations } from "../src/core/bash-executor.ts";
 import { type BashOperations, type BashToolDetails, createBashToolDefinition } from "../src/core/tools/bash.ts";
 import type * as outputAccumulator from "../src/core/tools/output-accumulator.ts";
 import { wrapToolDefinition } from "../src/core/tools/tool-definition-wrapper.ts";
+import { BashExecutionComponent } from "../src/modes/interactive/components/bash-execution.ts";
+import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { stripAnsi } from "../src/utils/ansi.ts";
 
 const probe = vi.hoisted(() => ({
 	stream: undefined as nodeFs.WriteStream | undefined,
@@ -49,7 +54,70 @@ vi.mock("node:fs", async (importOriginal) => {
 // smarty-dev#11307 / pi#248: log I/O is auxiliary and must not erase a completed command.
 // Keep reason: quota/write failures are expensive or unsafe to reach through a live user flow.
 describe("bash log failure preserves the command result", () => {
+	beforeAll(() => initTheme("dark"));
+
 	for (const kind of ["tool", "executor"] as const) {
+		// pi#248 P2-CODE-1: chunk metadata alone can open a log before display limits are hit.
+		it.each([false, true])(`${kind} keeps tiny-chunk output complete with log failure=%s`, async (failed) => {
+			probe.failure = failed ? new Error("tiny log write failed") : undefined;
+			const operations: BashOperations = {
+				exec: async (_command, _cwd, { onData }) => {
+					for (let i = 0; i < 1025; i++) onData(Buffer.from("z"));
+					return { exitCode: 0 };
+				},
+			};
+			const ui = {
+				terminal: { columns: 200, rows: 24 },
+				addInterval: () => ({ dispose: () => {} }),
+				removeInterval: () => {},
+				requestRender: () => {},
+			} as unknown as TUI;
+			const notice = "Output log unavailable: tiny log write failed";
+			try {
+				if (kind === "executor") {
+					const component = new BashExecutionComponent("fake", ui);
+					const result = await executeBashWithOperations("fake", tmpdir(), operations, {
+						onChunk: (text) => component.appendOutput(text),
+					});
+					component.setComplete(result.exitCode, result.cancelled, undefined, result.fullOutputPath);
+					expect(result.truncated).toBe(false);
+					expect(result.output).toBe("z".repeat(1025) + (failed ? `\n\n[${notice}]` : ""));
+					expect(result.fullOutputError).toBe(failed ? "tiny log write failed" : undefined);
+					for (const expanded of [false, true]) {
+						component.setExpanded(expanded);
+						expect(stripAnsi(component.render(200).join("\n")).includes(notice)).toBe(failed);
+					}
+				} else {
+					const definition = createBashToolDefinition(tmpdir(), { operations });
+					const result = await wrapToolDefinition(definition).execute("tiny-log", { command: "fake" });
+					expect(result.structuredContent).toMatchObject({
+						output: "z".repeat(1025),
+						truncated: false,
+						exit_code: 0,
+					});
+					expect(result.details?.truncation).toBeUndefined();
+					expect(result.details?.fullOutputError).toBe(failed ? "tiny log write failed" : undefined);
+					expect(result.details?.fullOutputPath).toBeUndefined();
+					expect(result.content[0]).toMatchObject({ text: "z".repeat(1025) + (failed ? `\n\n[${notice}]` : "") });
+					const component = new ToolExecutionComponent(
+						"bash",
+						"tiny-log",
+						{ command: "fake" },
+						{},
+						definition,
+						ui,
+						process.cwd(),
+					);
+					component.updateResult({ ...result, isError: false });
+					for (const expanded of [false, true]) {
+						component.setExpanded(expanded);
+						expect(stripAnsi(component.render(200).join("\n")).includes(notice)).toBe(failed);
+					}
+				}
+			} finally {
+				probe.failure = undefined;
+			}
+		});
 		for (const failureKind of ["quota", "write", "open"] as const) {
 			it.each([0, 7])(
 				`${kind} preserves output and exit %i after a ${failureKind} failure mid-command`,
@@ -67,7 +135,8 @@ describe("bash log failure preserves the command result", () => {
 					const removedBefore = probe.removed.length;
 					const operations: BashOperations = {
 						exec: async (_command, _cwd, { onData }) => {
-							onData(Buffer.from(`${"before\n".repeat(12000)}`));
+							// Exceeds the rolling display buffer, so the fallback really omits bytes.
+							onData(Buffer.from(`${"before\n".repeat(30000)}`));
 							const stream = probe.stream;
 							if (!stream) throw new Error("Expected a log stream");
 							await new Promise<void>((resolve) => stream.once("close", resolve));

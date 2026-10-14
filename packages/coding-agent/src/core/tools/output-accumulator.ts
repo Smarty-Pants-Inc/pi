@@ -33,7 +33,8 @@ export interface OutputSnapshot {
 	/** Present only when the full-output log omits part of the output. */
 	fullOutputTruncation?: FullOutputTruncation;
 	/**
-	 * Original error message when the full-output log failed. The log is then unavailable:
+	 * Error message when the full-output log failed, with the log's pathname replaced by
+	 * `[output log]`. The log is then unavailable:
 	 * `fullOutputPath` and `fullOutputTruncation` are absent.
 	 */
 	fullOutputError?: string;
@@ -96,9 +97,10 @@ function positiveInteger(value: number, name: string): number {
  * memory, and writes them on close after a marker naming the omitted byte
  * count. Output that fits both is written byte-identically.
  *
- * A failed log is not fatal: the error message is recorded in
- * `fullOutputError`, the log's buffers are released, and {@link readFullOutput}
- * falls back to the decoded display tail.
+ * A failed log is not fatal: the error message, with the log's pathname
+ * replaced by `[output log]`, is recorded in `fullOutputError`, the log's
+ * buffers are released, and {@link readFullOutput} falls back to the decoded
+ * display tail.
  */
 export class OutputAccumulator {
 	private readonly maxLines: number;
@@ -247,7 +249,8 @@ export class OutputAccumulator {
 	 * last `maxBytes / 2` bytes around an omission marker. When the log itself omits bytes, the
 	 * result is truncated and the omitted count refers to the original raw output. Head and tail are
 	 * decoded separately, so a character cut by either boundary is dropped and counted as omitted.
-	 * When the log failed, the result is the decoded display tail, marked truncated.
+	 * When the log failed, the result is the decoded display tail; it is marked truncated only when
+	 * that tail omits decoded bytes.
 	 */
 	async readFullOutput(maxBytes: number): Promise<FullOutput> {
 		if (this.fullOutputError !== undefined) {
@@ -298,7 +301,10 @@ export class OutputAccumulator {
 		}
 	}
 
-	/** Fallback when the log failed: the last `maxBytes` of the decoded display tail. */
+	/**
+	 * Fallback when the log failed: the last `maxBytes` of the decoded display tail. Truncated only
+	 * when decoded bytes are omitted; the log failure alone does not lose bytes from the result.
+	 */
 	private readDisplayTail(maxBytes: number): FullOutput {
 		const bytes = Buffer.from(this.tailText, "utf-8");
 		let start = Math.max(0, bytes.length - Math.max(0, maxBytes));
@@ -306,13 +312,13 @@ export class OutputAccumulator {
 		const text = bytes.subarray(start).toString("utf-8");
 		const omitted = this.totalDecodedBytes - (bytes.length - start);
 		const content = omitted > 0 ? `[... ${omitted} bytes omitted ...]\n\n${text}` : text;
-		return { content, truncated: true };
+		return { content, truncated: omitted > 0 };
 	}
 
 	/** Record the first log failure and release the log's buffers; later output is not logged. */
 	private recordLogFailure(error: unknown): void {
 		if (this.fullOutputError !== undefined) return;
-		this.fullOutputError = error instanceof Error ? error.message : String(error);
+		this.fullOutputError = this.describeLogFailure(error);
 		this.rawChunks = [];
 		this.logHead = undefined;
 		this.logTail = undefined;
@@ -320,6 +326,28 @@ export class OutputAccumulator {
 		this.logTailNext = 0;
 		const stream = this.tempFileStream;
 		if (stream && !stream.destroyed) stream.destroy();
+	}
+
+	/**
+	 * The failure message with every known log pathname replaced by `[output log]`. Builds a new
+	 * string; the error object, its message, path and code are left unchanged.
+	 */
+	private describeLogFailure(error: unknown): string {
+		const paths = new Set<string>();
+		if (this.tempFilePath) paths.add(this.tempFilePath);
+		if (error instanceof Error) {
+			// Native fs errors name the failed path, which can differ from the fallback temp path.
+			for (const key of ["path", "dest"]) {
+				const value: unknown = Reflect.get(error, key);
+				if (typeof value === "string" && value.length > 0) paths.add(value);
+			}
+		}
+		let message = error instanceof Error ? error.message : String(error);
+		// Longest first, so a path that contains another is replaced whole.
+		for (const path of [...paths].sort((a, b) => b.length - a.length)) {
+			message = message.split(path).join("[output log]");
+		}
+		return message;
 	}
 
 	getLastLineBytes(): number {

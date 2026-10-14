@@ -21,6 +21,64 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
+interface OpenFailure {
+	path?: string;
+	error?: unknown;
+}
+
+/** Run the next spill-file open after `prepare(path)`, recording the native exclusive-open error. */
+function failNextOpen(prepare: (path: string) => void): OpenFailure {
+	const failure: OpenFailure = {};
+	const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
+	if (!openSync) throw new Error("No native openSync implementation");
+	vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
+		if (typeof path !== "string") throw new Error("Expected a filename");
+		failure.path = path;
+		prepare(path);
+		try {
+			return openSync(path, flags, mode);
+		} catch (error) {
+			failure.error = error;
+			throw error;
+		}
+	});
+	return failure;
+}
+
+function collectStrings(value: unknown, out: string[] = []): string[] {
+	if (typeof value === "string") out.push(value);
+	else if (Array.isArray(value)) for (const item of value) collectStrings(item, out);
+	else if (value && typeof value === "object") for (const item of Object.values(value)) collectStrings(item, out);
+	return out;
+}
+
+async function runVisible(kind: string, root: string, operations: BashOperations) {
+	const streamed: unknown[] = [];
+	const result =
+		kind === "executor"
+			? await executeBashWithOperations("fake", root, operations, { onChunk: (chunk) => streamed.push(chunk) })
+			: await wrapToolDefinition(createBashToolDefinition(root, { operations })).execute(
+					"exclusive-bash",
+					{ command: "fake" },
+					undefined,
+					// A provisional path can precede the async failure; check streamed text and final metadata.
+					(update) => streamed.push(update.content),
+				);
+	return { result, visible: collectStrings([result, streamed]).join("\n") };
+}
+
+/** smarty-dev#11307 P2-SEC-1: the failed log's pathname stays out of results, metadata and streams. */
+function expectRedactedOpenFailure(failure: OpenFailure, visible: string): void {
+	if (!failure.path) throw new Error("No spill-file open");
+	expect(failure.error).toBeInstanceOf(Error);
+	// The native error object itself is not mutated.
+	expect(failure.error).toMatchObject({ code: "EEXIST", path: failure.path });
+	expect(failure.error).toHaveProperty("message", expect.stringContaining(failure.path));
+	expect(visible).toContain("EEXIST");
+	expect(visible).toContain("[output log]");
+	expect(visible).not.toContain(failure.path);
+}
+
 // smarty-dev#2153 / #1998: both bash spill paths must ignore a permissive caller umask.
 // Native Windows has different temp-directory and permission contracts; symlinks may require privileges.
 describe.skipIf(process.platform === "win32")("private bash full output files", () => {
@@ -81,21 +139,16 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 			const victim = join(root, "fake-victim");
 			writeFileSync(victim, "fake sentinel");
 			// The spill file is created with a synchronous exclusive open (pi#203 R3).
-			const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
-			if (!openSync) throw new Error("No native openSync implementation");
-			vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
-				if (typeof path !== "string") throw new Error("Expected a filename");
-				symlinkSync(victim, path);
-				return openSync(path, flags, mode);
+			const failure = failNextOpen((path) => symlinkSync(victim, path));
+			const { result, visible } = await runVisible(kind, root, {
+				exec: async (_command, _cwd, { onData }) => {
+					onData(Buffer.from("fake row\n".repeat(3000)));
+					return { exitCode: 0 };
+				},
 			});
-			await expect(
-				runBash(kind, {
-					exec: async (_command, _cwd, { onData }) => {
-						onData(Buffer.from("fake row\n".repeat(3000)));
-						return { exitCode: 0 };
-					},
-				}),
-			).resolves.toBeUndefined();
+			expect(result).not.toHaveProperty("fullOutputPath", expect.any(String));
+			expect(result).not.toHaveProperty("details.fullOutputPath", expect.any(String));
+			expectRedactedOpenFailure(failure, visible);
 			expect(readFileSync(victim, "utf8")).toBe("fake sentinel");
 		});
 
@@ -132,27 +185,17 @@ describe("portable bash full output files", () => {
 
 	for (const kind of ["tool", "executor"]) {
 		it(`${kind} preserves the command result and an existing regular file`, async () => {
-			const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
-			if (!openSync) throw new Error("No native openSync implementation");
-			vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
-				if (typeof path !== "string") throw new Error("Expected a filename");
+			const failure = failNextOpen((path) => {
 				spillPaths.push(path);
 				writeFileSync(path, "fake sentinel");
-				return openSync(path, flags, mode);
 			});
-			const operations: BashOperations = {
+			const { result, visible } = await runVisible(kind, root, {
 				exec: async (_command, _cwd, { onData }) => {
 					onData(Buffer.from("fake row\n".repeat(3000)));
 					return { exitCode: 0 };
 				},
-			};
-			const run =
-				kind === "executor"
-					? executeBashWithOperations("fake", root, operations)
-					: wrapToolDefinition(createBashToolDefinition(root, { operations })).execute("exclusive-bash", {
-							command: "fake",
-						});
-			const result = await run;
+			});
+			expectRedactedOpenFailure(failure, visible);
 			expect(result).toMatchObject(kind === "executor" ? { exitCode: 0 } : { structuredContent: { exit_code: 0 } });
 			expect(result).not.toHaveProperty("fullOutputPath", expect.any(String));
 			expect(result).not.toHaveProperty("details.fullOutputPath", expect.any(String));
