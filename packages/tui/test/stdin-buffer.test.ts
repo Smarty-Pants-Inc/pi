@@ -127,6 +127,66 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["\x1b[<35;20;5m"]);
 		});
 
+		// smarty-dev#12091: chunk timers must not flush a later event before its own deadline.
+		it("keeps one timer for a many-chunk event ending in an incomplete sequence", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			const timers = t.mock.method(globalThis, "setTimeout");
+			const reply = `\x1b]0;${"x".repeat(12 * 4096)}`;
+			processInput(reply);
+			t.mock.timers.tick(5);
+			processInput("\x07\x1b[");
+			t.mock.timers.tick(5);
+			assert.deepStrictEqual(emittedSequences, [`${reply}\x07`]);
+			assert.equal(buffer.getBuffer(), "\x1b[");
+			t.mock.timers.tick(4);
+			assert.deepStrictEqual(emittedSequences, [`${reply}\x07`]);
+			t.mock.timers.tick(1);
+			assert.deepStrictEqual(emittedSequences, [`${reply}\x07`, "\x1b["]);
+			assert.equal(timers.mock.callCount(), 2);
+		});
+
+		// smarty-dev#12091: consuming a recognized reply must not transfer its deadline to the next reply.
+		it("gives a new recognized reply its own deadline after completion or cancellation", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			for (const boundary of ["\x07", "\x18", "\x1a"]) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				processInput("\x1b]10;");
+				t.mock.timers.tick(5);
+				processInput(`${"x".repeat(3 * 4096)}${boundary}\x1b]11;`);
+				t.mock.timers.tick(5);
+				assert.equal(buffer.getBuffer(), "\x1b]11;", JSON.stringify(boundary));
+				t.mock.timers.tick(4);
+				assert.equal(buffer.getBuffer(), "\x1b]11;");
+				t.mock.timers.tick(1);
+				assert.equal(buffer.getBuffer(), "");
+				processInput("tail\r\n\x07q");
+				assert.equal(emittedSequences.at(-1), "q");
+			}
+		});
+
+		// smarty-dev#12091: all ways of consuming the buffer must cancel its only timer.
+		it("cancels chunk timers on completion, explicit flush and clear", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			for (const action of ["complete", "flush", "clear"] as const) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				const reply = `\x1b]0;${"x".repeat(3 * 4096)}`;
+				processInput(reply);
+				t.mock.timers.tick(5);
+				if (action === "complete") processInput("\x07");
+				else if (action === "flush") assert.deepStrictEqual(buffer.flush(), [reply]);
+				else buffer.clear();
+				const completed = action === "complete" ? [`${reply}\x07`] : [];
+				processInput("\x1b[");
+				t.mock.timers.tick(5);
+				assert.deepStrictEqual(emittedSequences, completed, action);
+				assert.equal(buffer.getBuffer(), "\x1b[", action);
+				t.mock.timers.tick(5);
+				assert.deepStrictEqual(emittedSequences, [...completed, "\x1b["], action);
+			}
+		});
+
 		it("should flush incomplete sequence after timeout", async () => {
 			processInput("\x1b[<35");
 			assert.deepStrictEqual(emittedSequences, []);
@@ -336,6 +396,65 @@ describe("StdinBuffer", () => {
 			processInput(`\x1b]11;${"x".repeat(70 * 1024)}\x07z`);
 			assert.equal(buffer.getBuffer(), "");
 			assert.deepStrictEqual(emittedSequences, ["z"]);
+		});
+
+		// smarty-dev#12091: real-sized unknown input must be linear, bounded and never auto-submit.
+		it("processes one 1 MiB unterminated unknown OSC within the linear-time budget", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			const input = `\x1b]0;${"\r\n".repeat((1024 * 1024 - 4) / 2)}`;
+			assert.equal(Buffer.byteLength(input), 1024 * 1024);
+			const start = performance.now();
+			processInput(input);
+			const elapsed = performance.now() - start;
+			assert.ok(elapsed < 200, `1 MiB scan took ${elapsed.toFixed(1)}ms (budget: 200ms)`);
+			assert.equal(buffer.getBuffer(), "");
+			assert.deepStrictEqual(emittedSequences, []);
+			// The byte discard window is already exhausted by this event; CR/LF stay quarantined.
+			processInput("keys\r\n");
+			assert.deepStrictEqual(emittedSequences, [..."keys"]);
+			processInput("\x07\r");
+			assert.deepStrictEqual(emittedSequences, [..."keys", "\r"]);
+		});
+
+		for (const header of ["\x1b]0;", "\x1bPunknown;", "\x1b_unknown;", "\x1b^unknown;", "\x1bXunknown;"]) {
+			// smarty-dev#12091: the UTF-8 size cap and bounded discard also cover unknown control strings.
+			it(`caps unknown ${JSON.stringify(header)} and resumes keys after the discard window`, (t) => {
+				t.mock.timers.enable({ apis: ["setTimeout"] });
+				processInput(`a${header}${"é".repeat(32 * 1024)}`);
+				assert.equal(buffer.getBuffer(), "");
+				assert.deepStrictEqual(emittedSequences, ["a"]);
+				processInput("tail\r\n");
+				t.mock.timers.tick(499);
+				processInput("late\r\n");
+				assert.deepStrictEqual(emittedSequences, ["a"]);
+				t.mock.timers.tick(1);
+				processInput("q\r\n");
+				assert.deepStrictEqual(emittedSequences, ["a", "q"]);
+				processInput("\x1b");
+				processInput("\\\r\x1b[A");
+				assert.deepStrictEqual(emittedSequences, ["a", "q", "\r", "\x1b[A"]);
+			});
+		}
+
+		// smarty-dev#12091: incremental scans must revisit a trailing ESC to distinguish ST/resync.
+		it("resumes split terminators and recognized-reply resynchronization after many chunks", () => {
+			for (const header of [
+				"\x1b]10;",
+				"\x1b]0;",
+				"\x1bPunknown;",
+				"\x1b_unknown;",
+				"\x1b^unknown;",
+				"\x1bXunknown;",
+			]) {
+				const reply = `${header}${"x".repeat(3 * 4096)}`;
+				processInput(`${reply}\x1b`);
+				assert.equal(buffer.getBuffer(), `${reply}\x1b`);
+				processInput("\\q");
+				assert.deepStrictEqual(emittedSequences.slice(-2), [`${reply}\x1b\\`, "q"]);
+			}
+			processInput(`\x1b]11;${"x".repeat(3 * 4096)}\x1b`);
+			processInput("[Ar");
+			assert.deepStrictEqual(emittedSequences.slice(-2), ["\x1b[A", "r"]);
 		});
 
 		// pi#244: explicit flush must not convert a recognized reply into keyboard/control input.
