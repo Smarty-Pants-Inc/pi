@@ -45,7 +45,7 @@ describe("user bash full-output log cap", () => {
 
 	function expectNotice(output: string, path: string) {
 		const omitted = TOTAL_BYTES - FULL_OUTPUT_HEAD_BYTES - FULL_OUTPUT_TAIL_BYTES;
-		expect(output).toContain(`[Full output log capped: ${omitted} of ${TOTAL_BYTES} bytes omitted from ${path}]`);
+		expect(output).toContain(`[Output log capped: ${omitted} of ${TOTAL_BYTES} bytes omitted from ${path}]`);
 	}
 
 	it("keeps exact head, marker and tail of a 50 MiB stream and reports it in the output text", async () => {
@@ -57,6 +57,48 @@ describe("user bash full-output log cap", () => {
 		expect(result.truncated).toBe(true);
 		expect(result.exitCode).toBe(0);
 		expectNotice(result.output, path);
+		expect(result.fullOutputTruncation).toEqual({
+			totalBytes: TOTAL_BYTES,
+			omittedBytes: TOTAL_BYTES - FULL_OUTPUT_HEAD_BYTES - FULL_OUTPUT_TAIL_BYTES,
+		});
+	});
+
+	// Audit finding 1: a backend that emits over-cap output and then fails must still report the cap.
+	it("keeps the original error and adds the cap when the backend fails after over-cap output", async () => {
+		const cause = new Error("socket reset");
+		const original = Object.assign(new Error("remote disconnect", { cause }), { code: "ECONNRESET" });
+		const error = await executeBashWithOperations("fake", root, {
+			exec: async (_command, _cwd, { onData }) => {
+				for (let i = 0; i < TOTAL_BYTES / MIB; i++) onData(chunk(i));
+				throw original;
+			},
+		}).then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBe(original);
+		expect(original.cause).toBe(cause);
+		expect(original.code).toBe("ECONNRESET");
+		expect(original.message.startsWith("remote disconnect\n\n")).toBe(true);
+		const path = /omitted from (\S+)\]/.exec(original.message)?.[1];
+		if (!path) throw new Error("No full output path in error");
+		expectNotice(original.message, path);
+		expect(readFileSync(path).equals(expectedLog())).toBe(true);
+	});
+
+	it("rethrows an uncapped backend failure unchanged", async () => {
+		const original = new Error("remote disconnect");
+		const error = await executeBashWithOperations("fake", root, {
+			exec: async (_command, _cwd, { onData }) => {
+				onData(Buffer.from("hello\n"));
+				throw original;
+			},
+		}).then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBe(original);
+		expect(original.message).toBe("remote disconnect");
 	});
 
 	it("keeps the cap and notice when the command is cancelled", async () => {
@@ -94,7 +136,7 @@ describe("user bash full-output log cap", () => {
 		const expected = `start green \u00e9\n${"red\n".repeat(200000)}`;
 		expect(chunks.join("")).toBe(expected);
 		expect(readFileSync(path, "utf8")).toBe(expected);
-		expect(result.output).not.toContain("Full output log capped");
+		expect(result.output).not.toContain("Output log capped");
 		expect(result.output).toBe(truncateTail(expected).content);
 	});
 

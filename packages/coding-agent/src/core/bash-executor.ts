@@ -8,8 +8,8 @@
 
 import { splitIncompleteAnsiSuffix, stripAnsi } from "../utils/ansi.ts";
 import { sanitizeBinaryOutput } from "../utils/shell.ts";
-import type { BashOperations } from "./tools/bash.ts";
-import { OutputAccumulator } from "./tools/output-accumulator.ts";
+import { appendErrorNotice, type BashOperations } from "./tools/bash.ts";
+import { type FullOutputTruncation, OutputAccumulator } from "./tools/output-accumulator.ts";
 
 // ============================================================================
 // Types
@@ -33,6 +33,8 @@ export interface BashResult {
 	truncated: boolean;
 	/** Path to temp file containing full output (if output exceeded truncation threshold) */
 	fullOutputPath?: string;
+	/** Present only when the full-output log omits part of the output. */
+	fullOutputTruncation?: FullOutputTruncation;
 }
 
 // ============================================================================
@@ -71,15 +73,17 @@ export async function executeBashWithOperations(
 		appendText(complete);
 	};
 
-	let bashResult: BashResult;
+	let bashResult: BashResult | undefined;
+	let execError: { error: unknown } | undefined;
 	let tempFileError: unknown;
 	try {
 		let exitCode: number | null = null;
 		try {
 			({ exitCode } = await operations.exec(command, cwd, { onData, signal: options?.signal }));
 		} catch (error) {
-			// An aborted command still returns the output it produced so far.
-			if (!options?.signal?.aborted) throw error;
+			// An aborted command still returns the output it produced so far. Other errors are rethrown
+			// after the log is closed, carrying the cap notice when the log omits output.
+			if (!options?.signal?.aborted) execError = { error };
 		}
 		const rest = pendingAnsi + decoder.decode();
 		pendingAnsi = "";
@@ -89,17 +93,24 @@ export async function executeBashWithOperations(
 		const cancelled = options?.signal?.aborted ?? false;
 		let text = snapshot.content;
 		const logTruncation = snapshot.fullOutputTruncation;
+		let notice: string | undefined;
 		if (logTruncation && snapshot.fullOutputPath) {
 			// Session and RPC copies keep only the output text, so the notice must live in it.
-			text += `\n\n[Full output log capped: ${logTruncation.omittedBytes} of ${logTruncation.totalBytes} bytes omitted from ${snapshot.fullOutputPath}]`;
+			notice = `[Output log capped: ${logTruncation.omittedBytes} of ${logTruncation.totalBytes} bytes omitted from ${snapshot.fullOutputPath}]`;
+			text += `\n\n${notice}`;
 		}
-		bashResult = {
-			output: text,
-			exitCode: cancelled ? undefined : (exitCode ?? undefined),
-			cancelled,
-			truncated: snapshot.truncation.truncated,
-			fullOutputPath: snapshot.fullOutputPath,
-		};
+		if (execError) {
+			if (notice) execError.error = appendErrorNotice(execError.error, notice);
+		} else {
+			bashResult = {
+				output: text,
+				exitCode: cancelled ? undefined : (exitCode ?? undefined),
+				cancelled,
+				truncated: snapshot.truncation.truncated,
+				fullOutputPath: snapshot.fullOutputPath,
+				...(notice && logTruncation ? { fullOutputTruncation: logTruncation } : {}),
+			};
+		}
 	} finally {
 		// Always flush and close the log, also after errors and cancellation.
 		try {
@@ -108,7 +119,10 @@ export async function executeBashWithOperations(
 			tempFileError = error;
 		}
 	}
+	// The command's own failure outranks a later log close failure.
+	if (execError) throw execError.error;
 	if (tempFileError) throw tempFileError;
+	if (!bashResult) throw new Error("Bash execution produced no result");
 	// An abort can arrive while the full-output stream is being flushed.
 	if (options?.signal?.aborted) {
 		bashResult.cancelled = true;

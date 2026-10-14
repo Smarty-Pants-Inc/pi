@@ -174,4 +174,42 @@ describe("bash full output cap (smarty-dev#11307)", () => {
 		expectCapNotice(message, path, MiB);
 		expectCappedLog(path, total);
 	});
+
+	// Audit finding 1: a backend that emits over-cap output and then fails must still report the cap.
+	it("keeps the original error and adds the cap when the backend fails after over-cap output", async () => {
+		const total = CAP + MiB;
+		const pathsBefore = probe.paths.length;
+		const cause = new Error("socket reset");
+		const original = Object.assign(new Error("remote disconnect", { cause }), { code: "ECONNRESET" });
+		const error = await runTool(
+			streamingOperations(total, () => {
+				throw original;
+			}),
+		).then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		const path = probe.paths[pathsBefore];
+		expect(probe.paths).toHaveLength(pathsBefore + 1);
+		expect(error).toBe(original);
+		expect(original.cause).toBe(cause);
+		expect(original.code).toBe("ECONNRESET");
+		expect(original.message.startsWith("remote disconnect\n\n")).toBe(true);
+		expectCapNotice(original.message, path, MiB);
+		expectCappedLog(path, total);
+	});
+
+	it("rethrows an uncapped backend failure unchanged", async () => {
+		const original = new Error("remote disconnect");
+		const error = await runTool(
+			streamingOperations(MiB, () => {
+				throw original;
+			}),
+		).then(
+			() => undefined,
+			(caught: unknown) => caught,
+		);
+		expect(error).toBe(original);
+		expect(original.message).toBe("remote disconnect");
+	});
 });

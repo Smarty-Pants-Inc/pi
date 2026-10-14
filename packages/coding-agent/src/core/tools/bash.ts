@@ -399,6 +399,7 @@ export function createShellToolDefinition(
 			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
 				const truncation = snapshot.truncation;
 				let text = snapshot.content || emptyText;
+				const logLabel = snapshot.fullOutputTruncation ? "Capped log" : "Full output";
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
 					details = {
@@ -410,11 +411,11 @@ export function createShellToolDefinition(
 					const endLine = truncation.totalLines;
 					if (truncation.lastLinePartial) {
 						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${logLabel}: ${snapshot.fullOutputPath}]`;
 					} else if (truncation.truncatedBy === "lines") {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. ${logLabel}: ${snapshot.fullOutputPath}]`;
 					} else {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${logLabel}: ${snapshot.fullOutputPath}]`;
 					}
 					const capped = snapshot.fullOutputTruncation;
 					if (capped) {
@@ -446,7 +447,16 @@ export function createShellToolDefinition(
 					});
 					exitCode = result.exitCode;
 				} catch (err) {
-					const snapshot = await finishOutput();
+					let snapshot: Awaited<ReturnType<typeof finishOutput>>;
+					try {
+						snapshot = await finishOutput();
+					} catch (closeError) {
+						// An arbitrary command failure outranks a later log close failure.
+						if (err instanceof Error && (err.message === "aborted" || err.message.startsWith("timeout:"))) {
+							throw closeError;
+						}
+						throw err;
+					}
 					const { text } = formatOutput(snapshot, "");
 					if (err instanceof Error && err.message === "aborted") {
 						throw new Error(appendStatus(text, "Command aborted"));
@@ -454,6 +464,13 @@ export function createShellToolDefinition(
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
 						const timeoutSecs = err.message.split(":")[1];
 						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+					}
+					const capped = snapshot.fullOutputTruncation;
+					if (capped && snapshot.fullOutputPath) {
+						throw appendErrorNotice(
+							err,
+							`[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}]`,
+						);
 					}
 					throw err;
 				}
@@ -489,6 +506,23 @@ export function createShellToolDefinition(
 		},
 		...createShellRenderers(config.prompt),
 	};
+}
+
+/**
+ * Add a notice to an execution error without replacing it: an Error keeps its identity, cause and
+ * custom properties and gains the notice in its message; other values are wrapped with `cause`.
+ */
+export function appendErrorNotice(error: unknown, notice: string): unknown {
+	if (error instanceof Error) {
+		try {
+			error.message = `${error.message}\n\n${notice}`;
+			return error;
+		} catch {
+			// Read-only message: wrap below.
+		}
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return new Error(`${message}\n\n${notice}`, { cause: error });
 }
 
 const bashToolConfig: ShellToolConfig = {
