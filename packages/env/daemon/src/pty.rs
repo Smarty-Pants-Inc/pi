@@ -272,7 +272,8 @@ pub fn run(
     };
     let waiter = sender.clone();
     thread::spawn(move || {
-        let _ = waiter.send(match child.wait() {
+        // Observe only: the request retains Child and the unreaped leader pins its PID/PGID.
+        let _ = waiter.send(match unix::wait_for_exit(pid) {
             Ok(status) => Message::Exit(status),
             Err(error) => Message::WaitFailed(error.to_string()),
         });
@@ -285,17 +286,27 @@ pub fn run(
     let mut aborted = false;
     let mut killed = false;
     let mut cleanup = None;
-    let terminate = || {
+    let mut terminate = |observation_failed| {
         cleanup_group(
             pid,
             groups,
-            || unix::terminate_group(pid),
+            || {
+                if observation_failed {
+                    // Without an exit observation, do not assume a raw PGID is still ours.
+                    Err(std::io::Error::other("leader exit observation failed"))
+                } else {
+                    unix::terminate_group(pid)
+                }
+            },
+            || unix::reap(&mut child),
             |message| eprintln!("pty: ERROR {message}"),
         )
     };
     let kill = |killed: &mut bool| {
         if !*killed {
             *killed = true;
+            // The observer never reaps, even on cancel: the live or zombie leader still pins this PGID.
+            // Exit fences this closure before reaping; WaitFailed breaks without processing another message.
             kill_group(pid);
         }
     };
@@ -333,15 +344,17 @@ pub fn run(
                 // Cleanup starts at leader exit, not after background output becomes idle.
                 // Fence later cancel/kill messages before forgetting this group.
                 killed = true;
-                cleanup = Some(terminate());
+                cleanup = Some(terminate(false));
                 if cleanup.as_ref().is_some_and(Result::is_err) {
                     break;
                 }
                 idle_until = Some(Instant::now() + EXIT_GRACE);
             }
             Ok(Message::WaitFailed(error)) => {
+                // Break immediately: no cancel/kill is processed after this cleanup/reap.
+                cleanup = Some(terminate(true));
                 status = Some(Err(error));
-                idle_until = Some(Instant::now());
+                break;
             }
             Ok(Message::Cancel) => {
                 aborted = true;
@@ -353,7 +366,7 @@ pub fn run(
         }
     }
     // A disconnected waiter still gets one bounded attempt, never a deferred retry.
-    let cleanup = cleanup.unwrap_or_else(terminate);
+    let cleanup = cleanup.unwrap_or_else(|| terminate(false));
     stop.store(true, Ordering::SeqCst);
     // Ending the input channel ends the writer thread.
     terminals.lock().unwrap().remove(&id);
@@ -378,21 +391,22 @@ fn cleanup_group(
     pid: u32,
     groups: &Groups,
     terminate: impl FnOnce() -> std::io::Result<bool>,
+    reap: impl FnOnce() -> std::io::Result<()>,
     log_error: impl FnOnce(&str),
 ) -> Result<(), Failure> {
-    // Keep shutdown from signalling this record between the final probe and its removal.
+    // Keep shutdown from signalling between the last group signal, reaping, and record removal.
+    // The unreaped leader reserves the PID/PGID for the entire bounded cleanup, including failure.
     let mut groups = groups.lock().unwrap();
     let outcome = terminate();
+    let reaped = reap();
     groups.remove(&pid);
     drop(groups);
-    // Never retain a failed cleanup for retry: a later attempt cannot prove this PGID
-    // still identifies the same group. Linux reserves the PGID while any member lives;
-    // the single bounded attempt stops immediately on ESRCH, and then forgets it.
-    match outcome {
-        Ok(true) => Ok(()),
-        outcome => {
+    // No signal or retained retry is allowed after reaping releases the identity pin.
+    match (outcome, reaped) {
+        (Ok(true), Ok(())) => Ok(()),
+        (outcome, reaped) => {
             let message = format!(
-                "PTY process group {pid} cleanup incomplete ({outcome:?}); dropping supervision without retry"
+                "PTY process group {pid} cleanup incomplete ({outcome:?}, reap {reaped:?}); dropping supervision without retry"
             );
             log_error(&message);
             Err(Failure::new("cleanup_failed", message))
@@ -420,6 +434,7 @@ mod tests {
                 attempts += 1;
                 Ok(true)
             },
+            || Ok(()),
             |_| panic!("successful cleanup must not log an error"),
         )
         .unwrap();
@@ -435,18 +450,44 @@ mod tests {
             Err(std::io::Error::from_raw_os_error(libc::EPERM)),
         ] {
             let groups: Groups = Arc::new(Mutex::new(Default::default()));
-            let pid = 124;
+            let request = PtyRequest::from_json(&json!({
+                "argv": ["/bin/sh", "-c", "exit 0"],
+                "cwd": crate::sys::tmpdir(), "cols": 80, "rows": 24,
+            }))
+            .unwrap();
+            let (_master, mut child) = unix::spawn(&request).unwrap();
+            let pid = child.id();
+            unix::wait_for_exit(pid).unwrap();
             groups.lock().unwrap().insert(pid);
             let caller = std::thread::current().id();
-            let mut attempts = 0;
+            let attempts = std::cell::Cell::new(0);
             let mut logs = Vec::new();
             let error = cleanup_group(
                 pid,
                 &groups,
                 || {
                     assert_eq!(std::thread::current().id(), caller);
-                    attempts += 1;
+                    attempts.set(attempts.get() + 1);
+                    // A repeated WNOWAIT observation proves cleanup still owns an unreaped leader.
+                    assert_eq!(unix::wait_for_exit(pid).unwrap().code(), Some(0));
+                    #[cfg(target_os = "linux")]
+                    assert!(
+                        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                            .unwrap()
+                            .rsplit_once(") ")
+                            .unwrap()
+                            .1
+                            .starts_with('Z')
+                    );
                     outcome
+                },
+                || {
+                    assert_eq!(
+                        attempts.get(),
+                        1,
+                        "leader must not be reaped before the cleanup attempt"
+                    );
+                    unix::reap(&mut child)
                 },
                 |message| logs.push(message.to_string()),
             )
@@ -454,11 +495,34 @@ mod tests {
             assert_eq!(error.code, "cleanup_failed");
             assert!(error.message.contains(&pid.to_string()));
             assert_eq!(logs, [error.message]);
-            assert_eq!(attempts, 1);
+            assert_eq!(attempts.get(), 1);
+            assert!(
+                unix::wait_for_exit(pid)
+                    .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+            );
             assert!(groups.lock().unwrap().is_empty());
             // The connection's kill_all path can only signal records still in this set.
             let later_signals: Vec<_> = groups.lock().unwrap().iter().copied().collect();
             assert!(later_signals.is_empty());
+        }
+    }
+
+    // pi#244: WNOWAIT must preserve both ordinary and signalled exit status until the request reaps.
+    #[test]
+    fn exit_observation_preserves_status_without_reaping() {
+        for (command, expected) in [("exit 23", 23), ("kill -KILL $$", 137)] {
+            let request = PtyRequest::from_json(&json!({
+                "argv": ["/bin/sh", "-c", command],
+                "cwd": crate::sys::tmpdir(), "cols": 80, "rows": 24,
+            }))
+            .unwrap();
+            let (_master, mut child) = unix::spawn(&request).unwrap();
+            let observed = unix::wait_for_exit(child.id()).unwrap();
+            let repeated = unix::wait_for_exit(child.id()).unwrap();
+            let reaped = child.wait().unwrap();
+            assert_eq!(crate::sys::exit_code(observed), expected);
+            assert_eq!(observed, repeated);
+            assert_eq!(observed, reaped);
         }
     }
 
@@ -567,6 +631,104 @@ mod tests {
         );
         assert_eq!(queued.load(Ordering::SeqCst), 0);
         assert_eq!(result.unwrap()["exitCode"], 137);
+    }
+
+    // pi#244: queued exit cleanup must keep the leader's PID/PGID reserved until its last signal.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn leader_stays_zombie_until_group_cleanup_returns() {
+        use std::os::unix::net::UnixStream;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let output = Arc::new(Output::default());
+        let control = Arc::new(Control::default());
+        let groups: Groups = Arc::new(Mutex::new(Default::default()));
+        let terminals = Arc::new(Mutex::new(HashMap::new()));
+        let (mut events, mut sink) = UnixStream::pair().unwrap();
+        events
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let writer = {
+            let output = output.clone();
+            thread::spawn(move || output.run(&mut sink))
+        };
+        let worker = {
+            let output = output.clone();
+            let control = control.clone();
+            let groups = groups.clone();
+            let terminals = terminals.clone();
+            thread::spawn(move || {
+                let request = PtyRequest::from_json(&json!({
+                    "argv": ["/bin/sh", "-c", "trap '' HUP TERM; read trigger; sleep 30 & echo $!; exit 7"],
+                    "cwd": crate::sys::tmpdir(), "cols": 80, "rows": 24,
+                })).unwrap();
+                run(8, request, &output, &control, &groups, &terminals)
+            })
+        };
+        let started = crate::frame::read_frame(&mut events).unwrap().unwrap();
+        let pid = started.json["pid"].as_u64().unwrap() as u32;
+        // Hold cleanup at its real entry point, then let the leader exit.
+        let record = groups.lock().unwrap();
+        write(&terminals, &json!({ "target": 8 }), b"go\n".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let zombie = loop {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+            if stat
+                .as_ref()
+                .is_some_and(|stat| stat.rsplit_once(") ").unwrap().1.starts_with('Z'))
+            {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        drop(record);
+        // The background child ignores TERM, so the real bounded cleanup is now waiting before SIGKILL.
+        thread::sleep(Duration::from_millis(100));
+        let pinned_during_cleanup = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .is_some_and(|stat| stat.rsplit_once(") ").unwrap().1.starts_with('Z'));
+        // Always release the lock and clean up before assertions, also on the unfixed implementation.
+        let result = worker.join().unwrap();
+        output.close();
+        let mut text = Vec::new();
+        while let Some(frame) = crate::frame::read_frame(&mut events).unwrap() {
+            text.extend(frame.payload);
+        }
+        writer.join().unwrap();
+        let background = String::from_utf8(text)
+            .unwrap()
+            .lines()
+            .find_map(|line| line.trim().parse::<u32>().ok())
+            .unwrap();
+        let background_live = std::fs::read_to_string(format!("/proc/{background}/stat"))
+            .ok()
+            .is_some_and(|stat| !stat.rsplit_once(") ").unwrap().1.starts_with('Z'));
+        if background_live {
+            // SAFETY: the test owns this background child; do not leak it on regression.
+            unsafe {
+                libc::kill(background as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        assert!(
+            zombie,
+            "leader {pid} was reaped before cleanup acquired the group lock"
+        );
+        assert!(
+            pinned_during_cleanup,
+            "leader {pid} was reaped during the bounded group cleanup"
+        );
+        assert_eq!(result.unwrap()["exitCode"], 7);
+        assert!(!background_live, "background child survived group cleanup");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "leader was not reaped after cleanup"
+        );
+        assert!(groups.lock().unwrap().is_empty());
+        assert!(terminals.lock().unwrap().is_empty());
     }
 
     // pi#244: cleanup starts on leader exit even while a background job keeps producing output.
@@ -805,8 +967,196 @@ mod unix {
         Ok((master, child))
     }
 
-    /// Stop remaining jobs before dropping the terminal's process-group record. The leader has already been waited
-    /// for; reap any other children in the group (orphans not adopted by this process are reaped by init).
+    /// Report the leader's exit without releasing its PID or PGID. Only the request may reap it, after cleanup.
+    pub fn wait_for_exit(pid: u32) -> io::Result<std::process::ExitStatus> {
+        use std::os::unix::process::ExitStatusExt;
+
+        loop {
+            // SAFETY: waitid initializes one siginfo_t for the exact child; WNOWAIT preserves the zombie.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let result = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    pid as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: a successful WEXITED waitid initializes the child PID and exit status fields.
+            if unsafe { info.si_pid() } != pid as libc::pid_t {
+                return Err(io::Error::other("waitid returned a different child"));
+            }
+            let status = unsafe { info.si_status() };
+            let raw = match info.si_code {
+                libc::CLD_EXITED => status << 8,
+                libc::CLD_KILLED => status,
+                libc::CLD_DUMPED => status | 0x80,
+                _ => return Err(io::Error::other("waitid did not report an exit")),
+            };
+            return Ok(std::process::ExitStatus::from_raw(raw));
+        }
+    }
+
+    /// Reap only after the final group signal. Also bounded when exit observation or cleanup failed.
+    pub fn reap(child: &mut Child) -> io::Result<()> {
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let deadline = Instant::now() + super::CLEANUP_KILL_WAIT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {}
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PTY leader did not exit before reap deadline",
+                ));
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    }
+
+    // A zombie-only group still passes kill(-pgid, 0). Inspect live members without waitpid(-pgid), which would
+    // reap the leader and release the identity pin before SIGKILL. Orphan zombies are left for their parent/init.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn group_has_live_members(pid: u32, deadline: std::time::Instant) -> io::Result<bool> {
+        for entry in std::fs::read_dir("/proc")? {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PTY group probe exceeded deadline",
+                ));
+            }
+            let entry = entry?;
+            let Some(member) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::pid_t>().ok())
+            else {
+                continue;
+            };
+            if member == pid as libc::pid_t {
+                continue;
+            }
+            // SAFETY: read-only membership query; the leader reserves the group identity throughout this scan.
+            let group = unsafe { libc::getpgid(member) };
+            if group < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if group != pid as libc::pid_t {
+                continue;
+            }
+            let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(libc::ENOENT) | Some(libc::ESRCH)) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let mut fields = stat
+                .rsplit_once(") ")
+                .ok_or_else(|| io::Error::other("invalid process stat"))?
+                .1
+                .split_whitespace();
+            let state = fields
+                .next()
+                .ok_or_else(|| io::Error::other("missing process state"))?;
+            let group = fields
+                .nth(1)
+                .and_then(|group| group.parse::<u32>().ok())
+                .ok_or_else(|| io::Error::other("missing process group"))?;
+            if group == pid && !matches!(state, "Z" | "X") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn group_has_live_members(pid: u32, deadline: std::time::Instant) -> io::Result<bool> {
+        let mut members = [0 as libc::pid_t; 4096];
+        let capacity = std::mem::size_of_val(&members) as libc::c_int;
+        // libproc.h's PROC_PGRP_ONLY is not exposed by libc; proc_listpids returns bytes (not a PID count).
+        const PROC_PGRP_ONLY: u32 = 2;
+        // SAFETY: libproc fills the PID array with at most capacity bytes.
+        let bytes = unsafe {
+            libc::proc_listpids(PROC_PGRP_ONLY, pid, members.as_mut_ptr().cast(), capacity)
+        };
+        if bytes <= 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if bytes >= capacity {
+            return Err(io::Error::other(
+                "PTY group member list exceeded probe capacity",
+            ));
+        }
+        for member in members
+            .into_iter()
+            .take(bytes as usize / std::mem::size_of::<libc::pid_t>())
+        {
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "PTY group probe exceeded deadline",
+                ));
+            }
+            if member <= 0 || member == pid as libc::pid_t {
+                continue;
+            }
+            // SAFETY: proc_pidinfo initializes one BSD process record in the supplied buffer.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of_val(&info) as libc::c_int;
+            let read = unsafe {
+                libc::proc_pidinfo(
+                    member,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    size,
+                )
+            };
+            if read != size {
+                let error = io::Error::last_os_error();
+                if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if info.pbi_pgid == pid && info.pbi_status != libc::SZOMB {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    fn group_has_live_members(_pid: u32, _deadline: std::time::Instant) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PTY live group probing is unsupported on this system",
+        ))
+    }
+
+    /// Stop remaining jobs while the leader is still unreaped. Never reap any group member during this attempt.
     pub fn terminate_group(pid: u32) -> io::Result<bool> {
         use std::thread;
         use std::time::{Duration, Instant};
@@ -816,7 +1166,7 @@ mod unix {
             (libc::SIGTERM, super::CLEANUP_TERM_WAIT),
             (libc::SIGKILL, super::CLEANUP_KILL_WAIT),
         ] {
-            // SAFETY: signal only the process group this terminal owns.
+            // SAFETY: the unreaped leader pins the process group this terminal owns until cleanup returns.
             if unsafe { libc::kill(group, signal) } != 0 {
                 let error = io::Error::last_os_error();
                 return if error.raw_os_error() == Some(libc::ESRCH) {
@@ -827,35 +1177,14 @@ mod unix {
             }
             let deadline = Instant::now() + bound;
             loop {
-                loop {
-                    // SAFETY: non-blocking waits for this group's children only; no other request's child is reaped.
-                    let reaped =
-                        unsafe { libc::waitpid(group, std::ptr::null_mut(), libc::WNOHANG) };
-                    if reaped > 0 && Instant::now() < deadline {
-                        continue;
-                    }
-                    if reaped >= 0 {
-                        break;
-                    }
-                    let error = io::Error::last_os_error();
-                    match error.raw_os_error() {
-                        Some(libc::ECHILD) => break,
-                        Some(libc::EINTR) if Instant::now() < deadline => continue,
-                        Some(libc::EINTR) => break,
-                        _ => return Err(error),
-                    }
-                }
-                // SAFETY: signal zero only probes whether the owned group still exists. Only ESRCH proves emptiness.
-                if unsafe { libc::kill(group, 0) } != 0 {
-                    let error = io::Error::last_os_error();
-                    return if error.raw_os_error() == Some(libc::ESRCH) {
-                        Ok(true)
-                    } else {
-                        Err(error)
-                    };
-                }
                 if Instant::now() >= deadline {
                     break;
+                }
+                match group_has_live_members(pid, deadline) {
+                    Ok(false) => return Ok(true),
+                    Ok(true) => {}
+                    Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
+                    Err(error) => return Err(error),
                 }
                 thread::sleep(
                     Duration::from_millis(10)
