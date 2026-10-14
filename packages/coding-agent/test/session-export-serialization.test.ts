@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MAX_MATERIALIZED_EXPORT_BYTES } from "../src/core/export-limits.ts";
 import { exportSessionToJsonl, serializeSessionBranch } from "../src/core/session-export.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
@@ -18,12 +18,21 @@ vi.mock("node:fs", async (importOriginal) => {
 });
 
 describe("session export serialization", () => {
-	afterEach(() => {
+	let testRoot: string;
+
+	beforeEach(() => {
+		testRoot = fs.mkdtempSync(join(tmpdir(), "pi-session-export-serialization-"));
+	});
+
+	afterEach(async () => {
 		vi.restoreAllMocks();
+		const actualFs = await vi.importActual<typeof fs>("node:fs");
+		actualFs.rmSync(testRoot, { recursive: true, force: true });
+		expect(actualFs.existsSync(testRoot)).toBe(false);
 	});
 
 	function directory(): string {
-		return fs.mkdtempSync(join(tmpdir(), "pi-session-export-serialization-"));
+		return fs.mkdtempSync(join(testRoot, "case-"));
 	}
 
 	function manager(): SessionManager {

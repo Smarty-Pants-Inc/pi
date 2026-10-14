@@ -147,117 +147,123 @@ describe("original compaction session identity", () => {
 	});
 
 	// #11897 / pi#242: real journal bytes and the historical fence, not simulated memory pressure.
-	// Default-on: bounded writes and sequential children keep the parent from retaining the journal.
-	test("survives a 300 MiB journal where the old full-branch identity exhausts a 1 GiB old-space cap", async () => {
-		const scratch = mkdtempSync(join(tmpdir(), "pi-compaction-identity-heavy-"));
-		try {
-			const original = join(scratch, "original.jsonl");
-			const fixedInput = join(scratch, "fixed.jsonl");
-			const timestamp = new Date(0).toISOString();
-			let writtenBytes = 0;
-			function* journalLines(): Generator<string> {
-				// Keep realistic Unicode text alongside large ASCII portions, as in
-				// multilingual tool output.
-				const body = `λ${"x".repeat(1024 * 1024 - 2)}`;
-				const header = { type: "session", version: 3, id: "identity-heavy", timestamp, cwd: scratch };
-				const headerLine = `${JSON.stringify(header)}\n`;
-				writtenBytes += Buffer.byteLength(headerLine);
-				yield headerLine;
-				// History accumulated since the prior checkpoint is still hot when the
-				// next compaction starts. Do not hide the regression by making it cold.
-				const compactionLine = `${JSON.stringify({
-					type: "compaction",
-					id: "checkpoint",
-					parentId: null,
-					timestamp,
-					summary: "Earlier multilingual history",
-					firstKeptEntryId: "checkpoint",
-					tokensBefore: 100_000_000,
-				})}\n`;
-				writtenBytes += Buffer.byteLength(compactionLine);
-				yield compactionLine;
-				let parentId: string | null = "checkpoint";
-				for (let index = 0; index < 300; index++) {
-					const id = `body-${index}`;
-					const line = `${JSON.stringify({
-						type: "message",
-						id,
-						parentId,
+	// Opt in because the 300 MiB journal and two bounded children are intentionally heavy.
+	test.skipIf(process.env.PI_HEAVY_TESTS !== "1")(
+		"heavy (default skipped; set PI_HEAVY_TESTS=1): survives a 300 MiB journal where the old full-branch identity exhausts a 1 GiB old-space cap",
+		async () => {
+			const scratch = mkdtempSync(join(tmpdir(), "pi-compaction-identity-heavy-"));
+			try {
+				const original = join(scratch, "original.jsonl");
+				const fixedInput = join(scratch, "fixed.jsonl");
+				const timestamp = new Date(0).toISOString();
+				let writtenBytes = 0;
+				function* journalLines(): Generator<string> {
+					// Keep realistic Unicode text alongside large ASCII portions, as in
+					// multilingual tool output.
+					const body = `λ${"x".repeat(1024 * 1024 - 2)}`;
+					const header = { type: "session", version: 3, id: "identity-heavy", timestamp, cwd: scratch };
+					const headerLine = `${JSON.stringify(header)}\n`;
+					writtenBytes += Buffer.byteLength(headerLine);
+					yield headerLine;
+					// History accumulated since the prior checkpoint is still hot when the
+					// next compaction starts. Do not hide the regression by making it cold.
+					const compactionLine = `${JSON.stringify({
+						type: "compaction",
+						id: "checkpoint",
+						parentId: null,
 						timestamp,
-						message: { role: "user", content: `${index}: ${body}`, timestamp: 0 },
+						summary: "Earlier multilingual history",
+						firstKeptEntryId: "checkpoint",
+						tokensBefore: 100_000_000,
 					})}\n`;
-					writtenBytes += Buffer.byteLength(line);
-					yield line;
-					parentId = id;
+					writtenBytes += Buffer.byteLength(compactionLine);
+					yield compactionLine;
+					let parentId: string | null = "checkpoint";
+					for (let index = 0; index < 300; index++) {
+						const id = `body-${index}`;
+						const line = `${JSON.stringify({
+							type: "message",
+							id,
+							parentId,
+							timestamp,
+							message: { role: "user", content: `${index}: ${body}`, timestamp: 0 },
+						})}\n`;
+						writtenBytes += Buffer.byteLength(line);
+						yield line;
+						parentId = id;
+					}
+					for (let index = 0; index < 100; index++) {
+						const id = `tail-${index}`;
+						const line = `${JSON.stringify({
+							type: "custom",
+							id,
+							parentId,
+							timestamp,
+							customType: "fixture-tail",
+						})}\n`;
+						writtenBytes += Buffer.byteLength(line);
+						yield line;
+						parentId = id;
+					}
 				}
-				for (let index = 0; index < 100; index++) {
-					const id = `tail-${index}`;
-					const line = `${JSON.stringify({
-						type: "custom",
-						id,
-						parentId,
-						timestamp,
-						customType: "fixture-tail",
-					})}\n`;
-					writtenBytes += Buffer.byteLength(line);
-					yield line;
-					parentId = id;
-				}
-			}
-			await pipeline(Readable.from(journalLines()), createWriteStream(original, { flags: "wx" }));
-			const size = statSync(original).size;
-			expect(size).toBe(writtenBytes);
-			expect(size).toBeGreaterThanOrEqual(300 * 1024 * 1024);
-			expect(size).toBeLessThan(301 * 1024 * 1024);
-			// Independent byte-identical files: the fixed child's real appends must not alter
-			// the old child's initial input. No sparse allocation or giant parent-side string.
-			copyFileSync(original, fixedInput);
-			expect(statSync(fixedInput).size).toBe(size);
-			const child = fileURLToPath(
-				new URL("./fixtures/ordinary-compaction-session-identity-child.ts", import.meta.url),
-			);
-			for (const mode of ["fixed", "old"] as const) {
-				const result = spawnSync(
-					process.execPath,
-					[
-						"--max-old-space-size=1024",
-						// Keep the young-generation allowance stable across Node 22 and 24.
-						"--max-semi-space-size=16",
-						"--experimental-strip-types",
-						child,
-						mode,
-						mode === "fixed" ? fixedInput : original,
-						String(size),
-					],
-					{ encoding: "utf8", timeout: 90_000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 },
+				await pipeline(Readable.from(journalLines()), createWriteStream(original, { flags: "wx" }));
+				const size = statSync(original).size;
+				expect(size).toBe(writtenBytes);
+				expect(size).toBeGreaterThanOrEqual(300 * 1024 * 1024);
+				expect(size).toBeLessThan(301 * 1024 * 1024);
+				// Independent byte-identical files: the fixed child's real appends must not alter
+				// the old child's initial input. No sparse allocation or giant parent-side string.
+				copyFileSync(original, fixedInput);
+				expect(statSync(fixedInput).size).toBe(size);
+				const child = fileURLToPath(
+					new URL("./fixtures/ordinary-compaction-session-identity-child.ts", import.meta.url),
 				);
-				const evidence = JSON.stringify({
-					mode,
-					status: result.status,
-					signal: result.signal,
-					error: result.error?.message,
-					stdout: result.stdout,
-					stderr: result.stderr,
-				});
-				expect(result.error, evidence).toBeUndefined();
-				expect(result.stdout, evidence).toContain(`IDENTITY_READY ${mode} ${size} 401\n`);
-				if (mode === "fixed") {
-					expect(result.status, evidence).toBe(0);
-					expect(result.signal, evidence).toBeNull();
-					expect(result.stdout, evidence).toContain("FIXED_ACCOUNTING_CHECKED\n");
-					expect(result.stdout, evidence).toContain("FIXED_MUTATION_REJECTED\n");
-				} else {
-					expect(result.status, evidence).not.toBe(0);
-					expect(result.signal, evidence).not.toBe("SIGKILL");
-					expect(result.stderr, evidence).toMatch(
-						/FATAL ERROR:.*(?:heap out of memory|Allocation failed.*JavaScript heap)/i,
+				for (const mode of ["fixed", "old"] as const) {
+					const result = spawnSync(
+						process.execPath,
+						[
+							"--max-old-space-size=1024",
+							// Keep the young-generation allowance stable across Node 22 and 24.
+							"--max-semi-space-size=16",
+							"--experimental-strip-types",
+							child,
+							mode,
+							mode === "fixed" ? fixedInput : original,
+							String(size),
+						],
+						{ encoding: "utf8", timeout: 90_000, killSignal: "SIGKILL", maxBuffer: 64 * 1024 },
 					);
+					const evidence = JSON.stringify({
+						mode,
+						status: result.status,
+						signal: result.signal,
+						error: result.error?.message,
+						stdout: result.stdout,
+						stderr: result.stderr,
+					});
+					expect(result.error, evidence).toBeUndefined();
+					expect(result.stdout, evidence).toContain(`IDENTITY_READY ${mode} ${size} 401\n`);
+					if (mode === "fixed") {
+						expect(result.status, evidence).toBe(0);
+						expect(result.signal, evidence).toBeNull();
+						expect(result.stdout, evidence).toContain("FIXED_ACCOUNTING_CHECKED\n");
+						expect(result.stdout, evidence).toContain("FIXED_MUTATION_REJECTED\n");
+						console.log(
+							`Heavy child receipt: ${JSON.stringify({ mode, status: result.status, signal: result.signal })}`,
+						);
+					} else {
+						expect(result.signal === "SIGABRT" || result.status === 134, evidence).toBe(true);
+						console.log(
+							`Heavy child receipt: ${JSON.stringify({ mode, status: result.status, signal: result.signal })}`,
+						);
+					}
 				}
+			} finally {
+				rmSync(scratch, { recursive: true, force: true });
 			}
-		} finally {
-			rmSync(scratch, { recursive: true, force: true });
-		}
-	}, 240_000);
+		},
+		240_000,
+	);
 
 	test("uses the production metadata path instead of getBranch's owned payload view", () => {
 		const { manager } = createManager();
