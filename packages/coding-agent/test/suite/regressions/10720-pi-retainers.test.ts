@@ -18,7 +18,7 @@ import { createHarness, type Harness } from "../harness.ts";
 const workerPath = fileURLToPath(new URL("../../../src/utils/image-resize-worker.ts", import.meta.url));
 
 // smarty-dev#10720: inspect the actual request closure, not a second implementation of its snapshot.
-async function retainedSnapshot(session: AgentSession): Promise<unknown> {
+async function retainedRequestValue(session: AgentSession, name: string): Promise<unknown> {
 	const inspector = new Session();
 	inspector.connect();
 	Object.defineProperty(globalThis, "__piRetainerProjection", {
@@ -38,7 +38,7 @@ async function retainedSnapshot(session: AgentSession): Promise<unknown> {
 		for (const scope of scopes.result) {
 			if (!scope.value?.objectId) continue;
 			const variables = await inspector.post("Runtime.getProperties", { objectId: scope.value.objectId });
-			const snapshot = variables.result.find((variable) => /^canonicalMessages(?:Digest)?$/.test(variable.name));
+			const snapshot = variables.result.find((variable) => variable.name === name);
 			if (snapshot) return snapshot.value?.value;
 		}
 		throw new Error("Request projection snapshot was not found in its closure");
@@ -143,16 +143,47 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 		const harness = await createHarness({
 			settings: { compaction: { enabled: false } },
 			prepareRequest: (request) => {
-				expected = createHash("sha256").update(JSON.stringify(request.context.messages)).digest("base64");
+				const hash = createHash("sha256");
+				for (const message of request.context.messages) {
+					hash.update(JSON.stringify(message));
+					hash.update("\0");
+				}
+				expected = hash.digest("base64");
 			},
 		});
 		try {
 			harness.setResponses([fauxAssistantMessage("reply")]);
 			await harness.session.prompt("large input ".repeat(2000));
-			const snapshot = await retainedSnapshot(harness.session);
+			const snapshot = await retainedRequestValue(harness.session, "canonicalMessagesDigest");
 			expect(typeof snapshot).toBe("string");
 			expect((snapshot as string).length).toBeLessThanOrEqual(44);
 			expect(snapshot).toBe(expected);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	// #11897: in-place request-hook edits are not safe to discard after overflow.
+	it("detects in-place request-hook edits and sends them unchanged when they fit", async () => {
+		const harness = await createHarness({
+			prepareRequest: (request) => {
+				const userMessage = request.context.messages.find((message) => message.role === "user");
+				if (userMessage?.role === "user") userMessage.content = [{ type: "text", text: "hook-edited input" }];
+			},
+		});
+		try {
+			harness.setResponses([
+				(context) => {
+					const userMessage = context.messages.find((message) => message.role === "user");
+					expect(userMessage).toMatchObject({
+						role: "user",
+						content: [{ type: "text", text: "hook-edited input" }],
+					});
+					return fauxAssistantMessage("reply");
+				},
+			]);
+			await harness.session.prompt("original input");
+			expect(await retainedRequestValue(harness.session, "canReproject")).toBe(false);
 		} finally {
 			harness.cleanup();
 		}
@@ -167,7 +198,7 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 			harness.setResponses([fauxAssistantMessage("fitting reply")]);
 			await harness.session.prompt("fitting input");
 			expect(harness.session.getLastAssistantText()).toBe("fitting reply");
-			expect(await retainedSnapshot(harness.session)).toBeUndefined();
+			expect(await retainedRequestValue(harness.session, "canonicalMessagesDigest")).toBeUndefined();
 		} finally {
 			harness.cleanup();
 		}

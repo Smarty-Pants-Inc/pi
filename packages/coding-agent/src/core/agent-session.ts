@@ -146,6 +146,7 @@ import type { OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
 import { assertOriginalCompactionAttempt, type OriginalCompactionAttempt } from "./ordinary-compaction.ts";
 import { assertOrdinaryRuntime, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
 import { createOrdinaryToolDefinitions } from "./ordinary-tools.ts";
+import { createOriginalCompactionSessionIdentity } from "./original-compaction-session-identity.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import { bindReceivedInputSession, getInputReceipt, type ReceivedInput, receiveInput } from "./received-input.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
@@ -1091,7 +1092,12 @@ export class AgentSession {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		const snapshotMessages = (messages: AgentMessage[]): string | undefined => {
 			try {
-				return createHash("sha256").update(JSON.stringify(messages)).digest("base64");
+				const hash = createHash("sha256");
+				for (const message of messages) {
+					hash.update(JSON.stringify(message));
+					hash.update("\0");
+				}
+				return hash.digest("base64");
 			} catch {
 				// SDK-only metadata may not serialize. It must not block a fitting request.
 				return undefined;
@@ -5022,24 +5028,7 @@ export class AgentSession {
 		owner.assertSessionStart(this);
 		const model = this.model;
 		const stream = this.agent.streamFunction;
-		const branchIdentity = () =>
-			JSON.stringify(
-				this.sessionManager
-					.getBranch()
-					.filter(
-						(entry) =>
-							!(
-								entry.type === "custom" &&
-								[
-									"smarty-sense:count-reservation-v1",
-									"smarty-sense:count-qualification-v1",
-									"smarty-sense:provider-reservation-v1",
-									"smarty-sense:provider-usage-v1",
-								].includes(entry.customType)
-							),
-					),
-			);
-		let branch = branchIdentity();
+		const branchIdentity = createOriginalCompactionSessionIdentity(this.sessionManager);
 		const checkState = () => {
 			owner.assertSessionStart(this);
 			this._compactionAbortController?.signal.throwIfAborted();
@@ -5052,17 +5041,17 @@ export class AgentSession {
 				this.isBashRunning ||
 				this.#originalAgent.hasQueuedMessages() ||
 				this.pendingMessageCount ||
-				this.#pendingModeInput?.() ||
-				branchIdentity() !== branch
+				this.#pendingModeInput?.()
 			)
 				throw new Error("OPS_COMPACTION_SESSION_CHANGED");
+			branchIdentity.check();
 		};
 		if (originalCompactionSessions.has(this)) throw new Error("OPS_COMPACTION_SESSION_FENCE_ONCE");
 		originalCompactionSessions.set(this, {
 			attempt,
 			check: checkState,
 			afterAppend: () => {
-				branch = branchIdentity();
+				branchIdentity.afterAppend();
 			},
 		});
 		attempt.check();

@@ -4,6 +4,7 @@ import { basename, join } from "path";
 import { APP_NAME, getExportTemplateDir } from "../../config.ts";
 import { getResolvedThemeColors, getThemeExportColors } from "../../modes/interactive/theme/theme.ts";
 import { normalizePath, resolvePath } from "../../utils/paths.ts";
+import { assertExportFileSize, assertExportValueSize, assertMaterializedExportSize } from "../export-limits.ts";
 import type { ToolDefinition } from "../extensions/types.ts";
 import type { SessionEntry } from "../session-manager.ts";
 import { SessionManager } from "../session-manager.ts";
@@ -141,6 +142,7 @@ interface SessionData {
  * Core HTML generation logic shared by both export functions.
  */
 function generateHtml(sessionData: SessionData, themeName?: string): string {
+	assertExportValueSize(sessionData, "HTML");
 	const templateDir = getExportTemplateDir();
 	const template = readFileSync(join(templateDir, "template.html"), "utf-8");
 	const templateCss = readFileSync(join(templateDir, "template.css"), "utf-8");
@@ -248,7 +250,9 @@ export async function exportSessionToHtml(
 		throw new Error("Nothing to export yet - start a conversation first");
 	}
 
+	assertMaterializedExportSize(sessionFile, sm.getEntryCount(), "HTML");
 	const entries = sm.getEntries();
+	assertExportValueSize(entries, "HTML");
 
 	// Pre-render custom tools if a tool renderer is provided
 	let renderedTools: Record<string, RenderedToolHtml> | undefined;
@@ -293,7 +297,9 @@ export async function exportFromFile(inputPath: string, options?: ExportOptions 
 		throw new Error(`File not found: ${resolvedInputPath}`);
 	}
 
+	assertExportFileSize(resolvedInputPath, "HTML");
 	const sm = SessionManager.open(resolvedInputPath);
+	assertMaterializedExportSize(undefined, sm.getEntryCount(), "HTML");
 
 	const sessionData: SessionData = {
 		header: sm.getHeader(),
