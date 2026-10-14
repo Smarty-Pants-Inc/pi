@@ -27,6 +27,10 @@ type Json = Record<string, unknown>;
 
 /** Guard the original value before copying it or reading its fields (smarty-dev#12074). */
 function snapshot(value: unknown, format: string, limit: number): Json {
+	// Entry serializers can replace canonical receipts; nested details still go through the
+	// JSON-compatible toJSON path in prepareExportValueForJson.
+	if (typeof value === "function") throw plainJsonError(format, "a callable entry");
+	if (value !== null && typeof value === "object") assertShallowPlain(value, format);
 	return prepareExportValueForJson(value, format, limit) as Json;
 }
 
@@ -151,11 +155,12 @@ function coldSnapshot(entry: object, parentId: string | null, format: string, li
 			assertShallowPlain(value, format);
 			continue;
 		}
-		// Primitive data only: the guard refuses functions, symbols, bigints and non-finite numbers.
-		snapshot(value === undefined ? null : value, format, remaining);
+		// Primitive data only: never validate a callable's hook and then patch the raw callable.
+		if (typeof value === "function") throw plainJsonError(format, "a callable resident replacement");
+		const prepared = prepareExportValueForJson(value === undefined ? null : value, format, remaining);
 		remaining -= key.length * 6 + 26 + (typeof value === "string" ? value.length * 6 : 0);
 		if (remaining < 0) throw new Error(`${format} export exceeds the 64 MiB materialization limit`);
-		patches.push([key, value]);
+		patches.push([key, value === undefined ? undefined : prepared]);
 	}
 	// The line is refused against the budget left after the resident reservations, before it is read.
 	const hot = snapshot(toHotEntry(entry, remaining), format, remaining);
@@ -164,7 +169,8 @@ function coldSnapshot(entry: object, parentId: string | null, format: string, li
 	for (const [key, value] of patches) {
 		Object.defineProperty(hot, key, { value, enumerable: true, writable: true, configurable: true });
 	}
-	return hot;
+	// Recheck the complete patched safe record before JSON.stringify can materialize it.
+	return snapshot(hot, format, limit);
 }
 
 /**

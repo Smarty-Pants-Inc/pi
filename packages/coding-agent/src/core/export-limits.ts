@@ -58,18 +58,30 @@ function plainJsonError(format: string, detail: string): TypeError {
 	return new TypeError(`${format} export accepts only plain JSON data; found ${detail}`);
 }
 
-/** JSON ignores noncallable data-valued toJSON; accessors and callable hooks are refused unread. */
-function hasJsonHook(node: object): boolean {
-	const descriptor = Object.getOwnPropertyDescriptor(node, "toJSON");
-	return descriptor !== undefined && (!("value" in descriptor) || typeof descriptor.value === "function");
+/** Find the first own or inherited data-valued toJSON slot without invoking accessors. */
+function findJsonHook(node: object, format: string): ((key: string) => unknown) | undefined {
+	let holder: object | null = node;
+	while (holder !== null) {
+		if (isProxy(holder)) throw plainJsonError(format, "a proxy");
+		const descriptor = Object.getOwnPropertyDescriptor(holder, "toJSON");
+		if (descriptor !== undefined) {
+			if (!("value" in descriptor)) throw plainJsonError(format, "a toJSON accessor");
+			if (typeof descriptor.value !== "function") return undefined;
+			if (isProxy(descriptor.value)) throw plainJsonError(format, "a proxy");
+			return descriptor.value as (key: string) => unknown;
+		}
+		holder = Object.getPrototypeOf(holder);
+	}
+	return undefined;
 }
 
 /**
  * Snapshot plain JSON data (smarty-dev#12074): null, booleans, finite numbers, strings,
  * plain arrays and plain or null-prototype objects. Undefined object data properties are
  * omitted; undefined array data elements become null. Root undefined is refused.
- * Proxies, serialized accessors, array holes and callable/accessor toJSON are refused, so no
- * user code runs and no getter is read. Object hidden and symbol properties, and array
+ * Proxies, serialized accessors, array holes and toJSON accessors are refused without invoking
+ * them. Data-valued toJSON hooks run with JSON.stringify's property key and their results are
+ * walked once as already-serialized values. Object hidden and symbol properties, and array
  * non-index properties, are ignored as JSON does. Values come from property descriptors.
  * The result uses null prototypes, so JSON.stringify finds no hooks on it and its output
  * matches native JSON.stringify of the input. The limit is the exact UTF-8 byte length of
@@ -130,13 +142,9 @@ export function prepareExportValueForJson(
 	// Verify the only permitted chains, Object.prototype -> null and Array.prototype ->
 	// Object.prototype -> null, before any node is enumerated. Each link is checked with
 	// isProxy before it is reflected on; Array.prototype's own prototype is mutable.
-	const objectPrototypeOk =
-		!isProxy(Object.prototype) && Object.getPrototypeOf(Object.prototype) === null && !hasJsonHook(Object.prototype);
+	const objectPrototypeOk = !isProxy(Object.prototype) && Object.getPrototypeOf(Object.prototype) === null;
 	const arrayPrototypeOk =
-		objectPrototypeOk &&
-		!isProxy(Array.prototype) &&
-		Object.getPrototypeOf(Array.prototype) === Object.prototype &&
-		!hasJsonHook(Array.prototype);
+		objectPrototypeOk && !isProxy(Array.prototype) && Object.getPrototypeOf(Array.prototype) === Object.prototype;
 	/** Own data value; refuses holes and accessors without reading them. */
 	const dataValue = (node: object, key: string): unknown => {
 		const descriptor = Object.getOwnPropertyDescriptor(node, key);
@@ -144,8 +152,9 @@ export function prepareExportValueForJson(
 		if (!("value" in descriptor)) throw plainJsonError(format, "an accessor property");
 		return descriptor.value;
 	};
-	const visit = (node: unknown, depth: number): unknown => {
+	const visit = (node: unknown, depth: number, key: string, applyToJson = true): unknown => {
 		if (depth > 100) throw exportLimitError(format);
+		if (node === undefined) return undefined;
 		if (typeof node === "string") {
 			chargeString(node);
 			return node;
@@ -164,67 +173,89 @@ export function prepareExportValueForJson(
 			charge(`${node}`.length);
 			return node;
 		}
-		if (typeof node !== "object") throw plainJsonError(format, `type ${typeof node}`);
+		// JSON.stringify omits symbols in objects and writes null for array elements;
+		// the root result is rejected below when it remains undefined.
+		if (typeof node === "symbol") return undefined;
+		const callable = typeof node === "function";
+		if (typeof node !== "object" && !callable) throw plainJsonError(format, `type ${typeof node}`);
+		const objectNode = node as object;
 		// Before any reflection: a proxy (live or revoked) could trap every later step.
-		if (isProxy(node)) throw plainJsonError(format, "a proxy");
-		// Intrinsic brands survive prototype replacement; these are never plain records.
-		if (
-			isAnyArrayBuffer(node) ||
-			isArrayBufferView(node) ||
-			isDate(node) ||
-			isMap(node) ||
-			isSet(node) ||
-			isBoxedPrimitive(node)
-		) {
-			throw plainJsonError(format, "a built-in object");
-		}
-		if (ancestors.has(node)) throw new Error("Cannot export circular session data");
-		const prototype = Object.getPrototypeOf(node);
-		const arrayNode = Array.isArray(node);
-		if (arrayNode) {
-			if (prototype !== Array.prototype || !arrayPrototypeOk) throw plainJsonError(format, "a non-plain array");
-		} else if ((prototype !== Object.prototype || !objectPrototypeOk) && prototype !== null) {
-			throw plainJsonError(format, "a non-plain object");
-		}
-		if (hasJsonHook(node)) {
-			throw plainJsonError(format, "a toJSON property");
-		}
-		let snapshot: unknown;
-		ancestors.add(node);
-		if (arrayNode) {
-			const length = Object.getOwnPropertyDescriptor(node, "length")!.value as number;
-			const array: unknown[] = [];
-			Object.setPrototypeOf(array, null);
-			// Brackets, then one comma before every element after the first.
-			charge(2);
-			for (let i = 0; i < length; i++) {
-				if (i > 0) charge(1);
-				const child = dataValue(node, String(i));
-				array[i] = visit(child === undefined ? null : child, depth + 1);
+		if (isProxy(objectNode)) throw plainJsonError(format, "a proxy");
+		if (ancestors.has(objectNode)) throw new Error("Cannot export circular session data");
+		ancestors.add(objectNode);
+		try {
+			// JSON.stringify calls an own or inherited data-valued toJSON before checking the
+			// holder's brand or enumerating its fields. Guard the replacement at the same depth
+			// and with the same property key before materializing any snapshot. A replacement is
+			// then processed as the already-serialized value, so its own toJSON is not chained.
+			const toJSON = applyToJson ? findJsonHook(objectNode, format) : undefined;
+			if (toJSON) return visit(Reflect.apply(toJSON, node, [key]), depth, key, false);
+			// JSON.stringify omits functions in objects and writes null for array elements;
+			// the root result is rejected below when it remains undefined.
+			if (callable) return undefined;
+			// Intrinsic brands survive prototype replacement; built-ins without toJSON remain refused.
+			if (
+				isAnyArrayBuffer(node) ||
+				isArrayBufferView(node) ||
+				isDate(node) ||
+				isMap(node) ||
+				isSet(node) ||
+				isBoxedPrimitive(node)
+			) {
+				throw plainJsonError(format, "a built-in object");
 			}
-			snapshot = array;
-		} else {
-			const record: Record<string, unknown> = Object.create(null);
-			// Braces; each emitted member adds its comma, quoted key and colon.
-			charge(2);
-			let emitted = false;
-			for (const property in node) {
-				// Inherited enumerable keys (polluted Object.prototype) are skipped, as JSON does.
-				if (!Object.hasOwn(node, property)) continue;
-				const child = dataValue(node, property);
-				// JSON.stringify omits undefined object data properties, including their keys.
-				if (child === undefined) continue;
-				if (emitted) charge(1);
-				emitted = true;
-				chargeString(property);
-				charge(1);
-				// Null prototype: assigning "__proto__" creates an own property.
-				record[property] = visit(child, depth + 1);
+			const prototype = Object.getPrototypeOf(node);
+			const arrayNode = Array.isArray(node);
+			if (arrayNode) {
+				if (prototype !== Array.prototype || !arrayPrototypeOk) throw plainJsonError(format, "a non-plain array");
+			} else if ((prototype !== Object.prototype || !objectPrototypeOk) && prototype !== null) {
+				throw plainJsonError(format, "a non-plain object");
 			}
-			snapshot = record;
+			let snapshot: unknown;
+			if (arrayNode) {
+				const length = Object.getOwnPropertyDescriptor(node, "length")!.value as number;
+				const array: unknown[] = [];
+				Object.setPrototypeOf(array, null);
+				// Brackets, then one comma before every element after the first.
+				charge(2);
+				for (let i = 0; i < length; i++) {
+					if (i > 0) charge(1);
+					const child = dataValue(node, String(i));
+					const prepared = visit(child === undefined ? null : child, depth + 1, String(i));
+					// A toJSON result of undefined is null in an array, as JSON.stringify writes.
+					array[i] = prepared === undefined ? null : prepared;
+					if (prepared === undefined) charge(4);
+				}
+				snapshot = array;
+			} else {
+				const record: Record<string, unknown> = Object.create(null);
+				// Braces; each emitted member adds its comma, quoted key and colon.
+				charge(2);
+				let emitted = false;
+				for (const property in node) {
+					// Inherited enumerable keys (polluted Object.prototype) are skipped, as JSON does.
+					if (!Object.hasOwn(node, property)) continue;
+					const child = dataValue(node, property);
+					// JSON.stringify omits undefined object data properties, including their keys.
+					if (child === undefined) continue;
+					const prepared = visit(child, depth + 1, property);
+					// A toJSON result of undefined omits an object member, as JSON.stringify writes.
+					if (prepared === undefined) continue;
+					if (emitted) charge(1);
+					emitted = true;
+					chargeString(property);
+					charge(1);
+					// Null prototype: assigning "__proto__" creates an own property.
+					record[property] = prepared;
+				}
+				snapshot = record;
+			}
+			return snapshot;
+		} finally {
+			ancestors.delete(objectNode);
 		}
-		ancestors.delete(node);
-		return snapshot;
 	};
-	return visit(value, 0);
+	const snapshot = visit(value, 0, "");
+	if (snapshot === undefined) throw plainJsonError(format, "type undefined");
+	return snapshot;
 }

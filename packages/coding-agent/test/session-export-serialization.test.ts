@@ -67,8 +67,8 @@ interface RefusalCase {
 	create: () => { value: unknown; spies?: Mock[] };
 }
 
-// smarty-dev#12074: the guard accepts only plain JSON. It refuses instead of invoking hooks,
-// getters or proxy traps, so untrusted entry data cannot run code or allocate during export.
+// smarty-dev#12074: the guard accepts plain JSON and JSON-compatible toJSON results. It refuses
+// accessors and proxy traps without invoking them, so untrusted entry data cannot re-enter getters.
 const refusals: RefusalCase[] = [
 	{
 		name: "own callable toJSON",
@@ -253,6 +253,18 @@ const refusals: RefusalCase[] = [
 	{ name: "boxed symbol", create: () => ({ value: Object(Symbol("x")) }) },
 ];
 
+const jsonHookCases = new Set([
+	"own callable toJSON",
+	"inherited toJSON from a plain prototype",
+	"toJSON two levels up a plain prototype chain",
+	"nonenumerable toJSON value",
+	"array with a modified local prototype",
+	"array own toJSON",
+	"Buffer",
+	"Date",
+]);
+const jsonOmittedCases = new Set(["function", "symbol"]);
+
 describe("session export serialization", () => {
 	let testRoot: string;
 
@@ -285,13 +297,88 @@ describe("session export serialization", () => {
 	}
 
 	// smarty-dev#12074: one test per refused kind covers root and nested positions.
-	it.each(refusals)("refuses $name at root and nested without invoking it", ({ create }) => {
-		const { value, spies = [] } = create();
-		const entry = { type: "custom", data: { items: [value] } };
+	it.each(refusals.filter(({ name }) => !jsonHookCases.has(name) && !jsonOmittedCases.has(name)))(
+		"refuses $name at root and nested without invoking it",
+		({ create }) => {
+			const { value, spies = [] } = create();
+			const entry = { type: "custom", data: { items: [value] } };
 
-		expect(() => prepareExportValueForJson(value, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
-		expect(() => prepareExportValueForJson(entry, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
-		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+			expect(() => prepareExportValueForJson(value, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+			expect(() => prepareExportValueForJson(entry, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each(refusals.filter(({ name }) => jsonOmittedCases.has(name)))(
+		"matches JSON.stringify omission for $name values",
+		({ create }) => {
+			const { value, spies = [] } = create();
+			const object = { value };
+			const array = [value];
+
+			expect(() => prepareExportValueForJson(value, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+			expect(JSON.stringify(prepareExportValueForJson(object, "JSONL entry", LIMIT))).toBe(JSON.stringify(object));
+			expect(JSON.stringify(prepareExportValueForJson(array, "JSONL entry", LIMIT))).toBe(JSON.stringify(array));
+			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+		},
+	);
+
+	it.each(refusals.filter(({ name }) => jsonHookCases.has(name)))(
+		"accepts $name through native toJSON semantics at root and nested positions",
+		({ create }) => {
+			const { value, spies = [] } = create();
+			const entry = { type: "custom", data: { items: [value] } };
+			const expectedRoot = JSON.stringify(value);
+			const expectedNested = JSON.stringify(entry);
+
+			expect(JSON.stringify(prepareExportValueForJson(value, "JSONL entry", LIMIT))).toBe(expectedRoot);
+			expect(JSON.stringify(prepareExportValueForJson(entry, "JSONL entry", LIMIT))).toBe(expectedNested);
+			for (const spy of spies) expect(spy).toHaveBeenCalled();
+		},
+	);
+
+	it("passes the native toJSON key and recursively guards its result", () => {
+		const hook = vi.fn((key: string) => ({ key, nested: new Date(0) }));
+		const value = { details: Object.defineProperty({}, "toJSON", { value: hook }) };
+		const expected = JSON.stringify(value);
+
+		expect(JSON.stringify(prepareExportValueForJson(value, "JSONL entry", LIMIT))).toBe(expected);
+		expect(hook).toHaveBeenCalledWith("details");
+	});
+
+	it("does not chain a returned built-in's toJSON hook", () => {
+		const returnedHook = vi.fn(() => ({ escaped: true }));
+		const returned = new Map<string, string>();
+		Object.defineProperty(returned, "toJSON", { value: returnedHook });
+		const outerHook = vi.fn(() => returned);
+
+		expect(() => prepareExportValueForJson({ toJSON: outerHook }, "JSONL entry", LIMIT)).toThrow(/built-in object/);
+		expect(outerHook).toHaveBeenCalledWith("");
+		expect(returnedHook).not.toHaveBeenCalled();
+	});
+
+	it("omits or nulls undefined hook results and invokes callable-object hooks", () => {
+		const undefinedHook = vi.fn(() => undefined);
+		const callableHook = vi.fn((key: string) => ({ key }));
+		const callable = Object.assign(() => "unused", { toJSON: callableHook });
+		const value = {
+			omitted: { toJSON: undefinedHook },
+			list: [{ toJSON: undefinedHook }, callable, () => "unused"],
+		};
+		const expected = JSON.stringify(value);
+
+		expect(JSON.stringify(prepareExportValueForJson(value, "JSONL entry", LIMIT))).toBe(expected);
+		expect(undefinedHook).toHaveBeenCalledWith("omitted");
+		expect(undefinedHook).toHaveBeenCalledWith("0");
+		expect(callableHook).toHaveBeenCalledWith("1");
+	});
+
+	it("refuses an over-budget toJSON result before snapshot materialization", () => {
+		const toJSON = vi.fn(() => "x".repeat(LIMIT));
+		const value = { toJSON };
+
+		expect(() => prepareExportValueForJson(value, "JSONL entry", LIMIT)).toThrow(/limit/);
+		expect(toJSON).toHaveBeenCalledWith("");
 	});
 
 	// smarty-dev#12074: JSON ignores noncallable data-valued toJSON at every level, including
@@ -394,25 +481,17 @@ describe("session export serialization", () => {
 		["boxed boolean", () => Object(true)],
 		["boxed bigint", () => Object(1n)],
 		["boxed symbol", () => Object(Symbol("x"))],
-	] satisfies [string, () => object][])("refuses re-prototyped %s without invoking hooks", (_name, create) => {
+	] satisfies [string, () => object][])("refuses re-prototyped %s without a toJSON hook", (_name, create) => {
 		for (const prototype of [null, Object.prototype]) {
 			const value = Object.setPrototypeOf(create(), prototype);
-			// Prove brand refusal independently of the hooks added below.
 			expect(() => prepareExportValueForJson(value, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
 			expect(() => prepareExportValueForJson({ value }, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
-			const toJSON = vi.fn(() => ({}));
-			Object.defineProperty(value, "toJSON", { value: toJSON });
-			const read = getter(value, "field");
-			expect(() => prepareExportValueForJson(value, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
-			expect(() => prepareExportValueForJson({ value }, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
-			expect(toJSON).not.toHaveBeenCalled();
-			expect(read).not.toHaveBeenCalled();
 		}
 	});
 
 	// smarty-dev#12074 ruling B: a re-prototyped RegExp or Error is an ordinary record to JSON (its
-	// internal slots and hidden own data are not serialized). Default prototypes stay refused, and a
-	// retained toJSON or accessor is still refused without invocation.
+	// internal slots and hidden own data are not serialized). Default prototypes stay refused, while
+	// a callable toJSON is applied and an accessor remains unread.
 	it.each([
 		["RegExp", () => /x/g],
 		["Error", () => new Error("x")],
@@ -427,15 +506,15 @@ describe("session export serialization", () => {
 			expect(JSON.stringify(value)).toBe('{"field":[1,"a"]}');
 
 			const hooked = Object.setPrototypeOf(create(), prototype);
-			const toJSON = vi.fn(() => ({}));
+			const toJSON = vi.fn(() => Object.create(null));
 			Object.defineProperty(hooked, "toJSON", { value: toJSON });
+			expect(JSON.stringify(prepareExportValueForJson(hooked, "JSONL entry", LIMIT))).toBe("{}");
+			expect(toJSON).toHaveBeenCalledWith("");
+
 			const accessor = Object.setPrototypeOf(create(), prototype);
 			const read = getter(accessor, "field");
-			for (const refused of [hooked, accessor]) {
-				expect(() => prepareExportValueForJson(refused, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
-				expect(() => prepareExportValueForJson({ refused }, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
-			}
-			expect(toJSON).not.toHaveBeenCalled();
+			expect(() => prepareExportValueForJson(accessor, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+			expect(() => prepareExportValueForJson({ accessor }, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
 			expect(read).not.toHaveBeenCalled();
 		}
 	});
@@ -470,11 +549,11 @@ describe("session export serialization", () => {
 
 	// smarty-dev#12074: inspect hooks on the actual allowed chains, not only local prototypes.
 	it.each(["callable", "getter", "setter"] as const)(
-		"refuses allowed-chain %s toJSON descriptors without invocation",
+		"handles allowed-chain %s toJSON descriptors like JSON.stringify",
 		(kind) => {
 			for (const prototype of [Object.prototype, Array.prototype]) {
 				const original = Object.getOwnPropertyDescriptor(prototype, "toJSON");
-				const hook = vi.fn(() => ({}));
+				const hook = vi.fn(() => Object.create(null));
 				const read = vi.fn(() => hook);
 				const descriptor: PropertyDescriptor =
 					kind === "getter" ? { get: read } : kind === "setter" ? { set: read } : { value: hook };
@@ -498,18 +577,31 @@ describe("session export serialization", () => {
 					if (original) Object.defineProperty(prototype, "toJSON", original);
 					else Reflect.deleteProperty(prototype, "toJSON");
 				}
-				expect(objectError).toBeInstanceOf(TypeError);
-				expect(arrayError).toBeInstanceOf(TypeError);
+				if (kind === "callable") {
+					expect(objectError).toBeUndefined();
+					expect(arrayError).toBeUndefined();
+					expect(hook).toHaveBeenCalled();
+				} else {
+					expect(objectError).toBeInstanceOf(TypeError);
+					expect(arrayError).toBeInstanceOf(TypeError);
+					expect(read).not.toHaveBeenCalled();
+				}
 				expect(nullPrototypeJson).toBe("{}");
-				expect(hook).not.toHaveBeenCalled();
-				expect(read).not.toHaveBeenCalled();
 			}
 		},
 	);
 
-	// smarty-dev#12074: a trailing malicious entry fails both public paths without running it,
-	// replacing the destination, leaking the handle or skipping temporary-file cleanup.
+	// smarty-dev#12074: a trailing entry serializer cannot replace the canonical record. The hook
+	// may run for JSON.stringify-compatible details, but the root entry is still rejected.
 	it.each([
+		// smarty-dev#12074: callable entry roots cannot alias canonical records via toJSON.
+		{
+			name: "callable root",
+			create: () => {
+				const toJSON = vi.fn(() => ({ type: "custom", provenance: { forged: true } }));
+				return { entry: Object.assign(() => undefined, { toJSON }), spies: [toJSON] };
+			},
+		},
 		{
 			name: "toJSON",
 			create: () => {
@@ -531,7 +623,7 @@ describe("session export serialization", () => {
 				return { entry: proxy, spies };
 			},
 		},
-	])("rejects a trailing $name entry in both export paths without invoking it", ({ create }) => {
+	])("rejects a trailing $name entry in both export paths", ({ create }) => {
 		const sessionManager = manager();
 		const { entry, spies } = create();
 		const entries = () => [entry];
@@ -1152,6 +1244,16 @@ describe("session export serialization", () => {
 				const coerce = vi.fn(() => "untrusted id");
 				Object.defineProperty(entry, "id", { value: { toString: coerce }, configurable: true });
 				return { entry, spies: [coerce] };
+			},
+		},
+		// smarty-dev#12074: never check a small hook result then serialize the raw cold replacement.
+		{
+			name: "callable timestamp replacement",
+			mutate: (entry: object) => {
+				let calls = 0;
+				const toJSON = vi.fn(() => (++calls === 1 ? "ok" : "x".repeat(MAX_MATERIALIZED_EXPORT_BYTES + 1)));
+				Object.defineProperty(entry, "timestamp", { value: Object.assign(() => undefined, { toJSON }) });
+				return { entry, spies: [toJSON] };
 			},
 		},
 		{ name: "user getter", mutate: (entry: object) => ({ entry, spies: [getter(entry, "extra")] }) },
