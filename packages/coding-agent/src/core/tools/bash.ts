@@ -74,6 +74,7 @@ const bashOutputSchema = Type.Object({
 			description: "Output log, when truncated. Very large output keeps only its first and last 4MB in the log",
 		}),
 	),
+	full_output_error: Type.Optional(Type.String({ description: "Why the output log is unavailable" })),
 	exit_code: Type.Number(),
 	wall_time_seconds: Type.Number(),
 });
@@ -85,6 +86,8 @@ export interface BashToolDetails {
 	fullOutputPath?: string;
 	/** Present when the output log omits part of the output. */
 	fullOutputTruncation?: FullOutputTruncation;
+	/** The log could not be saved; command output and status are still valid. */
+	fullOutputError?: string;
 }
 
 /**
@@ -391,31 +394,35 @@ export function createShellToolDefinition(
 				output.finish();
 				clearUpdateTimer();
 				emitOutputUpdate();
-				const snapshot = output.snapshot({ persistIfTruncated: true });
+				output.snapshot({ persistIfTruncated: true });
 				await output.closeTempFile();
-				return snapshot;
+				// Closing can fail after the command has already returned its output and exit code.
+				return output.snapshot();
 			};
 
 			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
 				const truncation = snapshot.truncation;
 				let text = snapshot.content || emptyText;
-				const logLabel = snapshot.fullOutputTruncation ? "Capped log" : "Full output";
+				const logNotice = snapshot.fullOutputError
+					? `Output log unavailable: ${snapshot.fullOutputError}`
+					: `${snapshot.fullOutputTruncation ? "Capped log" : "Full output"}: ${snapshot.fullOutputPath}`;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
 					details = {
 						truncation,
 						fullOutputPath: snapshot.fullOutputPath,
 						...(snapshot.fullOutputTruncation ? { fullOutputTruncation: snapshot.fullOutputTruncation } : {}),
+						...(snapshot.fullOutputError ? { fullOutputError: snapshot.fullOutputError } : {}),
 					};
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
 					if (truncation.lastLinePartial) {
 						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${logLabel}: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${logNotice}]`;
 					} else if (truncation.truncatedBy === "lines") {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. ${logLabel}: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. ${logNotice}]`;
 					} else {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${logLabel}: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${logNotice}]`;
 					}
 					const capped = snapshot.fullOutputTruncation;
 					if (capped) {
@@ -447,16 +454,7 @@ export function createShellToolDefinition(
 					});
 					exitCode = result.exitCode;
 				} catch (err) {
-					let snapshot: Awaited<ReturnType<typeof finishOutput>>;
-					try {
-						snapshot = await finishOutput();
-					} catch (closeError) {
-						// An arbitrary command failure outranks a later log close failure.
-						if (err instanceof Error && (err.message === "aborted" || err.message.startsWith("timeout:"))) {
-							throw closeError;
-						}
-						throw err;
-					}
+					const snapshot = await finishOutput();
 					const { text } = formatOutput(snapshot, "");
 					if (err instanceof Error && err.message === "aborted") {
 						throw new Error(appendStatus(text, "Command aborted"));
@@ -464,6 +462,9 @@ export function createShellToolDefinition(
 					if (err instanceof Error && err.message.startsWith("timeout:")) {
 						const timeoutSecs = err.message.split(":")[1];
 						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
+					}
+					if (snapshot.fullOutputError) {
+						throw appendErrorNotice(err, `[Output log unavailable: ${snapshot.fullOutputError}]`);
 					}
 					const capped = snapshot.fullOutputTruncation;
 					if (capped && snapshot.fullOutputPath) {
@@ -475,19 +476,22 @@ export function createShellToolDefinition(
 					throw err;
 				}
 
-				const snapshot = await finishOutput();
+				await finishOutput();
+				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
+				// A read failure can also make the log unavailable, so take metadata after the read.
+				const snapshot = output.snapshot();
 				const { text: outputText, details } = formatOutput(snapshot);
 				if (exitCode === null) {
 					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
 				}
 				const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
-				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
 				const structuredContent: BashToolOutput = {
 					output: fullOutput.content,
 					truncated: fullOutput.truncated,
 					...(fullOutput.truncated && snapshot.fullOutputPath
 						? { full_output_path: snapshot.fullOutputPath }
 						: {}),
+					...(snapshot.fullOutputError ? { full_output_error: snapshot.fullOutputError } : {}),
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};

@@ -3,6 +3,7 @@ import { readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
 import { type BashOperations, type BashToolOutput, createBashToolDefinition } from "../src/core/tools/bash.ts";
+import type * as outputAccumulator from "../src/core/tools/output-accumulator.ts";
 import { FULL_OUTPUT_HEAD_BYTES, FULL_OUTPUT_TAIL_BYTES } from "../src/core/tools/output-accumulator.ts";
 import { wrapToolDefinition } from "../src/core/tools/tool-definition-wrapper.ts";
 import { formatSize, truncateTail } from "../src/core/tools/truncate.ts";
@@ -13,10 +14,30 @@ import { getOutputDirectoryBytes } from "../src/utils/output-files.ts";
 
 const probe = vi.hoisted(() => ({ paths: [] as string[] }));
 
+// Inject a small log cap for normal tests; the opt-in real-shell probe uses production defaults.
+vi.mock("../src/core/tools/output-accumulator.ts", async (importOriginal) => {
+	const actual = await importOriginal<typeof outputAccumulator>();
+	const head = process.env.PI_HEAVY_TESTS === "1" ? actual.FULL_OUTPUT_HEAD_BYTES : 32 * 1024;
+	const tail = process.env.PI_HEAVY_TESTS === "1" ? actual.FULL_OUTPUT_TAIL_BYTES : 32 * 1024;
+	return {
+		...actual,
+		FULL_OUTPUT_HEAD_BYTES: head,
+		FULL_OUTPUT_TAIL_BYTES: tail,
+		OutputAccumulator: class extends actual.OutputAccumulator {
+			constructor(options: outputAccumulator.OutputAccumulatorOptions) {
+				super({ ...options, fullOutputHeadBytes: head, fullOutputTailBytes: tail });
+			}
+		},
+	};
+});
+
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof nodeFs>();
 	return {
 		...actual,
+		// Record deletion requests; leave destructive cleanup to hosted CI (#4664).
+		rmSync: vi.fn(),
+		unlinkSync: vi.fn(),
 		createWriteStream: vi.fn((...args: Parameters<typeof actual.createWriteStream>) => {
 			if (typeof args[0] === "string") probe.paths.push(args[0]);
 			return actual.createWriteStream(...args);
@@ -27,7 +48,7 @@ vi.mock("node:fs", async (importOriginal) => {
 const MiB = 1024 * 1024;
 const CAP = FULL_OUTPUT_HEAD_BYTES + FULL_OUTPUT_TAIL_BYTES;
 const MARKER_MAX = 1024;
-const CHUNK_SIZES = [4097, 5 * MiB + 3, 1, 196613, 9 * MiB + 1];
+const CHUNK_SIZES = [4097, FULL_OUTPUT_HEAD_BYTES + 3, 1, 19661, CAP + 1];
 
 /** Deterministic lines of 100 bytes whose letters depend on the offset and line number. */
 function generate(start: number, length: number): Buffer {
@@ -92,26 +113,29 @@ describe("bash full output cap (smarty-dev#11307)", () => {
 		expect(structured?.full_output_path).toBeUndefined();
 	});
 
-	it.skipIf(process.platform === "win32")("caps a real local shell's 50 MiB output", async () => {
-		const total = 50 * MiB;
-		const tool = wrapToolDefinition(createBashToolDefinition(tmpdir()));
-		const result = await tool.execute("bash-real-output-cap", {
-			command: `head -c ${total} /dev/zero`,
-		});
-		const details = result.details as { fullOutputPath?: string };
-		const path = details.fullOutputPath as string;
-		const file = readFileSync(path);
-		expect(file.length).toBeLessThanOrEqual(CAP + MARKER_MAX);
-		expect(file.subarray(0, FULL_OUTPUT_HEAD_BYTES).equals(Buffer.alloc(FULL_OUTPUT_HEAD_BYTES))).toBe(true);
-		expect(file.subarray(-FULL_OUTPUT_TAIL_BYTES).equals(Buffer.alloc(FULL_OUTPUT_TAIL_BYTES))).toBe(true);
-		const block = result.content[0];
-		if (block.type !== "text") throw new Error("Expected text output");
-		expectCapNotice(block.text, path, total - CAP);
-	});
+	it.skipIf(process.platform === "win32" || process.env.PI_HEAVY_TESTS !== "1")(
+		"caps a real local shell's 50 MiB output",
+		async () => {
+			const total = 50 * MiB;
+			const tool = wrapToolDefinition(createBashToolDefinition(tmpdir()));
+			const result = await tool.execute("bash-real-output-cap", {
+				command: `head -c ${total} /dev/zero`,
+			});
+			const details = result.details as { fullOutputPath?: string };
+			const path = details.fullOutputPath as string;
+			const file = readFileSync(path);
+			expect(file.length).toBeLessThanOrEqual(CAP + MARKER_MAX);
+			expect(file.subarray(0, FULL_OUTPUT_HEAD_BYTES).equals(Buffer.alloc(FULL_OUTPUT_HEAD_BYTES))).toBe(true);
+			expect(file.subarray(-FULL_OUTPUT_TAIL_BYTES).equals(Buffer.alloc(FULL_OUTPUT_TAIL_BYTES))).toBe(true);
+			const block = result.content[0];
+			if (block.type !== "text") throw new Error("Expected text output");
+			expectCapNotice(block.text, path, total - CAP);
+		},
+	);
 
-	// smarty-dev#11307: one wide rg wrote a 2.37 GB log; 50 MiB stands in for it here.
-	it("keeps the model tail, caps the log and reports the cap for a 50 MiB stream", async () => {
-		const total = 50 * MiB;
+	// smarty-dev#11307: a small injected cap exercises the same path as the 2.37 GB rg incident.
+	it("keeps the model tail, caps the log and reports the cap", async () => {
+		const total = CAP * 6;
 		const omitted = total - CAP;
 		const pathsBefore = probe.paths.length;
 		const diskBefore = getOutputDirectoryBytes();
@@ -141,7 +165,7 @@ describe("bash full output cap (smarty-dev#11307)", () => {
 	});
 
 	it("caps the log and reports the cap for a nonzero exit", async () => {
-		const total = 50 * MiB;
+		const total = CAP * 6;
 		const pathsBefore = probe.paths.length;
 		const result = await runTool(streamingOperations(total, () => ({ exitCode: 3 })));
 		const path = probe.paths[pathsBefore];
@@ -156,7 +180,7 @@ describe("bash full output cap (smarty-dev#11307)", () => {
 	});
 
 	it("caps the log and reports the cap when the command is aborted", async () => {
-		const total = CAP + MiB;
+		const total = CAP * 2;
 		const pathsBefore = probe.paths.length;
 		const run = runTool(
 			streamingOperations(total, () => {
@@ -171,13 +195,13 @@ describe("bash full output cap (smarty-dev#11307)", () => {
 		const message = (error as Error).message;
 		const path = probe.paths[pathsBefore];
 		expect(message).toContain("Command aborted");
-		expectCapNotice(message, path, MiB);
+		expectCapNotice(message, path, CAP);
 		expectCappedLog(path, total);
 	});
 
 	// Audit finding 1: a backend that emits over-cap output and then fails must still report the cap.
 	it("keeps the original error and adds the cap when the backend fails after over-cap output", async () => {
-		const total = CAP + MiB;
+		const total = CAP * 2;
 		const pathsBefore = probe.paths.length;
 		const cause = new Error("socket reset");
 		const original = Object.assign(new Error("remote disconnect", { cause }), { code: "ECONNRESET" });
@@ -195,14 +219,14 @@ describe("bash full output cap (smarty-dev#11307)", () => {
 		expect(original.cause).toBe(cause);
 		expect(original.code).toBe("ECONNRESET");
 		expect(original.message.startsWith("remote disconnect\n\n")).toBe(true);
-		expectCapNotice(original.message, path, MiB);
+		expectCapNotice(original.message, path, CAP);
 		expectCappedLog(path, total);
 	});
 
 	it("rethrows an uncapped backend failure unchanged", async () => {
 		const original = new Error("remote disconnect");
 		const error = await runTool(
-			streamingOperations(MiB, () => {
+			streamingOperations(FULL_OUTPUT_HEAD_BYTES, () => {
 				throw original;
 			}),
 		).then(

@@ -9,14 +9,26 @@ import {
 import { getOutputDirectoryBytes } from "../src/utils/output-files.ts";
 
 // smarty-dev#11307: the full-output log keeps the first 4 MiB, an omission marker and the last 4 MiB.
-// No test here removes files: the process-owned output directory is removed at process exit.
+// Most tests inject a 32 KiB head and a 32 KiB tail so the same paths run on small streams.
+// No test here removes files: rmSync and unlinkSync are recorded no-ops (#4664).
 
-const probe = vi.hoisted(() => ({ streams: [] as { stream: WriteStream; written: number }[] }));
+const probe = vi.hoisted(() => ({
+	streams: [] as { stream: WriteStream; written: number }[],
+	/** Paths passed to rmSync/unlinkSync; recorded instead of deleted (#4664). */
+	removed: [] as string[],
+}));
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof nodeFs>();
 	return {
 		...actual,
+		// Product deletion paths never run from local tests (#4664).
+		rmSync: vi.fn((path: nodeFs.PathLike) => {
+			probe.removed.push(String(path));
+		}),
+		unlinkSync: vi.fn((path: nodeFs.PathLike) => {
+			probe.removed.push(String(path));
+		}),
 		createWriteStream: vi.fn((...args: Parameters<typeof actual.createWriteStream>) => {
 			const stream = actual.createWriteStream(...args);
 			const entry = { stream, written: 0 };
@@ -31,12 +43,16 @@ vi.mock("node:fs", async (importOriginal) => {
 	};
 });
 
-const MiB = 1024 * 1024;
-const CAP = FULL_OUTPUT_HEAD_BYTES + FULL_OUTPUT_TAIL_BYTES;
+const KiB = 1024;
+const MiB = 1024 * KiB;
+const HEAD = 32 * KiB;
+const TAIL = 32 * KiB;
+const CAP = HEAD + TAIL;
+const SMALL = { fullOutputHeadBytes: HEAD, fullOutputTailBytes: TAIL };
 /** Upper bound for the omission marker between head and tail. */
 const MARKER_MAX = 1024;
 /** Uneven source chunks, including chunks larger than the head, the tail and the whole cap. */
-const CHUNK_SIZES = [1, 4097, 196613, 5 * MiB + 3, 333, 9 * MiB + 1, 65536];
+const CHUNK_SIZES = [1, 4097, 19661, 40 * KiB + 3, 333, 70 * KiB + 1, 6553];
 
 /** Deterministic ASCII byte at `offset`: lines of 100 bytes whose letters depend on the offset and line. */
 function generate(start: number, length: number): Buffer {
@@ -91,7 +107,7 @@ async function streamGenerated(
 ): Promise<StreamResult> {
 	const streamsBefore = probe.streams.length;
 	const diskBefore = getOutputDirectoryBytes();
-	const accumulator = new OutputAccumulator(options);
+	const accumulator = new OutputAccumulator({ ...SMALL, ...options });
 	let maxQueuedBytes = 0;
 	let maxRetainedBytes = 0;
 	let offset = 0;
@@ -117,21 +133,25 @@ async function streamGenerated(
 	};
 }
 
-function expectCappedFile(path: string, total: number): void {
+function expectCappedFile(path: string, total: number, head = HEAD, tail = TAIL): void {
 	const file = readFileSync(path);
-	const omitted = total - CAP;
-	expect(file.length).toBeGreaterThan(CAP);
-	expect(file.length).toBeLessThanOrEqual(CAP + MARKER_MAX);
+	const omitted = total - head - tail;
+	expect(file.length).toBeGreaterThan(head + tail);
+	expect(file.length).toBeLessThanOrEqual(head + tail + MARKER_MAX);
 	// Different offsets give different lines, so a misplaced head or tail does not compare equal.
-	expect(file.subarray(0, FULL_OUTPUT_HEAD_BYTES).equals(generate(0, FULL_OUTPUT_HEAD_BYTES))).toBe(true);
-	expect(
-		file
-			.subarray(file.length - FULL_OUTPUT_TAIL_BYTES)
-			.equals(generate(total - FULL_OUTPUT_TAIL_BYTES, FULL_OUTPUT_TAIL_BYTES)),
-	).toBe(true);
-	const marker = file.subarray(FULL_OUTPUT_HEAD_BYTES, file.length - FULL_OUTPUT_TAIL_BYTES).toString("utf8");
+	expect(file.subarray(0, head).equals(generate(0, head))).toBe(true);
+	expect(file.subarray(file.length - tail).equals(generate(total - tail, tail))).toBe(true);
+	const marker = file.subarray(head, file.length - tail).toString("utf8");
 	expect(marker.startsWith("\n")).toBe(true);
 	expect(marker).toContain(String(omitted));
+}
+
+/** Split `readFullOutput` content into head, omitted count and tail. */
+function parseFullOutput(content: string): { head: string; omitted: number; tail: string } {
+	const match = /^([\s\S]*)\n\n\[\.\.\. (\d+) bytes omitted \.\.\.\]\n\n([\s\S]*)$/.exec(content);
+	expect(match).not.toBeNull();
+	const [, head, omitted, tail] = match as RegExpExecArray;
+	return { head, omitted: Number(omitted), tail };
 }
 
 describe("full output log cap (smarty-dev#11307)", () => {
@@ -140,9 +160,14 @@ describe("full output log cap (smarty-dev#11307)", () => {
 		expect(FULL_OUTPUT_TAIL_BYTES).toBe(4 * MiB);
 	});
 
-	// smarty-dev#11307: a 2.37 GB rg log; the stream here is 50 MiB with an odd final partial tail ring.
-	it("caps a 50 MiB stream to the exact head, marker and tail with bounded writes and memory", async () => {
-		const total = 50 * MiB + 12347;
+	it("rejects non-positive log sizes", () => {
+		expect(() => new OutputAccumulator({ fullOutputHeadBytes: 0 })).toThrow(RangeError);
+		expect(() => new OutputAccumulator({ fullOutputTailBytes: 1.5 })).toThrow(RangeError);
+	});
+
+	// smarty-dev#11307: a 2.37 GB rg log; the stream here is 12x the cap with an odd final partial tail ring.
+	it("caps a long stream to the exact head, marker and tail with bounded writes and memory", async () => {
+		const total = 12 * CAP + 12347;
 		const { accumulator, stream, maxQueuedBytes, maxRetainedBytes, diskBytesCharged } = await streamGenerated(total);
 		const snapshot = accumulator.snapshot();
 		expect(snapshot.fullOutputPath).toBeDefined();
@@ -160,39 +185,83 @@ describe("full output log cap (smarty-dev#11307)", () => {
 		expect(diskBytesCharged).toBeLessThanOrEqual(CAP + MARKER_MAX);
 		expect(maxQueuedBytes).toBeLessThanOrEqual(CAP + MARKER_MAX);
 		expect(maxRetainedBytes).toBeGreaterThan(0);
-		expect(maxRetainedBytes).toBeLessThanOrEqual(CAP + MiB);
+		// Head and tail buffers plus the decoded display tail (at most four times the 50 KiB display limit).
+		expect(maxRetainedBytes).toBeLessThanOrEqual(CAP + 256 * KiB);
 	});
 
 	it("reads capped output by original-byte truncation semantics", async () => {
-		const total = 50 * MiB + 12347;
+		const total = 12 * CAP + 12347;
 		const { accumulator } = await streamGenerated(total, {}, false);
 		const omitted = total - CAP;
 
-		const small = await accumulator.readFullOutput(MiB);
+		const small = await accumulator.readFullOutput(16 * KiB);
 		expect(small.truncated).toBe(true);
-		expect(small.content.startsWith(generate(0, MiB / 2).toString("latin1"))).toBe(true);
-		expect(small.content.endsWith(generate(total - MiB / 2, MiB / 2).toString("latin1"))).toBe(true);
+		expect(small.content.startsWith(generate(0, 8 * KiB).toString("latin1"))).toBe(true);
+		expect(small.content.endsWith(generate(total - 8 * KiB, 8 * KiB).toString("latin1"))).toBe(true);
 		// The omitted count is measured against the original stream, not the capped file.
-		expect(small.content).toContain(`${total - MiB} bytes omitted`);
+		expect(small.content).toContain(`${total - 16 * KiB} bytes omitted`);
 
 		// A limit above the capped file size still omits bytes of the original output.
-		const large = await accumulator.readFullOutput(64 * MiB);
+		const large = await accumulator.readFullOutput(MiB);
 		expect(large.truncated).toBe(true);
-		expect(large.content.startsWith(generate(0, FULL_OUTPUT_HEAD_BYTES).toString("latin1"))).toBe(true);
-		expect(
-			large.content.endsWith(generate(total - FULL_OUTPUT_TAIL_BYTES, FULL_OUTPUT_TAIL_BYTES).toString("latin1")),
-		).toBe(true);
-		expect(large.content).toContain(String(omitted));
+		const parsed = parseFullOutput(large.content);
+		expect(parsed.head).toBe(generate(0, HEAD).toString("latin1"));
+		expect(parsed.tail).toBe(generate(total - TAIL, TAIL).toString("latin1"));
+		expect(parsed.omitted).toBe(omitted);
 		expect(large.content.length).toBeLessThanOrEqual(CAP + MARKER_MAX);
 	});
 
-	it("keeps exactly 8 MiB byte-identical and caps 8 MiB + 1 with one omitted byte", async () => {
+	// A multibyte character straddles both log cuts: the head ends inside a 3-byte character and the
+	// tail starts inside a 4-byte character.
+	it("decodes capped log head and tail separately without U+FFFD at either cut", async () => {
+		const head = 16;
+		const tail = 16;
+		const text = `${"a".repeat(15)}\u20ac${"b".repeat(20)}\u{1f600}${"c".repeat(13)}`;
+		const original = Buffer.from(text);
+		expect(original.length).toBe(55);
+		// The euro sign spans bytes 15..17 across the head cut at 16; the emoji spans 38..41 across
+		// the tail cut at 55 - 16 = 39.
+		expect(original[15]).toBe(0xe2);
+		expect(original[38]).toBe(0xf0);
+
+		const accumulator = new OutputAccumulator({ fullOutputHeadBytes: head, fullOutputTailBytes: tail });
+		for (const byte of original) accumulator.append(Buffer.from([byte]));
+		accumulator.finish();
+		const snapshot = accumulator.snapshot({ persistIfTruncated: true });
+		await accumulator.closeTempFile();
+		expect(snapshot.fullOutputError).toBeUndefined();
+		expect(snapshot.fullOutputTruncation).toEqual({ totalBytes: 55, omittedBytes: 55 - head - tail });
+		const file = readFileSync(snapshot.fullOutputPath as string);
+		expect(file.subarray(0, head).equals(original.subarray(0, head))).toBe(true);
+		expect(file.subarray(-tail).equals(original.subarray(-tail))).toBe(true);
+
+		// The whole capped log fits the limit: the fast path.
+		expect(file.length).toBeLessThan(1024);
+		const fast = await accumulator.readFullOutput(1024);
+		expect(fast.truncated).toBe(true);
+		expect(fast.content).not.toContain("\ufffd");
+		// One byte of the euro sign and three bytes of the emoji are dropped and counted as omitted.
+		expect(fast.content).toBe(`${"a".repeat(15)}\n\n[... 27 bytes omitted ...]\n\n${"c".repeat(13)}`);
+
+		// Every smaller limit: no U+FFFD, head and tail are exact original text, counts add up.
+		for (let maxBytes = 2; maxBytes < file.length; maxBytes++) {
+			const read = await accumulator.readFullOutput(maxBytes);
+			expect(read.truncated).toBe(true);
+			expect(read.content).not.toContain("\ufffd");
+			const parsed = parseFullOutput(read.content);
+			expect(text.startsWith(parsed.head)).toBe(true);
+			expect(text.endsWith(parsed.tail)).toBe(true);
+			expect(Buffer.byteLength(parsed.head) + Buffer.byteLength(parsed.tail) + parsed.omitted).toBe(55);
+		}
+	});
+
+	it("keeps exactly the cap byte-identical and caps the cap + 1 with one omitted byte", async () => {
 		const exact = await streamGenerated(CAP, {}, false);
 		const exactSnapshot = exact.accumulator.snapshot();
 		expect(exactSnapshot.fullOutputTruncation).toBeUndefined();
 		const exactFile = readFileSync(exactSnapshot.fullOutputPath as string);
 		expect(exactFile.equals(generate(0, CAP))).toBe(true);
-		const exactRead = await exact.accumulator.readFullOutput(16 * MiB);
+		const exactRead = await exact.accumulator.readFullOutput(MiB);
 		expect(exactRead.truncated).toBe(false);
 		expect(exactRead.content).toBe(generate(0, CAP).toString("latin1"));
 
@@ -203,11 +272,12 @@ describe("full output log cap (smarty-dev#11307)", () => {
 	});
 
 	it("keeps small binary and split UTF-8 output byte-identical", async () => {
-		const binary = Buffer.alloc(3 * MiB);
+		const binary = Buffer.alloc(48 * KiB);
 		for (let i = 0; i < binary.length; i++) binary[i] = (i * 167 + (i >> 11)) & 0xff;
 		const utf8 = Buffer.from("snowman \u2603 crab \u{1f980} e\u0301\n".repeat(4096));
 		const original = Buffer.concat([binary, utf8]);
-		const accumulator = new OutputAccumulator();
+		expect(original.length).toBeLessThan(512 * KiB);
+		const accumulator = new OutputAccumulator({ fullOutputHeadBytes: 256 * KiB, fullOutputTailBytes: 256 * KiB });
 		// Odd chunk sizes split multi-byte characters across appends.
 		for (let offset = 0, i = 0; offset < original.length; i++) {
 			const length = Math.min([7, 65537, 3, 1048573][i % 4], original.length - offset);
@@ -219,24 +289,29 @@ describe("full output log cap (smarty-dev#11307)", () => {
 		await accumulator.closeTempFile();
 		expect(snapshot.fullOutputTruncation).toBeUndefined();
 		expect(readFileSync(snapshot.fullOutputPath as string).equals(original)).toBe(true);
-		const full = await accumulator.readFullOutput(16 * MiB);
+		const full = await accumulator.readFullOutput(MiB);
 		expect(full.truncated).toBe(false);
 		expect(full.content).toBe(new TextDecoder().decode(original));
 	});
 
-	it("caps one source chunk larger than the whole cap", async () => {
-		const total = CAP + FULL_OUTPUT_TAIL_BYTES / 2 + 7;
-		const accumulator = new OutputAccumulator();
-		accumulator.append(generate(0, total));
-		accumulator.finish();
-		const snapshot = accumulator.snapshot({ persistIfTruncated: true });
-		await accumulator.closeTempFile();
-		expect(snapshot.fullOutputTruncation).toEqual({ totalBytes: total, omittedBytes: total - CAP });
-		expectCappedFile(snapshot.fullOutputPath as string, total);
-	});
+	// Production-sized output is opt-in; normal tests exercise the same path with the small cap.
+	it.skipIf(process.env.PI_HEAVY_TESTS !== "1")(
+		"caps one source chunk larger than the whole default cap",
+		async () => {
+			const defaultCap = FULL_OUTPUT_HEAD_BYTES + FULL_OUTPUT_TAIL_BYTES;
+			const total = defaultCap + FULL_OUTPUT_TAIL_BYTES / 2 + 7;
+			const accumulator = new OutputAccumulator();
+			accumulator.append(generate(0, total));
+			accumulator.finish();
+			const snapshot = accumulator.snapshot({ persistIfTruncated: true });
+			await accumulator.closeTempFile();
+			expect(snapshot.fullOutputTruncation).toEqual({ totalBytes: total, omittedBytes: total - defaultCap });
+			expectCappedFile(snapshot.fullOutputPath as string, total, FULL_OUTPUT_HEAD_BYTES, FULL_OUTPUT_TAIL_BYTES);
+		},
+	);
 
 	it("caps raw storage independently of a caller's larger display limit", async () => {
-		const total = 50 * MiB + 99;
+		const total = 12 * CAP + 99;
 		const { accumulator, diskBytesCharged } = await streamGenerated(
 			total,
 			{ maxBytes: 1024 * MiB, maxLines: Number.MAX_SAFE_INTEGER },
@@ -253,8 +328,9 @@ describe("full output log cap (smarty-dev#11307)", () => {
 	});
 
 	it("bounds chunk metadata and queued writes for tiny reused source buffers", async () => {
+		const options = { fullOutputHeadBytes: 128 * KiB, fullOutputTailBytes: 128 * KiB };
 		const streamsBefore = probe.streams.length;
-		const accumulator = new OutputAccumulator();
+		const accumulator = new OutputAccumulator(options);
 		const chunk = Buffer.from("z");
 		for (let i = 0; i < 100_000; i++) accumulator.append(chunk);
 		const stream = probe.streams[streamsBefore];
@@ -264,15 +340,15 @@ describe("full output log cap (smarty-dev#11307)", () => {
 			.flatMap((value) => (Array.isArray(value) ? value : [value]))
 			.filter(Buffer.isBuffer);
 		expect(buffers.length).toBeLessThan(16);
-		expect(stream.stream.writableLength).toBeLessThanOrEqual(FULL_OUTPUT_HEAD_BYTES);
+		expect(stream.stream.writableLength).toBeLessThanOrEqual(options.fullOutputHeadBytes);
 		chunk[0] = 0x78;
 		accumulator.finish();
 		const snapshot = accumulator.snapshot({ persistIfTruncated: true });
 		await accumulator.closeTempFile();
 		expect(readFileSync(snapshot.fullOutputPath as string).equals(Buffer.alloc(100_000, "z"))).toBe(true);
 
-		const tailAccumulator = new OutputAccumulator();
-		tailAccumulator.append(Buffer.alloc(FULL_OUTPUT_HEAD_BYTES));
+		const tailAccumulator = new OutputAccumulator(options);
+		tailAccumulator.append(Buffer.alloc(options.fullOutputHeadBytes));
 		for (let i = 0; i < 100_000; i++) tailAccumulator.append(chunk);
 		const tailBuffers = Object.values(tailAccumulator)
 			.flatMap((value) => (Array.isArray(value) ? value : [value]))

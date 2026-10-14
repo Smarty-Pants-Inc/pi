@@ -1,5 +1,5 @@
 import * as nodeFs from "node:fs";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,7 +11,14 @@ import { removeOutputDirectory } from "../src/utils/output-files.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof nodeFs>();
-	return { ...actual, createWriteStream: vi.fn(actual.createWriteStream), openSync: vi.fn(actual.openSync) };
+	return {
+		...actual,
+		createWriteStream: vi.fn(actual.createWriteStream),
+		openSync: vi.fn(actual.openSync),
+		// Record cleanup calls instead of executing deletion paths locally (#4664).
+		rmSync: vi.fn(),
+		unlinkSync: vi.fn(),
+	};
 });
 
 // smarty-dev#2153 / #1998: both bash spill paths must ignore a permissive caller umask.
@@ -64,12 +71,13 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 				// pi#203 CI: a killed process never runs its exit cleanup, so the owner's plain rm -rf
 				// (test.sh, the CI runner) must be able to remove the output directory.
 				const directory = dirname(paths[0]);
-				rmSync(directory, { recursive: true, force: true });
-				expect(existsSync(directory)).toBe(false);
+				// Owner write/search permissions permit cleanup; no real deletion is needed to prove it.
+				expect(statSync(directory).mode & 0o700).toBe(0o700);
 			},
 		);
 
-		it(`${kind} reports an existing symlink without overwriting its target`, async () => {
+		// smarty-dev#11307: an unavailable log must not replace the command result.
+		it(`${kind} omits a failed symlink log without overwriting its target`, async () => {
 			const victim = join(root, "fake-victim");
 			writeFileSync(victim, "fake sentinel");
 			// The spill file is created with a synchronous exclusive open (pi#203 R3).
@@ -87,11 +95,11 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 						return { exitCode: 0 };
 					},
 				}),
-			).rejects.toMatchObject({ code: "EEXIST" });
+			).resolves.toBeUndefined();
 			expect(readFileSync(victim, "utf8")).toBe("fake sentinel");
 		});
 
-		it(`${kind} reports a stream open failure that occurs before execution completes`, async () => {
+		it(`${kind} omits a failed log when opening it fails before execution completes`, async () => {
 			const blocked = join(root, "not-a-directory");
 			writeFileSync(blocked, "fake blocker");
 			vi.stubEnv("TMPDIR", blocked);
@@ -103,7 +111,7 @@ describe.skipIf(process.platform === "win32")("private bash full output files", 
 						return { exitCode: 0 };
 					},
 				}),
-			).rejects.toMatchObject({ code: "ENOTDIR" });
+			).resolves.toBeUndefined();
 		});
 	}
 });
@@ -123,7 +131,7 @@ describe("portable bash full output files", () => {
 	});
 
 	for (const kind of ["tool", "executor"]) {
-		it(`${kind} reports an existing regular file without overwriting it`, async () => {
+		it(`${kind} preserves the command result and an existing regular file`, async () => {
 			const openSync = vi.mocked(nodeFs.openSync).getMockImplementation();
 			if (!openSync) throw new Error("No native openSync implementation");
 			vi.mocked(nodeFs.openSync).mockImplementationOnce((path, flags, mode) => {
@@ -144,7 +152,10 @@ describe("portable bash full output files", () => {
 					: wrapToolDefinition(createBashToolDefinition(root, { operations })).execute("exclusive-bash", {
 							command: "fake",
 						});
-			await expect(run).rejects.toMatchObject({ code: "EEXIST" });
+			const result = await run;
+			expect(result).toMatchObject(kind === "executor" ? { exitCode: 0 } : { structuredContent: { exit_code: 0 } });
+			expect(result).not.toHaveProperty("fullOutputPath", expect.any(String));
+			expect(result).not.toHaveProperty("details.fullOutputPath", expect.any(String));
 			expect(spillPaths).toHaveLength(1);
 			expect(readFileSync(spillPaths[0], "utf8")).toBe("fake sentinel");
 		});

@@ -35,6 +35,8 @@ export interface BashResult {
 	fullOutputPath?: string;
 	/** Present only when the full-output log omits part of the output. */
 	fullOutputTruncation?: FullOutputTruncation;
+	/** The log could not be saved; command output and status are still valid. */
+	fullOutputError?: string;
 }
 
 // ============================================================================
@@ -75,7 +77,6 @@ export async function executeBashWithOperations(
 
 	let bashResult: BashResult | undefined;
 	let execError: { error: unknown } | undefined;
-	let tempFileError: unknown;
 	try {
 		let exitCode: number | null = null;
 		try {
@@ -89,12 +90,19 @@ export async function executeBashWithOperations(
 		pendingAnsi = "";
 		appendText(rest);
 		output.finish();
-		const snapshot = output.snapshot({ persistIfTruncated: true });
+		output.snapshot({ persistIfTruncated: true });
+		await output.closeTempFile();
+		const snapshot = output.snapshot();
 		const cancelled = options?.signal?.aborted ?? false;
 		let text = snapshot.content;
 		const logTruncation = snapshot.fullOutputTruncation;
 		let notice: string | undefined;
-		if (logTruncation && snapshot.fullOutputPath) {
+		if (snapshot.fullOutputError) {
+			notice = `[Output log unavailable: ${snapshot.fullOutputError}]`;
+			text += `\n\n${notice}`;
+			// The live ! component consumes streaming chunks, not the final output text.
+			options?.onChunk?.(`\n\n${notice}`);
+		} else if (logTruncation && snapshot.fullOutputPath) {
 			// Session and RPC copies keep only the output text, so the notice must live in it.
 			notice = `[Output log capped: ${logTruncation.omittedBytes} of ${logTruncation.totalBytes} bytes omitted from ${snapshot.fullOutputPath}]`;
 			text += `\n\n${notice}`;
@@ -109,19 +117,14 @@ export async function executeBashWithOperations(
 				truncated: snapshot.truncation.truncated,
 				fullOutputPath: snapshot.fullOutputPath,
 				...(notice && logTruncation ? { fullOutputTruncation: logTruncation } : {}),
+				...(snapshot.fullOutputError ? { fullOutputError: snapshot.fullOutputError } : {}),
 			};
 		}
 	} finally {
 		// Always flush and close the log, also after errors and cancellation.
-		try {
-			await output.closeTempFile();
-		} catch (error) {
-			tempFileError = error;
-		}
+		await output.closeTempFile();
 	}
-	// The command's own failure outranks a later log close failure.
 	if (execError) throw execError.error;
-	if (tempFileError) throw tempFileError;
 	if (!bashResult) throw new Error("Bash execution produced no result");
 	// An abort can arrive while the full-output stream is being flushed.
 	if (options?.signal?.aborted) {
