@@ -14,7 +14,12 @@ import {
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
 import type { BashSpawnEvent, ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { OutputAccumulator } from "./output-accumulator.ts";
+import {
+	FULL_OUTPUT_HEAD_BYTES,
+	FULL_OUTPUT_TAIL_BYTES,
+	type FullOutputTruncation,
+	OutputAccumulator,
+} from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
@@ -64,7 +69,12 @@ export type BashToolInput = Static<typeof bashSchema>;
 const bashOutputSchema = Type.Object({
 	output: Type.String({ description: "Combined stdout and stderr, possibly truncated" }),
 	truncated: Type.Boolean(),
-	full_output_path: Type.Optional(Type.String({ description: "Full output, when truncated" })),
+	full_output_path: Type.Optional(
+		Type.String({
+			description: "Output log, when truncated. Very large output keeps only its first and last 4MB in the log",
+		}),
+	),
+	full_output_error: Type.Optional(Type.String({ description: "Why the output log is unavailable" })),
 	exit_code: Type.Number(),
 	wall_time_seconds: Type.Number(),
 });
@@ -74,6 +84,10 @@ export type BashToolOutput = Static<typeof bashOutputSchema>;
 export interface BashToolDetails {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	/** Present when the output log omits part of the output. */
+	fullOutputTruncation?: FullOutputTruncation;
+	/** The log could not be saved; command output and status are still valid. */
+	fullOutputError?: string;
 }
 
 /**
@@ -279,7 +293,7 @@ export function createShellToolDefinition(
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, output is saved to a temp file that keeps at most the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}. Optionally provide a timeout in seconds.`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
@@ -338,6 +352,7 @@ export function createShellToolDefinition(
 					details: {
 						truncation: snapshot.truncation.truncated ? snapshot.truncation : undefined,
 						fullOutputPath: snapshot.fullOutputPath,
+						...(snapshot.fullOutputTruncation ? { fullOutputTruncation: snapshot.fullOutputTruncation } : {}),
 					},
 				});
 			};
@@ -379,27 +394,45 @@ export function createShellToolDefinition(
 				output.finish();
 				clearUpdateTimer();
 				emitOutputUpdate();
-				const snapshot = output.snapshot({ persistIfTruncated: true });
+				output.snapshot({ persistIfTruncated: true });
 				await output.closeTempFile();
-				return snapshot;
+				// Closing can fail after the command has already returned its output and exit code.
+				return output.snapshot();
 			};
 
 			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
 				const truncation = snapshot.truncation;
 				let text = snapshot.content || emptyText;
+				const logNotice =
+					snapshot.fullOutputError !== undefined
+						? `Output log unavailable: ${snapshot.fullOutputError}`
+						: `${snapshot.fullOutputTruncation ? "Capped log" : "Full output"}: ${snapshot.fullOutputPath}`;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
-					details = { truncation, fullOutputPath: snapshot.fullOutputPath };
+					details = {
+						truncation,
+						fullOutputPath: snapshot.fullOutputPath,
+						...(snapshot.fullOutputTruncation ? { fullOutputTruncation: snapshot.fullOutputTruncation } : {}),
+						...(snapshot.fullOutputError !== undefined ? { fullOutputError: snapshot.fullOutputError } : {}),
+					};
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
 					if (truncation.lastLinePartial) {
 						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${logNotice}]`;
 					} else if (truncation.truncatedBy === "lines") {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. ${logNotice}]`;
 					} else {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${logNotice}]`;
 					}
+					const capped = snapshot.fullOutputTruncation;
+					if (capped) {
+						text += `\n[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}]`;
+					}
+				} else if (snapshot.fullOutputError !== undefined) {
+					// Chunk-count storage limits can open a log before display truncation is needed.
+					text += `\n\n[${logNotice}]`;
+					details = { fullOutputError: snapshot.fullOutputError };
 				}
 				return { text, details };
 			};
@@ -435,22 +468,35 @@ export function createShellToolDefinition(
 						const timeoutSecs = err.message.split(":")[1];
 						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
 					}
+					if (snapshot.fullOutputError !== undefined) {
+						throw appendErrorNotice(err, `[Output log unavailable: ${snapshot.fullOutputError}]`);
+					}
+					const capped = snapshot.fullOutputTruncation;
+					if (capped && snapshot.fullOutputPath) {
+						throw appendErrorNotice(
+							err,
+							`[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}]`,
+						);
+					}
 					throw err;
 				}
 
-				const snapshot = await finishOutput();
+				await finishOutput();
+				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
+				// A read failure can also make the log unavailable, so take metadata after the read.
+				const snapshot = output.snapshot();
 				const { text: outputText, details } = formatOutput(snapshot);
 				if (exitCode === null) {
 					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
 				}
 				const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
-				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
 				const structuredContent: BashToolOutput = {
 					output: fullOutput.content,
 					truncated: fullOutput.truncated,
 					...(fullOutput.truncated && snapshot.fullOutputPath
 						? { full_output_path: snapshot.fullOutputPath }
 						: {}),
+					...(snapshot.fullOutputError !== undefined ? { full_output_error: snapshot.fullOutputError } : {}),
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};
@@ -469,6 +515,23 @@ export function createShellToolDefinition(
 		},
 		...createShellRenderers(config.prompt),
 	};
+}
+
+/**
+ * Add a notice to an execution error without replacing it: an Error keeps its identity, cause and
+ * custom properties and gains the notice in its message; other values are wrapped with `cause`.
+ */
+export function appendErrorNotice(error: unknown, notice: string): unknown {
+	if (error instanceof Error) {
+		try {
+			error.message = `${error.message}\n\n${notice}`;
+			return error;
+		} catch {
+			// Read-only message: wrap below.
+		}
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return new Error(`${message}\n\n${notice}`, { cause: error });
 }
 
 const bashToolConfig: ShellToolConfig = {

@@ -3,6 +3,8 @@
  */
 
 import { Container, Loader, Spacer, Text, type TUI } from "@earendil-works/pi-tui";
+import { formatCappedOutputLogNotice } from "../../../core/messages.ts";
+import type { FullOutputTruncation } from "../../../core/tools/output-accumulator.ts";
 import {
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
@@ -26,6 +28,7 @@ export class BashExecutionComponent extends Container {
 	private loader: Loader;
 	private truncationResult?: TruncationResult;
 	private fullOutputPath?: string;
+	private fullOutputTruncation?: FullOutputTruncation;
 	private expanded = false;
 	private contentContainer: Container;
 	/** `dim` marks `!!` commands, whose output is excluded from the model context. */
@@ -103,6 +106,7 @@ export class BashExecutionComponent extends Container {
 		cancelled: boolean,
 		truncationResult?: TruncationResult,
 		fullOutputPath?: string,
+		fullOutputTruncation?: FullOutputTruncation,
 	): void {
 		this.exitCode = exitCode;
 		this.status = cancelled
@@ -112,6 +116,7 @@ export class BashExecutionComponent extends Container {
 				: "complete";
 		this.truncationResult = truncationResult;
 		this.fullOutputPath = fullOutputPath;
+		this.fullOutputTruncation = fullOutputTruncation;
 
 		// Stop loader
 		this.loader.stop();
@@ -198,7 +203,14 @@ export class BashExecutionComponent extends Container {
 			// Add truncation warning (context truncation, not preview truncation)
 			const wasTruncated = this.truncationResult?.truncated || contextTruncation.truncated;
 			if (wasTruncated && this.fullOutputPath) {
-				statusParts.push(theme.fg("warning", `Output truncated. Full output: ${this.fullOutputPath}`));
+				statusParts.push(
+					theme.fg(
+						"warning",
+						this.fullOutputTruncation
+							? formatCappedOutputLogNotice(this.fullOutputPath, this.fullOutputTruncation)
+							: `Output truncated. Full output: ${this.fullOutputPath}`,
+					),
+				);
 			}
 
 			if (statusParts.length > 0) {

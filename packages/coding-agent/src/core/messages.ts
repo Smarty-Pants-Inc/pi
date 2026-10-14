@@ -7,6 +7,8 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Message, TextContent } from "@earendil-works/pi-ai";
+import type { FullOutputTruncation } from "./tools/output-accumulator.ts";
+import { formatSize } from "./tools/truncate.ts";
 
 export const COMPACTION_SUMMARY_PREFIX = `The conversation history before this point was compacted into the following summary:
 
@@ -34,6 +36,8 @@ export interface BashExecutionMessage {
 	cancelled: boolean;
 	truncated: boolean;
 	fullOutputPath?: string;
+	/** Present only when the output log at `fullOutputPath` is capped and omits its middle. */
+	fullOutputTruncation?: FullOutputTruncation;
 	timestamp: number;
 	/** If true, this message is excluded from LLM context (!! prefix) */
 	excludeFromContext?: boolean;
@@ -92,9 +96,25 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 		text += `\n\nCommand exited with code ${msg.exitCode}`;
 	}
 	if (msg.truncated && msg.fullOutputPath) {
-		text += `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`;
+		text += msg.fullOutputTruncation
+			? `\n\n[${formatCappedOutputLogNotice(msg.fullOutputPath, msg.fullOutputTruncation)}]`
+			: `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`;
 	}
 	return text;
+}
+
+/**
+ * Describe a capped output log. The log keeps equal-sized first and last parts, so each
+ * retained side is half of the bytes that were not omitted.
+ */
+export function formatCappedOutputLogNotice(fullOutputPath: string, truncation: FullOutputTruncation): string {
+	const { totalBytes, omittedBytes } = truncation;
+	const retainedPerSide = (totalBytes - omittedBytes) / 2;
+	return (
+		`Output truncated. Capped log omits ${omittedBytes} of ${totalBytes} bytes ` +
+		`(${formatSize(omittedBytes)} of ${formatSize(totalBytes)}); ` +
+		`keeps first and last ${formatSize(retainedPerSide)}: ${fullOutputPath}`
+	);
 }
 
 export function createBranchSummaryMessage(summary: string, fromId: string, timestamp: string): BranchSummaryMessage {

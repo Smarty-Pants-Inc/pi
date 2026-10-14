@@ -4100,6 +4100,7 @@ export class InteractiveMode {
 					message.cancelled,
 					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
 					message.fullOutputPath,
+					message.fullOutputTruncation,
 				);
 				this.chatContainer.addChild(component);
 				break;
@@ -7594,6 +7595,7 @@ export class InteractiveMode {
 				result.cancelled,
 				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
 				result.fullOutputPath,
+				result.fullOutputTruncation,
 			);
 
 			// Record the result in session
@@ -7635,6 +7637,7 @@ export class InteractiveMode {
 					result.cancelled,
 					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
 					result.fullOutputPath,
+					result.fullOutputTruncation,
 				);
 			}
 		} catch (error) {
