@@ -1,11 +1,44 @@
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
 import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
-import { assistantRecovery, recordedThrottledLimitWait, transferThrottledLimitWait } from "./recovery.ts";
+import {
+	assistantRecovery,
+	classifyProviderFailure,
+	recordedThrottledLimitWait,
+	transferThrottledLimitWait,
+} from "./recovery.ts";
 
 /** Whether a failed stream ended before its provider's completion event (owned decision first, smarty-dev#5822). */
 export function isPrematureStreamError(message: AssistantMessage): boolean {
 	return message.stopReason === "error" && assistantRecovery(message).recovery === "premature_stream";
+}
+
+/**
+ * The specific Codex disconnect that a session may restart once after discarding its partial response
+ * (smarty-dev#11900). Unlike the ordinary classifier, output is allowed here; the caller must ensure no
+ * tool from this response has started, enforce the one-shot allowance, and omit the failed attempt.
+ */
+export function isRetryableCodexStreamDisconnect(message: AssistantMessage): boolean {
+	if (
+		message.stopReason !== "error" ||
+		!message.errorMessage?.includes(
+			"stream error: stream disconnected before completion: stream closed before response.completed",
+		)
+	)
+		return false;
+	if (
+		message.diagnostics?.some(
+			(diagnostic) => diagnostic.type === "provider_stream_observer_error" || diagnostic.type === "provider_limit",
+		)
+	)
+		return false;
+	// An owned refusal wins; permanent exclusions in a wrapper still win over a retryable decision.
+	const recovery = assistantRecovery(message);
+	return (
+		recovery.retryable &&
+		recovery.recovery !== "context_length_exceeded" &&
+		classifyProviderFailure({ text: message.errorMessage, provider: message.provider }).retryable
+	);
 }
 
 /** Empty reasoning signatures are metadata, not output. Even a partial tool call is output. */

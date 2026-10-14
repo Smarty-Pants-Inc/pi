@@ -1183,6 +1183,7 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	#sessionEpoch: object = {};
 	#revision = 0;
 	#branchProjection?: {
 		revision: number;
@@ -1328,6 +1329,7 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 		};
 		this.fileEntries = [header];
+		this.#sessionEpoch = {};
 		this.#branchProjection = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
@@ -1347,6 +1349,7 @@ export class SessionManager {
 
 		if (header) {
 			this.fileEntries = entries;
+			this.#sessionEpoch = {};
 			this.sessionId = header.id;
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
@@ -1355,6 +1358,7 @@ export class SessionManager {
 		} else {
 			this.newSession(options);
 			this.fileEntries = this.fileEntries.concat(entries);
+			this.#sessionEpoch = {};
 		}
 
 		this._buildIndex();
@@ -1976,6 +1980,26 @@ export class SessionManager {
 		return this.leafId;
 	}
 
+	/** @internal Branch IDs and entry tags without copying owned payloads. */
+	getBranchIdentity(): {
+		entries: Array<{ id: string; type: SessionEntry["type"]; customType?: string }>;
+		leafId: string | null;
+		revision: number;
+		sessionEpoch: object;
+	} {
+		const path = this.getBranchProjection().path;
+		return {
+			entries: path.map((entry) => ({
+				id: entry.id,
+				type: entry.type,
+				...(entry.type === "custom" ? { customType: entry.customType } : {}),
+			})),
+			leafId: this.leafId,
+			revision: this.revision(),
+			sessionEpoch: this.#sessionEpoch,
+		};
+	}
+
 	/**
 	 * Cheap token that changes whenever the session content or leaf changes.
 	 * Use it to cache values derived from the session (for example, per-frame UI state).
@@ -2307,6 +2331,7 @@ export class SessionManager {
 		child.#ownedBootstrap = Buffer.from(`${selected.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
 		child.#persistOwnedBootstrap();
 		child.fileEntries = selected;
+		child.#sessionEpoch = {};
 		for (const entry of selected) {
 			if (entry.type !== "session") child.#ownedEntryIndex.set(entry.id, ownedSessionEntryMetadata(entry));
 		}
@@ -2395,6 +2420,7 @@ export class SessionManager {
 			}
 
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			this.#sessionEpoch = {};
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
@@ -2428,6 +2454,7 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+		this.#sessionEpoch = {};
 		this.sessionId = newSessionId;
 		this._buildIndex();
 		return undefined;
