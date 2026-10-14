@@ -125,3 +125,39 @@ try {
 		rmSync(directory, { recursive: true, force: true });
 	}
 });
+
+// pi#244: crash-stale startup guards must recover, including competing recoverers delayed before publication.
+for (const concurrent of [false, true]) {
+	test(`triage recovers a killed owner${concurrent ? " with one concurrent winner" : ""}`, { skip: process.platform === "win32" }, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "triage-crash-"));
+		const path = join(directory, "s");
+		const entry = fileURLToPath(new URL("./fixtures/issues-socket-child.ts", import.meta.url));
+		const owner = fork(entry, [path, "hold"], { execArgv: [], stdio: "pipe" });
+		assert.equal((await once(owner, "message"))[0], "held");
+		const dead = once(owner, "exit");
+		owner.kill("SIGKILL");
+		await dead;
+		const children = Array.from({ length: concurrent ? 2 : 1 }, () => fork(entry, [path, concurrent ? "recover-race" : "hold"], { execArgv: [], stdio: "pipe" }));
+		try {
+			const first = await Promise.all(children.map(async (child) => (await once(child, "message"))[0]));
+			const results: unknown[] = [];
+			for (const [i, child] of children.entries()) {
+				if (first[i] === "stale") {
+					const next = once(child, "message");
+					child.send("recover");
+					results.push((await next)[0]);
+				} else results.push(first[i]);
+			}
+			assert.equal(results.filter((result) => result === "held").length, 1);
+			assert.equal(results.filter((result) => result === "blocked").length, concurrent ? 1 : 0);
+		} finally {
+			await Promise.all(children.map(async (child) => {
+				if (child.exitCode !== null) return;
+				const exited = once(child, "exit");
+				if (child.connected) child.send("close");
+				await exited;
+			}));
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+}

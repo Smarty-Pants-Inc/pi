@@ -1,12 +1,13 @@
 // Host manager (Node only): runs a child host process and keeps at most one instance of it alive.
 import { type ChildProcess, fork } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, openSync, unlinkSync } from "node:fs";
+import { unlinkSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChordError } from "./errors.ts";
+import { acquireFileLock } from "./file-lock.ts";
 import { type IpcChannel, type IpcLink, ipcLink } from "./link.ts";
 
 /** Control messages share the IPC channel with chord frames: `{ chord2control: message }`. */
@@ -75,10 +76,9 @@ export interface ForkDriverOptions {
 
 /**
  * A process lock owned by the kernel for the holder's lifetime: an abstract socket (Linux, Android) or a named pipe
- * (Windows) vanishes with its process, so there is no stale state to take over and no race between two would-be
- * owners. Other platforms need a socket file, guarded by an exclusive file before any stale socket takeover.
- * The guard is removed on close or normal exit; after an unclean exit it must be removed manually, never raced over.
- * The child acquires it (before opening storage), so the lock follows the process that owns the data.
+ * (Windows) vanishes with its process. Other platforms need a socket file, guarded by an exclusive file before
+ * any stale socket takeover. The guard contains the PID and process start identity; an unclean guard is atomically
+ * renamed to a unique tombstone before its winner retries creation. The child acquires it before opening storage.
  */
 export async function processLock(name: string): Promise<() => Promise<void>> {
 	const key = createHash("sha256").update(name).digest("hex").slice(0, 32);
@@ -91,24 +91,17 @@ export async function processLock(name: string): Promise<() => Promise<void>> {
 				: `\0chord2-${key}`;
 	const server = createServer((socket) => socket.end());
 	const guard = `${address}.lock`;
-	let descriptor: number | undefined;
+	let removeGuard = (): void => {};
 	if (file) {
 		try {
-			descriptor = openSync(guard, "wx", 0o600);
+			removeGuard = await acquireFileLock(guard);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-			throw new ChordError("unavailable", `lock ${name} is held by another process`, { reason: "locked" });
+			if (error instanceof Error && error.message.startsWith("lock ")) {
+				throw new ChordError("unavailable", `lock ${name} is held by another process`, { reason: "locked" });
+			}
+			throw error;
 		}
 	}
-	const removeGuard = (): void => {
-		if (descriptor === undefined) return;
-		try {
-			unlinkSync(guard);
-		} finally {
-			closeSync(descriptor);
-			descriptor = undefined;
-		}
-	};
 	const removeFile = (): void => {
 		try {
 			if (server.listening) unlinkSync(address);

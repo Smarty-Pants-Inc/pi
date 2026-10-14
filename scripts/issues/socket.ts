@@ -1,17 +1,10 @@
-import { closeSync, openSync, unlinkSync } from "node:fs";
 import { lstat, unlink } from "node:fs/promises";
 import { connect, type Server } from "node:net";
+import { acquireFileLock } from "../../packages/chord/src/file-lock.ts";
 
-/** Serialize stale cleanup and binding, retaining the guard until close/exit. Unclean guard remnants fail closed. */
+/** Serialize stale cleanup and binding, retaining the guard until close/exit. Stale guards are atomically renamed. */
 export async function listenSocket(server: Server, path: string): Promise<void> {
-	const guard = `${path}.lock`;
-	let descriptor: number;
-	try {
-		descriptor = openSync(guard, "wx", 0o600);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-		throw new Error(`TRIAGE_SOCKET ${path} startup lock is held`);
-	}
+	const removeGuard = process.platform === "win32" ? () => {} : await acquireFileLock(`${path}.lock`);
 	let released = false;
 	const release = (): void => {
 		if (released) return;
@@ -19,16 +12,14 @@ export async function listenSocket(server: Server, path: string): Promise<void> 
 		process.removeListener("exit", release);
 		server.removeListener("close", release);
 		try {
-			unlinkSync(guard);
+			removeGuard();
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`TRIAGE_SOCKET ${path} guard cleanup:`, error);
-		} finally {
-			closeSync(descriptor);
+			console.error(`TRIAGE_SOCKET ${path} guard cleanup:`, error);
 		}
 	};
 	process.once("exit", release);
 	try {
-		await prepareSocket(path);
+		if (process.platform !== "win32") await prepareSocket(path);
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(path, () => {
