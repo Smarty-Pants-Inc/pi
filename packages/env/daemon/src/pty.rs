@@ -14,18 +14,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
-use std::sync::{Condvar, OnceLock};
 
 /// After the program exits, output still arriving is collected until this much silence.
 #[cfg(unix)]
 const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(unix)]
-const CLEANUP_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
+const CLEANUP_TERM_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(unix)]
-const CLEANUP_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
-#[cfg(unix)]
-const CLEANUP_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const CLEANUP_KILL_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Largest terminal size accepted, in cells.
 const MAX_CELLS: u64 = 4096;
 /// Queued input, including the write in progress, per terminal.
@@ -288,6 +284,15 @@ pub fn run(
     let mut idle_until: Option<Instant> = None;
     let mut aborted = false;
     let mut killed = false;
+    let mut cleanup = None;
+    let terminate = || {
+        cleanup_group(
+            pid,
+            groups,
+            || unix::terminate_group(pid),
+            |message| eprintln!("pty: ERROR {message}"),
+        )
+    };
     let kill = |killed: &mut bool| {
         if !*killed {
             *killed = true;
@@ -325,6 +330,13 @@ pub fn run(
             Ok(Message::Eof(_)) => ended = true,
             Ok(Message::Exit(exit)) => {
                 status = Some(Ok(exit));
+                // Cleanup starts at leader exit, not after background output becomes idle.
+                // Fence later cancel/kill messages before forgetting this group.
+                killed = true;
+                cleanup = Some(terminate());
+                if cleanup.as_ref().is_some_and(Result::is_err) {
+                    break;
+                }
                 idle_until = Some(Instant::now() + EXIT_GRACE);
             }
             Ok(Message::WaitFailed(error)) => {
@@ -340,18 +352,14 @@ pub fn run(
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
-    // The leader's exit is not the end of its background jobs. Keep ownership until the remaining group is stopped.
-    let cleanup = cleanup_group(pid, groups, move || unix::terminate_group(pid));
+    // A disconnected waiter still gets one bounded attempt, never a deferred retry.
+    let cleanup = cleanup.unwrap_or_else(terminate);
     stop.store(true, Ordering::SeqCst);
     // Ending the input channel ends the writer thread.
     terminals.lock().unwrap().remove(&id);
     let _ = reader.join();
     let _ = writer.join();
-    if let Some(cleanup) = cleanup {
-        cleanup.recv().unwrap_or_else(|_| {
-            Err(Failure::new("cleanup_failed", "PTY cleanup reaper stopped"))
-        })?;
-    }
+    cleanup?;
     if aborted {
         return Err(Failure::new("aborted", "aborted"));
     }
@@ -366,186 +374,28 @@ pub fn run(
 }
 
 #[cfg(unix)]
-struct PendingCleanup {
-    pid: u32,
-    groups: Groups,
-    terminate: Box<dyn FnMut() -> std::io::Result<bool> + Send>,
-    next_attempt: std::time::Instant,
-    backoff: std::time::Duration,
-    deadline: std::time::Instant,
-    result: Sender<Result<(), Failure>>,
-}
-
-#[cfg(unix)]
-struct CleanupReaperState {
-    pending: HashMap<u32, PendingCleanup>,
-    running: bool,
-}
-
-#[cfg(unix)]
-struct CleanupReaperInner {
-    state: Mutex<CleanupReaperState>,
-    wake: Condvar,
-    workers_started: AtomicUsize,
-}
-
-#[cfg(unix)]
-#[derive(Clone)]
-struct CleanupReaper {
-    inner: Arc<CleanupReaperInner>,
-}
-
-#[cfg(unix)]
-impl CleanupReaper {
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(CleanupReaperInner {
-                state: Mutex::new(CleanupReaperState {
-                    pending: HashMap::new(),
-                    running: false,
-                }),
-                wake: Condvar::new(),
-                workers_started: AtomicUsize::new(0),
-            }),
-        }
-    }
-
-    #[cfg(test)]
-    fn workers_started(&self) -> usize {
-        self.inner.workers_started.load(Ordering::SeqCst)
-    }
-
-    fn schedule(&self, pending: PendingCleanup) {
-        let mut state = self.inner.state.lock().unwrap();
-        state.pending.insert(pending.pid, pending);
-        if !state.running {
-            state.running = true;
-            let inner = self.inner.clone();
-            if let Err(error) = std::thread::Builder::new()
-                .name("pty-cleanup-reaper".to_string())
-                .spawn(move || run_cleanup_reaper(inner))
-            {
-                state.running = false;
-                for (_, pending) in state.pending.drain() {
-                    pending.groups.lock().unwrap().remove(&pending.pid);
-                    eprintln!(
-                        "pty: ERROR failed to start cleanup reaper for process group {}: {error}",
-                        pending.pid
-                    );
-                    let _ = pending.result.send(Err(Failure::new(
-                        "cleanup_failed",
-                        format!("Failed to start PTY cleanup reaper: {error}"),
-                    )));
-                }
-            }
-        }
-        self.inner.wake.notify_one();
-    }
-}
-
-#[cfg(unix)]
-fn cleanup_retry_backoff(backoff: std::time::Duration) -> std::time::Duration {
-    backoff.saturating_add(backoff).min(CLEANUP_RETRY_MAX)
-}
-
-#[cfg(unix)]
-fn run_cleanup_reaper(inner: Arc<CleanupReaperInner>) {
-    inner.workers_started.fetch_add(1, Ordering::SeqCst);
-    loop {
-        let mut pending = {
-            let mut state = inner.state.lock().unwrap();
-            loop {
-                if state.pending.is_empty() {
-                    state.running = false;
-                    return;
-                }
-                let (pid, next_attempt) = state
-                    .pending
-                    .iter()
-                    .min_by_key(|(_, pending)| pending.next_attempt)
-                    .map(|(pid, pending)| (*pid, pending.next_attempt))
-                    .unwrap();
-                let wait = next_attempt.saturating_duration_since(std::time::Instant::now());
-                if wait.is_zero() {
-                    break state.pending.remove(&pid).unwrap();
-                }
-                let (updated, _) = inner.wake.wait_timeout(state, wait).unwrap();
-                state = updated;
-            }
-        };
-
-        let expired = std::time::Instant::now() >= pending.deadline;
-        if !expired && matches!((pending.terminate)(), Ok(true)) {
-            pending.groups.lock().unwrap().remove(&pending.pid);
-            let _ = pending.result.send(Ok(()));
-            continue;
-        }
-        let now = std::time::Instant::now();
-        if expired || now >= pending.deadline {
-            pending.groups.lock().unwrap().remove(&pending.pid);
-            eprintln!(
-                "pty: ERROR process group {} cleanup deadline exceeded; dropping supervision",
-                pending.pid
-            );
-            let _ = pending.result.send(Err(Failure::new(
-                "cleanup_failed",
-                format!(
-                    "PTY process group {} cleanup deadline exceeded",
-                    pending.pid
-                ),
-            )));
-            continue;
-        }
-        pending.next_attempt = (now + pending.backoff).min(pending.deadline);
-        pending.backoff = cleanup_retry_backoff(pending.backoff);
-        let mut state = inner.state.lock().unwrap();
-        state.pending.insert(pending.pid, pending);
-        inner.wake.notify_one();
-    }
-}
-
-#[cfg(unix)]
-static CLEANUP_REAPER: OnceLock<CleanupReaper> = OnceLock::new();
-
-#[cfg(unix)]
 fn cleanup_group(
     pid: u32,
     groups: &Groups,
-    terminate: impl FnMut() -> std::io::Result<bool> + Send + 'static,
-) -> Option<std::sync::mpsc::Receiver<Result<(), Failure>>> {
-    let reaper = CLEANUP_REAPER.get_or_init(CleanupReaper::new);
-    cleanup_group_with_reaper(reaper, pid, groups, CLEANUP_TOTAL_DEADLINE, terminate)
-}
-
-#[cfg(unix)]
-fn cleanup_group_with_reaper(
-    reaper: &CleanupReaper,
-    pid: u32,
-    groups: &Groups,
-    total_deadline: std::time::Duration,
-    mut terminate: impl FnMut() -> std::io::Result<bool> + Send + 'static,
-) -> Option<std::sync::mpsc::Receiver<Result<(), Failure>>> {
-    match terminate() {
-        Ok(true) => {
-            groups.lock().unwrap().remove(&pid);
-            None
-        }
+    terminate: impl FnOnce() -> std::io::Result<bool>,
+    log_error: impl FnOnce(&str),
+) -> Result<(), Failure> {
+    // Keep shutdown from signalling this record between the final probe and its removal.
+    let mut groups = groups.lock().unwrap();
+    let outcome = terminate();
+    groups.remove(&pid);
+    drop(groups);
+    // Never retain a failed cleanup for retry: a later attempt cannot prove this PGID
+    // still identifies the same group. Linux reserves the PGID while any member lives;
+    // the single bounded attempt stops immediately on ESRCH, and then forgets it.
+    match outcome {
+        Ok(true) => Ok(()),
         outcome => {
-            eprintln!(
-                "pty: process group {pid} cleanup incomplete ({outcome:?}); retaining supervision"
+            let message = format!(
+                "PTY process group {pid} cleanup incomplete ({outcome:?}); dropping supervision without retry"
             );
-            let now = std::time::Instant::now();
-            let (result, receiver) = std::sync::mpsc::channel();
-            reaper.schedule(PendingCleanup {
-                pid,
-                groups: groups.clone(),
-                terminate: Box::new(terminate),
-                next_attempt: now + CLEANUP_RETRY_INITIAL,
-                backoff: CLEANUP_RETRY_INITIAL.saturating_add(CLEANUP_RETRY_INITIAL),
-                deadline: now + total_deadline,
-                result,
-            });
-            Some(receiver)
+            log_error(&message);
+            Err(Failure::new("cleanup_failed", message))
         }
     }
 }
@@ -554,169 +404,62 @@ fn cleanup_group_with_reaper(
 mod tests {
     use super::*;
 
-    // pi#244 / SECURITY delta round 1: a signal error or timeout must retain ownership until a later confirmed reap.
+    // pi#244: a confirmed-empty group is removed synchronously, with no cleanup worker.
     #[test]
-    fn cleanup_retains_ownership_after_signal_error_or_timeout() {
+    fn cleanup_success_removes_record_without_worker() {
+        let groups: Groups = Arc::new(Mutex::new(Default::default()));
+        let pid = 123;
+        groups.lock().unwrap().insert(pid);
+        let caller = std::thread::current().id();
+        let mut attempts = 0;
+        cleanup_group(
+            pid,
+            &groups,
+            || {
+                assert_eq!(std::thread::current().id(), caller);
+                attempts += 1;
+                Ok(true)
+            },
+            |_| panic!("successful cleanup must not log an error"),
+        )
+        .unwrap();
+        assert_eq!(attempts, 1);
+        assert!(groups.lock().unwrap().is_empty());
+    }
+
+    // pi#244: an unkillable group or signal error is logged once and never retained for later signals.
+    #[test]
+    fn cleanup_failure_logs_once_and_drops_record_without_retry() {
         for outcome in [
-            Err(std::io::Error::from_raw_os_error(libc::EPERM)),
             Ok(false),
+            Err(std::io::Error::from_raw_os_error(libc::EPERM)),
         ] {
             let groups: Groups = Arc::new(Mutex::new(Default::default()));
-            let pid = 123;
+            let pid = 124;
             groups.lock().unwrap().insert(pid);
-            let (resume, paused) = std::sync::mpsc::channel();
-            let mut first = Some(outcome);
-            cleanup_group(pid, &groups, move || {
-                if let Some(outcome) = first.take() {
-                    return outcome;
-                }
-                paused.recv().unwrap();
-                Ok(true)
-            });
-            assert!(
-                groups.lock().unwrap().contains(&pid),
-                "unreaped group lost ownership"
-            );
-            resume.send(()).unwrap();
-            wait_for_group_removed(&groups, pid);
-            assert!(groups.lock().unwrap().is_empty());
-        }
-    }
-
-    fn wait_for_group_removed(groups: &Groups, pid: u32) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while groups.lock().unwrap().contains(&pid) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "group {pid} was not removed"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    // pi#244: cleanup failures share one bounded reaper instead of one retry thread per terminal.
-    #[test]
-    fn cleanup_failures_share_one_reaper() {
-        let reaper = CleanupReaper::new();
-        let groups: Groups = Arc::new(Mutex::new(Default::default()));
-        let completed = Arc::new(AtomicUsize::new(0));
-        for pid in 100..103 {
-            groups.lock().unwrap().insert(pid);
-            let completed = completed.clone();
-            let mut first = true;
-            cleanup_group_with_reaper(
-                &reaper,
+            let caller = std::thread::current().id();
+            let mut attempts = 0;
+            let mut logs = Vec::new();
+            let error = cleanup_group(
                 pid,
                 &groups,
-                std::time::Duration::from_secs(2),
-                move || {
-                    if first {
-                        first = false;
-                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
-                    } else {
-                        completed.fetch_add(1, Ordering::SeqCst);
-                        Ok(true)
-                    }
+                || {
+                    assert_eq!(std::thread::current().id(), caller);
+                    attempts += 1;
+                    outcome
                 },
-            );
-        }
-        for pid in 100..103 {
-            wait_for_group_removed(&groups, pid);
-        }
-        assert_eq!(completed.load(Ordering::SeqCst), 3);
-        assert_eq!(reaper.workers_started(), 1);
-    }
-
-    // pi#244: retry intervals must grow exponentially and stop growing at the cap.
-    #[test]
-    fn cleanup_retry_cadence_backs_off() {
-        let reaper = CleanupReaper::new();
-        let groups: Groups = Arc::new(Mutex::new(Default::default()));
-        let pid = 104;
-        groups.lock().unwrap().insert(pid);
-        let attempts = Arc::new(Mutex::new(Vec::new()));
-        let recorded = attempts.clone();
-        let mut failures = 3;
-        cleanup_group_with_reaper(
-            &reaper,
-            pid,
-            &groups,
-            std::time::Duration::from_secs(3),
-            move || {
-                recorded.lock().unwrap().push(std::time::Instant::now());
-                if failures > 0 {
-                    failures -= 1;
-                    Ok(false)
-                } else {
-                    Ok(true)
-                }
-            },
-        );
-        wait_for_group_removed(&groups, pid);
-        let attempts = attempts.lock().unwrap();
-        assert!(attempts.len() >= 4);
-        assert!(attempts[1].duration_since(attempts[0]) >= std::time::Duration::from_millis(70));
-        assert!(attempts[2].duration_since(attempts[1]) >= std::time::Duration::from_millis(140));
-        assert!(attempts[3].duration_since(attempts[2]) >= std::time::Duration::from_millis(280));
-        let mut backoff = CLEANUP_RETRY_INITIAL;
-        for expected in [200, 400, 800, 1600, 3200, 5000, 5000] {
-            backoff = cleanup_retry_backoff(backoff);
-            assert_eq!(backoff, std::time::Duration::from_millis(expected));
-        }
-    }
-
-    // pi#244: a group that cannot be cleaned by the deadline is dropped rather than retried forever.
-    #[test]
-    fn cleanup_deadline_drops_record() {
-        let reaper = CleanupReaper::new();
-        let groups: Groups = Arc::new(Mutex::new(Default::default()));
-        let pid = 105;
-        groups.lock().unwrap().insert(pid);
-        let result = cleanup_group_with_reaper(
-            &reaper,
-            pid,
-            &groups,
-            std::time::Duration::from_millis(150),
-            || Ok(false),
-        )
-        .unwrap();
-        let error = result
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap()
+                |message| logs.push(message.to_string()),
+            )
             .unwrap_err();
-        assert_eq!(error.code, "cleanup_failed");
-        assert!(error.message.contains(&pid.to_string()));
-        assert!(!groups.lock().unwrap().contains(&pid));
-    }
-
-    // pi#244: a group that succeeds on a retry is removed from supervision immediately.
-    #[test]
-    fn cleanup_success_on_retry_removes_record() {
-        let reaper = CleanupReaper::new();
-        let groups: Groups = Arc::new(Mutex::new(Default::default()));
-        let pid = 106;
-        groups.lock().unwrap().insert(pid);
-        let mut first = true;
-        let result = cleanup_group_with_reaper(
-            &reaper,
-            pid,
-            &groups,
-            std::time::Duration::from_secs(2),
-            move || {
-                if first {
-                    first = false;
-                    Ok(false)
-                } else {
-                    Ok(true)
-                }
-            },
-        )
-        .unwrap();
-        result
-            .recv_timeout(std::time::Duration::from_secs(3))
-            .unwrap()
-            .unwrap();
-        assert!(!groups.lock().unwrap().contains(&pid));
+            assert_eq!(error.code, "cleanup_failed");
+            assert!(error.message.contains(&pid.to_string()));
+            assert_eq!(logs, [error.message]);
+            assert_eq!(attempts, 1);
+            assert!(groups.lock().unwrap().is_empty());
+            // The connection's kill_all path can only signal records still in this set.
+            let later_signals: Vec<_> = groups.lock().unwrap().iter().copied().collect();
+            assert!(later_signals.is_empty());
+        }
     }
 
     // pi#244: every charged input must release its memory budget, including a disconnected receiver's queue.
@@ -826,17 +569,18 @@ mod tests {
         assert_eq!(result.unwrap()["exitCode"], 137);
     }
 
-    // pi#244: an exited leader must not leave an unsupervised background job behind.
+    // pi#244: cleanup starts on leader exit even while a background job keeps producing output.
     #[test]
     fn shutdown_terminates_background_job() {
         let output = Arc::new(Output::default());
         let groups = Arc::new(Mutex::new(Default::default()));
         let terminals = Arc::new(Mutex::new(HashMap::new()));
         let request = PtyRequest::from_json(&json!({
-            "argv": ["/bin/sh", "-c", "trap '' HUP TERM; sleep 30 & echo $!; exit 0"],
+            "argv": ["/bin/sh", "-c", "trap '' HUP TERM; (sleep 0.1; while :; do printf 'busy\\n'; sleep 0.01; done) & echo $!; exit 0"],
             "cwd": crate::sys::tmpdir(), "cols": 80, "rows": 24,
         }))
         .unwrap();
+        let started = std::time::Instant::now();
         let result = run(
             1,
             request,
@@ -853,7 +597,14 @@ mod tests {
         while let Some(frame) = crate::frame::read_frame(&mut frames).unwrap() {
             text.extend(frame.payload);
         }
-        let pid: i32 = String::from_utf8(text).unwrap().trim().parse().unwrap();
+        let pid: i32 = String::from_utf8(text)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
         // Linux may briefly expose an orphan zombie until init reaps it; a zombie is not a live descendant.
         let live = if cfg!(target_os = "linux") {
             std::fs::read_to_string(format!("/proc/{pid}/stat"))
@@ -870,7 +621,11 @@ mod tests {
             }
         }
         assert_eq!(result.unwrap()["exitCode"], 0);
-        assert!(!live, "background sleep {pid} survived the PTY request");
+        assert!(
+            started.elapsed()
+                < CLEANUP_TERM_WAIT + CLEANUP_KILL_WAIT + std::time::Duration::from_secs(2)
+        );
+        assert!(!live, "background job {pid} survived the PTY request");
         assert!(terminals.lock().unwrap().is_empty());
         assert!(groups.lock().unwrap().is_empty());
     }
@@ -1057,7 +812,10 @@ mod unix {
         use std::time::{Duration, Instant};
 
         let group = -(pid as libc::pid_t);
-        for signal in [libc::SIGTERM, libc::SIGKILL] {
+        for (signal, bound) in [
+            (libc::SIGTERM, super::CLEANUP_TERM_WAIT),
+            (libc::SIGKILL, super::CLEANUP_KILL_WAIT),
+        ] {
             // SAFETY: signal only the process group this terminal owns.
             if unsafe { libc::kill(group, signal) } != 0 {
                 let error = io::Error::last_os_error();
@@ -1067,22 +825,23 @@ mod unix {
                     Err(error)
                 };
             }
-            let deadline = Instant::now() + Duration::from_millis(250);
+            let deadline = Instant::now() + bound;
             loop {
                 loop {
                     // SAFETY: non-blocking waits for this group's children only; no other request's child is reaped.
                     let reaped =
                         unsafe { libc::waitpid(group, std::ptr::null_mut(), libc::WNOHANG) };
-                    if reaped > 0 {
+                    if reaped > 0 && Instant::now() < deadline {
                         continue;
                     }
-                    if reaped == 0 {
+                    if reaped >= 0 {
                         break;
                     }
                     let error = io::Error::last_os_error();
                     match error.raw_os_error() {
                         Some(libc::ECHILD) => break,
-                        Some(libc::EINTR) => continue,
+                        Some(libc::EINTR) if Instant::now() < deadline => continue,
+                        Some(libc::EINTR) => break,
                         _ => return Err(error),
                     }
                 }
@@ -1098,7 +857,10 @@ mod unix {
                 if Instant::now() >= deadline {
                     break;
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(
+                    Duration::from_millis(10)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
             }
         }
         Ok(false)

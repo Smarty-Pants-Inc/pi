@@ -118,6 +118,10 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 
 ## Network and retries
 
+In this fork, the shipped model catalog is the default. Set **`PI_REMOTE_CATALOG=1`** to opt in to pi.dev catalog fetching and saved remote catalog overlays, including OpenRouter's personalized catalog. Unset, `0`, and other values keep the local baseline: interactive startup, RPC startup, model pickers, and `ModelRuntime.refresh()` do not fetch the remote catalog, even with `allowNetwork: true` or a forced refresh. Existing saved overlays are ignored, not deleted.
+
+This variable controls only the remote catalog. Provider requests, native provider discovery, authentication, update checks, and other networking retain their usual behavior. `PI_OFFLINE` / `--offline` still disable automatic catalog networking even with the opt-in; explicit `refresh({ allowNetwork: true })` can override offline mode only when `PI_REMOTE_CATALOG=1`. Opted-in catalogs still strip remote routing/auth fields, but their other metadata can affect token budgets, context retention, and image processing; enable only if you trust the catalog source.
+
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `transport` | `"auto" \| "sse" \| "websocket" \| "websocket-cached"` | `"auto"` | Preferred transport for AI providers that support multiple transports. |

@@ -186,6 +186,17 @@ export function withRemoteCatalog(
 			),
 		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
 		refreshModels: async (context) => {
+			// Fork default: use the pinned local baseline, including when a remote cache exists.
+			// Gate here so interactive/RPC startup and explicit runtime refreshes share the policy,
+			// without disabling provider discovery, authentication or other networking.
+			if (process.env.PI_REMOTE_CATALOG !== "1") {
+				await context.publish({
+					update: () => {
+						dynamicModels = [];
+					},
+				});
+				return;
+			}
 			const stored = context.stored;
 			const restored = remoteModels(stored, localGeneratedAt)
 				.filter((model) => model.provider === provider.id)
@@ -281,6 +292,14 @@ export function withPersonalizedCatalog(
 		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
 		getAllModels,
 		refreshModels: async (context) => {
+			if (process.env.PI_REMOTE_CATALOG !== "1") {
+				await context.publish({
+					update: () => {
+						personalModels = [];
+					},
+				});
+				return;
+			}
 			const restored = (context.stored?.models ?? [])
 				.filter((model) => model.provider === provider.id)
 				.flatMap((model) => {

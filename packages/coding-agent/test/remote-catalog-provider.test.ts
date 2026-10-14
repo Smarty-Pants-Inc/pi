@@ -11,7 +11,7 @@ import {
 	type Provider,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VERSION } from "../src/config.ts";
 import { ModelRuntime } from "../src/core/model-runtime.ts";
 import {
@@ -80,7 +80,65 @@ async function refreshProvider(
 	});
 }
 
+beforeEach(() => vi.stubEnv("PI_REMOTE_CATALOG", "1"));
 afterEach(() => vi.restoreAllMocks());
+
+describe("remote catalog opt-in", () => {
+	// pi#244: disabled catalogs must not activate hostile metadata from network or saved overlays.
+	it.each([undefined, "0", "true"])("keeps only the local baseline when PI_REMOTE_CATALOG=%s", async (value) => {
+		vi.stubEnv("PI_REMOTE_CATALOG", value);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected catalog request"));
+		const personalize = vi.fn<PersonalizeCatalog>();
+		const store = new InMemoryModelsStore();
+		await store.write("test-provider", {
+			models: [{ ...model("static"), contextWindow: 1, maxTokens: 999999999 }],
+			lastModified: Date.now() + 1000,
+		});
+		for (const provider of [testProvider(), withPersonalizedCatalog(builtinProvider(), personalize)]) {
+			await refreshProvider(provider, store, { allowNetwork: true, force: true });
+			expect(provider.getModels()).toEqual([model("static")]);
+		}
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(personalize).not.toHaveBeenCalled();
+	});
+
+	// pi#244: disabling the opt-in discards an already active remote or personalized overlay too.
+	it("drops active overlays when the remote catalog opt-in is removed", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response(JSON.stringify({ dynamic: model("dynamic") })));
+		const personalize: PersonalizeCatalog = async (catalog) => catalog;
+		for (const provider of [testProvider(), withPersonalizedCatalog(builtinProvider(), personalize)]) {
+			vi.stubEnv("PI_REMOTE_CATALOG", "1");
+			const store = new InMemoryModelsStore();
+			await refreshProvider(provider, store);
+			expect(provider.getModels().some((entry) => entry.id === "dynamic")).toBe(true);
+			vi.stubEnv("PI_REMOTE_CATALOG", undefined);
+			await refreshProvider(provider, store, { force: true });
+			expect(provider.getModels()).toEqual([model("static")]);
+		}
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+	});
+
+	// pi#244: the catalog policy must not silently turn off native provider discovery or other networking.
+	it("keeps default runtime refresh networking available to native providers", async () => {
+		vi.stubEnv("PI_REMOTE_CATALOG", undefined);
+		vi.stubEnv("PI_OFFLINE", undefined);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected catalog request"));
+		const refreshModels = vi.fn<NonNullable<Provider["refreshModels"]>>();
+		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null });
+		runtime.registerNativeProvider({ ...builtinProvider(), refreshModels });
+		await runtime.setRuntimeApiKey("test-provider", "local-test-key");
+		await runtime.setRuntimeApiKey("anthropic", "local-test-key");
+		refreshModels.mockClear();
+		const result = await runtime.refresh();
+		expect([...result.errors]).toEqual([]);
+		expect(refreshModels).toHaveBeenCalledWith(expect.objectContaining({ allowNetwork: true }));
+		expect(runtime.getModel("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(process.env.PI_OFFLINE).toBeUndefined();
+	});
+});
 
 describe("remote catalog provider", () => {
 	it("parses keyed catalogs, sends version headers, observes the refresh TTL, and supports forced refreshes", async () => {
