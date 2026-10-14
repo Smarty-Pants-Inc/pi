@@ -14,10 +14,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+#[cfg(unix)]
+use std::sync::{Condvar, OnceLock};
 
 /// After the program exits, output still arriving is collected until this much silence.
 #[cfg(unix)]
 const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(unix)]
+const CLEANUP_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(100);
+#[cfg(unix)]
+const CLEANUP_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(unix)]
+const CLEANUP_TOTAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 /// Largest terminal size accepted, in cells.
 const MAX_CELLS: u64 = 4096;
 /// Queued input, including the write in progress, per terminal.
@@ -333,12 +341,17 @@ pub fn run(
         }
     }
     // The leader's exit is not the end of its background jobs. Keep ownership until the remaining group is stopped.
-    let _ = cleanup_group(pid, groups, move || unix::terminate_group(pid));
+    let cleanup = cleanup_group(pid, groups, move || unix::terminate_group(pid));
     stop.store(true, Ordering::SeqCst);
     // Ending the input channel ends the writer thread.
     terminals.lock().unwrap().remove(&id);
     let _ = reader.join();
     let _ = writer.join();
+    if let Some(cleanup) = cleanup {
+        cleanup.recv().unwrap_or_else(|_| {
+            Err(Failure::new("cleanup_failed", "PTY cleanup reaper stopped"))
+        })?;
+    }
     if aborted {
         return Err(Failure::new("aborted", "aborted"));
     }
@@ -353,11 +366,165 @@ pub fn run(
 }
 
 #[cfg(unix)]
+struct PendingCleanup {
+    pid: u32,
+    groups: Groups,
+    terminate: Box<dyn FnMut() -> std::io::Result<bool> + Send>,
+    next_attempt: std::time::Instant,
+    backoff: std::time::Duration,
+    deadline: std::time::Instant,
+    result: Sender<Result<(), Failure>>,
+}
+
+#[cfg(unix)]
+struct CleanupReaperState {
+    pending: HashMap<u32, PendingCleanup>,
+    running: bool,
+}
+
+#[cfg(unix)]
+struct CleanupReaperInner {
+    state: Mutex<CleanupReaperState>,
+    wake: Condvar,
+    workers_started: AtomicUsize,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct CleanupReaper {
+    inner: Arc<CleanupReaperInner>,
+}
+
+#[cfg(unix)]
+impl CleanupReaper {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(CleanupReaperInner {
+                state: Mutex::new(CleanupReaperState {
+                    pending: HashMap::new(),
+                    running: false,
+                }),
+                wake: Condvar::new(),
+                workers_started: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn workers_started(&self) -> usize {
+        self.inner.workers_started.load(Ordering::SeqCst)
+    }
+
+    fn schedule(&self, pending: PendingCleanup) {
+        let mut state = self.inner.state.lock().unwrap();
+        state.pending.insert(pending.pid, pending);
+        if !state.running {
+            state.running = true;
+            let inner = self.inner.clone();
+            if let Err(error) = std::thread::Builder::new()
+                .name("pty-cleanup-reaper".to_string())
+                .spawn(move || run_cleanup_reaper(inner))
+            {
+                state.running = false;
+                for (_, pending) in state.pending.drain() {
+                    pending.groups.lock().unwrap().remove(&pending.pid);
+                    eprintln!(
+                        "pty: ERROR failed to start cleanup reaper for process group {}: {error}",
+                        pending.pid
+                    );
+                    let _ = pending.result.send(Err(Failure::new(
+                        "cleanup_failed",
+                        format!("Failed to start PTY cleanup reaper: {error}"),
+                    )));
+                }
+            }
+        }
+        self.inner.wake.notify_one();
+    }
+}
+
+#[cfg(unix)]
+fn cleanup_retry_backoff(backoff: std::time::Duration) -> std::time::Duration {
+    backoff.saturating_add(backoff).min(CLEANUP_RETRY_MAX)
+}
+
+#[cfg(unix)]
+fn run_cleanup_reaper(inner: Arc<CleanupReaperInner>) {
+    inner.workers_started.fetch_add(1, Ordering::SeqCst);
+    loop {
+        let mut pending = {
+            let mut state = inner.state.lock().unwrap();
+            loop {
+                if state.pending.is_empty() {
+                    state.running = false;
+                    return;
+                }
+                let (pid, next_attempt) = state
+                    .pending
+                    .iter()
+                    .min_by_key(|(_, pending)| pending.next_attempt)
+                    .map(|(pid, pending)| (*pid, pending.next_attempt))
+                    .unwrap();
+                let wait = next_attempt.saturating_duration_since(std::time::Instant::now());
+                if wait.is_zero() {
+                    break state.pending.remove(&pid).unwrap();
+                }
+                let (updated, _) = inner.wake.wait_timeout(state, wait).unwrap();
+                state = updated;
+            }
+        };
+
+        let expired = std::time::Instant::now() >= pending.deadline;
+        if !expired && matches!((pending.terminate)(), Ok(true)) {
+            pending.groups.lock().unwrap().remove(&pending.pid);
+            let _ = pending.result.send(Ok(()));
+            continue;
+        }
+        let now = std::time::Instant::now();
+        if expired || now >= pending.deadline {
+            pending.groups.lock().unwrap().remove(&pending.pid);
+            eprintln!(
+                "pty: ERROR process group {} cleanup deadline exceeded; dropping supervision",
+                pending.pid
+            );
+            let _ = pending.result.send(Err(Failure::new(
+                "cleanup_failed",
+                format!(
+                    "PTY process group {} cleanup deadline exceeded",
+                    pending.pid
+                ),
+            )));
+            continue;
+        }
+        pending.next_attempt = (now + pending.backoff).min(pending.deadline);
+        pending.backoff = cleanup_retry_backoff(pending.backoff);
+        let mut state = inner.state.lock().unwrap();
+        state.pending.insert(pending.pid, pending);
+        inner.wake.notify_one();
+    }
+}
+
+#[cfg(unix)]
+static CLEANUP_REAPER: OnceLock<CleanupReaper> = OnceLock::new();
+
+#[cfg(unix)]
 fn cleanup_group(
     pid: u32,
     groups: &Groups,
+    terminate: impl FnMut() -> std::io::Result<bool> + Send + 'static,
+) -> Option<std::sync::mpsc::Receiver<Result<(), Failure>>> {
+    let reaper = CLEANUP_REAPER.get_or_init(CleanupReaper::new);
+    cleanup_group_with_reaper(reaper, pid, groups, CLEANUP_TOTAL_DEADLINE, terminate)
+}
+
+#[cfg(unix)]
+fn cleanup_group_with_reaper(
+    reaper: &CleanupReaper,
+    pid: u32,
+    groups: &Groups,
+    total_deadline: std::time::Duration,
     mut terminate: impl FnMut() -> std::io::Result<bool> + Send + 'static,
-) -> Option<std::thread::JoinHandle<()>> {
+) -> Option<std::sync::mpsc::Receiver<Result<(), Failure>>> {
     match terminate() {
         Ok(true) => {
             groups.lock().unwrap().remove(&pid);
@@ -367,18 +534,18 @@ fn cleanup_group(
             eprintln!(
                 "pty: process group {pid} cleanup incomplete ({outcome:?}); retaining supervision"
             );
-            let groups = groups.clone();
-            Some(std::thread::spawn(move || {
-                // Normal cleanup follows the leader's Exit event. This bounded retry interval is only the safety net
-                // after a failed signal or KILL deadline; the record remains owned until a confirmed reap/empty group.
-                loop {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    if matches!(terminate(), Ok(true)) {
-                        groups.lock().unwrap().remove(&pid);
-                        return;
-                    }
-                }
-            }))
+            let now = std::time::Instant::now();
+            let (result, receiver) = std::sync::mpsc::channel();
+            reaper.schedule(PendingCleanup {
+                pid,
+                groups: groups.clone(),
+                terminate: Box::new(terminate),
+                next_attempt: now + CLEANUP_RETRY_INITIAL,
+                backoff: CLEANUP_RETRY_INITIAL.saturating_add(CLEANUP_RETRY_INITIAL),
+                deadline: now + total_deadline,
+                result,
+            });
+            Some(receiver)
         }
     }
 }
@@ -399,7 +566,7 @@ mod tests {
             groups.lock().unwrap().insert(pid);
             let (resume, paused) = std::sync::mpsc::channel();
             let mut first = Some(outcome);
-            let supervisor = cleanup_group(pid, &groups, move || {
+            cleanup_group(pid, &groups, move || {
                 if let Some(outcome) = first.take() {
                     return outcome;
                 }
@@ -411,9 +578,145 @@ mod tests {
                 "unreaped group lost ownership"
             );
             resume.send(()).unwrap();
-            supervisor.unwrap().join().unwrap();
+            wait_for_group_removed(&groups, pid);
             assert!(groups.lock().unwrap().is_empty());
         }
+    }
+
+    fn wait_for_group_removed(groups: &Groups, pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while groups.lock().unwrap().contains(&pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "group {pid} was not removed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    // pi#244: cleanup failures share one bounded reaper instead of one retry thread per terminal.
+    #[test]
+    fn cleanup_failures_share_one_reaper() {
+        let reaper = CleanupReaper::new();
+        let groups: Groups = Arc::new(Mutex::new(Default::default()));
+        let completed = Arc::new(AtomicUsize::new(0));
+        for pid in 100..103 {
+            groups.lock().unwrap().insert(pid);
+            let completed = completed.clone();
+            let mut first = true;
+            cleanup_group_with_reaper(
+                &reaper,
+                pid,
+                &groups,
+                std::time::Duration::from_secs(2),
+                move || {
+                    if first {
+                        first = false;
+                        Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                    } else {
+                        completed.fetch_add(1, Ordering::SeqCst);
+                        Ok(true)
+                    }
+                },
+            );
+        }
+        for pid in 100..103 {
+            wait_for_group_removed(&groups, pid);
+        }
+        assert_eq!(completed.load(Ordering::SeqCst), 3);
+        assert_eq!(reaper.workers_started(), 1);
+    }
+
+    // pi#244: retry intervals must grow exponentially and stop growing at the cap.
+    #[test]
+    fn cleanup_retry_cadence_backs_off() {
+        let reaper = CleanupReaper::new();
+        let groups: Groups = Arc::new(Mutex::new(Default::default()));
+        let pid = 104;
+        groups.lock().unwrap().insert(pid);
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = attempts.clone();
+        let mut failures = 3;
+        cleanup_group_with_reaper(
+            &reaper,
+            pid,
+            &groups,
+            std::time::Duration::from_secs(3),
+            move || {
+                recorded.lock().unwrap().push(std::time::Instant::now());
+                if failures > 0 {
+                    failures -= 1;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            },
+        );
+        wait_for_group_removed(&groups, pid);
+        let attempts = attempts.lock().unwrap();
+        assert!(attempts.len() >= 4);
+        assert!(attempts[1].duration_since(attempts[0]) >= std::time::Duration::from_millis(70));
+        assert!(attempts[2].duration_since(attempts[1]) >= std::time::Duration::from_millis(140));
+        assert!(attempts[3].duration_since(attempts[2]) >= std::time::Duration::from_millis(280));
+        let mut backoff = CLEANUP_RETRY_INITIAL;
+        for expected in [200, 400, 800, 1600, 3200, 5000, 5000] {
+            backoff = cleanup_retry_backoff(backoff);
+            assert_eq!(backoff, std::time::Duration::from_millis(expected));
+        }
+    }
+
+    // pi#244: a group that cannot be cleaned by the deadline is dropped rather than retried forever.
+    #[test]
+    fn cleanup_deadline_drops_record() {
+        let reaper = CleanupReaper::new();
+        let groups: Groups = Arc::new(Mutex::new(Default::default()));
+        let pid = 105;
+        groups.lock().unwrap().insert(pid);
+        let result = cleanup_group_with_reaper(
+            &reaper,
+            pid,
+            &groups,
+            std::time::Duration::from_millis(150),
+            || Ok(false),
+        )
+        .unwrap();
+        let error = result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "cleanup_failed");
+        assert!(error.message.contains(&pid.to_string()));
+        assert!(!groups.lock().unwrap().contains(&pid));
+    }
+
+    // pi#244: a group that succeeds on a retry is removed from supervision immediately.
+    #[test]
+    fn cleanup_success_on_retry_removes_record() {
+        let reaper = CleanupReaper::new();
+        let groups: Groups = Arc::new(Mutex::new(Default::default()));
+        let pid = 106;
+        groups.lock().unwrap().insert(pid);
+        let mut first = true;
+        let result = cleanup_group_with_reaper(
+            &reaper,
+            pid,
+            &groups,
+            std::time::Duration::from_secs(2),
+            move || {
+                if first {
+                    first = false;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            },
+        )
+        .unwrap();
+        result
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(!groups.lock().unwrap().contains(&pid));
     }
 
     // pi#244: every charged input must release its memory budget, including a disconnected receiver's queue.
