@@ -7,6 +7,9 @@ export default mergeConfig(
 		test: {
 			globals: true,
 			environment: "node",
+			// Forge has two vCPUs; Vitest's default reserves one and serializes all files.
+			// Keep local worker selection unchanged and retain per-file isolation in CI.
+			maxWorkers: process.env.CI ? 2 : undefined,
 			testTimeout: 30000,
 			// Tests run offline by default; opt in with allowNetwork() from test/test-network-env.ts.
 			env: { PI_OFFLINE: "1" },
