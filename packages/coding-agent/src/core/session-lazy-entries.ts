@@ -1,4 +1,4 @@
-import { closeSync, openSync, readSync } from "fs";
+import { closeSync, fstatSync, openSync, readSync } from "fs";
 
 /**
  * Bounded session memory (smarty-dev#2177).
@@ -47,25 +47,47 @@ export function isColdEntry(entry: object): boolean {
 	return coldEntries.has(entry);
 }
 
-/** Read and parse one session line. The last line read is cached for consecutive field reads. */
-function readEntryLine(location: EntryLocation, id: unknown): Json {
+/**
+ * Read and parse one session line. The last line read is cached for consecutive field reads.
+ * `maxBytes` (smarty-dev#12074) refuses a line longer than the caller's remaining budget before
+ * the file is opened; the range is checked against the open file's size before allocation.
+ */
+function readEntryLine(location: EntryLocation, id: unknown, maxBytes?: number): Json {
 	if (lastRead?.location === location) return lastRead.value;
-	const buffer = Buffer.allocUnsafe(location.length);
+	const { file, offset, length } = location;
+	const changed = () =>
+		new Error(`Session file changed on disk: entry ${String(id)} is no longer at byte ${offset} of ${file}`);
+	if (
+		!Number.isSafeInteger(offset) ||
+		!Number.isSafeInteger(length) ||
+		offset < 0 ||
+		length <= 0 ||
+		!Number.isSafeInteger(offset + length)
+	) {
+		throw changed();
+	}
+	if (maxBytes !== undefined && length > maxBytes) {
+		throw new Error(`Session entry ${String(id)} exceeds the remaining export limit (${length} bytes)`);
+	}
 	let fd: number;
 	try {
-		fd = openSync(location.file, "r");
+		fd = openSync(file, "r");
 	} catch (error) {
-		throw new Error(`Session file changed on disk: cannot read entry ${String(id)} from ${location.file}`, {
+		throw new Error(`Session file changed on disk: cannot read entry ${String(id)} from ${file}`, {
 			cause: error,
 		});
 	}
+	let buffer: Buffer;
 	try {
+		if (offset + length > fstatSync(fd).size) throw changed();
+		buffer = Buffer.allocUnsafe(length);
 		let read = 0;
-		while (read < location.length) {
-			const n = readSync(fd, buffer, read, location.length - read, location.offset + read);
-			if (n === 0) break;
+		while (read < length) {
+			const n = readSync(fd, buffer, read, length - read, offset + read);
+			if (n <= 0) break;
 			read += n;
 		}
+		if (read !== length) throw changed();
 	} finally {
 		closeSync(fd);
 	}
@@ -75,10 +97,14 @@ function readEntryLine(location: EntryLocation, id: unknown): Json {
 	} catch {
 		value = undefined;
 	}
-	if (!value || value.id !== id) {
-		throw new Error(
-			`Session file changed on disk: entry ${String(id)} is no longer at byte ${location.offset} of ${location.file}`,
-		);
+	// Parsed JSON has only own data properties; read id by descriptor anyway.
+	if (
+		!value ||
+		typeof value !== "object" ||
+		Array.isArray(value) ||
+		Object.getOwnPropertyDescriptor(value, "id")?.value !== id
+	) {
+		throw changed();
 	}
 	lastRead = { location, value };
 	return value;
@@ -181,12 +207,19 @@ export function copyEntry<T extends object>(entry: T, patch: Partial<T>): T {
 	return copy as T;
 }
 
-/** Return a fully resident copy of a cold entry (parsed from its line), or the entry itself. */
-export function toHotEntry<T extends object>(entry: T): T {
+/**
+ * Return a fully resident copy of a cold entry (parsed from its line), or the entry itself.
+ * `maxBytes` refuses a longer line before it is read. The id is read by data descriptor only.
+ */
+export function toHotEntry<T extends object>(entry: T, maxBytes?: number): T {
 	if (!coldEntries.has(entry)) return entry;
 	const location = locations.get(entry)!;
+	const id = Object.getOwnPropertyDescriptor(entry, "id");
+	if (!id || !("value" in id) || typeof id.value !== "string") {
+		throw new TypeError("Cold session entry id must be a string data property");
+	}
 	if (lastRead?.location === location) lastRead = undefined;
-	const hot = readEntryLine(location, (entry as Json).id);
+	const hot = readEntryLine(location, id.value, maxBytes);
 	lastRead = undefined;
 	setEntryLocation(hot, location);
 	return hot as T;
