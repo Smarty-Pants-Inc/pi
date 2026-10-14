@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { fork } from "node:child_process";
+import { type ChildProcess, fork } from "node:child_process";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { connect, createServer } from "node:net";
@@ -81,34 +81,66 @@ const path = process.argv[2];
 const unlink = fs.unlink;
 fs.unlink = async (file) => {
     if (file === path) {
-        process.send("checked");
-        await new Promise((resolve) => process.once("message", resolve));
+        await new Promise((resolve) => {
+            process.once("message", resolve);
+            process.send("checked");
+        });
     }
     return unlink(file);
 };
 syncBuiltinESMExports();
 const server = createServer((socket) => socket.end());
+await new Promise((resolve) => {
+    process.once("message", resolve);
+    process.send("ready");
+});
 try {
     await listenSocket(server, path);
-    process.send("held");
     process.once("message", () => server.close(() => process.exit(0)));
+    process.send("held");
 } catch (error) {
-    process.send("blocked");
-    process.exit(0);
+    process.send("blocked", () => process.exit(0));
 }
 `);
-	const children = [
-		fork(fixture, [path], { execArgv: [], stdio: "pipe" }),
-		fork(fixture, [path], { execArgv: [], stdio: "pipe" }),
-	];
+	const children = Array.from({ length: 2 }, () => {
+		const child = fork(fixture, [path], { execArgv: [], stdio: "pipe" });
+		const starter = {
+			child,
+			ready: once(child, "message"),
+			exited: once(child, "exit"),
+			outcome: undefined as unknown,
+		};
+		child.on("message", (message) => {
+			if (message === "held" || message === "blocked") starter.outcome = message;
+		});
+		return starter;
+	});
+	const send = async (child: ChildProcess, message: string): Promise<boolean> => {
+		if (child.exitCode !== null || child.signalCode !== null || !child.connected) return false;
+		return new Promise((resolve) => child.send(message, (error) => resolve(!error)));
+	};
 	try {
-		const first = await Promise.all(children.map(async (child) => (await once(child, "message"))[0]));
+		await Promise.all(children.map(async (starter) => {
+			const ready = await Promise.race([starter.ready, starter.exited.then(() => [starter.outcome])]);
+			assert.equal(ready[0], "ready");
+		}));
+		const first = await Promise.all(children.map(async (starter) => {
+			const message = Promise.race([
+				once(starter.child, "message").then(([result]) => result),
+				starter.exited.then(() => starter.outcome),
+			]);
+			if (!await send(starter.child, "start")) await starter.exited;
+			return message;
+		}));
 		const results: unknown[] = [];
-		for (const [i, child] of children.entries()) {
+		for (const [i, starter] of children.entries()) {
 			if (first[i] === "checked") {
-				const result = once(child, "message");
-				child.send("unlink");
-				results.push((await result)[0]);
+				const result = Promise.race([
+					once(starter.child, "message").then(([message]) => message),
+					starter.exited.then(() => starter.outcome),
+				]);
+				if (!await send(starter.child, "unlink")) await starter.exited;
+				results.push(await result);
 			} else {
 				results.push(first[i]);
 			}
@@ -116,11 +148,12 @@ try {
 		assert.equal(results.filter((result) => result === "held").length, 1);
 		assert.equal(results.filter((result) => result === "blocked").length, 1);
 	} finally {
-		await Promise.all(children.map(async (child) => {
-			if (child.exitCode !== null) return;
-			const exited = once(child, "exit");
-			if (child.connected) child.send("close");
-			await exited;
+		await Promise.all(children.map(async (starter) => {
+			// A blocked starter exits on its own; sending "close" can race that exit.
+			if (starter.outcome !== "blocked") {
+				if (starter.outcome !== "held" || !await send(starter.child, "close")) starter.child.kill();
+			}
+			await starter.exited;
 		}));
 		rmSync(directory, { recursive: true, force: true });
 	}
