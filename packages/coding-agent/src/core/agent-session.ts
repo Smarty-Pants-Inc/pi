@@ -2731,7 +2731,7 @@ export class AgentSession {
 	/**
 	 * Prepare a run and return its starting messages: compact first when needed, emit
 	 * before_agent_start, apply the run's prompt options and tool loadout, and build the starting
-	 * message followed by pending nextTurn messages (consumed here) and handler messages, with a
+	 * message followed by pending nextTurn context for user starts and handler messages, with a
 	 * system patch first when the prompt changed.
 	 */
 	private async _prepareRun(
@@ -2789,9 +2789,11 @@ export class AgentSession {
 		// A switch or revocation during hooks/images must finish before consuming one-shot context.
 		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 		this._checkInputAdmission();
-		// Inject any pending "nextTurn" messages as context alongside the starting message
-		messages.push(...this._pendingNextTurnMessages);
-		this._pendingNextTurnMessages = [];
+		// pi#97: nextTurn context belongs to the next user prompt, not a custom-triggered run.
+		if (trigger.messageType === "user") {
+			messages.push(...this._pendingNextTurnMessages);
+			this._pendingNextTurnMessages = [];
+		}
 		for (const [index, msg] of result.messages.entries()) {
 			const message: CustomMessage = {
 				role: "custom",
@@ -3373,15 +3375,15 @@ export class AgentSession {
 				);
 			}
 
-			// An earlier prompt can still be in preflight, for example in pre-prompt compaction whose
-			// compaction_end flushes input queued during compaction. Queue behind it instead of
-			// racing it into the agent and failing with "Agent is already processing a prompt".
+			// pi#97: opted-in input queues behind earlier preflights; a plain SDK prompt may
+			// overtake a held input hook. Active runs still require a queue option.
 			this._promptPreflights.add(preflightToken);
 			const mustQueue = () =>
 				this.isStreaming ||
 				(submission?.ingress !== undefined && this._isEmittingAgentSettled) ||
 				this._modelSwitchCompactionPending ||
-				this._promptPreflights.values().next().value !== preflightToken;
+				(options?.streamingBehavior !== undefined &&
+					this._promptPreflights.values().next().value !== preflightToken);
 
 			// Emit input event for extension interception (before skill/template expansion)
 			const processedInput = await this._runInputHandlers(

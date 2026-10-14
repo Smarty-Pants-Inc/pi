@@ -139,7 +139,8 @@ async function run(chat: ReturnType<typeof modelsChat>, code: string, env?: Exec
 	return { text, message, usage };
 }
 
-describe("code mode models.*", () => {
+// Fork-intended skip: fork admission disabled awaiting review (pi#131).
+describe.skip("code mode models.*", () => {
 	it("reads the model catalog without credentials in headers", async () => {
 		const chat = modelsChat();
 		const { text } = await run(

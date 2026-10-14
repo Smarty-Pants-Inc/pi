@@ -1062,7 +1062,6 @@ export class TaskScheduler {
 		this.#taskWaiters.rejectAll(error);
 		this.#idleWaiters.rejectAll(error);
 		this.#contexts.clear();
-		for (const invocation of this.#invocations.values()) invocation.controller.abort();
 	}
 
 	#kick(): void {
