@@ -24,7 +24,8 @@ vi.mock("../../../src/modes/rpc/jsonl.ts", () => ({
 	serializeJsonLine: (value: unknown) => `${JSON.stringify(value)}\n`,
 }));
 
-const disconnect = "stream error: stream disconnected before completion: stream closed before response.completed";
+// smarty-dev#11900: the exact Codex wording is covered by dedicated tests; this suite keeps generic retry policy coverage.
+const disconnect = "stream closed before response.completed";
 type NodeListener = Parameters<typeof process.on>[1];
 
 // smarty-dev#3200: exercise actual print/RPC subscribers, session recovery and the faux provider.
