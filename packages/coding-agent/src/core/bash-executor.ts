@@ -6,13 +6,10 @@
  * - Direct calls from modes that need bash execution
  */
 
-import type { WriteStream } from "node:fs";
-import { finished } from "node:stream/promises";
 import { splitIncompleteAnsiSuffix, stripAnsi } from "../utils/ansi.ts";
-import { createOutputFileStream } from "../utils/output-files.ts";
 import { sanitizeBinaryOutput } from "../utils/shell.ts";
 import type { BashOperations } from "./tools/bash.ts";
-import { DEFAULT_MAX_BYTES, truncateTail } from "./tools/truncate.ts";
+import { OutputAccumulator } from "./tools/output-accumulator.ts";
 
 // ============================================================================
 // Types
@@ -52,25 +49,9 @@ export async function executeBashWithOperations(
 	operations: BashOperations,
 	options?: BashExecutorOptions,
 ): Promise<BashResult> {
-	const outputChunks: string[] = [];
-	let outputBytes = 0;
-	const maxOutputBytes = DEFAULT_MAX_BYTES * 2;
-
-	let tempFilePath: string | undefined;
-	let tempFileStream: WriteStream | undefined;
-	let tempFileCompletion: Promise<Error | undefined> | undefined;
-	let totalBytes = 0;
-
-	const ensureTempFile = () => {
-		if (tempFilePath) return;
-		({ path: tempFilePath, stream: tempFileStream } = createOutputFileStream("pi-bash", ".log"));
-		// Capture even early open errors, then report them after execution has been joined.
-		tempFileCompletion = finished(tempFileStream).then(
-			() => undefined,
-			(error: Error) => error,
-		);
-		for (const chunk of outputChunks) tempFileStream.write(chunk);
-	};
+	// The accumulator receives sanitized text, so its display tail and its capped log both hold
+	// the sanitized output, as before.
+	const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
 
 	const decoder = new TextDecoder();
 	// Unfinished escape sequence at the end of the previous chunk, completed by the next chunk.
@@ -80,26 +61,18 @@ export async function executeBashWithOperations(
 		// Sanitize: strip ANSI, replace binary garbage, normalize newlines
 		const text = sanitizeBinaryOutput(stripAnsi(rawText)).replace(/\r/g, "");
 		if (!text) return;
-		if (totalBytes > DEFAULT_MAX_BYTES) ensureTempFile();
-		if (tempFileStream) tempFileStream.write(text);
-		outputChunks.push(text);
-		outputBytes += text.length;
-		while (outputBytes > maxOutputBytes && outputChunks.length > 1) {
-			const removed = outputChunks.shift()!;
-			outputBytes -= removed.length;
-		}
+		output.append(Buffer.from(text, "utf-8"));
 		options?.onChunk?.(text);
 	};
 
 	const onData = (data: Buffer) => {
-		totalBytes += data.length;
 		const { complete, pending } = splitIncompleteAnsiSuffix(pendingAnsi + decoder.decode(data, { stream: true }));
 		pendingAnsi = pending;
 		appendText(complete);
 	};
 
 	let bashResult: BashResult;
-	let tempFileError: Error | undefined;
+	let tempFileError: unknown;
 	try {
 		let exitCode: number | null = null;
 		try {
@@ -111,21 +84,28 @@ export async function executeBashWithOperations(
 		const rest = pendingAnsi + decoder.decode();
 		pendingAnsi = "";
 		appendText(rest);
-		const fullOutput = outputChunks.join("");
-		const truncationResult = truncateTail(fullOutput);
-		if (truncationResult.truncated) ensureTempFile();
+		output.finish();
+		const snapshot = output.snapshot({ persistIfTruncated: true });
 		const cancelled = options?.signal?.aborted ?? false;
+		let text = snapshot.content;
+		const logTruncation = snapshot.fullOutputTruncation;
+		if (logTruncation && snapshot.fullOutputPath) {
+			// Session and RPC copies keep only the output text, so the notice must live in it.
+			text += `\n\n[Full output log capped: ${logTruncation.omittedBytes} of ${logTruncation.totalBytes} bytes omitted from ${snapshot.fullOutputPath}]`;
+		}
 		bashResult = {
-			output: truncationResult.truncated ? truncationResult.content : fullOutput,
+			output: text,
 			exitCode: cancelled ? undefined : (exitCode ?? undefined),
 			cancelled,
-			truncated: truncationResult.truncated,
-			fullOutputPath: tempFilePath,
+			truncated: snapshot.truncation.truncated,
+			fullOutputPath: snapshot.fullOutputPath,
 		};
 	} finally {
-		if (tempFileStream) {
-			tempFileStream.end();
-			tempFileError = await tempFileCompletion;
+		// Always flush and close the log, also after errors and cancellation.
+		try {
+			await output.closeTempFile();
+		} catch (error) {
+			tempFileError = error;
 		}
 	}
 	if (tempFileError) throw tempFileError;

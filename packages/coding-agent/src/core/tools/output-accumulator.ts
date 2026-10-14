@@ -10,10 +10,24 @@ export interface OutputAccumulatorOptions {
 	tempFilePrefix?: string;
 }
 
+/** Raw bytes of the start of the output kept in the full-output log. */
+export const FULL_OUTPUT_HEAD_BYTES = 4 * 1024 * 1024;
+/** Raw bytes of the end of the output kept in the full-output log. */
+export const FULL_OUTPUT_TAIL_BYTES = 4 * 1024 * 1024;
+
+export interface FullOutputTruncation {
+	/** Raw bytes the command produced. */
+	totalBytes: number;
+	/** Raw bytes left out of the full-output log between its head and tail. */
+	omittedBytes: number;
+}
+
 export interface OutputSnapshot {
 	content: string;
 	truncation: TruncationResult;
 	fullOutputPath?: string;
+	/** Present only when the full-output log omits part of the output. */
+	fullOutputTruncation?: FullOutputTruncation;
 }
 
 export interface FullOutput {
@@ -31,7 +45,11 @@ function byteLength(text: string): number {
  *
  * Appends decode chunks with a streaming UTF-8 decoder, keeps only a decoded
  * tail for display snapshots, and opens a temp file when the full output needs
- * to be preserved.
+ * to be preserved. The temp file is capped: it streams the first
+ * {@link FULL_OUTPUT_HEAD_BYTES} raw bytes, keeps the last
+ * {@link FULL_OUTPUT_TAIL_BYTES} in memory, and writes them on close after a
+ * marker naming the omitted byte count. Output that fits both is written
+ * byte-identically.
  */
 export class OutputAccumulator {
 	private readonly maxLines: number;
@@ -55,6 +73,12 @@ export class OutputAccumulator {
 	private tempFilePath: string | undefined;
 	private tempFileStream: WriteStream | undefined;
 	private tempFileCompletion: Promise<Error | undefined> | undefined;
+	/** Raw bytes routed to the log so far (head written plus tail candidates). */
+	private logRoutedBytes = 0;
+	private logHead: Buffer | undefined;
+	private logTail: Buffer | undefined;
+	private logTailBytes = 0;
+	private logTailNext = 0;
 
 	constructor(options: OutputAccumulatorOptions = {}) {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -71,11 +95,12 @@ export class OutputAccumulator {
 		this.totalRawBytes += data.length;
 		this.appendDecodedText(this.decoder.decode(data, { stream: true }));
 
-		if (this.tempFileStream || this.shouldUseTempFile()) {
+		if (this.tempFilePath || this.shouldUseTempFile()) {
 			this.ensureTempFile();
-			this.tempFileStream?.write(data);
+			this.routeToLog(data);
 		} else if (data.length > 0) {
-			this.rawChunks.push(data);
+			// Copy so a small view cannot pin a larger input buffer.
+			this.rawChunks.push(Buffer.from(data));
 		}
 	}
 
@@ -113,10 +138,12 @@ export class OutputAccumulator {
 			this.ensureTempFile();
 		}
 
+		const fullOutputTruncation = this.getFullOutputTruncation();
 		return {
 			content: truncation.content,
 			truncation,
 			fullOutputPath: this.tempFilePath,
+			...(fullOutputTruncation ? { fullOutputTruncation } : {}),
 		};
 	}
 
@@ -128,6 +155,23 @@ export class OutputAccumulator {
 		const stream = this.tempFileStream;
 		this.tempFileStream = undefined;
 
+		const truncation = this.getFullOutputTruncation();
+		if (!stream.destroyed) {
+			if (this.logHead) stream.write(this.logHead.subarray(0, this.logRoutedBytes));
+			if (truncation) {
+				stream.write(
+					`\n\n[... ${truncation.omittedBytes} bytes omitted from this log (output was ${truncation.totalBytes} bytes; first ${FULL_OUTPUT_HEAD_BYTES} and last ${FULL_OUTPUT_TAIL_BYTES} bytes kept) ...]\n\n`,
+				);
+			}
+			if (this.logTail) {
+				const start = this.logTailBytes === FULL_OUTPUT_TAIL_BYTES ? this.logTailNext : 0;
+				stream.write(this.logTail.subarray(start, this.logTailBytes));
+				if (start > 0) stream.write(this.logTail.subarray(0, start));
+			}
+		}
+		this.logHead = undefined;
+		this.logTail = undefined;
+		this.logTailBytes = 0;
 		stream.end();
 		const error = await this.tempFileCompletion;
 		if (error) throw error;
@@ -136,7 +180,8 @@ export class OutputAccumulator {
 	/**
 	 * The complete output, for callers that can take more than the display snapshot. Call after
 	 * `finish()` and `closeTempFile()`. Output longer than `maxBytes` raw bytes keeps its first and
-	 * last `maxBytes / 2` bytes around an omission marker.
+	 * last `maxBytes / 2` bytes around an omission marker. When the log itself omits bytes, the
+	 * result is truncated and the omitted count refers to the original raw output.
 	 */
 	async readFullOutput(maxBytes: number): Promise<FullOutput> {
 		if (!this.tempFilePath) {
@@ -145,11 +190,18 @@ export class OutputAccumulator {
 		const file = await open(this.tempFilePath, "r");
 		try {
 			const size = (await file.stat()).size;
+			const logTruncation = this.getFullOutputTruncation();
 			if (size <= maxBytes) {
-				return { content: new TextDecoder().decode(await file.readFile()), truncated: false };
+				const content = new TextDecoder().decode(await file.readFile());
+				return { content, truncated: logTruncation !== undefined };
 			}
-			const headBytes = Math.floor(maxBytes / 2);
-			const tailBytes = maxBytes - headBytes;
+			let headBytes = Math.floor(maxBytes / 2);
+			let tailBytes = maxBytes - headBytes;
+			if (logTruncation) {
+				// Read only the kept head and tail, never the log's marker.
+				headBytes = Math.min(headBytes, FULL_OUTPUT_HEAD_BYTES, size);
+				tailBytes = Math.min(tailBytes, FULL_OUTPUT_TAIL_BYTES, size - headBytes);
+			}
 			const head = Buffer.alloc(headBytes);
 			const tail = Buffer.alloc(tailBytes);
 			await file.read(head, 0, headBytes, 0);
@@ -160,7 +212,7 @@ export class OutputAccumulator {
 			let tailStart = 0;
 			while (tailStart < tail.length && (tail[tailStart] & 0xc0) === 0x80) tailStart++;
 			const tailText = new TextDecoder().decode(tail.subarray(tailStart));
-			const omitted = size - headBytes - tailBytes;
+			const omitted = (logTruncation ? logTruncation.totalBytes : size) - headBytes - tailBytes;
 			return { content: `${headText}\n\n[... ${omitted} bytes omitted ...]\n\n${tailText}`, truncated: true };
 		} finally {
 			await file.close();
@@ -230,8 +282,50 @@ export class OutputAccumulator {
 
 	private shouldUseTempFile(): boolean {
 		return (
-			this.totalRawBytes > this.maxBytes || this.totalDecodedBytes > this.maxBytes || this.totalLines > this.maxLines
+			this.totalRawBytes > this.maxBytes ||
+			this.totalDecodedBytes > this.maxBytes ||
+			this.totalLines > this.maxLines ||
+			// Bound bytes and chunk metadata even when the display limits are huge.
+			this.totalRawBytes > FULL_OUTPUT_HEAD_BYTES ||
+			this.rawChunks.length >= 1024
 		);
+	}
+
+	private getFullOutputTruncation(): FullOutputTruncation | undefined {
+		const omittedBytes = this.totalRawBytes - FULL_OUTPUT_HEAD_BYTES - FULL_OUTPUT_TAIL_BYTES;
+		if (!this.tempFilePath || omittedBytes <= 0) return undefined;
+		return { totalBytes: this.totalRawBytes, omittedBytes };
+	}
+
+	/** Fixed buffers bound payload and object overhead, including millions of tiny source chunks. */
+	private routeToLog(data: Buffer): void {
+		if (data.length === 0) return;
+		let rest = data;
+		const headRoom = FULL_OUTPUT_HEAD_BYTES - this.logRoutedBytes;
+		if (headRoom > 0) {
+			const head = rest.subarray(0, headRoom);
+			this.logHead ??= Buffer.allocUnsafe(FULL_OUTPUT_HEAD_BYTES);
+			head.copy(this.logHead, this.logRoutedBytes);
+			rest = rest.subarray(head.length);
+			if (head.length === headRoom) {
+				this.tempFileStream?.write(this.logHead);
+				this.logHead = undefined;
+			}
+		}
+		this.logRoutedBytes += data.length;
+		if (rest.length === 0) return;
+		this.logTail ??= Buffer.allocUnsafe(FULL_OUTPUT_TAIL_BYTES);
+		if (rest.length >= FULL_OUTPUT_TAIL_BYTES) {
+			rest.copy(this.logTail, 0, rest.length - FULL_OUTPUT_TAIL_BYTES);
+			this.logTailBytes = FULL_OUTPUT_TAIL_BYTES;
+			this.logTailNext = 0;
+			return;
+		}
+		const first = Math.min(rest.length, FULL_OUTPUT_TAIL_BYTES - this.logTailNext);
+		rest.copy(this.logTail, this.logTailNext, 0, first);
+		if (first < rest.length) rest.copy(this.logTail, 0, first);
+		this.logTailNext = (this.logTailNext + rest.length) % FULL_OUTPUT_TAIL_BYTES;
+		this.logTailBytes = Math.min(this.logTailBytes + rest.length, FULL_OUTPUT_TAIL_BYTES);
 	}
 
 	private ensureTempFile(): void {
@@ -246,9 +340,10 @@ export class OutputAccumulator {
 			() => undefined,
 			(error: Error) => error,
 		);
-		for (const chunk of this.rawChunks) {
-			this.tempFileStream.write(chunk);
-		}
+		const chunks = this.rawChunks;
 		this.rawChunks = [];
+		for (const chunk of chunks) {
+			this.routeToLog(chunk);
+		}
 	}
 }
