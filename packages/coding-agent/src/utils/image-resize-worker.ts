@@ -19,25 +19,25 @@ function isResizeImageWorkerRequest(value: unknown): value is ResizeImageWorkerR
 }
 
 const port = parentPort;
-if (!port) {
-	throw new Error("image resize worker requires parentPort");
-}
-
-port.once("message", (message: unknown) => {
-	void (async () => {
-		try {
-			if (!isResizeImageWorkerRequest(message)) {
-				throw new Error("Invalid image resize worker request");
+// ponytail: extension discovery can select this file on the main thread. Do not create a
+// module-evaluation Error whose cached native import failure can retain an old session (#10720).
+if (port) {
+	port.once("message", (message: unknown) => {
+		void (async () => {
+			try {
+				if (!isResizeImageWorkerRequest(message)) {
+					throw new Error("Invalid image resize worker request");
+				}
+				const result = await resizeImageInProcess(message.inputBytes, message.mimeType, message.options);
+				const response: ResizeImageWorkerResponse = { type: IMAGE_RESIZE_WORKER_RESPONSE_TYPE, result };
+				port.postMessage(response);
+			} catch (error) {
+				const response: ResizeImageWorkerResponse = {
+					type: IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
+					error: error instanceof Error ? error.message : String(error),
+				};
+				port.postMessage(response);
 			}
-			const result = await resizeImageInProcess(message.inputBytes, message.mimeType, message.options);
-			const response: ResizeImageWorkerResponse = { type: IMAGE_RESIZE_WORKER_RESPONSE_TYPE, result };
-			port.postMessage(response);
-		} catch (error) {
-			const response: ResizeImageWorkerResponse = {
-				type: IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
-				error: error instanceof Error ? error.message : String(error),
-			};
-			port.postMessage(response);
-		}
-	})();
-});
+		})();
+	});
+}
