@@ -1,7 +1,7 @@
 // Host manager (Node only): runs a child host process and keeps at most one instance of it alive.
 import { type ChildProcess, fork } from "node:child_process";
 import { createHash } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { closeSync, openSync, unlinkSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -76,7 +76,8 @@ export interface ForkDriverOptions {
 /**
  * A process lock owned by the kernel for the holder's lifetime: an abstract socket (Linux, Android) or a named pipe
  * (Windows) vanishes with its process, so there is no stale state to take over and no race between two would-be
- * owners. Other platforms need a socket file, removed on exit; a leftover one nobody accepts on is taken over.
+ * owners. Other platforms need a socket file, guarded by an exclusive file before any stale socket takeover.
+ * The guard is removed on close or normal exit; after an unclean exit it must be removed manually, never raced over.
  * The child acquires it (before opening storage), so the lock follows the process that owns the data.
  */
 export async function processLock(name: string): Promise<() => Promise<void>> {
@@ -89,36 +90,65 @@ export async function processLock(name: string): Promise<() => Promise<void>> {
 				? join(tmpdir(), `chord2-${key}.sock`)
 				: `\0chord2-${key}`;
 	const server = createServer((socket) => socket.end());
-	for (;;) {
+	const guard = `${address}.lock`;
+	let descriptor: number | undefined;
+	if (file) {
 		try {
-			await new Promise<void>((resolve, reject) => {
-				server.once("error", reject);
-				server.listen(address, () => {
-					server.removeListener("error", reject);
-					resolve();
-				});
-			});
-			break;
+			descriptor = openSync(guard, "wx", 0o600);
 		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
-			if (!file || (await accepting(address))) {
-				throw new ChordError("unavailable", `lock ${name} is held by another process`, { reason: "locked" });
-			}
-			await rm(address, { force: true });
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			throw new ChordError("unavailable", `lock ${name} is held by another process`, { reason: "locked" });
 		}
 	}
+	const removeGuard = (): void => {
+		if (descriptor === undefined) return;
+		try {
+			unlinkSync(guard);
+		} finally {
+			closeSync(descriptor);
+			descriptor = undefined;
+		}
+	};
 	const removeFile = (): void => {
 		try {
-			unlinkSync(address);
-		} catch {
-			// Already gone.
+			if (server.listening) unlinkSync(address);
+		} finally {
+			removeGuard();
 		}
 	};
 	if (file) process.once("exit", removeFile);
+	try {
+		for (;;) {
+			try {
+				await new Promise<void>((resolve, reject) => {
+					server.once("error", reject);
+					server.listen(address, () => {
+						server.removeListener("error", reject);
+						resolve();
+					});
+				});
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EADDRINUSE") throw error;
+				if (!file || (await accepting(address))) {
+					throw new ChordError("unavailable", `lock ${name} is held by another process`, { reason: "locked" });
+				}
+				await rm(address, { force: true });
+			}
+		}
+	} catch (error) {
+		if (file) process.removeListener("exit", removeFile);
+		removeGuard();
+		throw error;
+	}
 	return () =>
 		new Promise<void>((resolve, reject) => {
-			if (file) process.removeListener("exit", removeFile);
-			server.close((error) => (error ? reject(error) : resolve()));
+			server.close((error) => {
+				if (file) process.removeListener("exit", removeFile);
+				removeGuard();
+				if (error) reject(error);
+				else resolve();
+			});
 		});
 }
 
