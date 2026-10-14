@@ -18,6 +18,8 @@ type SubmitContext = {
 	dispatchEditorInput(this: SubmitContext, input: ReceivedInput): Promise<void>;
 	submitEditorInput(this: SubmitContext, input: ReceivedInput): void;
 	flushPendingBashComponents: () => void;
+	/** No Herdr enrollment in these tests (smarty-dev#2636). */
+	captureHerdrSubmit: () => undefined;
 	onInputCallback?: (input: ReceivedInput) => void;
 	pendingUserInputs: ReceivedInput[];
 };
@@ -62,6 +64,7 @@ function createSubmitContext(): SubmitContext {
 		dispatchEditorInput: interactiveModePrototype.dispatchEditorInput,
 		submitEditorInput: interactiveModePrototype.submitEditorInput,
 		flushPendingBashComponents: vi.fn(),
+		captureHerdrSubmit: () => undefined,
 		pendingUserInputs: [],
 	};
 }
