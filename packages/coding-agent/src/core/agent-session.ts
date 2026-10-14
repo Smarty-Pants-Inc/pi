@@ -41,6 +41,7 @@ import {
 	getCurrentSystemMessage,
 	hasAssistantOutput,
 	isPrematureStreamError,
+	isRetryableCodexStreamDisconnect,
 	observeAssistantMessage,
 	observeAssistantStreamEvent,
 	type RetryPolicy,
@@ -602,6 +603,10 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	/** One replay of the exact Codex disconnect per request, independent of ordinary retry attempts. */
+	private _codexStreamDisconnectRetryUsed = false;
+	/** Sticky until turn_start: synthetic failure messages belong to the same response. */
+	private _assistantToolExecutionStarted = false;
 	private _retryFallbackUsed = false;
 	/** Only the first alternate request in the current recovery episode is one-shot. */
 	private _retryFallbackInFlight = false;
@@ -1609,6 +1614,10 @@ export class AgentSession {
 			this._assistantOutputObserved = false;
 			this._assistantStreamObserved = createAssistantStreamObservation();
 			this._heldReasoningUpdates = [];
+			this._assistantToolExecutionStarted = false;
+		} else if (event.type === "tool_execution_start") {
+			// Record before extensions or listeners can throw and produce a synthetic failure.
+			this._assistantToolExecutionStarted = true;
 		}
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
 			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
@@ -1663,6 +1672,7 @@ export class AgentSession {
 			const ingress = this._ingressQueuedMessages.get(event.message);
 			this._ingressQueuedMessages.delete(event.message);
 			this._overflowRecoveryAttempted = false;
+			this._codexStreamDisconnectRetryUsed = false;
 			const messageText = contentText(event.message.content, "");
 			// Empty text is valid for image-only queued input. Delivery is not truthiness.
 			// Check steering queue first; ingress input is always a follow-up with an exact display slot.
@@ -1799,6 +1809,9 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
+				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+					this._codexStreamDisconnectRetryUsed = false;
+				}
 				const fallbackSucceeded =
 					this._retryFallbackInFlight &&
 					(assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse");
@@ -1841,6 +1854,7 @@ export class AgentSession {
 		if (!this._assistantOutputObserved && !hasAssistantOutput(message) && throttledLimitWait(message)) return true;
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || !this._isRetryableError(message)) return false;
+		if (isRetryableCodexStreamDisconnect(message)) return settings.maxRetries > 0;
 		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
 
@@ -2599,6 +2613,7 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		this._retryFallbackUsed = false;
 		this._retryFallbackInFlight = false;
+		this._codexStreamDisconnectRetryUsed = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -2711,9 +2726,11 @@ export class AgentSession {
 			this._retryFallbackInFlight = false;
 		}
 
-		// The one-shot alternate and failed throttle retry cannot recover through compaction either.
+		// Final one-shot failures cannot gain another replay through compaction.
 		const compaction =
-			fallbackAttempt || (throttleWaitUsed && message.stopReason === "error")
+			fallbackAttempt ||
+			(throttleWaitUsed && message.stopReason === "error") ||
+			isRetryableCodexStreamDisconnect(message)
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -5992,6 +6009,11 @@ export class AgentSession {
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
+		// smarty-dev#11900: discard this exact partial response once, but never replay executed tools.
+		// Return directly when its allowance is spent so ordinary retries and fallback cannot take over.
+		if (isRetryableCodexStreamDisconnect(message)) {
+			return !this._assistantToolExecutionStarted && !this._codexStreamDisconnectRetryUsed;
+		}
 		// Never restart a request once output or a tool call has been streamed, except reasoning-only
 		// output on a premature close (smarty-dev#6730). The classifier below checks the message itself.
 		// The stream observation also covers a terminal message whose streamed content the provider dropped.
@@ -6057,6 +6079,15 @@ export class AgentSession {
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || this._retryFallbackInFlight) {
 			return false;
+		}
+
+		if (isRetryableCodexStreamDisconnect(message)) {
+			if (settings.maxRetries <= 0 || this._assistantToolExecutionStarted || this._codexStreamDisconnectRetryUsed) {
+				return false;
+			}
+			this._codexStreamDisconnectRetryUsed = true;
+			this._retryAttempt++;
+			return this._waitAndRetry(message, retryDelayMs(settings, 1), this._retryAttempt);
 		}
 
 		this._retryAttempt++;
