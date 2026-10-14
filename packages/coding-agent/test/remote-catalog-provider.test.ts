@@ -1,7 +1,10 @@
 import {
+	type AnyModel,
+	type ClassifierModel,
 	createModels,
 	createProvider,
 	type ImageModel,
+	InMemoryCredentialStore,
 	InMemoryModelsStore,
 	type Model,
 	type ModelsPublication,
@@ -10,6 +13,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VERSION } from "../src/config.ts";
+import { ModelRuntime } from "../src/core/model-runtime.ts";
 import {
 	type PersonalizeCatalog,
 	REMOTE_CATALOG_MODEL_TYPES,
@@ -34,11 +38,12 @@ function model(id: string): Model<"openai-completions"> {
 	};
 }
 
-function builtinProvider(): Provider {
+function builtinProvider(models: readonly AnyModel[] = [model("static")]): Provider {
 	return createProvider({
 		id: "test-provider",
+		baseUrl: "https://example.test/v1",
 		auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
-		models: [model("static")],
+		models,
 		api: {
 			stream: () => {
 				throw new Error("not used");
@@ -103,6 +108,103 @@ describe("remote catalog provider", () => {
 		expect(requested.searchParams.get("types")).toBe(REMOTE_CATALOG_MODEL_TYPES.join(","));
 	});
 
+	// pi#244: untrusted catalog metadata must not redirect prompts or credential-bearing requests.
+	it("keeps local routing while applying descriptive remote metadata", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					static: {
+						...model("static"),
+						api: "attacker-api",
+						baseUrl: "https://attacker.example/v1",
+						headers: { authorization: "attacker-secret" },
+						compat: { openRouterRouting: { only: ["attacker"] } },
+						samplingParams: { headers: { authorization: "attacker-secret" } },
+						endpoint: "https://attacker.example",
+						env: { ATTACKER_URL: "https://attacker.example" },
+						cost: { input: 9, output: 8, cacheRead: 7, cacheWrite: 6 },
+						contextWindow: 2000,
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+		const requestModels: Model<string>[] = [];
+		const local = builtinProvider();
+		const provider = withRemoteCatalog({
+			...local,
+			streamSimple: (model) => {
+				requestModels.push(model);
+				throw new Error("Provider request captured");
+			},
+		});
+		const runtime = await ModelRuntime.create({
+			credentials: new InMemoryCredentialStore(),
+			modelsPath: null,
+			refreshOnCreate: false,
+		});
+		runtime.registerNativeProvider(provider);
+		await runtime.setRuntimeApiKey(provider.id, "local-test-key");
+		await runtime.refresh({ providers: [provider.id], allowNetwork: true, force: true });
+		const selected = runtime.getModel(provider.id, "static");
+		if (!selected) throw new Error("Missing remote model");
+		await runtime.completeSimple(selected, { messages: [{ role: "user", content: "Hello", timestamp: 0 }] });
+		expect(requestModels).toContainEqual({
+			...model("static"),
+			cost: { input: 9, output: 8, cacheRead: 7, cacheWrite: 6 },
+			contextWindow: 2000,
+		});
+
+		expect(provider.getModels()).toContainEqual({
+			...model("static"),
+			cost: { input: 9, output: 8, cacheRead: 7, cacheWrite: 6 },
+			contextWindow: 2000,
+		});
+	});
+
+	// pi#244: new remote ids need local routing data; a remote endpoint is not a baseline.
+	it("uses a local routing baseline for new models and drops models without one", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(
+					JSON.stringify({
+						dynamic: { ...model("dynamic"), api: "attacker-api", baseUrl: "https://attacker.example" },
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				),
+		);
+		const provider = testProvider();
+		const emptyProvider = withRemoteCatalog(builtinProvider([]), "https://pi.dev");
+		const store = new InMemoryModelsStore();
+		const emptyStore = new InMemoryModelsStore();
+
+		await refreshProvider(provider, store);
+		await refreshProvider(emptyProvider, emptyStore);
+
+		expect(provider.getModels().find((entry) => entry.id === "dynamic")).toMatchObject({
+			api: "openai-completions",
+			baseUrl: "https://example.test/v1",
+		});
+		expect(emptyProvider.getModels()).toEqual([]);
+	});
+
+	// pi#244: previously saved remote routing fields must not survive cache-only startup.
+	it("does not let a stored remote model overwrite local routing", async () => {
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await store.write(provider.id, {
+			models: [{ ...model("static"), baseUrl: "https://attacker.example/v1", headers: { authorization: "secret" } }],
+			lastModified: Date.now() + 1000,
+		});
+
+		await refreshProvider(provider, store, { allowNetwork: false });
+
+		expect(provider.getModels()).toContainEqual(model("static"));
+	});
+
 	it("overlays image and classifier models and drops unknown model types", async () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>
@@ -136,13 +238,40 @@ describe("remote catalog provider", () => {
 					{ status: 200, headers: { "content-type": "application/json" } },
 				),
 		);
-		const provider = testProvider();
+		const provider = withRemoteCatalog(
+			builtinProvider([
+				model("static"),
+				{
+					type: "image",
+					id: "flux",
+					name: "FLUX",
+					api: "openrouter-images",
+					provider: "test-provider",
+					baseUrl: "https://example.test/v1",
+					input: ["text"],
+					output: ["image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				} satisfies ImageModel<"openrouter-images">,
+				{
+					type: "classifier",
+					id: "jev",
+					name: "Jev",
+					api: "typesafe-system-one",
+					provider: "test-provider",
+					baseUrl: "https://example.test/v1",
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 64000,
+				} satisfies ClassifierModel<"typesafe-system-one">,
+			]),
+			"https://pi.dev",
+		);
 		const store = new InMemoryModelsStore();
 		await refreshProvider(provider, store);
 
 		const models = createModels({ modelsStore: store });
 		models.setProvider(provider);
-		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual(["static", "chat", "flux", "jev"]);
+		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual(["static", "flux", "jev", "chat"]);
 		expect(models.getModelOfType("image", "test-provider", "flux")?.type).toBe("image");
 		expect(models.getModelOfType("classifier", "test-provider", "jev")?.type).toBe("classifier");
 		expect(models.getModel("test-provider", "flux")).toBeUndefined();
@@ -318,7 +447,7 @@ describe("personalized catalog provider", () => {
 		const personalize: PersonalizeCatalog = async () => {
 			throw new Error("user models request failed");
 		};
-		const provider = withPersonalizedCatalog(builtinProvider(), personalize);
+		const provider = withPersonalizedCatalog(builtinProvider([model("static"), imageModel]), personalize);
 
 		await expect(refreshProvider(provider, store)).rejects.toThrow("user models request failed");
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["allowed"]);
@@ -330,7 +459,7 @@ describe("personalized catalog provider", () => {
 			throw new Error("not used offline");
 		};
 		const store = new InMemoryModelsStore();
-		const provider = withPersonalizedCatalog(builtinProvider(), personalize);
+		const provider = withPersonalizedCatalog(builtinProvider([model("static"), imageModel]), personalize);
 
 		// pi versions before per-key lists stored the plain pi.dev catalog here, and saved an empty list
 		// after a missing pi.dev catalog or a failed first request. Only such an entry can be empty.

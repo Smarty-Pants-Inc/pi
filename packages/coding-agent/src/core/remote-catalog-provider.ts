@@ -29,13 +29,79 @@ function isSupportedModelType(model: { type?: unknown }): boolean {
 	);
 }
 
+type CatalogEntry = Record<string, unknown>;
+
+const DESCRIPTIVE_MODEL_FIELDS = [
+	"id",
+	"name",
+	"type",
+	"reasoning",
+	"thinkingLevelMap",
+	"input",
+	"inputLimits",
+	"cost",
+	"promptCache",
+	"contextWindow",
+	"maxTokens",
+	"output",
+] as const;
+
+function catalogModelType(model: CatalogEntry): ModelType | undefined {
+	if (model.type === undefined) return "chat";
+	return typeof model.type === "string" && REMOTE_CATALOG_MODEL_TYPES.includes(model.type as ModelType)
+		? (model.type as ModelType)
+		: undefined;
+}
+
+/** Keep only remote metadata and take every request-affecting field from local provider data. */
+function sanitizeCatalogModel(provider: Provider, model: CatalogEntry): AnyModel | undefined {
+	const type = catalogModelType(model);
+	if (!type || typeof model.id !== "string") return undefined;
+	const localModels = provider.getAllModels?.() ?? provider.getModels();
+	const baseline = localModels.find((candidate) => getModelType(candidate) === type && candidate.id === model.id);
+	const fallback = baseline ?? localModels.find((candidate) => getModelType(candidate) === type);
+	if (!fallback) return undefined;
+	const routingBaseline = baseline ?? { ...fallback, baseUrl: provider.baseUrl ?? fallback.baseUrl };
+	const descriptive: CatalogEntry = {};
+	for (const field of DESCRIPTIVE_MODEL_FIELDS) {
+		if (Object.hasOwn(model, field)) descriptive[field] = model[field];
+	}
+	return { ...routingBaseline, ...descriptive, provider: provider.id } as AnyModel;
+}
+
 function mergeModels<TModel extends AnyModel>(baseline: readonly TModel[], dynamic: readonly TModel[]): TModel[] {
 	const merged = new Map<string, TModel>();
-	for (const model of [...baseline, ...dynamic]) merged.set(`${getModelType(model)}\0${model.id}`, model);
+	for (const model of baseline) merged.set(`${getModelType(model)}\0${model.id}`, model);
+	for (const model of dynamic) {
+		const key = `${getModelType(model)}\0${model.id}`;
+		const existing = merged.get(key);
+		if (!existing) {
+			merged.set(key, model);
+			continue;
+		}
+		const safeModel =
+			isModelType(existing, "chat") && isModelType(model, "chat")
+				? {
+						...model,
+						provider: existing.provider,
+						api: existing.api,
+						baseUrl: existing.baseUrl,
+						headers: existing.headers,
+						compat: existing.compat,
+					}
+				: {
+						...model,
+						provider: existing.provider,
+						api: existing.api,
+						baseUrl: existing.baseUrl,
+						headers: existing.headers,
+					};
+		merged.set(key, safeModel as TModel);
+	}
 	return [...merged.values()];
 }
 
-function parseCatalog(providerId: string, value: unknown): AnyModel[] {
+function parseCatalog(provider: Provider, value: unknown): AnyModel[] {
 	const entries = Array.isArray(value)
 		? value
 		: typeof value === "object" && value !== null && "models" in value && Array.isArray(value.models)
@@ -43,21 +109,24 @@ function parseCatalog(providerId: string, value: unknown): AnyModel[] {
 			: typeof value === "object" && value !== null
 				? Object.values(value)
 				: undefined;
-	if (!entries) throw new Error(`Invalid model catalog for provider "${providerId}"`);
+	if (!entries) throw new Error(`Invalid model catalog for provider "${provider.id}"`);
 	return entries
-		.filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null && "id" in entry)
+		.filter((entry): entry is CatalogEntry => typeof entry === "object" && entry !== null && "id" in entry)
 		.filter(isSupportedModelType)
-		.map((model) => ({ ...model, provider: providerId }) as AnyModel);
+		.flatMap((model) => {
+			const sanitized = sanitizeCatalogModel(provider, model);
+			return sanitized ? [sanitized] : [];
+		});
 }
 
 /** Read a successful pi.dev catalog response. A missing or invalid Last-Modified header is 0. */
 async function readCatalog(
-	providerId: string,
+	provider: Provider,
 	response: Response,
 ): Promise<{ models: AnyModel[]; lastModified: number; etag: string | undefined }> {
 	const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
 	return {
-		models: parseCatalog(providerId, await response.json()),
+		models: parseCatalog(provider, await response.json()),
 		lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
 		etag: response.headers.get("etag") ?? undefined,
 	};
@@ -118,7 +187,12 @@ export function withRemoteCatalog(
 		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
 		refreshModels: async (context) => {
 			const stored = context.stored;
-			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
+			const restored = remoteModels(stored, localGeneratedAt)
+				.filter((model) => model.provider === provider.id)
+				.flatMap((model) => {
+					const sanitized = sanitizeCatalogModel(provider, model as unknown as CatalogEntry);
+					return sanitized ? [sanitized] : [];
+				});
 			if (
 				!(await context.publish({
 					update: () => {
@@ -170,7 +244,7 @@ export function withRemoteCatalog(
 				await context.publish({ persist: { ...(stored ?? { models: [] }), checkedAt } });
 				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
 			}
-			const catalog = await readCatalog(provider.id, response);
+			const catalog = await readCatalog(provider, response);
 			if (context.signal.aborted) return;
 			const entry: ModelsStoreEntry = { ...catalog, checkedAt };
 			const published = remoteModels(entry, localGeneratedAt);
@@ -207,7 +281,12 @@ export function withPersonalizedCatalog(
 		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
 		getAllModels,
 		refreshModels: async (context) => {
-			const restored = (context.stored?.models ?? []).filter((model) => model.provider === provider.id);
+			const restored = (context.stored?.models ?? [])
+				.filter((model) => model.provider === provider.id)
+				.flatMap((model) => {
+					const sanitized = sanitizeCatalogModel(provider, model as unknown as CatalogEntry);
+					return sanitized ? [sanitized] : [];
+				});
 			if (
 				!(await context.publish({
 					update: () => {
@@ -224,7 +303,7 @@ export function withPersonalizedCatalog(
 			let remote: readonly AnyModel[] = [];
 			if (response.status !== 404 && response.status !== 501) {
 				if (!response.ok) throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
-				const catalog = await readCatalog(provider.id, response);
+				const catalog = await readCatalog(provider, response);
 				if (isNewer(catalog.lastModified, localGeneratedAt)) remote = catalog.models;
 			}
 			const personalized = await personalize(mergeModels(builtinModels(), remote), context);
