@@ -13,7 +13,7 @@ import {
 	type StorageWrite,
 	watchEvents,
 } from "@earendil-works/pi-durable";
-import { describe, expect, it, onTestFinished } from "vitest";
+import { describe, expect, it, onTestFinished, vi } from "vitest";
 import { SessionImpl, setDefaultDocumentRetention } from "../src/session/session.ts";
 import { chatSetup, openChat } from "./chat-support.ts";
 import { addTool } from "./harness-support.ts";
@@ -379,6 +379,62 @@ describe("document cache retention", () => {
 		expect(session.documentCacheSizes).toMatchObject({ cached: 0, idle: 0, attached: 0 });
 	});
 
+	// pi#244: f44707e7 left the sweep armed after unloading every cached document.
+	it("clears its sweep when the cache empties and arms one again on a new load", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const now = vi.fn(() => Date.now());
+		const session = new SessionImpl(new ControlledStorage(), now, () => 1_000);
+		onTestFinished(async () => {
+			await session.close(context);
+			vi.useRealTimers();
+		});
+		await session.commit((tx) => tx.doc(SessionCounterDoc).then(() => undefined), context);
+		expect(session.documentCacheSizes).toMatchObject({ cached: 1, idle: 1 });
+		expect(vi.getTimerCount()).toBe(1);
+		await session.unloadDocuments();
+		expect(session.documentCacheSizes).toMatchObject({ cached: 0, idle: 0 });
+		expect(vi.getTimerCount()).toBe(0);
+		const calls = now.mock.calls.length;
+		const sweeps = session.documentCacheSizes.sweeps;
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(now).toHaveBeenCalledTimes(calls);
+		expect(session.documentCacheSizes.sweeps).toBe(sweeps);
+		expect(await session.snapshot(SessionCounterDoc, context)).toEqual({ count: 0 });
+		expect(session.documentCacheSizes).toMatchObject({ cached: 1, idle: 1 });
+		expect(vi.getTimerCount()).toBe(1);
+		await session.close(context);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	// pi#244: pinned or retired documents leave nothing for an idle sweep to evict.
+	it("clears its sweep when all documents are pinned or retired", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const now = vi.fn(() => Date.now());
+		const session = new SessionImpl(new ControlledStorage(), now, () => 1_000);
+		onTestFinished(async () => {
+			await session.close(context);
+			vi.useRealTimers();
+		});
+		await session.commit((tx) => tx.doc(SessionCounterDoc).then(() => undefined), context);
+		expect(vi.getTimerCount()).toBe(1);
+		const state = (await session.documentState(SessionCounterDoc, context))!;
+		expect(session.documentCacheSizes).toMatchObject({ cached: 1, idle: 0, attached: 1 });
+		expect(vi.getTimerCount()).toBe(0);
+		let calls = now.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(now).toHaveBeenCalledTimes(calls);
+		expect(state.value).toEqual({ count: 0 });
+		state.dispose();
+		expect(session.documentCacheSizes).toMatchObject({ cached: 1, idle: 1, attached: 0 });
+		expect(vi.getTimerCount()).toBe(1);
+		await session.commit((tx) => tx.retireDoc(SessionCounterDoc), context);
+		expect(session.documentCacheSizes).toMatchObject({ cached: 0, idle: 0 });
+		expect(vi.getTimerCount()).toBe(0);
+		calls = now.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(10_000);
+		expect(now).toHaveBeenCalledTimes(calls);
+	});
+
 	it("evicts on its timer without a commit, and tolerates a detach called twice", async () => {
 		const storage = new ControlledStorage();
 		const session = new SessionImpl(storage, Date.now, () => 20);
@@ -438,13 +494,20 @@ describe("document cache retention", () => {
 			expect(sizes().cached).toBe(1);
 			await session.close(context);
 		}
+		// pi#244: documents retained forever never give an idle timer anything to evict.
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+		onTestFinished(() => {
+			vi.useRealTimers();
+		});
 		const { session, clock, sizes } = open(Number.POSITIVE_INFINITY);
+		onTestFinished(() => session.close(context));
 		const conversationId = await createConversation(session);
 		await bump(session, conversationId);
 		clock.now += 1e15;
 		await session.commit(async () => {}, context);
 		await settleLine(session);
 		expect(sizes().cached).toBe(1);
+		expect(vi.getTimerCount()).toBe(0);
 		await session.close(context);
 	});
 
