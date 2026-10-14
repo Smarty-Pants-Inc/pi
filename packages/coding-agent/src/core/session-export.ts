@@ -14,16 +14,16 @@ import { dirname } from "node:path";
 import { resolvePath } from "../utils/paths.ts";
 import {
 	assertExportFileSize,
-	assertExportValueSize,
 	assertMaterializedExportSize,
 	MAX_MATERIALIZED_EXPORT_BYTES,
+	prepareExportValueForJson,
 } from "./export-limits.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader, type SessionManager } from "./session-manager.ts";
 
 type TrailingEntries = (parentId: string | null, timestamp: string) => readonly object[];
 
-function serializeEntry(entry: object): string {
-	const serialized = JSON.stringify(entry);
+function serializeEntry(entry: object, format: string, limit = MAX_MATERIALIZED_EXPORT_BYTES): string {
+	const serialized = JSON.stringify(prepareExportValueForJson(entry, format, limit));
 	if (typeof serialized !== "string") throw new Error("Session entry did not serialize to JSON");
 	return serialized;
 }
@@ -73,8 +73,7 @@ export function serializeSessionBranch(
 	const lines: string[] = [];
 	let remaining = MAX_MATERIALIZED_EXPORT_BYTES;
 	for (const entry of sessionBranchEntries(sessionManager, createTrailingEntries)) {
-		assertExportValueSize(entry, "String JSONL", remaining);
-		const line = `${serializeEntry(entry)}\n`;
+		const line = `${serializeEntry(entry, "String JSONL", remaining)}\n`;
 		remaining -= Buffer.byteLength(line);
 		if (remaining < 0) throw new Error("String JSONL export exceeds the 64 MiB limit; use JSONL export instead");
 		lines.push(line);
@@ -105,8 +104,7 @@ export function exportSessionToJsonl(
 	let closed = false;
 	try {
 		for (const entry of sessionBranchEntries(sessionManager, createTrailingEntries)) {
-			assertExportValueSize(entry, "JSONL entry");
-			const line = Buffer.from(`${serializeEntry(entry)}\n`);
+			const line = Buffer.from(`${serializeEntry(entry, "JSONL entry")}\n`);
 			let offset = 0;
 			while (offset < line.length) {
 				const written = writeSync(fd, line, offset, line.length - offset);
