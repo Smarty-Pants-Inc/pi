@@ -127,6 +127,9 @@ type InteractiveBashContext = {
 	pendingMessagesContainer: { addChild(component: unknown): void };
 	pendingBashComponents: unknown[];
 	isBashMode: boolean;
+	options: Record<string, never>;
+	captureHerdrSubmit(this: InteractiveBashContext, text: string): unknown;
+	observeSubmitFailure(error: unknown): void;
 	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
 	showError(message: string): void;
@@ -135,6 +138,7 @@ type InteractiveBashContext = {
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as {
 	setupEditorSubmitHandler(this: InteractiveBashContext): void;
+	captureHerdrSubmit(this: InteractiveBashContext, text: string): unknown;
 	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(this: InteractiveBashContext, command: string, excludeFromContext?: boolean): Promise<void>;
 };
@@ -252,6 +256,13 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			pendingMessagesContainer: { addChild: vi.fn() },
 			pendingBashComponents: [],
 			isBashMode: true,
+			// pi#160: submit captures the Herdr attestation first; with no attestor it returns undefined.
+			options: {},
+			captureHerdrSubmit: interactiveModePrototype.captureHerdrSubmit,
+			// Surface the real submit failure instead of crash-exiting the test process.
+			observeSubmitFailure: (error) => {
+				throw error;
+			},
 			dispatchEditorInput: interactiveModePrototype.dispatchEditorInput,
 			handleBashCommand: interactiveModePrototype.handleBashCommand,
 			showError: vi.fn(),
