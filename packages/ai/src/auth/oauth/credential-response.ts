@@ -37,10 +37,12 @@ export function getOAuthDiagnosticSecrets(
 	for (const [key, value] of Object.entries(headers)) {
 		if (!value) continue;
 		if (!isCredentialLabel(key)) continue;
-		secrets.push(value);
+		// Fetch/Headers trim field values before dispatch. Keep the configured and wire forms.
+		const normalized = value.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+		secrets.push(value, normalized);
 		// "Bearer x", "Basic x", "Token x": the credential part can be echoed alone.
-		const separator = value.search(/\s/);
-		if (separator >= 0) secrets.push(value.slice(separator).trim());
+		const separator = normalized.search(/[\t ]/);
+		if (separator >= 0) secrets.push(normalized.slice(separator).replace(/^[\t ]+/, ""));
 	}
 	if (!token) return secrets;
 	try {
@@ -76,9 +78,8 @@ export function getRequestDiagnosticSecrets(
 	);
 }
 
-// Short live values must not replace common words or single letters in diagnostics.
-// Credential-labeled fields and Bearer values are still masked at any length.
-const MIN_DIAGNOSTIC_SECRET_LENGTH = 8;
+// Explicitly known credentials are sensitive at every nonzero length, even when
+// masking them also changes ordinary words in a provider diagnostic.
 const MAX_DIAGNOSTIC_DECODE_PASSES = 16;
 const MAX_DIAGNOSTIC_DECODE_WORK = 256 * 1024;
 const JSON_ESCAPES: Readonly<Record<string, string>> = {
@@ -91,20 +92,16 @@ const JSON_ESCAPES: Readonly<Record<string, string>> = {
 	t: "\t",
 };
 
-function percentDecode(run: string): string {
-	try {
-		return decodeURIComponent(run);
-	} catch {
-		// Malformed UTF-8: decode byte by byte; matching still sees every ASCII credential character.
-		return run.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-	}
+/** Invalid UTF-8 cannot hide an adjacent valid credential, including a Unicode one. */
+function decodePercentDiagnostic(text: string): string {
+	return text.replace(/(?:%[0-9a-f]{2})+/gi, (encoded) => {
+		const bytes = new Uint8Array(encoded.length / 3);
+		for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(encoded.slice(i * 3 + 1, i * 3 + 3), 16);
+		return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+	});
 }
 
-/**
- * Decode one JSON-string layer and one percent-encoding layer. Slash runs are
- * consumed once, so each pass is linear; composition order does not matter
- * because the caller repeats passes and masks after each one.
- */
+/** Decode one JSON-string layer; slash runs are consumed once, so each pass is linear. */
 function decodeDiagnosticLayer(text: string): string {
 	const parts: string[] = [];
 	let copied = 0;
@@ -128,7 +125,7 @@ function decodeDiagnosticLayer(text: string): string {
 		i = text.indexOf("\\", end);
 	}
 	parts.push(text.slice(copied));
-	return parts.join("").replace(/(?:%[0-9a-f]{2})+/gi, percentDecode);
+	return parts.join("");
 }
 
 function base64Variants(secret: string): string[] {
@@ -154,7 +151,7 @@ function maskAll(text: string, values: readonly string[]): { text: string; match
 export function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
-		if (typeof secret !== "string" || secret.length < MIN_DIAGNOSTIC_SECRET_LENGTH) continue;
+		if (typeof secret !== "string" || secret.length === 0) continue;
 		variants.add(secret);
 		for (const value of base64Variants(secret)) variants.add(value);
 		// Form encoding turns spaces into "+", which percent decoding does not reverse.
@@ -174,11 +171,14 @@ export function redactValues(text: string, secrets: readonly string[]): string {
 	for (let pass = 0; text.includes("\\") || /%[0-9a-f]{2}/i.test(text); pass++) {
 		work += text.length;
 		if (pass === MAX_DIAGNOSTIC_DECODE_PASSES || work > MAX_DIAGNOSTIC_DECODE_WORK) return "***";
-		const decoded = decodeDiagnosticLayer(text);
-		if (decoded === text) break;
-		const masked = maskAll(decoded, values);
-		encodedMatch ||= masked.matched;
-		text = masked.text;
+		const previous = text;
+		// Mask between decoders so a literal encoded-looking credential cannot be decoded past.
+		for (const decode of [decodeDiagnosticLayer, decodePercentDiagnostic]) {
+			const masked = maskAll(decode(text), values);
+			encodedMatch ||= masked.matched;
+			text = masked.text;
+		}
+		if (text === previous) break;
 	}
 	// Untouched diagnostics stay byte-for-byte; an encoded match publishes the safe decoded form.
 	return encodedMatch ? text : original;

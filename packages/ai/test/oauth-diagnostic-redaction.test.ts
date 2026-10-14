@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	getOAuthDiagnosticSecrets,
 	getRequestDiagnosticSecrets,
 	redactOAuthDiagnostic,
 	redactOAuthDiagnosticValue,
@@ -109,6 +110,32 @@ describe("OAuth diagnostic redaction", () => {
 			expect(redactOAuthDiagnostic(`401 rejected ${secret}`, secrets)).toBe("401 rejected ***");
 		},
 	);
+
+	// smarty-dev#4703: configured credentials stay sensitive below the old eight-character cutoff.
+	it.each(["x-api-key", "api-key", "proxy-authorization", "cf-aig-authorization"])(
+		"masks nonempty known %s credentials regardless of length",
+		(header) => {
+			for (const length of [1, 7, 8]) {
+				const secret = "Q9bZ2p7X".slice(0, length);
+				const value = header.endsWith("authorization") ? `Basic ${secret}` : secret;
+				const secrets = getOAuthDiagnosticSecrets(undefined, { [header]: value });
+				expect(redactOAuthDiagnostic(`receipt=${secret}`, secrets)).toBe("receipt=***");
+				const norm = normalizeProviderError(new Error(`receipt=${secret}`), undefined, undefined, secrets);
+				expect(norm.localMessage).toBe("receipt=***");
+				expect(formatProviderError(norm)).not.toContain(secret);
+			}
+		},
+	);
+
+	// smarty-dev#4703: only explicitly known short words are substring-masked, never guessed.
+	it.each(["a", "the", "1234567"])("masks only known short live value %s", (secret) => {
+		const text = `the theater theme other normal a word ${secret}`;
+		expect(redactOAuthDiagnostic(text)).toBe(text);
+		expect(redactOAuthDiagnostic(text, [secret])).not.toContain(secret);
+		expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(secret))).not.toContain(secret);
+		expect(redactOAuthDiagnostic(`refresh_token=${secret}`, [secret])).not.toContain(`=${secret}`);
+		expect(redactOAuthDiagnostic(`Bearer ${secret}`, [secret])).toContain("***");
+	});
 
 	// pi#150 security round 3: one label set classifies headers and masks labels.
 	it("redacts an X-Client-Credential value reflected in an error under its label", () => {
