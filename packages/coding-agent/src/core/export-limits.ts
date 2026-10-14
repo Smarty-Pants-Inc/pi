@@ -1,14 +1,5 @@
 import { existsSync, statSync } from "node:fs";
-import {
-	isArrayBuffer,
-	isBigIntObject,
-	isBooleanObject,
-	isDataView,
-	isNumberObject,
-	isSharedArrayBuffer,
-	isStringObject,
-	isTypedArray,
-} from "node:util/types";
+import { isBigIntObject, isBooleanObject, isNumberObject, isStringObject } from "node:util/types";
 
 /** HTML and string exports need several simultaneous copies of the session payload. */
 export const MAX_MATERIALIZED_EXPORT_BYTES = 64 * 1024 * 1024;
@@ -64,30 +55,6 @@ export function assertExportValueSize(value: unknown, format: string, limit = MA
 }
 
 /**
- * Conservative budget units charged per raw binary byte. A byte can become one
- * element: the walk charges 24 units per value plus up to 8 digits * 6 + 2 = 50
- * units for a numbered key below the 64 MiB cap, so 74 <= 80.
- */
-const EXPORT_UNITS_PER_BINARY_BYTE = 80;
-
-function intrinsicByteLengthGetter(prototype: object): (this: unknown) => number {
-	return Object.getOwnPropertyDescriptor(prototype, "byteLength")!.get as (this: unknown) => number;
-}
-const typedArrayByteLength = intrinsicByteLengthGetter(Object.getPrototypeOf(Uint8Array.prototype));
-const dataViewByteLength = intrinsicByteLengthGetter(DataView.prototype);
-const arrayBufferByteLength = intrinsicByteLengthGetter(ArrayBuffer.prototype);
-const sharedArrayBufferByteLength = intrinsicByteLengthGetter(SharedArrayBuffer.prototype);
-
-/** Intrinsic byteLength of Buffer, ArrayBuffer, DataView or any typed array; ignores own overrides. */
-function binaryByteLength(node: unknown): number | undefined {
-	if (isTypedArray(node)) return Reflect.apply(typedArrayByteLength, node, []);
-	if (isDataView(node)) return Reflect.apply(dataViewByteLength, node, []);
-	if (isArrayBuffer(node)) return Reflect.apply(arrayBufferByteLength, node, []);
-	if (isSharedArrayBuffer(node)) return Reflect.apply(sharedArrayBufferByteLength, node, []);
-	return undefined;
-}
-
-/**
  * Resolve JSON hooks while bounding their actual output, then serialize only this
  * snapshot. A returned object's own toJSON is not called again at the same position.
  * Null prototypes prevent JSON.stringify from finding hooks on the snapshot itself.
@@ -99,22 +66,11 @@ export function prepareExportValueForJson(
 ): unknown {
 	let remaining = limit;
 	const ancestors = new WeakSet<object>();
-	// Charge raw binary before any hook (e.g. Buffer#toJSON) can allocate per-byte output.
-	const chargeBinary = (node: unknown): void => {
-		const byteLength = binaryByteLength(node);
-		if (byteLength === undefined) return;
-		remaining -= byteLength * EXPORT_UNITS_PER_BINARY_BYTE;
-		if (remaining < 0) throw exportLimitError(format);
-	};
 	const visit = (node: unknown, key: string, depth: number): unknown => {
 		if (depth > 100) throw exportLimitError(format);
-		chargeBinary(node);
 		if ((node !== null && typeof node === "object") || typeof node === "function" || typeof node === "bigint") {
 			const toJSON = (node as { toJSON?: unknown }).toJSON;
-			if (typeof toJSON === "function") {
-				node = Reflect.apply(toJSON, node, [key]);
-				chargeBinary(node);
-			}
+			if (typeof toJSON === "function") node = Reflect.apply(toJSON, node, [key]);
 		}
 		// JSON unboxes these wrappers after toJSON, but does not invoke another hook.
 		if (isNumberObject(node)) node = Number(node);
@@ -137,8 +93,7 @@ export function prepareExportValueForJson(
 			snapshot = array;
 		} else {
 			const record: Record<string, unknown> = Object.create(null);
-			for (const property in node) {
-				if (!Object.hasOwn(node, property)) continue;
+			for (const property of Object.keys(node)) {
 				remaining -= property.length * 6 + 2;
 				if (remaining < 0) throw exportLimitError(format);
 				const child = visit((node as Record<string, unknown>)[property], property, depth + 1);
