@@ -18,6 +18,7 @@ import {
 	MAX_MATERIALIZED_EXPORT_BYTES,
 	prepareExportValueForJson,
 } from "./export-limits.ts";
+import { toHotEntry } from "./session-lazy-entries.ts";
 import { CURRENT_SESSION_VERSION, type SessionHeader, type SessionManager } from "./session-manager.ts";
 
 type TrailingEntries = (parentId: string | null, timestamp: string) => readonly object[];
@@ -26,6 +27,29 @@ function serializeEntry(entry: object, format: string, limit = MAX_MATERIALIZED_
 	const serialized = JSON.stringify(prepareExportValueForJson(entry, format, limit));
 	if (typeof serialized !== "string") throw new Error("Session entry did not serialize to JSON");
 	return serialized;
+}
+
+/**
+ * Cold entries hold lazy accessors, also nested in message; spreading would keep or invoke
+ * them. Reparse the line without invoking them, then reapply resident primitive fields, which
+ * copyEntry patches (e.g. a branched compaction's firstKeptEntryId) may have changed.
+ */
+function residentEntry(entry: object): object {
+	const hot = toHotEntry(entry);
+	if (hot === entry) return entry;
+	const resident: Record<string, unknown> = { ...hot };
+	for (const key of Object.keys(entry)) {
+		const descriptor = Object.getOwnPropertyDescriptor(entry, key)!;
+		if ("value" in descriptor && (descriptor.value === null || typeof descriptor.value !== "object")) {
+			Object.defineProperty(resident, key, {
+				value: descriptor.value,
+				enumerable: true,
+				configurable: true,
+				writable: true,
+			});
+		}
+	}
+	return resident;
 }
 
 /** Walk single-entry reads rather than cloning the entire owned branch payload. */
@@ -58,7 +82,7 @@ function* sessionBranchEntries(
 	for (let i = ids.length - 1; i >= 0; i--) {
 		const entry = sessionManager.getEntry(ids[i]);
 		if (!entry) throw new Error("Session branch changed during export");
-		yield { ...entry, parentId };
+		yield { ...residentEntry(entry), parentId };
 		parentId = entry.id;
 	}
 	yield* createTrailingEntries?.(parentId, timestamp) ?? [];
