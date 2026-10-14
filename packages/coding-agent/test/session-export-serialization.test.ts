@@ -3,9 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
-import { prepareExportValueForJson } from "../src/core/export-limits.ts";
+import { MAX_MATERIALIZED_EXPORT_BYTES, prepareExportValueForJson } from "../src/core/export-limits.ts";
 import { exportSessionToJsonl, serializeSessionBranch } from "../src/core/session-export.ts";
-import { copyEntry, isColdEntry, toColdEntry } from "../src/core/session-lazy-entries.ts";
+import { copyEntry, type EntryLocation, isColdEntry, toColdEntry } from "../src/core/session-lazy-entries.ts";
 import { CURRENT_SESSION_VERSION, type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
 
 vi.mock("node:fs", async (importOriginal) => {
@@ -72,7 +72,6 @@ const refusals: RefusalCase[] = [
 			return { value: { toJSON }, spies: [toJSON] };
 		},
 	},
-	{ name: "own noncallable toJSON", create: () => ({ value: { toJSON: "not a function" } }) },
 	{
 		name: "own toJSON getter",
 		create: () => {
@@ -109,10 +108,6 @@ const refusals: RefusalCase[] = [
 			const toJSON = vi.fn(() => ({}));
 			return { value: Object.defineProperty({ kept: 1 }, "toJSON", { value: toJSON }), spies: [toJSON] };
 		},
-	},
-	{
-		name: "nonenumerable noncallable toJSON",
-		create: () => ({ value: Object.defineProperty({}, "toJSON", { value: null }) }),
 	},
 	{
 		name: "nonenumerable toJSON getter",
@@ -291,6 +286,40 @@ describe("session export serialization", () => {
 		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
 	});
 
+	// smarty-dev#12074: JSON ignores noncallable data-valued toJSON at every level, including
+	// sealEntryProvenance's hidden locked undefined slot. Enumerable members still keep their bytes.
+	it("matches native bytes for noncallable data-valued toJSON at root and nested levels", () => {
+		for (const toJSON of [undefined, null, false, 0, "not a hook", { kept: 1 }, [1]]) {
+			const object = { kept: true, toJSON };
+			const hidden = Object.defineProperty({ kept: true }, "toJSON", { value: toJSON });
+			const array = Object.assign([1, ""], { toJSON });
+			for (const value of [object, hidden, array, { object, hidden, array }]) {
+				const expected = JSON.stringify(value);
+				const bytes = Buffer.byteLength(expected);
+				expect(JSON.stringify(prepareExportValueForJson(value, "JSONL entry", bytes))).toBe(expected);
+				expect(() => prepareExportValueForJson(value, "JSONL entry", bytes - 1)).toThrow(/limit/);
+			}
+		}
+	});
+
+	// smarty-dev#12074: allowed prototype chains can also contain noncallable data slots.
+	it("ignores noncallable prototype toJSON descriptors without changing native bytes", () => {
+		for (const prototype of [Object.prototype, Array.prototype]) {
+			const original = Object.getOwnPropertyDescriptor(prototype, "toJSON");
+			try {
+				Object.defineProperty(prototype, "toJSON", { value: null, configurable: true });
+				for (const value of [{ list: [1, ""] }, [undefined, { kept: 1 }]]) {
+					expect(JSON.stringify(prepareExportValueForJson(value, "JSONL entry", LIMIT))).toBe(
+						JSON.stringify(value),
+					);
+				}
+			} finally {
+				if (original) Object.defineProperty(prototype, "toJSON", original);
+				else Reflect.deleteProperty(prototype, "toJSON");
+			}
+		}
+	});
+
 	// smarty-dev#12074: Decision D keeps native undefined semantics only in data slots.
 	it("omits undefined object fields and writes undefined array elements as null", () => {
 		const cases = [
@@ -357,8 +386,6 @@ describe("session export serialization", () => {
 		["boxed boolean", () => Object(true)],
 		["boxed bigint", () => Object(1n)],
 		["boxed symbol", () => Object(Symbol("x"))],
-		["RegExp", () => /x/],
-		["Error", () => new Error("x")],
 	] satisfies [string, () => object][])("refuses re-prototyped %s without invoking hooks", (_name, create) => {
 		for (const prototype of [null, Object.prototype]) {
 			const value = Object.setPrototypeOf(create(), prototype);
@@ -370,6 +397,36 @@ describe("session export serialization", () => {
 			const read = getter(value, "field");
 			expect(() => prepareExportValueForJson(value, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
 			expect(() => prepareExportValueForJson({ value }, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+			expect(toJSON).not.toHaveBeenCalled();
+			expect(read).not.toHaveBeenCalled();
+		}
+	});
+
+	// smarty-dev#12074 ruling B: a re-prototyped RegExp or Error is an ordinary record to JSON (its
+	// internal slots and hidden own data are not serialized). Default prototypes stay refused, and a
+	// retained toJSON or accessor is still refused without invocation.
+	it.each([
+		["RegExp", () => /x/g],
+		["Error", () => new Error("x")],
+	] satisfies [string, () => object][])("accepts re-prototyped %s as native JSON", (_name, create) => {
+		expect(() => prepareExportValueForJson(create(), "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+		for (const prototype of [null, Object.prototype]) {
+			const value = Object.setPrototypeOf(create(), prototype);
+			Object.defineProperty(value, "field", { value: [1, "a"], enumerable: true });
+			for (const data of [value, { value }]) {
+				expect(JSON.stringify(prepareExportValueForJson(data, "JSONL entry", LIMIT))).toBe(JSON.stringify(data));
+			}
+			expect(JSON.stringify(value)).toBe('{"field":[1,"a"]}');
+
+			const hooked = Object.setPrototypeOf(create(), prototype);
+			const toJSON = vi.fn(() => ({}));
+			Object.defineProperty(hooked, "toJSON", { value: toJSON });
+			const accessor = Object.setPrototypeOf(create(), prototype);
+			const read = getter(accessor, "field");
+			for (const refused of [hooked, accessor]) {
+				expect(() => prepareExportValueForJson(refused, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+				expect(() => prepareExportValueForJson({ refused }, "JSONL entry", LIMIT)).toThrow(/plain JSON/);
+			}
 			expect(toJSON).not.toHaveBeenCalled();
 			expect(read).not.toHaveBeenCalled();
 		}
@@ -404,7 +461,7 @@ describe("session export serialization", () => {
 	});
 
 	// smarty-dev#12074: inspect hooks on the actual allowed chains, not only local prototypes.
-	it.each(["callable", "getter", "noncallable"] as const)(
+	it.each(["callable", "getter", "setter"] as const)(
 		"refuses allowed-chain %s toJSON descriptors without invocation",
 		(kind) => {
 			for (const prototype of [Object.prototype, Array.prototype]) {
@@ -412,7 +469,7 @@ describe("session export serialization", () => {
 				const hook = vi.fn(() => ({}));
 				const read = vi.fn(() => hook);
 				const descriptor: PropertyDescriptor =
-					kind === "getter" ? { get: read } : { value: kind === "callable" ? hook : null };
+					kind === "getter" ? { get: read } : kind === "setter" ? { set: read } : { value: hook };
 				let objectError: unknown;
 				let arrayError: unknown;
 				let nullPrototypeJson: string | undefined;
@@ -485,11 +542,12 @@ describe("session export serialization", () => {
 		expect(fs.unlinkSync).toHaveBeenLastCalledWith(expect.stringMatching(/existing\.jsonl\..*\.tmp$/));
 	});
 
-	// smarty-dev#12074: key bytes are charged one property at a time, so a wide object stops
-	// early instead of materializing or inspecting every key first.
-	it("stops charging long keys early without enumerating the whole object", () => {
+	// smarty-dev#12074: key bytes are charged one property at a time, so the descriptor walk of a
+	// wide object stops after a partial walk. This checks descriptor reads and whole-object key
+	// helpers only; it does not claim the engine never enumerates keys internally (for-in may).
+	it("stops the descriptor walk of long keys early after a partial walk", () => {
 		const wide: Record<string, string> = {};
-		for (let i = 0; i < 8; i++) wide[`${String.fromCharCode(97 + i)}${"k".repeat(63)}`] = "v";
+		for (let i = 0; i < 8; i++) wide[`${String.fromCharCode(97 + i)}${"k".repeat(299)}`] = "v";
 		const keys = vi.spyOn(Object, "keys");
 		const entries = vi.spyOn(Object, "entries");
 		const descriptors = vi.spyOn(Object, "getOwnPropertyDescriptors");
@@ -511,9 +569,39 @@ describe("session export serialization", () => {
 		expect(error).toBeInstanceOf(Error);
 		expect((error as Error).message).toMatch(/limit/);
 		expect(wholeObject).toBe(false);
-		// One 64-character key costs 386 units, so the second key exceeds the 512-unit budget.
+		// One 300-character member emits at least 307 bytes (quotes, colon, "v"), so the second
+		// member exceeds the 512-byte budget under exact accounting.
 		expect(keyReads).toBeGreaterThan(0);
 		expect(keyReads).toBeLessThan(3);
+	});
+
+	// smarty-dev#12074 P2: the budget is the exact emitted byte count, including quotes, commas
+	// and brackets, so many empty strings cannot hide behind a per-character estimate.
+	it("charges exact emitted bytes for many empty strings", () => {
+		const value = Array.from({ length: 100 }, () => "");
+		const bytes = Buffer.byteLength(JSON.stringify(value));
+		expect(bytes).toBe(301);
+		expect(() => prepareExportValueForJson(value, "JSONL entry", bytes - 1)).toThrow(/limit/);
+		expect(JSON.stringify(prepareExportValueForJson(value, "JSONL entry", bytes))).toBe(JSON.stringify(value));
+	});
+
+	// smarty-dev#12074 P2: exact UTF-8 bytes must include escapes, surrogate handling and members.
+	it.each([
+		"",
+		'"\\\b\t\n\f\r\u0000',
+		"é雪",
+		"😀",
+		"\ud800",
+		"\udfff",
+		"\ud800A",
+		-0,
+		1e21,
+		{ "é\n": ["", undefined, "😀"], ignored: undefined },
+	])("charges exact native bytes for %j", (value) => {
+		const expected = JSON.stringify(value);
+		const bytes = Buffer.byteLength(expected);
+		expect(JSON.stringify(prepareExportValueForJson(value, "JSONL entry", bytes))).toBe(expected);
+		expect(() => prepareExportValueForJson(value, "JSONL entry", bytes - 1)).toThrow(/limit/);
 	});
 
 	// smarty-dev#12074
@@ -595,6 +683,31 @@ describe("session export serialization", () => {
 		expect(fs.readFileSync(destination, "utf8")).toBe(expected);
 	});
 
+	// smarty-dev#12074: the actual sealed entry's toJSON data slot is not a serializer hook.
+	it("exports a sealed toJSON undefined entry byte-identically in both public paths", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		const sessionManager = manager();
+		const entry = sessionManager.getEntry(sessionManager.getLeafId()!)!;
+		expect(Object.getOwnPropertyDescriptor(entry, "toJSON")).toEqual({
+			value: undefined,
+			enumerable: false,
+			writable: false,
+			configurable: false,
+		});
+		const header = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: sessionManager.getSessionId(),
+			timestamp: new Date().toISOString(),
+			cwd: sessionManager.getCwd(),
+		};
+		const expected = `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`;
+		expect(serializeSessionBranch(sessionManager)).toBe(expected);
+		const output = exportSessionToJsonl(sessionManager, join(directory(), "sealed.jsonl"));
+		expect(fs.readFileSync(output, "utf8")).toBe(expected);
+	});
+
 	// smarty-dev#12074: real HOT native entries contain optional undefined data slots.
 	it("exports HOT compaction and branch summary optionals as native journal bytes in both paths", () => {
 		vi.useFakeTimers();
@@ -657,8 +770,6 @@ describe("session export serialization", () => {
 		const getEntry = sessionManager.getEntry.bind(sessionManager);
 		vi.spyOn(sessionManager, "getEntry").mockImplementation((id) => (id === messageId ? cold : getEntry(id)));
 
-		const ids: string[] = [];
-		for (let id = sessionManager.getLeafId(); id; id = getEntry(id)!.parentId) ids.unshift(id);
 		const header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -666,11 +777,9 @@ describe("session export serialization", () => {
 			timestamp: new Date().toISOString(),
 			cwd: sessionManager.getCwd(),
 		};
-		const expected = [header, ...ids.map((id) => getEntry(id)!)]
-			.map((value) => `${JSON.stringify(value)}\n`)
-			.join("");
-		// Disk bytes for every entry, including the cold message, are reproduced exactly.
-		expect(expected.split("\n").slice(1, -1)).toEqual(journalLines.slice(1));
+		// Expected bytes come from disk, not live entries: the cold message shares coldMessage, so
+		// stringifying a live entry would invoke the spied lazy accessor.
+		const expected = `${[JSON.stringify(header), ...journalLines.slice(1)].join("\n")}\n`;
 
 		expect(serializeSessionBranch(sessionManager)).toBe(expected);
 		const destination = exportSessionToJsonl(sessionManager, join(directory(), "cold.jsonl"));
@@ -697,4 +806,266 @@ describe("session export serialization", () => {
 		expect(patchedFile.slice(patchedFile.indexOf("\n"))).toBe(patchedExpected.slice(patchedExpected.indexOf("\n")));
 		expect(read).not.toHaveBeenCalled();
 	});
+
+	/** Real disk journal whose first message can be replaced by a cold copy at any byte range. */
+	function coldJournal() {
+		const sessionDir = directory();
+		const writer = SessionManager.create(sessionDir, sessionDir);
+		const messageId = writer.appendMessage({ role: "user", content: "x".repeat(2048), timestamp: 1 });
+		writer.appendCustomEntry("later", { n: 1 });
+		const journal = writer.getSessionFile()!;
+		const journalLines = fs.readFileSync(journal, "utf8").trimEnd().split("\n");
+		const index = journalLines.findIndex((line) => (JSON.parse(line) as { id?: string }).id === messageId);
+		const line = journalLines[index];
+		const offset = journalLines.slice(0, index).reduce((sum, previous) => sum + Buffer.byteLength(previous) + 1, 0);
+		const sessionManager = SessionManager.open(journal);
+		const getEntry = sessionManager.getEntry.bind(sessionManager);
+		const header = {
+			type: "session",
+			version: CURRENT_SESSION_VERSION,
+			id: sessionManager.getSessionId(),
+			timestamp: new Date().toISOString(),
+			cwd: sessionManager.getCwd(),
+		};
+		// Export bytes before the cold entry: the export header and earlier (hot) journal lines.
+		const prefixBytes = [JSON.stringify(header), ...journalLines.slice(1, index)].reduce(
+			(sum, previous) => sum + Buffer.byteLength(previous) + 1,
+			0,
+		);
+		return {
+			journal,
+			line,
+			offset,
+			prefixBytes,
+			sessionManager,
+			cold: (location: Partial<EntryLocation> = {}) =>
+				toColdEntry(JSON.parse(line) as SessionEntry, {
+					file: journal,
+					offset,
+					length: Buffer.byteLength(line),
+					...location,
+				}),
+			// A plain override, not a spy: spy result bookkeeping would trap a returned proxy.
+			use: (entry: object) => {
+				sessionManager.getEntry = (id) => (id === messageId ? (entry as SessionEntry) : getEntry(id));
+			},
+		};
+	}
+
+	// smarty-dev#12074: the live branch entry itself is guarded before its id, parentId or any field
+	// is read, in the discovery pass and the output pass of both public paths.
+	it.each([
+		{ name: "id getter", mutate: (entry: object) => [getter(entry, "id")] },
+		{ name: "parentId getter", mutate: (entry: object) => [getter(entry, "parentId")] },
+		{ name: "data getter", mutate: (entry: object) => [getter(entry, "data")] },
+		{
+			name: "own toJSON",
+			mutate: (entry: object) => {
+				const toJSON = vi.fn(() => ({}));
+				Object.defineProperty(entry, "toJSON", { value: toJSON });
+				return [toJSON];
+			},
+		},
+		{
+			name: "prototype toJSON hook",
+			mutate: (entry: object) => {
+				const toJSON = vi.fn(() => ({}));
+				Object.setPrototypeOf(entry, { toJSON });
+				return [toJSON];
+			},
+		},
+		{
+			name: "prototype getter hook",
+			mutate: (entry: object) => {
+				const prototype = {};
+				const read = getter(prototype, "hook");
+				Object.setPrototypeOf(entry, prototype);
+				return [read];
+			},
+		},
+		{
+			name: "nested proxy",
+			mutate: (entry: object) => {
+				const { proxy, spies } = spiedProxy({ text: "nested" });
+				(entry as { data: unknown }).data = proxy;
+				return spies;
+			},
+		},
+		{ name: "proxy", mutate: () => [] as Mock[], wrap: true },
+	])("rejects a live branch entry with $name in both paths without invoking it", ({ mutate, wrap }) => {
+		const sessionManager = manager();
+		sessionManager.appendCustomEntry("leaf", { text: "leaf data" });
+		const leafId = sessionManager.getLeafId()!;
+		const getEntry = sessionManager.getEntry.bind(sessionManager);
+		const copy = JSON.parse(JSON.stringify(getEntry(leafId))) as object;
+		let spies: Mock[] = mutate(copy);
+		let entry = copy;
+		if (wrap) ({ proxy: entry, spies } = spiedProxy(copy));
+		// A plain override, not a spy: spy result bookkeeping would trap a returned proxy.
+		sessionManager.getEntry = (id) => (id === leafId ? (entry as SessionEntry) : getEntry(id));
+		const destination = join(directory(), "existing.jsonl");
+		fs.writeFileSync(destination, "existing destination");
+
+		expect(() => serializeSessionBranch(sessionManager)).toThrow(/plain JSON/);
+		expect(() => exportSessionToJsonl(sessionManager, destination)).toThrow(/plain JSON/);
+		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+		expect(fs.readFileSync(destination, "utf8")).toBe("existing destination");
+	});
+
+	// smarty-dev#12074: a cold line is refused against the current remaining budget before the
+	// file is read; the string export's aggregate remaining reaches cold rehydration.
+	it("refuses an oversized cold line before allocating, reading or parsing it", () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		const journal = coldJournal();
+		const overCeiling = journal.cold({ length: MAX_MATERIALIZED_EXPORT_BYTES + 1 });
+		// Fits the per-entry ceiling but not what remains after the export header line.
+		const overRemaining = journal.cold({ length: MAX_MATERIALIZED_EXPORT_BYTES - journal.prefixBytes + 1 });
+		const destination = join(directory(), "cold.jsonl");
+		const alloc = vi.spyOn(Buffer, "allocUnsafe");
+		const parse = vi.spyOn(JSON, "parse");
+
+		journal.use(overCeiling);
+		expect(() => serializeSessionBranch(journal.sessionManager)).toThrow(/remaining export limit/);
+		expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/remaining export limit/);
+		journal.use(overRemaining);
+		expect(() => serializeSessionBranch(journal.sessionManager)).toThrow(/remaining export limit/);
+		// The streaming path has only the per-entry ceiling; the range check then refuses it.
+		expect(() => exportSessionToJsonl(journal.sessionManager, destination)).toThrow(/changed on disk/);
+
+		expect(alloc.mock.calls.some(([size]) => size >= 1024 * 1024)).toBe(false);
+		expect(parse).not.toHaveBeenCalled();
+		expect(fs.existsSync(destination)).toBe(false);
+	});
+
+	// smarty-dev#12074: the byte range is checked against the open file, and the line must still
+	// hold the same entry.
+	it("refuses a cold line whose range is invalid, past the end, truncated or changed", () => {
+		const journal = coldJournal();
+		const length = Buffer.byteLength(journal.line);
+		const copy = join(directory(), "copy.jsonl");
+		const original = fs.readFileSync(journal.journal);
+		const cases: [string, Partial<EntryLocation>, () => void][] = [
+			["negative offset", { offset: -1 }, () => {}],
+			["fractional length", { length: length + 0.5 }, () => {}],
+			["unsafe end", { offset: Number.MAX_SAFE_INTEGER, length: 2 }, () => {}],
+			["past the end", { file: copy, offset: original.length - 2 }, () => fs.writeFileSync(copy, original)],
+			["truncated", { file: copy }, () => fs.truncateSync(copy, journal.offset + 10)],
+			[
+				"changed",
+				{ file: copy },
+				() => {
+					// Same length, different id: the range still parses but holds another entry.
+					const changed = journal.line.replace(
+						/"id":"(.)/,
+						(_match, c: string) => `"id":"${c === "Z" ? "Y" : "Z"}`,
+					);
+					fs.writeFileSync(copy, original.toString("utf8").replace(journal.line, changed));
+				},
+			],
+		];
+		for (const [name, location, prepare] of cases) {
+			fs.writeFileSync(copy, original);
+			const cold = journal.cold(location);
+			prepare();
+			journal.use(cold);
+			expect(() => serializeSessionBranch(journal.sessionManager), name).toThrow(/changed on disk/);
+			expect(() => exportSessionToJsonl(journal.sessionManager, join(directory(), "out.jsonl")), name).toThrow(
+				/changed on disk/,
+			);
+		}
+	});
+
+	// smarty-dev#12074: the cold marker trusts only generated lazy accessors; a cold entry mutated
+	// to carry hooks, proxies or other accessors is refused rather than laundered from disk.
+	it.each([
+		{
+			name: "non-plain prototype",
+			mutate: (entry: object) => {
+				const toJSON = vi.fn(() => ({}));
+				Object.setPrototypeOf(entry, { toJSON });
+				return { entry, spies: [toJSON] };
+			},
+		},
+		{
+			name: "own toJSON",
+			mutate: (entry: object) => {
+				const toJSON = vi.fn(() => ({}));
+				Object.defineProperty(entry, "toJSON", { value: toJSON });
+				return { entry, spies: [toJSON] };
+			},
+		},
+		{
+			name: "lazy-shaped id accessor",
+			mutate: (entry: object) => {
+				const get = vi.fn(() => "id");
+				const set = vi.fn();
+				Object.defineProperty(entry, "id", { get, set, enumerable: true, configurable: true });
+				return { entry, spies: [get, set] };
+			},
+		},
+		{
+			name: "id object with a coercion hook",
+			mutate: (entry: object) => {
+				const coerce = vi.fn(() => "untrusted id");
+				Object.defineProperty(entry, "id", { value: { toString: coerce }, configurable: true });
+				return { entry, spies: [coerce] };
+			},
+		},
+		{ name: "user getter", mutate: (entry: object) => ({ entry, spies: [getter(entry, "extra")] }) },
+		{
+			name: "lazy-shaped accessor absent from the line",
+			mutate: (entry: object) => {
+				const get = vi.fn(() => "extra");
+				const set = vi.fn();
+				Object.defineProperty(entry, "extra", { get, set, enumerable: true, configurable: true });
+				return { entry, spies: [get, set] };
+			},
+		},
+		{
+			name: "message user getter",
+			mutate: (entry: object) => ({
+				entry,
+				spies: [getter(Object.getOwnPropertyDescriptor(entry, "message")!.value, "extra")],
+			}),
+		},
+		{
+			name: "message proxy",
+			mutate: (entry: object) => {
+				const { proxy, spies } = spiedProxy({ role: "user" });
+				Object.defineProperty(entry, "message", { value: proxy });
+				return { entry, spies };
+			},
+		},
+		{
+			name: "proxy",
+			mutate: (entry: object) => {
+				const { proxy, spies } = spiedProxy(entry);
+				return { entry: proxy, spies };
+			},
+		},
+	] satisfies { name: string; mutate: (entry: object) => { entry: object; spies: Mock[] } }[])(
+		"rejects a cold entry with $name in both paths without invoking it",
+		({ mutate }) => {
+			const journal = coldJournal();
+			const cold = copyEntry(journal.cold(), {});
+			expect(isColdEntry(cold)).toBe(true);
+			const lazy = Object.getOwnPropertyDescriptor(
+				Object.getOwnPropertyDescriptor(cold, "message")!.value as object,
+				"content",
+			)!;
+			const read = vi.fn(lazy.get!);
+			const message = Object.getOwnPropertyDescriptor(cold, "message")!.value as object;
+			Object.defineProperty(message, "content", { ...lazy, get: read });
+			const { entry, spies } = mutate(cold);
+			journal.use(entry);
+
+			expect(() => serializeSessionBranch(journal.sessionManager)).toThrow(/plain JSON/);
+			expect(() => exportSessionToJsonl(journal.sessionManager, join(directory(), "out.jsonl"))).toThrow(
+				/plain JSON/,
+			);
+			for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+			expect(read).not.toHaveBeenCalled();
+		},
+	);
 });
