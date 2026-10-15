@@ -223,16 +223,25 @@ Which API to use:
 
 The two receipts answer different questions. `sendUserMessage(..., { metadata })` returns a persistence receipt: `turnStarted` with the persisted `entryId`, or `handled` with `entryId: null`. `submitUserMessage()` returns an admission receipt and never an entry ID.
 
-`SubmitUserMessageOptions` and `UserMessageReceipt` are exported types. The receipt contains `status: "accepted" | "queued" | "rejected"` and `sessionGeneration: string`, with optional `duplicate: true`, `admittedSessionGeneration`, and `reason`. `sessionGeneration` always echoes the caller's request generation, including on `session_changed`; read the context again for the current generation. Rejection reasons are `no_session`, `session_changed`, `payload_mismatch`, `shutting_down`, `admission_refused`, and `unsupported`.
+`SubmitUserMessageOptions` and `UserMessageReceipt` are exported types. The receipt contains `status: "accepted" | "queued" | "rejected"` and `sessionGeneration: string`, with optional `duplicate: true`, `admittedSessionGeneration`, and `reason`. `sessionGeneration` always echoes the caller's request generation, including on `session_changed`; read the context again for the current generation. Rejection reasons are `no_session`, `session_changed`, `payload_mismatch`, `shutting_down`, `admission_refused`, `quit_refused_busy`, and `unsupported`. The only reason on a non-rejected receipt is `quit_requested` (see exact `/quit` below).
 
 - `no_session`: called during extension loading, before a session binds.
 - `session_changed`: the API is stale (reload or session replacement) or the request generation is not current.
-- `unsupported`: the host did not bind receipt ingress (custom SDK hosts may omit it).
+- `unsupported`: the host did not bind receipt ingress (custom SDK hosts may omit it), or an idle exact `/quit` found no mode shutdown hook.
+- `quit_refused_busy`: exact `/quit` arrived while a turn was running, compaction was running, or another input was still being admitted.
 - `shutting_down`: shutdown closed ingress permanently.
 - `payload_mismatch`: the key was seen before with different text.
 - `admission_refused`: an input hook handled the input, a cap or lifecycle fence refused it, or the call came through another extension's borrowed API.
 
 `accepted` means an idle turn actually started; `queued` means the input entered that session's follow-up queue, including during preflight or settlement. Neither promises model completion. Input hooks still run and may transform the input. A hook returning `handled` produces `rejected/admission_refused`; thrown hook errors keep their isolated/continue behavior. Text is not trimmed or expanded as an extension command, skill command, or prompt template. V1 supports only `deliverAs: "followUp"` and `expandPromptTemplates: false`.
+
+Exact `/quit` is the one exception: text equal to `/quit` after trimming surrounding whitespace is a quit request, not user input. It never runs input hooks, reaches the model, enters a queue, or creates an entry.
+
+- Busy (a turn or post-run continuation is running, compaction is running, or another input is still being admitted): `rejected/quit_refused_busy`. The running turn, including any tool call, continues and persists its results.
+- Idle with a mode shutdown hook (TUI and RPC modes bind one): `accepted` with `reason: "quit_requested"`, settled before the hook runs, so a hook that tears the session down cannot turn it into `session_changed` or `shutting_down`. The mode then shuts down as for `ctx.shutdown()`.
+- Idle with no mode shutdown hook (for example, an SDK host that did not bind one): `rejected/unsupported`.
+
+A duplicate of an accepted quit returns `accepted`, `reason: "quit_requested"`, `duplicate: true` and `admittedSessionGeneration`, and does not call the hook again. Other text, such as `/quit now`, is admitted literally as before. `pi.sendUserMessage("/quit")`, with or without `metadata`, is unchanged: it sends literal user text, and its metadata and receipts are not affected.
 
 An admitted message is persisted as an ordinary user entry with empty metadata (`{}`) and a Pi-stamped `metadataSource`. The source policy differs from `sendUserMessage(..., { metadata })` because submit is meant to run from external callbacks:
 

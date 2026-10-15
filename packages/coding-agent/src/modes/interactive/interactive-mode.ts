@@ -3546,6 +3546,13 @@ export class InteractiveMode {
 		}
 		if (text === "/quit") {
 			this.editor.setText("");
+			// #11043: /quit must not tear down a running turn; the quit-now key stays explicit.
+			if (this.session.isStreaming || this.session.isCompacting || this.session.inputAdmissionCount > 0) {
+				this.showWarning(
+					`A turn is running. Press ${keyText("app.interrupt").replaceAll("escape", "Esc")} to stop it, then /quit. To quit now: ${keyText("app.exit")}.`,
+				);
+				return;
+			}
 			await this.shutdown();
 			return;
 		}

@@ -7,20 +7,22 @@ const MAX_TEXT_BYTES = 64 * 1024;
 const MAX_ID_BYTES = 256;
 const MAX_RESERVED_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
-type RejectionReason = NonNullable<UserMessageReceipt["reason"]>;
+type RejectionReason = Exclude<NonNullable<UserMessageReceipt["reason"]>, AcceptedReason>;
+/** Only an accepted exact /quit (#11043) carries a reason on a non-rejected receipt. */
+type AcceptedReason = "quit_requested";
 
 /** Private prompt admission observer; not an extension-provided callback. */
 export interface UserMessageAdmission {
 	readonly signal: AbortSignal;
 	check(): void;
-	accept(status: "accepted" | "queued"): void;
+	accept(status: "accepted" | "queued", reason?: AcceptedReason): void;
 	refuse(reason: RejectionReason): void;
 }
 
 // Retain only bounded history, never the caller's unchecked request-generation echo.
 type AdmissionOutcome =
 	| { status: "rejected"; reason: RejectionReason }
-	| { status: "accepted" | "queued"; admittedSessionGeneration: string };
+	| { status: "accepted" | "queued"; admittedSessionGeneration: string; reason?: AcceptedReason };
 
 interface Reservation {
 	textFingerprint: Buffer;
@@ -31,11 +33,10 @@ function receiptFor(outcome: AdmissionOutcome, requestGeneration: string, duplic
 	return {
 		status: outcome.status,
 		sessionGeneration: requestGeneration,
-		...(outcome.status === "rejected"
-			? { reason: outcome.reason }
-			: duplicate
-				? { admittedSessionGeneration: outcome.admittedSessionGeneration }
-				: {}),
+		...(outcome.status === "rejected" || outcome.reason ? { reason: outcome.reason } : {}),
+		...(outcome.status !== "rejected" && duplicate
+			? { admittedSessionGeneration: outcome.admittedSessionGeneration }
+			: {}),
 		...(duplicate ? { duplicate } : {}),
 	};
 }
@@ -203,7 +204,8 @@ export class UserMessageIngress {
 				signal.throwIfAborted();
 				if (generation !== this.generation || this.closedReason) throw new Error("User message session changed");
 			},
-			accept: (status) => settle({ status, admittedSessionGeneration: generation }),
+			accept: (status, reason) =>
+				settle({ status, admittedSessionGeneration: generation, ...(reason ? { reason } : {}) }),
 			refuse: (reason) => settle({ status: "rejected", reason }),
 		};
 		void run(request, admission).then(
