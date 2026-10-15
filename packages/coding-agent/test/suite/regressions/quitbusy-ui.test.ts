@@ -33,6 +33,7 @@ function createUiFixture(harness: Harness) {
 	const errors: string[] = [];
 	const recoveredImages = new Map<string, ImageContent>();
 	const stop = vi.fn();
+	const drainInput = vi.fn(async () => {});
 	// Only terminal/UI effects are fixtures. Admission, queues, exit and draft recovery use real code.
 	const mode = Object.assign(Object.create(InteractiveMode.prototype), {
 		runtimeHost: runtime,
@@ -41,7 +42,8 @@ function createUiFixture(harness: Harness) {
 		confirmUnsentDiscard: false,
 		compactionQueueWork: new Set<Promise<void>>(),
 		themeController: { disableAutoSync: vi.fn() },
-		ui: { terminal: { drainInput: async () => {} }, requestRender: vi.fn() },
+		ui: { terminal: { drainInput }, requestRender: vi.fn() },
+		uiHolds: new Set(),
 		stagingAudit: () => {},
 		stop,
 		showWarning: (message: string) => warnings.push(message),
@@ -62,6 +64,7 @@ function createUiFixture(harness: Harness) {
 		errors,
 		recoveredImages,
 		stop,
+		drainInput,
 		dispatch: (text: string) => dispatch.call(mode, receiveInput(text)),
 		restore: () => restore.call(mode),
 	};
@@ -105,12 +108,21 @@ describe("interactive unsent-input consent and draft recovery", () => {
 		await harness.session.steer("first queued input");
 		await harness.session.followUp("second queued input");
 		const fixture = createUiFixture(harness);
+		const order: string[] = [];
+		fixture.stop.mockImplementation(() => {
+			expect(blocks).toEqual([]);
+			order.push("stop");
+		});
 		const blocks = captureUnsentStderr(() => {
-			expect(harness.session.isDisposed).toBe(false);
-			expect(harness.session.agent.getQueuedMessages()).toHaveLength(2);
+			expect(harness.session.isDisposed).toBe(true);
+			expect(fixture.stop).toHaveBeenCalledTimes(1);
+			order.push("stderr");
 		});
 		// Returning instead of throwing prevents the production catch from treating the spy as an error.
-		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => {
+			order.push("exit");
+			return undefined as never;
+		});
 		await fixture.dispatch("/quit");
 		expect(fixture.warnings).toHaveLength(1);
 		expect(fixture.warnings[0]).toBe(
@@ -142,6 +154,7 @@ describe("interactive unsent-input consent and draft recovery", () => {
 		expect(exit).toHaveBeenCalledTimes(1);
 		expect(exit).toHaveBeenCalledWith(0);
 		expect(fixture.stop).toHaveBeenCalledTimes(1);
+		expect(order).toEqual(["stop", "stderr", "exit"]);
 		expect(fixture.warnings).toHaveLength(changed ? 2 : 1);
 		expect(blocks).toEqual([
 			`Unsent input (not saved; --no-session):\nfirst queued input\nsecond queued input\n${changed ? "third queued input\n" : ""}`,
@@ -153,7 +166,7 @@ describe("interactive unsent-input consent and draft recovery", () => {
 	});
 
 	// smarty-dev#13156 / pi#262: the explicit discard receipt covers every pending source and occurrence.
-	it("prints the full no-session backlog once before clearing any input owner", async () => {
+	it("prints the full no-session backlog once after terminal stop", async () => {
 		let enter!: () => void;
 		const entered = new Promise<void>((resolve) => {
 			enter = resolve;
@@ -212,13 +225,13 @@ describe("interactive unsent-input consent and draft recovery", () => {
 		void admission.catch(() => {});
 		try {
 			await entered;
-			const queued = harness.session.agent.getQueuedMessageOccurrences();
 			const fixture = createUiFixture(harness);
 			const blocks = captureUnsentStderr(() => {
-				expect(modePending).toBe(true);
-				expect(harness.session.inputAdmissionCount).toBe(1);
-				expect(harness.session.agent.getQueuedMessageOccurrences()).toEqual(queued);
-				expect(harness.session.shutdownSignal.aborted).toBe(false);
+				expect(modePending).toBe(false);
+				expect(harness.session.inputAdmissionCount).toBe(0);
+				expect(harness.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+				expect(harness.session.isDisposed).toBe(true);
+				expect(fixture.stop).toHaveBeenCalledTimes(1);
 			});
 			const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
 			await fixture.dispatch("/quit");
@@ -248,36 +261,129 @@ describe("interactive unsent-input consent and draft recovery", () => {
 		}
 	});
 
-	// smarty-dev#13156 / pi#262: a broken stderr is not consent to silently discard queued input.
-	it("refuses no-session discard when printing fails, retaining input for a later quit", async () => {
+	// smarty-dev#13156 / pi#262: headless disposal still writes before discarding any input.
+	it("retains headless input when synchronous stderr printing fails", async () => {
 		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
 		harnesses.push(harness);
 		await harness.session.followUp("keep after stderr failure");
 		const fixture = createUiFixture(harness);
 		let fail = true;
 		const blocks = captureUnsentStderr(() => {
+			expect(harness.session.isDisposed).toBe(false);
+			expect(harness.session.agent.getQueuedMessages()).toHaveLength(1);
 			if (fail) throw new Error("stderr unavailable");
 		});
-		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
-		await fixture.dispatch("/quit");
 		const queued = harness.session.agent.getQueuedMessageOccurrences();
-		await fixture.dispatch("/quit");
-		expect(fixture.errors).toEqual([
+		await expect(fixture.runtime.dispose({ operatorExit: true, discardUnsentInput: true })).rejects.toThrow(
 			"INPUT_ADMISSION_BUSY: unsent input could not be printed to stderr; input was not discarded",
-		]);
+		);
 		expect(blocks).toEqual([]);
 		expect(harness.session.agent.getQueuedMessageOccurrences()).toEqual(queued);
 		expect(harness.session.isDisposed).toBe(false);
 		expect(harness.session.inputsFenced).toBe(false);
 		expect(harness.session.shutdownSignal.aborted).toBe(false);
 		expect(fixture.stop).not.toHaveBeenCalled();
-		expect(exit).not.toHaveBeenCalled();
 		fail = false;
-		await fixture.dispatch("/quit");
+		await fixture.runtime.dispose({ operatorExit: true, discardUnsentInput: true });
 		expect(blocks).toEqual(["Unsent input (not saved; --no-session):\nkeep after stderr failure\n"]);
 		expect(harness.session.isDisposed).toBe(true);
 		expect(harness.sessionManager.getSessionFile()).toBeUndefined();
-		expect(exit).toHaveBeenCalledTimes(1);
+	});
+
+	// smarty-dev#13156 / pi#262: deferred stderr failure is not a recoverable pre-stop refusal.
+	it("reports a post-stop stderr failure without claiming successful exit", async () => {
+		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(harness);
+		await harness.session.followUp("visible after stop");
+		const fixture = createUiFixture(harness);
+		const blocks = captureUnsentStderr(() => {
+			expect(fixture.stop).toHaveBeenCalledTimes(1);
+			throw new Error("stderr unavailable after stop");
+		});
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		await fixture.dispatch("/quit");
+		await expect(fixture.dispatch("/quit")).rejects.toThrow("stderr unavailable after stop");
+		expect(blocks).toEqual([]);
+		expect(harness.session.isDisposed).toBe(true);
+		expect(fixture.errors).toEqual([]);
+		expect(exit).not.toHaveBeenCalled();
+	});
+
+	// smarty-dev#13156 / pi#262: a signal may upgrade disposal while the TUI is still draining input.
+	it("keeps the buffered block through a signal upgrade and prints it once after stop", async () => {
+		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(harness);
+		await harness.session.steer("first upgraded text");
+		await harness.session.followUp("second upgraded text");
+		const fixture = createUiFixture(harness);
+		fixture.editor.setText("");
+		const blocks = captureUnsentStderr(() => {
+			expect(fixture.stop).toHaveBeenCalledTimes(1);
+		});
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		await fixture.dispatch("/quit");
+		let enter!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		fixture.drainInput.mockImplementationOnce(async () => {
+			enter();
+			await held;
+		});
+		const quitting = fixture.dispatch("/quit");
+		const shutdown = Reflect.get(InteractiveMode.prototype, "shutdown") as (
+			this: InteractiveMode,
+			options: { fromSignal: boolean },
+		) => Promise<void>;
+		try {
+			await entered;
+			expect(blocks).toEqual([]);
+			expect(fixture.stop).not.toHaveBeenCalled();
+			const upgraded = shutdown.call(fixture.mode, { fromSignal: true });
+			release();
+			await Promise.all([quitting, upgraded]);
+			expect(blocks).toEqual([
+				"Unsent input (not saved; --no-session):\nfirst upgraded text\nsecond upgraded text\n",
+			]);
+			expect(fixture.stop).toHaveBeenCalledTimes(1);
+			expect(exit).toHaveBeenCalledTimes(1);
+			expect(exit).toHaveBeenCalledWith(0);
+		} finally {
+			release();
+			await quitting;
+		}
+	});
+
+	// smarty-dev#13156 / pi#262: preparation publication can fail after buffering but before beforeShutdown.
+	it("stops before flushing the retained block when disposal throws before terminal cleanup", async () => {
+		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(harness);
+		await harness.session.steer("first retained text");
+		await harness.session.followUp("second retained text");
+		const fixture = createUiFixture(harness);
+		const blocks = captureUnsentStderr(() => {
+			expect(fixture.stop).toHaveBeenCalledTimes(1);
+		});
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		await fixture.dispatch("/quit");
+		const unsubscribe = harness.session.subscribe((event) => {
+			if (event.type === "queue_update") throw new Error("queue publication failed");
+		});
+		try {
+			await expect(fixture.dispatch("/quit")).rejects.toThrow("queue publication failed");
+			expect(blocks).toEqual([
+				"Unsent input (not saved; --no-session):\nfirst retained text\nsecond retained text\n",
+			]);
+			expect(fixture.stop).toHaveBeenCalledTimes(1);
+			expect(exit).not.toHaveBeenCalled();
+			expect(fixture.errors).toEqual([]);
+		} finally {
+			unsubscribe();
+		}
 	});
 
 	it("merges unstamped user/custom text and images into one unsent draft, then submits as fresh input", async () => {

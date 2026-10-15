@@ -3430,7 +3430,11 @@ export class AgentSession {
 	 * Explicit operator exit only: fence and save every unsent occurrence before cancellation.
 	 * A save failure leaves the input and active operation owned by this session.
 	 */
-	prepareOperatorExit(options?: { discardUnsent?: boolean }): () => void {
+	prepareOperatorExit(options?: {
+		discardUnsent?: boolean;
+		/** TUI owner retains this block synchronously and prints it after terminal restoration. */
+		bufferUnsentInput?: (block: string) => void;
+	}): () => void {
 		if (this._inputsDisposed)
 			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "operator exit session is disposed");
 		const release = this.gateInputs();
@@ -3493,9 +3497,11 @@ export class AgentSession {
 							? contentText(message.content, "\n") || JSON.stringify(message)
 							: JSON.stringify(message),
 					);
-					// Write the whole block synchronously to stderr, not to a hidden recovery file.
-					// A failed/partial write refuses exit and leaves every input owner intact.
-					fs.writeFileSync(process.stderr.fd, `Unsent input (not saved; --no-session):\n${text.join("\n")}\n`);
+					const block = `Unsent input (not saved; --no-session):\n${text.join("\n")}\n`;
+					// The TUI must retain the block before clearing input, then print after its final redraw.
+					// Headless callers still write synchronously; failure leaves every input owner intact.
+					if (options?.bufferUnsentInput) options.bufferUnsentInput(block);
+					else fs.writeFileSync(process.stderr.fd, block);
 				} catch (cause) {
 					throw new InputAdmissionError(
 						"INPUT_ADMISSION_BUSY",

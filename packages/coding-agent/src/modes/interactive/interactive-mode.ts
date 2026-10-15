@@ -4617,6 +4617,7 @@ export class InteractiveMode {
 		}
 		this.isShuttingDown = true;
 		this.shutdownCompletion = (async () => {
+			let terminalStopped = false;
 			try {
 				// Keep signal handlers registered until terminal cleanup has completed.
 				// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
@@ -4658,20 +4659,35 @@ export class InteractiveMode {
 					// Drain any in-flight Kitty key release events before stopping.
 					// This prevents escape sequences from leaking to the parent shell over slow SSH.
 					this.operatorExitRequested = true;
-					await this.runtimeHost.dispose({
-						operatorExit: true,
-						discardUnsentInput:
-							options?.fromQuit === true &&
-							options.discardUnsentInput === true &&
-							this.confirmUnsentDiscard &&
-							this.confirmedUnsentRevision === this.session.queuedInputRevision,
-						beforeShutdown: async () => {
-							while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
-							this.themeController.disableAutoSync();
-							await this.ui.terminal.drainInput(1000);
-							this.stop();
-						},
-					});
+					const unsentInputBlocks: string[] = [];
+					try {
+						await this.runtimeHost.dispose({
+							operatorExit: true,
+							discardUnsentInput:
+								options?.fromQuit === true &&
+								options.discardUnsentInput === true &&
+								this.confirmUnsentDiscard &&
+								this.confirmedUnsentRevision === this.session.queuedInputRevision,
+							bufferUnsentInput: (block) => unsentInputBlocks.push(block),
+							beforeShutdown: async () => {
+								while (this.compactionQueueWork.size > 0)
+									await Promise.allSettled([...this.compactionQueueWork]);
+								this.themeController.disableAutoSync();
+								await this.ui.terminal.drainInput(1000);
+								this.stop();
+								terminalStopped = true;
+							},
+						});
+					} finally {
+						if (unsentInputBlocks.length > 0) {
+							// Even failed/upgraded disposal must report retained text, never before the final redraw.
+							if (!terminalStopped) {
+								this.stop();
+								terminalStopped = true;
+							}
+							fs.writeFileSync(process.stderr.fd, unsentInputBlocks.join(""));
+						}
+					}
 				}
 				if (this.terminalShutdownRequested) {
 					const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -4693,7 +4709,7 @@ export class InteractiveMode {
 
 				process.exit(0);
 			} catch (error) {
-				if (this.terminalShutdownRequested) throw error;
+				if (terminalStopped || this.terminalShutdownRequested) throw error;
 				if (
 					error instanceof InputAdmissionError &&
 					error.code === "INPUT_ADMISSION_BUSY" &&

@@ -781,6 +781,8 @@ export class AgentSessionRuntime {
 		operatorExit?: boolean;
 		/** Explicit operator consent to discard unsent input when no session file exists. */
 		discardUnsentInput?: boolean;
+		/** TUI-owned output, retained until terminal restoration completes. */
+		bufferUnsentInput?: (block: string) => void;
 		/** Terminal owner shutdown, distinct from an ordinary recoverable disposal refusal. */
 		terminal?: boolean;
 		beforeShutdown?: () => Promise<void>;
@@ -789,11 +791,17 @@ export class AgentSessionRuntime {
 		if (!options?.terminal && !options?.operatorExit) return this.#dispose(options);
 		// Snapshot synchronously while all input owners are still intact. Never cancel on save failure.
 		const releaseOperatorInputs = options.operatorExit
-			? this.session.prepareOperatorExit({ discardUnsent: options.discardUnsentInput })
+			? this.session.prepareOperatorExit({
+					discardUnsent: options.discardUnsentInput,
+					bufferUnsentInput: options.bufferUnsentInput,
+				})
 			: undefined;
 		this.terminalRejection = options.operatorExit
 			? (_messages, session) => {
-					const release = session.prepareOperatorExit({ discardUnsent: options.discardUnsentInput });
+					const release = session.prepareOperatorExit({
+						discardUnsent: options.discardUnsentInput,
+						bufferUnsentInput: options.bufferUnsentInput,
+					});
 					release();
 				}
 			: options.rejectQueuedInput;
