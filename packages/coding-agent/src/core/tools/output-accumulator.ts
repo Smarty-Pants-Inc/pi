@@ -4,6 +4,9 @@ import { finished } from "node:stream/promises";
 import { createOutputFileStream } from "../../utils/output-files.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
 
+// ponytail: match Fabric's 8 MiB shell log cap; preserve a useful head and tail, not an unbounded file.
+export const MAX_FULL_OUTPUT_FILE_BYTES = 8 * 1024 * 1024;
+
 export interface OutputAccumulatorOptions {
 	maxLines?: number;
 	maxBytes?: number;
@@ -30,6 +33,10 @@ export interface OutputSnapshot {
 	content: string;
 	truncation: TruncationResult;
 	fullOutputPath?: string;
+	/** Raw bytes produced by the command. */
+	totalRawBytes: number;
+	/** Whether the full-output log omitted bytes because it exceeded its raw-byte cap. */
+	fullOutputTruncated: boolean;
 	/** Present only when the full-output log omits part of the output. */
 	fullOutputTruncation?: FullOutputTruncation;
 	/**
@@ -204,6 +211,8 @@ export class OutputAccumulator {
 			content: truncation.content,
 			truncation,
 			fullOutputPath: fullOutputError === undefined ? this.tempFilePath : undefined,
+			totalRawBytes: this.totalRawBytes,
+			fullOutputTruncated: fullOutputTruncation !== undefined,
 			...(fullOutputTruncation ? { fullOutputTruncation } : {}),
 			...(fullOutputError !== undefined ? { fullOutputError } : {}),
 		};
@@ -225,9 +234,11 @@ export class OutputAccumulator {
 		if (this.fullOutputError === undefined && !stream.destroyed) {
 			if (this.logHead) stream.write(this.logHead.subarray(0, this.logRoutedBytes));
 			if (truncation) {
-				stream.write(
-					`\n\n[... ${truncation.omittedBytes} bytes omitted from this log (output was ${truncation.totalBytes} bytes; first ${this.headCap} and last ${this.tailCap} bytes kept) ...]\n\n`,
-				);
+				const marker =
+					this.headCap === FULL_OUTPUT_HEAD_BYTES && this.tailCap === FULL_OUTPUT_TAIL_BYTES
+						? `\n[... ${truncation.omittedBytes} bytes omitted; total ${truncation.totalBytes} bytes ...]\n`
+						: `\n\n[... ${truncation.omittedBytes} bytes omitted from this log (output was ${truncation.totalBytes} bytes; first ${this.headCap} and last ${this.tailCap} bytes kept) ...]\n\n`;
+				stream.write(marker);
 			}
 			if (this.logTail) {
 				const start = this.logTailBytes === this.tailCap ? this.logTailNext : 0;
@@ -276,6 +287,9 @@ export class OutputAccumulator {
 				const content = await file.readFile();
 				if (!logTruncation) {
 					return { content: new TextDecoder().decode(content), truncated: false };
+				}
+				if (this.headCap === FULL_OUTPUT_HEAD_BYTES && this.tailCap === FULL_OUTPUT_TAIL_BYTES) {
+					return { content: content.toString("utf-8"), truncated: true };
 				}
 				// The log is head, marker, tail. Decode the head and tail separately so characters cut by
 				// the log's own boundaries do not become U+FFFD next to the marker.
