@@ -1009,7 +1009,7 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 						});
 					} else {
 						pi.on("before_agent_start", async (event) => {
-							if (event.prompt !== "original") return;
+							if (event.messageType !== "user" || event.prompt !== "original") return;
 							entered.release();
 							await release.promise;
 						});
@@ -1305,7 +1305,7 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 							});
 						} else {
 							pi.on("before_agent_start", async (event) => {
-								if (event.prompt !== "delayed admission") return;
+								if (event.messageType !== "user" || event.prompt !== "delayed admission") return;
 								entered.release();
 								await release.promise;
 							});
@@ -1437,7 +1437,7 @@ describe("extension submitUserMessage ingress (#5533)", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("before_agent_start", async (event) => {
-						if (event.prompt !== "delayed before failure") return;
+						if (event.messageType !== "user" || event.prompt !== "delayed before failure") return;
 						entered.release();
 						await release.promise;
 					});

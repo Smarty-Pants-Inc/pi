@@ -6,7 +6,7 @@
  */
 
 import assert from "node:assert";
-import { beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import { matchesKey } from "../src/keys.ts";
 import { StdinBuffer } from "../src/stdin-buffer.ts";
 
@@ -23,6 +23,8 @@ describe("StdinBuffer", () => {
 			emittedSequences.push(sequence);
 		});
 	});
+
+	afterEach(() => buffer.destroy());
 
 	// Helper to process data through the buffer
 	function processInput(data: string | Buffer): void {
@@ -125,6 +127,66 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, ["\x1b[<35;20;5m"]);
 		});
 
+		// smarty-dev#12091: chunk timers must not flush a later event before its own deadline.
+		it("keeps one timer for a many-chunk event ending in an incomplete sequence", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			const timers = t.mock.method(globalThis, "setTimeout");
+			const reply = `\x1b]0;${"x".repeat(12 * 4096)}`;
+			processInput(reply);
+			t.mock.timers.tick(5);
+			processInput("\x07\x1b[");
+			t.mock.timers.tick(5);
+			assert.deepStrictEqual(emittedSequences, [`${reply}\x07`]);
+			assert.equal(buffer.getBuffer(), "\x1b[");
+			t.mock.timers.tick(4);
+			assert.deepStrictEqual(emittedSequences, [`${reply}\x07`]);
+			t.mock.timers.tick(1);
+			assert.deepStrictEqual(emittedSequences, [`${reply}\x07`, "\x1b["]);
+			assert.equal(timers.mock.callCount(), 2);
+		});
+
+		// smarty-dev#12091: consuming a recognized reply must not transfer its deadline to the next reply.
+		it("gives a new recognized reply its own deadline after completion or cancellation", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			for (const boundary of ["\x07", "\x18", "\x1a"]) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				processInput("\x1b]10;");
+				t.mock.timers.tick(5);
+				processInput(`${"x".repeat(3 * 4096)}${boundary}\x1b]11;`);
+				t.mock.timers.tick(5);
+				assert.equal(buffer.getBuffer(), "\x1b]11;", JSON.stringify(boundary));
+				t.mock.timers.tick(4);
+				assert.equal(buffer.getBuffer(), "\x1b]11;");
+				t.mock.timers.tick(1);
+				assert.equal(buffer.getBuffer(), "");
+				processInput("tail\r\n\x07q");
+				assert.equal(emittedSequences.at(-1), "q");
+			}
+		});
+
+		// smarty-dev#12091: all ways of consuming the buffer must cancel its only timer.
+		it("cancels chunk timers on completion, explicit flush and clear", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			for (const action of ["complete", "flush", "clear"] as const) {
+				buffer.clear();
+				emittedSequences.length = 0;
+				const reply = `\x1b]0;${"x".repeat(3 * 4096)}`;
+				processInput(reply);
+				t.mock.timers.tick(5);
+				if (action === "complete") processInput("\x07");
+				else if (action === "flush") assert.deepStrictEqual(buffer.flush(), [reply]);
+				else buffer.clear();
+				const completed = action === "complete" ? [`${reply}\x07`] : [];
+				processInput("\x1b[");
+				t.mock.timers.tick(5);
+				assert.deepStrictEqual(emittedSequences, completed, action);
+				assert.equal(buffer.getBuffer(), "\x1b[", action);
+				t.mock.timers.tick(5);
+				assert.deepStrictEqual(emittedSequences, [...completed, "\x1b["], action);
+			}
+		});
+
 		it("should flush incomplete sequence after timeout", async () => {
 			processInput("\x1b[<35");
 			assert.deepStrictEqual(emittedSequences, []);
@@ -189,6 +251,278 @@ describe("StdinBuffer", () => {
 			delayedBuffer.process("<65;48;39M");
 			assert.deepStrictEqual(delayedSequences, ["\x1b[<65;48;39M"]);
 			delayedBuffer.destroy();
+		});
+	});
+
+	describe("Terminal Reply Strings", () => {
+		const replies = [
+			{ header: "\x1b]4;1;", reply: "\x1b]4;1;rgb:eaea/6c6c/6d6d\x07" }, // Ghostty's Ayu Light palette color 1.
+			{ header: "\x1b]10;", reply: "\x1b]10;rgb:ffff/ffff/ffff\x1b\\" },
+			{ header: "\x1b]11;", reply: "\x1b]11;rgb:0000/0000/0000\x07" },
+			{ header: "\x1b]4;1;", reply: "\x1b]4;1;rgb:6464/6464/4d4d\x07" }, // Another reported color-reply tail.
+			{ header: "\x1bP>|", reply: "\x1bP>|Ghostty 1.3.1\x1b\\" },
+			{ header: "\x1b_Gi=1;", reply: "\x1b_Gi=1;OK\x1b\\" },
+			{ header: "\x1b]7501;?", reply: "\x1b]7501;?\x1b\\" },
+		];
+
+		for (const { header, reply } of replies) {
+			it(`keeps delayed ${JSON.stringify(reply)} intact within the deadline at every split after its reply header`, (t) => {
+				t.mock.timers.enable({ apis: ["setTimeout"] });
+				for (let split = header.length; split < reply.length; split++) {
+					const delayedBuffer = new StdinBuffer();
+					const sequences: string[] = [];
+					delayedBuffer.on("data", (sequence) => sequences.push(sequence));
+					try {
+						delayedBuffer.process(reply.slice(0, split));
+						t.mock.timers.tick(49);
+						delayedBuffer.process(`${reply.slice(split)}x`);
+						assert.equal(
+							sequences.some((sequence) => matchesKey(sequence, "ctrl+g")),
+							false,
+						);
+						assert.deepStrictEqual(sequences, [reply, "x"]);
+					} finally {
+						delayedBuffer.destroy();
+					}
+				}
+			});
+		}
+
+		it("discards an OSC reply across multiple expired sequence timeouts", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			processInput("\x1b]4;1;rgb:eaea/6c");
+			t.mock.timers.tick(100);
+			assert.deepStrictEqual(emittedSequences, []);
+			processInput("6c/6d6d");
+			t.mock.timers.tick(100);
+			assert.deepStrictEqual(emittedSequences, []);
+			processInput("\x07x");
+			assert.deepStrictEqual(emittedSequences, ["x"]);
+		});
+
+		it("still times out bare string introducers as Alt keys", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			for (const prefix of ["\x1b]", "\x1bP", "\x1b_"]) {
+				processInput(prefix);
+				t.mock.timers.tick(10);
+			}
+			assert.deepStrictEqual(emittedSequences, ["\x1b]", "\x1bP", "\x1b_"]);
+		});
+
+		for (const ambiguous of [
+			"\x1b]a",
+			"\x1b]1",
+			"\x1b]10",
+			"\x1b]0;title",
+			"\x1b]4;",
+			"\x1b]4;a;",
+			"\x1bPa",
+			"\x1bP>",
+			"\x1b_a",
+			"\x1b_G",
+			"\x1b_Gi=1",
+		]) {
+			it(`recovers batched legacy Alt input ${JSON.stringify(ambiguous)} within the sequence timeout`, (t) => {
+				t.mock.timers.enable({ apis: ["setTimeout"] });
+				const legacyBuffer = new StdinBuffer();
+				const sequences: string[] = [];
+				legacyBuffer.on("data", (sequence) => sequences.push(sequence));
+				try {
+					legacyBuffer.process(ambiguous);
+					t.mock.timers.tick(20);
+					legacyBuffer.process("x\r\x03\x04");
+					t.mock.timers.tick(49);
+					assert.deepStrictEqual(sequences, []);
+					t.mock.timers.tick(1);
+					assert.deepStrictEqual(sequences, [
+						ambiguous.slice(0, 2),
+						...ambiguous.slice(2),
+						"x",
+						"\r",
+						"\x03",
+						"\x04",
+					]);
+					assert.strictEqual(legacyBuffer.getBuffer(), "");
+
+					legacyBuffer.process("y\r\x03\x04");
+					assert.deepStrictEqual(sequences.slice(-4), ["y", "\r", "\x03", "\x04"]);
+				} finally {
+					legacyBuffer.destroy();
+				}
+			});
+		}
+
+		it("recognizes a reply header assembled within the ambiguous-input timeout", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			processInput("\x1b]1");
+			t.mock.timers.tick(5);
+			processInput("0;");
+			t.mock.timers.tick(9);
+			assert.deepStrictEqual(emittedSequences, []);
+			processInput("rgb:ffff/ffff/ffff\x1b\\");
+			assert.deepStrictEqual(emittedSequences, [replies[1].reply]);
+		});
+
+		// pi#244: recognized replies need an absolute deadline, then a bounded discard window.
+		it("expires an unterminated recognized reply before delivering later keys", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			processInput("\x1b]10;");
+			t.mock.timers.tick(9);
+			processInput("abc");
+			t.mock.timers.tick(1);
+			assert.equal(buffer.getBuffer(), "");
+			processInput("tail\r\n");
+			assert.deepStrictEqual(emittedSequences, []);
+			t.mock.timers.tick(499);
+			processInput("late");
+			assert.deepStrictEqual(emittedSequences, []);
+			t.mock.timers.tick(1);
+			processInput("xyz\r\n");
+			assert.deepStrictEqual(emittedSequences, ["x", "y", "z"]);
+		});
+
+		// pi#244: byte cap bounds retained UTF-8 bytes, even on a large single data event.
+		it("discards an over-cap reply without retaining or emitting its tail", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			processInput(`\x1b]10;${"é".repeat(32 * 1024)}`);
+			assert.equal(buffer.getBuffer(), "");
+			assert.deepStrictEqual(emittedSequences, []);
+			processInput("tail\r\n\x07q");
+			assert.deepStrictEqual(emittedSequences, ["q"]);
+		});
+
+		// pi#244: completed oversized strings also stay capped; parsing the suffix must resume immediately.
+		it("discards a complete oversized reply and resumes input in the same event", () => {
+			processInput(`\x1b]11;${"x".repeat(70 * 1024)}\x07z`);
+			assert.equal(buffer.getBuffer(), "");
+			assert.deepStrictEqual(emittedSequences, ["z"]);
+		});
+
+		// smarty-dev#12091: real-sized unknown input must be linear, bounded and never auto-submit.
+		it("processes one 1 MiB unterminated unknown OSC within the linear-time budget", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			const input = `\x1b]0;${"\r\n".repeat((1024 * 1024 - 4) / 2)}`;
+			assert.equal(Buffer.byteLength(input), 1024 * 1024);
+			const start = performance.now();
+			processInput(input);
+			const elapsed = performance.now() - start;
+			assert.ok(elapsed < 200, `1 MiB scan took ${elapsed.toFixed(1)}ms (budget: 200ms)`);
+			assert.equal(buffer.getBuffer(), "");
+			assert.deepStrictEqual(emittedSequences, []);
+			// The byte discard window is already exhausted by this event; CR/LF stay quarantined.
+			processInput("keys\r\n");
+			assert.deepStrictEqual(emittedSequences, [..."keys"]);
+			processInput("\x07\r");
+			assert.deepStrictEqual(emittedSequences, [..."keys", "\r"]);
+		});
+
+		for (const header of ["\x1b]0;", "\x1bPunknown;", "\x1b_unknown;", "\x1b^unknown;", "\x1bXunknown;"]) {
+			// smarty-dev#12091: the UTF-8 size cap and bounded discard also cover unknown control strings.
+			it(`caps unknown ${JSON.stringify(header)} and resumes keys after the discard window`, (t) => {
+				t.mock.timers.enable({ apis: ["setTimeout"] });
+				processInput(`a${header}${"é".repeat(32 * 1024)}`);
+				assert.equal(buffer.getBuffer(), "");
+				assert.deepStrictEqual(emittedSequences, ["a"]);
+				processInput("tail\r\n");
+				t.mock.timers.tick(499);
+				processInput("late\r\n");
+				assert.deepStrictEqual(emittedSequences, ["a"]);
+				t.mock.timers.tick(1);
+				processInput("q\r\n");
+				assert.deepStrictEqual(emittedSequences, ["a", "q"]);
+				processInput("\x1b");
+				processInput("\\\r\x1b[A");
+				assert.deepStrictEqual(emittedSequences, ["a", "q", "\r", "\x1b[A"]);
+			});
+		}
+
+		// smarty-dev#12091: incremental scans must revisit a trailing ESC to distinguish ST/resync.
+		it("resumes split terminators and recognized-reply resynchronization after many chunks", () => {
+			for (const header of [
+				"\x1b]10;",
+				"\x1b]0;",
+				"\x1bPunknown;",
+				"\x1b_unknown;",
+				"\x1b^unknown;",
+				"\x1bXunknown;",
+			]) {
+				const reply = `${header}${"x".repeat(3 * 4096)}`;
+				processInput(`${reply}\x1b`);
+				assert.equal(buffer.getBuffer(), `${reply}\x1b`);
+				processInput("\\q");
+				assert.deepStrictEqual(emittedSequences.slice(-2), [`${reply}\x1b\\`, "q"]);
+			}
+			processInput(`\x1b]11;${"x".repeat(3 * 4096)}\x1b`);
+			processInput("[Ar");
+			assert.deepStrictEqual(emittedSequences.slice(-2), ["\x1b[A", "r"]);
+		});
+
+		// pi#244: explicit flush must not convert a recognized reply into keyboard/control input.
+		it("discards a recognized reply on explicit flush", () => {
+			processInput("\x1bP>|reply");
+			assert.deepStrictEqual(buffer.flush(), []);
+			processInput("tail\x1b\\x");
+			assert.deepStrictEqual(emittedSequences, ["x"]);
+		});
+
+		// pi#244: each protocol boundary ends discard without leaking terminators as control keys.
+		for (const boundary of ["\x07", "\x1b\\", "\x18", "\x1a", "\x1b[A"]) {
+			it(`ends expired reply discard on ${JSON.stringify(boundary)}`, (t) => {
+				t.mock.timers.enable({ apis: ["setTimeout"] });
+				processInput("\x1b]11;");
+				t.mock.timers.tick(10);
+				processInput(`tail\r\n${boundary}x`);
+				assert.deepStrictEqual(emittedSequences, boundary === "\x1b[A" ? [boundary, "x"] : ["x"]);
+			});
+		}
+
+		// pi#244: the discard byte budget is an independent exit, not an indefinitely resetting timer.
+		it("ends the discard window at its byte cap and resumes plain typing", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			processInput("\x1bP>|");
+			t.mock.timers.tick(10);
+			for (let i = 0; i < 16; i++) {
+				processInput("x".repeat(4096));
+				assert.equal(buffer.getBuffer(), "");
+				assert.deepStrictEqual(emittedSequences, []);
+			}
+			processInput("plain\r\n");
+			assert.deepStrictEqual(emittedSequences, [..."plain"]);
+			processInput("\x1b");
+			processInput("\\\r");
+			assert.deepStrictEqual(emittedSequences, [..."plain", "\r"]);
+		});
+
+		// pi#244: a split ST after expiry is never an Alt key or a backslash keystroke.
+		it("discards a split late ST and clears quarantine on explicit clear", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			processInput("\x1b_Gi=1;");
+			t.mock.timers.tick(10);
+			processInput("tail\x1b");
+			processInput("\\x");
+			assert.deepStrictEqual(emittedSequences, ["x"]);
+			processInput("\x1b]10;");
+			t.mock.timers.tick(10);
+			buffer.clear();
+			processInput("\r");
+			assert.deepStrictEqual(emittedSequences, ["x", "\r"]);
+		});
+
+		it("recovers from an unterminated reply when a new escape sequence arrives", (t) => {
+			t.mock.timers.enable({ apis: ["setTimeout"] });
+			processInput("\x1b]4;1;rgb:eaea/6c");
+			t.mock.timers.tick(100);
+			processInput("\x1b");
+			t.mock.timers.tick(100);
+			processInput("[Ahello");
+			assert.deepStrictEqual(emittedSequences, ["\x1b[A", "h", "e", "l", "l", "o"]);
+		});
+
+		it("discards a canceled reply without swallowing subsequent input", () => {
+			for (const cancel of ["\x18", "\x1a"]) {
+				processInput(`\x1b]11;rgb:0000${cancel}x`);
+			}
+			assert.deepStrictEqual(emittedSequences, ["x", "x"]);
 		});
 	});
 
