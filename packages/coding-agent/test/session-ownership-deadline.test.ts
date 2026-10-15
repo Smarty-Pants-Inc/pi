@@ -269,8 +269,12 @@ test("terminal append uses a captured serialized private route", () => {
 	expect(agent).toContain("await this._flushPendingBashMessagesOwnedTerminal();");
 	expect(agent).toContain("await this._flushPendingCustomMessagesOwnedTerminal();");
 	// #7883: per-input metadata uses the same captured owned terminal appender.
+	// pi#160: the write receives `persisted`, the detached, checked copy of event.message, so what is
+	// checked is what is written. The property guarded here is unchanged: the message, receipt and
+	// per-input metadata still go through the captured serialized owned terminal appender, and
+	// `persisted` is plain data, so the queued write cannot observe later live mutations.
 	expect(agent).toMatch(
-		/await appendOwnedTerminalMessage\(\s*this\.sessionManager,\s*event\.message,\s*receipt,\s*metadata,\s*metadataSource,?\s*\)/,
+		/await appendOwnedTerminalMessage\(\s*this\.sessionManager,\s*persisted,\s*receipt,\s*metadata,\s*metadataSource,?\s*\)/,
 	);
 	expect(agent).toContain("await appendOwnedTerminalCustomMessage(");
 	expect(agent).toContain("Leave the failed message and suffix retained");

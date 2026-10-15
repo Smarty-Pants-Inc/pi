@@ -41,6 +41,7 @@ import {
 	linkifyUrls,
 	Markdown,
 	matchesKey,
+	ProcessTerminal,
 	Spacer,
 	setCapabilityOverrides,
 	setKeybindings,
@@ -99,6 +100,7 @@ import type {
 	WorkingIndicatorOptions,
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
+import type { HerdrInputBootstrap } from "../../core/herdr/bootstrap.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
 import { InputAdmissionError } from "../../core/input-admission.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
@@ -139,6 +141,7 @@ import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
 import { withBuiltInRenderers } from "../../core/tools/renderers/index.ts";
 import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
+import type { TurnReceipt } from "../../core/turn-receipts.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { addMcpServerConfig, loadMcpConfig } from "../../extensions/mcp/config.ts";
 import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
@@ -466,6 +469,8 @@ function formatLoginProviderCompletionDescription(provider: LoginProviderComplet
  * Options for InteractiveMode initialization.
  */
 export interface InteractiveModeOptions {
+	/** Herdr input-consumer enrollment made at startup (smarty-dev#2636). */
+	herdrInput?: HerdrInputBootstrap;
 	/** Providers that were migrated to auth.json (shows warning) */
 	migratedProviders?: string[];
 	/** Diagnostics collected before the interactive TUI was initialized. */
@@ -1073,6 +1078,12 @@ export class InteractiveMode {
 		this.ui.setFocus(this.editor);
 
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
+		const herdrInput = this.options.herdrInput;
+		if (herdrInput && this.ui.terminal instanceof ProcessTerminal) {
+			// Bytes outside the epoch (typed before the marker) are not attested: they taint the draft (pi#160).
+			this.ui.terminal.setInputMeter(herdrInput.meter, () => this.defaultEditor.markDraftTainted());
+			herdrInput.handOff();
+		} else herdrInput?.shutdown();
 		this.ui.start();
 		this.isInitialized = true;
 		this.programStatus.report();
@@ -2694,10 +2705,27 @@ export class InteractiveMode {
 		this.ui.requestRender();
 	}
 
+	private captureHerdrSubmit(text: string): Promise<TurnReceipt> | undefined {
+		const attestor = this.options.herdrInput?.attestor;
+		const terminal = this.ui.terminal;
+		if (!attestor || !(terminal instanceof ProcessTerminal)) return undefined;
+		return attestor.capture(terminal.inputOffset, {
+			// A custom editor's draft cannot be checked for taint.
+			tainted: this.defaultEditor.lastSubmitTainted || this.editor !== this.defaultEditor,
+			kind: text.startsWith("/") || text.startsWith("!") ? "discard" : "submit",
+		});
+	}
+
 	private addExtensionTerminalInputListener(
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined,
 	): () => void {
-		const subscription = { handler, unsubscribe: this.ui.addInputListener(handler) };
+		// An extension that rewrites terminal input taints the draft (smarty-dev#2636).
+		const tainting = (data: string) => {
+			const result = handler(data);
+			if (result?.data !== undefined && result.data !== data) this.defaultEditor.markDraftTainted();
+			return result;
+		};
+		const subscription = { handler: tainting, unsubscribe: this.ui.addInputListener(tainting) };
 		this.extensionTerminalInputSubscriptions.add(subscription);
 		return () => {
 			subscription.unsubscribe();
@@ -2775,7 +2803,11 @@ export class InteractiveMode {
 			setHeader: (factory) => this.setExtensionHeader(factory),
 			setTitle: (title) => this.ui.terminal.setTitle(title),
 			custom: (factory, options) => this.showExtensionCustom(factory, options),
-			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
+			pasteToEditor: (text) => {
+				// Synthetic paste: not bytes from the terminal client (smarty-dev#2636).
+				this.defaultEditor.markDraftTainted();
+				this.editor.handleInput(`\x1b[200~${text}\x1b[201~`);
+			},
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
 			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
@@ -3302,6 +3334,8 @@ export class InteractiveMode {
 		try {
 			const text = await readClipboardText();
 			if (!text || this.renderer.getFocusedComponent() !== target) return;
+			// Clipboard text is synthetic, not attested terminal bytes (pi#160).
+			if (target === this.defaultEditor) this.defaultEditor.markDraftTainted();
 			handleInput.call(target, `\x1b[200~${text}\x1b[201~`);
 			this.ui.requestRender();
 		} catch {
@@ -3388,17 +3422,36 @@ export class InteractiveMode {
 	}
 
 	private setupEditorSubmitHandler(): void {
+		let submitQueue = Promise.resolve();
 		const submit = async (text: string) => {
 			text = text.trim();
 			if (!text) return;
 			if (this.runtimeHost.inputsFenced || this.terminalShutdownRequested) {
-				this.editor.setText(text);
+				this.restoreRejectedInput(text);
 				this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
 				return;
 			}
-			await this.dispatchEditorInput(receiveInput(text));
+			// Synchronous, before any await: the cut is this Enter's byte end (smarty-dev#2636, #1515).
+			const attested = this.captureHerdrSubmit(text);
+			const input = attested
+				? attested.then((receipt) => receiveInput(text, undefined, receipt))
+				: receiveInput(text);
+			// Reserve FIFO order now, not when the cut answers. Order dispatch starts, not command completion.
+			const started = submitQueue
+				.then(() => input)
+				.then((input) => ({ completion: this.dispatchEditorInput(input) }));
+			// Do not adopt completion here: a held command must not block the next dispatch (pi#160).
+			submitQueue = started.then(
+				() => {},
+				() => {},
+			);
+			// Clear only this submission, before the terminal can fill the next draft (pi#160 R9).
+			this.editor.setText("");
+			const { completion } = await started;
+			// The caller still waits for this input's acknowledgement or rejection recovery.
+			await completion;
 		};
-		// Return the observed promise so callers that await submission still see its completion.
+		// Return the observed promise even though the editor itself does not await it.
 		this.defaultEditor.onSubmit = (text: string) =>
 			submit(text).catch((error: unknown) => this.observeSubmitFailure(error));
 		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;
@@ -3411,141 +3464,114 @@ export class InteractiveMode {
 		// Handle commands
 		if (text === "/settings") {
 			this.showSettingsSelector();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/scoped-models") {
-			this.editor.setText("");
 			await this.showModelsSelector();
 			return;
 		}
 		if (text === "/model" || text.startsWith("/model ")) {
 			const searchTerm = text.startsWith("/model ") ? text.slice(7).trim() : undefined;
-			this.editor.setText("");
 			await this.handleModelCommand(searchTerm);
 			return;
 		}
 		if (text === "/thinking" || text.startsWith("/thinking ")) {
 			const searchTerm = text.startsWith("/thinking ") ? text.slice(10).trim() : undefined;
-			this.editor.setText("");
 			this.handleThinkingCommand(searchTerm);
 			return;
 		}
 		if (text === "/export" || text.startsWith("/export ")) {
 			await this.handleExportCommand(text);
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/import" || text.startsWith("/import ")) {
-			this.editor.setText("");
 			await this.handleImportCommand(text);
 			return;
 		}
 		if (text === "/share") {
 			await this.handleShareCommand();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/bug" || text.startsWith("/bug ")) {
 			const hint = text.slice("/bug".length).trim();
-			this.editor.setText("");
 			await this.handleBugCommand(hint ? hint : undefined);
 			return;
 		}
 		if (text === "/copy") {
 			await this.handleCopyCommand();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/name" || text.startsWith("/name ")) {
 			this.handleNameCommand(text);
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/session") {
 			this.handleSessionCommand();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/changelog") {
 			this.handleChangelogCommand();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/hotkeys") {
 			this.handleHotkeysCommand();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/fork") {
 			this.showUserMessageSelector();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/clone") {
-			this.editor.setText("");
 			await this.handleCloneCommand();
 			return;
 		}
 		if (text === "/tree") {
 			this.showTreeSelector();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/trust") {
 			this.showTrustSelector();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/login" || text.startsWith("/login ")) {
 			const providerRef = text.startsWith("/login ") ? text.slice(7).trim() : undefined;
-			this.editor.setText("");
 			await this.handleLoginCommand(providerRef);
 			return;
 		}
 		if (text === "/logout") {
 			this.showOAuthSelector("logout");
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/new") {
-			this.editor.setText("");
 			await this.handleClearCommand();
 			return;
 		}
 		if (text === "/compact" || text.startsWith("/compact ")) {
 			const customInstructions = text.startsWith("/compact ") ? text.slice(9).trim() : undefined;
-			this.editor.setText("");
 			await this.handleCompactCommand(customInstructions);
 			return;
 		}
 		if (text === "/reload") {
-			this.editor.setText("");
 			await this.handleReloadCommand();
 			return;
 		}
 		if (text === "/debug") {
 			this.handleDebugCommand();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/arminsayshi") {
 			this.handleArminSaysHi();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/dementedelves") {
 			this.handleDementedDelves();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/resume") {
 			this.showSessionSelector();
-			this.editor.setText("");
 			return;
 		}
 		if (text === "/quit") {
-			this.editor.setText("");
 			await this.shutdown();
 			return;
 		}
@@ -3557,7 +3583,7 @@ export class InteractiveMode {
 			if (command) {
 				if (this.session.isBashRunning) {
 					this.showWarning("A bash command is already running. Press Esc to cancel it first.");
-					this.editor.setText(text);
+					this.restoreRejectedInput(text);
 					return;
 				}
 				this.editor.addToHistory?.(text);
@@ -4846,7 +4872,6 @@ export class InteractiveMode {
 
 	private async submitEditorPrompt(input: ReceivedInput, streamingBehavior?: "steer" | "followUp"): Promise<void> {
 		this.editor.addToHistory?.(input.text);
-		this.editor.setText("");
 		try {
 			await this.promptWithRecoveredImages(input, { streamingBehavior });
 		} catch (error) {
@@ -4901,10 +4926,12 @@ export class InteractiveMode {
 
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
+			const input = receiveInput(text);
+			this.editor.setText("");
 			if (this.isExtensionCommand(text)) {
-				await this.submitEditorPrompt(receiveInput(text));
+				await this.submitEditorPrompt(input);
 			} else {
-				this.queueCompactionMessage(receiveInput(text), "followUp");
+				this.queueCompactionMessage(input, "followUp");
 			}
 			return;
 		}
@@ -4912,7 +4939,9 @@ export class InteractiveMode {
 		// Alt+Enter queues a follow-up message (waits until agent finishes)
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
-			await this.submitEditorPrompt(receiveInput(text), "followUp");
+			const input = receiveInput(text);
+			this.editor.setText("");
+			await this.submitEditorPrompt(input, "followUp");
 		}
 		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
 		else if (this.editor.onSubmit) {
@@ -5217,7 +5246,6 @@ export class InteractiveMode {
 		this.compactionQueuedMessages.push({ input, mode });
 		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(input.text);
-		this.editor.setText("");
 		this.updatePendingMessagesDisplay();
 		this.showStatus("Queued message for after compaction");
 	}
