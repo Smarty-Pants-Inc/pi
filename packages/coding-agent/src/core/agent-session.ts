@@ -771,8 +771,8 @@ export class AgentSession {
 		});
 
 		// Raw SDK queues bypass session admission and display bookkeeping. Observe their mutations
-		// without claiming Agent's single owner lifecycle observer. Advance before native observers
-		// can reenter /quit; publish even if such an observer throws after insertion.
+		// without claiming Agent's single owner lifecycle observer or adding public session events.
+		// Advance before native observers can reenter /quit, even if they throw after insertion.
 		for (const method of [
 			"steer",
 			"followUp",
@@ -786,11 +786,7 @@ export class AgentSession {
 				writable: true,
 				value: (...args: unknown[]) => {
 					this._queuedInputRevision++;
-					try {
-						return Reflect.apply(original, this.agent, args);
-					} finally {
-						this._emitQueueUpdate();
-					}
+					return Reflect.apply(original, this.agent, args);
 				},
 			});
 		}
@@ -1488,7 +1484,6 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
-		if (event.type === "queue_update") this._queuedInputRevision++;
 		if (
 			event.type === "queue_update" ||
 			event.type === "compaction_start" ||
@@ -1680,7 +1675,7 @@ export class AgentSession {
 		// Native queue reservations leave the unsent set at delivery, including custom input
 		// with no steering/follow-up display slot. Persisted transfer still occurs at message_end.
 		if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom"))
-			this._emitQueueUpdate();
+			this._queuedInputRevision++;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
 			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
 			observeAssistantMessage(this._assistantStreamObserved, event.message);
@@ -3009,7 +3004,7 @@ export class AgentSession {
 				}
 			}
 			this._hasResumedInputs = true;
-			this._emitQueueUpdate();
+			this._queuedInputRevision++;
 		}
 	}
 
@@ -3210,7 +3205,7 @@ export class AgentSession {
 			fenceScope: this._inputFenceScope.getStore(),
 			release: () => {
 				if (!this._inputAdmissions.delete(admission)) return;
-				this._emitQueueUpdate();
+				this._queuedInputRevision++;
 				this._inputAdmissionScope.exit(() => this._runInputQueuedBehindPreflight());
 				this._resolveIdleWaitIfIdle();
 			},
@@ -4052,13 +4047,15 @@ export class AgentSession {
 						? "context"
 						: (options?.deliverAs ?? (options?.triggerTurn ? "steer" : "context")),
 		});
+		this._queuedInputRevision++;
 		try {
-			this._emitQueueUpdate();
-			return await this._deliverCustomMessage(appMessage, options);
+			await this._deliverCustomMessage(appMessage, options);
 		} catch (error) {
-			if (!this._operatorExitPrepared && this._unpersistedInputs.delete(appMessage)) this._emitQueueUpdate();
+			if (!this._operatorExitPrepared && this._unpersistedInputs.delete(appMessage)) this._queuedInputRevision++;
 			throw error;
 		}
+		// Notify after insertion, outside delivery cleanup: a throwing observer cannot orphan the queued input.
+		if (options?.deliverAs === "nextTurn") this._emitQueueUpdate();
 	}
 
 	private async _deliverCustomMessage(
@@ -4202,7 +4199,7 @@ export class AgentSession {
 		const receipt = this.#receivedMessageReceipts.get(appMessage);
 		if (receipt) this._persistedInputReceipts.add(receipt);
 		this._unpersistedInputs.delete(appMessage);
-		this._emitQueueUpdate();
+		this._queuedInputRevision++;
 		this.#receivedMessageReceipts.delete(appMessage);
 		this._recordMessageEntryId(appMessage, entryId);
 		this._entryIdsByMessage.set(appMessage, entryId);
@@ -4241,7 +4238,7 @@ export class AgentSession {
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
 					this._pendingCustomMessages.shift();
-					this._emitQueueUpdate();
+					this._queuedInputRevision++;
 					this.agent.state.messages.push(message);
 					this._recordMessageEntryId(message, id);
 					this._emit({ type: "message_start", message });
