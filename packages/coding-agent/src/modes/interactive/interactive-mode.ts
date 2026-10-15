@@ -3439,15 +3439,19 @@ export class InteractiveMode {
 			// Reserve FIFO order now, not when the cut answers. Order dispatch starts, not command completion.
 			const started = submitQueue
 				.then(() => input)
-				.then((input) => {
-					void this.dispatchEditorInput(input).catch((error: unknown) => this.observeSubmitFailure(error));
-				});
-			submitQueue = started.catch(() => {});
+				.then((input) => ({ completion: this.dispatchEditorInput(input) }));
+			// Do not adopt completion here: a held command must not block the next dispatch (pi#160).
+			submitQueue = started.then(
+				() => {},
+				() => {},
+			);
 			// Clear only this submission, before the terminal can fill the next draft (pi#160 R9).
 			this.editor.setText("");
-			await started;
+			const { completion } = await started;
+			// The caller still waits for this input's acknowledgement or rejection recovery.
+			await completion;
 		};
-		// Observe admission/start failures too; dispatch completion is observed independently above.
+		// Return the observed promise even though the editor itself does not await it.
 		this.defaultEditor.onSubmit = (text: string) =>
 			submit(text).catch((error: unknown) => this.observeSubmitFailure(error));
 		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;

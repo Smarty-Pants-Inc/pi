@@ -118,7 +118,7 @@ async function startRpcHarness(extension: (pi: ExtensionAPI) => void): Promise<{
 
 type InteractiveBashContext = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> | void };
-	editor: { addToHistory?: (text: string) => void };
+	editor: { setText(text: string): void; addToHistory?: (text: string) => void };
 	session: Harness["session"];
 	runtimeHost: AgentSessionRuntime;
 	sessionManager: Harness["sessionManager"];
@@ -247,7 +247,8 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 		const executeBash = vi.spyOn(harness.session, "executeBash").mockResolvedValue(localResult);
 		const context: InteractiveBashContext = {
 			defaultEditor: {},
-			editor: { addToHistory: vi.fn() },
+			// pi#160: clearing moved to submit time; setText is required by EditorComponent.
+			editor: { setText: vi.fn(), addToHistory: vi.fn() },
 			session: harness.session,
 			runtimeHost: createRuntimeHost(harness),
 			sessionManager: harness.sessionManager,

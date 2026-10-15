@@ -64,6 +64,7 @@ interface TestMode {
 	handleRightClickPaste(): Promise<void>;
 	handleClipboardPaste(): Promise<void>;
 	captureHerdrSubmit(text: string): Promise<TurnReceipt> | undefined;
+	observeSubmitFailure(error: unknown): void;
 }
 
 const NONCE = "0123456789abcdef";
@@ -334,6 +335,47 @@ test("an unsettled /scoped-models dispatch does not block later Enter", async ()
 	const input = await submitted(mode);
 	expect(input.text).toBe("hello");
 	expect(receiptRecord(getInputReceipt(input)).channel).toBe("keyboard");
+	expect(editor.getText()).toBe("next");
+});
+
+// pi#160 R11: dispatch-start FIFO must not acknowledge callers before their own dispatch settles.
+test.each([false, true])("submit joins its own dispatch without holding later Enter (reject: %s)", async (reject) => {
+	const { mode, editor, send } = setup();
+	const failure = new Error("selector failed");
+	let settle!: () => void;
+	const selector = vi.spyOn(mode, "showModelsSelector").mockImplementation(
+		() =>
+			new Promise<void>((resolve, rejectDispatch) => {
+				settle = () => (reject ? rejectDispatch(failure) : resolve());
+			}),
+	);
+	const observed = vi.spyOn(mode, "observeSubmitFailure").mockImplementation(() => {});
+	const completed: string[] = [];
+	const submissions: Promise<void>[] = [];
+	const onSubmit = editor.onSubmit!;
+	editor.onSubmit = (text) => {
+		submissions.push(
+			Promise.resolve(onSubmit(text)).then(() => {
+				completed.push(text);
+			}),
+		);
+	};
+
+	send("/scoped-models\r");
+	await vi.waitFor(() => expect(selector).toHaveBeenCalledOnce());
+	send("hello\rnext");
+	const input = await submitted(mode);
+	await submissions[1];
+	expect(input.text).toBe("hello");
+	expect(receiptRecord(getInputReceipt(input)).channel).toBe("keyboard");
+	expect(completed).toEqual(["hello"]);
+	expect(editor.getText()).toBe("next");
+
+	settle();
+	await submissions[0];
+	expect(completed).toEqual(["hello", "/scoped-models"]);
+	if (reject) expect(observed).toHaveBeenCalledExactlyOnceWith(failure);
+	else expect(observed).not.toHaveBeenCalled();
 	expect(editor.getText()).toBe("next");
 });
 
