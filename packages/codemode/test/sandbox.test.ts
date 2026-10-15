@@ -70,8 +70,8 @@ describe("embedded sources", () => {
 	});
 });
 
-// Dormant until reviewed re-enable: smarty-dev#4506. Includes all upstream backends.
-describe.skip.each(Object.keys(BACKENDS))("%s backend", (name) => {
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+describe.each(Object.keys(BACKENDS))("%s backend", (name) => {
 	beforeEach(() => {
 		backend = name;
 	});
@@ -809,8 +809,8 @@ describe.skip.each(Object.keys(BACKENDS))("%s backend", (name) => {
 	});
 });
 
-// Dormant until reviewed re-enable: smarty-dev#4506
-describe.skip("worker host", () => {
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+describe("worker host", () => {
 	beforeEach(() => {
 		backend = "worker";
 	});

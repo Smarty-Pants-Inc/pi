@@ -22,7 +22,6 @@
  * next exchange.
  */
 import { toCodemodeIdentifier } from "../identifier.ts";
-import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type {
 	CodemodeCall,
 	CodemodeCallStatus,
@@ -195,7 +194,7 @@ export interface ExecutionOptions {
 	launch: VmLauncher;
 }
 
-/** One script run in its own VM. Exported for host-only tests; admission remains refused. */
+/** One script run in its own VM. Exported for host-only tests. */
 export class Execution {
 	readonly promise: Promise<CodemodeResult>;
 	private resolveResult!: (result: CodemodeResult) => void;
@@ -217,7 +216,6 @@ export class Execution {
 	finished = false;
 
 	constructor(options: ExecutionOptions) {
-		refuseCodemodeAdmission();
 		this.promise = new Promise<CodemodeResult>((resolve) => {
 			this.resolveResult = resolve;
 		});
@@ -277,7 +275,6 @@ export class Execution {
 
 	/** `CodemodeRun.deliver()`. */
 	deliver(seq: number, now: number, id: number, outcome: CodemodeOutcome): void {
-		refuseCodemodeAdmission();
 		if (this.finished) return;
 		if (!Number.isFinite(now)) throw new Error(`The clock value of result ${seq} is not a finite number`);
 		if (!Number.isInteger(seq) || seq < 1 || this.delivered.has(seq)) {
@@ -511,7 +508,6 @@ export class CodemodeSandboxBase {
 	private closed = false;
 
 	constructor(options: CodemodeSandboxBaseOptions, launch: VmLauncher) {
-		refuseCodemodeAdmission();
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		this.memoryLimitBytes = options.memoryLimitBytes;
 		this.limits = resolveCodemodeLimits(options.limits);
@@ -545,7 +541,6 @@ export class CodemodeSandboxBase {
 	 * The script can use `store(key, value)` and `load(key)` on `options.store`.
 	 */
 	execute(code: string, options: CodemodeExecuteOptions = {}): Promise<CodemodeResult> {
-		refuseCodemodeAdmission();
 		if (this.closed) return Promise.reject(new Error("Sandbox is closed"));
 		const tools = new Map(this.toolsByName);
 		const execution = new Execution({
@@ -577,7 +572,6 @@ export class CodemodeSandboxBase {
 	 * error the script cannot catch.
 	 */
 	start(code: string, options: CodemodeRunOptions): CodemodeRun {
-		refuseCodemodeAdmission();
 		if (this.closed) throw new Error("Sandbox is closed");
 		if (!Number.isFinite(options.startedAt) || options.startedAt < 0) {
 			throw new Error("startedAt must be a non-negative number of milliseconds since the epoch");

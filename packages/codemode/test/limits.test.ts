@@ -1,10 +1,10 @@
 /**
- * Host budgets for one execution (pi#131 round-1 P1-3 and P2-4, smarty-dev#4506). The sandbox
- * refuses admission, so a test-only module mock admits only this host harness, whose fixture
- * posts supplied messages without creating a VM or evaluating a script. Shipping admission is unchanged.
+ * Host budgets for one execution (pi#131 round-1 P1-3 and P2-4, smarty-dev#4506).
+ * The hostile-worker fixture posts supplied messages without creating a VM or evaluating a script,
+ * checking that the host enforces its own budgets independently of guest validation.
  */
 import { Worker } from "node:worker_threads";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { Execution } from "../src/runtime/execution.ts";
 import {
 	BridgeBudget,
@@ -15,9 +15,6 @@ import {
 import { MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "../src/runtime/prelude-source.ts";
 import type { WorkerToHostMessage } from "../src/runtime/protocol.ts";
 import type { CodemodeResult, CodemodeTool } from "../src/types.ts";
-
-// PR #131: this mock is confined to the non-executing host fixture; admission tests never mock it.
-vi.mock("../src/security-admission.ts", () => ({ refuseCodemodeAdmission: () => {} }));
 
 const RAW_WORKER = new URL("./fixtures/raw-worker.ts", import.meta.url);
 

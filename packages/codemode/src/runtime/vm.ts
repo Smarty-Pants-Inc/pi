@@ -36,7 +36,6 @@
  * after each drain, so the host can check a replay step by step.
  */
 import { Intrinsics, JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
-import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
 import { BridgeBudget, CodemodeLimitError, resolveCodemodeLimits } from "./limits.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
@@ -160,7 +159,6 @@ function crashMessage(error: unknown): WorkerToHostMessage {
 }
 
 export async function startVm(options: StartVmOptions): Promise<VmSession> {
-	refuseCodemodeAdmission();
 	const { data, post: emit } = options;
 	const limits = resolveCodemodeLimits(data.limits);
 	const budget = new BridgeBudget(limits);

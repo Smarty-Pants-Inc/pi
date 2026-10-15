@@ -1,6 +1,6 @@
 # @earendil-works/pi-codemode
 
-> **Fork security admission:** Codemode and MCP are disabled pending a reviewed re-enable. Existing configuration, `+builtin:codemode`, `+builtin:mcp`, `-e builtin:<name>`, SDK factory activation, and standalone package APIs cannot activate them in this revision. See `packages/coding-agent/docs/security-reenable.md`. The examples below describe the deferred feature, not an available admission.
+> **Fork security admission:** Codemode is re-enabled after the pi#203 internal repairs (smarty-dev#4506 step 2). The CLI registers `codemode` inactive; enable it with `--tools codemode` or the `defaultTools` setting. SDK factories and standalone sandbox APIs work again. MCP remains refused, including from Codemode scripts. See `packages/coding-agent/docs/security-reenable.md`.
 
 Runs model-written JavaScript in a QuickJS VM (compiled to WebAssembly) where the only capability is calling injected tools. Nested tool calls never enter the LLM context; only the script's output and return value do.
 

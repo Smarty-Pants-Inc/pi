@@ -12,7 +12,6 @@
  */
 
 import { parentPort, workerData } from "node:worker_threads";
-import { refuseCodemodeAdmission } from "../security-admission.ts";
 import { isHostToWorkerMessage, type WorkerData, type WorkerToHostMessage } from "./protocol.ts";
 import { startVm } from "./vm.ts";
 
@@ -21,7 +20,6 @@ function post(message: WorkerToHostMessage): void {
 }
 
 async function main(data: WorkerData): Promise<void> {
-	refuseCodemodeAdmission();
 	const interrupt = new Int32Array(data.interrupt);
 	// The VM lives until the host terminates the worker, so the session is never disposed.
 	// startVm enforces the worker-side budgets shared by every VM transport.

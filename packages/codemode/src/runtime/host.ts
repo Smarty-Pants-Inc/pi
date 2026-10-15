@@ -1,5 +1,4 @@
 import { Worker } from "node:worker_threads";
-import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type { CodemodeSandboxOptions } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
 import { CodemodeSandboxBase, errorMessage, type VmLauncher } from "./execution.ts";
@@ -75,7 +74,6 @@ function workerLauncher(
  */
 export class CodemodeSandbox extends CodemodeSandboxBase {
 	constructor(options: CodemodeSandboxOptions = {}) {
-		refuseCodemodeAdmission();
 		super(options, workerLauncher(options.wasm, options.workerUrl ?? defaultWorkerUrl()));
 	}
 }

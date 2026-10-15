@@ -38,7 +38,6 @@
  * Failure: if the RPC call rejects (the remote isolate crashed, hit its CPU limit, or was
  * redeployed) or returns without a terminal message, the execution fails with `kind: "sandbox"`.
  */
-import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type { CodemodeError, CodemodeSandboxBaseOptions } from "../types.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
 import { CodemodeSandboxBase, errorMessage, type VmChannel, type VmLauncher } from "./execution.ts";
@@ -108,7 +107,6 @@ export function serveCodemodeRemote(
 	exchange: CodemodeRemoteExchange,
 	options: CodemodeServeOptions,
 ): Promise<void> {
-	refuseCodemodeAdmission();
 	const maxBudget = options.maxInterruptBudget ?? DEFAULT_INTERRUPT_BUDGET;
 	const budget = Math.min(request.interruptBudget ?? maxBudget, maxBudget);
 	const requestedMemory = request.data.memoryLimitBytes;
@@ -282,7 +280,6 @@ function remoteLauncher(remote: () => CodemodeRemote, interruptBudget: number | 
  */
 export class RemoteCodemodeSandbox extends CodemodeSandboxBase {
 	constructor(options: RemoteCodemodeSandboxOptions) {
-		refuseCodemodeAdmission();
 		super(options, remoteLauncher(options.remote, options.interruptBudget));
 	}
 }

@@ -45,22 +45,28 @@ const poison = new Proxy(
 	},
 );
 
-// PR #131: old configuration, explicit selection and SDK factories are not re-enable authority.
-it("does not supply Codemode or MCP factories to ordinary CLI startup", () => {
-	expect(builtInExtensions.map((extension) => extension.name)).not.toContain("codemode");
+// smarty-dev#4506 step 2: only Codemode's prerequisites were repaired by pi#203.
+it("supplies Codemode but not MCP to ordinary CLI startup", () => {
+	expect(builtInExtensions.map((extension) => extension.name)).toContain("codemode");
 	expect(builtInExtensions.map((extension) => extension.name)).not.toContain("mcp");
 });
 
-it("refuses SDK factory activation before any registration or session-start handler", () => {
-	for (const [factory, code] of [
-		[createCodemodeExtension, "CODEMODE"],
-		[createMcpExtension, "MCP"],
-	] as const) {
-		expect(() => factory(poison)(poison as ExtensionAPI)).toThrow(`${code}_SECURITY_REVIEW_REQUIRED`);
-	}
+it("loads the SDK Codemode factory as an inactive tool", async () => {
+	const extension = await loadExtensionFromFactory(
+		createCodemodeExtension(),
+		process.cwd(),
+		createEventBus(),
+		createExtensionRuntime(),
+	);
+	expect(extension.tools.get("codemode")?.definition).toMatchObject({ name: "codemode", defaultActive: false });
 });
 
-it("keeps package-manager builtins disabled even with explicit settings and refuses -e", async () => {
+it("still refuses the MCP SDK factory before inspecting its API", () => {
+	expect(() => createMcpExtension(poison)(poison as ExtensionAPI)).toThrow("MCP_SECURITY_REVIEW_REQUIRED");
+});
+
+// smarty-dev#4506: settings and explicit -e activate Codemode, never MCP.
+it("resolves Codemode but keeps MCP refused with settings and explicit -e", async () => {
 	const directory = mkdtempSync(join(tmpdir(), "pi131-admission-"));
 	try {
 		for (const extensions of [[], ["+builtin:codemode", "+builtin:mcp"]]) {
@@ -71,11 +77,12 @@ it("keeps package-manager builtins disabled even with explicit settings and refu
 				builtinExtensions: ["codemode", "mcp"],
 			});
 			const resolved = await manager.resolve();
-			expect(resolved.extensions.filter((resource) => resource.enabled)).toEqual([]);
-			for (const name of ["codemode", "mcp"])
-				await expect(manager.resolveExtensionSources([`builtin:${name}`])).rejects.toThrow(
-					"SECURITY_REVIEW_REQUIRED",
-				);
+			expect(resolved.extensions.filter((resource) => resource.enabled).map((resource) => resource.path)).toEqual([
+				"builtin:codemode",
+			]);
+			const explicit = await manager.resolveExtensionSources(["builtin:codemode"]);
+			expect(explicit.extensions).toMatchObject([{ path: "builtin:codemode", enabled: true }]);
+			await expect(manager.resolveExtensionSources(["builtin:mcp"])).rejects.toThrow("MCP_SECURITY_REVIEW_REQUIRED");
 		}
 	} finally {
 		rmSync(directory, { recursive: true, force: true });

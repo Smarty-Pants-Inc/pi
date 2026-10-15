@@ -33,8 +33,8 @@ function recordingRemote(options: Partial<CodemodeServeOptions> = {}) {
 	return { remote, exchanges, served };
 }
 
-// Dormant until reviewed re-enable: smarty-dev#4506
-describe.skip("InlineCodemodeSandbox", () => {
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+describe("InlineCodemodeSandbox", () => {
 	it("fails a script that computes past its interrupt budget as a timeout", async () => {
 		const sandbox = new InlineCodemodeSandbox({ wasm, interruptBudget: 1_000 });
 		for (const code of ["while (true) {}", "while (true) await null"]) {
@@ -58,8 +58,8 @@ describe.skip("InlineCodemodeSandbox", () => {
 	});
 });
 
-// Dormant until reviewed re-enable: smarty-dev#4506
-describe.skip("RemoteCodemodeSandbox", () => {
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+describe("RemoteCodemodeSandbox", () => {
 	it("runs tools in the caller and the script on the remote", async () => {
 		const { remote, served } = recordingRemote();
 		const seen: unknown[] = [];
