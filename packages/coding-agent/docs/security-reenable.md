@@ -27,6 +27,8 @@ The diagnostic remains `MCP_SECURITY_REVIEW_REQUIRED`. No runtime opt-in is acce
 
 ### Scoped MCP follow-up
 
+Tracked in smarty-dev#13330 (owner factory-repair, checkpoint 2026-10-22).
+
 MCP has separate dormant client, stdio/HTTP transport, OAuth, configuration/registry, extension/session, and CLI paths. pi#203 repaired Codemode, not those paths. Later MCP repairs include OAuth HTTPS/redirect/issuer/endpoint-origin validation (pi#173, pi#178), OAuth lifecycle follow-ups (pi#184), and HTTP redirect credential handling (pi#244); these do not by themselves establish that every deferred boundary is ready.
 
 Before re-enabling MCP, complete a separate boundary review and real-path offline test restoration across all retained entry points. In particular, bound HTTP JSON and error-body reads before buffering them (`transports/streamable-http.ts`), bound OAuth metadata/registration/token-response reads (`oauth/discovery.ts`, `oauth/flow.ts`), and enforce a finite host-owned request ceiling (`client.ts` currently lets non-finite or non-positive timeouts omit the timer). Keep client/transport, OAuth, CLI/registry mutation, cancellation, and session suites in that scope. Do not remove the MCP refusal piecemeal.
