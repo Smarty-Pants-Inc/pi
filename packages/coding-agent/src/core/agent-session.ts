@@ -4113,7 +4113,8 @@ export class AgentSession {
 	): void {
 		this._sessionQueueTransfers.add(message);
 		try {
-			this.agent[mode](message, onEnqueued);
+			if (onEnqueued) this.agent[mode](message, onEnqueued);
+			else this.agent[mode](message);
 		} finally {
 			this._sessionQueueTransfers.delete(message);
 		}
@@ -4395,7 +4396,7 @@ export class AgentSession {
 		);
 		const receipt = this.#receivedMessageReceipts.get(appMessage);
 		if (receipt) this._persistedInputReceipts.add(receipt);
-		this._unpersistedInputs.delete(appMessage);
+		if (this._unpersistedInputs.delete(appMessage)) this._preparedInputReceipts.delete(appMessage);
 		this._queuedInputRevision++;
 		this.#receivedMessageReceipts.delete(appMessage);
 		this._recordMessageEntryId(appMessage, entryId);
@@ -4430,7 +4431,7 @@ export class AgentSession {
 				);
 				const receipt = this.#receivedMessageReceipts.get(message);
 				if (receipt) this._persistedInputReceipts.add(receipt);
-				this._unpersistedInputs.delete(message);
+				if (this._unpersistedInputs.delete(message)) this._preparedInputReceipts.delete(message);
 				this.#receivedMessageReceipts.delete(message);
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
