@@ -47,6 +47,7 @@ interface TestMode {
 	showError: ReturnType<typeof vi.fn>;
 	updateEditorBorderColor: ReturnType<typeof vi.fn>;
 	flushPendingBashComponents: ReturnType<typeof vi.fn>;
+	showSettingsSelector: ReturnType<typeof vi.fn>;
 	setupKeyHandlers(): void;
 	setupEditorSubmitHandler(): void;
 	handleRightClickPaste(): Promise<void>;
@@ -72,13 +73,13 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer> = async () => PAUL) {
+function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer> = async () => PAUL, waitMs = 50) {
 	const counter = new EpochByteCounter();
 	counter.hold();
 	counter.arm(NONCE);
 	const cut = vi.fn<HerdrEpoch["cut"]>(answer);
 	const epoch: HerdrEpoch = { epoch: "paste-test", nonce: NONCE, cut, release: vi.fn() };
-	const attestor = new SubmitAttestor(counter, epoch, 50);
+	const attestor = new SubmitAttestor(counter, epoch, waitMs);
 	terminal = new ProcessTerminal();
 	vi.spyOn(process.stdout, "write").mockImplementation(() => true);
 	const ui = new TuiMainScreen(terminal);
@@ -104,6 +105,7 @@ function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer
 		showError: vi.fn(),
 		updateEditorBorderColor: vi.fn(),
 		flushPendingBashComponents: vi.fn(),
+		showSettingsSelector: vi.fn(),
 	});
 	mode.setupKeyHandlers();
 	mode.setupEditorSubmitHandler();
@@ -233,6 +235,40 @@ test.each(["inputsFenced", "terminalShutdownRequested"] as const)(
 		expect(receiptRecord(getInputReceipt(mode.pendingUserInputs[0]!)).channel).toBe("terminal");
 	},
 );
+
+// pi#160 R9 P1: a command continuation must not clear bytes typed after its Enter in the same read.
+test("/settings followed by a draft in one stdin read preserves the later draft", async () => {
+	const { mode, editor, cut, send } = setup();
+	send("/settings\rnext");
+	expect(editor.getText()).toBe("next");
+	expect(cut).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ cut: 10, kind: "discard" }));
+	await vi.waitFor(() => expect(mode.showSettingsSelector).toHaveBeenCalledOnce());
+	expect(editor.getText()).toBe("next");
+	expect(mode.pendingUserInputs).toEqual([]);
+});
+
+// pi#160 R9 P1: admission order belongs to the keypresses, not the attestation response order.
+test("two quick submits dispatch in keypress order when cuts resolve in reverse", async () => {
+	const answers: Array<(answer: CutAnswer) => void> = [];
+	const { mode, editor, cut, send } = setup(() => new Promise((resolve) => answers.push(resolve)), 1000);
+	send("first\rsecond\rnext");
+	expect(cut.mock.calls.map(([request]) => ({ seq: request.seq, cut: request.cut }))).toEqual([
+		{ seq: 1, cut: 6 },
+		{ seq: 2, cut: 13 },
+	]);
+	expect(editor.getText()).toBe("next");
+	answers[1]!(PAUL);
+	// Let the second cut settle without resolving the first or relying on a wall-clock delay.
+	await new Promise<void>((resolve) => setImmediate(resolve));
+	answers[0]!(PAUL);
+	await submitted(mode, 2);
+	expect(mode.pendingUserInputs.map((input) => input.text)).toEqual(["first", "second"]);
+	expect(mode.pendingUserInputs.map((input) => receiptRecord(getInputReceipt(input)).channel)).toEqual([
+		"keyboard",
+		"keyboard",
+	]);
+	expect(editor.getText()).toBe("next");
+});
 
 test("accepted submit cuts synchronously at Enter before later bytes or attestation await", async () => {
 	let resolveCut!: (answer: CutAnswer) => void;
