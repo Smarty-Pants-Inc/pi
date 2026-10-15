@@ -120,4 +120,4 @@ it("converges across randomized prepared revisions", () => {
 			expectAliasFree(tracker.value);
 		}
 	}
-});
+}, 30_000); // ~0.9 s locally, 5.4 s on a loaded CI runner: same workload, a timeout fit for CI.
