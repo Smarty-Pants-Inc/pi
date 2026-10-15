@@ -15,7 +15,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import fs, { readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { basename, dirname } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -431,6 +431,22 @@ export interface ExtensionBindings {
 
 export type QueuedInputDisposition = "handled" | "queued";
 export type PromptDisposition = QueuedInputDisposition | "started";
+
+/** Operator exit refused before writing or clearing input the outbox reader cannot replay. */
+export class UnsupportedUnsentInputError extends InputAdmissionError {
+	readonly role: AgentMessage["role"];
+	readonly mode: UnsentInput["mode"];
+
+	constructor(role: AgentMessage["role"], mode: UnsentInput["mode"]) {
+		super(
+			"INPUT_ADMISSION_BUSY",
+			`queued ${role} message (${mode}) cannot be saved for replay; input was not discarded`,
+		);
+		this.name = "UnsupportedUnsentInputError";
+		this.role = role;
+		this.mode = mode;
+	}
+}
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
@@ -3442,6 +3458,11 @@ export class AgentSession {
 				);
 			}
 			for (const [id, { input, receipt, order }] of this._nativeQueuedInputs) retain(input, receipt, id, order);
+			// Agent accepts every AgentMessage role, including arbitrary module-augmented roles.
+			// Session retention tracks user/custom only; inspect the actual queues too, including
+			// occurrences enqueued before attachment. Never silently clear an unrepresentable role.
+			for (const { id, message, mode } of this.agent.getQueuedMessageOccurrences())
+				retain({ message, mode }, undefined, id);
 			for (const admission of this._inputAdmissions) if (admission.input) retain(admission.input, admission.receipt);
 			for (const { input, mode } of this.#getPendingModeInputs?.() ?? [])
 				retain(
@@ -3455,12 +3476,34 @@ export class AgentSession {
 					},
 					getInputReceipt(input),
 				);
+			// Validate the complete snapshot before the first append, print, or queue clear.
+			// Use the reader's contract, not a role allowlist that could drift from replay.
+			for (const { input } of pending)
+				if (!readUnsentInput(input)) throw new UnsupportedUnsentInputError(input.message.role, input.mode);
 			if (pending.length && !this.sessionManager.isPersisted() && !options?.discardUnsent)
 				throw new InputAdmissionError(
 					"INPUT_ADMISSION_BUSY",
 					`${pending.length} queued messages are not saved (no session file). /quit again to discard them and exit.`,
 				);
 			pending.sort((left, right) => left.order - right.order);
+			if (pending.length && !this.sessionManager.isPersisted()) {
+				try {
+					const text = pending.map(({ input: { message } }) =>
+						message.role === "user" || message.role === "custom"
+							? contentText(message.content, "\n") || JSON.stringify(message)
+							: JSON.stringify(message),
+					);
+					// Write the whole block synchronously to stderr, not to a hidden recovery file.
+					// A failed/partial write refuses exit and leaves every input owner intact.
+					fs.writeFileSync(process.stderr.fd, `Unsent input (not saved; --no-session):\n${text.join("\n")}\n`);
+				} catch (cause) {
+					throw new InputAdmissionError(
+						"INPUT_ADMISSION_BUSY",
+						"unsent input could not be printed to stderr; input was not discarded",
+						{ cause },
+					);
+				}
+			}
 			for (const { input, receipt } of this.sessionManager.isPersisted() ? pending : []) {
 				if (getUnsentInputTransfer(receipt)) continue; // Already durable from an earlier exit; not yet consumed.
 				const origin = { sessionId: this.sessionManager.getSessionId(), host: hostname(), uid: userInfo().uid };

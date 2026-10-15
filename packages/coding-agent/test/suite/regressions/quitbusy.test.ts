@@ -1,11 +1,11 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { isDeepStrictEqual } from "node:util";
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, streamSimple } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentSession } from "../../../src/core/agent-session.ts";
+import { AgentSession, UnsupportedUnsentInputError } from "../../../src/core/agent-session.ts";
 import { AgentSessionRuntime, type AgentSessionServices } from "../../../src/core/agent-session-runtime.ts";
 import { convertToLlm } from "../../../src/core/messages.ts";
 import { receiveInput } from "../../../src/core/received-input.ts";
@@ -377,6 +377,152 @@ describe("operator exit and compaction settlement", () => {
 		expect(beforeRawPersistence).toBeGreaterThan(0);
 		expect(h.session.queuedInputRevision).toBeGreaterThan(beforeRawPersistence);
 		expect(h.session.agent.getQueuedMessages()).toEqual([]);
+	});
+
+	// smarty-dev#13156 / pi#262: Agent accepts all roles, but quit must refuse unreplayable input atomically.
+	it.each(
+		(["steer", "followUp"] as const).flatMap((mode) =>
+			(["assistant", "toolResult", "system"] as const).flatMap((role) =>
+				[false, true].map((beforeAttachment) => ({ mode, role, beforeAttachment })),
+			),
+		),
+	)("P1-B $mode refuses $role quit (pre-attached: $beforeAttachment)", async ({ mode, role, beforeAttachment }) => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		const agent = beforeAttachment
+			? new Agent({ streamFn: streamSimple, convertToLlm, initialState: { model: h.getModel(), tools: [] } })
+			: h.session.agent;
+		if (beforeAttachment) h.session.dispose();
+		const user: AgentMessage = { role: "user", content: "keep user", timestamp: 1 };
+		const custom: AgentMessage = {
+			role: "custom",
+			customType: "keep-custom",
+			content: "keep custom",
+			display: true,
+			details: { original: "caller metadata" },
+			timestamp: 1,
+		};
+		const unsupported: AgentMessage =
+			role === "assistant"
+				? fauxAssistantMessage("keep assistant")
+				: role === "toolResult"
+					? {
+							role,
+							toolCallId: "raw-tool-call",
+							toolName: "raw-tool",
+							content: [{ type: "text", text: "keep tool result" }],
+							isError: false,
+							timestamp: 1,
+						}
+					: { role, content: "keep system", timestamp: 1 };
+		for (const message of [user, unsupported, custom, user]) agent[mode](message);
+		const session = beforeAttachment
+			? new AgentSession({
+					agent,
+					sessionManager: h.sessionManager,
+					settingsManager: h.settingsManager,
+					modelRuntime: h.modelRuntime,
+					resourceLoader: h.resourceLoader,
+					cwd: h.tempDir,
+				})
+			: h.session;
+		if (beforeAttachment) extraSessions.push(session);
+		const runtime = new AgentSessionRuntime(
+			session,
+			{
+				cwd: h.tempDir,
+				agentDir: h.tempDir,
+				modelRuntime: h.modelRuntime,
+				settingsManager: h.settingsManager,
+				resourceLoader: h.resourceLoader,
+				diagnostics: [],
+			},
+			async () => {
+				throw new Error("replacement must not run");
+			},
+		);
+		const occurrences = agent.getQueuedMessageOccurrences();
+		const messages = structuredClone(agent.getQueuedMessages());
+		const entries = structuredClone(h.sessionManager.getEntries());
+		const observations: string[] = [];
+		const detach = agent.observeLifecycle((event) => observations.push(event.type));
+		try {
+			const failure = await runtime.dispose({ operatorExit: true }).catch((error: unknown) => error);
+			expect(failure).toBeInstanceOf(UnsupportedUnsentInputError);
+			expect(failure).toMatchObject({ role, mode, code: "INPUT_ADMISSION_BUSY" });
+			expect(agent.getQueuedMessageOccurrences()).toEqual(occurrences);
+			expect(agent.getQueuedMessages()).toEqual(messages);
+			expect(agent.getQueuedMessages(mode)).toEqual([user, unsupported, custom, user]);
+			expect(h.sessionManager.getEntries()).toEqual(entries);
+			expect(observations).toEqual(["attached"]);
+			expect(session.inputsFenced).toBe(false);
+			expect(session.shutdownSignal.aborted).toBe(false);
+			expect(session.isDisposed).toBe(false);
+			expect(h.faux.state.callCount).toBe(0);
+		} finally {
+			detach();
+		}
+	});
+
+	// smarty-dev#13156 / pi#262: custom is non-user input that the reader can replay, exactly once.
+	it.each(["steer", "followUp"] as const)("P1-B raw custom %s survives quit and two resumes", async (mode) => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		const message: AgentMessage = {
+			role: "custom",
+			customType: "pi-fabric-agent-message",
+			content: [{ type: "text", text: "keep custom carrier" }],
+			display: true,
+			details: { original: "carrier metadata" },
+			timestamp: 1,
+		};
+		h.session.agent[mode](message);
+		const release = h.session.prepareOperatorExit();
+		release();
+		h.session.dispose();
+		const file = h.sessionManager.getSessionFile()!;
+		const saved = SessionManager.open(file);
+		const outboxes = saved
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(1);
+		expect(outboxes[0]).toMatchObject({ data: { message, mode } });
+		const restore = (manager: SessionManager) =>
+			new AgentSession({
+				agent: new Agent({
+					streamFn: streamSimple,
+					convertToLlm,
+					initialState: { model: h.getModel(), tools: [] },
+				}),
+				sessionManager: manager,
+				settingsManager: h.settingsManager,
+				modelRuntime: h.modelRuntime,
+				resourceLoader: h.resourceLoader,
+				cwd: h.tempDir,
+			});
+		const resumed = restore(saved);
+		extraSessions.push(resumed);
+		h.setResponses([fauxAssistantMessage("custom replayed")]);
+		await resumed.resumeUnsentInputs();
+		const deliveries = saved.getEntries().filter((entry) => entry.unsentInputId === outboxes[0].id);
+		expect(deliveries).toHaveLength(1);
+		expect(deliveries[0]).toMatchObject({
+			type: "custom_message",
+			customType: message.customType,
+			content: message.content,
+			display: true,
+			details: message.details,
+		});
+		expect(h.faux.state.callCount).toBe(1);
+		resumed.dispose();
+		const reopened = SessionManager.open(file);
+		const second = restore(reopened);
+		extraSessions.push(second);
+		const before = reopened.getEntryCount();
+		await second.resumeUnsentInputs();
+		expect(second.agent.getQueuedMessages()).toEqual([]);
+		expect(reopened.getEntryCount()).toBe(before);
+		expect(h.faux.state.callCount).toBe(1);
 	});
 
 	// smarty-dev#13156 / pi#262: native consumption is not durable delivery when message_start throws.

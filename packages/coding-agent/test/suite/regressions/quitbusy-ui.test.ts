@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import type { ImageContent } from "@earendil-works/pi-ai/compat";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -29,6 +30,7 @@ function createUiFixture(harness: Harness) {
 		},
 	};
 	const warnings: string[] = [];
+	const errors: string[] = [];
 	const recoveredImages = new Map<string, ImageContent>();
 	const stop = vi.fn();
 	// Only terminal/UI effects are fixtures. Admission, queues, exit and draft recovery use real code.
@@ -43,6 +45,7 @@ function createUiFixture(harness: Harness) {
 		stagingAudit: () => {},
 		stop,
 		showWarning: (message: string) => warnings.push(message),
+		showError: (message: string) => errors.push(message),
 	}) as InteractiveMode;
 	const dispatch = Reflect.get(InteractiveMode.prototype, "dispatchEditorInput") as (
 		this: InteractiveMode,
@@ -56,11 +59,23 @@ function createUiFixture(harness: Harness) {
 		runtime,
 		editor,
 		warnings,
+		errors,
 		recoveredImages,
 		stop,
 		dispatch: (text: string) => dispatch.call(mode, receiveInput(text)),
 		restore: () => restore.call(mode),
 	};
+}
+
+function captureUnsentStderr(beforeWrite?: () => void): string[] {
+	const blocks: string[] = [];
+	const writeFileSync = fs.writeFileSync;
+	vi.spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+		if (file !== process.stderr.fd) return writeFileSync(file, data, options);
+		beforeWrite?.();
+		blocks.push(String(data));
+	});
+	return blocks;
 }
 
 // smarty-dev#13108 / #QUITBUSY: data safety and foreign-input trust boundaries need real-session coverage.
@@ -90,11 +105,18 @@ describe("interactive unsent-input consent and draft recovery", () => {
 		await harness.session.steer("first queued input");
 		await harness.session.followUp("second queued input");
 		const fixture = createUiFixture(harness);
+		const blocks = captureUnsentStderr(() => {
+			expect(harness.session.isDisposed).toBe(false);
+			expect(harness.session.agent.getQueuedMessages()).toHaveLength(2);
+		});
 		// Returning instead of throwing prevents the production catch from treating the spy as an error.
 		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
 		await fixture.dispatch("/quit");
 		expect(fixture.warnings).toHaveLength(1);
-		expect(fixture.warnings[0]).toContain("2 queued messages are not saved");
+		expect(fixture.warnings[0]).toBe(
+			"2 queued messages are not saved (no session file). /quit again to discard them and exit.",
+		);
+		expect(blocks).toEqual([]);
 		expect(exit).not.toHaveBeenCalled();
 		expect(fixture.stop).not.toHaveBeenCalled();
 		expect(harness.session.shutdownSignal.aborted).toBe(false);
@@ -114,16 +136,148 @@ describe("interactive unsent-input consent and draft recovery", () => {
 			expect(fixture.stop).not.toHaveBeenCalled();
 			expect(harness.session.isDisposed).toBe(false);
 			expect(harness.session.shutdownSignal.aborted).toBe(false);
+			expect(blocks).toEqual([]);
 			await fixture.dispatch("/quit");
 		}
 		expect(exit).toHaveBeenCalledTimes(1);
 		expect(exit).toHaveBeenCalledWith(0);
 		expect(fixture.stop).toHaveBeenCalledTimes(1);
 		expect(fixture.warnings).toHaveLength(changed ? 2 : 1);
+		expect(blocks).toEqual([
+			`Unsent input (not saved; --no-session):\nfirst queued input\nsecond queued input\n${changed ? "third queued input\n" : ""}`,
+		]);
 		expect(harness.session.isDisposed).toBe(true);
 		expect(harness.session.agent.getQueuedMessages()).toEqual([]);
 		expect(harness.sessionManager.getSessionFile()).toBeUndefined();
 		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	// smarty-dev#13156 / pi#262: the explicit discard receipt covers every pending source and occurrence.
+	it("prints the full no-session backlog once before clearing any input owner", async () => {
+		let enter!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const harness = await createHarness({
+			settings: { compaction: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "held admission") {
+							enter();
+							await held;
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		let modePending = true;
+		const staged = receiveInput("mode queued");
+		await harness.session.bindExtensions({
+			hasPendingInput: () => modePending,
+			getPendingInputs: () => (modePending ? [{ input: staged, mode: "followUp" }] : []),
+			clearPendingInputs: () => {
+				modePending = false;
+			},
+		});
+		await harness.session.steer("session steer");
+		const repeated = { role: "user" as const, content: "same raw user", timestamp: 1 };
+		harness.session.agent.followUp(repeated);
+		harness.session.agent.followUp(repeated);
+		await harness.session.sendCustomMessage(
+			{ customType: "aside", content: "next-turn aside", display: true },
+			{ deliverAs: "nextTurn" },
+		);
+		harness.session.agent.steer({
+			role: "custom",
+			customType: "pi-fabric-agent-message",
+			content: [{ type: "text", text: "raw custom" }],
+			display: true,
+			timestamp: 1,
+		});
+		const imageOnly = {
+			role: "custom" as const,
+			customType: "image-only",
+			content: [{ type: "image" as const, mimeType: "image/png", data: "original-bytes" }],
+			display: true,
+			timestamp: 1,
+		};
+		harness.session.agent.followUp(imageOnly);
+		const admission = harness.session.followUp("held admission");
+		void admission.catch(() => {});
+		try {
+			await entered;
+			const queued = harness.session.agent.getQueuedMessageOccurrences();
+			const fixture = createUiFixture(harness);
+			const blocks = captureUnsentStderr(() => {
+				expect(modePending).toBe(true);
+				expect(harness.session.inputAdmissionCount).toBe(1);
+				expect(harness.session.agent.getQueuedMessageOccurrences()).toEqual(queued);
+				expect(harness.session.shutdownSignal.aborted).toBe(false);
+			});
+			const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+			await fixture.dispatch("/quit");
+			expect(fixture.warnings).toEqual([
+				"8 queued messages are not saved (no session file). /quit again to discard them and exit.",
+			]);
+			expect(blocks).toEqual([]);
+			await fixture.dispatch("/quit");
+			expect(blocks).toEqual([
+				`Unsent input (not saved; --no-session):\nsession steer\nsame raw user\nsame raw user\nnext-turn aside\nraw custom\n${JSON.stringify(imageOnly)}\nheld admission\nmode queued\n`,
+			]);
+			expect(modePending).toBe(false);
+			expect(harness.session.isDisposed).toBe(true);
+			expect(harness.session.agent.getQueuedMessages()).toEqual([]);
+			expect(harness.sessionManager.getSessionFile()).toBeUndefined();
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+			).toEqual([]);
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(exit).toHaveBeenCalledWith(0);
+			await expect(admission).rejects.toThrow("INPUT_ADMISSION_ABORTED");
+		} finally {
+			release();
+			await admission.catch(() => {});
+		}
+	});
+
+	// smarty-dev#13156 / pi#262: a broken stderr is not consent to silently discard queued input.
+	it("refuses no-session discard when printing fails, retaining input for a later quit", async () => {
+		const harness = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(harness);
+		await harness.session.followUp("keep after stderr failure");
+		const fixture = createUiFixture(harness);
+		let fail = true;
+		const blocks = captureUnsentStderr(() => {
+			if (fail) throw new Error("stderr unavailable");
+		});
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		await fixture.dispatch("/quit");
+		const queued = harness.session.agent.getQueuedMessageOccurrences();
+		await fixture.dispatch("/quit");
+		expect(fixture.errors).toEqual([
+			"INPUT_ADMISSION_BUSY: unsent input could not be printed to stderr; input was not discarded",
+		]);
+		expect(blocks).toEqual([]);
+		expect(harness.session.agent.getQueuedMessageOccurrences()).toEqual(queued);
+		expect(harness.session.isDisposed).toBe(false);
+		expect(harness.session.inputsFenced).toBe(false);
+		expect(harness.session.shutdownSignal.aborted).toBe(false);
+		expect(fixture.stop).not.toHaveBeenCalled();
+		expect(exit).not.toHaveBeenCalled();
+		fail = false;
+		await fixture.dispatch("/quit");
+		expect(blocks).toEqual(["Unsent input (not saved; --no-session):\nkeep after stderr failure\n"]);
+		expect(harness.session.isDisposed).toBe(true);
+		expect(harness.sessionManager.getSessionFile()).toBeUndefined();
+		expect(exit).toHaveBeenCalledTimes(1);
 	});
 
 	it("merges unstamped user/custom text and images into one unsent draft, then submits as fresh input", async () => {
