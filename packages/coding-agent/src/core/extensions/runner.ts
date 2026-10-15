@@ -91,6 +91,8 @@ import type {
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
+	ToolPartialResultEvent,
+	ToolPartialResultEventResult,
 	ToolRenderers,
 	ToolResultEvent,
 	ToolResultEventResult,
@@ -195,6 +197,7 @@ type RunnerEmitEvent = Exclude<
 	| BashSpawnEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
+	| ToolPartialResultEvent
 	| UserBashEvent
 	| ContextEvent
 	| ContextWithSystemEvent
@@ -1436,6 +1439,61 @@ export class ExtensionRunner {
 		}
 
 		return modified ? currentMessage : undefined;
+	}
+
+	async emitToolPartialResult(
+		event: ToolPartialResultEvent,
+		signal?: AbortSignal,
+	): Promise<{ partialResult: ToolPartialResultEvent["partialResult"] }> {
+		let extensionPath = "tool_partial_result";
+		try {
+			signal = this.dispatchSignal(event.type, signal);
+			signal?.throwIfAborted();
+			const ctx = this.createContext();
+			const currentEvent: ToolPartialResultEvent = isolateValue(event);
+			for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
+				extensionPath = ext.path;
+				for (const handler of handlers) {
+					signal?.throwIfAborted();
+					const result = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
+						| ToolPartialResultEventResult
+						| undefined;
+					signal?.throwIfAborted();
+					if (result === undefined) continue;
+					if (result === null || typeof result !== "object" || Array.isArray(result)) {
+						throw new Error("Invalid partial tool result handler return");
+					}
+					// The documented optional partialResult permits an object to leave the snapshot unchanged.
+					if (result.partialResult === undefined) continue;
+					if (
+						result.partialResult === null ||
+						typeof result.partialResult !== "object" ||
+						Array.isArray(result.partialResult) ||
+						!Array.isArray(result.partialResult.content)
+					) {
+						throw new Error("Invalid partial tool result");
+					}
+					currentEvent.partialResult = result.partialResult;
+				}
+			}
+			if (!currentEvent.partialResult || !Array.isArray(currentEvent.partialResult.content)) {
+				throw new Error("Invalid partial tool result");
+			}
+			return { partialResult: isolateValue(currentEvent.partialResult) };
+		} catch {
+			// A redactor failure must never expose its input, including through diagnostics.
+			this.emitError({
+				extensionPath,
+				event: "tool_partial_result",
+				error: "Partial tool result withheld: handler failed",
+			});
+			return {
+				partialResult: {
+					content: [{ type: "text", text: "[REDACTED] Partial tool result withheld: handler failed" }],
+					details: undefined,
+				},
+			};
+		}
 	}
 
 	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {

@@ -196,6 +196,8 @@ export type {
 	ToolLoadout,
 	ToolLoadoutChanges,
 	ToolNamespace,
+	ToolPartialResultEvent,
+	ToolPartialResultEventResult,
 	ToolRendererResolver,
 	ToolRenderers,
 	ToolRenderResultOptions,

@@ -23,6 +23,7 @@ import type {
 	ExtensionFactory,
 	ExtensionUIContext,
 	ProviderConfig,
+	ToolPartialResultEventResult,
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
@@ -1281,6 +1282,174 @@ describe("ExtensionRunner", () => {
 
 			expect(result.entries).toMatchObject([{ type: "custom", customType: "kept" }]);
 			expect(errors).toEqual(["boundary failed"]);
+		});
+	});
+
+	// smarty-dev#13239: partial snapshots must be transformed before any observer sees them.
+	describe("tool_partial_result chaining", () => {
+		const snapshot = () => ({
+			content: [{ type: "text" as const, text: "synthetic-secret" }],
+			details: { raw: true },
+			structuredContent: { raw: "synthetic-secret" },
+		});
+		const event = () => ({
+			type: "tool_partial_result" as const,
+			toolName: "bash",
+			toolCallId: "parent/1",
+			parentToolCallId: "parent",
+			input: {},
+			partialResult: snapshot(),
+		});
+
+		it("composes whole replacements in extension and registration order", async () => {
+			const runtime = createExtensionRuntime();
+			const seen: unknown[] = [];
+			const first = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("tool_partial_result", (e) => {
+						expect(e.parentToolCallId).toBe("parent");
+						return { partialResult: { content: [{ type: "text", text: "[REDACTED]" }], details: undefined } };
+					});
+					pi.on("tool_partial_result", (e) => {
+						seen.push(e.partialResult);
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const second = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("tool_partial_result", (e) => ({
+						partialResult: { ...e.partialResult, structuredContent: { safe: true } },
+					}));
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
+			const result = await runner.emitToolPartialResult(event());
+			expect(seen).toEqual([{ content: [{ type: "text", text: "[REDACTED]" }], details: undefined }]);
+			expect(result.partialResult).toEqual({
+				content: [{ type: "text", text: "[REDACTED]" }],
+				details: undefined,
+				structuredContent: { safe: true },
+			});
+		});
+
+		it("isolates input and returned snapshots even for a handler returning void", async () => {
+			const runtime = createExtensionRuntime();
+			let retained: unknown;
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("tool_partial_result", (e) => {
+						retained = e.partialResult;
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const original = event();
+			const result = await runner.emitToolPartialResult(original);
+			expect(result.partialResult).toEqual(original.partialResult);
+			expect(retained).not.toBe(original.partialResult);
+			expect(result.partialResult).not.toBe(retained);
+		});
+
+		it.each([{}, { partialResult: undefined }])("accepts documented no-op objects: %j", async (noop) => {
+			const runtime = createExtensionRuntime();
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("tool_partial_result", () => noop);
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const original = event();
+			const result = await runner.emitToolPartialResult(original);
+			expect(result.partialResult).toEqual(original.partialResult);
+		});
+
+		it.each([false, true])("fails closed without secret-bearing diagnostics (async=%s)", async (asyncFailure) => {
+			const runtime = createExtensionRuntime();
+			let laterCalled = false;
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("tool_partial_result", () => {
+						if (asyncFailure) return Promise.reject(new Error("synthetic-secret"));
+						throw new Error("synthetic-secret");
+					});
+					pi.on("tool_partial_result", () => {
+						laterCalled = true;
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: unknown[] = [];
+			runner.onError((error) => errors.push(error));
+			const result = await runner.emitToolPartialResult(event());
+			expect(JSON.stringify([result, errors])).not.toContain("synthetic-secret");
+			expect(result.partialResult?.content).toEqual([
+				{ type: "text", text: "[REDACTED] Partial tool result withheld: handler failed" },
+			]);
+			expect(result.partialResult?.structuredContent).toBeUndefined();
+			expect(result.partialResult?.details).toBeUndefined();
+			expect(errors).toHaveLength(1);
+			expect(laterCalled).toBe(false);
+		});
+
+		it.each([
+			"null",
+			'"synthetic-secret"',
+			"42",
+			"true",
+			"[]",
+			'{"partialResult":null}',
+			'{"partialResult":42}',
+			'{"partialResult":[]}',
+			'{"partialResult":{}}',
+			'{"partialResult":{"content":null}}',
+		])("withholds malformed JavaScript hook results: %s", async (source) => {
+			const runtime = createExtensionRuntime();
+			let laterCalled = false;
+			const extension = await loadExtensionFromFactory(
+				(pi) => {
+					pi.on("tool_partial_result", () => JSON.parse(source) as ToolPartialResultEventResult);
+					pi.on("tool_partial_result", () => {
+						laterCalled = true;
+					});
+				},
+				tempDir,
+				createEventBus(),
+				runtime,
+			);
+			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
+			const errors: unknown[] = [];
+			runner.onError((error) => errors.push(error));
+			const result = await runner.emitToolPartialResult(event());
+			expect(JSON.stringify([result, errors])).not.toContain("synthetic-secret");
+			expect(result.partialResult.content).toEqual([
+				{ type: "text", text: "[REDACTED] Partial tool result withheld: handler failed" },
+			]);
+			expect(result.partialResult.details).toBeUndefined();
+			expect(result.partialResult.structuredContent).toBeUndefined();
+			expect(laterCalled).toBe(false);
+		});
+
+		it("withholds an aborted dispatch rather than falling back to the original snapshot", async () => {
+			const runner = new ExtensionRunner([], createExtensionRuntime(), tempDir, sessionManager, modelRegistry);
+			const controller = new AbortController();
+			controller.abort(new Error("synthetic-secret"));
+			const result = await runner.emitToolPartialResult(event(), controller.signal);
+			expect(JSON.stringify(result)).not.toContain("synthetic-secret");
 		});
 	});
 

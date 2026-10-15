@@ -1199,6 +1199,21 @@ export interface ToolExecutionUpdateEvent {
 	parentToolCallId?: string;
 }
 
+/** Transform a complete partial snapshot before tool_execution_update or nested onUpdate. */
+export interface ToolPartialResultEvent {
+	type: "tool_partial_result";
+	toolCallId: string;
+	toolName: string;
+	input: unknown;
+	partialResult: AgentToolResult<unknown>;
+	parentToolCallId?: string;
+}
+
+/** Replace the whole snapshot; omitted result means no change. */
+export interface ToolPartialResultEventResult {
+	partialResult?: AgentToolResult<unknown>;
+}
+
 /** Fired when a tool finishes executing */
 export interface ToolExecutionEndEvent {
 	type: "tool_execution_end";
@@ -1545,6 +1560,7 @@ export type ExtensionEvent =
 	| InputEvent
 	| ToolCallEvent
 	| ToolResultEvent
+	| ToolPartialResultEvent
 	| BashSpawnEvent;
 
 // ============================================================================
@@ -1790,6 +1806,10 @@ export interface ExtensionAPI {
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): () => void;
 	on(event: "bash_spawn", handler: ExtensionHandler<BashSpawnEvent, BashSpawnEventResult>): () => void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
+	on(
+		event: "tool_partial_result",
+		handler: ExtensionHandler<ToolPartialResultEvent, ToolPartialResultEventResult>,
+	): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
 

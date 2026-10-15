@@ -597,7 +597,12 @@ async function executeToolCallsSequential(
 				isError: preparation.isError,
 			};
 		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				preparation,
+				signal,
+				emitToolExecutionUpdate(toolCall, emit),
+				config,
+			);
 			finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -668,7 +673,12 @@ async function executeToolCallsParallel(
 				await emitToolExecutionEnd(finalized, emit);
 				return finalized;
 			}
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				preparation,
+				signal,
+				emitToolExecutionUpdate(toolCall, emit),
+				config,
+			);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -723,7 +733,7 @@ type ExecutedToolCallOutcome = {
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
 
 /** The `beforeToolCall` and `afterToolCall` hooks of {@link AgentLoopConfig}. */
-export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">;
+export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall" | "transformToolUpdate">;
 
 type ToolUpdateSink = (partialResult: AgentToolResult<any>) => Promise<void> | void;
 
@@ -867,7 +877,7 @@ export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallO
 	if (preparation.kind === "immediate") {
 		return { toolCall, result: preparation.result, isError: preparation.isError };
 	}
-	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}));
+	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}), options);
 	return finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
 }
 
@@ -875,6 +885,7 @@ async function executePreparedToolCall(
 	prepared: PreparedToolCall,
 	signal: AbortSignal | undefined,
 	onUpdate: ToolUpdateSink,
+	hooks: ToolCallHooks,
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
 	let acceptingUpdates = true;
@@ -888,7 +899,21 @@ async function executePreparedToolCall(
 			signal,
 			(partialResult) => {
 				if (!acceptingUpdates) return;
-				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+				// Start the transform now so it can detach the tool's snapshot before the tool mutates it.
+				// Preserve emission order even when asynchronous transforms finish out of order.
+				const transformed = (async () => {
+					try {
+						return (
+							(await hooks.transformToolUpdate?.(prepared.toolCall, prepared.args, partialResult, signal)) ??
+							partialResult
+						);
+					} catch {
+						// Neither the snapshot nor an error message containing it may cross this boundary.
+						return createErrorToolResult("[REDACTED] Partial tool result withheld: handler failed");
+					}
+				})();
+				const previous = updateEvents.at(-1) ?? Promise.resolve();
+				updateEvents.push(previous.then(async () => onUpdate(await transformed)));
 			},
 		);
 		const durationMs = elapsed();
