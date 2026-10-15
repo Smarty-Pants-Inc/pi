@@ -438,6 +438,16 @@ describe("operator exit and compaction settlement", () => {
 				.getEntries()
 				.some((entry) => entry.type === "message" && isDeepStrictEqual(entry.message, message)),
 		).toBe(false);
+		if (message.role === "custom")
+			expect(h.sessionManager.getEntries()).not.toContainEqual(
+				expect.objectContaining({
+					type: "custom_message",
+					customType: message.customType,
+					content: message.content,
+					display: message.display,
+					details: message.details,
+				}),
+			);
 		const services: AgentSessionServices = {
 			cwd: h.tempDir,
 			agentDir: h.tempDir,
