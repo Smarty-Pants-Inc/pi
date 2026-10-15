@@ -378,6 +378,292 @@ describe("operator exit and compaction settlement", () => {
 		expect(h.session.agent.getQueuedMessages()).toEqual([]);
 	});
 
+	// smarty-dev#13156 / pi#262: native consumption is not durable delivery when message_start throws.
+	it.each([
+		["steer", "user", false],
+		["followUp", "user", false],
+		["steer", "custom", false],
+		["followUp", "custom", false],
+		["steer", "user", true],
+		["followUp", "user", true],
+		["steer", "custom", true],
+		["followUp", "custom", true],
+	] as const)("P1 raw %s %s replays once (enqueue throws: %s)", async (mode, kind, enqueueThrows) => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		harnesses.push(h);
+		const image = { type: "image" as const, mimeType: "image/png", data: "raw-original-image-bytes" };
+		const content = [{ type: "text" as const, text: "raw retained input" }, image];
+		const message =
+			kind === "user"
+				? { role: "user" as const, content, timestamp: 1 }
+				: {
+						role: "custom" as const,
+						customType: "raw-aside",
+						content,
+						display: true,
+						details: { original: true },
+						timestamp: 1,
+					};
+		const revisionBeforeEnqueue = h.session.queuedInputRevision;
+		if (enqueueThrows) {
+			const detach = h.session.agent.observeLifecycle((event) => {
+				if (event.type === "queue_update") throw new Error("P1 enqueue observer failed");
+			});
+			expect(() => h.session.agent[mode](message)).toThrow("P1 enqueue observer failed");
+			detach();
+		} else h.session.agent[mode](message);
+		expect(h.session.agent.getQueuedMessages(mode)).toEqual([message]);
+		expect(h.session.queuedInputRevision).toBeGreaterThan(revisionBeforeEnqueue);
+		const revisionBeforeDelivery = h.session.queuedInputRevision;
+		const observedAfter = Date.now();
+		const unsubscribe = h.session.subscribe((event) => {
+			if (event.type === "message_start" && event.message === message) throw new Error("P1 publication failed");
+		});
+		h.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+		await h.session.prompt("active");
+		unsubscribe();
+		expect(h.session.getLastAssistantText()).toBeUndefined();
+		expect(h.session.state.errorMessage).toBe("P1 publication failed");
+		expect(h.session.queuedInputRevision).toBeGreaterThan(revisionBeforeDelivery);
+		expect(h.eventsOfType("message_start").some((event) => event.message === message)).toBe(true);
+		expect(h.eventsOfType("message_end").some((event) => event.message === message)).toBe(false);
+		expect(h.session.agent.getQueuedMessages()).toEqual([]);
+		expect(h.sessionManager.getEntries().some((entry) => entry.type === "message" && entry.message === message)).toBe(
+			false,
+		);
+		const services: AgentSessionServices = {
+			cwd: h.tempDir,
+			agentDir: h.tempDir,
+			modelRuntime: h.modelRuntime,
+			settingsManager: h.settingsManager,
+			resourceLoader: h.resourceLoader,
+			diagnostics: [],
+		};
+		const runtime = new AgentSessionRuntime(h.session, services, async () => {
+			throw new Error("replacement must not run");
+		});
+		await runtime.dispose({ operatorExit: true });
+		expect(h.session.isDisposed).toBe(true);
+		const file = h.sessionManager.getSessionFile()!;
+		const saved = SessionManager.open(file);
+		const outboxes = saved
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(1);
+		const outbox = outboxes[0];
+		if (outbox.type !== "custom") throw new Error("missing outbox");
+		const input = outbox.data as UnsentInput;
+		expect(input.message).toEqual(message);
+		expect(input.mode).toBe(mode);
+		expect(input.origin).toEqual({ sessionId: saved.getSessionId(), host: hostname(), uid: userInfo().uid });
+		expect(input.provenance).toMatchObject({ channel: "terminal", v: 1 });
+		expect(Date.parse(input.provenance!.receivedAt)).toBeGreaterThanOrEqual(observedAfter);
+		expect(input.metadata).toBeUndefined();
+		expect(input.metadataSource).toBeUndefined();
+		const resumed = new AgentSession({
+			agent: new Agent({ streamFn: streamSimple, convertToLlm, initialState: { model: h.getModel(), tools: [] } }),
+			sessionManager: saved,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(resumed);
+		await resumed.bindExtensions({});
+		h.setResponses([fauxAssistantMessage("replayed")]);
+		await resumed.resumeUnsentInputs();
+		const deliveries = saved.getEntries().filter((entry) => entry.unsentInputId === outbox.id);
+		expect(deliveries).toHaveLength(1);
+		if (deliveries[0].type !== "message" && deliveries[0].type !== "custom_message")
+			throw new Error("missing durable delivery");
+		expect(deliveries[0].provenance).toEqual(input.provenance);
+		if (kind === "user") expect(deliveries[0]).toMatchObject({ type: "message", message: { content } });
+		else expect(deliveries[0]).toMatchObject({ type: "custom_message", content, details: { original: true } });
+		resumed.dispose();
+		const secondManager = SessionManager.open(file);
+		const second = new AgentSession({
+			agent: new Agent({ streamFn: streamSimple, convertToLlm, initialState: { model: h.getModel(), tools: [] } }),
+			sessionManager: secondManager,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(second);
+		const before = secondManager.getEntryCount();
+		await second.resumeUnsentInputs();
+		expect(second.agent.getQueuedMessages()).toEqual([]);
+		expect(secondManager.getEntryCount()).toBe(before);
+	});
+
+	// smarty-dev#13156 / pi#262: an earlier native listener can throw before AgentSession observes delivery.
+	it.each(["steer", "followUp"] as const)("P1 raw %s survives an earlier native listener", async (mode) => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		harnesses.push(h);
+		h.session.dispose();
+		const message = { role: "user" as const, content: "earlier native listener input", timestamp: 1 };
+		const agent = new Agent({
+			streamFn: streamSimple,
+			convertToLlm,
+			initialState: { model: h.getModel(), tools: [] },
+		});
+		const unsubscribe = agent.subscribe((event) => {
+			if (event.type === "message_start" && event.message === message) throw new Error("P1 earlier native listener");
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: h.sessionManager,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(session);
+		agent[mode](message);
+		h.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+		await session.prompt("active");
+		unsubscribe();
+		expect(agent.state.errorMessage).toBe("P1 earlier native listener");
+		expect(agent.getQueuedMessages()).toEqual([]);
+		const runtime = new AgentSessionRuntime(
+			session,
+			{
+				cwd: h.tempDir,
+				agentDir: h.tempDir,
+				modelRuntime: h.modelRuntime,
+				settingsManager: h.settingsManager,
+				resourceLoader: h.resourceLoader,
+				diagnostics: [],
+			},
+			async () => {
+				throw new Error("replacement must not run");
+			},
+		);
+		await runtime.dispose({ operatorExit: true });
+		const file = h.sessionManager.getSessionFile()!;
+		const saved = SessionManager.open(file);
+		const outboxes = saved
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(1);
+		if (outboxes[0].type !== "custom") throw new Error("missing outbox");
+		expect(outboxes[0].data).toMatchObject({ message, mode });
+		// No harness observation reached this input, so enqueue must not fabricate a receipt.
+		expect((outboxes[0].data as UnsentInput).provenance).toBeUndefined();
+		const restore = (manager: SessionManager) =>
+			new AgentSession({
+				agent: new Agent({
+					streamFn: streamSimple,
+					convertToLlm,
+					initialState: { model: h.getModel(), tools: [] },
+				}),
+				sessionManager: manager,
+				settingsManager: h.settingsManager,
+				modelRuntime: h.modelRuntime,
+				resourceLoader: h.resourceLoader,
+				cwd: h.tempDir,
+			});
+		const resumed = restore(saved);
+		extraSessions.push(resumed);
+		await resumed.bindExtensions({});
+		h.setResponses([fauxAssistantMessage("replayed")]);
+		await resumed.resumeUnsentInputs();
+		expect(saved.getEntries().filter((entry) => entry.unsentInputId === outboxes[0].id)).toHaveLength(1);
+		resumed.dispose();
+		const secondManager = SessionManager.open(file);
+		const second = restore(secondManager);
+		extraSessions.push(second);
+		const before = secondManager.getEntryCount();
+		await second.resumeUnsentInputs();
+		expect(second.agent.getQueuedMessages()).toEqual([]);
+		expect(secondManager.getEntryCount()).toBe(before);
+	});
+
+	// smarty-dev#13156 / pi#262: saved input is consumed even if request preparation never dispatches it.
+	it.each(["steer", "followUp"] as const)("P1 raw %s committed input is not retained again", async (mode) => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		harnesses.push(h);
+		const message = { role: "user" as const, content: "committed raw input", timestamp: 1 };
+		h.session.agent[mode](message);
+		h.session.agent.prepareRequest = async () => {
+			throw new Error("P1 dispatch prevented");
+		};
+		await h.session.prompt("active");
+		expect(
+			h.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message === message),
+		).toHaveLength(1);
+		const revisionBeforeExit = h.session.queuedInputRevision;
+		const release = h.session.prepareOperatorExit();
+		release();
+		expect(h.session.queuedInputRevision).toBeGreaterThan(revisionBeforeExit);
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toEqual([]);
+	});
+
+	// smarty-dev#13156 / pi#262: normal native sends commit once and release pending retention.
+	it.each(["steer", "followUp"] as const)("P1 raw %s normal send is committed once", async (mode) => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		const message = { role: "user" as const, content: "normal raw input", timestamp: 1 };
+		h.session.agent[mode](message);
+		h.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+		await h.session.prompt("active");
+		expect(
+			h.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message === message),
+		).toHaveLength(1);
+		expect(h.session.agent.getQueuedMessages()).toEqual([]);
+		const release = h.session.prepareOperatorExit();
+		release();
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toEqual([]);
+	});
+
+	// smarty-dev#13156 / pi#262: intentionally removed native input must not become recoverable work.
+	it.each(["steer", "followUp"] as const)("P1 raw %s explicitly cleared input is discarded", async (mode) => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		const message = { role: "user" as const, content: "discard raw input", timestamp: 1 };
+		for (const clear of [
+			() => h.session.agent.removeQueuedMessages((queued) => queued === message),
+			() => (mode === "steer" ? h.session.agent.clearSteeringQueue() : h.session.agent.clearFollowUpQueue()),
+			() => h.session.clearQueue(),
+			() => h.session.agent.clearAllQueues(),
+		]) {
+			h.session.agent[mode](message);
+			const revision = h.session.queuedInputRevision;
+			const detach = h.session.agent.observeLifecycle((event) => {
+				if (event.type === "queue_update" && h.session.agent.getQueuedMessages(mode).length === 0)
+					throw new Error("P1 clear observer failed");
+			});
+			expect(clear).toThrow("P1 clear observer failed");
+			detach();
+			expect(h.session.queuedInputRevision).toBeGreaterThan(revision);
+		}
+		const release = h.session.prepareOperatorExit();
+		release();
+		expect(h.session.agent.getQueuedMessages()).toEqual([]);
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toEqual([]);
+	});
+
 	it("operator exit saves steer/follow-up/images/duplicate text and resume consumes each once", async () => {
 		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
 		harnesses.push(h);

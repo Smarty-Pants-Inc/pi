@@ -786,6 +786,23 @@ export class AgentSession {
 				writable: true,
 				value: (...args: unknown[]) => {
 					this._queuedInputRevision++;
+					if (method === "steer" || method === "followUp") {
+						const message = args[0] as AgentMessage;
+						// Retain before native publication, including listeners registered before this session.
+						// Do not issue a receipt here: raw receipt time remains first harness observation.
+						if ((message.role === "user" || message.role === "custom") && !this._unpersistedInputs.has(message))
+							this._unpersistedInputs.set(message, { message, mode: method });
+					} else if (method === "removeQueuedMessages") {
+						const predicate = args[0] as (message: AgentMessage) => boolean;
+						args[0] = (message: AgentMessage) => {
+							const remove = predicate(message);
+							if (remove) this._unpersistedInputs.delete(message);
+							return remove;
+						};
+					} else {
+						const mode = method === "clearSteeringQueue" ? "steer" : "followUp";
+						for (const message of this.agent.getQueuedMessages(mode)) this._unpersistedInputs.delete(message);
+					}
 					return Reflect.apply(original, this.agent, args);
 				},
 			});
@@ -1672,8 +1689,8 @@ export class AgentSession {
 			// Record before extensions or listeners can throw and produce a synthetic failure.
 			this._assistantToolExecutionStarted = true;
 		}
-		// Native queue reservations leave the unsent set at delivery, including custom input
-		// with no steering/follow-up display slot. Persisted transfer still occurs at message_end.
+		// Native queue delivery changes reservations, including custom input with no display slot.
+		// Retained input leaves the unsent set only after the real message_end append succeeds.
 		if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom"))
 			this._queuedInputRevision++;
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
@@ -1859,7 +1876,6 @@ export class AgentSession {
 			}
 			if (entryId) {
 				this._entryIdsByMessage.set(event.message, entryId);
-				// Raw SDK queue occurrences have a receipt but no session-side pending-map slot.
 				// Do not insert a throwing public callback between durable append and receipt bookkeeping.
 				if (this._unpersistedInputs.delete(event.message) || receipt) this._queuedInputRevision++;
 				if (receipt) this._persistedInputReceipts.add(receipt);
