@@ -739,6 +739,138 @@ describe("operator exit and compaction settlement", () => {
 		},
 	);
 
+	// Refs Smarty-Pants-Inc/smarty-dev#13156: raw reuse never transfers a live direct receipt.
+	it.each([
+		["steer", "inflight"],
+		["followUp", "inflight"],
+		["steer", "deferred"],
+		["followUp", "deferred"],
+	] as const)("P1 raw %s after %s direct publication retains independent occurrences", async (mode, timing) => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		harnesses.push(h);
+		let original: (typeof h.session.messages)[number] | undefined;
+		let starts = 0;
+		const unsubscribe = h.session.subscribe((event) => {
+			if (event.type !== "message_start" || event.message.role !== "user" || getMessageText(event.message) !== "A")
+				return;
+			original = event.message;
+			starts++;
+			if (timing === "inflight" && starts === 1) h.session.agent[mode](event.message);
+			else throw new Error("direct reuse publication failed");
+		});
+		h.setResponses([fauxAssistantMessage("direct reply")]);
+		await h.session.prompt("A");
+		unsubscribe();
+		expect(h.session.state.errorMessage).toBe("direct reuse publication failed");
+		if (!original) throw new Error("missing direct input");
+		if (timing === "deferred") h.session.agent[mode](original);
+		const direct = h.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message" && entry.message === original);
+		expect(direct).toHaveLength(timing === "inflight" ? 1 : 0);
+		const release = h.session.prepareOperatorExit();
+		release();
+		h.session.dispose();
+		const saved = SessionManager.open(h.sessionManager.getSessionFile()!);
+		const outboxes = saved
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(timing === "inflight" ? 1 : 2);
+		const inputs = outboxes.map((entry) => {
+			if (entry.type !== "custom") throw new Error("missing outbox");
+			return entry.data as UnsentInput;
+		});
+		for (const input of inputs) {
+			expect(input.message).toEqual(original);
+			expect(input.metadata).toBeUndefined();
+			expect(input.metadataSource).toBeUndefined();
+		}
+		expect(inputs[0].provenance).toMatchObject({ channel: "terminal", v: 1 });
+		if (timing === "inflight") {
+			if (direct[0].type !== "message") throw new Error("missing direct delivery");
+			expect(inputs[0].provenance).not.toEqual(direct[0].provenance);
+		} else expect(inputs[1].provenance).toBeUndefined();
+		const resumed = new AgentSession({
+			agent: new Agent({ streamFn: streamSimple, convertToLlm, initialState: { model: h.getModel(), tools: [] } }),
+			sessionManager: saved,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(resumed);
+		h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await resumed.resumeUnsentInputs();
+		for (const outbox of outboxes)
+			expect(saved.getEntries().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(1);
+		expect(
+			saved.getEntries().filter((entry) => entry.type === "message" && getMessageText(entry.message) === "A"),
+		).toHaveLength(2);
+		const before = saved.getEntryCount();
+		await resumed.resumeUnsentInputs();
+		expect(saved.getEntryCount()).toBe(before);
+	});
+
+	// Refs Smarty-Pants-Inc/smarty-dev#13156: prepared queue transfer is one occurrence, not two.
+	it.each(["steer", "followUp"] as const)("P1 session-owned %s transfer saves one snapshot", async (mode) => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		await h.session[mode]("owned transfer");
+		expect(h.session.agent.getQueuedMessageOccurrences()).toHaveLength(1);
+		const release = h.session.prepareOperatorExit();
+		release();
+		const outboxes = h.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(1);
+		expect(outboxes[0]).toMatchObject({ data: { provenance: { channel: "terminal", v: 1 } } });
+	});
+
+	// Refs Smarty-Pants-Inc/smarty-dev#13156: committed objects get a fresh raw enqueue order.
+	it.each(["steer", "followUp"] as const)("P1 requeued committed %s preserves outbox order", async (mode) => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		h.setResponses([fauxAssistantMessage("committed")]);
+		await h.session.prompt("A");
+		const original = h.session.messages.find((message) => message.role === "user");
+		if (!original) throw new Error("missing committed user message");
+		h.session.agent[mode]({ role: "user", content: "B", timestamp: 1 });
+		h.session.agent[mode](original);
+		const release = h.session.prepareOperatorExit();
+		release();
+		h.session.dispose();
+		const saved = SessionManager.open(h.sessionManager.getSessionFile()!);
+		const outboxes = saved
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(
+			outboxes.map((entry) => (entry.type === "custom" ? getMessageText((entry.data as UnsentInput).message) : "")),
+		).toEqual(["B", "A"]);
+		const resumed = new AgentSession({
+			agent: new Agent({ streamFn: streamSimple, convertToLlm, initialState: { model: h.getModel(), tools: [] } }),
+			sessionManager: saved,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(resumed);
+		h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await resumed.resumeUnsentInputs();
+		const delivered = saved.getEntries().filter((entry) => entry.unsentInputId);
+		expect(delivered.map((entry) => entry.unsentInputId)).toEqual(outboxes.map((entry) => entry.id));
+		expect(delivered.map((entry) => (entry.type === "message" ? getMessageText(entry.message) : ""))).toEqual([
+			"B",
+			"A",
+		]);
+		const before = saved.getEntryCount();
+		await resumed.resumeUnsentInputs();
+		expect(saved.getEntryCount()).toBe(before);
+	});
+
 	// smarty-dev#13156 / pi#262: intentionally removed native input must not become recoverable work.
 	it.each(["steer", "followUp"] as const)("P1 raw %s explicitly cleared input is discarded", async (mode) => {
 		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
