@@ -102,7 +102,9 @@ describe("owned credential sink messages", () => {
 				Response.json({ error: text, error_description: text, message: text }, { status: 401 }),
 			);
 			vi.stubGlobal("fetch", fetch);
-			const error = await failure(oauth.refresh({ type: "oauth", access: secret, refresh: secret, expires: 0 }, signal));
+			const error = await failure(
+				oauth.refresh({ type: "oauth", access: secret, refresh: secret, expires: 0 }, signal),
+			);
 			expect(fetch).toHaveBeenCalled();
 			expect(serialized(error)).not.toContain(text);
 			expect(serialized(error)).not.toContain(alias);
@@ -117,7 +119,9 @@ describe("owned credential sink messages", () => {
 				return Response.json({ error: text }, { status: 401 });
 			});
 			vi.stubGlobal("fetch", fetch);
-			const error = await failure(oauth.refresh({ type: "oauth", access: secret, refresh: secret, expires: 0 }, signal));
+			const error = await failure(
+				oauth.refresh({ type: "oauth", access: secret, refresh: secret, expires: 0 }, signal),
+			);
 			expect(fetch).toHaveBeenCalled();
 			expect(serialized(error)).not.toContain(text);
 			expect(serialized(error)).not.toContain(alias);

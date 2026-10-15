@@ -52,9 +52,10 @@ async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): P
 		throw new Error(`Could not load Radius OAuth config (HTTP ${response.status})`);
 	}
 
-	const discovery = (await readOAuthCredentialResponse(response, "Radius OAuth config")) as
-		| Partial<RadiusOAuthDiscovery>
-		| null;
+	const discovery = (await readOAuthCredentialResponse(
+		response,
+		"Radius OAuth config",
+	)) as Partial<RadiusOAuthDiscovery> | null;
 	if (typeof discovery?.authorizationEndpoint !== "string") {
 		throw new Error(`Invalid Radius OAuth config from ${new URL(gateway).origin}`);
 	}
