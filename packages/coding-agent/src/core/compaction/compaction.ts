@@ -24,6 +24,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
@@ -652,10 +653,42 @@ export async function completeSummarization(
 		cacheRetention: "none",
 		sessionId: options.sessionId ?? uuidv7(),
 	};
-	const produce = async (): Promise<AssistantMessage> =>
-		streamFn
-			? (await streamFn(model, context, requestOptions)).result()
-			: completeSimple(model, context, requestOptions);
+	const produce = async (): Promise<AssistantMessage> => {
+		// Custom streams may ignore cancellation during setup or never publish a terminal event.
+		// The owner must still settle, without accepting a late result or starting another retry.
+		try {
+			requestOptions.signal?.throwIfAborted();
+			if (streamFn) {
+				const stream = await raceWithAbortSignal(
+					Promise.resolve(streamFn(model, context, requestOptions)),
+					requestOptions.signal,
+				);
+				return await raceWithAbortSignal(stream.result(), requestOptions.signal);
+			}
+			return await raceWithAbortSignal(completeSimple(model, context, requestOptions), requestOptions.signal);
+		} catch (error) {
+			if (!requestOptions.signal?.aborted || error !== requestOptions.signal.reason) throw error;
+			// Preserve retryAssistantCall's aborted-response contract, including retry-indicator cleanup.
+			return {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "aborted",
+				errorMessage: "Summarization cancelled",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+		}
+	};
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
 }
 
