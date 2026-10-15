@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, streamSimple } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it } from "vitest";
@@ -59,17 +60,36 @@ describe("model switch recovery input (#97)", () => {
 				cwd: h.tempDir,
 			});
 			h.session.subscribe((event) => h.events.push(event));
-			const cleanup = h.cleanup;
-			h.cleanup = () => {
-				h.session.dispose();
-				return cleanup();
-			};
 		}
 		h.sessionManager.appendMessage({ role: "user", content: "x".repeat(80_000), timestamp: Date.now() - 2000 });
 		h.sessionManager.appendMessage({ ...fauxAssistantMessage("old response"), timestamp: Date.now() - 1000 });
 		h.session.refreshContext();
 		return h;
 	}
+
+	// smarty-dev#12837: replacement sessions must use the shared abort-and-settle cleanup too.
+	it("settles a converter-backed active turn before shared resource cleanup", async () => {
+		const entered = Promise.withResolvers<void>();
+		const h = await setup({ prepareRequest: () => undefined }, convertToLlm);
+		h.setResponses([
+			(_context, options) =>
+				new Promise((resolve) => {
+					options?.signal?.addEventListener(
+						"abort",
+						() => resolve(fauxAssistantMessage("", { stopReason: "aborted" })),
+						{ once: true },
+					);
+					entered.resolve();
+				}),
+		]);
+		const prompt = h.session.prompt("go");
+		await entered.promise;
+		await expect(h.cleanup()).resolves.toBeUndefined();
+		await prompt;
+		expect(h.session.isDisposed).toBe(true);
+		expect(h.session.isIdle).toBe(true);
+		expect(existsSync(h.tempDir)).toBe(false);
+	});
 
 	function expectRefused(h: Harness): void {
 		expect(h.faux.state.callCount).toBe(0);

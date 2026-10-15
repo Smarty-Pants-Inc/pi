@@ -271,7 +271,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		events.push(event);
 	});
 
-	return {
+	const harness: Harness = {
 		session,
 		sessionManager,
 		settingsManager,
@@ -292,16 +292,21 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		cleanup() {
 			if (cleanupPromise) return cleanupPromise;
 			cleanupPromise = (async () => {
+				// SDK converter tests may replace the initial session; settle the current owner.
+				const currentSession = harness.session;
 				// Fence before cancellation can yield to a hook; keep it closed through terminal disposal.
-				const release = session.gateInputs();
+				const release = currentSession.gateInputs();
 				try {
-					session.cancelForShutdown();
-					await session.abort();
+					currentSession.cancelForShutdown();
+					await currentSession.abort();
 					// smarty-dev#3048: test teardown deliberately recovers undelivered input.
-					session.clearQueue();
-					session.dispose();
-					fauxProvider.unregister();
-					if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+					currentSession.clearQueue();
+					try {
+						currentSession.dispose();
+					} finally {
+						fauxProvider.unregister();
+						if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+					}
 				} finally {
 					release();
 				}
@@ -312,4 +317,5 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			return cleanupPromise;
 		},
 	};
+	return harness;
 }
