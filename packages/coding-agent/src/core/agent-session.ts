@@ -899,6 +899,10 @@ export class AgentSession {
 
 		const previousValidateQueuedMessages = this.agent.validateQueuedMessages;
 		this.agent.validateQueuedMessages = (messages, mode) => {
+			if (this._inputsDisposed) {
+				previousValidateQueuedMessages?.(messages, mode);
+				return;
+			}
 			// Raw Agent listeners run before session observation and can throw after native dequeue.
 			// Refuse an unreplayable batch before reservation, not in a message_start listener.
 			for (const message of messages) {

@@ -614,6 +614,49 @@ describe("operator exit and compaction settlement", () => {
 		expect(agent.state.errorMessage).toBeUndefined();
 	});
 
+	// smarty-dev#13554: disposal detaches the Session validator from direct Agent reuse.
+	it.each(
+		(["steer", "followUp"] as const).flatMap((mode) =>
+			(["all", "one-at-a-time"] as const).map((queueMode) => ({ mode, queueMode })),
+		),
+	)("P2 post-dispose raw $mode assistant/toolResult $queueMode still delivers", async ({ mode, queueMode }) => {
+		const h = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		const agent = h.session.agent;
+		agent.steeringMode = queueMode;
+		agent.followUpMode = queueMode;
+		h.session.dispose();
+		const messages: AgentMessage[] = [
+			fauxAssistantMessage("raw assistant"),
+			{
+				role: "toolResult",
+				toolCallId: "raw-call",
+				toolName: "raw-tool",
+				content: [],
+				isError: false,
+				timestamp: 1,
+			},
+		];
+		const starts: AgentMessage[] = [];
+		const ends: AgentMessage[] = [];
+		agent.subscribe((event) => {
+			if (event.type === "message_start" && messages.includes(event.message)) starts.push(event.message);
+			if (event.type === "message_end" && messages.includes(event.message)) ends.push(event.message);
+		});
+		h.setResponses([
+			async () => {
+				for (const message of messages) agent[mode](message);
+				return fauxAssistantMessage("active");
+			},
+			...messages.map(() => fauxAssistantMessage("next")),
+		]);
+		await agent.prompt("active");
+		expect(starts).toEqual(messages);
+		expect(ends).toEqual(messages);
+		expect(agent.getQueuedMessageOccurrences()).toEqual([]);
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
 	// smarty-dev#13554: continue uses the same validation, including pre-attachment queues.
 	it.each(
 		(["steer", "followUp"] as const).flatMap((mode) =>
