@@ -74,11 +74,8 @@ async function postForm(url: string, fields: Record<string, string>, signal: Abo
 			body: new URLSearchParams(fields),
 			signal,
 		});
-	} catch (error) {
-		if (signal.aborted) {
-			throw new Error("Login cancelled");
-		}
-		throw error;
+	} catch {
+		throw new Error(signal.aborted ? "Login cancelled" : "xAI OAuth request failed");
 	}
 
 	let body: JsonObject;
@@ -98,9 +95,10 @@ async function postForm(url: string, fields: Record<string, string>, signal: Abo
 	};
 }
 
-function requestFailure(action: string, response: OAuthHttpResponse): Error {
+function requestFailure(action: string, response: OAuthHttpResponse, secrets: readonly string[] = []): Error {
 	// OAuth endpoint text can echo submitted or issued secrets: keep only the protocol error code.
-	const detail = typeof response.body.error === "string" ? oauthAuthorizationError(response.body.error) : undefined;
+	const detail =
+		typeof response.body.error === "string" ? oauthAuthorizationError(response.body.error, secrets) : undefined;
 	return new Error(`xAI OAuth ${action} failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
 }
 
@@ -192,7 +190,10 @@ async function pollForTokens(device: XaiDeviceCode, signal: AbortSignal): Promis
 			if (error === "expired_token") {
 				return { status: "failed", message: "xAI device code expired" };
 			}
-			return { status: "failed", message: requestFailure("device token polling", response).message };
+			return {
+				status: "failed",
+				message: requestFailure("device token polling", response, [device.deviceCode, device.userCode]).message,
+			};
 		},
 	});
 }
@@ -220,7 +221,7 @@ async function refreshXaiToken(refreshToken: string, signal: AbortSignal): Promi
 		signal,
 	);
 	if (!response.ok) {
-		throw requestFailure("token refresh", response);
+		throw requestFailure("token refresh", response, [refreshToken]);
 	}
 	return credentialsFromTokenResponse(response.body, refreshToken);
 }
