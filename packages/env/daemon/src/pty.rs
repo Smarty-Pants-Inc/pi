@@ -293,7 +293,10 @@ pub fn run(
             || {
                 if observation_failed {
                     // Without an exit observation, do not assume a raw PGID is still ours.
-                    Err(std::io::Error::other("leader exit observation failed"))
+                    GroupTermination {
+                        confirmed: false,
+                        error: Some(std::io::Error::other("leader exit observation failed")),
+                    }
                 } else {
                     unix::terminate_group(pid)
                 }
@@ -387,10 +390,17 @@ pub fn run(
 }
 
 #[cfg(unix)]
+#[derive(Debug)]
+struct GroupTermination {
+    confirmed: bool,
+    error: Option<std::io::Error>,
+}
+
+#[cfg(unix)]
 fn cleanup_group(
     pid: u32,
     groups: &Groups,
-    terminate: impl FnOnce() -> std::io::Result<bool>,
+    terminate: impl FnOnce() -> GroupTermination,
     reap: impl FnOnce() -> std::io::Result<()>,
     log_error: impl FnOnce(&str),
 ) -> Result<(), Failure> {
@@ -398,20 +408,30 @@ fn cleanup_group(
     // The unreaped leader reserves the PID/PGID for the entire bounded cleanup, including failure.
     let mut groups = groups.lock().unwrap();
     let outcome = terminate();
-    let reaped = reap();
-    groups.remove(&pid);
+    let reaped = if outcome.confirmed {
+        let reaped = reap();
+        // Once reaping can release the identity pin, no subsequent shutdown signal may use this PGID.
+        groups.remove(&pid);
+        Some(reaped)
+    } else {
+        // Dropping std::process::Child does not reap it. Keep the leader and its record pinned until
+        // daemon shutdown; never start a worker or release ownership of an unconfirmed group.
+        None
+    };
     drop(groups);
-    // No signal or retained retry is allowed after reaping releases the identity pin.
-    match (outcome, reaped) {
-        (Ok(true), Ok(())) => Ok(()),
-        (outcome, reaped) => {
-            let message = format!(
-                "PTY process group {pid} cleanup incomplete ({outcome:?}, reap {reaped:?}); dropping supervision without retry"
-            );
-            log_error(&message);
-            Err(Failure::new("cleanup_failed", message))
-        }
+    if outcome.error.is_none() && matches!(reaped, Some(Ok(()))) {
+        return Ok(());
     }
+    let disposition = if outcome.confirmed {
+        "group cleanup confirmed; supervision released without retry"
+    } else {
+        "retaining unreaped leader and supervision until daemon shutdown; no background retry"
+    };
+    let message = format!(
+        "PTY process group {pid} cleanup incomplete ({outcome:?}, reap {reaped:?}); {disposition}"
+    );
+    log_error(&message);
+    Err(Failure::new("cleanup_failed", message))
 }
 
 #[cfg(all(test, unix))]
@@ -432,7 +452,10 @@ mod tests {
             || {
                 assert_eq!(std::thread::current().id(), caller);
                 attempts += 1;
-                Ok(true)
+                GroupTermination {
+                    confirmed: true,
+                    error: None,
+                }
             },
             || Ok(()),
             |_| panic!("successful cleanup must not log an error"),
@@ -442,9 +465,9 @@ mod tests {
         assert!(groups.lock().unwrap().is_empty());
     }
 
-    // pi#244: an unkillable group or signal error is logged once and never retained for later signals.
+    // pi#244: failed cleanup logs once and keeps the unreaped leader/record until cleanup is confirmed.
     #[test]
-    fn cleanup_failure_logs_once_and_drops_record_without_retry() {
+    fn cleanup_failure_logs_once_and_retains_record_and_leader() {
         for outcome in [
             Ok(false),
             Err(std::io::Error::from_raw_os_error(libc::EPERM)),
@@ -462,6 +485,7 @@ mod tests {
             let caller = std::thread::current().id();
             let attempts = std::cell::Cell::new(0);
             let mut logs = Vec::new();
+            let reaps = std::cell::Cell::new(0);
             let error = cleanup_group(
                 pid,
                 &groups,
@@ -479,32 +503,64 @@ mod tests {
                             .1
                             .starts_with('Z')
                     );
-                    outcome
+                    GroupTermination {
+                        confirmed: matches!(outcome, Ok(true)),
+                        error: outcome.err(),
+                    }
                 },
                 || {
-                    assert_eq!(
-                        attempts.get(),
-                        1,
-                        "leader must not be reaped before the cleanup attempt"
-                    );
+                    reaps.set(reaps.get() + 1);
                     unix::reap(&mut child)
                 },
                 |message| logs.push(message.to_string()),
             )
             .unwrap_err();
+            let pinned = unix::wait_for_exit(pid).is_ok();
+            let retained = groups.lock().unwrap().contains(&pid);
+            // The test owns the exited child, and must not leak its pin on either implementation.
+            unix::reap(&mut child).unwrap();
+            groups.lock().unwrap().remove(&pid);
             assert_eq!(error.code, "cleanup_failed");
             assert!(error.message.contains(&pid.to_string()));
             assert_eq!(logs, [error.message]);
             assert_eq!(attempts.get(), 1);
-            assert!(
-                unix::wait_for_exit(pid)
-                    .is_err_and(|error| error.raw_os_error() == Some(libc::ECHILD))
+            assert_eq!(
+                reaps.get(),
+                0,
+                "unconfirmed cleanup must not reap its leader"
             );
-            assert!(groups.lock().unwrap().is_empty());
-            // The connection's kill_all path can only signal records still in this set.
-            let later_signals: Vec<_> = groups.lock().unwrap().iter().copied().collect();
-            assert!(later_signals.is_empty());
+            assert!(pinned, "unconfirmed cleanup released the PGID pin");
+            assert!(retained, "unconfirmed cleanup dropped the ownership record");
         }
+    }
+
+    // pi#244: a recovered TERM probe error remains visible even after hard-stop cleanup is confirmed.
+    #[test]
+    fn confirmed_cleanup_preserves_probe_error_and_logs_once() {
+        let groups: Groups = Arc::new(Mutex::new(Default::default()));
+        let pid = 123;
+        groups.lock().unwrap().insert(pid);
+        let mut reaps = 0;
+        let mut logs = Vec::new();
+        let error = cleanup_group(
+            pid,
+            &groups,
+            || GroupTermination {
+                confirmed: true,
+                error: Some(std::io::Error::other("injected TERM probe error")),
+            },
+            || {
+                reaps += 1;
+                Ok(())
+            },
+            |message| logs.push(message.to_string()),
+        )
+        .unwrap_err();
+        assert_eq!(reaps, 1);
+        assert_eq!(error.code, "cleanup_failed");
+        assert!(error.message.contains("injected TERM probe error"));
+        assert_eq!(logs, [error.message]);
+        assert!(groups.lock().unwrap().is_empty());
     }
 
     // pi#244: WNOWAIT must preserve both ordinary and signalled exit status until the request reaps.
@@ -795,7 +851,7 @@ mod tests {
 
 #[cfg(unix)]
 mod unix {
-    use super::PtyRequest;
+    use super::{GroupTermination, PtyRequest};
     use std::fs::File;
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -1157,10 +1213,21 @@ mod unix {
     }
 
     /// Stop remaining jobs while the leader is still unreaped. Never reap any group member during this attempt.
-    pub fn terminate_group(pid: u32) -> io::Result<bool> {
+    pub fn terminate_group(pid: u32) -> GroupTermination {
+        terminate_group_with_probe(pid, |deadline| group_has_live_members(pid, deadline))
+    }
+
+    fn terminate_group_with_probe(
+        pid: u32,
+        mut probe: impl FnMut(std::time::Instant) -> io::Result<bool>,
+    ) -> GroupTermination {
         use std::thread;
         use std::time::{Duration, Instant};
 
+        let mut outcome = GroupTermination {
+            confirmed: false,
+            error: None,
+        };
         let group = -(pid as libc::pid_t);
         for (signal, bound) in [
             (libc::SIGTERM, super::CLEANUP_TERM_WAIT),
@@ -1169,22 +1236,30 @@ mod unix {
             // SAFETY: the unreaped leader pins the process group this terminal owns until cleanup returns.
             if unsafe { libc::kill(group, signal) } != 0 {
                 let error = io::Error::last_os_error();
-                return if error.raw_os_error() == Some(libc::ESRCH) {
-                    Ok(true)
-                } else {
-                    Err(error)
-                };
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    outcome.confirmed = true;
+                    return outcome;
+                }
+                outcome.error.get_or_insert(error);
+                continue;
             }
             let deadline = Instant::now() + bound;
             loop {
                 if Instant::now() >= deadline {
                     break;
                 }
-                match group_has_live_members(pid, deadline) {
-                    Ok(false) => return Ok(true),
+                match probe(deadline) {
+                    Ok(false) => {
+                        outcome.confirmed = true;
+                        return outcome;
+                    }
                     Ok(true) => {}
-                    Err(error) if error.kind() == io::ErrorKind::TimedOut => break,
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        // A failed TERM probe is not proof of emptiness. Preserve the first error,
+                        // but always advance to the bounded SIGKILL pass with the leader still pinned.
+                        outcome.error.get_or_insert(error);
+                        break;
+                    }
                 }
                 thread::sleep(
                     Duration::from_millis(10)
@@ -1192,7 +1267,87 @@ mod unix {
                 );
             }
         }
-        Ok(false)
+        outcome
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod cleanup_tests {
+        use super::*;
+
+        // pi#244: a TERM probe error must not strand a job that ignores TERM/HUP.
+        #[test]
+        fn term_probe_error_still_kills_member_before_reaping_leader() {
+            for error_kind in [io::ErrorKind::Other, io::ErrorKind::TimedOut] {
+                let request = PtyRequest::from_json(&serde_json::json!({
+                    "argv": ["/bin/sh", "-c", "trap '' HUP TERM; sleep 30 & echo $!; exit 0"],
+                    "cwd": crate::sys::tmpdir(), "cols": 80, "rows": 24,
+                }))
+                .unwrap();
+                let (master, mut child) = spawn(&request).unwrap();
+                let pid = child.id();
+                wait_for_exit(pid).unwrap();
+                let mut bytes = [0; 64];
+                let read = (&master).read(&mut bytes).unwrap();
+                let member: u32 = std::str::from_utf8(&bytes[..read])
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let mut probes = 0;
+                let started = std::time::Instant::now();
+                let outcome = terminate_group_with_probe(pid, |deadline| {
+                    probes += 1;
+                    if probes == 1 {
+                        Err(io::Error::new(error_kind, "injected TERM probe failure"))
+                    } else {
+                        group_has_live_members(pid, deadline)
+                    }
+                });
+                let member_stat = std::fs::read_to_string(format!("/proc/{member}/stat")).ok();
+                let member_live = member_stat
+                    .as_ref()
+                    .is_some_and(|stat| !stat.rsplit_once(") ").unwrap().1.starts_with('Z'));
+                let killed = member_stat.as_ref().is_none_or(|stat| {
+                    stat.rsplit_once(") ").unwrap().1.split_whitespace().last() == Some("9")
+                });
+                let pinned = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .unwrap()
+                    .rsplit_once(") ")
+                    .unwrap()
+                    .1
+                    .starts_with('Z');
+                // Always clean up our original pinned group, including on the fail-first implementation.
+                // SAFETY: this test retains the unreaped leader's Child and owns every member in this group.
+                unsafe {
+                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                }
+                reap(&mut child).unwrap();
+                assert!(
+                    !member_live,
+                    "TERM-ignoring member survived the probe error"
+                );
+                assert!(killed, "member did not receive SIGKILL");
+                assert!(pinned, "leader was reaped before the hard-stop pass");
+                assert!(probes > 1, "hard-stop pass did not confirm cleanup");
+                assert!(
+                    outcome.confirmed,
+                    "hard-stop pass did not confirm member death"
+                );
+                assert!(
+                    outcome
+                        .error
+                        .unwrap()
+                        .to_string()
+                        .contains("injected TERM probe failure")
+                );
+                assert!(
+                    started.elapsed()
+                        < super::super::CLEANUP_TERM_WAIT
+                            + super::super::CLEANUP_KILL_WAIT
+                            + std::time::Duration::from_secs(1)
+                );
+            }
+        }
     }
 
     fn poll(fd: libc::c_int, events: libc::c_short) -> io::Result<bool> {
