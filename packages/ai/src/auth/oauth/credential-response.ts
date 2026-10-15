@@ -153,7 +153,11 @@ export function redactValues(text: string, secrets: readonly string[]): string {
 	for (const secret of secrets) {
 		if (typeof secret !== "string" || secret.length === 0) continue;
 		variants.add(secret);
-		for (const value of base64Variants(secret)) variants.add(value);
+		// Keep the Base64 expansion bounded: mask the raw value, one encoded layer, and one nested layer.
+		for (const value of base64Variants(secret)) {
+			variants.add(value);
+			for (const nested of base64Variants(value)) variants.add(nested);
+		}
 		// Form encoding turns spaces into "+", which percent decoding does not reverse.
 		variants.add(new URLSearchParams({ v: secret }).toString().slice(2));
 	}

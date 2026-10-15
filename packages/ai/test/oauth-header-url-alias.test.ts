@@ -17,9 +17,9 @@ const model: Model<"openai-completions"> = {
 	maxTokens: 128,
 };
 
-async function diagnostic(headers: Record<string, string>, text: string, origin: "model" | "options" = "model") {
+async function diagnostic(headers: Record<string, string>, text: string, origin: "model" | "options") {
+	let wire: Headers | undefined;
 	const events: unknown[] = [];
-	let requested = false;
 	const eventStream = stream(
 		{ ...model, headers: origin === "model" ? headers : undefined },
 		normalizeContext({ messages: [] }),
@@ -28,8 +28,8 @@ async function diagnostic(headers: Record<string, string>, text: string, origin:
 			headers: origin === "options" ? headers : undefined,
 			env: {},
 			maxRetries: 0,
-			fetch: async () => {
-				requested = true;
+			fetch: async (_input, init) => {
+				wire = new Headers(init?.headers);
 				return Response.json(
 					{ error: { message: text, type: "invalid_request_error", code: "invalid_request" } },
 					{ status: 400 },
@@ -39,13 +39,47 @@ async function diagnostic(headers: Record<string, string>, text: string, origin:
 	);
 	for await (const event of eventStream) events.push(event);
 	const output = await eventStream.result();
-	expect(requested).toBe(true);
 	expect(output.stopReason).toBe("error");
-	return JSON.stringify({ errorMessage: output.errorMessage, events });
+	return { wire, sinks: JSON.stringify({ errorMessage: output.errorMessage, events }) };
 }
 
-describe("known credential URL aliases", () => {
-	// smarty-dev#4703: ported from the audited carry's URL-alias sink regression.
+describe("known credential wire and URL aliases", () => {
+	// smarty-dev#4703: derived from fr-au-4703r/header-normalization-probe.mjs.
+	it("masks bare credentials after header whitespace normalization in both header origins", async () => {
+		const samples = [
+			...Array.from({ length: 8 }, (_, i) => "Q7Z9V2B4".slice(0, i + 1)),
+			"Q7Z9V2B4L0NG",
+			"é",
+			"\u00a0Q7\u00a0",
+		];
+		for (const secret of samples)
+			for (const header of [
+				"authorization",
+				"proxy-authorization",
+				"cf-aig-authorization",
+				"x-api-key",
+				"api-key",
+			]) {
+				for (const [left, right] of [
+					["", ""],
+					["  ", ""],
+					["", "  "],
+					["  ", "  "],
+					["\t", "\t"],
+				])
+					for (const origin of ["model", "options"] as const) {
+						const inner = header.endsWith("authorization") ? `Bearer ${secret}` : secret;
+						const headers = { [header]: left + inner + right };
+						expect(getOAuthDiagnosticSecrets(undefined, headers)).toContain(secret);
+						const result = await diagnostic(headers, `receipt=${secret}`, origin);
+						expect(result.wire?.get(header)).toBe(inner);
+						expect(result.sinks).not.toContain(secret);
+					}
+				}
+			}
+	});
+
+	// smarty-dev#4703: derived from fr-au-4703r/url-alias-sink-probe.mjs.
 	it("masks equivalent percent encodings at errorMessage and error-event sinks", async () => {
 		for (const secret of ["é", "/", "Q7", "Q7Z9V2B4", "Q7Z9V2B4L0NG"]) {
 			const canonical = encodeURIComponent(secret);
@@ -61,7 +95,8 @@ describe("known credential URL aliases", () => {
 					const headers = { [header]: header.endsWith("authorization") ? `Basic ${secret}` : secret };
 					const text = `receipt=https://echo.invalid/path/${value}?receipt=${value}#${value}`;
 					expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(undefined, headers))).not.toContain(value);
-					expect(await diagnostic(headers, text)).not.toContain(value);
+					const result = await diagnostic(headers, text, "model");
+					expect(result.sinks).not.toContain(value);
 				}
 		}
 	});
@@ -72,8 +107,17 @@ describe("known credential URL aliases", () => {
 		for (const value of [secret, [...secret].map((char) => `%${char.charCodeAt(0).toString(16)}`).join("")]) {
 			const text = `receipt=https://${value}@echo.invalid/`;
 			expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(undefined, headers))).not.toContain(value);
-			expect(await diagnostic(headers, text, "options")).not.toContain(value);
+			const result = await diagnostic(headers, text, "options");
+			expect(result.sinks).not.toContain(value);
 		}
+	});
+
+	it("masks padded and unpadded double-Base64 aliases", () => {
+		const secret = "Q7Z9";
+		const encode = (value: string) => btoa(Array.from(new TextEncoder().encode(value), (byte) => String.fromCharCode(byte)).join(""));
+		const padded = encode(encode(secret));
+		for (const alias of [padded, padded.replace(/=+$/, "")])
+			expect(redactOAuthDiagnostic(`receipt=${alias}`, [secret])).not.toContain(alias);
 	});
 
 	// smarty-dev#4703: retain the carry's malformed-neighbor, mixed-layer and budget assertions.
