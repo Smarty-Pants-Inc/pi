@@ -18,6 +18,7 @@ const model: Model<"openai-completions"> = {
 };
 
 async function diagnostic(headers: Record<string, string>, text: string, origin: "model" | "options") {
+	let requested = false;
 	let wire: Headers | undefined;
 	const events: unknown[] = [];
 	const eventStream = stream(
@@ -29,6 +30,7 @@ async function diagnostic(headers: Record<string, string>, text: string, origin:
 			env: {},
 			maxRetries: 0,
 			fetch: async (_input, init) => {
+				requested = true;
 				wire = new Headers(init?.headers);
 				return Response.json(
 					{ error: { message: text, type: "invalid_request_error", code: "invalid_request" } },
@@ -39,6 +41,7 @@ async function diagnostic(headers: Record<string, string>, text: string, origin:
 	);
 	for await (const event of eventStream) events.push(event);
 	const output = await eventStream.result();
+	expect(requested).toBe(true);
 	expect(output.stopReason).toBe("error");
 	return { wire, sinks: JSON.stringify({ errorMessage: output.errorMessage, events }) };
 }
@@ -52,7 +55,7 @@ describe("known credential wire and URL aliases", () => {
 			"é",
 			"\u00a0Q7\u00a0",
 		];
-		for (const secret of samples)
+		for (const secret of samples) {
 			for (const header of [
 				"authorization",
 				"proxy-authorization",
@@ -75,8 +78,8 @@ describe("known credential wire and URL aliases", () => {
 						expect(result.wire?.get(header)).toBe(inner);
 						expect(result.sinks).not.toContain(secret);
 					}
-				}
 			}
+		}
 	});
 
 	// smarty-dev#4703: derived from fr-au-4703r/url-alias-sink-probe.mjs.
@@ -114,7 +117,8 @@ describe("known credential wire and URL aliases", () => {
 
 	it("masks padded and unpadded double-Base64 aliases", () => {
 		const secret = "Q7Z9";
-		const encode = (value: string) => btoa(Array.from(new TextEncoder().encode(value), (byte) => String.fromCharCode(byte)).join(""));
+		const encode = (value: string) =>
+			btoa(Array.from(new TextEncoder().encode(value), (byte) => String.fromCharCode(byte)).join(""));
 		const padded = encode(encode(secret));
 		for (const alias of [padded, padded.replace(/=+$/, "")])
 			expect(redactOAuthDiagnostic(`receipt=${alias}`, [secret])).not.toContain(alias);

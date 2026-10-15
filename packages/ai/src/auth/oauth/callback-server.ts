@@ -93,7 +93,7 @@ export async function startOAuthCallbackServer<T>(
 			}
 			const error = url.searchParams.get("error");
 			if (error) {
-				const code = oauthAuthorizationError(error);
+				const code = oauthAuthorizationError(error, [options.state ?? "", url.searchParams.get("code") ?? ""]);
 				sendPage(response, 400, oauthErrorHtml(`${providerName} authorization failed.`, code));
 				finish({ error: new Error(`${providerName} authorization failed: ${code}`) });
 				return;

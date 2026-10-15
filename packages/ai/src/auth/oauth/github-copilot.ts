@@ -132,6 +132,14 @@ function parseGitHubCopilotModelCatalog(raw: unknown, allowPolicyFallback: boole
 	return { availableModelIds, policyModelIds };
 }
 
+async function fetchCredentialResponse(url: string, init: RequestInit): Promise<Response> {
+	try {
+		return await fetch(url, init);
+	} catch {
+		throw new Error("GitHub Copilot OAuth request failed");
+	}
+}
+
 async function fetchWithRateLimitRetry(
 	url: string,
 	init: RequestInit,
@@ -145,7 +153,7 @@ async function fetchWithRateLimitRetry(
 	const requestSignal = retryBudgetSignal ? AbortSignal.any([signal, retryBudgetSignal]) : signal;
 	const retryDeadline = retryBudgetSignal ? Date.now() + retryPolicy.maxElapsedMs : undefined;
 	for (let retry = 0; ; retry++) {
-		const response = await fetch(url, {
+		const response = await fetchCredentialResponse(url, {
 			...init,
 			signal: AbortSignal.any([requestSignal, AbortSignal.timeout(5000)]),
 		});
@@ -200,7 +208,7 @@ async function fetchGitHubCopilotModels(
 }
 
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
-	const response = await fetch(url, init);
+	const response = await fetchCredentialResponse(url, init);
 	if (!response.ok) {
 		// Device and token endpoints can echo submitted codes or tokens, in the body or reason phrase.
 		await response.body?.cancel().catch(() => undefined);
@@ -309,7 +317,10 @@ async function pollForGitHubAccessToken(
 				}
 
 				// The token endpoint can echo the submitted device code: keep only a protocol code, never error_description.
-				return { status: "failed", message: `Device flow failed: ${oauthAuthorizationError(error)}` };
+				return {
+					status: "failed",
+					message: `Device flow failed: ${oauthAuthorizationError(error, [device.device_code, device.user_code])}`,
+				};
 			}
 
 			return { status: "failed", message: "Invalid device token response" };

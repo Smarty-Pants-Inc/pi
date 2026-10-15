@@ -38,6 +38,14 @@ function requestSignal(signal: AbortSignal): AbortSignal {
 	return AbortSignal.any([AbortSignal.timeout(REQUEST_TIMEOUT_MS), signal]);
 }
 
+async function fetchCredentialResponse(url: string, init: RequestInit): Promise<Response> {
+	try {
+		return await fetch(url, init);
+	} catch {
+		throw new Error("Meta OAuth request failed");
+	}
+}
+
 async function readJson(response: Response): Promise<Record<string, unknown> | null> {
 	try {
 		const json = await response.json();
@@ -48,8 +56,8 @@ async function readJson(response: Response): Promise<Record<string, unknown> | n
 }
 
 /** Credential endpoint text can echo submitted or issued secrets: keep only the protocol error code. */
-function errorDetail(json: Record<string, unknown> | null): string {
-	return typeof json?.error === "string" ? `: ${oauthAuthorizationError(json.error)}` : "";
+function errorDetail(json: Record<string, unknown> | null, secrets: readonly string[] = []): string {
+	return typeof json?.error === "string" ? `: ${oauthAuthorizationError(json.error, secrets)}` : "";
 }
 
 /** The verification URI is opened in the user's browser; only http(s) URLs are trusted. */
@@ -69,7 +77,7 @@ function positiveNumber(value: unknown): number | undefined {
 }
 
 async function startDeviceAuthorization(signal: AbortSignal): Promise<DeviceAuthorization> {
-	const response = await fetch(DEVICE_AUTHORIZATION_URL, {
+	const response = await fetchCredentialResponse(DEVICE_AUTHORIZATION_URL, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -106,7 +114,7 @@ async function pollForIdentityToken(device: DeviceAuthorization, signal: AbortSi
 		waitBeforeFirstPoll: true,
 		signal,
 		poll: async () => {
-			const response = await fetch(DEVICE_TOKEN_URL, {
+			const response = await fetchCredentialResponse(DEVICE_TOKEN_URL, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
@@ -135,7 +143,7 @@ async function pollForIdentityToken(device: DeviceAuthorization, signal: AbortSi
 				default:
 					return {
 						status: "failed",
-						message: `Meta device token request failed with status ${response.status}${errorDetail(json)}`,
+						message: `Meta device token request failed with status ${response.status}${errorDetail(json, [device.deviceCode, device.userCode])}`,
 					};
 			}
 		},
@@ -144,7 +152,7 @@ async function pollForIdentityToken(device: DeviceAuthorization, signal: AbortSi
 
 /** Exchange an identity token for a Model API key. Keys are valid for about a day. */
 async function mintApiKey(identityToken: string, signal: AbortSignal): Promise<OAuthCredential> {
-	const response = await fetch(API_KEY_MINT_URL, {
+	const response = await fetchCredentialResponse(API_KEY_MINT_URL, {
 		method: "POST",
 		headers: {
 			Accept: "application/json",
@@ -159,16 +167,16 @@ async function mintApiKey(identityToken: string, signal: AbortSignal): Promise<O
 	if (response.status === 401 || response.status === 403) {
 		// Identity token is not renewable (see file header); only a fresh device flow helps.
 		throw new Error(
-			`Meta session expired (status ${response.status}). Run \`/login meta\` to sign in again.${errorDetail(json)}`,
+			`Meta session expired (status ${response.status}). Run \`/login meta\` to sign in again.${errorDetail(json, [identityToken])}`,
 		);
 	}
 	if (!response.ok) {
-		throw new Error(`Meta API key mint failed with status ${response.status}${errorDetail(json)}`);
+		throw new Error(`Meta API key mint failed with status ${response.status}${errorDetail(json, [identityToken])}`);
 	}
 	const apiKey = json?.api_key;
 	if (typeof apiKey !== "string" || !apiKey) {
-		const actionUrl = trustedHttpUrl(json?.action_url);
-		throw new Error(`Meta did not issue an API key.${actionUrl ? ` Complete setup at ${actionUrl}` : ""}`);
+		// Never publish a provider action_url: even an https URL can carry a credential.
+		throw new Error("Meta did not issue an API key. Complete setup at https://dev.meta.ai/billing");
 	}
 	return { type: "oauth", refresh: identityToken, access: apiKey, expires: Date.now() + API_KEY_LIFETIME_MS };
 }

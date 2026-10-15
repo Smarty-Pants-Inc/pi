@@ -46,8 +46,8 @@ function parseAuthorizationInput(input: string): string | undefined {
 }
 
 /** The key exchange endpoint can echo the submitted code: keep only the protocol error code. */
-function errorDetail(body: JsonObject): string | undefined {
-	return typeof body.error === "string" ? oauthAuthorizationError(body.error) : undefined;
+function errorDetail(body: JsonObject, secrets: readonly string[]): string | undefined {
+	return typeof body.error === "string" ? oauthAuthorizationError(body.error, secrets) : undefined;
 }
 
 async function exchangeAuthorizationCode(
@@ -72,6 +72,8 @@ async function exchangeAuthorizationCode(
 			headers: { accept: "application/json", "content-type": "application/json" },
 			body: JSON.stringify({ code, code_verifier: verifier, code_challenge_method: "S256" }),
 			signal: controller.signal,
+		}).catch(() => {
+			throw new Error("OpenRouter OAuth request failed");
 		});
 		try {
 			const parsed = (await response.json()) as unknown;
@@ -89,7 +91,7 @@ async function exchangeAuthorizationCode(
 	}
 
 	if (!response.ok) {
-		const detail = errorDetail(body);
+		const detail = errorDetail(body, [code, verifier]);
 		throw new Error(`OpenRouter OAuth key exchange failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
 	}
 

@@ -74,7 +74,10 @@ function authorizationResultFromManualInput(input: string, expectedState: string
 		throw new Error(`The pasted callback URL must start with ${REDIRECT_URI}`);
 	}
 	const error = url.searchParams.get("error");
-	if (error) throw new Error(`ChatGPT authorization failed: ${oauthAuthorizationError(error)}`);
+	if (error) {
+		const code = oauthAuthorizationError(error, [expectedState, url.searchParams.get("code") ?? ""]);
+		throw new Error(`ChatGPT authorization failed: ${code}`);
+	}
 	return authorizationResultFromCallback(url, expectedState);
 }
 
@@ -102,7 +105,7 @@ function startCallbackServer(expectedState: string): Promise<CallbackServer> {
 
 				const error = url.searchParams.get("error");
 				if (error) {
-					const code = oauthAuthorizationError(error);
+					const code = oauthAuthorizationError(error, [expectedState, url.searchParams.get("code") ?? ""]);
 					sendHtml(response, 400, oauthErrorHtml("ChatGPT was not connected.", `Error: ${code}`));
 					rejectResult(new Error(`ChatGPT authorization failed: ${code}`));
 					return;

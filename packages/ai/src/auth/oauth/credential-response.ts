@@ -297,27 +297,33 @@ export function redactOAuthDiagnosticValue(
 type SdkLogFunction = (message: string, ...args: unknown[]) => void;
 
 /**
- * SDK logger that masks every argument. Never hand the original Error, its
- * cause or custom inspect hooks to the console: they can carry the request key.
+ * Credential-bearing SDK requests log owned text only (smarty-dev#4703). An SDK
+ * message, body, URL or argument can contain an arbitrarily encoded credential;
+ * no finite alias mask makes that text safe. Do not inspect or forward it.
  */
-export function createRedactingSdkLogger(secrets: readonly string[]): {
+export function createRedactingSdkLogger(
+	secrets: readonly string[],
+	provider: "openai" | "azure-openai" | "openrouter" = "openai",
+): {
 	error: SdkLogFunction;
 	warn: SdkLogFunction;
 	info: SdkLogFunction;
 	debug: SdkLogFunction;
 } {
-	const safe = (message: string, args: unknown[]) =>
-		[message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, secrets));
+	// Close the label at runtime too; callers cannot turn configuration into log text.
+	const name = provider === "azure-openai" ? "azure-openai" : provider === "openrouter" ? "openrouter" : "openai";
+	// Keep live-value masking as defense in depth even for these owned lines.
+	const line = (level: string) => redactValues(`${name} sdk ${level}: message withheld`, secrets);
 	return {
-		error: (message, ...args) => console.error(...safe(message, args)),
-		warn: (message, ...args) => console.warn(...safe(message, args)),
-		info: (message, ...args) => console.info(...safe(message, args)),
-		debug: (message, ...args) => console.debug(...safe(message, args)),
+		error: () => console.error(line("error")),
+		warn: () => console.warn(line("warn")),
+		info: () => console.info(line("info")),
+		debug: () => console.debug(line("debug")),
 	};
 }
 
 /** OAuth errors are untrusted text. Keep only protocol codes; never echo error_description. */
-export function oauthAuthorizationError(code: string): string {
+export function oauthAuthorizationError(code: string, secrets: readonly string[] = []): string {
 	switch (code) {
 		case "access_denied":
 		case "invalid_request":
@@ -333,7 +339,8 @@ export function oauthAuthorizationError(code: string): string {
 		case "authorization_pending":
 		case "slow_down":
 		case "expired_token":
-			return code;
+			// Inspect only these short, closed protocol classes, never arbitrary provider text.
+			return redactValues(code, secrets) === code ? code : "authorization_error";
 		default:
 			return "authorization_error";
 	}
