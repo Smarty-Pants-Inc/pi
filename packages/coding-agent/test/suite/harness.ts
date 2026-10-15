@@ -16,6 +16,7 @@ import type {
 	ToolResultMessage,
 } from "@earendil-works/pi-ai/compat";
 import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+import { afterEach } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
 import type { ExtensionRunner, ExtensionUIContext, SessionStartEvent } from "../../src/core/extensions/index.ts";
@@ -31,6 +32,16 @@ import {
 	createTestExtensionsResult,
 	createTestResourceLoader,
 } from "../utilities.ts";
+
+// smarty-dev#12837: join every cancelled turn before the next test, including unawaited cleanup calls.
+const pendingCleanups = new Set<Promise<void>>();
+afterEach(async () => {
+	const pending = [...pendingCleanups];
+	pendingCleanups.clear();
+	const results = await Promise.allSettled(pending);
+	const failure = results.find((result) => result.status === "rejected");
+	if (failure?.status === "rejected") throw failure.reason;
+});
 
 type MessageTextPart = { type: "text"; text: string };
 
@@ -147,7 +158,7 @@ export interface Harness {
 	events: AgentSessionEvent[];
 	eventsOfType<T extends AgentSessionEvent["type"]>(type: T): Extract<AgentSessionEvent, { type: T }>[];
 	tempDir: string;
-	cleanup: () => void;
+	cleanup: () => Promise<void>;
 }
 
 function createTempDir(): string {
@@ -254,6 +265,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		extensionRunnerRef,
 	});
 
+	let cleanupPromise: Promise<void> | undefined;
 	const events: AgentSessionEvent[] = [];
 	session.subscribe((event) => {
 		events.push(event);
@@ -278,13 +290,26 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		},
 		tempDir,
 		cleanup() {
-			// smarty-dev#3048: test teardown deliberately recovers undelivered input.
-			session.clearQueue();
-			session.dispose();
-			fauxProvider.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
-			}
+			if (cleanupPromise) return cleanupPromise;
+			cleanupPromise = (async () => {
+				// Fence before cancellation can yield to a hook; keep it closed through terminal disposal.
+				const release = session.gateInputs();
+				try {
+					session.cancelForShutdown();
+					await session.abort();
+					// smarty-dev#3048: test teardown deliberately recovers undelivered input.
+					session.clearQueue();
+					session.dispose();
+					fauxProvider.unregister();
+					if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+				} finally {
+					release();
+				}
+			})();
+			pendingCleanups.add(cleanupPromise);
+			// The shared afterEach observes failures, even when a caller does not await cleanup itself.
+			void cleanupPromise.catch(() => {});
+			return cleanupPromise;
 		},
 	};
 }

@@ -62,7 +62,7 @@ describe("model switch recovery input (#97)", () => {
 			const cleanup = h.cleanup;
 			h.cleanup = () => {
 				h.session.dispose();
-				cleanup();
+				return cleanup();
 			};
 		}
 		h.sessionManager.appendMessage({ role: "user", content: "x".repeat(80_000), timestamp: Date.now() - 2000 });

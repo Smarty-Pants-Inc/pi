@@ -1,6 +1,12 @@
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fauxAssistantMessage, fauxToolCall, getCurrentTools, type TranscriptContext } from "@earendil-works/pi-ai";
+import {
+	createAssistantMessageEventStream,
+	fauxAssistantMessage,
+	fauxToolCall,
+	getCurrentTools,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
@@ -57,8 +63,8 @@ function orchestratorExtension(pi: ExtensionAPI): void {
 describe("AgentSession tool orchestration", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
-		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+	afterEach(async () => {
+		while (harnesses.length > 0) await harnesses.pop()?.cleanup();
 	});
 
 	it("supports tools that call other tools under any name through the extension API", async () => {
@@ -322,5 +328,69 @@ describe("AgentSession tool orchestration", () => {
 		await harness.session.prompt("go");
 		const result = harness.session.messages.find((message) => message.role === "toolResult");
 		expect(result && "nestedCalls" in result).toBe(false);
+	});
+
+	// smarty-dev#12837: a timed-out summarizer must not hold admission or persist a late checkpoint.
+	it.each([
+		{ phase: "setup", retry: false },
+		{ phase: "result", retry: false },
+		{ phase: "setup", retry: true },
+		{ phase: "result", retry: true },
+	] as const)("settles cleanup during stalled branch-summary $phase (retry: $retry)", async ({ phase, retry }) => {
+		const harness = await createHarness({
+			initialActiveToolNames: [],
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.prompt("go");
+
+		const firstUser = harness.sessionManager
+			.getBranch()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		if (!firstUser) throw new Error("No user entry");
+		const oldLeaf = harness.sessionManager.getLeafId();
+		const requested = Promise.withResolvers<void>();
+		const stream = createAssistantMessageEventStream();
+		const terminal = stream.result();
+		stream.result = () => {
+			requested.resolve();
+			return terminal;
+		};
+		const setup = Promise.withResolvers<typeof stream>();
+		let requestSignal: AbortSignal | undefined;
+		let streamCalls = 0;
+		harness.session.agent.streamFunction = (_model, _context, options) => {
+			streamCalls++;
+			if (retry && streamCalls === 1) {
+				const failure = createAssistantMessageEventStream();
+				failure.push({
+					type: "error",
+					reason: "error",
+					error: fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 rate limit" }),
+				});
+				return failure;
+			}
+			requestSignal = options?.signal;
+			if (phase === "setup") requested.resolve();
+			return phase === "setup" ? setup.promise : stream;
+		};
+		const navigation = harness.session.navigateTree(firstUser.id, { summarize: true });
+		await requested.promise;
+		expect(harness.session.isCompacting).toBe(true);
+
+		await expect(harness.cleanup()).resolves.toBeUndefined();
+		await expect(navigation).resolves.toMatchObject({ cancelled: true, aborted: true });
+		expect(requestSignal?.aborted).toBe(true);
+		expect(harness.session.isIdle).toBe(true);
+		expect(() => harness.session.dispose()).not.toThrow();
+
+		setup.resolve(stream);
+		stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("late summary") });
+		await Promise.resolve();
+		expect(streamCalls).toBe(retry ? 2 : 1);
+		expect(harness.eventsOfType("summarization_retry_finished")).toHaveLength(retry ? 1 : 0);
+		expect(harness.sessionManager.getLeafId()).toBe(oldLeaf);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "branch_summary")).toBe(false);
 	});
 });
