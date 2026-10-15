@@ -328,6 +328,17 @@ export const SettingsSchema = Type.Object(
 				description: "Model patterns for cycling, in the same format as the --models CLI flag.",
 			}),
 		),
+		modelPolicy: Type.Optional(
+			Type.Object(
+				{
+					allow: Type.Array(Type.String(), {
+						description:
+							"Case-insensitive provider/model globs. Only * is special; an empty list denies all models.",
+					}),
+				},
+				{ description: "Every configured settings layer must allow the requested provider/model." },
+			),
+		),
 		defaultTools: Type.Optional(
 			Type.Array(Type.String(), {
 				description:

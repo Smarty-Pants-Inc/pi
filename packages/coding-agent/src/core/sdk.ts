@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
+import { type ModelsSimpleStreamOptions, registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
@@ -257,9 +257,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
-	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
-
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath, settingsManager }));
 	const sessionManager = suppliedManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
@@ -272,6 +271,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	// The session manager is read before the model runtime, so an ownership refusal never touches the runtime.
+	const disposeModelPolicy = modelRuntime.addModelPolicy(settingsManager);
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
@@ -548,6 +549,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 	owner?.assertActive();
 	const session = new AgentSession(owner ? bindOrdinaryOptions(sessionConfig, owner) : sessionConfig);
+	const unregisterPolicyCleanup = registerSessionResourceCleanup((sessionId) => {
+		// Session IDs may be shared by SDK consumers; only release this disposed instance.
+		if (sessionId !== session.sessionId || !session.isDisposed) return;
+		disposeModelPolicy();
+		unregisterPolicyCleanup();
+	});
 	shutdownSignal = session.shutdownSignal;
 	owner?.bindSession(session);
 	owner?.installProviderGuard(session);
