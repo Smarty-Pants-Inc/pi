@@ -194,6 +194,26 @@ describe("modelPolicy.allow", () => {
 		}
 	});
 
+	it("denies every model when an existing settings file is empty, at load and on reload", async () => {
+		const model = { provider: "openai", id: "gpt-6" };
+		for (const scope of ["global", "project"] as const) {
+			const storage = new InMemorySettingsStorage();
+			storage.withLock("global", () => JSON.stringify({}));
+			storage.withLock("project", () => JSON.stringify({}));
+			storage.withLock(scope, () => "");
+			expect(SettingsManager.fromStorage(storage).isModelAllowed(model), `${scope} load`).toBe(false);
+
+			const reloaded = new InMemorySettingsStorage();
+			reloaded.withLock("global", () => JSON.stringify({ modelPolicy: { allow: ["openai/gpt-6"] } }));
+			reloaded.withLock("project", () => JSON.stringify({}));
+			const manager = SettingsManager.fromStorage(reloaded);
+			expect(manager.isModelAllowed(model), `${scope} before truncation`).toBe(true);
+			reloaded.withLock(scope, () => "");
+			await manager.reload();
+			expect(manager.isModelAllowed(model), `${scope} reload`).toBe(false);
+		}
+	});
+
 	it("cannot widen a policy through project null, malformed values or launch overrides", () => {
 		const manager = settings(["faux/gpt-6"]);
 		manager.applyOverrides({ modelPolicy: { allow: ["*"] } });

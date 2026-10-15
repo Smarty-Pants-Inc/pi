@@ -374,7 +374,9 @@ export class SettingsManager {
 			return undefined;
 		});
 
-		if (!content) {
+		// Only a missing file means "no settings". An existing empty file fails to parse like any other
+		// unreadable file, so a model policy can never be bypassed by truncating it.
+		if (content === undefined) {
 			return {};
 		}
 		const settings = JSON.parse(stripBom(content));
