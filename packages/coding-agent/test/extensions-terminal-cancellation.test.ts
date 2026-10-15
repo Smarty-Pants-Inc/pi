@@ -74,7 +74,8 @@ const cases: Array<{ event: ExtensionEvent["type"]; invoke: (runner: ExtensionRu
 	{ event: "before_provider_headers", invoke: (runner) => runner.emitBeforeProviderHeaders({ original: "yes" }) },
 	{
 		event: "before_agent_start",
-		invoke: (runner) => runner.emitBeforeAgentStart("original", undefined, { cwd: process.cwd() }),
+		invoke: (runner) =>
+			runner.emitBeforeAgentStart({ messageType: "user", prompt: "original" }, { cwd: process.cwd() }),
 	},
 	{ event: "resources_discover", invoke: (runner) => runner.emitResourcesDiscover(process.cwd(), "startup") },
 	...(["turn_end", "agent_before_settle"] as const).map((event) => ({

@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
-import { buildContextEntries, buildSessionProjection, SessionManager } from "../../src/core/session-manager.ts";
+import {
+	buildContextEntries,
+	buildSessionProjection,
+	type SessionEntry,
+	SessionManager,
+} from "../../src/core/session-manager.ts";
 
 // smarty-dev#2177: a stable branch must not allocate/walk full history on each projection.
 describe("branch projection cache", () => {
@@ -11,15 +16,20 @@ describe("branch projection cache", () => {
 		const session = SessionManager.inMemory();
 		for (let i = 0; i < 256; i++) session.appendCustomEntry("history", { i });
 		let parentReads = 0;
+		// pi#160: canonical entries are frozen, so count parentId reads on frozen accessor copies
+		// installed in the public byId index that the branch walk reads.
+		const byId = Reflect.get(session, "byId") as Map<string, SessionEntry>;
 		for (const entry of session.getEntries()) {
 			const parentId = entry.parentId;
-			Object.defineProperty(entry, "parentId", {
+			const descriptors = Object.getOwnPropertyDescriptors(entry);
+			descriptors.parentId = {
 				enumerable: true,
 				get: () => {
 					parentReads++;
 					return parentId;
 				},
-			});
+			};
+			byId.set(entry.id, Object.freeze(Object.create(Object.getPrototypeOf(entry), descriptors)));
 		}
 		const getEntries = vi.spyOn(session, "getEntries");
 		const first = session.buildSessionProjection();

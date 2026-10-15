@@ -1,6 +1,6 @@
 # MCP Servers
 
-> **Fork security admission:** Codemode and MCP are disabled pending a reviewed re-enable. Existing configuration, `+builtin:codemode`, `+builtin:mcp`, `-e builtin:<name>`, SDK factory activation, and standalone package APIs cannot activate them in this revision. See `packages/coding-agent/docs/security-reenable.md`. The examples below describe the deferred feature, not an available admission.
+> **Fork security admission:** MCP remains disabled pending its own reviewed re-enable. Configuration, `+builtin:mcp`, `-e builtin:mcp`, SDK factory activation, and standalone MCP APIs cannot activate it. Codemode was re-enabled separately after pi#203; that does not enable MCP. See `packages/coding-agent/docs/security-reenable.md`. The MCP examples below describe the deferred feature, not an available admission.
 
 Pi connects to [Model Context Protocol](https://modelcontextprotocol.io) servers over stdio or streamable HTTP and makes their tools and resources available to the model.
 
@@ -267,7 +267,7 @@ Changes to enabled state or exposure apply only to the current session. A file-c
 
 An installed extension that registers `/mcp`, such as `pi-mcp-adapter`, replaces the built-in MCP support for sessions. Pi then does not read `mcp.json` or connect its servers in a session, and `/mcp` belongs to the extension. Remove the extension to restore the built-in behavior. To disable built-in MCP support without a replacement, disable `mcp` under Built-in in `pi config`, or set `"extensions": ["-builtin:mcp"]` in [settings](settings.md#resources). `--no-mcp` disables it for one run.
 
-An extension that registers `codemode` or `tool_search` similarly replaces the built-in tool with that name. Shell-level `pi mcp` commands always use the built-in implementation.
+An extension that registers `codemode` or `tool_search` similarly replaces the built-in tool with that name. Pi activates the replacement for MCP servers and waits for the servers its calls need only when it declares [`reachesTools`](extensions.md#tool-exposure). Shell-level `pi mcp` commands always use the built-in implementation.
 
 ### Use MCP from the SDK
 

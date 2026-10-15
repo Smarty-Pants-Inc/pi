@@ -61,6 +61,7 @@ import {
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
+import { personalizeOpenRouterCatalog } from "@earendil-works/pi-ai/providers/openrouter";
 import {
 	assertChatModel,
 	assertClassifierInputSupported,
@@ -75,6 +76,7 @@ import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage, ReadOnlyAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
+import { ModelPolicyError, type ModelPolicyTarget } from "./model-policy.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import { ORDINARY_CREDENTIAL_PLACEHOLDER } from "./ordinary-credential-delivery.ts";
 import { assertOrdinaryOwner, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
@@ -88,9 +90,10 @@ import {
 	resolveConfiguredModelHeaders,
 	validateExtensionProvider,
 } from "./provider-composer.ts";
-import { withRemoteCatalog } from "./remote-catalog-provider.ts";
+import { withPersonalizedCatalog, withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
 import { currentSessionOwnership } from "./session-ownership.ts";
+import { SettingsManager } from "./settings-manager.ts";
 import {
 	createVirtualModel,
 	findLatestResponse,
@@ -100,6 +103,8 @@ import {
 	type VirtualModelDefinition,
 	withVirtualModels,
 } from "./virtual-models.ts";
+
+export { ModelPolicyError } from "./model-policy.ts";
 
 interface RegisteredVirtualModel {
 	model: Model<Api>;
@@ -130,6 +135,8 @@ export interface CreateModelRuntimeOptions {
 	signal?: AbortSignal;
 	/** Skip initial catalog and availability refresh. Static models remain available. */
 	refreshOnCreate?: boolean;
+	/** Settings used for request admission and model listings. Defaults to cwd and the runtime's agent directory. */
+	settingsManager?: SettingsManager;
 }
 
 export interface ModelRuntimeAuthOverrides extends AuthOperationOptions {
@@ -183,6 +190,7 @@ export class ModelRuntime implements Models {
 	providerRequestGuard?: { beforeProviderRequest: () => void; signal: AbortSignal };
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	private readonly models: MutableModels;
+	private readonly policySettings = new Map<SettingsManager, number>();
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
 	private readonly builtins = new Map<string, Provider>();
@@ -255,13 +263,19 @@ export class ModelRuntime implements Models {
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
-		const providers = builtinProviderCatalog
-			.builtinProviders()
-			.map((provider) =>
-				provider.id === "radius"
-					? provider
-					: withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt),
-			);
+		const providers = builtinProviderCatalog.builtinProviders().map((provider) => {
+			if (provider.id === "radius") return provider;
+			// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
+			if (provider.id === "openrouter") {
+				return withPersonalizedCatalog(
+					provider,
+					personalizeOpenRouterCatalog,
+					options.catalogBaseUrl,
+					builtinModelDataGeneratedAt,
+				);
+			}
+			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
+		});
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -270,6 +284,13 @@ export class ModelRuntime implements Models {
 			providers,
 			!owner && process.env.PI_OFFLINE === undefined,
 			owner,
+		);
+		runtime.addModelPolicy(
+			options.settingsManager ??
+				SettingsManager.create(
+					process.cwd(),
+					options.authPath ? dirname(options.authPath) : modelsPath ? dirname(modelsPath) : getAgentDir(),
+				),
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -474,8 +495,32 @@ export class ModelRuntime implements Models {
 		return this.models.getProvider(providerId);
 	}
 
-	getModels(providerId?: string): readonly Model<Api>[] {
-		return this.models.getModels(providerId);
+	/** Bind settings until the returned disposer runs, preserving every other registration. */
+	addModelPolicy(settingsManager: SettingsManager): () => void {
+		this.policySettings.set(settingsManager, (this.policySettings.get(settingsManager) ?? 0) + 1);
+		let disposed = false;
+		return () => {
+			if (disposed) return;
+			disposed = true;
+			const remaining = this.policySettings.get(settingsManager)! - 1;
+			if (remaining === 0) this.policySettings.delete(settingsManager);
+			else this.policySettings.set(settingsManager, remaining);
+		};
+	}
+
+	isModelAllowed(model: ModelPolicyTarget): boolean {
+		return [...this.policySettings.keys()].every((settings) => settings.isModelAllowed(model));
+	}
+
+	private assertModelAllowed(model: ModelPolicyTarget, handle?: DeferredHandle): void {
+		if (!this.isModelAllowed(model)) throw new ModelPolicyError(model);
+		if (handle) this.assertModelAllowed({ provider: handle.provider, id: handle.modelId });
+	}
+
+	/** includeDisallowed retains full metadata for explicit selection, never request admission. */
+	getModels(providerId?: string, options?: { includeDisallowed?: boolean }): readonly Model<Api>[] {
+		const models = this.models.getModels(providerId);
+		return options?.includeDisallowed ? models : models.filter((model) => this.isModelAllowed(model));
 	}
 
 	getModel(providerId: string, modelId: string): Model<Api> | undefined {
@@ -483,7 +528,7 @@ export class ModelRuntime implements Models {
 	}
 
 	getModelsOfType<TType extends ModelType>(type: TType, providerId?: string): readonly ModelTypeMap[TType][] {
-		return this.models.getModelsOfType(type, providerId);
+		return this.models.getModelsOfType(type, providerId).filter((model) => this.isModelAllowed(model));
 	}
 
 	getModelOfType<TType extends ModelType>(
@@ -495,10 +540,10 @@ export class ModelRuntime implements Models {
 	}
 
 	getAllModels(providerId?: string): readonly AnyModel[] {
-		return this.models.getAllModels(providerId);
+		return this.models.getAllModels(providerId).filter((model) => this.isModelAllowed(model));
 	}
 
-	getAvailableOfType<TType extends ModelType>(
+	async getAvailableOfType<TType extends ModelType>(
 		type: TType,
 		providerId?: string,
 		options?: AuthOperationOptions,
@@ -508,12 +553,14 @@ export class ModelRuntime implements Models {
 			return type === "chat"
 				? (this.getAvailable(providerId, options) as Promise<readonly ModelTypeMap[TType][]>)
 				: this.getAvailable(providerId, options).then(() => []);
-		return this.models.getAvailableOfType(type, providerId, options);
+		return (await this.models.getAvailableOfType(type, providerId, options)).filter((model) =>
+			this.isModelAllowed(model),
+		);
 	}
 
-	getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
+	async getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
 		if (this.#ordinaryOwner) return this.getAvailable(providerId, options);
-		return this.models.getAllAvailable(providerId, options);
+		return (await this.models.getAllAvailable(providerId, options)).filter((model) => this.isModelAllowed(model));
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
@@ -536,7 +583,10 @@ export class ModelRuntime implements Models {
 				.getModels(providerId)
 				.filter(
 					(model) =>
-						model.provider === allowed.provider && model.id === allowed.model && model.api === allowed.api,
+						model.provider === allowed.provider &&
+						model.id === allowed.model &&
+						model.api === allowed.api &&
+						this.isModelAllowed(model),
 				);
 		}
 		if (providerId) {
@@ -544,7 +594,7 @@ export class ModelRuntime implements Models {
 			try {
 				const available = await this.models.getAvailable(providerId, options);
 				if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
-				return available;
+				return available.filter((model) => this.isModelAllowed(model));
 			} catch (error) {
 				if (errorSeq === this.availabilityErrorSeq && !options?.signal?.aborted) {
 					this.availabilityError = error instanceof Error ? error.message : String(error);
@@ -553,7 +603,7 @@ export class ModelRuntime implements Models {
 			}
 		}
 		await this.queueAvailabilityRefresh(options?.signal);
-		return this.snapshot.available;
+		return this.snapshot.available.filter((model) => this.isModelAllowed(model));
 	}
 
 	getAvailableSnapshot(): readonly Model<Api>[] {
@@ -561,10 +611,14 @@ export class ModelRuntime implements Models {
 			this.#ordinaryOwner.assertCredentialBinding();
 			const allowed = this.#ordinaryOwner.decision.record.provider;
 			return this.snapshot.all.filter(
-				(model) => model.provider === allowed.provider && model.id === allowed.model && model.api === allowed.api,
+				(model) =>
+					model.provider === allowed.provider &&
+					model.id === allowed.model &&
+					model.api === allowed.api &&
+					this.isModelAllowed(model),
 			);
 		}
-		return this.snapshot.available;
+		return this.snapshot.available.filter((model) => this.isModelAllowed(model));
 	}
 
 	getError(): string | undefined {
@@ -622,6 +676,8 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
+		// Auxiliary callers may resolve credentials before entering the stream boundary.
+		if (typeof providerOrModel !== "string") this.assertModelAllowed(providerOrModel);
 		const owner = this.#ordinaryOwner;
 		if (owner) {
 			owner.assertCredentialBinding();
@@ -749,7 +805,21 @@ export class ModelRuntime implements Models {
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 
-	private async prepareRequest<
+	/** Synchronous admission, outside stream/operation error conversion and before auth resolution. */
+	private prepareRequest<
+		TModel extends AnyModel,
+		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
+	>(model: TModel, options: TOptions | undefined, handle?: DeferredHandle) {
+		this.assertModelAllowed(model, handle);
+		return async () => {
+			const prepared = await this.prepareAuthenticatedRequest(model, options);
+			// Settings or model identity may change while auth/header transforms are awaiting.
+			this.assertModelAllowed(prepared.model, handle);
+			return prepared;
+		};
+	}
+
+	private async prepareAuthenticatedRequest<
 		TModel extends AnyModel,
 		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
 	>(
@@ -848,13 +918,11 @@ export class ModelRuntime implements Models {
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
+		const prepare = this.prepareRequest(model, options as (StreamOptions & ModelsRequestTransforms) | undefined);
 		const transcript = normalizeContext(context);
 		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsRequestTransforms) | undefined,
-			);
+			const prepared = await prepare();
 			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			this.#ordinaryOwner?.assertSubmission();
 			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
@@ -870,6 +938,7 @@ export class ModelRuntime implements Models {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+		const prepare = this.prepareRequest(model, options);
 		const transcript = normalizeContext(context);
 		if (isVirtualModel(model)) {
 			// Requests outside the agent loop are routed here. Callers sized them before routing, so
@@ -892,7 +961,7 @@ export class ModelRuntime implements Models {
 		}
 		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
 			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			this.#ordinaryOwner?.assertSubmission();
 			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
@@ -908,9 +977,10 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
+		const prepare = this.prepareRequest(model, options, handle);
 		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
 			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			if (!prepared.provider.fetchDeferred) {
 				throw new SafeSetupError("deferred");
@@ -932,10 +1002,11 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredCancelOptions,
 	): Promise<void> {
+		const prepare = this.prepareRequest(model, options, handle);
 		let secrets: readonly string[] = [];
 		try {
 			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
 			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.cancelDeferred) {
 				throw new SafeSetupError("deferred");
@@ -952,10 +1023,11 @@ export class ModelRuntime implements Models {
 		context: ImagesContext,
 		options?: ModelsImagesOptions,
 	): Promise<AssistantImages> {
+		const prepare = this.prepareRequest(model, options);
 		let secrets: readonly string[] = [];
 		try {
 			assertImageModel(model);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
 			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.generateImages) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
@@ -974,11 +1046,12 @@ export class ModelRuntime implements Models {
 		context: ClassifierContext,
 		options?: ModelsClassifierOptions,
 	): Promise<ClassifierResult> {
+		const prepare = this.prepareRequest(model, options);
 		let secrets: readonly string[] = [];
 		try {
 			assertClassifierModel(model);
 			assertClassifierInputSupported(model, context);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
 			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.classify) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
@@ -1188,6 +1261,7 @@ export class ModelRuntime implements Models {
 			state?: unknown;
 		},
 	): Promise<ModelRoute> {
+		this.assertModelAllowed(model);
 		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		const name = `Virtual model ${model.provider}/${model.id}`;
 		const virtual = this.virtualModels.get(model.provider)?.get(model.id);
@@ -1207,6 +1281,7 @@ export class ModelRuntime implements Models {
 		const target = this.getPhysicalModel(route.model.provider, route.model.id);
 		const routed = `${name} routed to ${route.model.provider}/${route.model.id}`;
 		if (!target) throw new Error(`${routed}, which is not a physical model.`);
+		this.assertModelAllowed(target);
 		if (!this.hasConfiguredAuth(target.provider)) throw new Error(`${routed}, which has no credentials.`);
 		return { model: target, thinkingLevel: clampThinkingLevel(target, route.thinkingLevel), state: route.state };
 	}

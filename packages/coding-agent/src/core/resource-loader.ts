@@ -252,8 +252,12 @@ export function loadProjectContextFiles(options: {
 
 	while (true) {
 		const contextFile = loadContextFileFromDir(currentDir);
+		// Compare the directory's real path, not the file's: a worktree AGENTS.md that
+		// symlinks to the main repo's file resolves to the shadowed path itself.
 		const isShadowed =
-			shadowedContextFile !== undefined && canonicalizePath(contextFile?.path ?? "") === shadowedContextFile;
+			shadowedContextFile !== undefined &&
+			contextFile !== null &&
+			join(canonicalizePath(currentDir), basename(contextFile.path)) === shadowedContextFile;
 		if (contextFile && !isShadowed && !seenPaths.has(contextFile.path)) {
 			ancestorContextFiles.unshift(contextFile);
 			seenPaths.add(contextFile.path);
@@ -738,7 +742,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				extension.replaceable = builtin.replaceable === true;
 				result.extensions.push(extension);
 			} catch (error) {
-				result.errors.push({ path, error: error instanceof Error ? error.message : "failed to load extension" });
+				result.errors.push({ path, error: error instanceof Error ? error.message : String(error) });
 			}
 		}
 		return result;
@@ -1145,7 +1149,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 				extension.replaceable = isNamed && input.replaceable === true;
 				extensions.push(extension);
 			} catch (error) {
-				const message = error instanceof Error ? error.message : "failed to load extension";
+				const message = error instanceof Error ? error.message : String(error);
 				errors.push({ path: extensionPath, error: message });
 			}
 		}

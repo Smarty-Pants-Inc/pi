@@ -14,8 +14,10 @@
  */
 
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -40,6 +42,7 @@ import {
 	getCurrentSystemMessage,
 	hasAssistantOutput,
 	isPrematureStreamError,
+	isRetryableCodexStreamDisconnect,
 	observeAssistantMessage,
 	observeAssistantStreamEvent,
 	type RetryPolicy,
@@ -133,7 +136,7 @@ import {
 	type UserMessageReceipt,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
-import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { HOST_CAPABILITIES } from "./host-capabilities.ts";
 import { InputAdmissionError } from "./input-admission.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
@@ -145,6 +148,7 @@ import type { OriginalAutomaticEnrollment } from "./ordinary-automatic-hold.ts";
 import { assertOriginalCompactionAttempt, type OriginalCompactionAttempt } from "./ordinary-compaction.ts";
 import { assertOrdinaryRuntime, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
 import { createOrdinaryToolDefinitions } from "./ordinary-tools.ts";
+import { createOriginalCompactionSessionIdentity } from "./original-compaction-session-identity.ts";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts";
 import { bindReceivedInputSession, getInputReceipt, type ReceivedInput, receiveInput } from "./received-input.ts";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
@@ -155,6 +159,7 @@ import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type ContextEditEntry,
+	freezeDetached,
 	getLatestCompactionEntry,
 	type SessionEntry,
 	SessionManager,
@@ -179,7 +184,7 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { captureTerminalTurnReceipt, type TurnReceipt } from "./turn-receipts.ts";
+import { captureTerminalTurnReceipt, receiptRecord, type TurnReceipt, withoutAttribution } from "./turn-receipts.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import { type UserMessageAdmission, UserMessageIngress } from "./user-message-ingress.ts";
 import {
@@ -324,6 +329,21 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 // ============================================================================
 // Types
 // ============================================================================
+
+/** User content as blocks, so `"x"` and `[{ type: "text", text: "x" }]` compare as the same text. */
+function userContentBlocks(content: string | readonly (TextContent | ImageContent)[]): unknown {
+	return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
+/**
+ * A deep-frozen plain-data copy of a message for persistence. The JSON round trip reads every getter,
+ * Proxy trap and toJSON exactly once, so no live object survives: what the boundary checks is what is
+ * written. The copy is frozen because an unowned SessionManager returns stored entries by reference
+ * (getEntries, getBranch), and a later edit would otherwise be exported with the old attribution.
+ */
+function detachedMessage(message: AgentMessage): AgentMessage {
+	return freezeDetached(JSON.parse(JSON.stringify(message)) as AgentMessage);
+}
 
 function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
 	return headers
@@ -566,6 +586,11 @@ export class AgentSession {
 	private _messageEntryIds: WeakMap<AgentMessage, string[]> | undefined;
 	/** Receipt associations last only until this publication succeeds. */
 	readonly #receivedMessageReceipts = new WeakMap<AgentMessage, TurnReceipt>();
+	/**
+	 * Trusted snapshot of the exact content a keyboard receipt attested, as normalized blocks (pi#160).
+	 * Kept beside the receipt, never on the message, so no listener or extension can reach it.
+	 */
+	readonly #attestedUserContent = new WeakMap<AgentMessage, unknown>();
 	/** Metadata is occurrence-local, never attached to model-visible message objects. */
 	private readonly _userMessageSubmissions = new WeakMap<AgentMessage, UserMessageSubmission>();
 	private readonly _pendingUserMessageSubmissions = new Set<UserMessageSubmission>();
@@ -600,6 +625,10 @@ export class AgentSession {
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
 	private _retryAttempt = 0;
+	/** One replay of the exact Codex disconnect per request, independent of ordinary retry attempts. */
+	private _codexStreamDisconnectRetryUsed = false;
+	/** Sticky until turn_start: synthetic failure messages belong to the same response. */
+	private _assistantToolExecutionStarted = false;
 	private _retryFallbackUsed = false;
 	/** Only the first alternate request in the current recovery episode is one-shot. */
 	private _retryFallbackInFlight = false;
@@ -880,6 +909,23 @@ export class AgentSession {
 			this._beforeToolCall(context, this._nestedToolParents.get(context.toolCall));
 		this.agent.afterToolCall = (context) =>
 			this._afterToolCall(context, this._nestedToolParents.get(context.toolCall));
+		this.agent.transformToolUpdate = async (toolCall, args, partialResult, signal) => {
+			const runner = this._extensionRunner;
+			if (!runner.hasHandlers("tool_partial_result")) return undefined;
+			const parentToolCallId = this._nestedToolParents.get(toolCall);
+			const result = await runner.emitToolPartialResult(
+				{
+					type: "tool_partial_result",
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					input: args,
+					partialResult,
+					...(parentToolCallId ? { parentToolCallId } : {}),
+				},
+				signal ? AbortSignal.any([signal, this._shutdownCancellation.signal]) : this._shutdownCancellation.signal,
+			);
+			return result.partialResult;
+		};
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -996,6 +1042,7 @@ export class AgentSession {
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
 					beforeToolCall: this.agent.beforeToolCall,
 					afterToolCall: this.agent.afterToolCall,
+					transformToolUpdate: this.agent.transformToolUpdate,
 					signal,
 					onUpdate,
 				});
@@ -1048,7 +1095,8 @@ export class AgentSession {
 	private _installAgentRequestProjection(): void {
 		let requestModel = this.agent.state.model;
 		let canReproject = true;
-		let canonicalMessages: string | undefined;
+		// ponytail: retain only a fixed-size digest, not a second full transcript, between requests (#10720).
+		let canonicalMessagesDigest: string | undefined;
 		const previousConvertToLlm = this.agent.convertToLlm;
 		this.agent.convertToLlm = async (messages) => {
 			let converted = await previousConvertToLlm(messages);
@@ -1063,8 +1111,8 @@ export class AgentSession {
 				if (
 					!canReproject ||
 					previousConvertToLlm !== convertToLlm ||
-					canonicalMessages === undefined ||
-					canonicalMessages !== snapshotMessages(messages) ||
+					canonicalMessagesDigest === undefined ||
+					canonicalMessagesDigest !== snapshotMessages(messages) ||
 					!this.settingsManager.getCompactionSettings(requestModel).enabled
 				)
 					throw error;
@@ -1089,7 +1137,12 @@ export class AgentSession {
 		const previousPrepareRequest = this.agent.prepareRequest;
 		const snapshotMessages = (messages: AgentMessage[]): string | undefined => {
 			try {
-				return JSON.stringify(messages);
+				const hash = createHash("sha256");
+				for (const message of messages) {
+					hash.update(JSON.stringify(message));
+					hash.update("\0");
+				}
+				return hash.digest("base64");
 			} catch {
 				// SDK-only metadata may not serialize. It must not block a fitting request.
 				return undefined;
@@ -1102,11 +1155,22 @@ export class AgentSession {
 				const projection = this.sessionManager.buildSessionProjection();
 				const canonicalContext = {
 					...request.context,
-					messages: projection.messages,
+					// pi#160 persists detached, deep-frozen plain-data messages, and the projection reuses them.
+					// Request hooks may edit their input in place, so they get a mutable copy; stored history
+					// stays frozen. Unfrozen SDK messages are passed as is (they may not be cloneable).
+					messages: projection.messages.map((message) => {
+						if (!Object.isFrozen(message)) return message;
+						try {
+							return structuredClone(message);
+						} catch {
+							// Frozen SDK messages may contain opaque values; preserve their fitting-request behavior.
+							return message;
+						}
+					}),
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};
-				canonicalMessages = snapshotMessages(canonicalContext.messages);
+				canonicalMessagesDigest = snapshotMessages(canonicalContext.messages);
 				const previous = await previousPrepareRequest?.(
 					{
 						...request,
@@ -1120,8 +1184,8 @@ export class AgentSession {
 				// in-place edits, and opaque input is safe only when the final request fits.
 				canReproject =
 					(previous?.context === undefined || previous.context === canonicalContext) &&
-					canonicalMessages !== undefined &&
-					canonicalMessages === snapshotMessages(canonicalContext.messages);
+					canonicalMessagesDigest !== undefined &&
+					canonicalMessagesDigest === snapshotMessages(canonicalContext.messages);
 				return { previous, context: previous?.context ?? canonicalContext, projection };
 			};
 			const prepared = await prepare();
@@ -1167,7 +1231,7 @@ export class AgentSession {
 				// the accepted context is sent as is, and admission in convertToLlm fails closed if it overflows.
 				if (canReproject) {
 					const messages = this.sessionManager.buildSessionProjection().messages;
-					canonicalMessages = snapshotMessages(messages);
+					canonicalMessagesDigest = snapshotMessages(messages);
 					context = { ...context, messages };
 				}
 			}
@@ -1585,6 +1649,16 @@ export class AgentSession {
 		if (failures.length > 0) throw failures[0];
 	}
 
+	/** Attach a receipt to a harness-built user message; a keyboard receipt also snapshots the attested content. */
+	#attachUserMessageReceipt(message: AgentMessage, receipt: TurnReceipt): void {
+		this.#receivedMessageReceipts.set(message, receipt);
+		if (message.role === "user" && receiptRecord(receipt).channel === "keyboard") {
+			this.#attestedUserContent.set(message, structuredClone(userContentBlocks(message.content)));
+		} else {
+			this.#attestedUserContent.delete(message);
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (
@@ -1601,6 +1675,10 @@ export class AgentSession {
 			this._assistantOutputObserved = false;
 			this._assistantStreamObserved = createAssistantStreamObservation();
 			this._heldReasoningUpdates = [];
+			this._assistantToolExecutionStarted = false;
+		} else if (event.type === "tool_execution_start") {
+			// Record before extensions or listeners can throw and produce a synthetic failure.
+			this._assistantToolExecutionStarted = true;
 		}
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
 			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
@@ -1636,6 +1714,8 @@ export class AgentSession {
 			for (const update of held) await this._dispatchAgentEvent(update);
 		}
 
+		// agent_start is awaited before the first request, including reentrant aborts at transfer.
+		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -1655,6 +1735,7 @@ export class AgentSession {
 			const ingress = this._ingressQueuedMessages.get(event.message);
 			this._ingressQueuedMessages.delete(event.message);
 			this._overflowRecoveryAttempted = false;
+			this._codexStreamDisconnectRetryUsed = false;
 			const messageText = contentText(event.message.content, "");
 			// Empty text is valid for image-only queued input. Delivery is not truthiness.
 			// Check steering queue first; ingress input is always a follow-up with an exact display slot.
@@ -1708,61 +1789,81 @@ export class AgentSession {
 		// Handle session persistence
 		if (event.type === "message_end") {
 			let entryId: string | undefined;
-			const receipt = this.#receivedMessageReceipts.get(event.message);
+			let receipt = this.#receivedMessageReceipts.get(event.message);
+			// pi#160: the persistence-boundary check is the authority for keyboard attribution. Hooks,
+			// queues, message_end replacements and public listeners can all change the live message;
+			// the per-path downgrades only make earlier, narrower decisions. Attribution persists only
+			// when the content being written is exactly the content the receipt attested.
+			// The owned-terminal write is queued and serializes later, after async listeners may have
+			// mutated the live message, and a getter can answer differently on each read. So the check
+			// runs on a detached copy, and that same copy (never the live message) is handed to the write.
+			// Every message that carries a receipt or a submission is detached BEFORE its role is read:
+			// a role getter could answer "assistant" to a live check and "user" to the write. Role and
+			// content below are read only from `persisted`.
+			const attested = this.#attestedUserContent.get(event.message);
 			const submission = this._userMessageSubmissions.get(event.message);
-			if (submission && event.message.role !== "user") {
+			const persisted =
+				receipt !== undefined || attested !== undefined || submission !== undefined
+					? detachedMessage(event.message)
+					: event.message;
+			if (
+				receipt &&
+				!(
+					persisted.role === "user" &&
+					attested !== undefined &&
+					isDeepStrictEqual(userContentBlocks(persisted.content), attested)
+				)
+			) {
+				receipt = withoutAttribution(receipt);
+			}
+			if (submission && persisted.role !== "user") {
 				submission.reject(new Error("User message was replaced without persisting a user entry"));
 			}
-			const metadata = event.message.role === "user" ? submission?.metadata : undefined;
+			const metadata = persisted.role === "user" ? submission?.metadata : undefined;
 			const metadataSource = metadata === undefined ? undefined : submission?.metadataSource;
 			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
+			if (persisted.role === "custom") {
 				// Persist as CustomMessageEntry
 				entryId = this.#ordinaryOwner
 					? await appendOwnedTerminalCustomMessage(
 							this.sessionManager,
-							event.message.customType,
-							event.message.content,
-							event.message.display,
-							event.message.details,
+							persisted.customType,
+							persisted.content,
+							persisted.display,
+							persisted.details,
 							receipt,
 						)
 					: appendReceivedCustomMessage(
 							this.sessionManager,
-							event.message.customType,
-							event.message.content,
-							event.message.display,
-							event.message.details,
+							persisted.customType,
+							persisted.content,
+							persisted.display,
+							persisted.details,
 							receipt,
 						);
 				this.#receivedMessageReceipts.delete(event.message);
+				this.#attestedUserContent.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
 					this._retainTerminalPublicationFailure(error);
 				}
 			} else if (
-				event.message.role === "system" ||
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
+				persisted.role === "system" ||
+				persisted.role === "user" ||
+				persisted.role === "assistant" ||
+				persisted.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				try {
 					entryId = this.#ordinaryOwner
-						? await appendOwnedTerminalMessage(
-								this.sessionManager,
-								event.message,
-								receipt,
-								metadata,
-								metadataSource,
-							)
-						: appendReceivedMessage(this.sessionManager, event.message, receipt, metadata, metadataSource);
+						? await appendOwnedTerminalMessage(this.sessionManager, persisted, receipt, metadata, metadataSource)
+						: appendReceivedMessage(this.sessionManager, persisted, receipt, metadata, metadataSource);
 				} catch (error) {
 					submission?.reject(error);
 					throw error;
 				}
-				if (submission && event.message.role === "user") {
+				if (submission && persisted.role === "user") {
 					submission.resolve({
 						status: "turnStarted",
 						entryId,
@@ -1772,6 +1873,7 @@ export class AgentSession {
 					this._userMessageSubmissions.delete(event.message);
 				}
 				this.#receivedMessageReceipts.delete(event.message);
+				this.#attestedUserContent.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1791,6 +1893,9 @@ export class AgentSession {
 				// Reset retry counter immediately on successful assistant response
 				// This prevents accumulation across multiple LLM calls within a turn
 				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
+				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
+					this._codexStreamDisconnectRetryUsed = false;
+				}
 				const fallbackSucceeded =
 					this._retryFallbackInFlight &&
 					(assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse");
@@ -1833,6 +1938,7 @@ export class AgentSession {
 		if (!this._assistantOutputObserved && !hasAssistantOutput(message) && throttledLimitWait(message)) return true;
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || !this._isRetryableError(message)) return false;
+		if (isRetryableCodexStreamDisconnect(message)) return settings.maxRetries > 0;
 		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
 
@@ -1954,6 +2060,17 @@ export class AgentSession {
 					replacement.content == null
 						? ({ ...replacement, content: [] } as AgentMessage)
 						: replacement;
+				// smarty-dev#2636: Herdr attested the typed bytes, not text a message_end hook produced.
+				// Earlier downgrade only; the persistence-boundary check in _persistAgentEvent is the authority.
+				const receipt = this.#receivedMessageReceipts.get(event.message);
+				if (
+					receipt &&
+					event.message.role === "user" &&
+					(normalized.role !== "user" ||
+						!isDeepStrictEqual(userContentBlocks(event.message.content), userContentBlocks(normalized.content)))
+				) {
+					this.#receivedMessageReceipts.set(event.message, withoutAttribution(receipt));
+				}
 				this._replaceMessageInPlace(event.message, normalized);
 			}
 		} else if (event.type === "tool_execution_start") {
@@ -2165,6 +2282,7 @@ export class AgentSession {
 			exposure: this._getToolExposure(definition.name),
 			...(definition.namespace ? { namespace: definition.namespace } : {}),
 			...(definition.annotations ? { annotations: { ...definition.annotations } } : {}),
+			...(definition.reachesTools ? { reachesTools: definition.reachesTools } : {}),
 			sourceInfo,
 		}));
 	}
@@ -2531,12 +2649,83 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
+	/** Prepare user/custom triggers under their own admission, then use the guarded native dispatcher. */
+	private async _startRun(
+		trigger: BeforeAgentStartTrigger,
+		options: {
+			promptToken?: object;
+			admission?: InputAdmission;
+			receipt?: TurnReceipt;
+			submission?: UserMessageSubmission;
+			additionalMessages?: CustomMessage[];
+			beforeDispatch?: () => void;
+			onInputTransferred?: () => void;
+		} = {},
+	): Promise<void> {
+		// A nested custom dispatch never transfers the user admission it inherited.
+		if (trigger.messageType === "custom" && !options.admission) {
+			const admission = this._admitInput();
+			return this._withInputAdmission(admission, () => this._startRun(trigger, { ...options, admission }));
+		}
+		this._checkInputAdmission();
+		// User preflights keep their existing non-streaming queue/recovery contract.
+		// Custom triggers have no user preflight token, so they reserve the run here.
+		if (trigger.messageType === "custom") this._isAgentRunActive = true;
+		this._agentRunAbortRequested = false;
+		let runOwned = false;
+		try {
+			const messages = await this._prepareRun(trigger, options.receipt, options.submission);
+			if (trigger.messageType === "custom" && options.additionalMessages?.length) {
+				const start = messages.indexOf(trigger.message);
+				messages.splice(start + 1, 0, ...options.additionalMessages);
+			}
+			this._checkInputAdmission();
+			// Context held during before_agent_start precedes the starting messages, without splitting tools.
+			if (this.#ordinaryOwner) {
+				await this._flushPendingBashMessagesOwnedTerminal();
+				await this._flushPendingCustomMessagesOwnedTerminal();
+			} else {
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			}
+			this._checkInputAdmission();
+			options.beforeDispatch?.();
+			await this._runAgentPrompt(
+				messages,
+				options.promptToken,
+				undefined,
+				options.onInputTransferred,
+				options.admission,
+				() => {
+					runOwned = true;
+				},
+			);
+		} catch (error) {
+			if (!runOwned) {
+				this._isAgentRunActive = false;
+				this._runSystemPromptOptions = undefined;
+				if (this.#ordinaryOwner) {
+					await this.#ordinaryOwner.owner.terminal(async () => {
+						await this._flushPendingBashMessagesOwnedTerminal();
+						await this._flushPendingCustomMessagesOwnedTerminal();
+					});
+				} else {
+					this._flushPendingBashMessages();
+					this._flushPendingCustomMessages();
+				}
+				this._resolveIdleWaitIfIdle();
+			}
+			throw error;
+		}
+	}
+
 	private async _runAgentPrompt(
 		messages: AgentMessage | AgentMessage[] | undefined,
 		promptToken?: object,
 		automaticEnrollment?: OriginalAutomaticEnrollment,
 		onInputTransferred?: () => void,
 		transferringAdmission?: InputAdmission,
+		prepared?: () => void,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
@@ -2578,7 +2767,7 @@ export class AgentSession {
 		};
 		this._stopAfterCompactionFailure = false;
 		this._compactionStopOutcome = undefined;
-		this._agentRunAbortRequested = false;
+		if (!prepared) this._agentRunAbortRequested = false;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
@@ -2591,9 +2780,11 @@ export class AgentSession {
 		this._isAgentRunActive = true;
 		this._retryFallbackUsed = false;
 		this._retryFallbackInFlight = false;
+		this._codexStreamDisconnectRetryUsed = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
+			prepared?.();
 			if (automaticEnrollment) await automaticEnrollment(() => dispatch());
 			else if (this.#ordinaryOwner)
 				await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(), messages);
@@ -2653,6 +2844,91 @@ export class AgentSession {
 		}
 	}
 
+	/**
+	 * Prepare a run and return its starting messages: compact first when needed, emit
+	 * before_agent_start, apply the run's prompt options and tool loadout, and build the starting
+	 * message followed by pending nextTurn context for user starts and handler messages, with a
+	 * system patch first when the prompt changed.
+	 */
+	private async _prepareRun(
+		trigger: BeforeAgentStartTrigger,
+		receipt?: TurnReceipt,
+		submission?: UserMessageSubmission,
+	): Promise<AgentMessage[]> {
+		// User compaction stays in _prompt so its existing input-retention contract is unchanged.
+		const lastAssistant = this._findLastAssistantMessage();
+		if (trigger.messageType === "custom" && lastAssistant) {
+			const outcome = await this._awaitInput(this._checkCompaction(lastAssistant, false));
+			if (outcome === "failed" || outcome === "aborted") {
+				this.agent.steer(trigger.message);
+				throw new Error(`Custom run not sent: compaction ${outcome}; input retained in the steer queue.`);
+			}
+		}
+
+		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		const result = await this._awaitInput(
+			this._extensionRunner.emitBeforeAgentStart(
+				trigger,
+				this._baseSystemPromptOptions,
+				this._inheritedCancellation(),
+			),
+		);
+		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
+		// which updates the live loadout instead. An explicit edit wins; otherwise the live
+		// loadout is authoritative, so a setActiveTools() call is not undone here.
+		const handlerEditedTools =
+			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
+			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
+		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+
+		const messages: AgentMessage[] = [];
+		if (trigger.messageType === "custom") {
+			messages.push(trigger.message);
+		} else {
+			// Normalize images after before_agent_start so extension-driven model selection
+			// determines the resize profile used for the request and history.
+			const normalized = await this._awaitInput(this._normalizePromptImages(trigger.images));
+			const text =
+				normalized.hints.length > 0 ? `${trigger.prompt}\n\n${normalized.hints.join("\n")}` : trigger.prompt;
+			const message: AgentMessage = {
+				role: "user",
+				content: [{ type: "text", text }, ...normalized.images],
+				timestamp: Date.now(),
+			};
+			this.#attachUserMessageReceipt(message, receipt ?? captureTerminalTurnReceipt());
+			if (submission) {
+				submission.message = message;
+				this._userMessageSubmissions.set(message, submission);
+			}
+			messages.push(message);
+		}
+		// A switch or revocation during hooks/images must finish before consuming one-shot context.
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
+		this._checkInputAdmission();
+		// pi#97: nextTurn context belongs to the next user prompt, not a custom-triggered run.
+		if (trigger.messageType === "user") {
+			messages.push(...this._pendingNextTurnMessages);
+			this._pendingNextTurnMessages = [];
+		}
+		for (const [index, msg] of result.messages.entries()) {
+			const message: CustomMessage = {
+				role: "custom",
+				customType: msg.customType,
+				// Untyped extensions can pass null/missing content; normalize at ingestion.
+				content: msg.content ?? [],
+				display: msg.display,
+				details: msg.details,
+				timestamp: Date.now(),
+			};
+			this.#receivedMessageReceipts.set(message, result.messageReceipts[index]);
+			messages.push(message);
+		}
+		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+		this._runSystemPromptOptions = result.systemPromptOptions;
+		if (updateMessage) messages.unshift(updateMessage);
+		return messages;
+	}
+
 	private async _handlePostAgentRun(): Promise<boolean | "queuedInput"> {
 		const message = this._lastAssistantMessage;
 		const toolResults = this._lastAssistantToolResults;
@@ -2703,9 +2979,11 @@ export class AgentSession {
 			this._retryFallbackInFlight = false;
 		}
 
-		// The one-shot alternate and failed throttle retry cannot recover through compaction either.
+		// Final one-shot failures cannot gain another replay through compaction.
 		const compaction =
-			fallbackAttempt || (throttleWaitUsed && message.stopReason === "error")
+			fallbackAttempt ||
+			(throttleWaitUsed && message.stopReason === "error") ||
+			isRetryableCodexStreamDisconnect(message)
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -3029,7 +3307,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
-	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+	): Promise<{ text: string; images: ImageContent[] | undefined; transformed?: true } | undefined> {
 		if (!this._extensionRunner.hasHandlers("input")) {
 			return { text, images };
 		}
@@ -3047,7 +3325,7 @@ export class AgentSession {
 			return undefined;
 		}
 		if (inputResult.action === "transform") {
-			return { text: inputResult.text, images: inputResult.images ?? images };
+			return { text: inputResult.text, images: inputResult.images ?? images, transformed: true };
 		}
 		return { text, images };
 	}
@@ -3183,7 +3461,6 @@ export class AgentSession {
 		const preflightResult = options?.preflightResult;
 		const onInputTransferred = options?.onInputTransferred;
 		const preflightToken = {};
-		let messages: AgentMessage[] | undefined;
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -3216,9 +3493,8 @@ export class AgentSession {
 				);
 			}
 
-			// An earlier prompt can still be in preflight, for example in pre-prompt compaction whose
-			// compaction_end flushes input queued during compaction. Queue behind it instead of
-			// racing it into the agent and failing with "Agent is already processing a prompt".
+			// pi#97: opted-in input queues behind earlier preflights; a plain SDK prompt may
+			// overtake a held input hook. Active runs still require a queue option.
 			this._promptPreflights.add(preflightToken);
 			const mustQueue = () =>
 				this.isStreaming ||
@@ -3253,6 +3529,8 @@ export class AgentSession {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
+			// smarty-dev#2636: Herdr attested the typed bytes, not text a hook or template produced.
+			if (processedInput.transformed || expandedText !== text) receipt = withoutAttribution(receipt);
 
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
 			while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
@@ -3330,99 +3608,30 @@ export class AgentSession {
 				}
 			}
 
-			// Emit before_agent_start before normalizing images so extension-driven model
-			// selection determines the resize profile used for the request and history.
-			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-			const result = await this._awaitInput(
-				this._extensionRunner.emitBeforeAgentStart(
-					expandedText,
-					currentImages,
-					this._baseSystemPromptOptions,
-					this._inheritedCancellation(),
-				),
+			await this._startRun(
+				{ messageType: "user", prompt: expandedText, images: currentImages },
+				{
+					promptToken,
+					admission,
+					receipt,
+					submission,
+					beforeDispatch: () => {
+						this._checkInputAdmission();
+						this._queueTriggeredBehindPreflight();
+						this._promptPreflights.delete(preflightToken);
+						releasePreflight?.();
+					},
+					onInputTransferred: () => {
+						onInputTransferred?.();
+						preflightResult?.("started");
+					},
+				},
 			);
-			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-			// which updates the live loadout instead. An explicit edit wins; otherwise the live
-			// loadout is authoritative, so a setActiveTools() call is not undone here.
-			const handlerEditedTools =
-				result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-				result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-			if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
-
-			const normalized = await this._awaitInput(this._normalizePromptImages(currentImages));
-			const userText =
-				normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
-
-			// Build messages only after hooks and image normalization have completed.
-			messages = [];
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
-			userContent.push(...normalized.images);
-			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
-			this.#receivedMessageReceipts.set(userMessage, receipt);
-			if (submission) {
-				submission.message = userMessage;
-				this._userMessageSubmissions.set(userMessage, submission);
-			}
-			messages.push(userMessage);
-
-			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this._pendingNextTurnMessages) {
-				messages.push(msg);
-			}
-			this._pendingNextTurnMessages = [];
-
-			for (const [index, msg] of result.messages.entries()) {
-				const message: CustomMessage = {
-					role: "custom",
-					customType: msg.customType,
-					// Untyped extensions can pass null/missing content; normalize at ingestion.
-					content: msg.content ?? [],
-					display: msg.display,
-					details: msg.details,
-					timestamp: Date.now(),
-				};
-				this.#receivedMessageReceipts.set(message, result.messageReceipts[index]);
-				messages.push(message);
-			}
-			const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
-			this._runSystemPromptOptions = result.systemPromptOptions;
-			if (updateMessage) messages.unshift(updateMessage);
-		} catch (error) {
-			this._promptPreflights.delete(preflightToken);
-			throw error;
 		} finally {
-			if (!messages) {
-				this._promptPreflights.delete(preflightToken);
-				this._runTriggeredBehindPreflight();
-				this._runInputQueuedBehindPreflight();
-			}
+			this._promptPreflights.delete(preflightToken);
+			this._runTriggeredBehindPreflight();
+			this._runInputQueuedBehindPreflight();
 		}
-
-		if (!messages) return;
-
-		// A switch can also begin during before_agent_start or image normalization.
-		// Keep this prompt's admission token until its run can start, so triggered
-		// messages still queue behind it instead of acquiring a competing run.
-		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
-		this._checkInputAdmission();
-		// Triggered messages held during this preflight join its run, in the queue they asked for.
-		this._queueTriggeredBehindPreflight();
-		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
-		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
-		// run active synchronously, so later prompts still queue through isStreaming.
-		this._promptPreflights.delete(preflightToken);
-		const run = this._runAgentPrompt(
-			messages,
-			promptToken,
-			undefined,
-			() => {
-				onInputTransferred?.();
-				preflightResult?.("started");
-			},
-			admission,
-		);
-		releasePreflight?.();
-		await run;
 	}
 
 	private _queueTriggeredBehindPreflight(): void {
@@ -3456,8 +3665,11 @@ export class AgentSession {
 			this._queueTriggeredBehindPreflight();
 			return;
 		}
-		const messages = this._triggeredBehindPreflight.splice(0).map(({ message }) => message);
-		void this._runAgentPrompt(messages).catch((error: unknown) => {
+		const [first, ...rest] = this._triggeredBehindPreflight.splice(0);
+		void this._startRun(
+			{ messageType: "custom", message: first.message },
+			{ additionalMessages: rest.map(({ message }) => message) },
+		).catch((error: unknown) => {
 			this._extensionRunner.emitError({
 				extensionPath: "<queue>",
 				event: "sendMessage",
@@ -3622,6 +3834,8 @@ export class AgentSession {
 
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		// smarty-dev#2636: same rule as the direct path; Herdr attested the typed bytes only.
+		if (processedInput.transformed || expandedText !== text) receipt = withoutAttribution(receipt);
 
 		if (behavior === "steer") {
 			await this._queueSteer(expandedText, processedInput.images, receipt);
@@ -3683,7 +3897,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#receivedMessageReceipts.set(message, receipt);
+		this.#attachUserMessageReceipt(message, receipt);
 		if (submission) {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
@@ -3711,7 +3925,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#receivedMessageReceipts.set(message, receipt);
+		this.#attachUserMessageReceipt(message, receipt);
 		if (submission) {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
@@ -3894,7 +4108,7 @@ export class AgentSession {
 				this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
 				return;
 			}
-			await this._runAgentPrompt(appMessage);
+			await this._startRun({ messageType: "custom", message: appMessage });
 		} else if (this.isStreaming) {
 			// Appending now would put the message between an assistant tool call and its
 			// result, which providers that validate message order reject on replay. Defer
@@ -5020,24 +5234,7 @@ export class AgentSession {
 		owner.assertSessionStart(this);
 		const model = this.model;
 		const stream = this.agent.streamFunction;
-		const branchIdentity = () =>
-			JSON.stringify(
-				this.sessionManager
-					.getBranch()
-					.filter(
-						(entry) =>
-							!(
-								entry.type === "custom" &&
-								[
-									"smarty-sense:count-reservation-v1",
-									"smarty-sense:count-qualification-v1",
-									"smarty-sense:provider-reservation-v1",
-									"smarty-sense:provider-usage-v1",
-								].includes(entry.customType)
-							),
-					),
-			);
-		let branch = branchIdentity();
+		const branchIdentity = createOriginalCompactionSessionIdentity(this.sessionManager);
 		const checkState = () => {
 			owner.assertSessionStart(this);
 			this._compactionAbortController?.signal.throwIfAborted();
@@ -5050,17 +5247,17 @@ export class AgentSession {
 				this.isBashRunning ||
 				this.#originalAgent.hasQueuedMessages() ||
 				this.pendingMessageCount ||
-				this.#pendingModeInput?.() ||
-				branchIdentity() !== branch
+				this.#pendingModeInput?.()
 			)
 				throw new Error("OPS_COMPACTION_SESSION_CHANGED");
+			branchIdentity.check();
 		};
 		if (originalCompactionSessions.has(this)) throw new Error("OPS_COMPACTION_SESSION_FENCE_ONCE");
 		originalCompactionSessions.set(this, {
 			attempt,
 			check: checkState,
 			afterAppend: () => {
-				branch = branchIdentity();
+				branchIdentity.afterAppend();
 			},
 		});
 		attempt.check();
@@ -6001,6 +6198,11 @@ export class AgentSession {
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
+		// smarty-dev#11900: discard this exact partial response once, but never replay executed tools.
+		// Return directly when its allowance is spent so ordinary retries and fallback cannot take over.
+		if (isRetryableCodexStreamDisconnect(message)) {
+			return !this._assistantToolExecutionStarted && !this._codexStreamDisconnectRetryUsed;
+		}
 		// Never restart a request once output or a tool call has been streamed, except reasoning-only
 		// output on a premature close (smarty-dev#6730). The classifier below checks the message itself.
 		// The stream observation also covers a terminal message whose streamed content the provider dropped.
@@ -6066,6 +6268,15 @@ export class AgentSession {
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || this._retryFallbackInFlight) {
 			return false;
+		}
+
+		if (isRetryableCodexStreamDisconnect(message)) {
+			if (settings.maxRetries <= 0 || this._assistantToolExecutionStarted || this._codexStreamDisconnectRetryUsed) {
+				return false;
+			}
+			this._codexStreamDisconnectRetryUsed = true;
+			this._retryAttempt++;
+			return this._waitAndRetry(message, retryDelayMs(settings, 1), this._retryAttempt);
 		}
 
 		this._retryAttempt++;
@@ -6289,6 +6500,7 @@ export class AgentSession {
 			cancelled: result.cancelled,
 			truncated: result.truncated,
 			fullOutputPath: result.fullOutputPath,
+			fullOutputTruncation: result.fullOutputTruncation,
 			timestamp: Date.now(),
 			excludeFromContext: options?.excludeFromContext,
 		};

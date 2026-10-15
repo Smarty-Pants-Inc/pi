@@ -66,8 +66,10 @@ export type {
 	BashSpawnEvent,
 	BashSpawnEventResult,
 	BashToolCallEvent,
+	BeforeAgentStartCustomEvent,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
+	BeforeAgentStartUserEvent,
 	BeforeProviderHeadersEvent,
 	BeforeProviderRequestEvent,
 	BeforeProviderRequestEventResult,
@@ -186,6 +188,8 @@ export type {
 	ToolLoadout,
 	ToolLoadoutChanges,
 	ToolNamespace,
+	ToolPartialResultEvent,
+	ToolPartialResultEventResult,
 	ToolRendererResolver,
 	ToolRenderers,
 	ToolRenderResultOptions,
@@ -231,6 +235,7 @@ export { HOST_CAPABILITIES, type HostCapabilities } from "./core/host-capabiliti
 export { InputAdmissionError, type InputAdmissionErrorCode } from "./core/input-admission.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
 export { convertToLlm } from "./core/messages.ts";
+export { ModelPolicyError, type ModelPolicySettings } from "./core/model-policy.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,

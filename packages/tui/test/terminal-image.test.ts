@@ -292,14 +292,14 @@ describe("detectCapabilities", () => {
 		});
 	});
 
-	it("enables hyperlinks under Herdr", () => {
+	it("enables Kitty images and hyperlinks with the explicit Herdr marker", () => {
 		assert.deepStrictEqual(
 			withEnv({ TERM_PROGRAM: "herdr", COLORTERM: "truecolor" }, () => detectCapabilities()),
-			{ images: null, trueColor: true, hyperlinks: true },
+			{ images: "kitty", trueColor: true, hyperlinks: true },
 		);
-		assert.strictEqual(
-			withEnv({ TERM_PROGRAM: "herdr", PI_HYPERLINKS: "0" }, () => detectCapabilities()).hyperlinks,
-			false,
+		assert.deepStrictEqual(
+			withEnv({ TERM_PROGRAM: "HeRdR", HERDR_ENV: "1", PI_HYPERLINKS: "0" }, () => detectCapabilities()),
+			{ images: "kitty", trueColor: false, hyperlinks: false },
 		);
 	});
 
@@ -307,6 +307,12 @@ describe("detectCapabilities", () => {
 		assert.deepStrictEqual(
 			withEnv({ HERDR_ENV: "1", TERM: "xterm-256color" }, () => detectCapabilities()),
 			{ images: null, trueColor: false, hyperlinks: true },
+		);
+		assert.deepStrictEqual(
+			withEnv({ HERDR_ENV: "1", TERM_PROGRAM: "kitty", KITTY_WINDOW_ID: "1", COLORTERM: "24bit" }, () =>
+				detectCapabilities(),
+			),
+			{ images: null, trueColor: true, hyperlinks: true },
 		);
 		assert.strictEqual(withEnv({ HERDR_ENV: "1", PI_HYPERLINKS: "0" }, () => detectCapabilities()).hyperlinks, false);
 		const nested = withEnv({ HERDR_ENV: "1", TMUX: "/tmp/tmux-1000/default,1234,0" }, () =>
@@ -343,11 +349,11 @@ describe("detectCapabilities", () => {
 	});
 
 	// #10573
-	it("enables hyperlinks without images for Herdr", () => {
+	it("enables hyperlinks and Kitty images for Herdr", () => {
 		withEnv({ TERM_PROGRAM: "herdr", TERM: "xterm-256color", COLORTERM: "truecolor", KITTY_WINDOW_ID: "1" }, () => {
 			const caps = detectCapabilities();
 			assert.strictEqual(caps.hyperlinks, true);
-			assert.strictEqual(caps.images, null);
+			assert.strictEqual(caps.images, "kitty");
 			assert.strictEqual(caps.trueColor, true);
 		});
 		withEnv({ TERM_PROGRAM: "herdr", PI_HYPERLINKS: "0" }, () => {

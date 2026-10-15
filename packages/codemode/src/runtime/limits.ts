@@ -28,6 +28,11 @@ export const DEFAULT_CODEMODE_LIMITS: Readonly<CodemodeLimits> = Object.freeze({
 	maxPendingCalls: 256,
 });
 
+/** Default QuickJS heap budget for every backend: 256 MiB. */
+export const DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024;
+/** Host-owned ceiling. Callers may tighten, never raise, the QuickJS heap budget. */
+export const MAX_CODEMODE_MEMORY_LIMIT_BYTES = DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES;
+
 /** A script went over a {@link CodemodeLimits} budget or a store quota. The execution fails with `kind: "limit"`. */
 export class CodemodeLimitError extends Error {
 	constructor(message: string) {
@@ -36,14 +41,25 @@ export class CodemodeLimitError extends Error {
 	}
 }
 
-/** Defaults overridden by `limits`. Every value must be a positive finite number. */
+/** Callers may tighten the defaults. Every value must be a positive finite number. */
 export function resolveCodemodeLimits(limits: Partial<CodemodeLimits> = {}): CodemodeLimits {
 	const resolved = { ...DEFAULT_CODEMODE_LIMITS, ...limits };
-	for (const [key, value] of Object.entries(resolved)) {
+	for (const key of Object.keys(resolved) as (keyof CodemodeLimits)[]) {
+		const value = resolved[key];
 		if (!(value > 0 && Number.isFinite(value)))
 			throw new Error(`Codemode limit ${key} must be a positive finite number`);
+		resolved[key] = Math.min(value, DEFAULT_CODEMODE_LIMITS[key]);
 	}
 	return resolved;
+}
+
+/** Resolve at each admission boundary. Like other budgets, oversized requests are clamped. */
+export function resolveMemoryLimit(requested: number | undefined): number {
+	if (requested === undefined) return DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES;
+	if (!(requested > 0 && Number.isFinite(requested))) {
+		throw new CodemodeLimitError("Codemode memoryLimitBytes must be a positive finite number");
+	}
+	return Math.min(requested, MAX_CODEMODE_MEMORY_LIMIT_BYTES);
 }
 
 /** Characters a worker message carries. */
@@ -57,6 +73,11 @@ export function messageChars(message: WorkerToHostMessage): number {
 				: message.item.text.length;
 		case "done":
 			return message.ok ? (message.value?.length ?? 0) + message.writes.length : message.error.length;
+		case "started":
+			return message.fingerprint.length;
+		case "crash":
+		case "limit":
+			return message.message.length;
 		default:
 			return 0;
 	}

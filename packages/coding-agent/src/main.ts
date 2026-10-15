@@ -49,6 +49,7 @@ import { formatNoModelsAvailableMessage } from "./core/auth-guidance.ts";
 import { AuthStorage, ReadOnlyAuthStorage } from "./core/auth-storage.ts";
 import { exportFromFile } from "./core/export-html/index.ts";
 import type { InlineExtension } from "./core/extensions/types.ts";
+import { startHerdrInputConsumer } from "./core/herdr/bootstrap.ts";
 import { applyHttpProxySettings, configureHttpDispatcher } from "./core/http-dispatcher.ts";
 import { captureCliInputPlan, finalizeCliInputPlan, handoffModeInputPlan } from "./core/mode-turn-receipts.ts";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.ts";
@@ -75,7 +76,7 @@ import { loadMcpCommand } from "./extensions/mcp/cli.lazy.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
 import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
-import { validateThemeJson } from "./modes/interactive/theme/theme-json.ts";
+import { validateThemeJson } from "./modes/interactive/theme/theme-schema.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
 import { isLocalPath, normalizePath, resolvePath } from "./utils/paths.ts";
 import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.ts";
@@ -661,6 +662,8 @@ export async function main(args: string[], options?: MainOptions) {
 		return;
 	}
 	resetTimings();
+	// Commands and startup selectors can load user-authored themes before runtime creation.
+	setThemeJsonValidator(validateThemeJson);
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
@@ -984,6 +987,12 @@ export async function main(args: string[], options?: MainOptions) {
 		};
 	};
 	time("createRuntime");
+	// smarty-dev#2636: enroll as Herdr's input consumer before any extension loads. --help and
+	// --list-models exit before the TUI starts, so they never enroll (pi#160 review).
+	const herdrInput =
+		appMode === "interactive" && !parsed.help && parsed.listModels === undefined
+			? await startHerdrInputConsumer()
+			: undefined;
 	const runtime = await createAgentSessionRuntime(createRuntime, {
 		cwd: sessionManager.getCwd(),
 		agentDir,
@@ -1025,8 +1034,6 @@ export async function main(args: string[], options?: MainOptions) {
 	const { initialMessage, initialImages } = await prepareInitialMessage(parsed, stdinInput?.text);
 	if (appMode !== "rpc") finalizeCliInputPlan(parsed, initialMessage, initialImages, stdinInput);
 	time("prepareInitialMessage");
-	// pi reads user-authored themes, so it opts into full validation before any theme loads.
-	setThemeJsonValidator(validateThemeJson);
 	initTheme(settingsManager.getTheme(), appMode === "interactive");
 	time("initTheme");
 
@@ -1036,7 +1043,11 @@ export async function main(args: string[], options?: MainOptions) {
 	}
 
 	time("resolveModelScope");
-	const startupDiagnostics = deduplicateDiagnostics([...startupSettingsDiagnostics, ...runtime.diagnostics]);
+	const startupDiagnostics = deduplicateDiagnostics([
+		...startupSettingsDiagnostics,
+		...runtime.diagnostics,
+		...(herdrInput?.diagnostic ? [herdrInput.diagnostic] : []),
+	]);
 	const hasRuntimeErrors = runtime.diagnostics.some((diagnostic) => diagnostic.type === "error");
 	if (appMode !== "interactive" || hasRuntimeErrors) {
 		reportDiagnostics(startupDiagnostics);
@@ -1085,6 +1096,7 @@ export async function main(args: string[], options?: MainOptions) {
 			verbose: parsed.verbose,
 			tuiMode: parsed.tuiMode,
 			initialThemeSetting: parsed.useTheme,
+			herdrInput,
 		};
 		handoffModeInputPlan(parsed, interactiveOptions);
 		const interactiveMode = new InteractiveMode(runtime, interactiveOptions);

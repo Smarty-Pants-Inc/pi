@@ -39,8 +39,11 @@ describe("getSupportedThinkingLevels", () => {
 		expect(getSupportedThinkingLevels(model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
 	});
 
-	it("includes Claude Sonnet 5.5 with managed effort levels and official pricing", () => {
+	it("includes Claude Sonnet 5.5 with managed effort levels and pinned catalog pricing", () => {
 		const model = getModel("anthropic", "claude-sonnet-5-5");
+		// pi#244: nix/model-catalog.json at ea6fa125ab7590d583aa7c7f7293ed44114403e4 pins this price.
+		// Anthropic cache reads cost 10% of input: $2/M input gives $0.20/M cache reads.
+		// https://platform.claude.com/docs/en/about-claude/pricing#prompt-caching
 		expect(model).toMatchObject({
 			cost: { input: 2, output: 10, cacheRead: 0.2, cacheWrite: 2.5 },
 			contextWindow: 1_000_000,

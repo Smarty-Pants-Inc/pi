@@ -1,32 +1,75 @@
-import { Worker } from "node:worker_threads";
 import { expect, it } from "vitest";
-import { CodemodeSandbox } from "../src/index.ts";
+import { CodemodeSandbox, type CodemodeSandboxBase, loadQuickJSWasm } from "../src/index.ts";
+import { InlineCodemodeSandbox, RemoteCodemodeSandbox, serveCodemodeRemote } from "../src/portable.ts";
 
-// PR #131: the reviewed re-enable must precede all supported Codemode admission.
-it("refuses sandbox creation before inspecting options, including explicit attempts", () => {
-	const options = new Proxy(
-		{},
-		{
-			get() {
-				throw new Error("OPTIONS_INSPECTED");
-			},
-		},
-	);
-	expect(() => new CodemodeSandbox(options)).toThrow("CODEMODE_SECURITY_REVIEW_REQUIRED");
-});
+const echo = { name: "echo", execute: (args: unknown) => args };
+const backends: [string, () => CodemodeSandboxBase][] = [
+	[
+		"worker entry",
+		() =>
+			new CodemodeSandbox({
+				tools: [echo],
+				workerUrl: new URL("../src/runtime/worker.ts", import.meta.url),
+			}),
+	],
+	["portable inline", () => new InlineCodemodeSandbox({ tools: [echo], wasm: loadQuickJSWasm() })],
+	[
+		"portable remote",
+		() =>
+			new RemoteCodemodeSandbox({
+				tools: [echo],
+				remote: () => ({
+					execute: (request, exchange) =>
+						serveCodemodeRemote(
+							structuredClone(request),
+							async (messages) => structuredClone(await exchange(structuredClone(messages))),
+							{ wasm: loadQuickJSWasm() },
+						),
+				}),
+			}),
+	],
+];
 
-it("refuses the separately exported worker entry before creating a VM", async () => {
-	const worker = new Worker(new URL("../src/runtime/worker.ts", import.meta.url), { workerData: {} });
+// smarty-dev#4506 step 2: replace the shipping refusal with real execution, never an admission mock.
+it.each(backends)(
+	"admits %s through tools, output, and store while keeping host globals absent",
+	async (_name, create) => {
+		const sandbox = create();
+		try {
+			const result = await sandbox.execute(`
+				const value = await tools.echo({ answer: 42 });
+				store("answer", value.answer);
+				text(value);
+				return [typeof process, typeof require, typeof fetch, load("answer")];
+			`);
+			expect(result).toMatchObject({
+				ok: true,
+				value: ["undefined", "undefined", "undefined", 42],
+				output: [{ type: "text", text: '{"answer":42}' }],
+				calls: [{ name: "echo", status: "ok" }],
+				storeWrites: { set: { answer: 42 }, delete: [] },
+			});
+		} finally {
+			await sandbox.close();
+		}
+	},
+);
+
+// smarty-dev#4506: deterministic start/deliver also crosses the actual admitted host/VM boundary.
+it.each(backends)("admits deterministic start and delivery through %s", async (_name, create) => {
+	const sandbox = create();
 	try {
-		const message = await new Promise<{ type: string; message: string }>((resolve, reject) => {
-			worker.once("message", resolve);
-			worker.once("error", reject);
+		const run = sandbox.start("return await tools.echo(41);", {
+			startedAt: 0,
+			seed: 1,
+			tools: [{ name: "echo" }],
+			onCall: (call) => {
+				queueMicrotask(() => run.deliver(1, 1, call.id, { ok: true, value: call.args }));
+			},
 		});
-		expect(message).toMatchObject({
-			type: "crash",
-			message: expect.stringContaining("CODEMODE_SECURITY_REVIEW_REQUIRED"),
-		});
+		expect(await run.result).toMatchObject({ ok: true, value: 41, calls: [{ name: "echo", status: "ok" }] });
+		expect(run.finished).toBe(true);
 	} finally {
-		await worker.terminate();
+		await sandbox.close();
 	}
 });

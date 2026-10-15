@@ -173,7 +173,10 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 
 	return new AzureOpenAI({
 		apiKey,
-		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, options?.diagnosticSecrets)),
+		logger: createRedactingSdkLogger(
+			getOAuthDiagnosticSecrets(apiKey, headers, options?.diagnosticSecrets),
+			"azure-openai",
+		),
 		apiVersion,
 		dangerouslyAllowBrowser: true,
 		fetch: options?.fetch,

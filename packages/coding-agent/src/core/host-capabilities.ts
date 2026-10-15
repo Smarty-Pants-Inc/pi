@@ -17,6 +17,8 @@ export const HOST_CAPABILITIES = Object.freeze({
 	bashSpawnEvent: true as boolean,
 	/** `session_ready` is emitted once after a replacement session's input fence lifts. */
 	sessionReadyEvent: true as boolean,
+	/** `tool_partial_result` transforms snapshots before all tool update consumers. */
+	toolPartialResult: true as boolean,
 });
 
 export type HostCapabilities = typeof HOST_CAPABILITIES;

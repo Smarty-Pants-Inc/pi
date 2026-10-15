@@ -1,10 +1,21 @@
 /**
- * Host budgets for one execution (pi#131 round-1 P1-3 and P2-4, smarty-dev#4506). The sandbox
- * refuses to start while the Codemode switch is off, so these drive the host's Execution directly
- * with a worker that posts the messages a script could make the real worker send.
+ * Host budgets for one execution (pi#131 round-1 P1-3 and P2-4, smarty-dev#4506).
+ * The hostile-worker fixture posts supplied messages without creating a VM or evaluating a script,
+ * checking that the host enforces its own budgets independently of guest validation.
  */
+import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
-import { Execution } from "../src/runtime/host.ts";
+import {
+	CodemodeLimitError,
+	CodemodeSandbox,
+	type CodemodeSandboxBaseOptions,
+	DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES,
+	InlineCodemodeSandbox,
+	loadQuickJSWasm,
+	MAX_CODEMODE_MEMORY_LIMIT_BYTES,
+	resolveMemoryLimit,
+} from "../src/index.ts";
+import { Execution } from "../src/runtime/execution.ts";
 import {
 	BridgeBudget,
 	type CodemodeLimits,
@@ -14,7 +25,6 @@ import {
 import { MAX_STORE_TOTAL_CHARS, MAX_STORE_VALUE_CHARS } from "../src/runtime/prelude-source.ts";
 import type { WorkerToHostMessage } from "../src/runtime/protocol.ts";
 import type { CodemodeResult, CodemodeTool } from "../src/types.ts";
-import type { CodemodeWasmModule } from "../src/wasm.ts";
 
 const RAW_WORKER = new URL("./fixtures/raw-worker.ts", import.meta.url);
 
@@ -27,18 +37,31 @@ function run(
 		snapshot?: Record<string, unknown>;
 	} = {},
 ): Promise<CodemodeResult> {
+	const tools = options.tools ?? [];
 	return new Execution({
 		code: JSON.stringify(messages),
-		tools: new Map((options.tools ?? []).map((tool) => [tool.name, tool])),
-		globals: new Map(),
+		tools,
+		globals: [],
+		executors: { tools: new Map(tools.map((tool) => [tool.name, tool])), globals: new Map() },
 		timeoutMs: options.timeoutMs ?? 10_000,
 		signal: undefined,
+		// Omission remains valid input: Execution resolves the host default before launching.
 		memoryLimitBytes: undefined,
 		limits: resolveCodemodeLimits(options.limits),
 		snapshot: options.snapshot ?? {},
 		store: {},
-		wasm: Promise.resolve({} as CodemodeWasmModule),
-		workerUrl: RAW_WORKER,
+		launch: (data, events) => {
+			const worker = new Worker(RAW_WORKER, { workerData: data });
+			worker.on("message", events.message);
+			worker.on("error", (error) => events.failure({ kind: "sandbox", message: error.message }));
+			worker.on("exit", (code) => events.failure({ kind: "sandbox", message: `Worker exited: ${code}` }));
+			return {
+				post: (message) => worker.postMessage(message),
+				stop: async () => {
+					await worker.terminate();
+				},
+			};
+		},
 	}).promise;
 }
 
@@ -55,6 +78,96 @@ const text = (chars: number): WorkerToHostMessage => ({
 });
 const hang: CodemodeTool = { name: "t", execute: () => new Promise(() => {}) };
 
+// pi#267 review/astra P1: the public API is a trust boundary for model-written scripts.
+describe("host-owned memory limits", () => {
+	const localBackends = [
+		[
+			"inline",
+			(options: CodemodeSandboxBaseOptions = {}) =>
+				new InlineCodemodeSandbox({ wasm: loadQuickJSWasm(), interruptBudget: 1e9, ...options }),
+		],
+		["worker", (options: CodemodeSandboxBaseOptions = {}) => new CodemodeSandbox(options)],
+	] as const;
+
+	it("defaults, preserves tighter values, and clamps oversized requests like the other budgets", () => {
+		expect(resolveMemoryLimit(undefined)).toBe(DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES);
+		expect(resolveMemoryLimit(8 * 1024 * 1024)).toBe(8 * 1024 * 1024);
+		expect(resolveMemoryLimit(MAX_CODEMODE_MEMORY_LIMIT_BYTES)).toBe(MAX_CODEMODE_MEMORY_LIMIT_BYTES);
+		expect(resolveMemoryLimit(MAX_CODEMODE_MEMORY_LIMIT_BYTES * 8)).toBe(MAX_CODEMODE_MEMORY_LIMIT_BYTES);
+	});
+
+	it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+		"refuses invalid memory %s",
+		(value) => {
+			expect(() => resolveMemoryLimit(value)).toThrow(CodemodeLimitError);
+			for (const [, create] of localBackends) {
+				expect(() => create({ memoryLimitBytes: value })).toThrow(/positive finite/);
+			}
+		},
+	);
+
+	it.each(localBackends)(
+		"%s has an OOM default and recovers in the same process",
+		async (_name, create) => {
+			const sandbox = create(); // Deliberately NO memoryLimitBytes.
+			try {
+				const bomb = await sandbox.execute(
+					"const parts = []; for (;;) parts.push('x'.repeat(1 << 20) + parts.length);",
+				);
+				expect(bomb).toMatchObject({ ok: false, error: { message: expect.stringContaining("out of memory") } });
+				expect(await sandbox.execute("return 42")).toMatchObject({ ok: true, value: 42 });
+			} finally {
+				await sandbox.close();
+			}
+		},
+		30_000,
+	);
+
+	it.each(localBackends)("%s clamps a request above the ceiling before QuickJS starts", async (_name, create) => {
+		const sandbox = create({ memoryLimitBytes: MAX_CODEMODE_MEMORY_LIMIT_BYTES * 8 });
+		let fingerprint = "";
+		try {
+			const run = sandbox.start("return 42", {
+				startedAt: 0,
+				seed: 1,
+				onCall: () => {},
+				onStarted: (value) => {
+					fingerprint = value;
+				},
+			});
+			expect(await run.result).toMatchObject({ ok: true, value: 42 });
+			expect(fingerprint).toContain(`heap ${MAX_CODEMODE_MEMORY_LIMIT_BYTES},`);
+		} finally {
+			await sandbox.close();
+		}
+	});
+
+	it.each([undefined, 8 * 1024 * 1024, MAX_CODEMODE_MEMORY_LIMIT_BYTES * 8])(
+		"creates a worker with memory-derived V8 limits for request %s",
+		async (requested) => {
+			const sandbox = new CodemodeSandbox({
+				memoryLimitBytes: requested,
+				workerUrl: new URL("./fixtures/resource-limits-worker.ts", import.meta.url),
+			});
+			try {
+				const resolved = resolveMemoryLimit(requested);
+				expect(await sandbox.execute("return 1")).toMatchObject({
+					ok: true,
+					value: {
+						memoryLimitBytes: resolved,
+						resourceLimits: {
+							maxOldGenerationSizeMb: Math.ceil(resolved / (1024 * 1024)) + 48,
+							maxYoungGenerationSizeMb: 16,
+						},
+					},
+				});
+			} finally {
+				await sandbox.close();
+			}
+		},
+	);
+});
+
 describe("bridge deadline", () => {
 	it("clamps an infinite timeout to the host maximum, so a call that never settles cannot hang the run", async () => {
 		const started = performance.now();
@@ -68,6 +181,12 @@ describe("bridge deadline", () => {
 			error: { kind: "timeout", message: expect.stringContaining("100 ms") },
 		});
 		expect(performance.now() - started).toBeLessThan(5_000);
+	});
+
+	it("does not let options raise the hard deadline or bridge ceilings", () => {
+		const limits = resolveCodemodeLimits({ maxTimeoutMs: 60 * 60_000, maxCalls: 20_000 });
+		expect(limits.maxTimeoutMs).toBe(30 * 60_000);
+		expect(limits.maxCalls).toBe(10_000);
 	});
 
 	it("rejects limits that are not finite", () => {

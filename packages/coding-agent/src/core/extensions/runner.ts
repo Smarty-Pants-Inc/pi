@@ -34,8 +34,10 @@ import type {
 	AgentBeforeSettleEvent,
 	BashSpawnEvent,
 	BashSpawnEventResult,
+	BeforeAgentStartCustomEvent,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
+	BeforeAgentStartUserEvent,
 	BeforeProviderHeadersEvent,
 	BeforeProviderRequestEvent,
 	BoundaryContextPreview,
@@ -89,6 +91,8 @@ import type {
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
+	ToolPartialResultEvent,
+	ToolPartialResultEventResult,
 	ToolRenderers,
 	ToolResultEvent,
 	ToolResultEventResult,
@@ -171,6 +175,11 @@ function isUserBashEventResult(value: unknown): value is UserBashEventResult {
 	);
 }
 
+/** The message that starts a run: the before_agent_start event without its prompt fields. */
+export type BeforeAgentStartTrigger =
+	| Pick<BeforeAgentStartUserEvent, "messageType" | "prompt" | "images">
+	| Pick<BeforeAgentStartCustomEvent, "messageType" | "message">;
+
 /** Combined result from all before_agent_start handlers. */
 interface BeforeAgentStartCombinedResult {
 	messages: NonNullable<BeforeAgentStartEventResult["message"]>[];
@@ -188,6 +197,7 @@ type RunnerEmitEvent = Exclude<
 	| BashSpawnEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
+	| ToolPartialResultEvent
 	| UserBashEvent
 	| ContextEvent
 	| ContextWithSystemEvent
@@ -1431,6 +1441,61 @@ export class ExtensionRunner {
 		return modified ? currentMessage : undefined;
 	}
 
+	async emitToolPartialResult(
+		event: ToolPartialResultEvent,
+		signal?: AbortSignal,
+	): Promise<{ partialResult: ToolPartialResultEvent["partialResult"] }> {
+		let extensionPath = "tool_partial_result";
+		try {
+			signal = this.dispatchSignal(event.type, signal);
+			signal?.throwIfAborted();
+			const ctx = this.createContext();
+			const currentEvent: ToolPartialResultEvent = isolateValue(event);
+			for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
+				extensionPath = ext.path;
+				for (const handler of handlers) {
+					signal?.throwIfAborted();
+					const result = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
+						| ToolPartialResultEventResult
+						| undefined;
+					signal?.throwIfAborted();
+					if (result === undefined) continue;
+					if (result === null || typeof result !== "object" || Array.isArray(result)) {
+						throw new Error("Invalid partial tool result handler return");
+					}
+					// The documented optional partialResult permits an object to leave the snapshot unchanged.
+					if (result.partialResult === undefined) continue;
+					if (
+						result.partialResult === null ||
+						typeof result.partialResult !== "object" ||
+						Array.isArray(result.partialResult) ||
+						!Array.isArray(result.partialResult.content)
+					) {
+						throw new Error("Invalid partial tool result");
+					}
+					currentEvent.partialResult = result.partialResult;
+				}
+			}
+			if (!currentEvent.partialResult || !Array.isArray(currentEvent.partialResult.content)) {
+				throw new Error("Invalid partial tool result");
+			}
+			return { partialResult: isolateValue(currentEvent.partialResult) };
+		} catch {
+			// A redactor failure must never expose its input, including through diagnostics.
+			this.emitError({
+				extensionPath,
+				event: "tool_partial_result",
+				error: "Partial tool result withheld: handler failed",
+			});
+			return {
+				partialResult: {
+					content: [{ type: "text", text: "[REDACTED] Partial tool result withheld: handler failed" }],
+					details: undefined,
+				},
+			};
+		}
+	}
+
 	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
 		await this.closeToolScope(event.toolCallId);
 		signal = this.dispatchSignal(event.type, signal);
@@ -1732,8 +1797,7 @@ export class ExtensionRunner {
 	}
 
 	async emitBeforeAgentStart(
-		prompt: string,
-		images: ImageContent[] | undefined,
+		trigger: BeforeAgentStartTrigger,
 		systemPromptOptions: BuildSystemPromptOptions,
 		cancellation?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult> {
@@ -1757,9 +1821,8 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				try {
 					const event: BeforeAgentStartEvent = {
+						...isolateValue(trigger),
 						type: "before_agent_start",
-						prompt,
-						images,
 						get systemPrompt() {
 							return renderCurrentSystemPrompt();
 						},

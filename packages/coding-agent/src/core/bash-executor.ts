@@ -6,13 +6,10 @@
  * - Direct calls from modes that need bash execution
  */
 
-import type { WriteStream } from "node:fs";
-import { finished } from "node:stream/promises";
 import { splitIncompleteAnsiSuffix, stripAnsi } from "../utils/ansi.ts";
-import { createOutputFileStream } from "../utils/output-files.ts";
 import { sanitizeBinaryOutput } from "../utils/shell.ts";
-import type { BashOperations } from "./tools/bash.ts";
-import { DEFAULT_MAX_BYTES, truncateTail } from "./tools/truncate.ts";
+import { appendErrorNotice, type BashOperations } from "./tools/bash.ts";
+import { type FullOutputTruncation, OutputAccumulator } from "./tools/output-accumulator.ts";
 
 // ============================================================================
 // Types
@@ -36,6 +33,10 @@ export interface BashResult {
 	truncated: boolean;
 	/** Path to temp file containing full output (if output exceeded truncation threshold) */
 	fullOutputPath?: string;
+	/** Present only when the full-output log omits part of the output. */
+	fullOutputTruncation?: FullOutputTruncation;
+	/** The log could not be saved; command output and status are still valid. */
+	fullOutputError?: string;
 }
 
 // ============================================================================
@@ -52,25 +53,9 @@ export async function executeBashWithOperations(
 	operations: BashOperations,
 	options?: BashExecutorOptions,
 ): Promise<BashResult> {
-	const outputChunks: string[] = [];
-	let outputBytes = 0;
-	const maxOutputBytes = DEFAULT_MAX_BYTES * 2;
-
-	let tempFilePath: string | undefined;
-	let tempFileStream: WriteStream | undefined;
-	let tempFileCompletion: Promise<Error | undefined> | undefined;
-	let totalBytes = 0;
-
-	const ensureTempFile = () => {
-		if (tempFilePath) return;
-		({ path: tempFilePath, stream: tempFileStream } = createOutputFileStream("pi-bash", ".log"));
-		// Capture even early open errors, then report them after execution has been joined.
-		tempFileCompletion = finished(tempFileStream).then(
-			() => undefined,
-			(error: Error) => error,
-		);
-		for (const chunk of outputChunks) tempFileStream.write(chunk);
-	};
+	// The accumulator receives sanitized text, so its display tail and its capped log both hold
+	// the sanitized output, as before.
+	const output = new OutputAccumulator({ tempFilePrefix: "pi-bash" });
 
 	const decoder = new TextDecoder();
 	// Unfinished escape sequence at the end of the previous chunk, completed by the next chunk.
@@ -80,55 +65,67 @@ export async function executeBashWithOperations(
 		// Sanitize: strip ANSI, replace binary garbage, normalize newlines
 		const text = sanitizeBinaryOutput(stripAnsi(rawText)).replace(/\r/g, "");
 		if (!text) return;
-		if (totalBytes > DEFAULT_MAX_BYTES) ensureTempFile();
-		if (tempFileStream) tempFileStream.write(text);
-		outputChunks.push(text);
-		outputBytes += text.length;
-		while (outputBytes > maxOutputBytes && outputChunks.length > 1) {
-			const removed = outputChunks.shift()!;
-			outputBytes -= removed.length;
-		}
+		output.append(Buffer.from(text, "utf-8"));
 		options?.onChunk?.(text);
 	};
 
 	const onData = (data: Buffer) => {
-		totalBytes += data.length;
 		const { complete, pending } = splitIncompleteAnsiSuffix(pendingAnsi + decoder.decode(data, { stream: true }));
 		pendingAnsi = pending;
 		appendText(complete);
 	};
 
-	let bashResult: BashResult;
-	let tempFileError: Error | undefined;
+	let bashResult: BashResult | undefined;
+	let execError: { error: unknown } | undefined;
 	try {
 		let exitCode: number | null = null;
 		try {
 			({ exitCode } = await operations.exec(command, cwd, { onData, signal: options?.signal }));
 		} catch (error) {
-			// An aborted command still returns the output it produced so far.
-			if (!options?.signal?.aborted) throw error;
+			// An aborted command still returns the output it produced so far. Other errors are rethrown
+			// after the log is closed, carrying the cap notice when the log omits output.
+			if (!options?.signal?.aborted) execError = { error };
 		}
 		const rest = pendingAnsi + decoder.decode();
 		pendingAnsi = "";
 		appendText(rest);
-		const fullOutput = outputChunks.join("");
-		const truncationResult = truncateTail(fullOutput);
-		if (truncationResult.truncated) ensureTempFile();
+		output.finish();
+		output.snapshot({ persistIfTruncated: true });
+		await output.closeTempFile();
+		const snapshot = output.snapshot();
 		const cancelled = options?.signal?.aborted ?? false;
-		bashResult = {
-			output: truncationResult.truncated ? truncationResult.content : fullOutput,
-			exitCode: cancelled ? undefined : (exitCode ?? undefined),
-			cancelled,
-			truncated: truncationResult.truncated,
-			fullOutputPath: tempFilePath,
-		};
-	} finally {
-		if (tempFileStream) {
-			tempFileStream.end();
-			tempFileError = await tempFileCompletion;
+		let text = snapshot.content;
+		const logTruncation = snapshot.fullOutputTruncation;
+		let notice: string | undefined;
+		if (snapshot.fullOutputError) {
+			notice = `[Output log unavailable: ${snapshot.fullOutputError}]`;
+			text += `\n\n${notice}`;
+			// The live ! component consumes streaming chunks, not the final output text.
+			options?.onChunk?.(`\n\n${notice}`);
+		} else if (logTruncation && snapshot.fullOutputPath) {
+			// Session and RPC copies keep only the output text, so the notice must live in it.
+			notice = `[Output log capped: ${logTruncation.omittedBytes} of ${logTruncation.totalBytes} bytes omitted from ${snapshot.fullOutputPath}]`;
+			text += `\n\n${notice}`;
 		}
+		if (execError) {
+			if (notice) execError.error = appendErrorNotice(execError.error, notice);
+		} else {
+			bashResult = {
+				output: text,
+				exitCode: cancelled ? undefined : (exitCode ?? undefined),
+				cancelled,
+				truncated: snapshot.truncation.truncated,
+				fullOutputPath: snapshot.fullOutputPath,
+				...(notice && logTruncation ? { fullOutputTruncation: logTruncation } : {}),
+				...(snapshot.fullOutputError ? { fullOutputError: snapshot.fullOutputError } : {}),
+			};
+		}
+	} finally {
+		// Always flush and close the log, also after errors and cancellation.
+		await output.closeTempFile();
 	}
-	if (tempFileError) throw tempFileError;
+	if (execError) throw execError.error;
+	if (!bashResult) throw new Error("Bash execution produced no result");
 	// An abort can arrive while the full-output stream is being flushed.
 	if (options?.signal?.aborted) {
 		bashResult.cancelled = true;

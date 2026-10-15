@@ -1,11 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import { DEFAULT_MAX_AGENT_RETRY_DELAY_MS, type Model, type Transport } from "@earendil-works/pi-ai";
-import type {
-	TuiMode as RendererTuiMode,
-	ScrollViewScrollbar,
-	TerminalCapabilities,
-	WheelScrollLines,
-} from "@earendil-works/pi-tui";
+import type { Model } from "@earendil-works/pi-ai";
+import type { ScrollViewScrollbar, TerminalCapabilities, WheelScrollLines } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
@@ -14,181 +9,53 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { type ModelPolicyTarget, modelPolicyAllows } from "./model-policy.ts";
+import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
+import type {
+	CacheWarmingMode,
+	CompactionModelOverride,
+	DefaultProjectTrust,
+	FullscreenExitOutput,
+	MermaidRenderingMode,
+	PackageSource,
+	QuietStartup,
+	Settings,
+	ThinkingBudgetsSettings,
+	TransportSetting,
+	TuiMode,
+	WarningSettings,
+} from "./settings-schema.ts";
 
-export interface CompactionModelOverride {
-	reserveTokens?: number;
-	keepRecentTokens?: number;
-}
+export type {
+	BranchSummarySettings,
+	CacheWarmingMode,
+	CodemodeMode,
+	CodemodeSettings,
+	CompactionModelOverride,
+	CompactionSettings,
+	DefaultProjectTrust,
+	FullscreenExitOutput,
+	ImageSettings,
+	MarkdownSettings,
+	MermaidRenderingMode,
+	PackageSource,
+	ProviderRetrySettings,
+	QuietStartup,
+	RetrySettings,
+	Settings,
+	TerminalSettings,
+	ThinkingBudgetsSettings,
+	TransportSetting,
+	TuiMode,
+	WarningSettings,
+} from "./settings-schema.ts";
+/** Cache-warming profile. "idle" also warms between agent runs. */
+export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const satisfies readonly CacheWarmingMode[];
 
 const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
-	reserveTokens: 16384,
-	keepRecentTokens: 20000,
+	reserveTokens: SETTINGS_DEFAULTS.compaction.reserveTokens,
+	keepRecentTokens: SETTINGS_DEFAULTS.compaction.keepRecentTokens,
 };
-
-export interface CompactionSettings {
-	enabled?: boolean; // default: true
-	reserveTokens?: number; // default: 16384
-	keepRecentTokens?: number; // default: 20000
-	modelOverrides?: Record<string, CompactionModelOverride>; // exact "provider/modelId" keys
-}
-
-export interface BranchSummarySettings {
-	reserveTokens?: number; // default: 16384 (tokens reserved for prompt + LLM response)
-	skipPrompt?: boolean; // default: false - when true, skips "Summarize branch?" prompt and defaults to no summary
-}
-
-export interface ProviderRetrySettings {
-	timeoutMs?: number; // SDK/provider request timeout in milliseconds
-	maxRetries?: number; // SDK/provider retry attempts
-	maxRetryDelayMs?: number; // default: 60000 (max server-requested delay before failing)
-}
-
-export interface RetrySettings {
-	enabled?: boolean; // default: true
-	maxRetries?: number; // default: 3
-	baseDelayMs?: number; // default: 2000 (exponential backoff: 2s, 4s, 8s)
-	maxAgentDelayMs?: number; // default: 60000
-	provider?: ProviderRetrySettings;
-	/** Exact provider/modelId used once after agent retries are exhausted. Off by default. */
-	fallbackModel?: string;
-}
-
-export type TuiMode = RendererTuiMode;
-export type FullscreenExitOutput = "transcript" | "resume-hint";
-
-export interface TerminalSettings {
-	showImages?: boolean; // default: true (only relevant if terminal supports images)
-	imageWidthCells?: number; // default: 60 (preferred inline image width in terminal cells)
-	clearOnShrink?: boolean; // default: false (clear empty rows when content shrinks)
-	showTerminalProgress?: boolean; // default: false (OSC 9;4 terminal progress indicators)
-	hyperlinks?: boolean | "auto";
-	images?: "kitty" | "iterm2" | "auto" | false;
-	trueColor?: boolean | "auto";
-}
-
-export interface ImageSettings {
-	autoResize?: boolean; // default: true (resize images to 2000x2000 max for better model compatibility)
-	blockImages?: boolean; // default: false - when true, prevents all images from being sent to LLM providers
-}
-
-export interface ThinkingBudgetsSettings {
-	minimal?: number;
-	low?: number;
-	medium?: number;
-	high?: number;
-}
-
-export type MermaidRenderingMode = "off" | "final" | "streaming";
-
-/** Cache-warming profile. "idle" also warms between agent runs. */
-export const CACHE_WARMING_MODES = ["off", "streaming", "idle"] as const;
-export type CacheWarmingMode = (typeof CACHE_WARMING_MODES)[number];
-
-export interface MarkdownSettings {
-	codeBlockIndent?: string; // default: "  "
-	mermaid?: MermaidRenderingMode; // default: "streaming"
-}
-
-export interface WarningSettings {
-	anthropicExtraUsage?: boolean; // default: true
-}
-
-/**
- * How the codemode tool presents tools while it is active.
- * - `on`: declared tools that scripts can call get a note on calling them from scripts appended to
- *   their description; the codemode description lists only the tools without `direct` exposure.
- * - `only`: the codemode description lists every tool scripts can call, and active `direct` tools are
- *   not declared to the model.
- */
-export type CodemodeMode = "on" | "only";
-
-export interface CodemodeSettings {
-	/** Default: `on`. */
-	mode?: CodemodeMode;
-	/** Estimated tokens (characters / 4) the codemode description may spend on tool declarations. Default: 3000. */
-	inlineBudget?: number;
-}
-
-export type DefaultProjectTrust = "ask" | "always" | "never";
-/** true hides all startup output, "header" keeps only the startup header. */
-export type QuietStartup = boolean | "header";
-
-export type TransportSetting = Transport;
-
-/**
- * Package source for npm/git packages.
- * - String form: load all resources from the package
- * - Object form: filter which resources to load
- * - autoload=false: start empty and only apply explicit resource patterns
- */
-export type PackageSource =
-	| string
-	| {
-			source: string;
-			autoload?: boolean;
-			extensions?: string[];
-			skills?: string[];
-			prompts?: string[];
-			themes?: string[];
-	  };
-
-export interface Settings {
-	lastChangelogVersion?: string;
-	defaultProvider?: string;
-	defaultModel?: string;
-	defaultThinkingLevel?: ThinkingLevel;
-	modelThinkingLevels?: Record<string, ThinkingLevel>; // per-model default thinking level overrides keyed by "provider/modelId"
-	transport?: TransportSetting; // default: "auto"
-	steeringMode?: "all" | "one-at-a-time";
-	followUpMode?: "all" | "one-at-a-time";
-	theme?: string;
-	compaction?: CompactionSettings;
-	branchSummary?: BranchSummarySettings;
-	retry?: RetrySettings;
-	hideThinkingBlock?: boolean;
-	showCacheMissNotices?: boolean; // default: false - show cache cost and provider recovery notices
-	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
-	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows); supports leading ~ expansion
-	quietStartup?: QuietStartup; // default: false
-	defaultProjectTrust?: DefaultProjectTrust; // default: "ask"; global setting only
-	shellCommandPrefix?: string; // Prefix prepended to every bash command (e.g., "shopt -s expand_aliases" for alias support)
-	npmCommand?: string[]; // Command used for npm package lookup/install operations, argv-style (e.g., ["mise", "exec", "node@20", "--", "npm"])
-	collapseChangelog?: boolean; // Show condensed changelog after update (use /changelog for full)
-	enableInstallTelemetry?: boolean; // default: true - anonymous version/update ping after changelog-detected updates
-	enableAnalytics?: boolean; // default: false - opt-in analytics data sharing
-	trackingId?: string; // analytics tracking identifier, generated when analytics is enabled
-	deviceId?: string; // stable UUID of this installation, created when a login first needs it; global setting only
-	packages?: PackageSource[]; // Array of npm/git package sources (string or object with filtering)
-	extensions?: string[]; // Array of local extension file paths or directories
-	skills?: string[]; // Array of local skill file paths or directories
-	prompts?: string[]; // Array of local prompt template paths or directories
-	themes?: string[]; // Array of local theme file paths or directories
-	enableSkillCommands?: boolean; // default: true - register skills as /skill:name commands
-	terminal?: TerminalSettings;
-	images?: ImageSettings;
-	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
-	defaultTools?: string[]; // Initial tool selection; `+name`/`-name` entries add to or remove from the inherited selection
-	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
-	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
-	thinkingBudgets?: ThinkingBudgetsSettings; // Custom token budgets for thinking levels
-	editorPaddingX?: number; // Horizontal padding for input editor (default: 0)
-	outputPad?: 0 | 1; // Horizontal padding for transcript content (default: 1)
-	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
-	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
-	markdown?: MarkdownSettings;
-	warnings?: WarningSettings;
-	codemode?: CodemodeSettings;
-	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
-	httpProxy?: string; // Proxy URL applied as HTTP_PROXY and HTTPS_PROXY for Pi-managed HTTP clients
-	httpIdleTimeoutMs?: number; // HTTP header/body idle timeout in milliseconds; 0 disables it
-	cacheWarming?: CacheWarmingMode; // default: "streaming"; project settings override global settings
-	websocketConnectTimeoutMs?: number; // WebSocket connect/open handshake timeout in milliseconds; 0 disables it
-	tuiMode?: TuiMode; // default: "fullscreen"
-	fullscreenExitOutput?: FullscreenExitOutput; // default: "transcript"; no effect in regular TUI mode
-	fullscreenScrollbar?: ScrollViewScrollbar; // default: "auto"; no effect in regular TUI mode
-	fullscreenCopyOnSelect?: boolean; // default: true; no effect in regular TUI mode
-	fullscreenWheelScrollLines?: WheelScrollLines; // default: "auto"; lines per wheel event, 1-100
-}
 
 function isMergeableObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -406,6 +273,7 @@ export class SettingsManager {
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings;
+	private modelPolicyOverrides: unknown[] = [];
 	private projectTrusted: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -506,11 +374,18 @@ export class SettingsManager {
 			return undefined;
 		});
 
-		if (!content) {
+		// Only a missing file means "no settings". An existing empty file fails to parse like any other
+		// unreadable file, so a model policy can never be bypassed by truncating it.
+		if (content === undefined) {
 			return {};
 		}
-		const settings = JSON.parse(stripBom(content));
-		return SettingsManager.migrateSettings(settings);
+		const settings: unknown = JSON.parse(stripBom(content));
+		// Settings are a JSON object. Any other root (array, null, number, string) is a load error, so a
+		// model policy can never be bypassed by replacing the file's contents with valid non-object JSON.
+		if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+			throw new Error("settings file root must be a JSON object");
+		}
+		return SettingsManager.migrateSettings(settings as Record<string, unknown>);
 	}
 
 	private static tryLoadFromStorage(
@@ -657,8 +532,9 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
-	/** Apply additional overrides on top of current settings */
+	/** Apply additional overrides on top of current settings. Model policy overrides can only narrow. */
 	applyOverrides(overrides: Partial<Settings>): void {
+		if (overrides.modelPolicy !== undefined) this.modelPolicyOverrides.push(structuredClone(overrides.modelPolicy));
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
@@ -853,7 +729,7 @@ export class SettingsManager {
 	}
 
 	getSteeringMode(): "all" | "one-at-a-time" {
-		return this.settings.steeringMode || "one-at-a-time";
+		return this.settings.steeringMode || SETTINGS_DEFAULTS.steeringMode;
 	}
 
 	setSteeringMode(mode: "all" | "one-at-a-time"): void {
@@ -863,7 +739,7 @@ export class SettingsManager {
 	}
 
 	getFollowUpMode(): "all" | "one-at-a-time" {
-		return this.settings.followUpMode || "one-at-a-time";
+		return this.settings.followUpMode || SETTINGS_DEFAULTS.followUpMode;
 	}
 
 	setFollowUpMode(mode: "all" | "one-at-a-time"): void {
@@ -927,7 +803,7 @@ export class SettingsManager {
 	}
 
 	getTransport(): TransportSetting {
-		return this.settings.transport ?? "auto";
+		return this.settings.transport ?? SETTINGS_DEFAULTS.transport;
 	}
 
 	setTransport(transport: TransportSetting): void {
@@ -937,7 +813,7 @@ export class SettingsManager {
 	}
 
 	getCompactionEnabled(): boolean {
-		return this.settings.compaction?.enabled ?? true;
+		return this.settings.compaction?.enabled ?? SETTINGS_DEFAULTS.compaction.enabled;
 	}
 
 	setCompactionEnabled(enabled: boolean): void {
@@ -1000,17 +876,17 @@ export class SettingsManager {
 
 	getBranchSummarySettings(): { reserveTokens: number; skipPrompt: boolean } {
 		return {
-			reserveTokens: this.settings.branchSummary?.reserveTokens ?? 16384,
-			skipPrompt: this.settings.branchSummary?.skipPrompt ?? false,
+			reserveTokens: this.settings.branchSummary?.reserveTokens ?? SETTINGS_DEFAULTS.branchSummary.reserveTokens,
+			skipPrompt: this.settings.branchSummary?.skipPrompt ?? SETTINGS_DEFAULTS.branchSummary.skipPrompt,
 		};
 	}
 
 	getBranchSummarySkipPrompt(): boolean {
-		return this.settings.branchSummary?.skipPrompt ?? false;
+		return this.settings.branchSummary?.skipPrompt ?? SETTINGS_DEFAULTS.branchSummary.skipPrompt;
 	}
 
 	getRetryEnabled(): boolean {
-		return this.settings.retry?.enabled ?? true;
+		return this.settings.retry?.enabled ?? SETTINGS_DEFAULTS.retry.enabled;
 	}
 
 	setRetryEnabled(enabled: boolean): void {
@@ -1025,9 +901,9 @@ export class SettingsManager {
 	getRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number; maxAgentDelayMs: number } {
 		return {
 			enabled: this.getRetryEnabled(),
-			maxRetries: this.settings.retry?.maxRetries ?? 3,
-			baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
-			maxAgentDelayMs: this.settings.retry?.maxAgentDelayMs ?? DEFAULT_MAX_AGENT_RETRY_DELAY_MS,
+			maxRetries: this.settings.retry?.maxRetries ?? SETTINGS_DEFAULTS.retry.maxRetries,
+			baseDelayMs: this.settings.retry?.baseDelayMs ?? SETTINGS_DEFAULTS.retry.baseDelayMs,
+			maxAgentDelayMs: this.settings.retry?.maxAgentDelayMs ?? SETTINGS_DEFAULTS.retry.maxAgentDelayMs,
 		};
 	}
 
@@ -1050,7 +926,7 @@ export class SettingsManager {
 
 	getCacheWarmingMode(): CacheWarmingMode {
 		const mode = this.settings.cacheWarming;
-		return mode !== undefined && CACHE_WARMING_MODES.includes(mode) ? mode : "streaming";
+		return mode !== undefined && CACHE_WARMING_MODES.includes(mode) ? mode : SETTINGS_DEFAULTS.cacheWarming;
 	}
 
 	setCacheWarmingMode(mode: CacheWarmingMode): void {
@@ -1063,7 +939,8 @@ export class SettingsManager {
 		return {
 			timeoutMs: this.settings.retry?.provider?.timeoutMs,
 			maxRetries: this.settings.retry?.provider?.maxRetries,
-			maxRetryDelayMs: this.settings.retry?.provider?.maxRetryDelayMs ?? 60000,
+			maxRetryDelayMs:
+				this.settings.retry?.provider?.maxRetryDelayMs ?? SETTINGS_DEFAULTS.retry.provider.maxRetryDelayMs,
 		};
 	}
 
@@ -1072,11 +949,11 @@ export class SettingsManager {
 	}
 
 	getHideThinkingBlock(): boolean {
-		return this.settings.hideThinkingBlock ?? false;
+		return this.settings.hideThinkingBlock ?? SETTINGS_DEFAULTS.hideThinkingBlock;
 	}
 
 	getShowCacheMissNotices(): boolean {
-		return this.settings.showCacheMissNotices ?? false;
+		return this.settings.showCacheMissNotices ?? SETTINGS_DEFAULTS.showCacheMissNotices;
 	}
 
 	getExternalEditorCommand(): string {
@@ -1116,7 +993,7 @@ export class SettingsManager {
 
 	getQuietStartup(): QuietStartup {
 		const value = this.settings.quietStartup;
-		return value === true || value === "header" ? value : false;
+		return value === true || value === "header" ? value : SETTINGS_DEFAULTS.quietStartup;
 	}
 
 	setQuietStartup(quiet: QuietStartup): void {
@@ -1127,7 +1004,7 @@ export class SettingsManager {
 
 	getDefaultProjectTrust(): DefaultProjectTrust {
 		const value = this.globalSettings.defaultProjectTrust;
-		return value === "always" || value === "never" ? value : "ask";
+		return value === "always" || value === "never" ? value : SETTINGS_DEFAULTS.defaultProjectTrust;
 	}
 
 	setDefaultProjectTrust(defaultProjectTrust: DefaultProjectTrust): void {
@@ -1157,7 +1034,7 @@ export class SettingsManager {
 	}
 
 	getCollapseChangelog(): boolean {
-		return this.settings.collapseChangelog ?? false;
+		return this.settings.collapseChangelog ?? SETTINGS_DEFAULTS.collapseChangelog;
 	}
 
 	setCollapseChangelog(collapse: boolean): void {
@@ -1167,7 +1044,7 @@ export class SettingsManager {
 	}
 
 	getEnableInstallTelemetry(): boolean {
-		return this.settings.enableInstallTelemetry ?? true;
+		return this.settings.enableInstallTelemetry ?? SETTINGS_DEFAULTS.enableInstallTelemetry;
 	}
 
 	setEnableInstallTelemetry(enabled: boolean): void {
@@ -1177,7 +1054,7 @@ export class SettingsManager {
 	}
 
 	getEnableAnalytics(): boolean {
-		return this.settings.enableAnalytics ?? false;
+		return this.settings.enableAnalytics ?? SETTINGS_DEFAULTS.enableAnalytics;
 	}
 
 	getTrackingId(): string | undefined {
@@ -1290,7 +1167,7 @@ export class SettingsManager {
 	}
 
 	getEnableSkillCommands(): boolean {
-		return this.settings.enableSkillCommands ?? true;
+		return this.settings.enableSkillCommands ?? SETTINGS_DEFAULTS.enableSkillCommands;
 	}
 
 	setEnableSkillCommands(enabled: boolean): void {
@@ -1314,7 +1191,7 @@ export class SettingsManager {
 	}
 
 	getShowImages(): boolean {
-		return this.settings.terminal?.showImages ?? true;
+		return this.settings.terminal?.showImages ?? SETTINGS_DEFAULTS.terminal.showImages;
 	}
 
 	setShowImages(show: boolean): void {
@@ -1329,7 +1206,7 @@ export class SettingsManager {
 	getImageWidthCells(): number {
 		const width = this.settings.terminal?.imageWidthCells;
 		if (typeof width !== "number" || !Number.isFinite(width)) {
-			return 60;
+			return SETTINGS_DEFAULTS.terminal.imageWidthCells;
 		}
 		return Math.max(1, Math.floor(width));
 	}
@@ -1348,7 +1225,8 @@ export class SettingsManager {
 		if (this.settings.terminal?.clearOnShrink !== undefined) {
 			return this.settings.terminal.clearOnShrink;
 		}
-		return process.env.PI_CLEAR_ON_SHRINK === "1";
+		if (process.env.PI_CLEAR_ON_SHRINK === "1") return true;
+		return SETTINGS_DEFAULTS.terminal.clearOnShrink;
 	}
 
 	setClearOnShrink(enabled: boolean): void {
@@ -1361,7 +1239,7 @@ export class SettingsManager {
 	}
 
 	getShowTerminalProgress(): boolean {
-		return this.settings.terminal?.showTerminalProgress ?? false;
+		return this.settings.terminal?.showTerminalProgress ?? SETTINGS_DEFAULTS.terminal.showTerminalProgress;
 	}
 
 	setShowTerminalProgress(enabled: boolean): void {
@@ -1374,7 +1252,7 @@ export class SettingsManager {
 	}
 
 	getTuiMode(): TuiMode {
-		return this.settings.tuiMode === "regular" ? "regular" : "fullscreen";
+		return this.settings.tuiMode === "regular" ? "regular" : SETTINGS_DEFAULTS.tuiMode;
 	}
 
 	setTuiMode(mode: TuiMode): void {
@@ -1384,7 +1262,9 @@ export class SettingsManager {
 	}
 
 	getFullscreenExitOutput(): FullscreenExitOutput {
-		return this.settings.fullscreenExitOutput === "resume-hint" ? "resume-hint" : "transcript";
+		return this.settings.fullscreenExitOutput === "resume-hint"
+			? "resume-hint"
+			: SETTINGS_DEFAULTS.fullscreenExitOutput;
 	}
 
 	setFullscreenExitOutput(output: FullscreenExitOutput): void {
@@ -1395,7 +1275,7 @@ export class SettingsManager {
 
 	getFullscreenScrollbar(): ScrollViewScrollbar {
 		const mode = this.settings.fullscreenScrollbar;
-		return mode === "always" || mode === "hidden" ? mode : "auto";
+		return mode === "always" || mode === "hidden" ? mode : SETTINGS_DEFAULTS.fullscreenScrollbar;
 	}
 
 	setFullscreenScrollbar(mode: ScrollViewScrollbar): void {
@@ -1405,7 +1285,7 @@ export class SettingsManager {
 	}
 
 	getFullscreenCopyOnSelect(): boolean {
-		return this.settings.fullscreenCopyOnSelect ?? true;
+		return this.settings.fullscreenCopyOnSelect ?? SETTINGS_DEFAULTS.fullscreenCopyOnSelect;
 	}
 
 	setFullscreenCopyOnSelect(enabled: boolean): void {
@@ -1418,7 +1298,7 @@ export class SettingsManager {
 		const lines = this.settings.fullscreenWheelScrollLines;
 		return typeof lines === "number" && Number.isFinite(lines)
 			? Math.max(1, Math.min(100, Math.floor(lines)))
-			: "auto";
+			: SETTINGS_DEFAULTS.fullscreenWheelScrollLines;
 	}
 
 	setFullscreenWheelScrollLines(lines: WheelScrollLines): void {
@@ -1429,7 +1309,7 @@ export class SettingsManager {
 	}
 
 	getImageAutoResize(): boolean {
-		return this.settings.images?.autoResize ?? true;
+		return this.settings.images?.autoResize ?? SETTINGS_DEFAULTS.images.autoResize;
 	}
 
 	setImageAutoResize(enabled: boolean): void {
@@ -1442,7 +1322,7 @@ export class SettingsManager {
 	}
 
 	getBlockImages(): boolean {
-		return this.settings.images?.blockImages ?? false;
+		return this.settings.images?.blockImages ?? SETTINGS_DEFAULTS.images.blockImages;
 	}
 
 	setBlockImages(blocked: boolean): void {
@@ -1456,6 +1336,17 @@ export class SettingsManager {
 
 	getEnabledModels(): string[] | undefined {
 		return this.settings.enabledModels;
+	}
+
+	/** Match each settings layer independently: project settings cannot widen the global policy. */
+	isModelAllowed(model: ModelPolicyTarget): boolean {
+		// A settings file that failed to parse may hold a policy we can't read: deny rather than run unrestricted.
+		if (this.globalSettingsLoadError || this.projectSettingsLoadError) return false;
+		return (
+			modelPolicyAllows(this.globalSettings.modelPolicy, model) &&
+			modelPolicyAllows(this.projectSettings.modelPolicy, model) &&
+			this.modelPolicyOverrides.every((policy) => modelPolicyAllows(policy, model))
+		);
 	}
 
 	/** The resolved `defaultTools` selection, or undefined when no settings layer sets it. */
@@ -1472,7 +1363,7 @@ export class SettingsManager {
 	}
 
 	getDoubleEscapeAction(): "fork" | "tree" | "none" {
-		return this.settings.doubleEscapeAction ?? "tree";
+		return this.settings.doubleEscapeAction ?? SETTINGS_DEFAULTS.doubleEscapeAction;
 	}
 
 	setDoubleEscapeAction(action: "fork" | "tree" | "none"): void {
@@ -1484,7 +1375,7 @@ export class SettingsManager {
 	getTreeFilterMode(): "default" | "no-tools" | "user-only" | "labeled-only" | "all" {
 		const mode = this.settings.treeFilterMode;
 		const valid = ["default", "no-tools", "user-only", "labeled-only", "all"];
-		return mode && valid.includes(mode) ? mode : "default";
+		return mode && valid.includes(mode) ? mode : SETTINGS_DEFAULTS.treeFilterMode;
 	}
 
 	setTreeFilterMode(mode: "default" | "no-tools" | "user-only" | "labeled-only" | "all"): void {
@@ -1504,7 +1395,7 @@ export class SettingsManager {
 	}
 
 	getEditorPaddingX(): number {
-		return this.settings.editorPaddingX ?? 0;
+		return this.settings.editorPaddingX ?? SETTINGS_DEFAULTS.editorPaddingX;
 	}
 
 	setEditorPaddingX(padding: number): void {
@@ -1514,7 +1405,7 @@ export class SettingsManager {
 	}
 
 	getOutputPad(): 0 | 1 {
-		return this.settings.outputPad === 0 ? 0 : 1;
+		return this.settings.outputPad === 0 ? 0 : SETTINGS_DEFAULTS.outputPad;
 	}
 
 	setOutputPad(padding: 0 | 1): void {
@@ -1524,7 +1415,7 @@ export class SettingsManager {
 	}
 
 	getAutocompleteMaxVisible(): number {
-		return this.settings.autocompleteMaxVisible ?? 5;
+		return this.settings.autocompleteMaxVisible ?? SETTINGS_DEFAULTS.autocompleteMaxVisible;
 	}
 
 	setAutocompleteMaxVisible(maxVisible: number): void {
@@ -1534,12 +1425,12 @@ export class SettingsManager {
 	}
 
 	getCodeBlockIndent(): string {
-		return this.settings.markdown?.codeBlockIndent ?? "  ";
+		return this.settings.markdown?.codeBlockIndent ?? SETTINGS_DEFAULTS.markdown.codeBlockIndent;
 	}
 
 	getMermaidRenderingMode(): MermaidRenderingMode {
 		const mode = this.settings.markdown?.mermaid;
-		return mode === "off" || mode === "final" ? mode : "streaming";
+		return mode === "off" || mode === "final" ? mode : SETTINGS_DEFAULTS.markdown.mermaid;
 	}
 
 	setMermaidRenderingMode(mode: MermaidRenderingMode): void {

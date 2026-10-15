@@ -11,7 +11,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SessionManager } from "../../../src/core/session-manager.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
-const disconnect = "stream error: stream disconnected before completion: stream closed before response.completed";
+// smarty-dev#11900: the exact Codex wording is covered by dedicated tests; this suite keeps generic retry policy coverage.
+const disconnect = "stream closed before response.completed";
 
 // smarty-dev#3200: an empty Responses stream must not terminate a task agent.
 describe("premature stream recovery", () => {

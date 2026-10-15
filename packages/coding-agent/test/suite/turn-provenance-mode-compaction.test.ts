@@ -2,10 +2,10 @@ import { fauxAssistantMessage } from "@earendil-works/pi-ai";
 import type { EditorComponent, Terminal } from "@earendil-works/pi-tui";
 import { afterEach, expect, it, vi } from "vitest";
 import { AgentSessionRuntime } from "../../src/core/agent-session-runtime.ts";
-import { getInputReceipt, promptReceived, type ReceivedInput } from "../../src/core/received-input.ts";
+import { getInputReceipt, promptReceived, type ReceivedInput, receiveInput } from "../../src/core/received-input.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import { getTurnProvenance } from "../../src/core/turn-provenance.ts";
-import { receiptRecord } from "../../src/core/turn-receipts.ts";
+import { captureKeyboardTurnReceipt, receiptRecord } from "../../src/core/turn-receipts.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../src/modes/interactive/theme/theme.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -132,6 +132,81 @@ it.each([false, true])(
 		expect(receipts).toEqual(admitted);
 	},
 );
+// pi#160 review (smarty-dev#2636): the queued path drops keyboard attribution exactly like the direct path.
+it("drops keyboard attribution from an attested input transformed after queueing during compaction", async () => {
+	let release!: () => void;
+	const held = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	let entered!: () => void;
+	const started = new Promise<void>((resolve) => {
+		entered = resolve;
+	});
+	const h = await createHarness({
+		persistSession: true,
+		settings: { compaction: { enabled: false, keepRecentTokens: 1 } },
+		extensionFactories: [
+			(pi) => {
+				pi.on("input", (event) =>
+					event.text === "hooked" ? { action: "transform", text: "rewritten by hook" } : undefined,
+				);
+				pi.on("session_before_compact", async (event) => {
+					entered();
+					await held;
+					return {
+						compaction: {
+							summary: "summary",
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+						},
+					};
+				});
+			},
+		],
+	});
+	const mode = modeFor(h);
+	await h.session.bindExtensions({});
+	h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+	await h.session.prompt("seed one");
+	await h.session.prompt("seed two");
+	const compacting = h.session.compact();
+	await started;
+	// Herdr-attested submits that arrive while compaction runs are staged in the compaction queue.
+	const at = new Date().toISOString();
+	const hooked = receiveInput("hooked", undefined, captureKeyboardTurnReceipt("paul", "a".repeat(32), at));
+	const typed = receiveInput("typed as is", undefined, captureKeyboardTurnReceipt("paul", "b".repeat(32), at));
+	mode.compactionQueuedMessages.push({ input: hooked, mode: "steer" }, { input: typed, mode: "followUp" });
+	const hookedBefore = receiptRecord(getInputReceipt(hooked));
+	const typedBefore = receiptRecord(getInputReceipt(typed));
+	expect(hookedBefore.channel).toBe("keyboard");
+	release();
+	await compacting;
+	h.setResponses([fauxAssistantMessage("three"), fauxAssistantMessage("four"), fauxAssistantMessage("five")]);
+	// The retry path routes every queued input through steer/followUp and _prepareQueuedInput.
+	await mode.flushCompactionQueue({ willRetry: true });
+	await h.session.prompt("resume");
+	await vi.waitFor(() => {
+		expect(mode.compactionQueueTransfers).toBe(0);
+		expect(h.session.isIdle).toBe(true);
+	});
+	const persisted = SessionManager.open(h.sessionManager.getSessionFile()!)
+		.getEntries()
+		.flatMap((entry) => (entry.type === "message" && entry.message.role === "user" ? [entry] : []));
+	const find = (turnId: string) => persisted.find((entry) => getTurnProvenance(entry)?.turnId === turnId);
+	const hookedEntry = find(hookedBefore.turnId);
+	expect(JSON.stringify(hookedEntry?.message)).toContain("rewritten by hook");
+	expect(getTurnProvenance(hookedEntry!)).toEqual({
+		v: 1,
+		turnId: hookedBefore.turnId,
+		receivedAt: at,
+		channel: "terminal",
+		submissionToken: "a".repeat(32),
+	});
+	const typedEntry = find(typedBefore.turnId);
+	expect(JSON.stringify(typedEntry?.message)).toContain("typed as is");
+	expect(getTurnProvenance(typedEntry!)).toEqual(typedBefore);
+	expect(getTurnProvenance(typedEntry!)).toMatchObject({ channel: "keyboard", principal: { id: "paul" } });
+});
 // pi#95: failed automatic transfers retain receipts; restoring a draft discards the occurrence.
 it("keeps a receipt after failed transfer but mints a fresh occurrence after editor restoration", async () => {
 	let release!: () => void;
