@@ -5,12 +5,18 @@ import {
 	JSON_RPC_ERROR_CODES,
 	type JsonRpcId,
 	type JsonRpcMessage,
+	McpAbortError,
 	McpConnectionClosedError,
 	parseJsonRpcMessage,
 	toError,
 } from "../protocol/jsonrpc.ts";
 import { refuseMcpAdmission } from "../security-admission.ts";
-import { DEFAULT_MAX_MESSAGE_BYTES, type McpTransport, TransportEvents } from "./transport.ts";
+import {
+	DEFAULT_MAX_MESSAGE_BYTES,
+	type McpTransport,
+	type McpTransportSendOptions,
+	TransportEvents,
+} from "./transport.ts";
 
 const MAX_ERROR_BODY_BYTES = 8 * 1024;
 const ERROR_MESSAGE_BODY_CHARS = 500;
@@ -224,12 +230,16 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		this.protocolVersion = version;
 	}
 
-	async send(message: JsonRpcMessage): Promise<void> {
+	async send(message: JsonRpcMessage, { signal }: McpTransportSendOptions = {}): Promise<void> {
 		if (!this.started || this.closed) throw new McpConnectionClosedError();
-		const response = await this.authorizedFetch("POST", {
-			headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
-			body: JSON.stringify(message),
-		});
+		const response = await this.authorizedFetch(
+			"POST",
+			{
+				headers: { accept: "application/json, text/event-stream", "content-type": "application/json" },
+				body: JSON.stringify(message),
+			},
+			signal,
+		);
 		await this.checkResponse(response);
 		this.captureSession(response);
 
@@ -261,33 +271,45 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 		if (this.closed) return;
 		this.closed = true;
 		this.controller.abort();
+		let redirectError: McpHttpError | undefined;
 		if (this.started && this.sessionIdValue) {
 			// Best effort: the session expires on the server anyway. The auth provider may refresh tokens
 			// over the network, so it is not asked here and closing never waits for a refresh.
 			try {
-				const response = await this.fetch(this.url, {
+				const response = await this.fetchEndpoint({
 					method: "DELETE",
 					headers: this.buildHeaders({}, this.lastToken),
 					signal: AbortSignal.timeout(1_000),
 				});
 				await discard(response);
-			} catch {}
+			} catch (error) {
+				// Network cleanup remains best effort. Redirect refusal must reach close() callers,
+				// including McpClient, which has already detached its transport error listeners.
+				if (error instanceof McpHttpError) redirectError = error;
+			}
 		}
 		this.emitClose();
+		if (redirectError) throw redirectError;
 	}
 
 	/**
 	 * Fetch with auth headers. A 401 (or a 403 asking for more scope) is handed to the auth provider
 	 * once, and the request is retried with whatever credentials it left behind.
+	 *
+	 * `signal` only stops dispatch: getting a token or the authorization recovery can take a while, and a
+	 * request its sender gave up on in the meantime must not reach the server. It does not abort the shared
+	 * recovery, which other requests may wait for.
 	 */
 	private async authorizedFetch(
 		method: "GET" | "POST",
 		init: { headers: Record<string, string>; body?: string },
+		signal?: AbortSignal,
 	): Promise<Response> {
 		const onUnauthorized = this.options.authProvider?.onUnauthorized?.bind(this.options.authProvider);
 		for (let attempt = 0; ; attempt++) {
 			const { headers, token } = await this.headers(init.headers);
-			const response = await this.fetch(this.url, {
+			if (signal?.aborted) throw new McpAbortError();
+			const response = await this.fetchEndpoint({
 				method,
 				headers,
 				body: init.body,
@@ -299,6 +321,35 @@ export class StreamableHttpTransport extends TransportEvents implements McpTrans
 			} finally {
 				await discard(response);
 			}
+		}
+	}
+
+	/** Never let fetch replay MCP credentials or request data to an unvalidated redirect target. */
+	private async fetchEndpoint(init: RequestInit): Promise<Response> {
+		let url = this.url;
+		for (let redirects = 0; ; redirects++) {
+			const response = await this.fetch(url, { ...init, redirect: "manual" });
+			if (response.status < 300 || response.status >= 400) return response;
+			await discard(response);
+			const location = response.headers.get("location");
+			let target: URL;
+			try {
+				if (!location) throw new Error("missing Location");
+				target = new URL(location, url);
+			} catch {
+				throw new McpHttpError(response.status, "MCP HTTP redirect has an invalid or missing Location");
+			}
+			if (target.origin !== this.url.origin) {
+				throw new McpHttpError(response.status, "MCP HTTP cross-origin redirect refused");
+			}
+			if (target.username || target.password) {
+				throw new McpHttpError(response.status, "MCP HTTP redirect URL credentials refused");
+			}
+			if (response.status !== 307 && response.status !== 308) {
+				throw new McpHttpError(response.status, "MCP HTTP redirect requires status 307 or 308");
+			}
+			if (redirects >= 1) throw new McpHttpError(response.status, "MCP HTTP redirect limit exceeded");
+			url = target;
 		}
 	}
 

@@ -90,6 +90,22 @@ describe("provider retry classification", () => {
 		).toBe(true);
 	});
 
+	// Regression for #10842: keep both OpenRouter and gateway provider-error wording.
+	it.each(["Provider returned error", "The upstream provider returned an error"])(
+		"matches provider wrapper failures: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+			expect(
+				isRetryableAssistantError(
+					fauxAssistantMessage("", {
+						stopReason: "error",
+						errorMessage: `insufficient_quota: ${errorMessage}`,
+					}),
+				),
+			).toBe(false);
+		},
+	);
+
 	it("matches upstream request buffer exhaustion wording", () => {
 		expect(
 			isRetryableAssistantError(
