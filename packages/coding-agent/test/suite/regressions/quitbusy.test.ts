@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { Agent } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, streamSimple } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
@@ -431,9 +432,12 @@ describe("operator exit and compaction settlement", () => {
 		expect(h.eventsOfType("message_start").some((event) => event.message === message)).toBe(true);
 		expect(h.eventsOfType("message_end").some((event) => event.message === message)).toBe(false);
 		expect(h.session.agent.getQueuedMessages()).toEqual([]);
-		expect(h.sessionManager.getEntries().some((entry) => entry.type === "message" && entry.message === message)).toBe(
-			false,
-		);
+		// pi#160 persists detached copies; compare durable payloads, not live message references.
+		expect(
+			h.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "message" && isDeepStrictEqual(entry.message, message)),
+		).toBe(false);
 		const services: AgentSessionServices = {
 			cwd: h.tempDir,
 			agentDir: h.tempDir,
@@ -672,7 +676,9 @@ describe("operator exit and compaction settlement", () => {
 		};
 		await h.session.prompt("active");
 		expect(
-			h.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message === message),
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message" && isDeepStrictEqual(entry.message, message)),
 		).toHaveLength(1);
 		const revisionBeforeExit = h.session.queuedInputRevision;
 		const release = h.session.prepareOperatorExit();
@@ -694,7 +700,9 @@ describe("operator exit and compaction settlement", () => {
 		h.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
 		await h.session.prompt("active");
 		expect(
-			h.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message === message),
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message" && isDeepStrictEqual(entry.message, message)),
 		).toHaveLength(1);
 		expect(h.session.agent.getQueuedMessages()).toEqual([]);
 		const release = h.session.prepareOperatorExit();
@@ -720,7 +728,9 @@ describe("operator exit and compaction settlement", () => {
 			h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
 			await h.session.agent.prompt("active");
 			expect(
-				h.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message === message),
+				h.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "message" && isDeepStrictEqual(entry.message, message)),
 			).toHaveLength(1);
 			h.session.agent[mode](message);
 			const unsubscribe = h.session.subscribe((event) => {
@@ -769,7 +779,7 @@ describe("operator exit and compaction settlement", () => {
 		if (timing === "deferred") h.session.agent[mode](original);
 		const direct = h.sessionManager
 			.getEntries()
-			.filter((entry) => entry.type === "message" && entry.message === original);
+			.filter((entry) => entry.type === "message" && isDeepStrictEqual(entry.message, original));
 		expect(direct).toHaveLength(timing === "inflight" ? 1 : 0);
 		const release = h.session.prepareOperatorExit();
 		release();
