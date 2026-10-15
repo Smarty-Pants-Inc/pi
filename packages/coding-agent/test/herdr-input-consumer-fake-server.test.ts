@@ -59,7 +59,11 @@ async function run(
 		host.kill("SIGKILL");
 		rmSync(dir, { recursive: true, force: true });
 	});
-	const type = (bytes: Buffer) => host.stdin.write(`${bytes.toString("hex")}\n`);
+	// A late typing timer can fire after the child exited: never let its EPIPE escape the test.
+	host.stdin.on("error", () => {});
+	const type = (bytes: Buffer) => {
+		if (host.stdin.writable && !host.stdin.destroyed) host.stdin.write(`${bytes.toString("hex")}\n`);
+	};
 	const lines = createInterface({ input: host.stdout });
 	let slave = "";
 	let childPid = 0;
@@ -102,10 +106,11 @@ async function run(
 					const answer = { epoch, nonce: randomBytes(32).toString("hex"), tty, peer };
 					reply(enrollResult(scenario.signWith, request.params.challenge, paneId, answer));
 					// The fake owns the master: it writes the real marker and types for "Paul".
-					setTimeout(() => {
+					const typing = setTimeout(() => {
 						type(Buffer.from("x"));
 						type(Buffer.concat([epochMarker(answer.nonce), Buffer.from("hi\r")]));
 					}, 50);
+					cleanup.push(() => clearTimeout(typing));
 				} else if (request.method === "pane.input_consumer.cut") {
 					cutRequests++;
 					const answer = cutResult(scenario.signWith, cutRequestOf(request.params), {
