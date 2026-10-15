@@ -325,6 +325,14 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 */
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 
+	/** Transform a complete partial snapshot before any event or nested onUpdate callback. Errors withhold it. */
+	transformToolUpdate?: (
+		toolCall: AgentToolCall,
+		args: unknown,
+		partialResult: AgentToolResult<unknown>,
+		signal?: AbortSignal,
+	) => Promise<AgentToolResult<unknown> | undefined>;
+
 	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and tool-result message events are emitted.
 	 *
