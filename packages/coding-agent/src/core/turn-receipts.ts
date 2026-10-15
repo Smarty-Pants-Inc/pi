@@ -19,6 +19,23 @@ export function captureTerminalTurnReceipt(): TurnReceipt {
 	return receipt;
 }
 
+/** Rehydrate a native outbox receipt from session storage, never from caller message fields. */
+export function restoreTerminalTurnReceipt(record: TurnProvenance): TurnReceipt {
+	if (
+		record.v !== 1 ||
+		record.channel !== "terminal" ||
+		typeof record.turnId !== "string" ||
+		typeof record.receivedAt !== "string"
+	)
+		throw new Error("Invalid retained terminal receipt");
+	const receipt = Object.freeze({}) as TurnReceipt;
+	records.set(
+		receipt,
+		Object.freeze({ v: 1, channel: "terminal", turnId: record.turnId, receivedAt: record.receivedAt }),
+	);
+	return receipt;
+}
+
 /** Issue another occurrence at an already trusted observation, never a caller-provided time. */
 export function captureSiblingTerminalTurnReceipt(observed: TurnReceipt): TurnReceipt {
 	const record = records.get(observed);

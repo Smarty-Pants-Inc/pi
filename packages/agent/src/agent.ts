@@ -438,7 +438,9 @@ export class Agent {
 	}
 
 	/** Snapshot every undelivered message in both queues, independent of delivery mode. */
-	getQueuedMessages(): AgentMessage[] {
+	getQueuedMessages(mode?: "steer" | "followUp"): AgentMessage[] {
+		if (mode === "steer") return this.steeringQueue.snapshot();
+		if (mode === "followUp") return this.followUpQueue.snapshot();
 		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()];
 	}
 

@@ -525,6 +525,9 @@ export class InteractiveMode {
 	private pendingUserInputs: ReceivedInput[] = [];
 	private readonly inputPlan: ModeInputPlan;
 	private userInputInFlight = false;
+	private inFlightUserInput?: ReceivedInput;
+	private operatorExitRequested = false;
+	private readonly compactionTransferInputs = new Set<CompactionQueuedMessage>();
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private activeWorkingIndicatorEmbedded = false;
@@ -1325,6 +1328,9 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
+		// Resume operator-exit input without waiting for another editor submission.
+		await this.session.resumeUnsentInputs();
+
 		// Process initial messages
 		if (this.inputPlan.initial) await this.submitStartupInput(this.inputPlan.initial);
 		for (const input of this.inputPlan.remaining) {
@@ -1340,6 +1346,7 @@ export class InteractiveMode {
 			const prompt = this.promptWithRecoveredImages(userInput);
 			// Original session preflight owns the input before TUI staging clears.
 			this.userInputInFlight = false;
+			this.inFlightUserInput = undefined;
 			this.stagingAudit?.("input-transferred");
 			await prompt;
 		} catch (error: unknown) {
@@ -2068,11 +2075,33 @@ export class InteractiveMode {
 			mode: "tui",
 			hasPendingInput: () =>
 				!this.terminalShutdownRequested &&
+				!this.operatorExitRequested &&
 				(this.session !== session ||
 					this.pendingUserInputs.length > 0 ||
 					this.userInputInFlight ||
 					this.compactionQueuedMessages.length > 0 ||
 					this.compactionQueueTransfers > 0),
+			getPendingInputs: () => [
+				...this.pendingUserInputs.map((input) => ({
+					input: this.prepareRecoveredInput(input).input,
+					mode: "steer" as const,
+				})),
+				...(this.inFlightUserInput ? [{ input: this.inFlightUserInput, mode: "steer" as const }] : []),
+				...this.compactionQueuedMessages.map((message) => ({
+					input: this.prepareRecoveredInput(message.input).input,
+					mode: message.mode,
+				})),
+				...[...this.compactionTransferInputs].map((message) => ({
+					input: this.prepareRecoveredInput(message.input).input,
+					mode: message.mode,
+				})),
+			],
+			clearPendingInputs: () => {
+				this.pendingUserInputs = [];
+				this.inFlightUserInput = undefined;
+				this.userInputInFlight = false;
+				this.compactionQueuedMessages = [];
+			},
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			},
@@ -4464,6 +4493,7 @@ export class InteractiveMode {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
 			this.userInputInFlight = true;
+			this.inFlightUserInput = queuedInput;
 			this.stagingAudit?.("input-dequeued");
 			return queuedInput;
 		}
@@ -4472,6 +4502,7 @@ export class InteractiveMode {
 			this.onInputCallback = (input: ReceivedInput) => {
 				this.onInputCallback = undefined;
 				this.userInputInFlight = true;
+				this.inFlightUserInput = input;
 				this.stagingAudit?.("input-delivered");
 				resolve(input);
 			};
@@ -4577,8 +4608,11 @@ export class InteractiveMode {
 					// the final frame while the process is exiting.
 					// Drain any in-flight Kitty key release events before stopping.
 					// This prevents escape sequences from leaking to the parent shell over slow SSH.
+					this.operatorExitRequested = true;
 					await this.runtimeHost.dispose({
+						operatorExit: true,
 						beforeShutdown: async () => {
+							while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
 							this.themeController.disableAutoSync();
 							await this.ui.terminal.drainInput(1000);
 							this.stop();
@@ -4609,6 +4643,7 @@ export class InteractiveMode {
 				if (!this.handleInputAdmissionError(error)) throw error;
 				// Admission refusal precedes terminal teardown: the old session remains usable.
 				this.isShuttingDown = false;
+				this.operatorExitRequested = false;
 				this.shutdownCompletion = undefined;
 			}
 		})();
@@ -5231,15 +5266,17 @@ export class InteractiveMode {
 	}
 
 	private async transferCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.compactionQueuedMessages.length === 0) {
+		if (this.operatorExitRequested || this.compactionQueuedMessages.length === 0) {
 			return;
 		}
 
 		const queuedMessages = [...this.compactionQueuedMessages];
+		for (const message of queuedMessages) this.compactionTransferInputs.add(message);
 		const session = this.session;
 		const pending = new Set(queuedMessages);
 		const restored = new Set<CompactionQueuedMessage>();
 		const restoreQueue = (error: unknown, failed = [...pending]) => {
+			if (this.operatorExitRequested) return; // The synchronous durable exit snapshot owns these occurrences.
 			const retained = failed.filter((message) => {
 				pending.delete(message);
 				if (restored.has(message)) return false;
@@ -5283,6 +5320,7 @@ export class InteractiveMode {
 							{
 								onInputTransferred: () => {
 									pending.delete(message);
+									this.compactionTransferInputs.delete(message);
 								},
 							},
 							session,
@@ -5341,6 +5379,7 @@ export class InteractiveMode {
 					streamingBehavior: firstPrompt.mode,
 					onInputTransferred: () => {
 						firstTransferred = true;
+						this.compactionTransferInputs.delete(firstPrompt);
 					},
 				},
 				session,
@@ -5384,6 +5423,7 @@ export class InteractiveMode {
 		} catch (error) {
 			restoreQueue(error);
 		} finally {
+			for (const message of queuedMessages) this.compactionTransferInputs.delete(message);
 			this.compactionQueueTransfers--;
 			this.stagingAudit?.("compaction-transfer-settled");
 			this.scheduleShutdownRecheck();
@@ -6321,7 +6361,10 @@ export class InteractiveMode {
 				status = "Resumed session in current cwd";
 				result = await resume(selectedCwd);
 			}
-			if (!result.cancelled) this.showStatus(status);
+			if (!result.cancelled) {
+				this.showStatus(status);
+				await this.session.resumeUnsentInputs();
+			}
 			return result;
 		} catch (error: unknown) {
 			if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };

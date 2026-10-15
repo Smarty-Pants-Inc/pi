@@ -182,7 +182,18 @@ import {
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.ts";
 import { createAllToolDefinitions } from "./tools/index.ts";
 import { createToolDefinitionFromAgentTool } from "./tools/tool-definition-wrapper.ts";
-import { captureTerminalTurnReceipt, type TurnReceipt } from "./turn-receipts.ts";
+import {
+	captureTerminalTurnReceipt,
+	receiptRecord,
+	restoreTerminalTurnReceipt,
+	type TurnReceipt,
+} from "./turn-receipts.ts";
+import {
+	getUnsentInputTransfer,
+	linkUnsentInputTransfer,
+	UNSENT_INPUT_TYPE,
+	type UnsentInput,
+} from "./unsent-input.ts";
 import { addUsageToTotals, combineUsage, createUsageTotals } from "./usage-totals.ts";
 import { type UserMessageAdmission, UserMessageIngress } from "./user-message-ingress.ts";
 import {
@@ -386,6 +397,10 @@ export interface AgentSessionConfig {
 export interface ExtensionBindings {
 	/** Mode-owned submitted input awaiting transfer, not unsent editor drafts. */
 	hasPendingInput?: () => boolean;
+	/** Submitted mode input still awaiting native handoff. Snapshot without consuming. */
+	getPendingInputs?: () => ReadonlyArray<{ input: ReceivedInput; mode: "steer" | "followUp" }>;
+	/** Called only after the complete operator-exit snapshot has been saved. */
+	clearPendingInputs?: () => void;
 	uiContext?: ExtensionUIContext;
 	mode?: ExtensionMode;
 	commandContextActions?: ExtensionCommandContextActions;
@@ -489,6 +504,9 @@ interface InputFenceScope {
 }
 
 interface InputAdmission {
+	/** Recoverable content until actual queue/run transfer or handling. */
+	input?: UnsentInput;
+	receipt?: TurnReceipt;
 	controller: AbortController;
 	/** Own cancellation combined with inherited dispatch revocation. */
 	signal: AbortSignal;
@@ -527,6 +545,13 @@ export class AgentSession {
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	#ordinaryPreflights = 0;
 	#pendingModeInput?: () => boolean;
+	#getPendingModeInputs?: ExtensionBindings["getPendingInputs"];
+	#clearPendingModeInputs?: () => void;
+	private readonly _unpersistedInputs = new Map<AgentMessage, UnsentInput>();
+	private readonly _persistedInputReceipts = new WeakSet<TurnReceipt>();
+	private readonly _replayedInputs = new WeakMap<AgentMessage, UnsentInput>();
+	private _hasResumedInputs = false;
+	private _operatorExitPrepared = false;
 	readonly capabilities = HOST_CAPABILITIES;
 	private readonly _inputAdmissions = new Set<InputAdmission>();
 	private readonly _inputAdmissionScope = new AsyncLocalStorage<InputAdmission>();
@@ -582,6 +607,8 @@ export class AgentSession {
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
+	/** Public completion callbacks still belong to the encompassing compaction turn. */
+	private _completingCompaction?: AbortController;
 	private _stopAfterCompactionFailure = false;
 	/** Settlement outcome of the compaction that stopped the run; a later synthetic turn_end cannot replace it. */
 	private _compactionStopOutcome: AgentActivityOutcome | undefined;
@@ -755,6 +782,7 @@ export class AgentSession {
 		});
 		if (this._initialActiveToolNames === undefined) this._restoreToolsFromTranscript();
 		this.#ordinaryOwner?.bindSessionAdmission(this, (recheck, enroll) => this.#requestOrdinaryWake(recheck, enroll));
+		this._restoreUnsentInputs();
 		this.#auditState("session_attached");
 	}
 
@@ -1731,8 +1759,10 @@ export class AgentSession {
 			if (submission && event.message.role !== "user") {
 				submission.reject(new Error("User message was replaced without persisting a user entry"));
 			}
-			const metadata = event.message.role === "user" ? submission?.metadata : undefined;
-			const metadataSource = metadata === undefined ? undefined : submission?.metadataSource;
+			const replay = this._replayedInputs.get(event.message);
+			const metadata = event.message.role === "user" ? (submission?.metadata ?? replay?.metadata) : undefined;
+			const metadataSource =
+				metadata === undefined ? undefined : (submission?.metadataSource ?? replay?.metadataSource);
 			// Check if this is a custom message from extensions
 			if (event.message.role === "custom") {
 				// Persist as CustomMessageEntry
@@ -1796,7 +1826,11 @@ export class AgentSession {
 					this._retainTerminalPublicationFailure(error);
 				}
 			}
-			if (entryId) this._entryIdsByMessage.set(event.message, entryId);
+			if (entryId) {
+				this._entryIdsByMessage.set(event.message, entryId);
+				this._unpersistedInputs.delete(event.message);
+				if (receipt) this._persistedInputReceipts.add(receipt);
+			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			if (event.message.role === "assistant") {
@@ -2855,6 +2889,7 @@ export class AgentSession {
 		this._ingressQueuedMessages.clear();
 		const cancelled = new InputAdmissionError("INPUT_ADMISSION_ABORTED", "queued ingress was cancelled");
 		for (const message of messages) {
+			this._unpersistedInputs.delete(message);
 			this._userMessageSubmissions.get(message)?.reject(cancelled);
 			this._userMessageSubmissions.delete(message);
 		}
@@ -2892,12 +2927,125 @@ export class AgentSession {
 			this._followUpMessages.length > 0 ||
 			this._triggeredBehindPreflight.length > 0 ||
 			this._modelSwitchDispatches.size > 0 ||
-			this._deferredSettledActions.length > 0
+			this._deferredSettledActions.length > 0 ||
+			this._pendingNextTurnMessages.length > 0 ||
+			this._pendingCustomMessages.length > 0
 		)
 			throw new InputAdmissionError(
 				"INPUT_ADMISSION_BUSY",
 				"settle admitted input or recover queued input before replacement/disposal",
 			);
+	}
+
+	private _restoreUnsentInputs(): void {
+		const entries = this.sessionManager.getEntries();
+		const consumed = new Set(entries.flatMap((entry) => (entry.unsentInputId ? [entry.unsentInputId] : [])));
+		for (const entry of this.sessionManager.getBranch()) {
+			if (entry.type !== "custom" || entry.customType !== UNSENT_INPUT_TYPE || consumed.has(entry.id)) continue;
+			const input = entry.data as UnsentInput | undefined;
+			if (!input?.message || !["steer", "followUp", "nextTurn", "context"].includes(input.mode))
+				throw new Error(`Invalid unsent input entry ${entry.id}`);
+			const message = structuredClone(input.message);
+			const receipt = input.provenance ? restoreTerminalTurnReceipt(input.provenance) : captureTerminalTurnReceipt();
+			linkUnsentInputTransfer(receipt, entry.id);
+			this.#receivedMessageReceipts.set(message, receipt);
+			this._replayedInputs.set(message, input);
+			this._unpersistedInputs.set(message, { ...input, message });
+			if (message.role === "custom" && input.mode === "nextTurn") this._pendingNextTurnMessages.push(message);
+			else if (message.role === "custom" && input.mode === "context") this._pendingCustomMessages.push(message);
+			else {
+				if (input.mode === "followUp") this.agent.followUp(message);
+				else this.agent.steer(message);
+				if (message.role === "user") {
+					const text = contentText(message.content, "");
+					if (input.mode === "followUp") this._followUpMessages.push(text);
+					else this._steeringMessages.push(text);
+				}
+			}
+			this._hasResumedInputs = true;
+		}
+	}
+
+	/** Replay operator-exit input after the host has bound extensions and published the session. */
+	async resumeUnsentInputs(): Promise<void> {
+		if (!this._hasResumedInputs) return;
+		this._checkInputAdmission();
+		if (!this.isIdle || this.isSettling)
+			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "resume requires an idle session");
+		this._hasResumedInputs = false;
+		if (this.#ordinaryOwner) await this._flushPendingCustomMessagesOwnedTerminal();
+		else this._flushPendingCustomMessages();
+		const first = this.agent.getQueuedMessages()[0];
+		if (first) this.agent.removeQueuedMessages((message) => message === first);
+		const messages = [...(first ? [first] : []), ...this._pendingNextTurnMessages.splice(0)];
+		if (messages.length) await this._runAgentPrompt(messages);
+	}
+
+	/**
+	 * Explicit operator exit only: fence and save every unsent occurrence before cancellation.
+	 * A save failure leaves the input and active operation owned by this session.
+	 */
+	prepareOperatorExit(): () => void {
+		if (this._inputsDisposed)
+			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "operator exit session is disposed");
+		const release = this.gateInputs();
+		try {
+			const pending: Array<{ input: UnsentInput; receipt?: TurnReceipt }> = [];
+			const seen = new Set<object>();
+			const retain = (input: UnsentInput, receipt?: TurnReceipt) => {
+				const identity = receipt ?? input.message;
+				if (seen.has(identity) || (receipt && this._persistedInputReceipts.has(receipt))) return;
+				seen.add(identity);
+				pending.push({ input: { ...input, ...(receipt ? { provenance: receiptRecord(receipt) } : {}) }, receipt });
+			};
+			for (const input of this._unpersistedInputs.values()) {
+				const submission = this._userMessageSubmissions.get(input.message);
+				retain(
+					{
+						...input,
+						...(submission ? { metadata: submission.metadata, metadataSource: submission.metadataSource } : {}),
+					},
+					this.#receivedMessageReceipts.get(input.message),
+				);
+			}
+			for (const mode of ["steer", "followUp"] as const) {
+				for (const message of this.agent.getQueuedMessages(mode))
+					retain({ message, mode }, this.#receivedMessageReceipts.get(message));
+			}
+			for (const admission of this._inputAdmissions) if (admission.input) retain(admission.input, admission.receipt);
+			for (const { input, mode } of this.#getPendingModeInputs?.() ?? [])
+				retain(
+					{
+						message: {
+							role: "user",
+							content: [{ type: "text", text: input.text }, ...(input.images ?? [])],
+							timestamp: Date.now(),
+						},
+						mode,
+					},
+					getInputReceipt(input),
+				);
+			if (pending.length && !this.sessionManager.isPersisted())
+				throw new InputAdmissionError(
+					"INPUT_ADMISSION_BUSY",
+					"operator exit requires persistent storage for unsent input",
+				);
+			for (const { input, receipt } of pending) {
+				if (getUnsentInputTransfer(receipt)) continue; // Already durable from an earlier exit; not yet consumed.
+				const id = this.sessionManager.appendCustomEntry(UNSENT_INPUT_TYPE, structuredClone(input));
+				if (receipt) linkUnsentInputTransfer(receipt, id);
+			}
+			this._operatorExitPrepared = true;
+			this.#clearPendingModeInputs?.();
+			this._pendingNextTurnMessages = [];
+			this._pendingCustomMessages = [];
+			this._unpersistedInputs.clear();
+			this.clearQueue();
+			return release;
+		} catch (error) {
+			release();
+			throw error;
+		}
 	}
 
 	/**
@@ -2913,6 +3061,7 @@ export class AgentSession {
 		const fence = {};
 		this._inputFence = fence;
 		try {
+			if (!options?.rejectQueuedInput) this._assertInputsDrained();
 			// Held ingress is cancelled with a session_changed receipt, never counted as busy input,
 			// before abort or lifecycle hooks can yield. Other held input keeps #163 semantics.
 			this._invalidateUserMessageIngress("session_changed");
@@ -3123,6 +3272,15 @@ export class AgentSession {
 	): Promise<void> {
 		this._shutdownCancellation.signal.throwIfAborted();
 		const admission = this._admitInput();
+		admission.input = {
+			message: {
+				role: "user",
+				content: [{ type: "text", text }, ...(options?.images ?? [])],
+				timestamp: Date.now(),
+			},
+			mode: options?.streamingBehavior ?? "steer",
+		};
+		admission.receipt = receipt;
 		await this._withInputAdmission(admission, () => this._promptInAdmission(text, options, admission, receipt));
 	}
 
@@ -3279,6 +3437,12 @@ export class AgentSession {
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
 
+			if (admission?.input)
+				admission.input.message = {
+					role: "user",
+					content: [{ type: "text", text: expandedText }, ...(currentImages ?? [])],
+					timestamp: Date.now(),
+				};
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
 			while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
@@ -3384,6 +3548,11 @@ export class AgentSession {
 			userContent.push(...normalized.images);
 			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
 			this.#receivedMessageReceipts.set(userMessage, receipt);
+			this._unpersistedInputs.set(userMessage, {
+				message: userMessage,
+				mode: options?.streamingBehavior ?? "steer",
+			});
+			if (admission) admission.input = undefined;
 			if (submission) {
 				submission.message = userMessage;
 				this._userMessageSubmissions.set(userMessage, submission);
@@ -3463,7 +3632,7 @@ export class AgentSession {
 	 * assistant message: the messages are the run's input, as they would have been without the wait.
 	 */
 	private _runTriggeredBehindPreflight(): void {
-		if (this._shutdownCancellation.signal.aborted) return;
+		if (this._shutdownCancellation.signal.aborted || this._operatorExitPrepared) return;
 		// Keep ownership here while a switch is pending: its compaction caller discards
 		// the usual continuation decision, so moving these into agent queues would strand them.
 		if (
@@ -3497,7 +3666,7 @@ export class AgentSession {
 	 * next prompt.
 	 */
 	private _runInputQueuedBehindPreflight(): void {
-		if (this._shutdownCancellation.signal.aborted) return;
+		if (this._shutdownCancellation.signal.aborted || this._operatorExitPrepared) return;
 		if (
 			this._modelSwitchCompactionPending ||
 			!this._inputQueuedBehindPreflight ||
@@ -3598,6 +3767,11 @@ export class AgentSession {
 		receipt: TurnReceipt,
 	): Promise<QueuedInputDisposition> {
 		const admission = this._admitInput();
+		admission.input = {
+			message: { role: "user", content: [{ type: "text", text }, ...(images ?? [])], timestamp: Date.now() },
+			mode: behavior,
+		};
+		admission.receipt = receipt;
 		return await this._withInputAdmission(admission, () =>
 			this._queueAdmittedInput(text, images, behavior, source, receipt),
 		);
@@ -3713,8 +3887,11 @@ export class AgentSession {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
 		}
+		this._unpersistedInputs.set(message, { message, mode: "steer" });
+		const admission = this._inputAdmissionScope.getStore();
+		if (admission) admission.input = undefined;
 		this.agent.steer(message);
-		this._inputAdmissionScope.getStore()?.release();
+		admission?.release();
 		this._emitQueueUpdate();
 	}
 
@@ -3741,6 +3918,9 @@ export class AgentSession {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
 		}
+		this._unpersistedInputs.set(message, { message, mode: "followUp" });
+		const admission = this._inputAdmissionScope.getStore();
+		if (admission) admission.input = undefined;
 		if (ingress) {
 			this.agent.followUp(message, () => {
 				// Native insertion owns the message now. Commit tracking and the queued receipt
@@ -3802,7 +3982,21 @@ export class AgentSession {
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		this.#receivedMessageReceipts.set(appMessage, receipt);
-		return this._deliverCustomMessage(appMessage, options);
+		this._unpersistedInputs.set(appMessage, {
+			message: appMessage,
+			mode:
+				options?.deliverAs === "nextTurn"
+					? "nextTurn"
+					: options?.triggerTurn === false
+						? "context"
+						: (options?.deliverAs ?? (options?.triggerTurn ? "steer" : "context")),
+		});
+		try {
+			return await this._deliverCustomMessage(appMessage, options);
+		} catch (error) {
+			if (!this._operatorExitPrepared) this._unpersistedInputs.delete(appMessage);
+			throw error;
+		}
 	}
 
 	private async _deliverCustomMessage(
@@ -3943,6 +4137,9 @@ export class AgentSession {
 			appMessage.details,
 			this.#receivedMessageReceipts.get(appMessage),
 		);
+		const receipt = this.#receivedMessageReceipts.get(appMessage);
+		if (receipt) this._persistedInputReceipts.add(receipt);
+		this._unpersistedInputs.delete(appMessage);
 		this.#receivedMessageReceipts.delete(appMessage);
 		this._recordMessageEntryId(appMessage, entryId);
 		this._entryIdsByMessage.set(appMessage, entryId);
@@ -3974,6 +4171,9 @@ export class AgentSession {
 					message.details,
 					this.#receivedMessageReceipts.get(message),
 				);
+				const receipt = this.#receivedMessageReceipts.get(message);
+				if (receipt) this._persistedInputReceipts.add(receipt);
+				this._unpersistedInputs.delete(message);
 				this.#receivedMessageReceipts.delete(message);
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
@@ -4147,6 +4347,12 @@ export class AgentSession {
 
 			// The admitted envelope keeps the caller's receipt (received-input semantics).
 			const input = receiveInput(text, images, receipt);
+			admission.input = {
+				message: { role: "user", content: [{ type: "text", text }, ...(images ?? [])], timestamp: Date.now() },
+				mode: options?.deliverAs ?? "steer",
+				...(metadata ? { metadata, metadataSource } : {}),
+			};
+			admission.receipt = receipt;
 			await this._promptInAdmission(
 				input.text,
 				{
@@ -4207,6 +4413,12 @@ export class AgentSession {
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
+		for (const message of [
+			...this.agent.getQueuedMessages(),
+			...this._triggeredBehindPreflight.map(({ message }) => message),
+			...this._modelSwitchDispatches.keys(),
+		])
+			this._unpersistedInputs.delete(message);
 		this._triggeredBehindPreflight.splice(0);
 		this._modelSwitchDispatches.clear();
 		this._ingressQueuedMessages.clear();
@@ -4945,6 +5157,7 @@ export class AgentSession {
 			// Manual listeners may submit queued prompts. The selected operation's
 			// separate owner fence remains active through all completion hooks.
 			clearTimeout(timeout);
+			this._completingCompaction = controller;
 			clearManualState();
 			this._emit({
 				type: "compaction_end",
@@ -5021,6 +5234,7 @@ export class AgentSession {
 		} finally {
 			clearTimeout(timeout);
 			clearManualState();
+			if (this._completingCompaction === controller) this._completingCompaction = undefined;
 		}
 	}
 
@@ -5079,8 +5293,19 @@ export class AgentSession {
 	 * Cancel in-progress compaction (manual or auto).
 	 */
 	abortCompaction(): void {
+		const active =
+			this._compactionAbortController ||
+			this._autoCompactionAbortController ||
+			this._completingCompaction ||
+			this._compactionHooks.size > 0;
+		if (active && this._isAgentRunActive) {
+			this._agentRunAbortRequested = true;
+			this._compactionStopOutcome = "aborted";
+			this.#originalAgent.abort();
+		}
 		this._compactionAbortController?.abort();
 		this._autoCompactionAbortController?.abort();
+		this._completingCompaction?.abort();
 		for (const hook of this._compactionHooks) hook.abort();
 	}
 
@@ -5382,8 +5607,10 @@ export class AgentSession {
 				details,
 			};
 			clearTimeout(timeout);
+			this._completingCompaction = controller;
 			if (this._autoCompactionAbortController === controller) this._autoCompactionAbortController = undefined;
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			if (signal.aborted) return "aborted";
 
 			if (willRetry) return true;
 
@@ -5418,6 +5645,7 @@ export class AgentSession {
 		} finally {
 			clearTimeout(timeout);
 			if (this._autoCompactionAbortController === controller) this._autoCompactionAbortController = undefined;
+			if (this._completingCompaction === controller) this._completingCompaction = undefined;
 			this.#auditState("auto_compaction_settled");
 			this._resolveIdleWaitIfIdle();
 		}
@@ -5484,6 +5712,8 @@ export class AgentSession {
 		this._shutdownCancellation.signal.throwIfAborted();
 		this.#ordinaryOwner?.assertSessionStart(this);
 		if (bindings.hasPendingInput !== undefined) this.#pendingModeInput = bindings.hasPendingInput;
+		if (bindings.getPendingInputs !== undefined) this.#getPendingModeInputs = bindings.getPendingInputs;
+		if (bindings.clearPendingInputs !== undefined) this.#clearPendingModeInputs = bindings.clearPendingInputs;
 		if (bindings.uiContext !== undefined) {
 			this._extensionUIContext = bindings.uiContext;
 		}

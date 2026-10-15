@@ -2315,6 +2315,7 @@ describe("native input admission v1", () => {
 			options?: PromptOptions,
 		) => Promise<void>;
 		return {
+			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
 			prepareRecoveredInput: Reflect.get(InteractiveMode.prototype, "prepareRecoveredInput") as (
 				input: ReceivedInput,

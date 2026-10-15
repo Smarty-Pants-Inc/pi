@@ -62,6 +62,7 @@ import {
 import { bindSessionTurnAppender } from "./session-turn-appender.ts";
 import type { TurnProvenance } from "./turn-provenance.ts";
 import { receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
+import { getUnsentInputTransfer, UNSENT_INPUT_TYPE } from "./unsent-input.ts";
 import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-message-metadata.ts";
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
@@ -144,6 +145,8 @@ export interface NewSessionOptions {
 }
 
 export interface SessionEntryBase {
+	/** Unsent entry consumed by this actual persisted message transfer. */
+	unsentInputId?: string;
 	type: string;
 	id: string;
 	parentId: string | null;
@@ -1520,7 +1523,9 @@ export class SessionManager {
 	 */
 	private _hasConversation(): boolean {
 		return this.fileEntries.some(
-			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+			(e) =>
+				(e.type === "message" && (e.message.role === "user" || e.message.role === "assistant")) ||
+				(e.type === "custom" && e.customType === UNSENT_INPUT_TYPE),
 		);
 	}
 
@@ -1599,6 +1604,7 @@ export class SessionManager {
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
 				message,
+				...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
 				...(provenance ? { provenance } : {}),
 				...(message.role === "user" && metadata !== undefined ? { metadata, metadataSource } : {}),
 			};
@@ -1628,6 +1634,7 @@ export class SessionManager {
 				display,
 				details,
 				provenance,
+				...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
 				id: generateId(this.byId),
 				parentId: this.leafId,
 				timestamp: new Date().toISOString(),
@@ -1768,6 +1775,7 @@ export class SessionManager {
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
+			...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
 			...(provenance ? { provenance } : {}),
 			...(message.role === "user" && metadata !== undefined ? { metadata, metadataSource } : {}),
 		};
@@ -1922,6 +1930,7 @@ export class SessionManager {
 			display,
 			details,
 			provenance: receiptRecord(receipt),
+			...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
