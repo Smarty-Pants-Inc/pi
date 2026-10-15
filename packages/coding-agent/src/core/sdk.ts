@@ -259,7 +259,6 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath, settingsManager }));
-	modelRuntime.addModelPolicy(settingsManager);
 	const sessionManager = suppliedManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
@@ -272,6 +271,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	// The session manager is read before the model runtime, so an ownership refusal never touches the runtime.
+	modelRuntime.addModelPolicy(settingsManager);
 
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
