@@ -9,6 +9,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { type ModelPolicyTarget, modelPolicyAllows } from "./model-policy.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 import type {
 	CacheWarmingMode,
@@ -272,6 +273,7 @@ export class SettingsManager {
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings;
+	private modelPolicyOverrides: unknown[] = [];
 	private projectTrusted: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -372,11 +374,18 @@ export class SettingsManager {
 			return undefined;
 		});
 
-		if (!content) {
+		// Only a missing file means "no settings". An existing empty file fails to parse like any other
+		// unreadable file, so a model policy can never be bypassed by truncating it.
+		if (content === undefined) {
 			return {};
 		}
-		const settings = JSON.parse(stripBom(content));
-		return SettingsManager.migrateSettings(settings);
+		const settings: unknown = JSON.parse(stripBom(content));
+		// Settings are a JSON object. Any other root (array, null, number, string) is a load error, so a
+		// model policy can never be bypassed by replacing the file's contents with valid non-object JSON.
+		if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+			throw new Error("settings file root must be a JSON object");
+		}
+		return SettingsManager.migrateSettings(settings as Record<string, unknown>);
 	}
 
 	private static tryLoadFromStorage(
@@ -523,8 +532,9 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
-	/** Apply additional overrides on top of current settings */
+	/** Apply additional overrides on top of current settings. Model policy overrides can only narrow. */
 	applyOverrides(overrides: Partial<Settings>): void {
+		if (overrides.modelPolicy !== undefined) this.modelPolicyOverrides.push(structuredClone(overrides.modelPolicy));
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
@@ -1326,6 +1336,17 @@ export class SettingsManager {
 
 	getEnabledModels(): string[] | undefined {
 		return this.settings.enabledModels;
+	}
+
+	/** Match each settings layer independently: project settings cannot widen the global policy. */
+	isModelAllowed(model: ModelPolicyTarget): boolean {
+		// A settings file that failed to parse may hold a policy we can't read: deny rather than run unrestricted.
+		if (this.globalSettingsLoadError || this.projectSettingsLoadError) return false;
+		return (
+			modelPolicyAllows(this.globalSettings.modelPolicy, model) &&
+			modelPolicyAllows(this.projectSettings.modelPolicy, model) &&
+			this.modelPolicyOverrides.every((policy) => modelPolicyAllows(policy, model))
+		);
 	}
 
 	/** The resolved `defaultTools` selection, or undefined when no settings layer sets it. */

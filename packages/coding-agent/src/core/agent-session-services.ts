@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { Model } from "@earendil-works/pi-ai";
+import { type Model, registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { resolvePath } from "../utils/paths.ts";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.ts";
@@ -88,6 +88,9 @@ export interface AgentSessionServices {
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
+// Services have no standalone teardown; their receiving session owns policy cleanup.
+const serviceModelPolicyDisposers = new WeakMap<AgentSessionServices, () => void>();
+
 function applyExtensionFlagValues(
 	resourceLoader: ResourceLoader,
 	extensionFlagValues: Map<string, boolean | string> | undefined,
@@ -160,7 +163,9 @@ export async function createAgentSessionServices(
 	}
 	const cwd = resolvePath(options.cwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
+	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelOptions = {
+		settingsManager,
 		authPath: join(agentDir, "auth.json"),
 		modelsPath: join(agentDir, "models.json"),
 		signal: options.modelRuntimeSignal,
@@ -172,7 +177,7 @@ export async function createAgentSessionServices(
 		options.modelRuntime ??
 		(await ModelRuntime.create(owner ? bindOrdinaryOptions(modelOptions, owner) : modelOptions));
 	owner?.assertActive();
-	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const disposeModelPolicy = modelRuntime.addModelPolicy(settingsManager);
 	const resourceLoader = owner
 		? await owner.within(() => createOrdinaryResourceLoader(owner))
 		: new DefaultResourceLoader({ ...(options.resourceLoaderOptions ?? {}), cwd, agentDir, settingsManager });
@@ -227,6 +232,7 @@ export async function createAgentSessionServices(
 		resourceLoader,
 		diagnostics,
 	};
+	serviceModelPolicyDisposers.set(services, disposeModelPolicy);
 	owner?.bindServices(services);
 	return services;
 }
@@ -262,5 +268,12 @@ export async function createAgentSessionFromServices(
 		customTools: options.customTools,
 		sessionStartEvent: options.sessionStartEvent,
 	};
-	return createAgentSession(owner ? bindOrdinaryOptions(sessionOptions, owner) : sessionOptions);
+	const result = await createAgentSession(owner ? bindOrdinaryOptions(sessionOptions, owner) : sessionOptions);
+	const unregisterPolicyCleanup = registerSessionResourceCleanup((sessionId) => {
+		if (sessionId !== result.session.sessionId || !result.session.isDisposed) return;
+		serviceModelPolicyDisposers.get(services)?.();
+		serviceModelPolicyDisposers.delete(services);
+		unregisterPolicyCleanup();
+	});
+	return result;
 }

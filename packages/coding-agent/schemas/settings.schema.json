@@ -460,6 +460,22 @@
       },
       "description": "Model patterns for cycling, in the same format as the --models CLI flag."
     },
+    "modelPolicy": {
+      "type": "object",
+      "required": [
+        "allow"
+      ],
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Case-insensitive provider/model globs. Only * is special; an empty list denies all models."
+        }
+      },
+      "description": "Every configured settings layer must allow the requested provider/model."
+    },
     "defaultTools": {
       "type": "array",
       "items": {
