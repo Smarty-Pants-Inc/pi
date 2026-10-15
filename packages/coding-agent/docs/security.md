@@ -83,7 +83,7 @@ Use `--approve` or `--no-approve` when an automated run needs an explicit one-ti
 
 ## Codemode and MCP availability
 
-This fork refuses Codemode and MCP execution and configuration mutations until their security boundaries have been reviewed. See [Codemode and MCP reviewed re-enable](security-reenable.md) for the affected entry points, refusal diagnostics, and requirements for re-enabling them.
+Codemode is re-enabled after the pi#203 internal repairs, with finite host deadlines, bridge budgets, an owned output directory, and host store quotas. Its tool is registered inactive and nested calls still use the normal tool policy. MCP execution and configuration mutations remain refused pending their own reviewed re-enable. See [Codemode and MCP reviewed re-enable](security-reenable.md) for the affected entry points and remaining requirements.
 
 ## Reduce impact and improve recovery
 
