@@ -282,10 +282,13 @@ describe("owned fork committed selection", () => {
 		manager.appendLabelChange(root, "old");
 		manager.appendLabelChange(root, "resolved");
 		const before = storage.read();
-		const indexed = (Reflect.get(manager, "byId") as Map<string, SessionEntry>).get(selected)!;
+		const byId = Reflect.get(manager, "byId") as Map<string, SessionEntry>;
+		const indexed = byId.get(selected)!;
 		if (indexed.type !== "message") throw new Error("fixture message required");
 		Reflect.set(indexed.message, "content", "forged payload");
-		indexed.parentId = null;
+		// pi#160: canonical entries are frozen; forge the public index with a reparented shallow copy.
+		byId.set(selected, { ...indexed, parentId: null });
+		expect(byId.get(selected)).toMatchObject({ parentId: null, message: { content: "forged payload" } });
 		(Reflect.get(manager, "labelsById") as Map<string, string>).set(root, "forged label");
 		const read = vi.spyOn(storage, "read");
 		const childStorage = childJournal();

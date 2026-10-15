@@ -14,6 +14,7 @@ import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
 import { InputAdmissionError } from "../../src/core/input-admission.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
 import { type ReceivedInput, receiveInput } from "../../src/core/received-input.ts";
+import type { TurnReceipt } from "../../src/core/turn-receipts.ts";
 import { InteractiveMode } from "../../src/modes/interactive/interactive-mode.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
@@ -2309,6 +2310,10 @@ describe("native input admission v1", () => {
 		const checkShutdownRequested = Reflect.get(InteractiveMode.prototype, "checkShutdownRequested") as (
 			this: unknown,
 		) => Promise<void>;
+		const captureHerdrSubmit = Reflect.get(InteractiveMode.prototype, "captureHerdrSubmit") as (
+			this: unknown,
+			text: string,
+		) => Promise<TurnReceipt> | undefined;
 		const promptWithRecoveredImages = Reflect.get(InteractiveMode.prototype, "promptWithRecoveredImages") as (
 			this: unknown,
 			input: ReceivedInput,
@@ -2346,6 +2351,11 @@ describe("native input admission v1", () => {
 			},
 			checkShutdownRequested() {
 				return checkShutdownRequested.call(this);
+			},
+			// pi#160: the submit handler asks for a Herdr receipt; this mode has no Herdr enrollment.
+			options: {},
+			captureHerdrSubmit(text: string) {
+				return captureHerdrSubmit.call(this, text);
 			},
 			pendingUserInputs: [] as ReceivedInput[],
 			showError: vi.fn(),
