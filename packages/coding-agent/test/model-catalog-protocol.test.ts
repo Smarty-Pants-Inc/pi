@@ -109,6 +109,7 @@ describe("model catalog protocol with the current client", () => {
 
 	it("negotiates the catalog for its version and reaches the OpenRouter API", async () => {
 		allowNetwork();
+		vi.stubEnv("PI_REMOTE_CATALOG", "1");
 		const runtime = await ModelRuntime.create({
 			credentials: new InMemoryCredentialStore(),
 			modelsPath: null,

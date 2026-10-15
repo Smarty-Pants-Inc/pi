@@ -11,6 +11,7 @@ export default defineConfig({
 		// timed out green PRs out of the merge queue (smarty-dev#9281). A hang still fails within 30 s.
 		testTimeout: 30_000,
 		hookTimeout: 30_000,
+		setupFiles: ["./test/setup-document-retention.ts"],
 	},
 	resolve: {
 		conditions: ["source"],

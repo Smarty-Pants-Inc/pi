@@ -135,7 +135,7 @@ import {
 	type UserMessageReceipt,
 	wrapRegisteredTools,
 } from "./extensions/index.ts";
-import { emitSessionShutdownEvent } from "./extensions/runner.ts";
+import { type BeforeAgentStartTrigger, emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { HOST_CAPABILITIES } from "./host-capabilities.ts";
 import { InputAdmissionError } from "./input-admission.ts";
 import { createToolNameMatcher, isMcpToolName } from "./mcp-servers.ts";
@@ -1653,6 +1653,8 @@ export class AgentSession {
 			for (const update of held) await this._dispatchAgentEvent(update);
 		}
 
+		// agent_start is awaited before the first request, including reentrant aborts at transfer.
+		if (event.type === "agent_start" && this._agentRunAbortRequested) this.agent.abort();
 		// Record the calls a tool made through ctx.executeTool() and their usage on its result message.
 		if (this._nestedToolCalls) {
 			if (event.type === "message_start" && event.message.role === "toolResult") {
@@ -2187,6 +2189,7 @@ export class AgentSession {
 			exposure: this._getToolExposure(definition.name),
 			...(definition.namespace ? { namespace: definition.namespace } : {}),
 			...(definition.annotations ? { annotations: { ...definition.annotations } } : {}),
+			...(definition.reachesTools ? { reachesTools: definition.reachesTools } : {}),
 			sourceInfo,
 		}));
 	}
@@ -2553,12 +2556,83 @@ export class AgentSession {
 	// Prompting
 	// =========================================================================
 
+	/** Prepare user/custom triggers under their own admission, then use the guarded native dispatcher. */
+	private async _startRun(
+		trigger: BeforeAgentStartTrigger,
+		options: {
+			promptToken?: object;
+			admission?: InputAdmission;
+			receipt?: TurnReceipt;
+			submission?: UserMessageSubmission;
+			additionalMessages?: CustomMessage[];
+			beforeDispatch?: () => void;
+			onInputTransferred?: () => void;
+		} = {},
+	): Promise<void> {
+		// A nested custom dispatch never transfers the user admission it inherited.
+		if (trigger.messageType === "custom" && !options.admission) {
+			const admission = this._admitInput();
+			return this._withInputAdmission(admission, () => this._startRun(trigger, { ...options, admission }));
+		}
+		this._checkInputAdmission();
+		// User preflights keep their existing non-streaming queue/recovery contract.
+		// Custom triggers have no user preflight token, so they reserve the run here.
+		if (trigger.messageType === "custom") this._isAgentRunActive = true;
+		this._agentRunAbortRequested = false;
+		let runOwned = false;
+		try {
+			const messages = await this._prepareRun(trigger, options.receipt, options.submission);
+			if (trigger.messageType === "custom" && options.additionalMessages?.length) {
+				const start = messages.indexOf(trigger.message);
+				messages.splice(start + 1, 0, ...options.additionalMessages);
+			}
+			this._checkInputAdmission();
+			// Context held during before_agent_start precedes the starting messages, without splitting tools.
+			if (this.#ordinaryOwner) {
+				await this._flushPendingBashMessagesOwnedTerminal();
+				await this._flushPendingCustomMessagesOwnedTerminal();
+			} else {
+				this._flushPendingBashMessages();
+				this._flushPendingCustomMessages();
+			}
+			this._checkInputAdmission();
+			options.beforeDispatch?.();
+			await this._runAgentPrompt(
+				messages,
+				options.promptToken,
+				undefined,
+				options.onInputTransferred,
+				options.admission,
+				() => {
+					runOwned = true;
+				},
+			);
+		} catch (error) {
+			if (!runOwned) {
+				this._isAgentRunActive = false;
+				this._runSystemPromptOptions = undefined;
+				if (this.#ordinaryOwner) {
+					await this.#ordinaryOwner.owner.terminal(async () => {
+						await this._flushPendingBashMessagesOwnedTerminal();
+						await this._flushPendingCustomMessagesOwnedTerminal();
+					});
+				} else {
+					this._flushPendingBashMessages();
+					this._flushPendingCustomMessages();
+				}
+				this._resolveIdleWaitIfIdle();
+			}
+			throw error;
+		}
+	}
+
 	private async _runAgentPrompt(
 		messages: AgentMessage | AgentMessage[] | undefined,
 		promptToken?: object,
 		automaticEnrollment?: OriginalAutomaticEnrollment,
 		onInputTransferred?: () => void,
 		transferringAdmission?: InputAdmission,
+		prepared?: () => void,
 	): Promise<void> {
 		this.#ordinaryOwner?.assertSubmission();
 		// A prompt admitted before the switch may still be finishing async input hooks.
@@ -2600,7 +2674,7 @@ export class AgentSession {
 		};
 		this._stopAfterCompactionFailure = false;
 		this._compactionStopOutcome = undefined;
-		this._agentRunAbortRequested = false;
+		if (!prepared) this._agentRunAbortRequested = false;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
 		this._recordSelection();
@@ -2617,6 +2691,7 @@ export class AgentSession {
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
+			prepared?.();
 			if (automaticEnrollment) await automaticEnrollment(() => dispatch());
 			else if (this.#ordinaryOwner)
 				await this.#ordinaryOwner.requestProvenance.run(promptToken, () => dispatch(), messages);
@@ -2674,6 +2749,91 @@ export class AgentSession {
 			// biome-ignore lint/correctness/noUnsafeFinally: A terminal persistence failure must reject after settlement notification.
 			if (persistenceFailure) throw persistenceFailure.cause;
 		}
+	}
+
+	/**
+	 * Prepare a run and return its starting messages: compact first when needed, emit
+	 * before_agent_start, apply the run's prompt options and tool loadout, and build the starting
+	 * message followed by pending nextTurn context for user starts and handler messages, with a
+	 * system patch first when the prompt changed.
+	 */
+	private async _prepareRun(
+		trigger: BeforeAgentStartTrigger,
+		receipt?: TurnReceipt,
+		submission?: UserMessageSubmission,
+	): Promise<AgentMessage[]> {
+		// User compaction stays in _prompt so its existing input-retention contract is unchanged.
+		const lastAssistant = this._findLastAssistantMessage();
+		if (trigger.messageType === "custom" && lastAssistant) {
+			const outcome = await this._awaitInput(this._checkCompaction(lastAssistant, false));
+			if (outcome === "failed" || outcome === "aborted") {
+				this.agent.steer(trigger.message);
+				throw new Error(`Custom run not sent: compaction ${outcome}; input retained in the steer queue.`);
+			}
+		}
+
+		const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
+		const result = await this._awaitInput(
+			this._extensionRunner.emitBeforeAgentStart(
+				trigger,
+				this._baseSystemPromptOptions,
+				this._inheritedCancellation(),
+			),
+		);
+		// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
+		// which updates the live loadout instead. An explicit edit wins; otherwise the live
+		// loadout is authoritative, so a setActiveTools() call is not undone here.
+		const handlerEditedTools =
+			result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
+			result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
+		if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
+
+		const messages: AgentMessage[] = [];
+		if (trigger.messageType === "custom") {
+			messages.push(trigger.message);
+		} else {
+			// Normalize images after before_agent_start so extension-driven model selection
+			// determines the resize profile used for the request and history.
+			const normalized = await this._awaitInput(this._normalizePromptImages(trigger.images));
+			const text =
+				normalized.hints.length > 0 ? `${trigger.prompt}\n\n${normalized.hints.join("\n")}` : trigger.prompt;
+			const message: AgentMessage = {
+				role: "user",
+				content: [{ type: "text", text }, ...normalized.images],
+				timestamp: Date.now(),
+			};
+			this.#receivedMessageReceipts.set(message, receipt ?? captureTerminalTurnReceipt());
+			if (submission) {
+				submission.message = message;
+				this._userMessageSubmissions.set(message, submission);
+			}
+			messages.push(message);
+		}
+		// A switch or revocation during hooks/images must finish before consuming one-shot context.
+		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
+		this._checkInputAdmission();
+		// pi#97: nextTurn context belongs to the next user prompt, not a custom-triggered run.
+		if (trigger.messageType === "user") {
+			messages.push(...this._pendingNextTurnMessages);
+			this._pendingNextTurnMessages = [];
+		}
+		for (const [index, msg] of result.messages.entries()) {
+			const message: CustomMessage = {
+				role: "custom",
+				customType: msg.customType,
+				// Untyped extensions can pass null/missing content; normalize at ingestion.
+				content: msg.content ?? [],
+				display: msg.display,
+				details: msg.details,
+				timestamp: Date.now(),
+			};
+			this.#receivedMessageReceipts.set(message, result.messageReceipts[index]);
+			messages.push(message);
+		}
+		const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
+		this._runSystemPromptOptions = result.systemPromptOptions;
+		if (updateMessage) messages.unshift(updateMessage);
+		return messages;
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean | "queuedInput"> {
@@ -3208,7 +3368,6 @@ export class AgentSession {
 		const preflightResult = options?.preflightResult;
 		const onInputTransferred = options?.onInputTransferred;
 		const preflightToken = {};
-		let messages: AgentMessage[] | undefined;
 
 		try {
 			// Handle extension commands first (execute immediately, even during streaming)
@@ -3241,9 +3400,8 @@ export class AgentSession {
 				);
 			}
 
-			// An earlier prompt can still be in preflight, for example in pre-prompt compaction whose
-			// compaction_end flushes input queued during compaction. Queue behind it instead of
-			// racing it into the agent and failing with "Agent is already processing a prompt".
+			// pi#97: opted-in input queues behind earlier preflights; a plain SDK prompt may
+			// overtake a held input hook. Active runs still require a queue option.
 			this._promptPreflights.add(preflightToken);
 			const mustQueue = () =>
 				this.isStreaming ||
@@ -3355,99 +3513,30 @@ export class AgentSession {
 				}
 			}
 
-			// Emit before_agent_start before normalizing images so extension-driven model
-			// selection determines the resize profile used for the request and history.
-			const selectedToolsBefore = this._baseSystemPromptOptions.selectedTools;
-			const result = await this._awaitInput(
-				this._extensionRunner.emitBeforeAgentStart(
-					expandedText,
-					currentImages,
-					this._baseSystemPromptOptions,
-					this._inheritedCancellation(),
-				),
+			await this._startRun(
+				{ messageType: "user", prompt: expandedText, images: currentImages },
+				{
+					promptToken,
+					admission,
+					receipt,
+					submission,
+					beforeDispatch: () => {
+						this._checkInputAdmission();
+						this._queueTriggeredBehindPreflight();
+						this._promptPreflights.delete(preflightToken);
+						releasePreflight?.();
+					},
+					onInputTransferred: () => {
+						onInputTransferred?.();
+						preflightResult?.("started");
+					},
+				},
 			);
-			// Handlers may edit event.systemPromptOptions.selectedTools or call setActiveTools(),
-			// which updates the live loadout instead. An explicit edit wins; otherwise the live
-			// loadout is authoritative, so a setActiveTools() call is not undone here.
-			const handlerEditedTools =
-				result.systemPromptOptions.selectedTools.length !== selectedToolsBefore.length ||
-				result.systemPromptOptions.selectedTools.some((name, index) => name !== selectedToolsBefore[index]);
-			if (!handlerEditedTools) result.systemPromptOptions.selectedTools = this.getActiveToolNames();
-
-			const normalized = await this._awaitInput(this._normalizePromptImages(currentImages));
-			const userText =
-				normalized.hints.length > 0 ? `${expandedText}\n\n${normalized.hints.join("\n")}` : expandedText;
-
-			// Build messages only after hooks and image normalization have completed.
-			messages = [];
-			const userContent: (TextContent | ImageContent)[] = [{ type: "text", text: userText }];
-			userContent.push(...normalized.images);
-			const userMessage: AgentMessage = { role: "user", content: userContent, timestamp: Date.now() };
-			this.#receivedMessageReceipts.set(userMessage, receipt);
-			if (submission) {
-				submission.message = userMessage;
-				this._userMessageSubmissions.set(userMessage, submission);
-			}
-			messages.push(userMessage);
-
-			// Inject any pending "nextTurn" messages as context alongside the user message
-			for (const msg of this._pendingNextTurnMessages) {
-				messages.push(msg);
-			}
-			this._pendingNextTurnMessages = [];
-
-			for (const [index, msg] of result.messages.entries()) {
-				const message: CustomMessage = {
-					role: "custom",
-					customType: msg.customType,
-					// Untyped extensions can pass null/missing content; normalize at ingestion.
-					content: msg.content ?? [],
-					display: msg.display,
-					details: msg.details,
-					timestamp: Date.now(),
-				};
-				this.#receivedMessageReceipts.set(message, result.messageReceipts[index]);
-				messages.push(message);
-			}
-			const updateMessage = this._preparePromptAndToolLoadout(result.systemPromptOptions);
-			this._runSystemPromptOptions = result.systemPromptOptions;
-			if (updateMessage) messages.unshift(updateMessage);
-		} catch (error) {
-			this._promptPreflights.delete(preflightToken);
-			throw error;
 		} finally {
-			if (!messages) {
-				this._promptPreflights.delete(preflightToken);
-				this._runTriggeredBehindPreflight();
-				this._runInputQueuedBehindPreflight();
-			}
+			this._promptPreflights.delete(preflightToken);
+			this._runTriggeredBehindPreflight();
+			this._runInputQueuedBehindPreflight();
 		}
-
-		if (!messages) return;
-
-		// A switch can also begin during before_agent_start or image normalization.
-		// Keep this prompt's admission token until its run can start, so triggered
-		// messages still queue behind it instead of acquiring a competing run.
-		while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
-		this._checkInputAdmission();
-		// Triggered messages held during this preflight join its run, in the queue they asked for.
-		this._queueTriggeredBehindPreflight();
-		// This preflight ends here, before dispatch can reach an agent_start handler: that handler
-		// must see this prompt as started (isPromptPending), not pending. _runAgentPrompt marks the
-		// run active synchronously, so later prompts still queue through isStreaming.
-		this._promptPreflights.delete(preflightToken);
-		const run = this._runAgentPrompt(
-			messages,
-			promptToken,
-			undefined,
-			() => {
-				onInputTransferred?.();
-				preflightResult?.("started");
-			},
-			admission,
-		);
-		releasePreflight?.();
-		await run;
 	}
 
 	private _queueTriggeredBehindPreflight(): void {
@@ -3481,8 +3570,11 @@ export class AgentSession {
 			this._queueTriggeredBehindPreflight();
 			return;
 		}
-		const messages = this._triggeredBehindPreflight.splice(0).map(({ message }) => message);
-		void this._runAgentPrompt(messages).catch((error: unknown) => {
+		const [first, ...rest] = this._triggeredBehindPreflight.splice(0);
+		void this._startRun(
+			{ messageType: "custom", message: first.message },
+			{ additionalMessages: rest.map(({ message }) => message) },
+		).catch((error: unknown) => {
 			this._extensionRunner.emitError({
 				extensionPath: "<queue>",
 				event: "sendMessage",
@@ -3919,7 +4011,7 @@ export class AgentSession {
 				this._triggeredBehindPreflight.push({ message: appMessage, deliverAs: options.deliverAs });
 				return;
 			}
-			await this._runAgentPrompt(appMessage);
+			await this._startRun({ messageType: "custom", message: appMessage });
 		} else if (this.isStreaming) {
 			// Appending now would put the message between an assistant tool call and its
 			// result, which providers that validate message order reject on replay. Defer

@@ -5,6 +5,7 @@ import {
 	type ModelsStoreEntry,
 	type ModelType,
 	type Provider,
+	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
 import { VERSION } from "../config.ts";
 import { fetchWithRetry } from "../utils/management-http.ts";
@@ -28,13 +29,79 @@ function isSupportedModelType(model: { type?: unknown }): boolean {
 	);
 }
 
+type CatalogEntry = Record<string, unknown>;
+
+const DESCRIPTIVE_MODEL_FIELDS = [
+	"id",
+	"name",
+	"type",
+	"reasoning",
+	"thinkingLevelMap",
+	"input",
+	"inputLimits",
+	"cost",
+	"promptCache",
+	"contextWindow",
+	"maxTokens",
+	"output",
+] as const;
+
+function catalogModelType(model: CatalogEntry): ModelType | undefined {
+	if (model.type === undefined) return "chat";
+	return typeof model.type === "string" && REMOTE_CATALOG_MODEL_TYPES.includes(model.type as ModelType)
+		? (model.type as ModelType)
+		: undefined;
+}
+
+/** Keep only remote metadata and take every request-affecting field from local provider data. */
+function sanitizeCatalogModel(provider: Provider, model: CatalogEntry): AnyModel | undefined {
+	const type = catalogModelType(model);
+	if (!type || typeof model.id !== "string") return undefined;
+	const localModels = provider.getAllModels?.() ?? provider.getModels();
+	const baseline = localModels.find((candidate) => getModelType(candidate) === type && candidate.id === model.id);
+	const fallback = baseline ?? localModels.find((candidate) => getModelType(candidate) === type);
+	if (!fallback) return undefined;
+	const routingBaseline = baseline ?? { ...fallback, baseUrl: provider.baseUrl ?? fallback.baseUrl };
+	const descriptive: CatalogEntry = {};
+	for (const field of DESCRIPTIVE_MODEL_FIELDS) {
+		if (Object.hasOwn(model, field)) descriptive[field] = model[field];
+	}
+	return { ...routingBaseline, ...descriptive, provider: provider.id } as AnyModel;
+}
+
 function mergeModels<TModel extends AnyModel>(baseline: readonly TModel[], dynamic: readonly TModel[]): TModel[] {
 	const merged = new Map<string, TModel>();
-	for (const model of [...baseline, ...dynamic]) merged.set(`${getModelType(model)}\0${model.id}`, model);
+	for (const model of baseline) merged.set(`${getModelType(model)}\0${model.id}`, model);
+	for (const model of dynamic) {
+		const key = `${getModelType(model)}\0${model.id}`;
+		const existing = merged.get(key);
+		if (!existing) {
+			merged.set(key, model);
+			continue;
+		}
+		const safeModel =
+			isModelType(existing, "chat") && isModelType(model, "chat")
+				? {
+						...model,
+						provider: existing.provider,
+						api: existing.api,
+						baseUrl: existing.baseUrl,
+						headers: existing.headers,
+						compat: existing.compat,
+					}
+				: {
+						...model,
+						provider: existing.provider,
+						api: existing.api,
+						baseUrl: existing.baseUrl,
+						headers: existing.headers,
+					};
+		merged.set(key, safeModel as TModel);
+	}
 	return [...merged.values()];
 }
 
-function parseCatalog(providerId: string, value: unknown): AnyModel[] {
+function parseCatalog(provider: Provider, value: unknown): AnyModel[] {
 	const entries = Array.isArray(value)
 		? value
 		: typeof value === "object" && value !== null && "models" in value && Array.isArray(value.models)
@@ -42,20 +109,65 @@ function parseCatalog(providerId: string, value: unknown): AnyModel[] {
 			: typeof value === "object" && value !== null
 				? Object.values(value)
 				: undefined;
-	if (!entries) throw new Error(`Invalid model catalog for provider "${providerId}"`);
+	if (!entries) throw new Error(`Invalid model catalog for provider "${provider.id}"`);
 	return entries
-		.filter((entry): entry is Record<string, unknown> => typeof entry === "object" && entry !== null && "id" in entry)
+		.filter((entry): entry is CatalogEntry => typeof entry === "object" && entry !== null && "id" in entry)
 		.filter(isSupportedModelType)
-		.map((model) => ({ ...model, provider: providerId }) as AnyModel);
+		.flatMap((model) => {
+			const sanitized = sanitizeCatalogModel(provider, model);
+			return sanitized ? [sanitized] : [];
+		});
+}
+
+/** Read a successful pi.dev catalog response. A missing or invalid Last-Modified header is 0. */
+async function readCatalog(
+	provider: Provider,
+	response: Response,
+): Promise<{ models: AnyModel[]; lastModified: number; etag: string | undefined }> {
+	const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
+	return {
+		models: parseCatalog(provider, await response.json()),
+		lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
+		etag: response.headers.get("etag") ?? undefined,
+	};
+}
+
+/** Whether a pi.dev catalog is newer than the model data shipped with pi. */
+function isNewer(lastModified: number | undefined, localGeneratedAt: number | undefined): boolean {
+	return localGeneratedAt === undefined || (lastModified !== undefined && lastModified > localGeneratedAt);
 }
 
 function remoteModels(entry: ModelsStoreEntry | undefined, localGeneratedAt: number | undefined): readonly AnyModel[] {
-	if (!entry) return [];
-	if (localGeneratedAt !== undefined && (entry.lastModified === undefined || entry.lastModified <= localGeneratedAt)) {
-		return [];
-	}
-	return entry.models;
+	return entry && isNewer(entry.lastModified, localGeneratedAt) ? entry.models : [];
 }
+
+function requestCatalog(
+	providerId: string,
+	catalogBaseUrl: string,
+	signal: AbortSignal,
+	validator?: string,
+): Promise<Response> {
+	const url = new URL(`/api/models/providers/${encodeURIComponent(providerId)}`, catalogBaseUrl);
+	url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","));
+	return fetchWithRetry(
+		url,
+		{
+			headers: {
+				accept: "application/json",
+				"User-Agent": getPiUserAgent(VERSION),
+				...(validator ? { "if-none-match": validator } : {}),
+			},
+			signal,
+		},
+		{ attemptTimeoutMs: REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS },
+	);
+}
+
+/** Replaces the catalog with a credential-specific model list. */
+export type PersonalizeCatalog = (
+	catalog: readonly AnyModel[],
+	context: RefreshModelsContext,
+) => Promise<readonly AnyModel[]>;
 
 /** Add a persisted pi.dev catalog overlay to a static built-in provider. */
 export function withRemoteCatalog(
@@ -74,8 +186,24 @@ export function withRemoteCatalog(
 			),
 		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
 		refreshModels: async (context) => {
+			// Fork default: use the pinned local baseline, including when a remote cache exists.
+			// Gate here so interactive/RPC startup and explicit runtime refreshes share the policy,
+			// without disabling provider discovery, authentication or other networking.
+			if (process.env.PI_REMOTE_CATALOG !== "1") {
+				await context.publish({
+					update: () => {
+						dynamicModels = [];
+					},
+				});
+				return;
+			}
 			const stored = context.stored;
-			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);
+			const restored = remoteModels(stored, localGeneratedAt)
+				.filter((model) => model.provider === provider.id)
+				.flatMap((model) => {
+					const sanitized = sanitizeCatalogModel(provider, model as unknown as CatalogEntry);
+					return sanitized ? [sanitized] : [];
+				});
 			if (
 				!(await context.publish({
 					update: () => {
@@ -86,6 +214,9 @@ export function withRemoteCatalog(
 				return;
 			}
 			if (!context.allowNetwork || context.signal.aborted) return;
+			// Skip the request if pi.dev was checked less than REMOTE_CATALOG_REFRESH_INTERVAL_MS ago.
+			// An entry without lastModified (saved by an older pi, or after a failed first request) is
+			// always refetched: remoteModels() ignores it, so waiting would leave the overlay empty.
 			if (
 				!context.force &&
 				stored?.checkedAt !== undefined &&
@@ -98,20 +229,7 @@ export function withRemoteCatalog(
 			// Only revalidate when a cached body backs the validator, so a 304 can never
 			// leave the overlay empty.
 			const validator = stored && stored.models.length > 0 ? stored.etag : undefined;
-			const url = new URL(`/api/models/providers/${encodeURIComponent(provider.id)}`, catalogBaseUrl);
-			url.searchParams.set("types", REMOTE_CATALOG_MODEL_TYPES.join(","));
-			const response = await fetchWithRetry(
-				url,
-				{
-					headers: {
-						accept: "application/json",
-						"User-Agent": getPiUserAgent(VERSION),
-						...(validator ? { "if-none-match": validator } : {}),
-					},
-					signal: context.signal,
-				},
-				{ attemptTimeoutMs: REMOTE_CATALOG_ATTEMPT_TIMEOUT_MS },
-			);
+			const response = await requestCatalog(provider.id, catalogBaseUrl, context.signal, validator);
 			if (context.signal.aborted) return;
 			const checkedAt = Date.now();
 			// Unchanged: dynamicModels already holds the stored overlay, so only the
@@ -137,20 +255,82 @@ export function withRemoteCatalog(
 				await context.publish({ persist: { ...(stored ?? { models: [] }), checkedAt } });
 				throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
 			}
-			const refreshed = parseCatalog(provider.id, await response.json());
-			const lastModified = Date.parse(response.headers.get("last-modified") ?? "");
+			const catalog = await readCatalog(provider, response);
 			if (context.signal.aborted) return;
-			const entry: ModelsStoreEntry = {
-				models: refreshed,
-				checkedAt,
-				lastModified: Number.isNaN(lastModified) ? 0 : lastModified,
-				etag: response.headers.get("etag") ?? undefined,
-			};
+			const entry: ModelsStoreEntry = { ...catalog, checkedAt };
 			const published = remoteModels(entry, localGeneratedAt);
 			await context.publish({
 				persist: entry,
 				update: () => {
 					dynamicModels = published;
+				},
+			});
+		},
+	};
+}
+
+/**
+ * Like `withRemoteCatalog`, but on each network refresh the catalog (built-in models plus a newer
+ * pi.dev catalog) is passed through `personalize` and the result is saved. The saved entry holds
+ * the personalized list, not the pi.dev catalog, and replaces the catalog, including offline.
+ * The refresh interval and etag revalidation are skipped. An empty list (nothing saved yet, or an
+ * empty catalog saved by an older pi after a failed or missing pi.dev catalog) falls back to the
+ * built-in models.
+ */
+export function withPersonalizedCatalog(
+	provider: Provider,
+	personalize: PersonalizeCatalog,
+	catalogBaseUrl: string = DEFAULT_CATALOG_BASE_URL,
+	localGeneratedAt?: number,
+): Provider {
+	let personalModels: readonly AnyModel[] = [];
+	const builtinModels = (): readonly AnyModel[] => provider.getAllModels?.() ?? provider.getModels();
+	const getAllModels = (): readonly AnyModel[] => (personalModels.length > 0 ? personalModels : builtinModels());
+
+	return {
+		...provider,
+		getModels: () => getAllModels().filter((model) => isModelType(model, "chat")),
+		getAllModels,
+		refreshModels: async (context) => {
+			if (process.env.PI_REMOTE_CATALOG !== "1") {
+				await context.publish({
+					update: () => {
+						personalModels = [];
+					},
+				});
+				return;
+			}
+			const restored = (context.stored?.models ?? [])
+				.filter((model) => model.provider === provider.id)
+				.flatMap((model) => {
+					const sanitized = sanitizeCatalogModel(provider, model as unknown as CatalogEntry);
+					return sanitized ? [sanitized] : [];
+				});
+			if (
+				!(await context.publish({
+					update: () => {
+						personalModels = restored;
+					},
+				}))
+			) {
+				return;
+			}
+			if (!context.allowNetwork || context.signal.aborted) return;
+
+			const response = await requestCatalog(provider.id, catalogBaseUrl, context.signal);
+			if (context.signal.aborted) return;
+			let remote: readonly AnyModel[] = [];
+			if (response.status !== 404 && response.status !== 501) {
+				if (!response.ok) throw new Error(`Model catalog request failed for ${provider.id}: ${response.status}`);
+				const catalog = await readCatalog(provider, response);
+				if (isNewer(catalog.lastModified, localGeneratedAt)) remote = catalog.models;
+			}
+			const personalized = await personalize(mergeModels(builtinModels(), remote), context);
+			if (context.signal.aborted) return;
+			await context.publish({
+				persist: { models: personalized, checkedAt: Date.now() },
+				update: () => {
+					personalModels = personalized;
 				},
 			});
 		},
