@@ -70,7 +70,7 @@ describe("MeteredInput", () => {
 	});
 
 	// pi#160 review: bytes held from before the marker are in no attested interval.
-	it("signals pre-epoch bytes before the parser sees them, and only those", () => {
+	it("signals pre-epoch bytes before and after the parser sees them, and only those", () => {
 		const parser = new StdinBuffer();
 		const log: string[] = [];
 		const input = new MeteredInput((text) => parser.process(text));
@@ -79,7 +79,7 @@ describe("MeteredInput", () => {
 		input.setMeter({ ...openMeter(), takePending: () => pending }, () => log.push("unmetered"));
 		input.write(Buffer.from("\r"));
 		parser.destroy();
-		assert.deepEqual(log, ["unmetered", "x", "h", "i", "\r"]);
+		assert.deepEqual(log, ["unmetered", "x", "unmetered", "h", "i", "\r"]);
 	});
 
 	it("ends the meter and stops reporting offsets when detached", () => {

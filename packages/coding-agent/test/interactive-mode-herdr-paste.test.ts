@@ -84,7 +84,11 @@ afterEach(() => {
 	vi.restoreAllMocks();
 });
 
-function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer> = async () => PAUL, waitMs = 50) {
+function setup(
+	answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer> = async () => PAUL,
+	waitMs = 50,
+	preEpoch = "",
+) {
 	const counter = new EpochByteCounter();
 	counter.hold();
 	counter.arm(NONCE);
@@ -140,6 +144,7 @@ function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer
 		() => {},
 	);
 	const send = (data: string | Buffer) => process.stdin.emit("data", data);
+	if (preEpoch) send(preEpoch);
 	send(epochMarker(NONCE));
 	return { mode, editor, ui, cut, send };
 }
@@ -184,6 +189,33 @@ test("Ctrl+V clipboard text plus Enter is terminal without changing paste behavi
 	expect(input.images).toBeUndefined();
 	expect(receiptRecord(getInputReceipt(input)).channel).toBe("terminal");
 	expect(cut).toHaveBeenCalledOnce();
+});
+
+// pi#160 R10 P1: an unmetered Enter must not leave its trailing draft eligible for attribution.
+test("pre-epoch submit and trailing draft stay terminal when metered input resumes", async () => {
+	const { mode, editor, cut, send } = setup(undefined, undefined, "old\rnext");
+	expect(editor.getText()).toBe("next");
+	send("more\r");
+	const mixed = await submitted(mode, 2);
+	expect(mode.pendingUserInputs.map((input) => input.text)).toEqual(["old", "nextmore"]);
+	for (const input of [mode.pendingUserInputs[0]!, mixed]) {
+		const receipt = receiptRecord(getInputReceipt(input));
+		expect(receipt.channel).toBe("terminal");
+		expect(receipt).not.toHaveProperty("principal");
+	}
+	expect(cut).toHaveBeenCalledExactlyOnceWith(
+		expect.objectContaining({
+			cut: 5,
+			digest: createHash("sha256").update("more\r").digest("hex"),
+			kind: "submit",
+		}),
+	);
+	// The next draft contains only epoch bytes and must still be attributable.
+	send("clean\r");
+	expect(receiptRecord(getInputReceipt(await submitted(mode, 3)))).toMatchObject({
+		channel: "keyboard",
+		principal: { id: "paul" },
+	});
 });
 
 test("genuine typed input still receives a keyboard receipt", async () => {

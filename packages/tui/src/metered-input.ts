@@ -35,8 +35,9 @@ export class MeteredInput {
 	}
 
 	/**
-	 * `onUnmetered` runs before `preEpoch` bytes reach the parser while a meter is attached: those bytes
-	 * are in no attested interval, so the caller taints the draft they land in (pi#160 review).
+	 * `onUnmetered` runs before and after `preEpoch` bytes reach the parser while a meter is attached:
+	 * those bytes are in no attested interval. Taint again after the feed because an unmetered submit
+	 * can clear the taint before trailing unmetered text enters the next draft (pi#160 review).
 	 */
 	setMeter(meter: InputByteMeter | undefined, onUnmetered?: () => void): void {
 		this.onUnmetered = onUnmetered;
@@ -63,6 +64,7 @@ export class MeteredInput {
 			this.onUnmetered?.();
 			const text = this.decoder.write(result.preEpoch);
 			if (text) this.feed(text);
+			this.onUnmetered?.();
 		}
 		for (let i = 0; i < result.epoch.length; i++) {
 			const text = this.decoder.write(result.epoch.subarray(i, i + 1));
