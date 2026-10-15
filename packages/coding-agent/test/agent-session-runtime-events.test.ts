@@ -224,6 +224,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 			const mode = {
 				session,
 				compactionQueuedMessages: [input],
+				compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 				compactionQueueTransfers: 0,
 				compactionQueueWork: new Set<Promise<void>>(),
 				recoveredImages: new Map<string, ImageContent>(),
@@ -264,6 +265,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const mode = {
 			session,
 			compactionQueuedMessages: [{ input: receiveInput("dispatched A"), mode: "steer" as const }],
+			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
@@ -322,6 +324,7 @@ describe("AgentSessionRuntime session lifecycle events", () => {
 		const mode = {
 			session,
 			compactionQueuedMessages: [input],
+			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
