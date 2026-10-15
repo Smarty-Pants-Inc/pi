@@ -13,6 +13,7 @@ import {
 	type Storage,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SessionImpl } from "../src/session/session.ts";
 import { addTask, assistant, describeMessage, openHarness, system, toolResult, user } from "./harness-support.ts";
 import { context } from "./session-support.ts";
 
@@ -649,6 +650,7 @@ describe("conversation context", () => {
 			settings: { contextRetentionMs: 1_000 },
 			now,
 		});
+		const session = harness as unknown as SessionImpl;
 		const rows: Record<string, number> = {};
 		const Probe = probeTask(async (name, load) => {
 			const before = scanned.rows;
@@ -662,6 +664,10 @@ describe("conversation context", () => {
 			const id = await harness.commit((tx) => tx.createTask(Probe, { name }, options), context);
 			expect((await harness.waitForTask(id, context)).state.outcome).toEqual(DONE.outcome);
 			await root.waitForIdle(context);
+			// pi#244: exactly one document sweep while evictable documents exist; none once the cache is empty.
+			expect(vi.getTimerCount()).toBe(session.documentCacheSizes.idle > 0 ? 1 : 0);
+			await session.unloadDocuments();
+			expect(session.documentCacheSizes).toMatchObject({ cached: 0, idle: 0 });
 		};
 		await probe("first");
 		expect(vi.getTimerCount()).toBe(0);
@@ -688,6 +694,7 @@ describe("conversation context", () => {
 			settings: { contextRetentionMs: 1_000 },
 		});
 		const other = await root.fork(first.id, { ownership: { kind: "ownerless" } }, context);
+		const session = harness as unknown as SessionImpl;
 		const rows: number[] = [];
 		const Read = defineTask<Record<string, never>, { phase: "run" }, null>({
 			name: "test.idle-context-read",
@@ -716,6 +723,10 @@ describe("conversation context", () => {
 		);
 		expect((await harness.waitForTask(id, context)).state.outcome).toEqual(DONE.outcome);
 		expect(rows).toEqual([22, 1, 22]);
+		// pi#244: no context timer may hide alongside the single document sweep.
+		expect(vi.getTimerCount()).toBe(session.documentCacheSizes.idle > 0 ? 1 : 0);
+		await session.unloadDocuments();
+		expect(session.documentCacheSizes).toMatchObject({ cached: 0, idle: 0 });
 		expect(vi.getTimerCount()).toBe(0);
 		await harness.close(context);
 	});

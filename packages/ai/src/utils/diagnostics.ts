@@ -16,6 +16,7 @@ export const ASSISTANT_DIAGNOSTIC_TYPES = [
 	"pi_messages_response_failure",
 	"pi_messages_rewrite",
 	"anthropic_input_transformations",
+	"anthropic_strict_tools_fallback",
 ] as const;
 
 export type AssistantMessageDiagnosticType = (typeof ASSISTANT_DIAGNOSTIC_TYPES)[number];
