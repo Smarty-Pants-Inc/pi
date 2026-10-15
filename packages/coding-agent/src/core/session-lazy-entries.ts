@@ -163,15 +163,20 @@ function lazyReader(location: EntryLocation, id: unknown, parent: string | undef
 
 /**
  * Like `{ ...entry, ...patch }`, but lazy fields stay lazy: a cold entry's copy reads the same
- * line until it is written to a new file.
+ * line until it is written to a new file. Sealed entries are frozen (pi#160), so their copied
+ * descriptors are non-configurable: a patched key is defined in place of its source descriptor,
+ * keeping key order (and JSON bytes) without reading lazy fields.
  */
 export function copyEntry<T extends object>(entry: T, patch: Partial<T>): T {
 	const copy = {};
+	const define = (key: string, value: unknown) =>
+		Object.defineProperty(copy, key, { value, writable: true, enumerable: true, configurable: true });
 	for (const key of Object.keys(entry)) {
-		Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(entry, key)!);
+		if (Object.hasOwn(patch, key)) define(key, (patch as Record<string, unknown>)[key]);
+		else Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(entry, key)!);
 	}
 	for (const [key, value] of Object.entries(patch)) {
-		Object.defineProperty(copy, key, { value, writable: true, enumerable: true, configurable: true });
+		if (!Object.hasOwn(copy, key)) define(key, value);
 	}
 	const location = locations.get(entry);
 	if (coldEntries.has(entry) && location) {

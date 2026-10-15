@@ -103,13 +103,25 @@ describe("session context edits", () => {
 	});
 
 	it("normalizes imported string replacements while projecting array-only roles", () => {
-		const session = SessionManager.inMemory();
-		const assistantId = session.appendMessage(assistant("original"));
-		const editId = session.appendContextEdit(assistantId, null);
+		// pi#160: canonical entries are frozen; seed the raw string replacement through a real import.
+		const source = SessionManager.inMemory();
+		const assistantId = source.appendMessage(assistant("original"));
+		const editId = source.appendContextEdit(assistantId, null);
+		const header = source.getHeader();
+		if (!header) throw new Error("expected session header");
+		const imported = structuredClone(source.getEntries()).map((entry) =>
+			entry.type === "context_edit" && entry.id === editId
+				? { ...entry, replacement: { content: "imported replacement" } }
+				: entry,
+		);
+		expect(imported.filter((entry) => entry.id === editId)).toHaveLength(1);
+		const session = SessionManager.inMemory(process.cwd(), undefined, [structuredClone(header), ...imported]);
+
 		const edit = session.getEntry(editId);
 		if (edit?.type !== "context_edit") throw new Error("expected context edit");
-		edit.replacement = { content: "imported replacement" };
-
+		expect(edit.targetId).toBe(assistantId);
+		expect(edit.replacement).toEqual({ content: "imported replacement" });
+		expect(typeof edit.replacement?.content).toBe("string");
 		expect(session.buildSessionProjection().messages[0]).toMatchObject({
 			role: "assistant",
 			content: [{ type: "text", text: "imported replacement" }],

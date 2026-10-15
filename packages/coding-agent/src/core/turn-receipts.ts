@@ -82,7 +82,12 @@ export function receiptRecord(receipt?: TurnReceipt): ReceiptRecord {
 }
 
 const sealedEntries = new WeakSet<object>();
-/** Protect only the reserved provenance JSON graph, including missing historical records. */
+/**
+ * Protect the reserved provenance JSON graph (including missing historical records), then freeze the
+ * containing append-only entry so a slot beside the receipt (e.g. `message`) cannot be swapped while
+ * the attribution stays attached (pi#160). Only the entry object is frozen; nested data and details
+ * keep their own mutability.
+ */
 export function sealEntryProvenance(entry: object, reserveSerializer: boolean): void {
 	if (!sealedEntries.has(entry)) {
 		const raw: unknown = Reflect.get(entry, "provenance");
@@ -115,4 +120,5 @@ export function sealEntryProvenance(entry: object, reserveSerializer: boolean): 
 			configurable: false,
 		});
 	}
+	Object.freeze(entry);
 }
