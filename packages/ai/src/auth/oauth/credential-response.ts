@@ -78,8 +78,8 @@ export function getRequestDiagnosticSecrets(
 	);
 }
 
-// Explicitly known credentials are sensitive at every nonzero length, even when
-// masking them also changes ordinary words in a provider diagnostic.
+// Known credentials remain sensitive at every nonzero length. Short values containing
+// letters/numbers need token boundaries; punctuation-only values cannot corrupt word letters.
 const MAX_DIAGNOSTIC_DECODE_PASSES = 16;
 const MAX_DIAGNOSTIC_DECODE_WORK = 256 * 1024;
 const JSON_ESCAPES: Readonly<Record<string, string>> = {
@@ -138,14 +138,23 @@ function maskAll(text: string, values: readonly string[]): { text: string; match
 	let matched = false;
 	for (const value of values) {
 		if (!text.includes(value)) continue;
-		matched = true;
-		text = text.split(value).join("***");
+		if (value.length < 4 && /[\p{L}\p{N}]/u.test(value)) {
+			const literal = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			text = text.replace(new RegExp(`(?<![\\p{L}\\p{N}])${literal}(?![\\p{L}\\p{N}])`, "gu"), () => {
+				matched = true;
+				return "***";
+			});
+		} else {
+			matched = true;
+			text = text.split(value).join("***");
+		}
 	}
 	return { text, matched };
 }
 
 /**
  * Mask only the live values in `secrets` (raw, JSON/URI-escaped, form or base64 encoded).
+ * Values/aliases shorter than four characters containing letters/numbers need non-alphanumeric boundaries.
  * No label heuristics, so an opaque provider token without a live value stays byte for byte.
  */
 export function redactValues(text: string, secrets: readonly string[]): string {

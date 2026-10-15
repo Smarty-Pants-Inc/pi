@@ -127,12 +127,16 @@ describe("OAuth diagnostic redaction", () => {
 		},
 	);
 
-	// smarty-dev#4703: only explicitly known short words are substring-masked, never guessed.
-	it.each(["a", "the", "1234567"])("masks only known short live value %s", (secret) => {
+	// smarty-dev#4703: mask known short tokens, not their occurrences inside ordinary words.
+	it.each([
+		["a", "the theater theme other normal *** word ***"],
+		["the", "*** theater theme other normal a word ***"],
+		["1234567", "the theater theme other normal a word ***"],
+	])("masks only known short live value %s", (secret, expected) => {
 		const text = `the theater theme other normal a word ${secret}`;
 		expect(redactOAuthDiagnostic(text)).toBe(text);
-		expect(redactOAuthDiagnostic(text, [secret])).not.toContain(secret);
-		expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(secret))).not.toContain(secret);
+		expect(redactOAuthDiagnostic(text, [secret])).toBe(expected);
+		expect(redactOAuthDiagnostic(text, getOAuthDiagnosticSecrets(secret))).toBe(expected);
 		expect(redactOAuthDiagnostic(`refresh_token=${secret}`, [secret])).not.toContain(`=${secret}`);
 		expect(redactOAuthDiagnostic(`Bearer ${secret}`, [secret])).toContain("***");
 	});
