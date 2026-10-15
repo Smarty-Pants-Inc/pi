@@ -47,6 +47,14 @@ function formUrlEncode(fields: Record<string, string>): string {
 	return new URLSearchParams(fields).toString();
 }
 
+async function fetchCredentialResponse(url: string, init: RequestInit): Promise<Response> {
+	try {
+		return await fetch(url, init);
+	} catch {
+		throw new Error("Kimi Code OAuth request failed");
+	}
+}
+
 async function readJson(response: Response): Promise<Record<string, unknown> | null> {
 	try {
 		const json = await response.json();
@@ -69,7 +77,7 @@ function trustedHttpUrl(value: unknown): string | null {
 }
 
 async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal): Promise<DeviceAuthorization> {
-	const response = await fetch(`${oauthHost}/api/oauth/device_authorization`, {
+	const response = await fetchCredentialResponse(`${oauthHost}/api/oauth/device_authorization`, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/x-www-form-urlencoded",
@@ -156,7 +164,7 @@ async function pollForToken(
 		waitBeforeFirstPoll: true,
 		signal,
 		poll: async () => {
-			const response = await fetch(`${oauthHost}/api/oauth/token`, {
+			const response = await fetchCredentialResponse(`${oauthHost}/api/oauth/token`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",
@@ -206,7 +214,7 @@ async function pollForToken(
 			}
 			return {
 				status: "failed",
-				message: `Kimi Code device token request failed (status ${response.status})${typeof error === "string" ? `: ${oauthAuthorizationError(error)}` : ""}`,
+				message: `Kimi Code device token request failed (status ${response.status})${typeof error === "string" ? `: ${oauthAuthorizationError(error, [device.deviceCode, device.userCode])}` : ""}`,
 			};
 		},
 	});
@@ -228,7 +236,7 @@ async function refreshToken(oauthHost: string, refreshTokenValue: string, signal
 
 		let response: Response;
 		try {
-			response = await fetch(`${oauthHost}/api/oauth/token`, {
+			response = await fetchCredentialResponse(`${oauthHost}/api/oauth/token`, {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/x-www-form-urlencoded",

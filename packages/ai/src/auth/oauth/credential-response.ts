@@ -37,10 +37,12 @@ export function getOAuthDiagnosticSecrets(
 	for (const [key, value] of Object.entries(headers)) {
 		if (!value) continue;
 		if (!isCredentialLabel(key)) continue;
-		secrets.push(value);
+		// Fetch/Headers trim field values before dispatch. Keep the configured and wire forms.
+		const normalized = value.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+		secrets.push(value, normalized);
 		// "Bearer x", "Basic x", "Token x": the credential part can be echoed alone.
-		const separator = value.search(/\s/);
-		if (separator >= 0) secrets.push(value.slice(separator).trim());
+		const separator = normalized.search(/[\t ]/);
+		if (separator >= 0) secrets.push(normalized.slice(separator).replace(/^[\t ]+/, ""));
 	}
 	if (!token) return secrets;
 	try {
@@ -76,9 +78,8 @@ export function getRequestDiagnosticSecrets(
 	);
 }
 
-// Short live values must not replace common words or single letters in diagnostics.
-// Credential-labeled fields and Bearer values are still masked at any length.
-const MIN_DIAGNOSTIC_SECRET_LENGTH = 8;
+// Known credentials remain sensitive at every nonzero length. Short values containing
+// letters/numbers need token boundaries; punctuation-only values cannot corrupt word letters.
 const MAX_DIAGNOSTIC_DECODE_PASSES = 16;
 const MAX_DIAGNOSTIC_DECODE_WORK = 256 * 1024;
 const JSON_ESCAPES: Readonly<Record<string, string>> = {
@@ -91,20 +92,16 @@ const JSON_ESCAPES: Readonly<Record<string, string>> = {
 	t: "\t",
 };
 
-function percentDecode(run: string): string {
-	try {
-		return decodeURIComponent(run);
-	} catch {
-		// Malformed UTF-8: decode byte by byte; matching still sees every ASCII credential character.
-		return run.replace(/%([0-9a-f]{2})/gi, (_, hex: string) => String.fromCharCode(Number.parseInt(hex, 16)));
-	}
+/** Invalid UTF-8 cannot hide an adjacent valid credential, including a Unicode one. */
+function decodePercentDiagnostic(text: string): string {
+	return text.replace(/(?:%[0-9a-f]{2})+/gi, (encoded) => {
+		const bytes = new Uint8Array(encoded.length / 3);
+		for (let i = 0; i < bytes.length; i++) bytes[i] = Number.parseInt(encoded.slice(i * 3 + 1, i * 3 + 3), 16);
+		return new TextDecoder("utf-8", { ignoreBOM: true }).decode(bytes);
+	});
 }
 
-/**
- * Decode one JSON-string layer and one percent-encoding layer. Slash runs are
- * consumed once, so each pass is linear; composition order does not matter
- * because the caller repeats passes and masks after each one.
- */
+/** Decode one JSON-string layer; slash runs are consumed once, so each pass is linear. */
 function decodeDiagnosticLayer(text: string): string {
 	const parts: string[] = [];
 	let copied = 0;
@@ -128,7 +125,7 @@ function decodeDiagnosticLayer(text: string): string {
 		i = text.indexOf("\\", end);
 	}
 	parts.push(text.slice(copied));
-	return parts.join("").replace(/(?:%[0-9a-f]{2})+/gi, percentDecode);
+	return parts.join("");
 }
 
 function base64Variants(secret: string): string[] {
@@ -141,22 +138,35 @@ function maskAll(text: string, values: readonly string[]): { text: string; match
 	let matched = false;
 	for (const value of values) {
 		if (!text.includes(value)) continue;
-		matched = true;
-		text = text.split(value).join("***");
+		if (value.length < 4 && /[\p{L}\p{N}]/u.test(value)) {
+			const literal = value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			text = text.replace(new RegExp(`(?<![\\p{L}\\p{N}])${literal}(?![\\p{L}\\p{N}])`, "gu"), () => {
+				matched = true;
+				return "***";
+			});
+		} else {
+			matched = true;
+			text = text.split(value).join("***");
+		}
 	}
 	return { text, matched };
 }
 
 /**
  * Mask only the live values in `secrets` (raw, JSON/URI-escaped, form or base64 encoded).
+ * Values/aliases shorter than four characters containing letters/numbers need non-alphanumeric boundaries.
  * No label heuristics, so an opaque provider token without a live value stays byte for byte.
  */
 export function redactValues(text: string, secrets: readonly string[]): string {
 	const variants = new Set<string>();
 	for (const secret of secrets) {
-		if (typeof secret !== "string" || secret.length < MIN_DIAGNOSTIC_SECRET_LENGTH) continue;
+		if (typeof secret !== "string" || secret.length === 0) continue;
 		variants.add(secret);
-		for (const value of base64Variants(secret)) variants.add(value);
+		// Keep the Base64 expansion bounded: mask the raw value, one encoded layer, and one nested layer.
+		for (const value of base64Variants(secret)) {
+			variants.add(value);
+			for (const nested of base64Variants(value)) variants.add(nested);
+		}
 		// Form encoding turns spaces into "+", which percent decoding does not reverse.
 		variants.add(new URLSearchParams({ v: secret }).toString().slice(2));
 	}
@@ -174,11 +184,14 @@ export function redactValues(text: string, secrets: readonly string[]): string {
 	for (let pass = 0; text.includes("\\") || /%[0-9a-f]{2}/i.test(text); pass++) {
 		work += text.length;
 		if (pass === MAX_DIAGNOSTIC_DECODE_PASSES || work > MAX_DIAGNOSTIC_DECODE_WORK) return "***";
-		const decoded = decodeDiagnosticLayer(text);
-		if (decoded === text) break;
-		const masked = maskAll(decoded, values);
-		encodedMatch ||= masked.matched;
-		text = masked.text;
+		const previous = text;
+		// Mask between decoders so a literal encoded-looking credential cannot be decoded past.
+		for (const decode of [decodeDiagnosticLayer, decodePercentDiagnostic]) {
+			const masked = maskAll(decode(text), values);
+			encodedMatch ||= masked.matched;
+			text = masked.text;
+		}
+		if (text === previous) break;
 	}
 	// Untouched diagnostics stay byte-for-byte; an encoded match publishes the safe decoded form.
 	return encodedMatch ? text : original;
@@ -293,27 +306,33 @@ export function redactOAuthDiagnosticValue(
 type SdkLogFunction = (message: string, ...args: unknown[]) => void;
 
 /**
- * SDK logger that masks every argument. Never hand the original Error, its
- * cause or custom inspect hooks to the console: they can carry the request key.
+ * Credential-bearing SDK requests log owned text only (smarty-dev#4703). An SDK
+ * message, body, URL or argument can contain an arbitrarily encoded credential;
+ * no finite alias mask makes that text safe. Do not inspect or forward it.
  */
-export function createRedactingSdkLogger(secrets: readonly string[]): {
+export function createRedactingSdkLogger(
+	secrets: readonly string[],
+	provider: "openai" | "azure-openai" | "openrouter" = "openai",
+): {
 	error: SdkLogFunction;
 	warn: SdkLogFunction;
 	info: SdkLogFunction;
 	debug: SdkLogFunction;
 } {
-	const safe = (message: string, args: unknown[]) =>
-		[message, ...args].map((arg) => redactOAuthDiagnosticValue(arg, secrets));
+	// Close the label at runtime too; callers cannot turn configuration into log text.
+	const name = provider === "azure-openai" ? "azure-openai" : provider === "openrouter" ? "openrouter" : "openai";
+	// Keep live-value masking as defense in depth even for these owned lines.
+	const line = (level: string) => redactValues(`${name} sdk ${level}: message withheld`, secrets);
 	return {
-		error: (message, ...args) => console.error(...safe(message, args)),
-		warn: (message, ...args) => console.warn(...safe(message, args)),
-		info: (message, ...args) => console.info(...safe(message, args)),
-		debug: (message, ...args) => console.debug(...safe(message, args)),
+		error: () => console.error(line("error")),
+		warn: () => console.warn(line("warn")),
+		info: () => console.info(line("info")),
+		debug: () => console.debug(line("debug")),
 	};
 }
 
 /** OAuth errors are untrusted text. Keep only protocol codes; never echo error_description. */
-export function oauthAuthorizationError(code: string): string {
+export function oauthAuthorizationError(code: string, secrets: readonly string[] = []): string {
 	switch (code) {
 		case "access_denied":
 		case "invalid_request":
@@ -329,7 +348,8 @@ export function oauthAuthorizationError(code: string): string {
 		case "authorization_pending":
 		case "slow_down":
 		case "expired_token":
-			return code;
+			// Inspect only these short, closed protocol classes, never arbitrary provider text.
+			return redactValues(code, secrets) === code ? code : "authorization_error";
 		default:
 			return "authorization_error";
 	}
