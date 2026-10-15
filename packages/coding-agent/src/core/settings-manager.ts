@@ -379,8 +379,13 @@ export class SettingsManager {
 		if (content === undefined) {
 			return {};
 		}
-		const settings = JSON.parse(stripBom(content));
-		return SettingsManager.migrateSettings(settings);
+		const settings: unknown = JSON.parse(stripBom(content));
+		// Settings are a JSON object. Any other root (array, null, number, string) is a load error, so a
+		// model policy can never be bypassed by replacing the file's contents with valid non-object JSON.
+		if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+			throw new Error("settings file root must be a JSON object");
+		}
+		return SettingsManager.migrateSettings(settings as Record<string, unknown>);
 	}
 
 	private static tryLoadFromStorage(
