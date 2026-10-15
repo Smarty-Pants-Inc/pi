@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { Component, EditorComponent } from "@earendil-works/pi-tui";
-import { getKeybindings, ProcessTerminal, setKeybindings, TuiMainScreen } from "@earendil-works/pi-tui";
+import { Container, getKeybindings, ProcessTerminal, setKeybindings, TuiMainScreen } from "@earendil-works/pi-tui";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { HerdrInputBootstrap } from "../src/core/herdr/bootstrap.ts";
 import { EpochByteCounter, epochMarker } from "../src/core/herdr/epoch-bytes.ts";
@@ -12,6 +12,8 @@ import { getInputReceipt, type ReceivedInput } from "../src/core/received-input.
 import { receiptRecord, type TurnReceipt } from "../src/core/turn-receipts.ts";
 import { CustomEditor } from "../src/modes/interactive/components/custom-editor.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import { initTheme } from "../src/modes/interactive/theme/theme.ts";
+import { stripAnsi } from "../src/utils/ansi.ts";
 
 const clipboard = vi.hoisted(() => ({
 	readClipboardFilePaths: vi.fn<() => Promise<string[] | null>>(),
@@ -37,10 +39,18 @@ interface TestMode {
 	options: { herdrInput: Pick<HerdrInputBootstrap, "attestor"> };
 	runtimeHost: {
 		inputsFenced: boolean;
-		session: { isCompacting: boolean; isStreaming: boolean; isBashRunning: boolean };
+		session: {
+			isCompacting: boolean;
+			isStreaming: boolean;
+			isBashRunning: boolean;
+			compact(customInstructions?: string): Promise<void>;
+		};
 	};
 	terminalShutdownRequested: boolean;
 	pendingUserInputs: ReceivedInput[];
+	compactionQueuedMessages: { input: ReceivedInput; mode: "steer" | "followUp" }[];
+	chatContainer: Container;
+	pendingMessagesContainer: Container;
 	editorRevision: number;
 	isBashMode: boolean;
 	ordinaryEditorSubmit: EditorComponent["onSubmit"];
@@ -48,6 +58,7 @@ interface TestMode {
 	updateEditorBorderColor: ReturnType<typeof vi.fn>;
 	flushPendingBashComponents: ReturnType<typeof vi.fn>;
 	showSettingsSelector: ReturnType<typeof vi.fn>;
+	showModelsSelector(): void | Promise<void>;
 	setupKeyHandlers(): void;
 	setupEditorSubmitHandler(): void;
 	handleRightClickPaste(): Promise<void>;
@@ -87,7 +98,7 @@ function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer
 	const keybindings = new KeybindingsManager();
 	setKeybindings(keybindings);
 	const editor = new CustomEditor(ui, { borderColor: (s) => s, selectList: {} as never }, keybindings);
-	const mode = Object.assign(Object.create(InteractiveMode.prototype) as TestMode, {
+	const mode: TestMode = Object.assign(Object.create(InteractiveMode.prototype) as TestMode, {
 		defaultEditor: editor,
 		editor,
 		keybindings,
@@ -96,10 +107,21 @@ function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer
 		options: { herdrInput: { attestor } },
 		runtimeHost: {
 			inputsFenced: false,
-			session: { isCompacting: false, isStreaming: false, isBashRunning: false },
+			session: {
+				isCompacting: false,
+				isStreaming: false,
+				isBashRunning: false,
+				compact: vi.fn<() => Promise<void>>(),
+				getSteeringMessages: () => [],
+				getFollowUpMessages: () => [],
+			},
 		},
 		terminalShutdownRequested: false,
 		pendingUserInputs: [],
+		compactionQueuedMessages: [],
+		chatContainer: new Container(),
+		pendingMessagesContainer: new Container(),
+		clearStatusIndicator: vi.fn(),
 		editorRevision: 0,
 		isBashMode: false,
 		showError: vi.fn(),
@@ -267,6 +289,42 @@ test("two quick submits dispatch in keypress order when cuts resolve in reverse"
 		"keyboard",
 		"keyboard",
 	]);
+	expect(editor.getText()).toBe("next");
+});
+
+// pi#160 R9b: a selector continuation that never settles must not hold later Enter submissions.
+test("an unsettled /scoped-models dispatch does not block later Enter", async () => {
+	const { mode, editor, send } = setup();
+	const selector = vi.spyOn(mode, "showModelsSelector").mockImplementation(() => new Promise<void>(() => {}));
+	send("/scoped-models\r");
+	await vi.waitFor(() => expect(selector).toHaveBeenCalledOnce());
+	send("hello\rnext");
+	const input = await submitted(mode);
+	expect(input.text).toBe("hello");
+	expect(receiptRecord(getInputReceipt(input)).channel).toBe("keyboard");
+	expect(editor.getText()).toBe("next");
+});
+
+// pi#160 R9b: a pending /compact must leave the existing visible compaction queue reachable.
+test("Enter during pending /compact reaches the compaction queue", async () => {
+	initTheme("dark");
+	const { mode, editor, send } = setup();
+	vi.spyOn(mode.runtimeHost.session, "compact").mockImplementation(() => {
+		mode.runtimeHost.session.isCompacting = true;
+		return new Promise<void>(() => {});
+	});
+	send("/compact\r");
+	await vi.waitFor(() => expect(mode.runtimeHost.session.isCompacting).toBe(true));
+	send("hello\rnext");
+	await vi.waitFor(() => expect(mode.compactionQueuedMessages).toHaveLength(1));
+
+	const queued = mode.compactionQueuedMessages[0]!;
+	expect(queued.mode).toBe("steer");
+	expect(queued.input.text).toBe("hello");
+	expect(receiptRecord(getInputReceipt(queued.input)).channel).toBe("keyboard");
+	expect(mode.pendingUserInputs).toEqual([]);
+	expect(stripAnsi(mode.chatContainer.render(120).join("\n"))).toContain("Queued message for after compaction");
+	expect(stripAnsi(mode.pendingMessagesContainer.render(120).join("\n"))).toContain("Steering: hello");
 	expect(editor.getText()).toBe("next");
 });
 

@@ -3427,7 +3427,7 @@ export class InteractiveMode {
 			text = text.trim();
 			if (!text) return;
 			if (this.runtimeHost.inputsFenced || this.terminalShutdownRequested) {
-				this.editor.setText(text);
+				this.restoreRejectedInput(text);
 				this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
 				return;
 			}
@@ -3436,16 +3436,18 @@ export class InteractiveMode {
 			const input = attested
 				? attested.then((receipt) => receiveInput(text, undefined, receipt))
 				: receiveInput(text);
-			// Reserve FIFO order now, not when the cut answers. A failed dispatch must not poison the queue.
-			const dispatched = submitQueue.then(async () => {
-				await this.dispatchEditorInput(await input);
-			});
-			submitQueue = dispatched.catch(() => {});
+			// Reserve FIFO order now, not when the cut answers. Order dispatch starts, not command completion.
+			const started = submitQueue
+				.then(() => input)
+				.then((input) => {
+					void this.dispatchEditorInput(input).catch((error: unknown) => this.observeSubmitFailure(error));
+				});
+			submitQueue = started.catch(() => {});
 			// Clear only this submission, before the terminal can fill the next draft (pi#160 R9).
 			this.editor.setText("");
-			await dispatched;
+			await started;
 		};
-		// Return the observed promise so callers that await submission still see its completion.
+		// Observe admission/start failures too; dispatch completion is observed independently above.
 		this.defaultEditor.onSubmit = (text: string) =>
 			submit(text).catch((error: unknown) => this.observeSubmitFailure(error));
 		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;
