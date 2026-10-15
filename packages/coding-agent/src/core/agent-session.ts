@@ -16,6 +16,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { hostname, userInfo } from "node:os";
 import { basename, dirname } from "node:path";
 import {
 	type AfterToolCallContext,
@@ -191,6 +192,7 @@ import {
 import {
 	getUnsentInputTransfer,
 	linkUnsentInputTransfer,
+	readUnsentInput,
 	UNSENT_INPUT_TYPE,
 	type UnsentInput,
 } from "./unsent-input.ts";
@@ -551,6 +553,8 @@ export class AgentSession {
 	private readonly _persistedInputReceipts = new WeakSet<TurnReceipt>();
 	private readonly _replayedInputs = new WeakMap<AgentMessage, UnsentInput>();
 	private _hasResumedInputs = false;
+	private readonly _unsentInputDrafts: AgentMessage[] = [];
+	private _queuedInputRevision = 0;
 	private _operatorExitPrepared = false;
 	readonly capabilities = HOST_CAPABILITIES;
 	private readonly _inputAdmissions = new Set<InputAdmission>();
@@ -765,6 +769,31 @@ export class AgentSession {
 			followUp: (input, source) =>
 				this._queueUserInput(input.text, input.images, "followUp", source ?? "interactive", getInputReceipt(input)),
 		});
+
+		// Raw SDK queues bypass session admission and display bookkeeping. Observe their mutations
+		// without claiming Agent's single owner lifecycle observer. Advance before native observers
+		// can reenter /quit; publish even if such an observer throws after insertion.
+		for (const method of [
+			"steer",
+			"followUp",
+			"clearSteeringQueue",
+			"clearFollowUpQueue",
+			"removeQueuedMessages",
+		] as const) {
+			const original = this.agent[method].bind(this.agent);
+			Object.defineProperty(this.agent, method, {
+				configurable: true,
+				writable: true,
+				value: (...args: unknown[]) => {
+					this._queuedInputRevision++;
+					try {
+						return Reflect.apply(original, this.agent, args);
+					} finally {
+						this._emitQueueUpdate();
+					}
+				},
+			});
+		}
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -1459,6 +1488,7 @@ export class AgentSession {
 
 	/** Emit an event to all listeners */
 	private _emit(event: AgentSessionEvent): void {
+		if (event.type === "queue_update") this._queuedInputRevision++;
 		if (
 			event.type === "queue_update" ||
 			event.type === "compaction_start" ||
@@ -1647,6 +1677,10 @@ export class AgentSession {
 			// Record before extensions or listeners can throw and produce a synthetic failure.
 			this._assistantToolExecutionStarted = true;
 		}
+		// Native queue reservations leave the unsent set at delivery, including custom input
+		// with no steering/follow-up display slot. Persisted transfer still occurs at message_end.
+		if (event.type === "message_start" && (event.message.role === "user" || event.message.role === "custom"))
+			this._emitQueueUpdate();
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
 			this._assistantOutputObserved ||= hasAssistantOutput(event.message);
 			observeAssistantMessage(this._assistantStreamObserved, event.message);
@@ -1828,7 +1862,9 @@ export class AgentSession {
 			}
 			if (entryId) {
 				this._entryIdsByMessage.set(event.message, entryId);
-				this._unpersistedInputs.delete(event.message);
+				// Raw SDK queue occurrences have a receipt but no session-side pending-map slot.
+				// Do not insert a throwing public callback between durable append and receipt bookkeeping.
+				if (this._unpersistedInputs.delete(event.message) || receipt) this._queuedInputRevision++;
 				if (receipt) this._persistedInputReceipts.add(receipt);
 			}
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
@@ -2942,10 +2978,20 @@ export class AgentSession {
 		const consumed = new Set(entries.flatMap((entry) => (entry.unsentInputId ? [entry.unsentInputId] : [])));
 		for (const entry of this.sessionManager.getBranch()) {
 			if (entry.type !== "custom" || entry.customType !== UNSENT_INPUT_TYPE || consumed.has(entry.id)) continue;
-			const input = entry.data as UnsentInput | undefined;
-			if (!input?.message || !["steer", "followUp", "nextTurn", "context"].includes(input.mode))
-				throw new Error(`Invalid unsent input entry ${entry.id}`);
+			const input = readUnsentInput(entry.data);
+			if (!input) throw new Error(`Invalid unsent input entry ${entry.id}`);
 			const message = structuredClone(input.message);
+			// The origin is written only at operator exit. Historical/imported/foreign outboxes
+			// remain editable drafts: never restore their receipts or bind their metadata.
+			if (
+				input.origin?.sessionId !== this.sessionManager.getSessionId() ||
+				input.origin.host !== hostname() ||
+				input.origin.uid !== userInfo().uid
+			) {
+				if (message.role === "user" || message.role === "custom")
+					this._unsentInputDrafts.push({ role: "user", content: message.content, timestamp: message.timestamp });
+				continue;
+			}
 			const receipt = input.provenance ? restoreTerminalTurnReceipt(input.provenance) : captureTerminalTurnReceipt();
 			linkUnsentInputTransfer(receipt, entry.id);
 			this.#receivedMessageReceipts.set(message, receipt);
@@ -2963,7 +3009,18 @@ export class AgentSession {
 				}
 			}
 			this._hasResumedInputs = true;
+			this._emitQueueUpdate();
 		}
+	}
+
+	/** Take foreign outbox content for the editor, once per live instance; never submit it. */
+	takeUnsentInputDrafts(): AgentMessage[] {
+		return this._unsentInputDrafts.splice(0);
+	}
+
+	/** Monotonic input occurrence revision; reading it never mutates queue state. */
+	get queuedInputRevision(): number {
+		return this._queuedInputRevision;
 	}
 
 	/** Replay operator-exit input after the host has bound extensions and published the session. */
@@ -3032,7 +3089,8 @@ export class AgentSession {
 				);
 			for (const { input, receipt } of this.sessionManager.isPersisted() ? pending : []) {
 				if (getUnsentInputTransfer(receipt)) continue; // Already durable from an earlier exit; not yet consumed.
-				const id = this.sessionManager.appendCustomEntry(UNSENT_INPUT_TYPE, structuredClone(input));
+				const origin = { sessionId: this.sessionManager.getSessionId(), host: hostname(), uid: userInfo().uid };
+				const id = this.sessionManager.appendCustomEntry(UNSENT_INPUT_TYPE, structuredClone({ ...input, origin }));
 				if (receipt) linkUnsentInputTransfer(receipt, id);
 			}
 			this._operatorExitPrepared = true;
@@ -3152,11 +3210,14 @@ export class AgentSession {
 			fenceScope: this._inputFenceScope.getStore(),
 			release: () => {
 				if (!this._inputAdmissions.delete(admission)) return;
+				this._emitQueueUpdate();
 				this._inputAdmissionScope.exit(() => this._runInputQueuedBehindPreflight());
 				this._resolveIdleWaitIfIdle();
 			},
 		};
 		this._inputAdmissions.add(admission);
+		// No public callback before the caller attaches this admission's recoverable content.
+		this._queuedInputRevision++;
 		return admission;
 	}
 
@@ -3992,9 +4053,10 @@ export class AgentSession {
 						: (options?.deliverAs ?? (options?.triggerTurn ? "steer" : "context")),
 		});
 		try {
+			this._emitQueueUpdate();
 			return await this._deliverCustomMessage(appMessage, options);
 		} catch (error) {
-			if (!this._operatorExitPrepared) this._unpersistedInputs.delete(appMessage);
+			if (!this._operatorExitPrepared && this._unpersistedInputs.delete(appMessage)) this._emitQueueUpdate();
 			throw error;
 		}
 	}
@@ -4140,6 +4202,7 @@ export class AgentSession {
 		const receipt = this.#receivedMessageReceipts.get(appMessage);
 		if (receipt) this._persistedInputReceipts.add(receipt);
 		this._unpersistedInputs.delete(appMessage);
+		this._emitQueueUpdate();
 		this.#receivedMessageReceipts.delete(appMessage);
 		this._recordMessageEntryId(appMessage, entryId);
 		this._entryIdsByMessage.set(appMessage, entryId);
@@ -4178,6 +4241,7 @@ export class AgentSession {
 				// Leave the failed message and suffix retained if persistence fails.
 				try {
 					this._pendingCustomMessages.shift();
+					this._emitQueueUpdate();
 					this.agent.state.messages.push(message);
 					this._recordMessageEntryId(message, id);
 					this._emit({ type: "message_start", message });

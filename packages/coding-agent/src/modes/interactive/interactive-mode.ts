@@ -528,6 +528,7 @@ export class InteractiveMode {
 	private inFlightUserInput?: ReceivedInput;
 	private operatorExitRequested = false;
 	private confirmUnsentDiscard = false;
+	private confirmedUnsentRevision?: number;
 	private readonly compactionTransferInputs = new Set<CompactionQueuedMessage>();
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -1329,6 +1330,8 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
+		// Foreign input is a visible draft, never an automatic resume submission.
+		this.restoreUnsentInputDrafts();
 		// Resume operator-exit input without waiting for another editor submission.
 		await this.session.resumeUnsentInputs();
 
@@ -4619,7 +4622,11 @@ export class InteractiveMode {
 					this.operatorExitRequested = true;
 					await this.runtimeHost.dispose({
 						operatorExit: true,
-						discardUnsentInput: options?.fromQuit && options.discardUnsentInput,
+						discardUnsentInput:
+							options?.fromQuit === true &&
+							options.discardUnsentInput === true &&
+							this.confirmUnsentDiscard &&
+							this.confirmedUnsentRevision === this.session.queuedInputRevision,
 						beforeShutdown: async () => {
 							while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
 							this.themeController.disableAutoSync();
@@ -4657,6 +4664,7 @@ export class InteractiveMode {
 					)
 				) {
 					this.confirmUnsentDiscard = options?.fromQuit === true;
+					this.confirmedUnsentRevision = this.session.queuedInputRevision;
 					this.showWarning(error.message.slice("INPUT_ADMISSION_BUSY: ".length));
 				} else if (!this.handleInputAdmissionError(error)) throw error;
 				// Admission refusal precedes terminal teardown: the old session remains usable.
@@ -4821,6 +4829,21 @@ export class InteractiveMode {
 			process.removeListener("SIGINT", ignoreSigint);
 			throw error;
 		}
+	}
+
+	private restoreUnsentInputDrafts(): void {
+		const drafts = this.session.takeUnsentInputDrafts();
+		if (drafts.length === 0) return;
+		// Recover only editable content, not foreign provenance, metadata, or receipt stamps.
+		const text = this.recoveryText(
+			drafts.map((message) =>
+				message.role === "custom"
+					? { role: "user", content: message.content, timestamp: message.timestamp }
+					: message,
+			),
+		);
+		if (text) this.restoreRejectedInput(text);
+		this.showWarning("Foreign or unstamped unsent input restored as draft; not sent. Review before submitting.");
 	}
 
 	private recoveryText(messages: AgentMessage[], imagesOnly = false): string {
@@ -6384,6 +6407,7 @@ export class InteractiveMode {
 			}
 			if (!result.cancelled) {
 				this.showStatus(status);
+				this.restoreUnsentInputDrafts();
 				await this.session.resumeUnsentInputs();
 			}
 			return result;
@@ -7202,6 +7226,10 @@ export class InteractiveMode {
 				result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
 			}
 			this.showStatus(result.cancelled ? "Import cancelled" : `Session imported from: ${inputPath}`);
+			if (!result.cancelled) {
+				this.restoreUnsentInputDrafts();
+				await this.session.resumeUnsentInputs();
+			}
 		} catch (error: unknown) {
 			if (error instanceof SessionImportFileNotFoundError) {
 				this.showError(`Failed to import session: ${error.message}`);
