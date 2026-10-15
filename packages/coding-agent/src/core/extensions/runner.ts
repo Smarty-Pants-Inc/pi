@@ -1459,7 +1459,21 @@ export class ExtensionRunner {
 						| ToolPartialResultEventResult
 						| undefined;
 					signal?.throwIfAborted();
-					if (result?.partialResult !== undefined) currentEvent.partialResult = result.partialResult;
+					if (result === undefined) continue;
+					if (result === null || typeof result !== "object" || Array.isArray(result)) {
+						throw new Error("Invalid partial tool result handler return");
+					}
+					// The documented optional partialResult permits an object to leave the snapshot unchanged.
+					if (result.partialResult === undefined) continue;
+					if (
+						result.partialResult === null ||
+						typeof result.partialResult !== "object" ||
+						Array.isArray(result.partialResult) ||
+						!Array.isArray(result.partialResult.content)
+					) {
+						throw new Error("Invalid partial tool result");
+					}
+					currentEvent.partialResult = result.partialResult;
 				}
 			}
 			if (!currentEvent.partialResult || !Array.isArray(currentEvent.partialResult.content)) {

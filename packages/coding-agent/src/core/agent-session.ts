@@ -887,7 +887,7 @@ export class AgentSession {
 			this._beforeToolCall(context, this._nestedToolParents.get(context.toolCall));
 		this.agent.afterToolCall = (context) =>
 			this._afterToolCall(context, this._nestedToolParents.get(context.toolCall));
-		this.agent.transformToolUpdate = async (toolCall, args, partialResult) => {
+		this.agent.transformToolUpdate = async (toolCall, args, partialResult, signal) => {
 			const runner = this._extensionRunner;
 			if (!runner.hasHandlers("tool_partial_result")) return undefined;
 			const parentToolCallId = this._nestedToolParents.get(toolCall);
@@ -900,7 +900,7 @@ export class AgentSession {
 					partialResult,
 					...(parentToolCallId ? { parentToolCallId } : {}),
 				},
-				this._shutdownCancellation.signal,
+				signal ? AbortSignal.any([signal, this._shutdownCancellation.signal]) : this._shutdownCancellation.signal,
 			);
 			return result.partialResult;
 		};
