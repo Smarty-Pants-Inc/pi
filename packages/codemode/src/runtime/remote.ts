@@ -42,7 +42,7 @@ import type { CodemodeError, CodemodeSandboxBaseOptions } from "../types.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
 import { CodemodeSandboxBase, errorMessage, type VmChannel, type VmLauncher } from "./execution.ts";
 import { DEFAULT_INTERRUPT_BUDGET, inlineLauncher } from "./inline.ts";
-import { resolveCodemodeLimits } from "./limits.ts";
+import { resolveCodemodeLimits, resolveMemoryLimit } from "./limits.ts";
 import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
@@ -93,7 +93,7 @@ export interface CodemodeServeOptions {
 	wasm: CodemodeWasmModule | Promise<CodemodeWasmModule>;
 	/** Upper bound for a request's interrupt budget, and the budget when a request names none. */
 	maxInterruptBudget?: number;
-	/** Upper bound for a request's VM memory, and the limit when a request names none. */
+	/** May only tighten the shared host-owned memory default and ceiling. Must be positive and finite. */
 	maxMemoryLimitBytes?: number;
 }
 
@@ -109,14 +109,10 @@ export function serveCodemodeRemote(
 ): Promise<void> {
 	const maxBudget = options.maxInterruptBudget ?? DEFAULT_INTERRUPT_BUDGET;
 	const budget = Math.min(request.interruptBudget ?? maxBudget, maxBudget);
-	const requestedMemory = request.data.memoryLimitBytes;
-	const maxMemory = options.maxMemoryLimitBytes;
-	const memoryLimitBytes =
-		requestedMemory === undefined
-			? maxMemory
-			: maxMemory === undefined
-				? requestedMemory
-				: Math.min(requestedMemory, maxMemory);
+	const memoryLimitBytes = Math.min(
+		resolveMemoryLimit(request.data.memoryLimitBytes),
+		resolveMemoryLimit(options.maxMemoryLimitBytes),
+	);
 	const data: VmStartData = {
 		...request.data,
 		memoryLimitBytes,

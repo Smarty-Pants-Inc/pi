@@ -18,10 +18,11 @@ See [Usage on Node and Bun](#usage-on-node-and-bun) and [Usage on Cloudflare Wor
 ## Usage on Node and Bun
 
 ```ts
-import { CodemodeSandbox } from "@earendil-works/pi-codemode";
+import { CodemodeSandbox, DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES } from "@earendil-works/pi-codemode";
 
 const sandbox = new CodemodeSandbox({
 	timeoutMs: 60_000,
+	memoryLimitBytes: DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES, // 256 MiB; callers may only tighten this cap
 	tools: [
 		{
 			name: "read",
@@ -339,6 +340,14 @@ A run defaults to the finite `limits.maxTimeoutMs` deadline (30 minutes); a larg
 | `limit`   | the script went over a `limits` budget or the store quota; the VM was stopped |
 
 `result.output` holds the text and image items in the order the script produced them, also for failed executions. The host keeps all of it until the script ends, so output is limited to `MAX_OUTPUT_CHARS` (16 Mi) characters of text and base64 image data and `MAX_OUTPUT_ITEMS` (100000) items. Past either limit the script fails with a `RangeError`, even if it catches the error. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.
+
+Every backend defaults to a 256 MiB QuickJS heap limit and clamps larger requests to the
+host-owned 256 MiB ceiling. Non-positive and non-finite limits are refused. Remote server
+limits may only tighten this cap; Cloudflare helpers default to 32 MiB. Allocation failures
+return `ok: false` with `out of memory`; a later execution gets a fresh VM. Node workers
+also have V8 `resourceLimits`: the resolved MiB limit plus 48 MiB for old-generation JS,
+and 16 MiB for young-generation JS (64 MiB fixed headroom). Node's guard does not limit
+external/ArrayBuffer or wasm memory; the QuickJS allocator limit remains essential.
 
 ## How it works
 

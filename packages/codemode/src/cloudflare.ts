@@ -19,6 +19,7 @@ import {
 	InlineCodemodeSandbox,
 	type InlineCodemodeSandboxOptions,
 } from "./runtime/inline.ts";
+import { resolveMemoryLimit } from "./runtime/limits.ts";
 import { type CodemodeRemoteExchange, type CodemodeRemoteRequest, serveCodemodeRemote } from "./runtime/remote.ts";
 import type { CodemodeWasmModule } from "./wasm.ts";
 
@@ -36,7 +37,11 @@ export const cloudflareQuickJSWasm: CodemodeWasmModule = quickjsWasm;
 
 /** `InlineCodemodeSandbox` with the QuickJS module Wrangler bundled. */
 export function createInlineCodemodeSandbox(options: Omit<InlineCodemodeSandboxOptions, "wasm"> = {}) {
-	return new InlineCodemodeSandbox({ ...options, wasm: quickjsWasm });
+	return new InlineCodemodeSandbox({
+		...options,
+		wasm: quickjsWasm,
+		memoryLimitBytes: Math.min(resolveMemoryLimit(options.memoryLimitBytes), DEFAULT_REMOTE_MEMORY_LIMIT_BYTES),
+	});
 }
 
 /**

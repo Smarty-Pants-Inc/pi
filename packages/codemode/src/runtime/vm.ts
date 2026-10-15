@@ -37,7 +37,7 @@
  */
 import { Intrinsics, JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
 import type { CodemodeWasmModule } from "../wasm.ts";
-import { BridgeBudget, CodemodeLimitError, resolveCodemodeLimits } from "./limits.ts";
+import { BridgeBudget, CodemodeLimitError, resolveCodemodeLimits, resolveMemoryLimit } from "./limits.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import type { HostToWorkerMessage, VmStartData, WorkerToHostMessage } from "./protocol.ts";
 
@@ -161,6 +161,8 @@ function crashMessage(error: unknown): WorkerToHostMessage {
 export async function startVm(options: StartVmOptions): Promise<VmSession> {
 	const { data, post: emit } = options;
 	const limits = resolveCodemodeLimits(data.limits);
+	// Also guard direct worker/VM entry, independently of the public sandbox constructors.
+	const memoryLimitBytes = resolveMemoryLimit(data.memoryLimitBytes);
 	const budget = new BridgeBudget(limits);
 	const pending = new Set<number>();
 	let stopped = false;
@@ -188,7 +190,7 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 	};
 	const vm = await QuickJS.create({
 		wasm: options.wasm,
-		memoryLimit: data.memoryLimitBytes,
+		memoryLimit: memoryLimitBytes,
 		// Without a guard, deep recursion overflows the wasm stack and traps instead of throwing a
 		// catchable RangeError.
 		maxStackSize,
@@ -344,7 +346,7 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 			const budget = options.interruptBudget ?? "none";
 			post({
 				type: "started",
-				fingerprint: `quickjs-wasi ${versions["quickjs-wasi"]}, quickjs ${versions.quickjs}, prelude ${PRELUDE_HASH}, deterministic ${DETERMINISTIC_VERSION}, stack ${maxStackSize}, heap ${data.memoryLimitBytes ?? "none"}, budget ${budget}, bridge ${Object.values(limits).join("/")}`,
+				fingerprint: `quickjs-wasi ${versions["quickjs-wasi"]}, quickjs ${versions.quickjs}, prelude ${PRELUDE_HASH}, deterministic ${DETERMINISTIC_VERSION}, stack ${maxStackSize}, heap ${memoryLimitBytes}, budget ${budget}, bridge ${Object.values(limits).join("/")}`,
 			});
 		}
 
