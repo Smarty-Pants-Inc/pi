@@ -180,8 +180,8 @@ describe("AgentSession tool orchestration", () => {
 		}
 	});
 
-	// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
-	it.skip("registers codemode and tool_search inactive until they are named", async () => {
+	// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+	it("registers codemode and tool_search inactive until they are named", async () => {
 		const extensionFactories = [createCodemodeExtension(), createToolSearchExtension()];
 		const plain = await createHarness({ extensionFactories });
 		harnesses.push(plain);

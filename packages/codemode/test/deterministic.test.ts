@@ -104,8 +104,8 @@ afterEach(() => {
 });
 
 for (const [backend, create] of Object.entries(BACKENDS)) {
-	// Dormant until reviewed re-enable: smarty-dev#4506
-	describe.skip(`deterministic runs (${backend})`, () => {
+	// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+	describe(`deterministic runs (${backend})`, () => {
 		it("makes the same calls and output for the same start, seed, and results", async () => {
 			const code = `
 				const values = [Date.now(), performance.now(), Math.random(), Math.random(), new Date().toISOString()];
@@ -366,8 +366,8 @@ for (const [backend, create] of Object.entries(BACKENDS)) {
 	});
 }
 
-// Dormant until reviewed re-enable: smarty-dev#4506
-describe.skip("deterministic runs (remote transport)", () => {
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+describe("deterministic runs (remote transport)", () => {
 	it("applies results in seq order when the transport reorders replies sent in order", async () => {
 		const sandbox = remote({}, true);
 		const recorded = start(
@@ -384,8 +384,8 @@ describe.skip("deterministic runs (remote transport)", () => {
 	});
 });
 
-// Dormant until reviewed re-enable: smarty-dev#4506
-describe.skip("execute() is not deterministic", () => {
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
+describe("execute() is not deterministic", () => {
 	it("reads the real clock and real randomness", async () => {
 		const sandbox = new CodemodeSandbox();
 		const before = Date.now();

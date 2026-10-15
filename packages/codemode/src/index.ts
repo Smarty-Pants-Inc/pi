@@ -20,6 +20,9 @@ export {
 	type CodemodeLimits,
 	checkCodemodeStoreQuota,
 	DEFAULT_CODEMODE_LIMITS,
+	DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES,
+	MAX_CODEMODE_MEMORY_LIMIT_BYTES,
+	resolveMemoryLimit,
 } from "./runtime/limits.ts";
 export {
 	MAX_OUTPUT_CHARS,

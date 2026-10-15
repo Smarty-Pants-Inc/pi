@@ -19,8 +19,8 @@ import {
 	InlineCodemodeSandbox,
 	type InlineCodemodeSandboxOptions,
 } from "./runtime/inline.ts";
+import { resolveMemoryLimit } from "./runtime/limits.ts";
 import { type CodemodeRemoteExchange, type CodemodeRemoteRequest, serveCodemodeRemote } from "./runtime/remote.ts";
-import { refuseCodemodeAdmission } from "./security-admission.ts";
 import type { CodemodeWasmModule } from "./wasm.ts";
 
 export * from "./portable.ts";
@@ -37,8 +37,11 @@ export const cloudflareQuickJSWasm: CodemodeWasmModule = quickjsWasm;
 
 /** `InlineCodemodeSandbox` with the QuickJS module Wrangler bundled. */
 export function createInlineCodemodeSandbox(options: Omit<InlineCodemodeSandboxOptions, "wasm"> = {}) {
-	refuseCodemodeAdmission();
-	return new InlineCodemodeSandbox({ ...options, wasm: quickjsWasm });
+	return new InlineCodemodeSandbox({
+		...options,
+		wasm: quickjsWasm,
+		memoryLimitBytes: Math.min(resolveMemoryLimit(options.memoryLimitBytes), DEFAULT_REMOTE_MEMORY_LIMIT_BYTES),
+	});
 }
 
 /**
@@ -68,7 +71,6 @@ export class CodemodeSandboxDurableObject<Env = unknown> extends DurableObject<E
 
 	/** Called by `RemoteCodemodeSandbox` over RPC. Resolves when the script has settled or was stopped. */
 	execute(request: CodemodeRemoteRequest, exchange: CodemodeRemoteExchange): Promise<void> {
-		refuseCodemodeAdmission();
 		return serveCodemodeRemote(request, exchange, {
 			wasm: quickjsWasm,
 			maxInterruptBudget: this.maxInterruptBudget,

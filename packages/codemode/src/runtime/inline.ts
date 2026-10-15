@@ -31,7 +31,6 @@
  * a microtask, after the VM has returned, so host code (tool calls, `finish()`, disposal) never
  * runs inside a VM callback and never re-enters the VM.
  */
-import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type { CodemodeSandboxBaseOptions } from "../types.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
 import { CodemodeSandboxBase, errorMessage, type VmLauncher } from "./execution.ts";
@@ -59,9 +58,7 @@ export function inlineLauncher(
 	wasm: CodemodeWasmModule | Promise<CodemodeWasmModule>,
 	interruptBudget: number = DEFAULT_INTERRUPT_BUDGET,
 ): VmLauncher {
-	refuseCodemodeAdmission();
 	return async (data, events) => {
-		refuseCodemodeAdmission();
 		let module: CodemodeWasmModule;
 		try {
 			module = await wasm;
@@ -124,7 +121,6 @@ export function inlineLauncher(
  */
 export class InlineCodemodeSandbox extends CodemodeSandboxBase {
 	constructor(options: InlineCodemodeSandboxOptions) {
-		refuseCodemodeAdmission();
 		super(options, inlineLauncher(options.wasm, options.interruptBudget));
 	}
 }
