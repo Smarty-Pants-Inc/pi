@@ -122,6 +122,7 @@ describe("ExtensionContext.isSettling", () => {
 						}
 					});
 					pi.on("before_agent_start", (event, ctx) => {
+						if (event.messageType !== "user") return;
 						// A deferred prompt's pre-run handlers are outside agent_settled: a turn requested here is not deferred.
 						observed.push(`before:${event.prompt}:idle=${ctx.isIdle()}:settling=${ctx.isSettling()}`);
 					});

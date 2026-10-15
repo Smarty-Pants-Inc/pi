@@ -43,15 +43,40 @@ const BUDGETS = {
 		// Diagnostics and operation errors reach the shared credential redactor and isolation utility (pi#159).
 		"./utils/*": { maxFiles: 5, forbid: ["providers/", "api/", "index.ts"] },
 	},
+	"packages/codemode": {
+		// Node and Bun users never load the Cloudflare entry, which imports the `cloudflare:workers` built-in.
+		// The fork retains host-owned limits and the security-admission refusal (+2 to upstream's 12).
+		".": { maxFiles: 14, forbid: ["codemode/src/cloudflare.ts"] },
+		// Runtimes without Node built-ins (Workers, browsers) import these; neither may reach the worker-thread host
+		// or the file-based wasm loader.
+		"./portable": {
+			// Fork limits.ts and security-admission.ts preserve S3 (pi#202), adding two modules.
+			maxFiles: 10,
+			forbid: ["codemode/src/index.ts", "runtime/host.ts", "runtime/worker.ts", "codemode/src/wasm.ts"],
+		},
+		"./cloudflare": {
+			// Fork limits.ts and security-admission.ts preserve S3 (pi#202), adding two modules.
+			maxFiles: 11,
+			forbid: ["codemode/src/index.ts", "runtime/host.ts", "runtime/worker.ts", "codemode/src/wasm.ts"],
+		},
+	},
 	"packages/durable": {
 		".": {
-			// Upstream adds the shared storage scan module to its 62-file graph; the fork adds
-			// the retry error-body parser and dependency-free credential redactor (+2), and the recovery
-			// classifier moved out of retry/overflow (+1, smarty-dev#5822). The publication projector
-			// now shares S2's dependency-free isolation utility (+1, pi#159).
-			maxFiles: 67,
-			forbid: ["packages/ai/src/index.ts", "packages/ai/src/utils/typebox-helpers.ts"],
+			// Tool argument validation reaches TypeBox; provider-session creation reaches pi-ai's lean UUID utility; the
+			// memory and SQLite storages share scan order and cursor handling. Values from Chord's root (copyJson,
+			// replicatedState) reach its host runtime through the root barrel (upstream: 66 files).
+			// The fork adds credential redaction, owned diagnostics, recovery classification (smarty-dev#5822),
+			// and S2's dependency-free isolation utility (pi#159): four files, retained by S3's publication projector.
+			maxFiles: 70,
+			forbid: [
+				"packages/ai/src/index.ts",
+				"packages/ai/src/utils/typebox-helpers.ts",
+				// Photon (WebAssembly) loads only through `./images`.
+				"packages/durable/src/images/",
+			],
 		},
+		// The file tools reach their environment helpers and the Harness definitions they need, not the Harness itself.
+		"./tools": { maxFiles: 17, forbid: ["packages/durable/src/images/"] },
 	},
 };
 

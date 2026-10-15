@@ -438,6 +438,7 @@ function createExtensionAPI(
 				definition: bindExtensionMetadataMethods(extension.path, tool, {
 					execute: true,
 					prepareArguments: true,
+					reachesTools: true,
 					prepareLoadout: true,
 					renderCall: true,
 					renderResult: true,

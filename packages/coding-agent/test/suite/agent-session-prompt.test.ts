@@ -2,12 +2,19 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
-import { fauxAssistantMessage, fauxToolCall, type Model } from "@earendil-works/pi-ai";
+import {
+	fauxAssistantMessage,
+	fauxToolCall,
+	getCurrentSystemPrompt,
+	type Model,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
+import type { BeforeAgentStartEvent, ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
+import { receiptRecord } from "../../src/core/turn-receipts.ts";
 import { createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
@@ -555,5 +562,238 @@ describe("AgentSession prompt characterization", () => {
 		await expect(harness.session.prompt("hi")).rejects.toThrow(
 			`No API key found for ${harness.getModel().provider}.`,
 		);
+	});
+
+	// #10267 / smarty-dev#2867: both trigger kinds keep the runner-issued receipts through publication.
+	it.each(["user", "custom"] as const)("transfers hook receipts exactly once for a %s trigger", async (kind) => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", () => ({
+						message: { customType: "hook-one", content: "one", display: false },
+					}));
+				},
+				(pi) => {
+					pi.on("before_agent_start", () => ({
+						message: { customType: "hook-two", content: "two", display: false },
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const issued: ReturnType<typeof receiptRecord>[] = [];
+		const emit = harness.session.extensionRunner.emitBeforeAgentStart.bind(harness.session.extensionRunner);
+		const spy = vi
+			.spyOn(harness.session.extensionRunner, "emitBeforeAgentStart")
+			.mockImplementation(async (...args) => {
+				const result = await emit(...args);
+				issued.push(...result.messageReceipts.map(receiptRecord));
+				return result;
+			});
+		try {
+			await harness.session.sendCustomMessage(
+				{ customType: "aside", content: "next turn only", display: false },
+				{ deliverAs: "nextTurn" },
+			);
+			harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+			if (kind === "user") await harness.session.prompt("start");
+			else
+				await harness.session.sendCustomMessage(
+					{ customType: "trigger", content: "start", display: false },
+					{ triggerTurn: true },
+				);
+			await harness.session.prompt("later");
+			const entries = harness.sessionManager.getEntries();
+			const hooks = entries.flatMap((entry) =>
+				entry.type === "custom_message" && entry.customType.startsWith("hook-") ? [entry.provenance] : [],
+			);
+			expect(hooks).toEqual(issued);
+			expect(issued).toHaveLength(4);
+			expect(
+				entries.filter((entry) => entry.type === "custom_message" && entry.customType === "aside"),
+			).toHaveLength(1);
+			const inputReceipts = entries.flatMap((entry) =>
+				"provenance" in entry && entry.provenance ? [entry.provenance.turnId] : [],
+			);
+			expect(new Set(inputReceipts).size).toBe(inputReceipts.length);
+			expect(harness.session.inputAdmissionCount).toBe(0);
+			expect(harness.session.isIdle).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	// Issue #10267, #5581: a run started by sendMessage(..., { triggerTurn: true }) skipped
+	// before_agent_start, so its second request patched away the sections handlers had added.
+	describe("runs started by a custom message", () => {
+		it("keeps the same system prompt for every request of the run", async () => {
+			const events: BeforeAgentStartEvent[] = [];
+			const noopTool: AgentTool = {
+				name: "noop",
+				label: "Noop",
+				description: "Does nothing",
+				parameters: Type.Object({}),
+				execute: async () => ({ content: [{ type: "text", text: "ok" }], details: {} }),
+			};
+			const harness = await createHarness({
+				tools: [noopTool],
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", (event) => {
+							events.push(event);
+							event.systemPromptOptions.sections.extension_rules = "Answer in one word.";
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const prompts: string[] = [];
+			const record = (response: ReturnType<typeof fauxAssistantMessage>) => (context: TranscriptContext) => {
+				prompts.push(getCurrentSystemPrompt(context.messages));
+				return response;
+			};
+			harness.setResponses([
+				record(fauxAssistantMessage("hi")),
+				record(fauxAssistantMessage([fauxToolCall("noop", {})], { stopReason: "toolUse" })),
+				record(fauxAssistantMessage("done")),
+			]);
+
+			await harness.session.prompt("hello");
+			await harness.session.sendCustomMessage(
+				{ customType: "task-done", content: "background task finished", display: true },
+				{ triggerTurn: true },
+			);
+
+			expect(prompts).toHaveLength(3);
+			expect(prompts[0]).toContain("Answer in one word.");
+			expect(new Set(prompts).size).toBe(1);
+			expect(events.map((event) => event.messageType)).toEqual(["user", "custom"]);
+			const customEvent = events[1];
+			expect(customEvent.messageType === "custom" && customEvent.message.customType).toBe("task-done");
+		});
+
+		it("queues a custom message sent while before_agent_start runs into the starting run", async () => {
+			let releaseHandler: () => void = () => {};
+			const handlerStarted = Promise.withResolvers<void>();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", async (event) => {
+							if (event.messageType !== "custom" || event.message.customType !== "first") return;
+							handlerStarted.resolve();
+							await new Promise<void>((resolve) => {
+								releaseHandler = resolve;
+							});
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const requests: TranscriptContext[] = [];
+			harness.setResponses([
+				(context) => {
+					requests.push(context);
+					return fauxAssistantMessage("handled both");
+				},
+			]);
+
+			const first = harness.session.sendCustomMessage(
+				{ customType: "first", content: "task one finished", display: true },
+				{ triggerTurn: true },
+			);
+			await handlerStarted.promise;
+			expect(harness.session.isIdle).toBe(false);
+			const second = harness.session.sendCustomMessage(
+				{ customType: "second", content: "task two finished", display: true },
+				{ triggerTurn: true },
+			);
+			releaseHandler();
+			await Promise.all([first, second]);
+
+			expect(requests).toHaveLength(1);
+			const texts = requests[0].messages.flatMap((message) =>
+				message.role === "user" && typeof message.content !== "string"
+					? message.content.flatMap((part) => (part.type === "text" ? [part.text] : []))
+					: [],
+			);
+			expect(texts).toEqual(["task one finished", "task two finished"]);
+		});
+
+		it("includes a custom message sent without triggerTurn while the run starts in its first request", async () => {
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", () => {
+							pi.sendMessage(
+								{ customType: "note", content: "context from handler", display: true },
+								{ triggerTurn: false },
+							);
+						});
+					},
+				],
+			});
+			harnesses.push(harness);
+			const requests: TranscriptContext[] = [];
+			harness.setResponses([
+				(context) => {
+					requests.push(context);
+					return fauxAssistantMessage("done");
+				},
+			]);
+
+			await harness.session.prompt("hello");
+
+			expect(requests).toHaveLength(1);
+			expect(JSON.stringify(requests[0].messages)).toContain("context from handler");
+		});
+
+		// #10267 / smarty-dev#3048: admission revocation refuses unpublished input, also for custom triggers.
+		it.each(["user", "custom"] as const)("revokes a %s preflight before publication", async (kind) => {
+			let releaseHandler: () => void = () => {};
+			const handlerStarted = Promise.withResolvers<void>();
+			const later = vi.fn();
+			const harness = await createHarness({
+				extensionFactories: [
+					(pi) => {
+						pi.on("before_agent_start", async () => {
+							handlerStarted.resolve();
+							await new Promise<void>((resolve) => {
+								releaseHandler = resolve;
+							});
+							return { message: { customType: "late", content: "discarded", display: false } };
+						});
+						pi.on("before_agent_start", later);
+					},
+				],
+			});
+			harnesses.push(harness);
+			harness.setResponses([fauxAssistantMessage("should not complete")]);
+
+			const run =
+				kind === "user"
+					? harness.session.prompt("start")
+					: harness.session.sendCustomMessage(
+							{ customType: "task-done", content: "background task finished", display: true },
+							{ triggerTurn: true },
+						);
+			const refused = expect(run).rejects.toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
+			await handlerStarted.promise;
+			const aborted = harness.session.abort();
+			await Promise.all([refused, aborted]);
+			releaseHandler();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			expect(harness.session.messages).toEqual([]);
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "message" || entry.type === "custom_message"),
+			).toEqual([]);
+			expect(later).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(harness.getPendingResponseCount()).toBe(1);
+			expect(harness.session.inputAdmissionCount).toBe(0);
+			expect(harness.session.isIdle).toBe(true);
+		});
 	});
 });

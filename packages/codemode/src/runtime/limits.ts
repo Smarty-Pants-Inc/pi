@@ -36,12 +36,14 @@ export class CodemodeLimitError extends Error {
 	}
 }
 
-/** Defaults overridden by `limits`. Every value must be a positive finite number. */
+/** Callers may tighten the defaults. Every value must be a positive finite number. */
 export function resolveCodemodeLimits(limits: Partial<CodemodeLimits> = {}): CodemodeLimits {
 	const resolved = { ...DEFAULT_CODEMODE_LIMITS, ...limits };
-	for (const [key, value] of Object.entries(resolved)) {
+	for (const key of Object.keys(resolved) as (keyof CodemodeLimits)[]) {
+		const value = resolved[key];
 		if (!(value > 0 && Number.isFinite(value)))
 			throw new Error(`Codemode limit ${key} must be a positive finite number`);
+		resolved[key] = Math.min(value, DEFAULT_CODEMODE_LIMITS[key]);
 	}
 	return resolved;
 }
@@ -57,6 +59,11 @@ export function messageChars(message: WorkerToHostMessage): number {
 				: message.item.text.length;
 		case "done":
 			return message.ok ? (message.value?.length ?? 0) + message.writes.length : message.error.length;
+		case "started":
+			return message.fingerprint.length;
+		case "crash":
+		case "limit":
+			return message.message.length;
 		default:
 			return 0;
 	}
