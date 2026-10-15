@@ -22,7 +22,6 @@
  * next exchange.
  */
 import { toCodemodeIdentifier } from "../identifier.ts";
-import { refuseCodemodeAdmission } from "../security-admission.ts";
 import type {
 	CodemodeCall,
 	CodemodeCallStatus,
@@ -46,6 +45,7 @@ import {
 	type CodemodeLimits,
 	checkCodemodeStoreQuota,
 	resolveCodemodeLimits,
+	resolveMemoryLimit,
 } from "./limits.ts";
 import {
 	type HostToWorkerMessage,
@@ -195,7 +195,7 @@ export interface ExecutionOptions {
 	launch: VmLauncher;
 }
 
-/** One script run in its own VM. Exported for host-only tests; admission remains refused. */
+/** One script run in its own VM. Exported for host-only tests. */
 export class Execution {
 	readonly promise: Promise<CodemodeResult>;
 	private resolveResult!: (result: CodemodeResult) => void;
@@ -217,7 +217,6 @@ export class Execution {
 	finished = false;
 
 	constructor(options: ExecutionOptions) {
-		refuseCodemodeAdmission();
 		this.promise = new Promise<CodemodeResult>((resolve) => {
 			this.resolveResult = resolve;
 		});
@@ -225,6 +224,7 @@ export class Execution {
 		this.control = options.control;
 		this.signal = options.signal;
 		const limits = resolveCodemodeLimits(options.limits);
+		const memoryLimitBytes = resolveMemoryLimit(options.memoryLimitBytes);
 		this.budget = new BridgeBudget(limits);
 		this.snapshot = options.snapshot;
 
@@ -251,7 +251,7 @@ export class Execution {
 				description: tool.description ?? "",
 			})),
 			globals: options.globals.map((global) => ({ name: global.name, spread: global.spread === true })),
-			memoryLimitBytes: options.memoryLimitBytes,
+			memoryLimitBytes,
 			limits,
 			store: options.store,
 			...(options.deterministic ? { deterministic: options.deterministic } : {}),
@@ -277,7 +277,6 @@ export class Execution {
 
 	/** `CodemodeRun.deliver()`. */
 	deliver(seq: number, now: number, id: number, outcome: CodemodeOutcome): void {
-		refuseCodemodeAdmission();
 		if (this.finished) return;
 		if (!Number.isFinite(now)) throw new Error(`The clock value of result ${seq} is not a finite number`);
 		if (!Number.isInteger(seq) || seq < 1 || this.delivered.has(seq)) {
@@ -504,16 +503,15 @@ export class CodemodeSandboxBase {
 	private readonly toolsByName = new Map<string, CodemodeTool>();
 	private readonly globalsByName = new Map<string, CodemodeTool>();
 	private readonly timeoutMs: number;
-	private readonly memoryLimitBytes: number | undefined;
+	private readonly memoryLimitBytes: number;
 	private readonly limits: CodemodeLimits;
 	private readonly launch: VmLauncher;
 	private readonly running = new Set<Execution>();
 	private closed = false;
 
 	constructor(options: CodemodeSandboxBaseOptions, launch: VmLauncher) {
-		refuseCodemodeAdmission();
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-		this.memoryLimitBytes = options.memoryLimitBytes;
+		this.memoryLimitBytes = resolveMemoryLimit(options.memoryLimitBytes);
 		this.limits = resolveCodemodeLimits(options.limits);
 		this.launch = launch;
 		for (const tool of options.tools ?? []) this.registerTool(tool);
@@ -545,7 +543,6 @@ export class CodemodeSandboxBase {
 	 * The script can use `store(key, value)` and `load(key)` on `options.store`.
 	 */
 	execute(code: string, options: CodemodeExecuteOptions = {}): Promise<CodemodeResult> {
-		refuseCodemodeAdmission();
 		if (this.closed) return Promise.reject(new Error("Sandbox is closed"));
 		const tools = new Map(this.toolsByName);
 		const execution = new Execution({
@@ -577,7 +574,6 @@ export class CodemodeSandboxBase {
 	 * error the script cannot catch.
 	 */
 	start(code: string, options: CodemodeRunOptions): CodemodeRun {
-		refuseCodemodeAdmission();
 		if (this.closed) throw new Error("Sandbox is closed");
 		if (!Number.isFinite(options.startedAt) || options.startedAt < 0) {
 			throw new Error("startedAt must be a non-negative number of milliseconds since the epoch");

@@ -28,6 +28,11 @@ export const DEFAULT_CODEMODE_LIMITS: Readonly<CodemodeLimits> = Object.freeze({
 	maxPendingCalls: 256,
 });
 
+/** Default QuickJS heap budget for every backend: 256 MiB. */
+export const DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES = 256 * 1024 * 1024;
+/** Host-owned ceiling. Callers may tighten, never raise, the QuickJS heap budget. */
+export const MAX_CODEMODE_MEMORY_LIMIT_BYTES = DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES;
+
 /** A script went over a {@link CodemodeLimits} budget or a store quota. The execution fails with `kind: "limit"`. */
 export class CodemodeLimitError extends Error {
 	constructor(message: string) {
@@ -46,6 +51,15 @@ export function resolveCodemodeLimits(limits: Partial<CodemodeLimits> = {}): Cod
 		resolved[key] = Math.min(value, DEFAULT_CODEMODE_LIMITS[key]);
 	}
 	return resolved;
+}
+
+/** Resolve at each admission boundary. Like other budgets, oversized requests are clamped. */
+export function resolveMemoryLimit(requested: number | undefined): number {
+	if (requested === undefined) return DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES;
+	if (!(requested > 0 && Number.isFinite(requested))) {
+		throw new CodemodeLimitError("Codemode memoryLimitBytes must be a positive finite number");
+	}
+	return Math.min(requested, MAX_CODEMODE_MEMORY_LIMIT_BYTES);
 }
 
 /** Characters a worker message carries. */

@@ -130,7 +130,9 @@ export interface CodemodeSandboxBaseOptions {
 	limits?: Partial<CodemodeLimits>;
 	/**
 	 * Maximum memory the QuickJS VM may allocate. Allocations beyond it fail inside the script as
-	 * `InternalError: out of memory`. Default: no limit beyond wasm32's 4 GiB address space.
+	 * `InternalError: out of memory`. Default and host-owned ceiling: 256 MiB
+	 * (`DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES` / `MAX_CODEMODE_MEMORY_LIMIT_BYTES`). Larger values
+	 * are clamped; non-positive or non-finite values are refused. Remotes may impose a tighter cap.
 	 */
 	memoryLimitBytes?: number;
 }

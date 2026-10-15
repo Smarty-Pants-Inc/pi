@@ -1,6 +1,6 @@
 /**
  * Codemode host limits that live in coding-agent (pi#131 round-1 P1-3 and P1-4, smarty-dev#4506).
- * Codemode stays refused, so these call the internals directly.
+ * Trust-boundary checks complement the real sandbox and faux-provider session suites.
  */
 import { appendFileSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
