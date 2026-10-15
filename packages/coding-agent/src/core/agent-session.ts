@@ -887,6 +887,23 @@ export class AgentSession {
 			this._beforeToolCall(context, this._nestedToolParents.get(context.toolCall));
 		this.agent.afterToolCall = (context) =>
 			this._afterToolCall(context, this._nestedToolParents.get(context.toolCall));
+		this.agent.transformToolUpdate = async (toolCall, args, partialResult) => {
+			const runner = this._extensionRunner;
+			if (!runner.hasHandlers("tool_partial_result")) return undefined;
+			const parentToolCallId = this._nestedToolParents.get(toolCall);
+			const result = await runner.emitToolPartialResult(
+				{
+					type: "tool_partial_result",
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					input: args,
+					partialResult,
+					...(parentToolCallId ? { parentToolCallId } : {}),
+				},
+				this._shutdownCancellation.signal,
+			);
+			return result.partialResult;
+		};
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -1003,6 +1020,7 @@ export class AgentSession {
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
 					beforeToolCall: this.agent.beforeToolCall,
 					afterToolCall: this.agent.afterToolCall,
+					transformToolUpdate: this.agent.transformToolUpdate,
 					signal,
 					onUpdate,
 				});
