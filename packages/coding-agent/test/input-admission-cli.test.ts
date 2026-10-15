@@ -792,7 +792,10 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		async (entry) => {
 			const p = await launch(`nested-queue-${entry}`);
 			p.send({ id: "held-A", type: entry, message: "nested-queue-A" });
-			await vi.waitFor(() => expect(p.records.filter((record) => record.type === "agent_settled")).toHaveLength(1));
+			// Child startup and extension load fall inside this first wait, so it gets the helpers' 15 s budget.
+			await vi.waitFor(() => expect(p.records.filter((record) => record.type === "agent_settled")).toHaveLength(1), {
+				timeout: 15000,
+			});
 			p.send({ id: "held-state", type: "get_state" });
 			expect((await p.response("held-state")).data).toMatchObject({
 				inputAdmissionCount: 1,
