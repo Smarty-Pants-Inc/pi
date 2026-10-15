@@ -160,7 +160,9 @@ export async function createAgentSessionServices(
 	}
 	const cwd = resolvePath(options.cwd);
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getAgentDir();
+	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelOptions = {
+		settingsManager,
 		authPath: join(agentDir, "auth.json"),
 		modelsPath: join(agentDir, "models.json"),
 		signal: options.modelRuntimeSignal,
@@ -172,7 +174,7 @@ export async function createAgentSessionServices(
 		options.modelRuntime ??
 		(await ModelRuntime.create(owner ? bindOrdinaryOptions(modelOptions, owner) : modelOptions));
 	owner?.assertActive();
-	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	modelRuntime.addModelPolicy(settingsManager);
 	const resourceLoader = owner
 		? await owner.within(() => createOrdinaryResourceLoader(owner))
 		: new DefaultResourceLoader({ ...(options.resourceLoaderOptions ?? {}), cwd, agentDir, settingsManager });

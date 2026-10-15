@@ -1,6 +1,6 @@
 # Settings Reference
 
-This reference lists user-configurable settings, their types, defaults, and purposes. Project settings override agent-directory settings. Resource lists are combined. See [Configuration](configuration.md) for file locations and trust behavior.
+This reference lists user-configurable settings, their types, defaults, and purposes. Project settings override agent-directory settings, except `modelPolicy`, which can only narrow the inherited policy. Resource lists are combined. See [Configuration](configuration.md) for file locations and trust behavior.
 
 ## Model and thinking
 
@@ -14,6 +14,7 @@ This reference lists user-configurable settings, their types, defaults, and purp
 | `modelThinkingLevels` | object | None | Per-model startup thinking levels keyed by exact `provider/modelId`. |
 | `thinkingBudgets` | object | Built-in budgets | Token budgets for `minimal`, `low`, `medium`, and `high` thinking levels. |
 | `enabledModels` | `string[]` | All available models | Model patterns used for startup selection and model cycling. Uses the same format as `--models`. |
+| `modelPolicy.allow` | `string[]` | Unrestricted | Enforced allow-list of case-insensitive `provider/model` globs. `*` matches any run of characters, including `/`; other characters are literal. An empty list denies all models. Project policy can only narrow global policy. |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in the transcript. |
 | `showCacheMissNotices` | boolean | `false` | Show notices for significant cache misses, successful cache warming, compaction usage, and provider recovery. |
 | `cacheWarming` | `"off" \| "streaming" \| "idle"` | `"streaming"` | Keep eligible provider prompt caches warm during active runs or, with `"idle"`, between runs. Global setting only. |
@@ -21,6 +22,29 @@ This reference lists user-configurable settings, their types, defaults, and purp
 Cache warming runs only when the model declares a cache lifetime and Pi estimates at least $0.05 in avoided cache-miss cost. Refresh usage counts toward session totals but does not enter model context. `/session` shows the next decision; extensions can override it with `cache_warming_decision`. See [Prompt Cache Lifetimes](models.md#prompt-cache-lifetimes).
 
 See [Choose a Model](models.md) for model selection and thinking controls.
+
+### Enforced model policy
+
+Set `modelPolicy` in the agent-directory `settings.json` to restrict every provider, including native providers:
+
+```json
+{
+  "modelPolicy": {
+    "allow": [
+      "anthropic/claude-opus-5-5",
+      "anthropic/claude-sonnet-5-5",
+      "anthropic/claude-haiku-5-5",
+      "openai/gpt-6*"
+    ]
+  }
+}
+```
+
+A request must match at least one pattern in **each** configured policy layer. For example, a project `.pi/settings.json` with `{"modelPolicy":{"allow":["openai/*"]}}` narrows this global policy to GPT-6 models on OpenAI. A project list containing `"*"` cannot enable a globally disallowed model. Runtime settings overrides also only narrow the policy. Invalid policy values deny requests rather than disabling enforcement.
+
+Unlike `enabledModels`, this is a request restriction, not a cycling preference. Pi never auto-appends to it. `/model`, model cycling, and `--list-models` show only allowed models. Requests for other models, including compaction, branch summaries, and cache warming, are refused locally before authentication or network access. SDK calls through `ModelRuntime` throw the exported `ModelPolicyError`, with the message `model <provider>/<id> is not allowed by modelPolicy.allow`; an agent turn presents the refusal as an error response.
+
+Omitting `modelPolicy` preserves unrestricted behavior. After editing settings, use `/reload`. This policy controls Pi's configured model runtime, not arbitrary network code in trusted extensions or independently constructed low-level pi-ai clients.
 
 ## Interaction
 

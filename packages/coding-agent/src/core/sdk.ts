@@ -257,9 +257,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
-	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
-
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath, settingsManager }));
+	modelRuntime.addModelPolicy(settingsManager);
 	const sessionManager = suppliedManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {

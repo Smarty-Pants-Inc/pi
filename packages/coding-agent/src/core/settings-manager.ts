@@ -14,6 +14,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { type ModelPolicySettings, type ModelPolicyTarget, modelPolicyAllows } from "./model-policy.ts";
 
 export interface CompactionModelOverride {
 	reserveTokens?: number;
@@ -167,6 +168,7 @@ export interface Settings {
 	terminal?: TerminalSettings;
 	images?: ImageSettings;
 	enabledModels?: string[]; // Model patterns for cycling (same format as --models CLI flag)
+	modelPolicy?: ModelPolicySettings; // Every configured layer must allow the requested provider/model
 	defaultTools?: string[]; // Initial tool selection; `+name`/`-name` entries add to or remove from the inherited selection
 	doubleEscapeAction?: "fork" | "tree" | "none"; // Action for double-escape with empty editor (default: "tree")
 	treeFilterMode?: "default" | "no-tools" | "user-only" | "labeled-only" | "all"; // Default filter when opening /tree
@@ -406,6 +408,7 @@ export class SettingsManager {
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings;
+	private modelPolicyOverrides: unknown[] = [];
 	private projectTrusted: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -657,8 +660,9 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
-	/** Apply additional overrides on top of current settings */
+	/** Apply additional overrides on top of current settings. Model policy overrides can only narrow. */
 	applyOverrides(overrides: Partial<Settings>): void {
+		if (overrides.modelPolicy !== undefined) this.modelPolicyOverrides.push(structuredClone(overrides.modelPolicy));
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
@@ -1456,6 +1460,15 @@ export class SettingsManager {
 
 	getEnabledModels(): string[] | undefined {
 		return this.settings.enabledModels;
+	}
+
+	/** Match each settings layer independently: project settings cannot widen the global policy. */
+	isModelAllowed(model: ModelPolicyTarget): boolean {
+		return (
+			modelPolicyAllows(this.globalSettings.modelPolicy, model) &&
+			modelPolicyAllows(this.projectSettings.modelPolicy, model) &&
+			this.modelPolicyOverrides.every((policy) => modelPolicyAllows(policy, model))
+		);
 	}
 
 	/** The resolved `defaultTools` selection, or undefined when no settings layer sets it. */
