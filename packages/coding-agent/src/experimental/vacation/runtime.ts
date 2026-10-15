@@ -15,8 +15,8 @@ import {
 	type TaskGraph,
 } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { ModelRuntime } from "../../core/model-runtime.ts";
-import { SettingsManager } from "../../core/settings-manager.ts";
+import type { SettingsManager } from "../../core/settings-manager.ts";
+import { createHarnessModelRuntime } from "../model-runtime.ts";
 import {
 	configureHarnessHttp,
 	createHarnessSettings,
@@ -124,8 +124,7 @@ export async function openDurable(options: OpenDurableOptions = {}): Promise<Ope
 	const location = await selectSession(options.cwd ?? process.cwd(), options.continueSession ?? false);
 	let harness: Harness | undefined;
 	try {
-		const modelRuntime = await ModelRuntime.create();
-		const settingsManager = SettingsManager.create(location.cwd);
+		const { modelRuntime, settingsManager } = await createHarnessModelRuntime(location.cwd);
 		configureHarnessHttp(settingsManager);
 		const settings = createHarnessSettings(settingsManager);
 		const registry = createVacationRegistry();

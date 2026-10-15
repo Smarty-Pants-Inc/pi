@@ -17,8 +17,6 @@ import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite
 import lockfile from "proper-lockfile";
 import Type, { type Static } from "typebox";
 import { Check } from "typebox/value";
-import { ModelRuntime } from "../core/model-runtime.ts";
-import { SettingsManager } from "../core/settings-manager.ts";
 import { COORDINATOR_PROTOCOL_VERSION } from "./coordinator.ts";
 import {
 	configureHarnessHttp,
@@ -27,6 +25,7 @@ import {
 	ExecutionEnvs,
 	findInitialAgentModel,
 } from "./durable/harness-setup.ts";
+import { createHarnessModelRuntime } from "./model-runtime.ts";
 import { createSessionPluginFacetLoader } from "./plugins/bundled.ts";
 import {
 	consumeInternalProcessRole,
@@ -775,8 +774,7 @@ async function createCodingAgentHarness(
 	options: SessionWorkerOptions,
 ): Promise<SessionWorkerRuntime> {
 	const { cwd } = options.metadata;
-	const modelRuntime = await ModelRuntime.create();
-	const settingsManager = SettingsManager.create(cwd);
+	const { modelRuntime, settingsManager } = await createHarnessModelRuntime(cwd);
 	configureHarnessHttp(settingsManager);
 	const envs = new ExecutionEnvs(cwd);
 	let harness: Harness | undefined;
