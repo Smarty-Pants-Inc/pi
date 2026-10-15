@@ -5,6 +5,7 @@ import { type Api, fauxAssistantMessage, fauxProvider, InMemoryModelsStore, type
 import type { TUI } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { listModels } from "../src/cli/list-models.ts";
+import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { generateSummary } from "../src/core/compaction/compaction.ts";
 import { resolveCliModel, resolveModelScope } from "../src/core/model-resolver.ts";
@@ -267,6 +268,105 @@ describe("modelPolicy.allow", () => {
 		expect(manager.getEnabledModels()).toContain("faux/gpt-5.5");
 		await manager.flush();
 		expect(manager.getGlobalSettings().modelPolicy).toEqual({ allow: ["faux/gpt-6"] });
+	});
+
+	// pi#257 / smarty-dev#13159: disposed projects must not keep narrowing a reused SDK runtime.
+	it.each(["sdk", "services"] as const)("releases only the disposed session's policy through %s", async (path) => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-model-policy-reuse-"));
+		onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+		const runtime = await createRuntime();
+		const anthropic: Model<Api> = { ...runtime.getModel("anthropic", "claude-haiku-4-5")!, id: "claude-sonnet-5-5" };
+		const openai: Model<Api> = { ...runtime.getModel("openai", "gpt-5.5")!, id: "gpt-6" };
+		const create = async (manager: SettingsManager, model: Model<Api>) => {
+			const sessionManager = SessionManager.inMemory(directory);
+			if (path === "sdk") {
+				return createAgentSession({
+					cwd: directory,
+					agentDir: directory,
+					modelRuntime: runtime,
+					settingsManager: manager,
+					sessionManager,
+					resourceLoader: createTestResourceLoader(),
+					model,
+					tools: [],
+				});
+			}
+			const services = await createAgentSessionServices({
+				cwd: directory,
+				agentDir: directory,
+				modelRuntime: runtime,
+				settingsManager: manager,
+				resourceLoaderOptions: { noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true },
+			});
+			return createAgentSessionFromServices({ services, sessionManager, model, tools: [] });
+		};
+		const { session: a } = await create(settings(undefined, ["openai/gpt-6*"]), openai);
+		onTestFinished(() => a.dispose());
+		const { session: b } = await create(settings(undefined, ["anthropic/claude-*-5-5"]), anthropic);
+		onTestFinished(() => b.dispose());
+		expect(() => runtime.streamSimple(anthropic, context)).toThrow(ModelPolicyError);
+		expect(() => runtime.streamSimple(openai, context)).toThrow(ModelPolicyError);
+		a.dispose();
+		a.dispose();
+		expect(runtime.isModelAllowed(anthropic)).toBe(true);
+		await b.setModel(anthropic);
+		expect(await runtime.getAuth(anthropic)).toBeDefined();
+		const fetch = vi.fn(() => Promise.reject(new Error("inert admitted request")));
+		const response = await runtime.completeSimple(anthropic, context, { fetch, maxRetries: 0 });
+		expect(fetch).toHaveBeenCalled();
+		expect(response.errorMessage).not.toContain("modelPolicy.allow");
+		expect(() => runtime.streamSimple(openai, context)).toThrow(ModelPolicyError);
+		b.dispose();
+		expect(runtime.isModelAllowed(openai)).toBe(true);
+	});
+
+	// pi#257: a shared session ID must not make disposal release another live session's policy.
+	it("keeps a shared settings registration until every live session releases it", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-model-policy-shared-"));
+		onTestFinished(() => rmSync(directory, { recursive: true, force: true }));
+		const runtime = await createRuntime(settings(allow));
+		const options = {
+			cwd: directory,
+			agentDir: directory,
+			modelRuntime: runtime,
+			settingsManager: settings(undefined, ["openai/gpt-6*"]),
+			sessionManager: SessionManager.inMemory(directory),
+			resourceLoader: createTestResourceLoader(),
+			model: runtime.getModel("openai", "gpt-5.5")!,
+			tools: [],
+		};
+		const { session: a } = await createAgentSession(options);
+		onTestFinished(() => a.dispose());
+		const { session: b } = await createAgentSession(options);
+		onTestFinished(() => b.dispose());
+		expect(a.sessionId).toBe(b.sessionId);
+		const anthropic = { provider: "anthropic", id: "claude-sonnet-5-5" };
+		a.dispose();
+		expect(runtime.isModelAllowed(anthropic)).toBe(false);
+		b.dispose();
+		expect(runtime.isModelAllowed(anthropic)).toBe(true);
+		expect(runtime.isModelAllowed(options.model)).toBe(false);
+	});
+
+	// pi#257: each registration, including the runtime's baseline, has independent ownership.
+	it("reference-counts repeated policy registrations and makes disposal idempotent", async () => {
+		const baseline = settings(allow);
+		const runtime = await createRuntime(baseline);
+		const manager = settings(undefined, ["openai/gpt-6*"]);
+		const anthropic = { provider: "anthropic", id: "claude-sonnet-5-5" };
+		const old = { provider: "openai", id: "gpt-5.5" };
+		const first = runtime.addModelPolicy(manager);
+		const second = runtime.addModelPolicy(manager);
+		expect(runtime.isModelAllowed(anthropic)).toBe(false);
+		first();
+		first();
+		expect(runtime.isModelAllowed(anthropic)).toBe(false);
+		second();
+		expect(runtime.isModelAllowed(anthropic)).toBe(true);
+		const duplicateBaseline = runtime.addModelPolicy(baseline);
+		duplicateBaseline();
+		duplicateBaseline();
+		expect(runtime.isModelAllowed(old)).toBe(false);
 	});
 
 	it("refuses a disallowed virtual selection even if its target is allowed", async () => {

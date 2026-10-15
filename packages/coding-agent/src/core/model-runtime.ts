@@ -190,7 +190,7 @@ export class ModelRuntime implements Models {
 	providerRequestGuard?: { beforeProviderRequest: () => void; signal: AbortSignal };
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	private readonly models: MutableModels;
-	private readonly policySettings = new Set<SettingsManager>();
+	private readonly policySettings = new Map<SettingsManager, number>();
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
 	private readonly builtins = new Map<string, Provider>();
@@ -495,13 +495,21 @@ export class ModelRuntime implements Models {
 		return this.models.getProvider(providerId);
 	}
 
-	/** Bind session settings without discarding policy already attached to a supplied runtime. */
-	addModelPolicy(settingsManager: SettingsManager): void {
-		this.policySettings.add(settingsManager);
+	/** Bind settings until the returned disposer runs, preserving every other registration. */
+	addModelPolicy(settingsManager: SettingsManager): () => void {
+		this.policySettings.set(settingsManager, (this.policySettings.get(settingsManager) ?? 0) + 1);
+		let disposed = false;
+		return () => {
+			if (disposed) return;
+			disposed = true;
+			const remaining = this.policySettings.get(settingsManager)! - 1;
+			if (remaining === 0) this.policySettings.delete(settingsManager);
+			else this.policySettings.set(settingsManager, remaining);
+		};
 	}
 
 	isModelAllowed(model: ModelPolicyTarget): boolean {
-		return [...this.policySettings].every((settings) => settings.isModelAllowed(model));
+		return [...this.policySettings.keys()].every((settings) => settings.isModelAllowed(model));
 	}
 
 	private assertModelAllowed(model: ModelPolicyTarget, handle?: DeferredHandle): void {
