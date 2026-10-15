@@ -3372,7 +3372,6 @@ export class AgentSession {
 		const fence = {};
 		this._inputFence = fence;
 		try {
-			if (!options?.rejectQueuedInput) this._assertInputsDrained();
 			// Held ingress is cancelled with a session_changed receipt, never counted as busy input,
 			// before abort or lifecycle hooks can yield. Other held input keeps #163 semantics.
 			this._invalidateUserMessageIngress("session_changed");
