@@ -779,6 +779,8 @@ export class AgentSessionRuntime {
 	async dispose(options?: {
 		/** Operator quit: durably retain unsent input before terminal cancellation. Defaults to false. */
 		operatorExit?: boolean;
+		/** Explicit operator consent to discard unsent input when no session file exists. */
+		discardUnsentInput?: boolean;
 		/** Terminal owner shutdown, distinct from an ordinary recoverable disposal refusal. */
 		terminal?: boolean;
 		beforeShutdown?: () => Promise<void>;
@@ -786,10 +788,12 @@ export class AgentSessionRuntime {
 	}): Promise<void> {
 		if (!options?.terminal && !options?.operatorExit) return this.#dispose(options);
 		// Snapshot synchronously while all input owners are still intact. Never cancel on save failure.
-		const releaseOperatorInputs = options.operatorExit ? this.session.prepareOperatorExit() : undefined;
+		const releaseOperatorInputs = options.operatorExit
+			? this.session.prepareOperatorExit({ discardUnsent: options.discardUnsentInput })
+			: undefined;
 		this.terminalRejection = options.operatorExit
 			? (_messages, session) => {
-					const release = session.prepareOperatorExit();
+					const release = session.prepareOperatorExit({ discardUnsent: options.discardUnsentInput });
 					release();
 				}
 			: options.rejectQueuedInput;

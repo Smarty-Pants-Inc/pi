@@ -527,6 +527,7 @@ export class InteractiveMode {
 	private userInputInFlight = false;
 	private inFlightUserInput?: ReceivedInput;
 	private operatorExitRequested = false;
+	private confirmUnsentDiscard = false;
 	private readonly compactionTransferInputs = new Set<CompactionQueuedMessage>();
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
@@ -3436,6 +3437,7 @@ export class InteractiveMode {
 	/** Dispatch commands or transfer the same admitted envelope to ordinary prompt handling. */
 	private async dispatchEditorInput(input: ReceivedInput): Promise<void> {
 		const text = input.text;
+		if (text !== "/quit") this.confirmUnsentDiscard = false;
 
 		// Handle commands
 		if (text === "/settings") {
@@ -3575,7 +3577,7 @@ export class InteractiveMode {
 		}
 		if (text === "/quit") {
 			this.editor.setText("");
-			await this.shutdown();
+			await this.shutdown({ fromQuit: true, discardUnsentInput: this.confirmUnsentDiscard });
 			return;
 		}
 
@@ -3621,6 +3623,7 @@ export class InteractiveMode {
 
 	/** Shared idle submission path; the caller owns admission before any editor effects. */
 	private submitEditorInput(input: ReceivedInput): void {
+		this.confirmUnsentDiscard = false;
 		this.flushPendingBashComponents();
 		if (this.onInputCallback) {
 			this.onInputCallback(input);
@@ -3671,6 +3674,7 @@ export class InteractiveMode {
 				break;
 
 			case "queue_update":
+				this.confirmUnsentDiscard = false;
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				break;
@@ -4545,7 +4549,11 @@ export class InteractiveMode {
 	private isShuttingDown = false;
 	private shutdownCompletion?: Promise<void>;
 
-	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
+	private async shutdown(options?: {
+		fromSignal?: boolean;
+		fromQuit?: boolean;
+		discardUnsentInput?: boolean;
+	}): Promise<void> {
 		const upgrade = options?.fromSignal && !this.terminalShutdownRequested;
 		if (options?.fromSignal) this.terminalShutdownRequested = true;
 		if (this.isShuttingDown) {
@@ -4611,6 +4619,7 @@ export class InteractiveMode {
 					this.operatorExitRequested = true;
 					await this.runtimeHost.dispose({
 						operatorExit: true,
+						discardUnsentInput: options?.fromQuit && options.discardUnsentInput,
 						beforeShutdown: async () => {
 							while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
 							this.themeController.disableAutoSync();
@@ -4640,7 +4649,16 @@ export class InteractiveMode {
 				process.exit(0);
 			} catch (error) {
 				if (this.terminalShutdownRequested) throw error;
-				if (!this.handleInputAdmissionError(error)) throw error;
+				if (
+					error instanceof InputAdmissionError &&
+					error.code === "INPUT_ADMISSION_BUSY" &&
+					error.message.endsWith(
+						" queued messages are not saved (no session file). /quit again to discard them and exit.",
+					)
+				) {
+					this.confirmUnsentDiscard = options?.fromQuit === true;
+					this.showWarning(error.message.slice("INPUT_ADMISSION_BUSY: ".length));
+				} else if (!this.handleInputAdmissionError(error)) throw error;
 				// Admission refusal precedes terminal teardown: the old session remains usable.
 				this.isShuttingDown = false;
 				this.operatorExitRequested = false;
@@ -4868,6 +4886,7 @@ export class InteractiveMode {
 	}
 
 	private async submitEditorPrompt(input: ReceivedInput, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+		this.confirmUnsentDiscard = false;
 		this.editor.addToHistory?.(input.text);
 		this.editor.setText("");
 		try {
@@ -5192,6 +5211,7 @@ export class InteractiveMode {
 	}
 
 	private updatePendingMessagesDisplay(): void {
+		this.confirmUnsentDiscard = false;
 		this.pendingMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
@@ -5237,6 +5257,7 @@ export class InteractiveMode {
 	}
 
 	private queueCompactionMessage(input: ReceivedInput, mode: "steer" | "followUp"): void {
+		this.confirmUnsentDiscard = false;
 		this.compactionQueuedMessages.push({ input, mode });
 		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(input.text);

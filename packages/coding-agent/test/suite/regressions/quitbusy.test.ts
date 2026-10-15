@@ -168,6 +168,61 @@ describe("operator exit and compaction settlement", () => {
 		expect(delivered.provenance).toEqual(input.provenance);
 	});
 
+	// smarty-dev#13108: --no-session requires explicit consent, never creates a session file.
+	it("nonpersistent operator exit retains queued input until explicit discard consent", async () => {
+		const h = await createHarness({ persistSession: false, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		const entered = gate();
+		h.setResponses([
+			async (_context, options) => {
+				entered.resolve();
+				await new Promise<void>((resolve) => {
+					if (options?.signal?.aborted) resolve();
+					else options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+				return fauxAssistantMessage("", { stopReason: "aborted" });
+			},
+		]);
+		const run = h.session.prompt("active");
+		await entered.promise;
+		await h.session.steer("keep steer");
+		await h.session.followUp("keep follow-up");
+		const services: AgentSessionServices = {
+			cwd: h.tempDir,
+			agentDir: h.tempDir,
+			modelRuntime: h.modelRuntime,
+			settingsManager: h.settingsManager,
+			resourceLoader: h.resourceLoader,
+			diagnostics: [],
+		};
+		const runtime = new AgentSessionRuntime(h.session, services, async () => {
+			throw new Error("replacement must refuse before construction");
+		});
+		const queued = h.session.agent.getQueuedMessages();
+		await expect(runtime.dispose({ operatorExit: true })).rejects.toThrow(
+			"2 queued messages are not saved (no session file). /quit again to discard them and exit.",
+		);
+		expect(h.session.agent.getQueuedMessages()).toEqual(queued);
+		expect(h.session.isDisposed).toBe(false);
+		expect(h.session.shutdownSignal.aborted).toBe(false);
+		expect(h.sessionManager.isPersisted()).toBe(false);
+		expect(h.sessionManager.getSessionFile()).toBeUndefined();
+		await expect(runtime.newSession()).rejects.toThrow("INPUT_ADMISSION_BUSY");
+		await expect(runtime.switchSession("missing")).rejects.toThrow("INPUT_ADMISSION_BUSY");
+		await expect(runtime.dispose()).rejects.toThrow("INPUT_ADMISSION_BUSY");
+		await expect(runtime.dispose({ discardUnsentInput: true })).rejects.toThrow("INPUT_ADMISSION_BUSY");
+		await runtime.dispose({ operatorExit: true, discardUnsentInput: true });
+		await run;
+		expect(h.session.isDisposed).toBe(true);
+		expect(h.session.agent.getQueuedMessages()).toEqual([]);
+		expect(h.sessionManager.getSessionFile()).toBeUndefined();
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
+		).toEqual([]);
+	});
+
 	it("operator exit saves steer/follow-up/images/duplicate text and resume consumes each once", async () => {
 		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
 		harnesses.push(h);

@@ -2985,7 +2985,7 @@ export class AgentSession {
 	 * Explicit operator exit only: fence and save every unsent occurrence before cancellation.
 	 * A save failure leaves the input and active operation owned by this session.
 	 */
-	prepareOperatorExit(): () => void {
+	prepareOperatorExit(options?: { discardUnsent?: boolean }): () => void {
 		if (this._inputsDisposed)
 			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "operator exit session is disposed");
 		const release = this.gateInputs();
@@ -3025,12 +3025,12 @@ export class AgentSession {
 					},
 					getInputReceipt(input),
 				);
-			if (pending.length && !this.sessionManager.isPersisted())
+			if (pending.length && !this.sessionManager.isPersisted() && !options?.discardUnsent)
 				throw new InputAdmissionError(
 					"INPUT_ADMISSION_BUSY",
-					"operator exit requires persistent storage for unsent input",
+					`${pending.length} queued messages are not saved (no session file). /quit again to discard them and exit.`,
 				);
-			for (const { input, receipt } of pending) {
+			for (const { input, receipt } of this.sessionManager.isPersisted() ? pending : []) {
 				if (getUnsentInputTransfer(receipt)) continue; // Already durable from an earlier exit; not yet consumed.
 				const id = this.sessionManager.appendCustomEntry(UNSENT_INPUT_TYPE, structuredClone(input));
 				if (receipt) linkUnsentInputTransfer(receipt, id);
