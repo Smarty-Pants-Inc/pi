@@ -1333,6 +1333,8 @@ export class SettingsManager {
 
 	/** Match each settings layer independently: project settings cannot widen the global policy. */
 	isModelAllowed(model: ModelPolicyTarget): boolean {
+		// A settings file that failed to parse may hold a policy we can't read: deny rather than run unrestricted.
+		if (this.globalSettingsLoadError || this.projectSettingsLoadError) return false;
 		return (
 			modelPolicyAllows(this.globalSettings.modelPolicy, model) &&
 			modelPolicyAllows(this.projectSettings.modelPolicy, model) &&

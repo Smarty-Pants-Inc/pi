@@ -182,6 +182,17 @@ describe("modelPolicy.allow", () => {
 		expect(settings(["faux/gpt-6"]).isModelAllowed({ ...model, id: "gpt-6\n" })).toBe(false);
 	});
 
+	it("denies every model when a settings file fails to parse", () => {
+		const model = { provider: "openai", id: "gpt-6" };
+		for (const scope of ["global", "project"] as const) {
+			const storage = new InMemorySettingsStorage();
+			storage.withLock("global", () => JSON.stringify({}));
+			storage.withLock("project", () => JSON.stringify({}));
+			storage.withLock(scope, () => '{"modelPolicy": {"allow": ["openai/gpt-6"]');
+			expect(SettingsManager.fromStorage(storage).isModelAllowed(model), scope).toBe(false);
+		}
+	});
+
 	it("cannot widen a policy through project null, malformed values or launch overrides", () => {
 		const manager = settings(["faux/gpt-6"]);
 		manager.applyOverrides({ modelPolicy: { allow: ["*"] } });
