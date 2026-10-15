@@ -5,13 +5,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { describe, expect, it } from "vitest";
 import type { AgentSession } from "../../../src/core/agent-session.ts";
 import { AgentSessionRuntime, type CreateAgentSessionRuntimeFactory } from "../../../src/core/agent-session-runtime.ts";
 import { loadExtensionsCached } from "../../../src/core/extensions/loader.ts";
+import { getInputReceipt, promptReceived, receiveInput } from "../../../src/core/received-input.ts";
 import { DefaultResourceLoader } from "../../../src/core/resource-loader.ts";
+import { SessionManager } from "../../../src/core/session-manager.ts";
 import { SettingsManager } from "../../../src/core/settings-manager.ts";
+import { getTurnProvenance } from "../../../src/core/turn-provenance.ts";
+import { captureKeyboardTurnReceipt, receiptRecord } from "../../../src/core/turn-receipts.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -47,6 +52,17 @@ async function retainedRequestValue(session: AgentSession, name: string): Promis
 		await inspector.post("Runtime.releaseObjectGroup", { objectGroup: "pi-retainer-test" });
 		inspector.disconnect();
 	}
+}
+
+function userText(message: AgentMessage | undefined): string | undefined {
+	if (message?.role !== "user") return undefined;
+	if (typeof message.content === "string") return message.content;
+	return message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
+}
+
+// pi#160: the stored user message reused by the session projection, which persistence deep-freezes.
+function storedUserMessage(harness: Harness): AgentMessage | undefined {
+	return harness.sessionManager.buildSessionProjection().messages.find((message) => message.role === "user");
 }
 
 function createLoader(cwd: string): DefaultResourceLoader {
@@ -164,16 +180,21 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 	});
 
 	// #11897: in-place request-hook edits are not safe to discard after overflow.
+	// pi#160: the projected user message is the frozen persisted one; the hook edits a mutable copy.
 	it("detects in-place request-hook edits and sends them unchanged when they fit", async () => {
+		let hookSawFrozen: boolean | undefined;
 		const harness = await createHarness({
 			prepareRequest: (request) => {
 				const userMessage = request.context.messages.find((message) => message.role === "user");
+				hookSawFrozen = userMessage !== undefined && Object.isFrozen(userMessage);
 				if (userMessage?.role === "user") userMessage.content = [{ type: "text", text: "hook-edited input" }];
 			},
 		});
 		try {
+			let providerRan = false;
 			harness.setResponses([
 				(context) => {
+					providerRan = true;
 					const userMessage = context.messages.find((message) => message.role === "user");
 					expect(userMessage).toMatchObject({
 						role: "user",
@@ -183,7 +204,163 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 				},
 			]);
 			await harness.session.prompt("original input");
+			expect(providerRan).toBe(true);
+			expect(hookSawFrozen).toBe(false);
+			expect(harness.session.getLastAssistantText()).toBe("reply");
+			const stored = storedUserMessage(harness);
+			expect(Object.isFrozen(stored)).toBe(true);
+			expect(userText(stored)).toBe("original input");
 			expect(await retainedRequestValue(harness.session, "canReproject")).toBe(false);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	// pi#160: a nested in-place edit (content block text) is detected by the digest and never reaches history.
+	it("detects nested in-place request-hook edits without touching frozen history", async () => {
+		const harness = await createHarness({
+			prepareRequest: (request) => {
+				const userMessage = request.context.messages.find((message) => message.role === "user");
+				if (userMessage?.role !== "user" || !Array.isArray(userMessage.content)) {
+					throw new Error("Expected a user message with content blocks");
+				}
+				const block = userMessage.content[0];
+				if (block?.type === "text") block.text = `${block.text}, nested edit`;
+			},
+		});
+		try {
+			let providerRan = false;
+			harness.setResponses([
+				(context) => {
+					providerRan = true;
+					const userMessage = context.messages.find((message) => message.role === "user");
+					expect(userText(userMessage)).toBe("original input, nested edit");
+					return fauxAssistantMessage("nested reply");
+				},
+			]);
+			await harness.session.prompt("original input");
+			expect(providerRan).toBe(true);
+			expect(harness.session.getLastAssistantText()).toBe("nested reply");
+			const stored = storedUserMessage(harness);
+			expect(Object.isFrozen(stored)).toBe(true);
+			expect(userText(stored)).toBe("original input");
+			expect(await retainedRequestValue(harness.session, "canReproject")).toBe(false);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	// pi#160 counterexample: a hook that leaves the frozen projected input untouched keeps it reprojectable.
+	it("keeps untouched frozen projected input reprojectable", async () => {
+		let expected: string | undefined;
+		const harness = await createHarness({
+			settings: { compaction: { enabled: false } },
+			prepareRequest: (request) => {
+				const hash = createHash("sha256");
+				for (const message of request.context.messages) {
+					hash.update(JSON.stringify(message));
+					hash.update("\0");
+				}
+				expected = hash.digest("base64");
+			},
+		});
+		try {
+			let providerRan = false;
+			harness.setResponses([
+				() => {
+					providerRan = true;
+					return fauxAssistantMessage("untouched reply");
+				},
+			]);
+			await harness.session.prompt("untouched input");
+			expect(providerRan).toBe(true);
+			const stored = storedUserMessage(harness);
+			expect(Object.isFrozen(stored)).toBe(true);
+			expect(userText(stored)).toBe("untouched input");
+			expect(await retainedRequestValue(harness.session, "canReproject")).toBe(true);
+			expect(await retainedRequestValue(harness.session, "canonicalMessagesDigest")).toBe(expected);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	// pi#160: a request-hook edit must not overwrite keyboard-attested stored text or its attribution.
+	it("keeps keyboard-attested stored text and attribution when a request hook edits its copy", async () => {
+		const harness = await createHarness({
+			persistSession: true,
+			prepareRequest: (request) => {
+				const userMessage = request.context.messages.find((message) => message.role === "user");
+				if (userMessage?.role === "user" && Array.isArray(userMessage.content)) {
+					const block = userMessage.content[0];
+					if (block?.type === "text") block.text = "rewritten by request hook";
+				}
+			},
+		});
+		try {
+			let providerText: string | undefined;
+			harness.setResponses([
+				(context) => {
+					providerText = userText(context.messages.find((message) => message.role === "user"));
+					return fauxAssistantMessage("attested reply");
+				},
+			]);
+			const token = "c".repeat(32);
+			const input = receiveInput(
+				"typed by paul",
+				undefined,
+				captureKeyboardTurnReceipt("paul", token, new Date().toISOString()),
+			);
+			const before = receiptRecord(getInputReceipt(input));
+			await promptReceived(harness.session, input);
+			expect(providerText).toBe("rewritten by request hook");
+			const stored = storedUserMessage(harness);
+			expect(Object.isFrozen(stored)).toBe(true);
+			expect(userText(stored)).toBe("typed by paul");
+			const entry = SessionManager.open(harness.sessionManager.getSessionFile()!)
+				.getEntries()
+				.find((value) => value.type === "message" && value.message.role === "user");
+			expect(entry?.type === "message" ? userText(entry.message) : undefined).toBe("typed by paul");
+			expect(getTurnProvenance(entry!)).toEqual(before);
+			expect(getTurnProvenance(entry!)).toMatchObject({ channel: "keyboard", principal: { id: "paul" } });
+			expect(await retainedRequestValue(harness.session, "canReproject")).toBe(false);
+		} finally {
+			harness.cleanup();
+		}
+	});
+
+	// pi#160 / #11897: an in-place one-shot request edit must not be discarded by overflow recovery.
+	it("refuses overflowing request-hook edits without replaying or rebuilding their input", async () => {
+		let preparations = 0;
+		const harness = await createHarness({
+			models: [{ id: "large", contextWindow: 100_000 }],
+			settings: {
+				compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 1000 },
+				retry: { enabled: false },
+			},
+			prepareRequest: (request) => {
+				preparations++;
+				const userMessage = request.context.messages.findLast((message) => message.role === "user");
+				if (userMessage?.role === "user") {
+					userMessage.content = [{ type: "text", text: "one-shot request instruction" }];
+				}
+				return { model: { ...request.model, contextWindow: 16_000 } };
+			},
+		});
+		try {
+			harness.sessionManager.appendMessage({ role: "user", content: "x".repeat(80_000), timestamp: 1 });
+			harness.sessionManager.appendMessage(fauxAssistantMessage("old response"));
+			harness.session.refreshContext();
+			harness.setResponses([fauxAssistantMessage("must not send after discarding the edit")]);
+			await harness.session.prompt("original input");
+			expect(preparations).toBe(1);
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(harness.eventsOfType("compaction_start")).toHaveLength(0);
+			expect(harness.eventsOfType("message_end").at(-1)?.message).toMatchObject({
+				stopReason: "error",
+				errorMessage: expect.stringMatching(/context exceeds window/i),
+			});
+			expect(await retainedRequestValue(harness.session, "canReproject")).toBe(false);
+			expect(JSON.stringify(harness.sessionManager.getEntries())).not.toContain("one-shot request instruction");
 		} finally {
 			harness.cleanup();
 		}

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
+import type { SessionEntry } from "../src/core/session-manager.ts";
 import { RpcClient } from "../src/modes/rpc/rpc-client.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
 import { createHarness, type Harness } from "./suite/harness.ts";
@@ -87,6 +88,20 @@ function createRuntimeHost(harness: Harness): AgentSessionRuntime {
 		setRebindSession: vi.fn(),
 		setLifecycleCompleteHandler: vi.fn(),
 	} as unknown as AgentSessionRuntime;
+}
+
+// pi#160: canonical entries are frozen, so corrupt graphs are seeded by installing a forged
+// shallow copy in the byId index that the branch walk reads, then asserting the seed took effect.
+function forgeParentId(harness: Harness, entryId: string, parentId: string): void {
+	const byId = Reflect.get(harness.sessionManager, "byId") as Map<string, SessionEntry>;
+	const canonical = byId.get(entryId);
+	if (!canonical) {
+		throw new Error(`Expected entry to forge: ${entryId}`);
+	}
+	expect(canonical.parentId).not.toBe(parentId);
+	byId.set(entryId, { ...canonical, parentId });
+	expect(byId.get(entryId)?.parentId).toBe(parentId);
+	expect(harness.sessionManager.getEntry(entryId)?.parentId).toBe(parentId);
 }
 
 function getResponse(id: string): Record<string, unknown> {
@@ -448,11 +463,8 @@ describe("get_branch_entries_page", () => {
 	it("rejects a self-parent cycle while building an initial page", async () => {
 		const harness = await createHarness();
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "self", timestamp: 1 });
-		const leaf = harness.sessionManager.getEntry(leafId);
-		if (!leaf) {
-			throw new Error("Expected the page leaf");
-		}
-		leaf.parentId = leafId;
+		// pi#160: self-parent cycle via forged index entry.
+		forgeParentId(harness, leafId, leafId);
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
 			lineHandler(JSON.stringify({ id: "self-cycle", type: "get_branch_entries_page", limit: 1, leafId }));
@@ -470,11 +482,8 @@ describe("get_branch_entries_page", () => {
 		const harness = await createHarness();
 		const rootId = harness.sessionManager.appendMessage({ role: "user", content: "root", timestamp: 1 });
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "leaf", timestamp: 2 });
-		const root = harness.sessionManager.getEntry(rootId);
-		if (!root) {
-			throw new Error("Expected the page root");
-		}
-		root.parentId = leafId;
+		// pi#160: root -> leaf -> root cycle via forged index entry.
+		forgeParentId(harness, rootId, leafId);
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
 			lineHandler(JSON.stringify({ id: "initial-cycle", type: "get_branch_entries_page", limit: 3, leafId }));
@@ -492,11 +501,8 @@ describe("get_branch_entries_page", () => {
 		const harness = await createHarness();
 		const aId = harness.sessionManager.appendMessage({ role: "user", content: "A", timestamp: 1 });
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "B", timestamp: 2 });
-		const a = harness.sessionManager.getEntry(aId);
-		if (!a) {
-			throw new Error("Expected cycle entry A");
-		}
-		a.parentId = leafId;
+		// pi#160: A -> B -> A cycle via forged index entry.
+		forgeParentId(harness, aId, leafId);
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
 			const firstPage = await requestBranchEntriesPage(lineHandler, "cycle-first", { limit: 1, leafId });
@@ -538,11 +544,8 @@ describe("get_branch_entries_page", () => {
 		const rootId = harness.sessionManager.appendMessage({ role: "user", content: "root", timestamp: 1 });
 		const leafId = harness.sessionManager.appendMessage({ role: "user", content: "leaf", timestamp: 2 });
 		const cursorId = harness.sessionManager.appendMessage({ role: "user", content: "cursor", timestamp: 3 });
-		const root = harness.sessionManager.getEntry(rootId);
-		if (!root) {
-			throw new Error("Expected the page root");
-		}
-		root.parentId = leafId;
+		// pi#160: root -> leaf -> root cycle below the cursor via forged index entry.
+		forgeParentId(harness, rootId, leafId);
 		const { lineHandler, cleanup } = await startRpcMode(harness);
 		try {
 			lineHandler(

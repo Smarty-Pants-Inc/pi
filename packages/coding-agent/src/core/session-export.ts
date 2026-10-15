@@ -79,14 +79,14 @@ function parentLink(entry: object, format: string): string | null {
 }
 
 /**
- * Generated lazy accessor shape (enumerable, configurable, get + set). Not an identity proof:
- * a user accessor of the same shape on a key the line also holds is replaced by the disk value.
- * It is never invoked either way.
+ * Generated lazy accessor shape (enumerable, get + set), configurable unless its container is
+ * frozen (pi#160). Not an identity proof: a user accessor of the same shape on a key the line
+ * also holds is replaced by the disk value. It is never invoked either way.
  */
-function isLazyShaped(descriptor: PropertyDescriptor): boolean {
+function isLazyShaped(node: object, descriptor: PropertyDescriptor): boolean {
 	return (
 		descriptor.enumerable === true &&
-		descriptor.configurable === true &&
+		(descriptor.configurable === true || Object.isFrozen(node)) &&
 		typeof descriptor.get === "function" &&
 		typeof descriptor.set === "function"
 	);
@@ -99,7 +99,7 @@ function lazyKeys(node: object, format: string): string[] {
 		if (!Object.hasOwn(node, key)) continue;
 		const descriptor = Object.getOwnPropertyDescriptor(node, key)!;
 		if ("value" in descriptor) continue;
-		if (key === "id" || !isLazyShaped(descriptor)) throw plainJsonError(format, "an accessor property");
+		if (key === "id" || !isLazyShaped(node, descriptor)) throw plainJsonError(format, "an accessor property");
 		keys.push(key);
 	}
 	return keys;

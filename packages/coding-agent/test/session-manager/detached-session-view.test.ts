@@ -292,6 +292,10 @@ describe("detached session snapshots", () => {
 		const manager = SessionManager.inMemory();
 		manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
 		const nativeTree = manager.getTree();
+		// pi#160: canonical entries are frozen; give the structural source an independent mutable
+		// entry so the assertions below still prove wrapping never freezes source entries.
+		nativeTree[0].entry = { ...nativeTree[0].entry };
+		expect(Object.isFrozen(nativeTree[0].entry)).toBe(false);
 		const source = { ...detachedSessionView(manager), getTree: () => nativeTree };
 		const tree = detachedSessionView(source).getTree();
 		expect(tree).not.toBe(nativeTree);
