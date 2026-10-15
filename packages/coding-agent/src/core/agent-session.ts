@@ -550,6 +550,13 @@ export class AgentSession {
 	#getPendingModeInputs?: ExtensionBindings["getPendingInputs"];
 	#clearPendingModeInputs?: () => void;
 	private readonly _unpersistedInputs = new Map<AgentMessage, UnsentInput>();
+	/** Native enqueue occurrences outlive consumption until durable message_end publication. */
+	private readonly _nativeQueuedInputs = new Map<
+		number,
+		{ input: UnsentInput; receipt?: TurnReceipt; order: number }
+	>();
+	private readonly _unpersistedInputOrder = new WeakMap<AgentMessage, number>();
+	private _nextInputOrder = 0;
 	private readonly _persistedInputReceipts = new WeakSet<TurnReceipt>();
 	private readonly _replayedInputs = new WeakMap<AgentMessage, UnsentInput>();
 	private _hasResumedInputs = false;
@@ -770,6 +777,11 @@ export class AgentSession {
 				this._queueUserInput(input.text, input.images, "followUp", source ?? "interactive", getInputReceipt(input)),
 		});
 
+		for (const { id, message, mode } of this.agent.getQueuedMessageOccurrences()) {
+			if (message.role === "user" || message.role === "custom")
+				this._nativeQueuedInputs.set(id, { input: { message, mode }, order: ++this._nextInputOrder });
+		}
+
 		// Raw SDK queues bypass session admission and display bookkeeping. Observe their mutations
 		// without claiming Agent's single owner lifecycle observer or adding public session events.
 		// Advance before native observers can reenter /quit, even if they throw after insertion.
@@ -788,20 +800,37 @@ export class AgentSession {
 					this._queuedInputRevision++;
 					if (method === "steer" || method === "followUp") {
 						const message = args[0] as AgentMessage;
-						// Retain before native publication, including listeners registered before this session.
-						// Do not issue a receipt here: raw receipt time remains first harness observation.
-						if ((message.role === "user" || message.role === "custom") && !this._unpersistedInputs.has(message))
-							this._unpersistedInputs.set(message, { message, mode: method });
+						const onEnqueued = args[1] as ((id: number) => void) | undefined;
+						args[1] = (id: number) => {
+							// Transfer session-owned attribution, but never borrow a prior raw occurrence's receipt.
+							const input = this._unpersistedInputs.get(message);
+							if (message.role === "user" || message.role === "custom")
+								this._nativeQueuedInputs.set(id, {
+									input: input ?? { message, mode: method },
+									receipt: input ? this.#receivedMessageReceipts.get(message) : undefined,
+									order: this._unpersistedInputOrder.get(message) ?? ++this._nextInputOrder,
+								});
+							this._unpersistedInputs.delete(message);
+							this._unpersistedInputOrder.delete(message);
+							onEnqueued?.(id);
+						};
 					} else if (method === "removeQueuedMessages") {
-						const predicate = args[0] as (message: AgentMessage) => boolean;
-						args[0] = (message: AgentMessage) => {
-							const remove = predicate(message);
-							if (remove) this._unpersistedInputs.delete(message);
+						const predicate = args[0] as (message: AgentMessage, occurrenceId: number) => boolean;
+						args[0] = (message: AgentMessage, occurrenceId: number) => {
+							const remove = predicate(message, occurrenceId);
+							if (remove) {
+								this._unpersistedInputs.delete(message);
+								this._nativeQueuedInputs.delete(occurrenceId);
+							}
 							return remove;
 						};
 					} else {
 						const mode = method === "clearSteeringQueue" ? "steer" : "followUp";
-						for (const message of this.agent.getQueuedMessages(mode)) this._unpersistedInputs.delete(message);
+						for (const entry of this.agent.getQueuedMessageOccurrences()) {
+							if (entry.mode !== mode) continue;
+							this._unpersistedInputs.delete(entry.message);
+							this._nativeQueuedInputs.delete(entry.id);
+						}
 					}
 					return Reflect.apply(original, this.agent, args);
 				},
@@ -1670,6 +1699,15 @@ export class AgentSession {
 
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
+		if (event.type === "message_start" || event.type === "message_end") {
+			const id = this.agent.queuedMessageOccurrenceId;
+			const queued = id === undefined ? undefined : this._nativeQueuedInputs.get(id);
+			if (queued) {
+				// First harness observation is occurrence-local, including repeated use of one raw object.
+				queued.receipt ??= captureTerminalTurnReceipt();
+				this.#receivedMessageReceipts.set(event.message, queued.receipt);
+			}
+		}
 		if (
 			(event.type === "message_start" || event.type === "message_end") &&
 			(event.message.role === "user" || event.message.role === "custom") &&
@@ -1877,6 +1915,8 @@ export class AgentSession {
 			if (entryId) {
 				this._entryIdsByMessage.set(event.message, entryId);
 				// Do not insert a throwing public callback between durable append and receipt bookkeeping.
+				const occurrenceId = this.agent.queuedMessageOccurrenceId;
+				if (occurrenceId !== undefined) this._nativeQueuedInputs.delete(occurrenceId);
 				if (this._unpersistedInputs.delete(event.message) || receipt) this._queuedInputRevision++;
 				if (receipt) this._persistedInputReceipts.add(receipt);
 			}
@@ -2893,6 +2933,7 @@ export class AgentSession {
 				timestamp: Date.now(),
 			};
 			this.#receivedMessageReceipts.set(message, receipt ?? captureTerminalTurnReceipt());
+			this._unpersistedInputOrder.set(message, ++this._nextInputOrder);
 			this._unpersistedInputs.set(message, {
 				message,
 				mode: streamingBehavior ?? "steer",
@@ -3181,6 +3222,7 @@ export class AgentSession {
 			linkUnsentInputTransfer(receipt, entry.id);
 			this.#receivedMessageReceipts.set(message, receipt);
 			this._replayedInputs.set(message, input);
+			this._unpersistedInputOrder.set(message, ++this._nextInputOrder);
 			this._unpersistedInputs.set(message, { ...input, message });
 			if (message.role === "custom" && input.mode === "nextTurn") this._pendingNextTurnMessages.push(message);
 			else if (message.role === "custom" && input.mode === "context") this._pendingCustomMessages.push(message);
@@ -3232,13 +3274,17 @@ export class AgentSession {
 			throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "operator exit session is disposed");
 		const release = this.gateInputs();
 		try {
-			const pending: Array<{ input: UnsentInput; receipt?: TurnReceipt }> = [];
-			const seen = new Set<object>();
-			const retain = (input: UnsentInput, receipt?: TurnReceipt) => {
-				const identity = receipt ?? input.message;
+			const pending: Array<{ input: UnsentInput; receipt?: TurnReceipt; order: number }> = [];
+			const seen = new Set<object | number>();
+			const retain = (input: UnsentInput, receipt?: TurnReceipt, occurrenceId?: number, order?: number) => {
+				const identity = occurrenceId ?? receipt ?? input.message;
 				if (seen.has(identity) || (receipt && this._persistedInputReceipts.has(receipt))) return;
 				seen.add(identity);
-				pending.push({ input: { ...input, ...(receipt ? { provenance: receiptRecord(receipt) } : {}) }, receipt });
+				pending.push({
+					input: { ...input, ...(receipt ? { provenance: receiptRecord(receipt) } : {}) },
+					receipt,
+					order: order ?? this._unpersistedInputOrder.get(input.message) ?? ++this._nextInputOrder,
+				});
 			};
 			for (const input of this._unpersistedInputs.values()) {
 				const submission = this._userMessageSubmissions.get(input.message);
@@ -3250,9 +3296,17 @@ export class AgentSession {
 					this.#receivedMessageReceipts.get(input.message),
 				);
 			}
-			for (const mode of ["steer", "followUp"] as const) {
-				for (const message of this.agent.getQueuedMessages(mode))
-					retain({ message, mode }, this.#receivedMessageReceipts.get(message));
+			for (const [id, { input, receipt, order }] of this._nativeQueuedInputs) {
+				const submission = this._userMessageSubmissions.get(input.message);
+				retain(
+					{
+						...input,
+						...(submission ? { metadata: submission.metadata, metadataSource: submission.metadataSource } : {}),
+					},
+					receipt,
+					id,
+					order,
+				);
 			}
 			for (const admission of this._inputAdmissions) if (admission.input) retain(admission.input, admission.receipt);
 			for (const { input, mode } of this.#getPendingModeInputs?.() ?? [])
@@ -3272,6 +3326,7 @@ export class AgentSession {
 					"INPUT_ADMISSION_BUSY",
 					`${pending.length} queued messages are not saved (no session file). /quit again to discard them and exit.`,
 				);
+			pending.sort((left, right) => left.order - right.order);
 			for (const { input, receipt } of this.sessionManager.isPersisted() ? pending : []) {
 				if (getUnsentInputTransfer(receipt)) continue; // Already durable from an earlier exit; not yet consumed.
 				const origin = { sessionId: this.sessionManager.getSessionId(), host: hostname(), uid: userInfo().uid };
@@ -3283,6 +3338,7 @@ export class AgentSession {
 			this._pendingNextTurnMessages = [];
 			this._pendingCustomMessages = [];
 			this._unpersistedInputs.clear();
+			this._nativeQueuedInputs.clear();
 			this.clearQueue();
 			return release;
 		} catch (error) {
@@ -4061,6 +4117,7 @@ export class AgentSession {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
 		}
+		this._unpersistedInputOrder.set(message, ++this._nextInputOrder);
 		this._unpersistedInputs.set(message, { message, mode: "steer" });
 		const admission = this._inputAdmissionScope.getStore();
 		if (admission) admission.input = undefined;
@@ -4092,6 +4149,7 @@ export class AgentSession {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
 		}
+		this._unpersistedInputOrder.set(message, ++this._nextInputOrder);
 		this._unpersistedInputs.set(message, { message, mode: "followUp" });
 		const admission = this._inputAdmissionScope.getStore();
 		if (admission) admission.input = undefined;
@@ -4156,6 +4214,7 @@ export class AgentSession {
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
 		this.#receivedMessageReceipts.set(appMessage, receipt);
+		this._unpersistedInputOrder.set(appMessage, ++this._nextInputOrder);
 		this._unpersistedInputs.set(appMessage, {
 			message: appMessage,
 			mode:

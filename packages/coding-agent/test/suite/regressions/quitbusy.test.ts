@@ -585,6 +585,79 @@ describe("operator exit and compaction settlement", () => {
 		expect(secondManager.getEntryCount()).toBe(before);
 	});
 
+	// Refs Smarty-Pants-Inc/smarty-dev#13156: one raw object can represent two enqueue occurrences.
+	it.each(["steer", "followUp"] as const)("P1 repeated raw %s survives first publication failure", async (mode) => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		harnesses.push(h);
+		const message = { role: "user" as const, content: "same raw object twice", timestamp: 1 };
+		h.session.agent[mode](message);
+		h.session.agent[mode](message);
+		const occurrences = h.session.agent.getQueuedMessageOccurrences();
+		expect(occurrences).toHaveLength(2);
+		expect(occurrences[0].id).not.toBe(occurrences[1].id);
+		expect(occurrences.map((entry) => entry.message)).toEqual([message, message]);
+		const unsubscribe = h.session.subscribe((event) => {
+			if (event.type === "message_start" && event.message === message) throw new Error("first occurrence failed");
+		});
+		h.setResponses([fauxAssistantMessage("initial")]);
+		// Use the native run: session.prompt would automatically continue the remaining queue after failure.
+		await h.session.agent.prompt("active");
+		unsubscribe();
+		expect(h.session.agent.state.errorMessage).toBe("first occurrence failed");
+		expect(h.session.agent.getQueuedMessages(mode)).toEqual([message]);
+		const release = h.session.prepareOperatorExit();
+		release();
+		h.session.dispose();
+		const file = h.sessionManager.getSessionFile()!;
+		const saved = SessionManager.open(file);
+		const outboxes = saved
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(2);
+		for (const entry of outboxes) {
+			if (entry.type !== "custom") throw new Error("missing outbox");
+			expect(entry.data).toMatchObject({ message, mode });
+		}
+		// Only the first occurrence reached a harness listener. Attribution must not leak to the second.
+		expect(outboxes[0].type === "custom" ? (outboxes[0].data as UnsentInput).provenance : undefined).toBeDefined();
+		expect(outboxes[1].type === "custom" ? (outboxes[1].data as UnsentInput).provenance : undefined).toBeUndefined();
+		const restore = (manager: SessionManager) =>
+			new AgentSession({
+				agent: new Agent({
+					streamFn: streamSimple,
+					convertToLlm,
+					initialState: { model: h.getModel(), tools: [] },
+				}),
+				sessionManager: manager,
+				settingsManager: h.settingsManager,
+				modelRuntime: h.modelRuntime,
+				resourceLoader: h.resourceLoader,
+				cwd: h.tempDir,
+			});
+		const resumed = restore(saved);
+		extraSessions.push(resumed);
+		h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+		await resumed.resumeUnsentInputs();
+		for (const entry of outboxes)
+			expect(saved.getEntries().filter((delivery) => delivery.unsentInputId === entry.id)).toHaveLength(1);
+		expect(
+			saved
+				.getEntries()
+				.filter((entry) => entry.type === "message" && getMessageText(entry.message) === message.content),
+		).toHaveLength(2);
+		resumed.dispose();
+		const reopened = SessionManager.open(file);
+		const second = restore(reopened);
+		extraSessions.push(second);
+		const before = reopened.getEntryCount();
+		await second.resumeUnsentInputs();
+		expect(second.agent.getQueuedMessages()).toEqual([]);
+		expect(reopened.getEntryCount()).toBe(before);
+	});
+
 	// smarty-dev#13156 / pi#262: saved input is consumed even if request preparation never dispatches it.
 	it.each(["steer", "followUp"] as const)("P1 raw %s committed input is not retained again", async (mode) => {
 		const h = await createHarness({
@@ -632,6 +705,39 @@ describe("operator exit and compaction settlement", () => {
 				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE),
 		).toEqual([]);
 	});
+
+	// Refs Smarty-Pants-Inc/smarty-dev#13156: a persisted receipt belongs only to its enqueue occurrence.
+	it.each(["steer", "followUp"] as const)(
+		"P1 raw %s remains recoverable after an earlier same-object send",
+		async (mode) => {
+			const h = await createHarness({
+				persistSession: true,
+				settings: { compaction: { enabled: false }, retry: { enabled: false } },
+			});
+			harnesses.push(h);
+			const message = { role: "user" as const, content: "reuse after commit", timestamp: 1 };
+			h.session.agent[mode](message);
+			h.setResponses([fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+			await h.session.agent.prompt("active");
+			expect(
+				h.sessionManager.getEntries().filter((entry) => entry.type === "message" && entry.message === message),
+			).toHaveLength(1);
+			h.session.agent[mode](message);
+			const unsubscribe = h.session.subscribe((event) => {
+				if (event.type === "message_start" && event.message === message) throw new Error("later occurrence failed");
+			});
+			h.setResponses([fauxAssistantMessage("three")]);
+			await h.session.agent.prompt("next");
+			unsubscribe();
+			const release = h.session.prepareOperatorExit();
+			release();
+			const outboxes = h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+			expect(outboxes).toHaveLength(1);
+			expect(outboxes[0]).toMatchObject({ data: { message, mode } });
+		},
+	);
 
 	// smarty-dev#13156 / pi#262: intentionally removed native input must not become recoverable work.
 	it.each(["steer", "followUp"] as const)("P1 raw %s explicitly cleared input is discarded", async (mode) => {

@@ -147,18 +147,23 @@ export interface AgentOptions {
 	toolExecution?: ToolExecutionMode;
 }
 
+let nextQueuedMessageOccurrenceId = 0;
+
 class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
+	private messages: Array<{ id: number; message: AgentMessage }> = [];
 	private reserved = 0;
 	private selected: AgentMessage[] = [];
+	private selectedOccurrences: number[] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
 		this.mode = mode;
 	}
 
-	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
+	enqueue(message: AgentMessage): number {
+		const id = ++nextQueuedMessageOccurrenceId;
+		this.messages.push({ id, message });
+		return id;
 	}
 
 	hasItems(): boolean {
@@ -166,13 +171,17 @@ class PendingMessageQueue {
 	}
 
 	peek(): AgentMessage[] {
-		if (this.mode === "all") return this.messages.slice();
+		if (this.mode === "all") return this.snapshot();
 		const first = this.messages[0];
-		return first ? [first] : [];
+		return first ? [first.message] : [];
 	}
 
 	snapshot(): AgentMessage[] {
-		return this.messages.slice();
+		return this.messages.map(({ message }) => message);
+	}
+
+	occurrences(): Array<{ id: number; message: AgentMessage }> {
+		return this.messages.map((entry) => ({ ...entry }));
 	}
 
 	get size(): number {
@@ -186,32 +195,37 @@ class PendingMessageQueue {
 		// ponytail: Selection is serial per queue. Keep the exact returned array
 		// so clear can invalidate its iterator. Concurrent selectors would need
 		// separate reservations.
-		this.selected = this.messages.slice(this.reserved, end);
+		const selected = this.messages.slice(this.reserved, end);
+		this.selected = selected.map(({ message }) => message);
+		this.selectedOccurrences = selected.map(({ id }) => id);
 		this.reserved = end;
 		return this.selected;
 	}
 
-	consume(message: AgentMessage): void {
-		const index = this.messages.indexOf(message);
+	consume(message: AgentMessage): number | undefined {
+		const index = this.messages.findIndex((entry) => entry.message === message);
 		if (index >= 0 && index < this.reserved) {
-			this.messages.splice(index, 1);
+			const [entry] = this.messages.splice(index, 1);
 			this.reserved--;
+			return entry.id;
 		}
+		return undefined;
 	}
 
 	release(): void {
 		this.selected.length = 0;
+		this.selectedOccurrences = [];
 		this.reserved = 0;
 	}
 
-	remove(predicate: (message: AgentMessage) => boolean): void {
+	remove(predicate: (message: AgentMessage, occurrenceId: number) => boolean): void {
 		for (let index = this.messages.length - 1; index >= 0; index--) {
-			const message = this.messages[index];
-			if (!predicate(message)) continue;
+			const { id, message } = this.messages[index];
+			if (!predicate(message, id)) continue;
 			this.messages.splice(index, 1);
 			if (index < this.reserved) this.reserved--;
 			// Keep reservation slots stable: the loop skips this slot before message_start.
-			const selectedIndex = this.selected.indexOf(message);
+			const selectedIndex = this.selectedOccurrences.indexOf(id);
 			if (selectedIndex >= 0) delete this.selected[selectedIndex];
 		}
 	}
@@ -265,6 +279,7 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private _queuedMessageOccurrenceId?: number;
 	private lifecycleObserver?: (event: Readonly<AgentLifecycleObservation>) => void;
 	private observeStream?: (stream: StreamFn, signal: AbortSignal) => StreamFn;
 	/** Session identifier forwarded to providers for cache-aware backends. */
@@ -386,18 +401,22 @@ export class Agent {
 	}
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
-		this.steeringQueue.enqueue(message);
+	steer(
+		message: AgentMessage,
+		/** @internal Runs after insertion, before external observers. */ onEnqueued?: (id: number) => void,
+	): void {
+		const id = this.steeringQueue.enqueue(message);
+		onEnqueued?.(id);
 		this.observe("queue_update");
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
 	followUp(
 		message: AgentMessage,
-		/** @internal Runs after insertion, before external observers. */ onEnqueued?: () => void,
+		/** @internal Runs after insertion, before external observers. */ onEnqueued?: (id: number) => void,
 	): void {
-		this.followUpQueue.enqueue(message);
-		onEnqueued?.();
+		const id = this.followUpQueue.enqueue(message);
+		onEnqueued?.(id);
 		this.observe("queue_update");
 	}
 
@@ -420,7 +439,7 @@ export class Agent {
 	}
 
 	/** Remove selected queued messages without releasing or retargeting other reservations. */
-	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): void {
+	removeQueuedMessages(predicate: (message: AgentMessage, occurrenceId: number) => boolean): void {
 		this.steeringQueue.remove(predicate);
 		this.followUpQueue.remove(predicate);
 		this.observe("queue_update");
@@ -442,6 +461,19 @@ export class Agent {
 		if (mode === "steer") return this.steeringQueue.snapshot();
 		if (mode === "followUp") return this.followUpQueue.snapshot();
 		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()];
+	}
+
+	/** @internal Stable enqueue identities, including queues populated before session attachment. */
+	getQueuedMessageOccurrences(): Array<{ id: number; message: AgentMessage; mode: "steer" | "followUp" }> {
+		return [
+			...this.steeringQueue.occurrences().map((entry) => ({ ...entry, mode: "steer" as const })),
+			...this.followUpQueue.occurrences().map((entry) => ({ ...entry, mode: "followUp" as const })),
+		];
+	}
+
+	/** @internal Enqueue occurrence belonging to the current message publication, if queued. */
+	get queuedMessageOccurrenceId(): number | undefined {
+		return this._queuedMessageOccurrenceId;
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -695,8 +727,9 @@ export class Agent {
 		}
 		switch (event.type) {
 			case "message_start":
-				this.steeringQueue.consume(sourceMessage ?? event.message);
-				this.followUpQueue.consume(sourceMessage ?? event.message);
+				this._queuedMessageOccurrenceId =
+					this.steeringQueue.consume(sourceMessage ?? event.message) ??
+					this.followUpQueue.consume(sourceMessage ?? event.message);
 				this._state.streamingMessage = event.message;
 				break;
 
