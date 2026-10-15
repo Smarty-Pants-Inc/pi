@@ -135,7 +135,7 @@ function createClient(
 	const headers = providerHeadersToRecord({ ...model.headers, ...optionsHeaders });
 	return new OpenAI({
 		apiKey,
-		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets)),
+		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets), "openrouter"),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,
