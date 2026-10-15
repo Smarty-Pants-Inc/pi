@@ -1,12 +1,16 @@
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "vitest";
 import { MAX_MATERIALIZED_EXPORT_BYTES, prepareExportValueForJson } from "../src/core/export-limits.ts";
 import { exportSessionToJsonl, serializeSessionBranch } from "../src/core/session-export.ts";
 import { copyEntry, type EntryLocation, isColdEntry, toColdEntry } from "../src/core/session-lazy-entries.ts";
 import { CURRENT_SESSION_VERSION, type SessionEntry, SessionManager } from "../src/core/session-manager.ts";
+import { appendReceivedMessage } from "../src/core/session-turn-appender.ts";
+import { getTurnProvenance } from "../src/core/turn-provenance.ts";
+import { captureKeyboardTurnReceipt, receiptRecord } from "../src/core/turn-receipts.ts";
 
 /** Unmocked rmSync, captured before the mock replaces it; used only for this file's scratch root. */
 const realFs = vi.hoisted(() => ({ rmSync: undefined as typeof fs.rmSync | undefined }));
@@ -917,6 +921,91 @@ describe("session export serialization", () => {
 		expect(read).not.toHaveBeenCalled();
 	});
 
+	// pi#160 / pi#247: sealing a real cold keyboard message makes its generated content accessor
+	// non-configurable. Both public exports must reparse it without weakening stored attribution.
+	it.each(["string", "streaming"] as const)("exports frozen cold keyboard history through %s JSONL", (format) => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+		const sessionDir = directory();
+		const writer = SessionManager.create(sessionDir, sessionDir);
+		const text = "keyboard-attested history\n".repeat(128);
+		const receipt = captureKeyboardTurnReceipt("paul", "a".repeat(32), new Date().toISOString());
+		const id = appendReceivedMessage(
+			writer,
+			{ role: "user", content: [{ type: "text", text }], timestamp: 1 },
+			receipt,
+		);
+		writer.appendMessage(fauxAssistantMessage("reply"));
+		for (let i = 0; i < 105; i++) writer.appendCustomEntry("padding", i);
+		writer.appendCompaction("the old turn is summarized", null, 100);
+		const journal = writer.getSessionFile()!;
+		const diskLines = fs.readFileSync(journal, "utf8").trimEnd().split("\n");
+		const sessionManager = SessionManager.open(journal);
+		const stored = sessionManager.getEntry(id);
+		if (stored?.type !== "message" || stored.message.role !== "user") throw new Error("missing keyboard history");
+		const message = stored.message;
+		expect(isColdEntry(stored)).toBe(true);
+		expect(Object.isFrozen(message)).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(message, "content")).toMatchObject({
+			get: expect.any(Function),
+			set: expect.any(Function),
+			enumerable: true,
+			configurable: false,
+		});
+		const output =
+			format === "string"
+				? serializeSessionBranch(sessionManager)
+				: fs.readFileSync(exportSessionToJsonl(sessionManager, join(directory(), "keyboard.jsonl")), "utf8");
+		expect(output.slice(output.indexOf("\n") + 1)).toBe(`${diskLines.slice(1).join("\n")}\n`);
+		const exported = output
+			.trimEnd()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { id?: string })
+			.find((entry) => entry.id === id);
+		expect(exported).toMatchObject({
+			message: { role: "user", content: [{ type: "text", text }] },
+			provenance: receiptRecord(receipt),
+		});
+		expect(() => {
+			const content = message.content;
+			if (Array.isArray(content) && content[0]?.type === "text") content[0].text = "forged";
+		}).toThrow(TypeError);
+		expect(message.content).toEqual([{ type: "text", text }]);
+		expect(getTurnProvenance(stored)).toEqual(receiptRecord(receipt));
+		expect(fs.readFileSync(journal, "utf8").trimEnd().split("\n")).toEqual(diskLines);
+	});
+
+	// pi#160 / pi#247: all stored entry roots are sealed, not just keyboard message wrappers.
+	it.each(["string", "streaming"] as const)("exports frozen cold root fields through %s JSONL", (format) => {
+		const sessionDir = directory();
+		const writer = SessionManager.create(sessionDir, sessionDir);
+		writer.appendMessage({ role: "user", content: "initial turn", timestamp: 1 });
+		writer.appendMessage(fauxAssistantMessage("reply"));
+		const summary = "old compaction summary\n".repeat(128);
+		const id = writer.appendCompaction(summary, null, 100);
+		for (let i = 0; i < 105; i++) writer.appendCustomEntry("padding", i);
+		writer.appendCompaction("latest compaction", null, 100);
+		const journal = writer.getSessionFile()!;
+		const diskLines = fs.readFileSync(journal, "utf8").trimEnd().split("\n");
+		const sessionManager = SessionManager.open(journal);
+		const stored = sessionManager.getEntry(id);
+		if (stored?.type !== "compaction") throw new Error("missing old compaction");
+		expect(isColdEntry(stored)).toBe(true);
+		expect(Object.isFrozen(stored)).toBe(true);
+		expect(Object.getOwnPropertyDescriptor(stored, "summary")).toMatchObject({
+			get: expect.any(Function),
+			set: expect.any(Function),
+			enumerable: true,
+			configurable: false,
+		});
+		const output =
+			format === "string"
+				? serializeSessionBranch(sessionManager)
+				: fs.readFileSync(exportSessionToJsonl(sessionManager, join(directory(), "compaction.jsonl")), "utf8");
+		expect(output.slice(output.indexOf("\n") + 1)).toBe(`${diskLines.slice(1).join("\n")}\n`);
+		expect(stored.summary).toBe(summary);
+	});
+
 	/** Bytes coldSnapshot reserves before reading a cold line: parent link plus resident primitives. */
 	function residentReserve(entry: object, parentId: string | null): number {
 		let bytes = typeof parentId === "string" ? parentId.length * 6 + 26 : 30;
@@ -1280,6 +1369,28 @@ describe("session export serialization", () => {
 				const get = vi.fn(() => "extra");
 				const set = vi.fn();
 				Object.defineProperty(entry, "extra", { get, set, enumerable: true, configurable: true });
+				return { entry, spies: [get, set] };
+			},
+		},
+		// pi#160 / pi#247: a non-configurable shape is accepted only on a frozen container.
+		{
+			name: "locked lazy-shaped field on an unfrozen entry",
+			mutate: (entry: object) => {
+				const get = vi.fn(() => "forged");
+				const set = vi.fn();
+				Object.defineProperty(entry, "timestamp", { get, set, enumerable: true, configurable: false });
+				expect(Object.isFrozen(entry)).toBe(false);
+				return { entry, spies: [get, set] };
+			},
+		},
+		// pi#160 / pi#247: accepting sealed lazy shapes still requires a matching disk key.
+		{
+			name: "frozen lazy-shaped accessor absent from the line",
+			mutate: (entry: object) => {
+				const get = vi.fn(() => "extra");
+				const set = vi.fn();
+				Object.defineProperty(entry, "extra", { get, set, enumerable: true, configurable: true });
+				Object.freeze(entry);
 				return { entry, spies: [get, set] };
 			},
 		},

@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { hostname, userInfo } from "node:os";
 import { basename, dirname } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import {
 	type AfterToolCallContext,
 	type AfterToolCallResult,
@@ -159,6 +160,7 @@ import {
 	type BranchSummaryEntry,
 	type CompactionEntry,
 	type ContextEditEntry,
+	freezeDetached,
 	getLatestCompactionEntry,
 	type SessionEntry,
 	SessionManager,
@@ -188,6 +190,7 @@ import {
 	receiptRecord,
 	restoreTerminalTurnReceipt,
 	type TurnReceipt,
+	withoutAttribution,
 } from "./turn-receipts.ts";
 import {
 	getUnsentInputTransfer,
@@ -340,6 +343,21 @@ export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 // ============================================================================
 // Types
 // ============================================================================
+
+/** User content as blocks, so `"x"` and `[{ type: "text", text: "x" }]` compare as the same text. */
+function userContentBlocks(content: string | readonly (TextContent | ImageContent)[]): unknown {
+	return typeof content === "string" ? [{ type: "text", text: content }] : content;
+}
+
+/**
+ * A deep-frozen plain-data copy of a message for persistence. The JSON round trip reads every getter,
+ * Proxy trap and toJSON exactly once, so no live object survives: what the boundary checks is what is
+ * written. The copy is frozen because an unowned SessionManager returns stored entries by reference
+ * (getEntries, getBranch), and a later edit would otherwise be exported with the old attribution.
+ */
+function detachedMessage(message: AgentMessage): AgentMessage {
+	return freezeDetached(JSON.parse(JSON.stringify(message)) as AgentMessage);
+}
 
 function withoutDeletedHeaders(headers: ProviderHeaders | undefined): Record<string, string> | undefined {
 	return headers
@@ -555,7 +573,13 @@ export class AgentSession {
 	/** Native enqueue occurrences outlive consumption until durable message_end publication. */
 	private readonly _nativeQueuedInputs = new Map<
 		number,
-		{ input: UnsentInput; receipt?: TurnReceipt; submission?: UserMessageSubmission; order: number }
+		{
+			input: UnsentInput;
+			receipt?: TurnReceipt;
+			attested?: unknown;
+			submission?: UserMessageSubmission;
+			order: number;
+		}
 	>();
 	private readonly _unpersistedInputOrder = new WeakMap<AgentMessage, number>();
 	private _nextInputOrder = 0;
@@ -607,6 +631,11 @@ export class AgentSession {
 	private _messageEntryIds: WeakMap<AgentMessage, string[]> | undefined;
 	/** Receipt associations last only until this publication succeeds. */
 	readonly #receivedMessageReceipts = new WeakMap<AgentMessage, TurnReceipt>();
+	/**
+	 * Trusted snapshot of the exact content a keyboard receipt attested, as normalized blocks (pi#160).
+	 * Kept beside the receipt, never on the message, so no listener or extension can reach it.
+	 */
+	readonly #attestedUserContent = new WeakMap<AgentMessage, unknown>();
 	/** Metadata is occurrence-local, never attached to model-visible message objects. */
 	private readonly _userMessageSubmissions = new WeakMap<AgentMessage, UserMessageSubmission>();
 	private readonly _pendingUserMessageSubmissions = new Set<UserMessageSubmission>();
@@ -819,6 +848,7 @@ export class AgentSession {
 											}
 										: { message, mode: method },
 									receipt: input ? this._preparedInputReceipts.get(message) : undefined,
+									attested: input ? this.#attestedUserContent.get(message) : undefined,
 									submission,
 									order:
 										(input ? this._unpersistedInputOrder.get(message) : undefined) ?? ++this._nextInputOrder,
@@ -999,6 +1029,23 @@ export class AgentSession {
 			this._beforeToolCall(context, this._nestedToolParents.get(context.toolCall));
 		this.agent.afterToolCall = (context) =>
 			this._afterToolCall(context, this._nestedToolParents.get(context.toolCall));
+		this.agent.transformToolUpdate = async (toolCall, args, partialResult, signal) => {
+			const runner = this._extensionRunner;
+			if (!runner.hasHandlers("tool_partial_result")) return undefined;
+			const parentToolCallId = this._nestedToolParents.get(toolCall);
+			const result = await runner.emitToolPartialResult(
+				{
+					type: "tool_partial_result",
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					input: args,
+					partialResult,
+					...(parentToolCallId ? { parentToolCallId } : {}),
+				},
+				signal ? AbortSignal.any([signal, this._shutdownCancellation.signal]) : this._shutdownCancellation.signal,
+			);
+			return result.partialResult;
+		};
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -1115,6 +1162,7 @@ export class AgentSession {
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
 					beforeToolCall: this.agent.beforeToolCall,
 					afterToolCall: this.agent.afterToolCall,
+					transformToolUpdate: this.agent.transformToolUpdate,
 					signal,
 					onUpdate,
 				});
@@ -1227,7 +1275,18 @@ export class AgentSession {
 				const projection = this.sessionManager.buildSessionProjection();
 				const canonicalContext = {
 					...request.context,
-					messages: projection.messages,
+					// pi#160 persists detached, deep-frozen plain-data messages, and the projection reuses them.
+					// Request hooks may edit their input in place, so they get a mutable copy; stored history
+					// stays frozen. Unfrozen SDK messages are passed as is (they may not be cloneable).
+					messages: projection.messages.map((message) => {
+						if (!Object.isFrozen(message)) return message;
+						try {
+							return structuredClone(message);
+						} catch {
+							// Frozen SDK messages may contain opaque values; preserve their fitting-request behavior.
+							return message;
+						}
+					}),
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};
@@ -1710,6 +1769,16 @@ export class AgentSession {
 		if (failures.length > 0) throw failures[0];
 	}
 
+	/** Attach a receipt to a harness-built user message; a keyboard receipt also snapshots the attested content. */
+	#attachUserMessageReceipt(message: AgentMessage, receipt: TurnReceipt): void {
+		this.#receivedMessageReceipts.set(message, receipt);
+		if (message.role === "user" && receiptRecord(receipt).channel === "keyboard") {
+			this.#attestedUserContent.set(message, structuredClone(userContentBlocks(message.content)));
+		} else {
+			this.#attestedUserContent.delete(message);
+		}
+	}
+
 	/** Internal handler for agent events - shared by subscribe and reconnect */
 	private _handleAgentEvent = async (event: AgentEvent): Promise<void> => {
 		if (event.type === "message_start" || event.type === "message_end") {
@@ -1855,68 +1924,92 @@ export class AgentSession {
 			let entryId: string | undefined;
 			const occurrenceId = this.agent.queuedMessageOccurrenceId;
 			const queued = occurrenceId === undefined ? undefined : this._nativeQueuedInputs.get(occurrenceId);
-			const receipt =
+			const inputReceipt =
 				queued?.receipt ??
 				(occurrenceId === undefined
 					? (this._preparedInputReceipts.get(event.message) ?? this.#receivedMessageReceipts.get(event.message))
 					: undefined);
+			// Keep narrower hook downgrades, but retain the original occurrence's transfer identity.
+			let receipt = this.#receivedMessageReceipts.get(event.message) ?? inputReceipt;
 			const submission =
 				occurrenceId === undefined ? this._userMessageSubmissions.get(event.message) : queued?.submission;
-			if (submission && event.message.role !== "user") {
+			const replay = occurrenceId === undefined ? this._replayedInputs.get(event.message) : queued?.input;
+			// pi#160: the persistence-boundary check is the authority for keyboard attribution. Hooks,
+			// queues, message_end replacements and public listeners can all change the live message;
+			// the per-path downgrades only make earlier, narrower decisions. Attribution persists only
+			// when the content being written is exactly the content the receipt attested.
+			// The owned-terminal write is queued and serializes later, after async listeners may have
+			// mutated the live message, and a getter can answer differently on each read. So the check
+			// runs on a detached copy, and that same copy (never the live message) is handed to the write.
+			// Every message that carries a receipt or a submission is detached BEFORE its role is read:
+			// a role getter could answer "assistant" to a live check and "user" to the write. Role and
+			// content below are read only from `persisted`.
+			const attested = occurrenceId === undefined ? this.#attestedUserContent.get(event.message) : queued?.attested;
+			const persisted =
+				receipt !== undefined || attested !== undefined || submission !== undefined
+					? detachedMessage(event.message)
+					: event.message;
+			if (
+				receipt &&
+				!(
+					persisted.role === "user" &&
+					attested !== undefined &&
+					isDeepStrictEqual(userContentBlocks(persisted.content), attested)
+				)
+			) {
+				receipt = withoutAttribution(receipt);
+			}
+			const transfer = getUnsentInputTransfer(inputReceipt);
+			if (receipt && transfer) linkUnsentInputTransfer(receipt, transfer);
+			if (submission && persisted.role !== "user") {
 				submission.reject(new Error("User message was replaced without persisting a user entry"));
 			}
-			const replay = occurrenceId === undefined ? this._replayedInputs.get(event.message) : queued?.input;
-			const metadata = event.message.role === "user" ? (submission?.metadata ?? replay?.metadata) : undefined;
+			const metadata = persisted.role === "user" ? (submission?.metadata ?? replay?.metadata) : undefined;
 			const metadataSource =
 				metadata === undefined ? undefined : (submission?.metadataSource ?? replay?.metadataSource);
 			// Check if this is a custom message from extensions
-			if (event.message.role === "custom") {
+			if (persisted.role === "custom") {
 				// Persist as CustomMessageEntry
 				entryId = this.#ordinaryOwner
 					? await appendOwnedTerminalCustomMessage(
 							this.sessionManager,
-							event.message.customType,
-							event.message.content,
-							event.message.display,
-							event.message.details,
+							persisted.customType,
+							persisted.content,
+							persisted.display,
+							persisted.details,
 							receipt,
 						)
 					: appendReceivedCustomMessage(
 							this.sessionManager,
-							event.message.customType,
-							event.message.content,
-							event.message.display,
-							event.message.details,
+							persisted.customType,
+							persisted.content,
+							persisted.display,
+							persisted.details,
 							receipt,
 						);
 				this.#receivedMessageReceipts.delete(event.message);
+				this.#attestedUserContent.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
 					this._retainTerminalPublicationFailure(error);
 				}
 			} else if (
-				event.message.role === "system" ||
-				event.message.role === "user" ||
-				event.message.role === "assistant" ||
-				event.message.role === "toolResult"
+				persisted.role === "system" ||
+				persisted.role === "user" ||
+				persisted.role === "assistant" ||
+				persisted.role === "toolResult"
 			) {
 				// Regular LLM message - persist as SessionMessageEntry
 				try {
 					entryId = this.#ordinaryOwner
-						? await appendOwnedTerminalMessage(
-								this.sessionManager,
-								event.message,
-								receipt,
-								metadata,
-								metadataSource,
-							)
-						: appendReceivedMessage(this.sessionManager, event.message, receipt, metadata, metadataSource);
+						? await appendOwnedTerminalMessage(this.sessionManager, persisted, receipt, metadata, metadataSource)
+						: appendReceivedMessage(this.sessionManager, persisted, receipt, metadata, metadataSource);
 				} catch (error) {
 					submission?.reject(error);
 					throw error;
 				}
-				if (submission && event.message.role === "user") {
+				if (submission && persisted.role === "user") {
 					submission.resolve({
 						status: "turnStarted",
 						entryId,
@@ -1926,6 +2019,7 @@ export class AgentSession {
 					this._userMessageSubmissions.delete(event.message);
 				}
 				this.#receivedMessageReceipts.delete(event.message);
+				this.#attestedUserContent.delete(event.message);
 				try {
 					this._recordMessageEntryId(event.message, entryId);
 				} catch (error) {
@@ -1938,6 +2032,7 @@ export class AgentSession {
 				if (occurrenceId !== undefined) this._nativeQueuedInputs.delete(occurrenceId);
 				if ((occurrenceId === undefined && this._unpersistedInputs.delete(event.message)) || receipt)
 					this._queuedInputRevision++;
+				if (inputReceipt) this._persistedInputReceipts.add(inputReceipt);
 				if (receipt) this._persistedInputReceipts.add(receipt);
 				if (!this._unpersistedInputs.has(event.message)) this._preparedInputReceipts.delete(event.message);
 			}
@@ -2120,6 +2215,17 @@ export class AgentSession {
 					replacement.content == null
 						? ({ ...replacement, content: [] } as AgentMessage)
 						: replacement;
+				// smarty-dev#2636: Herdr attested the typed bytes, not text a message_end hook produced.
+				// Earlier downgrade only; the persistence-boundary check in _persistAgentEvent is the authority.
+				const receipt = this.#receivedMessageReceipts.get(event.message);
+				if (
+					receipt &&
+					event.message.role === "user" &&
+					(normalized.role !== "user" ||
+						!isDeepStrictEqual(userContentBlocks(event.message.content), userContentBlocks(normalized.content)))
+				) {
+					this.#receivedMessageReceipts.set(event.message, withoutAttribution(receipt));
+				}
 				this._replaceMessageInPlace(event.message, normalized);
 			}
 		} else if (event.type === "tool_execution_start") {
@@ -2954,7 +3060,7 @@ export class AgentSession {
 				timestamp: Date.now(),
 			};
 			const preparedReceipt = receipt ?? captureTerminalTurnReceipt();
-			this.#receivedMessageReceipts.set(message, preparedReceipt);
+			this.#attachUserMessageReceipt(message, preparedReceipt);
 			this._preparedInputReceipts.set(message, preparedReceipt);
 			this._unpersistedInputOrder.set(message, ++this._nextInputOrder);
 			this._unpersistedInputs.set(message, {
@@ -3241,9 +3347,25 @@ export class AgentSession {
 					this._unsentInputDrafts.push({ role: "user", content: message.content, timestamp: message.timestamp });
 				continue;
 			}
-			const receipt = input.provenance ? restoreTerminalTurnReceipt(input.provenance) : captureTerminalTurnReceipt();
+			// Stored keyboard provenance is not a fresh attestation; replay retains terminal identity only.
+			const provenance = input.provenance;
+			const receipt = provenance
+				? restoreTerminalTurnReceipt(
+						provenance.channel === "keyboard"
+							? {
+									v: provenance.v,
+									channel: "terminal",
+									turnId: provenance.turnId,
+									receivedAt: provenance.receivedAt,
+									...(provenance.submissionToken === undefined
+										? {}
+										: { submissionToken: provenance.submissionToken }),
+								}
+							: provenance,
+					)
+				: captureTerminalTurnReceipt();
 			linkUnsentInputTransfer(receipt, entry.id);
-			this.#receivedMessageReceipts.set(message, receipt);
+			this.#attachUserMessageReceipt(message, receipt);
 			this._replayedInputs.set(message, input);
 			this._preparedInputReceipts.set(message, receipt);
 			this._unpersistedInputOrder.set(message, ++this._nextInputOrder);
@@ -3516,7 +3638,7 @@ export class AgentSession {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
-	): Promise<{ text: string; images: ImageContent[] | undefined } | undefined> {
+	): Promise<{ text: string; images: ImageContent[] | undefined; transformed?: true } | undefined> {
 		if (!this._extensionRunner.hasHandlers("input")) {
 			return { text, images };
 		}
@@ -3534,7 +3656,7 @@ export class AgentSession {
 			return undefined;
 		}
 		if (inputResult.action === "transform") {
-			return { text: inputResult.text, images: inputResult.images ?? images };
+			return { text: inputResult.text, images: inputResult.images ?? images, transformed: true };
 		}
 		return { text, images };
 	}
@@ -3747,13 +3869,17 @@ export class AgentSession {
 				expandedText = this._expandSkillCommand(expandedText);
 				expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
 			}
+			// smarty-dev#2636: Herdr attested the typed bytes, not text a hook or template produced.
+			if (processedInput.transformed || expandedText !== text) receipt = withoutAttribution(receipt);
 
-			if (admission?.input)
+			if (admission?.input) {
+				admission.receipt = receipt;
 				admission.input.message = {
 					role: "user",
 					content: [{ type: "text", text: expandedText }, ...(currentImages ?? [])],
 					timestamp: Date.now(),
 				};
+			}
 			// Preserve an already-admitted prompt if a switch began while its input hook ran.
 			while (this._modelSwitchCompactionPending) await this._awaitInput(this._modelSwitchAdmissionWait);
 			// If streaming or behind another prompt, queue via steer() or followUp() based on option
@@ -4060,6 +4186,8 @@ export class AgentSession {
 
 		let expandedText = this._expandSkillCommand(processedInput.text);
 		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		// smarty-dev#2636: same rule as the direct path; Herdr attested the typed bytes only.
+		if (processedInput.transformed || expandedText !== text) receipt = withoutAttribution(receipt);
 
 		if (behavior === "steer") {
 			await this._queueSteer(expandedText, processedInput.images, receipt);
@@ -4133,7 +4261,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#receivedMessageReceipts.set(message, receipt);
+		this.#attachUserMessageReceipt(message, receipt);
 		if (submission) {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);
@@ -4166,7 +4294,7 @@ export class AgentSession {
 			content.push(...images);
 		}
 		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
-		this.#receivedMessageReceipts.set(message, receipt);
+		this.#attachUserMessageReceipt(message, receipt);
 		if (submission) {
 			submission.message = message;
 			this._userMessageSubmissions.set(message, submission);

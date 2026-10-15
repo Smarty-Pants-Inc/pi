@@ -1,4 +1,5 @@
 import { closeSync, fstatSync, openSync, readSync } from "fs";
+import { freezeDetached } from "./turn-receipts.ts";
 
 /**
  * Bounded session memory (smarty-dev#2177).
@@ -183,21 +184,30 @@ export function toColdEntry<T extends object>(entry: T, location: EntryLocation)
 function lazyReader(location: EntryLocation, id: unknown, parent: string | undefined, key: string): () => unknown {
 	return () => {
 		const line = readEntryLine(location, id);
-		return parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
+		const value = parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
+		const provenance = line.provenance as { channel?: unknown } | undefined;
+		// The parsed line is cached and shared by consecutive field reads. Never expose mutable
+		// attested content from it; nested custom data/details retain their mutability (pi#160).
+		return provenance?.channel === "keyboard" && key === "content" ? freezeDetached(value) : value;
 	};
 }
 
 /**
  * Like `{ ...entry, ...patch }`, but lazy fields stay lazy: a cold entry's copy reads the same
- * line until it is written to a new file.
+ * line until it is written to a new file. Sealed entries are frozen (pi#160), so their copied
+ * descriptors are non-configurable: a patched key is defined in place of its source descriptor,
+ * keeping key order (and JSON bytes) without reading lazy fields.
  */
 export function copyEntry<T extends object>(entry: T, patch: Partial<T>): T {
 	const copy = {};
+	const define = (key: string, value: unknown) =>
+		Object.defineProperty(copy, key, { value, writable: true, enumerable: true, configurable: true });
 	for (const key of Object.keys(entry)) {
-		Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(entry, key)!);
+		if (Object.hasOwn(patch, key)) define(key, (patch as Record<string, unknown>)[key]);
+		else Object.defineProperty(copy, key, Object.getOwnPropertyDescriptor(entry, key)!);
 	}
 	for (const [key, value] of Object.entries(patch)) {
-		Object.defineProperty(copy, key, { value, writable: true, enumerable: true, configurable: true });
+		if (!Object.hasOwn(copy, key)) define(key, value);
 	}
 	const location = locations.get(entry);
 	if (coldEntries.has(entry) && location) {

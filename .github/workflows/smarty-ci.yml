@@ -36,8 +36,9 @@ jobs:
     # (smarty-dev#2177); admit them without contributor or bot-author allowlists.
     # Fork source remains excluded from this runner; retired pr-gate.yml stays deleted.
     if: (github.event_name != 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    # Queue drafts and priority-ci PRs use the existing priority pool (runners-lead, 2026-10-13).
-    runs-on: ${{ (startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'smarty-priority' || 'smarty-linux-x64' }}
+    # Pushes (main, the install artifact; queue drafts), queue-draft PRs and priority-ci PRs use the existing priority pool
+    # (runners-lead, 2026-10-13; push routing smarty-dev#12205). Push events carry no head_ref or labels.
+    runs-on: ${{ (github.event_name == 'push' || startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'smarty-priority' || 'smarty-linux-x64' }}
     # Forge disposable VMs: 2 vCPU / 8 GB, up to 7 VMs in the shared pool.
     timeout-minutes: 150
     steps:

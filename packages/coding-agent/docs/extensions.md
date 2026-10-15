@@ -110,6 +110,8 @@ Events cover resource discovery, sessions, agent and message lifecycle, provider
 
 `message_end` can replace a finalized message while preserving its role. `tool_call` can mutate input or block execution. `tool_result` handlers compose, with each handler seeing prior changes.
 
+`tool_partial_result` transforms accumulated tool-output snapshots before any `tool_execution_update` reaches agent/session subscribers, JSON/RPC/TUI, or a nested `ctx.executeTool()` `onUpdate` callback. Return `{ partialResult }` to replace the whole snapshot (including `content`, `structuredContent`, and `details`); handlers compose in registration order, each seeing prior replacements. A handler failure withholds the snapshot behind a redacted placeholder, without exposing its error text. Detect support with `pi.hostCapabilities?.toolPartialResult === true`; `tool_execution_update` remains notification-only. Final results still require a `tool_result` handler.
+
 <a id="provider_stream_event"></a>
 
 `provider_stream_event` fires once for each parsed provider stream event before Pi normalizes it. The event is `{ type: "provider_stream_event" }` only: it carries no provider data, model fields, or raw event, so provider responses cannot leak credential values through it. `after_provider_response` likewise carries only the HTTP status, never response headers. Both events are notification-only and are not persisted.

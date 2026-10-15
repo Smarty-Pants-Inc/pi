@@ -86,7 +86,8 @@ describe("received input handoff", () => {
 		await h.session.agent.prompt([]);
 		const entry = h.sessionManager
 			.getEntries()
-			.find((value) => value.type === "message" && value.message === retained);
+			// The persisted user message is a detached copy of the live one (pi#160 review), so match by value.
+			.find((value) => value.type === "message" && JSON.stringify(value.message) === JSON.stringify(retained));
 		expect(entry).toMatchObject({ provenance: { receivedAt: first, channel: "terminal" } });
 		expect(SessionManager.open(h.session.sessionFile!).getEntry(entry!.id)).toEqual(entry);
 	});
