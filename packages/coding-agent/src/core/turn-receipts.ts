@@ -81,25 +81,32 @@ export function receiptRecord(receipt?: TurnReceipt): ReceiptRecord {
 	return (receipt && records.get(receipt)) ?? records.get(captureTerminalTurnReceipt())!;
 }
 
+/** Deep-freeze plain data (objects and arrays) in place and return it. */
+export function freezeDetached<T>(value: T): T {
+	const pending: unknown[] = [value];
+	const seen = new WeakSet<object>();
+	while (pending.length) {
+		const node = pending.pop();
+		if (node === null || typeof node !== "object" || Object.isFrozen(node) || seen.has(node)) continue;
+		seen.add(node);
+		for (const child of Object.values(node)) pending.push(child);
+		Object.freeze(node);
+	}
+	return value;
+}
+
 const sealedEntries = new WeakSet<object>();
 /**
  * Protect the reserved provenance JSON graph (including missing historical records), then freeze the
  * containing append-only entry so a slot beside the receipt (e.g. `message`) cannot be swapped while
- * the attribution stays attached (pi#160). Only the entry object is frozen; nested data and details
- * keep their own mutability.
+ * the attribution stays attached (pi#160). Keyboard-attributed message wrappers and content graphs are
+ * also frozen; nested custom data and details keep their own mutability.
  */
 export function sealEntryProvenance(entry: object, reserveSerializer: boolean): void {
 	if (!sealedEntries.has(entry)) {
 		const raw: unknown = Reflect.get(entry, "provenance");
 		const value: unknown = raw === undefined ? undefined : JSON.parse(JSON.stringify(raw));
-		const pending: unknown[] = [value];
-		while (pending.length) {
-			const node = pending.pop();
-			if (node !== null && typeof node === "object") {
-				for (const child of Object.values(node)) pending.push(child);
-				Object.freeze(node);
-			}
-		}
+		freezeDetached(value);
 		// copyEntry may carry an already locked descriptor from a sealed source.
 		const slot = Object.getOwnPropertyDescriptor(entry, "provenance");
 		if (slot?.configurable === false && "value" in slot) {
@@ -119,6 +126,24 @@ export function sealEntryProvenance(entry: object, reserveSerializer: boolean): 
 			writable: false,
 			configurable: false,
 		});
+	}
+	const provenance = Reflect.get(entry, "provenance") as { channel?: unknown } | undefined;
+	if (provenance?.channel === "keyboard") {
+		const type: unknown = Reflect.get(entry, "type");
+		const key = type === "message" ? "message" : type === "custom_message" ? "content" : undefined;
+		const slot = key === undefined ? undefined : Object.getOwnPropertyDescriptor(entry, key);
+		if (slot && "value" in slot) {
+			const payload: unknown = slot.value;
+			if (type === "message" && payload !== null && typeof payload === "object") {
+				// Inspect the descriptor, not the value: cold content must stay lazy. Its reader
+				// freezes the content on access. Only freeze the wrapper so nested details stay mutable.
+				const content = Object.getOwnPropertyDescriptor(payload, "content");
+				if (content && "value" in content) freezeDetached(content.value);
+				Object.freeze(payload);
+			} else if (type === "custom_message") {
+				freezeDetached(payload);
+			}
+		}
 	}
 	Object.freeze(entry);
 }

@@ -61,7 +61,7 @@ import {
 
 import { bindSessionTurnAppender } from "./session-turn-appender.ts";
 import type { TurnProvenance } from "./turn-provenance.ts";
-import { receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
+import { freezeDetached, receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
 import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-message-metadata.ts";
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
@@ -364,19 +364,7 @@ type DetachedSessionSource = Pick<
 const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
 const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
 
-/** Deep-freeze plain data (objects and arrays) in place and return it. */
-export function freezeDetached<T>(value: T): T {
-	const pending: unknown[] = [value];
-	const seen = new WeakSet<object>();
-	while (pending.length) {
-		const node = pending.pop();
-		if (node === null || typeof node !== "object" || Object.isFrozen(node) || seen.has(node)) continue;
-		seen.add(node);
-		for (const child of Object.values(node)) pending.push(child);
-		Object.freeze(node);
-	}
-	return value;
-}
+export { freezeDetached } from "./turn-receipts.ts";
 
 /**
  * Extension-facing history reads return deep-detached values, so a retained entry edited

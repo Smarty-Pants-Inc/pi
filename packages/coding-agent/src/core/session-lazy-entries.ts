@@ -1,4 +1,5 @@
 import { closeSync, openSync, readSync } from "fs";
+import { freezeDetached } from "./turn-receipts.ts";
 
 /**
  * Bounded session memory (smarty-dev#2177).
@@ -157,7 +158,11 @@ export function toColdEntry<T extends object>(entry: T, location: EntryLocation)
 function lazyReader(location: EntryLocation, id: unknown, parent: string | undefined, key: string): () => unknown {
 	return () => {
 		const line = readEntryLine(location, id);
-		return parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
+		const value = parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
+		const provenance = line.provenance as { channel?: unknown } | undefined;
+		// The parsed line is cached and shared by consecutive field reads. Never expose mutable
+		// attested content from it; nested custom data/details retain their mutability (pi#160).
+		return provenance?.channel === "keyboard" && key === "content" ? freezeDetached(value) : value;
 	};
 }
 
