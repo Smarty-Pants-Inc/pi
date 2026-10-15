@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import type { ImageContent } from "@earendil-works/pi-ai/compat";
 import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -78,6 +79,8 @@ function captureUnsentStderr(beforeWrite?: () => void): string[] {
 		beforeWrite?.();
 		blocks.push(String(data));
 	});
+	// smarty-dev#13156: InteractiveMode uses node:fs namespace bindings, not the default object.
+	syncBuiltinESMExports();
 	return blocks;
 }
 
@@ -86,6 +89,7 @@ describe("interactive unsent-input consent and draft recovery", () => {
 	const harnesses: Harness[] = [];
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		syncBuiltinESMExports();
 		for (const harness of harnesses.splice(0)) await harness.cleanup();
 	});
 
