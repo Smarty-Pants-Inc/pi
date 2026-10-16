@@ -16,6 +16,82 @@ const azurePeakLoadError =
 	"The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.";
 
 describe("provider retry classification", () => {
+	it.each([
+		"Selected model is at capacity. Please try a different model.",
+		'{"message":"Selected model is at capacity. Please try a different model."}',
+		"SELECTED MODEL IS AT CAPACITY. PLEASE TRY A DIFFERENT MODEL.",
+		"server_is_overloaded",
+	])("matches exact capacity text and baseline overloaded errors: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
+
+	it.each([
+		"Selected model is at capacity! Please try a different model.",
+		"Selected model is at capacity. Please try a different model!",
+		"Unselected model is at capacity. Please try a different model.",
+		"Selected model is at capacity.",
+		"Please try a different model.",
+		"at capacity; try again",
+		// Consumer audit row 22 drops inference slow_down; OAuth polling keeps its separate protocol handling.
+		"request limit reached",
+		"slow down",
+		"slow_down",
+		'{"error":{"code":"slow_down"}}',
+		"(SLOW_DOWN): request deferred",
+		"preslow_down",
+		"slow_downstream",
+		"slow_down_extra",
+		"_slow_down",
+	])("does not broaden capacity matching: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+	});
+
+	it.each([
+		"GoUsageLimitError",
+		"FreeUsageLimitError",
+		"Monthly usage limit reached",
+		"available balance",
+		"insufficient_quota",
+		"out of budget",
+		"quota exceeded",
+		"billing",
+	])("keeps exclusions ahead of capacity matching: %s", (limit) => {
+		for (const capacity of ["Selected model is at capacity. Please try a different model.", "slow_down"]) {
+			expect(
+				isRetryableAssistantError(
+					fauxAssistantMessage("", { stopReason: "error", errorMessage: `${limit}: ${capacity}` }),
+				),
+			).toBe(false);
+		}
+	});
+
+	// Regression for #10842: keep OpenRouter and gateway provider-wrapper wording.
+	it.each(["Provider returned error", "The upstream provider returned an error"])(
+		"matches provider wrapper failures: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+			expect(
+				isRetryableAssistantError(
+					fauxAssistantMessage("", { stopReason: "error", errorMessage: `insufficient_quota: ${errorMessage}` }),
+				),
+			).toBe(false);
+		},
+	);
+
+	// smarty-dev#1856: local gateway restart.
+	it.each(["connect ECONNREFUSED 127.0.0.1:8317", "read ECONNRESET", "400 unknown provider for model gpt-5"])(
+		"matches local gateway restart failures: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+		},
+	);
+	it.each(["400 invalid request", "insufficient_quota", "insufficient_quota: 400 unknown provider for model gpt-5"])(
+		"keeps non-transient errors non-retryable: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+		},
+	);
+
 	it("matches explicit provider retry guidance", () => {
 		expect(
 			isRetryableAssistantError(

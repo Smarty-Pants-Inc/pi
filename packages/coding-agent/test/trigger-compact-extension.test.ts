@@ -13,6 +13,8 @@ function createContext(tokens: number | null, compact = vi.fn()): ExtensionConte
 		model: undefined,
 		scopedModels: [],
 		isIdle: () => true,
+		isSettling: () => false,
+		isPromptPending: () => false,
 		isProjectTrusted: () => true,
 		signal: undefined,
 		abort: vi.fn(),

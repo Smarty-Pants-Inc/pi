@@ -100,6 +100,7 @@ describe("ExtensionRunner", () => {
 	const extensionContextActions: ExtensionContextActions = {
 		getModel: () => undefined,
 		isIdle: () => true,
+		isSettling: () => false,
 		isProjectTrusted: () => true,
 		getSignal: () => undefined,
 		abort: () => {},
@@ -536,6 +537,33 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("context creation", () => {
+		it("reflects live settlement and pending prompt state on an existing context", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const ctx = runner.createContext();
+			expect(ctx.isSettling()).toBe(false);
+			expect(ctx.isPromptPending()).toBe(false);
+
+			let settling = true;
+			let promptPending = false;
+			runner.bindCore(extensionActions, {
+				...extensionContextActions,
+				isSettling: () => settling,
+				isPromptPending: () => promptPending,
+			});
+			expect(ctx.isSettling()).toBe(true);
+			expect(ctx.isPromptPending()).toBe(false);
+
+			settling = false;
+			promptPending = true;
+			expect(ctx.isSettling()).toBe(false);
+			expect(ctx.isPromptPending()).toBe(true);
+
+			runner.bindCore(extensionActions, extensionContextActions);
+			expect(ctx.isSettling()).toBe(false);
+			expect(ctx.isPromptPending()).toBe(false);
+		});
+
 		it("exposes the current abort signal on ExtensionContext", async () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);

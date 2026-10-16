@@ -86,10 +86,10 @@ function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean)
 		return { images: null, trueColor: hasTrueColorHint, hyperlinks: false };
 	}
 
-	// Herdr forwards OSC 8 hyperlinks and supports the Kitty graphics protocol. Check it before
-	// outer-terminal detection because variables like KITTY_WINDOW_ID can leak into its panes.
-	if (termProgram === "herdr") {
-		return { images: "kitty", trueColor: hasTrueColorHint, hyperlinks: true };
+	// Herdr forwards OSC 8 hyperlinks. Only the explicit TERM_PROGRAM marker promises Kitty graphics;
+	// legacy Herdr 0.9.0 sets only HERDR_ENV. Check both before leaked outer-terminal variables.
+	if (termProgram === "herdr" || process.env.HERDR_ENV === "1") {
+		return { images: termProgram === "herdr" ? "kitty" : null, trueColor: hasTrueColorHint, hyperlinks: true };
 	}
 
 	if (process.env.KITTY_WINDOW_ID || termProgram === "kitty") {
@@ -731,6 +731,32 @@ export function renderImage(
  */
 export function hyperlink(text: string, url: string): string {
 	return `\x1b]8;;${url}\x1b\\${text}\x1b]8;;\x1b\\`;
+}
+
+const URL_PATTERN = /https?:\/\/[^\s<>"'`\x00-\x1f\x7f]+/g;
+
+/** Drop trailing punctuation, but keep a closing parenthesis that the URL opened. */
+function trimUrl(match: string): string {
+	let url = match;
+	for (;;) {
+		const last = url.at(-1);
+		if (last && ".,;:!?'\"]".includes(last)) url = url.slice(0, -1);
+		else if (last === ")" && url.split(")").length > url.split("(").length) url = url.slice(0, -1);
+		else return url;
+	}
+}
+
+/**
+ * Wrap http(s) URLs in plain text as OSC 8 hyperlinks when the terminal supports them.
+ * Wrapped rows keep the full link target, so a click on any row opens the whole URL.
+ * Text that already contains OSC 8 links is returned unchanged.
+ */
+export function linkifyUrls(text: string): string {
+	if (!getCapabilities().hyperlinks || text.includes("\x1b]8;")) return text;
+	return text.replace(URL_PATTERN, (match) => {
+		const url = trimUrl(match);
+		return hyperlink(url, url) + match.slice(url.length);
+	});
 }
 
 /** Shorten home-prefixed absolute paths to ~/... for compact display. */

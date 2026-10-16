@@ -6,12 +6,13 @@
  * definition, so the tool's public shape is unchanged.
  */
 
-import { Text } from "@earendil-works/pi-tui";
+import { getCapabilities, Text } from "@earendil-works/pi-tui";
 import { keyHint } from "../../../modes/interactive/components/keybinding-hints.ts";
 import type { Theme } from "../../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/types.ts";
 import type { FindToolDetails } from "../find.ts";
-import { getTextOutput, invalidArgText, shortenPath, str } from "../render-utils.ts";
+import { resolveToCwd } from "../path-utils.ts";
+import { getTextOutput, invalidArgText, linkPath, shortenPath, str } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
 
 function formatFindCall(args: { pattern: string; path?: string; limit?: number } | undefined, theme: Theme): string {
@@ -30,6 +31,10 @@ function formatFindCall(args: { pattern: string; path?: string; limit?: number }
 	}
 	return text;
 }
+/** Find output rows are paths relative to the search directory, apart from the empty-result message and notices. */
+function isFindResultPath(line: string): boolean {
+	return line !== "" && line !== "No files found matching pattern" && !line.startsWith("[");
+}
 function formatFindResult(
 	result: {
 		content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
@@ -38,6 +43,8 @@ function formatFindResult(
 	options: ToolRenderResultOptions,
 	theme: Theme,
 	showImages: boolean,
+	rawPath: string | null,
+	cwd: string,
 ): string {
 	const output = getTextOutput(result, showImages).trim();
 	let text = "";
@@ -46,7 +53,8 @@ function formatFindResult(
 		const maxLines = options.expanded ? lines.length : 20;
 		const displayLines = lines.slice(0, maxLines);
 		const remaining = lines.length - maxLines;
-		text += `\n${displayLines.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
+		const linkBase = getCapabilities().hyperlinks && rawPath !== null ? resolveToCwd(rawPath || ".", cwd) : undefined;
+		text += `\n${displayLines.map((line) => theme.fg("toolOutput", linkBase && isFindResultPath(line) ? linkPath(line, line, linkBase) : line)).join("\n")}`;
 		if (remaining > 0) {
 			text += `${theme.fg("muted", `\n... (${remaining} more lines,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
 		}
@@ -71,7 +79,16 @@ export const findRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 	},
 	renderResult(result, options, theme, context) {
 		const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-		text.setText(formatFindResult(result as any, options, theme, context.showImages));
+		text.setText(
+			formatFindResult(
+				result as any,
+				options,
+				theme,
+				context.showImages,
+				context.isError ? null : str((context.args as { path?: unknown } | undefined)?.path),
+				context.cwd,
+			),
+		);
 		return text;
 	},
 };

@@ -1,0 +1,193 @@
+/**
+ * Enroll as Herdr's input consumer at interactive startup, before any extension loads (smarty-dev#2636).
+ *
+ * Pi sets raw mode first (Herdr requires it at enroll), holds at most 64 KiB while enrolling, and waits
+ * up to 2 s for the marker. Further input is backpressured until the TUI takes over. Held bytes are
+ * handed to the TUI's terminal through the meter, so startup input is never lost. Failed preconditions
+ * mean no epoch: every turn stays `terminal`.
+ */
+import { readFileSync } from "node:fs";
+import type { InputByteMeter } from "@earendil-works/pi-tui";
+import type { AgentSessionRuntimeDiagnostic } from "../agent-session-services.ts";
+import { EpochByteCounter, type PushResult } from "./epoch-bytes.ts";
+import { enrollHerdrInputConsumer } from "./input-consumer.ts";
+import { checkServerTrustRoot, type ServerTrustRoot } from "./server-auth.ts";
+import { SubmitAttestor } from "./submit-attestor.ts";
+
+const MARKER_WAIT_MS = 2000;
+// Bound raw input (including the marker), not just the counter's held or replayable bytes (#3155).
+const MAX_BOOTSTRAP_BYTES = 64 * 1024;
+
+export interface HerdrInputBootstrap {
+	/** Attach to the interactive TUI's terminal before it starts reading. */
+	readonly meter: InputByteMeter;
+	/** Undefined when enrollment failed: held input is still replayed, but nothing is attested. */
+	readonly attestor?: SubmitAttestor;
+	/** Why nothing is attested, shown once with the startup diagnostics (e.g. `server-unauthenticated`). */
+	readonly diagnostic?: AgentSessionRuntimeDiagnostic;
+	/**
+	 * Call synchronously right before the TUI's terminal starts: it restores the pre-Pi tty mode, and the
+	 * terminal (through `meter`) then owns the epoch.
+	 */
+	handOff(): void;
+	/**
+	 * Undo enrollment when no TUI takes the input: restore the tty mode and release the epoch. Runs on
+	 * process exit until `handOff`, so `pi --help`, `--list-models` and startup errors cannot leave the
+	 * tty raw (pi#160 review); Herdr ends the epoch when the process dies. No-op after `handOff`.
+	 */
+	shutdown(): void;
+}
+
+function sysctl(path: string): number | undefined {
+	try {
+		return Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+	} catch {
+		return undefined;
+	}
+}
+
+/** Same-uid processes must not be able to inject input (TIOCSTI) or attach to Herdr (ptrace). */
+function preconditionsHold(): boolean {
+	return sysctl("/proc/sys/dev/tty/legacy_tiocsti") === 0 && (sysctl("/proc/sys/kernel/yama/ptrace_scope") ?? 0) >= 1;
+}
+
+function concat(parts: PushResult[]): PushResult {
+	const epochParts = parts.filter((part) => part.epoch.length);
+	return {
+		preEpoch: Buffer.concat(parts.map((part) => part.preEpoch)),
+		epoch: Buffer.concat(epochParts.map((part) => part.epoch)),
+		epochStart: epochParts[0]?.epochStart ?? 0,
+	};
+}
+
+/** Host checks; tests substitute them, since the real trust root must be root-owned. */
+export interface HerdrHostChecks {
+	hardened(): boolean;
+	/** Undefined when no trust root is installed on this host. */
+	trustRoot(): ServerTrustRoot | undefined;
+}
+
+const HOST_CHECKS: HerdrHostChecks = { hardened: preconditionsHold, trustRoot: () => checkServerTrustRoot() };
+
+function unavailable(reason: string): AgentSessionRuntimeDiagnostic {
+	return {
+		type: "warning",
+		message: `Herdr input attestation unavailable (${reason}): typed turns are recorded as terminal.`,
+	};
+}
+
+export async function startHerdrInputConsumer(
+	env: NodeJS.ProcessEnv = process.env,
+	host: HerdrHostChecks = HOST_CHECKS,
+): Promise<HerdrInputBootstrap | undefined> {
+	const socketPath = env.HERDR_SOCKET_PATH;
+	const paneId = env.HERDR_PANE_ID;
+	const stdin = process.stdin;
+	if (process.platform !== "linux" || !socketPath || !paneId || !stdin.isTTY || !host.hardened()) return undefined;
+	const root = host.trustRoot();
+	// No key file is the expected state on hosts without Herdr's server key installed: stay silent.
+	if (!root) return undefined;
+	if ("rejected" in root) {
+		// Installed but not trustworthy: say so, and pass input through untouched (no raw mode, no hold).
+		const counter = new EpochByteCounter();
+		return {
+			diagnostic: unavailable(root.rejected),
+			meter: { push: (chunk) => counter.push(chunk), end: () => {} },
+			handOff: () => {},
+			shutdown: () => {},
+		};
+	}
+	const trustRoot = root.key;
+
+	const wasRaw = stdin.isRaw;
+	stdin.setRawMode(true);
+	const counter = new EpochByteCounter();
+	counter.hold();
+	const pending: PushResult[] = [];
+	let receivedBytes = 0;
+	const enqueue = (result: PushResult) => {
+		// Holding input returns empty results; do not retain one object per read.
+		if (result.preEpoch.length || result.epoch.length) pending.push(result);
+	};
+	let markerSeen: () => void = () => {};
+	const onData = (chunk: Buffer | string) => {
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+		const take = Math.min(bytes.length, MAX_BOOTSTRAP_BYTES - receivedBytes);
+		if (take < bytes.length) {
+			// Stop before unshift: the suffix must wait for the TUI, not reenter this listener.
+			stdin.pause();
+			stdin.unshift(bytes.subarray(take));
+		}
+		receivedBytes += take;
+		// Copy a partial read so bootstrap does not retain the unread suffix's backing buffer.
+		enqueue(counter.push(take < bytes.length ? Buffer.from(bytes.subarray(0, take)) : bytes));
+		if (counter.active || receivedBytes === MAX_BOOTSTRAP_BYTES) {
+			stdin.pause();
+			markerSeen();
+		}
+	};
+	stdin.on("data", onData);
+	stdin.resume();
+
+	const enrolled = await enrollHerdrInputConsumer({ socketPath, paneId, trustRoot, timeoutMs: MARKER_WAIT_MS });
+	if (enrolled.ok) {
+		enqueue(counter.arm(enrolled.epoch.nonce));
+		if (!counter.active && receivedBytes < MAX_BOOTSTRAP_BYTES) {
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(() => markerSeen(), MARKER_WAIT_MS);
+				markerSeen = () => {
+					clearTimeout(timer);
+					markerSeen = () => {};
+					resolve();
+				};
+			});
+		}
+	}
+	stdin.off("data", onData);
+	stdin.pause();
+	if (!enrolled.ok || !counter.active) {
+		if (enrolled.ok) enrolled.epoch.release();
+		enqueue(counter.abandon());
+		stdin.setRawMode(wasRaw);
+		const reason = enrolled.ok ? "no-marker" : enrolled.reason;
+		// Keep what was typed during enrollment: the TUI replays it as ordinary input.
+		return {
+			diagnostic: unavailable(reason),
+			meter: { push: (chunk) => counter.push(chunk), takePending: () => concat(pending.splice(0)), end: () => {} },
+			handOff: () => {},
+			shutdown: () => {},
+		};
+	}
+	const epoch = enrolled.epoch;
+	let owned = true;
+	const disown = (): boolean => {
+		if (!owned) return false;
+		owned = false;
+		process.off("exit", shutdown);
+		stdin.setRawMode(wasRaw);
+		return true;
+	};
+	const shutdown = () => {
+		if (!disown()) return;
+		counter.end();
+		// At exit the release cannot be sent: it needs a new connection, which connects asynchronously
+		// (pi#160 E2E). Herdr ends the epoch when this process dies; the call only covers a non-exit path.
+		epoch.release();
+	};
+	process.on("exit", shutdown);
+	return {
+		meter: {
+			push: (chunk) => counter.push(chunk),
+			takePending: () => concat(pending.splice(0)),
+			end: () => {
+				counter.end();
+				epoch.release();
+			},
+		},
+		attestor: new SubmitAttestor(counter, epoch),
+		handOff: () => {
+			disown();
+		},
+		shutdown,
+	};
+}

@@ -80,8 +80,8 @@ function getRenderablePreviewInput(args: RenderableEditArgs | undefined): { path
 
 	return null;
 }
-function formatEditCall(args: RenderableEditArgs | undefined, theme: Theme, cwd: string): string {
-	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd);
+function formatEditCall(args: RenderableEditArgs | undefined, theme: Theme, cwd: string, line?: number): string {
+	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd, { line });
 	return `${theme.fg("toolTitle", theme.bold("edit"))} ${pathDisplay}`;
 }
 function formatEditResult(
@@ -138,7 +138,9 @@ function buildEditCallComponent(
 	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 	component.setPaddingX(outputPad);
 	component.clear();
-	component.addChild(new Text(formatEditCall(args, theme, cwd), 0, 0));
+	const firstChangedLine =
+		component.preview && !("error" in component.preview) ? component.preview.firstChangedLine : undefined;
+	component.addChild(new Text(formatEditCall(args, theme, cwd, firstChangedLine), 0, 0));
 
 	if (!component.preview) {
 		return component;

@@ -32,7 +32,9 @@ function assistantEnd(stopReason: AssistantMessage["stopReason"], errorMessage?:
 	return { type: "message_end", message };
 }
 
-const settled: AgentSessionEvent = { type: "agent_settled", aborted: false };
+const settled: AgentSessionEvent = { type: "agent_settled", outcome: "completed", aborted: false };
+const failed: AgentSessionEvent = { type: "agent_settled", outcome: "error", aborted: false };
+const aborted: AgentSessionEvent = { type: "agent_settled", outcome: "aborted", aborted: true };
 
 const compactionEnd = (
 	reason: "manual" | "threshold" | "overflow",
@@ -69,14 +71,14 @@ describe("ProgramStatusReporter", () => {
 		send({ type: "agent_start" }, assistantEnd("error", "overloaded"), assistantEnd("stop"), settled);
 		expect(last()).toEqual({ state: "done" });
 
-		send({ type: "agent_start" }, assistantEnd("error", "Invalid API key\n{details}"), settled);
+		send({ type: "agent_start" }, assistantEnd("error", "Invalid API key\n{details}"), failed);
 		expect(last()).toEqual({ state: "error", message: "Invalid API key" });
 
-		send({ type: "agent_start" }, assistantEnd("aborted"), { type: "agent_settled", aborted: true });
+		send({ type: "agent_start" }, assistantEnd("aborted"), aborted);
 		expect(last()).toEqual({ state: "idle" });
 
 		// Aborted after a successful response, for example in an agent_before_settle hook or a retry delay.
-		send({ type: "agent_start" }, assistantEnd("stop"), { type: "agent_settled", aborted: true });
+		send({ type: "agent_start" }, assistantEnd("stop"), aborted);
 		expect(last()).toEqual({ state: "idle" });
 	});
 
@@ -87,7 +89,7 @@ describe("ProgramStatusReporter", () => {
 			assistantEnd("length"),
 			{ type: "compaction_start", reason: "overflow" },
 			compactionEnd("overflow", { errorMessage: "Compaction failed\nstack" }),
-			settled,
+			failed,
 		);
 		expect(last()).toEqual({ state: "error", message: "Compaction failed" });
 

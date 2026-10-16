@@ -30,7 +30,9 @@ function styledReadLineRange(args: ReadRenderArgs | undefined, theme: Theme): st
 	return range ? theme.fg("warning", range) : "";
 }
 function formatReadCall(args: ReadRenderArgs | undefined, theme: Theme, cwd: string): string {
-	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd);
+	const pathDisplay = renderToolPath(str(args?.file_path ?? args?.path), theme, cwd, {
+		line: typeof args?.offset === "number" ? args.offset : undefined,
+	});
 	return `${theme.fg("toolTitle", theme.bold("read"))} ${pathDisplay}${styledReadLineRange(args, theme)}`;
 }
 function trimTrailingEmptyLines(lines: string[]): string[] {
