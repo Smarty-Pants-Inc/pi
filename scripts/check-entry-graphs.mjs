@@ -36,10 +36,20 @@ const WORKSPACE = {
 const BUDGETS = {
 	"packages/ai": {
 		"./models": {
-			maxFiles: 15,
+			// Closed diagnostic ownership is retained alongside publication isolation and credential redaction.
+			maxFiles: 16,
 			forbid: ["providers/", "models.generated.ts", "index.ts", "utils/validation.ts", "utils/typebox-helpers.ts"],
 		},
-		"./utils/*": { maxFiles: 3, forbid: ["providers/", "api/", "index.ts"] },
+		"./utils/*": {
+			maxFiles: 3,
+			maxFilesByEntry: {
+				// Publication needs detached snapshots, closed diagnostics, private recovery lineage and redaction.
+				"./utils/event-stream": 5,
+				// The retry loop keeps closed diagnostic normalization and credential redaction; pure users use recovery.
+				"./utils/retry": 4,
+			},
+			forbid: ["providers/", "api/", "index.ts"],
+		},
 	},
 	"packages/codemode": {
 		// Node and Bun users never load the Cloudflare entry, which imports the `cloudflare:workers` built-in.
@@ -149,9 +159,10 @@ for (const [pkgDir, budgets] of Object.entries(BUDGETS)) {
 				continue;
 			}
 			const graph = [...walk(source)].map((file) => relative(ROOT, file));
-			if (graph.length > budget.maxFiles) {
+			const maxFiles = budget.maxFilesByEntry?.[name] ?? budget.maxFiles;
+			if (graph.length > maxFiles) {
 				console.error(
-					`${pkgDir} export "${name}" reaches ${graph.length} files, budget ${budget.maxFiles}\n` +
+					`${pkgDir} export "${name}" reaches ${graph.length} files, budget ${maxFiles}\n` +
 						graph.map((file) => `    ${file}`).join("\n"),
 				);
 				failures += 1;

@@ -1,5 +1,51 @@
 // Published diagnostics are rebuilt from Pi-owned fields; provider text stays private.
 
+const KNOWN_RAW_STOP_REASONS: ReadonlySet<string> = new Set([
+	"end_turn",
+	"max_tokens",
+	"stop_sequence",
+	"tool_use",
+	"pause_turn",
+	"refusal",
+	"model_context_window_exceeded",
+	"guardrail_intervened",
+	"content_filtered",
+	"stop",
+	"length",
+	"tool_calls",
+	"function_call",
+	"content_filter",
+	"network_error",
+	"model_length",
+	"error",
+	"end",
+	"sensitive",
+	"completed",
+	"failed",
+	"cancelled",
+	"incomplete",
+	"incomplete.max_output_tokens",
+	"incomplete.content_filter",
+	"incomplete.server_error",
+	"incomplete.max_time_limit",
+	"STOP",
+	"MAX_TOKENS",
+	"SAFETY",
+	"RECITATION",
+	"LANGUAGE",
+	"OTHER",
+	"BLOCKLIST",
+	"PROHIBITED_CONTENT",
+	"SPII",
+	"MALFORMED_FUNCTION_CALL",
+	"IMAGE_SAFETY",
+	"UNEXPECTED_TOOL_CALL",
+	"FINISH_REASON_UNSPECIFIED",
+]);
+export function closedRawStopReason(value: unknown): string {
+	return typeof value === "string" && KNOWN_RAW_STOP_REASONS.has(value) ? value : "other";
+}
+
 export const ASSISTANT_DIAGNOSTIC_TYPES = [
 	"provider_limit",
 	"provider_stream_observer_error",

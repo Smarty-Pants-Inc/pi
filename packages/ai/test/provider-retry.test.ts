@@ -118,20 +118,17 @@ describe("provider request retries", () => {
 	});
 
 	// pi#280 / smarty-dev#3155: lean recovery ownership must preserve plan-limit retry admission.
-	it.each(["code", "type"])(
-		"does not retry a Smarty limit carried by %s, even with x-should-retry",
-		async (field) => {
-			const error = Object.assign(providerError(429, { "x-should-retry": "true", "retry-after-ms": "0" }), {
-				error: { [field]: "smarty_limit", throttled: true },
-			});
-			const request = vi.fn<() => Promise<string>>().mockRejectedValue(error);
-			const beforeProviderRequest = vi.fn();
+	it.each(["code", "type"])("does not retry a Smarty limit carried by %s, even with x-should-retry", async (field) => {
+		const error = Object.assign(providerError(429, { "x-should-retry": "true", "retry-after-ms": "0" }), {
+			error: { [field]: "smarty_limit", throttled: true },
+		});
+		const request = vi.fn<() => Promise<string>>().mockRejectedValue(error);
+		const beforeProviderRequest = vi.fn();
 
-			await expect(retryProviderRequest(request, { maxRetries: 2, beforeProviderRequest })).rejects.toBe(error);
-			expect(request).toHaveBeenCalledOnce();
-			expect(beforeProviderRequest).toHaveBeenCalledOnce();
-		},
-	);
+		await expect(retryProviderRequest(request, { maxRetries: 2, beforeProviderRequest })).rejects.toBe(error);
+		expect(request).toHaveBeenCalledOnce();
+		expect(beforeProviderRequest).toHaveBeenCalledOnce();
+	});
 
 	// pi#280 / smarty-dev#3155: the extracted classifier must not broaden the owned protocol code.
 	it.each(["code", "type"])("does not suppress a provider retry for a non-limit %s", async (field) => {

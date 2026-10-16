@@ -1,5 +1,5 @@
 import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
-import { projectAssistantMessageDiagnostics } from "./diagnostics.ts";
+import { closedRawStopReason, projectAssistantMessageDiagnostics } from "./diagnostics.ts";
 import { transferThrottledLimitWait } from "./recovery.ts";
 
 /**
@@ -298,51 +298,6 @@ function cloneAssistantContent(block: AssistantContent, isolated: unknown): Assi
 		default:
 			return isolated as AssistantContent;
 	}
-}
-const KNOWN_RAW_STOP_REASONS: ReadonlySet<string> = new Set([
-	"end_turn",
-	"max_tokens",
-	"stop_sequence",
-	"tool_use",
-	"pause_turn",
-	"refusal",
-	"model_context_window_exceeded",
-	"guardrail_intervened",
-	"content_filtered",
-	"stop",
-	"length",
-	"tool_calls",
-	"function_call",
-	"content_filter",
-	"network_error",
-	"model_length",
-	"error",
-	"end",
-	"sensitive",
-	"completed",
-	"failed",
-	"cancelled",
-	"incomplete",
-	"incomplete.max_output_tokens",
-	"incomplete.content_filter",
-	"incomplete.server_error",
-	"incomplete.max_time_limit",
-	"STOP",
-	"MAX_TOKENS",
-	"SAFETY",
-	"RECITATION",
-	"LANGUAGE",
-	"OTHER",
-	"BLOCKLIST",
-	"PROHIBITED_CONTENT",
-	"SPII",
-	"MALFORMED_FUNCTION_CALL",
-	"IMAGE_SAFETY",
-	"UNEXPECTED_TOOL_CALL",
-	"FINISH_REASON_UNSPECIFIED",
-]);
-export function closedRawStopReason(value: unknown): string {
-	return typeof value === "string" && KNOWN_RAW_STOP_REASONS.has(value) ? value : "other";
 }
 export type PublicationPhase = "partial" | "success" | "failure";
 const SUCCESS_STOP_REASONS: ReadonlySet<string> = new Set(["stop", "length", "toolUse", "deferred"]);

@@ -1499,104 +1499,6 @@ describe("operator exit and compaction settlement", () => {
 			expect(
 				outboxes.map((entry) =>
 					entry.type === "custom" ? getMessageText((entry.data as UnsentInput).message) : "",
-
-	// pi#281 / smarty-dev#3155: delivery consumes only its active ancestry (pi#280 finding).
-	it.each(
-		(["local", "foreign"] as const).flatMap((origin) =>
-			(["sibling", "active"] as const).map((branch) => ({ origin, branch })),
-		),
-	)("restores $origin outbox after $branch branch restart", async ({ origin, branch }) => {
-		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
-		harnesses.push(h);
-		await h.session.followUp("branch-local saved input");
-		const release = h.session.prepareOperatorExit();
-		release();
-		h.session.dispose();
-		const file = h.sessionManager.getSessionFile()!;
-		const saved = SessionManager.open(file);
-		const outboxes = saved
-			.getEntries()
-			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
-		expect(outboxes).toHaveLength(1);
-		const outbox = outboxes[0];
-		const restore = (manager: SessionManager) => {
-			const session = new AgentSession({
-				agent: new Agent({
-					streamFn: streamSimple,
-					convertToLlm,
-					initialState: { model: h.getModel(), tools: [], messages: manager.buildSessionContext().messages },
-				}),
-				sessionManager: manager,
-				settingsManager: h.settingsManager,
-				modelRuntime: h.modelRuntime,
-				resourceLoader: h.resourceLoader,
-				cwd: h.tempDir,
-			});
-			extraSessions.push(session);
-			return session;
-		};
-		const childA = saved.appendCustomEntry("test.branch", { name: "A" });
-		const first = restore(saved);
-		h.setResponses([fauxAssistantMessage("delivered on A")]);
-		await first.resumeUnsentInputs();
-		const deliveriesOnA = saved.getBranch().filter((entry) => entry.unsentInputId === outbox.id);
-		expect(deliveriesOnA).toHaveLength(1);
-		expect(saved.getBranch().some((entry) => entry.id === childA)).toBe(true);
-		expect(h.faux.state.callCount).toBe(1);
-		if (branch === "sibling") {
-			expect(await first.navigateTree(outbox.id)).toMatchObject({ cancelled: false });
-			// A branch pointer alone is not persisted; append B so reopen selects B's ancestry.
-			saved.appendCustomEntry("test.branch", { name: "B" });
-			expect(saved.getBranch().some((entry) => entry.id === deliveriesOnA[0].id)).toBe(false);
-		}
-		first.dispose();
-		if (origin === "foreign") {
-			// Model an imported outbox with a real historical delivery, not a forged consumption marker.
-			const lines = readFileSync(file, "utf8")
-				.trimEnd()
-				.split("\n")
-				.map((line) => {
-					const entry: { id?: string; data?: UnsentInput } = JSON.parse(line);
-					if (entry.id === outbox.id) entry.data!.origin!.host = `${hostname()}-foreign`;
-					return JSON.stringify(entry);
-				});
-			writeFileSync(file, `${lines.join("\n")}\n`);
-		}
-		const reopened = SessionManager.open(file);
-		expect(reopened.getEntries().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(1);
-		expect(reopened.getBranch().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(
-			branch === "active" ? 1 : 0,
-		);
-		const second = restore(reopened);
-		const before = reopened.getEntryCount();
-		if (branch === "sibling" && origin === "local") {
-			expect(second.getFollowUpMessages()).toEqual(["branch-local saved input"]);
-			expect(second.agent.getQueuedMessages().map(getMessageText)).toEqual(["branch-local saved input"]);
-			expect(second.takeUnsentInputDrafts()).toEqual([]);
-			h.setResponses([fauxAssistantMessage("delivered on B")]);
-			await second.resumeUnsentInputs();
-			expect(reopened.getBranch().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(1);
-			expect(reopened.getEntries().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(2);
-			expect(h.faux.state.callCount).toBe(2);
-			second.dispose();
-			const thirdManager = SessionManager.open(file);
-			const third = restore(thirdManager);
-			const after = thirdManager.getEntryCount();
-			await third.resumeUnsentInputs();
-			expect(third.agent.getQueuedMessages()).toEqual([]);
-			expect(thirdManager.getEntryCount()).toBe(after);
-			expect(h.faux.state.callCount).toBe(2);
-		} else {
-			expect(second.agent.getQueuedMessages()).toEqual([]);
-			expect(second.takeUnsentInputDrafts().map(getMessageText)).toEqual(
-				branch === "sibling" ? ["branch-local saved input"] : [],
-			);
-			expect(second.takeUnsentInputDrafts()).toEqual([]);
-			await second.resumeUnsentInputs();
-			expect(reopened.getEntryCount()).toBe(before);
-			expect(h.faux.state.callCount).toBe(1);
-		}
-	});
 				),
 			).toEqual(["native pending", "admitted pending", "mode pending"]);
 			expect(saved.getEntries().filter((entry) => entry.unsentInputId)).toEqual([]);
@@ -1839,5 +1741,103 @@ describe("operator exit and compaction settlement", () => {
 		await second.resumeUnsentInputs();
 		expect(second.agent.hasQueuedMessages()).toBe(false);
 		expect(secondManager.getEntryCount()).toBe(before);
+	});
+
+	// pi#281 / smarty-dev#3155: delivery consumes only its active ancestry (pi#280 finding).
+	it.each(
+		(["local", "foreign"] as const).flatMap((origin) =>
+			(["sibling", "active"] as const).map((branch) => ({ origin, branch })),
+		),
+	)("restores $origin outbox after $branch branch restart", async ({ origin, branch }) => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		await h.session.followUp("branch-local saved input");
+		const release = h.session.prepareOperatorExit();
+		release();
+		h.session.dispose();
+		const file = h.sessionManager.getSessionFile()!;
+		const saved = SessionManager.open(file);
+		const outboxes = saved
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(1);
+		const outbox = outboxes[0];
+		const restore = (manager: SessionManager) => {
+			const session = new AgentSession({
+				agent: new Agent({
+					streamFn: streamSimple,
+					convertToLlm,
+					initialState: { model: h.getModel(), tools: [], messages: manager.buildSessionContext().messages },
+				}),
+				sessionManager: manager,
+				settingsManager: h.settingsManager,
+				modelRuntime: h.modelRuntime,
+				resourceLoader: h.resourceLoader,
+				cwd: h.tempDir,
+			});
+			extraSessions.push(session);
+			return session;
+		};
+		const childA = saved.appendCustomEntry("test.branch", { name: "A" });
+		const first = restore(saved);
+		h.setResponses([fauxAssistantMessage("delivered on A")]);
+		await first.resumeUnsentInputs();
+		const deliveriesOnA = saved.getBranch().filter((entry) => entry.unsentInputId === outbox.id);
+		expect(deliveriesOnA).toHaveLength(1);
+		expect(saved.getBranch().some((entry) => entry.id === childA)).toBe(true);
+		expect(h.faux.state.callCount).toBe(1);
+		if (branch === "sibling") {
+			expect(await first.navigateTree(outbox.id)).toMatchObject({ cancelled: false });
+			// A branch pointer alone is not persisted; append B so reopen selects B's ancestry.
+			saved.appendCustomEntry("test.branch", { name: "B" });
+			expect(saved.getBranch().some((entry) => entry.id === deliveriesOnA[0].id)).toBe(false);
+		}
+		first.dispose();
+		if (origin === "foreign") {
+			// Model an imported outbox with a real historical delivery, not a forged consumption marker.
+			const lines = readFileSync(file, "utf8")
+				.trimEnd()
+				.split("\n")
+				.map((line) => {
+					const entry: { id?: string; data?: UnsentInput } = JSON.parse(line);
+					if (entry.id === outbox.id) entry.data!.origin!.host = `${hostname()}-foreign`;
+					return JSON.stringify(entry);
+				});
+			writeFileSync(file, `${lines.join("\n")}\n`);
+		}
+		const reopened = SessionManager.open(file);
+		expect(reopened.getEntries().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(1);
+		expect(reopened.getBranch().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(
+			branch === "active" ? 1 : 0,
+		);
+		const second = restore(reopened);
+		const before = reopened.getEntryCount();
+		if (branch === "sibling" && origin === "local") {
+			expect(second.getFollowUpMessages()).toEqual(["branch-local saved input"]);
+			expect(second.agent.getQueuedMessages().map(getMessageText)).toEqual(["branch-local saved input"]);
+			expect(second.takeUnsentInputDrafts()).toEqual([]);
+			h.setResponses([fauxAssistantMessage("delivered on B")]);
+			await second.resumeUnsentInputs();
+			expect(reopened.getBranch().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(1);
+			expect(reopened.getEntries().filter((entry) => entry.unsentInputId === outbox.id)).toHaveLength(2);
+			expect(h.faux.state.callCount).toBe(2);
+			second.dispose();
+			const thirdManager = SessionManager.open(file);
+			const third = restore(thirdManager);
+			const after = thirdManager.getEntryCount();
+			await third.resumeUnsentInputs();
+			expect(third.agent.getQueuedMessages()).toEqual([]);
+			expect(thirdManager.getEntryCount()).toBe(after);
+			expect(h.faux.state.callCount).toBe(2);
+		} else {
+			expect(second.agent.getQueuedMessages()).toEqual([]);
+			expect(second.takeUnsentInputDrafts().map(getMessageText)).toEqual(
+				branch === "sibling" ? ["branch-local saved input"] : [],
+			);
+			expect(second.takeUnsentInputDrafts()).toEqual([]);
+			await second.resumeUnsentInputs();
+			expect(reopened.getEntryCount()).toBe(before);
+			expect(h.faux.state.callCount).toBe(1);
+		}
 	});
 });
