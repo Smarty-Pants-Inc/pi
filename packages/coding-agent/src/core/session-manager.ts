@@ -25,6 +25,7 @@ import {
 	renameSync,
 	type Stats,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
@@ -42,6 +43,7 @@ import {
 } from "./messages.ts";
 import {
 	copyEntry,
+	type EntryLocation,
 	getEntryLocation,
 	isColdEntry,
 	readSessionFileLines,
@@ -52,6 +54,7 @@ import {
 import { bindSessionTurnAppender } from "./session-turn-appender.ts";
 import type { TurnProvenance } from "./turn-provenance.ts";
 import { freezeDetached, receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
+import { getUnsentInputTransfer, UNSENT_INPUT_TYPE } from "./unsent-input.ts";
 import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-message-metadata.ts";
 
 /** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
@@ -74,6 +77,8 @@ export interface NewSessionOptions {
 }
 
 export interface SessionEntryBase {
+	/** Unsent entry consumed by this actual persisted message transfer. */
+	unsentInputId?: string;
 	type: string;
 	id: string;
 	parentId: string | null;
@@ -1266,38 +1271,47 @@ export class SessionManager {
 		const target = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
 		const temporary = `${target}.${process.pid}.tmp`;
 		const fd = openSync(temporary, "w");
+		let publish: () => void;
 		try {
-			this.#writeEntries(fd, this.sessionFile);
+			publish = this.#writeEntries(fd, this.sessionFile);
 		} finally {
 			closeSync(fd);
 		}
 		renameSync(temporary, target);
+		publish();
 	}
 
 	/**
-	 * Write every entry to `fd` (a new file that becomes `file`) and record each entry's new byte
-	 * range. Cold entries are rebound to the new file one line at a time.
+	 * Write retained entries and an optional pending append without changing canonical memory.
+	 * Prepare cold replacements one line at a time; publish locations/index/cache changes only
+	 * after the caller has closed the file and, for rewrites, renamed it into place.
 	 */
-	#writeEntries(fd: number, file: string): void {
+	#writeEntries(fd: number, file: string, pendingEntry?: SessionEntry): () => void {
+		const written: { entry: FileEntry; location: EntryLocation; rebound?: SessionEntry }[] = [];
 		let offset = 0;
-		for (let i = 0; i < this.fileEntries.length; i++) {
-			const entry = this.fileEntries[i];
+		for (let i = 0; i < this.fileEntries.length + (pendingEntry ? 1 : 0); i++) {
+			const entry = i < this.fileEntries.length ? this.fileEntries[i] : pendingEntry!;
 			const line = JSON.stringify(entry);
 			const length = Buffer.byteLength(line);
 			writeFileSync(fd, `${line}\n`);
 			const location = { file, offset, length };
 			offset += length + 1;
-			if (!isColdEntry(entry)) {
-				setEntryLocation(entry, location);
-				continue;
-			}
-			const rebound = toColdEntry(JSON.parse(line) as SessionEntry, location);
-			sealEntryProvenance(rebound, true);
-			this.fileEntries[i] = rebound;
-			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
+			const rebound = isColdEntry(entry) ? toColdEntry(JSON.parse(line) as SessionEntry, location) : undefined;
+			if (rebound) sealEntryProvenance(rebound, true);
+			written.push({ entry, location, rebound });
 		}
-		this.#revisionKey = undefined;
-		this.#branchProjection = undefined;
+		return () => {
+			for (const [i, { entry, location, rebound }] of written.entries()) {
+				if (!rebound) {
+					setEntryLocation(entry, location);
+					continue;
+				}
+				this.fileEntries[i] = rebound;
+				if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
+			}
+			this.#revisionKey = undefined;
+			this.#branchProjection = undefined;
+		};
 	}
 
 	/** Append one entry line and record its byte range. */
@@ -1367,41 +1381,64 @@ export class SessionManager {
 	}
 
 	/**
-	 * A new session file is created only once the session contains a user or assistant message.
+	 * A new session file is created once it contains a user/assistant message or unsent input.
 	 * Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
 	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
 	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
 	 */
-	private _hasConversation(): boolean {
-		return this.fileEntries.some(
-			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+	private _hasConversation(pendingEntry?: SessionEntry): boolean {
+		const startsConversation = (entry: FileEntry): boolean =>
+			(entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant")) ||
+			(entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		return (
+			(pendingEntry !== undefined && startsConversation(pendingEntry)) || this.fileEntries.some(startsConversation)
 		);
 	}
 
 	#persistEntry(entry: SessionEntry): void {
-		if (!this.persist || !this.sessionFile) return;
+		const file = this.sessionFile;
+		if (!this.persist || !file) return;
 
 		if (!this.flushed) {
-			if (!this._hasConversation()) return;
-			const fd = openSync(this.sessionFile, "wx");
+			if (!this._hasConversation(entry)) return;
+			// A failed wx open owns nothing: never clean up an already existing file.
+			const fd = openSync(file, "wx");
+			let publish: () => void;
+			let closeAttempted = false;
 			try {
-				this.#writeEntries(fd, this.sessionFile);
-			} finally {
+				publish = this.#writeEntries(fd, file, entry);
+				closeAttempted = true;
 				closeSync(fd);
+			} catch (error) {
+				// Preserve the persistence error even if closing or removing our new file fails.
+				if (!closeAttempted) {
+					try {
+						closeSync(fd);
+					} catch {
+						// The write error takes precedence over this cleanup error.
+					}
+				}
+				try {
+					unlinkSync(file);
+				} catch {
+					// Best effort: an unremovable owned file may still block a later retry.
+				}
+				throw error;
 			}
+			publish();
 			this.flushed = true;
 		} else {
-			this.#appendLine(this.sessionFile, entry);
+			this.#appendLine(file, entry);
 		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
 		sealEntryProvenance(entry, true);
+		this.#persistEntry(entry);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this.extendBranchProjection(entry);
-		this.#persistEntry(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1427,6 +1464,7 @@ export class SessionManager {
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
+			...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
 			...(provenance ? { provenance } : {}),
 			...(message.role === "user" && metadata !== undefined ? { metadata, metadataSource } : {}),
 		};
@@ -1581,6 +1619,7 @@ export class SessionManager {
 			display,
 			details,
 			provenance: receiptRecord(receipt),
+			...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1940,7 +1979,6 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		const fromId = this.leafId ?? "root";
-		this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),

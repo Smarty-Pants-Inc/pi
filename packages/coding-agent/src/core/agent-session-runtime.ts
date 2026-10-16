@@ -645,12 +645,33 @@ export class AgentSessionRuntime {
 	}
 
 	async dispose(options?: {
+		/** Operator quit: retain unsent input before terminal cancellation. Defaults to false. */
+		operatorExit?: boolean;
+		/** Explicit operator consent to discard unsent input when no session file exists. */
+		discardUnsentInput?: boolean;
+		/** TUI-owned output, retained until terminal restoration completes. */
+		bufferUnsentInput?: (block: string) => void;
 		terminal?: boolean;
 		beforeShutdown?: () => Promise<void>;
 		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
 	}): Promise<void> {
-		if (!options?.terminal) return this.#dispose(options);
-		this.terminalRejection = options.rejectQueuedInput;
+		if (!options?.terminal && !options?.operatorExit) return this.#dispose(options);
+		// Snapshot synchronously while all owners are intact. Never cancel on save/print failure.
+		const releaseOperatorInputs = options.operatorExit
+			? this.session.prepareOperatorExit({
+					discardUnsent: options.discardUnsentInput,
+					bufferUnsentInput: options.bufferUnsentInput,
+				})
+			: undefined;
+		this.terminalRejection = options.operatorExit
+			? (_messages, session) => {
+					const release = session.prepareOperatorExit({
+						discardUnsent: options.discardUnsentInput,
+						bufferUnsentInput: options.bufferUnsentInput,
+					});
+					release();
+				}
+			: options.rejectQueuedInput;
 		this.terminalCancellation.abort(
 			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
 		);
@@ -659,9 +680,11 @@ export class AgentSessionRuntime {
 			this.session.cancelForShutdown();
 		} catch (cause) {
 			publicationFailure = { cause };
+		} finally {
+			releaseOperatorInputs?.();
 		}
 		if (this.lifecycleActive) await this.lifecycleCompletion;
-		await this.#dispose(options);
+		await this.#dispose({ ...options, terminal: true, rejectQueuedInput: this.terminalRejection });
 		if (publicationFailure) throw publicationFailure.cause;
 	}
 

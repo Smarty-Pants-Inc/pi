@@ -141,7 +141,9 @@ export interface AgentOptions {
 	toolExecution?: ToolExecutionMode;
 }
 
-type QueuedMessage = { message: AgentMessage };
+let nextQueuedMessageOccurrenceId = 0;
+
+type QueuedMessage = { id: number; message: AgentMessage };
 
 class PendingMessageQueue {
 	private messages: QueuedMessage[] = [];
@@ -154,8 +156,10 @@ class PendingMessageQueue {
 		this.mode = mode;
 	}
 
-	enqueue(message: AgentMessage): void {
-		this.messages.push({ message });
+	enqueue(message: AgentMessage): number {
+		const id = ++nextQueuedMessageOccurrenceId;
+		this.messages.push({ id, message });
+		return id;
 	}
 
 	hasItems(): boolean {
@@ -172,6 +176,10 @@ class PendingMessageQueue {
 		return this.messages.map((entry) => entry.message);
 	}
 
+	occurrences(): QueuedMessage[] {
+		return this.messages.map((entry) => ({ ...entry }));
+	}
+
 	reserve(): AgentMessage[] {
 		// The loop can fail preparation after taking a batch. Keep the original
 		// messages here until message_end commits them, including their images and order.
@@ -182,6 +190,13 @@ class PendingMessageQueue {
 		this.selected = this.selectedEntries.map((entry) => entry.message);
 		this.reserved = end;
 		return this.selected;
+	}
+
+	occurrenceId(source: AgentMessageOccurrence): number | undefined {
+		// Only the exact reserved batch/slot owns an enqueue identity. A prepared
+		// message can share this object without belonging to the queued occurrence.
+		if (source.batch !== this.selected || this.selected[source.index] !== source.message) return undefined;
+		return this.selectedEntries[source.index]?.id;
 	}
 
 	consume(source: AgentMessageOccurrence): void {
@@ -204,10 +219,10 @@ class PendingMessageQueue {
 		this.reserved = 0;
 	}
 
-	remove(predicate: (message: AgentMessage) => boolean): void {
+	remove(predicate: (message: AgentMessage, occurrenceId: number) => boolean): void {
 		for (let index = this.messages.length - 1; index >= 0; index--) {
 			const entry = this.messages[index];
-			if (!predicate(entry.message)) continue;
+			if (!predicate(entry.message, entry.id)) continue;
 			this.messages.splice(index, 1);
 			if (index < this.reserved) this.reserved--;
 			// The entry identifies a queue occurrence even when messages are aliased.
@@ -266,6 +281,7 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	private _queuedMessageOccurrenceId?: number;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -347,17 +363,21 @@ export class Agent {
 	}
 
 	/** Queue a message to be injected after the current assistant turn finishes. */
-	steer(message: AgentMessage): void {
-		this.steeringQueue.enqueue(message);
+	steer(
+		message: AgentMessage,
+		/** @internal Runs after insertion, before external observers. */ onEnqueued?: (id: number) => void,
+	): void {
+		const id = this.steeringQueue.enqueue(message);
+		onEnqueued?.(id);
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
 	followUp(
 		message: AgentMessage,
-		/** @internal Runs after insertion, before external observers. */ onEnqueued?: () => void,
+		/** @internal Runs after insertion, before external observers. */ onEnqueued?: (id: number) => void,
 	): void {
-		this.followUpQueue.enqueue(message);
-		onEnqueued?.();
+		const id = this.followUpQueue.enqueue(message);
+		onEnqueued?.(id);
 	}
 
 	/** Remove all queued steering messages. */
@@ -377,7 +397,7 @@ export class Agent {
 	}
 
 	/** Remove selected queued messages without releasing or retargeting other reservations. */
-	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): void {
+	removeQueuedMessages(predicate: (message: AgentMessage, occurrenceId: number) => boolean): void {
 		this.steeringQueue.remove(predicate);
 		this.followUpQueue.remove(predicate);
 	}
@@ -394,8 +414,23 @@ export class Agent {
 	}
 
 	/** Snapshot every undelivered message in both queues, independent of delivery mode. */
-	getQueuedMessages(): AgentMessage[] {
+	getQueuedMessages(mode?: "steer" | "followUp"): AgentMessage[] {
+		if (mode === "steer") return this.steeringQueue.snapshot();
+		if (mode === "followUp") return this.followUpQueue.snapshot();
 		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()];
+	}
+
+	/** @internal Stable enqueue identities, including queues populated before session attachment. */
+	getQueuedMessageOccurrences(): Array<{ id: number; message: AgentMessage; mode: "steer" | "followUp" }> {
+		return [
+			...this.steeringQueue.occurrences().map((entry) => ({ ...entry, mode: "steer" as const })),
+			...this.followUpQueue.occurrences().map((entry) => ({ ...entry, mode: "followUp" as const })),
+		];
+	}
+
+	/** @internal Enqueue occurrence belonging to the current message publication, if queued. */
+	get queuedMessageOccurrenceId(): number | undefined {
+		return this._queuedMessageOccurrenceId;
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -638,6 +673,12 @@ export class Agent {
 	 * and `finishRun()` clears runtime-owned state.
 	 */
 	private async processEvents(event: AgentEvent, source?: AgentMessageOccurrence): Promise<void> {
+		// Capture before message_end retires the reservation. Awaited Session listeners
+		// still need its identity at the persistence boundary after that commit.
+		const occurrenceId =
+			source && (event.type === "message_start" || event.type === "message_end")
+				? (this.steeringQueue.occurrenceId(source) ?? this.followUpQueue.occurrenceId(source))
+				: undefined;
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;
@@ -686,8 +727,15 @@ export class Agent {
 		if (!signal) {
 			throw new Error("Agent listener invoked outside active run");
 		}
-		for (const listener of this.listeners) {
-			await listener(event, signal);
+		this._queuedMessageOccurrenceId = occurrenceId;
+		try {
+			for (const listener of this.listeners) {
+				await listener(event, signal);
+			}
+		} finally {
+			// Publication context, not message identity: never leak a queued ID to a
+			// later prepared alias, failure event, or code running after settlement.
+			this._queuedMessageOccurrenceId = undefined;
 		}
 	}
 }

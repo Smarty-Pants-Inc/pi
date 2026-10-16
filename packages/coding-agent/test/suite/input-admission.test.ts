@@ -2320,6 +2320,8 @@ describe("native input admission v1", () => {
 			options?: PromptOptions,
 		) => Promise<void>;
 		return {
+			// pi#262 / smarty-dev#3155: operator exit joins mode-owned compaction handoffs.
+			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
 			prepareRecoveredInput: Reflect.get(InteractiveMode.prototype, "prepareRecoveredInput") as (
 				input: ReceivedInput,
@@ -2359,6 +2361,7 @@ describe("native input admission v1", () => {
 			},
 			pendingUserInputs: [] as ReceivedInput[],
 			showError: vi.fn(),
+			showWarning: vi.fn(),
 			clearStatusIndicator: vi.fn(),
 			flushPendingBashComponents: vi.fn(),
 			updatePendingMessagesDisplay: vi.fn(),
@@ -2567,6 +2570,7 @@ describe("native input admission v1", () => {
 		mode.pendingUserInputs.length = 0;
 	});
 
+	// pi#262 / smarty-dev#3155: the refused no-session quit now offers explicit discard consent.
 	it("TUI shutdown refuses admitted input before stopping the terminal", async () => {
 		const held = gate();
 		const h = await setup([
@@ -2586,7 +2590,9 @@ describe("native input admission v1", () => {
 		} finally {
 			exit.mockRestore();
 		}
-		expect(mode.showError).toHaveBeenCalledWith(expect.stringContaining("INPUT_ADMISSION_BUSY"));
+		expect(mode.showWarning).toHaveBeenCalledWith(
+			"1 queued messages are not saved (no session file). /quit again to discard them and exit.",
+		);
 		expect(mode.stop).not.toHaveBeenCalled();
 		expect(mode.ui.terminal.drainInput).not.toHaveBeenCalled();
 		expect(mode.isShuttingDown).toBe(false);
