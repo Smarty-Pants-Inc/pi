@@ -8,6 +8,7 @@ import {
 	EventStream,
 	getCurrentTools,
 	getToolStateChanges,
+	isolateValue,
 	normalizeContext,
 	type SystemMessage,
 	type ToolResultMessage,
@@ -29,7 +30,11 @@ import type {
 	StreamFn,
 } from "./types.ts";
 
-export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
+/** Original input slot, preserved even when tool declaration normalization copies its message. */
+export type AgentMessageOccurrence = { batch: AgentMessage[]; index: number; message: AgentMessage };
+
+/** Only a source belonging to a queue's reserved batch can transfer that queue occurrence. */
+export type AgentEventSink = (event: AgentEvent, source?: AgentMessageOccurrence) => Promise<void> | void;
 
 /**
  * Start an agent loop with a new prompt message.
@@ -107,18 +112,19 @@ export async function runAgentLoop(
 	signal: AbortSignal | undefined,
 	streamFn: StreamFn,
 ): Promise<AgentMessage[]> {
-	const initialMessages = declareToolChanges(context, prompts);
-	const newMessages: AgentMessage[] = [...initialMessages];
+	const hadPrompts = prompts.length > 0;
+	const newMessages: AgentMessage[] = [];
 	const currentContext: AgentContext = {
 		...context,
-		messages: [...context.messages, ...initialMessages],
+		messages: [...context.messages],
 	};
 
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
-	for (const message of initialMessages) {
-		await emit({ type: "message_start", message });
-		await emit({ type: "message_end", message });
+	const injectedPrompts = await appendPendingMessages(currentContext, newMessages, [prompts], emit);
+	if (hadPrompts && !injectedPrompts) {
+		await emit({ type: "agent_end", messages: newMessages });
+		return newMessages;
 	}
 
 	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
@@ -172,15 +178,15 @@ async function runLoop(
 	let config = initialConfig;
 	let lastCompletedTurn: PrepareNextTurnContext | undefined;
 	let explicitContinuation = false;
+	let contextOnlyTurn = false;
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
+	let hasMoreToolCalls = true;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
-		let hasMoreToolCalls = true;
-
 		// Inner loop: process tool calls and steering messages
-		while (hasMoreToolCalls || pendingMessages.length > 0) {
+		while (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn) {
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
@@ -204,17 +210,21 @@ async function runLoop(
 				if (pendingMessages.length === 0) {
 					pendingMessages = (await config.getSteeringMessages?.()) || [];
 				}
+				if (!hasMoreToolCalls && !contextOnlyTurn && preparedMessages.length === 0 && pendingMessages.length === 0)
+					break;
 				await emit({ type: "turn_start" });
 			}
 
-			// Process prepared and queued messages before the next assistant response.
-			for (const message of declareToolChanges(currentContext, [...preparedMessages, ...pendingMessages])) {
-				await emit({ type: "message_start", message });
-				await emit({ type: "message_end", message });
-				currentContext.messages.push(message);
-				newMessages.push(message);
-			}
+			const injectedMessages = await appendPendingMessages(
+				currentContext,
+				newMessages,
+				[preparedMessages, pendingMessages],
+				emit,
+			);
 			pendingMessages = [];
+			// Clearing queued input is not a context-only continuation decision.
+			if (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages) break;
+			contextOnlyTurn = false;
 
 			const requestUpdate = await config.prepareRequest?.(
 				{
@@ -275,6 +285,8 @@ async function runLoop(
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
+				// Finalized results must reach both transcripts before a batch failure escapes.
+				if (executedToolBatch.failure) throw executedToolBatch.failure.error;
 			}
 
 			lastCompletedTurn = {
@@ -310,6 +322,7 @@ async function runLoop(
 		// No natural request was selected, so fulfill the continuation decision with one context-only turn.
 		if (explicitContinuation) {
 			explicitContinuation = false;
+			contextOnlyTurn = true;
 			continue;
 		}
 
@@ -318,6 +331,35 @@ async function runLoop(
 	}
 
 	await emit({ type: "agent_end", messages: newMessages });
+}
+
+type PendingMessage = {
+	message: AgentMessage;
+	source?: AgentMessageOccurrence;
+};
+
+async function appendPendingMessages(
+	context: AgentContext,
+	newMessages: AgentMessage[],
+	batches: AgentMessage[][],
+	emit: AgentEventSink,
+): Promise<boolean> {
+	let injected = false;
+	// The final pass reconciles tools if a pending system declaration was cleared
+	// during an awaited event. A synthetic declaration never counts as queued input.
+	for (const pending of [batches, []]) {
+		for (const { message, source } of declareToolChanges(context, pending)) {
+			if (source && source.batch[source.index] !== source.message) continue;
+			await emit({ type: "message_start", message }, source);
+			// A start listener can withdraw this occurrence before the transcript commit.
+			if (source && source.batch[source.index] !== source.message) continue;
+			await emit({ type: "message_end", message }, source);
+			context.messages.push(message);
+			newMessages.push(message);
+			if (source) injected = true;
+		}
+	}
+	return injected;
 }
 
 /**
@@ -330,7 +372,13 @@ async function runLoop(
  * the executable set, so replay always yields exactly `context.tools`. Otherwise a new
  * system message is inserted before the first non-system pending message.
  */
-function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage[]): AgentMessage[] {
+function declareToolChanges(context: AgentContext, batches: AgentMessage[][]): PendingMessage[] {
+	// Keep each original reservation slot alongside its normalized message. The
+	// caller rechecks that slot before message_start; queued custody lasts until message_end.
+	const entries: PendingMessage[] = batches.flatMap((batch) =>
+		batch.map((message, index) => ({ message, source: { batch, index, message } })),
+	);
+	const pendingMessages = entries.map((entry) => entry.message);
 	let systemIndex = -1;
 	for (let i = pendingMessages.length - 1; i >= 0; i--) {
 		if (pendingMessages[i].role === "system") {
@@ -352,14 +400,16 @@ function declareToolChanges(context: AgentContext, pendingMessages: AgentMessage
 
 	if (pending) {
 		// Keep the caller's message object when it already declares no tool changes.
-		if (unchanged && !pending.toolsAdded?.length && !pending.toolsRemoved?.length) return pendingMessages;
-		return baseline.map((message, index) => (index === systemIndex ? withToolChanges(pending, changes) : message));
+		if (unchanged && !pending.toolsAdded?.length && !pending.toolsRemoved?.length) return entries;
+		return entries.map((entry, index) =>
+			index === systemIndex ? { ...entry, message: withToolChanges(pending, changes) } : entry,
+		);
 	}
-	if (unchanged) return pendingMessages;
+	if (unchanged) return entries;
 	const update = withToolChanges({ role: "system", content: "", timestamp: Date.now() }, changes);
 	const insertIndex = pendingMessages.findIndex((message) => message.role !== "system");
 	const index = insertIndex === -1 ? pendingMessages.length : insertIndex;
-	return [...pendingMessages.slice(0, index), update, ...pendingMessages.slice(index)];
+	return [...entries.slice(0, index), { message: update }, ...entries.slice(index)];
 }
 
 const NO_CHANGES: ToolStateChanges = { toolsAdded: [], toolsRemoved: [] };
@@ -480,8 +530,16 @@ async function failToolCallsFromTruncatedMessage(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
+	let firstEmissionError: { error: unknown } | undefined;
+	const emitFinalizedEvent: AgentEventSink = async (event) => {
+		try {
+			await emit(event);
+		} catch (error) {
+			firstEmissionError ??= { error };
+		}
+	};
 	for (const toolCall of toolCalls) {
-		await emit({
+		await emitFinalizedEvent({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
@@ -494,12 +552,12 @@ async function failToolCallsFromTruncatedMessage(
 			),
 			isError: true,
 		};
-		await emitToolExecutionEnd(finalized, emit);
+		await emitToolExecutionEnd(finalized, emitFinalizedEvent);
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
+		await emitToolResultMessage(toolResultMessage, emitFinalizedEvent);
 		messages.push(toolResultMessage);
 	}
-	return { messages, terminate: false };
+	return { messages, terminate: false, failure: firstEmissionError };
 }
 
 /**
@@ -525,6 +583,7 @@ async function executeToolCalls(
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	failure?: { error: unknown };
 };
 
 async function executeToolCallsSequential(
@@ -537,49 +596,73 @@ async function executeToolCallsSequential(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
-
-	for (const toolCall of toolCalls) {
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
-		});
-
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
-		let finalized: FinalizedToolCallOutcome;
-		if (preparation.kind === "immediate") {
-			finalized = {
-				toolCall,
-				result: preparation.result,
-				isError: preparation.isError,
-			};
-		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
-			finalized = await finalizeExecutedToolCall(
-				currentContext,
-				assistantMessage,
-				preparation,
-				executed,
-				config,
-				signal,
-			);
+	let failure: { error: unknown } | undefined;
+	// Finish publishing the current call, then stop before starting another one.
+	const emitFinalizedEvent: AgentEventSink = async (event) => {
+		try {
+			await emit(event);
+		} catch (error) {
+			failure ??= { error };
 		}
+	};
 
-		await emitToolExecutionEnd(finalized, emit);
-		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
-		finalizedCalls.push(finalized);
-		messages.push(toolResultMessage);
+	try {
+		for (const toolCall of toolCalls) {
+			await emitFinalizedEvent({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: toolCall.arguments,
+			});
 
-		if (signal?.aborted) {
-			break;
+			const preparation = failure
+				? {
+						kind: "immediate" as const,
+						result: createErrorToolResult("Tool execution skipped because event publication failed"),
+						isError: true,
+					}
+				: await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+			let finalized: FinalizedToolCallOutcome;
+			if (preparation.kind === "immediate") {
+				finalized = {
+					toolCall,
+					result: preparation.result,
+					isError: preparation.isError,
+				};
+			} else {
+				const executed = await executePreparedToolCall(
+					preparation,
+					signal,
+					emitToolExecutionUpdate(toolCall, emit),
+					config,
+				);
+				failure ??= executed.updateFailure;
+				finalized = await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					preparation,
+					executed,
+					config,
+					signal,
+				);
+			}
+
+			await emitToolExecutionEnd(finalized, emitFinalizedEvent);
+			const toolResultMessage = createToolResultMessage(finalized);
+			await emitToolResultMessage(toolResultMessage, emitFinalizedEvent);
+			finalizedCalls.push(finalized);
+			messages.push(toolResultMessage);
+			if (failure || signal?.aborted) break;
 		}
+	} catch (error) {
+		// Preserve earlier finalized messages without normalizing an unexpected execution failure.
+		failure = { error };
 	}
 
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		failure,
 	};
 }
 
@@ -592,14 +675,35 @@ async function executeToolCallsParallel(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
+	let firstEmissionError: { error: unknown } | undefined;
+	let firstUpdateError: { error: unknown } | undefined;
+	// A finalized outcome belongs to the batch even if its public event fails.
+	// Settle started siblings and publish finalized results, but never start new work after a preflight failure.
+	const emitFinalizedEvent: AgentEventSink = async (event) => {
+		try {
+			await emit(event);
+		} catch (error) {
+			firstEmissionError ??= { error };
+		}
+	};
 
 	for (const toolCall of toolCalls) {
-		await emit({
+		await emitFinalizedEvent({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
 			args: toolCall.arguments,
 		});
+		if (firstEmissionError) {
+			const finalized = {
+				toolCall,
+				result: createErrorToolResult("Tool execution skipped because event publication failed"),
+				isError: true,
+			} satisfies FinalizedToolCallOutcome;
+			await emitToolExecutionEnd(finalized, emitFinalizedEvent);
+			finalizedCalls.push(finalized);
+			break;
+		}
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
@@ -608,25 +712,33 @@ async function executeToolCallsParallel(
 				result: preparation.result,
 				isError: preparation.isError,
 			} satisfies FinalizedToolCallOutcome;
-			await emitToolExecutionEnd(finalized, emit);
+			await emitToolExecutionEnd(finalized, emitFinalizedEvent);
 			finalizedCalls.push(finalized);
-			if (signal?.aborted) {
+			if (firstEmissionError || signal?.aborted) {
 				break;
 			}
 			continue;
 		}
 
 		finalizedCalls.push(async () => {
-			if (signal?.aborted) {
+			if (preflightFailed || signal?.aborted) {
 				const finalized = {
 					toolCall,
-					result: createErrorToolResult("Operation aborted"),
+					result: createErrorToolResult(
+						preflightFailed ? "Tool execution skipped because event publication failed" : "Operation aborted",
+					),
 					isError: true,
 				} satisfies FinalizedToolCallOutcome;
-				await emitToolExecutionEnd(finalized, emit);
+				await emitToolExecutionEnd(finalized, emitFinalizedEvent);
 				return finalized;
 			}
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				preparation,
+				signal,
+				emitToolExecutionUpdate(toolCall, emit),
+				config,
+			);
+			firstUpdateError ??= executed.updateFailure;
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -635,7 +747,7 @@ async function executeToolCallsParallel(
 				config,
 				signal,
 			);
-			await emitToolExecutionEnd(finalized, emit);
+			await emitToolExecutionEnd(finalized, emitFinalizedEvent);
 			return finalized;
 		});
 		if (signal?.aborted) {
@@ -643,19 +755,30 @@ async function executeToolCallsParallel(
 		}
 	}
 
-	const orderedFinalizedCalls = await Promise.all(
+	// A preflight failure skips execution, but every published start still needs an end.
+	// Freeze this decision before closures run so execution-time listener errors do not skip siblings.
+	const preflightFailed = firstEmissionError !== undefined;
+	const settledCalls = await Promise.allSettled(
 		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
 	);
+	const orderedFinalizedCalls = settledCalls.flatMap((entry) => (entry.status === "fulfilled" ? [entry.value] : []));
 	const messages: ToolResultMessage[] = [];
 	for (const finalized of orderedFinalizedCalls) {
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
+		// Attempt message_end even if message_start failed, without replacing or retrying the result.
+		await emitToolResultMessage(toolResultMessage, emitFinalizedEvent);
 		messages.push(toolResultMessage);
 	}
 
+	// Unexpected execution failures are not normalized here or hidden by a listener error.
+	const failedExecution = settledCalls.find((entry) => entry.status === "rejected");
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		failure:
+			failedExecution?.status === "rejected"
+				? { error: failedExecution.reason }
+				: (firstUpdateError ?? firstEmissionError),
 	};
 }
 
@@ -676,12 +799,13 @@ type ExecutedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
 	durationMs: number;
+	updateFailure?: { error: unknown };
 };
 
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
 
 /** The `beforeToolCall` and `afterToolCall` hooks of {@link AgentLoopConfig}. */
-export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">;
+export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall" | "transformToolUpdate">;
 
 type ToolUpdateSink = (partialResult: AgentToolResult<any>) => Promise<void> | void;
 
@@ -796,6 +920,7 @@ export interface RunToolCallOptions extends ToolCallHooks {
 	/** Passed to the hooks as the current agent context. */
 	context: AgentContext;
 	signal?: AbortSignal;
+	/** Progress publication is best-effort and cannot replace the returned execution outcome. */
 	onUpdate?: ToolUpdateSink;
 }
 
@@ -814,7 +939,7 @@ export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallO
 	if (preparation.kind === "immediate") {
 		return { toolCall, result: preparation.result, isError: preparation.isError };
 	}
-	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}));
+	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}), options);
 	return finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
 }
 
@@ -822,11 +947,14 @@ async function executePreparedToolCall(
 	prepared: PreparedToolCall,
 	signal: AbortSignal | undefined,
 	onUpdate: ToolUpdateSink,
+	hooks: ToolCallHooks,
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
+	let updateFailure: { error: unknown } | undefined;
 	let acceptingUpdates = true;
 	const startedAt = performance.now();
 	const elapsed = () => Math.round(performance.now() - startedAt);
+	let outcome: ExecutedToolCallOutcome;
 
 	try {
 		const result = await prepared.tool.execute(
@@ -835,25 +963,48 @@ async function executePreparedToolCall(
 			signal,
 			(partialResult) => {
 				if (!acceptingUpdates) return;
-				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+				// Start the transform now so it can detach the tool's snapshot before the tool mutates it.
+				// Preserve emission order even when asynchronous transforms finish out of order.
+				const transformed = (async () => {
+					try {
+						// Detach before any await, including absent or undefined transform results.
+						const snapshot = isolateValue(partialResult);
+						return (
+							(await hooks.transformToolUpdate?.(prepared.toolCall, prepared.args, snapshot, signal)) ?? snapshot
+						);
+					} catch {
+						// Neither the snapshot nor an error message containing it may cross this boundary.
+						return createErrorToolResult("[REDACTED] Partial tool result withheld: handler failed");
+					}
+				})();
+				const previous = updateEvents.at(-1) ?? Promise.resolve();
+				updateEvents.push(
+					previous.then(async () => {
+						try {
+							await onUpdate(await transformed);
+						} catch (error) {
+							// Keep progress failure separate from the execution outcome. The loop
+							// propagates it after settlement; nested callers still receive the outcome.
+							updateFailure ??= { error };
+						}
+					}),
+				);
 			},
 		);
-		const durationMs = elapsed();
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return { result, isError: result.isError === true, durationMs };
+		outcome = { result, isError: result.isError === true, durationMs: elapsed() };
 	} catch (error) {
-		const durationMs = elapsed();
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return {
+		outcome = {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
-			durationMs,
+			durationMs: elapsed(),
 		};
 	} finally {
 		acceptingUpdates = false;
 	}
+	// Settle progress after capturing execution, never inside its failure conversion.
+	await Promise.all(updateEvents);
+	if (updateFailure) outcome.updateFailure = updateFailure;
+	return outcome;
 }
 
 async function finalizeExecutedToolCall(
@@ -883,11 +1034,15 @@ async function finalizeExecutedToolCall(
 			if (afterResult) {
 				// Structured content not replaced along with the content may no longer match it.
 				const structuredContent =
-					afterResult.structuredContent ?? (afterResult.content ? undefined : result.structuredContent);
+					afterResult.structuredContent !== undefined
+						? afterResult.structuredContent
+						: afterResult.content !== undefined
+							? undefined
+							: result.structuredContent;
 				result = {
 					...result,
 					content: afterResult.content ?? result.content,
-					details: afterResult.details ?? result.details,
+					details: afterResult.details === undefined ? result.details : afterResult.details,
 					usage: afterResult.usage ?? result.usage,
 					terminate: afterResult.terminate ?? result.terminate,
 				};
