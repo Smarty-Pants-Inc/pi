@@ -530,6 +530,11 @@ export class InteractiveMode {
 	private pendingUserInputs: ReceivedInput[] = [];
 	private readonly inputPlan: ModeInputPlan;
 	private userInputInFlight = false;
+	private inFlightUserInput?: ReceivedInput;
+	private operatorExitRequested = false;
+	private confirmUnsentDiscard = false;
+	private confirmedUnsentRevision?: number;
+	private readonly compactionTransferInputs = new Set<CompactionQueuedMessage>();
 	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private activeWorkingIndicatorEmbedded = false;
@@ -1336,6 +1341,11 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
+		// Foreign input is a visible draft, never an automatic resume submission.
+		this.restoreUnsentInputDrafts();
+		// Resume operator-exit input without waiting for another editor submission.
+		await this.session.resumeUnsentInputs();
+
 		// Process initial messages
 		if (this.inputPlan.initial) await this.submitStartupInput(this.inputPlan.initial);
 		for (const input of this.inputPlan.remaining) {
@@ -1351,6 +1361,7 @@ export class InteractiveMode {
 			const prompt = this.promptWithRecoveredImages(userInput);
 			// Original session preflight owns the input before TUI staging clears.
 			this.userInputInFlight = false;
+			this.inFlightUserInput = undefined;
 			this.stagingAudit?.("input-transferred");
 			await prompt;
 		} catch (error: unknown) {
@@ -2079,11 +2090,33 @@ export class InteractiveMode {
 			mode: "tui",
 			hasPendingInput: () =>
 				!this.terminalShutdownRequested &&
+				!this.operatorExitRequested &&
 				(this.session !== session ||
 					this.pendingUserInputs.length > 0 ||
 					this.userInputInFlight ||
 					this.compactionQueuedMessages.length > 0 ||
 					this.compactionQueueTransfers > 0),
+			getPendingInputs: () => [
+				...this.pendingUserInputs.map((input) => ({
+					input: this.prepareRecoveredInput(input).input,
+					mode: "steer" as const,
+				})),
+				...(this.inFlightUserInput ? [{ input: this.inFlightUserInput, mode: "steer" as const }] : []),
+				...this.compactionQueuedMessages.map((message) => ({
+					input: this.prepareRecoveredInput(message.input).input,
+					mode: message.mode,
+				})),
+				...[...this.compactionTransferInputs].map((message) => ({
+					input: this.prepareRecoveredInput(message.input).input,
+					mode: message.mode,
+				})),
+			],
+			clearPendingInputs: () => {
+				this.pendingUserInputs = [];
+				this.inFlightUserInput = undefined;
+				this.userInputInFlight = false;
+				this.compactionQueuedMessages = [];
+			},
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
 			},
@@ -3460,6 +3493,7 @@ export class InteractiveMode {
 	/** Dispatch commands or transfer the same admitted envelope to ordinary prompt handling. */
 	private async dispatchEditorInput(input: ReceivedInput): Promise<void> {
 		const text = input.text;
+		if (text !== "/quit") this.confirmUnsentDiscard = false;
 
 		// Handle commands
 		if (text === "/settings") {
@@ -3572,7 +3606,7 @@ export class InteractiveMode {
 			return;
 		}
 		if (text === "/quit") {
-			await this.shutdown();
+			await this.shutdown({ fromQuit: true, discardUnsentInput: this.confirmUnsentDiscard });
 			return;
 		}
 
@@ -3618,6 +3652,7 @@ export class InteractiveMode {
 
 	/** Shared idle submission path; the caller owns admission before any editor effects. */
 	private submitEditorInput(input: ReceivedInput): void {
+		this.confirmUnsentDiscard = false;
 		this.flushPendingBashComponents();
 		if (this.onInputCallback) {
 			this.onInputCallback(input);
@@ -3668,6 +3703,7 @@ export class InteractiveMode {
 				break;
 
 			case "queue_update":
+				this.confirmUnsentDiscard = false;
 				this.updatePendingMessagesDisplay();
 				this.ui.requestRender();
 				break;
@@ -4502,6 +4538,7 @@ export class InteractiveMode {
 		const queuedInput = this.pendingUserInputs.shift();
 		if (queuedInput !== undefined) {
 			this.userInputInFlight = true;
+			this.inFlightUserInput = queuedInput;
 			this.stagingAudit?.("input-dequeued");
 			return queuedInput;
 		}
@@ -4510,6 +4547,7 @@ export class InteractiveMode {
 			this.onInputCallback = (input: ReceivedInput) => {
 				this.onInputCallback = undefined;
 				this.userInputInFlight = true;
+				this.inFlightUserInput = input;
 				this.stagingAudit?.("input-delivered");
 				resolve(input);
 			};
@@ -4552,7 +4590,11 @@ export class InteractiveMode {
 	private isShuttingDown = false;
 	private shutdownCompletion?: Promise<void>;
 
-	private async shutdown(options?: { fromSignal?: boolean }): Promise<void> {
+	private async shutdown(options?: {
+		fromSignal?: boolean;
+		fromQuit?: boolean;
+		discardUnsentInput?: boolean;
+	}): Promise<void> {
 		const upgrade = options?.fromSignal && !this.terminalShutdownRequested;
 		if (options?.fromSignal) this.terminalShutdownRequested = true;
 		if (this.isShuttingDown) {
@@ -4575,6 +4617,7 @@ export class InteractiveMode {
 		}
 		this.isShuttingDown = true;
 		this.shutdownCompletion = (async () => {
+			let terminalStopped = false;
 			try {
 				// Keep signal handlers registered until terminal cleanup has completed.
 				// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
@@ -4615,13 +4658,36 @@ export class InteractiveMode {
 					// the final frame while the process is exiting.
 					// Drain any in-flight Kitty key release events before stopping.
 					// This prevents escape sequences from leaking to the parent shell over slow SSH.
-					await this.runtimeHost.dispose({
-						beforeShutdown: async () => {
-							this.themeController.disableAutoSync();
-							await this.ui.terminal.drainInput(1000);
-							this.stop();
-						},
-					});
+					this.operatorExitRequested = true;
+					const unsentInputBlocks: string[] = [];
+					try {
+						await this.runtimeHost.dispose({
+							operatorExit: true,
+							discardUnsentInput:
+								options?.fromQuit === true &&
+								options.discardUnsentInput === true &&
+								this.confirmUnsentDiscard &&
+								this.confirmedUnsentRevision === this.session.queuedInputRevision,
+							bufferUnsentInput: (block) => unsentInputBlocks.push(block),
+							beforeShutdown: async () => {
+								while (this.compactionQueueWork.size > 0)
+									await Promise.allSettled([...this.compactionQueueWork]);
+								this.themeController.disableAutoSync();
+								await this.ui.terminal.drainInput(1000);
+								this.stop();
+								terminalStopped = true;
+							},
+						});
+					} finally {
+						if (unsentInputBlocks.length > 0) {
+							// Even failed/upgraded disposal must report retained text, never before the final redraw.
+							if (!terminalStopped) {
+								this.stop();
+								terminalStopped = true;
+							}
+							fs.writeFileSync(process.stderr.fd, unsentInputBlocks.join(""));
+						}
+					}
 				}
 				if (this.terminalShutdownRequested) {
 					const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
@@ -4643,10 +4709,21 @@ export class InteractiveMode {
 
 				process.exit(0);
 			} catch (error) {
-				if (this.terminalShutdownRequested) throw error;
-				if (!this.handleInputAdmissionError(error)) throw error;
+				if (terminalStopped || this.terminalShutdownRequested) throw error;
+				if (
+					error instanceof InputAdmissionError &&
+					error.code === "INPUT_ADMISSION_BUSY" &&
+					error.message.endsWith(
+						" queued messages are not saved (no session file). /quit again to discard them and exit.",
+					)
+				) {
+					this.confirmUnsentDiscard = options?.fromQuit === true;
+					this.confirmedUnsentRevision = this.session.queuedInputRevision;
+					this.showWarning(error.message.slice("INPUT_ADMISSION_BUSY: ".length));
+				} else if (!this.handleInputAdmissionError(error)) throw error;
 				// Admission refusal precedes terminal teardown: the old session remains usable.
 				this.isShuttingDown = false;
+				this.operatorExitRequested = false;
 				this.shutdownCompletion = undefined;
 			}
 		})();
@@ -4808,6 +4885,21 @@ export class InteractiveMode {
 		}
 	}
 
+	private restoreUnsentInputDrafts(): void {
+		const drafts = this.session.takeUnsentInputDrafts();
+		if (drafts.length === 0) return;
+		// Recover only editable content, not foreign provenance, metadata, or receipt stamps.
+		const text = this.recoveryText(
+			drafts.map((message) =>
+				message.role === "custom"
+					? { role: "user", content: message.content, timestamp: message.timestamp }
+					: message,
+			),
+		);
+		if (text) this.restoreRejectedInput(text);
+		this.showWarning("Foreign or unstamped unsent input restored as draft; not sent. Review before submitting.");
+	}
+
 	private recoveryText(messages: AgentMessage[], imagesOnly = false): string {
 		const text: string[] = [];
 		for (const message of messages) {
@@ -4871,6 +4963,7 @@ export class InteractiveMode {
 	}
 
 	private async submitEditorPrompt(input: ReceivedInput, streamingBehavior?: "steer" | "followUp"): Promise<void> {
+		this.confirmUnsentDiscard = false;
 		this.editor.addToHistory?.(input.text);
 		try {
 			await this.promptWithRecoveredImages(input, { streamingBehavior });
@@ -5198,6 +5291,7 @@ export class InteractiveMode {
 	}
 
 	private updatePendingMessagesDisplay(): void {
+		this.confirmUnsentDiscard = false;
 		this.pendingMessagesContainer.clear();
 		const { steering: steeringMessages, followUp: followUpMessages } = this.getAllQueuedMessages();
 		if (steeringMessages.length > 0 || followUpMessages.length > 0) {
@@ -5243,6 +5337,7 @@ export class InteractiveMode {
 	}
 
 	private queueCompactionMessage(input: ReceivedInput, mode: "steer" | "followUp"): void {
+		this.confirmUnsentDiscard = false;
 		this.compactionQueuedMessages.push({ input, mode });
 		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(input.text);
@@ -5271,15 +5366,17 @@ export class InteractiveMode {
 	}
 
 	private async transferCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.compactionQueuedMessages.length === 0) {
+		if (this.operatorExitRequested || this.compactionQueuedMessages.length === 0) {
 			return;
 		}
 
 		const queuedMessages = [...this.compactionQueuedMessages];
+		for (const message of queuedMessages) this.compactionTransferInputs.add(message);
 		const session = this.session;
 		const pending = new Set(queuedMessages);
 		const restored = new Set<CompactionQueuedMessage>();
 		const restoreQueue = (error: unknown, failed = [...pending]) => {
+			if (this.operatorExitRequested) return; // The synchronous durable exit snapshot owns these occurrences.
 			const retained = failed.filter((message) => {
 				pending.delete(message);
 				if (restored.has(message)) return false;
@@ -5323,6 +5420,7 @@ export class InteractiveMode {
 							{
 								onInputTransferred: () => {
 									pending.delete(message);
+									this.compactionTransferInputs.delete(message);
 								},
 							},
 							session,
@@ -5381,6 +5479,7 @@ export class InteractiveMode {
 					streamingBehavior: firstPrompt.mode,
 					onInputTransferred: () => {
 						firstTransferred = true;
+						this.compactionTransferInputs.delete(firstPrompt);
 					},
 				},
 				session,
@@ -5424,6 +5523,7 @@ export class InteractiveMode {
 		} catch (error) {
 			restoreQueue(error);
 		} finally {
+			for (const message of queuedMessages) this.compactionTransferInputs.delete(message);
 			this.compactionQueueTransfers--;
 			this.stagingAudit?.("compaction-transfer-settled");
 			this.scheduleShutdownRecheck();
@@ -6361,7 +6461,11 @@ export class InteractiveMode {
 				status = "Resumed session in current cwd";
 				result = await resume(selectedCwd);
 			}
-			if (!result.cancelled) this.showStatus(status);
+			if (!result.cancelled) {
+				this.showStatus(status);
+				this.restoreUnsentInputDrafts();
+				await this.session.resumeUnsentInputs();
+			}
 			return result;
 		} catch (error: unknown) {
 			if (this.isTerminalRuntimeCancellation(error)) return { cancelled: true };
@@ -7178,6 +7282,10 @@ export class InteractiveMode {
 				result = await this.runtimeHost.importFromJsonl(inputPath, selectedCwd);
 			}
 			this.showStatus(result.cancelled ? "Import cancelled" : `Session imported from: ${inputPath}`);
+			if (!result.cancelled) {
+				this.restoreUnsentInputDrafts();
+				await this.session.resumeUnsentInputs();
+			}
 		} catch (error: unknown) {
 			if (error instanceof SessionImportFileNotFoundError) {
 				this.showError(`Failed to import session: ${error.message}`);
