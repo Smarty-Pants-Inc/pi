@@ -281,6 +281,8 @@ async function runLoop(
 					currentContext.messages.push(result);
 					newMessages.push(result);
 				}
+				// Finalized results must reach both transcripts before a batch failure escapes.
+				if (executedToolBatch.failure) throw executedToolBatch.failure.error;
 			}
 
 			lastCompletedTurn = {
@@ -522,8 +524,16 @@ async function failToolCallsFromTruncatedMessage(
 	emit: AgentEventSink,
 ): Promise<ExecutedToolCallBatch> {
 	const messages: ToolResultMessage[] = [];
+	let firstEmissionError: { error: unknown } | undefined;
+	const emitFinalizedEvent: AgentEventSink = async (event) => {
+		try {
+			await emit(event);
+		} catch (error) {
+			firstEmissionError ??= { error };
+		}
+	};
 	for (const toolCall of toolCalls) {
-		await emit({
+		await emitFinalizedEvent({
 			type: "tool_execution_start",
 			toolCallId: toolCall.id,
 			toolName: toolCall.name,
@@ -536,12 +546,12 @@ async function failToolCallsFromTruncatedMessage(
 			),
 			isError: true,
 		};
-		await emitToolExecutionEnd(finalized, emit);
+		await emitToolExecutionEnd(finalized, emitFinalizedEvent);
 		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emit);
+		await emitToolResultMessage(toolResultMessage, emitFinalizedEvent);
 		messages.push(toolResultMessage);
 	}
-	return { messages, terminate: false };
+	return { messages, terminate: false, failure: firstEmissionError };
 }
 
 /**
@@ -567,6 +577,7 @@ async function executeToolCalls(
 type ExecutedToolCallBatch = {
 	messages: ToolResultMessage[];
 	terminate: boolean;
+	failure?: { error: unknown };
 };
 
 async function executeToolCallsSequential(
@@ -579,65 +590,72 @@ async function executeToolCallsSequential(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallOutcome[] = [];
 	const messages: ToolResultMessage[] = [];
-
-	for (const toolCall of toolCalls) {
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
-		});
-
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
-		let finalized: FinalizedToolCallOutcome;
-		if (preparation.kind === "immediate") {
-			finalized = {
-				toolCall,
-				result: preparation.result,
-				isError: preparation.isError,
-			};
-		} else {
-			const executed = await executePreparedToolCall(
-				preparation,
-				signal,
-				emitToolExecutionUpdate(toolCall, emit),
-				config,
-			);
-			finalized = await finalizeExecutedToolCall(
-				currentContext,
-				assistantMessage,
-				preparation,
-				executed,
-				config,
-				signal,
-			);
+	let failure: { error: unknown } | undefined;
+	// Finish publishing the current call, then stop before starting another one.
+	const emitFinalizedEvent: AgentEventSink = async (event) => {
+		try {
+			await emit(event);
+		} catch (error) {
+			failure ??= { error };
 		}
+	};
 
-		let firstEmissionError: { error: unknown } | undefined;
-		// Publish this completed result even if an end/start listener fails, but
-		// propagate the first failure before executing any later tool call.
-		const emitFinalizedEvent: AgentEventSink = async (event) => {
-			try {
-				await emit(event);
-			} catch (error) {
-				firstEmissionError ??= { error };
+	try {
+		for (const toolCall of toolCalls) {
+			await emitFinalizedEvent({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: toolCall.arguments,
+			});
+
+			const preparation = failure
+				? {
+						kind: "immediate" as const,
+						result: createErrorToolResult("Tool execution skipped because event publication failed"),
+						isError: true,
+					}
+				: await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+			let finalized: FinalizedToolCallOutcome;
+			if (preparation.kind === "immediate") {
+				finalized = {
+					toolCall,
+					result: preparation.result,
+					isError: preparation.isError,
+				};
+			} else {
+				const executed = await executePreparedToolCall(
+					preparation,
+					signal,
+					emitToolExecutionUpdate(toolCall, emit),
+					config,
+				);
+				finalized = await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					preparation,
+					executed,
+					config,
+					signal,
+				);
 			}
-		};
-		await emitToolExecutionEnd(finalized, emitFinalizedEvent);
-		const toolResultMessage = createToolResultMessage(finalized);
-		await emitToolResultMessage(toolResultMessage, emitFinalizedEvent);
-		finalizedCalls.push(finalized);
-		messages.push(toolResultMessage);
-		if (firstEmissionError) throw firstEmissionError.error;
 
-		if (signal?.aborted) {
-			break;
+			await emitToolExecutionEnd(finalized, emitFinalizedEvent);
+			const toolResultMessage = createToolResultMessage(finalized);
+			await emitToolResultMessage(toolResultMessage, emitFinalizedEvent);
+			finalizedCalls.push(finalized);
+			messages.push(toolResultMessage);
+			if (failure || signal?.aborted) break;
 		}
+	} catch (error) {
+		// Preserve earlier finalized messages without normalizing an unexpected execution failure.
+		failure = { error };
 	}
 
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(finalizedCalls),
+		failure,
 	};
 }
 
@@ -668,7 +686,16 @@ async function executeToolCallsParallel(
 			toolName: toolCall.name,
 			args: toolCall.arguments,
 		});
-		if (firstEmissionError) break;
+		if (firstEmissionError) {
+			const finalized = {
+				toolCall,
+				result: createErrorToolResult("Tool execution skipped because event publication failed"),
+				isError: true,
+			} satisfies FinalizedToolCallOutcome;
+			await emitToolExecutionEnd(finalized, emitFinalizedEvent);
+			finalizedCalls.push(finalized);
+			break;
+		}
 
 		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
 		if (preparation.kind === "immediate") {
@@ -686,10 +713,12 @@ async function executeToolCallsParallel(
 		}
 
 		finalizedCalls.push(async () => {
-			if (signal?.aborted) {
+			if (preflightFailed || signal?.aborted) {
 				const finalized = {
 					toolCall,
-					result: createErrorToolResult("Operation aborted"),
+					result: createErrorToolResult(
+						preflightFailed ? "Tool execution skipped because event publication failed" : "Operation aborted",
+					),
 					isError: true,
 				} satisfies FinalizedToolCallOutcome;
 				await emitToolExecutionEnd(finalized, emitFinalizedEvent);
@@ -717,13 +746,11 @@ async function executeToolCallsParallel(
 		}
 	}
 
-	// Preflight has not invoked any prepared closure yet. On publication failure,
-	// flush only immediate outcomes; even earlier prepared tools must remain unstarted.
-	const callsToSettle = firstEmissionError
-		? finalizedCalls.filter((entry) => typeof entry !== "function")
-		: finalizedCalls;
+	// A preflight failure skips execution, but every published start still needs an end.
+	// Freeze this decision before closures run so execution-time listener errors do not skip siblings.
+	const preflightFailed = firstEmissionError !== undefined;
 	const settledCalls = await Promise.allSettled(
-		callsToSettle.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
 	);
 	const orderedFinalizedCalls = settledCalls.flatMap((entry) => (entry.status === "fulfilled" ? [entry.value] : []));
 	const messages: ToolResultMessage[] = [];
@@ -736,12 +763,10 @@ async function executeToolCallsParallel(
 
 	// Unexpected execution failures are not normalized here or hidden by a listener error.
 	const failedExecution = settledCalls.find((entry) => entry.status === "rejected");
-	if (failedExecution?.status === "rejected") throw failedExecution.reason;
-	if (firstEmissionError) throw firstEmissionError.error;
-
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
+		failure: failedExecution?.status === "rejected" ? { error: failedExecution.reason } : firstEmissionError,
 	};
 }
 

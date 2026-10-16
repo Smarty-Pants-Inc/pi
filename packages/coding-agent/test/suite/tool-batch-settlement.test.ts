@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentContext, AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import { fauxAssistantMessage, fauxToolCall, type ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -19,8 +19,14 @@ type NativeName = "write" | "edit";
 type Outcome = "success" | "throw" | "cancel";
 type Scheduling = "default" | "parallel-override";
 
+interface LoopCapture {
+	context?: AgentContext;
+	newMessages?: AgentMessage[];
+}
+
 interface Batch {
 	harness: Harness;
+	loop: LoopCapture;
 	native: NativeName;
 	outcome: Outcome;
 	scheduling: Scheduling;
@@ -37,6 +43,42 @@ function toolResults(messages: readonly AgentMessage[]): ToolResultMessage[] {
 
 function entryMessages(entries: readonly FileEntry[]): AgentMessage[] {
 	return entries.flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+}
+
+// pi#274 / smarty-dev#10068: events update Agent.state even when the loop drops its own results.
+// A tool-free first turn exposes the actual newMessages array before a later listener can throw;
+// prepareRequest retains the actual context used for that later batch, not an event-derived copy.
+function captureLoop(harness: Harness): LoopCapture {
+	const loop: LoopCapture = {};
+	const agent = harness.session.agent;
+	const prepareRequest = agent.prepareRequest;
+	const finishTurn = agent.finishTurn;
+	let firstTurn = true;
+	agent.prepareRequest = async (request, signal) => {
+		const update = await prepareRequest?.(request, signal);
+		loop.context = update ? (update.context ?? request.context) : request.context;
+		return update || undefined;
+	};
+	agent.finishTurn = async (turn, signal) => {
+		loop.newMessages = turn.newMessages;
+		const decision = await finishTurn?.(turn, signal);
+		if (firstTurn) {
+			firstTurn = false;
+			return { action: "continue" };
+		}
+		return decision || undefined;
+	};
+	return loop;
+}
+
+function loopTranscripts(harness: Harness, loop: LoopCapture): Array<[string, AgentMessage[]]> {
+	if (!loop.context || !loop.newMessages) throw new Error("The tool-free probe turn did not capture the loop arrays");
+	expect(loop.context.messages).not.toBe(harness.session.agent.state.messages);
+	expect(loop.newMessages).not.toBe(harness.session.agent.state.messages);
+	return [
+		["loop currentContext.messages", loop.context.messages],
+		["loop newMessages", loop.newMessages],
+	];
 }
 
 function assertSettlement(batch: Batch, sessionEvents: AgentSessionEvent[], failure?: Error, nativeOnly = false): void {
@@ -94,6 +136,7 @@ function assertSettlement(batch: Batch, sessionEvents: AgentSessionEvent[], fail
 	expect(reopened.getSessionFile()).toBe(file);
 	expect(reopened.getSessionId()).toBe(harness.session.sessionId);
 	const transcripts: Array<[string, AgentMessage[]]> = [
+		...loopTranscripts(harness, batch.loop),
 		["agent.messages", harness.session.agent.state.messages],
 		["SessionManager entries", entryMessages(harness.sessionManager.getEntries())],
 		["SessionManager branch", entryMessages(harness.sessionManager.getBranch())],
@@ -175,6 +218,7 @@ const sequentialRegressions = (["write", "edit"] as const).flatMap((native) =>
 );
 const failureSites = [
 	{ stage: "tool_execution_end", target: SIBLING_ID },
+	{ stage: "tool_execution_end", target: NATIVE_ID },
 	{ stage: "message_start", target: SIBLING_ID },
 	{ stage: "message_end", target: SIBLING_ID },
 	{ stage: "message_start", target: NATIVE_ID },
@@ -229,10 +273,12 @@ describe("native tool batch settlement", () => {
 		harness.session.setAutoRetryEnabled(false);
 		harness.session.setAutoCompactionEnabled(false);
 		await harness.session.bindExtensions({});
+		const loop = captureLoop(harness);
 		const path = join(harness.tempDir, "native-result.txt");
 		if (native === "edit") writeFileSync(path, BEFORE);
 		const batch: Batch = {
 			harness,
+			loop,
 			native,
 			outcome,
 			scheduling,
@@ -253,6 +299,7 @@ describe("native tool batch settlement", () => {
 		);
 		const siblingCall = fauxToolCall("sibling", {}, { id: SIBLING_ID });
 		harness.setResponses([
+			fauxAssistantMessage("capture loop-owned arrays"),
 			fauxAssistantMessage(scheduling === "default" ? [nativeCall, siblingCall] : [siblingCall, nativeCall], {
 				stopReason: "toolUse",
 			}),
@@ -346,12 +393,14 @@ describe("native tool batch settlement", () => {
 				.trim()
 				.split("\n")
 				.map((line) => JSON.parse(line) as FileEntry);
-			for (const messages of [
-				entryMessages(harness.sessionManager.getEntries()),
-				entryMessages(disk),
-				SessionManager.open(file).buildSessionContext().messages,
-			]) {
-				expect(JSON.parse(JSON.stringify(toolResults(messages)))).toEqual(canonical);
+			const transcripts: Array<[string, AgentMessage[]]> = [
+				...loopTranscripts(harness, batch.loop),
+				["SessionManager entries", entryMessages(harness.sessionManager.getEntries())],
+				["disk JSONL", entryMessages(disk)],
+				["reopened context", SessionManager.open(file).buildSessionContext().messages],
+			];
+			for (const [source, messages] of transcripts) {
+				expect(JSON.parse(JSON.stringify(toolResults(messages))), source).toEqual(canonical);
 			}
 			const completions = sessionEvents.filter((event) => event.type === "tool_execution_end");
 			expect(completions).toMatchObject([{ toolCallId: NATIVE_ID, toolName: native, isError: false }]);
@@ -365,74 +414,246 @@ describe("native tool batch settlement", () => {
 		},
 	);
 
-	// Smarty-Pants-Inc/smarty-dev#10068: no-late-effects counterexample, not completed-sibling settlement.
+	// pi#274 / smarty-dev#10068: a published start needs a terminal error even if preflight never executes it.
 	it.each([
-		{ order: "unknown-first", stage: "tool_execution_end" },
-		{ order: "prepared-first", stage: "tool_execution_end" },
-		{ order: "unknown-first", stage: "tool_execution_start" },
-	] as const)("parallel preflight $order / $stage prevents late writes", async ({ order, stage }) => {
-		const nativeTool = createWriteTool(process.cwd());
-		const harness = await createHarness({
-			persistSession: true,
-			tools: [{ ...nativeTool, executionMode: "parallel" } as AgentTool],
-		});
+		{ order: "unknown-first", stage: "tool_execution_end", target: "unknown" },
+		{ order: "prepared-first", stage: "tool_execution_end", target: "unknown" },
+		{ order: "unknown-first", stage: "tool_execution_start", target: "native" },
+		{ order: "prepared-first", stage: "tool_execution_start", target: "unknown" },
+		{ order: "prepared-first", stage: "tool_execution_start", target: "native" },
+	] as const)(
+		"parallel preflight $order / $stage / $target prevents late writes",
+		async ({ order, stage, target }) => {
+			const nativeTool = createWriteTool(process.cwd());
+			const execute = vi.spyOn(nativeTool, "execute");
+			const harness = await createHarness({
+				persistSession: true,
+				tools: [{ ...nativeTool, executionMode: "parallel" } as AgentTool],
+			});
+			harnesses.push(harness);
+			harness.session.setAutoRetryEnabled(false);
+			harness.session.setAutoCompactionEnabled(false);
+			await harness.session.bindExtensions({});
+			const loop = captureLoop(harness);
+			const path = join(harness.tempDir, "must-not-exist.txt");
+			const unknownId = "unknown-preflight";
+			const unknownCall = fauxToolCall("missing-tool", {}, { id: unknownId });
+			const nativeCall = fauxToolCall("write", { path, content: CONTENT }, { id: NATIVE_ID });
+			const calls = order === "unknown-first" ? [unknownCall, nativeCall] : [nativeCall, unknownCall];
+			const failedId = target === "unknown" ? unknownId : NATIVE_ID;
+			const startedIds = calls.slice(0, calls.findIndex((call) => call.id === failedId) + 1).map((call) => call.id);
+			harness.setResponses([
+				fauxAssistantMessage("capture loop-owned arrays"),
+				fauxAssistantMessage(calls, { stopReason: "toolUse" }),
+				fauxAssistantMessage("done"),
+			]);
+			const failure = new Error(`preflight ${stage} subscriber failed`);
+			let failureCalls = 0;
+			harness.session.subscribe((event) => {
+				if (event.type !== stage || event.toolCallId !== failedId) return;
+				failureCalls++;
+				throw failure;
+			});
+			const sessionEvents: AgentSessionEvent[] = [];
+			harness.session.subscribe((event) => {
+				sessionEvents.push(event);
+			});
+
+			await harness.session.prompt("do not execute tools after preflight publication fails");
+
+			// A start event is an obligation to settle, not permission to invoke a prepared native tool.
+			expect(execute).not.toHaveBeenCalled();
+			expect(existsSync(path)).toBe(false);
+			expect(failureCalls).toBe(1);
+			expect(harness.eventsOfType("tool_execution_start").map((event) => event.toolCallId)).toEqual(startedIds);
+			const completions = harness.eventsOfType("tool_execution_end");
+			expect(completions).toHaveLength(startedIds.length);
+			expect(sessionEvents.filter((event) => event.type === "tool_execution_start")).toEqual(
+				harness.eventsOfType("tool_execution_start"),
+			);
+			expect(sessionEvents.filter((event) => event.type === "tool_execution_end")).toEqual(completions);
+			const results = toolResults(harness.session.agent.state.messages);
+			expect(results.map((result) => result.toolCallId)).toEqual(startedIds);
+			for (const result of results) {
+				expect(result).toMatchObject({
+					toolName: result.toolCallId === unknownId ? "missing-tool" : "write",
+					isError: true,
+				});
+				const ends = completions.filter((event) => event.toolCallId === result.toolCallId);
+				expect(ends).toHaveLength(1);
+				expect(ends[0]).toMatchObject({ toolName: result.toolName, isError: true });
+				expect(ends[0].result.content).toEqual(result.content);
+			}
+			const canonical = JSON.parse(JSON.stringify(results)) as ToolResultMessage[];
+			const file = harness.sessionManager.getSessionFile();
+			if (!file) throw new Error("persistSession did not allocate a session file");
+			const disk = readFileSync(file, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line) as FileEntry);
+			const reopened = SessionManager.open(file);
+			const transcripts: Array<[string, AgentMessage[]]> = [
+				...loopTranscripts(harness, loop),
+				["SessionManager entries", entryMessages(harness.sessionManager.getEntries())],
+				["SessionManager branch", entryMessages(harness.sessionManager.getBranch())],
+				["SessionManager context", harness.sessionManager.buildSessionContext().messages],
+				["disk JSONL", entryMessages(disk)],
+				["reopened context", reopened.buildSessionContext().messages],
+			];
+			for (const [source, events] of [
+				["harness observer", harness.events],
+				["healthy session observer", sessionEvents],
+			] as const) {
+				for (const type of ["message_start", "message_end"] as const) {
+					transcripts.push([
+						`${source} ${type}`,
+						events.flatMap((event) => (event.type === type ? [event.message] : [])),
+					]);
+				}
+			}
+			for (const [source, messages] of transcripts) {
+				expect(JSON.parse(JSON.stringify(toolResults(messages))), source).toEqual(canonical);
+			}
+			expect(
+				harness.session.messages.filter(
+					(message) => message.role === "assistant" && message.errorMessage === failure.message,
+				),
+			).toHaveLength(1);
+			expect(harness.session.agent.state.pendingToolCalls.size).toBe(0);
+			expect(harness.session.agent.state.isStreaming).toBe(false);
+			expect(harness.session.isIdle).toBe(true);
+		},
+	);
+
+	// pi#274 / smarty-dev#10068: truncated native arguments must never execute, even when settlement listeners fail.
+	it.each(
+		(["write-first", "edit-first"] as const).flatMap((order) =>
+			(["none", "tool_execution_start", "tool_execution_end", "message_start", "message_end"] as const).map(
+				(stage) => ({ order, stage }),
+			),
+		),
+	)("truncated native batch $order survives $stage subscriber", async ({ order, stage }) => {
+		const writeTool = createWriteTool(process.cwd());
+		const editTool = createEditTool(process.cwd());
+		const writeExecute = vi.spyOn(writeTool, "execute");
+		const editExecute = vi.spyOn(editTool, "execute");
+		const harness = await createHarness({ persistSession: true, tools: [writeTool, editTool] });
 		harnesses.push(harness);
 		harness.session.setAutoRetryEnabled(false);
 		harness.session.setAutoCompactionEnabled(false);
 		await harness.session.bindExtensions({});
-		const path = join(harness.tempDir, "must-not-exist.txt");
-		const unknownId = "unknown-preflight";
-		const unknownCall = fauxToolCall("missing-tool", {}, { id: unknownId });
-		const nativeCall = fauxToolCall("write", { path, content: CONTENT }, { id: NATIVE_ID });
+		const loop = captureLoop(harness);
+		const writePath = join(harness.tempDir, "truncated-write.txt");
+		const editPath = join(harness.tempDir, "truncated-edit.txt");
+		writeFileSync(editPath, BEFORE);
+		const writeCall = fauxToolCall("write", { path: writePath, content: CONTENT }, { id: "truncated-write" });
+		const editCall = fauxToolCall(
+			"edit",
+			{ path: editPath, edits: [{ oldText: BEFORE, newText: CONTENT }] },
+			{ id: "truncated-edit" },
+		);
+		const calls = order === "write-first" ? [writeCall, editCall] : [editCall, writeCall];
+		const callIds = calls.map((call) => call.id);
 		harness.setResponses([
-			fauxAssistantMessage(order === "unknown-first" ? [unknownCall, nativeCall] : [nativeCall, unknownCall], {
-				stopReason: "toolUse",
-			}),
+			fauxAssistantMessage("capture loop-owned arrays"),
+			fauxAssistantMessage(calls, { stopReason: "length" }),
 			fauxAssistantMessage("done"),
 		]);
-		const failure = new Error(`preflight ${stage} subscriber failed`);
+		const failure = new Error(`truncated ${stage} subscriber failed`);
 		let failureCalls = 0;
 		harness.session.subscribe((event) => {
-			if (event.type !== stage) return;
-			if (event.toolCallId !== (stage === "tool_execution_end" ? unknownId : NATIVE_ID)) return;
+			const selected =
+				stage === "tool_execution_start" || stage === "tool_execution_end"
+					? event.type === stage && event.toolCallId === calls[1].id
+					: (event.type === "message_start" || event.type === "message_end") &&
+						event.type === stage &&
+						event.message.role === "toolResult" &&
+						event.message.toolCallId === calls[1].id;
+			if (!selected) return;
 			failureCalls++;
 			throw failure;
 		});
+		const sessionEvents: AgentSessionEvent[] = [];
+		harness.session.subscribe((event) => {
+			sessionEvents.push(event);
+		});
 
-		await harness.session.prompt("do not execute tools after preflight publication fails");
+		await harness.session.prompt("do not execute tools from a truncated response");
 
-		// An earlier prepared entry is still unstarted, even though its start event was emitted.
-		expect(existsSync(path)).toBe(false);
-		expect(failureCalls).toBe(1);
-		expect(harness.eventsOfType("tool_execution_end")).toMatchObject([
-			{ toolCallId: unknownId, toolName: "missing-tool", isError: true },
-		]);
+		expect(writeExecute).not.toHaveBeenCalled();
+		expect(editExecute).not.toHaveBeenCalled();
+		expect(existsSync(writePath)).toBe(false);
+		expect(readFileSync(editPath, "utf8")).toBe(BEFORE);
+		expect(failureCalls).toBe(stage === "none" ? 0 : 1);
 		const results = toolResults(harness.session.agent.state.messages);
-		expect(results).toHaveLength(1);
-		expect(results[0]).toMatchObject({ toolCallId: unknownId, toolName: "missing-tool", isError: true });
+		expect(results.map((result) => result.toolCallId)).toEqual(callIds);
+		for (const [index, result] of results.entries()) {
+			expect(result).toMatchObject({ toolName: calls[index].name, isError: true });
+			if (stage !== "tool_execution_start" || index === 0) {
+				expect(result.content).toEqual([
+					{
+						type: "text",
+						text: expect.stringContaining("output token limit"),
+					},
+				]);
+			}
+		}
+		const canonical = JSON.parse(JSON.stringify(results)) as ToolResultMessage[];
 		const file = harness.sessionManager.getSessionFile();
 		if (!file) throw new Error("persistSession did not allocate a session file");
 		const disk = readFileSync(file, "utf8")
 			.trim()
 			.split("\n")
 			.map((line) => JSON.parse(line) as FileEntry);
-		for (const messages of [
-			entryMessages(harness.sessionManager.getEntries()),
-			entryMessages(disk),
-			SessionManager.open(file).buildSessionContext().messages,
-			...(["message_start", "message_end"] as const).map((type) =>
-				harness.events.flatMap((event) => (event.type === type ? [event.message] : [])),
-			),
-		]) {
-			expect(toolResults(messages)).toEqual(results);
+		const transcripts: Array<[string, AgentMessage[]]> = [
+			...loopTranscripts(harness, loop),
+			["SessionManager entries", entryMessages(harness.sessionManager.getEntries())],
+			["SessionManager branch", entryMessages(harness.sessionManager.getBranch())],
+			["SessionManager context", harness.sessionManager.buildSessionContext().messages],
+			["disk JSONL", entryMessages(disk)],
+			["reopened context", SessionManager.open(file).buildSessionContext().messages],
+		];
+		for (const [source, events] of [
+			["harness observer", harness.events],
+			["healthy session observer", sessionEvents],
+		] as const) {
+			const starts = events.filter((event) => event.type === "tool_execution_start");
+			expect(
+				starts.map((event) => event.toolCallId),
+				source,
+			).toEqual(callIds);
+			const ends = events.filter((event) => event.type === "tool_execution_end");
+			expect(
+				ends.map((event) => event.toolCallId),
+				source,
+			).toEqual(callIds);
+			for (const [index, end] of ends.entries()) {
+				expect(end, source).toMatchObject({ toolName: calls[index].name, isError: true });
+				expect(end.result.content, source).toEqual(results[index].content);
+			}
+			for (const type of ["message_start", "message_end"] as const) {
+				transcripts.push([
+					`${source} ${type}`,
+					events.flatMap((event) => (event.type === type ? [event.message] : [])),
+				]);
+			}
 		}
-		expect(
-			harness.session.messages.filter(
-				(message) => message.role === "assistant" && message.errorMessage === failure.message,
-			),
-		).toHaveLength(1);
+		for (const [source, messages] of transcripts) {
+			expect(JSON.parse(JSON.stringify(toolResults(messages))), source).toEqual(canonical);
+		}
+		if (stage === "none") {
+			expect(harness.session.getLastAssistantText()).toBe("done");
+		} else {
+			expect(
+				harness.session.messages.filter(
+					(message) => message.role === "assistant" && message.errorMessage === failure.message,
+				),
+			).toHaveLength(1);
+		}
 		expect(harness.session.agent.state.pendingToolCalls.size).toBe(0);
+		expect(harness.session.agent.state.isStreaming).toBe(false);
 		expect(harness.session.isIdle).toBe(true);
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
 	});
 
 	// Smarty-Pants-Inc/smarty-dev#10068: explicit parallel scheduling must settle every completed sibling result.
