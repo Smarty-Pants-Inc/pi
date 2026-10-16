@@ -13,6 +13,11 @@ type InteractiveModePrototype = {
 type ImportCommandContext = {
 	clearStatusIndicator: () => void;
 	runtimeHost: { importFromJsonl: (inputPath: string, cwdOverride?: string) => Promise<{ cancelled: boolean }> };
+	// smarty-dev#13156: successful import restores unsent input before returning.
+	restoreUnsentInputDrafts: () => void;
+	session: { resumeUnsentInputs: () => Promise<void> };
+	isTerminalRuntimeCancellation: (error: unknown) => boolean;
+	handleInputAdmissionError: (error: unknown) => boolean;
 	showError: (message: string) => void;
 	showStatus: (message: string) => void;
 	showExtensionConfirm: (title: string, message: string) => Promise<boolean>;
@@ -69,6 +74,10 @@ describe("InteractiveMode /import parsing", () => {
 				throw new Error("unexpected fatal error");
 			}),
 			promptForMissingSessionCwd: vi.fn(async () => undefined),
+			restoreUnsentInputDrafts: vi.fn(),
+			session: { resumeUnsentInputs: vi.fn(async () => {}) },
+			isTerminalRuntimeCancellation: vi.fn(() => false),
+			handleInputAdmissionError: vi.fn(() => false),
 			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
 		};
 
@@ -101,6 +110,10 @@ describe("InteractiveMode /import parsing", () => {
 				throw new Error("unexpected fatal error");
 			}),
 			promptForMissingSessionCwd: vi.fn(async () => undefined),
+			restoreUnsentInputDrafts: vi.fn(),
+			session: { resumeUnsentInputs: vi.fn(async () => {}) },
+			isTerminalRuntimeCancellation: vi.fn(() => false),
+			handleInputAdmissionError: vi.fn(() => false),
 			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
 		};
 
@@ -132,6 +145,10 @@ describe("InteractiveMode /import parsing", () => {
 			renderCurrentSessionState: vi.fn(),
 			handleFatalRuntimeError,
 			promptForMissingSessionCwd: vi.fn(async () => undefined),
+			restoreUnsentInputDrafts: vi.fn(),
+			session: { resumeUnsentInputs: vi.fn(async () => {}) },
+			isTerminalRuntimeCancellation: vi.fn(() => false),
+			handleInputAdmissionError: vi.fn(() => false),
 			getPathCommandArgument: interactiveModePrototype.getPathCommandArgument,
 		};
 
