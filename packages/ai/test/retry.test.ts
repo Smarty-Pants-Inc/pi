@@ -16,12 +16,16 @@ const azurePeakLoadError =
 	"The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.";
 
 describe("provider retry classification", () => {
+	// Fork contract: 2f7bc1365047f8a4361a083c17851512d2d2c6b4; retained by 05ea5a83179db695c07f43ea7241d4775390e170.
 	it.each([
 		"Selected model is at capacity. Please try a different model.",
 		'{"message":"Selected model is at capacity. Please try a different model."}',
 		"SELECTED MODEL IS AT CAPACITY. PLEASE TRY A DIFFERENT MODEL.",
+		"slow_down",
+		'{"error":{"code":"slow_down"}}',
+		"(SLOW_DOWN): request deferred",
 		"server_is_overloaded",
-	])("matches exact capacity text and baseline overloaded errors: %s", (errorMessage) => {
+	])("matches exact capacity text and delimited codes: %s", (errorMessage) => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 	});
 
@@ -32,12 +36,8 @@ describe("provider retry classification", () => {
 		"Selected model is at capacity.",
 		"Please try a different model.",
 		"at capacity; try again",
-		// Consumer audit row 22 drops inference slow_down; OAuth polling keeps its separate protocol handling.
 		"request limit reached",
 		"slow down",
-		"slow_down",
-		'{"error":{"code":"slow_down"}}',
-		"(SLOW_DOWN): request deferred",
 		"preslow_down",
 		"slow_downstream",
 		"slow_down_extra",
@@ -261,6 +261,29 @@ describe("retryAssistantCall", () => {
 		expect(produce).toHaveBeenCalledTimes(4); // 1 initial + 3 retries
 		expect(onRetryScheduled).toHaveBeenCalledTimes(3);
 		expect(onRetryFinished).toHaveBeenCalledWith(false, 3, "terminated");
+	});
+
+	// pi#280: the restored 2f7bc1365 classifier still requires a retry budget and no output.
+	it.each([
+		["empty error", "", "error", 4, 3],
+		["aborted", "", "aborted", 1, 0],
+		["successful stop", "", "stop", 1, 0],
+		["answer output", "visible answer", "error", 1, 0],
+	] as const)("bounds slow_down retries for %s", async (_label, text, stopReason, calls, retries) => {
+		const produce = vi.fn(async () => fauxAssistantMessage(text, { stopReason, errorMessage: "slow_down" }));
+		const onRetryScheduled = vi.fn();
+		const onRetryFinished = vi.fn();
+		const res = await retryAssistantCall(produce, enabled, undefined, { onRetryScheduled, onRetryFinished });
+		expect(res.stopReason).toBe(stopReason);
+		expect(res.content).toEqual([{ type: "text", text }]);
+		expect(produce).toHaveBeenCalledTimes(calls);
+		expect(onRetryScheduled).toHaveBeenCalledTimes(retries);
+		if (retries > 0) {
+			expect(res.recovery).toEqual({ recovery: "retryable", retryable: true });
+			expect(onRetryFinished).toHaveBeenCalledWith(false, retries, "slow_down");
+		} else {
+			expect(onRetryFinished).not.toHaveBeenCalled();
+		}
 	});
 
 	it("reports capped retry delays", async () => {
