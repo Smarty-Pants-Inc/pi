@@ -2,7 +2,7 @@ import type { ImageContent, Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
 import type { AgentSession, PromptOptions } from "../src/core/agent-session.ts";
-import { bindReceivedInputSession, receiveInput } from "../src/core/received-input.ts";
+import { bindReceivedInputSession, type ReceivedInput, receiveInput } from "../src/core/received-input.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -324,6 +324,7 @@ describe("InteractiveMode compaction events", () => {
 		const snapshots: { kind: string; transfers: number; queued: number }[] = [];
 		const fakeThis = {
 			compactionQueuedMessages: [...queued],
+			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
@@ -381,6 +382,7 @@ describe("InteractiveMode compaction events", () => {
 			];
 			const fakeThis = {
 				compactionQueuedMessages: [...batch],
+				compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 				compactionQueueTransfers: 0,
 				compactionQueueWork: new Set<Promise<void>>(),
 				recoveredImages: new Map<string, ImageContent>(),
@@ -442,6 +444,7 @@ describe("InteractiveMode compaction events", () => {
 	test("preserves steering behavior when flushing into an active agent run", async () => {
 		const fakeThis = {
 			compactionQueuedMessages: [{ input: receiveInput("change direction"), mode: "steer" as const }],
+			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
