@@ -553,6 +553,7 @@ export class AgentSession {
 	private _hasResumedInputs = false;
 	private readonly _unsentInputDrafts: AgentMessage[] = [];
 	private _queuedInputRevision = 0;
+	private _queueDrainError?: UnsupportedUnsentInputError;
 	private _operatorExitPrepared = false;
 	readonly capabilities = HOST_CAPABILITIES;
 	private readonly _inputAdmissions = new Set<InputAdmission>();
@@ -795,6 +796,24 @@ export class AgentSession {
 				},
 			});
 		}
+
+		const previousValidateQueuedMessages = this.agent.validateQueuedMessages;
+		this.agent.validateQueuedMessages = (messages, mode) => {
+			if (this._inputsDisposed) {
+				previousValidateQueuedMessages?.(messages, mode);
+				return;
+			}
+			// Raw Agent listeners run before session observation and can throw after native dequeue.
+			// Refuse an unreplayable batch before reservation, not in a message_start listener.
+			for (const message of messages) {
+				if (!readUnsentInput({ message, mode })) {
+					const error = new UnsupportedUnsentInputError(message.role, mode);
+					this._queueDrainError = error;
+					throw error;
+				}
+			}
+			previousValidateQueuedMessages?.(messages, mode);
+		};
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -2651,6 +2670,7 @@ export class AgentSession {
 		};
 		this._stopAfterCompactionFailure = false;
 		this._compactionStopOutcome = undefined;
+		this._queueDrainError = undefined;
 		this._inputPublicationFailed = false;
 		if (!prepared) this._agentRunAbortRequested = false;
 		this._failedResponse = undefined;
@@ -2803,6 +2823,9 @@ export class AgentSession {
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean> {
+		// Agent publishes loop failures as assistant errors. Preserve this typed refusal and
+		// do not automatically retry the same retained batch forever.
+		if (this._queueDrainError) throw this._queueDrainError;
 		const message = this._lastAssistantMessage;
 		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;

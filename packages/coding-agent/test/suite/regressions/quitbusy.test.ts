@@ -511,6 +511,249 @@ describe("operator exit and compaction settlement", () => {
 		agent.clearAllQueues();
 	});
 
+	// pi#272 / smarty-dev#3155: refuse unreplayable batches before native listeners can half-publish them.
+	it.each(
+		(["steer", "followUp"] as const).flatMap((mode) =>
+			(["assistant", "toolResult"] as const).flatMap((role) =>
+				(["all", "one-at-a-time"] as const).flatMap((queueMode) =>
+					[0, 1, 2].map((position) => ({ mode, role, queueMode, position })),
+				),
+			),
+		),
+	)("P1 active raw $mode $role $queueMode $position", async ({ mode, role, queueMode, position }) => {
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false }, retry: { enabled: false } },
+		});
+		harnesses.push(h);
+		h.session.dispose();
+		const unsupported: AgentMessage =
+			role === "assistant"
+				? fauxAssistantMessage("raw assistant")
+				: {
+						role: "toolResult",
+						toolCallId: "raw-call",
+						toolName: "raw-tool",
+						content: [{ type: "text", text: "raw result" }],
+						isError: false,
+						timestamp: 1,
+					};
+		const valid: AgentMessage[] = [
+			{ role: "user", content: "valid before or after", timestamp: 1 },
+			{ role: "custom", customType: "valid-aside", content: "valid custom", display: true, timestamp: 1 },
+		];
+		const batch = [...valid];
+		batch.splice(position, 0, unsupported);
+		const agent = new Agent({
+			streamFn: streamSimple,
+			convertToLlm,
+			initialState: { model: h.getModel(), tools: [] },
+			steeringMode: queueMode,
+			followUpMode: queueMode,
+		});
+		let rawStarts = 0;
+		agent.subscribe((event) => {
+			if (event.type === "message_start" && event.message === unsupported) {
+				rawStarts++;
+				throw new Error("pi#272 earlier native listener rejected raw role");
+			}
+		});
+		const session = new AgentSession({
+			agent,
+			sessionManager: h.sessionManager,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(session);
+		let occurrences: ReturnType<Agent["getQueuedMessageOccurrences"]> = [];
+		h.setResponses([
+			async () => {
+				expect(agent.signal).toBeDefined();
+				for (const message of batch) agent[mode](message);
+				occurrences = agent.getQueuedMessageOccurrences();
+				return fauxAssistantMessage("active reply");
+			},
+			fauxAssistantMessage("valid prefix reply"),
+			fauxAssistantMessage("valid prefix reply two"),
+		]);
+		const failure = await session.prompt("active").catch((error: unknown) => error);
+		const retained = queueMode === "all" ? occurrences : occurrences.slice(position);
+		expect.soft(rawStarts).toBe(0);
+		expect.soft(agent.getQueuedMessageOccurrences()).toEqual(retained);
+		expect(failure).toBeInstanceOf(UnsupportedUnsentInputError);
+		expect(failure).toMatchObject({ role, mode, code: "INPUT_ADMISSION_BUSY" });
+		expect(
+			h.sessionManager
+				.getEntries()
+				.some((entry) => entry.type === "message" && isDeepStrictEqual(entry.message, unsupported)),
+		).toBe(false);
+		const beforeExit = structuredClone(h.sessionManager.getEntries());
+		expect(() => session.prepareOperatorExit()).toThrow(UnsupportedUnsentInputError);
+		expect(h.sessionManager.getEntries()).toEqual(beforeExit);
+		expect(agent.getQueuedMessageOccurrences()).toEqual(retained);
+		// Removing only the unsupported occurrence must unblock the original valid FIFO suffix.
+		agent.removeQueuedMessages((message) => message === unsupported);
+		h.setResponses([
+			fauxAssistantMessage("recovered one"),
+			fauxAssistantMessage("recovered two"),
+			fauxAssistantMessage("recovered three"),
+		]);
+		await session.prompt("recover");
+		expect(agent.getQueuedMessages()).toEqual([]);
+		const entries = h.sessionManager.getEntries();
+		const delivered = entries.filter(
+			(entry) =>
+				(entry.type === "message" && isDeepStrictEqual(entry.message, valid[0])) ||
+				(entry.type === "custom_message" && entry.customType === "valid-aside"),
+		);
+		expect(delivered.map((entry) => entry.type)).toEqual(["message", "custom_message"]);
+	});
+
+	// pi#272 / smarty-dev#3155: session policy must not narrow standalone Agent's all-role queue contract.
+	it.each(
+		(["steer", "followUp"] as const).flatMap((mode) =>
+			(["all", "one-at-a-time"] as const).map((queueMode) => ({ mode, queueMode })),
+		),
+	)("P1 standalone raw $mode $queueMode still delivers all roles", async ({ mode, queueMode }) => {
+		const h = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		h.session.dispose();
+		const agent = new Agent({
+			streamFn: streamSimple,
+			convertToLlm,
+			initialState: { model: h.getModel(), tools: [] },
+			steeringMode: queueMode,
+			followUpMode: queueMode,
+		});
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "raw user", timestamp: 1 },
+			{ role: "custom", customType: "standalone", content: "raw custom", display: true, timestamp: 1 },
+			fauxAssistantMessage("raw assistant"),
+			{
+				role: "toolResult",
+				toolCallId: "raw-call",
+				toolName: "raw-tool",
+				content: [],
+				isError: false,
+				timestamp: 1,
+			},
+			{ role: "system", content: "raw system", timestamp: 1 },
+		];
+		const starts: AgentMessage[] = [];
+		const ends: AgentMessage[] = [];
+		agent.subscribe((event) => {
+			if (event.type === "message_start" && messages.includes(event.message)) starts.push(event.message);
+			if (event.type === "message_end" && messages.includes(event.message)) ends.push(event.message);
+		});
+		h.setResponses([
+			async () => {
+				for (const message of messages) agent[mode](message);
+				return fauxAssistantMessage("first");
+			},
+			...messages.map(() => fauxAssistantMessage("next")),
+		]);
+		await agent.prompt("active");
+		expect(starts).toEqual(messages);
+		expect(ends).toEqual(messages);
+		expect(agent.getQueuedMessageOccurrences()).toEqual([]);
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
+	// pi#272 / smarty-dev#3155: continue uses the same validation, including pre-attachment queues.
+	it.each(
+		(["steer", "followUp"] as const).flatMap((mode) =>
+			(["assistant", "toolResult"] as const).map((role) => ({ mode, role })),
+		),
+	)("P1 queued continue $mode $role refuses before run start", async ({ mode, role }) => {
+		const h = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		h.session.dispose();
+		const message: AgentMessage =
+			role === "assistant"
+				? fauxAssistantMessage("raw")
+				: {
+						role: "toolResult",
+						toolCallId: "raw-call",
+						toolName: "raw-tool",
+						content: [],
+						isError: false,
+						timestamp: 1,
+					};
+		const agent = new Agent({
+			streamFn: streamSimple,
+			convertToLlm,
+			initialState: { model: h.getModel(), messages: [fauxAssistantMessage("previous")] },
+		});
+		agent[mode](message);
+		const occurrences = agent.getQueuedMessageOccurrences();
+		const session = new AgentSession({
+			agent,
+			sessionManager: h.sessionManager,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(session);
+		const events: string[] = [];
+		agent.subscribe((event) => {
+			events.push(event.type);
+		});
+		await expect(agent.continue({ fromQueuedMessages: true })).rejects.toMatchObject({
+			name: "UnsupportedUnsentInputError",
+			role,
+			mode,
+		});
+		expect(events).toEqual([]);
+		expect(agent.getQueuedMessageOccurrences()).toEqual(occurrences);
+		expect(agent.signal).toBeUndefined();
+	});
+
+	// pi#272 / smarty-dev#3155: disposal detaches the Session validator from direct Agent reuse.
+	it.each(
+		(["steer", "followUp"] as const).flatMap((mode) =>
+			(["all", "one-at-a-time"] as const).map((queueMode) => ({ mode, queueMode })),
+		),
+	)("P2 post-dispose raw $mode assistant/toolResult $queueMode still delivers", async ({ mode, queueMode }) => {
+		const h = await createHarness({ settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		const agent = h.session.agent;
+		agent.steeringMode = queueMode;
+		agent.followUpMode = queueMode;
+		h.session.dispose();
+		const messages: AgentMessage[] = [
+			fauxAssistantMessage("raw assistant"),
+			{
+				role: "toolResult",
+				toolCallId: "raw-call",
+				toolName: "raw-tool",
+				content: [],
+				isError: false,
+				timestamp: 1,
+			},
+		];
+		const starts: AgentMessage[] = [];
+		const ends: AgentMessage[] = [];
+		agent.subscribe((event) => {
+			if (event.type === "message_start" && messages.includes(event.message)) starts.push(event.message);
+			if (event.type === "message_end" && messages.includes(event.message)) ends.push(event.message);
+		});
+		h.setResponses([
+			async () => {
+				for (const message of messages) agent[mode](message);
+				return fauxAssistantMessage("active");
+			},
+			...messages.map(() => fauxAssistantMessage("next")),
+		]);
+		await agent.prompt("active");
+		expect(starts).toEqual(messages);
+		expect(ends).toEqual(messages);
+		expect(agent.getQueuedMessageOccurrences()).toEqual([]);
+		expect(agent.state.errorMessage).toBeUndefined();
+	});
+
 	// pi#262 / smarty-dev#3155: raw custom carriers preserve details and get one actual consumption link.
 	it.each(["steer", "followUp"] as const)("P1-B raw custom %s survives quit and two resumes", async (mode) => {
 		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
