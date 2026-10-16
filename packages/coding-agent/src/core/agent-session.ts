@@ -432,7 +432,7 @@ export interface ExtensionBindings {
 export type QueuedInputDisposition = "handled" | "queued";
 export type PromptDisposition = QueuedInputDisposition | "started";
 
-/** Operator exit refused before writing or clearing input the outbox reader cannot replay. */
+/** Queue transfer or operator exit refused before losing input the outbox reader cannot replay. */
 export class UnsupportedUnsentInputError extends InputAdmissionError {
 	readonly role: AgentMessage["role"];
 	readonly mode: UnsentInput["mode"];
@@ -604,6 +604,7 @@ export class AgentSession {
 	private _hasResumedInputs = false;
 	private readonly _unsentInputDrafts: AgentMessage[] = [];
 	private _queuedInputRevision = 0;
+	private _queueDrainError?: UnsupportedUnsentInputError;
 	private _operatorExitPrepared = false;
 	readonly capabilities = HOST_CAPABILITIES;
 	private readonly _inputAdmissions = new Set<InputAdmission>();
@@ -895,6 +896,24 @@ export class AgentSession {
 				},
 			});
 		}
+
+		const previousValidateQueuedMessages = this.agent.validateQueuedMessages;
+		this.agent.validateQueuedMessages = (messages, mode) => {
+			if (this._inputsDisposed) {
+				previousValidateQueuedMessages?.(messages, mode);
+				return;
+			}
+			// Raw Agent listeners run before session observation and can throw after native dequeue.
+			// Refuse an unreplayable batch before reservation, not in a message_start listener.
+			for (const message of messages) {
+				if (!readUnsentInput({ message, mode })) {
+					const error = new UnsupportedUnsentInputError(message.role, mode);
+					this._queueDrainError = error;
+					throw error;
+				}
+			}
+			previousValidateQueuedMessages?.(messages, mode);
+		};
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -2961,6 +2980,7 @@ export class AgentSession {
 		};
 		this._stopAfterCompactionFailure = false;
 		this._compactionStopOutcome = undefined;
+		this._queueDrainError = undefined;
 		if (!prepared) this._agentRunAbortRequested = false;
 		// Compaction before the prompt may have scheduled a retry; the new prompt replaces it.
 		this._failedResponse = undefined;
@@ -3134,6 +3154,9 @@ export class AgentSession {
 	}
 
 	private async _handlePostAgentRun(): Promise<boolean | "queuedInput"> {
+		// Agent publishes loop failures as assistant errors. Preserve this typed refusal and
+		// do not automatically retry the same retained batch forever.
+		if (this._queueDrainError) throw this._queueDrainError;
 		const message = this._lastAssistantMessage;
 		const toolResults = this._lastAssistantToolResults;
 		this._lastAssistantMessage = undefined;

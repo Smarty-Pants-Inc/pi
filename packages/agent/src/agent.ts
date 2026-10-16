@@ -189,7 +189,7 @@ class PendingMessageQueue {
 		return this.messages.length;
 	}
 
-	reserve(): AgentMessage[] {
+	reserve(validate?: (messages: readonly AgentMessage[]) => void): AgentMessage[] {
 		// The loop can fail preparation after taking a batch. Keep the original
 		// messages here until message_start, including their images and order.
 		const end = this.mode === "all" ? this.messages.length : Math.min(this.reserved + 1, this.messages.length);
@@ -197,7 +197,10 @@ class PendingMessageQueue {
 		// so clear can invalidate its iterator. Concurrent selectors would need
 		// separate reservations.
 		const selected = this.messages.slice(this.reserved, end);
-		this.selected = selected.map(({ message }) => message);
+		const messages = selected.map(({ message }) => message);
+		// Session retention must accept the complete batch before any occurrence transfers.
+		validate?.(messages);
+		this.selected = messages;
 		this.selectedOccurrences = selected.map(({ id }) => id);
 		this.reserved = end;
 		return this.selected;
@@ -272,6 +275,8 @@ export class Agent {
 	) => Promise<AfterToolCallResult | undefined>;
 	public transformToolUpdate?: AgentLoopConfig["transformToolUpdate"];
 	public finishTurn?: FinishTurn;
+	/** @internal Synchronous batch check before reservation or message publication. Does not restrict enqueue admission. */
+	public validateQueuedMessages?: (messages: readonly AgentMessage[], mode: "steer" | "followUp") => void;
 	public prepareRequest?: PrepareRequest;
 	public prepareNextTurn?: (
 		signal?: AbortSignal,
@@ -539,13 +544,13 @@ export class Agent {
 		}
 
 		if (lastMessage.role === "assistant" || options?.fromQueuedMessages) {
-			const queuedSteering = this.steeringQueue.reserve();
+			const queuedSteering = this.reserveQueuedMessages("steer");
 			if (queuedSteering.length > 0) {
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
-			const queuedFollowUps = this.followUpQueue.reserve();
+			const queuedFollowUps = this.reserveQueuedMessages("followUp");
 			if (queuedFollowUps.length > 0) {
 				await this.runPromptMessages(queuedFollowUps);
 				return;
@@ -615,6 +620,11 @@ export class Agent {
 		};
 	}
 
+	private reserveQueuedMessages(mode: "steer" | "followUp"): AgentMessage[] {
+		const queue = mode === "steer" ? this.steeringQueue : this.followUpQueue;
+		return queue.reserve((messages) => this.validateQueuedMessages?.(messages, mode));
+	}
+
 	private createLoopConfig(options: { skipInitialSteeringPoll?: boolean } = {}): AgentLoopConfig {
 		let skipInitialSteeringPoll = options.skipInitialSteeringPoll === true;
 		return {
@@ -650,9 +660,9 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.reserve();
+				return this.reserveQueuedMessages("steer");
 			},
-			getFollowUpMessages: async () => this.followUpQueue.reserve(),
+			getFollowUpMessages: async () => this.reserveQueuedMessages("followUp"),
 		};
 	}
 
