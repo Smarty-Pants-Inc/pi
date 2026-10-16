@@ -13,8 +13,7 @@ import type {
 	ModelType,
 	ModelTypeMap,
 } from "../types.ts";
-import { formatThrownValue } from "./diagnostics.ts";
-import { ModelsError, SafeSetupError } from "./models-error.ts";
+import { formatThrownValue, ModelsError, SafeSetupError } from "./models-error.ts";
 
 /** The type of a model. Models without `type` are chat models. */
 export function getModelType(model: AnyModel): ModelType {

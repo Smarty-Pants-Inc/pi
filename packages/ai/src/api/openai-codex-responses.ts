@@ -23,14 +23,11 @@ import type {
 } from "../types.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
-import {
-	appendAssistantMessageDiagnostic,
-	createAssistantMessageDiagnostic,
-	formatThrownValue,
-} from "../utils/diagnostics.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, ProviderDataError, providerLabel } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { formatThrownValue } from "../utils/models-error.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import {

@@ -45,6 +45,7 @@ export * from "./utils/assistant-message-snapshot.ts";
 export * from "./utils/diagnostics.ts";
 export * from "./utils/event-stream.ts";
 export * from "./utils/json-parse.ts";
+export { formatThrownValue } from "./utils/models-error.ts";
 export * from "./utils/overflow.ts";
 export { ProviderRequestLimitError } from "./utils/provider-retry.ts";
 export * from "./utils/retry.ts";

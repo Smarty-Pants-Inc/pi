@@ -13,8 +13,7 @@
 
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantRecovery } from "../types.ts";
-import { ProviderRequestLimitError } from "./provider-retry.ts";
-import { classifyProviderFailure, validHttpStatus } from "./recovery.ts";
+import { classifyProviderFailure, isSmartyLimitError, ProviderRequestLimitError, validHttpStatus } from "./recovery.ts";
 
 export interface NormalizedProviderError {
 	/** HTTP status code, when one could be extracted from the SDK error object. */
@@ -182,10 +181,8 @@ const MAX_SMARTY_RESET_MS = 31 * 24 * 60 * 60 * 1000;
 
 /** Render only closed window names and a bounded, locally formatted reset time. */
 export function smartyLimitMessage(error: unknown): string | undefined {
-	const body = (error as { error?: unknown } | null | undefined)?.error;
-	if (typeof body !== "object" || body === null) return undefined;
-	const { code, type, throttled, window, resets_at: resetsAt } = body as Record<string, unknown>;
-	if (code !== "smarty_limit" && type !== "smarty_limit") return undefined;
+	if (!isSmartyLimitError(error)) return undefined;
+	const { throttled, window, resets_at: resetsAt } = error.error;
 	if (throttled === true) return SMARTY_THROTTLE_MESSAGE;
 	const name =
 		typeof window === "string" && Object.hasOwn(SMARTY_LIMIT_WINDOWS, window) ? SMARTY_LIMIT_WINDOWS[window] : "plan";

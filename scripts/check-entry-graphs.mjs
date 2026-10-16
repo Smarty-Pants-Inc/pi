@@ -43,15 +43,18 @@ const BUDGETS = {
 	},
 	"packages/codemode": {
 		// Node and Bun users never load the Cloudflare entry, which imports the `cloudflare:workers` built-in.
-		".": { maxFiles: 12, forbid: ["codemode/src/cloudflare.ts"] },
+		// Shared runtime/limits.ts enforces finite host/worker traffic, call, and memory quotas.
+		".": { maxFiles: 13, forbid: ["codemode/src/cloudflare.ts"] },
 		// Runtimes without Node built-ins (Workers, browsers) import these; neither may reach the worker-thread host
 		// or the file-based wasm loader.
 		"./portable": {
-			maxFiles: 8,
+			// Shared runtime/limits.ts retains finite host/worker traffic, call, and memory quotas.
+			maxFiles: 9,
 			forbid: ["codemode/src/index.ts", "runtime/host.ts", "runtime/worker.ts", "codemode/src/wasm.ts"],
 		},
 		"./cloudflare": {
-			maxFiles: 9,
+			// Shared runtime/limits.ts also bounds Cloudflare host/worker traffic, calls, and memory.
+			maxFiles: 10,
 			forbid: ["codemode/src/index.ts", "runtime/host.ts", "runtime/worker.ts", "codemode/src/wasm.ts"],
 		},
 	},

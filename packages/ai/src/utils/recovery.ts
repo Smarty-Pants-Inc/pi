@@ -1,6 +1,22 @@
 // Universal pre-suppression classification from private provider fields (smarty-dev#5822 C3).
 import type { AssistantMessage, AssistantRecovery, AssistantRecoveryClass } from "../types.ts";
 
+/** Local admission failures are terminal, not provider failures to retry. */
+export class ProviderRequestLimitError extends Error {
+	constructor(requests: number, limit: number) {
+		super(`Provider request limit reached (${requests}/${limit}); no further requests allowed`);
+		this.name = "ProviderRequestLimitError";
+	}
+}
+
+/** Classify the owned limit code without loading HTTP-body formatting or credential masking. */
+export function isSmartyLimitError(error: unknown): error is { error: Record<string, unknown> } {
+	const body = (error as { error?: unknown } | null | undefined)?.error;
+	if (typeof body !== "object" || body === null) return false;
+	const { code, type } = body as Record<string, unknown>;
+	return code === "smarty_limit" || type === "smarty_limit";
+}
+
 function buildProviderErrorPattern(patterns: readonly string[]): RegExp {
 	return new RegExp(patterns.join("|"), "i");
 }

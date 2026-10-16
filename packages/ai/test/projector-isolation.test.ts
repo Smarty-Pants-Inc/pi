@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AssistantMessage, AssistantMessageEvent } from "../src/types.ts";
-import { projectAssistantMessage } from "../src/utils/diagnostics.ts";
+import { projectAssistantMessage } from "../src/utils/assistant-message-snapshot.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 
 // smarty-dev#5443 S2 / smarty-dev#5822 C2 / pi#159: one isolation pass per published message.

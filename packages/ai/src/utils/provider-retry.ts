@@ -1,5 +1,7 @@
 import type { ProviderRequestOptions } from "../types.ts";
-import { smartyLimitMessage } from "./error-body.ts";
+import { isSmartyLimitError, ProviderRequestLimitError } from "./recovery.ts";
+
+export { ProviderRequestLimitError } from "./recovery.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
@@ -26,7 +28,7 @@ function isProviderError(error: unknown): error is ProviderError {
 
 /** Mirrors the pinned OpenAI/Anthropic SDK retry policy; review when either SDK is upgraded. */
 function isRetryableProviderError(error: ProviderError): boolean {
-	if (smartyLimitMessage(error) !== undefined) return false;
+	if (isSmartyLimitError(error)) return false;
 	const shouldRetry = error.headers?.get("x-should-retry");
 	if (shouldRetry === "true") return true;
 	if (shouldRetry === "false") return false;
@@ -70,13 +72,6 @@ function getRetryDelayMs(error: ProviderError, retryIndex: number, maxRetryDelay
 
 	const exponentialDelay = Math.min(0.5 * 2 ** retryIndex, 8) * 1000;
 	return exponentialDelay * (1 - Math.random() * 0.25);
-}
-
-export class ProviderRequestLimitError extends Error {
-	constructor(requests: number, limit: number) {
-		super(`Provider request limit reached (${requests}/${limit}); no further requests allowed`);
-		this.name = "ProviderRequestLimitError";
-	}
 }
 
 function createAbortError(signal?: AbortSignal): Error {

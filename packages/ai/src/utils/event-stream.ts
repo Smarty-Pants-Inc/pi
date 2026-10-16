@@ -1,6 +1,11 @@
 import { redactOAuthDiagnostic, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
-import { cloneToolCall, type PublicationPhase, projectAssistantMessage, terminalPhase } from "./diagnostics.ts";
+import {
+	cloneToolCall,
+	type PublicationPhase,
+	projectAssistantMessage,
+	terminalPhase,
+} from "./assistant-message-snapshot.ts";
 import { assistantRecovery, ownedRecovery, transferThrottledLimitWait } from "./recovery.ts";
 
 class FifoQueue<T> {
