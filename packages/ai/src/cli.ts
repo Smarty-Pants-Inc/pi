@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { writePrivateAuthFile } from "./cli-auth.ts";
 import type { AuthPrompt, OAuthCredential, Provider } from "./index.ts";
 import { builtinProviders } from "./providers/all.ts";
 
@@ -26,7 +27,7 @@ function loadAuth(): Record<string, OAuthCredential> {
 }
 
 function saveAuth(auth: Record<string, OAuthCredential>): void {
-	writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), "utf-8");
+	writePrivateAuthFile(AUTH_FILE, JSON.stringify(auth, null, 2));
 }
 
 async function answerPrompt(rl: ReturnType<typeof createInterface>, authPrompt: AuthPrompt): Promise<string> {

@@ -1,5 +1,40 @@
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import type { Api, AssistantMessage, AssistantMessageEvent, Model, ProviderStreams } from "../types.ts";
-import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { AssistantMessageEventStream, protectAssistantMessageStream } from "../utils/event-stream.ts";
+import { ModelsError, SafeSetupError } from "../utils/models-error.ts";
+
+export { SafeSetupError } from "../utils/models-error.ts";
+
+/** Classification itself is untrusted: instanceof and code access can invoke Proxy traps. */
+export function requestSetupError(error: unknown, preserveCode = false): SafeSetupError {
+	try {
+		if (preserveCode && error instanceof SafeSetupError) return new SafeSetupError(error.code);
+		if (error instanceof ModelsError) return new SafeSetupError("setup_ModelsError");
+		if (error instanceof TypeError) return new SafeSetupError("setup_TypeError");
+		if (error instanceof RangeError) return new SafeSetupError("setup_RangeError");
+		if (error instanceof SyntaxError) return new SafeSetupError("setup_SyntaxError");
+		if (error instanceof ReferenceError) return new SafeSetupError("setup_ReferenceError");
+		if (error instanceof URIError) return new SafeSetupError("setup_URIError");
+		if (error instanceof EvalError) return new SafeSetupError("setup_EvalError");
+		if (error instanceof Error) return new SafeSetupError("setup_Error");
+	} catch {
+		// Never surface the trap's thrown value or attempt another classification.
+	}
+	return new SafeSetupError("setup_ThrownValue");
+}
+
+function setupErrorText(error: unknown): string {
+	try {
+		if (error instanceof SafeSetupError) return new SafeSetupError(error.code).message;
+		if (error instanceof Error && !(error instanceof ModelsError)) {
+			const message = error.message;
+			if (typeof message === "string" && message) return message;
+		}
+	} catch {
+		// A Proxy trap or hostile accessor falls through to a fixed category.
+	}
+	return requestSetupError(error).message;
+}
 
 function createSetupErrorMessage(model: Model<Api>, error: unknown, timestamp: number): AssistantMessage {
 	return {
@@ -17,7 +52,7 @@ function createSetupErrorMessage(model: Model<Api>, error: unknown, timestamp: n
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		stopReason: "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
+		errorMessage: setupErrorText(error),
 		timestamp,
 	};
 }
@@ -45,12 +80,12 @@ async function forwardStream(
  */
 export function lazyStream(
 	model: Model<Api>,
-	setup: () => Promise<AsyncIterable<AssistantMessageEvent>>,
+	setup: (outer: AssistantMessageEventStream) => Promise<AsyncIterable<AssistantMessageEvent>>,
 ): AssistantMessageEventStream {
 	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
 
-	setup()
+	setup(outer)
 		.then((inner) => forwardStream(outer, inner))
 		.catch((error) => {
 			const message = createSetupErrorMessage(model, error, startedAt);
@@ -74,14 +109,21 @@ export interface LazyApiCapabilities {
 export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
 	const api: ProviderStreams = {
 		stream: (model, context, options) =>
-			lazyStream(model, async () => (await load()).stream(model, context, options)),
+			lazyStream(model, async (outer) => {
+				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+				return (await load()).stream(model, context, options);
+			}),
 		streamSimple: (model, context, options) =>
-			lazyStream(model, async () => (await load()).streamSimple(model, context, options)),
+			lazyStream(model, async (outer) => {
+				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+				return (await load()).streamSimple(model, context, options);
+			}),
 	};
 
 	if (capabilities?.fetchDeferred) {
 		api.fetchDeferred = (model, handle, options) =>
-			lazyStream(model, async () => {
+			lazyStream(model, async (outer) => {
+				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
 				const implementation = await load();
 				if (!implementation.fetchDeferred) throw new Error("API does not support deferred responses");
 				return implementation.fetchDeferred(model, handle, options);

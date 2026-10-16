@@ -19,6 +19,8 @@ import type {
 	Usage,
 } from "../types.ts";
 import { createAssistantMessageEventStream } from "../utils/event-stream.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
+import { transferThrottledLimitWait } from "../utils/retry.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 
 const DEFAULT_API = "faux";
@@ -271,7 +273,7 @@ function withUsageEstimate(
 		promptCache.set(sessionId, prompt);
 	}
 
-	return {
+	const result: AssistantMessage = {
 		...message,
 		usage: {
 			input,
@@ -282,6 +284,8 @@ function withUsageEstimate(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 	};
+	transferThrottledLimitWait(message, result);
+	return result;
 }
 
 function splitStringByTokenSize(text: string, minTokenSize: number, maxTokenSize: number): string[] {
@@ -298,7 +302,7 @@ function splitStringByTokenSize(text: string, minTokenSize: number, maxTokenSize
 
 function cloneMessage(message: AssistantMessage, api: string, provider: string, modelId: string): AssistantMessage {
 	const cloned = structuredClone(message);
-	return {
+	const result: AssistantMessage = {
 		...cloned,
 		api,
 		provider,
@@ -306,6 +310,8 @@ function cloneMessage(message: AssistantMessage, api: string, provider: string, 
 		timestamp: cloned.timestamp ?? Date.now(),
 		usage: cloned.usage ?? DEFAULT_USAGE,
 	};
+	transferThrottledLimitWait(message, result);
+	return result;
 }
 
 function createDeferredMessage(model: Model<string>, handle: DeferredHandle): AssistantMessage {
@@ -526,7 +532,7 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 
 		queueMicrotask(async () => {
 			try {
-				await streamOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+				await streamOptions?.onResponse?.(providerResponse(200));
 				if (!step) {
 					let message = createErrorMessage(
 						new Error("No more faux responses queued"),
@@ -593,7 +599,7 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 
 		queueMicrotask(async () => {
 			try {
-				await fetchOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+				await fetchOptions?.onResponse?.(providerResponse(200));
 				const entry = deferredResponses.get(handle.id);
 				if (
 					!entry ||
@@ -650,14 +656,14 @@ export function createFauxCore(options: RegisterFauxProviderOptions) {
 	};
 
 	const cancelDeferred = async (
-		requestModel: Model<string>,
+		_requestModel: Model<string>,
 		handle: DeferredHandle,
 		cancelOptions?: DeferredCancelOptions,
 	): Promise<void> => {
 		state.cancelledDeferred.push(structuredClone(handle));
 		const entry = deferredResponses.get(handle.id);
 		if (entry) entry.cancelled = true;
-		await cancelOptions?.onResponse?.({ status: 200, headers: {} }, requestModel);
+		await cancelOptions?.onResponse?.(providerResponse(200));
 	};
 
 	function getModel(): Model<string>;

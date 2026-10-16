@@ -263,7 +263,7 @@ describe("OpenAI Decisions", () => {
 		expect(result.stopReason).toBe("stop");
 	});
 
-	it("includes the API error body for other HTTP failures", async () => {
+	it("publishes an owned status without the API error body for other HTTP failures", async () => {
 		const result = await classify(model, context, {
 			apiKey: "secret",
 			maxRetries: 0,
@@ -275,8 +275,34 @@ describe("OpenAI Decisions", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("OpenAI Decisions error (400)");
-		expect(result.errorMessage).toContain("Decision input exceeds the token limit.");
+		// smarty-dev#5822 (pi#202 round 2): owned text with the status, not the API error body.
+		expect(result.errorMessage).toBe("OpenAI Decisions error (400)");
+	});
+
+	// smarty-dev#3155: upstream's shared transport retains physical-request admission.
+	it("admits every physical attempt and masks reflected request credentials", async () => {
+		const beforeProviderRequest = vi.fn(async () => {});
+		let attempts = 0;
+		const retry = await classify(model, context, {
+			apiKey: "synthetic-decisions-key",
+			beforeProviderRequest,
+			fetch: async () =>
+				++attempts === 1
+					? new Response("busy", { status: 503, headers: { "retry-after-ms": "0" } })
+					: Response.json({ answers: wireAnswers }),
+		});
+		expect(retry.stopReason).toBe("stop");
+		expect(beforeProviderRequest).toHaveBeenCalledTimes(2);
+		const reflected = await classify(model, context, {
+			apiKey: "synthetic-decisions-key",
+			headers: { "x-custom-token": "synthetic-header-value" },
+			maxRetries: 0,
+			fetch: async () =>
+				Response.json({ error: { message: "synthetic-decisions-key synthetic-header-value" } }, { status: 400 }),
+		});
+		expect(reflected.stopReason).toBe("error");
+		expect(reflected.errorMessage).not.toContain("synthetic-decisions-key");
+		expect(reflected.errorMessage).not.toContain("synthetic-header-value");
 	});
 
 	it("rejects models for other classifier APIs and missing API keys", async () => {

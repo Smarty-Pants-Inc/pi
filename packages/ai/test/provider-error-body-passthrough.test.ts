@@ -9,8 +9,7 @@
 //
 // This test routes a 403-with-body APIError through the OpenRouter image
 // provider (one of the body-blind providers) and asserts the resulting
-// errorMessage contains both the status and the body reason. It is EXPECTED TO
-// FAIL until the provider catch blocks read the SDK error body.
+// errorMessage contains the status but no provider-authored reason (smarty-dev#5822).
 
 import { describe, expect, it, vi } from "vitest";
 import { generateImages } from "../src/images.ts";
@@ -51,7 +50,7 @@ vi.mock("openai", () => {
 });
 
 describe("provider error body passthrough", () => {
-	it("surfaces the HTTP body reason instead of the opaque SDK message (openrouter images)", async () => {
+	it("surfaces the HTTP status as owned text instead of the opaque SDK message (openrouter images)", async () => {
 		const model: ImageModel<"openrouter-images"> = {
 			type: "image",
 			id: "black-forest-labs/flux.2-pro",
@@ -70,10 +69,7 @@ describe("provider error body passthrough", () => {
 		const output = await generateImages(model, context, { apiKey: "test" });
 
 		expect(output.stopReason).toBe("error");
-		// The status should be surfaced.
-		expect(output.errorMessage).toContain("403");
-		// The body reason must not be swallowed by the opaque SDK message.
-		expect(output.errorMessage).toContain("blocked by gateway WAF");
-		expect(output.errorMessage).not.toBe("403 status code (no body)");
+		// smarty-dev#5822: status is surfaced as owned text; body is never published.
+		expect(output.errorMessage).toBe("Provider request failed (403)");
 	});
 });

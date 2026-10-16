@@ -9,12 +9,12 @@
  * models.json custom provider with `"api": "pi-messages"`.
  */
 
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import type {
 	AssistantMessage,
 	AssistantMessageEvent,
+	AssistantRecovery,
 	CacheRetention,
-	JsonObject,
-	JsonValue,
 	Model,
 	ProviderEnv,
 	SimpleStreamOptions,
@@ -25,10 +25,19 @@ import type {
 	TranscriptContext,
 } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import { formatProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { headersToRecord, providerHeadersToRecord } from "../utils/headers.ts";
+import { providerHeadersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import {
+	markProviderStreamObserverFailure,
+	PROVIDER_STREAM_OBSERVER_FAILED,
+	providerResponse,
+	providerStreamNotification,
+} from "../utils/provider-observation.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
+import { classifyProviderFailure, validHttpStatus } from "../utils/recovery.ts";
 
 export interface PiMessagesOptions extends StreamOptions {
 	reasoning?: ThinkingLevel;
@@ -95,15 +104,58 @@ type PiMessagesErrorBody = {
 	};
 };
 
-export class PiMessagesResponseError extends Error {
-	code?: string;
-	readonly diagnosticDetails: JsonObject;
+export type PiMessagesErrorCategory =
+	| "unauthorized"
+	| "forbidden"
+	| "not_found"
+	| "rate_limited"
+	| "quota_exceeded"
+	| "overloaded"
+	| "context_length_exceeded"
+	| "invalid_request"
+	| "server_error"
+	| "timeout";
+const PI_MESSAGES_ERROR_CATEGORIES: Readonly<Record<string, PiMessagesErrorCategory>> = {
+	unauthorized: "unauthorized",
+	authentication_error: "unauthorized",
+	invalid_api_key: "unauthorized",
+	forbidden: "forbidden",
+	permission_denied: "forbidden",
+	not_found: "not_found",
+	model_not_found: "not_found",
+	rate_limited: "rate_limited",
+	rate_limit: "rate_limited",
+	rate_limit_exceeded: "rate_limited",
+	too_many_requests: "rate_limited",
+	quota_exceeded: "quota_exceeded",
+	insufficient_quota: "quota_exceeded",
+	overloaded: "overloaded",
+	busy: "overloaded",
+	server_busy: "overloaded",
+	unavailable: "overloaded",
+	context_length_exceeded: "context_length_exceeded",
+	invalid_request: "invalid_request",
+	invalid_request_error: "invalid_request",
+	bad_request: "invalid_request",
+	server_error: "server_error",
+	internal_error: "server_error",
+	api_error: "server_error",
+	timeout: "timeout",
+};
 
-	constructor(message: string, code: string | undefined, diagnosticDetails: JsonObject) {
-		super(message);
+/** Only owned categories, status and recovery survive this response boundary. */
+export class PiMessagesResponseError extends Error {
+	readonly status: number | undefined;
+	readonly category: PiMessagesErrorCategory | undefined;
+	readonly recovery: AssistantRecovery;
+
+	constructor(status: number | undefined, category: PiMessagesErrorCategory | undefined, recovery: AssistantRecovery) {
+		const detail = [status === undefined ? undefined : `HTTP ${status}`, category].filter(Boolean).join(", ");
+		super(detail ? `Provider request failed (${detail})` : "Provider request failed");
 		this.name = "PiMessagesResponseError";
-		this.code = code;
-		this.diagnosticDetails = diagnosticDetails;
+		this.status = status;
+		this.category = category;
+		this.recovery = recovery;
 	}
 }
 
@@ -117,42 +169,24 @@ function parsePiMessagesErrorBody(body: string): PiMessagesErrorBody | undefined
 	}
 }
 
-function truncateDiagnosticString(value: string): string {
-	const maxLength = 8192;
-	return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
-}
-
-function formatPiMessagesResponseError(
-	response: Response,
-	body: string,
-	errorBody: PiMessagesErrorBody | undefined,
-): string {
-	const message = typeof errorBody?.error?.message === "string" ? errorBody.error.message : undefined;
-	const code = typeof errorBody?.error?.code === "string" ? errorBody.error.code : undefined;
-	const suffix = message ?? body;
-	const codeSuffix = code ? ` (${code})` : "";
-	return `${response.status} ${response.statusText}: ${suffix}${codeSuffix}`;
-}
-
 function createPiMessagesResponseError(
 	model: Model<"pi-messages">,
-	url: URL,
 	response: Response,
 	body: string,
 ): PiMessagesResponseError {
-	const errorBody = parsePiMessagesErrorBody(body);
-	const code = typeof errorBody?.error?.code === "string" ? errorBody.error.code : undefined;
-	return new PiMessagesResponseError(formatPiMessagesResponseError(response, body, errorBody), code, {
-		version: 1,
+	const error = parsePiMessagesErrorBody(body)?.error;
+	const code = typeof error?.code === "string" ? error.code : undefined;
+	const category =
+		code !== undefined && Object.hasOwn(PI_MESSAGES_ERROR_CATEGORIES, code)
+			? PI_MESSAGES_ERROR_CATEGORIES[code]
+			: undefined;
+	const status = validHttpStatus(response.status);
+	const recovery = classifyProviderFailure({
+		text: [typeof error?.message === "string" ? error.message : undefined, code, body].filter(Boolean).join("\n"),
+		status,
 		provider: model.provider,
-		model: model.id,
-		url: url.toString(),
-		status: response.status,
-		statusText: response.statusText,
-		...(errorBody?.error === undefined ? {} : { error: errorBody.error as JsonValue }),
-		...(errorBody ? {} : { body: truncateDiagnosticString(body) }),
-		timestampMs: Date.now(),
 	});
+	return new PiMessagesResponseError(status, category, recovery);
 }
 
 function createEmptyUsage(): PiMessagesUsage {
@@ -166,15 +200,69 @@ function createEmptyUsage(): PiMessagesUsage {
 	};
 }
 
+function boundUsageNumber(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0
+		? Math.min(value, Number.MAX_SAFE_INTEGER)
+		: 0;
+}
+function boundUsage(value: unknown): PiMessagesUsage {
+	const wire =
+		typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+	const wireCost =
+		typeof wire.cost === "object" && wire.cost !== null && !Array.isArray(wire.cost)
+			? (wire.cost as Record<string, unknown>)
+			: {};
+	const usage: PiMessagesUsage = {
+		input: boundUsageNumber(wire.input),
+		output: boundUsageNumber(wire.output),
+		cacheRead: boundUsageNumber(wire.cacheRead),
+		cacheWrite: boundUsageNumber(wire.cacheWrite),
+		totalTokens: boundUsageNumber(wire.totalTokens),
+		cost: {
+			input: boundUsageNumber(wireCost.input),
+			output: boundUsageNumber(wireCost.output),
+			cacheRead: boundUsageNumber(wireCost.cacheRead),
+			cacheWrite: boundUsageNumber(wireCost.cacheWrite),
+			total: boundUsageNumber(wireCost.total),
+		},
+	};
+	if (typeof wire.reasoning === "number" && wire.reasoning >= 0) usage.reasoning = boundUsageNumber(wire.reasoning);
+	if (typeof wire.cacheWrite1h === "number" && wire.cacheWrite1h >= 0)
+		usage.cacheWrite1h = boundUsageNumber(wire.cacheWrite1h);
+	return usage;
+}
+function isWireObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizeWireToolCall(value: unknown, fallback: ToolCall | undefined): ToolCall {
+	const source = isWireObject(value) ? value : {};
+	const text = (key: "id" | "name" | "thoughtSignature" | "namespace" | "argumentsError"): string | undefined => {
+		const field = source[key];
+		return typeof field === "string" ? field : typeof fallback?.[key] === "string" ? fallback[key] : undefined;
+	};
+	const thoughtSignature = text("thoughtSignature");
+	const namespace = text("namespace");
+	const argumentsError = text("argumentsError");
+	return {
+		type: "toolCall",
+		id: text("id") ?? "",
+		name: text("name") ?? "",
+		arguments: isWireObject(source.arguments)
+			? (source.arguments as ToolCall["arguments"])
+			: isWireObject(fallback?.arguments)
+				? fallback.arguments
+				: {},
+		...(thoughtSignature === undefined ? {} : { thoughtSignature }),
+		...(namespace === undefined ? {} : { namespace }),
+		...(argumentsError === undefined ? {} : { argumentsError }),
+	};
+}
+
 function appendRewriteDiagnostic(message: AssistantMessage, rewrite: PiMessagesRewriteImpact | undefined): void {
 	if (!rewrite) {
 		return;
 	}
-	appendAssistantMessageDiagnostic(message, {
-		type: "pi_messages_rewrite",
-		timestamp: Date.now(),
-		details: { ...rewrite },
-	});
+	appendAssistantMessageDiagnostic(message, createAssistantMessageDiagnostic("pi_messages_rewrite"));
 }
 
 function createEventConverter(model: Model<"pi-messages">) {
@@ -195,7 +283,7 @@ function createEventConverter(model: Model<"pi-messages">) {
 			case "done":
 				Object.assign(partial, {
 					stopReason: event.reason,
-					usage: event.usage,
+					usage: boundUsage(event.usage),
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
@@ -203,11 +291,16 @@ function createEventConverter(model: Model<"pi-messages">) {
 				}
 				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "done", reason: event.reason, message: partial };
-			case "error":
+			case "error": {
+				const recovery = classifyProviderFailure({
+					text: typeof event.errorMessage === "string" ? event.errorMessage : undefined,
+					provider: model.provider,
+				});
 				Object.assign(partial, {
 					stopReason: event.reason,
-					usage: event.usage,
-					errorMessage: event.errorMessage,
+					usage: boundUsage(event.usage),
+					errorMessage: formatProviderError({ recovery }),
+					recovery,
 					responseId: event.responseId,
 				});
 				if (event.providerThinkingLevel !== undefined) {
@@ -215,6 +308,7 @@ function createEventConverter(model: Model<"pi-messages">) {
 				}
 				appendRewriteDiagnostic(partial, event.rewrite);
 				return { type: "error", reason: event.reason, error: partial };
+			}
 			case "start":
 				break;
 			case "text_start":
@@ -259,7 +353,10 @@ function createEventConverter(model: Model<"pi-messages">) {
 				break;
 			}
 			case "toolcall_end":
-				Object.assign(partial.content[event.contentIndex]!, event.toolCall);
+				partial.content[event.contentIndex] = normalizeWireToolCall(
+					event.toolCall,
+					partial.content[event.contentIndex] as ToolCall | undefined,
+				);
 				toolJson.delete(event.contentIndex);
 				return {
 					type: "toolcall_end",
@@ -335,9 +432,10 @@ function createErrorEvent(model: Model<"pi-messages">, error: unknown, aborted: 
 	};
 
 	if (!aborted && error instanceof PiMessagesResponseError) {
+		assistantMessage.recovery = error.recovery;
 		appendAssistantMessageDiagnostic(
 			assistantMessage,
-			createAssistantMessageDiagnostic("pi_messages_response_failure", error, error.diagnosticDetails),
+			createAssistantMessageDiagnostic("pi_messages_response_failure"),
 		);
 	}
 
@@ -357,8 +455,11 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 	context: TranscriptContext,
 	options?: PiMessagesOptions,
 ): AssistantMessageEventStream => {
-	const eventStream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const eventStream = new AssistantMessageEventStream(diagnosticSecrets);
 	const convertEvent = createEventConverter(model);
+	let observerFailed = false;
+	let observerFailureUsage: PiMessagesUsage | undefined;
 
 	void (async () => {
 		try {
@@ -389,6 +490,7 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				payload = nextPayload;
 			}
 
+			checkProviderRequest(options);
 			const response = await (options?.fetch ?? globalThis.fetch)(url, {
 				method: "POST",
 				headers: {
@@ -401,18 +503,27 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 				signal: options?.signal,
 			});
 
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponse(response.status));
 
 			if (!response.ok) {
 				const body = await response.text();
-				throw createPiMessagesResponseError(model, url, response, body);
+				throw createPiMessagesResponseError(model, response, body);
 			}
 			if (!response.body) {
 				throw new Error(`${model.provider} response has no body`);
 			}
 
 			for await (const piEvent of readPiMessagesEvents(response.body)) {
-				await options?.onProviderStreamEvent?.(piEvent, model);
+				try {
+					await options?.onProviderStreamEvent?.(providerStreamNotification());
+				} catch {
+					observerFailed = true;
+					// Keep billable accounting without converting or publishing the rejected wire event.
+					if (piEvent.type === "done" || piEvent.type === "error") {
+						observerFailureUsage = boundUsage(piEvent.usage);
+					}
+					throw new Error(PROVIDER_STREAM_OBSERVER_FAILED);
+				}
 				const event = convertEvent(piEvent);
 				eventStream.push(event);
 				if (event.type === "done" || event.type === "error") {
@@ -422,7 +533,12 @@ export const stream: StreamFunction<"pi-messages", PiMessagesOptions> = (
 
 			throw new Error(`${model.provider} stream ended without a terminal event`);
 		} catch (error) {
-			eventStream.push(createErrorEvent(model, error, options?.signal?.aborted ?? false));
+			const event = createErrorEvent(model, error, options?.signal?.aborted ?? false);
+			if (observerFailed && event.type === "error") {
+				if (observerFailureUsage !== undefined) event.error.usage = observerFailureUsage;
+				markProviderStreamObserverFailure(event.error);
+			}
+			eventStream.push(event);
 		}
 	})();
 

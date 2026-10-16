@@ -1,3 +1,4 @@
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import type {
 	ClassifierAnswer,
 	ClassifierApi,
@@ -129,7 +130,10 @@ export async function classifySystemOne(
 		return output;
 	} catch (error) {
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-		output.errorMessage = formatProviderError(normalizeProviderError(error), `${transport.label} error`);
+		output.errorMessage = formatProviderError(
+			normalizeProviderError(error, model.provider, undefined, getRequestDiagnosticSecrets(model, options)),
+			`${transport.label} error`,
+		);
 		return output;
 	}
 }

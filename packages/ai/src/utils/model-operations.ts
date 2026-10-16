@@ -1,3 +1,4 @@
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type {
 	AnyModel,
 	Api,
@@ -12,7 +13,8 @@ import type {
 	ModelType,
 	ModelTypeMap,
 } from "../types.ts";
-import { ModelsError } from "./models-error.ts";
+import { formatThrownValue } from "./diagnostics.ts";
+import { ModelsError, SafeSetupError } from "./models-error.ts";
 
 /** The type of a model. Models without `type` are chat models. */
 export function getModelType(model: AnyModel): ModelType {
@@ -26,7 +28,7 @@ export function isModelType<TType extends ModelType>(model: AnyModel, type: TTyp
 
 export function assertChatModel(model: AnyModel): asserts model is Model<Api> {
 	if (!isModelType(model, "chat")) {
-		throw new ModelsError("provider", `Model ${model.provider}/${model.id} is not a chat model`);
+		throw new SafeSetupError("not_chat");
 	}
 }
 
@@ -42,6 +44,34 @@ export function assertClassifierModel(model: AnyModel): asserts model is Classif
 	}
 }
 
+function operationErrorMessage(error: unknown, secrets: readonly string[]): string {
+	try {
+		return redactOAuthDiagnostic(formatThrownValue(error), secrets);
+	} catch {
+		return "operation failed";
+	}
+}
+
+/** Mask a provider's own error result; it can echo the request key or headers. */
+export function protectOperationResult<T extends { errorMessage?: string }>(result: T, secrets: readonly string[]): T {
+	if (typeof result?.errorMessage !== "string") return result;
+	return { ...result, errorMessage: operationErrorMessage(result.errorMessage, secrets) };
+}
+
+/** A public rejection keeps masked message/name, never raw cause or other properties. */
+export function protectOperationError(error: unknown, secrets: readonly string[]): Error {
+	try {
+		if (error instanceof SafeSetupError) return error;
+		const safe = new Error(operationErrorMessage(error, secrets));
+		if (error instanceof Error && typeof error.name === "string" && error.name !== "Error") {
+			safe.name = redactOAuthDiagnostic(error.name, secrets);
+		}
+		return safe;
+	} catch {
+		return new Error("operation failed");
+	}
+}
+
 /** Rejects classifier images for models whose catalog entry does not accept image input. */
 export function assertClassifierInputSupported(
 	model: ClassifierModel<ClassifierApi>,
@@ -52,14 +82,19 @@ export function assertClassifierInputSupported(
 	}
 }
 
-export function imageErrorResult(model: ImageModel<ImageApi>, error: unknown, aborted = false): AssistantImages {
+export function imageErrorResult(
+	model: ImageModel<ImageApi>,
+	error: unknown,
+	aborted = false,
+	secrets: readonly string[] = [],
+): AssistantImages {
 	return {
 		api: model.api,
 		provider: model.provider,
 		model: model.id,
 		output: [],
 		stopReason: aborted ? "aborted" : "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
+		errorMessage: operationErrorMessage(error, secrets),
 		timestamp: Date.now(),
 	};
 }
@@ -68,6 +103,7 @@ export function classifierErrorResult(
 	model: ClassifierModel<ClassifierApi>,
 	error: unknown,
 	aborted = false,
+	secrets: readonly string[] = [],
 ): ClassifierResult {
 	return {
 		api: model.api,
@@ -75,7 +111,7 @@ export function classifierErrorResult(
 		model: model.id,
 		answers: {},
 		stopReason: aborted ? "aborted" : "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
+		errorMessage: operationErrorMessage(error, secrets),
 		timestamp: Date.now(),
 	};
 }

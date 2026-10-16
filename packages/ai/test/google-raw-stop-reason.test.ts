@@ -93,7 +93,7 @@ vi.mock("@google/genai", () => {
 import { stream as streamGoogleGenerativeAi } from "../src/api/google-generative-ai.ts";
 import { stream as streamGoogleVertex } from "../src/api/google-vertex.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Model, StreamOptions } from "../src/types.ts";
+import type { StreamOptions } from "../src/types.ts";
 
 beforeEach(() => {
 	googleGenAiMock.streamChunks = undefined;
@@ -190,6 +190,22 @@ describe("Google raw stop reasons", () => {
 		expect(message.rawStopReason).toBe("STOP");
 		expect(message.content.some((block) => block.type === "toolCall")).toBe(true);
 	});
+
+	// smarty-dev#5822: unknown provider finish reasons never reach published text.
+	it.each(adapters)("keeps a planted unknown finish reason private for $name", async ({ createStream }) => {
+		const planted = "corp-eu-west-7-tenant-plum sk-ant-api03-synthetic5822roundthree";
+		googleGenAiMock.finishReason = planted;
+		googleGenAiMock.includeFunctionCall = false;
+		const stream = createStream();
+		const events: string[] = [];
+		for await (const event of stream) events.push(JSON.stringify(event));
+		const message = await stream.result();
+		expect(message.stopReason).toBe("error");
+		expect(message.rawStopReason).toBe("other");
+		const published = [message.errorMessage, JSON.stringify(message), ...events].join("\n");
+		expect(published).not.toContain("tenant-plum");
+		expect(published).not.toContain("synthetic5822");
+	});
 });
 
 describe("Google provider stream events", () => {
@@ -218,8 +234,9 @@ describe("Google provider stream events", () => {
 	];
 
 	it.each(adapters)(
-		"forwards each SDK chunk in order before normalizing it for $name",
-		async ({ model, createStream }) => {
+		// smarty-dev#5822 C1: one owned notification per chunk, never chunk or model.
+		"notifies once per SDK chunk without provider data for $name",
+		async ({ createStream }) => {
 			googleGenAiMock.streamChunks = [
 				{
 					responseId: "resp_google",
@@ -230,18 +247,13 @@ describe("Google provider stream events", () => {
 					usageMetadata: { promptTokenCount: 2, candidatesTokenCount: 1, totalTokenCount: 3 },
 				},
 			];
-			const received: unknown[] = [];
-			const eventModels: Model<Api>[] = [];
-			const result = await createStream(async (chunk, eventModel) => {
+			const calls: unknown[][] = [];
+			const result = await createStream(async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(chunk);
-				eventModels.push(eventModel);
+				calls.push(args);
 			}).result();
 
-			expect(received).toEqual(googleGenAiMock.streamChunks);
-			expect(received[0]).toBe(googleGenAiMock.streamChunks[0]);
-			expect(received[1]).toBe(googleGenAiMock.streamChunks[1]);
-			expect(eventModels).toEqual([model, model]);
+			expect(calls).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
 			expect(result.stopReason).toBe("stop");
 			expect(result.responseId).toBe("resp_google");
 			expect(result.content).toEqual([{ type: "text", text: "hello" }]);

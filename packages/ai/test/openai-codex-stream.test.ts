@@ -11,7 +11,7 @@ import {
 	stream as streamOpenAICodexResponses,
 	streamSimple as streamSimpleOpenAICodexResponses,
 } from "../src/api/openai-codex-responses.ts";
-import type { Api, Context, Model } from "../src/types.ts";
+import type { Context, Model } from "../src/types.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -98,7 +98,7 @@ function buildSSEPayload({
 }
 
 describe("openai-codex streaming", () => {
-	it("streams SSE responses and forwards raw provider events", async () => {
+	it("streams SSE responses and forwards provider event notifications", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
 
@@ -192,14 +192,12 @@ describe("openai-codex streaming", () => {
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		});
 
-		const providerEvents: unknown[] = [];
-		const providerEventModels: Model<Api>[] = [];
+		const providerCalls: unknown[][] = [];
 		const streamResult = streamOpenAICodexResponses(model, context, {
 			apiKey: token,
 			transport: "sse",
-			onProviderStreamEvent: (event, eventModel) => {
-				providerEvents.push(event);
-				providerEventModels.push(eventModel);
+			onProviderStreamEvent: (...args: unknown[]) => {
+				providerCalls.push(args);
 			},
 		});
 		let sawTextDelta = false;
@@ -217,14 +215,8 @@ describe("openai-codex streaming", () => {
 
 		expect(sawTextDelta).toBe(true);
 		expect(sawDone).toBe(true);
-		expect(providerEvents.map((event) => (event as { type?: string }).type)).toEqual([
-			"response.output_item.added",
-			"response.content_part.added",
-			"response.output_text.delta",
-			"response.output_item.done",
-			"response.completed",
-		]);
-		expect(providerEventModels).toEqual([model, model, model, model, model]);
+		// smarty-dev#5822 C1: one owned notification per event, never raw event or model.
+		expect(providerCalls).toEqual(Array.from({ length: 5 }, () => [{ type: "provider_stream_event" }]));
 	});
 
 	// Regression test for https://github.com/earendil-works/pi/issues/9047
@@ -1329,11 +1321,10 @@ describe("openai-codex streaming", () => {
 		});
 		await streamResult.result();
 	});
-	it("forwards auto transport and raw provider events from streamSimple", async () => {
+	it("forwards auto transport and provider event notifications from streamSimple", async () => {
 		const token = mockToken();
 		const sentBodies: unknown[] = [];
-		const providerEvents: unknown[] = [];
-		const providerEventModels: Model<Api>[] = [];
+		const providerCalls: unknown[][] = [];
 		let capturedWebSocketHeaders: Record<string, string> | undefined;
 
 		const fetchMock = vi.fn(async () => new Response("unexpected fetch", { status: 500 }));
@@ -1434,22 +1425,14 @@ describe("openai-codex streaming", () => {
 			apiKey: token,
 			sessionId: "session-auto",
 			transport: "auto",
-			onProviderStreamEvent: (event, eventModel) => {
-				providerEvents.push(event);
-				providerEventModels.push(eventModel);
+			onProviderStreamEvent: (...args: unknown[]) => {
+				providerCalls.push(args);
 			},
 		}).result();
 
 		expect(result.endTurn).toBe(false);
 		expect(sentBodies).toHaveLength(1);
-		expect(providerEvents.map((event) => (event as { type?: string }).type)).toEqual([
-			"response.output_item.added",
-			"response.content_part.added",
-			"response.output_text.delta",
-			"response.output_item.done",
-			"response.done",
-		]);
-		expect(providerEventModels).toEqual([model, model, model, model, model]);
+		expect(providerCalls).toEqual(Array.from({ length: 5 }, () => [{ type: "provider_stream_event" }]));
 		expect(capturedWebSocketHeaders?.["session-id"]).toBe("session-auto");
 		expect(capturedWebSocketHeaders?.session_id).toBeUndefined();
 		expect(capturedWebSocketHeaders?.["x-client-request-id"]).toBe("session-auto");
@@ -1737,7 +1720,8 @@ describe("openai-codex streaming", () => {
 			websocketFailures: 1,
 			sseFallbacks: 1,
 			websocketFallbackActive: true,
-			lastWebSocketError: "WebSocket connect timeout after 50ms",
+			// smarty-dev#5822: owned category, never error text.
+			lastWebSocketError: "timeout",
 		});
 	});
 
@@ -2741,5 +2725,79 @@ describe("openai-codex streaming", () => {
 		const result = await resultPromise;
 		expect(result.content.find((content) => content.type === "text")?.text).toBe("Hello");
 		expect(codexRequests).toBe(4);
+	});
+
+	// smarty-dev#5822: classify JSON body privately, publish only status.
+	it("keeps the SSE error status without the JSON body in errorMessage", async () => {
+		const body = JSON.stringify({
+			error: { message: "m", type: "invalid_request_error", code: "compaction_affinity_missing" },
+		});
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(body, {
+					status: 409,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context = normalizeContext({
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		});
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: mockToken(),
+			transport: "sse",
+			maxRetries: 0,
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("openai-codex API error (409)");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps the friendly SSE usage-limit message without a status", async () => {
+		const fetchMock = vi.fn(
+			async () =>
+				new Response(
+					JSON.stringify({ error: { code: "usage_limit_reached", message: "limit", plan_type: "PLUS" } }),
+					{ status: 403, headers: { "content-type": "application/json" } },
+				),
+		);
+		vi.stubGlobal("fetch", fetchMock);
+		const model: Model<"openai-codex-responses"> = {
+			id: "gpt-5.1-codex",
+			name: "GPT-5.1 Codex",
+			api: "openai-codex-responses",
+			provider: "openai-codex",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: true,
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 400000,
+			maxTokens: 128000,
+		};
+		const context = normalizeContext({
+			systemPrompt: "You are a helpful assistant.",
+			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
+		});
+		const result = await streamOpenAICodexResponses(model, context, {
+			apiKey: mockToken(),
+			transport: "sse",
+			maxRetries: 3,
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("You have hit your ChatGPT usage limit (plus plan).");
+		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
 });

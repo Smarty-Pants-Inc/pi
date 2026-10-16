@@ -1,3 +1,4 @@
+import { getRequestDiagnosticSecrets } from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -14,11 +15,14 @@ import type {
 	TranscriptContext,
 } from "../types.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
+import { closedRawStopReason } from "../utils/diagnostics.ts";
+import { formatProviderError, normalizeProviderError, ProviderDataError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
+import { checkProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import { getCurrentTools, resolveTranscript } from "../utils/transcript.ts";
@@ -27,7 +31,6 @@ import { buildBaseOptions } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
 const MISTRAL_TOOL_CALL_ID_LENGTH = 9;
-const MAX_MISTRAL_ERROR_BODY_CHARS = 4000;
 
 /**
  * Provider-specific options for the Mistral API.
@@ -127,7 +130,7 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 	context: TranscriptContext,
 	options?: MistralOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const stream = new AssistantMessageEventStream(getRequestDiagnosticSecrets(model, options));
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	(async () => {
@@ -151,7 +154,7 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 			}
 			const mistralStream = await requestMistralStream(model, payload, apiKey, options);
 			stream.push({ type: "start", partial: output });
-			await consumeChatStream(model, output, stream, mistralStream, options?.onProviderStreamEvent);
+			await consumeChatStream(model, output, stream, mistralStream, options);
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -172,7 +175,9 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 				delete (block as { partialArgs?: string }).partialArgs;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatMistralError(error);
+			const norm = normalizeProviderError(error, model.provider);
+			output.recovery ??= norm.recovery;
+			output.errorMessage = formatProviderError(norm, "Mistral API error");
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -267,34 +272,6 @@ function deriveMistralToolCallId(id: string, attempt: number): string {
 		.slice(0, MISTRAL_TOOL_CALL_ID_LENGTH);
 }
 
-function formatMistralError(error: unknown): string {
-	if (error instanceof Error) {
-		const httpError = error as Error & { statusCode?: unknown; body?: unknown };
-		const statusCode = typeof httpError.statusCode === "number" ? httpError.statusCode : undefined;
-		const bodyText = typeof httpError.body === "string" ? httpError.body.trim() : undefined;
-		if (statusCode !== undefined && bodyText) {
-			return `Mistral API error (${statusCode}): ${truncateErrorText(bodyText, MAX_MISTRAL_ERROR_BODY_CHARS)}`;
-		}
-		if (statusCode !== undefined) return `Mistral API error (${statusCode}): ${error.message}`;
-		return error.message;
-	}
-	return safeJsonStringify(error);
-}
-
-function truncateErrorText(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;
-}
-
-function safeJsonStringify(value: unknown): string {
-	try {
-		const serialized = JSON.stringify(value);
-		return serialized === undefined ? String(value) : serialized;
-	} catch {
-		return String(value);
-	}
-}
-
 async function requestMistralStream(
 	model: Model<"mistral-conversations">,
 	payload: MistralChatPayload,
@@ -312,6 +289,7 @@ async function requestMistralStream(
 	const combinedSignal = combineAbortSignals([options?.signal, headerTimeoutSignal]);
 	let response: Response;
 	try {
+		checkProviderRequest(options);
 		response = await (options?.fetch ?? globalThis.fetch)(url, {
 			method: "POST",
 			headers,
@@ -327,7 +305,7 @@ async function requestMistralStream(
 		combinedSignal.cleanup();
 	}
 
-	await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+	await options?.onResponse?.(providerResponse(response.status));
 
 	if (!response.ok) {
 		const body = await response.text();
@@ -517,7 +495,12 @@ function parseMistralEvent(raw: string): MistralCompletionEvent | typeof MISTRAL
 	if (!data) return undefined;
 	if (data === "[DONE]") return MISTRAL_STREAM_DONE;
 
-	const parsed: unknown = JSON.parse(data);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(data);
+	} catch {
+		throw new ProviderDataError(data);
+	}
 	if (!isMistralRecord(parsed) || !Array.isArray(parsed.choices)) {
 		throw new Error("Invalid Mistral streaming event");
 	}
@@ -578,7 +561,7 @@ async function consumeChatStream(
 	output: AssistantMessage,
 	stream: AssistantMessageEventStream,
 	mistralStream: AsyncIterable<MistralCompletionEvent>,
-	onProviderStreamEvent: StreamOptions["onProviderStreamEvent"],
+	options: Pick<StreamOptions, "onProviderStreamEvent"> | undefined,
 ): Promise<void> {
 	let currentBlock: TextContent | ThinkingContent | null = null;
 	const blocks = output.content;
@@ -608,7 +591,7 @@ async function consumeChatStream(
 
 	for await (const event of mistralStream) {
 		const chunk = event.data;
-		await onProviderStreamEvent?.(chunk, model);
+		await notifyProviderStreamEvent(options, output);
 		// Mistral's streamed CompletionChunk carries an id field. Keep the first non-empty one,
 		// mirroring how OpenAI-style streaming exposes a stable response identifier per stream.
 		output.responseId ||= chunk.id;
@@ -947,6 +930,6 @@ function mapChatStopReason(reason: string | null): { stopReason: StopReason; err
 			// Mistral reports transient server failures this way; "server error" makes the message retryable.
 			return { stopReason: "error", errorMessage: "Provider stopped with: error (server error)" };
 		default:
-			return { stopReason: "error", errorMessage: `Provider stopped with: ${reason}` };
+			return { stopReason: "error", errorMessage: `Provider stopped with: ${closedRawStopReason(reason)}` };
 	}
 }

@@ -1,8 +1,16 @@
-import { fauxAssistantMessage, fauxToolCall, getCurrentTools, type TranscriptContext } from "@earendil-works/pi-ai";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import {
+	createAssistantMessageEventStream,
+	fauxAssistantMessage,
+	fauxToolCall,
+	getCurrentTools,
+	type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
 import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ExtensionAPI } from "../../src/core/extensions/types.ts";
+import type { ExtensionAPI, ExtensionToolContext } from "../../src/core/extensions/types.ts";
 import { createCodemodeExtension } from "../../src/extensions/codemode/index.ts";
 import { createToolSearchExtension } from "../../src/extensions/tool-search/index.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -55,8 +63,8 @@ function orchestratorExtension(pi: ExtensionAPI): void {
 describe("AgentSession tool orchestration", () => {
 	const harnesses: Harness[] = [];
 
-	afterEach(() => {
-		while (harnesses.length > 0) harnesses.pop()?.cleanup();
+	afterEach(async () => {
+		while (harnesses.length > 0) await harnesses.pop()?.cleanup();
 	});
 
 	it("supports tools that call other tools under any name through the extension API", async () => {
@@ -112,6 +120,62 @@ describe("AgentSession tool orchestration", () => {
 		expect(persisted?.type === "message" && persisted.message).toMatchObject({ nestedCalls: result.nestedCalls });
 	});
 
+	// pi#150: nested descendants settle before parent result publication.
+	it("joins fire-and-forget native children before persisting complete parent provenance", async () => {
+		let retained: ExtensionToolContext | undefined;
+		let child: Promise<unknown> | undefined;
+		let effects = 0;
+		const harness = await createHarness({
+			initialActiveToolNames: [],
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "child",
+						label: "Child",
+						description: "Native child",
+						parameters: Type.Object({}),
+						execute: async () => {
+							await new Promise((resolve) => setTimeout(resolve, 20));
+							effects++;
+							return { content: [], details: {} };
+						},
+					});
+					pi.registerTool({
+						name: "parent",
+						label: "Parent",
+						description: "Native parent",
+						parameters: Type.Object({}),
+						execute: async (_id, _args, _signal, _update, ctx) => {
+							retained = ctx;
+							child = ctx.executeTool("child", {});
+							return { content: [], details: {} };
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("parent", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		try {
+			await harness.session.prompt("go");
+			const result = harness.session.messages.find((message) => message.role === "toolResult");
+			expect(result).toMatchObject({ nestedCalls: { complete: true, calls: [{ name: "child", status: "ok" }] } });
+			expect(effects).toBe(1);
+			await expect(retained!.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
+			expect(effects).toBe(1);
+			const persisted = harness.sessionManager
+				.getBranch()
+				.find((entry) => entry.type === "message" && entry.message.role === "toolResult");
+			expect(persisted?.type === "message" && persisted.message).toMatchObject({ nestedCalls: { complete: true } });
+		} finally {
+			await child;
+		}
+	});
+
 	it("registers codemode and tool_search inactive until they are named", async () => {
 		const extensionFactories = [createCodemodeExtension(), createToolSearchExtension()];
 		const plain = await createHarness({ extensionFactories });
@@ -130,6 +194,121 @@ describe("AgentSession tool orchestration", () => {
 		expect(initial.session.getActiveToolNames()).toEqual(["tool_search"]);
 	});
 
+	// pi#150 review R1: nested calls go through public session.agent hooks, like model-issued calls.
+	it("applies a public deny and a public redactor to nested calls, keeping parent attribution", async () => {
+		const extensionCalls: string[] = [];
+		const harness = await createHarness({
+			initialActiveToolNames: [],
+			extensionFactories: [
+				orchestratorExtension,
+				(pi) => {
+					pi.on("tool_call", (event) => {
+						extensionCalls.push(`call ${event.toolName}:${event.parentToolCallId ?? "top"}`);
+					});
+					pi.on("tool_result", (event) => {
+						extensionCalls.push(`result ${event.toolName}:${event.parentToolCallId ?? "top"}`);
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		const agent = harness.session.agent;
+		const before = agent.beforeToolCall;
+		const after = agent.afterToolCall;
+		const publicCalls: string[] = [];
+		agent.beforeToolCall = async (context, signal) => {
+			publicCalls.push(`before ${context.toolCall.name}`);
+			if (context.toolCall.name === "helper") return { block: true, reason: "denied by SDK" };
+			return before?.(context, signal);
+		};
+		agent.afterToolCall = async (context, signal) => {
+			publicCalls.push(`after ${context.toolCall.name}`);
+			const inner = await after?.(context, signal);
+			if (context.toolCall.name === "echo") return { ...inner, content: [{ type: "text", text: "[redacted]" }] };
+			return inner;
+		};
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("run_tools", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+		]);
+		await harness.session.prompt("go");
+		const result = harness.session.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult",
+		);
+		if (!result) throw new Error("No tool result");
+		const text = (result.content[0] as { text: string }).text;
+		expect(text.split(" | ").slice(0, 2)).toEqual(["denied by SDK", "[redacted]"]);
+		expect(text).not.toContain("helped");
+		expect(text).not.toContain("echo: hi");
+		expect(publicCalls).toEqual([
+			"before run_tools",
+			"before helper",
+			"before echo",
+			"after echo",
+			"after run_tools",
+		]);
+		const parent = result.toolCallId;
+		expect(extensionCalls).toEqual([
+			"call run_tools:top",
+			`call echo:${parent}`,
+			`result echo:${parent}`,
+			"result run_tools:top",
+		]);
+	});
+
+	// pi#150 review R6: nested calls still name files omitted from tool-result summary prose.
+	it("keeps the files of nested read, edit and write calls in a branch summary", async () => {
+		const harness = await createHarness({
+			initialActiveToolNames: ["read", "edit", "write"],
+			extensionFactories: [
+				(pi) => {
+					pi.registerTool({
+						name: "files",
+						label: "files",
+						description: "Touches files through other tools.",
+						parameters: Type.Object({}),
+						execute: async (_id, _params, _signal, _onUpdate, ctx) => {
+							const outcomes = [
+								await ctx.executeTool("read", { path: "nested-read.txt" }),
+								await ctx.executeTool("edit", {
+									path: "nested-edit.txt",
+									edits: [{ oldText: "old", newText: "new" }],
+								}),
+								await ctx.executeTool("write", { path: "nested-write.txt", content: "written" }),
+							];
+							const failed = outcomes.filter((outcome) => outcome.isError).length;
+							return { content: [{ type: "text", text: `failed: ${failed}` }], details: {} };
+						},
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		await harness.session.bindExtensions({});
+		writeFileSync(join(harness.tempDir, "nested-read.txt"), "read me");
+		writeFileSync(join(harness.tempDir, "nested-edit.txt"), "old");
+		harness.setResponses([
+			fauxAssistantMessage([fauxToolCall("files", {})], { stopReason: "toolUse" }),
+			fauxAssistantMessage("done"),
+			fauxAssistantMessage("## Goal\nexplored files"),
+		]);
+		await harness.session.prompt("go");
+		const result = harness.session.messages.find(
+			(message): message is ToolResultMessage => message.role === "toolResult",
+		);
+		expect(result?.content).toEqual([{ type: "text", text: "failed: 0" }]);
+		const firstUser = harness.sessionManager
+			.getBranch()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		if (!firstUser) throw new Error("No user entry");
+		const navigation = await harness.session.navigateTree(firstUser.id, { summarize: true });
+		expect(navigation.summaryEntry?.details).toMatchObject({
+			readFiles: ["nested-read.txt"],
+			modifiedFiles: expect.arrayContaining(["nested-edit.txt", "nested-write.txt"]),
+		});
+	});
+
 	it("leaves results without nested calls unchanged", async () => {
 		const harness = await createHarness({ initialActiveToolNames: [], extensionFactories: [orchestratorExtension] });
 		harnesses.push(harness);
@@ -141,5 +320,66 @@ describe("AgentSession tool orchestration", () => {
 		await harness.session.prompt("go");
 		const result = harness.session.messages.find((message) => message.role === "toolResult");
 		expect(result && "nestedCalls" in result).toBe(false);
+	});
+
+	// smarty-dev#12837: a timed-out summarizer cannot hold admission or persist a late checkpoint.
+	it.each([
+		{ phase: "setup", retry: false },
+		{ phase: "result", retry: false },
+		{ phase: "setup", retry: true },
+		{ phase: "result", retry: true },
+	] as const)("settles cleanup during stalled branch-summary $phase (retry: $retry)", async ({ phase, retry }) => {
+		const harness = await createHarness({
+			initialActiveToolNames: [],
+			settings: { retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 } },
+		});
+		harnesses.push(harness);
+		harness.setResponses([fauxAssistantMessage("done")]);
+		await harness.session.prompt("go");
+		const firstUser = harness.sessionManager
+			.getBranch()
+			.find((entry) => entry.type === "message" && entry.message.role === "user");
+		if (!firstUser) throw new Error("No user entry");
+		const oldLeaf = harness.sessionManager.getLeafId();
+		const requested = Promise.withResolvers<void>();
+		const stream = createAssistantMessageEventStream();
+		const terminal = stream.result();
+		stream.result = () => {
+			requested.resolve();
+			return terminal;
+		};
+		const setup = Promise.withResolvers<typeof stream>();
+		let requestSignal: AbortSignal | undefined;
+		let streamCalls = 0;
+		harness.session.agent.streamFunction = (_model, _context, options) => {
+			streamCalls++;
+			if (retry && streamCalls === 1) {
+				const failure = createAssistantMessageEventStream();
+				failure.push({
+					type: "error",
+					reason: "error",
+					error: fauxAssistantMessage("", { stopReason: "error", errorMessage: "429 rate limit" }),
+				});
+				return failure;
+			}
+			requestSignal = options?.signal;
+			if (phase === "setup") requested.resolve();
+			return phase === "setup" ? setup.promise : stream;
+		};
+		const navigation = harness.session.navigateTree(firstUser.id, { summarize: true });
+		await requested.promise;
+		expect(harness.session.isCompacting).toBe(true);
+		await expect(harness.cleanup()).resolves.toBeUndefined();
+		await expect(navigation).resolves.toMatchObject({ cancelled: true, aborted: true });
+		expect(requestSignal?.aborted).toBe(true);
+		expect(harness.session.isIdle).toBe(true);
+		expect(() => harness.session.dispose()).not.toThrow();
+		setup.resolve(stream);
+		stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("late summary") });
+		await Promise.resolve();
+		expect(streamCalls).toBe(retry ? 2 : 1);
+		expect(harness.eventsOfType("summarization_retry_finished")).toHaveLength(retry ? 1 : 0);
+		expect(harness.sessionManager.getLeafId()).toBe(oldLeaf);
+		expect(harness.sessionManager.getEntries().some((entry) => entry.type === "branch_summary")).toBe(false);
 	});
 });

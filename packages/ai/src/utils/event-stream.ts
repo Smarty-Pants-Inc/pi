@@ -1,4 +1,7 @@
+import { redactOAuthDiagnostic, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
+import { cloneToolCall, type PublicationPhase, projectAssistantMessage, terminalPhase } from "./diagnostics.ts";
+import { assistantRecovery, ownedRecovery, transferThrottledLimitWait } from "./recovery.ts";
 
 class FifoQueue<T> {
 	private incoming: T[] = [];
@@ -88,6 +91,91 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	}
 }
 
+interface StreamProtection {
+	secrets: string[];
+}
+// Outside the class to preserve structural compatibility of custom streams.
+const streamProtections = new WeakMap<object, StreamProtection>();
+
+export function protectAssistantMessageStream(
+	stream: AssistantMessageEventStream,
+	secrets: readonly string[] | undefined,
+): void {
+	const values = (secrets ?? []).filter((secret): secret is string => typeof secret === "string" && secret !== "");
+	if (values.length === 0) return;
+	const protection = streamProtections.get(stream);
+	if (protection) protection.secrets.push(...values);
+	else streamProtections.set(stream, { secrets: values });
+}
+function protectMessage(message: AssistantMessage, protection: StreamProtection): void {
+	const { secrets } = protection;
+	if (typeof message.errorMessage === "string")
+		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
+	if (typeof message.rawStopReason === "string")
+		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
+	const deferred = message.deferred;
+	if (typeof deferred?.id === "string") {
+		const id = redactValues(deferred.id, secrets);
+		if (id !== deferred.id) message.deferred = { ...deferred, id };
+	}
+}
+function projectMessage(message: AssistantMessage, phase: PublicationPhase): AssistantMessage {
+	const projected = projectAssistantMessage(message, phase);
+	const recovery = message.stopReason === "error" ? assistantRecovery(message) : ownedRecovery(message.recovery);
+	if (recovery !== undefined) projected.recovery = recovery;
+	transferThrottledLimitWait(message, projected);
+	return projected;
+}
+function projectEvent(event: AssistantMessageEvent): AssistantMessageEvent {
+	switch (event.type) {
+		case "done":
+			return {
+				type: "done",
+				reason: event.reason,
+				message: projectMessage(event.message, terminalPhase(event.message)),
+			};
+		case "error":
+			return { type: "error", reason: event.reason, error: projectMessage(event.error, "failure") };
+		case "start":
+			return { type: "start", partial: projectMessage(event.partial, "partial") };
+		case "text_start":
+		case "thinking_start":
+		case "toolcall_start":
+			return {
+				type: event.type,
+				contentIndex: event.contentIndex,
+				partial: projectMessage(event.partial, "partial"),
+			};
+		case "text_delta":
+		case "thinking_delta":
+		case "toolcall_delta":
+			return {
+				type: event.type,
+				contentIndex: event.contentIndex,
+				delta: event.delta,
+				partial: projectMessage(event.partial, "partial"),
+			};
+		case "text_end":
+		case "thinking_end":
+			return {
+				type: event.type,
+				contentIndex: event.contentIndex,
+				content: event.content,
+				partial: projectMessage(event.partial, "partial"),
+			};
+		case "toolcall_end": {
+			const partial = projectMessage(event.partial, "partial");
+			const block = partial.content[event.contentIndex];
+			return {
+				type: "toolcall_end",
+				contentIndex: event.contentIndex,
+				toolCall: block?.type === "toolCall" ? block : cloneToolCall(event.toolCall),
+				partial,
+			};
+		}
+	}
+}
+
 /**
  * Event stream of one assistant response. It also times the response: the final message (`done` or `error` event, or
  * the result passed to `end()`) gets `durationMs`, measured with a monotonic clock from the stream's creation, unless
@@ -98,7 +186,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	readonly #startedAt = Date.now();
 	readonly #startedAtMonotonic = performance.now();
 
-	constructor() {
+	constructor(diagnosticSecrets?: readonly string[]) {
 		super(
 			(event) => event.type === "done" || event.type === "error",
 			(event) => {
@@ -110,17 +198,32 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new Error("Unexpected event type for final result");
 			},
 		);
+		protectAssistantMessageStream(this, diagnosticSecrets);
 	}
 
 	override push(event: AssistantMessageEvent): void {
-		if (event.type === "done") this.#time(event.message);
-		else if (event.type === "error") this.#time(event.error);
-		super.push(event);
+		if (this.done) return;
+		const published = projectEvent(event);
+		const protection = streamProtections.get(this);
+		if (protection) {
+			if ("partial" in published) protectMessage(published.partial, protection);
+			if (published.type === "done") protectMessage(published.message, protection);
+			if (published.type === "error") protectMessage(published.error, protection);
+		}
+		if (published.type === "done") this.#time(published.message);
+		else if (published.type === "error") this.#time(published.error);
+		super.push(published);
 	}
 
 	override end(result?: AssistantMessage): void {
-		if (result !== undefined) this.#time(result);
-		super.end(result);
+		let published = result;
+		if (result !== undefined) {
+			published = projectMessage(result, terminalPhase(result));
+			const protection = streamProtections.get(this);
+			if (protection) protectMessage(published, protection);
+			this.#time(published);
+		}
+		super.end(published);
 	}
 
 	#time(message: AssistantMessage): void {

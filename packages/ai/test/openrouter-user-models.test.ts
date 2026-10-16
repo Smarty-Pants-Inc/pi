@@ -99,6 +99,50 @@ describe("personalizeOpenRouterCatalog", () => {
 		expect(result[4]).toBe(classifierModel);
 	});
 
+	// pi#202: catalog refresh errors have no stream projector and must already be value-free.
+	it.each(["transport", "invalid JSON", "HTTP rejection"])("publishes owned errors for %s", async (failure) => {
+		const canary = "openrouter-private-wire-value-without-a-credential-label";
+		if (failure === "transport") {
+			vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error(canary, { cause: { credential: canary } }));
+		} else {
+			stubUserModels(
+				new Response(canary, {
+					status: failure === "HTTP rejection" ? 500 : 200,
+					headers: { "x-private-wire-value": canary },
+				}),
+			);
+		}
+		const error: unknown = await personalizeOpenRouterCatalog([chatModel("a")], refreshContext()).catch(
+			(error: unknown) => error,
+		);
+		expect(error).toBeInstanceOf(Error);
+		expect(String(error)).not.toContain(canary);
+		if (error instanceof Error) {
+			expect(error.cause).toBeUndefined();
+			expect(error.stack).not.toContain(canary);
+			expect(error.message).toBe(
+				failure === "invalid JSON"
+					? "Invalid OpenRouter model list response"
+					: failure === "HTTP rejection"
+						? "OpenRouter model list request failed: 500"
+						: "OpenRouter model list request failed",
+			);
+		}
+	});
+
+	it("uses the configured OpenRouter endpoint without copying wire endpoint fields into models", async () => {
+		const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			Response.json({
+				data: [{ id: "a", baseUrl: "https://wire-origin.example", api: "wire-api" }],
+			}),
+		);
+		const context = { ...refreshContext(), baseUrl: "https://us.openrouter.ai/api/v1/" };
+		const result = await personalizeOpenRouterCatalog([chatModel("a")], context);
+		expect(fetch.mock.calls[0][0]).toBe("https://us.openrouter.ai/api/v1/models/user");
+		expect(new Headers(fetch.mock.calls[0][1]?.headers).get("authorization")).toBe("Bearer sk-or-test");
+		expect(result[0]).toMatchObject({ api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1" });
+	});
+
 	it.each([401, 403, 404])(
 		"returns the catalog unchanged when the endpoint rejects the key or is missing (%i)",
 		async (status) => {

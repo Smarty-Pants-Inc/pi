@@ -8,7 +8,11 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
+	type AssistantRecovery,
 	createAssistantMessageEventStream,
+	isContextOverflow,
+	isPrematureStreamError,
+	isRetryableAssistantError,
 	type Model,
 	parseStreamingJson,
 	type SimpleStreamOptions,
@@ -16,6 +20,12 @@ import {
 	type ToolCall,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
+import { classifyProviderFailure, validHttpStatus } from "@earendil-works/pi-ai/utils/recovery";
+
+// A gateway error stream is untrusted: bound both retained bytes and total classification time.
+const MAX_PROXY_ERROR_BYTES = 16 * 1024;
+const MAX_PROXY_ERROR_READ_MS = 5_000;
 
 /**
  * Proxy event types - server sends these with partial field stripped to reduce bandwidth.
@@ -159,16 +169,47 @@ export function streamProxy(
 			});
 
 			if (!response.ok) {
-				let errorMessage = `Proxy error: ${response.status} ${response.statusText}`;
+				const status = validHttpStatus(response.status);
+				// Preserve the legacy JSON `error` / status-text fallback privately, never on an Error.
+				let privateText = response.statusText;
+				// The HTTP failure already owns the result; private classification must not stall it (#3155).
+				const deadline = new AbortController();
+				const timeout = setTimeout(() => deadline.abort(), MAX_PROXY_ERROR_READ_MS);
+				const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
 				try {
-					const errorData = (await response.json()) as { error?: string };
-					if (errorData.error) {
-						errorMessage = `Proxy error: ${errorData.error}`;
+					reader = response.body?.getReader();
+					if (reader) {
+						const decoder = new TextDecoder();
+						let text = "";
+						let bytes = 0;
+						while (!signal.aborted) {
+							const { done, value } = await raceWithAbortSignal(reader.read(), signal);
+							if (signal.aborted) break;
+							if (done) {
+								const data = JSON.parse(text + decoder.decode()) as { error?: string } | null;
+								if (data?.error) privateText = `Proxy error: ${data.error}`;
+								break;
+							}
+							bytes += value.byteLength;
+							if (bytes > MAX_PROXY_ERROR_BYTES) break;
+							text += decoder.decode(value, { stream: true });
+						}
 					}
 				} catch {
-					// Couldn't parse error response
+					// Body/parser failures and deadlines are private too; the HTTP failure still owns the result.
+				} finally {
+					clearTimeout(timeout);
+					if (reader) {
+						// Do not await cancellation: a gateway may never settle its cancel hook.
+						void reader.cancel().catch(() => {});
+						reader.releaseLock();
+						reader = undefined;
+					}
 				}
-				throw new Error(errorMessage);
+				if (options.signal?.aborted) throw new Error("Request aborted by user");
+				partial.recovery = classifyProviderFailure({ text: privateText, status, provider: model.provider });
+				// Only owned text crosses the catch/publication boundary (smarty-dev#5822, pi#202 CR-4).
+				throw new Error(status === undefined ? "Proxy error" : `Proxy error (${status})`);
 			}
 
 			reader = response.body!.getReader();
@@ -249,6 +290,29 @@ export function streamProxy(
 	})();
 
 	return stream;
+}
+
+/**
+ * The owned recovery decision for a proxy wire error, decided from its private text by the same public checks
+ * that read the published text before (overflow, premature stream, retryable), so retry behaviour is unchanged.
+ * The probe message is local and never published; it has no output, so only the text decides.
+ */
+function proxyRecovery(partial: AssistantMessage, wireText: unknown): AssistantRecovery {
+	const probe: AssistantMessage = {
+		...partial,
+		content: [],
+		usage: { ...partial.usage, output: 0 },
+		stopReason: "error",
+		errorMessage: typeof wireText === "string" ? wireText : "",
+		recovery: undefined,
+		diagnostics: undefined,
+	};
+	if (isContextOverflow(probe)) return { recovery: "context_length_exceeded", retryable: false };
+	// Quota and billing refusals win over everything else, as in the shared classifier.
+	if (!isRetryableAssistantError(probe)) return { retryable: false };
+	return isPrematureStreamError(probe)
+		? { recovery: "premature_stream", retryable: true }
+		: { recovery: "retryable", retryable: true };
 }
 
 /**
@@ -375,14 +439,19 @@ function processProxyEvent(
 			}
 			return { type: "done", reason: proxyEvent.reason, message: partial };
 
-		case "error":
-			partial.stopReason = proxyEvent.reason;
-			partial.errorMessage = proxyEvent.errorMessage;
+		case "error": {
+			// The wire text stays private: it only decides recovery, exactly as the published text used to
+			// (smarty-dev#5822, pi#202 round 4). The published text is owned, with a closed reason code.
+			const reason = proxyEvent.reason === "aborted" ? "aborted" : "error";
+			partial.stopReason = reason;
+			partial.recovery = proxyRecovery(partial, proxyEvent.errorMessage);
+			partial.errorMessage = reason === "aborted" ? "Proxy error (aborted)" : "Proxy error";
 			partial.usage = proxyEvent.usage;
 			if (proxyEvent.providerThinkingLevel !== undefined) {
 				partial.providerThinkingLevel = proxyEvent.providerThinkingLevel;
 			}
-			return { type: "error", reason: proxyEvent.reason, error: partial };
+			return { type: "error", reason, error: partial };
+		}
 
 		default: {
 			const _exhaustiveCheck: never = proxyEvent;

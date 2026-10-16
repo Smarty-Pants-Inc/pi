@@ -9,21 +9,20 @@
 //
 // `normalizeProviderError` probes the known SDK field shapes (Mistral,
 // `openai`, `@google/genai`, AWS Bedrock) and returns a struct each provider
-// composes into its display string. The `messageCarriesBody` flag captures the
-// Anthropic / `@google/genai` happy path where the SDK already folded the body
-// into the message, so providers can preserve it without double-printing.
+// uses only to classify the failure. Provider text never becomes public error text.
 
-export const MAX_PROVIDER_ERROR_BODY_CHARS = 4000;
+import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
+import type { AssistantRecovery } from "../types.ts";
+import { ProviderRequestLimitError } from "./provider-retry.ts";
+import { classifyProviderFailure, validHttpStatus } from "./recovery.ts";
 
 export interface NormalizedProviderError {
 	/** HTTP status code, when one could be extracted from the SDK error object. */
 	status?: number;
-	/** Raw HTTP body reason, already trimmed and truncated to the cap. */
-	body?: string;
-	/** `error.message`, or `safeJsonStringify(error)` for a non-`Error` throw. */
-	message: string;
-	/** True when `message` already contains the body (no separate body to add). */
-	messageCarriesBody: boolean;
+	/** Owned decision classified before suppression. */
+	recovery: AssistantRecovery;
+	/** Masked local validation/transport failure, never provider response text. */
+	localMessage?: string;
 }
 
 type SdkErrorShape = Error & {
@@ -35,22 +34,59 @@ type SdkErrorShape = Error & {
 	$response?: { statusCode?: unknown; body?: unknown };
 };
 
-export function normalizeProviderError(error: unknown): NormalizedProviderError {
-	if (!(error instanceof Error)) {
-		return { message: safeJsonStringify(error), messageCarriesBody: false };
+export function normalizeProviderError(
+	error: unknown,
+	provider?: string,
+	privateText?: string,
+	secrets: readonly string[] = [],
+): NormalizedProviderError {
+	const status = error instanceof Error ? extractStatus(error as SdkErrorShape) : undefined;
+	const text = privateText ? `${providerErrorText(error)}\n${privateText}` : providerErrorText(error);
+	const recovery = classifyProviderFailure({ text, status, provider });
+	if (status !== undefined) return { status, recovery };
+	return isLocalError(error)
+		? { recovery, localMessage: redactOAuthDiagnostic(error.message, secrets) }
+		: { recovery };
+}
+
+const providerDataTexts = new WeakMap<object, string>();
+
+/** Provider-origin failures have owned name/message/stack and no raw payload or cause. */
+export class ProviderDataError extends Error {
+	readonly status?: number;
+
+	constructor(privateText: string, status?: number, name = "ProviderDataError") {
+		super("Provider request failed");
+		this.name = name;
+		const valid = validHttpStatus(status);
+		if (valid !== undefined) this.status = valid;
+		providerDataTexts.set(this, privateText);
 	}
-
-	const sdkError = error as SdkErrorShape;
-	const status = extractStatus(sdkError);
-	const body = extractBody(sdkError);
-	const messageCarriesBody = body === undefined || error.message.includes(body);
-
-	return {
-		status,
-		body,
-		message: error.message,
-		messageCarriesBody,
-	} satisfies NormalizedProviderError;
+}
+export function providerLabel(provider: string): string {
+	return /^[a-z0-9-]{1,40}$/.test(provider) ? provider : "provider";
+}
+function isLocalError(error: unknown): error is Error {
+	if (!(error instanceof Error) || !error.message) return false;
+	if (error instanceof ProviderDataError) return false;
+	if (error instanceof ProviderRequestLimitError) return true;
+	const fields = error as SdkErrorShape;
+	return (
+		fields.statusCode === undefined &&
+		fields.status === undefined &&
+		(fields.body === undefined || fields.body === "") &&
+		fields.error === undefined &&
+		fields.$metadata === undefined &&
+		fields.$response === undefined
+	);
+}
+/** Private classification input only; never publish this text. */
+export function providerErrorText(error: unknown): string {
+	if (!(error instanceof Error)) return safeJsonStringify(error);
+	const dataText = providerDataTexts.get(error);
+	if (dataText !== undefined) return dataText;
+	const body = pickBodyText(error as SdkErrorShape);
+	return body === undefined ? error.message : `${error.message}\n${body}`;
 }
 
 /**
@@ -59,11 +95,12 @@ export function normalizeProviderError(error: unknown): NormalizedProviderError 
  * `$metadata.httpStatusCode` (Bedrock) → `$response.statusCode` (Bedrock).
  */
 function extractStatus(error: SdkErrorShape): number | undefined {
-	if (typeof error.statusCode === "number") return error.statusCode;
-	if (typeof error.status === "number") return error.status;
-	if (typeof error.$metadata?.httpStatusCode === "number") return error.$metadata.httpStatusCode;
-	if (typeof error.$response?.statusCode === "number") return error.$response.statusCode;
-	return undefined;
+	return (
+		validHttpStatus(error.statusCode) ??
+		validHttpStatus(error.status) ??
+		validHttpStatus(error.$metadata?.httpStatusCode) ??
+		validHttpStatus(error.$response?.statusCode)
+	);
 }
 
 /**
@@ -73,14 +110,6 @@ function extractStatus(error: SdkErrorShape): number | undefined {
  * streams are treated as no body so they do not surface as `"{}"` or serialized
  * stream internals. The chosen body is truncated to the cap.
  */
-function extractBody(error: SdkErrorShape): string | undefined {
-	const bodyText = pickBodyText(error);
-	if (bodyText === undefined) return undefined;
-	const trimmed = bodyText.trim();
-	if (trimmed.length === 0) return undefined;
-	return truncateErrorText(trimmed, MAX_PROVIDER_ERROR_BODY_CHARS);
-}
-
 function pickBodyText(error: SdkErrorShape): string | undefined {
 	if (typeof error.body === "string") return error.body;
 	if (isPlainNonEmptyObject(error.error)) return safeJsonStringify(error.error);
@@ -125,18 +154,62 @@ function isPlainNonEmptyObject(value: unknown): boolean {
  * - no prefix: `"<status>: <body>"`
  * - prefix:    `"<prefix> (<status>): <body>"`
  */
-export function formatProviderError(norm: NormalizedProviderError, prefix?: string): string {
-	if (norm.messageCarriesBody || norm.status === undefined || norm.body === undefined) {
-		return prefix !== undefined && norm.status !== undefined
-			? `${prefix} (${norm.status}): ${norm.message}`
-			: norm.message;
-	}
-	return prefix !== undefined ? `${prefix} (${norm.status}): ${norm.body}` : `${norm.status}: ${norm.body}`;
+export function formatProviderError(norm: NormalizedProviderError, label = "Provider request failed"): string {
+	if (norm.localMessage !== undefined) return norm.localMessage;
+	const status = norm.status === undefined ? "" : ` (${norm.status})`;
+	const detail =
+		norm.recovery.recovery === "context_length_exceeded"
+			? ": context length exceeded"
+			: norm.recovery.recovery === "premature_stream"
+				? ": stream ended without completing"
+				: norm.recovery.retryable && norm.status === undefined
+					? ": network or server error"
+					: "";
+	return `${label}${status}${detail}`;
 }
 
-export function truncateErrorText(text: string, maxChars: number): string {
-	if (text.length <= maxChars) return text;
-	return `${text.slice(0, maxChars)}... [truncated ${text.length - maxChars} chars]`;
+export const PROVIDER_LIMIT_DIAGNOSTIC = "provider_limit";
+const SMARTY_LIMIT_WINDOWS: Readonly<Record<string, string>> = {
+	"5h": "5-hour",
+	day: "daily",
+	"1d": "daily",
+	week: "weekly",
+	"7d": "weekly",
+	month: "monthly",
+};
+export const SMARTY_THROTTLE_MESSAGE = "Flash runs one request at a time";
+const MAX_SMARTY_RESET_MS = 31 * 24 * 60 * 60 * 1000;
+
+/** Render only closed window names and a bounded, locally formatted reset time. */
+export function smartyLimitMessage(error: unknown): string | undefined {
+	const body = (error as { error?: unknown } | null | undefined)?.error;
+	if (typeof body !== "object" || body === null) return undefined;
+	const { code, type, throttled, window, resets_at: resetsAt } = body as Record<string, unknown>;
+	if (code !== "smarty_limit" && type !== "smarty_limit") return undefined;
+	if (throttled === true) return SMARTY_THROTTLE_MESSAGE;
+	const name =
+		typeof window === "string" && Object.hasOwn(SMARTY_LIMIT_WINDOWS, window) ? SMARTY_LIMIT_WINDOWS[window] : "plan";
+	const resetMs =
+		typeof resetsAt === "number" && Number.isFinite(resetsAt)
+			? resetsAt * 1000
+			: typeof resetsAt === "string"
+				? Date.parse(resetsAt)
+				: Number.NaN;
+	const now = Date.now();
+	const reset =
+		Number.isFinite(resetMs) && resetMs > now && resetMs - now <= MAX_SMARTY_RESET_MS
+			? ` More at ${new Date(resetMs).toISOString().slice(11, 16)}Z.`
+			: "";
+	return `Your ${name} limit is used up.${reset}`;
+}
+export function smartyThrottleRetryAfterSeconds(error: unknown): number | undefined {
+	if (smartyLimitMessage(error) === undefined) return undefined;
+	const { error: body, headers } = error as { error: { throttled?: unknown }; headers?: unknown };
+	if (body.throttled !== true || !(headers instanceof Headers)) return undefined;
+	const retryAfter = headers.get("retry-after")?.trim();
+	if (!retryAfter || !/^\d+$/.test(retryAfter)) return undefined;
+	const seconds = Number(retryAfter);
+	return seconds <= 30 ? seconds : undefined;
 }
 
 export function safeJsonStringify(value: unknown): string {

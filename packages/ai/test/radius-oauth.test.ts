@@ -116,6 +116,23 @@ describe("Radius OAuth", () => {
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
+	// pi#150: a code-shaped error field can still be an echoed credential.
+	it("does not reflect an echoed lowercase secret in the error code", async () => {
+		const secret = "leaked_refresh_secret";
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => jsonResponse({ error: secret, error_description: secret }, 400)),
+		);
+		const oauth = createRadiusOAuth({ name: "Radius", gateway: GATEWAY });
+		const message = await oauth
+			.refresh({ type: "oauth", access: "old-access", refresh: secret, expires: 0 }, new AbortController().signal)
+			.then(
+				() => "",
+				(error: Error) => error.message,
+			);
+		expect(message).toBe("Radius OAuth token request failed: authorization_error");
+	});
+
 	it("discovers only the interactive browser authorization endpoint", async () => {
 		const fetchMock = vi.fn(async (input: unknown) => {
 			expect(requestUrl(input)).toBe(`${GATEWAY}/v1/oauth`);
@@ -169,9 +186,11 @@ describe("Radius OAuth", () => {
 		};
 
 		const failed = await login();
-		expect("error" in failed && failed.error.message).toContain("invalid_grant: code expired");
+		// pi#150: endpoint text can echo credentials; show only the protocol class.
+		expect("error" in failed && failed.error.message).toBe("Radius OAuth token request failed: invalid_grant");
 		expect(failed.status).toBe(502);
-		expect(failed.page).toContain("code expired");
+		expect(failed.page).toContain("invalid_grant");
+		expect(failed.page).not.toContain("code expired");
 
 		tokenStatus = 200;
 		const succeeded = await login();

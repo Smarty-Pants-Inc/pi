@@ -14,6 +14,7 @@
 import { getProviderEnvValue } from "../../utils/provider-env.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer, waitForCallbackOrManualInput } from "./callback-server.ts";
+import { oauthAuthorizationError } from "./credential-response.ts";
 import { generatePKCE } from "./pkce.ts";
 
 const AUTHORIZE_URL = "https://openrouter.ai/auth";
@@ -44,15 +45,8 @@ function parseAuthorizationInput(input: string): string | undefined {
 	return value;
 }
 
-function errorDetail(body: JsonObject): string | undefined {
-	if (typeof body.error_description === "string") return body.error_description;
-	if (typeof body.message === "string") return body.message;
-	if (typeof body.error === "string") return body.error;
-	if (body.error && typeof body.error === "object" && !Array.isArray(body.error)) {
-		const message = (body.error as JsonObject).message;
-		if (typeof message === "string") return message;
-	}
-	return undefined;
+function errorDetail(body: JsonObject, secrets: readonly string[]): string | undefined {
+	return typeof body.error === "string" ? oauthAuthorizationError(body.error, secrets) : undefined;
 }
 
 async function exchangeAuthorizationCode(
@@ -77,6 +71,8 @@ async function exchangeAuthorizationCode(
 			headers: { accept: "application/json", "content-type": "application/json" },
 			body: JSON.stringify({ code, code_verifier: verifier, code_challenge_method: "S256" }),
 			signal: controller.signal,
+		}).catch(() => {
+			throw new Error("OpenRouter OAuth request failed");
 		});
 		try {
 			const parsed = (await response.json()) as unknown;
@@ -94,7 +90,7 @@ async function exchangeAuthorizationCode(
 	}
 
 	if (!response.ok) {
-		const detail = errorDetail(body);
+		const detail = errorDetail(body, [code, verifier]);
 		throw new Error(`OpenRouter OAuth key exchange failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);
 	}
 

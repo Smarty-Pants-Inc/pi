@@ -11,6 +11,11 @@ import type {
 	ChatCompletionSystemMessageParam,
 	ChatCompletionToolMessageParam,
 } from "openai/resources/chat/completions.js";
+import {
+	createRedactingSdkLogger,
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+} from "../auth/oauth/credential-response.ts";
 import { calculateCost, clampThinkingLevel } from "../models.ts";
 import type {
 	AssistantMessage,
@@ -35,14 +40,26 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import {
+	appendAssistantMessageDiagnostic,
+	closedRawStopReason,
+	createAssistantMessageDiagnostic,
+} from "../utils/diagnostics.ts";
+import {
+	formatProviderError,
+	normalizeProviderError,
+	PROVIDER_LIMIT_DIAGNOSTIC,
+	smartyLimitMessage,
+	smartyThrottleRetryAfterSeconds,
+} from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { headersToRecord } from "../utils/headers.ts";
 import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { notifyProviderResponse, notifyProviderStreamEvent } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { recordThrottledLimitWait } from "../utils/retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import {
@@ -306,7 +323,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 	context: TranscriptContext,
 	options?: OpenAICompletionsOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, getCompat(model).supportsMidConvoSystemMessages);
 
 	(async () => {
@@ -350,6 +368,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				model,
 				normalizedContext,
 				apiKey,
+				diagnosticSecrets,
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
@@ -377,10 +396,23 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
+					beforeProviderRequest: options?.beforeProviderRequest,
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			try {
+				await notifyProviderResponse(options, output, response.status);
+			} catch (error) {
+				// No iterator has started to own cleanup yet. Do not let body cancellation
+				// delay or replace the owned observer failure after a billable response.
+				try {
+					openaiStream.controller.abort();
+					void response.body?.cancel().catch(() => undefined);
+				} catch {
+					// A custom transport's synchronous cleanup failure is secondary too.
+				}
+				throw error;
+			}
 			stream.push({ type: "start", partial: output });
 
 			interface StreamingToolCallBlock extends ToolCall {
@@ -556,7 +588,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			};
 
 			for await (const chunk of openaiStream) {
-				await options?.onProviderStreamEvent?.(chunk, model);
+				await notifyProviderStreamEvent(options, output);
 				if (!chunk || typeof chunk !== "object") continue;
 
 				// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
@@ -718,14 +750,24 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				delete (block as { streamIndex?: number }).streamIndex;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatProviderError(normalizeProviderError(error));
-			// Some providers via OpenRouter give additional information in this field.
-			// normalizeProviderError already stringifies the parsed body (error.error)
-			// into errorMessage, so only append the raw metadata when it is not already
-			// present to avoid double-printing it.
-			const rawMetadata = (error as any)?.error?.metadata?.raw;
-			if (rawMetadata && !output.errorMessage.includes(String(rawMetadata))) {
-				output.errorMessage += `\n${rawMetadata}`;
+			const limitMessage = smartyLimitMessage(error);
+			if (limitMessage !== undefined) {
+				output.errorMessage = limitMessage;
+				output.recovery ??= { retryable: false };
+				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
+				if (retryAfterSeconds !== undefined) recordThrottledLimitWait(output, retryAfterSeconds);
+				appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(PROVIDER_LIMIT_DIAGNOSTIC));
+			} else {
+				const rawMetadata = (error as { error?: { metadata?: { raw?: unknown } } } | undefined)?.error?.metadata
+					?.raw;
+				const norm = normalizeProviderError(
+					error,
+					model.provider,
+					rawMetadata === undefined || rawMetadata === null ? undefined : String(rawMetadata),
+					diagnosticSecrets,
+				);
+				output.recovery ??= norm.recovery;
+				output.errorMessage = formatProviderError(norm);
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
@@ -760,6 +802,7 @@ function createClient(
 	model: Model<"openai-completions">,
 	context: TranscriptContext,
 	apiKey: string,
+	diagnosticSecrets: readonly string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
@@ -794,6 +837,7 @@ function createClient(
 
 	return new OpenAI({
 		apiKey,
+		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets)),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,
@@ -1582,7 +1626,7 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | str
 		default:
 			return {
 				stopReason: "error",
-				errorMessage: `Provider finish_reason: ${reason}`,
+				errorMessage: `Provider finish_reason: ${closedRawStopReason(reason)}`,
 			};
 	}
 }

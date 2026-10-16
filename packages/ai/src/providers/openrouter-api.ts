@@ -33,13 +33,13 @@ export interface OpenRouterModel {
 }
 
 /**
- * Convert one $/token price to $/1M tokens. 0 means free. Missing, invalid and negative prices use
- * the fallback: OpenRouter reports -1 for router models such as `openrouter/auto`, whose price
- * depends on the model they pick.
+ * Convert one $/token price to $/1M tokens. Missing prices keep the fallback. Invalid and negative
+ * sentinel prices are unknown and use a zero estimate, never a credit or a partial parsed rate.
  */
 function perMillion(value: string | undefined, fallback: number): number {
-	const perToken = Number.parseFloat(value ?? "");
-	return perToken >= 0 ? Number((perToken * 1_000_000).toFixed(6)) : fallback;
+	if (value === undefined) return fallback;
+	const rate = Number(value) * 1_000_000;
+	return Number.isFinite(rate) && rate > 0 ? Number(rate.toFixed(6)) : 0;
 }
 
 /**

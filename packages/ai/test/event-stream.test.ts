@@ -123,18 +123,18 @@ describe("AssistantMessageEventStream timing", () => {
 		const answer = message(Date.now());
 		await sleep(20);
 		done.push({ type: "done", reason: "stop", message: answer });
-		expect(answer.durationMs).toBeGreaterThanOrEqual(15);
-		expect((await done.result()).durationMs).toBe(answer.durationMs);
+		// smarty-dev#5822 C2: time the published copy, not the producer-owned object.
+		expect((await done.result()).durationMs).toBeGreaterThanOrEqual(15);
+		expect(answer.durationMs).toBeUndefined();
 
 		const failed = new AssistantMessageEventStream();
 		const error = { ...message(Date.now()), stopReason: "error" as const };
 		failed.push({ type: "error", reason: "error", error });
-		expect(error.durationMs).toBeGreaterThanOrEqual(0);
+		expect((await failed.result()).durationMs).toBeGreaterThanOrEqual(0);
 
 		const ended = new AssistantMessageEventStream();
-		const result = message(Date.now());
-		ended.end(result);
-		expect(result.durationMs).toBeGreaterThanOrEqual(0);
+		ended.end(message(Date.now()));
+		expect((await ended.result()).durationMs).toBeGreaterThanOrEqual(0);
 	});
 
 	it("keeps an existing duration, so a forwarding stream keeps the inner measurement", async () => {
@@ -143,14 +143,15 @@ describe("AssistantMessageEventStream timing", () => {
 		const inner = new AssistantMessageEventStream();
 		const answer = message(Date.now());
 		inner.push({ type: "done", reason: "stop", message: answer });
-		const measured = answer.durationMs;
-		outer.push({ type: "done", reason: "stop", message: answer });
-		expect(answer.durationMs).toBe(measured);
+		const forwarded = await inner.result();
+		const measured = forwarded.durationMs;
+		outer.push({ type: "done", reason: "stop", message: forwarded });
+		expect((await outer.result()).durationMs).toBe(measured);
 		expect(measured).toBeLessThan(20);
 
-		const preset = message(Date.now(), 1234);
-		new AssistantMessageEventStream().push({ type: "done", reason: "stop", message: preset });
-		expect(preset.durationMs).toBe(1234);
+		const preset = new AssistantMessageEventStream();
+		preset.push({ type: "done", reason: "stop", message: message(Date.now(), 1234) });
+		expect((await preset.result()).durationMs).toBe(1234);
 	});
 
 	it("leaves a message untimed when it started before the stream, such as a fetched deferred result", () => {

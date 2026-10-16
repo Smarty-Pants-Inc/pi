@@ -1,5 +1,10 @@
 import OpenAI from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import {
+	createRedactingSdkLogger,
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+} from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type {
 	Api,
@@ -15,11 +20,11 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "../types.ts";
-import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
+import { formatProviderError, normalizeProviderError, providerErrorText, providerLabel } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { headersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
@@ -149,7 +154,8 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 	context: TranscriptContext,
 	options?: OpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, getCompat(model).supportsMidConvoSystemMessages);
 
 	// Start async processing
@@ -188,6 +194,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				model,
 				normalizedContext,
 				apiKey,
+				diagnosticSecrets,
 				options?.headers,
 				options?.fetch,
 				cacheSessionId,
@@ -214,10 +221,11 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
+					beforeProviderRequest: options?.beforeProviderRequest,
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponse(response.status));
 			stream.push({ type: "start", partial: output });
 
 			await processResponsesStream(openaiStream, output, stream, model, {
@@ -248,14 +256,19 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
+			const norm = normalizeProviderError(error, model.provider, undefined, diagnosticSecrets);
+			output.recovery ??= norm.recovery;
 			const errorMessage = formatProviderError(
-				normalizeProviderError(error),
-				`${model.provider === "openai" ? "OpenAI" : model.provider} API error`,
+				norm,
+				`${model.provider === "openai" ? "OpenAI" : providerLabel(model.provider)} API error`,
 			);
-			// Sign in with ChatGPT shares the subscription's usage limit with other apps.
-			output.errorMessage = errorMessage.includes("subscription_sharing_usage_limit_exceeded")
-				? `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`
-				: errorMessage;
+			if (providerErrorText(error).includes("subscription_sharing_usage_limit_exceeded")) {
+				output.errorHint = "chatgpt_usage";
+			}
+			output.errorMessage =
+				output.errorHint === "chatgpt_usage"
+					? `${errorMessage}\nCheck your ChatGPT usage: ${CHATGPT_USAGE_URL}`
+					: errorMessage;
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -288,6 +301,7 @@ function createClient(
 	model: Model<"openai-responses">,
 	context: TranscriptContext,
 	apiKey: string,
+	diagnosticSecrets: readonly string[],
 	optionsHeaders?: ProviderHeaders,
 	fetch?: typeof globalThis.fetch,
 	sessionId?: string,
@@ -321,6 +335,7 @@ function createClient(
 
 	return new OpenAI({
 		apiKey,
+		logger: createRedactingSdkLogger(getOAuthDiagnosticSecrets(apiKey, headers, diagnosticSecrets)),
 		baseURL: model.baseUrl,
 		dangerouslyAllowBrowser: true,
 		fetch,

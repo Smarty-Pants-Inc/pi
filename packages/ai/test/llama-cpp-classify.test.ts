@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	answerFromProbabilities,
 	classify,
@@ -8,6 +8,7 @@ import {
 	renderQuestion,
 } from "../src/api/llama-cpp-classify.ts";
 import type { ClassifierContext, ClassifierModel, ClassifierOptions } from "../src/types.ts";
+import { ProviderRequestLimitError } from "../src/utils/provider-retry.ts";
 
 let serverCount = 0;
 
@@ -100,6 +101,11 @@ const context: ClassifierContext = {
 		},
 		severity: { type: "score", instructions: "How severe is this?", criteria: ["low", "medium", "high"] },
 	},
+};
+
+const choiceContext: ClassifierContext = {
+	state: {},
+	questions: { pick: { type: "choice", instructions: "Pick", criteria: { a: "", b: "" } } },
 };
 
 /** Maps multi-character labels to single tokens, as a real vocabulary would. */
@@ -325,7 +331,7 @@ describe("llama.cpp classifier", () => {
 	it("passes completion payloads and responses through the request hooks", async () => {
 		const server = fakeServer();
 		const payloads: unknown[] = [];
-		const statuses: number[] = [];
+		const statuses: (number | undefined)[] = [];
 		const options: ClassifierOptions = {
 			fetch: server.fetch,
 			onPayload: (payload) => {
@@ -349,14 +355,369 @@ describe("llama.cpp classifier", () => {
 		expect(server.requests.find((request) => request.url.endsWith("/completion"))?.body.id_slot).toBe(1);
 	});
 
+	// #3155 F1: the request budget applies to bootstrap requests before any physical fetch.
+	it.each([0, 1])("stops at the physical request limit %i without retrying admission", async (limit) => {
+		const server = fakeServer();
+		const reason = new ProviderRequestLimitError(limit, limit);
+		let admitted = 0;
+		const result = await classify(model(), choiceContext, {
+			fetch: server.fetch,
+			beforeProviderRequest: () => {
+				if (admitted >= limit) throw reason;
+				admitted++;
+			},
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe(reason.message);
+		expect(result.answers).toEqual({});
+		expect(admitted).toBe(limit);
+		expect(server.requests).toHaveLength(limit);
+	});
+
+	// #3155 F1: a caller's original abort reason must survive the retry helper's generic AbortError.
+	it("preserves a pre-aborted caller reason without admission or fetch", async () => {
+		const controller = new AbortController();
+		const reason = new Error("Synthetic caller cancellation");
+		controller.abort(reason);
+		const server = fakeServer();
+		let admissions = 0;
+		const result = await classify(model(), choiceContext, {
+			signal: controller.signal,
+			fetch: server.fetch,
+			beforeProviderRequest: () => {
+				admissions++;
+			},
+		});
+
+		expect(result.stopReason).toBe("aborted");
+		expect(result.errorMessage).toBe(reason.message);
+		expect(admissions).toBe(0);
+		expect(server.requests).toEqual([]);
+	});
+
+	// #3155 F1: all endpoints, deeper completions and physical retries need fresh admission.
+	it("admits every allowed fetch and preserves Llama protocol and value-free response hooks", async () => {
+		vi.useFakeTimers();
+		try {
+			const server = fakeServer({
+				next: (_prompt, depth): Record<string, number> => (depth < 4096 ? { A: -0.1 } : { A: -0.1, B: -2 }),
+			});
+			const events: string[] = [];
+			const responses: unknown[] = [];
+			const classifierModel = { ...model(), id: "exact/model:Q4_K_M", headers: { "x-model": "model" } };
+			let retried = false;
+			const pending = classify(classifierModel, choiceContext, {
+				apiKey: "synthetic-local-key",
+				headers: { "X-Model": "override", "x-request": "request" },
+				beforeProviderRequest: () => {
+					events.push("admit");
+				},
+				onResponse: (response) => {
+					responses.push(response);
+				},
+				fetch: async (input, init) => {
+					const path = new URL(String(input)).pathname;
+					events.push(path);
+					if (path === "/completion" && !retried) {
+						retried = true;
+						return new Response("synthetic retry", { status: 503, headers: { "retry-after-ms": "1" } });
+					}
+					return server.fetch(input, init);
+				},
+			});
+			await vi.advanceTimersByTimeAsync(100);
+			const result = await pending;
+
+			expect(result.stopReason).toBe("stop");
+			expect(result.answers.pick).toMatchObject({ type: "choice", choice: "a" });
+			expect(retried).toBe(true);
+			expect(completionDepths(server.requests)).toEqual([256, 4096]);
+			expect(events.filter((event) => event === "/completion")).toHaveLength(3);
+			expect(events).toEqual(events.filter((event) => event !== "admit").flatMap((path) => ["admit", path]));
+			expect(new Set(events)).toEqual(new Set(["admit", "/tokenize", "/apply-template", "/completion"]));
+			for (const request of server.requests) {
+				expect(request.body.model).toBe(classifierModel.id);
+				expect(request.headers.get("authorization")).toBe("Bearer synthetic-local-key");
+				expect(request.headers.get("content-type")).toBe("application/json");
+				expect(request.headers.get("x-model")).toBe("override");
+				expect(request.headers.get("x-request")).toBe("request");
+			}
+			expect(responses).toEqual([{ status: 200 }, { status: 200 }]);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// #3155 F1: a limit reached during backoff must block the retry and preserve its abort reason.
+	it("does not fetch again when retry admission aborts with the original limit reason", async () => {
+		vi.useFakeTimers();
+		try {
+			const server = fakeServer();
+			const controller = new AbortController();
+			const reason = new ProviderRequestLimitError(1, 1);
+			let attempts = 0;
+			let deny = false;
+			const pending = classify(model(), choiceContext, {
+				signal: controller.signal,
+				beforeProviderRequest: () => {
+					if (deny) {
+						controller.abort(reason);
+						throw reason;
+					}
+				},
+				fetch: async (input, init) => {
+					if (String(input).endsWith("/completion")) {
+						attempts++;
+						deny = true;
+						return new Response("retry", { status: 503, headers: { "retry-after-ms": "1" } });
+					}
+					return server.fetch(input, init);
+				},
+			});
+			await vi.advanceTimersByTimeAsync(100);
+			const result = await pending;
+
+			expect(attempts).toBe(1);
+			expect(controller.signal.reason).toBe(reason);
+			expect(result.stopReason).toBe("aborted");
+			expect(result.errorMessage).toBe(reason.message);
+			expect(result.answers).toEqual({});
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// #3155 F2: bound decoded bytes, not Content-Length, on success and retryable error responses.
+	it.each([200, 503])("rejects an oversized %i body without retry and releases its reader", async (status) => {
+		const server = fakeServer();
+		const responses: Response[] = [];
+		const signals: AbortSignal[] = [];
+		const cancellations: unknown[] = [];
+		let pulls = 0;
+		let attempts = 0;
+		const result = await classify(model(), choiceContext, {
+			fetch: async (input, init) => {
+				if (!String(input).endsWith("/completion")) return server.fetch(input, init);
+				attempts++;
+				if (init?.signal) signals.push(init.signal);
+				const body = new ReadableStream<Uint8Array>(
+					{
+						pull(controller) {
+							pulls++;
+							if (pulls <= 6) controller.enqueue(new Uint8Array(1024 * 1024).fill(32));
+							else controller.close();
+						},
+						cancel(reason) {
+							cancellations.push(reason);
+						},
+					},
+					{ highWaterMark: 0 },
+				);
+				// Inject already-decoded bytes, as fetch does after HTTP decompression.
+				const response = new Response(body, {
+					status,
+					headers: { "content-length": "1", "content-encoding": "gzip", "x-should-retry": "true" },
+				});
+				responses.push(response);
+				return response;
+			},
+		});
+
+		expect(result.stopReason).toBe("error");
+		expect(result.answers).toEqual({});
+		expect(result.errorMessage).toBe("llama.cpp response body exceeds 4194304 byte limit");
+		expect(attempts).toBe(1);
+		expect(pulls).toBe(5);
+		expect(cancellations).toHaveLength(1);
+		expect(signals).toHaveLength(1);
+		expect(signals[0]?.aborted).toBe(true);
+		expect(responses[0]?.body?.locked).toBe(false);
+	});
+
+	// #3155 F2 control: the inclusive 4 MiB boundary still permits JSON, HTTP errors and normal retries.
+	it.each([200, 400, 503])("accepts a bounded %i body and preserves protocol and optional auth", async (status) => {
+		vi.useFakeTimers();
+		try {
+			const server = fakeServer();
+			const responses: Response[] = [];
+			const observed: unknown[] = [];
+			let attempts = 0;
+			const pending = classify(model(), choiceContext, {
+				onResponse: (response) => {
+					observed.push(response);
+				},
+				fetch: async (input, init) => {
+					if (!String(input).endsWith("/completion")) return server.fetch(input, init);
+					attempts++;
+					if (attempts > 1) return server.fetch(input, init);
+					const text = status === 200 ? await (await server.fetch(input, init)).text() : "bounded provider error";
+					const bytes = new TextEncoder().encode(text.padEnd(4 * 1024 * 1024, " "));
+					const body = new ReadableStream<Uint8Array>({
+						start(controller) {
+							controller.enqueue(bytes.subarray(0, 1024));
+							controller.enqueue(bytes.subarray(1024));
+							controller.close();
+						},
+					});
+					const response = new Response(body, { status, headers: { "retry-after-ms": "1" } });
+					responses.push(response);
+					return response;
+				},
+			});
+			await vi.advanceTimersByTimeAsync(100);
+			const result = await pending;
+
+			expect(result.stopReason).toBe(status === 400 ? "error" : "stop");
+			if (status === 400) {
+				expect(result.errorMessage).toBe("llama.cpp error (400)");
+				expect(result.answers).toEqual({});
+			} else {
+				expect(result.errorMessage).toBeUndefined();
+				expect(result.answers.pick).toMatchObject({ type: "choice", choice: "a" });
+			}
+			expect(attempts).toBe(status === 503 ? 2 : 1);
+			expect(observed).toEqual(status === 400 ? [] : [{ status: 200 }]);
+			expect(responses[0]?.body?.locked).toBe(false);
+			for (const request of server.requests) {
+				expect(request.headers.has("authorization")).toBe(false);
+				expect(request.body.model).toBe("qwen");
+			}
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// #3155 F2: no caller signal is needed to interrupt a stalled body, including the default deadline.
+	it.each([undefined, 25])("bounds a stalled read with timeoutMs=%s and clears the deadline", async (timeoutMs) => {
+		vi.useFakeTimers();
+		try {
+			const server = fakeServer();
+			const cancellations: unknown[] = [];
+			let response: Response | undefined;
+			let signal: AbortSignal | null | undefined;
+			let settled = false;
+			const pending = classify(model(), choiceContext, {
+				timeoutMs,
+				maxRetries: 0,
+				fetch: async (input, init) => {
+					if (!String(input).endsWith("/completion")) return server.fetch(input, init);
+					signal = init?.signal;
+					response = new Response(
+						new ReadableStream<Uint8Array>({
+							cancel(reason) {
+								cancellations.push(reason);
+							},
+						}),
+					);
+					return response;
+				},
+			}).then((result) => {
+				settled = true;
+				return result;
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			expect(response).toBeDefined();
+			expect(signal?.aborted).toBe(false);
+			expect(vi.getTimerCount()).toBe(1);
+			const deadline = timeoutMs ?? 60_000;
+			await vi.advanceTimersByTimeAsync(deadline - 1);
+			expect(settled).toBe(false);
+			await vi.advanceTimersByTimeAsync(1);
+			const result = await pending;
+
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe(`Request timed out after ${deadline}ms`);
+			expect(result.answers).toEqual({});
+			expect(signal?.aborted).toBe(true);
+			expect(cancellations).toHaveLength(1);
+			expect(cancellations[0]).toBe(signal?.reason);
+			expect(response?.body?.locked).toBe(false);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// #3155 F2 control: caller reasons win even when cancellation is triggered by the attempt timeout.
+	it.each([false, true])("preserves caller abort precedence (timeout race: %s)", async (raceTimeout) => {
+		vi.useFakeTimers();
+		try {
+			const server = fakeServer();
+			const caller = new AbortController();
+			const reason = new Error("Synthetic caller wins over timeout");
+			const cancel = vi.fn();
+			let response: Response | undefined;
+			const pending = classify(model(), choiceContext, {
+				signal: caller.signal,
+				timeoutMs: 50,
+				fetch: async (input, init) => {
+					if (!String(input).endsWith("/completion")) return server.fetch(input, init);
+					if (raceTimeout) init?.signal?.addEventListener("abort", () => caller.abort(reason), { once: true });
+					response = new Response(new ReadableStream<Uint8Array>({ cancel }));
+					return response;
+				},
+			});
+			await vi.advanceTimersByTimeAsync(0);
+			expect(response).toBeDefined();
+			if (raceTimeout) await vi.advanceTimersByTimeAsync(50);
+			else caller.abort(reason);
+			const result = await pending;
+
+			expect(result.stopReason).toBe("aborted");
+			expect(result.errorMessage).toBe(reason.message);
+			expect(result.answers).toEqual({});
+			expect(cancel).toHaveBeenCalledTimes(1);
+			expect(response?.body?.locked).toBe(false);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	// #3155 F2 control: a retried physical request gets a fresh, clearable deadline.
+	it("restarts the deadline for a retry rather than timing out the logical completion", async () => {
+		vi.useFakeTimers();
+		try {
+			const server = fakeServer();
+			const signals: AbortSignal[] = [];
+			let attempts = 0;
+			const pending = classify(model(), choiceContext, {
+				timeoutMs: 50,
+				fetch: async (input, init) => {
+					if (!String(input).endsWith("/completion")) return server.fetch(input, init);
+					attempts++;
+					if (init?.signal) signals.push(init.signal);
+					await new Promise<void>((resolve) => setTimeout(resolve, 40));
+					return attempts === 1
+						? new Response("retry", { status: 503, headers: { "retry-after-ms": "1" } })
+						: server.fetch(input, init);
+				},
+			});
+			await vi.advanceTimersByTimeAsync(100);
+			const result = await pending;
+
+			expect(result.stopReason).toBe("stop");
+			expect(result.answers.pick).toMatchObject({ type: "choice", choice: "a" });
+			expect(attempts).toBe(2);
+			expect(signals).toHaveLength(2);
+			expect(signals[0]?.aborted).toBe(true);
+			expect(signals[1]?.aborted).toBe(false);
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("reports server errors and cancellation", async () => {
 		const failing = await classify(model(), context, {
 			maxRetries: 0,
 			fetch: async () => new Response('{"error":{"message":"context overflow"}}', { status: 400 }),
 		});
 		expect(failing.stopReason).toBe("error");
-		expect(failing.errorMessage).toContain("llama.cpp error (400)");
-		expect(failing.errorMessage).toContain("context overflow");
+		// smarty-dev#5822: owned text, never the server's message.
+		expect(failing.errorMessage).toBe("llama.cpp error (400)");
 
 		const controller = new AbortController();
 		controller.abort();

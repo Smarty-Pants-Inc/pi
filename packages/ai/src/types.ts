@@ -148,17 +148,26 @@ export type ProviderEnv = Record<string, string>;
 export type ProviderHeaders = Record<string, string | null>;
 export type FetchFunction = typeof globalThis.fetch;
 
+/** Value-free observation: only a validated integer HTTP status from 100 through 599. */
 export interface ProviderResponse {
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
+}
+
+/** Pi-owned notification; no raw event, event name, payload, identifier or model. */
+export interface ProviderStreamNotification {
+	readonly type: "provider_stream_event";
 }
 
 /** Authentication, HTTP transport, and lifecycle callbacks shared by provider requests. */
 export interface ProviderRequestOptions<TModel = Model<Api>> {
 	signal?: AbortSignal;
+	/** Synchronous admission check before every physical provider attempt, including retries. */
+	beforeProviderRequest?: () => void;
 	/** Explicit parent context for telemetry produced by this logical request. */
 	telemetryContext?: TelemetryContext;
 	apiKey?: string;
+	/** Live credential values to redact at diagnostic sinks; never sent to the provider. */
+	diagnosticSecrets?: readonly string[];
 	/**
 	 * Optional fetch implementation for provider HTTP requests.
 	 * Defaults to `globalThis.fetch`. Provider adapters that cannot inject a custom implementation may reject it.
@@ -179,7 +188,7 @@ export interface ProviderRequestOptions<TModel = Model<Api>> {
 	/**
 	 * Optional callback invoked after an HTTP response is received.
 	 */
-	onResponse?: (response: ProviderResponse, model: TModel) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
 	 * Optional custom HTTP headers to include in API requests.
 	 * Merged with provider defaults; caller values override default headers.
@@ -214,13 +223,12 @@ export interface StreamOptions extends ProviderRequestOptions<Model<Api>> {
 	 * Optional callback invoked after an HTTP response is received and before
 	 * its body stream is consumed.
 	 */
-	onResponse?: (response: ProviderResponse, model: Model<Api>) => void | Promise<void>;
+	onResponse?: (response: ProviderResponse) => void | Promise<void>;
 	/**
-	 * Optional observer for each parsed provider stream event before Pi normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
-	 * Adapter support is explicit; unsupported adapters do not invoke it.
+	 * Called for each parsed provider stream event before normalization, with no provider data.
+	 * A rejection ends the request with a non-retryable provider_stream_observer_error.
 	 */
-	onProviderStreamEvent?: (data: unknown, model: Model<Api>) => void | Promise<void>;
+	onProviderStreamEvent?: (event: ProviderStreamNotification) => void | Promise<void>;
 	temperature?: number;
 	/**
 	 * Arbitrary sampling parameters merged into the request body as-is, after the named request
@@ -567,6 +575,14 @@ export interface UserMessage {
 	timestamp: number; // Unix timestamp in milliseconds
 }
 
+export type AssistantErrorHint = "bedrock_data_retention" | "chatgpt_usage";
+export type AssistantRecoveryClass = "retryable" | "premature_stream" | "context_length_exceeded";
+/** Pi-owned decision classified from the original failure before text suppression. */
+export interface AssistantRecovery {
+	recovery?: AssistantRecoveryClass;
+	retryable: boolean;
+}
+
 export interface AssistantMessage {
 	role: "assistant";
 	content: (TextContent | ThinkingContent | ToolCall)[];
@@ -584,6 +600,8 @@ export interface AssistantMessage {
 	stopReason: StopReason;
 	deferred?: DeferredHandle;
 	errorMessage?: string;
+	recovery?: AssistantRecovery;
+	errorHint?: AssistantErrorHint;
 	rawStopReason?: string;
 	/**
 	 * Provider indication of whether the model explicitly ended its turn.
@@ -796,8 +814,10 @@ export type TranscriptContext = {
  * Direct `streamSimple()` calls throw synchronously when request auth is missing.
  * Updates and `done` must never appear before `start`.
  *
- * `partial` is the shared live response-so-far helper, not an event-time
- * snapshot. Text and thinking blocks are empty when their `*_start` event is
+ * `partial` (and `message`/`error`/`toolCall`) is a detached snapshot taken when
+ * pushed. Later provider writes cannot change it; consumer writes cannot reach
+ * the provider, later events or result(). Blocks carry only declared fields.
+ * Text and thinking blocks are empty when their `*_start` event is
  * emitted and grow only through their corresponding `*_delta` events until the
  * authoritative `*_end`. Redacted thinking may be complete at start and emit no
  * deltas. Tool-call arguments at `toolcall_start` are provider-specific;

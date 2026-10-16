@@ -12,6 +12,7 @@
 import { normalizeRadiusGatewayUrl } from "../../providers/radius-config.ts";
 import type { OAuthAuth, OAuthCredential, ProviderAuthInteraction } from "../types.ts";
 import { startOAuthCallbackServer } from "./callback-server.ts";
+import { oauthAuthorizationError, readOAuthCredentialResponse } from "./credential-response.ts";
 import { pollOAuthDeviceCodeFlow } from "./device-code.ts";
 import { generatePKCE } from "./pkce.ts";
 
@@ -42,17 +43,21 @@ async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): P
 	const response = await fetch(new URL("/v1/oauth", gateway), {
 		headers: { accept: "application/json" },
 		signal,
+	}).catch(() => {
+		throw new Error("Radius OAuth config request failed");
 	});
 
 	if (!response.ok) {
-		throw new Error(
-			`Could not load Radius OAuth config from ${gateway}: ${response.status} ${await response.text()}`,
-		);
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`Could not load Radius OAuth config (HTTP ${response.status})`);
 	}
 
-	const discovery = (await response.json()) as Partial<RadiusOAuthDiscovery>;
-	if (typeof discovery.authorizationEndpoint !== "string") {
-		throw new Error(`Invalid Radius OAuth config from ${gateway}`);
+	const discovery = (await readOAuthCredentialResponse(
+		response,
+		"Radius OAuth config",
+	)) as Partial<RadiusOAuthDiscovery> | null;
+	if (typeof discovery?.authorizationEndpoint !== "string") {
+		throw new Error(`Invalid Radius OAuth config from ${new URL(gateway).origin}`);
 	}
 	return { authorizationEndpoint: discovery.authorizationEndpoint };
 }
@@ -60,35 +65,34 @@ async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): P
 class OAuthResponseError extends Error {
 	readonly status: number;
 	readonly oauthError?: string;
+	readonly #protocolError?: string;
 
-	constructor(status: number, oauthError: string | undefined, description: string | undefined, message: string) {
-		const detail = oauthError
-			? description
-				? `${oauthError}: ${description}`
-				: oauthError
-			: description || String(status);
-		super(`${message}: ${detail}`);
+	constructor(status: number, protocolError: string | undefined, message: string, secrets: readonly string[]) {
+		const safeCode = protocolError === undefined ? undefined : oauthAuthorizationError(protocolError, secrets);
+		super(`${message}: ${safeCode ?? String(status)}`);
 		this.status = status;
-		this.oauthError = oauthError;
+		this.oauthError = safeCode;
+		this.#protocolError = protocolError;
+	}
+
+	matchesCode(code: string): boolean {
+		return this.#protocolError === code;
 	}
 }
 
-async function readOAuthResponseError(response: Response, message: string): Promise<OAuthResponseError> {
-	const text = await response.text().catch(() => "");
-	let oauthError: string | undefined;
-	let description: string | undefined;
-
-	if (text) {
-		try {
-			const data = JSON.parse(text) as { error?: unknown; error_description?: unknown };
-			oauthError = typeof data.error === "string" ? data.error : undefined;
-			description = typeof data.error_description === "string" ? data.error_description : undefined;
-		} catch {
-			description = text;
-		}
-	}
-
-	return new OAuthResponseError(response.status, oauthError, description, message);
+async function readOAuthResponseError(
+	response: Response,
+	message: string,
+	secrets: readonly string[] = [],
+): Promise<OAuthResponseError> {
+	const data = await readOAuthCredentialResponse(response, message).catch(() => undefined);
+	const error = data && typeof data === "object" ? (data as { error?: unknown }).error : undefined;
+	return new OAuthResponseError(
+		response.status,
+		typeof error === "string" ? oauthAuthorizationError(error) : undefined,
+		message,
+		secrets,
+	);
 }
 
 async function requestOAuthToken(
@@ -104,23 +108,21 @@ async function requestOAuthToken(
 			body,
 			signal,
 		});
-	} catch (error) {
-		if (signal.aborted) {
-			throw new Error("Login cancelled");
-		}
-		throw error;
+	} catch {
+		throw new Error(signal.aborted ? "Login cancelled" : "Radius OAuth request failed");
 	}
 
 	if (!response.ok) {
-		throw await readOAuthResponseError(response, "Radius OAuth token request failed");
+		throw await readOAuthResponseError(response, "Radius OAuth token request failed", [...body.values()]);
 	}
 
-	const data = (await response.json()) as {
+	const data = (await readOAuthCredentialResponse(response, "Radius OAuth token")) as {
 		access_token: string;
 		refresh_token: string;
 		expires_in: number;
 		scope?: string;
-	};
+	} | null;
+	if (!data || typeof data !== "object") throw new Error("Radius OAuth token response is invalid");
 
 	return {
 		type: "oauth",
@@ -195,18 +197,21 @@ async function requestDeviceAuthorization(gateway: string, signal: AbortSignal):
 			body: new URLSearchParams({ client_id: OAUTH_CLIENT_ID, scope: OAUTH_SCOPE }),
 			signal,
 		});
-	} catch (error) {
-		if (signal.aborted) {
-			throw new Error("Login cancelled");
-		}
-		throw error;
+	} catch {
+		throw new Error(signal.aborted ? "Login cancelled" : "Radius OAuth request failed");
 	}
 
 	if (!response.ok) {
 		throw await readOAuthResponseError(response, "Radius OAuth device authorization failed");
 	}
 
-	const data = (await response.json()) as Partial<DeviceAuthorizationResponse>;
+	const data = (await readOAuthCredentialResponse(
+		response,
+		"Radius OAuth device authorization",
+	)) as Partial<DeviceAuthorizationResponse> | null;
+	if (!data || typeof data !== "object") {
+		throw new Error("Radius OAuth device authorization response is missing required fields");
+	}
 	if (!data.device_code || !data.user_code || !data.verification_uri || !data.expires_in) {
 		throw new Error("Radius OAuth device authorization response is missing required fields");
 	}
@@ -250,18 +255,15 @@ async function loginWithDeviceCode(gateway: string, interaction: ProviderAuthInt
 				if (!(error instanceof OAuthResponseError)) {
 					throw error;
 				}
-				switch (error.oauthError) {
-					case "authorization_pending":
-						return { status: "pending" };
-					case "slow_down":
-						return { status: "slow_down" };
-					case "expired_token":
-						return { status: "failed", message: "Device authorization expired." };
-					case "access_denied":
-						return { status: "failed", message: "Device authorization was denied." };
-					default:
-						throw error;
+				if (error.matchesCode("authorization_pending")) return { status: "pending" };
+				if (error.matchesCode("slow_down")) return { status: "slow_down" };
+				if (error.matchesCode("expired_token")) {
+					return { status: "failed", message: "Device authorization expired." };
 				}
+				if (error.matchesCode("access_denied")) {
+					return { status: "failed", message: "Device authorization was denied." };
+				}
+				throw error;
 			}
 		},
 	});

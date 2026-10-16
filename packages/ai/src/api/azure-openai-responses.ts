@@ -1,11 +1,16 @@
 import { AzureOpenAI } from "openai";
 import type { ResponseCreateParamsStreaming } from "openai/resources/responses/responses.js";
+import {
+	createRedactingSdkLogger,
+	getOAuthDiagnosticSecrets,
+	getRequestDiagnosticSecrets,
+} from "../auth/oauth/credential-response.ts";
 import { clampThinkingLevel } from "../models.ts";
 import type { Api, AssistantMessage, Model, SimpleStreamOptions, StreamFunction, TranscriptContext } from "../types.ts";
 import { formatProviderError, normalizeProviderError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { headersToRecord } from "../utils/headers.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
+import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { type AzureEndpointOptions, resolveAzureConfig, resolveDeploymentName } from "./azure-openai-config.ts";
@@ -18,8 +23,10 @@ const AZURE_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode",
 // OpenAI Responses rejects max_output_tokens below 16: https://github.com/earendil-works/pi/issues/6265
 const OPENAI_RESPONSES_MIN_OUTPUT_TOKENS = 16;
 
-function formatAzureOpenAIError(error: unknown): string {
-	return formatProviderError(normalizeProviderError(error), "Azure OpenAI API error");
+function formatAzureOpenAIError(error: unknown, output: AssistantMessage, secrets: readonly string[]): string {
+	const norm = normalizeProviderError(error, output.provider, undefined, secrets);
+	output.recovery ??= norm.recovery;
+	return formatProviderError(norm, "Azure OpenAI API error");
 }
 
 // Azure OpenAI Responses-specific options
@@ -37,7 +44,8 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 	context: TranscriptContext,
 	options?: AzureOpenAIResponsesOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	const diagnosticSecrets = getRequestDiagnosticSecrets(model, options);
+	const stream = new AssistantMessageEventStream(diagnosticSecrets);
 	const normalizedContext = resolveTranscript(context, model.compat?.supportsMidConvoSystemMessages);
 
 	// Start async processing
@@ -88,10 +96,11 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				{
 					maxRetries: options?.maxRetries,
 					maxRetryDelayMs: options?.maxRetryDelayMs,
+					beforeProviderRequest: options?.beforeProviderRequest,
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
+			await options?.onResponse?.(providerResponse(response.status));
 			stream.push({ type: "start", partial: output });
 
 			await processResponsesStream(openaiStream, output, stream, model, {
@@ -120,7 +129,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = formatAzureOpenAIError(error);
+			output.errorMessage = formatAzureOpenAIError(error, output, diagnosticSecrets);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
 		}
@@ -163,6 +172,10 @@ function createClient(model: Model<"azure-openai-responses">, apiKey: string, op
 
 	return new AzureOpenAI({
 		apiKey,
+		logger: createRedactingSdkLogger(
+			getOAuthDiagnosticSecrets(apiKey, headers, options?.diagnosticSecrets),
+			"azure-openai",
+		),
 		apiVersion,
 		dangerouslyAllowBrowser: true,
 		fetch: options?.fetch,

@@ -161,6 +161,81 @@ describe("NestedToolCallRunner", () => {
 		expect(runner.takeRecord("free")).toMatchObject({ calls: { complete: true }, usage: undefined });
 	});
 
+	it("drains unawaited descendants before recording the parent completion and usage", async () => {
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const tools: AgentTool[] = [
+			{
+				name: "leaf",
+				label: "Leaf",
+				description: "Leaf",
+				parameters: Type.Object({}),
+				execute: async () => {
+					await held;
+					return { content: [], details: {}, usage: usage(7, 0.01) };
+				},
+			},
+		];
+		const { runner } = createRunner(tools);
+		let leaf: Promise<unknown> | undefined;
+		tools.push({
+			name: "middle",
+			label: "Middle",
+			description: "Middle",
+			parameters: Type.Object({}),
+			execute: async (id) => {
+				leaf = runner.execute(id, "leaf", {});
+				return { content: [], details: {} };
+			},
+		});
+		let settled = false;
+		const parent = runner.execute("call", "middle", {}).then(() => {
+			settled = true;
+		});
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			expect(settled).toBe(false);
+		} finally {
+			release();
+			await parent;
+			await leaf;
+		}
+		expect(runner.takeRecord("call")).toMatchObject({ calls: { complete: true }, usage: { input: 7 } });
+	});
+
+	it("does not execute a child cancelled while waiting for the exclusive queue", async () => {
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let effects = 0;
+		const tool: AgentTool = {
+			name: "queued",
+			label: "Queued",
+			description: "Queued",
+			parameters: Type.Object({}),
+			executionMode: "sequential",
+			execute: async () => {
+				effects++;
+				await held;
+				return { content: [], details: {} };
+			},
+		};
+		const { runner } = createRunner([tool]);
+		const first = runner.execute("first", "queued", {});
+		const cancellation = new AbortController();
+		const second = runner.execute("second", "queued", {}, { signal: cancellation.signal });
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		cancellation.abort();
+		release();
+		await first;
+		expect((await second).isError).toBe(true);
+		expect(effects).toBe(1);
+		expect(runner.takeRecord("second")?.calls).toMatchObject({ complete: true, calls: [{ status: "error" }] });
+	});
+
 	it("serializes concurrent calls to sequential tools", async () => {
 		let active = 0;
 		let maxActive = { sequential: 0, parallel: 0 };

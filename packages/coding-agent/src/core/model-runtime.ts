@@ -25,6 +25,7 @@ import {
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
+	getOAuthDiagnosticSecrets,
 	type ImageApi,
 	type ImageModel,
 	type ImagesContext,
@@ -53,6 +54,9 @@ import {
 	type Provider,
 	type ProviderHeaders,
 	type ProviderRequestOptions,
+	protectAssistantMessageStream,
+	requestSetupError,
+	SafeSetupError,
 	type SimpleStreamOptions,
 	type StreamOptions,
 } from "@earendil-works/pi-ai";
@@ -65,11 +69,14 @@ import {
 	assertImageModel,
 	classifierErrorResult,
 	imageErrorResult,
+	protectOperationError,
+	protectOperationResult,
 } from "@earendil-works/pi-ai/utils/model-operations";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
+import { ModelPolicyError, type ModelPolicyTarget } from "./model-policy.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
 	type AuthStatus,
@@ -83,6 +90,7 @@ import {
 } from "./provider-composer.ts";
 import { withPersonalizedCatalog, withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
+import { SettingsManager } from "./settings-manager.ts";
 import {
 	createVirtualModel,
 	findLatestResponse,
@@ -92,6 +100,8 @@ import {
 	type VirtualModelDefinition,
 	withVirtualModels,
 } from "./virtual-models.ts";
+
+export { ModelPolicyError } from "./model-policy.ts";
 
 interface RegisteredVirtualModel {
 	model: Model<Api>;
@@ -122,6 +132,8 @@ export interface CreateModelRuntimeOptions {
 	signal?: AbortSignal;
 	/** Skip initial catalog and availability refresh. Static models remain available. */
 	refreshOnCreate?: boolean;
+	/** Request/listing policy. Defaults to cwd and the runtime's agent directory. */
+	settingsManager?: SettingsManager;
 }
 
 export interface ModelRuntimeAuthOverrides extends AuthOperationOptions {
@@ -171,6 +183,9 @@ function mergeHeaders(
 
 /** Configured pi-ai Models collection used by coding-agent and SDK consumers. */
 export class ModelRuntime implements Models {
+	/** One shared admission guard for an unattended dispatch, including warming and summaries. */
+	providerRequestGuard?: Required<Pick<ProviderRequestOptions, "beforeProviderRequest" | "signal">>;
+	private readonly policySettings = new Map<SettingsManager, number>();
 	private readonly models: MutableModels;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
@@ -245,6 +260,13 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
+		);
+		runtime.addModelPolicy(
+			options.settingsManager ??
+				SettingsManager.create(
+					process.cwd(),
+					options.authPath ? dirname(options.authPath) : modelsPath ? dirname(modelsPath) : getAgentDir(),
+				),
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -446,8 +468,32 @@ export class ModelRuntime implements Models {
 		return this.models.getProvider(providerId);
 	}
 
-	getModels(providerId?: string): readonly Model<Api>[] {
-		return this.models.getModels(providerId);
+	/** Bind settings until disposed, preserving every other registration. */
+	addModelPolicy(settingsManager: SettingsManager): () => void {
+		this.policySettings.set(settingsManager, (this.policySettings.get(settingsManager) ?? 0) + 1);
+		let disposed = false;
+		return () => {
+			if (disposed) return;
+			disposed = true;
+			const remaining = this.policySettings.get(settingsManager)! - 1;
+			if (remaining === 0) this.policySettings.delete(settingsManager);
+			else this.policySettings.set(settingsManager, remaining);
+		};
+	}
+
+	isModelAllowed(model: ModelPolicyTarget): boolean {
+		return [...this.policySettings.keys()].every((settings) => settings.isModelAllowed(model));
+	}
+
+	private assertModelAllowed(model: ModelPolicyTarget, handle?: DeferredHandle): void {
+		if (!this.isModelAllowed(model)) throw new ModelPolicyError(model);
+		if (handle) this.assertModelAllowed({ provider: handle.provider, id: handle.modelId });
+	}
+
+	/** includeDisallowed keeps explicit-selection metadata, never request admission. */
+	getModels(providerId?: string, options?: { includeDisallowed?: boolean }): readonly Model<Api>[] {
+		const models = this.models.getModels(providerId);
+		return options?.includeDisallowed ? models : models.filter((model) => this.isModelAllowed(model));
 	}
 
 	getModel(providerId: string, modelId: string): Model<Api> | undefined {
@@ -455,7 +501,7 @@ export class ModelRuntime implements Models {
 	}
 
 	getModelsOfType<TType extends ModelType>(type: TType, providerId?: string): readonly ModelTypeMap[TType][] {
-		return this.models.getModelsOfType(type, providerId);
+		return this.models.getModelsOfType(type, providerId).filter((model) => this.isModelAllowed(model));
 	}
 
 	getModelOfType<TType extends ModelType>(
@@ -467,19 +513,21 @@ export class ModelRuntime implements Models {
 	}
 
 	getAllModels(providerId?: string): readonly AnyModel[] {
-		return this.models.getAllModels(providerId);
+		return this.models.getAllModels(providerId).filter((model) => this.isModelAllowed(model));
 	}
 
-	getAvailableOfType<TType extends ModelType>(
+	async getAvailableOfType<TType extends ModelType>(
 		type: TType,
 		providerId?: string,
 		options?: AuthOperationOptions,
 	): Promise<readonly ModelTypeMap[TType][]> {
-		return this.models.getAvailableOfType(type, providerId, options);
+		return (await this.models.getAvailableOfType(type, providerId, options)).filter((model) =>
+			this.isModelAllowed(model),
+		);
 	}
 
-	getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
-		return this.models.getAllAvailable(providerId, options);
+	async getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
+		return (await this.models.getAllAvailable(providerId, options)).filter((model) => this.isModelAllowed(model));
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
@@ -492,7 +540,7 @@ export class ModelRuntime implements Models {
 			try {
 				const available = await this.models.getAvailable(providerId, options);
 				if (errorSeq === this.availabilityErrorSeq) this.availabilityError = undefined;
-				return available;
+				return available.filter((model) => this.isModelAllowed(model));
 			} catch (error) {
 				if (errorSeq === this.availabilityErrorSeq && !options?.signal?.aborted) {
 					this.availabilityError = error instanceof Error ? error.message : String(error);
@@ -501,11 +549,11 @@ export class ModelRuntime implements Models {
 			}
 		}
 		await this.queueAvailabilityRefresh(options?.signal);
-		return this.snapshot.available;
+		return this.snapshot.available.filter((model) => this.isModelAllowed(model));
 	}
 
 	getAvailableSnapshot(): readonly Model<Api>[] {
-		return this.snapshot.available;
+		return this.snapshot.available.filter((model) => this.isModelAllowed(model));
 	}
 
 	getError(): string | undefined {
@@ -558,6 +606,7 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
+		if (typeof providerOrModel !== "string") this.assertModelAllowed(providerOrModel);
 		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
 		const resolution = await this.models.getAuth(providerOrModel, overrides);
 		if (!resolution) return undefined;
@@ -655,7 +704,20 @@ export class ModelRuntime implements Models {
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 
-	private async prepareRequest<
+	/** Synchronous refusal precedes authentication and stream/operation error conversion. */
+	private prepareRequest<
+		TModel extends AnyModel,
+		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
+	>(model: TModel, options: TOptions | undefined, handle?: DeferredHandle) {
+		this.assertModelAllowed(model, handle);
+		return async () => {
+			const prepared = await this.prepareAuthenticatedRequest(model, options);
+			this.assertModelAllowed(prepared.model, handle);
+			return prepared;
+		};
+	}
+
+	private async prepareAuthenticatedRequest<
 		TModel extends AnyModel,
 		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
 	>(
@@ -666,19 +728,37 @@ export class ModelRuntime implements Models {
 		model: TModel;
 		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 	}> {
+		const requestGuard = this.providerRequestGuard;
 		const provider = this.models.getProvider(model.provider);
-		if (!provider) throw new ModelsError("provider", `Unknown provider: ${model.provider}`);
-		const resolution = await this.getAuth(model, {
-			apiKey: options?.apiKey,
-			env: options?.env,
-			signal: options?.signal,
-		});
-		if (!resolution) throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
+		if (!provider) throw new SafeSetupError("provider");
+		let resolution: AuthResult | undefined;
+		try {
+			resolution = await this.getAuth(model, {
+				apiKey: options?.apiKey,
+				env: options?.env,
+				signal: options?.signal,
+			});
+		} catch (error) {
+			throw requestSetupError(error);
+		}
+		if (!resolution) throw new SafeSetupError("auth");
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
 		const providerOptions = rawProviderOptions as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
+		const apiKey = providerOptions.apiKey ?? resolution.auth.apiKey;
 		let headers = mergeHeaders(resolution.auth.headers, providerOptions.headers);
-		if (transformHeaders) headers = await transformHeaders(headers ?? {});
+		const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey, headers ?? {}, [
+			...(resolution.diagnosticSecrets ?? []),
+			...(providerOptions.diagnosticSecrets ?? []),
+		]);
+		if (transformHeaders) {
+			try {
+				headers = await transformHeaders(headers ?? {});
+			} catch (error) {
+				throw requestSetupError(error);
+			}
+			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers ?? {}));
+		}
 		const env =
 			resolution.env || providerOptions.env
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
@@ -689,7 +769,19 @@ export class ModelRuntime implements Models {
 			model: requestModel,
 			options: {
 				...providerOptions,
-				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
+				apiKey,
+				diagnosticSecrets,
+				...(requestGuard
+					? {
+							beforeProviderRequest: () => {
+								requestGuard.beforeProviderRequest();
+								providerOptions.beforeProviderRequest?.();
+							},
+							signal: providerOptions.signal
+								? AbortSignal.any([providerOptions.signal, requestGuard.signal])
+								: requestGuard.signal,
+						}
+					: {}),
 				headers,
 				env,
 			} as Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>,
@@ -701,13 +793,12 @@ export class ModelRuntime implements Models {
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
+		const prepare = this.prepareRequest(model, options as (StreamOptions & ModelsRequestTransforms) | undefined);
 		const transcript = normalizeContext(context);
-		return lazyStream(model, async () => {
+		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsRequestTransforms) | undefined,
-			);
+			const prepared = await prepare();
+			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
 		});
 	}
@@ -721,6 +812,7 @@ export class ModelRuntime implements Models {
 	}
 
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+		const prepare = this.prepareRequest(model, options);
 		const transcript = normalizeContext(context);
 		if (isVirtualModel(model)) {
 			// Requests outside the agent loop are routed here. Callers sized them before routing, so
@@ -741,9 +833,10 @@ export class ModelRuntime implements Models {
 				return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
 			});
 		}
-		return lazyStream(model, async () => {
+		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
+			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
 		});
 	}
@@ -757,11 +850,13 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
+		const prepare = this.prepareRequest(model, options, handle);
+		return lazyStream(model, async (outer) => {
 			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
+			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 			if (!prepared.provider.fetchDeferred) {
-				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+				throw new SafeSetupError("deferred");
 			}
 			return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
 		});
@@ -780,12 +875,17 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredCancelOptions,
 	): Promise<void> {
-		assertChatModel(model);
-		const prepared = await this.prepareRequest(model, options);
-		if (!prepared.provider.cancelDeferred) {
-			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+		const prepare = this.prepareRequest(model, options, handle);
+		let secrets: readonly string[] = [];
+		try {
+			assertChatModel(model);
+			const prepared = await prepare();
+			secrets = prepared.options.diagnosticSecrets ?? [];
+			if (!prepared.provider.cancelDeferred) throw new SafeSetupError("deferred");
+			await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
+		} catch (error) {
+			throw protectOperationError(error, secrets);
 		}
-		await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
 	}
 
 	async generateImages(
@@ -793,15 +893,21 @@ export class ModelRuntime implements Models {
 		context: ImagesContext,
 		options?: ModelsImagesOptions,
 	): Promise<AssistantImages> {
+		const prepare = this.prepareRequest(model, options);
+		let secrets: readonly string[] = [];
 		try {
 			assertImageModel(model);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
+			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.generateImages) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support image generation`);
 			}
-			return await prepared.provider.generateImages(prepared.model, context, prepared.options as ImagesOptions);
+			return protectOperationResult(
+				await prepared.provider.generateImages(prepared.model, context, prepared.options as ImagesOptions),
+				secrets,
+			);
 		} catch (error) {
-			return imageErrorResult(model, error, options?.signal?.aborted);
+			return imageErrorResult(model, error, options?.signal?.aborted, secrets);
 		}
 	}
 
@@ -810,16 +916,22 @@ export class ModelRuntime implements Models {
 		context: ClassifierContext,
 		options?: ModelsClassifierOptions,
 	): Promise<ClassifierResult> {
+		const prepare = this.prepareRequest(model, options);
+		let secrets: readonly string[] = [];
 		try {
 			assertClassifierModel(model);
 			assertClassifierInputSupported(model, context);
-			const prepared = await this.prepareRequest(model, options);
+			const prepared = await prepare();
+			secrets = prepared.options.diagnosticSecrets ?? [];
 			if (!prepared.provider.classify) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support classification`);
 			}
-			return await prepared.provider.classify(prepared.model, context, prepared.options as ClassifierOptions);
+			return protectOperationResult(
+				await prepared.provider.classify(prepared.model, context, prepared.options as ClassifierOptions),
+				secrets,
+			);
 		} catch (error) {
-			return classifierErrorResult(model, error, options?.signal?.aborted);
+			return classifierErrorResult(model, error, options?.signal?.aborted, secrets);
 		}
 	}
 
@@ -1011,6 +1123,7 @@ export class ModelRuntime implements Models {
 			state?: unknown;
 		},
 	): Promise<ModelRoute> {
+		this.assertModelAllowed(model);
 		const name = `Virtual model ${model.provider}/${model.id}`;
 		const virtual = this.virtualModels.get(model.provider)?.get(model.id);
 		if (!virtual) throw new Error(`${name} is not registered.`);
@@ -1029,6 +1142,7 @@ export class ModelRuntime implements Models {
 		const target = this.getPhysicalModel(route.model.provider, route.model.id);
 		const routed = `${name} routed to ${route.model.provider}/${route.model.id}`;
 		if (!target) throw new Error(`${routed}, which is not a physical model.`);
+		this.assertModelAllowed(target);
 		if (!this.hasConfiguredAuth(target.provider)) throw new Error(`${routed}, which has no credentials.`);
 		return { model: target, thinkingLevel: clampThinkingLevel(target, route.thinkingLevel), state: route.state };
 	}

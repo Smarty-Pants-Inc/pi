@@ -21,6 +21,7 @@ import type {
 	Tool,
 	TranscriptContext,
 } from "../types.ts";
+import { ProviderDataError } from "../utils/error-body.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { collapseSystemMessages, withoutInitialSystemMessage } from "../utils/transcript.ts";
@@ -465,7 +466,7 @@ export function mapStopReason(reason: FinishReason): StopReason {
 			return "error";
 		default: {
 			const _exhaustive: never = reason;
-			throw new Error(`Unhandled stop reason: ${_exhaustive}`);
+			throw new ProviderDataError(`Unhandled stop reason: ${_exhaustive}`);
 		}
 	}
 }
@@ -495,7 +496,7 @@ export function mapStopReasonString(reason: string): StopReason {
  */
 export function retryGoogleRequest<T>(
 	request: () => Promise<T>,
-	options?: Pick<StreamOptions, "maxRetries" | "maxRetryDelayMs" | "signal">,
+	options?: Pick<StreamOptions, "maxRetries" | "maxRetryDelayMs" | "signal" | "beforeProviderRequest">,
 ): Promise<T> {
 	return retryProviderRequest(
 		async () => {
@@ -511,6 +512,7 @@ export function retryGoogleRequest<T>(
 		{
 			maxRetries: options?.maxRetries,
 			maxRetryDelayMs: options?.maxRetryDelayMs,
+			beforeProviderRequest: options?.beforeProviderRequest,
 			signal: options?.signal,
 		},
 	);

@@ -1,4 +1,5 @@
 import type { AssistantMessage } from "../types.ts";
+import { ownedRecovery } from "./recovery.ts";
 
 /**
  * Regex patterns to detect context overflow errors from different providers.
@@ -135,7 +136,11 @@ const NON_OVERFLOW_PATTERNS = [
  * @returns true if the message indicates a context overflow
  */
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
-	// Case 1: Check error message patterns
+	if (message.stopReason === "error") {
+		const recovery = ownedRecovery(message.recovery);
+		if (recovery !== undefined) return recovery.recovery === "context_length_exceeded";
+	}
+	// Case 1: Legacy messages without a pre-suppression decision.
 	if (message.stopReason === "error" && message.errorMessage) {
 		// Skip messages matching known non-overflow patterns (e.g. throttling / rate-limit)
 		const isNonOverflow = NON_OVERFLOW_PATTERNS.some((p) => p.test(message.errorMessage!));

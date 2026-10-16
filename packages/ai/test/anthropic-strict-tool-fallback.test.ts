@@ -4,7 +4,8 @@ import { Type } from "typebox";
 import { describe, expect, it, vi } from "vitest";
 import { type AnthropicOptions, stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { stream as streamPiMessages } from "../src/api/pi-messages.ts";
-import type { Model, Tool, TranscriptContext } from "../src/types.ts";
+import type { AssistantMessageEvent, Model, Tool, TranscriptContext } from "../src/types.ts";
+import { ProviderRequestLimitError } from "../src/utils/provider-retry.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const grammarError =
@@ -119,10 +120,8 @@ describe("Anthropic preferred strict tool fallback", () => {
 		expect(payloads.map((payload) => payload.stream)).toEqual([true, true]);
 		expect(payloads[1]).toMatchObject({ inference_geo: "us" });
 		expect(JSON.stringify(transcript)).toBe(original);
-		expect(result.diagnostics?.[0]).toMatchObject({
-			type: "anthropic_strict_tools_fallback",
-			details: { reason: "strict_tool_limits_exceeded" },
-		});
+		expect(onResponse.mock.calls).toEqual([[{ status: 200 }]]);
+		expect(result.diagnostics).toEqual([{ type: "anthropic_strict_tools_fallback", timestamp: expect.any(Number) }]);
 	});
 
 	it("downgrades inline additions and same-name redefinitions without downgrading require", async () => {
@@ -173,7 +172,7 @@ describe("Anthropic preferred strict tool fallback", () => {
 		const { payloads, options } = harness(() => errorResponse());
 		const result = await streamAnthropic(model, context(tools), options).result();
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain(grammarError);
+		expect(result.errorMessage).toBe("Anthropic API error (400)");
 		expect(payloads).toHaveLength(1);
 	});
 
@@ -198,7 +197,7 @@ describe("Anthropic preferred strict tool fallback", () => {
 			options,
 		).result();
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toContain("Required grammar is still too large");
+		expect(result.errorMessage).toBe("Anthropic API error (400)");
 		expect(payloads).toHaveLength(2);
 		expect((payloads[1].tools as BetaTool[])[1].strict).toBe(true);
 	});
@@ -219,6 +218,98 @@ describe("Anthropic preferred strict tool fallback", () => {
 		expect(result.stopReason).toBe("error");
 		expect(payloads).toHaveLength(0);
 		expect(result.diagnostics).toBeUndefined();
+	});
+
+	// pi#202 / pi#10409: SDK retry, strict fallback and final admission share the guard and value-free sinks.
+	it.each([2, 3])("guards every attempt and isolates canaries with a physical request budget of %i", async (limit) => {
+		const canary = "private-wire-value-not-a-known-credential-pattern";
+		const order: string[] = [];
+		const { payloads, options } = harness((_payload, attempt) => {
+			order.push(`http:${attempt}`);
+			const response =
+				attempt === 1
+					? errorResponse(`Overloaded: ${canary}`, 503, "overloaded_error")
+					: attempt === 2
+						? errorResponse(`${grammarError} ${canary}`)
+						: successResponse();
+			response.headers.set("retry-after-ms", "1");
+			response.headers.set("x-private-wire-value", canary);
+			return response;
+		});
+		let admitted = 0;
+		const beforeProviderRequest = vi.fn(() => {
+			order.push(`guard:${admitted + 1}`);
+			if (admitted >= limit) throw new ProviderRequestLimitError(admitted, limit);
+			admitted++;
+		});
+		const onResponse = vi.fn();
+		const onProviderStreamEvent = vi.fn();
+		const stream = streamAnthropic(model, context([tool("preferred", "prefer"), tool("required", "require")]), {
+			...options,
+			maxRetries: 1,
+			beforeProviderRequest,
+			onResponse,
+			onProviderStreamEvent,
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+
+		expect(beforeProviderRequest).toHaveBeenCalledTimes(3);
+		expect(payloads).toHaveLength(limit);
+		expect(order).toEqual(["guard:1", "http:1", "guard:2", "http:2", "guard:3", ...(limit === 3 ? ["http:3"] : [])]);
+		expect(payloads.map((payload) => (payload.tools as BetaTool[])[0].strict)).toEqual(
+			limit === 3 ? [true, true, undefined] : [true, true],
+		);
+		expect(payloads.every((payload) => (payload.tools as BetaTool[])[1].strict === true)).toBe(true);
+		expect(result.diagnostics).toEqual([{ type: "anthropic_strict_tools_fallback", timestamp: expect.any(Number) }]);
+		expect(
+			JSON.stringify({
+				events,
+				result,
+				responses: onResponse.mock.calls,
+				notices: onProviderStreamEvent.mock.calls,
+			}),
+		).not.toContain(canary);
+		if (limit === 2) {
+			expect(result.stopReason).toBe("error");
+			expect(result.errorMessage).toBe("Provider request limit reached (2/2); no further requests allowed");
+			expect(events.map((event) => event.type)).toEqual(["error"]);
+			expect(onResponse).not.toHaveBeenCalled();
+			expect(onProviderStreamEvent).not.toHaveBeenCalled();
+		} else {
+			expect(result.stopReason).toBe("stop");
+			expect(result.responseId).toBe("msg_test");
+			expect(events.map((event) => event.type)).toEqual(["start", "done"]);
+			expect(onResponse.mock.calls).toEqual([[{ status: 200 }]]);
+			expect(onProviderStreamEvent.mock.calls).toEqual([
+				[{ type: "provider_stream_event" }],
+				[{ type: "provider_stream_event" }],
+				[{ type: "provider_stream_event" }],
+			]);
+		}
+	});
+
+	// pi#202 / pi#10409: only an SDK request rejection, never admission, can authorize a downgrade.
+	it("does not downgrade a provider-shaped admission failure", async () => {
+		const { payloads, options } = harness(() => successResponse());
+		const beforeProviderRequest = vi.fn(() => {
+			throw Anthropic.APIError.generate(
+				400,
+				{ error: { type: "invalid_request_error", message: grammarError } },
+				grammarError,
+				new Headers(),
+			);
+		});
+		const result = await streamAnthropic(model, context([tool("preferred", "prefer")]), {
+			...options,
+			beforeProviderRequest,
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toBe("Anthropic API error (400)");
+		expect(result.diagnostics).toBeUndefined();
+		expect(payloads).toHaveLength(0);
+		expect(beforeProviderRequest).toHaveBeenCalledTimes(1);
 	});
 
 	it("honors cancellation before the fallback attempt", async () => {

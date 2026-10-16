@@ -56,41 +56,35 @@ function parseAuthorizationInput(input: string): { code?: string; state?: string
 	return { code: value };
 }
 
-function formatErrorDetails(error: unknown): string {
-	if (error instanceof Error) {
-		const details: string[] = [`${error.name}: ${error.message}`];
-		const errorWithCode = error as Error & { code?: string; errno?: number | string; cause?: unknown };
-		if (errorWithCode.code) details.push(`code=${errorWithCode.code}`);
-		if (typeof errorWithCode.errno !== "undefined") details.push(`errno=${String(errorWithCode.errno)}`);
-		if (typeof error.cause !== "undefined") {
-			details.push(`cause=${formatErrorDetails(error.cause)}`);
-		}
-		if (error.stack) {
-			details.push(`stack=${error.stack}`);
-		}
-		return details.join("; ");
+async function postJson(
+	url: string,
+	body: Record<string, string | number>,
+	signal: AbortSignal,
+	operation: "Anthropic token exchange" | "Anthropic token refresh",
+): Promise<string> {
+	let response: Response;
+	try {
+		response = await fetch(url, {
+			method: "POST",
+			headers: {
+				"Content-Type": "application/json",
+				Accept: "application/json",
+			},
+			body: JSON.stringify(body),
+			signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
+		});
+	} catch {
+		throw new Error(`${operation} request failed.`);
 	}
-	return String(error);
-}
-
-async function postJson(url: string, body: Record<string, string | number>, signal: AbortSignal): Promise<string> {
-	const response = await fetch(url, {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Accept: "application/json",
-		},
-		body: JSON.stringify(body),
-		signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
-	});
-
-	const responseBody = await response.text();
-
 	if (!response.ok) {
-		throw new Error(`HTTP request failed. status=${response.status}; url=${url}; body=${responseBody}`);
+		await response.body?.cancel().catch(() => undefined);
+		throw new Error(`${operation} request failed. HTTP ${response.status}`);
 	}
-
-	return responseBody;
+	try {
+		return await response.text();
+	} catch {
+		throw new Error(`${operation} request failed. HTTP ${response.status}; response body could not be read`);
+	}
 }
 
 async function exchangeAuthorizationCode(
@@ -100,33 +94,25 @@ async function exchangeAuthorizationCode(
 	redirectUri: string,
 	signal: AbortSignal,
 ): Promise<OAuthCredential> {
-	let responseBody: string;
-	try {
-		responseBody = await postJson(
-			TOKEN_URL,
-			{
-				grant_type: "authorization_code",
-				client_id: CLIENT_ID,
-				code,
-				state,
-				redirect_uri: redirectUri,
-				code_verifier: verifier,
-			},
-			signal,
-		);
-	} catch (error) {
-		throw new Error(
-			`Token exchange request failed. url=${TOKEN_URL}; redirect_uri=${redirectUri}; response_type=authorization_code; details=${formatErrorDetails(error)}`,
-		);
-	}
+	const responseBody = await postJson(
+		TOKEN_URL,
+		{
+			grant_type: "authorization_code",
+			client_id: CLIENT_ID,
+			code,
+			state,
+			redirect_uri: redirectUri,
+			code_verifier: verifier,
+		},
+		signal,
+		"Anthropic token exchange",
+	);
 
 	let tokenData: { access_token: string; refresh_token: string; expires_in: number };
 	try {
 		tokenData = JSON.parse(responseBody) as { access_token: string; refresh_token: string; expires_in: number };
-	} catch (error) {
-		throw new Error(
-			`Token exchange returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
-		);
+	} catch {
+		throw new Error("Anthropic token exchange returned invalid JSON.");
 	}
 
 	return {
@@ -238,20 +224,16 @@ async function loginAnthropicCopyCode(interaction: ProviderAuthInteraction): Pro
  * Refresh Anthropic OAuth token
  */
 async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal): Promise<OAuthCredential> {
-	let responseBody: string;
-	try {
-		responseBody = await postJson(
-			TOKEN_URL,
-			{
-				grant_type: "refresh_token",
-				client_id: CLIENT_ID,
-				refresh_token: refreshToken,
-			},
-			signal,
-		);
-	} catch (error) {
-		throw new Error(`Anthropic token refresh request failed. url=${TOKEN_URL}; details=${formatErrorDetails(error)}`);
-	}
+	const responseBody = await postJson(
+		TOKEN_URL,
+		{
+			grant_type: "refresh_token",
+			client_id: CLIENT_ID,
+			refresh_token: refreshToken,
+		},
+		signal,
+		"Anthropic token refresh",
+	);
 
 	let data: { access_token: string; refresh_token: string; expires_in: number; scope?: string };
 	try {
@@ -261,10 +243,8 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 			expires_in: number;
 			scope?: string;
 		};
-	} catch (error) {
-		throw new Error(
-			`Anthropic token refresh returned invalid JSON. url=${TOKEN_URL}; body=${responseBody}; details=${formatErrorDetails(error)}`,
-		);
+	} catch {
+		throw new Error("Anthropic token refresh returned invalid JSON.");
 	}
 
 	return {

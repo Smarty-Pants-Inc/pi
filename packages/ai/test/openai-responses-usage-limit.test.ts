@@ -45,8 +45,8 @@ describe("OpenAI Responses ChatGPT usage limit", () => {
 
 		const errorMessage = await getErrorMessage(response);
 
-		expect(errorMessage).toContain("subscription_sharing_usage_limit_exceeded");
-		expect(errorMessage).toContain("Check your ChatGPT usage: https://chatgpt.com/settings/usage");
+		// smarty-dev#5822: owned text and remedy; the provider code remains private.
+		expect(errorMessage).toBe("OpenAI API error (429)\nCheck your ChatGPT usage: https://chatgpt.com/settings/usage");
 	});
 
 	it("links to ChatGPT usage when the stream fails", async () => {
@@ -62,7 +62,7 @@ describe("OpenAI Responses ChatGPT usage limit", () => {
 
 		const errorMessage = await getErrorMessage(response);
 
-		expect(errorMessage).toContain("subscription_sharing_usage_limit_exceeded: Usage limit reached.");
-		expect(errorMessage).toContain("Check your ChatGPT usage: https://chatgpt.com/settings/usage");
+		// smarty-dev#5822: the stream's code and message remain private.
+		expect(errorMessage).toBe("OpenAI API error\nCheck your ChatGPT usage: https://chatgpt.com/settings/usage");
 	});
 });

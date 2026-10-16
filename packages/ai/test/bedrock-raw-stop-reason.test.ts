@@ -57,7 +57,6 @@ vi.mock("@aws-sdk/client-bedrock-runtime", () => {
 
 import { stream as streamBedrock } from "../src/api/bedrock-converse-stream.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { Api, Model } from "../src/types.ts";
 
 beforeEach(() => {
 	bedrockMock.streamEvents = undefined;
@@ -69,32 +68,29 @@ const context = normalizeContext({
 });
 
 describe("Bedrock provider stream events", () => {
-	it("forwards SDK stream items in order before normalizing them", async () => {
+	// smarty-dev#5822 C1: one owned notification per SDK item, never item or model.
+	it("notifies once per SDK stream item without provider data", async () => {
 		bedrockMock.streamEvents = [
 			{ messageStart: { role: "assistant" } },
 			{ contentBlockDelta: { contentBlockIndex: 0, delta: { text: "hello" } } },
 			{ messageStop: { stopReason: "end_turn", additionalModelResponseFields: { source: "test" } } },
 			{ metadata: { usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } } },
 		];
-		const received: unknown[] = [];
-		const eventModels: Model<Api>[] = [];
+		const calls: unknown[][] = [];
 		const result = await streamBedrock(model, context, {
 			cacheRetention: "none",
-			onProviderStreamEvent: async (item, eventModel) => {
+			onProviderStreamEvent: async (...args: unknown[]) => {
 				await Promise.resolve();
-				received.push(item);
-				eventModels.push(eventModel);
+				calls.push(args);
 			},
 		}).result();
 
-		expect(received).toEqual(bedrockMock.streamEvents);
-		for (const [index, item] of received.entries()) expect(item).toBe(bedrockMock.streamEvents[index]);
-		expect(eventModels).toEqual([model, model, model, model]);
+		expect(calls).toEqual(Array.from({ length: 4 }, () => [{ type: "provider_stream_event" }]));
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "hello" }]);
 	});
 
-	it("forwards SDK error items before reporting them", async () => {
+	it("notifies for SDK error items before reporting them", async () => {
 		const exception = new Error("bedrock stream failed");
 		bedrockMock.streamEvents = [{ messageStart: { role: "assistant" } }, { internalServerException: exception }];
 		const received: unknown[] = [];
@@ -105,9 +101,10 @@ describe("Bedrock provider stream events", () => {
 			},
 		}).result();
 
-		expect(received).toEqual(bedrockMock.streamEvents);
+		expect(received).toEqual([{ type: "provider_stream_event" }, { type: "provider_stream_event" }]);
 		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe("bedrock stream failed");
+		// smarty-dev#5822 C4: owned category, not exception text.
+		expect(result.errorMessage).toBe("Internal server error");
 	});
 });
 

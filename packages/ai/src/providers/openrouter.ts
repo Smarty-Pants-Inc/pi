@@ -27,13 +27,23 @@ export async function personalizeOpenRouterCatalog(
 ): Promise<readonly AnyModel[]> {
 	const key = context.credential?.type === "oauth" ? context.credential.access : context.credential?.key;
 	if (!key) return catalog;
-	const response = await fetch(`${(context.baseUrl ?? OPENROUTER_BASE_URL).replace(/\/+$/, "")}/models/user`, {
-		headers: { accept: "application/json", authorization: `Bearer ${key}` },
-		signal: AbortSignal.any([context.signal, AbortSignal.timeout(OPENROUTER_USER_MODELS_TIMEOUT_MS)]),
-	});
+	let response: Response;
+	try {
+		response = await fetch(`${(context.baseUrl ?? OPENROUTER_BASE_URL).replace(/\/+$/, "")}/models/user`, {
+			headers: { accept: "application/json", authorization: `Bearer ${key}` },
+			signal: AbortSignal.any([context.signal, AbortSignal.timeout(OPENROUTER_USER_MODELS_TIMEOUT_MS)]),
+		});
+	} catch {
+		throw new Error("OpenRouter model list request failed");
+	}
 	if (response.status === 401 || response.status === 403 || response.status === 404) return catalog;
 	if (!response.ok) throw new Error(`OpenRouter model list request failed: ${response.status}`);
-	const body: unknown = await response.json();
+	let body: unknown;
+	try {
+		body = await response.json();
+	} catch {
+		throw new Error("Invalid OpenRouter model list response");
+	}
 	if (typeof body !== "object" || body === null || !("data" in body) || !Array.isArray(body.data)) {
 		throw new Error("Invalid OpenRouter model list response");
 	}
