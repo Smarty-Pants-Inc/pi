@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -16,8 +17,14 @@ import { estimateTokens } from "../../src/core/compaction/index.ts";
 import { createHarness, getUserTexts, type Harness } from "./harness.ts";
 
 type SessionWithCompactionInternals = {
-	_checkCompaction: (assistantMessage: AssistantMessage, skipAbortedCheck?: boolean) => Promise<boolean>;
-	_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<boolean>;
+	_checkCompaction: (
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck?: boolean,
+	) => Promise<boolean | "failed" | "aborted">;
+	_runAutoCompaction: (
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+	) => Promise<boolean | "failed" | "aborted">;
 };
 
 function createUsage(totalTokens: number) {
@@ -97,7 +104,7 @@ function seedCompactableSession(harness: Harness): void {
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 
-async function createAbortableCompactionHarness(): Promise<{
+async function createAbortableCompactionHarness(persistSession = false): Promise<{
 	harness: Harness;
 	compactionStarted: Promise<void>;
 }> {
@@ -106,6 +113,7 @@ async function createAbortableCompactionHarness(): Promise<{
 		markCompactionStarted = resolve;
 	});
 	const harness = await createHarness({
+		persistSession,
 		settings: { compaction: { keepRecentTokens: 1 } },
 		extensionFactories: [
 			(pi) => {
@@ -419,7 +427,7 @@ describe("AgentSession compaction characterization", () => {
 		};
 		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe(false);
+		await expect(sessionInternals._runAutoCompaction("threshold", false)).resolves.toBe("failed");
 
 		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
 			reason: "threshold",
@@ -441,7 +449,8 @@ describe("AgentSession compaction characterization", () => {
 
 	it("compacts and resumes after a length stop below the desired output limit", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			// #2742: fitting input lets output truncation select recovery.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -732,16 +741,40 @@ describe("AgentSession compaction characterization", () => {
 		);
 	});
 
-	it("cancels in-progress manual compaction when abortCompaction is called", async () => {
-		const { harness, compactionStarted } = await createAbortableCompactionHarness();
+	// smarty-dev#217: cancellation preserves the existing persisted history.
+	it("cancels in-progress manual compaction without changing persisted history", async () => {
+		const { harness, compactionStarted } = await createAbortableCompactionHarness(true);
 		harnesses.push(harness);
-
+		const manager = harness.sessionManager;
+		const file = manager.getSessionFile();
+		if (!file) throw new Error("Expected a persisted session");
+		const beforeBytes = readFileSync(file);
+		const header = structuredClone(manager.getHeader());
+		const entries = structuredClone(manager.getEntries());
+		const messages = structuredClone(harness.session.messages);
+		const leaf = manager.getLeafId();
+		const originalId = manager.getSessionId();
 		const compactPromise = harness.session.compact();
 		const compactExpectation = expect(compactPromise).rejects.toThrow("Compaction cancelled");
 		await compactionStarted;
 		harness.session.abortCompaction();
-
 		await compactExpectation;
+		expect(readFileSync(file)).toEqual(beforeBytes);
+		expect(manager.getHeader()).toEqual(header);
+		expect(manager.getEntries()).toEqual(entries);
+		expect(manager.getLeafId()).toBe(leaf);
+		expect(manager.getSessionId()).toBe(originalId);
+		expect(manager.getSessionFile()).toBe(file);
+		expect(harness.session.sessionManager).toBe(manager);
+		expect(harness.session.messages).toEqual(messages);
+		expect(harness.faux.state.callCount).toBe(0);
+		expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
+		expect(harness.eventsOfType("compaction_end")[0]).toMatchObject({
+			result: undefined,
+			aborted: true,
+			willRetry: false,
+		});
+		expect(harness.session.isIdle).toBe(true);
 	});
 
 	// Regression test for #8920.
@@ -831,7 +864,8 @@ describe("AgentSession compaction characterization", () => {
 	it("compacts successful overflow responses without retrying", async () => {
 		const harness = await createHarness({
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
-			models: [{ id: "faux-1", contextWindow: 1, maxTokens: 100 }],
+			// #2742: valid input can still produce provider-reported silent overflow.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => ({
@@ -846,9 +880,12 @@ describe("AgentSession compaction characterization", () => {
 			],
 		});
 		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("completed answer")]);
+		seedCompactableSession(harness);
+		const completed = harness.session.messages.at(-1) as AssistantMessage;
+		completed.usage = createUsage(10_001);
+		const sessionInternals = harness.session as unknown as SessionWithCompactionInternals;
 
-		await expect(harness.session.prompt("hello")).resolves.toBeUndefined();
+		await expect(sessionInternals._checkCompaction(completed)).resolves.toBe(false);
 
 		const compactionEnd = harness.eventsOfType("compaction_end").at(-1);
 		expect(compactionEnd).toMatchObject({
@@ -856,7 +893,7 @@ describe("AgentSession compaction characterization", () => {
 			aborted: false,
 			willRetry: false,
 		});
-		expect(harness.faux.state.callCount).toBe(1);
+		expect(harness.faux.state.callCount).toBe(0);
 	});
 
 	it("ignores stale pre-compaction assistant usage on pre-prompt checks", async () => {

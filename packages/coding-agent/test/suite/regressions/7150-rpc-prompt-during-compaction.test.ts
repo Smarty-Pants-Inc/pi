@@ -1,6 +1,5 @@
 import { fauxAssistantMessage } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it } from "vitest";
-import type { PromptDisposition } from "../../../src/core/agent-session.ts";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, getMessageText, getUserTexts, type Harness } from "../harness.ts";
 
 describe("issue #7150: RPC prompt during manual compaction", () => {
@@ -58,14 +57,12 @@ describe("issue #7150: RPC prompt during manual compaction", () => {
 		const compactPromise = harness.session.compact();
 		await compactionStarted;
 
-		let preflightResult: PromptDisposition | undefined;
+		const transferred = vi.fn();
 		let promptError: unknown;
 		try {
 			await harness.session.prompt("PROBE-7150", {
 				source: "rpc",
-				preflightResult: (result) => {
-					preflightResult = result;
-				},
+				onInputTransferred: transferred,
 			});
 		} catch (error) {
 			promptError = error;
@@ -80,7 +77,7 @@ describe("issue #7150: RPC prompt during manual compaction", () => {
 				entry.type === "message" && entry.message.role === "user" ? [getMessageText(entry.message)] : [],
 			);
 
-		expect(preflightResult).toBeUndefined();
+		expect(transferred).not.toHaveBeenCalled();
 		expect(promptError).toEqual(
 			expect.objectContaining({ message: expect.stringContaining("compaction is in progress") }),
 		);

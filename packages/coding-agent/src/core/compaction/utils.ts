@@ -15,6 +15,10 @@ export interface FileOperations {
 	edited: Set<string>;
 }
 
+// The category sets cannot recover write/edit interleaving. Keep only the most recent observed
+// modifications; carried summary lists remain an older prefix without inventing tool chronology.
+const recentModifications = new WeakMap<FileOperations, Set<string>>();
+
 export function createFileOps(): FileOperations {
 	return {
 		read: new Set(),
@@ -47,40 +51,79 @@ export function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOp
 function addFileOp(toolName: string, args: Record<string, unknown> | undefined, fileOps: FileOperations): void {
 	const path = typeof args?.path === "string" ? args.path : undefined;
 	if (!path) return;
-	switch (toolName) {
-		case "read":
-			fileOps.read.add(path);
-			break;
-		case "write":
-			fileOps.written.add(path);
-			break;
-		case "edit":
-			fileOps.edited.add(path);
-			break;
+	const set =
+		toolName === "read"
+			? fileOps.read
+			: toolName === "write"
+				? fileOps.written
+				: toolName === "edit"
+					? fileOps.edited
+					: undefined;
+	// Delete first so native and nested calls keep least-to-most-recent ordering (pi#88).
+	set?.delete(path);
+	set?.add(path);
+	if (toolName === "write" || toolName === "edit") {
+		let recent = recentModifications.get(fileOps);
+		if (!recent) {
+			recent = new Set();
+			recentModifications.set(fileOps, recent);
+		}
+		recent.delete(path);
+		recent.add(path);
+		if (recent.size > MAX_SUMMARY_FILES) recent.delete(recent.values().next().value!);
 	}
+}
+
+/**
+ * Most recent files kept per list. Earlier compactions carry their lists forward, so without a cap
+ * the lists grow with the whole session (smarty-dev#2177: 4,891 paths, 510 KB, in one summary).
+ */
+export const MAX_SUMMARY_FILES = 50;
+
+export interface FileLists {
+	/** Read-only files, least to most recently used, at most MAX_SUMMARY_FILES. */
+	readFiles: string[];
+	/** Modified files, least to most recently used, at most MAX_SUMMARY_FILES. */
+	modifiedFiles: string[];
+	omittedReadFiles: number;
+	omittedModifiedFiles: number;
 }
 
 /**
  * Compute final file lists from file operations.
- * Returns readFiles (files only read, not modified) and modifiedFiles.
+ * Returns readFiles (files only read, not modified) and modifiedFiles, each capped to the most
+ * recently used MAX_SUMMARY_FILES, in recency order so the next compaction keeps the newest.
  */
-export function computeFileLists(fileOps: FileOperations): { readFiles: string[]; modifiedFiles: string[] } {
+export function computeFileLists(fileOps: FileOperations): FileLists {
 	const modified = new Set([...fileOps.edited, ...fileOps.written]);
-	const readOnly = [...fileOps.read].filter((f) => !modified.has(f)).sort();
-	const modifiedFiles = [...modified].sort();
-	return { readFiles: readOnly, modifiedFiles };
+	// Preserve the existing fallback for callers supplying only sets, then move observed touches
+	// after carried paths in their actual mixed write/edit order. Do not mutate the caller's sets.
+	for (const path of recentModifications.get(fileOps) ?? []) {
+		if (modified.delete(path)) modified.add(path);
+	}
+	const readOnly = [...fileOps.read].filter((f) => !modified.has(f));
+	const modifiedFiles = [...modified];
+	return {
+		readFiles: readOnly.slice(-MAX_SUMMARY_FILES),
+		modifiedFiles: modifiedFiles.slice(-MAX_SUMMARY_FILES),
+		omittedReadFiles: Math.max(0, readOnly.length - MAX_SUMMARY_FILES),
+		omittedModifiedFiles: Math.max(0, modifiedFiles.length - MAX_SUMMARY_FILES),
+	};
 }
 
 /**
- * Format file operations as XML tags for summary.
+ * Format file operations as XML tags for summary. Lists are sorted for reading.
  */
-export function formatFileOperations(readFiles: string[], modifiedFiles: string[]): string {
+export function formatFileOperations(lists: FileLists): string {
+	const section = (tag: string, files: string[], omitted: number) => {
+		const lines = [...files].sort();
+		if (omitted > 0) lines.push(`(+${omitted} earlier files omitted)`);
+		return `<${tag}>\n${lines.join("\n")}\n</${tag}>`;
+	};
 	const sections: string[] = [];
-	if (readFiles.length > 0) {
-		sections.push(`<read-files>\n${readFiles.join("\n")}\n</read-files>`);
-	}
-	if (modifiedFiles.length > 0) {
-		sections.push(`<modified-files>\n${modifiedFiles.join("\n")}\n</modified-files>`);
+	if (lists.readFiles.length > 0) sections.push(section("read-files", lists.readFiles, lists.omittedReadFiles));
+	if (lists.modifiedFiles.length > 0) {
+		sections.push(section("modified-files", lists.modifiedFiles, lists.omittedModifiedFiles));
 	}
 	if (sections.length === 0) return "";
 	return `\n\n${sections.join("\n\n")}`;

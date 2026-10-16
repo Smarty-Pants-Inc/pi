@@ -2,6 +2,64 @@ import { describe, expect, test } from "vitest";
 import { normalizeSessionName, parseArgs } from "../src/cli/args.ts";
 
 describe("parseArgs", () => {
+	// Regression for Smarty-Pants-Inc/smarty-dev#2751.
+	describe("--max-provider-requests", () => {
+		test("parses separate and equals values, leaving prompts intact", () => {
+			expect(parseArgs(["--max-provider-requests", "2", "test"])).toMatchObject({
+				maxProviderRequests: 2,
+				messages: ["test"],
+				diagnostics: [],
+			});
+			expect(parseArgs(["--max-provider-requests=3", "test"])).toMatchObject({
+				maxProviderRequests: 3,
+				messages: ["test"],
+				diagnostics: [],
+			});
+			expect(parseArgs([]).maxProviderRequests).toBeUndefined();
+			expect(parseArgs(["--", "--max-provider-requests", "1"]).maxProviderRequests).toBeUndefined();
+		});
+		test.each(["0", "-1", "1.5", "NaN", "Infinity", "9007199254740992", "", "1x"])(
+			"rejects invalid cap %s",
+			(value) => {
+				expect(parseArgs([`--max-provider-requests=${value}`]).diagnostics).toEqual([
+					{ type: "error", message: "--max-provider-requests requires a positive safe integer" },
+				]);
+			},
+		);
+		test("rejects missing and repeated values without consuming other flags", () => {
+			expect(parseArgs(["--max-provider-requests"]).diagnostics).toHaveLength(1);
+			expect(parseArgs(["--max-provider-requests", "--version"])).toMatchObject({
+				version: true,
+				diagnostics: [{ type: "error", message: "--max-provider-requests requires a positive safe integer" }],
+			});
+			expect(parseArgs(["--max-provider-requests", "1", "--max-provider-requests=2"]).diagnostics).toHaveLength(1);
+		});
+	});
+	describe("--no-auto-compaction", () => {
+		test("recognizes the explicit switch without consuming a prompt or forwarding an extension flag", () => {
+			const result = parseArgs(["--mode", "rpc", "--no-auto-compaction", "continue"]);
+			expect(result.noAutoCompaction).toBe(true);
+			expect(result.mode).toBe("rpc");
+			expect(result.messages).toEqual(["continue"]);
+			expect(result.unknownFlags.size).toBe(0);
+			expect(result.diagnostics).toEqual([]);
+		});
+		test("does not change the default", () => {
+			expect(parseArgs([]).noAutoCompaction).toBeUndefined();
+			expect(parseArgs(["--mode", "rpc"]).noAutoCompaction).toBeUndefined();
+		});
+		test("does not mistake an unknown equals option for the native selection", () => {
+			const result = parseArgs(["--no-auto-compaction=true"]);
+			expect(result.noAutoCompaction).toBeUndefined();
+			expect(result.unknownFlags.get("no-auto-compaction")).toBe("true");
+		});
+		test("preserves the option terminator", () => {
+			const result = parseArgs(["--", "--no-auto-compaction"]);
+			expect(result.noAutoCompaction).toBeUndefined();
+			expect(result.messages).toEqual(["--no-auto-compaction"]);
+		});
+	});
+
 	describe("--version flag", () => {
 		test("parses --version flag", () => {
 			const result = parseArgs(["--version"]);

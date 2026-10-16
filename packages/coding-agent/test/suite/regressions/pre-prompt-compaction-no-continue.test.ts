@@ -1,4 +1,4 @@
-import { type AssistantMessage, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { type AssistantMessage, fauxAssistantMessage, type ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHarness, getUserTexts, type Harness } from "../harness.ts";
 
@@ -25,7 +25,8 @@ describe("pre-prompt compaction regression", () => {
 
 	it("compacts length-stop overflow before a new prompt without continuing from an assistant message", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			// #2742: retained output selects length recovery; the next input must fit.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -72,4 +73,118 @@ describe("pre-prompt compaction regression", () => {
 		expect(getUserTexts(harness)).toContain("next prompt");
 		expect(harness.faux.state.callCount).toBe(1);
 	});
+
+	// smarty-dev#217: retain accepted attachments without acknowledging a model dispatch.
+	it.each(["failed", "aborted"] as const)("retains unsent input after %s compaction", async (outcome) => {
+		const harness = await createHarness({
+			// #2742: summary input fits although prior usage selects overflow recovery.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", (event) => ({
+						action: "transform",
+						text: `processed:${event.text}`,
+						images: event.images,
+					}));
+					if (outcome === "aborted") pi.on("session_before_compact", () => ({ cancel: true }));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const now = Date.now();
+		const model = harness.getModel();
+		harness.sessionManager.appendMessage({ role: "user", content: "previous prompt", timestamp: now - 1000 });
+		harness.sessionManager.appendMessage({
+			...fauxAssistantMessage("previous response", { timestamp: now - 500 }),
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			usage: createUsage(10_001),
+		});
+		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+		const before = structuredClone(harness.sessionManager.getEntries());
+		harness.setResponses([fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" })]);
+		const beforeAgentStart = vi.spyOn(harness.session.extensionRunner, "emitBeforeAgentStart");
+		const continueSpy = vi.spyOn(harness.session.agent, "continue");
+		const queue = vi.spyOn(harness.session.agent, "followUp");
+		const transferred = vi.fn();
+		const images: ImageContent[] = [{ type: "image", data: "synthetic-image", mimeType: "image/png" }];
+
+		await expect(
+			harness.session.prompt("pending input", {
+				images,
+				streamingBehavior: "followUp",
+				onInputTransferred: transferred,
+			}),
+		).rejects.toThrow("Input is retained in the followUp queue");
+
+		// The receiving session owns the retained queue; this is not a turnStarted receipt.
+		expect(transferred).toHaveBeenCalledTimes(1);
+		expect(harness.sessionManager.getEntries()).toEqual(before);
+		expect(getUserTexts(harness)).not.toContain("processed:pending input");
+		expect(harness.session.getFollowUpMessages()).toEqual(["processed:pending input"]);
+		expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+		expect(queue).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({
+				role: "user",
+				content: [{ type: "text", text: "processed:pending input" }, ...images],
+			}),
+		);
+		expect(beforeAgentStart).not.toHaveBeenCalled();
+		expect(continueSpy).not.toHaveBeenCalled();
+		expect(harness.faux.state.callCount).toBe(outcome === "failed" ? 1 : 0);
+		expect(harness.session.isIdle).toBe(true);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			result: undefined,
+			aborted: outcome === "aborted",
+		});
+	});
+
+	// pi#74 review F3: a custom trigger held by failed preflight must not restart retained input.
+	it.each(["failed", "aborted"] as const)(
+		"keeps a triggered message held before %s compaction queued, with no new run",
+		async (outcome) => {
+			const harness = await createHarness({
+				models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
+				settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+				extensionFactories: [
+					(pi) => {
+						pi.on("input", () => {
+							pi.sendMessage({ customType: "wake", content: "wake", display: false }, { triggerTurn: true });
+							return undefined;
+						});
+						if (outcome === "aborted") pi.on("session_before_compact", () => ({ cancel: true }));
+					},
+				],
+			});
+			harnesses.push(harness);
+			const now = Date.now();
+			const model = harness.getModel();
+			harness.sessionManager.appendMessage({ role: "user", content: "previous prompt", timestamp: now - 1000 });
+			harness.sessionManager.appendMessage({
+				...fauxAssistantMessage("previous response", { timestamp: now - 500 }),
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				usage: createUsage(10_001),
+			});
+			harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+			harness.setResponses([
+				fauxAssistantMessage("", { stopReason: "error", errorMessage: "insufficient_quota" }),
+				fauxAssistantMessage("must not run"),
+			]);
+			const runPrompt = vi.spyOn(harness.session.agent, "prompt");
+
+			await expect(harness.session.prompt("pending input")).rejects.toThrow("Input is retained in the steer queue");
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(runPrompt).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(outcome === "failed" ? 1 : 0);
+			expect(getUserTexts(harness)).not.toContain("pending input");
+			expect(harness.session.messages.some((message) => message.role === "custom")).toBe(false);
+			expect(harness.session.getSteeringMessages()).toEqual(["pending input"]);
+			expect(harness.session.agent.hasQueuedMessages()).toBe(true);
+			expect(harness.session.isIdle).toBe(true);
+		},
+	);
 });

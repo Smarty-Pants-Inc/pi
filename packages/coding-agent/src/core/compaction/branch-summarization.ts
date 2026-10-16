@@ -215,14 +215,15 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		}
 	}
 
+	// Oldest entry the walk reaches. File ops are extracted oldest first after the walk so the recency
+	// order (and the cap in computeFileLists) follows the session, not the walk.
+	let walkStart = 0;
+
 	// Second pass: walk from newest to oldest, adding messages until token budget
 	for (let i = entries.length - 1; i >= 0; i--) {
 		const entry = entries[i];
 		const message = getMessageFromEntry(entry);
 		if (!message) continue;
-
-		// Extract file ops from assistant messages (tool calls)
-		extractFileOpsFromMessage(message, fileOps);
 
 		const tokens = estimateTokens(message);
 
@@ -236,11 +237,19 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 				}
 			}
 			// Stop - we've hit the budget
+			walkStart = i;
 			break;
 		}
 
 		messages.unshift(message);
 		totalTokens += tokens;
+	}
+
+	// From the raw entries, not the prose: tool results are left out of the summary text, but they carry
+	// the files of nested calls (ctx.executeTool, codemode).
+	for (let i = walkStart; i < entries.length; i++) {
+		const entry = entries[i];
+		if (entry.type === "message") extractFileOpsFromMessage(entry.message, fileOps);
 	}
 
 	return { messages, fileOps, totalTokens };
@@ -370,8 +379,9 @@ export async function generateBranchSummary(
 	summary = BRANCH_SUMMARY_PREAMBLE + summary;
 
 	// Compute file lists and append to summary
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	const fileLists = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = fileLists;
+	summary += formatFileOperations(fileLists);
 
 	return {
 		summary: summary || "No summary generated",

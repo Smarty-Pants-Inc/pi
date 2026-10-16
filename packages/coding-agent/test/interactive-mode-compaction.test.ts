@@ -1,10 +1,30 @@
-import type { Usage } from "@earendil-works/pi-ai";
+import type { ImageContent, Usage } from "@earendil-works/pi-ai";
 import { Container } from "@earendil-works/pi-tui";
 import { describe, expect, test, vi } from "vitest";
+import type { AgentSession, PromptOptions } from "../src/core/agent-session.ts";
+import { bindReceivedInputSession, receiveInput } from "../src/core/received-input.ts";
 import type { SessionEntry } from "../src/core/session-manager.ts";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
+
+function bindTransferFixture(session: {
+	prompt(text: string, options?: PromptOptions): Promise<void>;
+	steer(text: string): Promise<void>;
+	followUp(text: string): Promise<void>;
+}): void {
+	bindReceivedInputSession(session as unknown as AgentSession, {
+		prompt: (input, options) => session.prompt(input.text, options),
+		steer: async (input) => {
+			await session.steer(input.text);
+			return "queued";
+		},
+		followUp: async (input) => {
+			await session.followUp(input.text);
+			return "queued";
+		},
+	});
+}
 
 describe("InteractiveMode compaction events", () => {
 	test("uses the cache miss notice setting for compaction and branch summary costs", () => {
@@ -106,7 +126,7 @@ describe("InteractiveMode compaction events", () => {
 		);
 	});
 
-	test("renders retained entries and appends the latest summary cost at the bottom", async () => {
+	test.each([false, true])("renders retained entries and summary cost (willRetry: %s)", async (willRetry) => {
 		const usage: Usage = {
 			input: 10,
 			output: 20,
@@ -170,14 +190,14 @@ describe("InteractiveMode compaction events", () => {
 
 		await handleEvent.call(fakeThis, {
 			type: "compaction_end",
-			reason: "manual",
+			reason: willRetry ? "overflow" : "manual",
 			result: {
 				tokensBefore: 123,
 				summary: "summary",
 				usage,
 			},
 			aborted: false,
-			willRetry: false,
+			willRetry,
 		});
 
 		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
@@ -195,7 +215,7 @@ describe("InteractiveMode compaction events", () => {
 			kind: "compaction",
 			usage,
 		});
-		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry: false });
+		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry });
 	});
 
 	test("updates the working state when the same agent run resumes after compaction", async () => {
@@ -230,13 +250,169 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(2);
 	});
 
+	// pi#117: failed/cancelled compaction must retain exact queued envelopes.
+	test.each([
+		{ reason: "manual" as const, aborted: false },
+		{ reason: "manual" as const, aborted: true },
+		{ reason: "threshold" as const, aborted: true },
+		{ reason: "overflow" as const, aborted: false },
+	])("retains exact queued input after $reason compaction (aborted: $aborted)", async ({ reason, aborted }) => {
+		const queued = [
+			{ input: receiveInput("  original steering\n"), mode: "steer" },
+			{ input: receiveInput("original follow-up"), mode: "followUp" },
+		];
+		const before = structuredClone(queued);
+		initTheme("dark");
+		const fakeThis = {
+			isInitialized: true,
+			chatContainer: new Container(),
+			compactionQueuedMessages: queued,
+			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
+			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
+			autoCompactionLoader: undefined,
+			defaultEditor: {},
+			statusContainer: { clear: vi.fn() },
+			clearStatusIndicator: vi.fn(),
+			showError: vi.fn(),
+			showStatus: vi.fn(),
+			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
+			settingsManager: { getShowTerminalProgress: () => false },
+			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+		};
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+			this: typeof fakeThis,
+			event: {
+				type: "compaction_end";
+				reason: "manual" | "threshold" | "overflow";
+				result: undefined;
+				aborted: boolean;
+				willRetry: boolean;
+				errorMessage?: string;
+			},
+		) => Promise<void>;
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason,
+			result: undefined,
+			aborted,
+			willRetry: false,
+			errorMessage: aborted ? undefined : "synthetic compaction failure",
+		});
+		expect(fakeThis.flushCompactionQueue).not.toHaveBeenCalled();
+		expect(fakeThis.compactionQueuedMessages).toBe(queued);
+		expect(queued).toEqual(before);
+		if (reason === "overflow" && !aborted) {
+			expect(stripAnsi(fakeThis.chatContainer.render(120).join("\n"))).toContain("synthetic compaction failure");
+		}
+	});
+
+	test.each([false, true])("keeps detached prompt transfers staged until settlement (reject: %s)", async (reject) => {
+		let resolvePrompt!: () => void;
+		let rejectPrompt!: (error: Error) => void;
+		const prompt = new Promise<void>((resolve, reject) => {
+			resolvePrompt = resolve;
+			rejectPrompt = reject;
+		});
+		const queued = [{ input: receiveInput("original input"), mode: "steer" as const }];
+		const fakeThis = {
+			compactionQueuedMessages: [...queued],
+			compactionQueueTransfers: 0,
+			compactionQueueWork: new Set<Promise<void>>(),
+			recoveredImages: new Map<string, ImageContent>(),
+			session: {
+				clearQueue: vi.fn(),
+				prompt: vi.fn().mockReturnValue(prompt),
+				steer: vi.fn(),
+				followUp: vi.fn(),
+			},
+			isExtensionCommand: vi.fn().mockReturnValue(false),
+			updatePendingMessagesDisplay: vi.fn(),
+			showError: vi.fn(),
+		};
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+			this: typeof fakeThis,
+		) => Promise<void>;
+		bindTransferFixture(fakeThis.session);
+		await flush.call(fakeThis);
+		expect(fakeThis.compactionQueuedMessages).toEqual([]);
+		expect(fakeThis.compactionQueueTransfers).toBe(1);
+		const intervening = { input: receiveInput("newly staged input"), mode: "steer" as const };
+		fakeThis.compactionQueuedMessages.push(intervening);
+		if (reject) rejectPrompt(new Error("preflight failed"));
+		else resolvePrompt();
+		await vi.waitFor(() => expect(fakeThis.compactionQueueTransfers).toBe(0));
+		expect(fakeThis.compactionQueuedMessages).toEqual(reject ? [...queued, intervening] : [intervening]);
+		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		expect(fakeThis.showError).toHaveBeenCalledTimes(reject ? 1 : 0);
+	});
+
+	test.each([false, true])(
+		"partial transfer preserves accepted messages and restores failures in order (prompt fails first: %s)",
+		async (promptFirst) => {
+			let rejectPrompt!: (cause: Error) => void;
+			let rejectTail!: (cause: Error) => void;
+			const prompt = new Promise<void>((_, reject) => {
+				rejectPrompt = reject;
+			});
+			const tail = new Promise<void>((_, reject) => {
+				rejectTail = reject;
+			});
+			const batch = [
+				{ input: receiveInput("A"), mode: "steer" as const },
+				{ input: receiveInput("accepted"), mode: "followUp" as const },
+				{ input: receiveInput("C"), mode: "followUp" as const },
+			];
+			const fakeThis = {
+				compactionQueuedMessages: [...batch],
+				compactionQueueTransfers: 0,
+				compactionQueueWork: new Set<Promise<void>>(),
+				recoveredImages: new Map<string, ImageContent>(),
+				session: {
+					prompt: vi.fn(() => prompt),
+					clearQueue: vi.fn(),
+					steer: vi.fn(),
+					followUp: vi.fn().mockResolvedValueOnce(undefined).mockReturnValueOnce(tail),
+				},
+				isExtensionCommand: () => false,
+				updatePendingMessagesDisplay: vi.fn(),
+				showError: vi.fn(),
+			};
+			Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+			const flush = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
+				this: typeof fakeThis,
+			) => Promise<void>;
+			bindTransferFixture(fakeThis.session);
+			const completion = flush.call(fakeThis);
+			await vi.waitFor(() => expect(fakeThis.session.followUp).toHaveBeenCalledTimes(2));
+			const intervening = { input: receiveInput("B"), mode: "steer" as const };
+			fakeThis.compactionQueuedMessages.push(intervening);
+			if (promptFirst) {
+				rejectPrompt(new Error("first"));
+				await vi.waitFor(() => expect(fakeThis.showError).toHaveBeenCalledTimes(1));
+				rejectTail(new Error("tail"));
+			} else {
+				rejectTail(new Error("tail"));
+				await completion;
+				expect(fakeThis.compactionQueuedMessages).toEqual([batch[2], intervening]);
+				rejectPrompt(new Error("first"));
+			}
+			await completion;
+			await vi.waitFor(() => expect(fakeThis.compactionQueueTransfers).toBe(0));
+			expect(fakeThis.compactionQueuedMessages).toEqual([batch[0], batch[2], intervening]);
+			expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
+		},
+	);
+
 	// Regression test for #9340.
 	test("routes interactive response aborts through AgentSession", () => {
 		const abort = vi.fn(async () => {});
 		const ui = {
 			clearAllQueues: () => ({ steering: [], followUp: [] }),
 			updatePendingMessagesDisplay: vi.fn(),
-			session: { abort },
+			session: { abort, agent: { getQueuedMessages: () => [] } },
+			recoveryText: () => "",
 		};
 		const restoreQueuedMessagesToEditor = Reflect.get(InteractiveMode.prototype, "restoreQueuedMessagesToEditor") as (
 			this: typeof ui,
@@ -250,7 +426,10 @@ describe("InteractiveMode compaction events", () => {
 
 	test("preserves steering behavior when flushing into an active agent run", async () => {
 		const fakeThis = {
-			compactionQueuedMessages: [{ text: "change direction", mode: "steer" as const }],
+			compactionQueuedMessages: [{ input: receiveInput("change direction"), mode: "steer" as const }],
+			compactionQueueTransfers: 0,
+			compactionQueueWork: new Set<Promise<void>>(),
+			recoveredImages: new Map<string, ImageContent>(),
 			session: {
 				clearQueue: vi.fn(),
 				prompt: vi.fn().mockResolvedValue(undefined),
@@ -262,6 +441,8 @@ describe("InteractiveMode compaction events", () => {
 			showError: vi.fn(),
 		};
 
+		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		bindTransferFixture(fakeThis.session);
 		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof fakeThis,
 			options?: { willRetry?: boolean },
@@ -269,7 +450,10 @@ describe("InteractiveMode compaction events", () => {
 
 		await flushCompactionQueue.call(fakeThis, { willRetry: false });
 
-		expect(fakeThis.session.prompt).toHaveBeenCalledWith("change direction", { streamingBehavior: "steer" });
+		expect(fakeThis.session.prompt).toHaveBeenCalledWith(
+			"change direction",
+			expect.objectContaining({ streamingBehavior: "steer" }),
+		);
 		expect(fakeThis.compactionQueuedMessages).toEqual([]);
 		expect(fakeThis.showError).not.toHaveBeenCalled();
 	});

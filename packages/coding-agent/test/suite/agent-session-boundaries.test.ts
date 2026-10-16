@@ -130,8 +130,9 @@ describe("AgentSession actionable boundaries", () => {
 		const requests: string[] = [];
 		const instruction = "EXACT-REPLACEMENT-INSTRUCTION ".repeat(100);
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 2_000, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			// #2742: keep the 2k trigger but leave room for the verbatim instruction and system prompt.
+			models: [{ id: "faux-1", contextWindow: 4_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 2_000 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("turn_end", (event, ctx) => {
@@ -184,8 +185,9 @@ describe("AgentSession actionable boundaries", () => {
 		const requests: string[] = [];
 		const instruction = "EXACT-UNSENT-INSTRUCTION ".repeat(100);
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 2_000, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
+			// #2742: threshold crossing must not require sending over-window input.
+			models: [{ id: "faux-1", contextWindow: 4_000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 2_000 } },
 			extensionFactories: [
 				(pi) => {
 					pi.on("turn_end", () => {
@@ -733,7 +735,9 @@ describe("AgentSession actionable boundaries", () => {
 			expect.objectContaining({ type: "custom", customType: "committed-after-abort", data: true }),
 		);
 		// #10607: settlement reports the abort although the last response succeeded.
-		expect(harness.eventsOfType("agent_settled")).toEqual([{ type: "agent_settled", aborted: true }]);
+		expect(harness.eventsOfType("agent_settled")).toEqual([
+			{ type: "agent_settled", outcome: "aborted", aborted: true },
+		]);
 	});
 });
 
@@ -786,7 +790,8 @@ describe("durable length recovery", () => {
 			execute: async () => ({ content: [{ type: "text", text: "done" }], details: {} }),
 		};
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			// #2742: input fits; the output length stop selects recovery.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			tools: [tool],
 			extensionFactories: [
@@ -829,7 +834,8 @@ describe("durable length recovery", () => {
 	it("gives a distinct queued follow-up its own length-recovery budget", async () => {
 		let queued = false;
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			// #2742: input fits; test separate length-recovery budgets.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -915,7 +921,10 @@ describe("durable length recovery", () => {
 		harness.session.refreshContext();
 		harness.setResponses([fauxAssistantMessage("new answer")]);
 
-		await harness.session.prompt("next prompt");
+		// smarty-dev#217: cancelled pre-prompt compaction retains input without dispatch.
+		await expect(harness.session.prompt("next prompt")).rejects.toThrow("compaction was cancelled");
+		expect(harness.session.getSteeringMessages()).toEqual(["next prompt"]);
+		expect(harness.faux.state.callCount).toBe(0);
 
 		const edits = harness.sessionManager.getEntries().filter((entry) => entry.type === "context_edit");
 		expect(edits.filter((entry) => entry.targetId === partialId).at(-1)?.replacement).toBeNull();
@@ -930,7 +939,8 @@ describe("durable length recovery", () => {
 		let replaced = false;
 		let overflowId: string | undefined;
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1_000, maxTokens: 100 }],
+			// #2742: provider overflow recovery is distinct from local input admission.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -1032,7 +1042,8 @@ describe("durable length recovery", () => {
 
 	it("keeps omissions and does not retry when recovery compaction fails", async () => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 1000, maxTokens: 100 }],
+			// #2742: the length response, not oversized input, selects recovery.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: {
 				compaction: { keepRecentTokens: 1, reserveTokens: 0 },
 				retry: { enabled: false, maxRetries: 0, baseDelayMs: 1 },

@@ -24,6 +24,7 @@ import type {
 	Usage,
 } from "@earendil-works/pi-ai/compat";
 import { completeSimple } from "@earendil-works/pi-ai/compat";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import { convertToLlm } from "../messages.ts";
 import {
 	buildSessionProjection,
@@ -269,6 +270,24 @@ export function shouldCompact(contextTokens: number, contextWindow: number, sett
 	return contextTokens > contextWindow - settings.reserveTokens;
 }
 
+/** Final size-only check after request transforms; stale provider usage is not an input bound. */
+export function assertContextFitsWindow(
+	messages: AgentMessage[],
+	model: Pick<Model<string>, "contextWindow"> | undefined,
+): void {
+	if (!model || model.contextWindow <= 0) return;
+	const system = getCurrentSystemMessage(messages);
+	let tokens = system ? estimateTokens(system) : 0;
+	for (const message of messages) {
+		if (message.role !== "system") tokens += estimateTokens(message);
+	}
+	if (tokens > model.contextWindow) {
+		throw new Error(
+			`Context exceeds window: estimated ${tokens} input tokens, window ${model.contextWindow}. Compact or reduce input before retrying.`,
+		);
+	}
+}
+
 // ============================================================================
 // Cut point detection
 // ============================================================================
@@ -335,6 +354,8 @@ export function estimateTokens(message: AgentMessage): number {
 			return Math.ceil(chars / 4);
 		}
 		case "bashExecution": {
+			// !! output remains in history but is intrinsically absent from model context.
+			if (message.excludeFromContext) return 0;
 			chars = message.command.length + message.output.length;
 			return Math.ceil(chars / 4);
 		}
@@ -624,6 +645,7 @@ export async function completeSummarization(
 	retry?: RetryPolicy,
 	callbacks?: RetryCallbacks,
 ): Promise<AssistantMessage> {
+	assertContextFitsWindow(context.messages, model);
 	// Avoid cache writes for one-off summaries. Reuse caller-supplied routing when available;
 	// callers without a session ID, including branch summaries, receive a fresh routing ID.
 	const requestOptions: SimpleStreamOptions = {
@@ -631,10 +653,42 @@ export async function completeSummarization(
 		cacheRetention: "none",
 		sessionId: options.sessionId ?? uuidv7(),
 	};
-	const produce = async (): Promise<AssistantMessage> =>
-		streamFn
-			? (await streamFn(model, context, requestOptions)).result()
-			: completeSimple(model, context, requestOptions);
+	const produce = async (): Promise<AssistantMessage> => {
+		// Custom streams may ignore cancellation during setup or never publish a terminal event.
+		// The owner must still settle, without accepting a late result or starting another retry.
+		try {
+			requestOptions.signal?.throwIfAborted();
+			if (streamFn) {
+				const stream = await raceWithAbortSignal(
+					Promise.resolve(streamFn(model, context, requestOptions)),
+					requestOptions.signal,
+				);
+				return await raceWithAbortSignal(stream.result(), requestOptions.signal);
+			}
+			return await raceWithAbortSignal(completeSimple(model, context, requestOptions), requestOptions.signal);
+		} catch (error) {
+			if (!requestOptions.signal?.aborted || error !== requestOptions.signal.reason) throw error;
+			// Preserve retryAssistantCall's aborted-response contract, including retry-indicator cleanup.
+			return {
+				role: "assistant",
+				content: [],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "aborted",
+				errorMessage: "Summarization cancelled",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+		}
+	};
 	return retryAssistantCall(produce, retry, requestOptions.signal, callbacks);
 }
 
@@ -752,6 +806,7 @@ export async function generateSummaryWithUsage(
 		callbacks,
 	);
 
+	if (response.stopReason === "aborted") throw new DOMException("Compaction cancelled", "AbortError");
 	const failure = getSummarizationFailure(response, "Summarization");
 	if (failure) {
 		throw new Error(failure);
@@ -987,6 +1042,28 @@ export async function compact(
 		settings,
 	} = preparation;
 
+	// One retry allowance for the operation, not a fresh allowance for each
+	// split summary. Do not mutate the caller's policy or retry ordinary turns.
+	if (retry) {
+		retry = { ...retry };
+		const remaining = retry;
+		const callerCallbacks = callbacks;
+		callbacks = {
+			...callbacks,
+			onRetryScheduled: (...args) => {
+				signal?.throwIfAborted();
+				remaining.maxRetries = Math.max(0, remaining.maxRetries - 1);
+				return callerCallbacks?.onRetryScheduled?.(...args);
+			},
+			onRetryAttemptStart: async () => {
+				signal?.throwIfAborted();
+				await callerCallbacks?.onRetryAttemptStart?.();
+				signal?.throwIfAborted();
+			},
+		};
+	}
+	signal?.throwIfAborted();
+
 	// Generate summaries and merge into one
 	let summary: string;
 	let summaryUsage: Usage;
@@ -1014,6 +1091,7 @@ export async function compact(
 			historyText = historyResult.text;
 			historyUsage = historyResult.usage;
 		}
+		signal?.throwIfAborted();
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
@@ -1053,9 +1131,11 @@ export async function compact(
 		summaryUsage = result.usage;
 	}
 
+	signal?.throwIfAborted();
 	// Compute file lists and append to summary
-	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-	summary += formatFileOperations(readFiles, modifiedFiles);
+	const fileLists = computeFileLists(fileOps);
+	const { readFiles, modifiedFiles } = fileLists;
+	summary += formatFileOperations(fileLists);
 
 	if (!firstKeptEntryId) {
 		throw new Error("First kept entry has no UUID - session may need migration");
@@ -1104,6 +1184,7 @@ async function generateTurnPrefixSummary(
 		callbacks,
 	);
 
+	if (response.stopReason === "aborted") throw new DOMException("Compaction cancelled", "AbortError");
 	const failure = getSummarizationFailure(response, "Turn prefix summarization");
 	if (failure) {
 		throw new Error(failure);
