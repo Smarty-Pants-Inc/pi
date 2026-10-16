@@ -10,7 +10,7 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
-import { isRetryableAssistantError, retryDelayMs } from "@earendil-works/pi-ai/utils/retry";
+import { isRetryableAssistantError, retryDelayMs } from "@earendil-works/pi-ai/utils/recovery";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { AssistantEntry, ResetEntry, SystemEntry, UserEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
