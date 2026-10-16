@@ -923,7 +923,12 @@ describe("ExtensionRunner", () => {
 	it("resolves tool renderers in extension load order, each able to defer to the next", async () => {
 		const runtime = createExtensionRuntime();
 		const eventBus = createEventBus();
-		const renderCall = () => ({ render: () => [], invalidate: () => {} });
+		// pi#280 / smarty-dev#3155: prove source-bound wrappers delegate, not just their shape.
+		const component = { render: () => ["delegated extension renderer"], invalidate: () => {} };
+		const renderCall = vi.fn((_args: unknown, _theme: unknown, _context: unknown) => component);
+		const args = { proof: "renderer arguments" };
+		const theme = {} as never;
+		const context = {} as never;
 		const first = await loadExtensionFromFactory(
 			(pi) => pi.registerToolRenderer((toolName, next) => (toolName === "a" ? { renderCall } : next())),
 			tempDir,
@@ -941,11 +946,18 @@ describe("ExtensionRunner", () => {
 		// Returned renderer callbacks are source-bound wrappers, not the original functions.
 		const firstRenderers = runner.resolveToolRenderers("a", () => undefined);
 		expect(firstRenderers).toEqual({ renderCall: expect.any(Function) });
-		expect(firstRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
+		const firstComponent = firstRenderers!.renderCall!(args, theme, context);
+		expect(renderCall).toHaveBeenCalledExactlyOnceWith(args, theme, context);
+		expect(firstComponent).toBe(component);
+		expect(firstComponent.render(80)).toEqual(["delegated extension renderer"]);
 		expect(runner.resolveToolRenderers("b", () => undefined)).toEqual({ renderShell: "self" });
 		const baseRenderers = runner.resolveToolRenderers("b", () => ({ renderCall }));
 		expect(baseRenderers).toEqual({ renderCall: expect.any(Function) });
-		expect(baseRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
+		const baseComponent = baseRenderers!.renderCall!(args, theme, context);
+		expect(renderCall).toHaveBeenCalledTimes(2);
+		expect(renderCall).toHaveBeenNthCalledWith(2, args, theme, context);
+		expect(baseComponent).toBe(component);
+		expect(baseComponent.render(80)).toEqual(["delegated extension renderer"]);
 	});
 
 	describe("boundary chaining", () => {
