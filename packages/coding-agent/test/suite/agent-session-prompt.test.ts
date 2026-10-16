@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BeforeAgentStartEvent, ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
+import { receiptRecord } from "../../src/core/turn-receipts.ts";
 import { createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
 
@@ -563,6 +564,65 @@ describe("AgentSession prompt characterization", () => {
 		);
 	});
 
+	// #10267 / smarty-dev#2867: both trigger kinds keep runner-issued receipts through publication.
+	it.each(["user", "custom"] as const)("transfers hook receipts exactly once for a %s trigger", async (kind) => {
+		const harness = await createHarness({
+			extensionFactories: [
+				(pi) => {
+					pi.on("before_agent_start", () => ({
+						message: { customType: "hook-one", content: "one", display: false },
+					}));
+				},
+				(pi) => {
+					pi.on("before_agent_start", () => ({
+						message: { customType: "hook-two", content: "two", display: false },
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		const issued: ReturnType<typeof receiptRecord>[] = [];
+		const emit = harness.session.extensionRunner.emitBeforeAgentStart.bind(harness.session.extensionRunner);
+		const spy = vi
+			.spyOn(harness.session.extensionRunner, "emitBeforeAgentStart")
+			.mockImplementation(async (...args) => {
+				const result = await emit(...args);
+				issued.push(...result.messageReceipts.map(receiptRecord));
+				return result;
+			});
+		try {
+			await harness.session.sendCustomMessage(
+				{ customType: "aside", content: "next turn only", display: false },
+				{ deliverAs: "nextTurn" },
+			);
+			harness.setResponses([fauxAssistantMessage("first"), fauxAssistantMessage("second")]);
+			if (kind === "user") await harness.session.prompt("start");
+			else
+				await harness.session.sendCustomMessage(
+					{ customType: "trigger", content: "start", display: false },
+					{ triggerTurn: true },
+				);
+			await harness.session.prompt("later");
+			const entries = harness.sessionManager.getEntries();
+			const hooks = entries.flatMap((entry) =>
+				entry.type === "custom_message" && entry.customType.startsWith("hook-") ? [entry.provenance] : [],
+			);
+			expect(hooks).toEqual(issued);
+			expect(issued).toHaveLength(4);
+			expect(
+				entries.filter((entry) => entry.type === "custom_message" && entry.customType === "aside"),
+			).toHaveLength(1);
+			const inputReceipts = entries.flatMap((entry) =>
+				"provenance" in entry && entry.provenance ? [entry.provenance.turnId] : [],
+			);
+			expect(new Set(inputReceipts).size).toBe(inputReceipts.length);
+			expect(harness.session.inputAdmissionCount).toBe(0);
+			expect(harness.session.isIdle).toBe(true);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
 	// Issue #10267, #5581: a run started by sendMessage(..., { triggerTurn: true }) skipped
 	// before_agent_start, so its second request patched away the sections handlers had added.
 	describe("runs started by a custom message", () => {
@@ -687,9 +747,11 @@ describe("AgentSession prompt characterization", () => {
 			expect(JSON.stringify(requests[0].messages)).toContain("context from handler");
 		});
 
-		it("aborts a run when abort is requested while before_agent_start runs", async () => {
+		// #10267 / smarty-dev#3048: revocation refuses unpublished input, also for custom triggers.
+		it.each(["user", "custom"] as const)("revokes a %s preflight before publication", async (kind) => {
 			let releaseHandler: () => void = () => {};
 			const handlerStarted = Promise.withResolvers<void>();
+			const later = vi.fn();
 			const harness = await createHarness({
 				extensionFactories: [
 					(pi) => {
@@ -698,25 +760,37 @@ describe("AgentSession prompt characterization", () => {
 							await new Promise<void>((resolve) => {
 								releaseHandler = resolve;
 							});
+							return { message: { customType: "late", content: "discarded", display: false } };
 						});
+						pi.on("before_agent_start", later);
 					},
 				],
 			});
 			harnesses.push(harness);
 			harness.setResponses([fauxAssistantMessage("should not complete")]);
-
-			const run = harness.session.sendCustomMessage(
-				{ customType: "task-done", content: "background task finished", display: true },
-				{ triggerTurn: true },
-			);
+			const run =
+				kind === "user"
+					? harness.session.prompt("start")
+					: harness.session.sendCustomMessage(
+							{ customType: "task-done", content: "background task finished", display: true },
+							{ triggerTurn: true },
+						);
+			const refused = expect(run).rejects.toMatchObject({ code: "INPUT_ADMISSION_ABORTED" });
 			await handlerStarted.promise;
 			const aborted = harness.session.abort();
+			await Promise.all([refused, aborted]);
 			releaseHandler();
-			await Promise.all([run, aborted]);
-
-			const last = harness.session.messages.at(-1);
-			expect(last?.role).toBe("assistant");
-			expect(last?.role === "assistant" && last.stopReason).toBe("aborted");
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(harness.session.messages).toEqual([]);
+			expect(
+				harness.sessionManager
+					.getEntries()
+					.filter((entry) => entry.type === "message" || entry.type === "custom_message"),
+			).toEqual([]);
+			expect(later).not.toHaveBeenCalled();
+			expect(harness.faux.state.callCount).toBe(0);
+			expect(harness.getPendingResponseCount()).toBe(1);
+			expect(harness.session.inputAdmissionCount).toBe(0);
 			expect(harness.session.isIdle).toBe(true);
 		});
 	});

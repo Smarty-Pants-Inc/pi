@@ -51,9 +51,12 @@ export class WorkingStatusIndicator extends StatusIndicator {
 export class RetryStatusIndicator extends StatusIndicator {
 	private countdown: CountdownTimer | undefined;
 
-	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number) {
+	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number, waitMessage?: string) {
+		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
 		const retryMessage = (seconds: number) =>
-			`Retrying (${attempt}/${maxAttempts}) in ${seconds}s... (${keyText("app.interrupt")} to cancel)`;
+			waitMessage !== undefined
+				? `Waiting ${seconds}s: ${waitMessage} ${cancelHint}`
+				: `Retrying (${attempt}/${maxAttempts}) in ${seconds}s... ${cancelHint}`;
 		super(
 			"retry",
 			ui,

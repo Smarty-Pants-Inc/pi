@@ -63,6 +63,8 @@ export type {
 	AgentToolUpdateCallback,
 	AppKeybinding,
 	AutocompleteProviderFactory,
+	BashSpawnEvent,
+	BashSpawnEventResult,
 	BashToolCallEvent,
 	BeforeAgentStartCustomEvent,
 	BeforeAgentStartEvent,
@@ -148,6 +150,8 @@ export type {
 	ResolvedCommand,
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
+	SendUserMessageOptions,
+	SendUserMessageResult,
 	SessionBeforeCompactEvent,
 	SessionBeforeCompactResult,
 	SessionBeforeForkEvent,
@@ -181,6 +185,8 @@ export type {
 	ToolLoadout,
 	ToolLoadoutChanges,
 	ToolNamespace,
+	ToolPartialResultEvent,
+	ToolPartialResultEventResult,
 	ToolRendererResolver,
 	ToolRenderers,
 	ToolRenderResultOptions,
@@ -194,6 +200,8 @@ export type {
 	UIPromptStartEvent,
 	UserBashEvent,
 	UserBashEventResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
 	WidgetPlacement,
 	WorkingIndicatorOptions,
 	WriteToolCallEvent,
@@ -217,8 +225,11 @@ export {
 } from "./core/extensions/index.ts";
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.ts";
+export { HOST_CAPABILITIES, type HostCapabilities } from "./core/host-capabilities.ts";
+export { InputAdmissionError, type InputAdmissionErrorCode } from "./core/input-admission.ts";
 export type { RegisteredMcpServer } from "./core/mcp-servers.ts";
 export { convertToLlm } from "./core/messages.ts";
+export { ModelPolicyError, type ModelPolicySettings } from "./core/model-policy.ts";
 export { ModelRegistry } from "./core/model-registry.ts";
 export {
 	type ModelScopeDiagnostic,
@@ -398,6 +409,17 @@ export {
 	type ProjectTrustStoreEntry,
 	type ProjectTrustUpdate,
 } from "./core/trust-manager.ts";
+export {
+	getTurnProvenance,
+	TURN_PROVENANCE_VERSION,
+	type TurnChannel,
+	type TurnFabricVia,
+	type TurnPrincipal,
+	type TurnProvenance,
+	type TurnSender,
+	type TurnSenderKind,
+} from "./core/turn-provenance.ts";
+export { UserMessageMetadataError, type UserMessageMetadataErrorCode } from "./core/user-message-metadata.ts";
 export {
 	type ModelRoute,
 	type ModelRouteReason,

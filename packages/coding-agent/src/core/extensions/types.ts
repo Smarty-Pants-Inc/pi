@@ -34,7 +34,6 @@ import type {
 	Provider,
 	ProviderClassifier,
 	ProviderHeaders,
-	ProviderId,
 	ProviderImages,
 	RefreshModelsContext,
 	SimpleStreamOptions,
@@ -62,6 +61,7 @@ import type { CompactionPreparation, CompactionResult } from "../compaction/inde
 import type { EventBus } from "../event-bus.ts";
 import type { ExecOptions, ExecResult } from "../exec.ts";
 import type { ReadonlyFooterDataProvider } from "../footer-data-provider.ts";
+import type { HostCapabilities } from "../host-capabilities.ts";
 import type { KeybindingsManager } from "../keybindings.ts";
 import type { McpServerConfig, McpServerRegistry, RegisteredMcpServer } from "../mcp-servers.ts";
 import type { CustomMessage } from "../messages.ts";
@@ -99,10 +99,23 @@ import type {
 	ReadToolInput,
 	WriteToolInput,
 } from "../tools/index.ts";
+import type {
+	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+} from "../user-message-metadata.ts";
 import type { ModelRoute, ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 
 export type { ExecOptions, ExecResult } from "../exec.ts";
 export type { BuildSystemPromptOptions, NormalizedBuildSystemPromptOptions } from "../system-prompt.ts";
+export type {
+	SendUserMessageHandler,
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
+} from "../user-message-metadata.ts";
 export type { AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode };
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.ts";
 
@@ -147,6 +160,9 @@ export type EditorFactory = (tui: TUI, theme: EditorTheme, keybindings: Keybindi
  * Each mode (interactive, RPC, print) provides its own implementation.
  */
 export interface ExtensionUIContext {
+	/** Synchronous host-wide hold snapshot, not a lock. Persistent widgets and the main editor are not holds. */
+	holdState(): "dialog" | "custom" | "editor" | undefined;
+
 	/** Show a selector and return the user's choice. */
 	select(title: string, options: string[], opts?: ExtensionUIDialogOptions): Promise<string | undefined>;
 
@@ -346,10 +362,16 @@ export interface ExtensionContext {
 	thinkingLevel?: ThinkingLevel;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
+	/** True while agent_settled handlers run; triggered sends are deferred until they finish. */
+	isSettling(): boolean;
+	/** True while prompt input or before_agent_start preflight is running, before the run starts. */
+	isPromptPending(): boolean;
 	/** Whether project-local trust is active for this context. */
 	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
 	signal: AbortSignal | undefined;
+	/** @internal Built-in bash execution attestation. */
+	emitBashSpawn?: (event: BashSpawnEvent, signal?: AbortSignal) => Promise<BashSpawnEventResult | undefined>;
 	/** Abort the current agent operation */
 	abort(): void;
 	/** Whether there are queued messages waiting */
@@ -447,8 +469,17 @@ export interface ReplacedSessionContext extends ExtensionCommandContext {
 
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options: SendUserMessageOptions & { metadata: UserMessageMetadata },
+	): Promise<SendUserMessageResult>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: Omit<SendUserMessageOptions, "metadata"> & { metadata?: undefined },
 	): Promise<void>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: optional metadata preserves legacy void results
+	): Promise<void | SendUserMessageResult>;
 }
 
 // ============================================================================
@@ -913,20 +944,15 @@ export interface BeforeProviderHeadersEvent {
 	headers: ProviderHeaders;
 }
 
-/** Fired after a provider response is received and before the response stream is consumed. */
+/** Value-free response notification: only a validated integer HTTP status (100-599), never headers. */
 export interface AfterProviderResponseEvent {
 	type: "after_provider_response";
-	status: number;
-	headers: Record<string, string>;
+	status?: number;
 }
 
-/** Fired for a parsed provider stream event before Pi normalizes it. */
+/** Value-free notification for a parsed provider stream event before normalization. */
 export interface ProviderStreamEvent {
 	type: "provider_stream_event";
-	provider: ProviderId;
-	api: Api;
-	model: string;
-	data: unknown;
 }
 
 interface BeforeAgentStartEventBase {
@@ -1032,7 +1058,9 @@ export interface AgentBeforeSettleEvent extends BoundaryState {
 /** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */
 export interface AgentSettledEvent {
 	type: "agent_settled";
-	/** Whether the run ended because it was aborted, for example with Escape. */
+	/** Final run result, including cancellation or failure during retry/compaction/settlement. */
+	outcome: AgentActivityOutcome;
+	/** Equivalent to outcome === "aborted". */
 	aborted: boolean;
 }
 
@@ -1109,6 +1137,20 @@ export interface ToolExecutionUpdateEvent {
 	partialResult: any;
 	/** Set when another tool (for example a codemode script) made this call. */
 	parentToolCallId?: string;
+}
+
+/** Transform a complete partial snapshot before tool_execution_update or nested onUpdate. */
+export interface ToolPartialResultEvent {
+	type: "tool_partial_result";
+	toolCallId: string;
+	toolName: string;
+	input: unknown;
+	partialResult: AgentToolResult<unknown>;
+	parentToolCallId?: string;
+}
+
+export interface ToolPartialResultEventResult {
+	partialResult?: AgentToolResult<unknown>;
 }
 
 /** Fired when a tool finishes executing */
@@ -1189,6 +1231,24 @@ export type InputEventResult =
 // ============================================================================
 // Tool Events
 // ============================================================================
+
+/** Read-only attestation of built-in bash execution; each handler receives a detached snapshot. */
+export interface BashSpawnEvent {
+	type: "bash_spawn";
+	toolCallId: string;
+	command: string;
+	shellPath?: string;
+	shellArgs?: string[];
+	cwd: string;
+	env: Readonly<Record<string, string | undefined>>;
+	backend: "local-builtin" | "custom";
+}
+
+export interface BashSpawnEventResult {
+	/** First veto wins; thrown handler errors also fail closed. */
+	block?: boolean;
+	reason?: string;
+}
 
 interface ToolCallEventBase {
 	type: "tool_call";
@@ -1434,7 +1494,9 @@ export type ExtensionEvent =
 	| UserBashEvent
 	| InputEvent
 	| ToolCallEvent
-	| ToolResultEvent;
+	| ToolResultEvent
+	| ToolPartialResultEvent
+	| BashSpawnEvent;
 
 // ============================================================================
 // Event Results
@@ -1590,6 +1652,9 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
+	/** Behaviors of this host (see HOST_CAPABILITIES). */
+	readonly hostCapabilities: HostCapabilities;
+
 	// =========================================================================
 	// Event Subscription
 	// =========================================================================
@@ -1659,7 +1724,12 @@ export interface ExtensionAPI {
 	on(event: "model_select", handler: ExtensionHandler<ModelSelectEvent>): () => void;
 	on(event: "thinking_level_select", handler: ExtensionHandler<ThinkingLevelSelectEvent>): () => void;
 	on(event: "tool_call", handler: ExtensionHandler<ToolCallEvent, ToolCallEventResult>): () => void;
+	on(event: "bash_spawn", handler: ExtensionHandler<BashSpawnEvent, BashSpawnEventResult>): () => void;
 	on(event: "tool_result", handler: ExtensionHandler<ToolResultEvent, ToolResultEventResult>): () => void;
+	on(
+		event: "tool_partial_result",
+		handler: ExtensionHandler<ToolPartialResultEvent, ToolPartialResultEventResult>,
+	): () => void;
 	on(event: "user_bash", handler: ExtensionHandler<UserBashEvent, UserBashEventResult>): () => void;
 	on(event: "input", handler: ExtensionHandler<InputEvent, InputEventResult>): () => void;
 
@@ -1737,11 +1807,25 @@ export interface ExtensionAPI {
 	 * Send a user message to the agent. Always triggers a turn.
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
 	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
+	 * With metadata, returns a receipt when handled or after the user entry is persisted.
+	 * Pi stamps metadataSource from the loader path and execution context. Borrowed APIs cannot confer
+	 * another extension's identity; unbound metadata sends reject. Direct SDK sends are stamped sdk.
+	 * Metadata is snapshotted and deeply frozen before preflight, stored on the entry, never sent to the model.
+	 * Do not await a queued receipt inside a handler that must return before that input can be delivered.
 	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options: SendUserMessageOptions & { metadata: UserMessageMetadata },
+	): Promise<SendUserMessageResult>;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options?: Omit<SendUserMessageOptions, "metadata"> & { metadata?: undefined },
 	): void;
+	sendUserMessage(
+		content: string | (TextContent | ImageContent)[],
+		options: SendUserMessageOptions,
+		// biome-ignore lint/suspicious/noConfusingVoidType: optional metadata preserves legacy void results
+	): void | Promise<SendUserMessageResult>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -1943,9 +2027,9 @@ export interface ProviderConfig {
 	 * (`getCurrentSystemPrompt(context.messages)`, `getCurrentTools(context.messages)`).
 	 * Implementations must invoke `options.onPayload` before sending the provider request and use any
 	 * returned replacement payload. They must invoke `options.onResponse` after receiving the response
-	 * and before consuming its body, matching built-in providers. Implementations may invoke
-	 * `options.onProviderStreamEvent(data, model)` with parsed stream events before normalization.
-	 * Event data is adapter-owned and must be treated as read-only.
+	 * and before consuming its body, matching built-in providers, passing only `{ status }`. Implementations may
+	 * invoke `options.onProviderStreamEvent` with `{ type: "provider_stream_event" }` once per parsed stream
+	 * event, before normalization. Neither callback receives provider data.
 	 */
 	streamSimple?: (
 		model: Model<Api>,
@@ -2105,11 +2189,6 @@ export type SendMessageHandler = <T = unknown>(
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 
-export type SendUserMessageHandler = (
-	content: string | (TextContent | ImageContent)[],
-	options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
-) => void;
-
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
@@ -2198,6 +2277,8 @@ export interface ExtensionActions {
 	getSettings: GetSettingsHandler;
 	setActiveTools: SetActiveToolsHandler;
 	refreshTools: RefreshToolsHandler;
+	/** Throws for revoked callbacks, otherwise supplies inherited pi.exec cancellation. */
+	inheritedCancellation?: () => AbortSignal | undefined;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
 	getThinkingLevel: GetThinkingLevelHandler;
@@ -2212,6 +2293,8 @@ export interface ExtensionContextActions {
 	getModel: () => Model<any> | undefined;
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;
+	isSettling: () => boolean;
+	isPromptPending?: () => boolean;
 	isProjectTrusted: () => boolean;
 	getSignal: () => AbortSignal | undefined;
 	abort: () => void;

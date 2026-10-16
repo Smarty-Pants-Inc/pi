@@ -108,6 +108,8 @@ export {
 } from "./keys.ts";
 // LaTeX rendering
 export { type RenderLatexOptions, renderLatex } from "./latex.ts";
+// Measured terminal input
+export { type InputByteMeter, MeteredInput } from "./metered-input.ts";
 // Native platform integration
 export { getNativeClipboard, type NativeClipboard } from "./native-platform.ts";
 export { oklabToOkhslLightness } from "./oklab.ts";
@@ -147,6 +149,7 @@ export {
 	type ImageProtocol,
 	type ImageRenderOptions,
 	imageFallback,
+	linkifyUrls,
 	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,

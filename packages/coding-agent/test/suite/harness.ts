@@ -16,10 +16,12 @@ import type {
 	ToolResultMessage,
 } from "@earendil-works/pi-ai/compat";
 import { registerFauxProvider, streamSimple } from "@earendil-works/pi-ai/compat";
+import { afterEach } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../../src/core/agent-session.ts";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import type { ExtensionRunner, ExtensionUIContext } from "../../src/core/extensions/index.ts";
+import type { ExtensionRunner, ExtensionUIContext, SessionStartEvent } from "../../src/core/extensions/index.ts";
 import { convertToLlm } from "../../src/core/messages.ts";
+import type { ModelRuntime } from "../../src/core/model-runtime.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
 import type { Settings } from "../../src/core/settings-manager.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
@@ -30,6 +32,16 @@ import {
 	createTestExtensionsResult,
 	createTestResourceLoader,
 } from "../utilities.ts";
+
+// smarty-dev#12837: join cancelled turns before the next test, including unawaited cleanup calls.
+const pendingCleanups = new Set<Promise<void>>();
+afterEach(async () => {
+	const pending = [...pendingCleanups];
+	pendingCleanups.clear();
+	const results = await Promise.allSettled(pending);
+	const failure = results.find((result) => result.status === "rejected");
+	if (failure?.status === "rejected") throw failure.reason;
+});
 
 type MessageTextPart = { type: "text"; text: string };
 
@@ -74,6 +86,7 @@ export function getToolResult(harness: Harness, toolName: string): ToolResultMes
 /** An extension UI context that does nothing, with `overrides` applied. */
 export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {}): ExtensionUIContext {
 	return {
+		holdState: () => undefined,
 		select: async () => undefined,
 		confirm: async () => false,
 		input: async () => undefined,
@@ -109,6 +122,9 @@ export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {})
 }
 
 export interface HarnessOptions {
+	persistSession?: boolean;
+	cwd?: string;
+	sessionStartEvent?: SessionStartEvent;
 	models?: FauxModelDefinition[];
 	settings?: Partial<Settings>;
 	tools?: AgentTool[];
@@ -121,6 +137,7 @@ export interface HarnessOptions {
 	modelsJson?: Record<string, unknown>;
 	/** Session to continue, for example to test a resume. Default: a new in-memory session. */
 	sessionManager?: SessionManager;
+	prepareRequest?: Agent["prepareRequest"];
 }
 
 export interface Harness {
@@ -128,6 +145,8 @@ export interface Harness {
 	sessionManager: SessionManager;
 	settingsManager: SettingsManager;
 	authStorage: AuthStorage;
+	modelRuntime: ModelRuntime;
+	resourceLoader: ResourceLoader;
 	faux: FauxProviderRegistration;
 	models: [Model<string>, ...Model<string>[]];
 	getModel(): Model<string>;
@@ -138,7 +157,7 @@ export interface Harness {
 	events: AgentSessionEvent[];
 	eventsOfType<T extends AgentSessionEvent["type"]>(type: T): Extract<AgentSessionEvent, { type: T }>[];
 	tempDir: string;
-	cleanup: () => void;
+	cleanup: () => Promise<void>;
 }
 
 function createTempDir(): string {
@@ -158,7 +177,10 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 	const withConfiguredAuth = options.withConfiguredAuth ?? true;
 	const extensionRunnerRef: { current?: ExtensionRunner } = {};
 
-	const sessionManager = options.sessionManager ?? SessionManager.inMemory();
+	const cwd = options.cwd ?? tempDir;
+	const sessionManager =
+		options.sessionManager ??
+		(options.persistSession ? SessionManager.create(cwd, tempDir) : SessionManager.inMemory());
 	const settingsManager = SettingsManager.inMemory(options.settings);
 
 	const authStorage = AuthStorage.inMemory();
@@ -199,6 +221,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			tools: [],
 		},
 		convertToLlm,
+		prepareRequest: options.prepareRequest,
 		onPayload: async (payload) => {
 			const runner = extensionRunnerRef.current;
 			if (!runner?.hasHandlers("before_provider_request")) {
@@ -211,11 +234,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 			if (!runner?.hasHandlers("after_provider_response")) {
 				return;
 			}
-			await runner.emit({
-				type: "after_provider_response",
-				status: response.status,
-				headers: response.headers,
-			});
+			await runner.emit({ type: "after_provider_response", status: response.status });
 		},
 		transformContext: async (messages: AgentMessage[]) => {
 			const runner = extensionRunnerRef.current;
@@ -224,17 +243,19 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		},
 	});
 	const extensionsResult = options.extensionFactories
-		? await createTestExtensionsResult(options.extensionFactories, tempDir)
+		? await createTestExtensionsResult(options.extensionFactories, cwd)
 		: undefined;
 	const resourceLoader =
 		options.resourceLoader ?? createTestResourceLoader(extensionsResult ? { extensionsResult } : undefined);
 
+	const modelRuntime = getModelRuntime(modelRegistry);
 	const session = new AgentSession({
 		agent,
 		sessionManager,
 		settingsManager,
-		cwd: tempDir,
-		modelRuntime: getModelRuntime(modelRegistry),
+		cwd,
+		modelRuntime,
+		sessionStartEvent: options.sessionStartEvent,
 		resourceLoader,
 		baseToolsOverride: toolMap,
 		initialActiveToolNames: options.initialActiveToolNames,
@@ -244,16 +265,19 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		extensionRunnerRef,
 	});
 
+	let cleanupPromise: Promise<void> | undefined;
 	const events: AgentSessionEvent[] = [];
 	session.subscribe((event) => {
 		events.push(event);
 	});
 
-	return {
+	const harness: Harness = {
 		session,
 		sessionManager,
 		settingsManager,
 		authStorage,
+		modelRuntime,
+		resourceLoader,
 		faux: fauxProvider,
 		models: fauxProvider.models,
 		getModel: fauxProvider.getModel,
@@ -266,11 +290,29 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		},
 		tempDir,
 		cleanup() {
-			session.dispose();
-			fauxProvider.unregister();
-			if (existsSync(tempDir)) {
-				rmSync(tempDir, { recursive: true });
-			}
+			if (cleanupPromise) return cleanupPromise;
+			cleanupPromise = (async () => {
+				const currentSession = harness.session;
+				const release = currentSession.gateInputs();
+				try {
+					currentSession.cancelForShutdown();
+					await currentSession.abort();
+					// smarty-dev#3048: test teardown deliberately recovers undelivered input.
+					currentSession.clearQueue();
+					try {
+						currentSession.dispose();
+					} finally {
+						fauxProvider.unregister();
+						if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+					}
+				} finally {
+					release();
+				}
+			})();
+			pendingCleanups.add(cleanupPromise);
+			void cleanupPromise.catch(() => {});
+			return cleanupPromise;
 		},
 	};
+	return harness;
 }

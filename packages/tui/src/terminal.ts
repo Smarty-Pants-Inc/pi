@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { setKittyProtocolActive } from "./keys.ts";
+import { type InputByteMeter, MeteredInput } from "./metered-input.ts";
 import { isNativeModifierPressed } from "./native-modifiers.ts";
 import { getNativePlatformHelper } from "./native-platform.ts";
 import {
@@ -92,6 +93,8 @@ export interface Terminal {
 
 	// Write output to terminal
 	write(data: string): void;
+	/** Optional render lifecycle hook for terminals awaiting a requested frame. */
+	onRenderPending?(pending: boolean): void;
 
 	// Get terminal dimensions
 	get columns(): number;
@@ -159,7 +162,10 @@ export class ProcessTerminal implements Terminal {
 	private keyboardProtocolNegotiationBuffer = "";
 	private keyboardProtocolBufferFlushTimer?: ReturnType<typeof setTimeout>;
 	private stdinBuffer?: StdinBuffer;
-	private stdinDataHandler?: (data: string) => void;
+	private stdinDataHandler?: (data: Buffer | string) => void;
+	private meteredInput?: MeteredInput;
+	private inputMeter?: InputByteMeter;
+	private onUnmeteredInput?: () => void;
 	private progressInterval?: ReturnType<typeof setInterval>;
 	/** Latest program status, kept across stop() so start() can report it again. */
 	private programStatus?: ProgramStatus;
@@ -186,6 +192,21 @@ export class ProcessTerminal implements Terminal {
 		return this._kittyProtocolActive;
 	}
 
+	/**
+	 * Attach the byte meter of an attested input epoch (smarty-dev#2636). Stopping the terminal ends it:
+	 * stdin then belongs to another process, so later bytes cannot be counted.
+	 */
+	setInputMeter(meter: InputByteMeter | undefined, onUnmetered?: () => void): void {
+		this.inputMeter = meter;
+		this.onUnmeteredInput = onUnmetered;
+		if (this.meteredInput) this.meteredInput.setMeter(meter, onUnmetered);
+	}
+
+	/** Epoch byte offset of all input handled so far (the current sequence's end while it is dispatched). */
+	get inputOffset(): number | undefined {
+		return this.meteredInput?.offset;
+	}
+
 	get modifyOtherKeysActive(): boolean {
 		return this._modifyOtherKeysActive;
 	}
@@ -199,7 +220,7 @@ export class ProcessTerminal implements Terminal {
 		if (process.stdin.setRawMode) {
 			process.stdin.setRawMode(true);
 		}
-		process.stdin.setEncoding("utf8");
+		// Raw Buffers: an attested input epoch counts bytes before decoding (smarty-dev#2636).
 		process.stdin.resume();
 
 		// Enable bracketed paste mode - terminal will wrap pastes in \x1b[200~ ... \x1b[201~
@@ -263,10 +284,11 @@ export class ProcessTerminal implements Terminal {
 			}
 		});
 
-		// Handler that pipes stdin data through the buffer
-		this.stdinDataHandler = (data: string) => {
-			this.stdinBuffer!.process(data);
-		};
+		// Handler that pipes stdin data through the buffer, counting epoch bytes when metered
+		const input = new MeteredInput((text) => this.stdinBuffer?.process(text));
+		this.meteredInput = input;
+		input.setMeter(this.inputMeter, this.onUnmeteredInput);
+		this.stdinDataHandler = (data: Buffer | string) => input.write(data);
 	}
 
 	/**
@@ -489,6 +511,11 @@ export class ProcessTerminal implements Terminal {
 			setKittyProtocolActive(false);
 		}
 		this.disableModifyOtherKeys();
+
+		this.meteredInput?.setMeter(undefined);
+		this.meteredInput = undefined;
+		this.inputMeter = undefined;
+		this.onUnmeteredInput = undefined;
 
 		// Clean up StdinBuffer
 		if (this.stdinBuffer) {

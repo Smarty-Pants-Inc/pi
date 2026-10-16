@@ -12,18 +12,26 @@ import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
 import { resolvePath } from "../../utils/paths.ts";
+import { refuseUnreviewedBuiltin } from "../builtin-security-admission.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
+import { HOST_CAPABILITIES } from "../host-capabilities.ts";
 import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
+import {
+	assertExtensionMetadataCaller,
+	bindExtensionMetadataCallback,
+	bindExtensionMetadataSource,
+} from "../user-message-metadata.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
 	EntryRenderer,
 	Extension,
 	ExtensionAPI,
+	ExtensionContext,
 	ExtensionFactory,
 	ExtensionRuntime,
 	ExtensionVirtualModel,
@@ -125,6 +133,100 @@ function getAliases(): Record<string, string> {
 }
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
+
+type CallbackKeys<T> = {
+	[K in keyof T]-?: NonNullable<T[K]> extends (...args: never[]) => unknown ? K : never;
+}[keyof T];
+
+/** Enumerate callback fields exhaustively; preserve the original method receiver. */
+function bindExtensionMetadataMethods<T extends object>(
+	extensionPath: string,
+	value: T,
+	methods: Record<CallbackKeys<T>, true>,
+): T {
+	const bound = { ...value };
+	for (const key of Object.keys(methods) as CallbackKeys<T>[]) {
+		const callback = value[key];
+		if (typeof callback !== "function") continue;
+		Object.defineProperty(bound, key, {
+			value: bindExtensionMetadataCallback(extensionPath, callback.bind(value)),
+			enumerable: true,
+			configurable: true,
+			writable: true,
+		});
+	}
+	return bound;
+}
+
+function bindProviderConfig(extensionPath: string, config: ProviderConfig): ProviderConfig {
+	return {
+		...bindExtensionMetadataMethods(extensionPath, config, { streamSimple: true, refreshModels: true }),
+		images:
+			config.images &&
+			Object.fromEntries(
+				Object.entries(config.images).map(([api, implementation]) => [
+					api,
+					implementation && bindExtensionMetadataMethods(extensionPath, implementation, { generateImages: true }),
+				]),
+			),
+		classifiers:
+			config.classifiers &&
+			Object.fromEntries(
+				Object.entries(config.classifiers).map(([api, implementation]) => [
+					api,
+					implementation && bindExtensionMetadataMethods(extensionPath, implementation, { classify: true }),
+				]),
+			),
+		oauth:
+			config.oauth &&
+			bindExtensionMetadataMethods(extensionPath, config.oauth, {
+				login: true,
+				refreshToken: true,
+				getApiKey: true,
+				modifyModels: true,
+			}),
+	};
+}
+
+function bindNativeProvider(extensionPath: string, provider: Provider): Provider {
+	return {
+		...bindExtensionMetadataMethods(extensionPath, provider, {
+			getModels: true,
+			getAllModels: true,
+			refreshModels: true,
+			filterModels: true,
+			filterAllModels: true,
+			stream: true,
+			streamSimple: true,
+			fetchDeferred: true,
+			cancelDeferred: true,
+			generateImages: true,
+			classify: true,
+		}),
+		// Native providers may implement these properties with prototype getters.
+		id: provider.id,
+		name: provider.name,
+		baseUrl: provider.baseUrl,
+		headers: provider.headers,
+		auth: {
+			...provider.auth,
+			apiKey:
+				provider.auth.apiKey &&
+				bindExtensionMetadataMethods(extensionPath, provider.auth.apiKey, {
+					login: true,
+					check: true,
+					resolve: true,
+				}),
+			oauth:
+				provider.auth.oauth &&
+				bindExtensionMetadataMethods(extensionPath, provider.auth.oauth, {
+					login: true,
+					refresh: true,
+					toAuth: true,
+				}),
+		},
+	};
+}
 
 let extensionCacheCwd: string | undefined;
 let extensionCacheGeneration = 0;
@@ -257,6 +359,10 @@ function createExtensionAPI(
 		}
 		runtime.assertActive();
 	};
+	const assertRegistration = () => {
+		assertActive();
+		assertExtensionMetadataCaller(extension.path);
+	};
 	const applyRuntimeChange = (change: () => void) => {
 		if (state === "loading") pendingRuntimeChanges.push(change);
 		else change();
@@ -270,8 +376,8 @@ function createExtensionAPI(
 	const api = {
 		// Registration methods - write to extension
 		on(event: string, handler: HandlerFn): () => void {
-			assertActive();
-			const registeredHandler: HandlerFn = (...args) => handler(...args);
+			assertRegistration();
+			const registeredHandler = bindExtensionMetadataCallback(extension.path, handler);
 			const list = extension.handlers.get(event) ?? [];
 			list.push(registeredHandler);
 			extension.handlers.set(event, list);
@@ -287,21 +393,28 @@ function createExtensionAPI(
 		},
 
 		registerTool(tool: ToolDefinition): void {
-			assertActive();
+			assertRegistration();
 			if (typeof tool.parameters !== "object" || tool.parameters === null || Array.isArray(tool.parameters)) {
 				throw new Error(
 					`Tool "${tool.name}" registered by extension "${extension.path}" must define an object parameter schema.`,
 				);
 			}
 			extension.tools.set(tool.name, {
-				definition: tool,
+				definition: bindExtensionMetadataMethods(extension.path, tool, {
+					execute: true,
+					prepareArguments: true,
+					reachesTools: true,
+					prepareLoadout: true,
+					renderCall: true,
+					renderResult: true,
+				}),
 				sourceInfo: extension.sourceInfo,
 			});
 			runtime.refreshTools();
 		},
 
 		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
-			assertActive();
+			assertRegistration();
 			if (typeof name !== "string" || name.length === 0) {
 				throw new Error(
 					`Command registered by extension "${extension.path}" must have a non-empty string name. Use pi.registerCommand("name", { description, handler }).`,
@@ -313,7 +426,7 @@ function createExtensionAPI(
 			extension.commands.set(name, {
 				name,
 				sourceInfo: extension.sourceInfo,
-				...options,
+				...bindExtensionMetadataMethods(extension.path, options, { handler: true, getArgumentCompletions: true }),
 			});
 		},
 
@@ -321,11 +434,16 @@ function createExtensionAPI(
 			shortcut: KeyId,
 			options: {
 				description?: string;
-				handler: (ctx: import("./types.ts").ExtensionContext) => Promise<void> | void;
+				handler: (ctx: ExtensionContext) => Promise<void> | void;
 			},
 		): void {
-			assertActive();
-			extension.shortcuts.set(shortcut, { shortcut, extensionPath: extension.path, ...options });
+			assertRegistration();
+			extension.shortcuts.set(shortcut, {
+				shortcut,
+				extensionPath: extension.path,
+				...options,
+				handler: bindExtensionMetadataCallback(extension.path, options.handler),
+			});
 		},
 
 		registerFlag(
@@ -349,25 +467,39 @@ function createExtensionAPI(
 		},
 
 		registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
-			assertActive();
-			extension.messageRenderers.set(customType, renderer as MessageRenderer);
+			assertRegistration();
+			extension.messageRenderers.set(
+				customType,
+				bindExtensionMetadataCallback(extension.path, renderer) as MessageRenderer,
+			);
 		},
 
 		registerMarkdownTransformer(transformer: MarkdownTransformer): void {
-			assertActive();
-			extension.markdownTransformer = transformer;
+			assertRegistration();
+			extension.markdownTransformer = bindExtensionMetadataCallback(extension.path, transformer);
 		},
 
 		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
-			assertActive();
+			assertRegistration();
 			extension.entryRenderers ??= new Map();
-			extension.entryRenderers.set(customType, renderer as EntryRenderer);
+			extension.entryRenderers.set(
+				customType,
+				bindExtensionMetadataCallback(extension.path, renderer) as EntryRenderer,
+			);
 		},
 
 		registerToolRenderer(resolver: ToolRendererResolver): void {
-			assertActive();
+			assertRegistration();
 			extension.toolRenderers ??= [];
-			extension.toolRenderers.push(resolver);
+			extension.toolRenderers.push(
+				bindExtensionMetadataCallback(extension.path, (toolName, next) => {
+					const renderers = resolver(toolName, next);
+					return (
+						renderers &&
+						bindExtensionMetadataMethods(extension.path, renderers, { renderCall: true, renderResult: true })
+					);
+				}),
+			);
 		},
 
 		// Flag access - checks extension registered it, reads from runtime
@@ -377,15 +509,24 @@ function createExtensionAPI(
 			return runtime.flagValues.has(name) ? runtime.flagValues.get(name) : pendingFlagValues.get(name);
 		},
 
+		hostCapabilities: HOST_CAPABILITIES,
+
 		// Action methods - delegate to shared runtime
 		sendMessage(message, options): void {
 			assertActive();
 			runtime.sendMessage(message, options);
 		},
 
-		sendUserMessage(content, options): void {
+		sendUserMessage(content, options) {
 			assertActive();
-			runtime.sendUserMessage(content, options);
+			// Read caller metadata once: binding, validation and error classification share it.
+			const metadata = options?.metadata;
+			try {
+				return runtime.sendUserMessage(content, bindExtensionMetadataSource(options, extension.path, metadata));
+			} catch (error) {
+				if (metadata !== undefined) return Promise.reject(error);
+				throw error;
+			}
 		},
 
 		appendEntry(customType: string, data?: unknown): void {
@@ -410,7 +551,12 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			return execCommand(command, args, options?.cwd ?? cwd, options);
+			const inherited = runtime.inheritedCancellation?.();
+			const signal =
+				inherited && options?.signal
+					? AbortSignal.any([inherited, options.signal])
+					: (inherited ?? options?.signal);
+			return execCommand(command, args, options?.cwd ?? cwd, { ...options, signal });
 		},
 
 		getActiveTools(): string[] {
@@ -454,13 +600,15 @@ function createExtensionAPI(
 		},
 
 		registerProvider(providerOrName: Provider | string, config?: ProviderConfig) {
-			assertActive();
+			assertRegistration();
 			if (typeof providerOrName === "string") {
 				if (!config) throw new Error("Provider config is required when registering by name");
-				applyRuntimeChange(() => runtime.registerProvider(providerOrName, config, extension.path));
+				const boundConfig = bindProviderConfig(extension.path, config);
+				applyRuntimeChange(() => runtime.registerProvider(providerOrName, boundConfig, extension.path));
 				return;
 			}
-			applyRuntimeChange(() => runtime.registerNativeProvider(providerOrName, extension.path));
+			const boundProvider = bindNativeProvider(extension.path, providerOrName);
+			applyRuntimeChange(() => runtime.registerNativeProvider(boundProvider, extension.path));
 		},
 
 		unregisterProvider(name: string) {
@@ -469,6 +617,7 @@ function createExtensionAPI(
 		},
 
 		registerMcpServer(name: string, config: McpServerConfig) {
+			refuseUnreviewedBuiltin("mcp");
 			assertActive();
 			const validated = validateMcpServerConfig(name, config);
 			if (typeof validated === "string") {
@@ -488,6 +637,7 @@ function createExtensionAPI(
 		},
 
 		unregisterMcpServer(name: string) {
+			refuseUnreviewedBuiltin("mcp");
 			assertActive();
 			applyRuntimeChange(() => runtime.mcpServers.unregister(name, extension.path));
 		},
@@ -498,12 +648,14 @@ function createExtensionAPI(
 		},
 
 		registerVirtualModel<TState>(model: ExtensionVirtualModel<TState>) {
-			assertActive();
+			assertRegistration();
 			// Routing runs after the runner binds, so the context is created per request. The state
 			// comes from the session branch that this router wrote.
 			const definition: VirtualModelDefinition = {
 				...model,
-				route: (request) => model.route(request as ModelRouteRequest<TState>, runtime.createContext()),
+				route: bindExtensionMetadataCallback(extension.path, (request) =>
+					model.route(request as ModelRouteRequest<TState>, runtime.createContext()),
+				),
 			};
 			applyRuntimeChange(() => runtime.registerVirtualModel(definition, extension.path));
 		},
@@ -519,8 +671,10 @@ function createExtensionAPI(
 				eventBus.emit(channel, data);
 			},
 			on(channel, handler) {
-				assertActive();
-				const unsubscribe = runtime.trackEventBusSubscription(eventBus.on(channel, handler));
+				assertRegistration();
+				const unsubscribe = runtime.trackEventBusSubscription(
+					eventBus.on(channel, bindExtensionMetadataCallback(extension.path, handler)),
+				);
 				if (state === "loading") loadingUnsubscribers.push(unsubscribe);
 				return unsubscribe;
 			},
@@ -556,6 +710,39 @@ function isCurrentCacheToken(cacheToken: ExtensionCacheToken | undefined): cache
 	);
 }
 
+let pendingCacheWarning: string | undefined;
+let cacheWarned = false;
+
+function cacheFallback(reason: string): true {
+	if (!cacheWarned) {
+		cacheWarned = true;
+		pendingCacheWarning = `SMARTY_JITI_CACHE_DIR ignored (${reason}); using the default jiti cache.`;
+	}
+	return true;
+}
+
+/** Shared jiti cache dir from SMARTY_JITI_CACHE_DIR, or true for jiti's default cache. */
+function jitiFsCache(): string | true {
+	const value = process.env.SMARTY_JITI_CACHE_DIR;
+	if (!value) return true;
+	if (process.platform === "win32") return cacheFallback("unsupported-platform");
+	if (!path.isAbsolute(value)) return cacheFallback("relative");
+	const dir = path.resolve(value);
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(dir);
+	} catch {
+		return cacheFallback("not a directory");
+	}
+	if (stat.isSymbolicLink()) return cacheFallback("symlink");
+	if (!stat.isDirectory()) return cacheFallback("not a directory");
+	if (typeof process.getuid === "function") {
+		if (stat.uid !== process.getuid()) return cacheFallback("foreign owner");
+		if ((stat.mode & 0o022) !== 0) return cacheFallback("group-or-other writable");
+	}
+	return dir;
+}
+
 async function loadExtensionModule(extensionPath: string, cacheToken?: ExtensionCacheToken) {
 	if (isCurrentCacheToken(cacheToken)) {
 		const cachedFactory = extensionCache.get(extensionPath);
@@ -575,6 +762,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 			: { alias: getAliases() };
 	const jiti = createJitiImpl(import.meta.url, {
 		moduleCache: false,
+		fsCache: jitiFsCache(),
 		...resolutionOptions,
 	});
 
@@ -621,7 +809,8 @@ async function initializeExtension(
 	const extension = createExtension(extensionPath, resolvedPath);
 	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
 	try {
-		await factory(load.api);
+		const invokeFactory = bindExtensionMetadataCallback(extensionPath, factory, true);
+		await invokeFactory(load.api);
 		load.commit();
 	} catch (error) {
 		load.discard();
@@ -641,7 +830,12 @@ async function loadExtension(
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
 	try {
-		const factory = await loadExtensionModule(resolvedPath, cacheToken);
+		const importModule = bindExtensionMetadataCallback(
+			extensionPath,
+			() => loadExtensionModule(resolvedPath, cacheToken),
+			true,
+		);
+		const factory = await importModule();
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
@@ -696,6 +890,10 @@ async function loadExtensionsInternal(
 			resolvedRuntime,
 			cacheToken,
 		);
+		if (pendingCacheWarning) {
+			warnings.push({ path: "", warning: pendingCacheWarning });
+			pendingCacheWarning = undefined;
+		}
 
 		if (error) {
 			errors.push({ path: extPath, error });

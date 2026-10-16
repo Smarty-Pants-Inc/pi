@@ -139,3 +139,33 @@ test("bash mode shell-quotes file paths and inserts them as arguments", async ()
 	);
 	expect(mocks.readClipboardImage).not.toHaveBeenCalled();
 });
+
+// pi#131 R4-4: an older completed bash command may leave a stale mode flag.
+test.each([
+	["stale mode flag", "!cat ", 5, "'/tmp/a;b.png' /tmp/plain.png"],
+	["open single quote", "!cat '", 6, undefined],
+	["open double quote", '!cat "', 6, undefined],
+	["trailing backslash", "!cat \\", 6, undefined],
+])("shell paste with %s", async (_name, editorText, col, expected) => {
+	const insertTextAtCursor = vi.fn<(text: string) => void>();
+	const showError = vi.fn<(message: string) => void>();
+	mocks.readClipboardFilePaths.mockResolvedValue(["/tmp/a;b.png", "/tmp/plain.png"]);
+	const context = {
+		editor: { getCursor: () => ({ line: 0, col }), getText: () => editorText, insertTextAtCursor },
+		isBashMode: false,
+		showError,
+		ui: { requestRender: vi.fn() },
+	};
+	const prototype = InteractiveMode.prototype as unknown as {
+		handleClipboardPaste(this: typeof context): Promise<void>;
+	};
+	await prototype.handleClipboardPaste.call(context);
+	if (expected === undefined) {
+		expect(insertTextAtCursor).not.toHaveBeenCalled();
+		expect(showError).toHaveBeenCalledExactlyOnceWith(
+			"Failed to paste from clipboard: Paste file paths outside quotes in a shell command",
+		);
+	} else {
+		expect(insertTextAtCursor).toHaveBeenCalledExactlyOnceWith(expected);
+	}
+});

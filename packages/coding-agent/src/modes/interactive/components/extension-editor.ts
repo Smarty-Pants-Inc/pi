@@ -21,6 +21,8 @@ import { keyHint } from "./keybinding-hints.ts";
 
 export interface ExtensionEditorOptions extends EditorOptions {
 	description?: string;
+	/** Host hold registration; returns an idempotent release callback. */
+	onExternalEditorOpen?: () => () => void;
 }
 
 export class ExtensionEditorComponent extends Container implements Focusable {
@@ -30,6 +32,7 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 	private tui: TUI;
 	private keybindings: KeybindingsManager;
 	private externalEditorCommand: string;
+	private onExternalEditorOpen?: () => () => void;
 
 	private _focused = false;
 	get focused(): boolean {
@@ -61,7 +64,8 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 			(process.platform === "win32" ? "notepad" : "nano");
 		this.onSubmitCallback = onSubmit;
 		this.onCancelCallback = onCancel;
-		const { description, ...editorOptions } = options ?? {};
+		const { description, onExternalEditorOpen, ...editorOptions } = options ?? {};
+		this.onExternalEditorOpen = onExternalEditorOpen;
 
 		// Add top border
 		this.addChild(new DynamicBorder());
@@ -124,8 +128,9 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 
 	private async handleOpenExternalEditor(): Promise<void> {
 		const content = this.editor.getText();
-		this.tui.stop();
+		const release = this.onExternalEditorOpen?.();
 		try {
+			this.tui.stop();
 			const result = await editInExternalEditor({
 				command: this.externalEditorCommand,
 				content,
@@ -134,8 +139,12 @@ export class ExtensionEditorComponent extends Container implements Focusable {
 				this.editor.setText(result.content);
 			}
 		} finally {
-			this.tui.start();
-			this.tui.requestRender(true);
+			try {
+				this.tui.start();
+				this.tui.requestRender(true);
+			} finally {
+				release?.();
+			}
 		}
 	}
 }

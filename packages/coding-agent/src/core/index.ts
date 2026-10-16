@@ -94,4 +94,14 @@ export {
 	type TurnStartEvent,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export { HOST_CAPABILITIES, type HostCapabilities } from "./host-capabilities.ts";
+export { InputAdmissionError, type InputAdmissionErrorCode } from "./input-admission.ts";
+export { ModelPolicyError, type ModelPolicySettings } from "./model-policy.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export type {
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
+} from "./user-message-metadata.ts";
+export { UserMessageMetadataError, type UserMessageMetadataErrorCode } from "./user-message-metadata.ts";

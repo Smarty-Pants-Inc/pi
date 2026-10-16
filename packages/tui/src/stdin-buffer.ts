@@ -22,6 +22,9 @@ import { EventEmitter } from "events";
 const ESC = "\x1b";
 const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
+const MAX_TERMINAL_REPLY_BYTES = 64 * 1024;
+const TERMINAL_REPLY_DISCARD_MS = 500;
+const INPUT_CHUNK_CHARACTERS = 4096;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
 // Color and program-status OSC replies, XTVersion, and Kitty graphics replies.
@@ -29,7 +32,13 @@ const BRACKETED_PASTE_END = "\x1b[201~";
 const TERMINAL_REPLY_HEADER_PATTERN = /^\x1b(?:\](?:1[01];|4;\d{1,3};|7501;\?)|P>\||_G(?:[a-z]=\d+,)*[a-z]=\d+;)/;
 
 function isControlString(data: string): boolean {
-	return data.startsWith(`${ESC}]`) || data.startsWith(`${ESC}P`) || data.startsWith(`${ESC}_`);
+	return (
+		data.startsWith(`${ESC}]`) ||
+		data.startsWith(`${ESC}P`) ||
+		data.startsWith(`${ESC}_`) ||
+		data.startsWith(`${ESC}^`) ||
+		data.startsWith(`${ESC}X`)
+	);
 }
 
 /**
@@ -69,6 +78,11 @@ function isCompleteSequence(data: string): "complete" | "incomplete" | "not-esca
 	// APC sequences: ESC _ ... ESC \ (includes Kitty graphics responses)
 	if (afterEsc.startsWith("_")) {
 		return isCompleteApcSequence(data);
+	}
+
+	// PM and SOS strings also end with ST (ESC \).
+	if (afterEsc.startsWith("^") || afterEsc.startsWith("X")) {
+		return data.endsWith(`${ESC}\\`) ? "complete" : "incomplete";
 	}
 
 	// SS3 sequences: ESC O
@@ -198,7 +212,10 @@ function parseUnmodifiedKittyPrintableCodepoint(sequence: string): number | unde
 	return codepoint >= 32 ? codepoint : undefined;
 }
 
-function extractCompleteSequences(buffer: string): { sequences: string[]; remainder: string } {
+function extractCompleteSequences(
+	buffer: string,
+	scanOffset = 0,
+): { sequences: string[]; remainder: string; scanOffset: number } {
 	const sequences: string[] = [];
 	let pos = 0;
 
@@ -209,7 +226,10 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 		if (remaining.startsWith(ESC)) {
 			const terminalReply = isControlString(remaining) && TERMINAL_REPLY_HEADER_PATTERN.test(remaining);
 			// Find the end of this escape sequence
-			let seqEnd = 1;
+			// Revisit the last scanned byte: a trailing ESC needs the next byte
+			// to distinguish ST from a new sequence. Earlier bytes are settled.
+			let seqEnd = Math.max(1, scanOffset);
+			scanOffset = 0;
 			while (seqEnd <= remaining.length) {
 				if (terminalReply && seqEnd > 2) {
 					const char = remaining[seqEnd - 1];
@@ -245,7 +265,9 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 							nextChar === "]" || // OSC
 							nextChar === "O" || // SS3
 							nextChar === "P" || // DCS
-							nextChar === "_" // APC
+							nextChar === "_" || // APC
+							nextChar === "^" || // PM
+							nextChar === "X" // SOS
 						) {
 							sequences.push(ESC);
 							pos += 1;
@@ -266,7 +288,7 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 			}
 
 			if (seqEnd > remaining.length) {
-				return { sequences, remainder: remaining };
+				return { sequences, remainder: remaining, scanOffset: remaining.length };
 			}
 		} else {
 			// Not an escape sequence - take a single character
@@ -275,15 +297,16 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 		}
 	}
 
-	return { sequences, remainder: "" };
+	return { sequences, remainder: "", scanOffset: 0 };
 }
 
 export type StdinBufferOptions = {
 	/**
 	 * Maximum time to wait for an incomplete keyboard or mouse sequence
-	 * (default: 50ms). Strings with a recognized terminal reply header wait for
-	 * their terminator instead, so delayed replies cannot become keypresses.
-	 * Ambiguous legacy Alt-key input still uses this timeout.
+	 * (default: 50ms). Recognized terminal replies also use this finite deadline,
+	 * then discard their tail for at most 500ms or 64 KiB, or until resynchronization.
+	 * All control strings share the 64 KiB size cap and bounded tail discard.
+	 * Ambiguous legacy Alt-key input below that cap still uses this timeout.
 	 */
 	timeout?: number;
 	/**
@@ -304,12 +327,19 @@ export type StdinBufferEventMap = {
  */
 export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private buffer: string = "";
+	private scanOffset = 0;
 	private timeout: ReturnType<typeof setTimeout> | null = null;
 	private readonly timeoutMs: number;
 	private readonly escapeTimeoutMs: number;
 	private pasteMode: boolean = false;
 	private pasteBuffer: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
+	private replyDeadline = false;
+	private discardTimeout: ReturnType<typeof setTimeout> | null = null;
+	private discardedReply: "osc" | "other" | undefined;
+	private discardWindow = false;
+	private discardBytes = 0;
+	private discardEscape = false;
 
 	constructor(options: StdinBufferOptions = {}) {
 		super();
@@ -318,8 +348,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	public process(data: string | Buffer): void {
-		// Clear any pending timeout
-		if (this.timeout) {
+		// Keyboard deadlines restart per event; recognized replies keep an absolute deadline.
+		if (!this.replyDeadline && this.timeout !== null) {
 			clearTimeout(this.timeout);
 			this.timeout = null;
 		}
@@ -343,13 +373,33 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			return;
 		}
 
+		// Bound transient reply accumulation even when one data event contains a huge payload.
+		for (let offset = 0; offset < str.length; offset += INPUT_CHUNK_CHARACTERS) {
+			this.processChunk(str.slice(offset, offset + INPUT_CHUNK_CHARACTERS));
+		}
+		this.armTimeout();
+	}
+
+	private processChunk(str: string): void {
+		if (this.discardedReply !== undefined) str = this.consumeDiscardedReply(str);
+		if (str.length === 0) return;
 		this.buffer += str;
+		if (isControlString(this.buffer) && Buffer.byteLength(this.buffer) > MAX_TERMINAL_REPLY_BYTES) {
+			const overflow = this.buffer.slice(2);
+			this.discardReply();
+			const remaining = this.consumeDiscardedReply(overflow, false);
+			if (remaining.length > 0) this.processChunk(remaining);
+			return;
+		}
 
 		if (this.pasteMode) {
+			// Search only where the end marker can newly appear: input may arrive one byte at a time.
+			const searchFrom = Math.max(0, this.pasteBuffer.length - BRACKETED_PASTE_END.length + 1);
 			this.pasteBuffer += this.buffer;
 			this.buffer = "";
+			this.scanOffset = 0;
 
-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
+			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END, searchFrom);
 			if (endIndex !== -1) {
 				const pastedContent = this.pasteBuffer.slice(0, endIndex);
 				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
@@ -361,17 +411,23 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.emit("paste", pastedContent);
 
 				if (remaining.length > 0) {
-					this.process(remaining);
+					this.processChunk(remaining);
 				}
 			}
 			return;
 		}
 
-		const startIndex = this.buffer.indexOf(BRACKETED_PASTE_START);
+		const startIndex = this.buffer.indexOf(
+			BRACKETED_PASTE_START,
+			Math.max(0, this.scanOffset - BRACKETED_PASTE_START.length + 1),
+		);
 		if (startIndex !== -1) {
+			if (this.timeout !== null) clearTimeout(this.timeout);
+			this.timeout = null;
+			this.replyDeadline = false;
 			if (startIndex > 0) {
 				const beforePaste = this.buffer.slice(0, startIndex);
-				const result = extractCompleteSequences(beforePaste);
+				const result = extractCompleteSequences(beforePaste, Math.min(this.scanOffset, beforePaste.length));
 				for (const sequence of result.sequences) {
 					this.emitDataSequence(sequence);
 				}
@@ -382,6 +438,7 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			this.pasteMode = true;
 			this.pasteBuffer = this.buffer;
 			this.buffer = "";
+			this.scanOffset = 0;
 
 			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
 			if (endIndex !== -1) {
@@ -395,25 +452,40 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 				this.emit("paste", pastedContent);
 
 				if (remaining.length > 0) {
-					this.process(remaining);
+					this.processChunk(remaining);
 				}
 			}
 			return;
 		}
 
-		const result = extractCompleteSequences(this.buffer);
+		const result = extractCompleteSequences(this.buffer, this.scanOffset);
+		if (result.remainder.length < this.buffer.length || !TERMINAL_REPLY_HEADER_PATTERN.test(result.remainder)) {
+			// A consumed or canceled reply cannot lend its deadline to the next sequence.
+			if (this.timeout !== null) clearTimeout(this.timeout);
+			this.timeout = null;
+			this.replyDeadline = false;
+		}
 		this.buffer = result.remainder;
+		this.scanOffset = result.scanOffset;
 
 		for (const sequence of result.sequences) {
 			this.emitDataSequence(sequence);
 		}
+	}
 
+	private armTimeout(): void {
+		// Only the final remainder of a data event gets a timer, never its chunks.
+		// An absolute reply deadline survives trickling input until that reply is consumed.
+		if (this.replyDeadline && this.timeout !== null) return;
+		if (this.timeout !== null) clearTimeout(this.timeout);
+		this.timeout = null;
+		this.replyDeadline = false;
 		if (this.buffer.length > 0) {
-			// Only a recognizable reply header establishes a delimited string.
-			// Flushing it would turn a delayed tail into text and an OSC's BEL
-			// terminator into Ctrl+G (the external editor shortcut). Other input,
-			// including Alt+] followed by text, must retain bounded recovery.
-			if (TERMINAL_REPLY_HEADER_PATTERN.test(this.buffer)) return;
+			if (TERMINAL_REPLY_HEADER_PATTERN.test(this.buffer)) {
+				this.replyDeadline = true;
+				this.timeout = setTimeout(() => this.discardReply(), this.timeoutMs);
+				return;
+			}
 			const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs;
 			this.timeout = setTimeout(() => {
 				const flushed = this.flush();
@@ -432,6 +504,71 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 	}
 
+	private discardReply(): void {
+		this.discardedReply = this.buffer.startsWith(`${ESC}]`) ? "osc" : "other";
+		this.buffer = "";
+		this.scanOffset = 0;
+		if (this.timeout !== null) clearTimeout(this.timeout);
+		this.timeout = null;
+		this.pendingKittyPrintableCodepoint = undefined;
+		this.replyDeadline = false;
+		this.discardWindow = true;
+		this.discardBytes = 0;
+		this.discardEscape = false;
+		if (this.discardTimeout !== null) clearTimeout(this.discardTimeout);
+		this.discardTimeout = setTimeout(() => {
+			this.discardTimeout = null;
+			this.discardWindow = false;
+		}, TERMINAL_REPLY_DISCARD_MS);
+	}
+
+	private endDiscard(): void {
+		if (this.discardTimeout !== null) clearTimeout(this.discardTimeout);
+		this.discardTimeout = null;
+		this.discardedReply = undefined;
+		this.discardWindow = false;
+		this.discardEscape = false;
+		this.discardBytes = 0;
+	}
+
+	private consumeDiscardedReply(str: string, countBytes = true): string {
+		if (this.discardEscape) {
+			this.endDiscard();
+			return str.startsWith("\\") ? str.slice(1) : ESC + str;
+		}
+		let printable = "";
+		for (let i = 0; i < str.length; i++) {
+			const char = str[i]!;
+			if (char === "\x18" || char === "\x1a" || (char === "\x07" && this.discardedReply === "osc")) {
+				this.endDiscard();
+				return printable + str.slice(i + 1);
+			}
+			if (char === ESC) {
+				if (i + 1 === str.length) {
+					this.discardEscape = true;
+					return printable;
+				}
+				this.endDiscard();
+				return printable + str.slice(str[i + 1] === "\\" ? i + 2 : i);
+			}
+			if (this.discardWindow) {
+				if (countBytes) {
+					this.discardBytes += Buffer.byteLength(char);
+					if (this.discardBytes >= MAX_TERMINAL_REPLY_BYTES) {
+						this.discardWindow = false;
+						if (this.discardTimeout !== null) clearTimeout(this.discardTimeout);
+						this.discardTimeout = null;
+					}
+				}
+			} else if (char !== "\r" && char !== "\n") {
+				// Residual: a tail later than the bounded discard window can become editor text.
+				// Keep CR/LF quarantined until a protocol boundary, so it cannot auto-submit.
+				printable += char;
+			}
+		}
+		return printable;
+	}
+
 	private emitDataSequence(sequence: string): void {
 		const rawCodepoint = sequence.length === 1 ? sequence.codePointAt(0) : undefined;
 		if (rawCodepoint !== undefined && rawCodepoint === this.pendingKittyPrintableCodepoint) {
@@ -444,27 +581,36 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	}
 
 	flush(): string[] {
-		if (this.timeout) {
+		if (this.timeout !== null) {
 			clearTimeout(this.timeout);
 			this.timeout = null;
 		}
+		this.replyDeadline = false;
 
 		if (this.buffer.length === 0) {
 			return [];
 		}
 
+		if (TERMINAL_REPLY_HEADER_PATTERN.test(this.buffer)) {
+			this.discardReply();
+			return [];
+		}
 		const sequences = [this.buffer];
 		this.buffer = "";
+		this.scanOffset = 0;
 		this.pendingKittyPrintableCodepoint = undefined;
 		return sequences;
 	}
 
 	clear(): void {
-		if (this.timeout) {
+		if (this.timeout !== null) {
 			clearTimeout(this.timeout);
 			this.timeout = null;
 		}
+		this.replyDeadline = false;
+		this.endDiscard();
 		this.buffer = "";
+		this.scanOffset = 0;
 		this.pasteMode = false;
 		this.pasteBuffer = "";
 		this.pendingKittyPrintableCodepoint = undefined;

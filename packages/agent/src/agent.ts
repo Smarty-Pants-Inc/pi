@@ -11,7 +11,7 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { type AgentMessageOccurrence, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -122,6 +122,7 @@ export interface AgentOptions {
 	onProviderStreamEvent?: SimpleStreamOptions["onProviderStreamEvent"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+	transformToolUpdate?: AgentLoopConfig["transformToolUpdate"];
 	finishTurn?: FinishTurn;
 	prepareRequest?: PrepareRequest;
 	prepareNextTurn?: (
@@ -140,8 +141,13 @@ export interface AgentOptions {
 	toolExecution?: ToolExecutionMode;
 }
 
+type QueuedMessage = { message: AgentMessage };
+
 class PendingMessageQueue {
-	private messages: AgentMessage[] = [];
+	private messages: QueuedMessage[] = [];
+	private reserved = 0;
+	private selected: AgentMessage[] = [];
+	private selectedEntries: QueuedMessage[] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -149,7 +155,7 @@ class PendingMessageQueue {
 	}
 
 	enqueue(message: AgentMessage): void {
-		this.messages.push(message);
+		this.messages.push({ message });
 	}
 
 	hasItems(): boolean {
@@ -157,19 +163,62 @@ class PendingMessageQueue {
 	}
 
 	peek(): AgentMessage[] {
-		if (this.mode === "all") return this.messages.slice();
+		if (this.mode === "all") return this.snapshot();
 		const first = this.messages[0];
-		return first ? [first] : [];
+		return first ? [first.message] : [];
 	}
 
-	drain(): AgentMessage[] {
-		const drained = this.peek();
-		this.messages = this.messages.slice(drained.length);
-		return drained;
+	snapshot(): AgentMessage[] {
+		return this.messages.map((entry) => entry.message);
+	}
+
+	reserve(): AgentMessage[] {
+		// The loop can fail preparation after taking a batch. Keep the original
+		// messages here until message_end commits them, including their images and order.
+		const end = this.mode === "all" ? this.messages.length : Math.min(this.reserved + 1, this.messages.length);
+		// Selection is serial per queue. Keep the exact returned array so clear
+		// can invalidate its iterator. Concurrent selectors would need separate reservations.
+		this.selectedEntries = this.messages.slice(this.reserved, end);
+		this.selected = this.selectedEntries.map((entry) => entry.message);
+		this.reserved = end;
+		return this.selected;
+	}
+
+	consume(source: AgentMessageOccurrence): void {
+		// Prepared input can alias a queued message without owning its reservation.
+		if (source.batch !== this.selected || this.selected[source.index] !== source.message) return;
+		const entry = this.selectedEntries[source.index];
+		if (!entry) return;
+		const index = this.messages.indexOf(entry);
+		if (index >= 0 && index < this.reserved) {
+			this.messages.splice(index, 1);
+			this.reserved--;
+			// Retire exactly this reserved occurrence, not an equal message reference.
+			delete this.selected[source.index];
+		}
+	}
+
+	release(): void {
+		this.selected.length = 0;
+		this.selectedEntries = [];
+		this.reserved = 0;
+	}
+
+	remove(predicate: (message: AgentMessage) => boolean): void {
+		for (let index = this.messages.length - 1; index >= 0; index--) {
+			const entry = this.messages[index];
+			if (!predicate(entry.message)) continue;
+			this.messages.splice(index, 1);
+			if (index < this.reserved) this.reserved--;
+			// The entry identifies a queue occurrence even when messages are aliased.
+			const selectedIndex = this.selectedEntries.indexOf(entry);
+			if (selectedIndex >= 0) delete this.selected[selectedIndex];
+		}
 	}
 
 	clear(): void {
 		this.messages = [];
+		this.release();
 	}
 }
 
@@ -206,6 +255,7 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
+	public transformToolUpdate?: AgentLoopConfig["transformToolUpdate"];
 	public finishTurn?: FinishTurn;
 	public prepareRequest?: PrepareRequest;
 	public prepareNextTurn?: (
@@ -240,6 +290,7 @@ export class Agent {
 		this.onProviderStreamEvent = runtimeOptions.onProviderStreamEvent;
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
 		this.afterToolCall = runtimeOptions.afterToolCall;
+		this.transformToolUpdate = runtimeOptions.transformToolUpdate;
 		this.finishTurn = runtimeOptions.finishTurn;
 		this.prepareRequest = runtimeOptions.prepareRequest;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
@@ -301,8 +352,12 @@ export class Agent {
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
-	followUp(message: AgentMessage): void {
+	followUp(
+		message: AgentMessage,
+		/** @internal Runs after insertion, before external observers. */ onEnqueued?: () => void,
+	): void {
 		this.followUpQueue.enqueue(message);
+		onEnqueued?.();
 	}
 
 	/** Remove all queued steering messages. */
@@ -321,6 +376,12 @@ export class Agent {
 		this.clearFollowUpQueue();
 	}
 
+	/** Remove selected queued messages without releasing or retargeting other reservations. */
+	removeQueuedMessages(predicate: (message: AgentMessage) => boolean): void {
+		this.steeringQueue.remove(predicate);
+		this.followUpQueue.remove(predicate);
+	}
+
 	/** Returns true when either queue still contains pending messages. */
 	hasQueuedMessages(): boolean {
 		return this.steeringQueue.hasItems() || this.followUpQueue.hasItems();
@@ -330,6 +391,11 @@ export class Agent {
 	peekQueuedMessages(): AgentMessage[] {
 		const steering = this.steeringQueue.peek();
 		return steering.length > 0 ? steering : this.followUpQueue.peek();
+	}
+
+	/** Snapshot every undelivered message in both queues, independent of delivery mode. */
+	getQueuedMessages(): AgentMessage[] {
+		return [...this.steeringQueue.snapshot(), ...this.followUpQueue.snapshot()];
 	}
 
 	/** Active abort signal for the current run, if any. */
@@ -380,8 +446,8 @@ export class Agent {
 		await this.runPromptMessages(messages);
 	}
 
-	/** Continue from the current transcript. The last message must be a user or tool-result message. */
-	async continue(): Promise<void> {
+	/** Continue the transcript, or explicitly start from retained input after a terminal turn. */
+	async continue(options?: { fromQueuedMessages?: boolean }): Promise<void> {
 		if (this.activeRun) {
 			throw new Error("Agent is already processing. Wait for completion before continuing.");
 		}
@@ -391,20 +457,24 @@ export class Agent {
 			throw new Error("No messages to continue from");
 		}
 
-		if (lastMessage.role === "assistant") {
-			const queuedSteering = this.steeringQueue.drain();
+		if (lastMessage.role === "assistant" || options?.fromQueuedMessages) {
+			const queuedSteering = this.steeringQueue.reserve();
 			if (queuedSteering.length > 0) {
 				await this.runPromptMessages(queuedSteering, { skipInitialSteeringPoll: true });
 				return;
 			}
 
-			const queuedFollowUps = this.followUpQueue.drain();
+			const queuedFollowUps = this.followUpQueue.reserve();
 			if (queuedFollowUps.length > 0) {
 				await this.runPromptMessages(queuedFollowUps);
 				return;
 			}
 
-			throw new Error("Cannot continue from message role: assistant");
+			throw new Error(
+				options?.fromQueuedMessages
+					? "No queued messages to continue from"
+					: "Cannot continue from message role: assistant",
+			);
 		}
 
 		await this.runContinuation();
@@ -438,7 +508,7 @@ export class Agent {
 				messages,
 				this.createContextSnapshot(),
 				this.createLoopConfig(options),
-				(event) => this.processEvents(event),
+				(event, source) => this.processEvents(event, source),
 				signal,
 				this.streamFunction,
 			);
@@ -450,7 +520,7 @@ export class Agent {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
 				this.createLoopConfig(),
-				(event) => this.processEvents(event),
+				(event, source) => this.processEvents(event, source),
 				signal,
 				this.streamFunction,
 			);
@@ -479,6 +549,7 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			transformToolUpdate: this.transformToolUpdate,
 			finishTurn: this.finishTurn,
 			prepareRequest: this.prepareRequest,
 			prepareNextTurn:
@@ -498,9 +569,9 @@ export class Agent {
 					skipInitialSteeringPoll = false;
 					return [];
 				}
-				return this.steeringQueue.drain();
+				return this.steeringQueue.reserve();
 			},
-			getFollowUpMessages: async () => this.followUpQueue.drain(),
+			getFollowUpMessages: async () => this.followUpQueue.reserve(),
 		};
 	}
 
@@ -548,6 +619,10 @@ export class Agent {
 	}
 
 	private finishRun(): void {
+		// No message_end commit means no ownership transfer. A later prompt or
+		// continuation can take the exact uncommitted batch before newer input.
+		this.steeringQueue.release();
+		this.followUpQueue.release();
 		this._state.isStreaming = false;
 		this._state.streamingMessage = undefined;
 		this._state.pendingToolCalls = new Set<string>();
@@ -562,7 +637,7 @@ export class Agent {
 	 * considered idle later, after all awaited listeners for `agent_end` finish
 	 * and `finishRun()` clears runtime-owned state.
 	 */
-	private async processEvents(event: AgentEvent): Promise<void> {
+	private async processEvents(event: AgentEvent, source?: AgentMessageOccurrence): Promise<void> {
 		switch (event.type) {
 			case "message_start":
 				this._state.streamingMessage = event.message;
@@ -575,6 +650,11 @@ export class Agent {
 			case "message_end":
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
+				// Commit before releasing queued custody or calling fallible subscribers.
+				if (source) {
+					this.steeringQueue.consume(source);
+					this.followUpQueue.consume(source);
+				}
 				break;
 
 			case "tool_execution_start": {

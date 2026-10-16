@@ -254,6 +254,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 			keybindings: {},
 			ui,
 			disposeActiveSelector: vi.fn(),
+			beginUIHold: vi.fn(() => () => {}),
 		};
 		const showExtensionCustom = <T>(
 			factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,
@@ -326,6 +327,7 @@ describe("InteractiveMode.showExtensionCustom", () => {
 				keybindings: {},
 				ui,
 				disposeActiveSelector: vi.fn(),
+				beginUIHold: vi.fn(() => () => {}),
 			};
 			const showExtensionCustom = <T>(
 				factory: (tui: TUI, theme: unknown, keybindings: unknown, done: (result: T) => void) => Component,

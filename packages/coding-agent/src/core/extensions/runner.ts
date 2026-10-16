@@ -2,31 +2,38 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
+import { isDeepStrictEqual } from "node:util";
 import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
+	isolateValue,
 	type Model,
 	type Provider,
 	type ProviderHeaders,
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
 import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
+import { raceWithAbortSignal } from "../../utils/abort.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import type { SessionManager } from "../session-manager.ts";
+import { detachedSessionView, type SessionManager } from "../session-manager.ts";
 import {
 	type BuildSystemPromptOptions,
 	buildSystemPrompt,
 	type NormalizedBuildSystemPromptOptions,
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
+import { captureTerminalTurnReceipt, type TurnReceipt } from "../turn-receipts.ts";
 import type { VirtualModelDefinition } from "../virtual-models.ts";
+import { boundaryReceiptSlots, receiveBoundaryEntries } from "./boundary-receipts.ts";
 import type {
 	AgentBeforeSettleEvent,
+	BashSpawnEvent,
+	BashSpawnEventResult,
 	BeforeAgentStartCustomEvent,
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -84,6 +91,8 @@ import type {
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
+	ToolPartialResultEvent,
+	ToolPartialResultEventResult,
 	ToolRenderers,
 	ToolResultEvent,
 	ToolResultEventResult,
@@ -173,6 +182,7 @@ export type BeforeAgentStartTrigger =
 /** Combined result from all before_agent_start handlers. */
 interface BeforeAgentStartCombinedResult {
 	messages: NonNullable<BeforeAgentStartEventResult["message"]>[];
+	messageReceipts: TurnReceipt[];
 	systemPromptOptions: NormalizedBuildSystemPromptOptions;
 }
 
@@ -183,8 +193,10 @@ interface BeforeAgentStartCombinedResult {
 type RunnerEmitEvent = Exclude<
 	ExtensionEvent,
 	| ToolCallEvent
+	| BashSpawnEvent
 	| ProjectTrustEvent
 	| ToolResultEvent
+	| ToolPartialResultEvent
 	| UserBashEvent
 	| ContextEvent
 	| ContextWithSystemEvent
@@ -228,6 +240,7 @@ type BoundaryBaseEvent =
 
 interface BoundaryDispatchResult {
 	entries: SessionBoundaryDraft[];
+	entryReceipts: (TurnReceipt | undefined)[];
 	continue: boolean;
 	context: BoundaryContextPreview;
 	valid: boolean;
@@ -265,9 +278,10 @@ export type ShutdownHandler = () => void;
 export async function emitSessionShutdownEvent(
 	extensionRunner: ExtensionRunner,
 	event: SessionShutdownEvent,
+	signal?: AbortSignal,
 ): Promise<boolean> {
 	if (extensionRunner.hasHandlers("session_shutdown")) {
-		await extensionRunner.emit(event);
+		await extensionRunner.emit(event, signal);
 		return true;
 	}
 	return false;
@@ -329,6 +343,7 @@ export async function emitProjectTrustEvent(
 }
 
 const noOpUIContext: ExtensionUIContext = {
+	holdState: () => undefined,
 	select: async () => undefined,
 	confirm: async () => false,
 	input: async () => undefined,
@@ -373,6 +388,8 @@ export class ExtensionRunner {
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
 	private isIdleFn: () => boolean = () => true;
+	private isSettlingFn: () => boolean = () => false;
+	private isPromptPendingFn: () => boolean = () => false;
 	private isProjectTrustedFn: () => boolean = () => true;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
 	private waitForIdleFn: () => Promise<void> = async () => {};
@@ -386,6 +403,7 @@ export class ExtensionRunner {
 	private executeToolFn: ExtensionContextActions["executeTool"];
 	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
 	/** Registered MCP servers already reported as unhandled. */
+	private readonly toolScopes = new Map<string, { closed: boolean; pending: Set<Promise<unknown>> }>();
 	private readonly reportedMcpServers = new Set<string>();
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
@@ -396,6 +414,7 @@ export class ExtensionRunner {
 	private shortcutDiagnostics: ResourceDiagnostic[] = [];
 	private commandDiagnostics: ResourceDiagnostic[] = [];
 	private staleMessage: string | undefined;
+	private shutdownSignal: AbortSignal | undefined;
 	private uiPromptDepth = 0;
 	private activeUIPrompt: { kind: UIPromptKind; title?: string } | undefined;
 
@@ -405,6 +424,7 @@ export class ExtensionRunner {
 		cwd: string,
 		sessionManager: SessionManager,
 		modelRegistry: ModelRegistry,
+		shutdownSignal?: AbortSignal,
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
@@ -412,6 +432,7 @@ export class ExtensionRunner {
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
 		this.modelRegistry = modelRegistry;
+		this.shutdownSignal = shutdownSignal;
 	}
 
 	bindCore(
@@ -437,6 +458,7 @@ export class ExtensionRunner {
 		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
 		this.runtime.refreshTools = actions.refreshTools;
+		this.runtime.inheritedCancellation = actions.inheritedCancellation;
 		this.runtime.getCommands = actions.getCommands;
 		this.runtime.setModel = actions.setModel;
 		this.runtime.getThinkingLevel = actions.getThinkingLevel;
@@ -447,6 +469,8 @@ export class ExtensionRunner {
 		this.getModel = contextActions.getModel;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
+		this.isSettlingFn = contextActions.isSettling;
+		this.isPromptPendingFn = contextActions.isPromptPending ?? (() => false);
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
 		this.getSignalFn = contextActions.getSignal;
 		this.abortFn = contextActions.abort;
@@ -570,7 +594,20 @@ export class ExtensionRunner {
 	}
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
-		this.uiContext = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		const wrapped = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
+		this.uiContext = uiContext
+			? new Proxy(wrapped, {
+					get: (target, key, receiver) => {
+						this.assertActive();
+						const value: unknown = Reflect.get(target, key, receiver);
+						if (typeof value !== "function") return value;
+						return (...args: unknown[]) => {
+							this.assertActive();
+							return Reflect.apply(value, target, args);
+						};
+					},
+				})
+			: noOpUIContext;
 		this.mode = mode;
 	}
 
@@ -904,7 +941,7 @@ export class ExtensionRunner {
 			},
 			get sessionManager() {
 				runner.assertActive();
-				return runner.sessionManager;
+				return detachedSessionView(runner.sessionManager);
 			},
 			get modelRegistry() {
 				runner.assertActive();
@@ -926,6 +963,14 @@ export class ExtensionRunner {
 				runner.assertActive();
 				return runner.isIdleFn();
 			},
+			isSettling: () => {
+				runner.assertActive();
+				return runner.isSettlingFn();
+			},
+			isPromptPending: () => {
+				runner.assertActive();
+				return runner.isPromptPendingFn();
+			},
 			isProjectTrusted: () => {
 				runner.assertActive();
 				return runner.isProjectTrustedFn();
@@ -933,6 +978,11 @@ export class ExtensionRunner {
 			get signal() {
 				runner.assertActive();
 				return runner.getSignalFn();
+			},
+			get emitBashSpawn() {
+				runner.assertActive();
+				if (!runner.hasHandlers("bash_spawn")) return undefined;
+				return (event: BashSpawnEvent, signal?: AbortSignal) => runner.emitBashSpawn(event, signal);
 			},
 			abort: () => {
 				runner.assertActive();
@@ -967,6 +1017,12 @@ export class ExtensionRunner {
 	 */
 	createToolContext(toolCallId: string, signal: AbortSignal | undefined): ExtensionToolContext {
 		const runner = this;
+		let scope = this.toolScopes.get(toolCallId);
+		if (!scope) {
+			scope = { closed: false, pending: new Set() };
+			this.toolScopes.set(toolCallId, scope);
+		}
+		const callScope = scope;
 		// createContext() returns a fresh object, so adding properties does not affect other contexts.
 		return Object.defineProperties(this.createContext() as ExtensionToolContext, {
 			tools: {
@@ -988,10 +1044,33 @@ export class ExtensionRunner {
 							isError: true,
 						};
 					}
-					return runner.executeToolFn(toolCallId, name, args, { ...options, signal: options.signal ?? signal });
+					if (callScope.closed) throw new Error("Nested tool call scope is closed after parent settlement");
+					const signals = [signal, options.signal, runner.shutdownSignal].filter(
+						(candidate): candidate is AbortSignal => candidate !== undefined,
+					);
+					const childSignal = signals.length ? AbortSignal.any(signals) : undefined;
+					childSignal?.throwIfAborted();
+					const pending = Promise.resolve().then(() => {
+						childSignal?.throwIfAborted();
+						return runner.executeToolFn!(toolCallId, name, args, { ...options, signal: childSignal });
+					});
+					callScope.pending.add(pending);
+					try {
+						return await pending;
+					} finally {
+						callScope.pending.delete(pending);
+					}
 				},
 			},
 		});
+	}
+
+	private async closeToolScope(toolCallId: string): Promise<void> {
+		const scope = this.toolScopes.get(toolCallId);
+		if (!scope) return;
+		scope.closed = true;
+		await Promise.allSettled(scope.pending);
+		this.toolScopes.delete(toolCallId);
 	}
 
 	createCommandContext(): ExtensionCommandContext {
@@ -1033,29 +1112,106 @@ export class ExtensionRunner {
 		return context;
 	}
 
+	/** Handler waits share terminal cancellation; shutdown cleanup has its own deadline. */
+	private dispatchSignal(event: ExtensionEvent["type"], signal?: AbortSignal): AbortSignal | undefined {
+		const shutdownSignal = event === "session_shutdown" ? undefined : this.shutdownSignal;
+		return signal && shutdownSignal && signal !== shutdownSignal
+			? AbortSignal.any([signal, shutdownSignal])
+			: (signal ?? shutdownSignal);
+	}
+
+	private async dispatchHandler(
+		handler: (event: ExtensionEvent, ctx: ExtensionContext) => unknown,
+		event: ExtensionEvent,
+		ctx: ExtensionContext,
+		signal: AbortSignal | undefined,
+	): Promise<unknown> {
+		signal?.throwIfAborted();
+		const result = await raceWithAbortSignal(Promise.resolve(handler(event, ctx)), signal);
+		signal?.throwIfAborted();
+		return result;
+	}
+
 	async emitBoundary(
 		baseEvent: BoundaryBaseEvent,
-		buildContext: (entries: SessionBoundaryDraft[]) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
+		buildContext: (
+			entries: SessionBoundaryDraft[],
+			receipts?: (TurnReceipt | undefined)[],
+		) => BoundaryContextPreview | Promise<BoundaryContextPreview>,
+		getPendingMessages?: () => AgentMessage[],
+		signal?: AbortSignal,
 	): Promise<BoundaryDispatchResult> {
+		signal = this.dispatchSignal(baseEvent.type, signal);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let entries: SessionBoundaryDraft[] = [];
+		let entryReceipts: (TurnReceipt | undefined)[] = [];
 		let shouldContinue = false;
-		let context = await buildContext(entries);
+		let previewRevision = this.sessionManager.revision();
+		let previewPendingMessages = getPendingMessages?.().slice();
+		let context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
+		signal?.throwIfAborted();
+		if (!this.hasHandlers(baseEvent.type)) return { entries, entryReceipts, continue: false, context, valid: true };
+		context = structuredClone(context);
+		let contextSnapshot = structuredClone(context);
 		let valid = true;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
+				const before = entries;
+				const hadEntries = Array.isArray(entries) && entries.length > 0;
+				let previousEntries: SessionBoundaryDraft[] | undefined;
+				if (hadEntries) {
+					try {
+						previousEntries = structuredClone(entries);
+					} catch {
+						// Uncloneable proposals still follow preview validation.
+					}
+				}
 				const event = {
-					...baseEvent,
-					entries,
+					...structuredClone(baseEvent),
+					entries: structuredClone(entries),
 					continue: shouldContinue,
 					context,
 				} as TurnEndEvent | AgentBeforeSettleEvent;
+				const previousReceipts = entryReceipts;
+				const slots = boundaryReceiptSlots(event.entries, entryReceipts);
+				let receivedSelection = false;
+				let observed: TurnReceipt | undefined;
 				try {
-					const handlerResult = (await handler(event, ctx)) as BoundaryResult | undefined;
-					if (handlerResult?.entries !== undefined) entries = handlerResult.entries;
-					if (handlerResult?.continue !== undefined) shouldContinue = handlerResult.continue;
+					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| BoundaryResult
+						| undefined;
+					signal?.throwIfAborted();
+					observed = captureTerminalTurnReceipt();
+					const returnedEntries = handlerResult?.entries;
+					const received = receiveBoundaryEntries(
+						returnedEntries !== undefined ? returnedEntries : event.entries,
+						slots,
+						observed,
+					);
+					entries = received.entries;
+					entryReceipts = received.receipts;
+					receivedSelection = true;
+					const returnedContinue = handlerResult?.continue;
+					if (returnedContinue !== undefined) shouldContinue = returnedContinue;
 				} catch (err) {
+					signal?.throwIfAborted();
+					if (!receivedSelection) {
+						try {
+							const retained = receiveBoundaryEntries(
+								event.entries,
+								slots,
+								observed ?? captureTerminalTurnReceipt(),
+							);
+							entries = retained.entries;
+							entryReceipts = retained.receipts;
+						} catch {
+							// A poisoned in-place draft cannot replace the pre-handler proposal (#132 R4-10).
+							entries = before;
+							entryReceipts = previousReceipts;
+						}
+					}
 					this.emitError({
 						extensionPath: ext.path,
 						event: baseEvent.type,
@@ -1065,9 +1221,33 @@ export class ExtensionRunner {
 				}
 
 				try {
-					context = await buildContext(entries);
+					if (!Array.isArray(entries)) throw new Error("Boundary entries must be an array");
+					const unchangedEntries = previousEntries
+						? isDeepStrictEqual(previousEntries, entries)
+						: !hadEntries && entries.length === 0;
+					const nextRevision = this.sessionManager.revision();
+					const nextPendingMessages = getPendingMessages?.();
+					if (
+						valid &&
+						unchangedEntries &&
+						previousReceipts.length === entryReceipts.length &&
+						previousReceipts.every((receipt, index) => receipt === entryReceipts[index]) &&
+						isDeepStrictEqual(context, contextSnapshot) &&
+						previewRevision === nextRevision &&
+						previewPendingMessages?.length === nextPendingMessages?.length &&
+						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
+					)
+						continue;
+					previewRevision = nextRevision;
+					previewPendingMessages = nextPendingMessages?.slice();
+					context = structuredClone(
+						await raceWithAbortSignal(Promise.resolve(buildContext(entries, entryReceipts)), signal),
+					);
+					signal?.throwIfAborted();
+					contextSnapshot = structuredClone(context);
 					valid = true;
 				} catch (err) {
+					signal?.throwIfAborted();
 					valid = false;
 					this.emitError({
 						extensionPath: ext.path,
@@ -1078,10 +1258,15 @@ export class ExtensionRunner {
 				}
 			}
 		}
-
 		return valid
-			? { entries, continue: shouldContinue, context, valid: true }
-			: { entries: [], continue: false, context, valid: false };
+			? {
+					entries: structuredClone(entries),
+					entryReceipts,
+					continue: shouldContinue,
+					context: structuredClone(context),
+					valid: true,
+				}
+			: { entries: [], entryReceipts: [], continue: false, context, valid: false };
 	}
 
 	private isSessionBeforeEvent(event: RunnerEmitEvent): event is SessionBeforeEvent {
@@ -1093,22 +1278,44 @@ export class ExtensionRunner {
 		);
 	}
 
-	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+	emit<TEvent extends RunnerEmitEvent>(event: TEvent, signal?: AbortSignal): Promise<RunnerEmitResult<TEvent>> {
+		const dispatch = this.emitEvent(event, signal);
+		void dispatch.catch(() => {});
+		return dispatch;
+	}
+
+	private async emitEvent<TEvent extends RunnerEmitEvent>(
+		event: TEvent,
+		operationSignal?: AbortSignal,
+	): Promise<RunnerEmitResult<TEvent>> {
+		if (event.type === "tool_execution_end") {
+			await this.closeToolScope(event.toolCallId);
+		} else if (event.type === "agent_end") {
+			await Promise.all([...this.toolScopes.keys()].map((id) => this.closeToolScope(id)));
+		}
+		const signal = this.dispatchSignal(event.type, operationSignal ?? ("signal" in event ? event.signal : undefined));
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
 				try {
-					const handlerResult = await handler(event, ctx);
+					const snapshot =
+						"signal" in event
+							? { ...isolateValue({ ...event, signal: undefined }), signal: event.signal }
+							: isolateValue(event);
+					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
+					signal?.throwIfAborted();
 
 					if (this.isSessionBeforeEvent(event) && handlerResult) {
-						result = handlerResult as SessionBeforeEventResult;
+						result = isolateValue(handlerResult) as SessionBeforeEventResult;
 						if (result.cancel) {
 							return result as RunnerEmitResult<TEvent>;
 						}
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1126,15 +1333,21 @@ export class ExtensionRunner {
 
 	/** Returns the event's own action unless a handler overrides it; the last override wins. */
 	async emitCacheWarmingDecision(event: CacheWarmingDecisionEvent): Promise<CacheWarmingAction> {
+		const signal = this.dispatchSignal(event.type);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let action = event.action;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
 				try {
-					const result = (await handler(event, ctx)) as CacheWarmingDecisionEventResult | undefined;
+					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| CacheWarmingDecisionEventResult
+						| undefined;
+					signal?.throwIfAborted();
 					if (result?.action !== undefined) action = result.action;
 				} catch (err) {
+					signal?.throwIfAborted();
 					this.emitError({
 						extensionPath: ext.path,
 						event: event.type,
@@ -1149,6 +1362,8 @@ export class ExtensionRunner {
 	}
 
 	async emitMessageEnd(event: MessageEndEvent): Promise<AgentMessage | undefined> {
+		const signal = this.dispatchSignal(event.type);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let currentMessage = event.message;
 		let modified = false;
@@ -1156,11 +1371,14 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "message_end")) {
 			for (const handler of handlers) {
 				try {
-					const currentEvent: MessageEndEvent = { ...event, message: currentMessage };
-					const handlerResult = (await handler(currentEvent, ctx)) as MessageEndEventResult | undefined;
-					if (!handlerResult?.message) continue;
-
-					if (handlerResult.message.role !== currentMessage.role) {
+					const draft = isolateValue(currentMessage);
+					const currentEvent: MessageEndEvent = { ...event, message: draft };
+					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
+						| MessageEndEventResult
+						| undefined;
+					signal?.throwIfAborted();
+					const candidate = handlerResult?.message ?? draft;
+					if (candidate.role !== currentMessage.role) {
 						this.emitError({
 							extensionPath: ext.path,
 							event: "message_end",
@@ -1169,9 +1387,12 @@ export class ExtensionRunner {
 						continue;
 					}
 
-					currentMessage = handlerResult.message;
-					modified = true;
+					if (!isDeepStrictEqual(candidate, currentMessage)) {
+						currentMessage = isolateValue(candidate);
+						modified = true;
+					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1187,15 +1408,74 @@ export class ExtensionRunner {
 		return modified ? currentMessage : undefined;
 	}
 
-	async emitToolResult(event: ToolResultEvent): Promise<ToolResultEventResult | undefined> {
+	async emitToolPartialResult(
+		event: ToolPartialResultEvent,
+		signal?: AbortSignal,
+	): Promise<{ partialResult: ToolPartialResultEvent["partialResult"] }> {
+		let extensionPath = "tool_partial_result";
+		try {
+			signal = this.dispatchSignal(event.type, signal);
+			signal?.throwIfAborted();
+			const ctx = this.createContext();
+			const currentEvent: ToolPartialResultEvent = isolateValue(event);
+			for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
+				extensionPath = ext.path;
+				for (const handler of handlers) {
+					signal?.throwIfAborted();
+					const result = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
+						| ToolPartialResultEventResult
+						| undefined;
+					signal?.throwIfAborted();
+					if (result === undefined) continue;
+					if (result === null || typeof result !== "object" || Array.isArray(result)) {
+						throw new Error("Invalid partial tool result handler return");
+					}
+					if (result.partialResult === undefined) continue;
+					if (
+						result.partialResult === null ||
+						typeof result.partialResult !== "object" ||
+						Array.isArray(result.partialResult) ||
+						!Array.isArray(result.partialResult.content)
+					)
+						throw new Error("Invalid partial tool result");
+					currentEvent.partialResult = result.partialResult;
+				}
+			}
+			if (!currentEvent.partialResult || !Array.isArray(currentEvent.partialResult.content)) {
+				throw new Error("Invalid partial tool result");
+			}
+			return { partialResult: isolateValue(currentEvent.partialResult) };
+		} catch {
+			// Redactor failures must not expose input, including through diagnostics.
+			this.emitError({
+				extensionPath,
+				event: "tool_partial_result",
+				error: "Partial tool result withheld: handler failed",
+			});
+			return {
+				partialResult: {
+					content: [{ type: "text", text: "[REDACTED] Partial tool result withheld: handler failed" }],
+					details: undefined,
+				},
+			};
+		}
+	}
+
+	async emitToolResult(event: ToolResultEvent, signal?: AbortSignal): Promise<ToolResultEventResult | undefined> {
+		await this.closeToolScope(event.toolCallId);
+		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
-		const currentEvent: ToolResultEvent = { ...event };
+		const currentEvent: ToolResultEvent = isolateValue(event);
 		let modified = false;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "tool_result")) {
 			for (const handler of handlers) {
+				signal?.throwIfAborted();
 				try {
-					const handlerResult = (await handler(currentEvent, ctx)) as ToolResultEventResult | undefined;
+					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
+						| ToolResultEventResult
+						| undefined;
+					signal?.throwIfAborted();
 					if (!handlerResult) continue;
 
 					if (handlerResult.content !== undefined) {
@@ -1221,6 +1501,7 @@ export class ExtensionRunner {
 						modified = true;
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1237,22 +1518,25 @@ export class ExtensionRunner {
 			return undefined;
 		}
 
-		return {
+		return isolateValue({
 			content: currentEvent.content,
 			details: currentEvent.details,
 			structuredContent: currentEvent.structuredContent,
 			isError: currentEvent.isError,
 			usage: currentEvent.usage,
-		};
+		});
 	}
 
-	async emitToolCall(event: ToolCallEvent): Promise<ToolCallEventResult | undefined> {
+	async emitToolCall(event: ToolCallEvent, signal?: AbortSignal): Promise<ToolCallEventResult | undefined> {
+		signal = this.dispatchSignal(event.type, signal);
 		const ctx = this.createContext();
 		let result: ToolCallEventResult | undefined;
 
 		for (const { handlers } of snapshotEventHandlers(this.extensions, "tool_call")) {
 			for (const handler of handlers) {
-				const handlerResult = await handler(event, ctx);
+				signal?.throwIfAborted();
+				const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+				signal?.throwIfAborted();
 
 				if (handlerResult) {
 					result = handlerResult as ToolCallEventResult;
@@ -1266,13 +1550,44 @@ export class ExtensionRunner {
 		return result;
 	}
 
+	async emitBashSpawn(event: BashSpawnEvent, signal?: AbortSignal): Promise<BashSpawnEventResult | undefined> {
+		this.assertActive();
+		signal = this.dispatchSignal(event.type, signal);
+		signal?.throwIfAborted();
+		const ctx = this.createContext();
+		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "bash_spawn")) {
+			for (const handler of handlers) {
+				try {
+					const result = (await this.dispatchHandler(handler, structuredClone(event), ctx, signal)) as
+						| BashSpawnEventResult
+						| undefined;
+					if (result?.block) return { block: true, reason: result.reason ?? "Bash spawn blocked" };
+				} catch (err) {
+					signal?.throwIfAborted();
+					const message = err instanceof Error ? err.message : String(err);
+					this.emitError({
+						extensionPath: ext.path,
+						event: "bash_spawn",
+						error: message,
+						stack: err instanceof Error ? err.stack : undefined,
+					});
+					return { block: true, reason: `bash_spawn handler failed: ${message}` };
+				}
+			}
+		}
+		return undefined;
+	}
+
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
+		const signal = this.dispatchSignal(event.type);
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "user_bash")) {
 			for (const handler of handlers) {
 				try {
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 					if (handlerResult === undefined) continue;
 					if (!isUserBashEventResult(handlerResult)) {
 						throw new Error(
@@ -1281,6 +1596,7 @@ export class ExtensionRunner {
 					}
 					return handlerResult;
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1303,6 +1619,8 @@ export class ExtensionRunner {
 	 * handlers then see the full transcript and their output is used as returned.
 	 */
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		const signal = this.dispatchSignal("context");
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
 
@@ -1312,7 +1630,10 @@ export class ExtensionRunner {
 					const visibleMessages = currentMessages.filter((message) => message.role !== "system");
 					const visibleSnapshot = visibleMessages.slice();
 					const event: ContextEvent = { type: "context", messages: visibleMessages };
-					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
+					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| ContextEventResult
+						| undefined;
+					signal?.throwIfAborted();
 
 					// Handlers may return a new list or edit event.messages in place.
 					const returned =
@@ -1321,6 +1642,7 @@ export class ExtensionRunner {
 					if (!returned) continue;
 					currentMessages = restoreSystemMessages(currentMessages, visibleSnapshot, returned);
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1338,7 +1660,10 @@ export class ExtensionRunner {
 				try {
 					const hadLeadingSystemMessage = currentMessages[0]?.role === "system";
 					const event: ContextWithSystemEvent = { type: "context_with_system", messages: currentMessages };
-					const handlerResult = (await handler(event, ctx)) as ContextEventResult | undefined;
+					const handlerResult = (await this.dispatchHandler(handler, event, ctx, signal)) as
+						| ContextEventResult
+						| undefined;
+					signal?.throwIfAborted();
 					currentMessages = handlerResult?.messages ?? currentMessages;
 					// Providers read the prompt and initial tools from the leading system message.
 					// Losing it is never intended; report it but honor the handler's output.
@@ -1350,6 +1675,7 @@ export class ExtensionRunner {
 						});
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1362,10 +1688,12 @@ export class ExtensionRunner {
 			}
 		}
 
-		return currentMessages;
+		return structuredClone(currentMessages);
 	}
 
 	async emitBeforeProviderRequest(payload: unknown): Promise<unknown> {
+		const signal = this.dispatchSignal("before_provider_request");
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let currentPayload = payload;
 
@@ -1376,11 +1704,13 @@ export class ExtensionRunner {
 						type: "before_provider_request",
 						payload: currentPayload,
 					};
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 					if (handlerResult !== undefined) {
 						currentPayload = handlerResult;
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1397,6 +1727,8 @@ export class ExtensionRunner {
 	}
 
 	async emitBeforeProviderHeaders(headers: ProviderHeaders): Promise<ProviderHeaders> {
+		const signal = this.dispatchSignal("before_provider_headers");
+		signal?.throwIfAborted();
 		const ctx = this.createContext();
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_provider_headers")) {
@@ -1407,8 +1739,10 @@ export class ExtensionRunner {
 						type: "before_provider_headers",
 						headers,
 					};
-					await handler(event, ctx);
+					await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1427,7 +1761,10 @@ export class ExtensionRunner {
 	async emitBeforeAgentStart(
 		trigger: BeforeAgentStartTrigger,
 		systemPromptOptions: BuildSystemPromptOptions,
+		cancellation?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult> {
+		const signal = this.dispatchSignal("before_agent_start", cancellation);
+		signal?.throwIfAborted();
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
 		const renderCurrentSystemPrompt = (): string => buildSystemPrompt(currentOptions);
 		const ctx = Object.defineProperties(
@@ -1439,28 +1776,41 @@ export class ExtensionRunner {
 			return renderCurrentSystemPrompt();
 		};
 		const messages: NonNullable<BeforeAgentStartEventResult["message"]>[] = [];
+		const messageReceipts: TurnReceipt[] = [];
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "before_agent_start")) {
 			for (const handler of handlers) {
 				try {
 					const event: BeforeAgentStartEvent = {
-						...trigger,
+						...isolateValue(trigger),
 						type: "before_agent_start",
 						get systemPrompt() {
 							return renderCurrentSystemPrompt();
 						},
 						systemPromptOptions: currentOptions,
 					};
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 
 					if (handlerResult) {
+						const receipt = captureTerminalTurnReceipt();
 						const result = handlerResult as BeforeAgentStartEventResult;
-						if (result.message) messages.push(result.message);
+						const message = result.message;
+						if (message) {
+							messages.push({
+								customType: message.customType,
+								content: message.content,
+								display: message.display,
+								details: message.details,
+							});
+							messageReceipts.push(receipt);
+						}
 						if (result.systemPrompt !== undefined) {
 							currentOptions.forceSystemPrompt = result.systemPrompt;
 						}
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1473,7 +1823,7 @@ export class ExtensionRunner {
 			}
 		}
 
-		return { messages, systemPromptOptions: currentOptions };
+		return { messages, messageReceipts, systemPromptOptions: currentOptions };
 	}
 
 	async emitResourcesDiscover(
@@ -1485,6 +1835,8 @@ export class ExtensionRunner {
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
 		const ctx = this.createContext();
+		const signal = this.dispatchSignal("resources_discover");
+		signal?.throwIfAborted();
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
@@ -1493,7 +1845,8 @@ export class ExtensionRunner {
 			for (const handler of handlers) {
 				try {
 					const event: ResourcesDiscoverEvent = { type: "resources_discover", cwd, reason };
-					const handlerResult = await handler(event, ctx);
+					const handlerResult = await this.dispatchHandler(handler, event, ctx, signal);
+					signal?.throwIfAborted();
 					const result = handlerResult as ResourcesDiscoverResult | undefined;
 
 					if (result?.skillPaths?.length) {
@@ -1506,6 +1859,7 @@ export class ExtensionRunner {
 						themePaths.push(...result.themePaths.map((path) => ({ path, extensionPath: ext.path })));
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					const message = err instanceof Error ? err.message : String(err);
 					const stack = err instanceof Error ? err.stack : undefined;
 					this.emitError({
@@ -1527,28 +1881,33 @@ export class ExtensionRunner {
 		images: ImageContent[] | undefined,
 		source: InputSource,
 		streamingBehavior?: "steer" | "followUp",
+		signal?: AbortSignal,
 	): Promise<InputEventResult> {
+		signal = this.dispatchSignal("input", signal);
 		const ctx = this.createContext();
 		let currentText = text;
 		let currentImages = images;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input")) {
 			for (const handler of handlers) {
+				signal?.throwIfAborted();
 				try {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
-						images: currentImages,
+						images: currentImages?.map((image) => ({ ...image })),
 						source,
 						streamingBehavior,
 					};
-					const result = (await handler(event, ctx)) as InputEventResult | undefined;
+					const result = (await this.dispatchHandler(handler, event, ctx, signal)) as InputEventResult | undefined;
+					signal?.throwIfAborted();
 					if (result?.action === "handled") return result;
 					if (result?.action === "transform") {
 						currentText = result.text;
-						currentImages = result.images ?? currentImages;
+						currentImages = result.images?.map((image) => ({ ...image })) ?? currentImages;
 					}
 				} catch (err) {
+					signal?.throwIfAborted();
 					this.emitError({
 						extensionPath: ext.path,
 						event: "input",

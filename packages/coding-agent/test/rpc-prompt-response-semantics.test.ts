@@ -12,7 +12,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.ts";
 import type { AgentSessionRuntime } from "../src/core/agent-session-runtime.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import type { LoadExtensionsResult } from "../src/core/extensions/index.ts";
+import type { ExtensionFactory, LoadExtensionsResult } from "../src/core/extensions/index.ts";
+import type { ReceivedInput } from "../src/core/received-input.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
 import { runRpcMode } from "../src/modes/rpc/rpc-mode.ts";
@@ -22,6 +23,7 @@ import { createTestExtensionsResult, createTestResourceLoader } from "./utilitie
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
 	lineHandler: undefined as ((line: string) => void) | undefined,
+	onOutputLine: undefined as ((line: string) => void) | undefined,
 }));
 
 vi.mock("../src/core/output-guard.js", () => ({
@@ -30,6 +32,7 @@ vi.mock("../src/core/output-guard.js", () => ({
 	waitForRawStdoutBackpressure: vi.fn(async () => {}),
 	writeRawStdout: (line: string) => {
 		rpcIo.outputLines.push(line);
+		rpcIo.onOutputLine?.(line);
 	},
 }));
 
@@ -87,10 +90,16 @@ async function createRuntimeHost(options: {
 	responseDelayMs: number;
 	model?: Model<any>;
 	extensionsResult?: LoadExtensionsResult;
+	extensionFactories?: ExtensionFactory[];
 }): Promise<{
 	runtimeHost: AgentSessionRuntime;
+	session: AgentSession;
+	sessionManager: SessionManager;
 	cleanup: () => Promise<void>;
 }> {
+	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
+	const previousSignals = signals.map((signal) => ({ signal, listeners: process.listeners(signal) }));
+	const previousEnd = process.stdin.listeners("end");
 	const tempDir = join(tmpdir(), `pi-rpc-prompt-${Date.now()}-${Math.random().toString(36).slice(2)}`);
 	mkdirSync(tempDir, { recursive: true });
 
@@ -132,7 +141,13 @@ async function createRuntimeHost(options: {
 		settingsManager,
 		cwd: tempDir,
 		modelRuntime: getModelRuntime(modelRegistry),
-		resourceLoader: createTestResourceLoader({ extensionsResult: options.extensionsResult }),
+		resourceLoader: createTestResourceLoader({
+			extensionsResult:
+				options.extensionsResult ??
+				(options.extensionFactories
+					? await createTestExtensionsResult(options.extensionFactories, tempDir)
+					: undefined),
+		}),
 	});
 
 	const runtimeHost = {
@@ -142,16 +157,29 @@ async function createRuntimeHost(options: {
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
 		setRebindSession: vi.fn(),
+		setLifecycleCompleteHandler: vi.fn(),
 	} as unknown as AgentSessionRuntime;
 
 	return {
 		runtimeHost,
+		session,
+		sessionManager,
 		cleanup: async () => {
+			for (const { signal, listeners } of previousSignals) {
+				for (const listener of process.listeners(signal)) {
+					if (!listeners.includes(listener)) process.off(signal, listener);
+				}
+			}
+			for (const listener of process.stdin.listeners("end")) {
+				if (!previousEnd.includes(listener)) process.stdin.off("end", listener as () => void);
+			}
 			try {
 				await session.abort();
 			} catch {
 				// ignore test cleanup failures
 			}
+			// smarty-dev#3048: explicitly recover acknowledged queued input before disposal.
+			session.clearQueue();
 			session.dispose();
 			if (existsSync(tempDir)) {
 				rmSync(tempDir, { recursive: true });
@@ -162,22 +190,26 @@ async function createRuntimeHost(options: {
 
 async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): Promise<{
 	lineHandler: (line: string) => void;
+	runtimeHost: AgentSessionRuntime;
+	session: AgentSession;
+	sessionManager: SessionManager;
 	cleanup: () => Promise<void>;
 }> {
 	rpcIo.outputLines = [];
 	rpcIo.lineHandler = undefined;
 
-	const { runtimeHost, cleanup } = await createRuntimeHost(options);
+	const { runtimeHost, session, sessionManager, cleanup } = await createRuntimeHost(options);
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
 
-	return { lineHandler: rpcIo.lineHandler!, cleanup };
+	return { lineHandler: rpcIo.lineHandler!, runtimeHost, session, sessionManager, cleanup };
 }
 
 describe("RPC prompt response semantics", () => {
 	afterEach(() => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
+		rpcIo.onOutputLine = undefined;
 	});
 
 	it("emits one failure response when prompt preflight rejects", async () => {
@@ -215,6 +247,101 @@ describe("RPC prompt response semantics", () => {
 				});
 			});
 		} finally {
+			await cleanup();
+		}
+	});
+
+	// PR #145: a rejected received envelope produces exactly one correlated refusal.
+	it("serializes a string prompt rejection as failure text", async () => {
+		const { lineHandler, session, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
+		const prompt = vi
+			.spyOn(session as unknown as { _promptReceived(input: ReceivedInput): Promise<void> }, "_promptReceived")
+			.mockRejectedValue("plain rejection");
+		try {
+			lineHandler(JSON.stringify({ id: "string-rejection", type: "prompt", message: "Hello" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "string-rejection")).toEqual([
+					{
+						id: "string-rejection",
+						type: "response",
+						command: "prompt",
+						success: false,
+						error: "plain rejection",
+					},
+				]),
+			);
+		} finally {
+			prompt.mockRestore();
+			await cleanup();
+		}
+	});
+
+	// pi#132: a handled extension command still completes a deferred shutdown without a run.
+	it("shuts down after an extension command requests it without an agent run", async () => {
+		const order: string[] = [];
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
+			order.push("exit");
+		}) as never);
+		const { lineHandler, runtimeHost, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 0,
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("shutdown", {
+						handler: async (_args, ctx) => {
+							await Promise.resolve();
+							ctx.shutdown();
+						},
+					});
+				},
+			],
+		});
+		rpcIo.onOutputLine = (line) => {
+			const record = JSON.parse(line) as Record<string, unknown>;
+			if (record.id === "extension-shutdown" && record.type === "response" && record.success === true)
+				order.push("response");
+		};
+		try {
+			lineHandler(JSON.stringify({ id: "extension-shutdown", type: "prompt", message: "/shutdown" }));
+			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+			expect(order.slice(0, 2)).toEqual(["response", "exit"]);
+			expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_start")).toBe(false);
+			expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			exit.mockRestore();
+			await cleanup();
+		}
+	});
+
+	it("defers an extension-requested shutdown until the active run settles", async () => {
+		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
+		const { lineHandler, runtimeHost, session, cleanup } = await startRpcMode({
+			withAuth: true,
+			responseDelayMs: 500,
+			extensionFactories: [
+				(pi) => {
+					pi.registerCommand("shutdown", {
+						handler: async (_args, ctx) => {
+							ctx.shutdown();
+						},
+					});
+				},
+			],
+		});
+		try {
+			lineHandler(JSON.stringify({ id: "active-run", type: "prompt", message: "Start" }));
+			await vi.waitFor(() => expect(session.isStreaming).toBe(true));
+			lineHandler(JSON.stringify({ id: "live-shutdown", type: "prompt", message: "/shutdown" }));
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "live-shutdown")).toMatchObject([{ success: true }]),
+			);
+			expect(exit).not.toHaveBeenCalled();
+			expect(runtimeHost.dispose).not.toHaveBeenCalled();
+			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0), { timeout: 2_000 });
+			expect(session.isStreaming).toBe(false);
+			expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
+		} finally {
+			exit.mockRestore();
 			await cleanup();
 		}
 	});
