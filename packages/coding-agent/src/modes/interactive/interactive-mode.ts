@@ -527,6 +527,7 @@ export class InteractiveMode {
 	private onInputCallback?: (input: ReceivedInput) => void;
 	private pendingUserInputs: ReceivedInput[] = [];
 	private readonly inputPlan: ModeInputPlan;
+	private readonly transferredStartupInputs = new WeakSet<ReceivedInput>();
 	private userInputInFlight = false;
 	private inFlightUserInput?: ReceivedInput;
 	private operatorExitRequested = false;
@@ -2049,6 +2050,10 @@ export class InteractiveMode {
 		}
 	}
 
+	private getPendingStartupInputs(): ReceivedInput[] {
+		return this.inputPlan.remaining.filter((input) => !this.transferredStartupInputs.has(input));
+	}
+
 	/**
 	 * Initialize the extension system with TUI-based UI context.
 	 */
@@ -2062,11 +2067,17 @@ export class InteractiveMode {
 				!this.terminalShutdownRequested &&
 				!this.operatorExitRequested &&
 				(this.session !== session ||
+					this.getPendingStartupInputs().length > 0 ||
 					this.pendingUserInputs.length > 0 ||
 					this.userInputInFlight ||
 					this.compactionQueuedMessages.length > 0 ||
 					this.compactionQueueTransfers > 0),
 			getPendingInputs: () => [
+				// Startup suffix occurrences retain their original receipt and order before later editor input.
+				...this.getPendingStartupInputs().map((input) => ({
+					input: this.prepareRecoveredInput(input).input,
+					mode: "steer" as const,
+				})),
 				// Older dequeued/transferring occurrences precede newly staged input.
 				...(this.inFlightUserInput
 					? [{ input: this.prepareRecoveredInput(this.inFlightUserInput).input, mode: "steer" as const }]
@@ -2087,6 +2098,7 @@ export class InteractiveMode {
 			clearPendingInputs: () => {
 				// pi#262 / smarty-dev#3155: only the completed save owns cancellation recovery.
 				this.operatorExitInputsSaved = true;
+				for (const input of this.inputPlan.remaining) this.transferredStartupInputs.add(input);
 				this.pendingUserInputs = [];
 				this.inFlightUserInput = undefined;
 				this.userInputInFlight = false;
@@ -4876,6 +4888,7 @@ export class InteractiveMode {
 			await promptReceived(this.session, input, {
 				onInputTransferred: () => {
 					transferred = true;
+					this.transferredStartupInputs.add(input);
 				},
 			});
 		} catch (error: unknown) {

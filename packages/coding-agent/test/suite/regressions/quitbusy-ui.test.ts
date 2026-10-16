@@ -3,13 +3,14 @@ import { syncBuiltinESMExports } from "node:module";
 import { Agent } from "@earendil-works/pi-agent-core";
 import type { ImageContent } from "@earendil-works/pi-ai/compat";
 import { fauxAssistantMessage, streamSimple } from "@earendil-works/pi-ai/compat";
-import { Container } from "@earendil-works/pi-tui";
+import { Container, type Terminal } from "@earendil-works/pi-tui";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentSession, type AgentSessionEvent } from "../../../src/core/agent-session.ts";
 import { AgentSessionRuntime, type AgentSessionServices } from "../../../src/core/agent-session-runtime.ts";
 import { convertToLlm } from "../../../src/core/messages.ts";
-import { type ReceivedInput, receiveInput } from "../../../src/core/received-input.ts";
+import { getInputReceipt, type ReceivedInput, receiveInput } from "../../../src/core/received-input.ts";
 import { SessionManager } from "../../../src/core/session-manager.ts";
+import { receiptRecord } from "../../../src/core/turn-receipts.ts";
 import { UNSENT_INPUT_TYPE, type UnsentInput } from "../../../src/core/unsent-input.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
@@ -55,6 +56,8 @@ function createUiFixture(harness: Harness) {
 		confirmUnsentDiscard: false,
 		operatorExitRequested: false,
 		operatorExitInputsSaved: false,
+		inputPlan: { remaining: [] },
+		transferredStartupInputs: new WeakSet<ReceivedInput>(),
 		pendingUserInputs: [] as ReceivedInput[],
 		userInputInFlight: false,
 		compactionQueuedMessages: [] as Array<{ input: ReceivedInput; mode: "steer" | "followUp" }>,
@@ -125,12 +128,73 @@ function captureUnsentStderr(beforeWrite?: () => void): string[] {
 	return blocks;
 }
 
+type StartupModeInternals = {
+	bindCurrentSessionExtensions(): Promise<void>;
+	checkForPackageUpdates(): Promise<string[]>;
+	checkTmuxKeyboardSetup(): Promise<string | undefined>;
+	getReceivedUserInput(): Promise<ReceivedInput>;
+	dispatchEditorInput(input: ReceivedInput): Promise<void>;
+	inputPlan: { initial?: ReceivedInput; remaining: ReceivedInput[] };
+};
+
+function createStartupMode(harness: Harness, initialMessages: string[]): InteractiveMode {
+	initTheme("dark");
+	vi.stubEnv("PI_OFFLINE", "1");
+	vi.stubEnv("PI_SKIP_VERSION_CHECK", "1");
+	vi.stubEnv("TMUX", "");
+	const terminal: Terminal = {
+		columns: 100,
+		rows: 30,
+		kittyProtocolActive: false,
+		start: () => {},
+		stop: () => {},
+		drainInput: async () => {},
+		write: () => {},
+		moveBy: () => {},
+		hideCursor: () => {},
+		showCursor: () => {},
+		clearLine: () => {},
+		clearFromCursor: () => {},
+		clearScreen: () => {},
+		setTitle: () => {},
+		setProgress: () => {},
+		setProgramStatus: () => {},
+	};
+	const runtime = new AgentSessionRuntime(
+		harness.session,
+		{
+			cwd: harness.tempDir,
+			agentDir: harness.tempDir,
+			modelRuntime: harness.modelRuntime,
+			settingsManager: harness.settingsManager,
+			resourceLoader: harness.resourceLoader,
+			diagnostics: [],
+		},
+		async () => {
+			throw new Error("This fixture must not replace the session");
+		},
+	);
+	const mode = new InteractiveMode(runtime, {
+		initialMessage: initialMessages[0],
+		initialMessages: initialMessages.slice(1),
+		terminal,
+	});
+	const internals = mode as unknown as StartupModeInternals;
+	vi.spyOn(mode, "init").mockImplementation(async () => {
+		await internals.bindCurrentSessionExtensions();
+	});
+	vi.spyOn(internals, "checkForPackageUpdates").mockResolvedValue([]);
+	vi.spyOn(internals, "checkTmuxKeyboardSetup").mockResolvedValue(undefined);
+	return mode;
+}
+
 // pi#262 / smarty-dev#3155: data safety and foreign-input trust boundaries need real-session coverage.
 describe("interactive unsent-input consent and draft recovery", () => {
 	const harnesses: Harness[] = [];
 	const extraSessions: AgentSession[] = [];
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
 		syncBuiltinESMExports();
 		for (const session of extraSessions.splice(0)) {
 			if (session.isDisposed) continue;
@@ -951,5 +1015,266 @@ describe("interactive unsent-input consent and draft recovery", () => {
 		expect(harness.session.isDisposed).toBe(true);
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
 		expect(harness.faux.state.callCount).toBe(0);
+	});
+
+	// pi#262 / smarty-dev#3155: ordinary startup still transfers every captured occurrence once in order.
+	it("transfers all startup inputs in original order without creating outboxes", async () => {
+		const h = await createHarness({ persistSession: true, settings: { compaction: { enabled: false } } });
+		harnesses.push(h);
+		h.setResponses([
+			fauxAssistantMessage("first reply"),
+			fauxAssistantMessage("second reply"),
+			fauxAssistantMessage("third reply"),
+		]);
+		const mode = createStartupMode(h, ["startup first", "startup second", "startup third"]);
+		const internals = mode as unknown as StartupModeInternals;
+		const expectedReceipts = [internals.inputPlan.initial, ...internals.inputPlan.remaining].map((input) =>
+			receiptRecord(getInputReceipt(input!)),
+		);
+		const loopEnd = new Error("startup loop end");
+		vi.spyOn(internals, "getReceivedUserInput").mockRejectedValue(loopEnd);
+		await expect(mode.run()).rejects.toBe(loopEnd);
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message")
+				.filter((entry) => entry.message.role === "user")
+				.map((entry) => getMessageText(entry.message)),
+		).toEqual(["startup first", "startup second", "startup third"]);
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message")
+				.filter((entry) => entry.message.role === "user")
+				.map((entry) => entry.provenance),
+		).toEqual(expectedReceipts);
+		expect(h.sessionManager.getEntries().filter((entry) => entry.type === "custom")).toEqual([]);
+		expect(h.faux.state.callCount).toBe(3);
+	});
+
+	// pi#262 / smarty-dev#3155: startup suffixes are saved once after the transferred first turn.
+	it("saves an unsubmitted startup suffix without duplicating the transferred first input", async () => {
+		let requestEntered!: () => void;
+		const requestStarted = new Promise<void>((resolve) => {
+			requestEntered = resolve;
+		});
+		let releaseRequest!: () => void;
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false } },
+			prepareRequest: async (_request, signal) => {
+				requestEntered();
+				await new Promise<void>((resolve) => {
+					releaseRequest = resolve;
+					signal?.addEventListener("abort", () => resolve(), { once: true });
+				});
+			},
+		});
+		harnesses.push(h);
+		h.setResponses([fauxAssistantMessage("first reply"), fauxAssistantMessage("replayed second")]);
+		const mode = createStartupMode(h, ["startup first", "startup second"]);
+		const internals = mode as unknown as StartupModeInternals;
+		const expectedReceipts = [internals.inputPlan.initial, ...internals.inputPlan.remaining].map((input) =>
+			receiptRecord(getInputReceipt(input!)),
+		);
+		const loopEnd = new Error("startup loop end");
+		vi.spyOn(internals, "getReceivedUserInput").mockRejectedValue(loopEnd);
+		const running = mode.run();
+		await requestStarted;
+		const beforeQuit = h.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "message")
+			.filter((entry) => entry.message.role === "user")
+			.map((entry) => getMessageText(entry.message));
+		expect(beforeQuit).toEqual(["startup first"]);
+
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		await internals.dispatchEditorInput(receiveInput("/quit"));
+		const outboxes = h.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom")
+			.filter((entry) => entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(1);
+		expect(getMessageText((outboxes[0]!.data as UnsentInput).message)).toBe("startup second");
+		expect((outboxes[0]!.data as UnsentInput).provenance).toEqual(expectedReceipts[1]);
+		expect(
+			h.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type === "message")
+				.filter((entry) => entry.message.role === "user")
+				.map((entry) => getMessageText(entry.message)),
+		).toEqual(["startup first"]);
+		expect(exit).toHaveBeenCalledWith(0);
+		releaseRequest();
+		await expect(running).rejects.toBe(loopEnd);
+
+		const file = h.sessionManager.getSessionFile();
+		if (!file) throw new Error("Missing persisted session");
+		const resumedManager = SessionManager.open(file);
+		const resumed = new AgentSession({
+			agent: new Agent({
+				streamFn: streamSimple,
+				convertToLlm,
+				initialState: { model: h.getModel(), tools: [] },
+			}),
+			sessionManager: resumedManager,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(resumed);
+		await resumed.bindExtensions({});
+		const callsBeforeResume = h.faux.state.callCount;
+		await resumed.resumeUnsentInputs();
+		expect(h.faux.state.callCount).toBe(callsBeforeResume + 1);
+		expect(
+			resumedManager
+				.getEntries()
+				.filter((entry) => entry.type === "message")
+				.filter((entry) => entry.message.role === "user")
+				.map((entry) => getMessageText(entry.message)),
+		).toEqual(["startup first", "startup second"]);
+
+		const resumedCount = resumedManager.getEntryCount();
+		const callsAfterResume = h.faux.state.callCount;
+		resumed.dispose();
+		const reopenedManager = SessionManager.open(file);
+		const reopened = new AgentSession({
+			agent: new Agent({
+				streamFn: streamSimple,
+				convertToLlm,
+				initialState: { model: h.getModel(), tools: [] },
+			}),
+			sessionManager: reopenedManager,
+			settingsManager: h.settingsManager,
+			modelRuntime: h.modelRuntime,
+			resourceLoader: h.resourceLoader,
+			cwd: h.tempDir,
+		});
+		extraSessions.push(reopened);
+		await reopened.bindExtensions({});
+		await reopened.resumeUnsentInputs();
+		expect(reopenedManager.getEntryCount()).toBe(resumedCount);
+		expect(h.faux.state.callCount).toBe(callsAfterResume);
+	});
+
+	// pi#262 / smarty-dev#3155: a held admission and the startup suffix keep native order in one snapshot.
+	it("saves a held first startup input before its unsubmitted suffix", async () => {
+		let inputEntered!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			inputEntered = resolve;
+		});
+		let releaseInput!: () => void;
+		const heldInput = new Promise<void>((resolve) => {
+			releaseInput = resolve;
+		});
+		const h = await createHarness({
+			persistSession: true,
+			settings: { compaction: { enabled: false } },
+			extensionFactories: [
+				(pi) => {
+					pi.on("input", async (event) => {
+						if (event.text === "held startup first") {
+							inputEntered();
+							await heldInput;
+						}
+					});
+				},
+			],
+		});
+		harnesses.push(h);
+		const mode = createStartupMode(h, ["held startup first", "startup suffix"]);
+		const internals = mode as unknown as StartupModeInternals;
+		const expectedReceipts = [internals.inputPlan.initial, ...internals.inputPlan.remaining].map((input) =>
+			receiptRecord(getInputReceipt(input!)),
+		);
+		const loopEnd = new Error("startup loop end");
+		vi.spyOn(internals, "getReceivedUserInput").mockRejectedValue(loopEnd);
+		const running = mode.run();
+		await entered;
+
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		await internals.dispatchEditorInput(receiveInput("/quit"));
+		const outboxes = h.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom")
+			.filter((entry) => entry.customType === UNSENT_INPUT_TYPE);
+		expect(outboxes).toHaveLength(2);
+		expect(outboxes.map((entry) => getMessageText((entry.data as UnsentInput).message))).toEqual([
+			"held startup first",
+			"startup suffix",
+		]);
+		expect(outboxes.map((entry) => (entry.data as UnsentInput).provenance)).toEqual(expectedReceipts);
+		expect(exit).toHaveBeenCalledWith(0);
+		releaseInput();
+		await expect(running).rejects.toBe(loopEnd);
+	});
+
+	// pi#262 / smarty-dev#3155: a changed startup suffix invalidates no-session discard consent.
+	it("requires fresh no-session consent when the startup suffix changes", async () => {
+		let requestCount = 0;
+		let firstEntered!: () => void;
+		const firstStarted = new Promise<void>((resolve) => {
+			firstEntered = resolve;
+		});
+		let releaseFirst!: () => void;
+		const firstHeld = new Promise<void>((resolve) => {
+			releaseFirst = resolve;
+		});
+		let secondEntered!: () => void;
+		const secondStarted = new Promise<void>((resolve) => {
+			secondEntered = resolve;
+		});
+		let releaseSecond!: () => void;
+		const secondHeld = new Promise<void>((resolve) => {
+			releaseSecond = resolve;
+		});
+		const h = await createHarness({
+			settings: { compaction: { enabled: false } },
+			prepareRequest: async () => {
+				requestCount++;
+				if (requestCount === 1) {
+					firstEntered();
+					await firstHeld;
+				} else if (requestCount === 2) {
+					secondEntered();
+					await secondHeld;
+				}
+			},
+		});
+		harnesses.push(h);
+		h.setResponses([
+			fauxAssistantMessage("first reply"),
+			fauxAssistantMessage("second reply"),
+			fauxAssistantMessage("third reply"),
+		]);
+		const mode = createStartupMode(h, ["first startup", "second startup", "third startup"]);
+		const internals = mode as unknown as StartupModeInternals;
+		const warnings: string[] = [];
+		vi.spyOn(mode as unknown as { showWarning(message: string): void }, "showWarning").mockImplementation(
+			(message) => {
+				warnings.push(message);
+			},
+		);
+		const loopEnd = new Error("startup loop end");
+		vi.spyOn(internals, "getReceivedUserInput").mockRejectedValue(loopEnd);
+		const running = mode.run();
+		await firstStarted;
+		const exit = vi.spyOn(process, "exit").mockImplementation(() => undefined as never);
+		await internals.dispatchEditorInput(receiveInput("/quit"));
+		expect(warnings).toHaveLength(1);
+		expect(warnings[0]).toContain("2 queued messages are not saved");
+		expect(exit).not.toHaveBeenCalled();
+
+		releaseFirst();
+		await secondStarted;
+		await internals.dispatchEditorInput(receiveInput("/quit"));
+		expect(warnings).toHaveLength(2);
+		expect(warnings[1]).toContain("1 queued messages are not saved");
+		expect(exit).not.toHaveBeenCalled();
+
+		releaseSecond();
+		await expect(running).rejects.toBe(loopEnd);
 	});
 });
