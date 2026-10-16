@@ -8,8 +8,13 @@ describe("Box render cache", () => {
 	class Child implements Component {
 		lines: string[];
 		renders = 0;
-		constructor(lines: string[]) { this.lines = lines; }
-		render(): string[] { this.renders++; return this.lines; }
+		constructor(lines: string[]) {
+			this.lines = lines;
+		}
+		render(): string[] {
+			this.renders++;
+			return this.lines;
+		}
 		invalidate(): void {}
 	}
 	const child = (lines: string[]) => new Child(lines);

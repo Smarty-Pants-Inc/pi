@@ -468,7 +468,13 @@ describe("TUI Kitty image cleanup", () => {
 		component.lines = ["top", "middle", "bottom!"];
 		tui.requestRender();
 		await terminal.waitForRender();
-		assert.deepStrictEqual(terminal.getViewport().slice(0, 3).map((line) => line.trimEnd()), ["top", "middle", "bottom!"]);
+		assert.deepStrictEqual(
+			terminal
+				.getViewport()
+				.slice(0, 3)
+				.map((line) => line.trimEnd()),
+			["top", "middle", "bottom!"],
+		);
 		const image = encodeKitty("AAAA", { columns: 2, rows: 1, imageId: 51, moveCursor: false });
 		component.lines = ["top", image, "bottom!"];
 		terminal.clearWrites();
@@ -480,7 +486,13 @@ describe("TUI Kitty image cleanup", () => {
 		tui.requestRender(true);
 		await terminal.waitForRender();
 		assert.ok(terminal.getWrites().includes(deleteKittyImage(51)), "removed image should be deleted");
-		assert.deepStrictEqual(terminal.getViewport().slice(0, 3).map((line) => line.trimEnd()), ["top", "middle", "bottom!"]);
+		assert.deepStrictEqual(
+			terminal
+				.getViewport()
+				.slice(0, 3)
+				.map((line) => line.trimEnd()),
+			["top", "middle", "bottom!"],
+		);
 		tui.stop();
 	});
 

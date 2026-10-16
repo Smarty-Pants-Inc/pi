@@ -21,7 +21,9 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			columns: 80,
 			rows: 24,
 			kittyProtocolActive: false,
-			start(onInput) { input = onInput; },
+			start(onInput) {
+				input = onInput;
+			},
 			stop: noop,
 			drainInput: async () => {},
 			write: noop,

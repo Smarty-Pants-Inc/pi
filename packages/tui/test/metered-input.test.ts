@@ -13,7 +13,9 @@ function openMeter(): InputByteMeter & { ended: boolean } {
 			total += chunk.length;
 			return { preEpoch: Buffer.alloc(0), epoch: chunk, epochStart };
 		},
-		end() { this.ended = true; },
+		end() {
+			this.ended = true;
+		},
 	};
 }
 
@@ -33,20 +35,28 @@ describe("MeteredInput", () => {
 		input.write(Buffer.from("A\rB"));
 		parser.destroy();
 		assert.deepEqual(events, [
-			{ seq: "A", end: 1 }, { seq: "\r", end: 2 }, { seq: "B", end: 3 },
+			{ seq: "A", end: 1 },
+			{ seq: "\r", end: 2 },
+			{ seq: "B", end: 3 },
 		]);
 	});
 	it("counts UTF-8 bytes and reassembles characters split across reads", () => {
 		const { input, events, parser } = harness(openMeter());
 		for (const byte of Buffer.from("é\r")) input.write(Buffer.from([byte]));
 		parser.destroy();
-		assert.deepEqual(events, [{ seq: "é", end: 2 }, { seq: "\r", end: 3 }]);
+		assert.deepEqual(events, [
+			{ seq: "é", end: 2 },
+			{ seq: "\r", end: 3 },
+		]);
 	});
 	it("ends a paste at its closing marker byte", () => {
 		const { input, events, parser } = harness(openMeter());
 		input.write(Buffer.from("\x1b[200~hi\x1b[201~\r"));
 		parser.destroy();
-		assert.deepEqual(events, [{ seq: "paste:hi", end: 14 }, { seq: "\r", end: 15 }]);
+		assert.deepEqual(events, [
+			{ seq: "paste:hi", end: 14 },
+			{ seq: "\r", end: 15 },
+		]);
 	});
 	it("reports no offset without a meter and still decodes split UTF-8", () => {
 		const { input, events, parser } = harness();

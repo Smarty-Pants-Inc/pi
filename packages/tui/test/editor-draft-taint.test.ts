@@ -24,7 +24,10 @@ function type(editor: Editor, text: string): void {
 
 describe("Editor draft taint", () => {
 	it("leaves a typed draft and a terminal paste untainted", () => {
-		assert.deepEqual(submitAfter((e) => type(e, "hi")), { text: "hi", tainted: false });
+		assert.deepEqual(
+			submitAfter((e) => type(e, "hi")),
+			{ text: "hi", tainted: false },
+		);
 		assert.equal(submitAfter((e) => e.handleInput("\x1b[200~pasted\x1b[201~")).tainted, false);
 	});
 

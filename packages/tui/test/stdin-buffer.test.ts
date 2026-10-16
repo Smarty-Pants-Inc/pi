@@ -428,7 +428,14 @@ describe("StdinBuffer", () => {
 			});
 		}
 		it("resumes split terminators and recognized-reply resynchronization after many chunks", () => {
-			for (const header of ["\x1b]10;", "\x1b]0;", "\x1bPunknown;", "\x1b_unknown;", "\x1b^unknown;", "\x1bXunknown;"]) {
+			for (const header of [
+				"\x1b]10;",
+				"\x1b]0;",
+				"\x1bPunknown;",
+				"\x1b_unknown;",
+				"\x1b^unknown;",
+				"\x1bXunknown;",
+			]) {
 				const reply = `${header}${"x".repeat(3 * 4096)}`;
 				processInput(`${reply}\x1b`);
 				assert.equal(buffer.getBuffer(), `${reply}\x1b`);

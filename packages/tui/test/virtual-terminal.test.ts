@@ -12,17 +12,24 @@ it("VirtualTerminal.stop clears pending render state and releases existing waite
 	const terminal = new VirtualTerminal();
 	terminal.onRenderPending(true);
 	let oldResolved = false;
-	const oldWaiter = terminal.waitForRender().then(() => { oldResolved = true; });
+	const oldWaiter = terminal.waitForRender().then(() => {
+		oldResolved = true;
+	});
 	await terminal.flush();
 	assert.equal(oldResolved, false);
 	terminal.stop();
 	await oldWaiter;
 	assert.equal(oldResolved, true);
 	await terminal.waitForRender();
-	terminal.start(() => {}, () => {});
+	terminal.start(
+		() => {},
+		() => {},
+	);
 	terminal.onRenderPending(true);
 	let newResolved = false;
-	const newWaiter = terminal.waitForRender().then(() => { newResolved = true; });
+	const newWaiter = terminal.waitForRender().then(() => {
+		newResolved = true;
+	});
 	await terminal.flush();
 	assert.equal(newResolved, false);
 	terminal.onRenderPending(false);
@@ -78,7 +85,9 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			await nextTick();
 			assert.equal(pending.mock.calls.at(-1)?.arguments[0], true);
 			let resolved = false;
-			const waiter = terminal.waitForRender().then(() => { resolved = true; });
+			const waiter = terminal.waitForRender().then(() => {
+				resolved = true;
+			});
 			await advance(14);
 			assert.equal(renders.mock.calls.length, 1);
 			assert.equal(resolved, false);
@@ -91,6 +100,8 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			assert.ok(terminal.getViewport().includes("restarted"));
 			await advance(100);
 			assert.equal(renders.mock.calls.length, 2, "no canceled frame may leak into the next run");
-		} finally { tui.stop({ preserveScreen: true }); }
+		} finally {
+			tui.stop({ preserveScreen: true });
+		}
 	});
 }
