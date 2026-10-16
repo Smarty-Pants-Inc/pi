@@ -53,7 +53,9 @@ function setup(t: TestContext, enrolled: boolean) {
 	});
 	t.mock.method(process.stdin, "resume", () => process.stdin);
 	t.mock.method(process.stdin, "pause", () => process.stdin);
-	if (process.stdin.setRawMode) t.mock.method(process.stdin, "setRawMode", () => process.stdin);
+	if (typeof process.stdin.setRawMode === "function") {
+		t.mock.method(process.stdin, "setRawMode", () => process.stdin);
+	}
 	t.mock.method(process, "kill", () => true);
 
 	initTheme("dark");
