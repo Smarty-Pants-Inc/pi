@@ -40,6 +40,14 @@ import type {
 	CodemodeTool,
 } from "../types.ts";
 import {
+	BridgeBudget,
+	CodemodeLimitError,
+	type CodemodeLimits,
+	checkCodemodeStoreQuota,
+	resolveCodemodeLimits,
+	resolveMemoryLimit,
+} from "./limits.ts";
+import {
 	type HostToWorkerMessage,
 	isWorkerToHostMessage,
 	type VmStartData,
@@ -169,7 +177,7 @@ function checkGlobals(globals: readonly CodemodeDeclaredGlobal[]): void {
 /** Callbacks of a host-controlled run: its calls go to the caller, which answers them with `deliver()`. */
 type Control = Pick<CodemodeRunOptions, "onStarted" | "onCall" | "onIdle">;
 
-interface ExecutionOptions {
+export interface ExecutionOptions {
 	code: string;
 	tools: readonly CodemodeDeclaredTool[];
 	globals: readonly CodemodeDeclaredGlobal[];
@@ -178,14 +186,17 @@ interface ExecutionOptions {
 	timeoutMs: number;
 	signal: AbortSignal | undefined;
 	memoryLimitBytes: number | undefined;
+	limits: CodemodeLimits;
+	/** Caller-owned snapshot, for quota checks independent of the guest serializer. */
+	snapshot: Readonly<Record<string, unknown>>;
 	store: Record<string, string>;
 	deterministic?: { startedAt: number; seed: number };
 	control?: Control;
 	launch: VmLauncher;
 }
 
-/** One script run in its own VM. */
-class Execution {
+/** One script run in its own VM. Exported for host-only tests. */
+export class Execution {
 	readonly promise: Promise<CodemodeResult>;
 	private resolveResult!: (result: CodemodeResult) => void;
 	private channel: VmChannel | undefined;
@@ -196,7 +207,9 @@ class Execution {
 	/** Result numbers `deliver()` used. */
 	private readonly delivered = new Set<number>();
 	private readonly signal: AbortSignal | undefined;
-	private readonly timer: ReturnType<typeof setTimeout> | undefined;
+	private readonly timer: ReturnType<typeof setTimeout>;
+	private readonly budget: BridgeBudget;
+	private readonly snapshot: Readonly<Record<string, unknown>>;
 	private readonly output: CodemodeOutputItem[] = [];
 	private readonly calls: CodemodeCall[] = [];
 	private readonly pending = new Map<number, PendingCall>();
@@ -210,12 +223,16 @@ class Execution {
 		this.executors = options.executors;
 		this.control = options.control;
 		this.signal = options.signal;
+		const limits = resolveCodemodeLimits(options.limits);
+		const memoryLimitBytes = resolveMemoryLimit(options.memoryLimitBytes);
+		this.budget = new BridgeBudget(limits);
+		this.snapshot = options.snapshot;
 
-		if (Number.isFinite(options.timeoutMs)) {
-			this.timer = setTimeout(() => {
-				this.finish({ kind: "timeout", message: `Execution timed out after ${options.timeoutMs} ms` });
-			}, options.timeoutMs);
-		}
+		// Every transport and both execute()/start() retain the fork's finite host deadline.
+		const timeoutMs = Math.min(options.timeoutMs, limits.maxTimeoutMs);
+		this.timer = setTimeout(() => {
+			this.finish({ kind: "timeout", message: `Execution timed out after ${timeoutMs} ms` });
+		}, timeoutMs);
 
 		if (options.signal) {
 			if (options.signal.aborted) {
@@ -234,7 +251,8 @@ class Execution {
 				description: tool.description ?? "",
 			})),
 			globals: options.globals.map((global) => ({ name: global.name, spread: global.spread === true })),
-			memoryLimitBytes: options.memoryLimitBytes,
+			memoryLimitBytes,
+			limits,
 			store: options.store,
 			...(options.deterministic ? { deterministic: options.deterministic } : {}),
 		};
@@ -280,6 +298,12 @@ class Execution {
 			: outcome.message;
 		const properties =
 			!outcome.ok && outcome.properties !== undefined ? JSON.stringify(outcome.properties) : undefined;
+		try {
+			this.budget.settle((payload?.length ?? 0) + (properties?.length ?? 0));
+		} catch (error) {
+			this.finish({ kind: "limit", message: errorMessage(error) });
+			return;
+		}
 		this.delivered.add(seq);
 		this.pending.delete(id);
 		if (pending.record) {
@@ -317,6 +341,10 @@ class Execution {
 		try {
 			this.handleMessage(message);
 		} catch (error) {
+			if (error instanceof CodemodeLimitError) {
+				this.finish({ kind: "limit", message: error.message });
+				return;
+			}
 			this.finish({
 				kind: "sandbox",
 				message:
@@ -330,12 +358,15 @@ class Execution {
 	private handleMessage(message: unknown): void {
 		if (this.finished) return;
 		if (!isWorkerToHostMessage(message)) throw new BridgeError("unknown message from the worker");
+		if (message.type === "call" && this.pending.has(message.id)) {
+			throw new BridgeError(`duplicate call id ${message.id}`);
+		}
+		this.budget.charge(message);
 		switch (message.type) {
 			case "output":
 				this.output.push(message.item);
 				break;
 			case "call":
-				if (this.pending.has(message.id)) throw new BridgeError(`duplicate call id ${message.id}`);
 				if (this.control) this.forwardCall(message, this.control);
 				else void this.handleCall(message);
 				break;
@@ -351,6 +382,9 @@ class Execution {
 			case "crash":
 				this.finish({ kind: "sandbox", message: message.message });
 				break;
+			case "limit":
+				this.finish({ kind: "limit", message: message.message });
+				break;
 		}
 	}
 
@@ -361,7 +395,9 @@ class Execution {
 			return;
 		}
 		const value = message.value === undefined ? undefined : parseBridgeJson(message.value, "return value");
-		this.finish(undefined, value, parseStoreWrites(message.writes), message.during);
+		const writes = parseStoreWrites(message.writes);
+		checkCodemodeStoreQuota(this.snapshot, writes);
+		this.finish(undefined, value, writes, message.during);
 	}
 
 	/** A host-controlled run: record the call and hand it to the caller, which answers with `deliver()`. */
@@ -403,6 +439,12 @@ class Execution {
 		if (record) {
 			record.status = status;
 			record.durationMs = performance.now() - pending.startedAt;
+		}
+		try {
+			this.budget.settle((reply.payload?.length ?? 0) + (reply.properties?.length ?? 0));
+		} catch (error) {
+			this.finish({ kind: "limit", message: errorMessage(error) });
+			return;
 		}
 		this.post(reply);
 	}
@@ -461,14 +503,16 @@ export class CodemodeSandboxBase {
 	private readonly toolsByName = new Map<string, CodemodeTool>();
 	private readonly globalsByName = new Map<string, CodemodeTool>();
 	private readonly timeoutMs: number;
-	private readonly memoryLimitBytes: number | undefined;
+	private readonly memoryLimitBytes: number;
+	private readonly limits: CodemodeLimits;
 	private readonly launch: VmLauncher;
 	private readonly running = new Set<Execution>();
 	private closed = false;
 
 	constructor(options: CodemodeSandboxBaseOptions, launch: VmLauncher) {
 		this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-		this.memoryLimitBytes = options.memoryLimitBytes;
+		this.memoryLimitBytes = resolveMemoryLimit(options.memoryLimitBytes);
+		this.limits = resolveCodemodeLimits(options.limits);
 		this.launch = launch;
 		for (const tool of options.tools ?? []) this.registerTool(tool);
 		checkGlobals(options.globals ?? []);
@@ -509,6 +553,8 @@ export class CodemodeSandboxBase {
 			timeoutMs: options.timeoutMs ?? this.timeoutMs,
 			signal: options.signal,
 			memoryLimitBytes: this.memoryLimitBytes,
+			limits: this.limits,
+			snapshot: options.store ?? {},
 			store: serializeStore(options.store),
 			launch: this.launch,
 		});
@@ -549,6 +595,8 @@ export class CodemodeSandboxBase {
 			timeoutMs: options.timeoutMs ?? Number.POSITIVE_INFINITY,
 			signal: options.signal,
 			memoryLimitBytes: this.memoryLimitBytes,
+			limits: this.limits,
+			snapshot: options.store ?? {},
 			store: serializeStore(options.store),
 			deterministic: { startedAt: options.startedAt, seed: options.seed },
 			control: { onStarted: options.onStarted, onCall: options.onCall, onIdle: options.onIdle },

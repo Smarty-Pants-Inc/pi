@@ -67,7 +67,8 @@ afterEach(() => {
 	vi.useRealTimers();
 });
 
-describe("McpClient", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("McpClient", () => {
 	it("initializes the connection before exposing server information", async () => {
 		const { client, server } = await connect();
 		expect(client.connectionState).toBe("connected");

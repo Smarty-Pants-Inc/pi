@@ -1,3 +1,4 @@
+import { refuseUnreviewedBuiltin } from "../../core/builtin-security-admission.ts";
 /**
  * `pi mcp`: add, remove, and check MCP servers and sign in to them outside a session. Agents run it
  * through bash to configure servers, verify an `mcp.json` they wrote, and start an OAuth sign-in;
@@ -183,6 +184,12 @@ function parseOptions(
 
 /** Run `pi mcp <args>` and return the exit code. */
 export async function runMcpCommand(args: string[], options: McpCommandOptions): Promise<number> {
+	try {
+		refuseUnreviewedBuiltin("mcp");
+	} catch (cause) {
+		(options.error ?? console.error)(cause instanceof Error ? cause.message : "MCP_SECURITY_REVIEW_REQUIRED");
+		return 1;
+	}
 	const log = options.log ?? ((line: string) => console.log(line));
 	const error = options.error ?? ((line: string) => console.error(line));
 	const [command, ...rest] = args;

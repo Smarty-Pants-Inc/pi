@@ -27,6 +27,8 @@ export interface ExecResult {
 	killed: boolean;
 }
 
+const EXEC_FORCE_KILL_GRACE_MS = 5000;
+
 /**
  * Execute a shell command and return stdout/stderr/code.
  * Supports timeout and abort signal.
@@ -37,6 +39,8 @@ export async function execCommand(
 	cwd: string,
 	options?: ExecOptions,
 ): Promise<ExecResult> {
+	// Refuse before spawn: an already-cancelled caller creates no process (#132 R1-S7).
+	if (options?.signal?.aborted) return { stdout: "", stderr: "", code: 1, killed: true };
 	return new Promise((resolve) => {
 		const proc = spawn(command, args, {
 			cwd,
@@ -48,19 +52,22 @@ export async function execCommand(
 		let stderr = "";
 		let killed = false;
 		let timeoutId: NodeJS.Timeout | undefined;
+		let forceKillId: NodeJS.Timeout | undefined;
 
 		const killProcess = () => {
 			if (!killed) {
 				killed = true;
 				proc.kill("SIGTERM");
-				// Force kill after 5 seconds if SIGTERM doesn't work
-				setTimeout(() => {
-					if (!proc.killed) {
-						proc.kill("SIGKILL");
-					}
-				}, 5000);
+				// Force kill after the grace period if the child has not exited. `proc.killed` only
+				// records signal delivery, not termination (#132 R2-S1).
+				forceKillId = setTimeout(() => {
+					if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL");
+				}, EXEC_FORCE_KILL_GRACE_MS);
 			}
 		};
+		proc.once("exit", () => {
+			if (forceKillId) clearTimeout(forceKillId);
+		});
 
 		// Handle abort signal
 		if (options?.signal) {

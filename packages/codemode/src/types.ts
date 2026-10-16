@@ -1,3 +1,4 @@
+import type { CodemodeLimits } from "./runtime/limits.ts";
 import type { CodemodeWasmModule } from "./wasm.ts";
 
 export interface CodemodeToolContext {
@@ -70,7 +71,9 @@ export type CodemodeErrorKind =
 	 * The VM or its transport failed outside the script's control (for example a wasm trap, a missing
 	 * worker file, or a remote sandbox that failed).
 	 */
-	| "sandbox";
+	| "sandbox"
+	/** The script exceeded a bridge budget or store quota. The VM was stopped. */
+	| "limit";
 
 export interface CodemodeError {
 	kind: CodemodeErrorKind;
@@ -119,14 +122,17 @@ export interface CodemodeSandboxBaseOptions {
 	 */
 	globals?: CodemodeTool[];
 	/**
-	 * Overall deadline per execution, including time spent in tools. `Infinity` disables the
-	 * deadline; the execution then only ends when the script settles or is aborted.
-	 * Default: 300000.
+	 * Overall deadline per execution, including time spent in tools. Values above
+	 * `limits.maxTimeoutMs`, `Infinity` included, are clamped to it. Default: 300000.
 	 */
 	timeoutMs?: number;
+	/** Host budgets per execution. Default: `DEFAULT_CODEMODE_LIMITS`. Values must be positive and finite. */
+	limits?: Partial<CodemodeLimits>;
 	/**
 	 * Maximum memory the QuickJS VM may allocate. Allocations beyond it fail inside the script as
-	 * `InternalError: out of memory`. Default: no limit beyond wasm32's 4 GiB address space.
+	 * `InternalError: out of memory`. Default and host-owned ceiling: 256 MiB
+	 * (`DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES` / `MAX_CODEMODE_MEMORY_LIMIT_BYTES`). Larger values
+	 * are clamped; non-positive or non-finite values are refused. Remotes may impose a tighter cap.
 	 */
 	memoryLimitBytes?: number;
 }
@@ -212,7 +218,7 @@ export interface CodemodeRunOptions {
 	globals?: CodemodeDeclaredGlobal[];
 	store?: Readonly<Record<string, unknown>>;
 	signal?: AbortSignal;
-	/** Deadline of this run in ms. Default: none (not the sandbox's default). */
+	/** Deadline of this run in ms. Defaults to `limits.maxTimeoutMs`; larger values, including Infinity, are clamped. */
 	timeoutMs?: number;
 	/** The VM's fingerprint, before the script runs and before any of its calls. */
 	onStarted?(fingerprint: string): void;
@@ -230,7 +236,7 @@ export interface CodemodeRun {
 	readonly result: Promise<CodemodeResult>;
 	/**
 	 * Whether the run has its outcome: the script ended, timed out, or failed, or the run was aborted. Set when that is
-	 * decided, before `result` settles; calls can no longer be answered. It does not mean the VM has exited.
+	 * decided, before `result` settles (which waits for the VM to stop); calls can no longer be answered.
 	 */
 	readonly finished: boolean;
 	/**

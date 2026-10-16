@@ -5,7 +5,8 @@ import { McpClient, StdioTransport } from "../src/index.ts";
 const fixture = fileURLToPath(new URL("./fixtures/stdio-server.mjs", import.meta.url));
 const stubborn = fileURLToPath(new URL("./fixtures/stubborn-server.mjs", import.meta.url));
 
-describe("StdioTransport", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("StdioTransport", () => {
 	it("connects to a newline-delimited MCP server and captures stderr", async () => {
 		const stderr: string[] = [];
 		const transport = new StdioTransport({

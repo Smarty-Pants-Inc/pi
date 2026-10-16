@@ -2,6 +2,7 @@ import { Worker } from "node:worker_threads";
 import type { CodemodeSandboxOptions } from "../types.ts";
 import { type CodemodeWasmModule, loadQuickJSWasm } from "../wasm.ts";
 import { CodemodeSandboxBase, errorMessage, type VmLauncher } from "./execution.ts";
+import { resolveMemoryLimit } from "./limits.ts";
 import type { WorkerData } from "./protocol.ts";
 
 function defaultWorkerUrl(): URL {
@@ -26,11 +27,21 @@ function workerLauncher(options: CodemodeSandboxOptions): VmLauncher {
 			throw new Error(`Failed to load QuickJS: ${errorMessage(error)}`);
 		}
 		const interrupt = new SharedArrayBuffer(4);
-		const workerData: WorkerData = { ...data, wasm: module, interrupt };
+		const memoryLimitBytes = resolveMemoryLimit(data.memoryLimitBytes);
+		const workerData: WorkerData = { ...data, memoryLimitBytes, wasm: module, interrupt };
 		const releaseWorker = options.acquireWorker?.();
 		let worker: Worker;
 		try {
-			worker = new Worker(options.workerUrl ?? defaultWorkerUrl(), { workerData });
+			worker = new Worker(options.workerUrl ?? defaultWorkerUrl(), {
+				workerData,
+				// V8 heap guard in addition to QuickJS's allocator guard. Reserve 64 MiB
+				// for worker JS: 48 MiB old generation and 16 MiB young generation.
+				// Node resourceLimits do not cover external/ArrayBuffer (including wasm) memory.
+				resourceLimits: {
+					maxOldGenerationSizeMb: Math.ceil(memoryLimitBytes / (1024 * 1024)) + 48,
+					maxYoungGenerationSizeMb: 16,
+				},
+			});
 		} catch (error) {
 			releaseWorker?.();
 			throw new Error(`Failed to start worker: ${errorMessage(error)}`);

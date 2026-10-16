@@ -13,16 +13,20 @@ import {
 	trackDetachedChildPid,
 	untrackDetachedChildPid,
 } from "../../utils/shell.ts";
-import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { OutputAccumulator } from "./output-accumulator.ts";
+import type { BashSpawnEvent, ExtensionContext, ToolDefinition } from "../extensions/types.ts";
+import {
+	FULL_OUTPUT_HEAD_BYTES,
+	FULL_OUTPUT_TAIL_BYTES,
+	type FullOutputTruncation,
+	OutputAccumulator,
+} from "./output-accumulator.ts";
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
 
-const MAX_TIMEOUT_MS = 2_147_483_647;
+const MAX_TIMEOUT_SECONDS = 300;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
 const STRUCTURED_OUTPUT_MAX_BYTES = 1024 * 1024;
-const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
 
 function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 	if (timeout === undefined) return undefined;
@@ -30,16 +34,25 @@ function resolveTimeoutMs(timeout: number | undefined): number | undefined {
 		throw new Error("Invalid timeout: must be a finite number of seconds");
 	}
 
-	const timeoutMs = timeout * 1000;
-	if (timeoutMs > MAX_TIMEOUT_MS) {
-		throw new Error(`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds`);
+	if (timeout > MAX_TIMEOUT_SECONDS) {
+		throw new Error(
+			`Invalid timeout: maximum is ${MAX_TIMEOUT_SECONDS} seconds (the value is in seconds, not milliseconds)`,
+		);
 	}
-	return timeoutMs;
+	return timeout * 1000;
 }
 
 const bashSchema = Type.Object({
 	command: Type.String({ description: "Shell command to execute" }),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+	// ponytail: match the fleet's 5-minute foreground ceiling; longer jobs run detached.
+	timeout: Type.Optional(
+		Type.Number({
+			exclusiveMinimum: 0,
+			maximum: MAX_TIMEOUT_SECONDS,
+			description:
+				"Timeout in SECONDS, not milliseconds (max 300 = 5 min; optional, no default). For longer work run it in the background.",
+		}),
+	),
 });
 
 export const bashToolSystemPromptContribution = {
@@ -56,7 +69,12 @@ export type BashToolInput = Static<typeof bashSchema>;
 const bashOutputSchema = Type.Object({
 	output: Type.String({ description: "Combined stdout and stderr, possibly truncated" }),
 	truncated: Type.Boolean(),
-	full_output_path: Type.Optional(Type.String({ description: "Full output, when truncated" })),
+	full_output_path: Type.Optional(
+		Type.String({
+			description: "Output log, when truncated. Very large output keeps only its first and last 4MB in the log",
+		}),
+	),
+	full_output_error: Type.Optional(Type.String({ description: "Why the output log is unavailable" })),
 	exit_code: Type.Number(),
 	wall_time_seconds: Type.Number(),
 });
@@ -66,6 +84,10 @@ export type BashToolOutput = Static<typeof bashOutputSchema>;
 export interface BashToolDetails {
 	truncation?: TruncationResult;
 	fullOutputPath?: string;
+	/** Present when the output log omits part of the output. */
+	fullOutputTruncation?: FullOutputTruncation;
+	/** The log could not be saved; command output and status are still valid. */
+	fullOutputError?: string;
 }
 
 /**
@@ -93,26 +115,43 @@ export interface BashOperations {
 	) => Promise<{ exitCode: number | null }>;
 }
 
+type LocalShellSpawn = Omit<BashSpawnEvent, "type" | "toolCallId" | "backend">;
+
 /** Shared process execution used by the built-in shell tools. */
-export function createLocalShellOperations(shellName: string, resolveShellConfig: () => ShellConfig): BashOperations {
+export function createLocalShellOperations(
+	shellName: string,
+	resolveShellConfig: (env: NodeJS.ProcessEnv) => ShellConfig,
+	beforeSpawn?: (spawn: LocalShellSpawn) => Promise<void>,
+): BashOperations {
 	return {
 		exec: async (command, cwd, { onData, signal, timeout, env }) => {
 			const timeoutMs = resolveTimeoutMs(timeout);
 			if (signal?.aborted) {
 				throw new Error("aborted");
 			}
-			const shellConfig = resolveShellConfig();
+			const effectiveEnv = { ...(env ?? getShellEnv()) };
+			const shellConfig = resolveShellConfig(effectiveEnv);
 			try {
 				await fsAccess(cwd, constants.F_OK);
 			} catch {
 				throw new Error(`Working directory does not exist: ${cwd}\nCannot execute ${shellName} commands.`);
 			}
+			// Revocation during the asynchronous cwd check must not still spawn.
+			if (signal?.aborted) {
+				throw new Error("aborted");
+			}
 
 			const commandFromStdin = shellConfig.commandTransport === "stdin";
-			const child = spawn(shellConfig.shell, commandFromStdin ? shellConfig.args : [...shellConfig.args, command], {
+			const shellPath = shellConfig.shell;
+			const shellArgs = commandFromStdin ? [...shellConfig.args] : [...shellConfig.args, command];
+			if (beforeSpawn) {
+				await beforeSpawn({ command, shellPath, shellArgs: [...shellArgs], cwd, env: { ...effectiveEnv } });
+			}
+			if (signal?.aborted) throw new Error("aborted");
+			const child = spawn(shellPath, shellArgs, {
 				cwd,
 				detached: process.platform !== "win32",
-				env: env ?? getShellEnv(),
+				env: effectiveEnv,
 				stdio: [commandFromStdin ? "pipe" : "ignore", "pipe", "pipe"],
 				windowsHide: true,
 			});
@@ -172,7 +211,7 @@ export function createLocalShellOperations(shellName: string, resolveShellConfig
  * standard local shell behavior while wrapping or rewriting commands.
  */
 export function createLocalBashOperations(options?: { shellPath?: string }): BashOperations {
-	return createLocalShellOperations("bash", () => getShellConfig(options?.shellPath));
+	return createLocalShellOperations("bash", (env) => getShellConfig(options?.shellPath, env));
 }
 
 export interface BashSpawnContext {
@@ -245,26 +284,29 @@ export function createShellToolDefinition(
 	config: ShellToolConfig,
 	options?: BashToolOptions,
 ): ToolDefinition<typeof bashSchema, BashToolDetails | undefined, BashRenderState> {
-	const ops = options?.operations ?? createLocalBashOperations({ shellPath: options?.shellPath });
+	const customOperations = options?.operations;
+	const shellPath = options?.shellPath;
+	const ops = customOperations ?? createLocalBashOperations({ shellPath });
 	const commandPrefix = options?.commandPrefix;
 	const exposeSessionEnvironment = options?.exposeSessionEnvironment ?? true;
 	const spawnHook = options?.spawnHook;
 	return {
 		name: config.name,
 		label: config.label,
-		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.`,
+		description: `Execute a ${config.shellName} command in the current working directory. Returns stdout and stderr. Output is truncated to last ${DEFAULT_MAX_LINES} lines or ${DEFAULT_MAX_BYTES / 1024}KB (whichever is hit first). If truncated, output is saved to a temp file that keeps at most the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}. Optionally provide a timeout in seconds.`,
 		promptSnippet: config.promptSnippet,
 		promptGuidelines: exposeSessionEnvironment && config.promptGuidelines ? [...config.promptGuidelines] : undefined,
 		parameters: bashSchema,
 		outputSchema: bashOutputSchema,
 		constrainedSampling: { type: "json_schema", strict: "prefer" },
 		async execute(
-			_toolCallId,
+			toolCallId,
 			{ command, timeout }: { command: string; timeout?: number },
 			signal?: AbortSignal,
 			onUpdate?,
 			ctx?: ExtensionContext,
 		) {
+			resolveTimeoutMs(timeout);
 			const resolvedCommand = commandPrefix ? `${commandPrefix}\n${command}` : command;
 			const spawnContext = resolveSpawnContext(
 				resolvedCommand,
@@ -273,6 +315,27 @@ export function createShellToolDefinition(
 				exposeSessionEnvironment,
 				ctx,
 			);
+			// Snapshot hook output before any asynchronous handler can change a retained reference.
+			const execution: BashSpawnContext = {
+				command: spawnContext.command,
+				cwd: spawnContext.cwd,
+				env: { ...spawnContext.env },
+			};
+			const emitBashSpawn = config.name === "bash" ? ctx?.emitBashSpawn : undefined;
+			const beforeSpawn = emitBashSpawn
+				? async (spawn: LocalShellSpawn) => {
+						const result = await emitBashSpawn(
+							{ type: "bash_spawn", toolCallId, backend: "local-builtin", ...spawn },
+							signal,
+						);
+						if (result?.block) throw new Error(result.reason ?? "Bash spawn blocked");
+					}
+				: undefined;
+			const executionOps =
+				beforeSpawn && !customOperations
+					? createLocalShellOperations("bash", (env) => getShellConfig(shellPath, env), beforeSpawn)
+					: ops;
+
 			const output = new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix });
 			let acceptingOutput = true;
 			let updateTimer: NodeJS.Timeout | undefined;
@@ -289,6 +352,7 @@ export function createShellToolDefinition(
 					details: {
 						truncation: snapshot.truncation.truncated ? snapshot.truncation : undefined,
 						fullOutputPath: snapshot.fullOutputPath,
+						...(snapshot.fullOutputTruncation ? { fullOutputTruncation: snapshot.fullOutputTruncation } : {}),
 					},
 				});
 			};
@@ -330,27 +394,45 @@ export function createShellToolDefinition(
 				output.finish();
 				clearUpdateTimer();
 				emitOutputUpdate();
-				const snapshot = output.snapshot({ persistIfTruncated: true });
+				output.snapshot({ persistIfTruncated: true });
 				await output.closeTempFile();
-				return snapshot;
+				// Closing can fail after the command has already returned its output and exit code.
+				return output.snapshot();
 			};
 
 			const formatOutput = (snapshot: Awaited<ReturnType<typeof finishOutput>>, emptyText = "(no output)") => {
 				const truncation = snapshot.truncation;
 				let text = snapshot.content || emptyText;
+				const logNotice =
+					snapshot.fullOutputError !== undefined
+						? `Output log unavailable: ${snapshot.fullOutputError}`
+						: `Full output: ${snapshot.fullOutputPath}`;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
-					details = { truncation, fullOutputPath: snapshot.fullOutputPath };
+					details = {
+						truncation,
+						fullOutputPath: snapshot.fullOutputPath,
+						...(snapshot.fullOutputTruncation ? { fullOutputTruncation: snapshot.fullOutputTruncation } : {}),
+						...(snapshot.fullOutputError !== undefined ? { fullOutputError: snapshot.fullOutputError } : {}),
+					};
 					const startLine = truncation.totalLines - truncation.outputLines + 1;
 					const endLine = truncation.totalLines;
 					if (truncation.lastLinePartial) {
 						const lastLineSize = formatSize(output.getLastLineBytes());
-						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing last ${formatSize(truncation.outputBytes)} of line ${endLine} (line is ${lastLineSize}). ${logNotice}]`;
 					} else if (truncation.truncatedBy === "lines") {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines}. ${logNotice}]`;
 					} else {
-						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Full output: ${snapshot.fullOutputPath}]`;
+						text += `\n\n[Showing lines ${startLine}-${endLine} of ${truncation.totalLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). ${logNotice}]`;
 					}
+					const capped = snapshot.fullOutputTruncation;
+					if (capped) {
+						text += `\n[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)} (${formatSize(FULL_OUTPUT_HEAD_BYTES + FULL_OUTPUT_TAIL_BYTES)} cap)]`;
+					}
+				} else if (snapshot.fullOutputError !== undefined) {
+					// Chunk-count storage limits can open a log before display truncation is needed.
+					text += `\n\n[${logNotice}]`;
+					details = { fullOutputError: snapshot.fullOutputError };
 				}
 				return { text, details };
 			};
@@ -361,11 +443,19 @@ export function createShellToolDefinition(
 			try {
 				let exitCode: number | null;
 				try {
-					const result = await ops.exec(spawnContext.command, spawnContext.cwd, {
+					if (customOperations && emitBashSpawn) {
+						const result = await emitBashSpawn(
+							{ type: "bash_spawn", toolCallId, backend: "custom", ...execution, env: { ...execution.env } },
+							signal,
+						);
+						if (result?.block) throw new Error(result.reason ?? "Bash spawn blocked");
+					}
+					if (signal?.aborted) throw new Error("aborted");
+					const result = await executionOps.exec(execution.command, execution.cwd, {
 						onData: handleData,
 						signal,
 						timeout,
-						env: spawnContext.env,
+						env: execution.env,
 					});
 					exitCode = result.exitCode;
 				} catch (err) {
@@ -378,22 +468,35 @@ export function createShellToolDefinition(
 						const timeoutSecs = err.message.split(":")[1];
 						throw new Error(appendStatus(text, `Command timed out after ${timeoutSecs} seconds`));
 					}
+					if (snapshot.fullOutputError !== undefined) {
+						throw appendErrorNotice(err, `[Output log unavailable: ${snapshot.fullOutputError}]`);
+					}
+					const capped = snapshot.fullOutputTruncation;
+					if (capped && snapshot.fullOutputPath) {
+						throw appendErrorNotice(
+							err,
+							`[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}]`,
+						);
+					}
 					throw err;
 				}
 
-				const snapshot = await finishOutput();
+				await finishOutput();
+				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
+				// A read failure can also make the log unavailable, so take metadata after the read.
+				const snapshot = output.snapshot();
 				const { text: outputText, details } = formatOutput(snapshot);
 				if (exitCode === null) {
 					throw new Error(appendStatus(outputText, "Command terminated without an exit code"));
 				}
 				const wallTimeSeconds = Math.round((performance.now() - startedAt) / 100) / 10;
-				const fullOutput = await output.readFullOutput(STRUCTURED_OUTPUT_MAX_BYTES);
 				const structuredContent: BashToolOutput = {
 					output: fullOutput.content,
 					truncated: fullOutput.truncated,
 					...(fullOutput.truncated && snapshot.fullOutputPath
 						? { full_output_path: snapshot.fullOutputPath }
 						: {}),
+					...(snapshot.fullOutputError !== undefined ? { full_output_error: snapshot.fullOutputError } : {}),
 					exit_code: exitCode,
 					wall_time_seconds: wallTimeSeconds,
 				};
@@ -412,6 +515,23 @@ export function createShellToolDefinition(
 		},
 		...createShellRenderers(config.prompt),
 	};
+}
+
+/**
+ * Add a notice to an execution error without replacing it: an Error keeps its identity, cause and
+ * custom properties and gains the notice in its message; other values are wrapped with `cause`.
+ */
+export function appendErrorNotice(error: unknown, notice: string): unknown {
+	if (error instanceof Error) {
+		try {
+			error.message = `${error.message}\n\n${notice}`;
+			return error;
+		} catch {
+			// Read-only message: wrap below.
+		}
+	}
+	const message = error instanceof Error ? error.message : String(error);
+	return new Error(`${message}\n\n${notice}`, { cause: error });
 }
 
 const bashToolConfig: ShellToolConfig = {

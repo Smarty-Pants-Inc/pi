@@ -1,5 +1,6 @@
 import type { CodemodeDuring, CodemodeOutputItem } from "../types.ts";
 import type { CodemodeWasmModule } from "../wasm.ts";
+import type { CodemodeLimits } from "./limits.ts";
 
 /**
  * Messages between the host (main thread) and the worker. Tool arguments,
@@ -17,6 +18,8 @@ export interface VmStartData {
 	tools: { name: string; jsName: string; description: string }[];
 	globals: { name: string; spread: boolean }[];
 	memoryLimitBytes: number | undefined;
+	/** Bridge budgets the worker checks before it posts each message. */
+	limits: CodemodeLimits;
 	/** Snapshot for `load()`: key to JSON text. */
 	store: Record<string, string>;
 	/**
@@ -51,6 +54,8 @@ export type WorkerToHostMessage =
 	| { type: "done"; ok: false; error: ScriptErrorJson; during?: CodemodeDuring }
 	/** The VM failed outside the script's control, for example a wasm trap. */
 	| { type: "crash"; message: string }
+	/** The script went over a bridge budget; the VM posts nothing more. */
+	| { type: "limit"; message: string }
 	/** Deterministic mode, before the script runs: what the VM is, so a replay can refuse a different one. */
 	| { type: "started"; fingerprint: string }
 	/**
@@ -83,6 +88,7 @@ export function isWorkerToHostMessage(value: unknown): value is WorkerToHostMess
 		type === "output" ||
 		type === "done" ||
 		type === "crash" ||
+		type === "limit" ||
 		type === "started" ||
 		type === "idle"
 	);

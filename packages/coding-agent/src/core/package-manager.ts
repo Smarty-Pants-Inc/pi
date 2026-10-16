@@ -48,6 +48,7 @@ import {
 	resolvePath,
 } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import { isUnreviewedBuiltin, refuseUnreviewedBuiltin } from "./builtin-security-admission.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
 import { type PiManifest, readPiManifest } from "./pi-manifest.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";
@@ -987,7 +988,8 @@ export class DefaultPackageManager implements PackageManager {
 				accumulator.extensions,
 				path,
 				{ source: "builtin", scope: projectEnabled === undefined ? "user" : "project", origin: "top-level" },
-				projectEnabled ?? isEnabledByOverrides(path, globalSettings.extensions ?? [], globalBaseDir),
+				!isUnreviewedBuiltin(name) &&
+					(projectEnabled ?? isEnabledByOverrides(path, globalSettings.extensions ?? [], globalBaseDir)),
 			);
 		}
 
@@ -1002,6 +1004,8 @@ export class DefaultPackageManager implements PackageManager {
 		const scope: SourceScope = options?.temporary ? "temporary" : options?.local ? "project" : "user";
 		// `-e builtin:<name>` loads a built-in extension; the resource loader reports unknown names.
 		for (const source of sources.filter((source) => source.startsWith(BUILTIN_PATH_PREFIX))) {
+			const name = source.slice(BUILTIN_PATH_PREFIX.length);
+			if (name === "codemode" || name === "mcp") refuseUnreviewedBuiltin(name);
 			this.addResource(accumulator.extensions, source, { source: "builtin", scope, origin: "top-level" }, true);
 		}
 		const packageSources = sources

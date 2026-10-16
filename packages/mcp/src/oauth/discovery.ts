@@ -6,7 +6,14 @@
 
 import type { McpFetch } from "../auth-provider.ts";
 import { LATEST_PROTOCOL_VERSION } from "../protocol/types.ts";
-import { OAuthIssuerMismatchError } from "./errors.ts";
+import { refuseMcpAdmission } from "../security-admission.ts";
+import { metadataFetch, secureEndpoint, validateOAuthEndpointOrigins } from "./endpoints.ts";
+import {
+	OAuthInsecureEndpointError,
+	OAuthIssuerMismatchError,
+	OAuthRedirectRefusedError,
+	OAuthResourceMismatchError,
+} from "./errors.ts";
 import {
 	type AuthorizationServerMetadata,
 	type OAuthChallenge,
@@ -61,7 +68,7 @@ async function fetchMetadata(
 	protocolVersion: string,
 	signal: AbortSignal | undefined,
 ): Promise<Response> {
-	return fetch(url, {
+	return metadataFetch(fetch, url, {
 		headers: { Accept: "application/json", "MCP-Protocol-Version": protocolVersion },
 		signal,
 	});
@@ -76,6 +83,7 @@ export async function discoverProtectedResourceMetadata(
 		signal?: AbortSignal;
 	} = {},
 ): Promise<OAuthProtectedResourceMetadata> {
+	refuseMcpAdmission();
 	const server = new URL(serverUrl);
 	const fetch = options.fetch ?? globalThis.fetch;
 	const version = options.protocolVersion ?? LATEST_PROTOCOL_VERSION;
@@ -100,13 +108,16 @@ export async function discoverProtectedResourceMetadata(
 		discard(response);
 		throw new Error(`HTTP ${response.status} loading OAuth protected resource metadata`);
 	}
-	return parseProtectedResourceMetadata(await response.json());
+	const metadata = parseProtectedResourceMetadata(await response.json());
+	// RFC 9728 §3.3: metadata naming another resource must not steer this server's authorization.
+	selectResource(server, metadata);
+	return metadata;
 }
 
 export function buildAuthorizationServerDiscoveryUrls(
 	authorizationServerUrl: string | URL,
 ): { url: URL; type: "oauth" | "oidc" }[] {
-	const issuer = new URL(authorizationServerUrl);
+	const issuer = secureEndpoint(authorizationServerUrl);
 	const path = pathSuffix(issuer.pathname);
 	const urls: { url: URL; type: "oauth" | "oidc" }[] = [
 		{ url: new URL(`/.well-known/oauth-authorization-server${path}`, issuer.origin), type: "oauth" },
@@ -118,8 +129,18 @@ export function buildAuthorizationServerDiscoveryUrls(
 
 export async function discoverAuthorizationServerMetadata(
 	authorizationServerUrl: string | URL,
-	options: { fetch?: McpFetch; protocolVersion?: string; skipIssuerValidation?: boolean; signal?: AbortSignal } = {},
+	options: {
+		fetch?: McpFetch;
+		protocolVersion?: string;
+		/** @deprecated Ignored. Exact issuer identity is always required; configure a metadata URL instead. */
+		skipIssuerValidation?: boolean;
+		/** See `OAuthFlowOptions.allowedEndpointOrigins`. */
+		allowedEndpointOrigins?: readonly string[];
+		signal?: AbortSignal;
+	} = {},
 ): Promise<AuthorizationServerMetadata | undefined> {
+	refuseMcpAdmission();
+	validateOAuthEndpointOrigins(undefined, options.allowedEndpointOrigins);
 	const fetch = options.fetch ?? globalThis.fetch;
 	for (const { url } of buildAuthorizationServerDiscoveryUrls(authorizationServerUrl)) {
 		const response = await fetchMetadata(
@@ -134,12 +155,10 @@ export async function discoverAuthorizationServerMetadata(
 			throw new Error(`HTTP ${response.status} loading authorization server metadata from ${url}`);
 		}
 		const metadata = parseAuthorizationServerMetadata(await response.json());
-		if (!options.skipIssuerValidation) {
-			const expected = String(authorizationServerUrl);
-			// URL parsing adds a trailing slash to bare origins, so compare without one on either side.
-			const trim = (value: string) => (value.endsWith("/") ? value.slice(0, -1) : value);
-			if (trim(metadata.issuer) !== trim(expected)) throw new OAuthIssuerMismatchError(expected, metadata.issuer);
-		}
+		// RFC 8414 §3.3: exact issuer identity is mandatory, regardless of skipIssuerValidation.
+		const expected = String(authorizationServerUrl);
+		if (metadata.issuer !== expected) throw new OAuthIssuerMismatchError(expected, metadata.issuer);
+		validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
 		return metadata;
 	}
 	return undefined;
@@ -149,13 +168,21 @@ export async function discoverOAuthServerInfo(
 	serverUrl: string | URL,
 	options: {
 		resourceMetadataUrl?: URL;
-		/** Metadata document to use instead of discovery. It is trusted as configured, so its issuer is not checked. */
+		/**
+		 * Metadata document to use instead of discovery. It is trusted as configured, so its issuer is not checked,
+		 * but its endpoints must still share the origin of the issuer it names (see `allowedEndpointOrigins`).
+		 */
 		authorizationServerMetadataUrl?: URL;
 		fetch?: McpFetch;
+		/** @deprecated Ignored. Exact issuer identity is always required; configure a metadata URL instead. */
 		skipIssuerValidation?: boolean;
+		/** See `OAuthFlowOptions.allowedEndpointOrigins`. */
+		allowedEndpointOrigins?: readonly string[];
 		signal?: AbortSignal;
 	} = {},
 ): Promise<OAuthServerInfo> {
+	refuseMcpAdmission();
+	validateOAuthEndpointOrigins(undefined, options.allowedEndpointOrigins);
 	let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
 	try {
 		resourceMetadata = await discoverProtectedResourceMetadata(serverUrl, {
@@ -164,7 +191,13 @@ export async function discoverOAuthServerInfo(
 			signal: options.signal,
 		});
 	} catch (error) {
-		if (error instanceof TypeError) throw error;
+		if (
+			error instanceof TypeError ||
+			error instanceof OAuthInsecureEndpointError ||
+			error instanceof OAuthRedirectRefusedError ||
+			error instanceof OAuthResourceMismatchError
+		)
+			throw error;
 	}
 	if (options.authorizationServerMetadataUrl) {
 		const url = options.authorizationServerMetadataUrl;
@@ -179,14 +212,17 @@ export async function discoverOAuthServerInfo(
 			throw new Error(`HTTP ${response.status} loading authorization server metadata from ${url}`);
 		}
 		const metadata = parseAuthorizationServerMetadata(await response.json());
+		validateOAuthEndpointOrigins(metadata, options.allowedEndpointOrigins);
 		return { authorizationServerUrl: metadata.issuer, authorizationServerMetadata: metadata, resourceMetadata };
 	}
-	const authorizationServerUrl = resourceMetadata?.authorization_servers?.[0] ?? String(new URL("/", serverUrl));
+	// Without resource metadata the issuer is the server origin, which has no trailing slash.
+	const authorizationServerUrl = resourceMetadata?.authorization_servers?.[0] ?? new URL(serverUrl).origin;
 	return {
 		authorizationServerUrl,
 		authorizationServerMetadata: await discoverAuthorizationServerMetadata(authorizationServerUrl, {
 			fetch: options.fetch,
 			skipIssuerValidation: options.skipIssuerValidation,
+			allowedEndpointOrigins: options.allowedEndpointOrigins,
 			signal: options.signal,
 		}),
 		resourceMetadata,
@@ -204,12 +240,12 @@ export function selectResource(serverUrl: string | URL, metadata?: OAuthProtecte
 	const requested = resourceUrlFromServerUrl(serverUrl);
 	const configured = new URL(metadata.resource);
 	if (requested.origin !== configured.origin) {
-		throw new Error(`Protected resource ${metadata.resource} does not match MCP server ${requested}`);
+		throw new OAuthResourceMismatchError(requested.href, metadata.resource);
 	}
 	const requestedPath = requested.pathname.endsWith("/") ? requested.pathname : `${requested.pathname}/`;
 	const configuredPath = configured.pathname.endsWith("/") ? configured.pathname : `${configured.pathname}/`;
 	if (!requestedPath.startsWith(configuredPath)) {
-		throw new Error(`Protected resource ${metadata.resource} does not match MCP server ${requested}`);
+		throw new OAuthResourceMismatchError(requested.href, metadata.resource);
 	}
 	return metadata.resource;
 }

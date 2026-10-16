@@ -71,7 +71,15 @@ function rebuildBashResultRenderComponent(
 
 	if (truncation?.truncated || fullOutputPath) {
 		const warnings: string[] = [];
-		if (fullOutputPath) {
+		const capped = result.details?.fullOutputTruncation;
+		if (fullOutputPath && capped) {
+			// The log keeps equal head and tail slices; derive them from the recorded counts so this presentation
+			// module does not import the accumulator runtime.
+			const keptPerSide = formatSize(Math.max(0, (capped.totalBytes - capped.omittedBytes) / 2));
+			warnings.push(
+				`Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${fullOutputPath} keeps the first ${keptPerSide} and last ${keptPerSide}`,
+			);
+		} else if (fullOutputPath) {
 			warnings.push(`Full output: ${fullOutputPath}`);
 		}
 		if (truncation?.truncated) {

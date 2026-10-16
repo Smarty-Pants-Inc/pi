@@ -1,5 +1,5 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { AgentTool } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantImages,
@@ -27,6 +27,7 @@ import {
 	type CodemodeToolDetails,
 	createCodemodeTool,
 } from "../../src/extensions/codemode/tool.ts";
+import { getOutputDirectory } from "../../src/utils/output-files.ts";
 import { createHarness, getToolResult, type Harness, type HarnessOptions } from "./harness.ts";
 
 const TINY_PNG_BASE64 =
@@ -116,6 +117,7 @@ function checkSavedImages(text: string): string {
 		.join("\n");
 }
 
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 describe("AgentSession codemode tool", () => {
 	const harnesses: Harness[] = [];
 
@@ -444,6 +446,7 @@ describe("AgentSession codemode tool", () => {
 	});
 });
 
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 describe("codemode options and store", () => {
 	const harnesses: Harness[] = [];
 
@@ -520,7 +523,8 @@ describe("codemode options and store", () => {
 		expect(n).toBeLessThan(512);
 	});
 
-	it("truncates output to the token budget and spills the full text", async () => {
+	// smarty-dev#4506: output must cross the real sandbox/host boundary into its owned directory.
+	it("truncates output to the token budget and spills the full text into the owned directory", async () => {
 		const harness = await setup();
 		const result = await run(
 			harness,
@@ -530,6 +534,10 @@ describe("codemode options and store", () => {
 		const path = details.fullOutputPath;
 		if (!path) throw new Error("No spill file");
 		try {
+			expect(result.isError).toBe(false);
+			expect(dirname(path)).toBe(getOutputDirectory());
+			expect(lstatSync(getOutputDirectory()).mode & 0o777).toBe(0o700);
+			expect(lstatSync(path).mode & 0o777).toBe(0o400);
 			const text = resultText(result);
 			expect(text).toMatch(/^Warning: truncated output/);
 			expect(text).toContain("row 0\n");
@@ -661,6 +669,7 @@ describe("codemode options and store", () => {
 	});
 });
 
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 describe("codemode models", () => {
 	const harnesses: Harness[] = [];
 

@@ -129,27 +129,31 @@ describe("DefaultPackageManager", () => {
 				cwd: tempDir,
 				agentDir,
 				settingsManager,
-				builtinExtensions: ["mcp", "llama.cpp"],
+				builtinExtensions: ["mcp", "llama.cpp", "codemode"],
 			});
 			const builtins = async () =>
 				(await pm.resolve()).extensions.map((r) => [r.path, r.enabled, r.metadata.source, r.metadata.scope]);
 
+			// smarty-dev#4506: MCP opt-in stays refused; reviewed Codemode remains admitted.
 			expect(await builtins()).toEqual([
-				["builtin:mcp", true, "builtin", "user"],
+				["builtin:mcp", false, "builtin", "user"],
 				["builtin:llama.cpp", true, "builtin", "user"],
+				["builtin:codemode", true, "builtin", "user"],
 			]);
 
 			settingsManager.setExtensionPaths(["-builtin:mcp"]);
 			settingsManager.setProjectExtensionPaths(["+builtin:mcp", "-builtin:llama.cpp"]);
 			expect(await builtins()).toEqual([
-				["builtin:mcp", true, "builtin", "project"],
+				["builtin:mcp", false, "builtin", "project"],
 				["builtin:llama.cpp", false, "builtin", "project"],
+				["builtin:codemode", true, "builtin", "user"],
 			]);
 
 			settingsManager.setProjectExtensionPaths([]);
 			expect(await builtins()).toEqual([
 				["builtin:mcp", false, "builtin", "user"],
 				["builtin:llama.cpp", true, "builtin", "user"],
+				["builtin:codemode", true, "builtin", "user"],
 			]);
 		});
 
@@ -600,6 +604,35 @@ Content`,
 	});
 
 	describe("resolveExtensionSources", () => {
+		// smarty-dev#4506: refuse before accumulating resources or resolving package sources.
+		it("should refuse explicit MCP before resource accumulation", async () => {
+			const internals = packageManager as unknown as {
+				addResource(...args: unknown[]): void;
+				resolvePackageSources(...args: unknown[]): Promise<void>;
+			};
+			const addResource = vi.spyOn(internals, "addResource");
+			const resolvePackageSources = vi.spyOn(internals, "resolvePackageSources");
+
+			await expect(packageManager.resolveExtensionSources(["builtin:mcp", "npm:must-not-resolve"])).rejects.toThrow(
+				"MCP_SECURITY_REVIEW_REQUIRED",
+			);
+			expect(addResource).not.toHaveBeenCalled();
+			expect(resolvePackageSources).not.toHaveBeenCalled();
+		});
+
+		// smarty-dev#4506: final reviewed policy admits Codemode, including explicit loading.
+		it("should resolve explicit Codemode", async () => {
+			const result = await packageManager.resolveExtensionSources(["builtin:codemode"]);
+
+			expect(result.extensions).toEqual([
+				{
+					path: "builtin:codemode",
+					enabled: true,
+					metadata: { source: "builtin", scope: "user", origin: "top-level" },
+				},
+			]);
+		});
+
 		it("should resolve local paths", async () => {
 			const extPath = join(tempDir, "ext.ts");
 			writeFileSync(extPath, "export default function() {}");

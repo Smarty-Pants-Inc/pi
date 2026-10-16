@@ -9,6 +9,7 @@ import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
+import { type ModelPolicyTarget, modelPolicyAllows } from "./model-policy.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
 import type {
 	CacheWarmingMode,
@@ -274,6 +275,7 @@ export class SettingsManager {
 	private globalSettings: Settings;
 	private projectSettings: Settings;
 	private settings: Settings;
+	private modelPolicyOverrides: unknown[] = [];
 	private projectTrusted: boolean;
 	private modifiedFields = new Set<keyof Settings>(); // Track global fields modified during session
 	private modifiedNestedFields = new Map<keyof Settings, Set<string>>(); // Track global nested field modifications
@@ -374,11 +376,13 @@ export class SettingsManager {
 			return undefined;
 		});
 
-		if (!content) {
-			return {};
+		// Only absence means no settings; empty or non-object JSON must fail closed.
+		if (content === undefined) return {};
+		const settings: unknown = JSON.parse(stripBom(content));
+		if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
+			throw new Error("settings file root must be a JSON object");
 		}
-		const settings = JSON.parse(stripBom(content));
-		return SettingsManager.migrateSettings(settings);
+		return SettingsManager.migrateSettings(settings as Record<string, unknown>);
 	}
 
 	private static tryLoadFromStorage(
@@ -525,8 +529,9 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
-	/** Apply additional overrides on top of current settings */
+	/** Apply overrides; model policies may only narrow prior layers. */
 	applyOverrides(overrides: Partial<Settings>): void {
+		if (overrides.modelPolicy !== undefined) this.modelPolicyOverrides.push(structuredClone(overrides.modelPolicy));
 		this.settings = deepMergeSettings(this.settings, overrides);
 	}
 
@@ -925,9 +930,8 @@ export class SettingsManager {
 		this.save();
 	}
 
-	/** Read from global settings only because warming costs money. */
 	getCacheWarmingMode(): CacheWarmingMode {
-		const mode = this.globalSettings.cacheWarming;
+		const mode = this.settings.cacheWarming;
 		return mode !== undefined && CACHE_WARMING_MODES.includes(mode) ? mode : SETTINGS_DEFAULTS.cacheWarming;
 	}
 
@@ -1338,6 +1342,16 @@ export class SettingsManager {
 
 	getEnabledModels(): string[] | undefined {
 		return this.settings.enabledModels;
+	}
+
+	/** Match each layer independently; project settings cannot widen the global policy. */
+	isModelAllowed(model: ModelPolicyTarget): boolean {
+		if (this.globalSettingsLoadError || this.projectSettingsLoadError) return false;
+		return (
+			modelPolicyAllows(this.globalSettings.modelPolicy, model) &&
+			modelPolicyAllows(this.projectSettings.modelPolicy, model) &&
+			this.modelPolicyOverrides.every((policy) => modelPolicyAllows(policy, model))
+		);
 	}
 
 	/** The resolved `defaultTools` selection, or undefined when no settings layer sets it. */

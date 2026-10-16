@@ -456,9 +456,9 @@ export function resolveCliModel(options: {
 		return { model: undefined, warning: undefined, error: undefined };
 	}
 
-	// Important: use *all* models here, not just models with pre-configured auth.
-	// This allows "--api-key" to be used for first-time setup.
-	const models = [...modelRuntime.getModels()];
+	// Explicit selection retains policy-hidden identity for ModelPolicyError at dispatch.
+	// Include unauthenticated models for --api-key first-time setup; preserve ambiguity handling.
+	const models = [...modelRuntime.getModels(undefined, { includeDisallowed: true })];
 	if (models.length === 0) {
 		return {
 			model: undefined,

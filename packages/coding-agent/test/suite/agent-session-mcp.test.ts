@@ -117,7 +117,8 @@ function createFakeServer(
 	return pair;
 }
 
-describe("AgentSession MCP integration", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession MCP integration", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -437,7 +438,9 @@ describe("AgentSession MCP integration", () => {
 
 		const result = toolResult(harness, "mcp__docs__search");
 		expect(result.isError).toBe(true);
-		expect(getMessageText(result)).toBe("Tool mcp__docs__search not found");
+		expect(getMessageText(result)).toBe(
+			"Tool mcp__docs__search not found. Available tools in this session: codemode",
+		);
 		expect(calls).toEqual([]);
 	});
 
@@ -1028,7 +1031,8 @@ return [...new Set(await Promise.all(names.map(async (name) => (await describeNa
 	});
 });
 
-describe("AgentSession MCP servers registered by extensions", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession MCP servers registered by extensions", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {
@@ -1145,7 +1149,8 @@ describe("AgentSession MCP servers registered by extensions", () => {
 	});
 });
 
-describe("AgentSession MCP tools after resume and reload", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("AgentSession MCP tools after resume and reload", () => {
 	const harnesses: Harness[] = [];
 
 	afterEach(() => {

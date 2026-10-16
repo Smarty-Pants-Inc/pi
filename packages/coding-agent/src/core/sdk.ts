@@ -1,8 +1,9 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, setDefaultStreamFn, type ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ModelsSimpleStreamOptions } from "@earendil-works/pi-ai";
+import { type ModelsSimpleStreamOptions, registerSessionResourceCleanup } from "@earendil-works/pi-ai";
 import { clampThinkingLevel, type Message, type Model, streamSimple } from "@earendil-works/pi-ai/compat";
 import { getAgentDir } from "../config.ts";
+import { raceWithAbortSignal } from "../utils/abort.ts";
 import { resolvePath } from "../utils/paths.ts";
 import { AgentSession } from "./agent-session.ts";
 import { formatNoModelsAvailableMessage } from "./auth-guidance.ts";
@@ -124,9 +125,13 @@ export type {
 	ExtensionContext,
 	ExtensionFactory,
 	InlineExtension,
+	SendUserMessageOptions,
+	SendUserMessageResult,
 	SlashCommandInfo,
 	SlashCommandSource,
 	ToolDefinition,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
 } from "./extensions/index.ts";
 export type { PromptTemplate } from "./prompt-templates.ts";
 export type { Skill } from "./skills.ts";
@@ -195,9 +200,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 
 	const authPath = options.agentDir ? join(agentDir, "auth.json") : undefined;
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
-	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath }));
-
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
+	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath, settingsManager }));
 	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
@@ -210,278 +214,291 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
+	const disposeModelPolicy = modelRuntime.addModelPolicy(settingsManager);
+	let unregisterPolicyCleanup: (() => void) | undefined;
+	try {
+		let model = options.model;
+		let modelFallbackMessage: string | undefined;
 
-	let model = options.model;
-	let modelFallbackMessage: string | undefined;
+		// Assistant messages name the physical model that answered, so a virtual selection is only in
+		// model_change entries.
+		const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
+			modelRuntime.getModel(provider, modelId),
+		);
 
-	// Assistant messages name the physical model that answered, so a virtual selection is only in
-	// model_change entries.
-	const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
-		modelRuntime.getModel(provider, modelId),
-	);
-
-	// If session has data, try to restore model from it
-	if (!model && hasExistingSession && sessionModel) {
-		const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
-		if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
-			model = restoredModel;
+		// If session has data, try to restore model from it
+		if (!model && hasExistingSession && sessionModel) {
+			const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
+			if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
+				model = restoredModel;
+			}
+			if (!model) {
+				modelFallbackMessage = `Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`;
+			}
 		}
+
+		// If still no model, use findInitialModel (checks settings default, then provider defaults)
 		if (!model) {
-			modelFallbackMessage = `Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`;
+			const result = await findInitialModel({
+				scopedModels: [],
+				isContinuing: hasExistingSession,
+				defaultProvider: settingsManager.getDefaultProvider(),
+				defaultModelId: settingsManager.getDefaultModel(),
+				defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
+				modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
+				modelRuntime,
+			});
+			model = result.model;
+			if (!model) {
+				modelFallbackMessage = formatNoModelsAvailableMessage();
+			} else if (modelFallbackMessage) {
+				modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+			}
 		}
-	}
 
-	// If still no model, use findInitialModel (checks settings default, then provider defaults)
-	if (!model) {
-		const result = await findInitialModel({
-			scopedModels: [],
-			isContinuing: hasExistingSession,
-			defaultProvider: settingsManager.getDefaultProvider(),
-			defaultModelId: settingsManager.getDefaultModel(),
-			defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
-			modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
-			modelRuntime,
-		});
-		model = result.model;
+		let thinkingLevel = options.thinkingLevel;
+
+		// If session has data, restore thinking level from it
+		if (thinkingLevel === undefined && hasExistingSession) {
+			thinkingLevel = hasThinkingEntry
+				? (existingSession.thinkingLevel as ThinkingLevel)
+				: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
+		}
+
+		// Fall back to per-model override, then global default
+		if (thinkingLevel === undefined && model) {
+			const perModel = settingsManager.getModelThinkingLevel(model.provider, model.id);
+			if (perModel) {
+				thinkingLevel = perModel;
+			}
+		}
+		if (thinkingLevel === undefined) {
+			thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+		}
+
+		// Clamp to model capabilities
 		if (!model) {
-			modelFallbackMessage = formatNoModelsAvailableMessage();
-		} else if (modelFallbackMessage) {
-			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+			thinkingLevel = "off";
+		} else {
+			thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 		}
-	}
 
-	let thinkingLevel = options.thinkingLevel;
+		const toolListError = options.tools ? getToolListError(options.tools) : undefined;
+		if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
+		const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
+		// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
+		// replacing it, like the `defaultTools` setting.
+		const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
+		const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
+		const allowedToolNames = toolModifiers
+			? options.noTools === "all"
+				? selectedToolNames
+				: undefined
+			: (options.tools ?? (options.noTools === "all" ? [] : undefined));
+		const excludedToolNames = options.excludeTools;
+		const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
+		const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
 
-	// If session has data, restore thinking level from it
-	if (thinkingLevel === undefined && hasExistingSession) {
-		thinkingLevel = hasThinkingEntry
-			? (existingSession.thinkingLevel as ThinkingLevel)
-			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
-	}
-
-	// Fall back to per-model override, then global default
-	if (thinkingLevel === undefined && model) {
-		const perModel = settingsManager.getModelThinkingLevel(model.provider, model.id);
-		if (perModel) {
-			thinkingLevel = perModel;
-		}
-	}
-	if (thinkingLevel === undefined) {
-		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
-	}
-
-	// Clamp to model capabilities
-	if (!model) {
-		thinkingLevel = "off";
-	} else {
-		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
-	}
-
-	const toolListError = options.tools ? getToolListError(options.tools) : undefined;
-	if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
-	const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
-	// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
-	// replacing it, like the `defaultTools` setting.
-	const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
-	const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
-	const allowedToolNames = toolModifiers
-		? options.noTools === "all"
-			? selectedToolNames
-			: undefined
-		: (options.tools ?? (options.noTools === "all" ? [] : undefined));
-	const excludedToolNames = options.excludeTools;
-	const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
-	const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
-
-	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
-	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		const converted = convertToLlm(messages);
-		// Check setting dynamically so mid-session changes take effect
-		if (!settingsManager.getBlockImages()) {
-			return converted;
-		}
-		// Filter out ImageContent from all messages, replacing with text placeholder
-		return converted.map((msg) => {
-			if (msg.role === "user" || msg.role === "toolResult") {
-				const content = msg.content;
-				if (Array.isArray(content)) {
-					const hasImages = content.some((c) => c.type === "image");
-					if (hasImages) {
-						const filteredContent = content
-							.map((c) =>
-								c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
-							)
-							.filter(
-								(c, i, arr) =>
-									// Dedupe consecutive "Image reading is disabled." texts
-									!(
-										c.type === "text" &&
-										c.text === "Image reading is disabled." &&
-										i > 0 &&
-										arr[i - 1].type === "text" &&
-										(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
-									),
-							);
-						return { ...msg, content: filteredContent };
+		// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
+		const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
+			const converted = convertToLlm(messages);
+			// Check setting dynamically so mid-session changes take effect
+			if (!settingsManager.getBlockImages()) {
+				return converted;
+			}
+			// Filter out ImageContent from all messages, replacing with text placeholder
+			return converted.map((msg) => {
+				if (msg.role === "user" || msg.role === "toolResult") {
+					const content = msg.content;
+					if (Array.isArray(content)) {
+						const hasImages = content.some((c) => c.type === "image");
+						if (hasImages) {
+							const filteredContent = content
+								.map((c) =>
+									c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
+								)
+								.filter(
+									(c, i, arr) =>
+										// Dedupe consecutive "Image reading is disabled." texts
+										!(
+											c.type === "text" &&
+											c.text === "Image reading is disabled." &&
+											i > 0 &&
+											arr[i - 1].type === "text" &&
+											(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
+										),
+								);
+							return { ...msg, content: filteredContent };
+						}
 					}
 				}
-			}
-			return msg;
-		});
-	};
-
-	const extensionRunnerRef: { current?: ExtensionRunner } = {};
-	const cacheWarmer = new CacheWarmer(
-		modelRuntime,
-		sessionManager,
-		() => settingsManager.getCacheWarmingMode(),
-		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
-	);
-	const buildRequestOptions = (
-		requestModel: Model<any>,
-		options: ModelsSimpleStreamOptions = {},
-	): ModelsSimpleStreamOptions => {
-		const providerRetrySettings = settingsManager.getProviderRetrySettings();
-		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
-		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-		const headerRunner = extensionRunnerRef.current;
-		return {
-			...options,
-			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
-			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
-			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
-			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-			transformHeaders: async (requestHeaders) => {
-				const headers = mergeProviderAttributionHeaders(
-					requestModel,
-					settingsManager,
-					options.sessionId,
-					requestHeaders,
-				);
-				return headerRunner?.hasHandlers("before_provider_headers")
-					? headerRunner.emitBeforeProviderHeaders(headers ?? {})
-					: (headers ?? {});
-			},
+				return msg;
+			});
 		};
-	};
-	// Warm only requests for the selected model. Requests a virtual selection routed, or that an
-	// extension redirected, may not be repeated by the next request, so warming them could be wasted.
-	const cacheContextIsCurrent = (requestModel: Model<any>) => {
-		const messages = agent.state.messages;
-		return () => {
-			const currentModel = agent.state.model;
-			const currentMessages = agent.state.messages;
-			return (
-				currentModel.provider === requestModel.provider &&
-				currentModel.id === requestModel.id &&
-				messages.length <= currentMessages.length &&
-				messages.every((message, index) => currentMessages[index] === message)
+
+		const extensionRunnerRef: { current?: ExtensionRunner } = {};
+		const cacheWarmer = new CacheWarmer(
+			modelRuntime,
+			sessionManager,
+			() => settingsManager.getCacheWarmingMode(),
+			async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
+		);
+		// Request-preparation hooks stop waiting on terminal shutdown, like tool hooks.
+		let shutdownSignal: AbortSignal | undefined;
+		const buildRequestOptions = (
+			requestModel: Model<any>,
+			options: ModelsSimpleStreamOptions = {},
+		): ModelsSimpleStreamOptions => {
+			const providerRetrySettings = settingsManager.getProviderRetrySettings();
+			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+			const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+			const headerRunner = extensionRunnerRef.current;
+			return {
+				...options,
+				timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
+				websocketConnectTimeoutMs:
+					options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
+				maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
+				maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				transformHeaders: async (requestHeaders) => {
+					const headers = mergeProviderAttributionHeaders(
+						requestModel,
+						settingsManager,
+						options.sessionId,
+						requestHeaders,
+					);
+					return headerRunner?.hasHandlers("before_provider_headers")
+						? raceWithAbortSignal(headerRunner.emitBeforeProviderHeaders(headers ?? {}), shutdownSignal)
+						: (headers ?? {});
+				},
+			};
+		};
+		// Warm only requests for the selected model. Requests a virtual selection routed, or that an
+		// extension redirected, may not be repeated by the next request, so warming them could be wasted.
+		const cacheContextIsCurrent = (requestModel: Model<any>) => {
+			const messages = agent.state.messages;
+			return () => {
+				const currentModel = agent.state.model;
+				const currentMessages = agent.state.messages;
+				return (
+					currentModel.provider === requestModel.provider &&
+					currentModel.id === requestModel.id &&
+					messages.length <= currentMessages.length &&
+					messages.every((message, index) => currentMessages[index] === message)
+				);
+			};
+		};
+		const transformProviderPayload = async (payload: unknown) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner?.hasHandlers("before_provider_request")) return payload;
+			return raceWithAbortSignal(runner.emitBeforeProviderRequest(payload), shutdownSignal);
+		};
+		const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner?.hasHandlers("after_provider_response")) return;
+			// Value-free notification, never authenticated response headers (smarty-dev#5822 C1).
+			await raceWithAbortSignal(
+				runner.emit(
+					response.status === undefined
+						? { type: "after_provider_response" }
+						: { type: "after_provider_response", status: response.status },
+				),
+				shutdownSignal,
 			);
 		};
-	};
-	const transformProviderPayload = async (payload: unknown) => {
-		const runner = extensionRunnerRef.current;
-		if (!runner?.hasHandlers("before_provider_request")) return payload;
-		return runner.emitBeforeProviderRequest(payload);
-	};
-	const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
-		const runner = extensionRunnerRef.current;
-		if (!runner?.hasHandlers("after_provider_response")) return;
-		await runner.emit({
-			type: "after_provider_response",
-			status: response.status,
-			headers: response.headers,
-		});
-	};
-	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async (
-		data,
-		model,
-	) => {
-		const runner = extensionRunnerRef.current;
-		if (!runner?.hasHandlers("provider_stream_event")) return;
-		await runner.emit({
-			data,
-			type: "provider_stream_event",
-			provider: model.provider,
-			api: model.api,
-			model: model.id,
-		});
-	};
-
-	const agent = new Agent({
-		initialState: {
-			systemPrompt: "",
-			model,
-			thinkingLevel,
-			tools: [],
-			messages: existingSession.messages,
-		},
-		convertToLlm: convertToLlmWithBlockImages,
-		streamFn: async (model, context, options) => {
-			const requestOptions = buildRequestOptions(model, options);
-			// Compaction and summaries use their own routing ids; only session requests
-			// replace the cache entry, so warming restarts from them. Keep warming while
-			// the current transcript still extends the request's prefix. Agent state may
-			// shallow-copy the messages array or refresh the model object without changing
-			// the provider request, so top-level object identity is not a valid cache key.
-			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
-			}
-			return modelRuntime.streamSimple(model, context, requestOptions);
-		},
-		onPayload: transformProviderPayload,
-		onResponse: handleProviderResponse,
-		onProviderStreamEvent: handleProviderStreamEvent,
-		sessionId: sessionManager.getSessionId(),
-		transformContext: async (messages) => {
+		const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async () => {
 			const runner = extensionRunnerRef.current;
-			if (!runner) return messages;
-			return runner.emitContext(messages);
-		},
-		steeringMode: settingsManager.getSteeringMode(),
-		followUpMode: settingsManager.getFollowUpMode(),
-		transport: settingsManager.getTransport(),
-		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-	});
+			if (!runner?.hasHandlers("provider_stream_event")) return;
+			await runner.emit({ type: "provider_stream_event" });
+		};
 
-	// Restore missing settings metadata for older sessions.
-	if (hasExistingSession) {
-		if (!hasThinkingEntry) {
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "",
+				model,
+				thinkingLevel,
+				tools: [],
+				messages: existingSession.messages,
+			},
+			convertToLlm: convertToLlmWithBlockImages,
+			streamFn: async (model, context, options) => {
+				const requestOptions = buildRequestOptions(model, options);
+				// Compaction and summaries use their own routing ids; only session requests
+				// replace the cache entry, so warming restarts from them. Keep warming while
+				// the current transcript still extends the request's prefix. Agent state may
+				// shallow-copy the messages array or refresh the model object without changing
+				// the provider request, so top-level object identity is not a valid cache key.
+				if (options?.sessionId === sessionManager.getSessionId()) {
+					cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+				}
+				return modelRuntime.streamSimple(model, context, requestOptions);
+			},
+			onPayload: transformProviderPayload,
+			onResponse: handleProviderResponse,
+			onProviderStreamEvent: handleProviderStreamEvent,
+			sessionId: sessionManager.getSessionId(),
+			transformContext: async (messages) => {
+				const runner = extensionRunnerRef.current;
+				if (!runner) return messages;
+				return raceWithAbortSignal(runner.emitContext(messages), shutdownSignal);
+			},
+			steeringMode: settingsManager.getSteeringMode(),
+			followUpMode: settingsManager.getFollowUpMode(),
+			transport: settingsManager.getTransport(),
+			thinkingBudgets: settingsManager.getThinkingBudgets(),
+			maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		});
+
+		// Restore missing settings metadata for older sessions.
+		if (hasExistingSession) {
+			if (!hasThinkingEntry) {
+				sessionManager.appendThinkingLevelChange(thinkingLevel);
+			}
+		} else {
+			// Save initial model and thinking level for new sessions so they can be restored on resume
+			if (model) {
+				sessionManager.appendModelChange(model.provider, model.id);
+			}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
-	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
-		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
+
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd,
+			scopedModels: options.scopedModels,
+			resourceLoader,
+			customTools: options.customTools,
+			modelRuntime,
+			cacheWarmer,
+			initialActiveToolNames,
+			usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
+			defaultToolModifiers: toolModifiers,
+			allowedToolNames,
+			excludedToolNames,
+			extensionRunnerRef,
+			sessionStartEvent: options.sessionStartEvent,
+		});
+
+		unregisterPolicyCleanup = registerSessionResourceCleanup((sessionId) => {
+			// Session IDs may be shared: release only this disposed instance's registration.
+			if (sessionId !== session.sessionId || !session.isDisposed) return;
+			disposeModelPolicy();
+			unregisterPolicyCleanup?.();
+		});
+		shutdownSignal = session.shutdownSignal;
+		const extensionsResult = resourceLoader.getExtensions();
+
+		return {
+			session,
+			extensionsResult,
+			modelFallbackMessage,
+		};
+	} catch (error) {
+		// Roll back only this construction's lease, including failures before a session exists.
+		unregisterPolicyCleanup?.();
+		disposeModelPolicy();
+		throw error;
 	}
-
-	const session = new AgentSession({
-		agent,
-		sessionManager,
-		settingsManager,
-		cwd,
-		scopedModels: options.scopedModels,
-		resourceLoader,
-		customTools: options.customTools,
-		modelRuntime,
-		cacheWarmer,
-		initialActiveToolNames,
-		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
-		defaultToolModifiers: toolModifiers,
-		allowedToolNames,
-		excludedToolNames,
-		extensionRunnerRef,
-		sessionStartEvent: options.sessionStartEvent,
-	});
-
-	const extensionsResult = resourceLoader.getExtensions();
-
-	return {
-		session,
-		extensionsResult,
-		modelFallbackMessage,
-	};
 }

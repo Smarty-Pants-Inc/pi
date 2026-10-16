@@ -1,15 +1,19 @@
 import {
+	type AnyModel,
+	type ClassifierModel,
 	createModels,
 	createProvider,
 	type ImageModel,
+	InMemoryCredentialStore,
 	InMemoryModelsStore,
 	type Model,
 	type ModelsPublication,
 	type Provider,
 	type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { VERSION } from "../src/config.ts";
+import { ModelRuntime } from "../src/core/model-runtime.ts";
 import {
 	type PersonalizeCatalog,
 	REMOTE_CATALOG_MODEL_TYPES,
@@ -34,11 +38,12 @@ function model(id: string): Model<"openai-completions"> {
 	};
 }
 
-function builtinProvider(): Provider {
+function builtinProvider(models: readonly AnyModel[] = [model("static")]): Provider {
 	return createProvider({
 		id: "test-provider",
+		baseUrl: "https://example.test/v1",
 		auth: { apiKey: { name: "Test", resolve: async () => ({ auth: {} }) } },
-		models: [model("static")],
+		models,
 		api: {
 			stream: () => {
 				throw new Error("not used");
@@ -75,10 +80,121 @@ async function refreshProvider(
 	});
 }
 
+beforeEach(() => vi.stubEnv("PI_REMOTE_CATALOG", "1"));
 afterEach(() => vi.restoreAllMocks());
+
+describe("remote catalog opt-in", () => {
+	// pi#244: disabled catalogs must not activate hostile metadata from network or saved overlays.
+	it.each([undefined, "0", "true"])("keeps only the local baseline when PI_REMOTE_CATALOG=%s", async (value) => {
+		vi.stubEnv("PI_REMOTE_CATALOG", value);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected catalog request"));
+		const personalize = vi.fn<PersonalizeCatalog>();
+		for (const provider of [testProvider(), withPersonalizedCatalog(builtinProvider(), personalize)]) {
+			const store = new InMemoryModelsStore();
+			await store.write(provider.id, {
+				models: [{ ...model("static"), contextWindow: 1, maxTokens: 999999999 }],
+				lastModified: Date.now() + 1000,
+			});
+			await refreshProvider(provider, store, { allowNetwork: true, force: true });
+			expect(provider.getModels()).toEqual([model("static")]);
+			expect(await store.read(provider.id)).toBeUndefined();
+		}
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(personalize).not.toHaveBeenCalled();
+	});
+
+	// pi#244: disabling the opt-in discards an already active remote or personalized overlay too.
+	it("drops active overlays when the remote catalog opt-in is removed", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response(JSON.stringify({ dynamic: model("dynamic") })));
+		const personalize: PersonalizeCatalog = async (catalog) => catalog;
+		for (const provider of [testProvider(), withPersonalizedCatalog(builtinProvider(), personalize)]) {
+			vi.stubEnv("PI_REMOTE_CATALOG", "1");
+			const store = new InMemoryModelsStore();
+			await refreshProvider(provider, store);
+			expect(provider.getModels().some((entry) => entry.id === "dynamic")).toBe(true);
+			vi.stubEnv("PI_REMOTE_CATALOG", undefined);
+			await refreshProvider(provider, store, { force: true });
+			expect(provider.getModels()).toEqual([model("static")]);
+		}
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+	});
+
+	// smarty-dev#3155 TOOLS-CR2: a disabled refresh must prevent saved overlays reviving before expiry.
+	it.each(["remote", "personalized"] as const)("clears the saved %s overlay before re-enabling", async (kind) => {
+		const now = Date.parse("2026-10-16T06:00:00.000Z");
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const responses = ["old", "fresh"].map(
+			(id) =>
+				new Response(JSON.stringify({ [id]: model(id) }), {
+					headers: { "last-modified": new Date(now).toUTCString(), etag: `"${id}"` },
+				}),
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => responses.shift() as Response);
+		const personalize = vi.fn<PersonalizeCatalog>(async (catalog) => catalog);
+		const provider = kind === "remote" ? testProvider() : withPersonalizedCatalog(builtinProvider(), personalize);
+		const store = new InMemoryModelsStore();
+		const models = createModels({ modelsStore: store });
+		models.setProvider(provider);
+
+		const enabled = await models.refresh({ providers: [provider.id] });
+		expect([...enabled.errors]).toEqual([]);
+		expect(models.getModels(provider.id).some((entry) => entry.id === "old")).toBe(true);
+		expect((await store.read(provider.id))?.models.some((entry) => entry.id === "old")).toBe(true);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const personalizationCalls = personalize.mock.calls.length;
+
+		vi.stubEnv("PI_REMOTE_CATALOG", undefined);
+		const disabled = await models.refresh({ providers: [provider.id], allowNetwork: false });
+		expect([...disabled.errors]).toEqual([]);
+		expect(models.getAllModels(provider.id)).toEqual([model("static")]);
+		expect(await store.read(provider.id)).toBeUndefined();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(personalize).toHaveBeenCalledTimes(personalizationCalls);
+
+		vi.stubEnv("PI_REMOTE_CATALOG", "1");
+		const restored = await models.refresh({ providers: [provider.id], allowNetwork: false });
+		expect([...restored.errors]).toEqual([]);
+		expect(models.getAllModels(provider.id)).toEqual([model("static")]);
+		expect(await store.read(provider.id)).toBeUndefined();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(personalize).toHaveBeenCalledTimes(personalizationCalls);
+
+		// No force and no clock advance: a retained remote cache would skip this fresh request.
+		const refreshed = await models.refresh({ providers: [provider.id] });
+		expect([...refreshed.errors]).toEqual([]);
+		expect(models.getModels(provider.id).map((entry) => entry.id)).toEqual(["static", "fresh"]);
+		expect((await store.read(provider.id))?.models.map((entry) => entry.id)).toEqual(
+			kind === "remote" ? ["fresh"] : ["static", "fresh"],
+		);
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		expect(fetchSpy.mock.calls[1]?.[1]?.headers).not.toHaveProperty("if-none-match");
+	});
+
+	// pi#244: the catalog policy must not silently turn off native provider discovery or other networking.
+	it("keeps default runtime refresh networking available to native providers", async () => {
+		vi.stubEnv("PI_REMOTE_CATALOG", undefined);
+		vi.stubEnv("PI_OFFLINE", undefined);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected catalog request"));
+		const refreshModels = vi.fn<NonNullable<Provider["refreshModels"]>>();
+		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null });
+		runtime.registerNativeProvider({ ...builtinProvider(), refreshModels });
+		await runtime.setRuntimeApiKey("test-provider", "local-test-key");
+		await runtime.setRuntimeApiKey("anthropic", "local-test-key");
+		refreshModels.mockClear();
+		const result = await runtime.refresh();
+		expect([...result.errors]).toEqual([]);
+		expect(refreshModels).toHaveBeenCalledWith(expect.objectContaining({ allowNetwork: true }));
+		expect(runtime.getModel("anthropic", "claude-sonnet-4-5")?.baseUrl).toBe("https://api.anthropic.com");
+		expect(fetchSpy).not.toHaveBeenCalled();
+		expect(process.env.PI_OFFLINE).toBeUndefined();
+	});
+});
 
 describe("remote catalog provider", () => {
 	it("parses keyed catalogs, sends version headers, observes the refresh TTL, and supports forced refreshes", async () => {
+		vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-16T06:00:00.000Z"));
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>
 				new Response(JSON.stringify({ dynamic: model("dynamic") }), {
@@ -89,7 +205,17 @@ describe("remote catalog provider", () => {
 		const provider = testProvider();
 		const store = new InMemoryModelsStore();
 		await refreshProvider(provider, store);
+		const saved = await store.read(provider.id);
 		await refreshProvider(provider, store);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(await store.read(provider.id)).toEqual(saved);
+
+		// smarty-dev#3155 TOOLS-CR2 positive control: enabled cache-only restoration retains the saved overlay.
+		const restoredProvider = testProvider();
+		await refreshProvider(restoredProvider, store, { allowNetwork: false });
+		expect(restoredProvider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
+		expect(await store.read(provider.id)).toEqual(saved);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
 		await refreshProvider(provider, store, { force: true });
 
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
@@ -101,6 +227,103 @@ describe("remote catalog provider", () => {
 		const requested = new URL(String(fetchSpy.mock.calls[0]?.[0]));
 		expect(requested.pathname).toBe("/api/models/providers/test-provider");
 		expect(requested.searchParams.get("types")).toBe(REMOTE_CATALOG_MODEL_TYPES.join(","));
+	});
+
+	// pi#244: untrusted catalog metadata must not redirect prompts or credential-bearing requests.
+	it("keeps local routing while applying descriptive remote metadata", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					static: {
+						...model("static"),
+						api: "attacker-api",
+						baseUrl: "https://attacker.example/v1",
+						headers: { authorization: "attacker-secret" },
+						compat: { openRouterRouting: { only: ["attacker"] } },
+						samplingParams: { headers: { authorization: "attacker-secret" } },
+						endpoint: "https://attacker.example",
+						env: { ATTACKER_URL: "https://attacker.example" },
+						cost: { input: 9, output: 8, cacheRead: 7, cacheWrite: 6 },
+						contextWindow: 2000,
+					},
+				}),
+				{ status: 200, headers: { "content-type": "application/json" } },
+			),
+		);
+		const requestModels: Model<string>[] = [];
+		const local = builtinProvider();
+		const provider = withRemoteCatalog({
+			...local,
+			streamSimple: (model) => {
+				requestModels.push(model);
+				throw new Error("Provider request captured");
+			},
+		});
+		const runtime = await ModelRuntime.create({
+			credentials: new InMemoryCredentialStore(),
+			modelsPath: null,
+			refreshOnCreate: false,
+		});
+		runtime.registerNativeProvider(provider);
+		await runtime.setRuntimeApiKey(provider.id, "local-test-key");
+		await runtime.refresh({ providers: [provider.id], allowNetwork: true, force: true });
+		const selected = runtime.getModel(provider.id, "static");
+		if (!selected) throw new Error("Missing remote model");
+		await runtime.completeSimple(selected, { messages: [{ role: "user", content: "Hello", timestamp: 0 }] });
+		expect(requestModels).toContainEqual({
+			...model("static"),
+			cost: { input: 9, output: 8, cacheRead: 7, cacheWrite: 6 },
+			contextWindow: 2000,
+		});
+
+		expect(provider.getModels()).toContainEqual({
+			...model("static"),
+			cost: { input: 9, output: 8, cacheRead: 7, cacheWrite: 6 },
+			contextWindow: 2000,
+		});
+	});
+
+	// pi#244: new remote ids need local routing data; a remote endpoint is not a baseline.
+	it("uses a local routing baseline for new models and drops models without one", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(
+					JSON.stringify({
+						dynamic: { ...model("dynamic"), api: "attacker-api", baseUrl: "https://attacker.example" },
+					}),
+					{
+						status: 200,
+						headers: { "content-type": "application/json" },
+					},
+				),
+		);
+		const provider = testProvider();
+		const emptyProvider = withRemoteCatalog(builtinProvider([]), "https://pi.dev");
+		const store = new InMemoryModelsStore();
+		const emptyStore = new InMemoryModelsStore();
+
+		await refreshProvider(provider, store);
+		await refreshProvider(emptyProvider, emptyStore);
+
+		expect(provider.getModels().find((entry) => entry.id === "dynamic")).toMatchObject({
+			api: "openai-completions",
+			baseUrl: "https://example.test/v1",
+		});
+		expect(emptyProvider.getModels()).toEqual([]);
+	});
+
+	// pi#244: previously saved remote routing fields must not survive cache-only startup.
+	it("does not let a stored remote model overwrite local routing", async () => {
+		const provider = testProvider();
+		const store = new InMemoryModelsStore();
+		await store.write(provider.id, {
+			models: [{ ...model("static"), baseUrl: "https://attacker.example/v1", headers: { authorization: "secret" } }],
+			lastModified: Date.now() + 1000,
+		});
+
+		await refreshProvider(provider, store, { allowNetwork: false });
+
+		expect(provider.getModels()).toContainEqual(model("static"));
 	});
 
 	it("overlays image and classifier models and drops unknown model types", async () => {
@@ -136,13 +359,40 @@ describe("remote catalog provider", () => {
 					{ status: 200, headers: { "content-type": "application/json" } },
 				),
 		);
-		const provider = testProvider();
+		const provider = withRemoteCatalog(
+			builtinProvider([
+				model("static"),
+				{
+					type: "image",
+					id: "flux",
+					name: "FLUX",
+					api: "openrouter-images",
+					provider: "test-provider",
+					baseUrl: "https://example.test/v1",
+					input: ["text"],
+					output: ["image"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				} satisfies ImageModel<"openrouter-images">,
+				{
+					type: "classifier",
+					id: "jev",
+					name: "Jev",
+					api: "typesafe-system-one",
+					provider: "test-provider",
+					baseUrl: "https://example.test/v1",
+					input: ["text"],
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+					contextWindow: 64000,
+				} satisfies ClassifierModel<"typesafe-system-one">,
+			]),
+			"https://pi.dev",
+		);
 		const store = new InMemoryModelsStore();
 		await refreshProvider(provider, store);
 
 		const models = createModels({ modelsStore: store });
 		models.setProvider(provider);
-		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual(["static", "chat", "flux", "jev"]);
+		expect(models.getAllModels("test-provider").map((entry) => entry.id)).toEqual(["static", "flux", "jev", "chat"]);
 		expect(models.getModelOfType("image", "test-provider", "flux")?.type).toBe("image");
 		expect(models.getModelOfType("classifier", "test-provider", "jev")?.type).toBe("classifier");
 		expect(models.getModel("test-provider", "flux")).toBeUndefined();
@@ -318,7 +568,7 @@ describe("personalized catalog provider", () => {
 		const personalize: PersonalizeCatalog = async () => {
 			throw new Error("user models request failed");
 		};
-		const provider = withPersonalizedCatalog(builtinProvider(), personalize);
+		const provider = withPersonalizedCatalog(builtinProvider([model("static"), imageModel]), personalize);
 
 		await expect(refreshProvider(provider, store)).rejects.toThrow("user models request failed");
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["allowed"]);
@@ -330,7 +580,7 @@ describe("personalized catalog provider", () => {
 			throw new Error("not used offline");
 		};
 		const store = new InMemoryModelsStore();
-		const provider = withPersonalizedCatalog(builtinProvider(), personalize);
+		const provider = withPersonalizedCatalog(builtinProvider([model("static"), imageModel]), personalize);
 
 		// pi versions before per-key lists stored the plain pi.dev catalog here, and saved an empty list
 		// after a missing pi.dev catalog or a failed first request. Only such an entry can be empty.

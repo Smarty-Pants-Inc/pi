@@ -5,6 +5,7 @@
  */
 
 import { isObject } from "../protocol/jsonrpc.ts";
+import { secureEndpoint, validateOAuthEndpoints } from "./endpoints.ts";
 
 export interface OAuthProtectedResourceMetadata {
 	resource: string;
@@ -18,6 +19,7 @@ export interface AuthorizationServerMetadata {
 	authorization_endpoint: string;
 	token_endpoint: string;
 	registration_endpoint?: string;
+	revocation_endpoint?: string;
 	scopes_supported?: string[];
 	response_types_supported: string[];
 	grant_types_supported?: string[];
@@ -141,9 +143,11 @@ export function parseProtectedResourceMetadata(value: unknown): OAuthProtectedRe
 	return compact({
 		...input,
 		resource: safeUrl(input.resource, "OAuth protected resource metadata resource"),
-		authorization_servers: optionalStrings(input.authorization_servers, "authorization_servers")?.map((url) =>
-			safeUrl(url, "authorization server URL"),
-		),
+		authorization_servers: optionalStrings(input.authorization_servers, "authorization_servers")?.map((url) => {
+			const value = safeUrl(url, "authorization server URL");
+			secureEndpoint(value);
+			return value;
+		}),
 		scopes_supported: optionalStrings(input.scopes_supported, "scopes_supported"),
 	});
 }
@@ -152,12 +156,13 @@ export function parseAuthorizationServerMetadata(value: unknown): AuthorizationS
 	const input = object(value, "authorization server metadata");
 	const responseTypes = optionalStrings(input.response_types_supported, "response_types_supported");
 	if (!responseTypes) throw new Error("Invalid response_types_supported");
-	return compact({
+	const metadata = compact({
 		...input,
 		issuer: safeUrl(input.issuer, "authorization server issuer"),
 		authorization_endpoint: safeUrl(input.authorization_endpoint, "authorization endpoint"),
 		token_endpoint: safeUrl(input.token_endpoint, "token endpoint"),
 		registration_endpoint: optionalUrl(input.registration_endpoint, "registration endpoint"),
+		revocation_endpoint: optionalUrl(input.revocation_endpoint, "revocation endpoint"),
 		scopes_supported: optionalStrings(input.scopes_supported, "scopes_supported"),
 		response_types_supported: responseTypes,
 		grant_types_supported: optionalStrings(input.grant_types_supported, "grant_types_supported"),
@@ -178,6 +183,8 @@ export function parseAuthorizationServerMetadata(value: unknown): AuthorizationS
 				? input.authorization_response_iss_parameter_supported
 				: undefined,
 	});
+	validateOAuthEndpoints(metadata);
+	return metadata;
 }
 
 export function parseOAuthTokens(value: unknown): OAuthTokens {

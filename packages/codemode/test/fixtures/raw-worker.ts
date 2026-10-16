@@ -5,4 +5,6 @@
 import { parentPort, workerData } from "node:worker_threads";
 
 const messages: unknown = JSON.parse((workerData as { code: string }).code);
+// Stay alive like the real worker, which waits for call results until the host terminates it.
+parentPort?.on("message", () => {});
 for (const message of Array.isArray(messages) ? messages : [messages]) parentPort?.postMessage(message);

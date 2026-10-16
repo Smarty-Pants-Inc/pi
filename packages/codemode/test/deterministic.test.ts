@@ -104,6 +104,7 @@ afterEach(() => {
 });
 
 for (const [backend, create] of Object.entries(BACKENDS)) {
+	// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 	describe(`deterministic runs (${backend})`, () => {
 		it("makes the same calls and output for the same start, seed, and results", async () => {
 			const code = `
@@ -194,7 +195,7 @@ for (const [backend, create] of Object.entries(BACKENDS)) {
 			]);
 			const fingerprint = recorded.fingerprint()!;
 			expect(fingerprint).toMatch(
-				/^quickjs-wasi \S+, quickjs \S+, prelude [0-9a-f]{8}, deterministic \d+, stack \d+, heap 67108864, budget \S+$/,
+				/^quickjs-wasi \S+, quickjs \S+, prelude [0-9a-f]{8}, deterministic \d+, stack \d+, heap 67108864, budget \S+, bridge \S+$/,
 			);
 			if (backend === "remote") expect(fingerprint).toContain(`budget ${BUDGET}`);
 			else expect(fingerprint).toContain("budget none");
@@ -365,6 +366,7 @@ for (const [backend, create] of Object.entries(BACKENDS)) {
 	});
 }
 
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 describe("deterministic runs (remote transport)", () => {
 	it("applies results in seq order when the transport reorders replies sent in order", async () => {
 		const sandbox = remote({}, true);
@@ -382,6 +384,7 @@ describe("deterministic runs (remote transport)", () => {
 	});
 });
 
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 describe("execute() is not deterministic", () => {
 	it("reads the real clock and real randomness", async () => {
 		const sandbox = new CodemodeSandbox();

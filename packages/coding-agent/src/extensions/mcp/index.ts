@@ -30,6 +30,7 @@ import { join, resolve } from "node:path";
 import type { SelectItem } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { getAgentDir } from "../../config.ts";
+import { refuseUnreviewedBuiltin } from "../../core/builtin-security-admission.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -278,6 +279,7 @@ const MCP_USAGE = "Usage: /mcp, /mcp login [server], /mcp logout [server], /mcp 
 
 export function createMcpExtension(options: McpExtensionOptions = {}): ExtensionFactory {
 	return (pi: ExtensionAPI) => {
+		refuseUnreviewedBuiltin("mcp");
 		let servers: McpServer[] = [];
 		/** Servers from `mcp.json`, which take precedence over registered servers of the same name. */
 		let configuredEntries: McpServerEntry[] = [];

@@ -330,6 +330,17 @@ export const SettingsSchema = Type.Object(
 				description: "Model patterns for cycling, in the same format as the --models CLI flag.",
 			}),
 		),
+		modelPolicy: Type.Optional(
+			Type.Object(
+				{
+					allow: Type.Array(Type.String(), {
+						description:
+							"Case-insensitive provider/model globs. Only * is special; an empty list denies all models.",
+					}),
+				},
+				{ description: "Every configured settings layer must allow the requested provider/model." },
+			),
+		),
 		defaultTools: Type.Optional(
 			Type.Array(Type.String(), {
 				description:
@@ -402,7 +413,7 @@ export const SettingsSchema = Type.Object(
 		cacheWarming: Type.Optional(
 			Type.Union([Type.Literal("off"), Type.Literal("streaming"), Type.Literal("idle")], {
 				description:
-					'Cache-warming profile. "idle" also warms between agent runs. Global only because each refresh costs money.',
+					'Cache-warming profile. "idle" also warms between agent runs. Project settings override global settings.',
 				default: SETTINGS_DEFAULTS.cacheWarming,
 			}),
 		),

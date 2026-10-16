@@ -4,8 +4,11 @@ import {
 	type CodemodeRemoteExchange,
 	type CodemodeRemoteRequest,
 	type CodemodeServeOptions,
+	DEFAULT_CODEMODE_LIMITS,
+	DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES,
 	InlineCodemodeSandbox,
 	loadQuickJSWasm,
+	MAX_CODEMODE_MEMORY_LIMIT_BYTES,
 	RemoteCodemodeSandbox,
 	serveCodemodeRemote,
 } from "../src/index.ts";
@@ -16,8 +19,10 @@ const wasm = loadQuickJSWasm();
 function recordingRemote(options: Partial<CodemodeServeOptions> = {}) {
 	const exchanges: number[] = [];
 	const served: Promise<void>[] = [];
+	const requests: CodemodeRemoteRequest[] = [];
 	const remote: CodemodeRemote = {
 		execute(request: CodemodeRemoteRequest, exchange: CodemodeRemoteExchange) {
+			requests.push(structuredClone(request));
 			const done = serveCodemodeRemote(
 				structuredClone(request),
 				async (messages) => {
@@ -30,9 +35,10 @@ function recordingRemote(options: Partial<CodemodeServeOptions> = {}) {
 			return done;
 		},
 	};
-	return { remote, exchanges, served };
+	return { remote, exchanges, served, requests };
 }
 
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 describe("InlineCodemodeSandbox", () => {
 	it("fails a script that computes past its interrupt budget as a timeout", async () => {
 		const sandbox = new InlineCodemodeSandbox({ wasm, interruptBudget: 1_000 });
@@ -57,7 +63,88 @@ describe("InlineCodemodeSandbox", () => {
 	});
 });
 
+// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 describe("RemoteCodemodeSandbox", () => {
+	// pi#267: neither a public caller nor a raw RPC client can raise the host ceiling.
+	it("clamps the public remote request before sending it", async () => {
+		const { remote, requests, served } = recordingRemote();
+		const sandbox = new RemoteCodemodeSandbox({
+			remote: () => remote,
+			memoryLimitBytes: MAX_CODEMODE_MEMORY_LIMIT_BYTES * 8,
+		});
+		try {
+			expect(await sandbox.execute("return 42")).toMatchObject({ ok: true, value: 42 });
+			await Promise.all(served);
+			expect(requests[0].data.memoryLimitBytes).toBe(MAX_CODEMODE_MEMORY_LIMIT_BYTES);
+		} finally {
+			await sandbox.close();
+		}
+	});
+
+	it.each([
+		[undefined, undefined, DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES],
+		[MAX_CODEMODE_MEMORY_LIMIT_BYTES * 8, undefined, MAX_CODEMODE_MEMORY_LIMIT_BYTES],
+		[undefined, MAX_CODEMODE_MEMORY_LIMIT_BYTES * 8, DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES],
+		[MAX_CODEMODE_MEMORY_LIMIT_BYTES * 8, 32 * 1024 * 1024, 32 * 1024 * 1024],
+		[8 * 1024 * 1024, 32 * 1024 * 1024, 8 * 1024 * 1024],
+	])(
+		"resolves raw RPC memory %s with server cap %s to %s (including Cloudflare's 32 MiB policy)",
+		async (requested, maxMemory, expected) => {
+			const { remote, served } = recordingRemote({ maxMemoryLimitBytes: maxMemory });
+			const messages: unknown[] = [];
+			await remote.execute(
+				{
+					data: {
+						code: "return 42",
+						tools: [],
+						globals: [],
+						store: {},
+						limits: { ...DEFAULT_CODEMODE_LIMITS },
+						memoryLimitBytes: requested,
+						deterministic: { startedAt: 0, seed: 1 },
+					},
+				},
+				async (batch) => {
+					messages.push(...batch);
+					return null;
+				},
+			);
+			await Promise.all(served);
+			expect(messages).toContainEqual({
+				type: "started",
+				fingerprint: expect.stringContaining(`heap ${expected},`),
+			});
+			expect(messages).toContainEqual(expect.objectContaining({ type: "done", ok: true, value: "42" }));
+		},
+	);
+
+	it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY])(
+		"refuses invalid raw RPC and server memory %s",
+		(invalid) => {
+			for (const [requested, maxMemory] of [
+				[invalid, undefined],
+				[undefined, invalid],
+			]) {
+				const { remote } = recordingRemote({ maxMemoryLimitBytes: maxMemory });
+				expect(() =>
+					remote.execute(
+						{
+							data: {
+								code: "return 42",
+								tools: [],
+								globals: [],
+								store: {},
+								limits: { ...DEFAULT_CODEMODE_LIMITS },
+								memoryLimitBytes: requested,
+							},
+						},
+						async () => null,
+					),
+				).toThrow(/positive finite/);
+			}
+		},
+	);
+
 	it("runs tools in the caller and the script on the remote", async () => {
 		const { remote, served } = recordingRemote();
 		const seen: unknown[] = [];

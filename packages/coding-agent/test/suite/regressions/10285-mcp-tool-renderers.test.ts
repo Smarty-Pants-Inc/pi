@@ -11,7 +11,8 @@ import { createHarness } from "../harness.ts";
 
 const mcpExtension = createMcpExtension({ loadConfig: () => ({ servers: [], errors: [] }) });
 
-describe("MCP tool renderers", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506 (pi#131 cutoff)
+describe.skip("MCP tool renderers", () => {
 	// Regression #10285: a resumed session renders MCP tool calls before their server connected, if it
 	// ever does. They render with the MCP renderers anyway, instead of the expanded fallback.
 	it("renders calls to MCP tools that are not registered", async () => {

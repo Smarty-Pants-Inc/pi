@@ -37,6 +37,7 @@
  */
 import { Intrinsics, JSException, type JSValueHandle, MAX_STACK_SIZE, QuickJS } from "quickjs-wasi";
 import type { CodemodeWasmModule } from "../wasm.ts";
+import { BridgeBudget, CodemodeLimitError, resolveCodemodeLimits, resolveMemoryLimit } from "./limits.ts";
 import { PRELUDE_SOURCE } from "./prelude-source.ts";
 import type { HostToWorkerMessage, VmStartData, WorkerToHostMessage } from "./protocol.ts";
 
@@ -158,7 +159,27 @@ function crashMessage(error: unknown): WorkerToHostMessage {
 }
 
 export async function startVm(options: StartVmOptions): Promise<VmSession> {
-	const { data, post } = options;
+	const { data, post: emit } = options;
+	const limits = resolveCodemodeLimits(data.limits);
+	// Also guard direct worker/VM entry, independently of the public sandbox constructors.
+	const memoryLimitBytes = resolveMemoryLimit(data.memoryLimitBytes);
+	const budget = new BridgeBudget(limits);
+	const pending = new Set<number>();
+	let stopped = false;
+	// Enforce before posting to any transport, including inline/remote queues.
+	const post = (message: WorkerToHostMessage): void => {
+		if (stopped) return;
+		try {
+			budget.charge(message);
+		} catch (error) {
+			if (!(error instanceof CodemodeLimitError)) throw error;
+			stopped = true;
+			emit({ type: "limit", message: error.message });
+			return;
+		}
+		if (message.type === "call") pending.add(message.id);
+		emit(message);
+	};
 	const maxStackSize = options.maxStackSize ?? MAX_STACK_SIZE;
 	const deterministic = data.deterministic;
 	const clock: VirtualClock | undefined = deterministic && {
@@ -169,11 +190,11 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 	};
 	const vm = await QuickJS.create({
 		wasm: options.wasm,
-		memoryLimit: data.memoryLimitBytes,
+		memoryLimit: memoryLimitBytes,
 		// Without a guard, deep recursion overflows the wasm stack and traps instead of throwing a
 		// catchable RangeError.
 		maxStackSize,
-		interruptHandler: options.shouldInterrupt,
+		interruptHandler: () => stopped || options.shouldInterrupt(),
 		wasi: clock ? deterministicWasi(clock) : discardOutput,
 		...(clock ? { timezoneOffset: 0, intrinsics: Intrinsics.ALL & ~Intrinsics.WEAK_REF } : {}),
 	});
@@ -201,8 +222,10 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 	};
 	const session: VmSession = {
 		deliver(message) {
-			if (disposed) return;
+			if (disposed || stopped) return;
 			try {
+				if (!pending.delete(message.id)) throw new Error(`Call ${message.id} is not waiting for a result`);
+				budget.settle((message.payload?.length ?? 0) + (message.properties?.length ?? 0));
 				if (!clock) {
 					apply(message);
 					return;
@@ -222,7 +245,12 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 					nextSeq++;
 				}
 			} catch (error) {
-				post(crashMessage(error));
+				if (error instanceof CodemodeLimitError) {
+					stopped = true;
+					emit({ type: "limit", message: error.message });
+				} else {
+					post(crashMessage(error));
+				}
 			}
 		},
 		dispose() {
@@ -244,7 +272,9 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 		while (exports.qjs_is_job_pending()) {
 			// A job only fails for uncatchable errors, such as an interrupt.
 			if (exports.qjs_execute_pending_job() < 0) throw new Error("Promise job failed");
-			if (++jobs % JOBS_PER_POLL === 0 && options.shouldInterrupt()) throw new Error("Execution interrupted");
+			if (++jobs % JOBS_PER_POLL === 0 && (stopped || options.shouldInterrupt())) {
+				throw new Error("Execution interrupted");
+			}
 		}
 		vm.callFunction(stalled, api).dispose();
 	};
@@ -316,7 +346,7 @@ export async function startVm(options: StartVmOptions): Promise<VmSession> {
 			const budget = options.interruptBudget ?? "none";
 			post({
 				type: "started",
-				fingerprint: `quickjs-wasi ${versions["quickjs-wasi"]}, quickjs ${versions.quickjs}, prelude ${PRELUDE_HASH}, deterministic ${DETERMINISTIC_VERSION}, stack ${maxStackSize}, heap ${data.memoryLimitBytes ?? "none"}, budget ${budget}`,
+				fingerprint: `quickjs-wasi ${versions["quickjs-wasi"]}, quickjs ${versions.quickjs}, prelude ${PRELUDE_HASH}, deterministic ${DETERMINISTIC_VERSION}, stack ${maxStackSize}, heap ${memoryLimitBytes}, budget ${budget}, bridge ${Object.values(limits).join("/")}`,
 			});
 		}
 

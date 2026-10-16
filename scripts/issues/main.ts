@@ -1,12 +1,13 @@
 // Issue triage: sync issues, triage new ones with a pi-durable agent, and serve a small web UI for decisions.
 // See README.md.
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { Corpus, issueStatus, REPO } from "./github.ts";
+import { listenSocket } from "./socket.ts";
 import { PRIORITIES, type Priority, Triage } from "./triage.ts";
 
 const scriptDir = dirname(fileURLToPath(import.meta.url));
@@ -156,8 +157,8 @@ const server = createServer((req, res) => {
 });
 const socket = process.env.TRIAGE_SOCKET;
 if (socket) {
-	if (existsSync(socket)) unlinkSync(socket);
-	server.listen(socket, () => chmodSync(socket, 0o660));
+	await listenSocket(server, socket);
+	chmodSync(socket, 0o660);
 	console.log(`listening on ${socket}, token in ${tokenPath}`);
 } else {
 	const port = Number(process.env.TRIAGE_PORT ?? 7788);

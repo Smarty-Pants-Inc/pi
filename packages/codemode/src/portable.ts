@@ -12,6 +12,15 @@ export {
 	type InlineCodemodeSandboxOptions,
 } from "./runtime/inline.ts";
 export {
+	CodemodeLimitError,
+	type CodemodeLimits,
+	checkCodemodeStoreQuota,
+	DEFAULT_CODEMODE_LIMITS,
+	DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES,
+	MAX_CODEMODE_MEMORY_LIMIT_BYTES,
+	resolveMemoryLimit,
+} from "./runtime/limits.ts";
+export {
 	MAX_OUTPUT_CHARS,
 	MAX_OUTPUT_ITEMS,
 	MAX_STORE_TOTAL_CHARS,

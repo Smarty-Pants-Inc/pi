@@ -56,6 +56,26 @@ describe("model selector", () => {
 		selector.dispose();
 	});
 
+	// Fork model-policy regression: explicitly scoped models must still obey host policy.
+	it("filters disallowed scoped models", async () => {
+		harness = await createHarness({ models: [{ id: "allowed" }, { id: "blocked" }] });
+		const allowed = harness.getModel("allowed")!;
+		const blocked = harness.getModel("blocked")!;
+		vi.spyOn(harness.session.modelRuntime, "isModelAllowed").mockImplementation((model) => model.id === "allowed");
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			allowed,
+			harness.session.modelRuntime,
+			[{ model: allowed }, { model: blocked }],
+			() => {},
+			() => {},
+		);
+		const rendered = stripAnsi(selector.render(120).join("\n"));
+		expect(rendered).toContain("allowed");
+		expect(rendered).not.toContain("blocked");
+		selector.dispose();
+	});
+
 	it("uses the configured save binding", async () => {
 		setKeybindings(new KeybindingsManager({ "app.models.save": "ctrl+r" }));
 		harness = await createHarness();

@@ -120,7 +120,8 @@ describe("consumeSseStream", () => {
 	});
 });
 
-describe("StreamableHttpTransport", () => {
+// Dormant until reviewed re-enable: smarty-dev#4506
+describe.skip("StreamableHttpTransport", () => {
 	it("handles JSON and SSE responses with session and protocol headers", async () => {
 		const { url, requests } = await startServer(protocolHandler);
 		const transport = new StreamableHttpTransport({ url });

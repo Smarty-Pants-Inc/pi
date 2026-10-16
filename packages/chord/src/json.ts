@@ -87,10 +87,11 @@ function defineData(target: object, key: PropertyKey, value: JsonValue): void {
 
 /** Return whether a value is finite strict JSON with plain objects and no cycles. */
 export function isJsonValue(value: unknown): value is JsonValue {
-	return check(value, new Set<object>());
+	return check(value, new Set<object>(), 0);
 }
 
-function check(value: unknown, ancestors: Set<object>): boolean {
+function check(value: unknown, ancestors: Set<object>, depth: number): boolean {
+	if (depth > 512) return false;
 	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
 	if (typeof value === "number") return Number.isFinite(value);
 	if (Array.isArray(value)) {
@@ -106,7 +107,7 @@ function check(value: unknown, ancestors: Set<object>): boolean {
 					descriptor === undefined ||
 					!descriptor.enumerable ||
 					!("value" in descriptor) ||
-					!check(descriptor.value, ancestors)
+					!check(descriptor.value, ancestors, depth + 1)
 				) {
 					return false;
 				}
@@ -124,7 +125,7 @@ function check(value: unknown, ancestors: Set<object>): boolean {
 	ancestors.add(value);
 	try {
 		for (const descriptor of Object.values(Object.getOwnPropertyDescriptors(value))) {
-			if (!descriptor.enumerable || !("value" in descriptor) || !check(descriptor.value, ancestors)) {
+			if (!descriptor.enumerable || !("value" in descriptor) || !check(descriptor.value, ancestors, depth + 1)) {
 				return false;
 			}
 		}
