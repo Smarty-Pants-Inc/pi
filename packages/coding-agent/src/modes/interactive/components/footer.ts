@@ -49,6 +49,9 @@ interface SessionStats {
 	sessionId: string;
 	leafId: string | null;
 	entryCount: number;
+	sessionManager: AgentSession["sessionManager"];
+	revision: number;
+	sessionName: string | undefined;
 	limitsModel: unknown;
 	usageTotals: UsageTotals;
 	latestCacheHitRate: number | undefined;
@@ -101,6 +104,7 @@ export class FooterComponent implements Component {
 	 */
 	private getSessionStats(): SessionStats {
 		const sessionManager = this.session.sessionManager;
+		const revision = sessionManager.revision();
 		const entryCount = sessionManager.getEntryCount();
 		const sessionId = sessionManager.getSessionId();
 		const leafId = sessionManager.getLeafId();
@@ -109,6 +113,8 @@ export class FooterComponent implements Component {
 		if (
 			cached &&
 			cached.session === this.session &&
+			cached.sessionManager === sessionManager &&
+			cached.revision === revision &&
 			cached.sessionId === sessionId &&
 			cached.leafId === leafId &&
 			cached.entryCount === entryCount &&
@@ -143,6 +149,9 @@ export class FooterComponent implements Component {
 		const contextUsage = this.session.getContextUsage();
 		this.sessionStats = {
 			session: this.session,
+			sessionManager,
+			revision,
+			sessionName: sessionManager.getSessionName(),
 			sessionId,
 			leafId,
 			entryCount,
@@ -156,7 +165,7 @@ export class FooterComponent implements Component {
 
 	render(width: number): string[] {
 		const state = this.session.state;
-		const { usageTotals, latestCacheHitRate, contextUsage } = this.getSessionStats();
+		const { usageTotals, latestCacheHitRate, contextUsage, sessionName } = this.getSessionStats();
 		const contextWindow = contextUsage?.contextWindow ?? state.model?.contextWindow ?? 0;
 		const contextPercentValue = contextUsage?.percent ?? 0;
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
@@ -171,7 +180,6 @@ export class FooterComponent implements Component {
 		}
 
 		// Add session name if set
-		const sessionName = this.session.sessionManager.getSessionName();
 		if (sessionName) {
 			pwd = `${pwd} • ${sessionName}`;
 		}

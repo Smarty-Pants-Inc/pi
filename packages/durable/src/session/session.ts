@@ -573,6 +573,7 @@ export class SessionImpl implements Session {
 		return this.#enqueue(async () => {
 			this.#documents.clear();
 			this.#idleDocuments.clear();
+			this.#scheduleDocumentSweep();
 		});
 	}
 
@@ -614,6 +615,7 @@ export class SessionImpl implements Session {
 	#dropDocument(addressId: string): void {
 		this.#documents.delete(addressId);
 		this.#idleDocuments.delete(addressId);
+		if (this.#idleDocuments.size === 0) this.#scheduleDocumentSweep();
 	}
 
 	/**
@@ -624,8 +626,13 @@ export class SessionImpl implements Session {
 	#scheduleDocumentSweep(): void {
 		if (this.#closing !== undefined) return;
 		const oldest = this.#idleDocuments.values().next();
-		if (oldest.done === true) return;
-		const at = oldest.value + this.#documentRetentionMs();
+		const at = oldest.done === true ? undefined : oldest.value + this.#documentRetentionMs();
+		// pi#244: an empty or indefinitely retained cache has nothing for an idle timer to evict.
+		if (at === undefined || at === Number.POSITIVE_INFINITY) {
+			if (this.#documentSweep?.timer !== undefined) clearTimeout(this.#documentSweep.timer);
+			this.#documentSweep = undefined;
+			return;
+		}
 		if (this.#documentSweep !== undefined && this.#documentSweep.at <= at) return;
 		if (this.#documentSweep?.timer !== undefined) clearTimeout(this.#documentSweep.timer);
 		// The pending sweep stays set until its job runs, so touches while the line is busy queue no more.
@@ -673,6 +680,7 @@ export class SessionImpl implements Session {
 	#pinDocument(addressId: string, recordId: DocumentId): () => void {
 		this.#attachedDocuments.set(recordId, (this.#attachedDocuments.get(recordId) ?? 0) + 1);
 		this.#idleDocuments.delete(addressId);
+		if (this.#idleDocuments.size === 0) this.#scheduleDocumentSweep();
 		let pinned = true;
 		return () => {
 			if (!pinned) return;

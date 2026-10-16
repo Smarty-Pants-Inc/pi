@@ -13,6 +13,7 @@ import {
 	type Storage,
 } from "@earendil-works/pi-durable";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { SessionImpl } from "../src/session/session.ts";
 import { addTask, assistant, describeMessage, openHarness, system, toolResult, user } from "./harness-support.ts";
 import { context } from "./session-support.ts";
 
@@ -911,9 +912,15 @@ describe("conversation context", () => {
 		await harness.close(context);
 	});
 
-	it("drops an idle conversation's context read on a timer when nothing else runs", async () => {
+	// pi#173: idle cache expiry must not schedule a wake without a task/read event.
+	it("schedules no idle timer, reuses fresh context, and evicts expired context on the next task", async () => {
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
-		const { harness, registry, root, scanned } = await countingSetup({ settings: { contextRetentionMs: 1_000 } });
+		const now = vi.fn(() => Date.now());
+		const { harness, registry, root, scanned } = await countingSetup({
+			settings: { contextRetentionMs: 1_000 },
+			now,
+		});
+		const session = harness as unknown as SessionImpl;
 		const rows: Record<string, number> = {};
 		const Probe = probeTask(async (name, load) => {
 			const before = scanned.rows;
@@ -927,14 +934,70 @@ describe("conversation context", () => {
 			const id = await harness.commit((tx) => tx.createTask(Probe, { name }, options), context);
 			expect((await harness.waitForTask(id, context)).state.outcome).toEqual(DONE.outcome);
 			await root.waitForIdle(context);
+			// pi#244: exactly one document sweep while evictable documents exist; none once the cache is empty.
+			expect(vi.getTimerCount()).toBe(session.documentCacheSizes.idle > 0 ? 1 : 0);
+			await session.unloadDocuments();
+			expect(session.documentCacheSizes).toMatchObject({ cached: 0, idle: 0 });
 		};
-		const idle = vi.getTimerCount();
 		await probe("first");
-		expect(vi.getTimerCount()).toBe(idle + 1);
-		vi.advanceTimersByTime(1_000);
-		expect(vi.getTimerCount()).toBe(idle);
-		await probe("second");
-		expect(rows).toEqual({ first: 22, second: 22 });
+		expect(vi.getTimerCount()).toBe(0);
+		await vi.advanceTimersByTimeAsync(500);
+		await probe("fresh");
+		expect(rows.fresh).toBe(1);
+		expect(vi.getTimerCount()).toBe(0);
+		await vi.advanceTimersByTimeAsync(0);
+		const calls = now.mock.calls.length;
+		const scans = scanned.rows;
+		await vi.advanceTimersByTimeAsync(1_000);
+		expect(now).toHaveBeenCalledTimes(calls);
+		expect(scanned.rows).toBe(scans);
+		expect(vi.getTimerCount()).toBe(0);
+		await probe("expired");
+		expect(rows).toEqual({ first: 22, fresh: 1, expired: 22 });
+		await harness.close(context);
+	});
+
+	// pi#173: a running task reading another idle conversation must also check lazy expiry.
+	it("evicts an idle context on a read without a new task or commit", async () => {
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		const { harness, registry, root, first, scanned } = await countingSetup({
+			settings: { contextRetentionMs: 1_000 },
+		});
+		const other = await root.fork(first.id, { ownership: { kind: "ownerless" } }, context);
+		const session = harness as unknown as SessionImpl;
+		const rows: number[] = [];
+		const Read = defineTask<Record<string, never>, { phase: "run" }, null>({
+			name: "test.idle-context-read",
+			version: 1,
+			initial: () => ({ phase: "run" }),
+			phases: {
+				run: async (_task, runtime, taskContext) => {
+					for (const elapsed of [0, 500, 1_000]) {
+						vi.advanceTimersByTime(elapsed);
+						const before = scanned.rows;
+						await runtime.context(root.id, taskContext);
+						rows.push(scanned.rows - before);
+					}
+					await runtime.commit(() => DONE, taskContext);
+				},
+			},
+			abort: async (_task, runtime, taskContext) => {
+				await runtime.commit(() => ABORTED, taskContext);
+			},
+		});
+		addTask(registry, Read);
+		harness.resume();
+		const id = await harness.commit(
+			(tx) => tx.createTask(Read, {}, { ownership: { kind: "conversation" }, conversationId: other.id }),
+			context,
+		);
+		expect((await harness.waitForTask(id, context)).state.outcome).toEqual(DONE.outcome);
+		expect(rows).toEqual([22, 1, 22]);
+		// pi#244: no context timer may hide alongside the single document sweep.
+		expect(vi.getTimerCount()).toBe(session.documentCacheSizes.idle > 0 ? 1 : 0);
+		await session.unloadDocuments();
+		expect(session.documentCacheSizes).toMatchObject({ cached: 0, idle: 0 });
+		expect(vi.getTimerCount()).toBe(0);
 		await harness.close(context);
 	});
 

@@ -21,6 +21,8 @@ import {
 	openSync,
 	readdirSync,
 	readSync,
+	realpathSync,
+	renameSync,
 	type Stats,
 	statSync,
 	writeFileSync,
@@ -38,6 +40,23 @@ import {
 	createCompactionSummaryMessage,
 	createCustomMessage,
 } from "./messages.ts";
+import {
+	copyEntry,
+	getEntryLocation,
+	isColdEntry,
+	readSessionFileLines,
+	setEntryLocation,
+	toColdEntry,
+	toHotEntry,
+} from "./session-lazy-entries.ts";
+import { bindSessionTurnAppender } from "./session-turn-appender.ts";
+import type { TurnProvenance } from "./turn-provenance.ts";
+import { freezeDetached, receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
+import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-message-metadata.ts";
+
+/** Entries at the end of the file that stay resident besides the current context (smarty-dev#2177). */
+const RECENT_RESIDENT_ENTRIES = 100;
+
 export const CURRENT_SESSION_VERSION = 3;
 
 export interface SessionHeader {
@@ -64,6 +83,11 @@ export interface SessionEntryBase {
 export interface SessionMessageEntry extends SessionEntryBase {
 	type: "message";
 	message: AgentMessage;
+	provenance?: TurnProvenance;
+	/** Opaque per-input metadata from sendUserMessage; excluded from model context. */
+	readonly metadata?: UserMessageMetadata;
+	/** Pi-stamped submitter of metadata; never supplied by the caller. */
+	readonly metadataSource?: UserMessageMetadataSource;
 }
 
 export interface ThinkingLevelChangeEntry extends SessionEntryBase {
@@ -162,6 +186,7 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	content: string | (TextContent | ImageContent)[];
 	details?: T;
 	display: boolean;
+	provenance?: TurnProvenance;
 }
 
 /** Content that an append-only context edit may replace without changing message metadata. */
@@ -260,6 +285,78 @@ export type ReadonlySessionManager = Pick<
 	| "getTree"
 	| "getSessionName"
 >;
+
+type DetachedSessionSource = Pick<
+	ReadonlySessionManager,
+	"getLeafEntry" | "getEntry" | "getBranch" | "buildContextEntries" | "getEntries" | "getTree"
+>;
+// Detached views use constructor-captured canonical readers.
+const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
+const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
+
+export { freezeDetached } from "./turn-receipts.ts";
+
+/**
+ * Extension-facing history reads return deep-detached values, so a retained entry edited
+ * later cannot change canonical history, projection, revision or journal bytes (pi#132 R4-3).
+ */
+export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySessionManager {
+	let view = detachedSessionViews.get(manager);
+	if (!view) {
+		const source = detachedSessionSources.get(manager) ?? manager;
+		const snapshots = new WeakMap<SessionEntry, SessionEntry>();
+		// ponytail: retain one detached payload per canonical entry identity, trading that memory
+		// for O(n) pointer-only reads. Labels/edits append; forks and cold/hot changes replace
+		// entries. Invalidate here if a future path mutates a published entry in place.
+		const snapshot = (entry: SessionEntry | undefined): SessionEntry | undefined => {
+			if (!entry) return undefined;
+			let detached = snapshots.get(entry);
+			if (!detached) {
+				// ponytail: match #writeEntries/#appendLine and reload's JSON form before freezing.
+				// Typed arrays cannot be frozen, and frozen Map/Set objects still allow mutation.
+				detached = freezeDetached(JSON.parse(JSON.stringify(entry)) as SessionEntry);
+				snapshots.set(entry, detached);
+			}
+			return detached;
+		};
+		const entries = (values: SessionEntry[]): SessionEntry[] => {
+			const detached = values.map((entry) => snapshot(entry)!);
+			Object.freeze(detached);
+			return detached;
+		};
+		view = Object.freeze({
+			getCwd: manager.getCwd.bind(manager),
+			getSessionDir: manager.getSessionDir.bind(manager),
+			getSessionId: manager.getSessionId.bind(manager),
+			getSessionFile: manager.getSessionFile.bind(manager),
+			getLeafId: manager.getLeafId.bind(manager),
+			getLeafEntry: () => snapshot(source.getLeafEntry()),
+			getEntry: (id: string) => snapshot(source.getEntry(id)),
+			getLabel: manager.getLabel.bind(manager),
+			getBranch: (fromId?: string) => entries(source.getBranch(fromId)),
+			buildContextEntries: () => entries(source.buildContextEntries()),
+			buildSessionProjection: () => freezeDetached(buildSessionProjection(entries(source.getBranch()))),
+			getHeader: () => freezeDetached(structuredClone(manager.getHeader())),
+			getEntries: () => entries(source.getEntries()),
+			getTree: () => {
+				const roots = source.getTree();
+				const nodes = new Map<SessionTreeNode, SessionTreeNode>();
+				const pending = [...roots];
+				while (pending.length) {
+					const node = pending.pop()!;
+					if (nodes.has(node)) continue;
+					nodes.set(node, { ...node, entry: snapshot(node.entry)!, children: [] });
+					for (const child of node.children) pending.push(child);
+				}
+				for (const [node, detached] of nodes) detached.children = node.children.map((child) => nodes.get(child)!);
+				return freezeDetached(roots.map((node) => nodes.get(node)!));
+			},
+			getSessionName: manager.getSessionName.bind(manager),
+		} satisfies ReadonlySessionManager);
+		detachedSessionViews.set(manager, view);
+	}
+	return view;
+}
 
 function createSessionId(): string {
 	return uuidv7();
@@ -415,9 +512,12 @@ function buildSessionPath(
 	return path;
 }
 
-function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
-	let thinkingLevel = "off";
-	let model: { provider: string; modelId: string } | null = null;
+function getSessionContextSettings(
+	path: SessionEntry[],
+	previous?: Pick<SessionContext, "thinkingLevel" | "model">,
+): Pick<SessionContext, "thinkingLevel" | "model"> {
+	let thinkingLevel = previous?.thinkingLevel ?? "off";
+	let model = previous?.model ?? null;
 
 	for (const entry of path) {
 		if (entry.type === "thinking_level_change") {
@@ -478,7 +578,10 @@ export function buildContextEntries(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionEntry[] {
-	const path = buildSessionPath(entries, leafId, byId);
+	return buildContextEntriesFromPath(buildSessionPath(entries, leafId, byId));
+}
+
+function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
 	let compaction: CompactionEntry | null = null;
 
 	for (const entry of path) {
@@ -547,7 +650,14 @@ export function buildSessionProjection(
 ): SessionProjection {
 	const path = buildSessionPath(entries, leafId, byId);
 	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const contextEntries = buildContextEntries(entries, leafId, byId);
+	return projectSessionContext(buildContextEntriesFromPath(path), thinkingLevel, model);
+}
+
+function projectSessionContext(
+	contextEntries: SessionEntry[],
+	thinkingLevel: string,
+	model: SessionContext["model"],
+): SessionProjection {
 	const edits = new Map<string, ContextEditEntry>();
 	for (const entry of contextEntries) {
 		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
@@ -625,38 +735,33 @@ function parseSessionEntryLine(line: string): FileEntry | null {
 
 /** Exported for testing */
 export function loadEntriesFromFile(filePath: string): FileEntry[] {
+	return readEntriesFromFile(filePath, false);
+}
+
+/**
+ * Parse a session file. With `cold`, entries keep only small fields in memory and read large
+ * fields back from the file by byte offset (see session-lazy-entries.ts).
+ */
+function readEntriesFromFile(filePath: string, cold: boolean): FileEntry[] {
 	const resolvedFilePath = normalizePath(filePath);
 	if (!existsSync(resolvedFilePath)) return [];
 
 	const entries: FileEntry[] = [];
-	let pending = "";
-	const fd = openSync(resolvedFilePath, "r");
-	try {
-		const decoder = new StringDecoder("utf8");
-		const buffer = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
-
-		while (true) {
-			const bytesRead = readSync(fd, buffer, 0, buffer.length, null);
-			if (bytesRead === 0) break;
-
-			pending += decoder.write(buffer.subarray(0, bytesRead));
-			let lineStart = 0;
-			let newlineIndex = pending.indexOf("\n", lineStart);
-			while (newlineIndex !== -1) {
-				const entry = parseSessionEntryLine(pending.slice(lineStart, newlineIndex));
-				if (entry) entries.push(entry);
-				lineStart = newlineIndex + 1;
-				newlineIndex = pending.indexOf("\n", lineStart);
+	const { missingFinalNewline } = readSessionFileLines(
+		resolvedFilePath,
+		(line, offset, length) => {
+			const entry = parseSessionEntryLine(line);
+			if (!entry) return;
+			const location = { file: resolvedFilePath, offset, length };
+			if (cold && entry.type !== "session") {
+				entries.push(toColdEntry(entry, location));
+			} else {
+				if (cold) setEntryLocation(entry, location);
+				entries.push(entry);
 			}
-			pending = pending.slice(lineStart);
-		}
-
-		pending += decoder.end();
-		const finalEntry = parseSessionEntryLine(pending);
-		if (finalEntry) entries.push(finalEntry);
-	} finally {
-		closeSync(fd);
-	}
+		},
+		SESSION_READ_BUFFER_SIZE,
+	);
 
 	// Validate session header before repairing the file.
 	if (entries.length === 0) return entries;
@@ -665,7 +770,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
 		return [];
 	}
 
-	if (pending) appendFileSync(resolvedFilePath, "\n");
+	if (missingFinalNewline) appendFileSync(resolvedFilePath, "\n");
 	return entries;
 }
 
@@ -996,6 +1101,16 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	#sessionEpoch: object = {};
+	#revision = 0;
+	#branchProjection?: {
+		revision: number;
+		path: SessionEntry[];
+		contextEntries: SessionEntry[];
+		thinkingLevel: string;
+		model: SessionContext["model"];
+	};
+	#revisionKey: { entries: FileEntry[]; length: number; leafId: string | null } | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1008,6 +1123,21 @@ export class SessionManager {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
+		detachedSessionSources.set(this, {
+			getLeafEntry: () => (this.leafId ? this.byId.get(this.leafId) : undefined),
+			getEntry: (id) => this.byId.get(id),
+			getBranch: (fromId) => this.getBranchEntries(fromId),
+			buildContextEntries: () => this.getBranchProjection().contextEntries.slice(),
+			getEntries: () => this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session"),
+			getTree: () =>
+				this.buildTree(this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session")),
+		});
+		bindSessionTurnAppender(this, {
+			appendMessage: (message, receipt, metadata, metadataSource) =>
+				this.#appendReceivedMessage(message, receipt, metadata, metadataSource),
+			appendCustomMessage: (customType, content, display, details, receipt) =>
+				this.#appendReceivedCustomMessage(customType, content, display, details, receipt),
+		});
 		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
@@ -1029,7 +1159,7 @@ export class SessionManager {
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
-			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
+			const entries = preloadedFileEntries ?? readEntriesFromFile(this.sessionFile, true);
 
 			// If file was empty, initialize it with a valid session header. If it was
 			// non-empty but did not parse as a pi session, fail without modifying it.
@@ -1047,6 +1177,7 @@ export class SessionManager {
 
 			this._loadEntries(entries);
 			this.flushed = true;
+			this.#releaseColdEntries();
 		} else {
 			const explicitPath = this.sessionFile;
 			this.newSession();
@@ -1069,6 +1200,8 @@ export class SessionManager {
 			parentSession: options?.parentSession,
 		};
 		this.fileEntries = [header];
+		this.#sessionEpoch = {};
+		this.#branchProjection = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1087,6 +1220,7 @@ export class SessionManager {
 
 		if (header) {
 			this.fileEntries = entries;
+			this.#sessionEpoch = {};
 			this.sessionId = header.id;
 
 			if (migrateToCurrentVersion(this.fileEntries)) {
@@ -1095,18 +1229,21 @@ export class SessionManager {
 		} else {
 			this.newSession(options);
 			this.fileEntries = this.fileEntries.concat(entries);
+			this.#sessionEpoch = {};
 		}
 
 		this._buildIndex();
 	}
 
 	private _buildIndex(): void {
+		this.#branchProjection = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
+			sealEntryProvenance(entry, true);
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
 			if (entry.type === "label") {
@@ -1123,13 +1260,85 @@ export class SessionManager {
 
 	private _rewriteFile(): void {
 		if (!this.persist || !this.sessionFile) return;
-		const fd = openSync(this.sessionFile, "w");
+		// Cold entries read from the current file while the new one is written, so write a
+		// temporary file and rename it over the old one.
+		// Write next to the real path so a symlinked session file stays a symlink.
+		const target = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
+		const temporary = `${target}.${process.pid}.tmp`;
+		const fd = openSync(temporary, "w");
 		try {
-			for (const entry of this.fileEntries) {
-				writeFileSync(fd, `${JSON.stringify(entry)}\n`);
-			}
+			this.#writeEntries(fd, this.sessionFile);
 		} finally {
 			closeSync(fd);
+		}
+		renameSync(temporary, target);
+	}
+
+	/**
+	 * Write every entry to `fd` (a new file that becomes `file`) and record each entry's new byte
+	 * range. Cold entries are rebound to the new file one line at a time.
+	 */
+	#writeEntries(fd: number, file: string): void {
+		let offset = 0;
+		for (let i = 0; i < this.fileEntries.length; i++) {
+			const entry = this.fileEntries[i];
+			const line = JSON.stringify(entry);
+			const length = Buffer.byteLength(line);
+			writeFileSync(fd, `${line}\n`);
+			const location = { file, offset, length };
+			offset += length + 1;
+			if (!isColdEntry(entry)) {
+				setEntryLocation(entry, location);
+				continue;
+			}
+			const rebound = toColdEntry(JSON.parse(line) as SessionEntry, location);
+			sealEntryProvenance(rebound, true);
+			this.fileEntries[i] = rebound;
+			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
+		}
+		this.#revisionKey = undefined;
+		this.#branchProjection = undefined;
+	}
+
+	/** Append one entry line and record its byte range. */
+	#appendLine(file: string, entry: SessionEntry): void {
+		const line = JSON.stringify(entry);
+		// The file can be deleted while Pi runs; appendFileSync then recreates it.
+		const offset = existsSync(file) ? statSync(file).size : 0;
+		appendFileSync(file, `${line}\n`);
+		setEntryLocation(entry, { file, offset, length: Buffer.byteLength(line) });
+	}
+
+	/**
+	 * Bound session memory (smarty-dev#2177): keep the current context and the most recent entries
+	 * resident; every other entry keeps only its small fields and reads large ones from the file.
+	 * Runs after load, compaction and leaf moves; entries appended between runs stay resident.
+	 */
+	#releaseColdEntries(): void {
+		if (!this.persist || !this.flushed) return;
+		const hot = new Set<string>();
+		for (const entry of buildContextEntries([], this.leafId, this.byId)) hot.add(entry.id);
+		for (let i = Math.max(0, this.fileEntries.length - RECENT_RESIDENT_ENTRIES); i < this.fileEntries.length; i++) {
+			const entry = this.fileEntries[i];
+			if (entry.type !== "session") hot.add(entry.id);
+		}
+		let changed = false;
+		for (let i = 0; i < this.fileEntries.length; i++) {
+			const entry = this.fileEntries[i];
+			if (entry.type === "session") continue;
+			const location = getEntryLocation(entry);
+			if (!location) continue;
+			const next = hot.has(entry.id) ? toHotEntry(entry) : isColdEntry(entry) ? entry : toColdEntry(entry, location);
+			if (next === entry) continue;
+			sealEntryProvenance(next, true);
+			this.fileEntries[i] = next;
+			// With duplicate ids, byId keeps the later entry (as _buildIndex does); only replace that one.
+			if (this.byId.get(next.id) === entry) this.byId.set(next.id, next);
+			changed = true;
+		}
+		if (changed) {
+			this.#revisionKey = undefined;
+			this.#branchProjection = undefined;
 		}
 	}
 
@@ -1169,30 +1378,30 @@ export class SessionManager {
 		);
 	}
 
-	_persist(entry: SessionEntry): void {
+	#persistEntry(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
 		if (!this.flushed) {
 			if (!this._hasConversation()) return;
 			const fd = openSync(this.sessionFile, "wx");
 			try {
-				for (const e of this.fileEntries) {
-					writeFileSync(fd, `${JSON.stringify(e)}\n`);
-				}
+				this.#writeEntries(fd, this.sessionFile);
 			} finally {
 				closeSync(fd);
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this.#appendLine(this.sessionFile, entry);
 		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
+		sealEntryProvenance(entry, true);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
-		this._persist(entry);
+		this.extendBranchProjection(entry);
+		this.#persistEntry(entry);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -1202,12 +1411,24 @@ export class SessionManager {
 	 * These need to be appended via appendCompaction() and appendBranchSummary() methods.
 	 */
 	appendMessage(message: Message | CustomMessage | BashExecutionMessage): string {
+		return this.#appendReceivedMessage(message);
+	}
+
+	#appendReceivedMessage(
+		message: Message | CustomMessage | BashExecutionMessage,
+		receipt?: TurnReceipt,
+		metadata?: UserMessageMetadata,
+		metadataSource?: UserMessageMetadataSource,
+	): string {
+		const provenance = message.role === "user" || message.role === "custom" ? receiptRecord(receipt) : undefined;
 		const entry: SessionMessageEntry = {
 			type: "message",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
 			message,
+			...(provenance ? { provenance } : {}),
+			...(message.role === "user" && metadata !== undefined ? { metadata, metadataSource } : {}),
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1283,6 +1504,7 @@ export class SessionManager {
 			...(systemMessage ? { systemMessage: { ...systemMessage, timestamp: new Date(timestamp).getTime() } } : {}),
 		};
 		this._appendEntry(entry);
+		this.#releaseColdEntries();
 		return entry.id;
 	}
 
@@ -1342,12 +1564,23 @@ export class SessionManager {
 		display: boolean,
 		details?: T,
 	): string {
+		return this.#appendReceivedCustomMessage(customType, content, display, details);
+	}
+
+	#appendReceivedCustomMessage<T = unknown>(
+		customType: string,
+		content: string | (TextContent | ImageContent)[],
+		display: boolean,
+		details?: T,
+		receipt?: TurnReceipt,
+	): string {
 		const entry: CustomMessageEntry<T> = {
 			type: "custom_message",
 			customType,
 			content,
 			display,
 			details,
+			provenance: receiptRecord(receipt),
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
@@ -1403,6 +1636,47 @@ export class SessionManager {
 
 	getLeafId(): string | null {
 		return this.leafId;
+	}
+
+	/** @internal Branch IDs and entry tags without copying payloads. */
+	getBranchIdentity(): {
+		entries: Array<{ id: string; type: SessionEntry["type"]; customType?: string }>;
+		leafId: string | null;
+		revision: number;
+		sessionEpoch: object;
+	} {
+		const path = this.getBranchProjection().path;
+		return {
+			entries: path.map((entry) => ({
+				id: entry.id,
+				type: entry.type,
+				...(entry.type === "custom" ? { customType: entry.customType } : {}),
+			})),
+			leafId: this.leafId,
+			revision: this.revision(),
+			sessionEpoch: this.#sessionEpoch,
+		};
+	}
+
+	/**
+	 * Cheap token that changes whenever the session content or leaf changes.
+	 * Use it to cache values derived from the session (for example, per-frame UI state).
+	 */
+	revision(): number {
+		// ponytail: entries are append-only (push) or the array is replaced, and the leaf is the
+		// only other input, so (array, length, leaf) identifies the state without hooks at every
+		// mutation site. Revisit if entries are ever mutated or removed in place.
+		const key = this.#revisionKey;
+		if (
+			!key ||
+			key.entries !== this.fileEntries ||
+			key.length !== this.fileEntries.length ||
+			key.leafId !== this.leafId
+		) {
+			this.#revisionKey = { entries: this.fileEntries, length: this.fileEntries.length, leafId: this.leafId };
+			this.#revision++;
+		}
+		return this.#revision;
 	}
 
 	getLeafEntry(): SessionEntry | undefined {
@@ -1467,6 +1741,13 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		return this.getBranchEntries(fromId);
+	}
+
+	private getBranchEntries(fromId?: string): SessionEntry[] {
+		if (fromId === undefined || fromId === this.leafId) {
+			return this.getBranchProjection().path.slice();
+		}
 		const path: SessionEntry[] = [];
 		const startId = fromId ?? this.leafId;
 		let current = startId ? this.byId.get(startId) : undefined;
@@ -1483,7 +1764,46 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+		return this.getBranchProjection().contextEntries.slice();
+	}
+
+	/** Ordinary appends extend the cached branch instead of walking old history again. */
+	private extendBranchProjection(entry: SessionEntry): void {
+		const cache = this.#branchProjection;
+		const key = this.#revisionKey;
+		if (
+			!cache ||
+			cache.revision !== this.#revision ||
+			key?.entries !== this.fileEntries ||
+			key.length !== this.fileEntries.length - 1 ||
+			key.leafId !== entry.parentId
+		) {
+			this.#branchProjection = undefined;
+			return;
+		}
+		cache.path.push(entry);
+		if (entry.type === "compaction") {
+			cache.contextEntries = buildContextEntriesFromPath(cache.path);
+		} else if (cache.contextEntries !== cache.path) {
+			cache.contextEntries.push(entry);
+		}
+		Object.assign(cache, getSessionContextSettings([entry], cache));
+		cache.revision = this.revision();
+	}
+
+	/** Cache only the current branch selection, not mutable projected messages or past revisions. */
+	private getBranchProjection() {
+		const revision = this.revision();
+		if (this.#branchProjection?.revision !== revision) {
+			const path = buildSessionPath([], this.leafId, this.byId);
+			this.#branchProjection = {
+				revision,
+				path,
+				contextEntries: buildContextEntriesFromPath(path),
+				...getSessionContextSettings(path),
+			};
+		}
+		return this.#branchProjection;
 	}
 
 	/**
@@ -1491,7 +1811,8 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		return buildSessionProjection(this.getEntries(), this.leafId, this.byId);
+		const { contextEntries, thinkingLevel, model } = this.getBranchProjection();
+		return projectSessionContext(contextEntries, thinkingLevel, model ? { ...model } : null);
 	}
 
 	buildSessionContext(): SessionContext {
@@ -1512,6 +1833,11 @@ export class SessionManager {
 		return this.byId.size;
 	}
 
+	/** Physical records after the initial header, including duplicate IDs and extra headers. */
+	getPhysicalEntryCount(): number {
+		return this.fileEntries.length - 1;
+	}
+
 	/**
 	 * Get all session entries (excludes header). Returns a shallow copy.
 	 * The session is append-only: use appendXXX() to add entries, branch() to
@@ -1527,7 +1853,10 @@ export class SessionManager {
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries();
+		return this.buildTree(this.getEntries());
+	}
+
+	private buildTree(entries: SessionEntry[]): SessionTreeNode[] {
 		const nodeMap = new Map<string, SessionTreeNode>();
 		const roots: SessionTreeNode[] = [];
 
@@ -1581,6 +1910,8 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
+		this.#branchProjection = undefined;
+		this.#releaseColdEntries();
 	}
 
 	/**
@@ -1590,6 +1921,7 @@ export class SessionManager {
 	 */
 	resetLeaf(): void {
 		this.leafId = null;
+		this.#branchProjection = undefined;
 	}
 
 	/**
@@ -1621,6 +1953,7 @@ export class SessionManager {
 			fromHook,
 		};
 		this._appendEntry(entry);
+		this.#releaseColdEntries();
 		return entry.id;
 	}
 
@@ -1652,17 +1985,17 @@ export class SessionManager {
 				replacementByLabelId.set(labelId, entry.id);
 			}
 			pendingLabelIds.length = 0;
+			// copyEntry keeps cold fields lazy, so a long path is not loaded into memory at once.
 			pathWithoutLabels.push(
 				entry.type === "compaction"
-					? {
-							...entry,
+					? copyEntry(entry, {
 							parentId: pathParentId,
 							firstKeptEntryId:
 								entry.firstKeptEntryId === entry.id
 									? entry.id
 									: (replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId),
-						}
-					: { ...entry, parentId: pathParentId },
+						})
+					: copyEntry(entry, { parentId: pathParentId }),
 			);
 			pathParentId = entry.id;
 		}
@@ -1710,15 +2043,17 @@ export class SessionManager {
 			}
 
 			this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+			this.#sessionEpoch = {};
 			this.sessionId = newSessionId;
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Use the same rule as _persist(): write now if the branched path already
-			// has a conversation, otherwise let _persist() create the file later.
+			// Use the same rule as #persistEntry(): write now if the branched path already
+			// has a conversation, otherwise let #persistEntry() create the file later.
 			if (this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
+				this.#releaseColdEntries();
 			} else {
 				this.flushed = false;
 			}
@@ -1742,6 +2077,7 @@ export class SessionManager {
 			parentId = labelEntry.id;
 		}
 		this.fileEntries = [header, ...pathWithoutLabels, ...labelEntries];
+		this.#sessionEpoch = {};
 		this.sessionId = newSessionId;
 		this._buildIndex();
 		return undefined;
@@ -1774,7 +2110,7 @@ export class SessionManager {
 				if (!(error instanceof SessionHeaderScanLimitError)) throw error;
 				// The bounded scan is only a discovery optimization. A full load remains
 				// authoritative for legacy files with very large headers or prefixes.
-				preloadedFileEntries = loadEntriesFromFile(resolvedPath);
+				preloadedFileEntries = readEntriesFromFile(resolvedPath, true);
 				const firstEntry = preloadedFileEntries[0];
 				header = firstEntry?.type === "session" ? firstEntry : null;
 			}
@@ -1802,7 +2138,10 @@ export class SessionManager {
 
 	/** Create an in-memory session (no file persistence), optionally from entries held outside the filesystem. */
 	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions, entries?: FileEntry[]): SessionManager {
-		return new SessionManager(cwd, "", undefined, false, options, entries);
+		// Own the containers; _buildIndex detaches and seals reserved metadata.
+		// Unrelated live payloads retain their in-memory representation, not JSON wire semantics.
+		const snapshot = entries?.map((entry) => ({ ...entry }));
+		return new SessionManager(cwd, "", undefined, false, options, snapshot);
 	}
 
 	/**
@@ -1820,7 +2159,7 @@ export class SessionManager {
 	): SessionManager {
 		const resolvedSourcePath = resolvePath(sourcePath);
 		const resolvedTargetCwd = resolvePath(targetCwd);
-		const sourceEntries = loadEntriesFromFile(resolvedSourcePath);
+		const sourceEntries = readEntriesFromFile(resolvedSourcePath, true);
 		if (sourceEntries.length === 0) {
 			throw new Error(`Cannot fork: source session file is empty or invalid: ${resolvedSourcePath}`);
 		}
