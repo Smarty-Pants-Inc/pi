@@ -2972,9 +2972,9 @@ export class AgentSession {
 	}
 
 	private _restoreUnsentInputs(): void {
-		const entries = this.sessionManager.getEntries();
-		const consumed = new Set(entries.flatMap((entry) => (entry.unsentInputId ? [entry.unsentInputId] : [])));
-		for (const entry of this.sessionManager.getBranch()) {
+		const branch = this.sessionManager.getBranch();
+		const consumed = new Set(branch.flatMap((entry) => (entry.unsentInputId ? [entry.unsentInputId] : [])));
+		for (const entry of branch) {
 			if (entry.type !== "custom" || entry.customType !== UNSENT_INPUT_TYPE || consumed.has(entry.id)) continue;
 			const input = readUnsentInput(entry.data);
 			if (!input) throw new Error(`Invalid unsent input entry ${entry.id}`);
