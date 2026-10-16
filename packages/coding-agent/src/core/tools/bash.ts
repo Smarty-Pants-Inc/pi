@@ -406,7 +406,7 @@ export function createShellToolDefinition(
 				const logNotice =
 					snapshot.fullOutputError !== undefined
 						? `Output log unavailable: ${snapshot.fullOutputError}`
-						: `${snapshot.fullOutputTruncation ? "Capped log" : "Full output"}: ${snapshot.fullOutputPath}`;
+						: `Full output: ${snapshot.fullOutputPath}`;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
 					details = {
@@ -427,7 +427,7 @@ export function createShellToolDefinition(
 					}
 					const capped = snapshot.fullOutputTruncation;
 					if (capped) {
-						text += `\n[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)}]`;
+						text += `\n[Output log capped: ${capped.omittedBytes} of ${capped.totalBytes} bytes omitted; ${snapshot.fullOutputPath} keeps the first ${formatSize(FULL_OUTPUT_HEAD_BYTES)} and last ${formatSize(FULL_OUTPUT_TAIL_BYTES)} (${formatSize(FULL_OUTPUT_HEAD_BYTES + FULL_OUTPUT_TAIL_BYTES)} cap)]`;
 					}
 				} else if (snapshot.fullOutputError !== undefined) {
 					// Chunk-count storage limits can open a log before display truncation is needed.
