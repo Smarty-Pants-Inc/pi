@@ -92,7 +92,7 @@ describe("plain SessionManager append-only serialization", () => {
 			expect(submitted).toBe(bytes.length - prefix.length);
 			expect(submissions).toHaveLength(turns * 2);
 			expect(fs.writeFileSync).not.toHaveBeenCalled();
-			expect(bytes.subarray(0, prefix.length)).toEqual(prefix);
+			expect(bytes.subarray(0, prefix.length).equals(prefix)).toBe(true);
 			const reopened = SessionManager.open(file, directory);
 			expect(reopened.getHeader()).toEqual(manager.getHeader());
 			expect(reopened.getEntries()).toEqual(manager.getEntries());
@@ -102,9 +102,15 @@ describe("plain SessionManager append-only serialization", () => {
 	);
 
 	// smarty-dev#6719: a 10MiB prefix must not be submitted for every new entry.
+	// pi#280 / smarty-dev#3155: use native equality to avoid deep-matcher byte enumeration.
 	test("1000 turns after a 10MiB seed submit only suffixes", () => {
 		const prefix = seed(header);
 		expect(prefix.length).toBe(seedBytes);
+		const prefixCopy = Buffer.from(prefix);
+		expect(prefixCopy.equals(prefix)).toBe(true);
+		prefixCopy[Math.floor(prefixCopy.length / 2)] ^= 0xff;
+		expect(prefixCopy.equals(prefix)).toBe(false);
+		expect(prefix.subarray(0, prefix.length - 1).equals(prefix)).toBe(false);
 		fs.writeFileSync(file, prefix);
 		const manager = SessionManager.open(file, directory);
 		vi.clearAllMocks();
@@ -119,7 +125,7 @@ describe("plain SessionManager append-only serialization", () => {
 			.mock.calls.reduce((sum, call) => sum + Buffer.byteLength(call[1] as string), 0);
 		const bytes = fs.readFileSync(file);
 		expect(submitted).toBe(bytes.length - seedBytes);
-		expect(bytes.subarray(0, seedBytes)).toEqual(prefix);
+		expect(bytes.subarray(0, seedBytes).equals(prefix)).toBe(true);
 		expect(fs.writeFileSync).not.toHaveBeenCalled();
 		const reopened = SessionManager.open(file, directory);
 		expect(reopened.getEntries()).toEqual(manager.getEntries());
