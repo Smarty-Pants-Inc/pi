@@ -1,0 +1,82 @@
+merge_queue:
+  mode: serial
+  max_parallel_checks: 2
+  reset_on_external_merge: always
+
+# smarty-dev's plain rule (smarty-dev#865): the PR, its required checks and this queue are the
+# review. The Astra reviewer queues a ready PR after its success verdict; `hold` and DO NOT LAND
+# titles keep a PR out.
+queue_rules:
+  - name: default
+    batch_size: 4
+    batch_max_wait_time: 2 min
+    checks_timeout: 180 min
+    merge_method: merge
+    queue_conditions:
+      # release/runtime-a2 (smarty-dev#7403, chief-of-staff): the temporary landed home of the fleet's a2 runtime
+      # line (716a6046 + reviewed commits), with main's conditions; Mergify keeps one queue per base. Every commit
+      # on it is also on main. Retired when v1.1.0 is installed fleet-wide.
+      - or:
+          - base = main
+          - base = release/runtime-a2
+      - -draft
+      - -label = hold
+      - -title ~= (?i)do not land
+      - check-success = review/astra
+      # A PR that needs a named security pass (label needs-security-pass) waits for its
+      # review/security status, which the pass posts on the exact head (smarty-dev#806, #817).
+      - or:
+          - -label = needs-security-pass
+          - check-success = review/security
+      # An automated upstream sync (branch sync/upstream-*, bin/smarty-fork-sync) always waits for
+      # review/security; pi-security-astra acts on those heads (smarty-dev#755, #1004).
+      - or:
+          - -head ~= ^sync/upstream-
+          - check-success = review/security
+      - check-success = smarty-ci
+      - -check-failure = smarty-ci
+    merge_conditions:
+      - check-success = smarty-ci
+      - -check-failure = smarty-ci
+
+# The fleet's write App bot may queue (smarty-dev#735, #736): GitHub reports App bots as permission
+# none, so the default `sender-permission >= write` restriction refused its queue commands.
+commands_restrictions:
+  queue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  # The same allowance for `requeue` (smarty-dev#7327): without it Mergify refuses a fleet bot's requeue
+  # ('Command disallowed'), and a dequeued PR sits until someone notices (k3#958, ~18.5 h on 10-08).
+  requeue:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+  # The stuck-work check's R4 posts one `@mergifyio refresh` per head as the write App (smarty-dev#868,
+  # #983); without this Mergify answers "Command disallowed".
+  refresh:
+    conditions:
+      - or:
+          - sender-permission >= write
+          - sender = smarty-fleet-write[bot]
+          - sender = smarty-fleet-write-leads[bot]
+          - sender = smarty-fleet-write-lanes[bot]
+          - sender = smarty-fleet-write-versehq[bot]
+
+# Sanctioned front-of-queue route, as smarty-dev (#2004 T10; org for Paul 2026-10-02): a PR labelled p0 is
+# checked ahead of the rest of the queue.
+priority_rules:
+  - name: p0
+    conditions:
+      - label = p0
+    priority: high
+    # Priority must not discard in-flight CI (smarty-dev decision #2143, proven #2356).
+    allow_checks_interruption: false
