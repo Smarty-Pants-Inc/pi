@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +6,8 @@ import { type CredentialStore, createModels, type Provider } from "@earendil-wor
 import lockfile from "proper-lockfile";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { AuthStorage, FileAuthStorageBackend } from "../src/core/auth-storage.ts";
+
+vi.mock("node:fs", { spy: true });
 
 describe("AuthStorage", () => {
 	const tempDir = join(tmpdir(), `pi-test-auth-storage-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -113,9 +116,33 @@ describe("AuthStorage", () => {
 		expect(lockSpy).toHaveBeenCalledTimes(2);
 	});
 
+	// pi#280 / smarty-dev#3155: equal metadata must not hide a credential edit.
+	test("reloads same-size credential edits when all revision metadata collides", async () => {
+		writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
+		const frozenStats = statSync(authJsonPath, { bigint: true });
+		vi.spyOn(fs, "statSync").mockReturnValue(frozenStats);
+		const storage = AuthStorage.create(authJsonPath);
+		const lockSpy = vi.spyOn(lockfile, "lock");
+
+		await expect(storage.read("anthropic")).resolves.toEqual({ type: "api_key", key: "old" });
+		expect(lockSpy).not.toHaveBeenCalled();
+
+		writeAuthJson({ anthropic: { type: "api_key", key: "new" } });
+		expect(BigInt(readFileSync(authJsonPath).length)).toBe(frozenStats.size);
+		await expect(storage.read("anthropic")).resolves.toEqual({ type: "api_key", key: "new" });
+		expect(lockSpy).toHaveBeenCalledTimes(1);
+
+		await expect(storage.read("anthropic")).resolves.toEqual({ type: "api_key", key: "new" });
+		await expect(storage.list()).resolves.toEqual([{ providerId: "anthropic", type: "api_key" }]);
+		expect(lockSpy).toHaveBeenCalledTimes(1);
+	});
+
 	test("keeps a coalesced reload alive while another credential reader is waiting", async () => {
 		writeAuthJson({ anthropic: { type: "api_key", key: "old" } });
+		const frozenStats = statSync(authJsonPath, { bigint: true });
+		vi.spyOn(fs, "statSync").mockReturnValue(frozenStats);
 		const storage = AuthStorage.create(authJsonPath);
+		// Keep both values the same size to exercise filesystems with coarse timestamp resolution.
 		writeAuthJson({ anthropic: { type: "api_key", key: "new" } });
 		let grantLock: (() => void) | undefined;
 		const lockGranted = new Promise<void>((resolve) => {
@@ -137,6 +164,14 @@ describe("AuthStorage", () => {
 		await expect(second).resolves.toEqual({ type: "api_key", key: "new" });
 		expect(lockSpy).toHaveBeenCalledTimes(1);
 		expect(release).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(readFileSync(authJsonPath, "utf8"))).toEqual({
+			anthropic: { type: "api_key", key: "new" },
+		});
+		await expect(storage.read("anthropic")).resolves.toEqual({ type: "api_key", key: "new" });
+		await expect(storage.read("anthropic", { signal: firstController.signal })).rejects.toMatchObject({
+			name: "AbortError",
+		});
+		expect(lockSpy).toHaveBeenCalledTimes(1);
 	});
 
 	test.skipIf(process.platform === "win32")("creates new auth files with owner-only permissions", () => {
