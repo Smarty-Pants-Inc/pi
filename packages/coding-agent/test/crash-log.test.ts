@@ -1,5 +1,8 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { findExtensionStackMatches } from "../src/core/crash-log.ts";
+import { findExtensionStackMatches, readCrashLog, takeUnnotifiedCrash } from "../src/core/crash-log.ts";
 
 type StackExtension = Parameters<typeof findExtensionStackMatches>[1][number];
 
@@ -18,6 +21,37 @@ function packageExtension(source: string, baseDir: string, entry = "extensions/i
 		},
 	};
 }
+
+// smarty-dev#5271 / pi#280: returning one notice must not retire unseen crashes.
+describe("pending crash notices", () => {
+	test("keeps the older pending crash for the next notice", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "pi-crash-notices-")), "crashes.json");
+		const now = Date.now();
+		writeFileSync(
+			path,
+			JSON.stringify([
+				{ timestamp: new Date(now - 1000).toISOString(), message: "older" },
+				{ timestamp: new Date(now).toISOString(), message: "newer" },
+			]),
+		);
+		expect(takeUnnotifiedCrash(path, now)?.message).toBe("newer");
+		expect(readCrashLog(path).map((record) => record.notified === true)).toEqual([false, true]);
+		expect(takeUnnotifiedCrash(path, now)?.message).toBe("older");
+		expect(readCrashLog(path).every((record) => record.notified)).toBe(true);
+		expect(takeUnnotifiedCrash(path, now)).toBeUndefined();
+	});
+
+	test("does not announce expired records", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "pi-crash-expired-")), "crashes.json");
+		const now = Date.now();
+		writeFileSync(
+			path,
+			JSON.stringify([{ timestamp: new Date(now - 8 * 24 * 60 * 60 * 1000).toISOString(), message: "old" }]),
+		);
+		expect(takeUnnotifiedCrash(path, now)).toBeUndefined();
+		expect(readCrashLog(path)[0].notified).toBeUndefined();
+	});
+});
 
 describe("extension crash attribution", () => {
 	test("matches stack frames beneath loaded package roots", () => {
