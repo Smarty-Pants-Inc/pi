@@ -94,6 +94,10 @@ export interface RpcSlashCommand {
 // ============================================================================
 
 export interface RpcSessionState {
+	inputAdmissionCount: number;
+	inputsFenced: boolean;
+	isIdle: boolean;
+	isPromptPending: boolean;
 	model?: Model<any>;
 	thinkingLevel: ThinkingLevel;
 	isStreaming: boolean;
@@ -104,8 +108,20 @@ export interface RpcSessionState {
 	sessionId: string;
 	sessionName?: string;
 	autoCompactionEnabled: boolean;
+	/** Explicit CLI launch selection applied in memory; independent of the effective setting. */
+	readonly autoCompactionDisabledForProcess: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+}
+
+/** Terminal receipt for previously acknowledged queued input that shutdown could not deliver. */
+export interface RpcInputRejectedEvent {
+	type: "input_rejected";
+	reason: "shutdown";
+	sessionId: string;
+	error: string;
+	/** Complete original queued messages, including image attachments. No implicit replay. */
+	messages: AgentMessage[];
 }
 
 // ============================================================================
@@ -250,17 +266,17 @@ export type RpcResponse =
 
 /** Emitted when an extension needs user input */
 export type RpcExtensionUIRequest =
-	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout?: number }
-	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout?: number }
+	| { type: "extension_ui_request"; id: string; method: "select"; title: string; options: string[]; timeout: number }
+	| { type: "extension_ui_request"; id: string; method: "confirm"; title: string; message: string; timeout: number }
 	| {
 			type: "extension_ui_request";
 			id: string;
 			method: "input";
 			title: string;
 			placeholder?: string;
-			timeout?: number;
+			timeout: number;
 	  }
-	| { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string }
+	| { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string; timeout: number }
 	| {
 			type: "extension_ui_request";
 			id: string;

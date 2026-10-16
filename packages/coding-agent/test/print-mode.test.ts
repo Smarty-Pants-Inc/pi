@@ -1,5 +1,7 @@
 import type { AssistantMessage, ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { AgentSession, PromptOptions } from "../src/core/agent-session.ts";
+import { bindReceivedInputSession } from "../src/core/received-input.ts";
 import type { SessionShutdownEvent } from "../src/index.ts";
 import { runPrintMode } from "../src/modes/print-mode.ts";
 
@@ -17,7 +19,7 @@ type FakeSession = {
 	extensionRunner: FakeExtensionRunner;
 	bindExtensions: ReturnType<typeof vi.fn>;
 	subscribe: ReturnType<typeof vi.fn>;
-	prompt: ReturnType<typeof vi.fn>;
+	prompt: ReturnType<typeof vi.fn<(text: string, options?: PromptOptions) => Promise<void>>>;
 	reload: ReturnType<typeof vi.fn>;
 };
 
@@ -70,9 +72,22 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		extensionRunner,
 		bindExtensions: vi.fn(async () => {}),
 		subscribe: vi.fn(() => () => {}),
-		prompt: vi.fn(async () => {}),
+		prompt: vi.fn(async (_text: string, _options?: PromptOptions) => {}),
 		reload: vi.fn(async () => {}),
 	};
+	bindReceivedInputSession(session as unknown as AgentSession, {
+		prompt: async (input, options) => {
+			if (input.images) await session.prompt(input.text, { ...options, images: input.images });
+			else if (options) await session.prompt(input.text, options);
+			else await session.prompt(input.text);
+		},
+		steer: async () => {
+			throw new Error("Print mode does not steer");
+		},
+		followUp: async () => {
+			throw new Error("Print mode does not follow up");
+		},
+	});
 
 	return {
 		session,
@@ -122,6 +137,60 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledTimes(1);
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
+
+	// smarty-dev#3200 / pi#114: settlement is authoritative with a tool-result tail or length stop.
+	it.each([false, true])("returns failure for settled error with tool-result tail: %s", async (toolTail) => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "truncated", stopReason: "length" }));
+		if (toolTail)
+			Object.assign(runtimeHost.session.state, {
+				messages: [
+					...runtimeHost.session.state.messages,
+					{
+						role: "toolResult",
+						toolCallId: "partial",
+						toolName: "read",
+						content: [{ type: "text", text: "not executed" }],
+						isError: true,
+						timestamp: 0,
+					},
+				],
+			});
+		runtimeHost.session.subscribe.mockImplementation((listener) => {
+			runtimeHost.session.prompt.mockImplementation(async () => {
+				listener({ type: "agent_settled", outcome: "error" });
+			});
+			return () => {};
+		});
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "test",
+		});
+		expect(exitCode).toBe(1);
+		expect(errorSpy).toHaveBeenCalledWith("Request error");
+	});
+
+	// pi#132: successful output is not constrained by forced-shutdown drainage.
+	it("joins slow successful text output before the forced-shutdown drain budget", async () => {
+		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
+		const written: string[] = [];
+		vi.spyOn(process.stdout, "write").mockImplementation(((
+			chunk: string | Uint8Array,
+			callback?: (error?: Error | null) => void,
+		) => {
+			written.push(String(chunk));
+			setTimeout(() => callback?.(), String(chunk).length > 0 ? 1500 : 0);
+			return true;
+		}) as typeof process.stdout.write);
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const exitCode = await runPrintMode(runtimeHost as unknown as Parameters<typeof runPrintMode>[0], {
+			mode: "text",
+			initialMessage: "Say done",
+		});
+		expect(errorSpy).not.toHaveBeenCalled();
+		expect(exitCode).toBe(0);
+		expect(written.join("")).toBe("done\n");
+	}, 10_000);
 
 	it("emits session_shutdown and returns non-zero on assistant error", async () => {
 		const runtimeHost = createRuntimeHost(
