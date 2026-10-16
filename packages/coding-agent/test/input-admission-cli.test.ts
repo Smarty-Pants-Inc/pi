@@ -549,6 +549,9 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 	);
 	it("EOF aborts active bash before joining its correlated result", async () => {
 		const p = await launch("active-bash");
+		// smarty-dev#3048: a get_state response proves readiness; binding-1 precedes binding completion.
+		p.send({ id: "ready", type: "get_state" });
+		expect(await p.response("ready")).toMatchObject({ success: true });
 		p.send({ id: "bash", type: "bash", command: "echo owned-bash-started; sleep 3; echo must-not-run" });
 		await vi.waitFor(() =>
 			expect(
@@ -791,8 +794,10 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		"round6 idle %s retains authoritative abort refusal after nested custom settlement",
 		async (entry) => {
 			const p = await launch(`nested-queue-${entry}`);
+			// Keep startup in the response helper's 15 s budget, before exercising nested dispatch.
+			p.send({ id: "ready", type: "get_state" });
+			expect(await p.response("ready")).toMatchObject({ success: true });
 			p.send({ id: "held-A", type: entry, message: "nested-queue-A" });
-			// Child startup and extension load fall inside this first wait, so it gets the helpers' 15 s budget.
 			await vi.waitFor(() => expect(p.records.filter((record) => record.type === "agent_settled")).toHaveLength(1), {
 				timeout: 15000,
 			});
