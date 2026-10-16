@@ -938,9 +938,14 @@ describe("ExtensionRunner", () => {
 		);
 		const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
 
-		expect(runner.resolveToolRenderers("a", () => undefined)).toEqual({ renderCall });
+		// Returned renderer callbacks are source-bound wrappers, not the original functions.
+		const firstRenderers = runner.resolveToolRenderers("a", () => undefined);
+		expect(firstRenderers).toEqual({ renderCall: expect.any(Function) });
+		expect(firstRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
 		expect(runner.resolveToolRenderers("b", () => undefined)).toEqual({ renderShell: "self" });
-		expect(runner.resolveToolRenderers("b", () => ({ renderCall }))).toEqual({ renderCall });
+		const baseRenderers = runner.resolveToolRenderers("b", () => ({ renderCall }));
+		expect(baseRenderers).toEqual({ renderCall: expect.any(Function) });
+		expect(baseRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
 	});
 
 	describe("boundary chaining", () => {

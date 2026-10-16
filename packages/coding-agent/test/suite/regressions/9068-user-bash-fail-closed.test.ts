@@ -81,6 +81,7 @@ function createRuntimeHost(harness: Harness): AgentSessionRuntime {
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
 		setRebindSession: vi.fn(),
+		setLifecycleCompleteHandler: vi.fn(),
 	} as unknown as AgentSessionRuntime;
 }
 
@@ -116,8 +117,11 @@ async function startRpcHarness(extension: (pi: ExtensionAPI) => void): Promise<{
 
 type InteractiveBashContext = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> | void };
-	editor: { addToHistory?: (text: string) => void };
+	editor: { setText(text: string): void; addToHistory?: (text: string) => void };
 	session: Harness["session"];
+	runtimeHost: Pick<AgentSessionRuntime, "session" | "inputsFenced">;
+	options: Record<string, never>;
+	uncaughtCrash(error: Error): never;
 	sessionManager: Harness["sessionManager"];
 	ui: { requestRender(): void };
 	chatContainer: { addChild(component: unknown): void };
@@ -219,18 +223,20 @@ describe("RPC user_bash failure handling (#9068)", () => {
 	});
 });
 
-describe("Interactive user_bash failure handling (#9068)", () => {
-	test.each([
-		["!pwd", false],
-		["!!pwd", true],
-	])("fails closed for %s when a handler returns an empty result", async (input, excludeFromContext) => {
+describe.each([
+	["!pwd", false],
+	["!!pwd", true],
+] as const)("Interactive user_bash failure handling (#9068): %s", (input, excludeFromContext) => {
+	// pi#280: undefined is the paired local-execution control; invalid results and throws stay fail-closed.
+	test.each(["empty", "throw", "undefined"] as const)("handles a %s hook result", async (outcome) => {
 		const events: UserBashEvent[] = [];
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
 					pi.on("user_bash", async (event) => {
 						events.push(event);
-						return {} as unknown as UserBashEventResult;
+						if (outcome === "throw") throw new Error("Routing failed");
+						return outcome === "empty" ? ({} as unknown as UserBashEventResult) : undefined;
 					});
 				},
 			],
@@ -238,8 +244,14 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 		const executeBash = vi.spyOn(harness.session, "executeBash").mockResolvedValue(localResult);
 		const context: InteractiveBashContext = {
 			defaultEditor: {},
-			editor: { addToHistory: vi.fn() },
+			editor: { setText: vi.fn(), addToHistory: vi.fn() },
 			session: harness.session,
+			runtimeHost: { session: harness.session, inputsFenced: false },
+			options: {},
+			// Keep the real submit failure observer; replace only its process-exit boundary.
+			uncaughtCrash: (error) => {
+				throw error;
+			},
 			sessionManager: harness.sessionManager,
 			ui: { requestRender: vi.fn() },
 			chatContainer: { addChild: vi.fn() },
@@ -250,6 +262,8 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 			showError: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
 		};
+		// pi#280: submit also needs the real capture/dispatch/observer methods, not just handleBashCommand.
+		Object.setPrototypeOf(context, InteractiveMode.prototype);
 		interactiveModePrototype.setupEditorSubmitHandler.call(context);
 
 		try {
@@ -263,7 +277,15 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 					cwd: harness.sessionManager.getCwd(),
 				},
 			]);
-			expect(executeBash).not.toHaveBeenCalled();
+			expect(context.editor.setText).toHaveBeenCalledWith("");
+			expect(context.editor.addToHistory).toHaveBeenCalledWith(input);
+			expect(executeBash).toHaveBeenCalledTimes(outcome === "undefined" ? 1 : 0);
+			if (outcome === "undefined") {
+				expect(executeBash).toHaveBeenCalledWith("pwd", expect.any(Function), {
+					excludeFromContext,
+					operations: undefined,
+				});
+			}
 		} finally {
 			executeBash.mockRestore();
 			harness.cleanup();

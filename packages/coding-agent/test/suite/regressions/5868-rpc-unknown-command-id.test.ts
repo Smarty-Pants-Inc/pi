@@ -77,6 +77,7 @@ function createRuntimeHost(harness: Harness): AgentSessionRuntime {
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
 		setRebindSession: vi.fn(),
+		setLifecycleCompleteHandler: vi.fn(),
 	} as unknown as AgentSessionRuntime;
 }
 
@@ -84,6 +85,32 @@ describe("RPC unknown command responses (#5868)", () => {
 	afterEach(() => {
 		rpcIo.outputLines = [];
 		rpcIo.lineHandler = undefined;
+	});
+
+	// pi#280 / smarty-dev#3155: advertise the retained admission API in actual state responses.
+	test("publishes session capabilities on initial and subsequent state requests", async () => {
+		const listenerSnapshot = takeListenerSnapshot();
+		const harness = await createHarness();
+		try {
+			void runRpcMode(createRuntimeHost(harness));
+			await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+			for (const id of ["initial-state", "next-state"]) {
+				rpcIo.lineHandler?.(JSON.stringify({ id, type: "get_state" }));
+				await vi.waitFor(() => {
+					expect(parseOutputLines()).toContainEqual({
+						id,
+						type: "response",
+						command: "get_state",
+						success: true,
+						data: expect.objectContaining({ capabilities: harness.session.capabilities }),
+					});
+				});
+			}
+			expect(harness.session.capabilities.inputAdmission).toBe(1);
+		} finally {
+			harness.cleanup();
+			restoreListeners(listenerSnapshot);
+		}
 	});
 
 	test("preserves the request id on unknown command errors", async () => {

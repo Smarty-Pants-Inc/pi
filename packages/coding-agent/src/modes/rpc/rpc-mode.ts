@@ -514,6 +514,7 @@ export async function runRpcMode(
 
 			case "get_state": {
 				const state: RpcSessionState = {
+					capabilities: session.capabilities,
 					inputAdmissionCount: session.inputAdmissionCount,
 					inputsFenced: runtimeHost.inputsFenced,
 					isIdle: session.isIdle,

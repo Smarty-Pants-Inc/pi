@@ -35,6 +35,7 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"overloaded",
 	"\\bSelected model is at capacity\\. Please try a different model\\.",
+	"\\bslow_down\\b",
 	"server_busy",
 	"servers are currently busy",
 	"currently experiencing high demand",

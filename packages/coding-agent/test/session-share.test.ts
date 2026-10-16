@@ -10,6 +10,7 @@ const childProcessMocks = vi.hoisted(() => ({
 
 vi.mock("node:child_process", () => childProcessMocks);
 
+import { SessionManager } from "../src/core/session-manager.ts";
 import { shareSession } from "../src/modes/interactive/session-share.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
@@ -48,11 +49,7 @@ describe("shareSession", () => {
 		const errors: string[] = [];
 		const context = (name: "A" | "B") => ({
 			session: {
-				sessionManager: {
-					getSessionId: () => name,
-					getCwd: () => "/tmp",
-					getBranch: () => [],
-				},
+				sessionManager: SessionManager.inMemory("/tmp", { id: name }),
 				state: { systemPrompt: name, tools: [] },
 				settingsManager: { getSessionShareDestination: () => "auto" },
 				modelRuntime: { getProvider: () => undefined },
@@ -77,9 +74,19 @@ describe("shareSession", () => {
 		});
 
 		const shareA = shareSession(context("A") as never);
-		await aWritten.promise;
+		await Promise.race([
+			aWritten.promise,
+			shareA.then(() => {
+				throw new Error(`Share A returned before HTML export: ${errors.join("; ")}`);
+			}),
+		]);
 		const shareB = shareSession(context("B") as never);
-		await bWritten.promise;
+		await Promise.race([
+			bWritten.promise,
+			shareB.then(() => {
+				throw new Error(`Share B returned before HTML export: ${errors.join("; ")}`);
+			}),
+		]);
 		await shareA;
 		releaseB.resolve();
 		await shareB;
@@ -109,7 +116,7 @@ describe("shareSession", () => {
 
 		await shareSession({
 			session: {
-				sessionManager: { getSessionId: () => "gist", getCwd: () => "/tmp", getBranch: () => [] },
+				sessionManager: SessionManager.inMemory("/tmp", { id: "gist" }),
 				state: { systemPrompt: "", tools: [] },
 				settingsManager: { getSessionShareDestination: () => "gist" },
 				modelRuntime: { getProvider },
@@ -137,7 +144,7 @@ describe("shareSession", () => {
 
 		await shareSession({
 			session: {
-				sessionManager: { getSessionId: () => "radius", getCwd: () => "/tmp", getBranch: () => [] },
+				sessionManager: SessionManager.inMemory("/tmp", { id: "radius" }),
 				state: { systemPrompt: "", tools: [] },
 				settingsManager: { getSessionShareDestination: () => "radius" },
 				modelRuntime: { getProvider: () => undefined },

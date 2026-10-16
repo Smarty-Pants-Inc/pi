@@ -106,12 +106,27 @@ describe("session context edits", () => {
 		const session = SessionManager.inMemory();
 		const assistantId = session.appendMessage(assistant("original"));
 		const editId = session.appendContextEdit(assistantId, null);
-		const edit = session.getEntry(editId);
+		// Imported wire data must enter through ingestion, not mutation of a sealed history entry.
+		const entries = structuredClone(session.getEntries());
+		const edit = entries.find((entry) => entry.id === editId);
 		if (edit?.type !== "context_edit") throw new Error("expected context edit");
 		edit.replacement = { content: "imported replacement" };
+		const header = session.getHeader();
+		if (!header) throw new Error("expected session header");
+		const imported = SessionManager.inMemory(process.cwd(), undefined, [header, ...entries]);
 
-		expect(session.buildSessionProjection().messages[0]).toMatchObject({
+		expect(imported.getEntry(editId)).toMatchObject({ replacement: { content: "imported replacement" } });
+		expect(imported.buildSessionProjection().messages[0]).toMatchObject({
 			role: "assistant",
+			content: [{ type: "text", text: "imported replacement" }],
+		});
+		expect(text((imported.getEntry(assistantId) as { message: AssistantMessage }).message)).toBe("original");
+		expect(session.buildSessionProjection().messages).toEqual([]);
+		const sealed = imported.getEntry(editId);
+		if (!sealed) throw new Error("expected imported context edit");
+		expect(Object.isFrozen(sealed)).toBe(true);
+		expect(Reflect.set(sealed, "replacement", null)).toBe(false);
+		expect(imported.buildSessionProjection().messages[0]).toMatchObject({
 			content: [{ type: "text", text: "imported replacement" }],
 		});
 	});

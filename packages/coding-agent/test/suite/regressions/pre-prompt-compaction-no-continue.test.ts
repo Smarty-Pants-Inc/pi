@@ -109,6 +109,7 @@ describe("pre-prompt compaction regression", () => {
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 		const queue = vi.spyOn(harness.session.agent, "followUp");
 		const transferred = vi.fn();
+		const preflight = vi.fn();
 		const images: ImageContent[] = [{ type: "image", data: "synthetic-image", mimeType: "image/png" }];
 
 		await expect(
@@ -116,11 +117,13 @@ describe("pre-prompt compaction regression", () => {
 				images,
 				streamingBehavior: "followUp",
 				onInputTransferred: transferred,
+				preflightResult: preflight,
 			}),
 		).rejects.toThrow("Input is retained in the followUp queue");
 
 		// The receiving session owns the retained queue; this is not a turnStarted receipt.
 		expect(transferred).toHaveBeenCalledTimes(1);
+		expect(preflight).not.toHaveBeenCalled();
 		expect(harness.sessionManager.getEntries()).toEqual(before);
 		expect(getUserTexts(harness)).not.toContain("processed:pending input");
 		expect(harness.session.getFollowUpMessages()).toEqual(["processed:pending input"]);
@@ -130,7 +133,13 @@ describe("pre-prompt compaction regression", () => {
 				role: "user",
 				content: [{ type: "text", text: "processed:pending input" }, ...images],
 			}),
+			expect.any(Function),
 		);
+		// pi#280: the enqueue callback identifies native custody, not a new owner API.
+		const retained = harness.session.agent.getQueuedMessageOccurrences();
+		expect(retained).toHaveLength(1);
+		expect(retained[0]).toMatchObject({ id: expect.any(Number), mode: "followUp" });
+		expect(retained[0].message).toBe(queue.mock.calls[0][0]);
 		expect(beforeAgentStart).not.toHaveBeenCalled();
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(harness.faux.state.callCount).toBe(outcome === "failed" ? 1 : 0);
@@ -139,6 +148,13 @@ describe("pre-prompt compaction regression", () => {
 			result: undefined,
 			aborted: outcome === "aborted",
 		});
+
+		// Paired recovery control: taking retained input clears only the queue, not history.
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["processed:pending input"] });
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.sessionManager.getEntries()).toEqual(before);
+		expect(transferred).toHaveBeenCalledTimes(1);
 	});
 
 	// pi#74 review F3: a custom trigger held by failed preflight must not restart retained input.

@@ -8,6 +8,7 @@ import { KeybindingsManager } from "../src/core/keybindings.ts";
 import type { ExtensionEditorComponent } from "../src/modes/interactive/components/extension-editor.ts";
 import type { ExternalEditorResult } from "../src/modes/interactive/external-editor.ts";
 import { createInteractiveTui, InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
+import { ProgramStatusReporter } from "../src/modes/interactive/program-status-reporter.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { createHarness } from "./suite/harness.ts";
 
@@ -36,13 +37,19 @@ function createMode(tuiMode: "regular" | "fullscreen" = "regular"): Mode {
 	}) as unknown as EditorComponent;
 	const editorContainer = new Container();
 	editorContainer.addChild(editor);
+	const ui = createInteractiveTui({
+		tuiMode,
+		showHardwareCursor: false,
+		logDirectory: tmpdir(),
+		terminal: new VirtualTerminal(),
+	});
 	const mode = Object.assign(Object.create(InteractiveMode.prototype), {
-		ui: createInteractiveTui({
-			tuiMode,
-			showHardwareCursor: false,
-			logDirectory: tmpdir(),
-			terminal: new VirtualTerminal(),
-		}),
+		ui,
+		// pi#280: Object.create skips the reporter initialized on real InteractiveMode instances.
+		programStatus: new ProgramStatusReporter(
+			() => ui.terminal,
+			() => undefined,
+		),
 		editor,
 		editorContainer,
 		uiHolds: new Set<{ reason: "custom" | "editor"; cancel?: () => void }>(),
@@ -185,6 +192,8 @@ describe("host UI hold state (smarty-dev#2440, smarty-code#870)", () => {
 			for (const key of ["\r", "\x1b"]) {
 				const mode = createMode();
 				const ui = mode.createExtensionUIContext();
+				const report = vi.spyOn(mode.ui.terminal, "setProgramStatus");
+				expect(ui.holdState()).toBeUndefined();
 				const pending =
 					kind === "select"
 						? ui.select("Pick", ["choice"])
@@ -194,9 +203,13 @@ describe("host UI hold state (smarty-dev#2440, smarty-code#870)", () => {
 								? ui.input("Input")
 								: ui.editor("Edit", "draft");
 				expect(ui.holdState()).toBe("dialog");
+				expect(report).toHaveBeenLastCalledWith(
+					expect.objectContaining({ state: "blocked", kind: kind === "confirm" ? "permission" : "question" }),
+				);
 				mode.editorContainer.children[0].handleInput?.(key);
 				await pending;
 				expect(ui.holdState()).toBeUndefined();
+				expect(report).toHaveBeenLastCalledWith(expect.objectContaining({ state: "idle" }));
 			}
 		},
 	);

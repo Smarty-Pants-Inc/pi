@@ -41,7 +41,12 @@ describe("capacity retry custody", () => {
 				).toMatchObject([
 					{ role: "system" },
 					{ role: "user" },
-					{ role: "assistant", stopReason: "error", errorMessage },
+					{
+						role: "assistant",
+						stopReason: "error",
+						errorMessage,
+						recovery: { recovery: "retryable", retryable: true },
+					},
 					{ role: "assistant", stopReason: "stop" },
 				]);
 				expect(
@@ -99,6 +104,35 @@ describe("capacity retry custody", () => {
 				expect(harness.session.messages.at(-1)).toMatchObject({
 					stopReason: "error",
 					errorMessage: prefix + errorMessage,
+				});
+			});
+
+			// pi#280: an explicit owned refusal must beat transient-looking provider text.
+			it("honors an owned non-retryable decision", async () => {
+				const harness = await createHarness({
+					settings: { retry: { enabled: true, maxRetries: 2, baseDelayMs: 1 } },
+				});
+				harnesses.push(harness);
+				harness.setResponses([
+					{
+						...fauxAssistantMessage("", { stopReason: "error", errorMessage }),
+						recovery: { retryable: false },
+					},
+					fauxAssistantMessage("must not run"),
+				]);
+
+				await harness.session.prompt("test");
+
+				expect(harness.faux.state.callCount).toBe(1);
+				expect(harness.getPendingResponseCount()).toBe(1);
+				expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+				expect(harness.eventsOfType("auto_retry_end")).toEqual([]);
+				expect(harness.eventsOfType("agent_end").map((event) => event.willRetry)).toEqual([false]);
+				expect(harness.session.messages.at(-1)).toMatchObject({
+					role: "assistant",
+					stopReason: "error",
+					errorMessage,
+					recovery: { retryable: false },
 				});
 			});
 

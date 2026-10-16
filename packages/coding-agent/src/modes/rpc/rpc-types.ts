@@ -10,6 +10,7 @@ import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import type { PromptDisposition, QueuedInputDisposition, SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
+import type { HostCapabilities } from "../../core/host-capabilities.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 
@@ -94,6 +95,7 @@ export interface RpcSlashCommand {
 // ============================================================================
 
 export interface RpcSessionState {
+	capabilities: HostCapabilities;
 	inputAdmissionCount: number;
 	inputsFenced: boolean;
 	isIdle: boolean;

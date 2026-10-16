@@ -116,6 +116,8 @@ describe("generic original Agent identity and input transfer", () => {
 			const mode = {
 				session,
 				compactionQueuedMessages: [input],
+				// pi#280: mirror constructor-owned custody tracking in this prototype fixture.
+				compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 				compactionQueueTransfers: 0,
 				compactionQueueWork: new Set<Promise<void>>(),
 				recoveredImages: new Map<string, ImageContent>(),
@@ -126,6 +128,7 @@ describe("generic original Agent identity and input transfer", () => {
 			const check = vi
 				.spyOn(session as unknown as { _checkCompaction(): Promise<string> }, "_checkCompaction")
 				.mockImplementation(async () => {
+					expect(mode.compactionTransferInputs.has(input)).toBe(true);
 					mode.compactionQueuedMessages.push(later);
 					return outcome;
 				});
@@ -137,6 +140,8 @@ describe("generic original Agent identity and input transfer", () => {
 			try {
 				await flush.call(mode);
 				await vi.waitFor(() => expect(mode.compactionQueueTransfers).toBe(0));
+				expect(mode.compactionTransferInputs.size).toBe(0);
+				expect(mode.compactionQueueWork.size).toBe(0);
 				expect(mode.showError).toHaveBeenCalledTimes(1);
 				expect(mode.compactionQueuedMessages).toEqual([later]);
 				expect(session.getSteeringMessages()).toEqual([input.input.text]);
@@ -156,6 +161,7 @@ describe("generic original Agent identity and input transfer", () => {
 		const mode = {
 			session,
 			compactionQueuedMessages: [{ input: receiveInput("dispatched A"), mode: "steer" as const }],
+			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
@@ -178,6 +184,8 @@ describe("generic original Agent identity and input transfer", () => {
 			await flush.call(mode);
 			mode.compactionQueuedMessages.push({ input: receiveInput("new B"), mode: "steer" });
 			await vi.waitFor(() => expect(mode.compactionQueueTransfers).toBe(0));
+			expect(mode.compactionTransferInputs.size).toBe(0);
+			expect(mode.compactionQueueWork.size).toBe(0);
 			expect(mode.compactionQueuedMessages.map((message) => message.input.text)).toEqual(["new B"]);
 			expect(
 				session.messages.some(
@@ -214,6 +222,7 @@ describe("generic original Agent identity and input transfer", () => {
 		const mode = {
 			session,
 			compactionQueuedMessages: [input],
+			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
@@ -222,6 +231,7 @@ describe("generic original Agent identity and input transfer", () => {
 			showError: vi.fn(),
 		};
 		startOverlap = () => {
+			expect(mode.compactionTransferInputs.has(input)).toBe(true);
 			mode.compactionQueuedMessages.push(later);
 			overlap = session.agent.prompt("original overlapping run");
 			expect(session.agent.signal).toBeDefined();
@@ -237,6 +247,8 @@ describe("generic original Agent identity and input transfer", () => {
 		try {
 			await flush.call(mode);
 			await vi.waitFor(() => expect(mode.compactionQueueTransfers).toBe(0));
+			expect(mode.compactionTransferInputs.size).toBe(0);
+			expect(mode.compactionQueueWork.size).toBe(0);
 			expect(mode.compactionQueuedMessages).toEqual([input, later]);
 			expect(session.getSteeringMessages()).toEqual([]);
 			expect(session.messages.some((message) => JSON.stringify(message).includes(input.input.text))).toBe(false);

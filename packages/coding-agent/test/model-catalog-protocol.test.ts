@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getModelCatalogProviderKey,
 	MODEL_CATALOG_INDEX_KEY,
@@ -19,12 +19,13 @@ import { allowNetwork } from "./test-network-env.ts";
 
 const legacyRevision = `sha256-${"a".repeat(64)}`;
 const mixedApiRevision = `sha256-${"b".repeat(64)}`;
-const modelId = "anthropic/claude-sonnet-5";
+// pi#280: use an existing pinned-catalog row, not an obsolete model restored for this fixture.
+const modelId = "openai/gpt-4o";
 // Newer than the bundled catalog, so the client applies the remote overlay.
 const lastModified = new Date("2099-01-01T00:00:00Z").toUTCString();
 const commonModel = {
 	id: modelId,
-	name: "Claude Sonnet 5",
+	name: "Protocol fixture GPT-4o",
 	provider: "openrouter",
 	reasoning: true,
 	input: ["text"],
@@ -32,8 +33,19 @@ const commonModel = {
 	contextWindow: 200_000,
 	maxTokens: 64_000,
 };
-const legacyModel = { ...commonModel, api: "openai-completions", baseUrl: "https://openrouter.ai/api/v1" };
-const mixedApiModel = { ...commonModel, api: "anthropic-messages", baseUrl: "https://openrouter.ai/api" };
+const legacyModel = {
+	...commonModel,
+	name: "Legacy catalog GPT-4o",
+	api: "openai-completions",
+	baseUrl: "https://openrouter.ai/api/v1",
+};
+// The selected revision may supply metadata, but cannot change this model's local routing.
+const mixedApiModel = {
+	...commonModel,
+	name: "Typed catalog GPT-4o",
+	api: "anthropic-messages",
+	baseUrl: "https://openrouter.ai/api",
+};
 
 const index: ModelCatalogIndex = {
 	schemaVersion: 1,
@@ -107,46 +119,92 @@ describe("model catalog protocol with the current client", () => {
 		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 	});
 
-	it("negotiates the catalog for its version and reaches the OpenRouter API", async () => {
-		allowNetwork();
-		const runtime = await ModelRuntime.create({
-			credentials: new InMemoryCredentialStore(),
-			modelsPath: null,
-			catalogBaseUrl,
-			refreshOnCreate: false,
-		});
-		await runtime.setRuntimeApiKey("openrouter", "test-key");
-		const refresh = await runtime.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
-		expect([...refresh.errors]).toEqual([]);
+	beforeEach(() => {
+		requests.length = 0;
+	});
 
-		const catalogUrl = "/api/models/providers/openrouter?types=chat%2Cimage%2Cclassifier";
-		expect(requests).toEqual([catalogUrl, `${catalogUrl}&pi-version=${VERSION}`]);
+	afterEach(() => {
+		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
+	});
 
-		const expectedModel =
-			selectModelCatalog(index, VERSION)?.revision === legacyRevision ? legacyModel : mixedApiModel;
-		const model = runtime.getModel("openrouter", modelId);
-		expect(model).toMatchObject({ api: expectedModel.api, baseUrl: expectedModel.baseUrl });
-		if (!model) throw new Error(`Missing model: openrouter/${modelId}`);
+	// pi#280, #9099: default pinning and explicit negotiation are paired on the real runtime path.
+	it.each([undefined, "1"] as const)(
+		"negotiates only with PI_REMOTE_CATALOG=%s and reaches the locally routed OpenRouter API",
+		async (remoteCatalog) => {
+			allowNetwork();
+			vi.stubEnv("PI_REMOTE_CATALOG", remoteCatalog);
+			const providerRequests: string[] = [];
+			const nativeFetch = globalThis.fetch;
+			// Install before refresh: opt-in also calls /models/user. Never contact a live provider.
+			vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+				const request = new Request(input, init);
+				const url = new URL(request.url);
+				if (url.origin === catalogBaseUrl) return nativeFetch(request);
+				providerRequests.push(`${url.origin}${url.pathname}`);
+				expect(url.origin).toBe("https://openrouter.ai");
+				expect(request.headers.get("authorization")).toBe("Bearer test-key");
+				if (url.pathname === "/api/v1/models/user") {
+					return new Response(JSON.stringify({ data: [{ id: modelId }] }), {
+						headers: { "content-type": "application/json" },
+					});
+				}
+				expect(url.pathname).toBe("/api/v1/chat/completions");
+				const body: unknown = await request.json();
+				expect(body).toMatchObject({ model: modelId, stream: true });
+				return new Response(
+					`${[
+						{ id: "fixture", choices: [{ index: 0, delta: { content: "Fixture response" } }] },
+						{ id: "fixture", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+					]
+						.map((event) => `data: ${JSON.stringify(event)}\n\n`)
+						.join("")}data: [DONE]\n\n`,
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			});
+			const runtime = await ModelRuntime.create({
+				credentials: new InMemoryCredentialStore(),
+				modelsPath: null,
+				catalogBaseUrl,
+				refreshOnCreate: false,
+			});
+			const baseline = runtime.getModel("openrouter", modelId);
+			expect(baseline).toMatchObject({
+				api: "openai-completions",
+				baseUrl: "https://openrouter.ai/api/v1",
+			});
+			await runtime.setRuntimeApiKey("openrouter", "test-key");
+			expect(requests).toEqual([]);
+			expect(providerRequests).toEqual([]);
+			const refresh = await runtime.refresh({ allowNetwork: true, force: true, providers: ["openrouter"] });
+			expect(refresh.aborted).toBe(false);
+			expect([...refresh.errors]).toEqual([]);
 
-		let providerUrl: URL | undefined;
-		const nativeFetch = globalThis.fetch;
-		vi.stubGlobal("fetch", async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-			const request = new Request(input, init);
-			if (new URL(request.url).origin !== "https://openrouter.ai") return nativeFetch(request);
-			providerUrl = new URL(request.url);
-			throw new Error("Provider request captured");
-		});
-		try {
-			await runtime.completeSimple(
+			const catalogUrl = "/api/models/providers/openrouter?types=chat%2Cimage%2Cclassifier";
+			expect(requests).toEqual(remoteCatalog ? [catalogUrl, `${catalogUrl}&pi-version=${VERSION}`] : []);
+			const model = runtime.getModel("openrouter", modelId);
+			if (!model || !baseline) throw new Error(`Missing pinned model: openrouter/${modelId}`);
+			if (remoteCatalog) {
+				const expectedModel =
+					selectModelCatalog(index, VERSION)?.revision === legacyRevision ? legacyModel : mixedApiModel;
+				// Prove the selected overlay was applied, not merely that its requests succeeded.
+				expect(model).toMatchObject({ name: expectedModel.name, contextWindow: expectedModel.contextWindow });
+			} else {
+				expect(model).toEqual(baseline);
+			}
+			// Remote API/base URL fields cannot override the trusted local provider's request route.
+			expect(model).toMatchObject({ api: baseline.api, baseUrl: baseline.baseUrl });
+			const result = await runtime.completeSimple(
 				model,
 				{ messages: [{ role: "user", content: "Hello", timestamp: 0 }] },
 				{ apiKey: "test-key", maxRetries: 0 },
 			);
-		} finally {
-			vi.unstubAllGlobals();
-		}
-		expect(providerUrl?.pathname).toBe(
-			expectedModel.api === "anthropic-messages" ? "/api/v1/messages" : "/api/v1/chat/completions",
-		);
-	});
+			expect(result.stopReason).toBe("stop");
+			expect(result.content).toEqual([{ type: "text", text: "Fixture response" }]);
+			expect(providerRequests).toEqual([
+				...(remoteCatalog ? ["https://openrouter.ai/api/v1/models/user"] : []),
+				"https://openrouter.ai/api/v1/chat/completions",
+			]);
+		},
+	);
 });

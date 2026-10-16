@@ -1088,6 +1088,11 @@ export default function(pi: ExtensionAPI) {
 			expect(runner.getCommand("llama")?.description).toBe("built-in llama");
 		});
 
+		// MCP remains refused by the security gate; this retained fixture must never become an opt-in path.
+		const refusedMcpFactory = () => {
+			throw new Error("MCP_SECURITY_REVIEW_REQUIRED");
+		};
+
 		it("should skip built-in extensions disabled in settings", async () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: ["-builtin:mcp"] }));
 			const loaded: string[] = [];
@@ -1095,7 +1100,7 @@ export default function(pi: ExtensionAPI) {
 				cwd,
 				agentDir,
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "mcp", builtin: true, factory: refusedMcpFactory },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
@@ -1112,15 +1117,15 @@ export default function(pi: ExtensionAPI) {
 
 		it("should skip disabledBuiltinExtensions even when settings or -e enable them", async () => {
 			mkdirSync(join(cwd, ".pi"), { recursive: true });
-			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
+			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ extensions: ["+builtin:tool-search"] }));
 			const loaded: string[] = [];
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
-				disabledBuiltinExtensions: ["mcp"],
-				additionalExtensionPaths: ["builtin:mcp"],
+				disabledBuiltinExtensions: ["tool-search"],
+				additionalExtensionPaths: ["builtin:tool-search"],
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "tool-search", builtin: true, factory: () => void loaded.push("tool-search") },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
@@ -1131,19 +1136,18 @@ export default function(pi: ExtensionAPI) {
 			expect(loaded).toEqual(["llama"]);
 		});
 
-		it("should load built-in extensions after file extensions with and without trust resolution", async () => {
+		it("should keep MCP disabled beside file extensions with and without trust resolution", async () => {
 			const userExtDir = join(agentDir, "extensions");
 			mkdirSync(userExtDir, { recursive: true });
 			writeFileSync(join(userExtDir, "user.ts"), "export default function() {}");
 			mkdirSync(join(cwd, ".pi"), { recursive: true });
-			// A project override gives the built-in project scope, which must not move it ahead.
 			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
-				extensionFactories: [{ name: "mcp", builtin: true, factory: () => {} }],
+				extensionFactories: [{ name: "mcp", builtin: true, factory: refusedMcpFactory }],
 			});
-			const expected = [join(userExtDir, "user.ts"), "builtin:mcp"];
+			const expected = [join(userExtDir, "user.ts")];
 
 			await loader.reload({ resolveProjectTrust: async () => true });
 			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(expected);
@@ -1151,7 +1155,7 @@ export default function(pi: ExtensionAPI) {
 			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(expected);
 		});
 
-		it("should disable built-in extensions with noExtensions unless loaded with -e builtin:<name>", async () => {
+		it("should refuse explicit MCP but allow reviewed built-ins with noExtensions", async () => {
 			const loaded: string[] = [];
 			const loader = new DefaultResourceLoader({
 				cwd,
@@ -1159,17 +1163,29 @@ export default function(pi: ExtensionAPI) {
 				noExtensions: true,
 				additionalExtensionPaths: ["builtin:mcp", "builtin:missing"],
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "mcp", builtin: true, factory: refusedMcpFactory },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
-			await loader.reload();
+			await expect(loader.reload()).rejects.toThrow("MCP_SECURITY_REVIEW_REQUIRED");
+			expect(loader.getExtensions().extensions).toEqual([]);
+			expect(loaded).toEqual([]);
 
-			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(["builtin:mcp"]);
-			expect(loader.getExtensions().errors).toEqual([
+			const reviewedLoader = new DefaultResourceLoader({
+				cwd,
+				agentDir,
+				noExtensions: true,
+				additionalExtensionPaths: ["builtin:llama", "builtin:missing"],
+				extensionFactories: [{ name: "llama", builtin: true, factory: () => void loaded.push("llama") }],
+			});
+			await reviewedLoader.reload();
+			expect(reviewedLoader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
+				"builtin:llama",
+			]);
+			expect(reviewedLoader.getExtensions().errors).toEqual([
 				{ path: "builtin:missing", error: "Unknown built-in extension: builtin:missing" },
 			]);
-			expect(loaded).toEqual(["mcp"]);
+			expect(loaded).toEqual(["llama"]);
 		});
 
 		it("should apply project built-in extension overrides after trust resolves", async () => {
@@ -1184,24 +1200,20 @@ export default function(pi: ExtensionAPI) {
 				cwd,
 				agentDir,
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "mcp", builtin: true, factory: refusedMcpFactory },
 					{ name: "plain", factory: () => void loaded.push("plain") },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
 			await loader.reload({
 				resolveProjectTrust: async ({ extensionsResult }) => {
-					// Built-in extensions wait until project settings are known.
 					expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual(["<inline:plain>"]);
 					return true;
 				},
 			});
 
-			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual([
-				"builtin:mcp",
-				"<inline:plain>",
-			]);
-			expect(loaded).toEqual(["plain", "mcp"]);
+			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(["<inline:plain>"]);
+			expect(loaded).toEqual(["plain"]);
 		});
 	});
 

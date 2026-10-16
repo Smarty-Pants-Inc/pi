@@ -476,6 +476,9 @@
     },
     "modelPolicy": {
       "type": "object",
+      "required": [
+        "allow"
+      ],
       "properties": {
         "allow": {
           "type": "array",
@@ -485,9 +488,6 @@
           "description": "Case-insensitive provider/model globs. Only * is special; an empty list denies all models."
         }
       },
-      "required": [
-        "allow"
-      ],
       "description": "Every configured settings layer must allow the requested provider/model."
     },
     "defaultTools": {
