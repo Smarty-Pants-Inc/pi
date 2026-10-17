@@ -12,17 +12,8 @@ afterEach(() => {
 	dir = undefined;
 });
 
-// pi#163 SEC/Astra P2: repeated reads must copy pointers, not image/history payloads.
-// Benchmark: 2,000 entries, 20 x 1 MiB images, 100 getEntries()+getBranch() pairs.
-// Node 24.19.0, median of 3 standalone --expose-gc trials, b9357a76 -> per-entry cache:
-// including first read: 2849.52 -> 29.60 ms; end heap delta 264.79 -> 53.97 MiB.
-// after priming: 2897.04 -> 9.51 ms; end heap delta 149.93 -> 11.54 MiB;
-// post-GC retained delta 42.43 -> 0.03 MiB. GC before each batch; end delta is pre-GC,
-// and the last entries/branch arrays remain live through post-GC measurement.
-// pi#163 post-merge JSON normalization, same fixture/runtime, median of 3 trials, b470cafd -> JSON:
-// including first read: 30.54 -> 55.17 ms; end heap delta 55.71 -> 54.01 MiB;
-// post-GC retained delta 41.28 -> 40.97 MiB. After priming: 8.48 -> 9.10 ms;
-// end heap delta 11.54 -> 11.55 MiB; post-GC retained delta 0.01 -> 0.02 MiB.
+// smarty-dev#11897: snapshots keep persisted JSON isolation, not stable entry identity.
+// The real-sized retention/dispatch budgets live in session-history-memory.test.ts.
 describe("detached session snapshots", () => {
 	// pi#163 post-merge CODE P2: freezing a non-empty typed array must not break history reads.
 	it("returns the persisted JSON form of typed-array custom data on every history route", () => {
@@ -45,7 +36,7 @@ describe("detached session snapshots", () => {
 			view.buildSessionProjection().entries.at(-1)?.sourceEntry,
 			view.getTree()[0].children[0].entry,
 		]) {
-			expect(entry).toBe(detached);
+			expect(entry).toEqual(detached);
 		}
 		expect(SessionManager.open(manager.getSessionFile()!).getEntry(id)).toEqual(detached);
 		expect(manager.getEntry(id)?.type).toBe("custom");
@@ -75,90 +66,110 @@ describe("detached session snapshots", () => {
 		for (const value of [detached, detached.map, detached.set, detached.nested]) {
 			expect(Object.getPrototypeOf(value)).toBe(Object.prototype);
 		}
-		expect(() => Map.prototype.set.call(detached.map, "poisoned", 2)).toThrow(TypeError);
-		expect(() => Set.prototype.add.call(detached.set, 2)).toThrow(TypeError);
-		expect(Reflect.set(detached.map, "poisoned", 2)).toBe(false);
-		expect(Reflect.set(detached.set, "poisoned", 2)).toBe(false);
-		expect(() => detached.nested.values.push(2)).toThrow(TypeError);
-		expect(detachedSessionView(manager).getEntry(id)).toBe(entry);
-		expect(view.getEntries().at(-1)).toBe(entry);
+		const reads = {
+			getEntry: () => view.getEntry(id),
+			getLeafEntry: () => view.getLeafEntry(),
+			getEntries: () => view.getEntries().at(-1),
+			getBranch: () => view.getBranch().at(-1),
+			getBranchFromId: () => view.getBranch(id).at(-1),
+			buildContextEntries: () => view.buildContextEntries().at(-1),
+			buildSessionProjection: () => view.buildSessionProjection().entries.at(-1)?.sourceEntry,
+			getTree: () => view.getTree()[0].children[0].entry,
+		};
+		for (const [accessor, read] of Object.entries(reads)) {
+			const value = read();
+			if (value?.type !== "custom") throw new Error(`missing custom entry through ${accessor}`);
+			expect(value, accessor).not.toBe(manager.getEntry(id));
+			expect(value, accessor).toEqual(entry);
+			const payload = value.data as typeof detached;
+			expect(() => {
+				value.parentId = "poisoned";
+			}, accessor).toThrow(TypeError);
+			expect(() => Map.prototype.set.call(payload.map, "poisoned", 2), accessor).toThrow(TypeError);
+			expect(() => Set.prototype.add.call(payload.set, 2), accessor).toThrow(TypeError);
+			expect(Reflect.set(payload.map, "poisoned", 2), accessor).toBe(false);
+			expect(Reflect.set(payload.set, "poisoned", 2), accessor).toBe(false);
+			expect(() => payload.nested.values.push(2), accessor).toThrow(TypeError);
+			expect(read(), accessor).toEqual(entry);
+		}
+		for (const array of [view.getEntries(), view.getBranch(), view.buildContextEntries()]) {
+			expect(() => {
+				array.length = 0;
+			}).toThrow(TypeError);
+		}
+		expect(detachedSessionView(manager).getEntry(id)).toEqual(entry);
+		expect(view.getEntries().at(-1)).toEqual(entry);
 		expect(SessionManager.open(manager.getSessionFile()!).getEntry(id)).toEqual(entry);
 		expect(data.map).toEqual(new Map([["original", 1]]));
 		expect(data.set).toEqual(new Set([1]));
 		expect(data.nested.values).toEqual([1]);
 	});
 
-	it("JSON-round-trips each native entry once and freezes fresh pointer arrays", () => {
+	it("does not hydrate cold history for list selection and does not cache accessed entries", () => {
+		dir = mkdtempSync(join(tmpdir(), "pi-detached-lazy-"));
+		const manager = SessionManager.create(dir, dir);
+		const id = manager.appendMessage({ role: "user", content: "cold ".repeat(200_000), timestamp: 1 });
+		for (let i = 0; i < 120; i++) manager.appendCustomEntry("metadata", { i });
+		manager.appendCompaction("summary", null, 100);
+		expect(isColdEntry(manager.getEntry(id)!)).toBe(true);
+		const view = detachedSessionView(manager);
+		const serialize = vi.spyOn(JSON, "stringify");
+		const branch = view.getBranch();
+		const all = view.getEntries();
+		const context = view.buildContextEntries();
+		expect(branch.length).toBe(manager.getEntryCount());
+		expect(all.length).toBe(branch.length);
+		expect(context.length).toBeLessThan(branch.length);
+		expect(serialize).not.toHaveBeenCalled();
+		for (const entries of [branch, all, context]) expect(Object.isFrozen(entries)).toBe(true);
+		const first = branch[0];
+		expect(first.id).toBe(id);
+		expect(serialize).toHaveBeenCalledTimes(1);
+		const second = branch[0];
+		expect(serialize).toHaveBeenCalledTimes(2);
+		expect(first).not.toBe(second);
+		expect(first).toEqual(second);
+		expect(Object.isFrozen(first)).toBe(true);
+		expect(isColdEntry(manager.getEntry(id)!)).toBe(true);
+	});
+
+	it("returns fresh frozen per-call snapshots without a native-entry payload cache", () => {
 		const manager = SessionManager.inMemory();
-		for (let i = 0; i < 2_000; i++) {
-			manager.appendMessage({
-				role: "user",
-				content:
-					i % 100 === 0
-						? [
-								{
-									type: "image",
-									mimeType: "image/png",
-									data: String.fromCharCode(65 + i / 100).repeat(1_048_576),
-								},
-							]
-						: [{ type: "text", text: `entry ${i}` }],
-				timestamp: i,
-			});
-		}
+		const id = manager.appendMessage({ role: "user", content: [{ type: "text", text: "original" }], timestamp: 1 });
 		const view = detachedSessionView(manager);
 		expect(detachedSessionView(manager)).toBe(view);
-		const serialize = vi.spyOn(JSON, "stringify");
-		const parse = vi.spyOn(JSON, "parse");
 		const first = view.getEntries();
-		expect(serialize).toHaveBeenCalledTimes(2_000);
-		expect(parse).toHaveBeenCalledTimes(2_000);
-		for (let i = 0; i < 100; i++) {
-			const entries = view.getEntries();
-			const branch = view.getBranch();
-			expect(entries).not.toBe(first);
-			expect(branch).not.toBe(entries);
-			expect(Object.isFrozen(entries)).toBe(true);
-			expect(Object.isFrozen(branch)).toBe(true);
-			for (let j = 0; j < first.length; j++) {
-				expect(entries[j]).toBe(first[j]);
-				expect(branch[j]).toBe(first[j]);
-			}
-		}
-		expect(serialize).toHaveBeenCalledTimes(2_000);
-		expect(parse).toHaveBeenCalledTimes(2_000);
-		const id = manager.appendMessage({ role: "user", content: "new", timestamp: 2_001 });
-		// Native receipt sealing also round-trips JSON; count only the subsequent detached reads.
-		serialize.mockClear();
-		parse.mockClear();
-		expect(view.getEntry(id)).toBe(view.getEntries().at(-1));
-		expect(view.getLeafEntry()).toBe(view.getBranch().at(-1));
+		const second = view.getBranch();
+		expect(first).not.toBe(second);
+		expect(first[0]).not.toBe(second[0]);
+		expect(first).toEqual(second);
+		expect(Object.isFrozen(first)).toBe(true);
+		expect(Object.isFrozen(second)).toBe(true);
+		expect(view.getEntry(id)).toEqual(first[0]);
+		expect(view.getLeafEntry()).toEqual(first[0]);
 		expect(view.getEntry("missing")).toBeUndefined();
-		expect(serialize).toHaveBeenCalledTimes(1);
-		expect(parse).toHaveBeenCalledTimes(1);
-		expect(serialize.mock.calls.every(([entry]) => !Array.isArray(entry))).toBe(true);
-		const image = first[0];
-		if (image.type !== "message" || image.message.role !== "user" || !Array.isArray(image.message.content)) {
-			throw new Error("missing image fixture");
+		const entry = first[0];
+		if (entry.type !== "message" || entry.message.role !== "user" || !Array.isArray(entry.message.content)) {
+			throw new Error("missing message");
 		}
-		expect(Object.isFrozen(image)).toBe(true);
-		expect(Object.isFrozen(image.message)).toBe(true);
-		expect(Object.isFrozen(image.message.content)).toBe(true);
-		expect(Object.isFrozen(image.message.content[0])).toBe(true);
+		const message = entry.message;
+		for (const value of [entry, message, message.content, message.content[0]]) {
+			expect(Object.isFrozen(value)).toBe(true);
+		}
 		expect(() => {
 			first.length = 0;
 		}).toThrow(TypeError);
 		expect(() => {
-			image.parentId = "edited";
+			entry.parentId = "edited";
 		}).toThrow(TypeError);
-		const message = image.message;
 		expect(() => {
-			message.content = "edited";
+			message.content = [];
 		}).toThrow(TypeError);
+		expect(view.getEntries()).toEqual(second);
 	});
 
 	// pi#132 R4-3 / pi#163: projected content and tree wrappers must never reach native state.
-	it("builds frozen trees and edited projections from the same detached entries", () => {
+	it("builds frozen trees and edited projections with detached entry values", () => {
 		const manager = SessionManager.inMemory();
 		manager.appendModelChange("faux", "model");
 		manager.appendThinkingLevelChange("high");
@@ -173,17 +184,15 @@ describe("detached session snapshots", () => {
 			projection: manager.buildSessionProjection(),
 			revision: manager.revision(),
 		});
-		const serialize = vi.spyOn(JSON, "stringify");
-		const parse = vi.spyOn(JSON, "parse");
 		for (let i = 0; i < 3; i++) {
 			const projection = view.buildSessionProjection();
 			expect(projection).toEqual(manager.buildSessionProjection());
 			expect(projection.entries.map((entry) => entry.sourceEntry)).toEqual(view.buildContextEntries());
 			for (const projected of projection.entries)
-				expect(projected.sourceEntry).toBe(view.getEntry(projected.sourceEntry.id));
+				expect(projected.sourceEntry).toEqual(view.getEntry(projected.sourceEntry.id));
 			const replacement = view.getEntry(edit);
 			if (replacement?.type !== "context_edit" || !replacement.replacement) throw new Error("missing edit");
-			expect((projection.messages[0] as { content: unknown }).content).toBe(replacement.replacement.content);
+			expect((projection.messages[0] as { content: unknown }).content).toEqual(replacement.replacement.content);
 			expect(Object.isFrozen(projection)).toBe(true);
 			expect(() => {
 				projection.messages.length = 0;
@@ -196,7 +205,7 @@ describe("detached session snapshots", () => {
 			const pending = [...tree];
 			while (pending.length) {
 				const node = pending.pop()!;
-				expect(node.entry).toBe(entries.find((entry) => entry.id === node.entry.id));
+				expect(node.entry).toEqual(entries.find((entry) => entry.id === node.entry.id));
 				expect(Object.isFrozen(node)).toBe(true);
 				expect(Object.isFrozen(node.children)).toBe(true);
 				expect(() => {
@@ -205,8 +214,6 @@ describe("detached session snapshots", () => {
 				pending.push(...node.children);
 			}
 		}
-		expect(serialize).not.toHaveBeenCalled();
-		expect(parse).not.toHaveBeenCalled();
 		expect(
 			JSON.stringify({
 				entries: manager.getEntries(),
@@ -215,12 +222,12 @@ describe("detached session snapshots", () => {
 			}),
 		).toBe(before);
 		manager.appendLabelChange(user, "changed");
-		expect(view.getEntry(user)).toBe(entries.find((entry) => entry.id === user));
+		expect(view.getEntry(user)).toEqual(entries.find((entry) => entry.id === user));
 		expect(view.getLabel(user)).toBe("changed");
 		expect(view.getTree()[0].children[0].children[0].label).toBe("changed");
 		manager.branch(user);
 		expect(view.buildSessionProjection()).toEqual(manager.buildSessionProjection());
-		expect(view.getBranch(user).at(-1)).toBe(view.getEntry(user));
+		expect(view.getBranch(user).at(-1)).toEqual(view.getEntry(user));
 		manager.resetLeaf();
 		expect(view.buildSessionProjection()).toEqual(manager.buildSessionProjection());
 		expect(view.getLeafEntry()).toBeUndefined();
@@ -267,7 +274,7 @@ describe("detached session snapshots", () => {
 		const cold = view.getEntry(first);
 		expect(cold).not.toBe(original);
 		expect(cold).toEqual(original);
-		expect(view.getEntry(first)).toBe(cold);
+		expect(view.getEntry(first)).toEqual(cold);
 		manager.branch(first);
 		expect(isColdEntry(manager.getEntry(first)!)).toBe(false);
 		const hot = view.getEntry(first);

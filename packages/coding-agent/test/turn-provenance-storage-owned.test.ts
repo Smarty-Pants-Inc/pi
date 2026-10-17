@@ -65,8 +65,8 @@ function journal(bytes?: Buffer): JournalFixture {
 }
 
 describe("owned receipt materialization and publication", () => {
-	// pi#163 SEC/Astra P2 / pi#132 R4-3: bypass owned full-history clones without exposing native entries.
-	test("detached owned reads reuse frozen snapshots and cannot change journal bytes", () => {
+	// smarty-dev#11897 / pi#132 R4-3: detached reads do not retain owned payload copies.
+	test("detached owned reads return frozen values and cannot change journal bytes", () => {
 		const j = journal();
 		const m = SessionManager.openOwned("/synthetic", j);
 		const id = m.appendMessage({ role: "user", content: [{ type: "text", text: "original" }], timestamp: 1 });
@@ -78,39 +78,46 @@ describe("owned receipt materialization and publication", () => {
 			revision: m.revision(),
 		});
 		const bytes = Buffer.from(j.bytes);
-		// pi#194: snapshots are the persisted JSON form, one JSON.parse per newly seen entry.
-		const clone = vi.spyOn(JSON, "parse");
-		try {
-			const entries = view.getEntries();
-			expect(clone).toHaveBeenCalledTimes(2);
-			for (let i = 0; i < 100; i++) {
-				expect(view.getEntries()[0]).toBe(entries[0]);
-				expect(view.getBranch()[0]).toBe(entries[0]);
-				expect(view.buildContextEntries()[0]).toBe(entries[0]);
-				expect(view.getEntry(id)).toBe(entries[0]);
-				expect(view.getLeafEntry()).toBe(entries[1]);
-				expect(view.buildSessionProjection().entries[0].sourceEntry).toBe(entries[0]);
-				expect(view.getTree()[0].entry).toBe(entries[0]);
+		const entries = view.getEntries();
+		const reads = [
+			() => view.getEntries()[0],
+			() => view.getBranch()[0],
+			() => view.buildContextEntries()[0],
+			() => view.getEntry(id)!,
+			() => view.buildSessionProjection().entries[0].sourceEntry,
+			() => view.getTree()[0].entry,
+		];
+		for (const read of reads) {
+			const entry = read();
+			expect(entry).not.toBe(entries[0]);
+			expect(entry).toEqual(entries[0]);
+			expect(() => {
+				entry.parentId = "edited";
+			}).toThrow(TypeError);
+			if (entry.type !== "message" || entry.message.role !== "user" || !Array.isArray(entry.message.content)) {
+				throw new Error("missing message");
 			}
-			expect(clone).toHaveBeenCalledTimes(2);
+			const message = entry.message;
 			expect(() => {
-				entries[0].parentId = "edited";
+				message.content = "edited";
 			}).toThrow(TypeError);
-			expect(() => {
-				(view.buildSessionProjection().messages[0] as { content: { text: string }[] }).content[0].text = "edited";
-			}).toThrow(TypeError);
-			expect(
-				JSON.stringify({ entries: m.getEntries(), projection: m.buildSessionProjection(), revision: m.revision() }),
-			).toBe(before);
-			expect(j.bytes).toEqual(bytes);
-			m.appendCustomEntry("new", { value: 2 });
-			clone.mockClear();
-			expect(view.getEntries()[0]).toBe(entries[0]);
-			expect(view.getEntries()).toHaveLength(3);
-			expect(clone).toHaveBeenCalledTimes(1);
-		} finally {
-			clone.mockRestore();
+			expect(read()).toEqual(entries[0]);
 		}
+		const leaf = view.getLeafEntry()!;
+		expect(leaf).toEqual(entries[1]);
+		expect(() => {
+			leaf.parentId = "edited";
+		}).toThrow(TypeError);
+		expect(() => {
+			(view.buildSessionProjection().messages[0] as { content: { text: string }[] }).content[0].text = "edited";
+		}).toThrow(TypeError);
+		expect(
+			JSON.stringify({ entries: m.getEntries(), projection: m.buildSessionProjection(), revision: m.revision() }),
+		).toBe(before);
+		expect(j.bytes).toEqual(bytes);
+		m.appendCustomEntry("new", { value: 2 });
+		expect(view.getEntries()[0]).toEqual(entries[0]);
+		expect(view.getEntries()).toHaveLength(3);
 	});
 
 	test("normalizes the reserved undefined slot but preserves strict refusal of accessors and nested non-JSON", () => {

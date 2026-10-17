@@ -20,7 +20,7 @@ import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
 import type { ModelRegistry } from "../model-registry.ts";
 import type { ScopedModel } from "../model-resolver.ts";
-import { detachedSessionView, type SessionManager } from "../session-manager.ts";
+import { detachedSessionEntries, detachedSessionView, type SessionManager } from "../session-manager.ts";
 import {
 	type BuildSystemPromptOptions,
 	buildSystemPrompt,
@@ -1326,6 +1326,11 @@ export class ExtensionRunner {
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
+		// One read-only history selection per dispatch. Copying the full cold branch for
+		// every observer hydrates old payloads even when no handler reads them (#11897).
+		const branchEntries =
+			event.type === "session_before_compact" ? detachedSessionEntries(event.branchEntries) : undefined;
+		const observerEvent = event.type === "session_before_compact" ? { ...event, branchEntries: undefined } : event;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
@@ -1333,9 +1338,12 @@ export class ExtensionRunner {
 					// Observers never receive writable aliases to native state or finalized history.
 					// Keep AbortSignal identity: structured cloning cannot preserve its behavior.
 					const snapshot =
-						"signal" in event
-							? { ...isolateValue({ ...event, signal: undefined }), signal: event.signal }
-							: isolateValue(event);
+						"signal" in observerEvent
+							? { ...isolateValue({ ...observerEvent, signal: undefined }), signal: observerEvent.signal }
+							: isolateValue(observerEvent);
+					if (snapshot.type === "session_before_compact") snapshot.branchEntries = branchEntries!;
+					// Keep the small preparation/envelope per handler: Sets and extension flags
+					// may be mutable, unlike the shared frozen history.
 					const handlerResult = await this.dispatchHandler(handler, snapshot, ctx, signal);
 					signal?.throwIfAborted();
 
