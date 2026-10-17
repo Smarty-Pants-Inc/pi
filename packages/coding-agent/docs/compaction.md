@@ -312,6 +312,8 @@ Extensions can intercept and customize both compaction and branch summarization.
 
 Fired before auto-compaction or `/compact`. Can cancel or provide custom summary. See `SessionBeforeCompactEvent` and `CompactionPreparation` in the types file.
 
+`branchEntries` is a frozen branch selection shared across handlers. Each entry access returns a fresh, deeply frozen JSON snapshot; old payloads are not eagerly loaded or cached alongside native history. Do not mutate this history or rely on entry object identity. The event envelope and `preparation` remain separate per handler (including mutable file-operation sets), while the cancellation signal keeps its original identity. Extension session-manager reads likewise return detached values without retaining per-entry snapshots. List reads (`getBranch()`, `getEntries()`, `buildContextEntries()`) use the same frozen lazy selections, so requesting an array alone does not hydrate cold payloads; `buildSessionProjection()` copies only the finalized active context.
+
 ```typescript
 pi.on("session_before_compact", async (event, ctx) => {
   const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;

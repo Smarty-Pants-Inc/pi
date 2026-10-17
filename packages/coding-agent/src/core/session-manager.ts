@@ -369,6 +369,21 @@ const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
 
 export { freezeDetached } from "./turn-receipts.ts";
 
+function snapshotSessionEntry(entry: SessionEntry | undefined): SessionEntry | undefined {
+	// Match the persisted JSON form: typed arrays cannot be frozen, and frozen Map/Set
+	// objects still allow mutation. Never retain a detached payload beside native history.
+	return entry ? freezeDetached(JSON.parse(JSON.stringify(entry)) as SessionEntry) : undefined;
+}
+
+/** Package-private history selection: isolate on access, without hydrating cold entries. */
+export function detachedSessionEntries(values: SessionEntry[]): SessionEntry[] {
+	const entries = new Array<SessionEntry>(values.length);
+	values.forEach((entry, index) => {
+		Object.defineProperty(entries, index, { enumerable: true, get: () => snapshotSessionEntry(entry)! });
+	});
+	return Object.freeze(entries) as SessionEntry[];
+}
+
 /**
  * Extension-facing history reads return deep-detached values, so a retained entry edited
  * later cannot change native history, projection, revision or journal bytes (pi#132 R4-3).
@@ -377,26 +392,8 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 	let view = detachedSessionViews.get(manager);
 	if (!view) {
 		const source = detachedSessionSources.get(manager) ?? manager;
-		const snapshots = new WeakMap<SessionEntry, SessionEntry>();
-		// ponytail: retain one detached payload per native entry identity, trading that memory
-		// for O(n) pointer-only reads. Labels/edits append; forks and cold/hot changes replace
-		// entries. Invalidate here if a future native path mutates a published entry in place.
-		const snapshot = (entry: SessionEntry | undefined): SessionEntry | undefined => {
-			if (!entry) return undefined;
-			let detached = snapshots.get(entry);
-			if (!detached) {
-				// ponytail: match #writeEntries/#appendLine and reload's JSON form before freezing.
-				// Typed arrays cannot be frozen, and frozen Map/Set objects still allow mutation.
-				detached = freezeDetached(JSON.parse(JSON.stringify(entry)) as SessionEntry);
-				snapshots.set(entry, detached);
-			}
-			return detached;
-		};
-		const entries = (values: SessionEntry[]): SessionEntry[] => {
-			const detached = values.map((entry) => snapshot(entry)!);
-			Object.freeze(detached);
-			return detached;
-		};
+		const snapshot = snapshotSessionEntry;
+		const entries = detachedSessionEntries;
 		view = Object.freeze({
 			getCwd: manager.getCwd.bind(manager),
 			getSessionDir: manager.getSessionDir.bind(manager),
@@ -408,7 +405,8 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 			getLabel: manager.getLabel.bind(manager),
 			getBranch: (fromId?: string) => entries(source.getBranch(fromId)),
 			buildContextEntries: () => entries(source.buildContextEntries()),
-			buildSessionProjection: () => freezeDetached(buildSessionProjection(entries(source.getBranch()))),
+			buildSessionProjection: () =>
+				freezeDetached(JSON.parse(JSON.stringify(manager.buildSessionProjection())) as SessionProjection),
 			getHeader: () => freezeDetached(structuredClone(manager.getHeader())),
 			getEntries: () => entries(source.getEntries()),
 			getTree: () => {
