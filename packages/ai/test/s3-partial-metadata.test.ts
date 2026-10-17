@@ -1,7 +1,4 @@
-// T-C2 (smarty-dev#5822, S3 of #5443): early wire metadata is suppressed without destroying private state.
-// Adapters keep `responseId`/`responseModel`/`providerThinkingLevel` on their own private output object; every
-// published copy omits them on partials and on failed or aborted results. Events are snapshotted synchronously,
-// before the terminal error is awaited, so a later in-place mutation cannot hide an early leak.
+// T-C2 (smarty-dev#5822): suppress early/failed wire metadata without destroying private adapter state.
 import { describe, expect, it } from "vitest";
 import { openAICompletionsApi } from "../src/api/openai-completions.lazy.ts";
 import { stream as streamCompletions } from "../src/api/openai-completions.ts";
@@ -30,7 +27,6 @@ function model<TApi extends "openai-completions" | "pi-messages">(api: TApi): Mo
 	};
 }
 
-/** First chunk carries synthetic id/model, then text, then the body breaks off with a transport failure. */
 function failingCompletionsResponse(): Response {
 	const encoder = new TextEncoder();
 	const chunk = { id: SYNTHETIC_ID, model: SYNTHETIC_MODEL, choices: [{ index: 0, delta: { content: "hello" } }] };
@@ -44,7 +40,6 @@ function failingCompletionsResponse(): Response {
 	return new Response(body, { headers: { "content-type": "text/event-stream" } });
 }
 
-/** Iterate a stream, serializing every event at the moment it is delivered. */
 async function snapshots(stream: AsyncIterable<AssistantMessageEvent>): Promise<string[]> {
 	const seen: string[] = [];
 	for await (const event of stream) seen.push(JSON.stringify(event));
@@ -119,19 +114,16 @@ describe("T-C2: no early or failed wire metadata (smarty-dev#5822)", () => {
 		expectNoWireMetadata(JSON.stringify(await stream.result()));
 	});
 
-	it("model-less push and end apply partial and failure restrictions, and success keeps metadata", async () => {
+	it("model-less push and end restrict partials and failures, and success keeps metadata", async () => {
 		const partialStream = createAssistantMessageEventStream();
 		const source = message();
 		partialStream.push({ type: "start", partial: source });
 		partialStream.end(message());
 		expectNoWireMetadata(JSON.stringify(await snapshots(partialStream)));
 		expectNoWireMetadata(JSON.stringify(await partialStream.result()));
-
 		const failed = createAssistantMessageEventStream();
 		failed.end(message({ stopReason: "aborted" }));
 		expectNoWireMetadata(JSON.stringify(await failed.result()));
-
-		// Control: a successful result keeps its receipt (R1 non-goal; dropped by the section 9 slice).
 		const succeeded = createAssistantMessageEventStream();
 		succeeded.end(message({ stopReason: "stop" }));
 		expect((await succeeded.result()).responseId).toBe(SYNTHETIC_ID);
@@ -145,18 +137,13 @@ describe("T-C2: no early or failed wire metadata (smarty-dev#5822)", () => {
 		const iterator = stream[Symbol.asyncIterator]();
 		const early = (await iterator.next()).value as Extract<AssistantMessageEvent, { type: "text_delta" }>;
 		const earlyJson = JSON.stringify(early);
-
-		// The adapter keeps its private receipt and goes on mutating its own object.
 		expect(JSON.stringify(source)).toBe(before);
 		(source.content[0] as { text: string }).text += " and more";
 		source.usage.output = 99;
 		stream.push({ type: "error", reason: "error", error: { ...source, stopReason: "error", errorMessage: "x" } });
-
 		expect(JSON.stringify(early)).toBe(earlyJson);
 		expect(early.partial).not.toBe(source);
 		expect(source.responseId).toBe(SYNTHETIC_ID);
-
-		// A consumer mutating a published partial cannot reach adapter state.
 		(early.partial.content[0] as { text: string }).text = "consumer";
 		expect((source.content[0] as { text: string }).text).toBe("partial and more");
 	});

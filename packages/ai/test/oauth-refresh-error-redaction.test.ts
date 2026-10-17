@@ -1,4 +1,4 @@
-// pi#150 redaction port: OAuth refresh/mint errors on v1.0.4 flows must not echo credential endpoint bodies.
+// pi#150: OAuth refresh/mint errors must not echo credential endpoint bodies.
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
 import { githubCopilotOAuth } from "../src/auth/oauth/github-copilot.ts";

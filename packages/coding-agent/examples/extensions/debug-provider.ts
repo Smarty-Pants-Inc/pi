@@ -1,6 +1,5 @@
 /**
- * Provider stream event viewer. Events are value-free notifications: they show how many provider events a
- * response streamed, never provider data.
+ * Provider stream notification viewer (no raw provider data).
  *
  * Usage: /debug-provider [on|off]
  * With no argument, the command toggles capture. Captured events are persisted
@@ -46,7 +45,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("debug-provider", {
-		description: "Toggle capture of provider stream event notifications",
+		description: "Toggle capture of value-free provider stream notifications",
 		handler: async (args, ctx) => {
 			const requestedState = args.trim().toLowerCase();
 			if (requestedState !== "" && requestedState !== "on" && requestedState !== "off") {
@@ -69,7 +68,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("provider_stream_event", (event) => {
-		activeEvents?.push(structuredClone(event));
+		activeEvents?.push({ type: event.type });
 	});
 
 	pi.on("message_end", (event) => {

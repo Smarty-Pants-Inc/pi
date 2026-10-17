@@ -165,15 +165,12 @@ export type {
 	SessionCompactEvent,
 	SessionCompactFailedEvent,
 	SessionInfoChangedEvent,
-	SessionReadyEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 	SessionTreeEvent,
 	SlashCommandInfo,
 	SlashCommandSource,
 	SourceInfo,
-	SubmitUserMessageHandler,
-	SubmitUserMessageOptions,
 	TerminalInputHandler,
 	ThinkingLevelSelectEvent,
 	ToolAnnotations,
@@ -206,9 +203,6 @@ export type {
 	UserBashEventResult,
 	UserMessageMetadata,
 	UserMessageMetadataSource,
-	UserMessageReceipt,
-	UserMessageRenderer,
-	UserMessageRenderOptions,
 	WidgetPlacement,
 	WorkingIndicatorOptions,
 	WriteToolCallEvent,
@@ -408,6 +402,7 @@ export {
 	type WriteToolOptions,
 	withFileMutationQueue,
 } from "./core/tools/index.ts";
+export { formatReadLineRange } from "./core/tools/render-utils.ts";
 export {
 	hasTrustRequiringProjectResources,
 	type ProjectTrustDecision,
@@ -442,7 +437,6 @@ export { createMcpExtension, type McpExtensionOptions, type McpTransportFactory 
 export { createToolSearchExtension } from "./extensions/tool-search/index.ts";
 // Main entry point
 export { type MainOptions, main } from "./main.ts";
-export type { RpcAgentSessionEvent, RpcMessageEndEvent } from "./modes/index.ts";
 // Run modes for programmatic SDK usage
 export {
 	InteractiveMode,
@@ -450,16 +444,12 @@ export {
 	type JsonAgentSessionEvent,
 	type ModelInfo,
 	type PrintModeOptions,
-	type RpcBranchEntriesPage,
-	type RpcBranchEntriesPageRequest,
 	RpcClient,
 	type RpcClientOptions,
 	type RpcCommand,
 	type RpcEventListener,
 	type RpcExtensionUIRequest,
 	type RpcExtensionUIResponse,
-	type RpcExtensionUIResponseBody,
-	type RpcInputRejectedEvent,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,

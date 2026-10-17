@@ -288,9 +288,6 @@ export class OutputAccumulator {
 				if (!logTruncation) {
 					return { content: new TextDecoder().decode(content), truncated: false };
 				}
-				if (this.headCap === FULL_OUTPUT_HEAD_BYTES && this.tailCap === FULL_OUTPUT_TAIL_BYTES) {
-					return { content: content.toString("utf-8"), truncated: true };
-				}
 				// The log is head, marker, tail. Decode the head and tail separately so characters cut by
 				// the log's own boundaries do not become U+FFFD next to the marker.
 				const head = content.subarray(0, Math.min(this.headCap, size));

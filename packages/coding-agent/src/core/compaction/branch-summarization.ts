@@ -244,6 +244,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		messages.unshift(message);
 		totalTokens += tokens;
 	}
+
 	// From the raw entries, not the prose: tool results are left out of the summary text, but they carry
 	// the files of nested calls (ctx.executeTool, codemode).
 	for (let i = walkStart; i < entries.length; i++) {

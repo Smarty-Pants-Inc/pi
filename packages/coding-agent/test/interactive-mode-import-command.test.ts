@@ -13,7 +13,7 @@ type InteractiveModePrototype = {
 type ImportCommandContext = {
 	clearStatusIndicator: () => void;
 	runtimeHost: { importFromJsonl: (inputPath: string, cwdOverride?: string) => Promise<{ cancelled: boolean }> };
-	// smarty-dev#13156: successful import restores unsent input before returning.
+	// pi#262 / smarty-dev#3155: successful import restores drafts and resumes only local saved input.
 	restoreUnsentInputDrafts: () => void;
 	session: { resumeUnsentInputs: () => Promise<void> };
 	isTerminalRuntimeCancellation: (error: unknown) => boolean;
@@ -160,12 +160,11 @@ describe("InteractiveMode /import parsing", () => {
 	});
 });
 
-// pi#132 R4-4: the missing-cwd retry and the import submit share one cancellation boundary.
+// pi#132 R4-4: missing-cwd retry and import submission share one cancellation boundary.
 describe("InteractiveMode /import missing-cwd retry cancellation", () => {
 	const prototype = InteractiveMode.prototype as unknown as Record<string, (...args: unknown[]) => unknown>;
-
 	it.each(["cwd prompt", "retry"] as const)(
-		"shutdown cancelling the held %s settles the submit without crash or shutdown self-join",
+		"shutdown cancelling the held %s settles submit without crash or shutdown self-join",
 		async (held) => {
 			const shutdown = new AbortController();
 			const reason = new Error("SESSION_SHUTDOWN");
@@ -185,9 +184,9 @@ describe("InteractiveMode /import missing-cwd retry cancellation", () => {
 					defaultEditor: {} as { onSubmit?: (text: string) => Promise<void> },
 					editor: { setText: vi.fn(), addToHistory: vi.fn() },
 					runtimeHost: { inputsFenced: false, importFromJsonl },
+					captureHerdrSubmit: () => undefined,
 					terminalShutdownRequested: false,
 					isShuttingDown: true,
-					// Delayed cleanup: shutdown has not completed and must not be awaited by the submit.
 					shutdownCompletion: new Promise<void>(() => {}),
 					session: { shutdownSignal: shutdown.signal },
 					clearStatusIndicator: vi.fn(),

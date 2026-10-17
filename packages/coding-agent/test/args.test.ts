@@ -44,18 +44,15 @@ describe("parseArgs", () => {
 			expect(result.unknownFlags.size).toBe(0);
 			expect(result.diagnostics).toEqual([]);
 		});
-
 		test("does not change the default", () => {
 			expect(parseArgs([]).noAutoCompaction).toBeUndefined();
 			expect(parseArgs(["--mode", "rpc"]).noAutoCompaction).toBeUndefined();
 		});
-
 		test("does not mistake an unknown equals option for the native selection", () => {
 			const result = parseArgs(["--no-auto-compaction=true"]);
 			expect(result.noAutoCompaction).toBeUndefined();
 			expect(result.unknownFlags.get("no-auto-compaction")).toBe("true");
 		});
-
 		test("preserves the option terminator", () => {
 			const result = parseArgs(["--", "--no-auto-compaction"]);
 			expect(result.noAutoCompaction).toBeUndefined();

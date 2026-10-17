@@ -6,8 +6,7 @@ import type { AuthorizationServerMetadata } from "../src/oauth/types.ts";
 // security-admission.test.ts separately proves the shipping refusal still applies.
 vi.mock("../src/security-admission.ts", () => ({ refuseMcpAdmission: () => {} }));
 
-// pi#173 (Astra P1, then CODE P1): the token operations stay public API (documented since 1.0.x), and each one
-// binds its endpoints to the issuer origin and allowedEndpointOrigins itself, before any request.
+// pi#173: every public token operation must bind its own endpoint before making a request.
 const publicOperations = ["startAuthorization", "registerClient", "exchangeAuthorizationCode", "refreshAuthorization"];
 
 function crossOrigin(field: "authorization_endpoint" | "registration_endpoint" | "token_endpoint") {
@@ -81,8 +80,7 @@ describe("each exported operation binds its endpoint to the issuer origin itself
 	);
 });
 
-// smarty-dev#7638 (pi#173 r7 P1): metadata whose issuer AND endpoints are on another origin than the authorization
-// server the caller names must not pass just because the endpoints match their own issuer.
+// smarty-dev#7638 (pi#173 r7 P1): matching foreign endpoints and issuer cannot override the named server.
 function foreignIssuer(): AuthorizationServerMetadata {
 	return {
 		issuer: "https://attacker.test",
@@ -203,9 +201,9 @@ describe("authorizeMcp with skipIssuerValidation", () => {
 			codeVerifier: async () => "verifier",
 		};
 		await expect(
-			oauth.authorizeMcp(provider as never, {
+			oauth.authorizeMcp(provider, {
 				serverUrl: "https://resource.test/mcp",
-				fetch: fetch as never,
+				fetch,
 				skipIssuerValidation: true,
 			}),
 		).rejects.toBeInstanceOf(oauth.OAuthIssuerMismatchError);

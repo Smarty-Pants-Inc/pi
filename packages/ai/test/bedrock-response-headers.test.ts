@@ -34,7 +34,7 @@ async function startBedrockResponseServer(): Promise<string> {
 }
 
 describe("bedrock response observation", () => {
-	// smarty-dev#5822 C1: the status only; gateway headers and request ids never reach callbacks.
+	// smarty-dev#5822 C1: status only; no gateway headers or request ids.
 	it("passes only the validated status to onResponse", async () => {
 		const baseModel = getModel("amazon-bedrock", MODEL_ID) as Model<"bedrock-converse-stream">;
 		const model = { ...baseModel, baseUrl: await startBedrockResponseServer() };

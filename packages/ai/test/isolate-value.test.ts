@@ -13,8 +13,7 @@ class HttpError extends Error {
 	}
 }
 
-// smarty-dev#5377: hook isolation must clone a native Error faithfully; structuredClone
-// drops the subclass, the custom name and own fields such as `status` and `code`.
+// smarty-dev#5377: clone native Errors faithfully, including subclass, own fields and cause.
 describe("isolateValue", () => {
 	it("clones a native Error subclass with its prototype, fields and cause", () => {
 		const error = new HttpError("rate limited", { cause: new TypeError("inner") });
@@ -77,7 +76,7 @@ describe("isolateValue", () => {
 		expect(() => isolateValue(new Set([() => 1]))).toThrow();
 	});
 
-	// pi#159: Map/Set/views must share the graph memo, or aliases and cycles through them split.
+	// pi#159: Map/Set/views share the graph memo; aliases and cycles must not split.
 	it("keeps aliases of a shared object used as Map key, Map value and direct field", () => {
 		const shared = { n: 1 };
 		const map = new Map<unknown, unknown>([
@@ -93,7 +92,7 @@ describe("isolateValue", () => {
 		expect(value).toBe(copy.direct);
 		expect(copy.map.get("value")).toBe(copy.direct);
 		expect(copy.map.get(copy.direct)).toBe(copy.direct);
-		(copy.direct as { n: number }).n = 2;
+		copy.direct.n = 2;
 		expect(shared.n).toBe(1);
 	});
 
@@ -201,9 +200,8 @@ describe("isolateValue", () => {
 		for (const copy of [bufferFirst, viewsFirst]) {
 			expect(copy.buffer).not.toBe(first.buffer);
 			expect(copy.buffer.resizable).toBe(true);
-			for (const view of [copy.tracking, copy.fixed, copy.trackingView, copy.fixedView]) {
+			for (const view of [copy.tracking, copy.fixed, copy.trackingView, copy.fixedView])
 				expect(view.buffer).toBe(copy.buffer);
-			}
 			copy.buffer.resize(12);
 			expect(copy.tracking.length).toBe(12);
 			expect(copy.trackingView.byteLength).toBe(12);
@@ -243,7 +241,6 @@ describe("isolateValue", () => {
 		expect(copy.holder).not.toBe(holder);
 		expect(copy.holder.ref).toBe(copy.direct);
 		expect(copy.holder.back).toBe(copy);
-		// Like structuredClone, a class instance becomes a plain object with its own fields.
 		expect(Object.getPrototypeOf(copy.holder)).toBe(Object.prototype);
 		expect(Object.getPrototypeOf(copy.holder)).toBe(Object.getPrototypeOf(structuredClone(new Holder(1))));
 	});
@@ -300,8 +297,7 @@ describe("isolateValue", () => {
 		expect(copy.direct).not.toBe(shared);
 	});
 
-	// pi#159: a Map, Set or buffer whose class sets Symbol.toStringTag (even "Object") still
-	// clones as its native type, through the shared memo.
+	// pi#159: custom Symbol.toStringTag values must not change native-container handling.
 	it("keeps aliases and cycles through Map and Set subclasses with a custom toStringTag", () => {
 		class TaggedMap extends Map<unknown, unknown> {
 			get [Symbol.toStringTag]() {

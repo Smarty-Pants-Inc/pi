@@ -1,19 +1,11 @@
-/*
- * pi#193 CODE P1: the plain JSONL proof below runs the built CLI in print mode.
- * Owned ordinary startup needs a live owner/admission: --owner-host-profile
- * requires terminal stdin/stdout and rejects print mode or additional arguments.
- * Keep the owned-journal component tests; they do not prove ordinary CLI admission.
- * Named E2E plan: fleet canary crash/reload proof under a smarty-dev#8356-style
- * follow-up, using admitted ordinary startup and the same first-delta/pre-delta gates.
- */
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
+import { afterAll, describe, expect, test, vi } from "vitest";
 import {
 	type FileEntry,
 	loadEntriesFromFile,
@@ -24,14 +16,11 @@ import {
 
 const fixture = fileURLToPath(new URL("../fixtures/first-turn-child.ts", import.meta.url));
 const resolver = new URL("../../src/experimental/source-resolver.ts", import.meta.url).href;
-const ownedPreload = new URL("../fixtures/first-turn-owned-preload.ts", import.meta.url).href;
 const roots: string[] = [];
 const children = new Set<ChildProcess>();
 const boundaries = ["first-delta", "before-delta", "completed", "pre-delta-entry"] as const;
 const prompt = "Keep this first user message across a crash.";
 const reply = "A genuine faux-provider streamed reply with several text deltas.";
-let addon = "";
-let nativeUnavailable: string | undefined;
 
 interface Receipt {
 	type: "ready";
@@ -52,21 +41,10 @@ function scratch(): string {
 	return directory;
 }
 
-function start(storage: string, boundary: string, directory: string, file = "") {
+function start(boundary: string, directory: string, file = "") {
 	const child = spawn(
 		process.execPath,
-		[
-			"--import",
-			resolver,
-			...(storage === "owned" ? ["--import", ownedPreload] : []),
-			fixture,
-			storage,
-			boundary,
-			directory,
-			file ? "reopen" : "write",
-			file,
-			addon,
-		],
+		["--import", resolver, fixture, "plain", boundary, directory, file ? "reopen" : "write", file],
 		{
 			cwd: directory,
 			env: {
@@ -310,124 +288,60 @@ describe.skipIf(process.platform === "win32")("built CLI first-turn crash durabi
 });
 
 // smarty-code#1681: real SIGKILL/reload, not graceful abort or a mocked filesystem.
-// Native owned storage is Linux-only. Plain JSONL also runs on other Unix hosts.
-for (const storage of ["plain", "owned"] as const) {
-	describe.skipIf(process.platform === "win32" || (storage === "owned" && process.platform !== "linux"))(
-		`fresh first-turn crash durability: ${storage}`,
-		() => {
-			if (storage === "owned") {
-				beforeAll(() => {
-					const headers =
-						process.env.PI_APPEND_NODE_HEADERS ??
-						[
-							join(dirname(process.execPath), "../include/node"),
-							join(homedir(), ".cache/node-gyp", process.versions.node, "include/node"),
-							"/usr/include/node",
-						].find((path) => existsSync(join(path, "node_api.h")));
-					// Match the existing native append probe: portable unit runs may lack
-					// a C toolchain/Node headers. Linux native evidence must run unskipped.
-					if (!headers) {
-						nativeUnavailable = "Node headers unavailable; set PI_APPEND_NODE_HEADERS";
-						return;
-					}
-					const compiler = process.env.PI_APPEND_CC ?? "cc";
-					// ponytail: loaded merge-queue runners took >30 s to compile this addon (pi#193, queue draft #196);
-					// generous bounds keep the Linux native evidence unskipped instead of flaking.
-					const available = spawnSync(compiler, ["--version"], { encoding: "utf8", timeout: 30_000 });
-					if (available.error || available.status !== 0) {
-						nativeUnavailable = `Native probe compiler unavailable: ${compiler}`;
-						return;
-					}
-					addon = join(scratch(), "first-turn.node");
-					const compiled = spawnSync(
-						compiler,
-						[
-							"-std=c11",
-							"-shared",
-							"-fPIC",
-							"-O1",
-							"-ffunction-sections",
-							"-fdata-sections",
-							"-pthread",
-							"-I",
-							headers,
-							fileURLToPath(new URL("../fixtures/first-turn-native.c", import.meta.url)),
-							"-Wl,--gc-sections",
-							"-o",
-							addon,
-						],
-						{ encoding: "utf8", timeout: 180_000 },
-					);
-					expect(compiled.error).toBeUndefined();
-					expect(compiled.status, compiled.stderr).toBe(0);
-				}, 240_000);
-			}
-			// smarty-code#1681 acceptance (a), (b), (c), plus the pre-delta custom-entry seam.
-			test.for(boundaries)(
-				"SIGKILL at %s retains native history without replay",
-				{ timeout: 30_000 },
-				async (boundary, context) => {
-					if (storage === "owned" && nativeUnavailable) context.skip(nativeUnavailable);
-					const directory = scratch();
-					const writer = start(storage, boundary, directory);
-					try {
-						const receipt = await writer.ready;
-						expect(receipt.type).toBe("ready");
-						expect(receipt.providerCalls).toBe(1);
-						expect(receipt.deltaCount).toBe(
-							boundary === "first-delta" ? 1 : boundary === "completed" ? Math.ceil(reply.length / 4) : 0,
-						);
-						// Inspect disk BEFORE killing; no in-memory manager can satisfy this.
-						const bytes = readFileSync(receipt.file);
-						expect(bytes.at(-1)).toBe(10);
-						const rows = bytes
-							.toString("utf8")
-							.trimEnd()
-							.split("\n")
-							.map((line): FileEntry => JSON.parse(line));
-						expect(rows[0]).toEqual(receipt.header);
-						const entries = rows.slice(1) as SessionEntry[];
-						checkEntries(entries, boundary);
-						expect(writer.child.kill("SIGKILL")).toBe(true);
-						expect(await writer.closed).toEqual({ code: null, signal: "SIGKILL" });
-						expect(readFileSync(receipt.file)).toEqual(bytes);
-						// Both the plain reader and the native owned reader see the same file.
-						expect(loadEntriesFromFile(receipt.file)).toEqual(rows);
-						if (storage === "plain") {
-							const opened = SessionManager.open(receipt.file);
-							expect(opened.getHeader()).toEqual(receipt.header);
-							expect(opened.getEntries()).toEqual(entries);
-						}
-						const reader = start(storage, boundary, directory, receipt.file);
-						try {
-							const reloaded = await reader.ready;
-							expect(await reader.closed, reader.stderr()).toEqual({ code: 0, signal: null });
-							expect(reloaded.header).toEqual(receipt.header);
-							expect(reloaded.entries).toEqual(entries);
-							expect(reloaded.providerCalls).toBe(0);
-							expect(reloaded.streaming).toBe(false);
-							expect(reloaded.reconstructedMarkers).toBe(
-								boundary === "first-delta" || boundary === "completed" ? 1 : 0,
-							);
-							expect(reloaded.messages).toEqual(reloaded.context);
-							expect(reloaded.context?.filter((message) => message.role !== "system")).toHaveLength(
-								boundary === "completed" ? 2 : 1,
-							);
-							expect(readFileSync(receipt.file)).toEqual(bytes);
-						} finally {
-							if (children.has(reader.child)) {
-								reader.child.kill("SIGKILL");
-								await reader.closed;
-							}
-						}
-					} finally {
-						if (children.has(writer.child)) {
-							writer.child.kill("SIGKILL");
-							await writer.closed;
-						}
-					}
-				},
+describe.skipIf(process.platform === "win32")("fresh first-turn crash durability: plain", () => {
+	test.for(boundaries)("SIGKILL at %s retains history without replay", { timeout: 30_000 }, async (boundary) => {
+		const directory = scratch();
+		const writer = start(boundary, directory);
+		try {
+			const receipt = await writer.ready;
+			expect(receipt.type).toBe("ready");
+			expect(receipt.providerCalls).toBe(1);
+			expect(receipt.deltaCount).toBe(
+				boundary === "first-delta" ? 1 : boundary === "completed" ? Math.ceil(reply.length / 4) : 0,
 			);
-		},
-	);
-}
+			// Inspect disk BEFORE killing; no in-memory manager can satisfy this.
+			const bytes = readFileSync(receipt.file);
+			expect(bytes.at(-1)).toBe(10);
+			const rows = bytes
+				.toString("utf8")
+				.trimEnd()
+				.split("\n")
+				.map((line): FileEntry => JSON.parse(line));
+			expect(rows[0]).toEqual(receipt.header);
+			const entries = rows.slice(1) as SessionEntry[];
+			checkEntries(entries, boundary);
+			expect(writer.child.kill("SIGKILL")).toBe(true);
+			expect(await writer.closed).toEqual({ code: null, signal: "SIGKILL" });
+			expect(readFileSync(receipt.file)).toEqual(bytes);
+			expect(loadEntriesFromFile(receipt.file)).toEqual(rows);
+			const opened = SessionManager.open(receipt.file);
+			expect(opened.getHeader()).toEqual(receipt.header);
+			expect(opened.getEntries()).toEqual(entries);
+			const reader = start(boundary, directory, receipt.file);
+			try {
+				const reloaded = await reader.ready;
+				expect(await reader.closed, reader.stderr()).toEqual({ code: 0, signal: null });
+				expect(reloaded.header).toEqual(receipt.header);
+				expect(reloaded.entries).toEqual(entries);
+				expect(reloaded.providerCalls).toBe(0);
+				expect(reloaded.streaming).toBe(false);
+				expect(reloaded.reconstructedMarkers).toBe(boundary === "first-delta" || boundary === "completed" ? 1 : 0);
+				expect(reloaded.messages).toEqual(reloaded.context);
+				expect(reloaded.context?.filter((message) => message.role !== "system")).toHaveLength(
+					boundary === "completed" ? 2 : 1,
+				);
+				expect(readFileSync(receipt.file)).toEqual(bytes);
+			} finally {
+				if (children.has(reader.child)) {
+					reader.child.kill("SIGKILL");
+					await reader.closed;
+				}
+			}
+		} finally {
+			if (children.has(writer.child)) {
+				writer.child.kill("SIGKILL");
+				await writer.closed;
+			}
+		}
+	});
+});

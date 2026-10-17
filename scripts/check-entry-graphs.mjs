@@ -36,27 +36,35 @@ const WORKSPACE = {
 const BUDGETS = {
 	"packages/ai": {
 		"./models": {
-			// The publication projector shares S2's dependency-free isolation utility (+1, pi#159).
+			// Closed diagnostic ownership is retained alongside publication isolation and credential redaction.
 			maxFiles: 16,
 			forbid: ["providers/", "models.generated.ts", "index.ts", "utils/validation.ts", "utils/typebox-helpers.ts"],
 		},
-		// Diagnostics and operation errors reach the shared credential redactor and isolation utility (pi#159).
-		"./utils/*": { maxFiles: 5, forbid: ["providers/", "api/", "index.ts"] },
+		"./utils/*": {
+			maxFiles: 3,
+			maxFilesByEntry: {
+				// Publication needs detached snapshots, closed diagnostics, private recovery lineage and redaction.
+				"./utils/event-stream": 5,
+				// The retry loop keeps closed diagnostic normalization and credential redaction; pure users use recovery.
+				"./utils/retry": 4,
+			},
+			forbid: ["providers/", "api/", "index.ts"],
+		},
 	},
 	"packages/codemode": {
 		// Node and Bun users never load the Cloudflare entry, which imports the `cloudflare:workers` built-in.
-		// The fork retains host-owned limits and the security-admission refusal (+2 to upstream's 12).
-		".": { maxFiles: 14, forbid: ["codemode/src/cloudflare.ts"] },
+		// Shared runtime/limits.ts enforces finite host/worker traffic, call, and memory quotas.
+		".": { maxFiles: 13, forbid: ["codemode/src/cloudflare.ts"] },
 		// Runtimes without Node built-ins (Workers, browsers) import these; neither may reach the worker-thread host
 		// or the file-based wasm loader.
 		"./portable": {
-			// Fork limits.ts and security-admission.ts preserve S3 (pi#202), adding two modules.
-			maxFiles: 10,
+			// Shared runtime/limits.ts retains finite host/worker traffic, call, and memory quotas.
+			maxFiles: 9,
 			forbid: ["codemode/src/index.ts", "runtime/host.ts", "runtime/worker.ts", "codemode/src/wasm.ts"],
 		},
 		"./cloudflare": {
-			// Fork limits.ts and security-admission.ts preserve S3 (pi#202), adding two modules.
-			maxFiles: 11,
+			// Shared runtime/limits.ts also bounds Cloudflare host/worker traffic, calls, and memory.
+			maxFiles: 10,
 			forbid: ["codemode/src/index.ts", "runtime/host.ts", "runtime/worker.ts", "codemode/src/wasm.ts"],
 		},
 	},
@@ -64,10 +72,8 @@ const BUDGETS = {
 		".": {
 			// Tool argument validation reaches TypeBox; provider-session creation reaches pi-ai's lean UUID utility; the
 			// memory and SQLite storages share scan order and cursor handling. Values from Chord's root (copyJson,
-			// replicatedState) reach its host runtime through the root barrel (upstream: 66 files).
-			// The fork adds credential redaction, owned diagnostics, recovery classification (smarty-dev#5822),
-			// and S2's dependency-free isolation utility (pi#159): four files, retained by S3's publication projector.
-			maxFiles: 70,
+			// replicatedState) reach its host runtime through the root barrel.
+			maxFiles: 66,
 			forbid: [
 				"packages/ai/src/index.ts",
 				"packages/ai/src/utils/typebox-helpers.ts",
@@ -153,9 +159,10 @@ for (const [pkgDir, budgets] of Object.entries(BUDGETS)) {
 				continue;
 			}
 			const graph = [...walk(source)].map((file) => relative(ROOT, file));
-			if (graph.length > budget.maxFiles) {
+			const maxFiles = budget.maxFilesByEntry?.[name] ?? budget.maxFiles;
+			if (graph.length > maxFiles) {
 				console.error(
-					`${pkgDir} export "${name}" reaches ${graph.length} files, budget ${budget.maxFiles}\n` +
+					`${pkgDir} export "${name}" reaches ${graph.length} files, budget ${maxFiles}\n` +
 						graph.map((file) => `    ${file}`).join("\n"),
 				);
 				failures += 1;

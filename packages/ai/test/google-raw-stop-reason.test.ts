@@ -191,17 +191,15 @@ describe("Google raw stop reasons", () => {
 		expect(message.content.some((block) => block.type === "toolCall")).toBe(true);
 	});
 
-	// smarty-dev#5822 (pi#202 round 3): an unknown provider finish reason never reaches the published text.
+	// smarty-dev#5822: unknown provider finish reasons never reach published text.
 	it.each(adapters)("keeps a planted unknown finish reason private for $name", async ({ createStream }) => {
 		const planted = "corp-eu-west-7-tenant-plum sk-ant-api03-synthetic5822roundthree";
 		googleGenAiMock.finishReason = planted;
 		googleGenAiMock.includeFunctionCall = false;
-
 		const stream = createStream();
 		const events: string[] = [];
 		for await (const event of stream) events.push(JSON.stringify(event));
 		const message = await stream.result();
-
 		expect(message.stopReason).toBe("error");
 		expect(message.rawStopReason).toBe("other");
 		const published = [message.errorMessage, JSON.stringify(message), ...events].join("\n");
@@ -236,7 +234,7 @@ describe("Google provider stream events", () => {
 	];
 
 	it.each(adapters)(
-		// smarty-dev#5822 C1: one owned notification per chunk, never the chunk or model.
+		// smarty-dev#5822 C1: one owned notification per chunk, never chunk or model.
 		"notifies once per SDK chunk without provider data for $name",
 		async ({ createStream }) => {
 			googleGenAiMock.streamChunks = [

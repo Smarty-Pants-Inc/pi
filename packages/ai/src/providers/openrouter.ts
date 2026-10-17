@@ -34,7 +34,6 @@ export async function personalizeOpenRouterCatalog(
 			signal: AbortSignal.any([context.signal, AbortSignal.timeout(OPENROUTER_USER_MODELS_TIMEOUT_MS)]),
 		});
 	} catch {
-		// Fetch failures can reflect authenticated request values; refresh errors have no stream projector (pi#202).
 		throw new Error("OpenRouter model list request failed");
 	}
 	if (response.status === 401 || response.status === 403 || response.status === 404) return catalog;
@@ -43,7 +42,6 @@ export async function personalizeOpenRouterCatalog(
 	try {
 		body = await response.json();
 	} catch {
-		// JSON parser errors may contain response bytes. Never retain the error, body or cause.
 		throw new Error("Invalid OpenRouter model list response");
 	}
 	if (typeof body !== "object" || body === null || !("data" in body) || !Array.isArray(body.data)) {

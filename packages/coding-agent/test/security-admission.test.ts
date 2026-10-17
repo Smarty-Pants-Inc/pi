@@ -115,6 +115,6 @@ it("refuses configuration readers and writers before inspecting paths or values"
 it("refuses registry mutation before cloning or reading registration input", () => {
 	const registry = new McpServerRegistry();
 	expect(() => registry.register(poison as never)).toThrow("MCP_SECURITY_REVIEW_REQUIRED");
-	expect(() => registry.unregister("x", "sense")).toThrow("MCP_SECURITY_REVIEW_REQUIRED");
+	expect(() => registry.unregister("x", "test-extension")).toThrow("MCP_SECURITY_REVIEW_REQUIRED");
 	expect(registry.list()).toEqual([]);
 });

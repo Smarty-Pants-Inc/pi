@@ -1,7 +1,4 @@
-/**
- * pi#160 review P3: a Herdr trust root that is installed but rejected must warn, while a host without
- * one stays silent (no fleet host has /etc/herdr/server.pub yet, so absence is the expected state).
- */
+/** pi#160: rejected installed trust roots warn; absent trust roots remain silent. */
 import { generateKeyPairSync } from "node:crypto";
 import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -13,7 +10,6 @@ import { checkServerTrustRoot } from "../src/core/herdr/server-auth.ts";
 const env = { HERDR_SOCKET_PATH: "/nonexistent/herdr.sock", HERDR_PANE_ID: "w1:p1" };
 let dir = "";
 const restore: (() => void)[] = [];
-
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "pi-herdr-trust-"));
 	const stdin = process.stdin as NodeJS.ReadStream & { setRawMode?: (mode: boolean) => unknown };
@@ -28,12 +24,10 @@ beforeEach(() => {
 		else delete (stdin as { setRawMode?: unknown }).setRawMode;
 	});
 });
-
 afterEach(() => {
 	for (const step of restore.splice(0)) step();
 	rmSync(dir, { recursive: true, force: true });
 });
-
 describe.runIf(process.platform === "linux")("Herdr trust root at startup", () => {
 	it("stays silent when no trust root is installed", async () => {
 		const missing = join(dir, "server.pub");
@@ -45,8 +39,7 @@ describe.runIf(process.platform === "linux")("Herdr trust root at startup", () =
 		expect(bootstrap).toBeUndefined();
 		expect(process.stdin.setRawMode).not.toHaveBeenCalled();
 	});
-
-	it("warns when the trust root is present but not root-owned, without raw mode", async () => {
+	it("warns for a non-root-owned trust root without raw mode", async () => {
 		const path = join(dir, "server.pub");
 		writeFileSync(path, generateKeyPairSync("ed25519").publicKey.export({ type: "spki", format: "pem" }));
 		expect(checkServerTrustRoot(path)).toEqual({ rejected: "untrusted-trust-root" });
@@ -60,12 +53,10 @@ describe.runIf(process.platform === "linux")("Herdr trust root at startup", () =
 		});
 		expect(bootstrap?.attestor).toBeUndefined();
 		expect(process.stdin.setRawMode).not.toHaveBeenCalled();
-		// Typed input passes through as ordinary (pre-epoch) input.
 		const typed = Buffer.from("hello");
 		expect(bootstrap?.meter.push(typed)).toEqual({ preEpoch: typed, epoch: Buffer.alloc(0), epochStart: 0 });
 	});
-
-	it("reports the specific check that rejected the key", async () => {
+	it("reports the specific rejected-key check", async () => {
 		const dangling = join(dir, "dangling.pub");
 		symlinkSync(join(dir, "nowhere"), dangling);
 		expect(checkServerTrustRoot(dangling)).toEqual({ rejected: "untrusted-trust-root" });

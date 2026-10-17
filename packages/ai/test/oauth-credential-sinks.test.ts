@@ -1,4 +1,4 @@
-// smarty-dev#4703: the credential diagnostic boundary must withhold provider text, not enumerate encodings.
+// smarty-dev#4703: withhold provider credential diagnostics instead of enumerating encodings.
 import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
@@ -162,7 +162,7 @@ describe("owned credential sink messages", () => {
 		expect(serialized(error)).not.toContain(alias);
 	});
 
-	it("keeps Radius polling decisions private when a short device credential overlaps a protocol class", async () => {
+	it("keeps Radius polling private when a short credential overlaps a protocol class", async () => {
 		vi.useFakeTimers();
 		let polls = 0;
 		const fetch = vi.fn(async (input: string | URL | Request) => {

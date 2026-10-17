@@ -3,8 +3,6 @@ import { mkdir as fsMkdir } from "fs/promises";
 import { dirname } from "path";
 import { type Static, Type } from "typebox";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { ordinaryOwnerOf } from "../ordinary-owner-context.ts";
-import { currentSessionOwnership } from "../session-ownership.ts";
 import { writeFileAtomic } from "./atomic-write.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -48,8 +46,6 @@ export function createWriteToolDefinition(
 	cwd: string,
 	options?: WriteToolOptions,
 ): ToolDefinition<typeof writeSchema, undefined> {
-	const owner = options && ordinaryOwnerOf(options);
-	if (owner && options?.operations) throw new Error("OWNER_TOOL_OPERATIONS");
 	const ops = options?.operations ?? defaultWriteOperations;
 	return {
 		name: "write",
@@ -69,50 +65,31 @@ export function createWriteToolDefinition(
 			_onUpdate?,
 			ctx?: ExtensionContext,
 		) {
-			if (!owner && currentSessionOwnership()) throw new Error("OWNER_TOOL_BINDING_REQUIRED");
-			owner?.assertActive();
-			if (owner && ctx && (ctx.sessionManager !== owner.owner.manager || ctx.cwd !== cwd))
-				throw new Error("OWNER_TOOL_CONTEXT");
-			const absolutePath = resolveToCwd(path, owner ? cwd : ctx?.cwd || cwd);
-			const target = owner?.fileTarget(absolutePath, true);
+			const absolutePath = resolveToCwd(path, ctx?.cwd || cwd);
 			const dir = dirname(absolutePath);
-			const execute = () =>
-				withFileMutationQueue(absolutePath, async () => {
-					// Do not reject from an abort event listener here: that would release the
-					// mutation queue while an in-flight filesystem operation may still finish.
-					// Checking signal.aborted after each await observes the same aborts while
-					// keeping the queue locked until the current operation has settled.
-					const throwIfAborted = (): void => {
-						if (signal?.aborted) throw new Error("Operation aborted");
-						owner?.assertActive();
-					};
+			return withFileMutationQueue(absolutePath, async () => {
+				// Do not reject from an abort event listener here: that would release the
+				// mutation queue while an in-flight filesystem operation may still finish.
+				// Checking signal.aborted after each await observes the same aborts while
+				// keeping the queue locked until the current operation has settled.
+				const throwIfAborted = (): void => {
+					if (signal?.aborted) throw new Error("Operation aborted");
+				};
 
-					throwIfAborted();
-					// Create parent directories if needed.
-					if (!owner) await ops.mkdir(dir);
-					throwIfAborted();
+				throwIfAborted();
+				// Create parent directories if needed.
+				await ops.mkdir(dir);
+				throwIfAborted();
 
-					// Write the file contents.
-					if (owner && target) {
-						// Native write owns parent creation, replacement and durable readback.
-						await owner.owner.writeFile(
-							target.root,
-							target.relativePath,
-							Buffer.from(content),
-							undefined,
-							signal,
-						);
-					} else {
-						await ops.writeFile(absolutePath, content);
-					}
-					throwIfAborted();
+				// Write the file contents.
+				await ops.writeFile(absolutePath, content);
+				throwIfAborted();
 
-					return {
-						content: [{ type: "text" as const, text: `Successfully wrote to ${path}` }],
-						details: undefined,
-					};
-				});
-			return owner ? owner.within(execute) : execute();
+				return {
+					content: [{ type: "text", text: `Successfully wrote to ${path}` }],
+					details: undefined,
+				};
+			});
 		},
 		...writeRenderers,
 	};

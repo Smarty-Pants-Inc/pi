@@ -3,14 +3,33 @@ import { type Terminal, TuiAltScreen, TuiMainScreen } from "@earendil-works/pi-t
 import { describe, expect, test, vi } from "vitest";
 
 const nextTick = () => new Promise<void>((resolve) => process.nextTick(resolve));
+function createTerminal(): Terminal {
+	return {
+		columns: 80,
+		rows: 24,
+		kittyProtocolActive: false,
+		start: vi.fn(),
+		stop: vi.fn(),
+		drainInput: async () => {},
+		write: vi.fn(),
+		moveBy: vi.fn(),
+		hideCursor: vi.fn(),
+		showCursor: vi.fn(),
+		clearLine: vi.fn(),
+		clearFromCursor: vi.fn(),
+		clearScreen: vi.fn(),
+		setTitle: vi.fn(),
+		setProgress: vi.fn(),
+		setProgramStatus: vi.fn(),
+		onRenderPending: vi.fn(),
+	};
+}
 
-// pi#175 / smarty-dev#7403: exercise the public request path, not renderNow().
-// This lives in coding-agent because its test runner supports vi.useFakeTimers.
+// pi#175 / smarty-dev#7403: exercise public scheduling, not renderNow().
 describe.each([
 	{ name: "regular", Renderer: TuiMainScreen },
 	{ name: "fullscreen", Renderer: TuiAltScreen },
 ])("$name render coalescing", ({ Renderer }) => {
-	// pi#175 / smarty-dev#7403: t=5 requests cannot be lost, delayed to t=105, or duplicated.
 	test.each([
 		{ name: "A only", finalState: "A", secondRequest: false },
 		{ name: "A then B at t=85", finalState: "B", secondRequest: true },
@@ -21,24 +40,7 @@ describe.each([
 		vi.spyOn(performance, "now").mockImplementation(() => now);
 		let state = "initial";
 		const component = { render: vi.fn(() => [state]), invalidate: vi.fn() };
-		const terminal: Terminal = {
-			columns: 80,
-			rows: 24,
-			kittyProtocolActive: false,
-			start: vi.fn(),
-			stop: vi.fn(),
-			drainInput: async () => {},
-			write: vi.fn(),
-			moveBy: vi.fn(),
-			hideCursor: vi.fn(),
-			showCursor: vi.fn(),
-			clearLine: vi.fn(),
-			clearFromCursor: vi.fn(),
-			clearScreen: vi.fn(),
-			setTitle: vi.fn(),
-			setProgress: vi.fn(),
-		};
-		const tui = new Renderer(terminal);
+		const tui = new Renderer(createTerminal());
 		const advance = async (ms: number) => {
 			now += ms;
 			vi.advanceTimersByTime(ms);
@@ -48,7 +50,7 @@ describe.each([
 			tui.addChild(component);
 			tui.start();
 			await nextTick();
-			await advance(0); // t=0 relative to the first frame.
+			await advance(0);
 			expect(component.render).toHaveBeenCalledTimes(1);
 			await advance(5);
 			state = "A";
@@ -77,7 +79,7 @@ describe.each([
 		}
 	});
 
-	// pi#175 / smarty-dev#7403: stop must clear both pending flags and invalidate queued callbacks.
+	// Stop invalidates queued callbacks and clears both pending flags.
 	test.each(["timer", "normal nextTick", "immediate nextTick"])(
 		"clears a pending %s across a quick restart",
 		async (kind) => {
@@ -86,24 +88,7 @@ describe.each([
 			vi.spyOn(performance, "now").mockImplementation(() => now);
 			let state = "initial";
 			const component = { render: vi.fn(() => [state]), invalidate: vi.fn() };
-			const terminal: Terminal = {
-				columns: 80,
-				rows: 24,
-				kittyProtocolActive: false,
-				start: vi.fn(),
-				stop: vi.fn(),
-				drainInput: async () => {},
-				write: vi.fn(),
-				moveBy: vi.fn(),
-				hideCursor: vi.fn(),
-				showCursor: vi.fn(),
-				clearLine: vi.fn(),
-				clearFromCursor: vi.fn(),
-				clearScreen: vi.fn(),
-				setTitle: vi.fn(),
-				setProgress: vi.fn(),
-				onRenderPending: vi.fn(),
-			};
+			const terminal = createTerminal();
 			const tui = new Renderer(terminal);
 			const advance = async (ms: number) => {
 				now += ms;
@@ -155,29 +140,13 @@ describe.each([
 		},
 	);
 
-	test("renders the latest trailing state, leads after idle, and preserves requests across stop/start", async () => {
+	test("renders latest trailing state, leads after idle, and preserves requests through stop/start", async () => {
 		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
 		let now = 1000;
 		vi.spyOn(performance, "now").mockImplementation(() => now);
 		let state = "initial";
 		const component = { render: vi.fn(() => [state]), invalidate: vi.fn() };
-		const terminal: Terminal = {
-			columns: 80,
-			rows: 24,
-			kittyProtocolActive: false,
-			start: vi.fn(),
-			stop: vi.fn(),
-			drainInput: async () => {},
-			write: vi.fn(),
-			moveBy: vi.fn(),
-			hideCursor: vi.fn(),
-			showCursor: vi.fn(),
-			clearLine: vi.fn(),
-			clearFromCursor: vi.fn(),
-			clearScreen: vi.fn(),
-			setTitle: vi.fn(),
-			setProgress: vi.fn(),
-		};
+		const terminal = createTerminal();
 		const tui = new Renderer(terminal);
 		const advance = async (ms: number) => {
 			now += ms;
@@ -195,7 +164,6 @@ describe.each([
 			await nextTick();
 			await advance(0);
 			expect(component.render).toHaveBeenCalledTimes(1);
-
 			await advance(10);
 			await request("first");
 			expect(vi.getTimerCount()).toBe(1);
@@ -212,7 +180,6 @@ describe.each([
 			expect(component.render.mock.results.at(-1)?.value).toEqual(["LAST"]);
 			expect(terminal.write).toHaveBeenLastCalledWith(expect.stringContaining("LAST"));
 			expect(vi.getTimerCount()).toBe(0);
-
 			await advance(200);
 			expect(component.render).toHaveBeenCalledTimes(2);
 			await request("leading after idle");
@@ -220,7 +187,6 @@ describe.each([
 			expect(component.render).toHaveBeenCalledTimes(3);
 			expect(component.render.mock.results.at(-1)?.value).toEqual(["leading after idle"]);
 			expect(vi.getTimerCount()).toBe(0);
-
 			await advance(10);
 			await request("pending before stop");
 			tui.stop({ preserveScreen: true });
@@ -234,7 +200,6 @@ describe.each([
 			await advance(0);
 			expect(component.render).toHaveBeenCalledTimes(4);
 			expect(component.render.mock.results.at(-1)?.value).toEqual(["latest while stopped"]);
-
 			await advance(10);
 			await request("pending before quick restart");
 			tui.stop({ preserveScreen: true });

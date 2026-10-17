@@ -120,10 +120,15 @@ describe("bash full output file cap", () => {
 		expectCappedFile(file, data);
 		const saved = await output.readFullOutput(CAP + 1024);
 		expect(saved.truncated).toBe(true);
-		expect(saved.content).toBe(file.toString("utf-8"));
+		// The raw spill marker carries totals; the structured reader renders its own head/tail marker.
+		expect(saved.content).toBe(
+			`${data.subarray(0, HALF).toString("utf-8")}\n\n[... ${data.length - CAP} bytes omitted ...]\n\n${data.subarray(data.length - HALF).toString("utf-8")}`,
+		);
 		const smaller = await output.readFullOutput(MiB);
 		expect(smaller.truncated).toBe(true);
-		expect(smaller.content).toContain(`[... ${data.length - MiB} bytes omitted ...]`);
+		expect(smaller.content).toBe(
+			`${data.subarray(0, MiB / 2).toString("utf-8")}\n\n[... ${data.length - MiB} bytes omitted ...]\n\n${data.subarray(data.length - MiB / 2).toString("utf-8")}`,
+		);
 	}, 60_000);
 
 	// #6418: output up to the cap stays byte-identical (control: passes before and after the cap).
@@ -175,10 +180,17 @@ describe("bash full output file cap", () => {
 	it("preserves raw bytes of characters split by the head and tail cuts", async () => {
 		const data = makeUtf8StraddlingOutput(CAP + 3 * MiB);
 		// Odd chunk size so chunk boundaries also split characters.
-		const { snapshot, file } = await accumulate(data, 65_537);
+		const { output, snapshot, file } = await accumulate(data, 65_537);
 		expectCappedFile(file, data);
 		expect(snapshot.totalRawBytes).toBe(data.length);
 		expect(snapshot.fullOutputTruncated).toBe(true);
+		// Structured readers drop the two incomplete head bytes and three tail continuation bytes.
+		const rendered = await output.readFullOutput(CAP + 1024);
+		expect(rendered.truncated).toBe(true);
+		expect(rendered.content).toBe(
+			`${"a".repeat(HALF - 2)}\n\n[... ${data.length - CAP + 5} bytes omitted ...]\n\n${"a".repeat(HALF - 3)}`,
+		);
+		expect(rendered.content).not.toContain("\uFFFD");
 	}, 60_000);
 
 	// #6418: every model-facing notice states the cap and the total size.

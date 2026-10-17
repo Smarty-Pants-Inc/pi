@@ -197,7 +197,6 @@ async function fetchGitHubCopilotModels(
 		retryPolicy,
 	);
 	if (!response.ok) {
-		// Authenticated request: its error body and reason phrase can echo the bearer token.
 		await response.body?.cancel().catch(() => undefined);
 		throw new Error(`HTTP ${response.status}`);
 	}
@@ -210,11 +209,9 @@ async function fetchGitHubCopilotModels(
 async function fetchJson(url: string, init: RequestInit): Promise<unknown> {
 	const response = await fetchCredentialResponse(url, init);
 	if (!response.ok) {
-		// Device and token endpoints can echo submitted codes or tokens, in the body or reason phrase.
 		await response.body?.cancel().catch(() => undefined);
 		throw new Error(`HTTP ${response.status}`);
 	}
-	// A parser or body-reader error can quote the issued token: value-free reader.
 	return readOAuthCredentialResponse(response, "GitHub Copilot OAuth");
 }
 
@@ -316,7 +313,6 @@ async function pollForGitHubAccessToken(
 					return { status: "slow_down", intervalSeconds: typeof interval === "number" ? interval : undefined };
 				}
 
-				// The token endpoint can echo the submitted device code: keep only a protocol code, never error_description.
 				return {
 					status: "failed",
 					message: `Device flow failed: ${oauthAuthorizationError(error, [device.device_code, device.user_code])}`,

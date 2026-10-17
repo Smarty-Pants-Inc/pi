@@ -89,14 +89,15 @@ describe("remote catalog opt-in", () => {
 		vi.stubEnv("PI_REMOTE_CATALOG", value);
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("unexpected catalog request"));
 		const personalize = vi.fn<PersonalizeCatalog>();
-		const store = new InMemoryModelsStore();
-		await store.write("test-provider", {
-			models: [{ ...model("static"), contextWindow: 1, maxTokens: 999999999 }],
-			lastModified: Date.now() + 1000,
-		});
 		for (const provider of [testProvider(), withPersonalizedCatalog(builtinProvider(), personalize)]) {
+			const store = new InMemoryModelsStore();
+			await store.write(provider.id, {
+				models: [{ ...model("static"), contextWindow: 1, maxTokens: 999999999 }],
+				lastModified: Date.now() + 1000,
+			});
 			await refreshProvider(provider, store, { allowNetwork: true, force: true });
 			expect(provider.getModels()).toEqual([model("static")]);
+			expect(await store.read(provider.id)).toBeUndefined();
 		}
 		expect(fetchSpy).not.toHaveBeenCalled();
 		expect(personalize).not.toHaveBeenCalled();
@@ -118,6 +119,57 @@ describe("remote catalog opt-in", () => {
 			expect(provider.getModels()).toEqual([model("static")]);
 		}
 		expect(fetchSpy).toHaveBeenCalledTimes(2);
+	});
+
+	// smarty-dev#3155 TOOLS-CR2: a disabled refresh must prevent saved overlays reviving before expiry.
+	it.each(["remote", "personalized"] as const)("clears the saved %s overlay before re-enabling", async (kind) => {
+		const now = Date.parse("2026-10-16T06:00:00.000Z");
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const responses = ["old", "fresh"].map(
+			(id) =>
+				new Response(JSON.stringify({ [id]: model(id) }), {
+					headers: { "last-modified": new Date(now).toUTCString(), etag: `"${id}"` },
+				}),
+		);
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => responses.shift() as Response);
+		const personalize = vi.fn<PersonalizeCatalog>(async (catalog) => catalog);
+		const provider = kind === "remote" ? testProvider() : withPersonalizedCatalog(builtinProvider(), personalize);
+		const store = new InMemoryModelsStore();
+		const models = createModels({ modelsStore: store });
+		models.setProvider(provider);
+
+		const enabled = await models.refresh({ providers: [provider.id] });
+		expect([...enabled.errors]).toEqual([]);
+		expect(models.getModels(provider.id).some((entry) => entry.id === "old")).toBe(true);
+		expect((await store.read(provider.id))?.models.some((entry) => entry.id === "old")).toBe(true);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		const personalizationCalls = personalize.mock.calls.length;
+
+		vi.stubEnv("PI_REMOTE_CATALOG", undefined);
+		const disabled = await models.refresh({ providers: [provider.id], allowNetwork: false });
+		expect([...disabled.errors]).toEqual([]);
+		expect(models.getAllModels(provider.id)).toEqual([model("static")]);
+		expect(await store.read(provider.id)).toBeUndefined();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(personalize).toHaveBeenCalledTimes(personalizationCalls);
+
+		vi.stubEnv("PI_REMOTE_CATALOG", "1");
+		const restored = await models.refresh({ providers: [provider.id], allowNetwork: false });
+		expect([...restored.errors]).toEqual([]);
+		expect(models.getAllModels(provider.id)).toEqual([model("static")]);
+		expect(await store.read(provider.id)).toBeUndefined();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(personalize).toHaveBeenCalledTimes(personalizationCalls);
+
+		// No force and no clock advance: a retained remote cache would skip this fresh request.
+		const refreshed = await models.refresh({ providers: [provider.id] });
+		expect([...refreshed.errors]).toEqual([]);
+		expect(models.getModels(provider.id).map((entry) => entry.id)).toEqual(["static", "fresh"]);
+		expect((await store.read(provider.id))?.models.map((entry) => entry.id)).toEqual(
+			kind === "remote" ? ["fresh"] : ["static", "fresh"],
+		);
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+		expect(fetchSpy.mock.calls[1]?.[1]?.headers).not.toHaveProperty("if-none-match");
 	});
 
 	// pi#244: the catalog policy must not silently turn off native provider discovery or other networking.
@@ -142,6 +194,7 @@ describe("remote catalog opt-in", () => {
 
 describe("remote catalog provider", () => {
 	it("parses keyed catalogs, sends version headers, observes the refresh TTL, and supports forced refreshes", async () => {
+		vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-10-16T06:00:00.000Z"));
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>
 				new Response(JSON.stringify({ dynamic: model("dynamic") }), {
@@ -152,7 +205,17 @@ describe("remote catalog provider", () => {
 		const provider = testProvider();
 		const store = new InMemoryModelsStore();
 		await refreshProvider(provider, store);
+		const saved = await store.read(provider.id);
 		await refreshProvider(provider, store);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(await store.read(provider.id)).toEqual(saved);
+
+		// smarty-dev#3155 TOOLS-CR2 positive control: enabled cache-only restoration retains the saved overlay.
+		const restoredProvider = testProvider();
+		await refreshProvider(restoredProvider, store, { allowNetwork: false });
+		expect(restoredProvider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
+		expect(await store.read(provider.id)).toEqual(saved);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
 		await refreshProvider(provider, store, { force: true });
 
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);

@@ -52,7 +52,7 @@ import { closedRawStopReason } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, providerErrorText } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { providerHeadersToRecord } from "../utils/headers.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
@@ -74,7 +74,7 @@ import {
 	clampMaxTokensToContext,
 	clampReasoning,
 } from "./simple-options.ts";
-import { transformMessages } from "./transform-messages.ts";
+import { splitErrorToolResultImages, transformMessages } from "./transform-messages.ts";
 
 export type BedrockThinkingDisplay = "summarized" | "omitted";
 
@@ -249,7 +249,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			const supportsStrictMode = model.compat?.supportsStrictMode ?? false;
 			const client = new BedrockRuntimeClient(config);
 			if (options.beforeProviderRequest) {
-				// Deserialize runs inside Smithy's retry middleware, once per physical attempt.
+				// Deserialize is inside Smithy's retry middleware: one check per physical attempt.
 				client.middlewareStack.add(
 					(next) => async (args) => {
 						checkProviderRequest(options);
@@ -289,7 +289,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			const command = new ConverseStreamCommand(commandInput);
 
 			const response = await client.send(command, { abortSignal: options.signal });
-			// Status only: response headers and request ids are never passed to callbacks (smarty-dev#5822 C1).
 			await options.onResponse?.(providerResponse(response.$metadata.httpStatusCode));
 
 			for await (const item of response.stream!) {
@@ -377,34 +376,17 @@ const BEDROCK_ERROR_PREFIXES = {
  */
 const BEDROCK_DATA_RETENTION_DOCS_URL = "https://docs.aws.amazon.com/bedrock/latest/userguide/data-retention.html";
 
-/** Owned remedy for the one Bedrock failure Pi recognizes in provider text (smarty-dev#5822 C4). */
 const BEDROCK_DATA_RETENTION_REMEDY = `Configure a supported Bedrock data retention mode. See ${BEDROCK_DATA_RETENTION_DOCS_URL}`;
-
-/** Owned text for a Bedrock service exception whose name is not in the closed prefix list. */
 const BEDROCK_REQUEST_FAILED = "Bedrock request failed";
-
 type BedrockExceptionName = keyof typeof BEDROCK_ERROR_PREFIXES;
 
-/**
- * A modeled mid-stream exception arrives as a bare object, not an `Error`. Keep its known category as the
- * error name, so it is formatted and classified like the same exception from `client.send()`.
- */
 function bedrockStreamException(name: BedrockExceptionName, exception: unknown): Error {
 	const message = (exception as { message?: unknown } | undefined)?.message;
 	return Object.assign(new Error(typeof message === "string" ? message : ""), { name });
 }
 
-/**
- * Format a Bedrock error as owned text (smarty-dev#5822 C4). A Bedrock service exception publishes only its
- * closed category label, its validated HTTP status and the owned data-retention remedy; the provider's message,
- * body, unknown exception names and request ids are read for classification and never published. The owned
- * label ("Throttling error: ...") is part of the classified text, so a throttle that says "Too many tokens" is
- * not context overflow. Errors that are not Bedrock service exceptions (transport and Pi's own failures) keep
- * their redacted text until the universal owned-error rendering replaces it.
- */
 function formatBedrockError(error: unknown, output: AssistantMessage, secrets: readonly string[]): string {
 	const raw = normalizeProviderError(error, output.provider, undefined, secrets);
-	// Private: read only to classify and to recognize the retention failure.
 	const core = providerErrorText(error);
 	const name = error instanceof Error ? error.name : undefined;
 	const label =
@@ -413,13 +395,11 @@ function formatBedrockError(error: unknown, output: AssistantMessage, secrets: r
 			: error instanceof BedrockRuntimeServiceException
 				? BEDROCK_REQUEST_FAILED
 				: undefined;
-	// Classify first, from the original text and status (smarty-dev#5822 C3).
 	output.recovery ??= classifyProviderFailure({
 		text: label === undefined ? core : `${label}: ${core}`,
 		status: raw.status,
 		provider: output.provider,
 	});
-	// Transport and Pi-side failures publish owned text too (smarty-dev#5822, pi#202 round 2).
 	if (label === undefined) return formatProviderError(raw, "Bedrock request failed");
 	if (/data retention mode/i.test(core)) output.errorHint = "bedrock_data_retention";
 	const status = raw.status === undefined ? "" : ` (${raw.status})`;
@@ -676,7 +656,7 @@ function handleContentBlockStop(
 			stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: output });
 			break;
 		case "toolCall":
-			block.arguments = parseStreamingJson(block.partialJson);
+			Object.assign(block, parseToolCallArguments(block.partialJson));
 			// Finalize in-place and strip the scratch buffer so replay only
 			// carries parsed arguments.
 			delete (block as Block).partialJson;
@@ -1028,35 +1008,34 @@ function convertMessages(
 			case "toolResult": {
 				// Collect all consecutive toolResult messages into a single user message
 				// Bedrock requires all tool results to be in one message
-				const toolResults: ContentBlock.ToolResultMember[] = [];
-
-				// Add current tool result with all content blocks combined
-				toolResults.push({
-					toolResult: {
-						toolUseId: m.toolCallId,
-						content: convertToolResultContent(m.content),
-						status: m.isError ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
-					},
-				});
-
-				// Look ahead for consecutive toolResult messages
-				let j = i + 1;
+				const toolResults: ContentBlock[] = [];
+				// Claude rejects error tool results that contain anything but text, so for Claude their
+				// images follow all tool results of the turn (#10794). Other models keep them in place.
+				const errorImages: ContentBlock[] = [];
+				let j = i;
 				while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
-					const nextMsg = transformedMessages[j] as ToolResultMessage;
+					const toolMsg = transformedMessages[j] as ToolResultMessage;
+					const split = isAnthropicClaudeModel(model) ? splitErrorToolResultImages(toolMsg) : undefined;
 					toolResults.push({
 						toolResult: {
-							toolUseId: nextMsg.toolCallId,
-							content: convertToolResultContent(nextMsg.content),
-							status: nextMsg.isError ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
+							toolUseId: toolMsg.toolCallId,
+							content: convertToolResultContent(split?.content ?? toolMsg.content),
+							status: toolMsg.isError ? ToolResultStatus.ERROR : ToolResultStatus.SUCCESS,
 						},
 					});
+					if (split) {
+						errorImages.push(
+							{ text: split.caption },
+							...split.images.map((image) => ({ image: createImageBlock(image.mimeType, image.data) })),
+						);
+					}
 					j++;
 				}
 
 				// Skip the messages we've already processed
 				i = j - 1;
 
-				result.push({ role: ConversationRole.USER, content: toolResults });
+				result.push({ role: ConversationRole.USER, content: [...toolResults, ...errorImages] });
 				break;
 			}
 			default:

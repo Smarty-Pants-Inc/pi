@@ -282,7 +282,6 @@ describe("OAuth endpoint transport security (pi#173)", () => {
 				OAuthRedirectRefusedError,
 			);
 			expect(fetch).toHaveBeenCalledOnce();
-
 			const prm = vi.fn(async (_url: string | URL, _init?: RequestInit) => redirect(302, location));
 			await expect(
 				discoverOAuthServerInfo("https://oauth.test/mcp", {

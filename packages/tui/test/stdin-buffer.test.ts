@@ -145,7 +145,7 @@ describe("StdinBuffer", () => {
 			assert.equal(timers.mock.callCount(), 2);
 		});
 
-		// smarty-dev#12091: consuming a recognized reply must not transfer its deadline to the next reply.
+		// smarty-dev#12091: completion/cancellation cannot transfer a reply's deadline.
 		it("gives a new recognized reply its own deadline after completion or cancellation", (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			for (const boundary of ["\x07", "\x18", "\x1a"]) {
@@ -165,7 +165,7 @@ describe("StdinBuffer", () => {
 			}
 		});
 
-		// smarty-dev#12091: all ways of consuming the buffer must cancel its only timer.
+		// smarty-dev#12091: all buffer consumers cancel its only timer.
 		it("cancels chunk timers on completion, explicit flush and clear", (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			for (const action of ["complete", "flush", "clear"] as const) {
@@ -363,7 +363,7 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, [replies[1].reply]);
 		});
 
-		// pi#244: recognized replies need an absolute deadline, then a bounded discard window.
+		// pi#244: recognized replies have an absolute deadline and a bounded discard window.
 		it("expires an unterminated recognized reply before delivering later keys", (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			processInput("\x1b]10;");
@@ -380,8 +380,6 @@ describe("StdinBuffer", () => {
 			processInput("xyz\r\n");
 			assert.deepStrictEqual(emittedSequences, ["x", "y", "z"]);
 		});
-
-		// pi#244: byte cap bounds retained UTF-8 bytes, even on a large single data event.
 		it("discards an over-cap reply without retaining or emitting its tail", (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			processInput(`\x1b]10;${"é".repeat(32 * 1024)}`);
@@ -390,15 +388,12 @@ describe("StdinBuffer", () => {
 			processInput("tail\r\n\x07q");
 			assert.deepStrictEqual(emittedSequences, ["q"]);
 		});
-
-		// pi#244: completed oversized strings also stay capped; parsing the suffix must resume immediately.
 		it("discards a complete oversized reply and resumes input in the same event", () => {
 			processInput(`\x1b]11;${"x".repeat(70 * 1024)}\x07z`);
 			assert.equal(buffer.getBuffer(), "");
 			assert.deepStrictEqual(emittedSequences, ["z"]);
 		});
-
-		// smarty-dev#12091: real-sized unknown input must be linear, bounded and never auto-submit.
+		// smarty-dev#12091: unknown strings must be linear, bounded and never auto-submit.
 		it("processes one 1 MiB unterminated unknown OSC within the linear-time budget", (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			const input = `\x1b]0;${"\r\n".repeat((1024 * 1024 - 4) / 2)}`;
@@ -409,15 +404,12 @@ describe("StdinBuffer", () => {
 			assert.ok(elapsed < 200, `1 MiB scan took ${elapsed.toFixed(1)}ms (budget: 200ms)`);
 			assert.equal(buffer.getBuffer(), "");
 			assert.deepStrictEqual(emittedSequences, []);
-			// The byte discard window is already exhausted by this event; CR/LF stay quarantined.
 			processInput("keys\r\n");
 			assert.deepStrictEqual(emittedSequences, [..."keys"]);
 			processInput("\x07\r");
 			assert.deepStrictEqual(emittedSequences, [..."keys", "\r"]);
 		});
-
 		for (const header of ["\x1b]0;", "\x1bPunknown;", "\x1b_unknown;", "\x1b^unknown;", "\x1bXunknown;"]) {
-			// smarty-dev#12091: the UTF-8 size cap and bounded discard also cover unknown control strings.
 			it(`caps unknown ${JSON.stringify(header)} and resumes keys after the discard window`, (t) => {
 				t.mock.timers.enable({ apis: ["setTimeout"] });
 				processInput(`a${header}${"é".repeat(32 * 1024)}`);
@@ -435,8 +427,6 @@ describe("StdinBuffer", () => {
 				assert.deepStrictEqual(emittedSequences, ["a", "q", "\r", "\x1b[A"]);
 			});
 		}
-
-		// smarty-dev#12091: incremental scans must revisit a trailing ESC to distinguish ST/resync.
 		it("resumes split terminators and recognized-reply resynchronization after many chunks", () => {
 			for (const header of [
 				"\x1b]10;",
@@ -456,16 +446,12 @@ describe("StdinBuffer", () => {
 			processInput("[Ar");
 			assert.deepStrictEqual(emittedSequences.slice(-2), ["\x1b[A", "r"]);
 		});
-
-		// pi#244: explicit flush must not convert a recognized reply into keyboard/control input.
 		it("discards a recognized reply on explicit flush", () => {
 			processInput("\x1bP>|reply");
 			assert.deepStrictEqual(buffer.flush(), []);
 			processInput("tail\x1b\\x");
 			assert.deepStrictEqual(emittedSequences, ["x"]);
 		});
-
-		// pi#244: each protocol boundary ends discard without leaking terminators as control keys.
 		for (const boundary of ["\x07", "\x1b\\", "\x18", "\x1a", "\x1b[A"]) {
 			it(`ends expired reply discard on ${JSON.stringify(boundary)}`, (t) => {
 				t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -475,8 +461,6 @@ describe("StdinBuffer", () => {
 				assert.deepStrictEqual(emittedSequences, boundary === "\x1b[A" ? [boundary, "x"] : ["x"]);
 			});
 		}
-
-		// pi#244: the discard byte budget is an independent exit, not an indefinitely resetting timer.
 		it("ends the discard window at its byte cap and resumes plain typing", (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			processInput("\x1bP>|");
@@ -492,8 +476,6 @@ describe("StdinBuffer", () => {
 			processInput("\\\r");
 			assert.deepStrictEqual(emittedSequences, [..."plain", "\r"]);
 		});
-
-		// pi#244: a split ST after expiry is never an Alt key or a backslash keystroke.
 		it("discards a split late ST and clears quarantine on explicit clear", (t) => {
 			t.mock.timers.enable({ apis: ["setTimeout"] });
 			processInput("\x1b_Gi=1;");

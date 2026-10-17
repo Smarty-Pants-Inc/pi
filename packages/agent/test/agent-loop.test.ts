@@ -2198,9 +2198,7 @@ describe("runToolCall", () => {
 			isError: true,
 		});
 		expect(await runToolCall(call("d", "missing", {}), options)).toMatchObject({
-			result: {
-				content: [{ type: "text", text: "Tool missing not found. No tools are available in this session." }],
-			},
+			result: { content: [{ type: "text", text: "Tool missing not found" }] },
 			isError: true,
 		});
 		// Error results keep their details.
@@ -2211,26 +2209,6 @@ describe("runToolCall", () => {
 		expect(updates).toEqual([{ content: [{ type: "text", text: "partial" }], details: {} }]);
 		// Validation failures and unknown tools never reach the hooks; blocked calls skip afterToolCall.
 		expect(hookCalls).toEqual(["before a", "after a", "before c", "before e", "after e"]);
-	});
-
-	it.each([false, true])("preserves null-only redaction with content replacement=%s", async (replaceContent) => {
-		const content = [{ type: "text" as const, text: "redacted" }];
-		for (const redaction of [
-			{ structuredContent: null },
-			{ details: null },
-			{ structuredContent: null, details: null },
-		]) {
-			const afterResult = { ...redaction, ...(replaceContent ? { content } : {}) };
-			const outcome = await runToolCall(call("null", "echo", { value: "private" }), {
-				tools: [echo],
-				assistantMessage,
-				context: { messages: [] },
-				afterToolCall: async () => afterResult,
-			});
-			if ("structuredContent" in redaction) expect(outcome.result.structuredContent).toBeNull();
-			if ("details" in redaction) expect(outcome.result.details).toBeNull();
-			expect(outcome.result.content).toEqual(replaceContent ? content : [{ type: "text", text: "private" }]);
-		}
 	});
 
 	it("lets afterToolCall replace structured content and drops it when only content is replaced", async () => {

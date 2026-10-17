@@ -4,7 +4,6 @@ import { describe, it } from "node:test";
 import { type InputByteMeter, MeteredInput } from "../src/metered-input.ts";
 import { StdinBuffer } from "../src/stdin-buffer.ts";
 
-/** A meter whose epoch starts at the first byte (marker already consumed). */
 function openMeter(): InputByteMeter & { ended: boolean } {
 	let total = 0;
 	return {
@@ -41,7 +40,6 @@ describe("MeteredInput", () => {
 			{ seq: "B", end: 3 },
 		]);
 	});
-
 	it("counts UTF-8 bytes and reassembles characters split across reads", () => {
 		const { input, events, parser } = harness(openMeter());
 		for (const byte of Buffer.from("é\r")) input.write(Buffer.from([byte]));
@@ -51,7 +49,6 @@ describe("MeteredInput", () => {
 			{ seq: "\r", end: 3 },
 		]);
 	});
-
 	it("ends a paste at its closing marker byte", () => {
 		const { input, events, parser } = harness(openMeter());
 		input.write(Buffer.from("\x1b[200~hi\x1b[201~\r"));
@@ -61,15 +58,13 @@ describe("MeteredInput", () => {
 			{ seq: "\r", end: 15 },
 		]);
 	});
-
 	it("reports no offset without a meter and still decodes split UTF-8", () => {
 		const { input, events, parser } = harness();
 		for (const byte of Buffer.from("é")) input.write(Buffer.from([byte]));
 		parser.destroy();
 		assert.deepEqual(events, [{ seq: "é", end: undefined }]);
 	});
-
-	// pi#160 review: bytes held from before the marker are in no attested interval.
+	// pi#160: bytes held from before the marker are in no attested interval.
 	it("signals pre-epoch bytes before and after the parser sees them, and only those", () => {
 		const parser = new StdinBuffer();
 		const log: string[] = [];
@@ -81,7 +76,6 @@ describe("MeteredInput", () => {
 		parser.destroy();
 		assert.deepEqual(log, ["unmetered", "x", "unmetered", "h", "i", "\r"]);
 	});
-
 	it("ends the meter and stops reporting offsets when detached", () => {
 		const meter = openMeter();
 		const { input, events, parser } = harness(meter);

@@ -1,6 +1,6 @@
 # Settings Reference
 
-This reference lists user-configurable settings, their types, defaults, and purposes. Project settings override agent-directory settings, except `modelPolicy`, which can only narrow the inherited policy. Resource lists are combined. See [Configuration](configuration.md) for file locations and trust behavior.
+This reference lists user-configurable settings, their types, defaults, and purposes. Project settings override agent-directory settings. Resource lists are combined. See [Configuration](configuration.md) for file locations and trust behavior.
 
 Add `"$schema": "https://pi.dev/schemas/settings.schema.json"` to `settings.json` for editor validation and completion.
 
@@ -16,37 +16,13 @@ Add `"$schema": "https://pi.dev/schemas/settings.schema.json"` to `settings.json
 | `modelThinkingLevels` | object | None | Per-model startup thinking levels keyed by exact `provider/modelId`. |
 | `thinkingBudgets` | object | Built-in budgets | Token budgets for `minimal`, `low`, `medium`, and `high` thinking levels. |
 | `enabledModels` | `string[]` | All available models | Model patterns used for startup selection and model cycling. Uses the same format as `--models`. |
-| `modelPolicy.allow` | `string[]` | Unrestricted | Enforced allow-list of case-insensitive `provider/model` globs. `*` matches any run of characters, including `/`; other characters are literal. An empty list denies all models. Project policy can only narrow global policy. |
 | `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in the transcript. |
 | `showCacheMissNotices` | boolean | `false` | Show notices for significant cache misses, successful cache warming, compaction usage, and provider recovery. |
-| `cacheWarming` | `"off" \| "streaming" \| "idle"` | `"streaming"` | Keep eligible provider prompt caches warm during active runs or, with `"idle"`, between runs. Project settings override global settings. |
+| `cacheWarming` | `"off" \| "streaming" \| "idle"` | `"streaming"` | Keep eligible provider prompt caches warm during active runs or, with `"idle"`, between runs. Global setting only. |
 
 Cache warming runs only when the model declares a cache lifetime and Pi estimates at least $0.05 in avoided cache-miss cost. Refresh usage counts toward session totals but does not enter model context. `/session` shows the next decision; extensions can override it with `cache_warming_decision`. See [Prompt Cache Lifetimes](models.md#prompt-cache-lifetimes).
 
 See [Choose a Model](models.md) for model selection and thinking controls.
-
-### Enforced model policy
-
-Set `modelPolicy` in the agent-directory `settings.json` to restrict every provider, including native providers:
-
-```json
-{
-  "modelPolicy": {
-    "allow": [
-      "anthropic/claude-opus-5-5",
-      "anthropic/claude-sonnet-5-5",
-      "anthropic/claude-haiku-5-5",
-      "openai/gpt-6*"
-    ]
-  }
-}
-```
-
-A request must match at least one pattern in **each** configured policy layer. For example, a project `.pi/settings.json` with `{"modelPolicy":{"allow":["openai/*"]}}` narrows this global policy to GPT-6 models on OpenAI. A project list containing `"*"` cannot enable a globally disallowed model. Runtime settings overrides also only narrow the policy. Invalid policy values deny requests rather than disabling enforcement.
-
-Unlike `enabledModels`, this is a request restriction, not a cycling preference. Pi never auto-appends to it. `/model`, model cycling, and `--list-models` show only allowed models. Requests for other models, including compaction, branch summaries, and cache warming, are refused locally before authentication or network access. SDK calls through `ModelRuntime` throw the exported `ModelPolicyError`, with the message `model <provider>/<id> is not allowed by modelPolicy.allow`; an agent turn presents the refusal as an error response.
-
-Omitting `modelPolicy` preserves unrestricted behavior. After editing settings, use `/reload`. This policy controls Pi's configured model runtime, not arbitrary network code in trusted extensions or independently constructed low-level pi-ai clients.
 
 ## Interaction
 
@@ -88,6 +64,7 @@ CLI tool options override this setting for one invocation. `--tools` with only `
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `sessionDir` | string | Agent session directory | Session storage directory. Relative paths resolve from the working directory. `PI_CODING_AGENT_SESSION_DIR` and `--session-dir` override this setting. |
+| `sessionShareDestination` | `"auto" \| "gist" \| "radius"` | `"auto"` | Destination used by `/share`. `auto` uses Radius when authenticated and otherwise creates a GitHub gist. `gist` always uses a gist. `radius` requires Radius authentication and never falls back to a gist. |
 
 ### Compaction
 
@@ -142,10 +119,6 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 
 ## Network and retries
 
-In this fork, the shipped model catalog is the default. Set **`PI_REMOTE_CATALOG=1`** to opt in to pi.dev catalog fetching and saved remote catalog overlays, including OpenRouter's personalized catalog. Unset, `0`, and other values keep the local baseline: interactive startup, RPC startup, model pickers, and `ModelRuntime.refresh()` do not fetch the remote catalog, even with `allowNetwork: true` or a forced refresh. Existing saved overlays are ignored, not deleted.
-
-This variable controls only the remote catalog. Provider requests, native provider discovery, authentication, update checks, and other networking retain their usual behavior. `PI_OFFLINE` / `--offline` still disable automatic catalog networking even with the opt-in; explicit `refresh({ allowNetwork: true })` can override offline mode only when `PI_REMOTE_CATALOG=1`. Opted-in catalogs still strip remote routing/auth fields, but their other metadata can affect token budgets, context retention, and image processing; enable only if you trust the catalog source.
-
 | Setting | Type | Default | Description |
 |---|---|---|---|
 | `transport` | `"auto" \| "sse" \| "websocket" \| "websocket-cached"` | `"auto"` | Preferred transport for AI providers that support multiple transports. |
@@ -153,25 +126,12 @@ This variable controls only the remote catalog. Provider requests, native provid
 | `httpIdleTimeoutMs` | number | `300000` | HTTP header and body idle timeout in milliseconds. Set to `0` to disable. |
 | `websocketConnectTimeoutMs` | number | `15000` | WebSocket connection timeout in milliseconds. Set to `0` to disable. |
 | `retry.enabled` | boolean | `true` | Enable automatic agent-level retry for transient failures. |
-| `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts. Premature stream endings are capped at `2`. |
+| `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts. |
 | `retry.baseDelayMs` | number | `2000` | Initial exponential-backoff delay in milliseconds. |
 | `retry.maxAgentDelayMs` | number | `60000` | Maximum agent-level retry delay in milliseconds. |
-| `retry.fallbackModel` | string | None (off) | Exact `provider/modelId` of the configured alternate model to try once after transient agent retries are exhausted. |
 | `retry.provider.timeoutMs` | number | `httpIdleTimeoutMs` | Provider request timeout in milliseconds. |
 | `retry.provider.maxRetries` | number | `0` | Provider-level retry attempts. |
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Maximum server-requested delay in milliseconds. Set to `0` to disable the limit. |
-
-Agent retries and fallback ordinarily only restart requests with no output: nonempty text or reasoning, any tool-call block (including a partial call), or reported output tokens prevent recovery. Empty reasoning blocks and encrypted reasoning signatures alone do not count as output. Pi also remembers streamed deltas if a provider discards partial content in its final error.
-
-One exception: a premature stream ending (for example `stream closed before response.completed`) after reasoning only, with no answer text and no tool call, is restarted even though reasoning tokens were reported. The failed attempt's reasoning is discarded before it is shown as final or written to the session file. Other errors after reasoning stay final.
-
-The exact gateway error `stream error: stream disconnected before completion: stream closed before response.completed` can also restart a request after partial answer text or tool-call output, but only if no tool from that response has started executing. Pi omits the failed attempt from model context and retries once. A second such disconnect is final, including when a fallback model is configured. Tools executed by an earlier response do not block recovery of a new request.
-
-Other premature stream endings use at most two retries with the configured exponential backoff (by default 2s, then 4s). Lower `retry.maxRetries` values still apply, and `retry.enabled: false` disables both retry and fallback. Other transient failures keep their ordinary retry budget.
-
-Set `retry.fallbackModel` only to an explicitly chosen family alternate, for example `"cliproxyapi/your-alternate-model-id"`. Pi does not infer a family or select an alternate automatically. The alternate must exist in the model registry, have configured authentication, differ from the current model, and fit the current context. It gets one attempt, not a fresh retry budget. Unknown or unavailable alternates do not switch models. Global startup defaults are unchanged; the switched model remains selected in the session. The sealed `--owner-host-profile` interactive runtime pins a single provider identity and refuses fallback; changing that identity requires a fresh owner allocation. Ordinary print/JSON/RPC invocations do not use that sealed runtime.
-
-A switch appends a `model_change` entry and a custom `auto_retry_fallback` entry containing `fromModel`, `toModel`, `attempt`, and `errorMessage`, and emits an `auto_retry_fallback` event. Print, JSON, and RPC modes immediately write retry, exhausted-retry, and fallback notices to stderr; JSON/RPC stdout also carries the recovery events. Consume through `agent_settled`, not the first failed `message_end` or `agent_end`.
 
 Keep `retry.provider.maxRetries` at `0` unless provider-level retries are required. Provider retries can delay Pi from handling quota and usage-limit errors itself.
 

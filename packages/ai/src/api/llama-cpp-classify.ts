@@ -14,6 +14,7 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { providerHeadersToRecord } from "../utils/headers.ts";
 import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { DEFAULT_CLASSIFIER_TIMEOUT_MS, readClassifierBody } from "./classifier-shared.ts";
 
 /**
  * Classification with a chat model served by llama.cpp's `llama-server`.
@@ -245,11 +246,10 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 		) ?? {};
 	const { response, json } = await retryProviderRequest(
 		async () => {
-			const timeoutSignal = options?.timeoutMs !== undefined ? AbortSignal.timeout(options.timeoutMs) : undefined;
-			const signal =
-				options?.signal && timeoutSignal
-					? AbortSignal.any([options.signal, timeoutSignal])
-					: (options?.signal ?? timeoutSignal);
+			const controller = new AbortController();
+			const timeoutMs = options?.timeoutMs ?? DEFAULT_CLASSIFIER_TIMEOUT_MS;
+			const timeout = setTimeout(() => controller.abort(timeoutError(timeoutMs)), timeoutMs);
+			const signal = options?.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
 			try {
 				const next = await requestFetch(`${root}${path}`, {
 					method: "POST",
@@ -257,14 +257,27 @@ async function post(request: RequestContext, path: string, body: unknown, observ
 					body: JSON.stringify(payload),
 					signal,
 				});
-				if (!next.ok) throw httpError(next, await next.text());
-				return { response: next, json: (await next.json()) as unknown };
+				const text = await readClassifierBody(LABEL, next, signal);
+				if (!next.ok) throw httpError(next, text);
+				return { response: next, json: JSON.parse(text) as unknown };
 			} catch (error) {
-				if (timeoutSignal?.aborted && !options?.signal?.aborted) throw timeoutError(options!.timeoutMs!);
-				throw error;
+				const reason = options?.signal?.aborted
+					? options.signal.reason
+					: controller.signal.aborted
+						? controller.signal.reason
+						: error;
+				controller.abort(reason);
+				throw reason;
+			} finally {
+				clearTimeout(timeout);
 			}
 		},
-		{ maxRetries: options?.maxRetries ?? 2, maxRetryDelayMs: options?.maxRetryDelayMs, signal: options?.signal },
+		{
+			maxRetries: options?.maxRetries ?? 2,
+			maxRetryDelayMs: options?.maxRetryDelayMs,
+			beforeProviderRequest: options?.beforeProviderRequest,
+			signal: options?.signal,
+		},
 	);
 	if (observe) {
 		await options?.onResponse?.(providerResponse(response.status));
@@ -456,7 +469,12 @@ export const classify: ClassifierFunction<ClassifierOptions> = async (model, con
 		output.answers = {};
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 		output.errorMessage = formatProviderError(
-			normalizeProviderError(error, model.provider, undefined, getRequestDiagnosticSecrets(model, options)),
+			normalizeProviderError(
+				options?.signal?.aborted ? options.signal.reason : error,
+				model.provider,
+				undefined,
+				getRequestDiagnosticSecrets(model, options),
+			),
 			`${LABEL} error`,
 		);
 		return output;

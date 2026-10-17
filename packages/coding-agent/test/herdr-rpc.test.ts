@@ -1,8 +1,4 @@
-/**
- * pi#160 review (Astra P2): Herdr RPC framing is bounded. Before enrollment the peer is
- * unauthenticated, so an oversized frame, a flood of unconsumed bytes or a malformed frame must
- * close the socket and reject every pending call once with a typed error.
- */
+/** pi#160: unauthenticated Herdr RPC framing must be bounded and fail closed. */
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -20,15 +16,11 @@ const cleanup: (() => void)[] = [];
 afterEach(() => {
 	for (const step of cleanup.splice(0)) step();
 });
-
 interface FakeHerdr {
 	socketPath: string;
-	/** Resolves when the server sees Pi's side of the connection close. */
 	closed: Promise<void>;
 	requests: { id: string; method: string }[];
 }
-
-/** A fake Herdr that hands every request line to `answer`. */
 async function fakeHerdr(
 	answer: (socket: Socket, request: { id: string; method: string }) => void,
 ): Promise<FakeHerdr> {
@@ -60,7 +52,6 @@ async function fakeHerdr(
 	});
 	return { socketPath, closed, requests };
 }
-
 async function protocolError(promise: Promise<unknown>): Promise<HerdrRpcProtocolError> {
 	const error = await promise.then(
 		() => undefined,
@@ -72,8 +63,6 @@ async function protocolError(promise: Promise<unknown>): Promise<HerdrRpcProtoco
 
 describe("Herdr RPC framing bounds (pi#160 review)", () => {
 	it("keeps the caps far above the largest real frame", () => {
-		// Worst-case frames Herdr sends here (herdr src/app/api/input_consumer.rs), at the field
-		// limits Pi accepts: nonce 128 chars, 20-digit dev/ino, display name 80 four-byte chars.
 		const enroll = JSON.stringify({
 			id: "pi-ic-99999",
 			result: {
@@ -93,37 +82,31 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 				sig: "s".repeat(88),
 			},
 		});
-		const largest = Math.max(Buffer.byteLength(enroll), Buffer.byteLength(cut));
-		expect(largest).toBeLessThan(1024);
+		expect(Math.max(Buffer.byteLength(enroll), Buffer.byteLength(cut))).toBeLessThan(1024);
 		expect(MAX_FRAME_BYTES).toBe(1024 * 1024);
 		expect(MAX_PENDING_BYTES).toBeGreaterThanOrEqual(MAX_FRAME_BYTES);
 	});
-
-	it("closes and rejects every pending call once on an oversized frame with no newline", async () => {
+	it("closes and rejects every pending call once on an oversized unterminated frame", async () => {
 		const herdr = await fakeHerdr((socket, request) => {
-			// Answer only the second call, so both are pending, with one frame that never ends.
 			if (request.id === "pi-ic-2") socket.write(Buffer.alloc(MAX_FRAME_BYTES + 1, 0x61));
 		});
 		const connection = connectRpc(herdr.socketPath, 5000);
 		cleanup.push(() => connection.close());
-		const first = protocolError(connection.rpc("pane.input_consumer.enroll", {}));
-		const second = protocolError(connection.rpc("pane.input_consumer.enroll", {}));
-		const [a, b] = await Promise.all([first, second]);
+		const [a, b] = await Promise.all([
+			protocolError(connection.rpc("pane.input_consumer.enroll", {})),
+			protocolError(connection.rpc("pane.input_consumer.enroll", {})),
+		]);
 		expect(a.code).toBe("herdr_rpc_protocol_error");
 		expect(a.reason).toBe("frame_too_large");
-		// The same error object reaches both waiters: one failure, one rejection each.
 		expect(b).toBe(a);
 		await herdr.closed;
-		// A later call fails fast with the same typed error instead of waiting for a timeout.
 		expect(await protocolError(connection.rpc("pane.input_consumer.cut", {}))).toBe(a);
 	});
-
-	it("bounds the buffer and reports the oversized frame once (reader)", () => {
+	it("bounds the reader buffer and reports an oversized frame once", () => {
 		const errors: HerdrRpcProtocolError[] = [];
 		const frames: unknown[] = [];
-		const limits = { maxFrameBytes: 64, maxPendingBytes: 256 };
 		const reader = new FrameReader(
-			limits,
+			{ maxFrameBytes: 64, maxPendingBytes: 256 },
 			(frame) => frames.push(frame),
 			(error) => errors.push(error),
 		);
@@ -132,14 +115,12 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		reader.push(Buffer.alloc(40, 0x61));
 		expect(errors.map((e) => e.reason)).toEqual(["frame_too_large"]);
 		expect(reader.pendingBytes).toBe(0);
-		// Further data is ignored, including a valid frame.
 		reader.push(Buffer.from('{"id":"x","result":{}}\n'));
 		reader.push(Buffer.alloc(1000, 0x61));
 		expect(reader.pendingBytes).toBe(0);
 		expect(frames).toEqual([]);
 		expect(errors).toHaveLength(1);
 	});
-
 	it("rejects a complete line longer than the frame cap", () => {
 		const errors: HerdrRpcProtocolError[] = [];
 		const reader = new FrameReader(
@@ -150,7 +131,6 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		reader.push(Buffer.from(`{"id":"${"x".repeat(32)}"}\n`));
 		expect(errors.map((e) => e.reason)).toEqual(["frame_too_large"]);
 	});
-
 	it("closes on a flood of small frames over the aggregate cap", async () => {
 		const limits = { maxFrameBytes: 64, maxPendingBytes: 256 };
 		const flood = Buffer.from('{"id":"noise","result":{}}\n'.repeat(300));
@@ -164,8 +144,6 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		expect(a.reason).toBe("pending_overflow");
 		expect(b).toBe(a);
 		await herdr.closed;
-
-		// The same flood, deterministically, against the reader: nothing is parsed or held.
 		const errors: HerdrRpcProtocolError[] = [];
 		const frames: unknown[] = [];
 		const reader = new FrameReader(
@@ -179,13 +157,7 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		expect(frames).toEqual([]);
 		expect(reader.pendingBytes).toBe(0);
 	});
-
-	it("copies amortized O(n) bytes into one buffer when a frame at the cap arrives 1 byte at a time", () => {
-		// pi#160 review: concatenating the whole buffer per chunk copied O(n^2) bytes (about 512 GiB
-		// here), and holding a list of chunks kept about 1M Buffer objects alive. Count every byte
-		// Buffer.concat produces, Buffer#copy moves and Buffer.alloc zero-fills: appending each byte
-		// once plus doubling growth stays under 3x the frame. Buffer.allocUnsafe writes no bytes, so
-		// it is counted separately, by calls and size.
+	it("copies amortized O(n) bytes when a capped frame arrives one byte at a time", () => {
 		const prefix = '{"id":"drip","result":{"pad":"';
 		const suffix = '"}}';
 		const body = `${prefix}${"a".repeat(MAX_FRAME_BYTES - prefix.length - suffix.length)}${suffix}`;
@@ -234,8 +206,6 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 			reader.push(wire.subarray(at, at + 1));
 			if (at === MAX_FRAME_BYTES - 1) {
 				expect(reader.pendingBytes).toBe(MAX_FRAME_BYTES);
-				// One backing buffer and no per-chunk objects: no array, exactly one Buffer field,
-				// sized within the pending cap.
 				const fields = Object.values(reader);
 				expect(fields.filter(Array.isArray)).toEqual([]);
 				const buffers = fields.filter((field): field is Buffer => Buffer.isBuffer(field));
@@ -244,21 +214,16 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 				expect(buffers[0].length).toBeLessThanOrEqual(MAX_PENDING_BYTES);
 			}
 		}
-		const elapsed = performance.now() - started;
 		expect(errors).toEqual([]);
 		expect(frames).toHaveLength(1);
 		expect(frames[0]).toMatchObject({ id: "drip" });
-		// The remainder after the newline is kept for the next frame.
 		expect(reader.pendingBytes).toBe(4);
 		expect(copied).toBeLessThanOrEqual(3 * MAX_FRAME_BYTES);
-		// Doubling from 4 KiB to 1 MiB is 9 growths; the leftover 4 bytes take one more 4 KiB buffer.
 		expect(allocations).toBeLessThanOrEqual(10);
 		expect(allocatedBytes).toBeLessThanOrEqual(2 * MAX_FRAME_BYTES + 4096);
-		// Generous wall-clock bound: the quadratic reader takes minutes here.
-		expect(elapsed).toBeLessThan(10_000);
+		expect(performance.now() - started).toBeLessThan(10_000);
 	});
-
-	it("enforces the frame cap on the running length of a dripped frame", () => {
+	it("enforces the cap on the running length of a dripped frame", () => {
 		const errors: HerdrRpcProtocolError[] = [];
 		const frames: unknown[] = [];
 		const reader = new FrameReader(
@@ -276,8 +241,7 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		expect(frames).toEqual([]);
 		expect(errors).toHaveLength(1);
 	});
-
-	it("splits several frames and a remainder out of fragmented chunks", () => {
+	it("splits frames and a remainder from fragmented chunks", () => {
 		const errors: HerdrRpcProtocolError[] = [];
 		const frames: unknown[] = [];
 		const reader = new FrameReader(
@@ -293,22 +257,18 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		reader.push(Buffer.from(':"c"}\n'));
 		expect(frames).toEqual([{ id: "a" }, { id: "b" }, { id: "c" }]);
 		expect(reader.pendingBytes).toBe(0);
-		// A line over the cap that completes in a later chunk is still too large.
 		reader.push(Buffer.alloc(40, 0x61));
 		reader.push(Buffer.from(`${"a".repeat(30)}\n`));
 		expect(errors.map((e) => e.reason)).toEqual(["frame_too_large"]);
 	});
-
-	it("closes and rejects on a malformed JSON line", async () => {
+	it("closes and rejects malformed JSON", async () => {
 		const herdr = await fakeHerdr((socket) => socket.write("{not json\n"));
 		const connection = connectRpc(herdr.socketPath, 5000);
 		cleanup.push(() => connection.close());
-		const error = await protocolError(connection.rpc("pane.input_consumer.enroll", {}));
-		expect(error.reason).toBe("malformed_frame");
+		expect((await protocolError(connection.rpc("pane.input_consumer.enroll", {}))).reason).toBe("malformed_frame");
 		await herdr.closed;
 	});
-
-	it.each(["42", "null", '"text"', "[1,2]", ""])("treats the non-object frame %j as malformed", (line) => {
+	it.each(["42", "null", '"text"', "[1,2]", ""])("rejects non-object frame %j", (line) => {
 		const errors: HerdrRpcProtocolError[] = [];
 		const reader = new FrameReader(
 			{ maxFrameBytes: MAX_FRAME_BYTES, maxPendingBytes: MAX_PENDING_BYTES },
@@ -318,8 +278,7 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 		reader.push(Buffer.from(`${line}\n`));
 		expect(errors.map((e) => e.reason)).toEqual(["malformed_frame"]);
 	});
-
-	it("still runs a normal enroll, cut and release flow (counterexample)", async () => {
+	it("still runs a normal enroll, cut and release flow", async () => {
 		const herdr = await fakeHerdr((socket, request) => {
 			const results: Record<string, object> = {
 				"pane.input_consumer.enroll": { epoch: "e1", nonce: "n".repeat(128) },
@@ -330,8 +289,6 @@ describe("Herdr RPC framing bounds (pi#160 review)", () => {
 				},
 				"pane.input_consumer.release": {},
 			};
-			// An unsolicited frame for no pending call is ignored, and the answer arrives split in two
-			// writes, with a multi-byte character straddling the split.
 			const frame = Buffer.from(`${JSON.stringify({ id: request.id, result: results[request.method] })}\n`);
 			socket.write('{"id":"late","result":{}}\n');
 			const split = frame.indexOf(Buffer.from("\u00e4")) + 1;

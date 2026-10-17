@@ -540,8 +540,8 @@ describe("Context overflow error handling", () => {
 
 	describe.skipIf(!process.env.OPENROUTER_API_KEY)("OpenRouter", () => {
 		// Anthropic backend
-		it("anthropic/claude-sonnet-4 via OpenRouter - should detect overflow via isContextOverflow", async () => {
-			const model = getModel("openrouter", "anthropic/claude-sonnet-4");
+		it("anthropic/claude-sonnet-4.5 via OpenRouter - should detect overflow via isContextOverflow", async () => {
+			const model = getModel("openrouter", "anthropic/claude-sonnet-4.5");
 			const result = await testContextOverflow(model, process.env.OPENROUTER_API_KEY!);
 			logResult(result);
 
@@ -562,7 +562,7 @@ describe("Context overflow error handling", () => {
 		}, 120000);
 
 		// Mistral backend
-		it("mistralai/mistral-large via OpenRouter - should detect overflow via isContextOverflow", async () => {
+		it("mistralai/mistral-large-2512 via OpenRouter - should detect overflow via isContextOverflow", async () => {
 			const model = getModel("openrouter", "mistralai/mistral-large");
 			const result = await testContextOverflow(model, process.env.OPENROUTER_API_KEY!);
 			logResult(result);

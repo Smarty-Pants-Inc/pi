@@ -2,10 +2,21 @@
  * Codemode host limits that live in coding-agent (pi#131 round-1 P1-3 and P1-4, smarty-dev#4506).
  * Trust-boundary checks complement the real sandbox and faux-provider session suites.
  */
+import type * as Fs from "node:fs";
 import { appendFileSync, lstatSync, readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname } from "node:path";
+import { finished } from "node:stream/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createLimiter } from "../src/extensions/codemode/execute.ts";
+import {
+	createOutputFileStream,
+	getOutputDirectory,
+	getOutputDirectoryBytes,
+	MAX_OUTPUT_DIRECTORY_BYTES,
+	removeOutputDirectory,
+	writeOutputFile,
+} from "../src/utils/output-files.ts";
 
 const fsCalls = vi.hoisted(() => ({
 	rmSync: [] as string[],
@@ -15,7 +26,7 @@ const fsCalls = vi.hoisted(() => ({
 
 // Recorded-call probes: the tests never delete anything (smarty-dev#4664).
 vi.mock("node:fs", async (importOriginal) => {
-	const original = await importOriginal<typeof import("node:fs")>();
+	const original = await importOriginal<typeof Fs>();
 	return {
 		...original,
 		rmSync: (path: string) => {
@@ -33,17 +44,6 @@ vi.mock("node:fs", async (importOriginal) => {
 		},
 	};
 });
-
-const { createLimiter } = await import("../src/extensions/codemode/execute.ts");
-const {
-	createOutputFileStream,
-	getOutputDirectory,
-	getOutputDirectoryBytes,
-	MAX_OUTPUT_DIRECTORY_BYTES,
-	removeOutputDirectory,
-	writeOutputFile,
-} = await import("../src/utils/output-files.ts");
-const { finished } = await import("node:stream/promises");
 
 describe("model call limiter", () => {
 	it("drops a queued waiter as soon as its signal aborts", async () => {

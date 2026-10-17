@@ -1,5 +1,5 @@
-import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-works/chord";
-import { awaitWithContext, withAbortSignal, withoutAbortSignal } from "@earendil-works/chord/context";
+import { type Context, copyJson, type JsonValue } from "@earendil-works/chord";
+import { awaitWithContext, withAbortSignal } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
 import type { ExecutionEnv } from "../env/index.ts";
 import { errorMessage } from "../errors.ts";
@@ -25,9 +25,6 @@ import type {
 } from "../types.ts";
 import { agentHooks } from "./agent.ts";
 import { type ContextRange, readContextFrom } from "./context.ts";
-import { type AbortMarkPartialWriter, GenerationTask } from "./generation.ts";
-import { assignJson } from "./json.ts";
-import { LiveDoc } from "./live.ts";
 import type {
 	Agent,
 	AnyTask,
@@ -40,14 +37,6 @@ import type {
 	TaskInspection,
 } from "./types.ts";
 import { closedError, scanAll, Waiters } from "./util.ts";
-
-/** The built-in generation's `request` phase, dispatched with its private abort-mark writer as a fourth argument. */
-type RequestPhaseWithWriter = (
-	task: ErasedRunningTask,
-	runtime: ErasedRuntime,
-	context: Context,
-	writer: AbortMarkPartialWriter,
-) => Promise<void>;
 
 type AnyTaskRecord = TaskRecord<JsonValue, JsonValue, JsonValue>;
 /** A record that can still run code: pending, running, or waiting. */
@@ -1301,21 +1290,8 @@ export class TaskScheduler {
 			const checkpoint = current.state.checkpoint;
 			// Each phase handler resolves its agent afresh, at first use.
 			phase.agent = undefined;
-			const handler = erased(state.task).phases[checkpoint.phase]!;
 			try {
-				if (state.task === GenerationTask && checkpoint.phase === "request") {
-					// smarty-dev#7428 (pi#174): the one write past the abort mark is a one-shot closure handed only to this
-					// dispatch of the built-in generation's request phase. It is on no runtime, hook argument, or module
-					// export, and is revoked when the phase returns.
-					const grant = this.#livePartialGrant(invocation);
-					try {
-						await (handler as RequestPhaseWithWriter)(current, runtime, invocation.context, grant.write);
-					} finally {
-						grant.revoke();
-					}
-				} else {
-					await handler(current, runtime, invocation.context);
-				}
+				await erased(state.task).phases[checkpoint.phase]!(current, runtime, invocation.context);
 				previous = { checkpoint };
 			} catch (error) {
 				previous = { checkpoint, failure: { error } };
@@ -1599,7 +1575,7 @@ export class TaskScheduler {
 			},
 		};
 		const settings = this.#settings;
-		const runtime: ErasedRuntime = {
+		return {
 			taskId: invocation.taskId as TaskId<JsonValue>,
 			conversationId: invocation.conversationId,
 			signal: invocation.controller.signal,
@@ -1762,63 +1738,6 @@ export class TaskScheduler {
 				this.#report(error);
 			},
 		};
-		return runtime;
-	}
-
-	/** A single-use writer of `#commitLivePartial` for one request phase dispatch; `revoke` disables it. */
-	#livePartialGrant(invocation: Invocation): { readonly write: AbortMarkPartialWriter; readonly revoke: () => void } {
-		let open = true;
-		return {
-			write: (message, context) => {
-				if (!open) {
-					return Promise.reject(
-						new Error(
-							`Task ${invocation.taskId} cannot write a live partial under its abort mark: used or revoked`,
-						),
-					);
-				}
-				open = false;
-				return this.#commitLivePartial(invocation, message as unknown as JsonValue, context);
-			},
-			revoke: () => {
-				open = false;
-			},
-		};
-	}
-
-	/**
-	 * The one write a run invocation may make under its task's abort mark (smarty-dev#7428), reached only through
-	 * `#livePartialGrant`: commit `message` as the run's live partial, `pi.live` `generation.message` of the invocation's
-	 * conversation, past the abort mark and the cancellation of `context` the mark signalled, so the abort handler converts
-	 * the answer output the mark interrupted. Only while the generation owns the conversation's run and its live
-	 * generation exists, and only an assistant message. It writes nothing else and never changes the task's state; the
-	 * abort handler decides the outcome. It still rejects once the invocation ended or the Harness is closing.
-	 */
-	#commitLivePartial(invocation: Invocation, message: JsonValue, context: Context): Promise<void> {
-		const refuse = (why: string) =>
-			Promise.reject(
-				new Error(`Task ${invocation.taskId} cannot write a live partial under its abort mark: ${why}`),
-			);
-		if (invocation.mode !== "run") return refuse("not a run invocation");
-		if (typeof message !== "object" || message === null || Array.isArray(message) || message.role !== "assistant") {
-			return refuse("not an assistant message");
-		}
-		return this.#gated(
-			invocation,
-			async (tx, current) => {
-				if (current.kind !== GenerationTask.definition.name) {
-					throw new Error(`Task ${invocation.taskId} is not a generation`);
-				}
-				const live = await tx.doc(LiveDoc, invocation.conversationId);
-				if (live.run?.taskId !== invocation.taskId) {
-					throw new Error(`Task ${invocation.taskId} does not own the run of its conversation`);
-				}
-				if (live.generation === undefined) throw new Error(`Task ${invocation.taskId} has no live generation`);
-				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
-			},
-			context,
-			true,
-		);
 	}
 
 	/** Run a committed-state read unless the invocation has ended. */
@@ -1827,16 +1746,11 @@ export class TaskScheduler {
 		return read();
 	}
 
-	/**
-	 * Commit after rereading the task on the line and gating the invocation. `underAbortMark`, used only by
-	 * `#commitLivePartial`, lets a run invocation's commit pass the task's abort mark and the cancellation of `context`
-	 * the mark signalled; the invocation must still be live and the Harness open.
-	 */
+	/** Commit after rereading the task on the line and gating the invocation. */
 	#gated<T>(
 		invocation: Invocation,
 		change: (tx: Transaction, current: ErasedRunningTask) => T | Promise<T>,
 		context: Context,
-		underAbortMark = false,
 	): Promise<T> {
 		if (invocation.ended) return Promise.reject(endedError(invocation));
 		return this.#session.commitWith(
@@ -1847,12 +1761,12 @@ export class TaskScheduler {
 				if (found === undefined) throw new Error(`Task ${invocation.taskId} is terminal`);
 				if (found.state.status !== "running") throw new Error(`Task ${invocation.taskId} is ${found.state.status}`);
 				const current = found as ErasedRunningTask;
-				if (invocation.mode === "run" && current.abortRequested && !underAbortMark) {
+				if (invocation.mode === "run" && current.abortRequested) {
 					throw new Error(`Task ${invocation.taskId} has a durable abort mark`);
 				}
 				return change(tx, current);
 			},
-			underAbortMark ? withoutAbortSignal(context) : context,
+			context,
 			{ conversationId: invocation.conversationId, taskId: invocation.taskId },
 		);
 	}

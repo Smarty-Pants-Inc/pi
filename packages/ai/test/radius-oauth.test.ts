@@ -116,7 +116,7 @@ describe("Radius OAuth", () => {
 		expect(fetchMock).toHaveBeenCalledOnce();
 	});
 
-	// pi#150 security round 2: a code-shaped error field can still be an echoed secret.
+	// pi#150: a code-shaped error field can still be an echoed credential.
 	it("does not reflect an echoed lowercase secret in the error code", async () => {
 		const secret = "leaked_refresh_secret";
 		vi.stubGlobal(
@@ -186,7 +186,7 @@ describe("Radius OAuth", () => {
 		};
 
 		const failed = await login();
-		// pi#150: token endpoint text can echo secrets; only the protocol error code is shown.
+		// pi#150: endpoint text can echo credentials; show only the protocol class.
 		expect("error" in failed && failed.error.message).toBe("Radius OAuth token request failed: invalid_grant");
 		expect(failed.status).toBe(502);
 		expect(failed.page).toContain("invalid_grant");

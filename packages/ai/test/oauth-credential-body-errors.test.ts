@@ -1,6 +1,4 @@
-// pi#150 security round 3 and review R3: an OAuth rejection must carry no credential material in
-// any property, not only its message. Malformed success bodies, body-reader failures and echoed
-// error codes are checked on the whole serialized rejection object.
+// pi#150: OAuth rejection objects must retain no credential material in any property.
 import { inspect } from "node:util";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { anthropicOAuth } from "../src/auth/oauth/anthropic.ts";
@@ -10,7 +8,6 @@ import { createRadiusOAuth } from "../src/auth/oauth/radius.ts";
 import type { ProviderAuthInteraction } from "../src/auth/types.ts";
 
 const SECRET = "SECRETVALUE150XYZ";
-// V8 parse errors quote about ten characters of the body.
 const SECRET_PREFIX = SECRET.slice(0, 8);
 const signal = new AbortController().signal;
 
@@ -35,7 +32,6 @@ function jsonResponse(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-/** Success bodies whose parsing or reading fails with the credential in the native error. */
 const brokenSuccessBodies: [string, () => Response][] = [
 	["a bare credential", () => new Response(SECRET, { status: 200 })],
 	["a truncated token object", () => new Response(`{"access_token":"${SECRET}`, { status: 200 })],
@@ -184,8 +180,7 @@ describe("OAuth credential body errors", () => {
 			expect(serialized(error)).not.toContain(SECRET_PREFIX);
 		});
 
-		// pi#150 Astra P1: an echoing endpoint can put a token in the HTTP reason phrase.
-		it("a token endpoint failure reports only the numeric status, never statusText", async () => {
+		it("a token endpoint failure reports only numeric status, never statusText", async () => {
 			vi.stubGlobal(
 				"fetch",
 				vi.fn(async () => new Response(null, { status: 401, statusText: SECRET })),
@@ -197,7 +192,7 @@ describe("OAuth credential body errors", () => {
 			expect(serialized(error)).not.toContain(SECRET_PREFIX);
 		});
 
-		it("a model catalog failure reports only the numeric status, never statusText", async () => {
+		it("a model catalog failure reports only numeric status, never statusText", async () => {
 			vi.stubGlobal(
 				"fetch",
 				vi.fn(async (input: unknown) =>

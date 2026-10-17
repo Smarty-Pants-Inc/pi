@@ -8,26 +8,19 @@
 // collapse to `"Unknown: UnknownError"`.
 //
 // `normalizeProviderError` probes the known SDK field shapes (Mistral,
-// `openai`, `@google/genai`, AWS Bedrock). The message and body it reads stay
-// private: they only classify the failure (smarty-dev#5822, pi#202 round 2).
-// `formatProviderError` renders owned text from the validated status and the
-// owned recovery class, never from provider text.
+// `openai`, `@google/genai`, AWS Bedrock) and returns a struct each provider
+// uses only to classify the failure. Provider text never becomes public error text.
 
 import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantRecovery } from "../types.ts";
-import { ProviderRequestLimitError } from "./provider-retry.ts";
-import { classifyProviderFailure, validHttpStatus } from "./recovery.ts";
+import { classifyProviderFailure, isSmartyLimitError, ProviderRequestLimitError, validHttpStatus } from "./recovery.ts";
 
-/** Owned values of a provider error: nothing in it is provider text. */
 export interface NormalizedProviderError {
-	/** HTTP status, only from the dedicated SDK status fields and only as an integer 100-599. */
+	/** HTTP status code, when one could be extracted from the SDK error object. */
 	status?: number;
-	/** Owned recovery decision, classified from the original message, body and status. */
+	/** Owned decision classified before suppression. */
 	recovery: AssistantRecovery;
-	/**
-	 * Message of a local failure: an `Error` that carries no provider response field (no status, body or parsed
-	 * error), such as Pi's own validation and timeout errors or a transport failure. Provider responses never set it.
-	 */
+	/** Masked local validation/transport failure, never provider response text. */
 	localMessage?: string;
 }
 
@@ -40,11 +33,6 @@ type SdkErrorShape = Error & {
 	$response?: { statusCode?: unknown; body?: unknown };
 };
 
-/**
- * Classify a provider error from its private fields. `provider` is the trusted request provider
- * (`model.provider`); it selects provider-specific classification such as Cerebras's bodyless 400/413
- * overflow. `privateText` is further provider text to classify with it (OpenRouter's `metadata.raw`).
- */
 export function normalizeProviderError(
 	error: unknown,
 	provider?: string,
@@ -55,21 +43,14 @@ export function normalizeProviderError(
 	const text = privateText ? `${providerErrorText(error)}\n${privateText}` : providerErrorText(error);
 	const recovery = classifyProviderFailure({ text, status, provider });
 	if (status !== undefined) return { status, recovery };
-	// ponytail: label-based masking stays on local text until the universal owned rendering (next slice).
 	return isLocalError(error)
 		? { recovery, localMessage: redactOAuthDiagnostic(error.message, secrets) }
 		: { recovery };
 }
 
-/** Private provider text of errors adapters build from provider data; never on the error object itself. */
 const providerDataTexts = new WeakMap<object, string>();
 
-/**
- * An error an adapter builds from provider data (a stream error event, a failed response, an unparsable frame).
- * Where it came from decides how it is published, not which fields it has: it is never a local error. Its
- * message, name and stack are owned; the provider text is kept in a module-private map for classification only,
- * and it has no `cause` or payload (smarty-dev#5822, pi#202 round 3).
- */
+/** Provider-origin failures have owned name/message/stack and no raw payload or cause. */
 export class ProviderDataError extends Error {
 	readonly status?: number;
 
@@ -81,20 +62,12 @@ export class ProviderDataError extends Error {
 		providerDataTexts.set(this, privateText);
 	}
 }
-
-/** A closed provider label for owned text: the configured id only when it is a plain slug, else `provider`. */
 export function providerLabel(provider: string): string {
 	return /^[a-z0-9-]{1,40}$/.test(provider) ? provider : "provider";
 }
-
-/**
- * Local means only Pi's own validation and timeout errors and transport errors raised by Node or the fetch layer:
- * an `Error` that no adapter built from provider data and that carries no provider response field.
- */
 function isLocalError(error: unknown): error is Error {
 	if (!(error instanceof Error) || !error.message) return false;
 	if (error instanceof ProviderDataError) return false;
-	// Pi's own admission refusal, even after an SDK attached response metadata to it.
 	if (error instanceof ProviderRequestLimitError) return true;
 	const fields = error as SdkErrorShape;
 	return (
@@ -106,11 +79,7 @@ function isLocalError(error: unknown): error is Error {
 		fields.$response === undefined
 	);
 }
-
-/**
- * The original provider message and body. PRIVATE: read it only to classify or recognize a failure; never
- * publish it, in whole or in part.
- */
+/** Private classification input only; never publish this text. */
 export function providerErrorText(error: unknown): string {
 	if (!(error instanceof Error)) return safeJsonStringify(error);
 	const dataText = providerDataTexts.get(error);
@@ -120,7 +89,7 @@ export function providerErrorText(error: unknown): string {
 }
 
 /**
- * Probe the HTTP status, first integer 100-599 wins, in SDK-field order:
+ * Probe the HTTP status, first numeric hit wins, in SDK-field order:
  * `statusCode` (Mistral) → `status` (`openai`, `@google/genai`) →
  * `$metadata.httpStatusCode` (Bedrock) → `$response.statusCode` (Bedrock).
  */
@@ -137,7 +106,8 @@ function extractStatus(error: SdkErrorShape): number | undefined {
  * Probe the raw body reason, first usable hit wins, in SDK-field order:
  * `body` string (Mistral) → `error` parsed JSON body object (`openai` SDK's
  * `this.error`) → `$response.body` (Bedrock). Empty objects and unread response
- * streams are treated as no body. Private: classification input only.
+ * streams are treated as no body so they do not surface as `"{}"` or serialized
+ * stream internals. The chosen body is truncated to the cap.
  */
 function pickBodyText(error: SdkErrorShape): string | undefined {
 	if (typeof error.body === "string") return error.body;
@@ -175,12 +145,13 @@ function isPlainNonEmptyObject(value: unknown): boolean {
 }
 
 /**
- * Owned display text for a provider error (smarty-dev#5822, pi#202 round 2): the caller's Pi-side label, the
- * validated HTTP status and the owned recovery class, never the provider's message, body or code. The class
- * wording keeps the text classifiable when a message without an owned decision is read back.
+ * Compose a display string from a normalized error. When the message already
+ * carries the body (Anthropic / `@google/genai` happy path) or no body/status
+ * was extracted, the message is returned unchanged. Otherwise the status and
+ * body are surfaced, with an optional provider prefix.
  *
- * - `"<label> (<status>): <class>"`, with each part present only when known
- * - a local failure (Pi's own or the transport's, never a provider response) keeps its masked message
+ * - no prefix: `"<status>: <body>"`
+ * - prefix:    `"<prefix> (<status>): <body>"`
  */
 export function formatProviderError(norm: NormalizedProviderError, label = "Provider request failed"): string {
 	if (norm.localMessage !== undefined) return norm.localMessage;
@@ -196,10 +167,7 @@ export function formatProviderError(norm: NormalizedProviderError, label = "Prov
 	return `${label}${status}${detail}`;
 }
 
-/** Diagnostic type marking a provider plan/usage limit refusal; the agent must not retry it. */
 export const PROVIDER_LIMIT_DIAGNOSTIC = "provider_limit";
-
-/** Owned names of the gateway's limit windows; any other window is called the plan limit. */
 const SMARTY_LIMIT_WINDOWS: Readonly<Record<string, string>> = {
 	"5h": "5-hour",
 	day: "daily",
@@ -208,25 +176,13 @@ const SMARTY_LIMIT_WINDOWS: Readonly<Record<string, string>> = {
 	"7d": "weekly",
 	month: "monthly",
 };
-
-/** Owned wait text of a throttled limit (one request in flight). */
 export const SMARTY_THROTTLE_MESSAGE = "Flash runs one request at a time";
-
-/** The latest reset Pi shows; a later or invalid time is omitted. */
 const MAX_SMARTY_RESET_MS = 31 * 24 * 60 * 60 * 1000;
 
-/**
- * The Smarty Node gateway's plan-limit refusal: a 429 whose parsed body (`openai` SDK `error.error`) has
- * `code` or `type` `smarty_limit`. Returns OWNED text, or undefined for any other error (smarty-dev#5822,
- * pi#202 round 3): the gateway's own message is never published. The text uses only a closed window name and a
- * reset time Pi formats from a bounded timestamp. It is final until the window resets, so neither the provider
- * nor the agent retries it.
- */
+/** Render only closed window names and a bounded, locally formatted reset time. */
 export function smartyLimitMessage(error: unknown): string | undefined {
-	const body = (error as { error?: unknown } | null | undefined)?.error;
-	if (typeof body !== "object" || body === null) return undefined;
-	const { code, type, throttled, window, resets_at: resetsAt } = body as Record<string, unknown>;
-	if (code !== "smarty_limit" && type !== "smarty_limit") return undefined;
+	if (!isSmartyLimitError(error)) return undefined;
+	const { throttled, window, resets_at: resetsAt } = error.error;
 	if (throttled === true) return SMARTY_THROTTLE_MESSAGE;
 	const name =
 		typeof window === "string" && Object.hasOwn(SMARTY_LIMIT_WINDOWS, window) ? SMARTY_LIMIT_WINDOWS[window] : "plan";
@@ -243,13 +199,6 @@ export function smartyLimitMessage(error: unknown): string | undefined {
 			: "";
 	return `Your ${name} limit is used up.${reset}`;
 }
-
-/**
- * A throttled `smarty_limit` (`throttled: true`: the org already has a request in flight) with an integer
- * `Retry-After` of at most 30 seconds. Returns those seconds, or undefined for any other error, including
- * period and size limits (`throttled: false`) and a missing, longer or non-integer `Retry-After`.
- * The agent waits that long and retries once; this is not a retry the provider or the generic retry loop makes.
- */
 export function smartyThrottleRetryAfterSeconds(error: unknown): number | undefined {
 	if (smartyLimitMessage(error) === undefined) return undefined;
 	const { error: body, headers } = error as { error: { throttled?: unknown }; headers?: unknown };

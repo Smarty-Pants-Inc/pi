@@ -15,25 +15,24 @@ function defaultWorkerUrl(): URL {
  * termination simple: a runaway script, including one that only spins the microtask queue, is
  * killed with `terminate()` and cannot poison a later run. Before terminating, the host sets a
  * shared interrupt flag that the VM polls, because Bun's `terminate()` cannot stop a thread that
- * is spinning in wasm.
+ * is spinning in wasm. Stopping requests termination without waiting for exit: some built-ins do
+ * not poll the flag, so on Bun a worker can outlive the script's result.
  */
-function workerLauncher(
-	wasm: CodemodeWasmModule | Promise<CodemodeWasmModule> | undefined,
-	workerUrl: string | URL,
-): VmLauncher {
+function workerLauncher(options: CodemodeSandboxOptions): VmLauncher {
 	return async (data, events) => {
 		let module: CodemodeWasmModule;
 		try {
-			module = await (wasm ?? loadQuickJSWasm());
+			module = await (options.wasm ?? loadQuickJSWasm());
 		} catch (error) {
 			throw new Error(`Failed to load QuickJS: ${errorMessage(error)}`);
 		}
 		const interrupt = new SharedArrayBuffer(4);
 		const memoryLimitBytes = resolveMemoryLimit(data.memoryLimitBytes);
 		const workerData: WorkerData = { ...data, memoryLimitBytes, wasm: module, interrupt };
+		const releaseWorker = options.acquireWorker?.();
 		let worker: Worker;
 		try {
-			worker = new Worker(workerUrl, {
+			worker = new Worker(options.workerUrl ?? defaultWorkerUrl(), {
 				workerData,
 				// V8 heap guard in addition to QuickJS's allocator guard. Reserve 64 MiB
 				// for worker JS: 48 MiB old generation and 16 MiB young generation.
@@ -44,8 +43,10 @@ function workerLauncher(
 				},
 			});
 		} catch (error) {
+			releaseWorker?.();
 			throw new Error(`Failed to start worker: ${errorMessage(error)}`);
 		}
+		if (releaseWorker) worker.once("exit", releaseWorker);
 		worker.on("message", (message: unknown) => {
 			// Node 24/26 --watch leaks dependency reports onto the worker channel (nodejs/node#65044).
 			if (
@@ -66,13 +67,21 @@ function workerLauncher(
 		worker.on("exit", (code) => {
 			events.failure({ kind: "sandbox", message: `Worker exited with code ${code} before the script settled` });
 		});
-		return {
-			post: (message) => worker.postMessage(message),
-			stop: async () => {
-				Atomics.store(new Int32Array(interrupt), 0, 1);
-				await worker.terminate().catch(() => undefined);
-			},
+		const stop = async (): Promise<void> => {
+			Atomics.store(new Int32Array(interrupt), 0, 1);
+			// A non-interruptible built-in can delay Bun's terminate() until it returns (#10748).
+			// Do not hold up the result while that worker exits.
+			void worker.terminate().catch(() => undefined);
+			// terminate() refs the worker internally; unref it after requesting termination.
+			worker.unref();
 		};
+		try {
+			options.onWorkerStarted?.(new Promise<void>((resolve) => worker.once("exit", () => resolve())));
+		} catch (error) {
+			void stop();
+			throw error;
+		}
+		return { post: (message) => worker.postMessage(message), stop };
 	};
 }
 
@@ -85,6 +94,6 @@ function workerLauncher(
  */
 export class CodemodeSandbox extends CodemodeSandboxBase {
 	constructor(options: CodemodeSandboxOptions = {}) {
-		super(options, workerLauncher(options.wasm, options.workerUrl ?? defaultWorkerUrl()));
+		super(options, workerLauncher(options));
 	}
 }

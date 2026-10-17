@@ -11,7 +11,7 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { type AgentMessageOccurrence, runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -34,13 +34,6 @@ import type {
 } from "./types.ts";
 
 export type { QueueMode } from "./types.ts";
-
-export interface AgentLifecycleObservation {
-	type: string;
-	activeRun: boolean;
-	steering: number;
-	followUp: number;
-}
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 	return messages.filter(
@@ -150,11 +143,13 @@ export interface AgentOptions {
 
 let nextQueuedMessageOccurrenceId = 0;
 
+type QueuedMessage = { id: number; message: AgentMessage };
+
 class PendingMessageQueue {
-	private messages: Array<{ id: number; message: AgentMessage }> = [];
+	private messages: QueuedMessage[] = [];
 	private reserved = 0;
 	private selected: AgentMessage[] = [];
-	private selectedOccurrences: number[] = [];
+	private selectedEntries: QueuedMessage[] = [];
 	public mode: QueueMode;
 
 	constructor(mode: QueueMode) {
@@ -178,58 +173,64 @@ class PendingMessageQueue {
 	}
 
 	snapshot(): AgentMessage[] {
-		return this.messages.map(({ message }) => message);
+		return this.messages.map((entry) => entry.message);
 	}
 
-	occurrences(): Array<{ id: number; message: AgentMessage }> {
+	occurrences(): QueuedMessage[] {
 		return this.messages.map((entry) => ({ ...entry }));
-	}
-
-	get size(): number {
-		return this.messages.length;
 	}
 
 	reserve(validate?: (messages: readonly AgentMessage[]) => void): AgentMessage[] {
 		// The loop can fail preparation after taking a batch. Keep the original
-		// messages here until message_start, including their images and order.
+		// messages here until message_end commits them, including their images and order.
 		const end = this.mode === "all" ? this.messages.length : Math.min(this.reserved + 1, this.messages.length);
-		// ponytail: Selection is serial per queue. Keep the exact returned array
-		// so clear can invalidate its iterator. Concurrent selectors would need
-		// separate reservations.
-		const selected = this.messages.slice(this.reserved, end);
-		const messages = selected.map(({ message }) => message);
-		// Session retention must accept the complete batch before any occurrence transfers.
-		validate?.(messages);
-		this.selected = messages;
-		this.selectedOccurrences = selected.map(({ id }) => id);
+		// Selection is serial per queue. Keep the exact returned array so clear
+		// can invalidate its iterator. Concurrent selectors would need separate reservations.
+		const selectedEntries = this.messages.slice(this.reserved, end);
+		const selected = selectedEntries.map((entry) => entry.message);
+		// Validate before changing reservation state so a rejected batch remains wholly queued.
+		validate?.(selected);
+		this.selectedEntries = selectedEntries;
+		this.selected = selected;
 		this.reserved = end;
 		return this.selected;
 	}
 
-	consume(message: AgentMessage): number | undefined {
-		const index = this.messages.findIndex((entry) => entry.message === message);
+	occurrenceId(source: AgentMessageOccurrence): number | undefined {
+		// Only the exact reserved batch/slot owns an enqueue identity. A prepared
+		// message can share this object without belonging to the queued occurrence.
+		if (source.batch !== this.selected || this.selected[source.index] !== source.message) return undefined;
+		return this.selectedEntries[source.index]?.id;
+	}
+
+	consume(source: AgentMessageOccurrence): void {
+		// Prepared input can alias a queued message without owning its reservation.
+		if (source.batch !== this.selected || this.selected[source.index] !== source.message) return;
+		const entry = this.selectedEntries[source.index];
+		if (!entry) return;
+		const index = this.messages.indexOf(entry);
 		if (index >= 0 && index < this.reserved) {
-			const [entry] = this.messages.splice(index, 1);
+			this.messages.splice(index, 1);
 			this.reserved--;
-			return entry.id;
+			// Retire exactly this reserved occurrence, not an equal message reference.
+			delete this.selected[source.index];
 		}
-		return undefined;
 	}
 
 	release(): void {
 		this.selected.length = 0;
-		this.selectedOccurrences = [];
+		this.selectedEntries = [];
 		this.reserved = 0;
 	}
 
 	remove(predicate: (message: AgentMessage, occurrenceId: number) => boolean): void {
 		for (let index = this.messages.length - 1; index >= 0; index--) {
-			const { id, message } = this.messages[index];
-			if (!predicate(message, id)) continue;
+			const entry = this.messages[index];
+			if (!predicate(entry.message, entry.id)) continue;
 			this.messages.splice(index, 1);
 			if (index < this.reserved) this.reserved--;
-			// Keep reservation slots stable: the loop skips this slot before message_start.
-			const selectedIndex = this.selectedOccurrences.indexOf(id);
+			// The entry identifies a queue occurrence even when messages are aliased.
+			const selectedIndex = this.selectedEntries.indexOf(entry);
 			if (selectedIndex >= 0) delete this.selected[selectedIndex];
 		}
 	}
@@ -287,8 +288,6 @@ export class Agent {
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
 	private _queuedMessageOccurrenceId?: number;
-	private lifecycleObserver?: (event: Readonly<AgentLifecycleObservation>) => void;
-	private observeStream?: (stream: StreamFn, signal: AbortSignal) => StreamFn;
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -342,45 +341,6 @@ export class Agent {
 		return () => this.listeners.delete(listener);
 	}
 
-	/** Lifecycle observations precede asynchronous listeners. Queue transfer
-	 * observations follow message_end listeners so a failure cannot skip persistence.
-	 * Binding during a run is refused because it would omit that run's start.
-	 * The optional wrapper follows only original loop stream calls, not direct calls. */
-	observeLifecycle(
-		observer: (event: Readonly<AgentLifecycleObservation>) => void,
-		observeStream?: (stream: StreamFn, signal: AbortSignal) => StreamFn,
-	): () => void {
-		if (this.activeRun || this.lifecycleObserver)
-			throw new Error("Agent lifecycle observer requires an unobserved idle agent");
-		this.lifecycleObserver = observer;
-		this.observeStream = observeStream;
-		let attached = true;
-		const detach = () => {
-			if (!attached) return;
-			attached = false;
-			this.lifecycleObserver = undefined;
-			this.observeStream = undefined;
-		};
-		try {
-			this.observe("attached");
-		} catch (error) {
-			detach();
-			throw error;
-		}
-		return detach;
-	}
-
-	private observe(type: string): void {
-		this.lifecycleObserver?.(
-			Object.freeze({
-				type,
-				activeRun: this.activeRun !== undefined,
-				steering: this.steeringQueue.size,
-				followUp: this.followUpQueue.size,
-			}),
-		);
-	}
-
 	/**
 	 * Current agent state.
 	 *
@@ -415,7 +375,6 @@ export class Agent {
 	): void {
 		const id = this.steeringQueue.enqueue(message);
 		onEnqueued?.(id);
-		this.observe("queue_update");
 	}
 
 	/** Queue a message to run only after the agent would otherwise stop. */
@@ -425,19 +384,16 @@ export class Agent {
 	): void {
 		const id = this.followUpQueue.enqueue(message);
 		onEnqueued?.(id);
-		this.observe("queue_update");
 	}
 
 	/** Remove all queued steering messages. */
 	clearSteeringQueue(): void {
 		this.steeringQueue.clear();
-		this.observe("queue_update");
 	}
 
 	/** Remove all queued follow-up messages. */
 	clearFollowUpQueue(): void {
 		this.followUpQueue.clear();
-		this.observe("queue_update");
 	}
 
 	/** Remove all queued steering and follow-up messages. */
@@ -450,7 +406,6 @@ export class Agent {
 	removeQueuedMessages(predicate: (message: AgentMessage, occurrenceId: number) => boolean): void {
 		this.steeringQueue.remove(predicate);
 		this.followUpQueue.remove(predicate);
-		this.observe("queue_update");
 	}
 
 	/** Returns true when either queue still contains pending messages. */
@@ -594,9 +549,9 @@ export class Agent {
 				messages,
 				this.createContextSnapshot(),
 				this.createLoopConfig(options),
-				(event, sourceMessage) => this.processEvents(event, sourceMessage),
+				(event, source) => this.processEvents(event, source),
 				signal,
-				this.observeStream?.(this.streamFunction, signal) ?? this.streamFunction,
+				this.streamFunction,
 			);
 		});
 	}
@@ -606,9 +561,9 @@ export class Agent {
 			await runAgentLoopContinue(
 				this.createContextSnapshot(),
 				this.createLoopConfig(),
-				(event, sourceMessage) => this.processEvents(event, sourceMessage),
+				(event, source) => this.processEvents(event, source),
 				signal,
-				this.observeStream?.(this.streamFunction, signal) ?? this.streamFunction,
+				this.streamFunction,
 			);
 		});
 	}
@@ -683,7 +638,6 @@ export class Agent {
 		this._state.errorMessage = undefined;
 
 		try {
-			this.observe("run_start");
 			await executor(abortController.signal);
 		} catch (error) {
 			await this.handleRunFailure(error, abortController.signal.aborted);
@@ -711,8 +665,8 @@ export class Agent {
 	}
 
 	private finishRun(): void {
-		// No message_start means no ownership transfer. A later prompt or
-		// continuation can take the exact unseen batch before newer input.
+		// No message_end commit means no ownership transfer. A later prompt or
+		// continuation can take the exact uncommitted batch before newer input.
 		this.steeringQueue.release();
 		this.followUpQueue.release();
 		this._state.isStreaming = false;
@@ -720,7 +674,6 @@ export class Agent {
 		this._state.pendingToolCalls = new Set<string>();
 		this.activeRun?.resolve();
 		this.activeRun = undefined;
-		this.observe("run_settled");
 	}
 
 	/**
@@ -730,20 +683,15 @@ export class Agent {
 	 * considered idle later, after all awaited listeners for `agent_end` finish
 	 * and `finishRun()` clears runtime-owned state.
 	 */
-	private async processEvents(event: AgentEvent, sourceMessage?: AgentMessage): Promise<void> {
-		if (
-			event.type === "agent_start" ||
-			event.type === "agent_end" ||
-			event.type === "turn_start" ||
-			event.type === "turn_end"
-		) {
-			this.observe(event.type);
-		}
+	private async processEvents(event: AgentEvent, source?: AgentMessageOccurrence): Promise<void> {
+		// Capture before message_end retires the reservation. Awaited Session listeners
+		// still need its identity at the persistence boundary after that commit.
+		const occurrenceId =
+			source && (event.type === "message_start" || event.type === "message_end")
+				? (this.steeringQueue.occurrenceId(source) ?? this.followUpQueue.occurrenceId(source))
+				: undefined;
 		switch (event.type) {
 			case "message_start":
-				this._queuedMessageOccurrenceId =
-					this.steeringQueue.consume(sourceMessage ?? event.message) ??
-					this.followUpQueue.consume(sourceMessage ?? event.message);
 				this._state.streamingMessage = event.message;
 				break;
 
@@ -754,6 +702,11 @@ export class Agent {
 			case "message_end":
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
+				// Commit before releasing queued custody or calling fallible subscribers.
+				if (source) {
+					this.steeringQueue.consume(source);
+					this.followUpQueue.consume(source);
+				}
 				break;
 
 			case "tool_execution_start": {
@@ -785,11 +738,15 @@ export class Agent {
 		if (!signal) {
 			throw new Error("Agent listener invoked outside active run");
 		}
-		for (const listener of this.listeners) {
-			await listener(event, signal);
+		this._queuedMessageOccurrenceId = occurrenceId;
+		try {
+			for (const listener of this.listeners) {
+				await listener(event, signal);
+			}
+		} finally {
+			// Publication context, not message identity: never leak a queued ID to a
+			// later prepared alias, failure event, or code running after settlement.
+			this._queuedMessageOccurrenceId = undefined;
 		}
-		// The session persists input through message_end listeners. A throwing
-		// observer must not skip that transfer after the queue consumed the input.
-		if (event.type === "message_end") this.observe("queue_update");
 	}
 }

@@ -110,8 +110,8 @@ function createResponseModelSseResponse(model: string, contentBlock: ResponseCon
 }
 
 describe("Anthropic raw SSE parsing", () => {
-	// smarty-dev#5822 C1: one Pi-owned notification per parsed event, no raw event or model argument.
-	it("notifies the observer once per parsed provider stream event without provider data", async () => {
+	// smarty-dev#5822 C1: one owned notification per event, never the raw event or model.
+	it("notifies once per parsed provider stream event without provider data", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
 		const calls: unknown[][] = [];
 		const result = await streamAnthropic(
@@ -273,7 +273,7 @@ describe("Anthropic raw SSE parsing", () => {
 		} as unknown as Anthropic;
 
 		await streamAnthropic(
-			getModel("anthropic", "claude-haiku-4-5"),
+			getModel("openrouter", "anthropic/claude-haiku-4.5"),
 			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
 			{ client, thinkingEnabled: false },
 		).result();
@@ -330,7 +330,7 @@ describe("Anthropic raw SSE parsing", () => {
 			{ client: createFakeAnthropicClient(createSseResponse(events)) },
 		).result();
 
-		// smarty-dev#5822 N5682: Pi's count of the final event's drops, not the provider's paths and reasons.
+		// smarty-dev#5822 N5682: Pi's count, never provider paths or reasons.
 		expect(result.diagnostics).toEqual([
 			{ type: "anthropic_input_transformations", timestamp: expect.any(Number), thinkingBlocksDropped: 1 },
 		]);
@@ -576,7 +576,7 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
-		// smarty-dev#5822 (pi#202 round 3): owned refusal text; the provider's explanation is not published.
+		// smarty-dev#5822: the provider's refusal explanation is private.
 		expect(result.errorMessage).toBe("The model refused to complete the request");
 		expect(JSON.stringify(result)).not.toContain(explanation);
 	});

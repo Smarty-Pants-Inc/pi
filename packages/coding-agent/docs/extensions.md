@@ -66,8 +66,6 @@ Automatic retries, recovery, compaction, or queued work can continue afterward.
 
 `agent_before_settle` is the final actionable boundary: it can append entries and request one continuation.
 `agent_settled` is final and notification-only; use it when an integration needs to know Pi will not continue automatically.
-Its `outcome` is `aborted` when the run was cancelled: by a user abort (also during retry backoff or an `agent_before_settle` handler), by an extension that cancelled compaction, or by session shutdown. An abort after the last turn but before settlement also reports `aborted`. The outcome is `error` when the run ended on a provider, run, or compaction failure; otherwise it is `completed`.
-`ctx.isIdle()` is already true inside `agent_settled` handlers. `ctx.isSettling()` is true exactly while `agent_settled` handlers run, including held async handlers. During that time, `pi.sendUserMessage()` and `pi.sendMessage(..., { triggerTurn: true })` do not start a turn at once: the turn starts after the remaining handlers. `ctx.isSettling()` is false once those deferred turns begin, including in a deferred prompt's `input` and `before_agent_start` handlers, where a requested turn is not deferred.
 
 <a id="extensionapi-methods"></a>
 
@@ -80,7 +78,6 @@ Its `outcome` is `aborted` when the run was cancelled: by a user abort (also dur
 | Add a `/` command | `pi.registerCommand()` |
 | Add a shortcut or CLI flag | `pi.registerShortcut()` or `pi.registerFlag()` |
 | Send user or custom messages | `pi.sendUserMessage()` or `pi.sendMessage()` |
-| Admit correlated external user input with a receipt | [`pi.submitUserMessage()`](#correlated-user-message-admission) |
 | Persist non-context session data | `pi.appendEntry()` |
 | Change active tools, model, or thinking level | Session control methods on `pi` |
 | Add a model provider | `pi.registerProvider()` |
@@ -88,8 +85,6 @@ Its `outcome` is `aborted` when the run was cancelled: by a user abort (also dur
 | Route each request to a model | [`pi.registerVirtualModel()`](virtual-models.md) |
 | Add terminal rendering | Renderer registration and `ctx.ui` |
 | Communicate with another extension | `pi.events` |
-
-`pi.sendUserMessage(content, { metadata })` returns a promise for one admission receipt: `{ status: "turnStarted", entryId, metadata, metadataSource }` after the user entry is persisted, or `{ status: "handled", entryId: null, metadata, metadataSource }` when an input handler consumes it. Metadata is a plain JSON object, copied and deeply frozen before preflight and preserved per queued input. Proxies are rejected before any trap can run; only plain objects (including null-prototype objects) and plain arrays are accepted. It is stored on the session entry, never in model content or compaction summaries. Pi stamps `metadataSource` as `{ kind: "extension", extensionPath }` using the executing extension's loader path; options and metadata cannot override it. API objects can be shared, but identity cannot be borrowed: Pi enters the registered extension's execution context for module loading, its factory, and every registered callback: lifecycle/input and shared-event handlers, tools (execution, preparation and rendering), commands (handlers and completions), shortcuts, message/user/entry renderers, Markdown transformers, tool-renderer resolvers and their returned renderers, native/legacy provider and authentication callbacks, and virtual-model routing. It preserves the context across awaits and async descendants, including timers and promises scheduled during loading or handlers. Calling another extension's API to submit metadata or register callbacks from that context rejects with `UserMessageMetadataError.code === "INPUT_METADATA_SOURCE_MISMATCH"` before admission or registration. A metadata send through an extension API without its bound execution context rejects with `INPUT_METADATA_SOURCE_MISMATCH`; it never falls back to SDK attribution. Callbacks installed outside extension execution remain unbound and cannot submit extension metadata. Fresh `withSession` contexts from `newSession`, `fork`, and `switchSession` capture the initiating extension's identity and enforce the same source checks. Only direct SDK `session.sendUserMessage()` calls are stamped `{ kind: "sdk" }`. This is attribution through supported APIs, not an in-process sandbox: extensions still have full process and filesystem permissions. Consumers must trust metadata only from the source they expect (for example, Fabric must require its own extension's path). This identifies the submitting extension, not a verified remote sender. Metadata is limited to 16 KiB of serialized UTF-8 JSON, 16 nested containers including the root, and 1,000 total object keys/array elements. Budget failures reject with `UserMessageMetadataError` before admission. Calls without metadata remain fire-and-forget. Do not await a queued receipt from an event handler whose return is required for delivery; attach a `.then()` handler instead. See [SDK prompting](sdk.md#prompting).
 
 Use the exported declarations in [`extensions/types.ts`](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts) for exact event, context, tool, and result types.
 
@@ -110,13 +105,11 @@ Events cover resource discovery, sessions, agent and message lifecycle, provider
 
 `message_end` can replace a finalized message while preserving its role. `tool_call` can mutate input or block execution. `tool_result` handlers compose, with each handler seeing prior changes.
 
-`tool_partial_result` transforms accumulated tool-output snapshots before any `tool_execution_update` reaches agent/session subscribers, JSON/RPC/TUI, or a nested `ctx.executeTool()` `onUpdate` callback. Return `{ partialResult }` to replace the whole snapshot (including `content`, `structuredContent`, and `details`); handlers compose in registration order, each seeing prior replacements. A handler failure withholds the snapshot behind a redacted placeholder, without exposing its error text. Detect support with `pi.hostCapabilities?.toolPartialResult === true`; `tool_execution_update` remains notification-only. Final results still require a `tool_result` handler.
-
 <a id="provider_stream_event"></a>
 
-`provider_stream_event` fires once for each parsed provider stream event before Pi normalizes it. The event is `{ type: "provider_stream_event" }` only: it carries no provider data, model fields, or raw event, so provider responses cannot leak credential values through it. `after_provider_response` likewise carries only the HTTP status, never response headers. Both events are notification-only and are not persisted.
+`provider_stream_event` fires for each parsed provider stream event before Pi normalizes it. The event identifies the provider, API, and model; `event.data` is the earliest structured value available to Pi, not necessarily the original HTTP bytes or SSE frame. Treat it as read-only because mutation can affect normalization. The event is notification-only and is not persisted.
 
-Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported without changing the provider response. See [`debug-provider.ts`](../examples/extensions/debug-provider.ts) for an opt-in viewer that counts events per assistant message.
+Handlers are awaited in stream order, so slow handlers delay stream consumption. Handler errors are reported without changing the provider response. See [`debug-provider.ts`](../examples/extensions/debug-provider.ts) for an opt-in viewer that groups raw events by assistant message.
 
 <a id="context_with_system"></a>
 
@@ -133,12 +126,6 @@ Do not assume a sibling call or result exists when another tool event runs.
 Use `ctx.signal` for nested work owned by an active turn; commands and idle session events often have no operation signal.
 
 A `user_bash` handler that returns `undefined` passes the command to the next handler and then to local execution if no handler handles it. Returning `operations` or `result` stops propagation. A handler failure blocks the command rather than falling through to local execution.
-
-### `bash_spawn`
-
-`bash_spawn` fires immediately before the built-in bash executor runs, after the command prefix, spawn hook, working directory, environment, and local shell resolution have been applied. The event includes `toolCallId`, final `command`, `cwd`, an environment snapshot, `shellPath`/`shellArgs` for the stock local backend, and `backend` (`"local-builtin"` or `"custom"`). Each handler receives a detached snapshot, so mutations cannot rewrite execution or another handler’s view. Handlers run in registration order; the first veto or thrown error fails the tool call without spawning (or calling custom `exec`). Return `{ block: true, reason }` to veto.
-
-Check `pi.hostCapabilities.bashSpawnEvent` on the running host before granting execution. For `custom`, shell details are absent and Pi makes no claim about what that backend does. This event covers the built-in bash tool, not interactive `user_bash`, arbitrary replacement tools, or `pi.exec()`. Environment snapshots may contain secrets; do not log them indiscriminately.
 
 <a id="custom-tools"></a>
 <a id="register-tools"></a>
@@ -201,58 +188,6 @@ Register every tool first, keep optional tools inactive, and use `pi.setActiveTo
 
 Pi records the initial prompt and tool set in the transcript's first system message, then appends tool and prompt changes before the next model request. Providers that cannot represent the transition receive a complete transcript checkpoint, which can invalidate the cached prefix.
 
-<a id="correlated-user-message-admission"></a>
-
-### Correlated user-message admission
-
-Use `pi.submitUserMessage()` when an external channel (a chat bridge, webhook, or socket) delivers user text with its own delivery ID and needs an idempotent admission receipt:
-
-```typescript
-const receipt = await pi.submitUserMessage({
-  registrationEpoch: channelEpoch,
-  requestId: deliveryId,
-  sessionGeneration: ctx.userMessageSessionGeneration,
-  text: receivedText,
-  deliverAs: "followUp",
-  expandPromptTemplates: false,
-});
-```
-
-Which API to use:
-
-| Need | API |
-|---|---|
-| Fire-and-forget user message from extension code | `pi.sendUserMessage(content)` |
-| Attach JSON metadata and learn when the entry is persisted or handled | `pi.sendUserMessage(content, { metadata })` |
-| Admit external input exactly once per delivery ID, fenced to one session generation | `pi.submitUserMessage(request)` |
-
-The two receipts answer different questions. `sendUserMessage(..., { metadata })` returns a persistence receipt: `turnStarted` with the persisted `entryId`, or `handled` with `entryId: null`. `submitUserMessage()` returns an admission receipt and never an entry ID.
-
-`SubmitUserMessageOptions` and `UserMessageReceipt` are exported types. The receipt contains `status: "accepted" | "queued" | "rejected"` and `sessionGeneration: string`, with optional `duplicate: true`, `admittedSessionGeneration`, and `reason`. `sessionGeneration` always echoes the caller's request generation, including on `session_changed`; read the context again for the current generation. Rejection reasons are `no_session`, `session_changed`, `payload_mismatch`, `shutting_down`, `admission_refused`, and `unsupported`.
-
-- `no_session`: called during extension loading, before a session binds.
-- `session_changed`: the API is stale (reload or session replacement) or the request generation is not current.
-- `unsupported`: the host did not bind receipt ingress (custom SDK hosts may omit it).
-- `shutting_down`: shutdown closed ingress permanently.
-- `payload_mismatch`: the key was seen before with different text.
-- `admission_refused`: an input hook handled the input, a cap or lifecycle fence refused it, or the call came through another extension's borrowed API.
-
-`accepted` means an idle turn actually started; `queued` means the input entered that session's follow-up queue, including during preflight or settlement. Neither promises model completion. Input hooks still run and may transform the input. A hook returning `handled` produces `rejected/admission_refused`; thrown hook errors keep their isolated/continue behavior. Text is not trimmed or expanded as an extension command, skill command, or prompt template. V1 supports only `deliverAs: "followUp"` and `expandPromptTemplates: false`.
-
-An admitted message is persisted as an ordinary user entry with empty metadata (`{}`) and a Pi-stamped `metadataSource`. The source policy differs from `sendUserMessage(..., { metadata })` because submit is meant to run from external callbacks:
-
-- Inside this extension's execution context (factory, handlers, tools, commands, and timers or promises they schedule), the entry is stamped `{ kind: "extension", extensionPath }` from the loader path.
-- From a callback with no extension execution context (for example, a socket listener installed outside extension execution), the entry is stamped `{ kind: "sdk" }`. A metadata send in the same situation rejects with `INPUT_METADATA_SOURCE_MISMATCH` instead.
-- Through another extension's borrowed API, inside that other extension's execution context, the call returns `rejected/admission_refused` before the session sees it, so nothing is admitted and no key is reserved. A metadata send in the same situation rejects with `INPUT_METADATA_SOURCE_MISMATCH`.
-
-Request fields never select the source.
-
-Capture `ctx.userMessageSessionGeneration` when receiving input. Hosts without receipt ingress report an empty string. Reload and session replacement rotate it and cancel pending admissions and undelivered ingress follow-ups, without deleting ordinary or custom queued messages. New admissions are refused while session replacement is fenced (including from the replacement's `session_start` handlers; use [`session_ready`](#session_ready)) or reload rebuilds the runtime. During reload, ingress reopens after the new runtime and bindings are installed, before `session_start` runs; concurrent reloads keep it closed until their rebuild suspensions are released. A failed reload leaves ingress closed until a later reload succeeds. A cancelled replacement leaves the same session usable with its fresh generation. Previously started turns remain started. Shutdown permanently closes ingress.
-
-The idempotency key is `(registrationEpoch, requestId)` within one live session. The same key and original text returns the first status and reason with `duplicate: true`, even after reload or generation rotation; it never submits again. `sessionGeneration` echoes the retry's generation. Only duplicates of accepted or queued receipts also include `admittedSessionGeneration`, the first admission's generation. Changed text returns `rejected/payload_mismatch`. Duplicate lookup precedes generation validation, so an old receipt is not evidence of a new admission. Bounded correlation keys are reserved before lifecycle, size, or aggregate-budget refusal. Reservations, including rejected admission attempts, survive extension reloads but not process restart or creation of a different session runtime. Malformed requests and oversized correlation fields cannot establish a reservation. Text longer than 65,536 UTF-16 code units is refused with `admission_refused` before any duplicate lookup, hashing, or reservation (even under a key that is already reserved), so its key is not reserved: a later retry with the same key and valid text is admitted as a new request. Loader-level `no_session`, `unsupported`, `session_changed`, and borrowed-API refusals happen outside session admission and do not enter the session-owned ledger.
-
-The ledger retains at most **1024 keys**, never evicts, and refuses unseen keys with `admission_refused` when full. These exhaustion refusals are not reserved, but because capacity is never reclaimed, their keys cannot later submit in that session. Existing duplicates remain readable when full. Admission limits are **64 KiB UTF-8 text**, **256 UTF-8 bytes each** for epoch and request ID, and an **8 MiB aggregate original text/epoch/ID payload budget** per live session. A reservation within the size and aggregate limits consumes that budget even if a lifecycle fence or input hook refuses it; aggregate-refused payloads, and text over 64 KiB UTF-8 that fits within 65,536 code units, do not consume it and cannot later become admissions under the same key. Exceeding a limit returns `admission_refused`. The ledger stores a **32-byte SHA-256 fingerprint** of the original text's exact UTF-16 code units rather than the text. Each retained outcome contains only the historical status or rejection reason and, for accepted or queued admissions, the **36-byte ASCII admission-generation UUID**; the unchecked caller generation is never retained. Key, fingerprint, and outcome metadata are byte-bounded per entry as well as by the 1024-key capacity; this does not bound caller-owned requests or returned receipts. `pi.sendUserMessage()` keeps its existing behavior and return types.
-
 ### Tool rendering
 
 A tool's `renderCall` and `renderResult` draw its calls in the interactive transcript and in HTML exports. `pi.registerToolRenderer((toolName, next) => renderers)` chooses renderers for calls to any tool, including tools that are not registered yet, such as MCP tools in a resumed session before their server connected. `next()` returns what the remaining resolvers (in extension load order), then the registered tool, would use, so `next() ?? mine` only fills in.
@@ -284,21 +219,6 @@ These operations are command-only because calling them from lifecycle handlers c
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 
-<a id="session_ready"></a>
-
-`session_start` handlers of a replacement session (`/new`, `/resume`, `/import`, fork) run while its input is still fenced, so `pi.submitUserMessage()` from them, or from work they start, is refused with `session_changed`. `session_ready` fires once after that replacement finishes and the fence lifts:
-
-```typescript
-pi.on("session_ready", (event, ctx) => {
-  // event: { type: "session_ready"; reason: "new" | "resume" | "fork"; sessionGeneration: string }
-  flushPendingInput(event.sessionGeneration);
-});
-```
-
-`sessionGeneration` is the session's current `ctx.userMessageSessionGeneration`, the same value `session_start` saw. Submissions from the handler and from promises or timers it starts are admitted normally. The event is notification-only and not awaited. It does not fire on startup or reload (their `session_start` is not fenced), when `session_before_switch` or `session_before_fork` cancels, when the replacement session was never published, after shutdown or disposal begins, when shutdown was requested (for example `ctx.shutdown()` from `session_start`) before the replacement finished, or when another session replacement started first.
-
-Older hosts never emit `session_ready`; detect with `pi.hostCapabilities?.sessionReadyEvent === true`.
-
 <a id="state-management"></a>
 <a id="persist-state"></a>
 
@@ -322,27 +242,6 @@ Register an entry or message renderer when custom stored content should appear i
 <a id="interact-with-the-user"></a>
 <a id="account-for-each-mode"></a>
 
-### User-message rendering
-
-`pi.registerUserMessageRenderer(renderer)` replaces the display of user text in the interactive transcript:
-
-```typescript
-import { Text } from "@earendil-works/pi-tui";
-
-pi.registerUserMessageRenderer((text, { outputPad, timestamp }, theme) => {
-  const label = theme.bold(theme.fg("accent", `YOU · ${new Date(timestamp).toLocaleTimeString()}`));
-  return new Text(`${label}\n${text}`, outputPad, 0);
-});
-```
-
-The callback receives display text, the original message timestamp in milliseconds since the Unix epoch, the `outputPad` setting, and the active `Theme`. Return a `Component` or `undefined` for Pi's exact native Markdown rendering. Callback errors also fall back to native rendering, as with custom-message renderers. The first extension registering a user renderer wins; another registration by that same extension replaces its callback.
-
-A custom component owns its background, padding, and outside spacing. Pi keeps OSC 133 prompt zones around either rendering, including custom blank lines. A component that renders zero rows falls back to native rendering without emitting orphan zones. Components must fit the available width and support `invalidate()` as described in [Terminal UI](tui.md). Pi reinvokes the callback when the user component is invalidated or its output padding changes.
-
-The hook applies to newly submitted and replayed user text. Skill invocations remain native collapsible blocks; only their trailing user text uses the hook. It does not change stored messages, images, editor history, editing/forking, or model context. Native fallback still applies Markdown transformers; custom components render the supplied text themselves. Reload replaces registrations and rebuilds the transcript. RPC, JSON, and print modes do not invoke terminal renderers.
-
-See [`user-message-renderer.ts`](../examples/extensions/user-message-renderer.ts) for a plain-text feed with a timestamp label, background, and unshaded outside spacing.
-
 ### UI and modes
 
 `ctx.ui` provides dialogs, notifications, status text, widgets, titles, editor access, and custom components.
@@ -353,8 +252,6 @@ Extensions load in interactive, RPC, JSON, and print modes.
 Interactive mode provides the complete terminal UI.
 RPC can forward supported dialogs and notifications through the [RPC Extension UI protocol](rpc-extension-ui.md), but not custom terminal components; JSON and print modes have no UI.
 Guard terminal-only behavior with `ctx.mode === "tui"` and use `ctx.hasUI` for interactions supported by interactive and RPC clients.
-
-`ctx.ui.holdState(): "dialog" | "custom" | "editor" | undefined` synchronously reports one active host-wide UI hold, or `undefined` when none is active. In TUI mode it includes native and extension dialogs, `custom()` interactions (including async factories and hidden overlays until completion), and external editors. RPC reports `"dialog"` while a supported UI request awaits a client response; print/JSON report `undefined`. Persistent widgets, headers, footers, and the main editor are not holds. Use this cheap snapshot alongside `ctx.isPromptPending()` and agent-idle checks before automatic reloads; it does not reserve the UI or guarantee that a later reload is safe.
 
 Keep tool and event behavior independent from rendering so non-interactive modes remain functional.
 

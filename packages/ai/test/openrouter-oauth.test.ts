@@ -124,7 +124,7 @@ describe.sequential("OpenRouter OAuth", () => {
 			},
 		});
 
-		// pi#150: the key exchange body can echo the submitted code; only the status is shown.
+		// pi#150: the exchange body can echo the code; only status is public.
 		await expect(login).rejects.toThrow(/^OpenRouter OAuth key exchange failed \(HTTP 403\)$/);
 		expect((await callbackResponse)?.status).toBe(502);
 	});

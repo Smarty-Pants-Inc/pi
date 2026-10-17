@@ -99,7 +99,7 @@ describe("personalizeOpenRouterCatalog", () => {
 		expect(result[4]).toBe(classifierModel);
 	});
 
-	// pi#202: credential-bearing catalog failures are public refresh errors, without a stream projector.
+	// pi#202: catalog refresh errors have no stream projector and must already be value-free.
 	it.each(["transport", "invalid JSON", "HTTP rejection"])("publishes owned errors for %s", async (failure) => {
 		const canary = "openrouter-private-wire-value-without-a-credential-label";
 		if (failure === "transport") {

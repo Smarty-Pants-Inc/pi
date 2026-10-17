@@ -2,7 +2,7 @@ import type { Component } from "../tui.ts";
 import { truncateToWidth } from "../utils.ts";
 
 const DEFAULT_DURATION_MS = 1000;
-// ponytail: renders are capped at one per 100 ms (pi#175), so a shorter flash could expire before
+// Renders are capped at one per 100 ms (pi#175), so a shorter flash could expire before
 // any frame shows it. Two render windows guarantee at least one frame contains every flash.
 const MIN_VISIBLE_MS = 200;
 

@@ -8,8 +8,6 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../src/utils/ansi.ts";
 
-// Only the detached-transfer schedule is simulated here; the suite mode receipt
-// tests exercise real compaction, AgentSession admission, and JSONL persistence.
 function bindTransferFixture(session: {
 	prompt(text: string, options?: PromptOptions): Promise<void>;
 	steer(text: string): Promise<void>;
@@ -128,101 +126,131 @@ describe("InteractiveMode compaction events", () => {
 		);
 	});
 
-	test.each([false, true])(
-		"renders a successful compaction and flushes its queue (willRetry: %s)",
-		async (willRetry) => {
-			const usage: Usage = {
-				input: 10,
-				output: 20,
-				cacheRead: 30,
-				cacheWrite: 40,
-				totalTokens: 100,
-				cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.065, total: 0.125 },
-			};
-			const latestCompaction: SessionEntry = {
-				type: "compaction",
-				id: "latest",
-				parentId: "previous",
-				timestamp: "2025-01-02T00:00:00Z",
-				summary: "summary",
-				firstKeptEntryId: "kept",
+	test.each([false, true])("renders retained entries and summary cost (willRetry: %s)", async (willRetry) => {
+		const usage: Usage = {
+			input: 10,
+			output: 20,
+			cacheRead: 30,
+			cacheWrite: 40,
+			totalTokens: 100,
+			cost: { input: 0.01, output: 0.02, cacheRead: 0.03, cacheWrite: 0.065, total: 0.125 },
+		};
+		const latestCompaction: SessionEntry = {
+			type: "compaction",
+			id: "latest",
+			parentId: "previous",
+			timestamp: "2025-01-02T00:00:00Z",
+			summary: "summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 123,
+			usage,
+		};
+		const previousCompaction: SessionEntry = {
+			type: "compaction",
+			id: "previous",
+			parentId: null,
+			timestamp: "2025-01-01T00:00:00Z",
+			summary: "previous summary",
+			firstKeptEntryId: "kept",
+			tokensBefore: 100,
+			usage,
+		};
+		const fakeThis = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
+			autoCompactionEscapeHandler: undefined as (() => void) | undefined,
+			autoCompactionLoader: undefined,
+			defaultEditor: {},
+			statusContainer: { clear: vi.fn() },
+			chatContainer: { clear: vi.fn() },
+			sessionManager: { buildContextEntries: vi.fn().mockReturnValue([latestCompaction, previousCompaction]) },
+			renderSessionEntries: vi.fn(),
+			addMessageToChat: vi.fn(),
+			addCompactionCostNotice: vi.fn(),
+			showError: vi.fn(),
+			showStatus: vi.fn(),
+			clearStatusIndicator: vi.fn(),
+			flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
+			settingsManager: { getShowTerminalProgress: () => false },
+			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+		};
+
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+			this: typeof fakeThis,
+			event: {
+				type: "compaction_end";
+				reason: "manual" | "threshold" | "overflow";
+				result: { tokensBefore: number; summary: string; usage?: Usage } | undefined;
+				aborted: boolean;
+				willRetry: boolean;
+				errorMessage?: string;
+			},
+		) => Promise<void>;
+
+		await handleEvent.call(fakeThis, {
+			type: "compaction_end",
+			reason: willRetry ? "overflow" : "manual",
+			result: {
 				tokensBefore: 123,
+				summary: "summary",
 				usage,
-			};
-			const previousCompaction: SessionEntry = {
-				type: "compaction",
-				id: "previous",
-				parentId: null,
-				timestamp: "2025-01-01T00:00:00Z",
-				summary: "previous summary",
-				firstKeptEntryId: "kept",
-				tokensBefore: 100,
-				usage,
-			};
-			const fakeThis = {
-				isInitialized: true,
-				footer: { invalidate: vi.fn() },
-				programStatus: { handleEvent: vi.fn() },
-				autoCompactionEscapeHandler: undefined as (() => void) | undefined,
-				autoCompactionLoader: undefined,
-				defaultEditor: {},
-				statusContainer: { clear: vi.fn() },
-				chatContainer: { clear: vi.fn() },
-				sessionManager: { buildContextEntries: vi.fn().mockReturnValue([latestCompaction, previousCompaction]) },
-				renderSessionEntries: vi.fn(),
-				addMessageToChat: vi.fn(),
-				addCompactionCostNotice: vi.fn(),
-				showError: vi.fn(),
-				showStatus: vi.fn(),
-				clearStatusIndicator: vi.fn(),
-				flushCompactionQueue: vi.fn().mockResolvedValue(undefined),
-				settingsManager: { getShowTerminalProgress: () => false },
-				ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
-			};
+			},
+			aborted: false,
+			willRetry,
+		});
 
-			const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
-				this: typeof fakeThis,
-				event: {
-					type: "compaction_end";
-					reason: "manual" | "threshold" | "overflow";
-					result: { tokensBefore: number; summary: string; usage?: Usage } | undefined;
-					aborted: boolean;
-					willRetry: boolean;
-					errorMessage?: string;
-				},
-			) => Promise<void>;
+		expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
+		expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith([previousCompaction]);
+		expect(fakeThis.addMessageToChat).toHaveBeenCalledTimes(1);
+		expect(fakeThis.addMessageToChat).toHaveBeenCalledWith(
+			expect.objectContaining({
+				role: "compactionSummary",
+				tokensBefore: 123,
+				summary: "summary",
+			}),
+		);
+		expect(fakeThis.addCompactionCostNotice).toHaveBeenCalledWith({
+			type: "compaction_cost",
+			kind: "compaction",
+			usage,
+		});
+		expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry });
+	});
 
-			await handleEvent.call(fakeThis, {
-				type: "compaction_end",
-				reason: willRetry ? "overflow" : "manual",
-				result: {
-					tokensBefore: 123,
-					summary: "summary",
-					usage,
-				},
-				aborted: false,
-				willRetry,
-			});
+	test("updates the working state when the same agent run resumes after compaction", async () => {
+		const fakeThis = {
+			isInitialized: true,
+			footer: { invalidate: vi.fn() },
+			programStatus: { handleEvent: vi.fn() },
+			activeStatusIndicator: undefined,
+			workingVisible: true,
+			showWorkingStatusIndicator: vi.fn(),
+			clearStatusIndicator: vi.fn(),
+			settingsManager: { getShowTerminalProgress: () => true },
+			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
+		};
+		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
+			this: typeof fakeThis,
+			event: { type: "turn_start" },
+		) => Promise<void>;
 
-			expect(fakeThis.chatContainer.clear).toHaveBeenCalledTimes(1);
-			expect(fakeThis.renderSessionEntries).toHaveBeenCalledWith([previousCompaction]);
-			expect(fakeThis.addMessageToChat).toHaveBeenCalledTimes(1);
-			expect(fakeThis.addMessageToChat).toHaveBeenCalledWith(
-				expect.objectContaining({
-					role: "compactionSummary",
-					tokensBefore: 123,
-					summary: "summary",
-				}),
-			);
-			expect(fakeThis.addCompactionCostNotice).toHaveBeenCalledWith({
-				type: "compaction_cost",
-				kind: "compaction",
-				usage,
-			});
-			expect(fakeThis.flushCompactionQueue).toHaveBeenCalledWith({ willRetry });
-		},
-	);
+		await handleEvent.call(fakeThis, { type: "turn_start" });
 
+		expect(fakeThis.ui.terminal.setProgress).toHaveBeenCalledWith(true);
+		expect(fakeThis.showWorkingStatusIndicator).toHaveBeenCalledTimes(1);
+		expect(fakeThis.clearStatusIndicator).not.toHaveBeenCalled();
+		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
+
+		fakeThis.workingVisible = false;
+		await handleEvent.call(fakeThis, { type: "turn_start" });
+
+		expect(fakeThis.showWorkingStatusIndicator).toHaveBeenCalledTimes(1);
+		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledTimes(1);
+		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(2);
+	});
+
+	// pi#117: failed/cancelled compaction must retain exact queued envelopes.
 	test.each([
 		{ reason: "manual" as const, aborted: false },
 		{ reason: "manual" as const, aborted: true },
@@ -263,7 +291,6 @@ describe("InteractiveMode compaction events", () => {
 				errorMessage?: string;
 			},
 		) => Promise<void>;
-
 		await handleEvent.call(fakeThis, {
 			type: "compaction_end",
 			reason,
@@ -272,45 +299,12 @@ describe("InteractiveMode compaction events", () => {
 			willRetry: false,
 			errorMessage: aborted ? undefined : "synthetic compaction failure",
 		});
-
 		expect(fakeThis.flushCompactionQueue).not.toHaveBeenCalled();
 		expect(fakeThis.compactionQueuedMessages).toBe(queued);
 		expect(queued).toEqual(before);
 		if (reason === "overflow" && !aborted) {
 			expect(stripAnsi(fakeThis.chatContainer.render(120).join("\n"))).toContain("synthetic compaction failure");
 		}
-	});
-
-	test("updates the working state when the same agent run resumes after compaction", async () => {
-		const fakeThis = {
-			isInitialized: true,
-			footer: { invalidate: vi.fn() },
-			programStatus: { handleEvent: vi.fn() },
-			activeStatusIndicator: undefined,
-			workingVisible: true,
-			showWorkingStatusIndicator: vi.fn(),
-			clearStatusIndicator: vi.fn(),
-			settingsManager: { getShowTerminalProgress: () => true },
-			ui: { requestRender: vi.fn(), terminal: { setProgress: vi.fn() } },
-		};
-		const handleEvent = Reflect.get(InteractiveMode.prototype, "handleEvent") as (
-			this: typeof fakeThis,
-			event: { type: "turn_start" },
-		) => Promise<void>;
-
-		await handleEvent.call(fakeThis, { type: "turn_start" });
-
-		expect(fakeThis.ui.terminal.setProgress).toHaveBeenCalledWith(true);
-		expect(fakeThis.showWorkingStatusIndicator).toHaveBeenCalledTimes(1);
-		expect(fakeThis.clearStatusIndicator).not.toHaveBeenCalled();
-		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(1);
-
-		fakeThis.workingVisible = false;
-		await handleEvent.call(fakeThis, { type: "turn_start" });
-
-		expect(fakeThis.showWorkingStatusIndicator).toHaveBeenCalledTimes(1);
-		expect(fakeThis.clearStatusIndicator).toHaveBeenCalledTimes(1);
-		expect(fakeThis.ui.requestRender).toHaveBeenCalledTimes(2);
 	});
 
 	test.each([false, true])("keeps detached prompt transfers staged until settlement (reject: %s)", async (reject) => {
@@ -321,9 +315,9 @@ describe("InteractiveMode compaction events", () => {
 			rejectPrompt = reject;
 		});
 		const queued = [{ input: receiveInput("original input"), mode: "steer" as const }];
-		const snapshots: { kind: string; transfers: number; queued: number }[] = [];
 		const fakeThis = {
 			compactionQueuedMessages: [...queued],
+			// pi#262 / smarty-dev#3155: mirror the mode's real transfer snapshot owner.
 			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
@@ -334,12 +328,6 @@ describe("InteractiveMode compaction events", () => {
 				steer: vi.fn(),
 				followUp: vi.fn(),
 			},
-			stagingAudit: (kind: string) =>
-				snapshots.push({
-					kind,
-					transfers: fakeThis.compactionQueueTransfers,
-					queued: fakeThis.compactionQueuedMessages.length,
-				}),
 			isExtensionCommand: vi.fn().mockReturnValue(false),
 			updatePendingMessagesDisplay: vi.fn(),
 			showError: vi.fn(),
@@ -352,7 +340,6 @@ describe("InteractiveMode compaction events", () => {
 		await flush.call(fakeThis);
 		expect(fakeThis.compactionQueuedMessages).toEqual([]);
 		expect(fakeThis.compactionQueueTransfers).toBe(1);
-		expect(snapshots[0]).toEqual({ kind: "compaction-transfer-start", transfers: 1, queued: 1 });
 		const intervening = { input: receiveInput("newly staged input"), mode: "steer" as const };
 		fakeThis.compactionQueuedMessages.push(intervening);
 		if (reject) rejectPrompt(new Error("preflight failed"));
@@ -361,7 +348,6 @@ describe("InteractiveMode compaction events", () => {
 		expect(fakeThis.compactionQueuedMessages).toEqual(reject ? [...queued, intervening] : [intervening]);
 		expect(fakeThis.session.clearQueue).not.toHaveBeenCalled();
 		expect(fakeThis.showError).toHaveBeenCalledTimes(reject ? 1 : 0);
-		if (reject) expect(snapshots).toContainEqual({ kind: "compaction-restored", transfers: 1, queued: 2 });
 	});
 
 	test.each([false, true])(
@@ -382,6 +368,7 @@ describe("InteractiveMode compaction events", () => {
 			];
 			const fakeThis = {
 				compactionQueuedMessages: [...batch],
+				// pi#262 / smarty-dev#3155: mirror the mode's real transfer snapshot owner.
 				compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 				compactionQueueTransfers: 0,
 				compactionQueueWork: new Set<Promise<void>>(),
@@ -444,6 +431,7 @@ describe("InteractiveMode compaction events", () => {
 	test("preserves steering behavior when flushing into an active agent run", async () => {
 		const fakeThis = {
 			compactionQueuedMessages: [{ input: receiveInput("change direction"), mode: "steer" as const }],
+			// pi#262 / smarty-dev#3155: mirror the mode's real transfer snapshot owner.
 			compactionTransferInputs: new Set<{ input: ReceivedInput; mode: "steer" | "followUp" }>(),
 			compactionQueueTransfers: 0,
 			compactionQueueWork: new Set<Promise<void>>(),
@@ -460,12 +448,12 @@ describe("InteractiveMode compaction events", () => {
 		};
 
 		Object.setPrototypeOf(fakeThis, InteractiveMode.prototype);
+		bindTransferFixture(fakeThis.session);
 		const flushCompactionQueue = Reflect.get(InteractiveMode.prototype, "flushCompactionQueue") as (
 			this: typeof fakeThis,
 			options?: { willRetry?: boolean },
 		) => Promise<void>;
 
-		bindTransferFixture(fakeThis.session);
 		await flushCompactionQueue.call(fakeThis, { willRetry: false });
 
 		expect(fakeThis.session.prompt).toHaveBeenCalledWith(

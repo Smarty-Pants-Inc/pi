@@ -13,8 +13,7 @@ import type {
 	ModelType,
 	ModelTypeMap,
 } from "../types.ts";
-import { formatThrownValue } from "./diagnostics.ts";
-import { ModelsError, SafeSetupError } from "./models-error.ts";
+import { formatThrownValue, ModelsError, SafeSetupError } from "./models-error.ts";
 
 /** The type of a model. Models without `type` are chat models. */
 export function getModelType(model: AnyModel): ModelType {
@@ -44,12 +43,10 @@ export function assertClassifierModel(model: AnyModel): asserts model is Classif
 	}
 }
 
-/** Error text for a public non-chat result or rejection, masked with the request's live credentials. */
 function operationErrorMessage(error: unknown, secrets: readonly string[]): string {
 	try {
 		return redactOAuthDiagnostic(formatThrownValue(error), secrets);
 	} catch {
-		// A hostile thrown value must not escape through its own accessors.
 		return "operation failed";
 	}
 }
@@ -60,10 +57,7 @@ export function protectOperationResult<T extends { errorMessage?: string }>(resu
 	return { ...result, errorMessage: operationErrorMessage(result.errorMessage, secrets) };
 }
 
-/**
- * A rejection that crosses the public API: keep only the masked message and name,
- * never the raw error, its cause or other properties. Value-free setup errors pass through.
- */
+/** A public rejection keeps masked message/name, never raw cause or other properties. */
 export function protectOperationError(error: unknown, secrets: readonly string[]): Error {
 	try {
 		if (error instanceof SafeSetupError) return error;

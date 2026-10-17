@@ -1,4 +1,4 @@
-import { fauxAssistantMessage } from "@earendil-works/pi-ai";
+import { type FauxResponseFactory, fauxAssistantMessage } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, getMessageText, type Harness } from "../harness.ts";
 
@@ -24,7 +24,8 @@ describe("queued input after pre-prompt compaction", () => {
 
 	it.each(["steer", "followUp"] as const)("delivers %s input flushed at compaction_end exactly once", async (mode) => {
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 100, maxTokens: 100 }],
+			// pi#280: the retained system prompt must fit; prior usage still forces compaction.
+			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
 				(pi) => {
@@ -48,10 +49,24 @@ describe("queued input after pre-prompt compaction", () => {
 			api: model.api,
 			provider: model.provider,
 			model: model.id,
-			usage: createUsage(101),
+			usage: createUsage(10_001),
 		});
 		harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
-		harness.setResponses([fauxAssistantMessage("first answer"), fauxAssistantMessage("second answer")]);
+		const requests: string[][] = [];
+		harness.setResponses(
+			[fauxAssistantMessage("first answer"), fauxAssistantMessage("second answer")].map(
+				(response): FauxResponseFactory =>
+					(context) => {
+						requests.push(
+							context.messages
+								.filter((message) => message.role === "user")
+								.map(getMessageText)
+								.filter((text) => text === "triggering prompt" || text === "queued during compaction"),
+						);
+						return response;
+					},
+			),
+		);
 
 		// What InteractiveMode.flushCompactionQueue does for the first queued message.
 		let queued: Promise<void> | undefined;
@@ -65,7 +80,19 @@ describe("queued input after pre-prompt compaction", () => {
 		await expect(queued).resolves.toBeUndefined();
 		await harness.session.waitForIdle();
 
-		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({ aborted: false });
+		expect(harness.eventsOfType("compaction_end")).toMatchObject([{ aborted: false, result: expect.any(Object) }]);
+		// Paired scheduling control: steering joins the first request; follow-up waits for its answer.
+		expect(requests).toEqual(
+			mode === "steer"
+				? [["triggering prompt", "queued during compaction"]]
+				: [["triggering prompt"], ["triggering prompt", "queued during compaction"]],
+		);
+		expect(harness.faux.state.callCount).toBe(mode === "steer" ? 1 : 2);
+		expect(
+			harness
+				.eventsOfType("message_end")
+				.filter((event) => event.message.role === "assistant" && event.message.stopReason === "error"),
+		).toEqual([]);
 		// Later threshold compaction may summarize these turns, so read the persisted transcript.
 		const userTexts = harness.sessionManager
 			.getEntries()

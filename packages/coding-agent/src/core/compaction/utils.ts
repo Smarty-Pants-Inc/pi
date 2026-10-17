@@ -15,6 +15,10 @@ export interface FileOperations {
 	edited: Set<string>;
 }
 
+// The category sets cannot recover write/edit interleaving. Keep only the most recent observed
+// modifications; carried summary lists remain an older prefix without inventing tool chronology.
+const recentModifications = new WeakMap<FileOperations, Set<string>>();
+
 export function createFileOps(): FileOperations {
 	return {
 		read: new Set(),
@@ -58,6 +62,16 @@ function addFileOp(toolName: string, args: Record<string, unknown> | undefined, 
 	// Delete first so native and nested calls keep least-to-most-recent ordering (pi#88).
 	set?.delete(path);
 	set?.add(path);
+	if (toolName === "write" || toolName === "edit") {
+		let recent = recentModifications.get(fileOps);
+		if (!recent) {
+			recent = new Set();
+			recentModifications.set(fileOps, recent);
+		}
+		recent.delete(path);
+		recent.add(path);
+		if (recent.size > MAX_SUMMARY_FILES) recent.delete(recent.values().next().value!);
+	}
 }
 
 /**
@@ -82,6 +96,11 @@ export interface FileLists {
  */
 export function computeFileLists(fileOps: FileOperations): FileLists {
 	const modified = new Set([...fileOps.edited, ...fileOps.written]);
+	// Preserve the existing fallback for callers supplying only sets, then move observed touches
+	// after carried paths in their actual mixed write/edit order. Do not mutate the caller's sets.
+	for (const path of recentModifications.get(fileOps) ?? []) {
+		if (modified.delete(path)) modified.add(path);
+	}
 	const readOnly = [...fileOps.read].filter((f) => !modified.has(f));
 	const modifiedFiles = [...modified];
 	return {

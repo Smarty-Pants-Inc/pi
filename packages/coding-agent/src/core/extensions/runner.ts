@@ -100,7 +100,6 @@ import type {
 	UIPromptKind,
 	UserBashEvent,
 	UserBashEventResult,
-	UserMessageRenderer,
 } from "./types.ts";
 
 // Extension shortcuts compete with canonical keybinding ids from keybindings.json.
@@ -386,7 +385,6 @@ export class ExtensionRunner {
 	private sessionManager: SessionManager;
 	private modelRegistry: ModelRegistry;
 	private errorListeners: Set<ExtensionErrorListener> = new Set();
-	private getUserMessageSessionGeneration: () => string = () => "";
 	private getModel: () => Model<any> | undefined = () => undefined;
 	private getScopedModels: () => readonly ScopedModel[] = () => [];
 	private isIdleFn: () => boolean = () => true;
@@ -404,9 +402,8 @@ export class ExtensionRunner {
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
 	private executeToolFn: ExtensionContextActions["executeTool"];
 	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
-	/** Admission and joining are per call, not per session or captured context. */
-	private readonly toolScopes = new Map<string, { closed: boolean; pending: Set<Promise<unknown>> }>();
 	/** Registered MCP servers already reported as unhandled. */
+	private readonly toolScopes = new Map<string, { closed: boolean; pending: Set<Promise<unknown>> }>();
 	private readonly reportedMcpServers = new Set<string>();
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
@@ -452,7 +449,6 @@ export class ExtensionRunner {
 		// Copy actions into the shared runtime (all extension APIs reference this)
 		this.runtime.sendMessage = actions.sendMessage;
 		this.runtime.sendUserMessage = actions.sendUserMessage;
-		this.runtime.submitUserMessage = actions.submitUserMessage;
 		this.runtime.appendEntry = actions.appendEntry;
 		this.runtime.setSessionName = actions.setSessionName;
 		this.runtime.getSessionName = actions.getSessionName;
@@ -470,7 +466,6 @@ export class ExtensionRunner {
 		this.runtime.createContext = () => this.createContext();
 
 		// Context actions (required)
-		this.getUserMessageSessionGeneration = contextActions.getUserMessageSessionGeneration ?? (() => "");
 		this.getModel = contextActions.getModel;
 		this.getScopedModels = contextActions.getScopedModels;
 		this.isIdleFn = contextActions.isIdle;
@@ -600,8 +595,6 @@ export class ExtensionRunner {
 
 	setUIContext(uiContext?: ExtensionUIContext, mode: ExtensionMode = "print"): void {
 		const wrapped = uiContext ? this.wrapUIPromptContext(uiContext) : noOpUIContext;
-		// A caller may capture ui or an individual method before replacement. Check
-		// lifetime at invocation too, not only when ctx.ui is first read.
 		this.uiContext = uiContext
 			? new Proxy(wrapped, {
 					get: (target, key, receiver) => {
@@ -833,10 +826,6 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
-	getUserMessageRenderer(): UserMessageRenderer | undefined {
-		return this.extensions.find((ext) => ext.userMessageRenderer)?.userMessageRenderer;
-	}
-
 	getMarkdownTransformers(): MarkdownTransformer[] {
 		return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
 	}
@@ -934,10 +923,6 @@ export class ExtensionRunner {
 		const getModel = this.getModel;
 		const getScopedModels = this.getScopedModels;
 		return {
-			get userMessageSessionGeneration() {
-				runner.assertActive();
-				return runner.getUserMessageSessionGeneration();
-			},
 			get ui() {
 				runner.assertActive();
 				return runner.uiContext;
@@ -1065,7 +1050,6 @@ export class ExtensionRunner {
 					);
 					const childSignal = signals.length ? AbortSignal.any(signals) : undefined;
 					childSignal?.throwIfAborted();
-					// Register before dispatch: even fire-and-forget children belong to this call.
 					const pending = Promise.resolve().then(() => {
 						childSignal?.throwIfAborted();
 						return runner.executeToolFn!(toolCallId, name, args, { ...options, signal: childSignal });
@@ -1128,7 +1112,7 @@ export class ExtensionRunner {
 		return context;
 	}
 
-	/** All native handler waits share terminal cancellation; cleanup has its own deadline. */
+	/** Handler waits share terminal cancellation; shutdown cleanup has its own deadline. */
 	private dispatchSignal(event: ExtensionEvent["type"], signal?: AbortSignal): AbortSignal | undefined {
 		const shutdownSignal = event === "session_shutdown" ? undefined : this.shutdownSignal;
 		return signal && shutdownSignal && signal !== shutdownSignal
@@ -1144,7 +1128,6 @@ export class ExtensionRunner {
 	): Promise<unknown> {
 		signal?.throwIfAborted();
 		const result = await raceWithAbortSignal(Promise.resolve(handler(event, ctx)), signal);
-		// A settled promise can win its race just before abort. Never apply that result.
 		signal?.throwIfAborted();
 		return result;
 	}
@@ -1164,20 +1147,17 @@ export class ExtensionRunner {
 		let entries: SessionBoundaryDraft[] = [];
 		let entryReceipts: (TurnReceipt | undefined)[] = [];
 		let shouldContinue = false;
-		// Record the state represented by the preview before the builder can yield.
 		let previewRevision = this.sessionManager.revision();
 		let previewPendingMessages = getPendingMessages?.().slice();
 		let context = await raceWithAbortSignal(Promise.resolve(buildContext(entries)), signal);
 		signal?.throwIfAborted();
 		if (!this.hasHandlers(baseEvent.type)) return { entries, entryReceipts, continue: false, context, valid: true };
-		// One detached preview per build preserves observer sharing without exposing history.
 		context = structuredClone(context);
 		let contextSnapshot = structuredClone(context);
 		let valid = true;
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, baseEvent.type)) {
 			for (const handler of handlers) {
-				// A failed proposal remains visible so a later handler can replace it.
 				const before = entries;
 				const hadEntries = Array.isArray(entries) && entries.length > 0;
 				let previousEntries: SessionBoundaryDraft[] | undefined;
@@ -1185,7 +1165,7 @@ export class ExtensionRunner {
 					try {
 						previousEntries = structuredClone(entries);
 					} catch {
-						// Uncloneable extension data must still follow the usual preview validation.
+						// Uncloneable proposals still follow preview validation.
 					}
 				}
 				const event = {
@@ -1217,8 +1197,6 @@ export class ExtensionRunner {
 					if (returnedContinue !== undefined) shouldContinue = returnedContinue;
 				} catch (err) {
 					signal?.throwIfAborted();
-					// Existing semantics retain drafts mutated before a handler throws.
-					// A secondary flag failure cannot discard a successfully received selection.
 					if (!receivedSelection) {
 						try {
 							const retained = receiveBoundaryEntries(
@@ -1229,7 +1207,7 @@ export class ExtensionRunner {
 							entries = retained.entries;
 							entryReceipts = retained.receipts;
 						} catch {
-							// A poisoned in-place draft cannot be committed; keep the detached pre-handler proposal (#132 R4-10).
+							// A poisoned in-place draft cannot replace the pre-handler proposal (#132 R4-10).
 							entries = before;
 							entryReceipts = previousReceipts;
 						}
@@ -1244,8 +1222,6 @@ export class ExtensionRunner {
 
 				try {
 					if (!Array.isArray(entries)) throw new Error("Boundary entries must be an array");
-					// Observers need no new preview. Preserve in-place draft edits, canonical appends
-					// and queue changes, including mutations made before a handler throws.
 					const unchangedEntries = previousEntries
 						? isDeepStrictEqual(previousEntries, entries)
 						: !hadEntries && entries.length === 0;
@@ -1260,10 +1236,8 @@ export class ExtensionRunner {
 						previewRevision === nextRevision &&
 						previewPendingMessages?.length === nextPendingMessages?.length &&
 						(previewPendingMessages?.every((message, index) => message === nextPendingMessages?.[index]) ?? true)
-					) {
+					)
 						continue;
-					}
-
 					previewRevision = nextRevision;
 					previewPendingMessages = nextPendingMessages?.slice();
 					context = structuredClone(
@@ -1284,7 +1258,6 @@ export class ExtensionRunner {
 				}
 			}
 		}
-
 		return valid
 			? {
 					entries: structuredClone(entries),
@@ -1307,7 +1280,6 @@ export class ExtensionRunner {
 
 	emit<TEvent extends RunnerEmitEvent>(event: TEvent, signal?: AbortSignal): Promise<RunnerEmitResult<TEvent>> {
 		const dispatch = this.emitEvent(event, signal);
-		// Observer-only emitters may be fire-and-forget. Still observe terminal rejection.
 		void dispatch.catch(() => {});
 		return dispatch;
 	}
@@ -1316,7 +1288,6 @@ export class ExtensionRunner {
 		event: TEvent,
 		operationSignal?: AbortSignal,
 	): Promise<RunnerEmitResult<TEvent>> {
-		// Join before any observer, persistence, or cancellation can skip finalization.
 		if (event.type === "tool_execution_end") {
 			await this.closeToolScope(event.toolCallId);
 		} else if (event.type === "agent_end") {
@@ -1330,8 +1301,6 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, event.type)) {
 			for (const handler of handlers) {
 				try {
-					// Observers never receive writable aliases to native state or finalized history.
-					// Keep AbortSignal identity: structured cloning cannot preserve its behavior.
 					const snapshot =
 						"signal" in event
 							? { ...isolateValue({ ...event, signal: undefined }), signal: event.signal }
@@ -1402,8 +1371,6 @@ export class ExtensionRunner {
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "message_end")) {
 			for (const handler of handlers) {
 				try {
-					// A cancelled handler can outlive disposal. Neither its draft nor a
-					// returned replacement may alias finalized state, including nested content.
 					const draft = isolateValue(currentMessage);
 					const currentEvent: MessageEndEvent = { ...event, message: draft };
 					const handlerResult = (await this.dispatchHandler(handler, currentEvent, ctx, signal)) as
@@ -1463,16 +1430,14 @@ export class ExtensionRunner {
 					if (result === null || typeof result !== "object" || Array.isArray(result)) {
 						throw new Error("Invalid partial tool result handler return");
 					}
-					// The documented optional partialResult permits an object to leave the snapshot unchanged.
 					if (result.partialResult === undefined) continue;
 					if (
 						result.partialResult === null ||
 						typeof result.partialResult !== "object" ||
 						Array.isArray(result.partialResult) ||
 						!Array.isArray(result.partialResult.content)
-					) {
+					)
 						throw new Error("Invalid partial tool result");
-					}
 					currentEvent.partialResult = result.partialResult;
 				}
 			}
@@ -1481,7 +1446,7 @@ export class ExtensionRunner {
 			}
 			return { partialResult: isolateValue(currentEvent.partialResult) };
 		} catch {
-			// A redactor failure must never expose its input, including through diagnostics.
+			// Redactor failures must not expose input, including through diagnostics.
 			this.emitError({
 				extensionPath,
 				event: "tool_partial_result",
@@ -1590,11 +1555,9 @@ export class ExtensionRunner {
 		signal = this.dispatchSignal(event.type, signal);
 		signal?.throwIfAborted();
 		const ctx = this.createContext();
-
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "bash_spawn")) {
 			for (const handler of handlers) {
 				try {
-					// Attestation cannot rewrite the executor or another handler's view.
 					const result = (await this.dispatchHandler(handler, structuredClone(event), ctx, signal)) as
 						| BashSpawnEventResult
 						| undefined;
@@ -1612,7 +1575,6 @@ export class ExtensionRunner {
 				}
 			}
 		}
-
 		return undefined;
 	}
 
@@ -1801,7 +1763,6 @@ export class ExtensionRunner {
 		systemPromptOptions: BuildSystemPromptOptions,
 		cancellation?: AbortSignal,
 	): Promise<BeforeAgentStartCombinedResult> {
-		// The originating admission's revocation stops the loop, not only the caller's wait (#132 R4-12).
 		const signal = this.dispatchSignal("before_agent_start", cancellation);
 		signal?.throwIfAborted();
 		const currentOptions = normalizeBuildSystemPromptOptions(systemPromptOptions);
@@ -1873,9 +1834,9 @@ export class ExtensionRunner {
 		promptPaths: Array<{ path: string; extensionPath: string }>;
 		themePaths: Array<{ path: string; extensionPath: string }>;
 	}> {
+		const ctx = this.createContext();
 		const signal = this.dispatchSignal("resources_discover");
 		signal?.throwIfAborted();
-		const ctx = this.createContext();
 		const skillPaths: Array<{ path: string; extensionPath: string }> = [];
 		const promptPaths: Array<{ path: string; extensionPath: string }> = [];
 		const themePaths: Array<{ path: string; extensionPath: string }> = [];
@@ -1929,13 +1890,11 @@ export class ExtensionRunner {
 
 		for (const { ext, handlers } of snapshotEventHandlers(this.extensions, "input")) {
 			for (const handler of handlers) {
-				// Cancelled input stops dispatch; the caller already refused the submission.
 				signal?.throwIfAborted();
 				try {
 					const event: InputEvent = {
 						type: "input",
 						text: currentText,
-						// Handlers get detached images: a late in-place edit cannot change retained or recovered originals (#132 R4-6).
 						images: currentImages?.map((image) => ({ ...image })),
 						source,
 						streamingBehavior,

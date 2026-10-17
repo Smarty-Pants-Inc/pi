@@ -65,10 +65,9 @@ describe("builtin providers", () => {
 		const all = models.getModels();
 		expect(all.length).toBeGreaterThan(500);
 
-		// Kimi Coding may be omitted from generated catalogs.
 		for (const provider of providers) {
 			const list = models.getAllModels(provider.id);
-			if (provider.id !== "kimi-coding") expect(list.length).toBeGreaterThan(0);
+			expect(list.length).toBeGreaterThan(0);
 			expect(list.every((m) => m.provider === provider.id)).toBe(true);
 		}
 		expect(getBuiltinModel("radius", "balanced")).toMatchObject({
@@ -193,7 +192,7 @@ describe("builtin providers", () => {
 			["openrouter", "openai/gpt-5.6-terra"],
 		] as const;
 		const unsupported = [
-			["fireworks", "accounts/fireworks/models/inkling"],
+			["fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4"],
 			["openai", "gpt-4.1"],
 			["openai", "gpt-5.2"],
 			["anthropic", "claude-sonnet-4-5"],
@@ -273,20 +272,17 @@ describe("builtin providers", () => {
 		}
 	});
 
-	it.skipIf(!getBuiltinModel("kimi-coding", "k3"))(
-		"uses API-equivalent implied pricing for Kimi Coding subscription models",
-		() => {
-			const models = builtinModels();
-			const expectedCosts = {
-				k3: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
-				"kimi-for-coding-highspeed": { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
-			};
+	it("uses API-equivalent implied pricing for Kimi Coding subscription models", () => {
+		const models = builtinModels();
+		const expectedCosts = {
+			k3: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 },
+			"kimi-for-coding-highspeed": { input: 1.9, output: 8, cacheRead: 0.38, cacheWrite: 0 },
+		};
 
-			for (const [modelId, cost] of Object.entries(expectedCosts)) {
-				expect(models.getModel("kimi-coding", modelId)?.cost).toEqual(cost);
-			}
-		},
-	);
+		for (const [modelId, cost] of Object.entries(expectedCosts)) {
+			expect(models.getModel("kimi-coding", modelId)?.cost).toEqual(cost);
+		}
+	});
 
 	it("resolves Anthropic bearer auth from env with auth token precedence", async () => {
 		const models = createModels({

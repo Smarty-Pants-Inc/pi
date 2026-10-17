@@ -113,8 +113,6 @@ import {
 	resolveModelScopeFromModels,
 } from "../../core/model-resolver.ts";
 import { CredentialSynchronizationError } from "../../core/model-runtime.ts";
-import type { NativeTuiAuditState } from "../../core/ordinary-operational-audit.ts";
-import { bindOrdinaryTuiAudit } from "../../core/ordinary-owner-context.ts";
 import { writeStdoutBounded } from "../../core/output-guard.ts";
 import { DefaultPackageManager } from "../../core/package-manager.ts";
 import { RADIUS_MCP_URL, RADIUS_PROVIDER_ID } from "../../core/radius.ts";
@@ -529,13 +527,15 @@ export class InteractiveMode {
 	private onInputCallback?: (input: ReceivedInput) => void;
 	private pendingUserInputs: ReceivedInput[] = [];
 	private readonly inputPlan: ModeInputPlan;
+	private readonly transferredStartupInputs = new WeakSet<ReceivedInput>();
 	private userInputInFlight = false;
 	private inFlightUserInput?: ReceivedInput;
 	private operatorExitRequested = false;
+	private operatorExitInputsSaved = false;
 	private confirmUnsentDiscard = false;
+	private confirmedUnsentSession?: AgentSession;
 	private confirmedUnsentRevision?: number;
 	private readonly compactionTransferInputs = new Set<CompactionQueuedMessage>();
-	private readonly stagingAudit?: (kind: string) => void;
 	private activeStatusIndicator: StatusIndicator | undefined = undefined;
 	private activeWorkingIndicatorEmbedded = false;
 	private readonly idleStatus = new IdleStatus();
@@ -667,11 +667,6 @@ export class InteractiveMode {
 
 	constructor(runtimeHost: AgentSessionRuntime, options: InteractiveModeOptions = {}) {
 		this.runtimeHost = runtimeHost;
-		const originalSession = this.session;
-		this.stagingAudit = bindOrdinaryTuiAudit(runtimeHost.services, originalSession, this, () => {
-			if (this.session !== originalSession) throw new Error("OWNER_RUNTIME_SESSION");
-			return this.stagingState();
-		});
 		setCapabilityOverrides(this.settingsManager.getTerminalCapabilityOverrides());
 		const tuiMode = options.tuiMode ?? this.settingsManager.getTuiMode();
 		this.options = { ...options, tuiMode };
@@ -690,7 +685,6 @@ export class InteractiveMode {
 			void this.checkShutdownRequested().catch((cause: unknown) =>
 				this.uncaughtCrash(cause instanceof Error ? cause : new Error(String(cause))),
 			);
-			// A pending shutdown request withholds session_ready, so it cannot start a turn first.
 			return this.shutdownRequested;
 		});
 		this.runtimeHost.setRebindSession(async () => {
@@ -704,7 +698,7 @@ export class InteractiveMode {
 			logDirectory: getAgentDir(),
 			terminal: options.terminal,
 			onRightClickPaste: this.onRightClickPaste,
-			fullscreenCopyOnSelect: !this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect(),
+			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 			fullscreenWheelScrollLines: this.settingsManager.getFullscreenWheelScrollLines(),
 		});
 		this.ui = createInteractiveTuiReference(() => this.renderer);
@@ -750,15 +744,6 @@ export class InteractiveMode {
 			onChanged: () => this.updateEditorBorderColor(),
 			initialThemeSetting: options.initialThemeSetting,
 		});
-	}
-
-	private stagingState(): NativeTuiAuditState {
-		return {
-			pendingUserInputs: this.pendingUserInputs.length,
-			userInputInFlight: this.userInputInFlight,
-			compactionQueuedMessages: this.compactionQueuedMessages.length,
-			compactionQueueTransfers: this.compactionQueueTransfers,
-		};
 	}
 
 	private getAutocompleteSourceTag(sourceInfo?: SourceInfo): string | undefined {
@@ -1001,7 +986,7 @@ export class InteractiveMode {
 			logDirectory: getAgentDir(),
 			terminal,
 			onRightClickPaste: this.onRightClickPaste,
-			fullscreenCopyOnSelect: !this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect(),
+			fullscreenCopyOnSelect: this.settingsManager.getFullscreenCopyOnSelect(),
 			fullscreenWheelScrollLines: this.settingsManager.getFullscreenWheelScrollLines(),
 		});
 		nextUi.setClearOnShrink(clearOnShrink);
@@ -1085,7 +1070,7 @@ export class InteractiveMode {
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		const herdrInput = this.options.herdrInput;
 		if (herdrInput && this.ui.terminal instanceof ProcessTerminal) {
-			// Bytes outside the epoch (typed before the marker) are not attested: they taint the draft (pi#160).
+			// Bytes typed before the epoch marker are not attested: they taint the draft (pi#160).
 			this.ui.terminal.setInputMeter(herdrInput.meter, () => this.defaultEditor.markDraftTainted());
 			herdrInput.handOff();
 		} else herdrInput?.shutdown();
@@ -1179,22 +1164,18 @@ export class InteractiveMode {
 		// Ensure fd and rg are available after mounting the TUI (downloads if missing, adds to PATH via getBinDir)
 		// so slow downloads do not make startup appear frozen.
 		// Both are needed: fd for autocomplete, rg for grep tool and bash commands.
-		if (!this.stagingAudit) {
-			const [fdPath] = await Promise.all([
-				ensureTool("fd", (status) => this.showManagedToolStatus(status)),
-				ensureTool("rg", (status) => this.showManagedToolStatus(status)),
-			]);
-			this.fdPath = fdPath;
-		}
+		const [fdPath] = await Promise.all([
+			ensureTool("fd", (status) => this.showManagedToolStatus(status)),
+			ensureTool("rg", (status) => this.showManagedToolStatus(status)),
+		]);
+		this.fdPath = fdPath;
 
 		// Enable the remaining input handlers only after managed-tool setup completes.
 		this.setupKeyHandlers();
 		this.setupEditorSubmitHandler();
 		this.ui.requestRender();
 
-		// Initial binding cancellation is expected during terminal shutdown.
-		// Observe it here so run/main cannot become an unhandled rejection that
-		// cuts off asynchronous session_shutdown cleanup and terminal restoration.
+		// Shutdown owns cancellation and cleanup of an initial bind.
 		try {
 			await this.rebindCurrentSession();
 		} catch (error) {
@@ -1202,9 +1183,8 @@ export class InteractiveMode {
 				!this.shutdownCompletion ||
 				!this.session.shutdownSignal.aborted ||
 				error !== this.session.shutdownSignal.reason
-			) {
+			)
 				throw error;
-			}
 			await this.shutdownCompletion;
 			return;
 		}
@@ -1264,7 +1244,7 @@ export class InteractiveMode {
 			return;
 		}
 
-		if (!this.stagingAudit && !process.env.PI_OFFLINE) {
+		if (!process.env.PI_OFFLINE) {
 			const controller = new AbortController();
 			const timeout = setTimeout(() => controller.abort(), 15_000);
 			void refreshModelCatalogs(this.session.modelRuntime, controller.signal)
@@ -1273,37 +1253,34 @@ export class InteractiveMode {
 				.finally(() => clearTimeout(timeout));
 		}
 
-		// These optional processes/network requests have no owned recipe grant.
-		if (!this.stagingAudit) {
-			// Start version check asynchronously
-			checkForNewPiVersion(this.version).then((newRelease) => {
-				if (newRelease) {
-					this.showNewVersionNotification(newRelease);
+		// Start version check asynchronously
+		checkForNewPiVersion(this.version).then((newRelease) => {
+			if (newRelease) {
+				this.showNewVersionNotification(newRelease);
+			}
+		});
+
+		// Start package update check asynchronously
+		this.checkForPackageUpdates()
+			.then((updates) => {
+				if (updates.length > 0) {
+					this.showPackageUpdateNotification(updates);
+				}
+			})
+			.finally(() => {
+				// On Windows, npm can overwrite the shared console title while checking
+				// extension package versions. Restore Pi's title after the startup check.
+				if (process.platform === "win32" && this.isInitialized) {
+					this.updateTerminalTitle();
 				}
 			});
 
-			// Start package update check asynchronously
-			this.checkForPackageUpdates()
-				.then((updates) => {
-					if (updates.length > 0) {
-						this.showPackageUpdateNotification(updates);
-					}
-				})
-				.finally(() => {
-					// On Windows, npm can overwrite the shared console title while checking
-					// extension package versions. Restore Pi's title after the startup check.
-					if (process.platform === "win32" && this.isInitialized) {
-						this.updateTerminalTitle();
-					}
-				});
-
-			// Check tmux keyboard setup asynchronously
-			this.checkTmuxKeyboardSetup().then((warning) => {
-				if (warning) {
-					this.showWarning(warning);
-				}
-			});
-		}
+		// Check tmux keyboard setup asynchronously
+		this.checkTmuxKeyboardSetup().then((warning) => {
+			if (warning) {
+				this.showWarning(warning);
+			}
+		});
 
 		// Show startup warnings
 		const { migratedProviders, startupDiagnostics, modelFallbackMessage } = this.options;
@@ -1341,35 +1318,29 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
-		// Foreign input is a visible draft, never an automatic resume submission.
+		// Foreign input is an editable draft, never an automatic resume submission.
 		this.restoreUnsentInputDrafts();
-		// Resume operator-exit input without waiting for another editor submission.
 		await this.session.resumeUnsentInputs();
 
-		// Process initial messages
+		// Process initial messages without replacing their captured occurrence receipts.
 		if (this.inputPlan.initial) await this.submitStartupInput(this.inputPlan.initial);
-		for (const input of this.inputPlan.remaining) {
-			await this.submitStartupInput(input);
-		}
-
-		// Main interactive loop
+		for (const input of this.inputPlan.remaining) await this.submitStartupInput(input);
 		while (true) await this.submitUserInput(await this.getReceivedUserInput());
 	}
 
 	private async submitUserInput(userInput: ReceivedInput): Promise<void> {
 		try {
 			const prompt = this.promptWithRecoveredImages(userInput);
-			// Original session preflight owns the input before TUI staging clears.
+			// Session preflight owns the input before TUI staging clears.
 			this.userInputInFlight = false;
 			this.inFlightUserInput = undefined;
-			this.stagingAudit?.("input-transferred");
 			await prompt;
 		} catch (error: unknown) {
 			if (!this.handleInputAdmissionError(error, userInput.text))
 				this.showError(error instanceof Error ? error.message : "Unknown error occurred");
 		} finally {
 			this.userInputInFlight = false;
-			this.stagingAudit?.("input-settled");
+			this.inFlightUserInput = undefined;
 			await this.checkShutdownRequested();
 		}
 	}
@@ -1471,7 +1442,7 @@ export class InteractiveMode {
 	}
 
 	private reportInstallTelemetry(version: string): void {
-		if (this.stagingAudit || process.env.PI_OFFLINE) {
+		if (process.env.PI_OFFLINE) {
 			return;
 		}
 
@@ -2079,6 +2050,10 @@ export class InteractiveMode {
 		}
 	}
 
+	private getPendingStartupInputs(): ReceivedInput[] {
+		return this.inputPlan.remaining.filter((input) => !this.transferredStartupInputs.has(input));
+	}
+
 	/**
 	 * Initialize the extension system with TUI-based UI context.
 	 */
@@ -2092,30 +2067,43 @@ export class InteractiveMode {
 				!this.terminalShutdownRequested &&
 				!this.operatorExitRequested &&
 				(this.session !== session ||
+					this.getPendingStartupInputs().length > 0 ||
 					this.pendingUserInputs.length > 0 ||
 					this.userInputInFlight ||
 					this.compactionQueuedMessages.length > 0 ||
 					this.compactionQueueTransfers > 0),
 			getPendingInputs: () => [
-				...this.pendingUserInputs.map((input) => ({
+				// Startup suffix occurrences retain their original receipt and order before later editor input.
+				...this.getPendingStartupInputs().map((input) => ({
 					input: this.prepareRecoveredInput(input).input,
 					mode: "steer" as const,
 				})),
-				...(this.inFlightUserInput ? [{ input: this.inFlightUserInput, mode: "steer" as const }] : []),
-				...this.compactionQueuedMessages.map((message) => ({
-					input: this.prepareRecoveredInput(message.input).input,
-					mode: message.mode,
+				// Older dequeued/transferring occurrences precede newly staged input.
+				...(this.inFlightUserInput
+					? [{ input: this.prepareRecoveredInput(this.inFlightUserInput).input, mode: "steer" as const }]
+					: []),
+				...this.pendingUserInputs.map((input) => ({
+					input: this.prepareRecoveredInput(input).input,
+					mode: "steer" as const,
 				})),
 				...[...this.compactionTransferInputs].map((message) => ({
 					input: this.prepareRecoveredInput(message.input).input,
 					mode: message.mode,
 				})),
+				...this.compactionQueuedMessages.map((message) => ({
+					input: this.prepareRecoveredInput(message.input).input,
+					mode: message.mode,
+				})),
 			],
 			clearPendingInputs: () => {
+				// pi#262 / smarty-dev#3155: only the completed save owns cancellation recovery.
+				this.operatorExitInputsSaved = true;
+				for (const input of this.inputPlan.remaining) this.transferredStartupInputs.add(input);
 				this.pendingUserInputs = [];
 				this.inFlightUserInput = undefined;
 				this.userInputInFlight = false;
 				this.compactionQueuedMessages = [];
+				this.compactionTransferInputs.clear();
 			},
 			abortHandler: () => {
 				this.restoreQueuedMessagesToEditor({ abort: true });
@@ -2176,7 +2164,6 @@ export class InteractiveMode {
 			},
 			shutdownHandler: () => {
 				this.shutdownRequested = true;
-				// Native idle completion includes extension-origin handled input and cancelled compaction.
 				void session
 					.waitForIdle()
 					.then(() => this.checkShutdownRequested())
@@ -2185,12 +2172,8 @@ export class InteractiveMode {
 					);
 			},
 			onError: (error) => {
-				if (this.isShuttingDown && error.event === "session_shutdown") {
-					// Cleanup may have already stopped rendering; report incomplete shutdown outside the final frame.
-					console.error(error.error);
-				} else {
-					this.showExtensionError(error.extensionPath, error.error, error.stack);
-				}
+				if (this.isShuttingDown && error.event === "session_shutdown") console.error(error.error);
+				else this.showExtensionError(error.extensionPath, error.error, error.stack);
 			},
 		});
 
@@ -2221,7 +2204,7 @@ export class InteractiveMode {
 		configureHttpDispatcher(this.settingsManager.getHttpIdleTimeoutMs());
 		this.applyFullscreenScrollbarSetting();
 		if (this.renderer instanceof TuiAltScreen) {
-			this.renderer.setCopyOnSelect(!this.stagingAudit && this.settingsManager.getFullscreenCopyOnSelect());
+			this.renderer.setCopyOnSelect(this.settingsManager.getFullscreenCopyOnSelect());
 			this.renderer.setWheelScrollLines(this.settingsManager.getFullscreenWheelScrollLines());
 		}
 		this.footer.setSession(this.session);
@@ -2274,7 +2257,6 @@ export class InteractiveMode {
 	}
 
 	private isTerminalRuntimeCancellation(error: unknown): boolean {
-		// Shutdown owns the cleanup join. An abandoned command must not join it or exit early.
 		return (
 			!!this.shutdownCompletion &&
 			this.session.shutdownSignal.aborted &&
@@ -2282,10 +2264,7 @@ export class InteractiveMode {
 		);
 	}
 
-	/**
-	 * The one admission-recovery path: an authoritative `recoveredInput` receipt is restored exactly
-	 * once and replaces the submitted `original`, which is restored only when no receipt exists.
-	 */
+	/** Restore an authoritative recovery receipt once, falling back to the submitted text. */
 	private handleInputAdmissionError(error: unknown, original?: string): boolean {
 		if (!(error instanceof InputAdmissionError)) return false;
 		const recovered = error.recoveredInput ? this.recoveryText(error.recoveredInput) : original;
@@ -2358,8 +2337,7 @@ export class InteractiveMode {
 	}
 
 	private maybeSuggestBugReport(message: AssistantMessage): void {
-		// A premature close is a provider transport failure. A retried reasoning-only close (smarty-dev#6730) also
-		// arrives here stripped, without the stream observation that made it retryable.
+		// Premature closes are provider transport failures, including stripped reasoning-only retries.
 		if (message.stopReason !== "error" || isRetryableAssistantError(message) || isPrematureStreamError(message))
 			return;
 		if (/\b(?:abort(?:ed)?|cancel(?:l?ed)?)\b/i.test(message.errorMessage ?? "")) return;
@@ -2394,7 +2372,6 @@ export class InteractiveMode {
 		this.chatContainer.clear();
 		this.pendingMessagesContainer.clear();
 		this.compactionQueuedMessages = [];
-		this.stagingAudit?.("session-render-clear");
 		this.streamingComponent = undefined;
 		this.streamingMessage = undefined;
 		this.pendingTools.clear();
@@ -2742,8 +2719,12 @@ export class InteractiveMode {
 		const attestor = this.options.herdrInput?.attestor;
 		const terminal = this.ui.terminal;
 		if (!attestor || !(terminal instanceof ProcessTerminal)) return undefined;
-		return attestor.capture(terminal.inputOffset, {
-			// A custom editor's draft cannot be checked for taint.
+		const offset = terminal.inputOffset;
+		if (offset === undefined) {
+			// A stop/restart ends the enrolled epoch; report this turn's downgrade without reusing it (#3155).
+			this.showWarning("Herdr input attestation unavailable: this typed turn is recorded as terminal.");
+		}
+		return attestor.capture(offset, {
 			tainted: this.defaultEditor.lastSubmitTainted || this.editor !== this.defaultEditor,
 			kind: text.startsWith("/") || text.startsWith("!") ? "discard" : "submit",
 		});
@@ -2752,7 +2733,7 @@ export class InteractiveMode {
 	private addExtensionTerminalInputListener(
 		handler: (data: string) => { consume?: boolean; data?: string } | undefined,
 	): () => void {
-		// An extension that rewrites terminal input taints the draft (smarty-dev#2636).
+		// Rewritten terminal input is not attested client input (smarty-dev#2636).
 		const tainting = (data: string) => {
 			const result = handler(data);
 			if (result?.data !== undefined && result.data !== data) this.defaultEditor.markDraftTainted();
@@ -2812,7 +2793,6 @@ export class InteractiveMode {
 		return {
 			holdState: () =>
 				this.uiHolds.values().next().value?.reason ??
-				// Dialogs replace the main editor; renderer-owned interactions (e.g. fullscreen search) use overlays.
 				(this.ui.hasOverlay() || this.editorContainer.children.some((child) => child !== this.editor)
 					? "dialog"
 					: undefined),
@@ -2837,7 +2817,6 @@ export class InteractiveMode {
 			setTitle: (title) => this.ui.terminal.setTitle(title),
 			custom: (factory, options) => this.showExtensionCustom(factory, options),
 			pasteToEditor: (text) => {
-				// Synthetic paste: not bytes from the terminal client (smarty-dev#2636).
 				this.defaultEditor.markDraftTainted();
 				this.editor.handleInput(`\x1b[200~${text}\x1b[201~`);
 			},
@@ -3078,7 +3057,7 @@ export class InteractiveMode {
 	private setCustomEditorComponent(factory: EditorFactory | undefined): void {
 		this.editorComponentFactory = factory;
 
-		// Save text from current editor before switching
+		// Save expanded text before switching, including collapsed paste content.
 		const currentText = this.editor.getExpandedText?.() ?? this.editor.getText();
 
 		this.disposeActiveSelector();
@@ -3203,6 +3182,7 @@ export class InteractiveMode {
 				if (closed) return;
 				closed = true;
 				try {
+					// Preserve upstream handle-specific removal when another overlay opened above this one.
 					if (isOverlay) handle?.hide();
 					else if (mounted) restoreEditor();
 				} finally {
@@ -3224,11 +3204,10 @@ export class InteractiveMode {
 				try {
 					cleanup();
 				} catch {
-					// Preserve the original failure; cleanup's finally already released the hold.
+					// Preserve the original failure; cleanup already released the hold.
 				}
 				reject(error);
 			};
-			// Reload/session reset dismisses the interaction even if its async factory has not returned yet.
 			const release = this.beginUIHold("custom", () => close(undefined as T));
 			try {
 				Promise.resolve(factory(this.ui, theme, this.keybindings, close))
@@ -3357,17 +3336,12 @@ export class InteractiveMode {
 	}
 
 	private async handleRightClickPaste(): Promise<void> {
-		if (this.stagingAudit) {
-			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
-			return;
-		}
 		const target = this.renderer.getFocusedComponent();
 		const handleInput = target?.handleInput;
 		if (!target || !handleInput) return;
 		try {
 			const text = await readClipboardText();
 			if (!text || this.renderer.getFocusedComponent() !== target) return;
-			// Clipboard text is synthetic, not attested terminal bytes (pi#160).
 			if (target === this.defaultEditor) this.defaultEditor.markDraftTainted();
 			handleInput.call(target, `\x1b[200~${text}\x1b[201~`);
 			this.ui.requestRender();
@@ -3377,25 +3351,18 @@ export class InteractiveMode {
 	}
 
 	private async handleClipboardPaste(): Promise<void> {
-		if (this.stagingAudit) {
-			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
-			return;
-		}
 		try {
 			const filePaths = await readClipboardFilePaths();
 			if (filePaths) {
 				if (filePaths.some((filePath) => /\p{Cc}/u.test(filePath))) {
 					throw new Error("Clipboard file path contains control characters");
 				}
-				// Also derive shell context from the current text: an older bash command that finishes
-				// can reset the mode flag while a newer `!` command is in the editor.
 				const text = this.editor.getText?.() ?? "";
 				const shellInput = this.isBashMode || text.trimStart().startsWith("!");
 				const cursor = this.editor.getCursor?.();
 				const lines = text.split("\n");
 				const currentLine = cursor ? (lines[cursor.line] ?? "") : "";
 				if (shellInput) {
-					// Quoting only protects a path at an unquoted shell position.
 					const beforeCursor = cursor
 						? [...lines.slice(0, cursor.line), currentLine.slice(0, cursor.col)].join("\n")
 						: text;
@@ -3441,10 +3408,7 @@ export class InteractiveMode {
 		this.showStatus("Startup is still in progress");
 	}
 
-	/**
-	 * The editor drops onSubmit's promise, so observe it here (pi#132 R4-4). Shutdown owns exit and
-	 * cleanup: a late failure must neither crash-exit over it nor await its completion.
-	 */
+	/** The editor drops onSubmit's promise; terminal shutdown alone owns cleanup and exit. */
 	private observeSubmitFailure(error: unknown): void {
 		if (this.isTerminalRuntimeCancellation(error)) return;
 		if (this.isShuttingDown) {
@@ -3464,38 +3428,32 @@ export class InteractiveMode {
 				this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
 				return;
 			}
-			// Synchronous, before any await: the cut is this Enter's byte end (smarty-dev#2636, #1515).
+			// Capture this Enter's byte end synchronously, before another terminal frame (smarty-dev#2636).
 			const attested = this.captureHerdrSubmit(text);
 			const input = attested
 				? attested.then((receipt) => receiveInput(text, undefined, receipt))
 				: receiveInput(text);
-			// Reserve FIFO order now, not when the cut answers. Order dispatch starts, not command completion.
 			const started = submitQueue
 				.then(() => input)
 				.then((input) => ({ completion: this.dispatchEditorInput(input) }));
-			// Do not adopt completion here: a held command must not block the next dispatch (pi#160).
+			// Order dispatch starts, not completions: held commands cannot block later input (pi#160).
 			submitQueue = started.then(
 				() => {},
 				() => {},
 			);
-			// Clear only this submission, before the terminal can fill the next draft (pi#160 R9).
 			this.editor.setText("");
 			const { completion } = await started;
-			// The caller still waits for this input's acknowledgement or rejection recovery.
 			await completion;
 		};
-		// Return the observed promise even though the editor itself does not await it.
 		this.defaultEditor.onSubmit = (text: string) =>
 			submit(text).catch((error: unknown) => this.observeSubmitFailure(error));
 		this.ordinaryEditorSubmit = this.defaultEditor.onSubmit;
 	}
 
-	/** Dispatch commands or transfer the same admitted envelope to ordinary prompt handling. */
+	/** Dispatch commands or transfer the same received envelope to ordinary prompt handling. */
 	private async dispatchEditorInput(input: ReceivedInput): Promise<void> {
 		const text = input.text;
 		if (text !== "/quit") this.confirmUnsentDiscard = false;
-
-		// Handle commands
 		if (text === "/settings") {
 			this.showSettingsSelector();
 			return;
@@ -3609,8 +3567,6 @@ export class InteractiveMode {
 			await this.shutdown({ fromQuit: true, discardUnsentInput: this.confirmUnsentDiscard });
 			return;
 		}
-
-		// Handle bash command (! for normal, !! for excluded from context)
 		if (text.startsWith("!")) {
 			const isExcluded = text.startsWith("!!");
 			const command = isExcluded ? text.slice(2).trim() : text.slice(1).trim();
@@ -3622,44 +3578,28 @@ export class InteractiveMode {
 				}
 				this.editor.addToHistory?.(text);
 				await this.handleBashCommand(command, isExcluded);
-				// The user may have typed a new `!` command while this one ran.
 				this.isBashMode = (this.editor.getText?.() ?? "").trimStart().startsWith("!");
 				this.updateEditorBorderColor();
 				return;
 			}
 		}
-
-		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
-			if (this.isExtensionCommand(text)) {
-				await this.submitEditorPrompt(input);
-			} else {
-				this.queueCompactionMessage(input, "steer");
-			}
+			if (this.isExtensionCommand(text)) await this.submitEditorPrompt(input);
+			else this.queueCompactionMessage(input, "steer");
 			return;
 		}
-
-		// If streaming, use prompt() with steer behavior
-		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
 			await this.submitEditorPrompt(input, "steer");
 			return;
 		}
-
-		// Normal message submission
 		this.submitEditorInput(input);
 	}
 
-	/** Shared idle submission path; the caller owns admission before any editor effects. */
 	private submitEditorInput(input: ReceivedInput): void {
 		this.confirmUnsentDiscard = false;
 		this.flushPendingBashComponents();
-		if (this.onInputCallback) {
-			this.onInputCallback(input);
-		} else {
-			this.pendingUserInputs.push(input);
-			this.stagingAudit?.("input-enqueued");
-		}
+		if (this.onInputCallback) this.onInputCallback(input);
+		else this.pendingUserInputs.push(input);
 		this.editor.addToHistory?.(input.text);
 	}
 
@@ -3933,7 +3873,7 @@ export class InteractiveMode {
 				break;
 
 			case "agent_settled":
-				// Public settlement notification still runs inside the native settlement scope.
+				// The public notification still runs inside the settlement scope.
 				setImmediate(() => {
 					void this.checkShutdownRequested();
 				});
@@ -4006,7 +3946,6 @@ export class InteractiveMode {
 						this.chatContainer.addChild(new ThemedText(() => theme.fg("error", errorMessage), 1, 0));
 					}
 				}
-				// Failed or cancelled compaction must not submit queued work or restart compaction.
 				if (event.result && !event.aborted) {
 					void this.flushCompactionQueue({ willRetry: event.willRetry });
 				}
@@ -4023,12 +3962,6 @@ export class InteractiveMode {
 				this.showStatusIndicator(
 					new RetryStatusIndicator(this.ui, event.attempt, event.maxAttempts, event.delayMs, event.waitMessage),
 				);
-				this.ui.requestRender();
-				break;
-			}
-
-			case "auto_retry_fallback": {
-				this.showWarning(`Failed over from ${event.fromModel} to ${event.toModel} after ${event.attempt} retries`);
 				this.ui.requestRender();
 				break;
 			}
@@ -4175,6 +4108,7 @@ export class InteractiveMode {
 					message.truncated ? ({ truncated: true } as TruncationResult) : undefined,
 					message.fullOutputPath,
 					message.fullOutputTruncation,
+					message.fullOutputError,
 				);
 				this.chatContainer.addChild(component);
 				break;
@@ -4220,11 +4154,11 @@ export class InteractiveMode {
 			case "user": {
 				const textContent = this.getUserMessageText(message);
 				if (textContent) {
+					if (this.chatContainer.children.length > 0) {
+						this.chatContainer.addChild(new Spacer(1));
+					}
 					const skillBlock = parseSkillBlock(textContent);
 					if (skillBlock) {
-						if (this.chatContainer.children.length > 0) {
-							this.chatContainer.addChild(new Spacer(1));
-						}
 						// Render skill block (collapsible)
 						const component = new SkillInvocationMessageComponent(
 							skillBlock,
@@ -4235,16 +4169,12 @@ export class InteractiveMode {
 						this.chatContainer.addChild(component);
 						// Render user message separately if present
 						if (skillBlock.userMessage) {
+							this.chatContainer.addChild(new Spacer(1));
 							const userComponent = new UserMessageComponent(
 								skillBlock.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								this.outputPad,
 								this.getMarkdownTransformers(),
-								{
-									renderer: this.session.extensionRunner.getUserMessageRenderer(),
-									timestamp: message.timestamp,
-									leadingSpacer: true,
-								},
 							);
 							this.chatContainer.addChild(userComponent);
 						}
@@ -4254,11 +4184,6 @@ export class InteractiveMode {
 							this.getMarkdownThemeWithSettings(),
 							this.outputPad,
 							this.getMarkdownTransformers(),
-							{
-								renderer: this.session.extensionRunner.getUserMessageRenderer(),
-								timestamp: message.timestamp,
-								leadingSpacer: this.chatContainer.children.length > 0,
-							},
 						);
 						this.chatContainer.addChild(userComponent);
 					}
@@ -4539,16 +4464,13 @@ export class InteractiveMode {
 		if (queuedInput !== undefined) {
 			this.userInputInFlight = true;
 			this.inFlightUserInput = queuedInput;
-			this.stagingAudit?.("input-dequeued");
 			return queuedInput;
 		}
-
 		return new Promise((resolve) => {
 			this.onInputCallback = (input: ReceivedInput) => {
 				this.onInputCallback = undefined;
 				this.userInputInFlight = true;
 				this.inFlightUserInput = input;
-				this.stagingAudit?.("input-delivered");
 				resolve(input);
 			};
 		});
@@ -4604,7 +4526,6 @@ export class InteractiveMode {
 				await this.runtimeHost.dispose({
 					terminal: true,
 					beforeShutdown: async () => {
-						// Cancellation releases native admission first; each transfer catch owns recovery.
 						while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
 					},
 					rejectQueuedInput: (messages) => {
@@ -4619,20 +4540,8 @@ export class InteractiveMode {
 		this.shutdownCompletion = (async () => {
 			let terminalStopped = false;
 			try {
-				// Keep signal handlers registered until terminal cleanup has completed.
-				// `signal-exit` checks the listener list during the same SIGTERM/SIGHUP
-				// dispatch and re-sends the signal if only its own listeners remain.
-
+				// Retain signal ownership through asynchronous session cleanup and terminal restoration.
 				if (options?.fromSignal) {
-					// Signal-triggered shutdown (SIGTERM/SIGHUP). Emit extension cleanup
-					// (session_shutdown) BEFORE touching the terminal. Extension teardown
-					// such as removing sockets does not write to the tty, so it must not be
-					// skipped if a later terminal-restore write fails on a dead or stalled
-					// terminal. If the terminal is gone, the restore writes below emit EIO,
-					// which the stdout/stderr error handler turns into emergencyTerminalExit;
-					// the render loop is already idle, so this cannot hot-spin (see #4144).
-					// Custom interactions restore their saved editor on close. Close them
-					// before transferring staged text/images so cleanup cannot overwrite recovery.
 					this.cancelUIHolds();
 					this.disposeActiveSelector();
 					for (const input of this.pendingUserInputs.splice(0)) this.restoreRejectedInput(input.text);
@@ -4641,7 +4550,6 @@ export class InteractiveMode {
 					await this.runtimeHost.dispose({
 						terminal: true,
 						beforeShutdown: async () => {
-							// Cancellation releases native admission first; each transfer catch owns recovery.
 							while (this.compactionQueueWork.size > 0) await Promise.allSettled([...this.compactionQueueWork]);
 						},
 						rejectQueuedInput: (messages) => {
@@ -4653,11 +4561,6 @@ export class InteractiveMode {
 					await this.ui.terminal.drainInput(1000);
 					this.stop();
 				} else {
-					// Interactive quit (Ctrl+D, Ctrl+C, /quit, extension shutdown()). Stop the
-					// TUI before emitting shutdown events so extension UI cleanup cannot repaint
-					// the final frame while the process is exiting.
-					// Drain any in-flight Kitty key release events before stopping.
-					// This prevents escape sequences from leaking to the parent shell over slow SSH.
 					this.operatorExitRequested = true;
 					const unsentInputBlocks: string[] = [];
 					try {
@@ -4667,6 +4570,7 @@ export class InteractiveMode {
 								options?.fromQuit === true &&
 								options.discardUnsentInput === true &&
 								this.confirmUnsentDiscard &&
+								this.confirmedUnsentSession === this.session &&
 								this.confirmedUnsentRevision === this.session.queuedInputRevision,
 							bufferUnsentInput: (block) => unsentInputBlocks.push(block),
 							beforeShutdown: async () => {
@@ -4680,7 +4584,7 @@ export class InteractiveMode {
 						});
 					} finally {
 						if (unsentInputBlocks.length > 0) {
-							// Even failed/upgraded disposal must report retained text, never before the final redraw.
+							// Never print retained input before the last redraw, even on failed/upgraded disposal.
 							if (!terminalStopped) {
 								this.stop();
 								terminalStopped = true;
@@ -4699,14 +4603,12 @@ export class InteractiveMode {
 							`INPUT_ADMISSION_SHUTDOWN: recovered draft ${JSON.stringify({ text: draft, images })}\n`,
 							RECOVERY_OUTPUT_TIMEOUT_MS,
 						);
-						// An unread terminal did not take the recovery receipt: exit nonzero, never hang.
 						if (delivery === "incomplete") process.exit(RECOVERY_OUTPUT_INCOMPLETE_EXIT_CODE);
 					}
 				} else {
-					const resumeCommand = this.stagingAudit ? undefined : formatResumeCommand(this.sessionManager);
+					const resumeCommand = formatResumeCommand(this.sessionManager);
 					if (resumeCommand) process.stdout.write(`${chalk.dim("To resume this session:")} ${resumeCommand}\n`);
 				}
-
 				process.exit(0);
 			} catch (error) {
 				if (terminalStopped || this.terminalShutdownRequested) throw error;
@@ -4718,10 +4620,15 @@ export class InteractiveMode {
 					)
 				) {
 					this.confirmUnsentDiscard = options?.fromQuit === true;
+					this.confirmedUnsentSession = this.session;
 					this.confirmedUnsentRevision = this.session.queuedInputRevision;
 					this.showWarning(error.message.slice("INPUT_ADMISSION_BUSY: ".length));
-				} else if (!this.handleInputAdmissionError(error)) throw error;
-				// Admission refusal precedes terminal teardown: the old session remains usable.
+				} else if (!this.handleInputAdmissionError(error)) {
+					// pi#262 / smarty-dev#3155: a failed durable save is a refusal, not a terminal crash.
+					if (this.operatorExitInputsSaved || this.session.shutdownSignal.aborted) throw error;
+					this.showError(`Failed to save unsent input: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				// Admission refusal precedes teardown; the old session remains usable.
 				this.isShuttingDown = false;
 				this.operatorExitRequested = false;
 				this.shutdownCompletion = undefined;
@@ -4782,7 +4689,6 @@ export class InteractiveMode {
 	 * Check if shutdown was requested and perform shutdown if so.
 	 */
 	private scheduleShutdownRecheck(): void {
-		// A BUSY shutdown attempt must unwind before retrying released transfer custody.
 		setImmediate(() => {
 			void this.checkShutdownRequested().catch((cause: unknown) =>
 				this.uncaughtCrash(cause instanceof Error ? cause : new Error(String(cause))),
@@ -4888,7 +4794,7 @@ export class InteractiveMode {
 	private restoreUnsentInputDrafts(): void {
 		const drafts = this.session.takeUnsentInputDrafts();
 		if (drafts.length === 0) return;
-		// Recover only editable content, not foreign provenance, metadata, or receipt stamps.
+		// Recover editable content only, not foreign provenance, metadata, or receipts.
 		const text = this.recoveryText(
 			drafts.map((message) =>
 				message.role === "custom"
@@ -4921,7 +4827,7 @@ export class InteractiveMode {
 		return text.join("\n");
 	}
 
-	/** Move recovered image markers back into images; the received envelope keeps its receipt. */
+	/** Recover image markers into attachments without replacing the occurrence receipt. */
 	private prepareRecoveredInput(input: ReceivedInput): { input: ReceivedInput; transferred: () => void } {
 		let text = input.text;
 		const images = [...(input.images ?? [])];
@@ -4929,7 +4835,7 @@ export class InteractiveMode {
 		for (const [marker, image] of this.recoveredImages) {
 			if (!text.includes(marker)) continue;
 			text = text.replaceAll(marker, "");
-			images.push({ ...image }); // The recovery map keeps its immutable original (#132 R4-6).
+			images.push({ ...image });
 			markers.push(marker);
 		}
 		return {
@@ -4982,11 +4888,11 @@ export class InteractiveMode {
 			await promptReceived(this.session, input, {
 				onInputTransferred: () => {
 					transferred = true;
+					this.transferredStartupInputs.add(input);
 				},
 			});
 		} catch (error: unknown) {
 			this.showError(error instanceof Error ? error.message : "Unknown error occurred");
-			// Refused, untransferred startup input returns to the editor with its images (#132 R4-11).
 			if (!transferred)
 				this.restoreRejectedInput(
 					this.recoveryText([
@@ -5003,7 +4909,6 @@ export class InteractiveMode {
 	}
 
 	private restoreRejectedInput(text: string): void {
-		// A rejected submission is independent of drafts typed since it was cleared.
 		const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
 		this.editor.setText(draft ? `${draft}\n${text}` : text);
 		this.ui.requestRender();
@@ -5016,28 +4921,18 @@ export class InteractiveMode {
 			this.showError("INPUT_ADMISSION_FENCED: input was not accepted; retry after replacement");
 			return;
 		}
-
-		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
 			const input = receiveInput(text);
 			this.editor.setText("");
-			if (this.isExtensionCommand(text)) {
-				await this.submitEditorPrompt(input);
-			} else {
-				this.queueCompactionMessage(input, "followUp");
-			}
+			if (this.isExtensionCommand(text)) await this.submitEditorPrompt(input);
+			else this.queueCompactionMessage(input, "followUp");
 			return;
 		}
-
-		// Alt+Enter queues a follow-up message (waits until agent finishes)
-		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
 			const input = receiveInput(text);
 			this.editor.setText("");
 			await this.submitEditorPrompt(input, "followUp");
-		}
-		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
-		else if (this.editor.onSubmit) {
+		} else if (this.editor.onSubmit) {
 			if (this.editor.onSubmit !== this.ordinaryEditorSubmit) {
 				this.editor.setText("");
 				await this.editor.onSubmit(text);
@@ -5139,22 +5034,13 @@ export class InteractiveMode {
 	}
 
 	private async handleOpenExternalEditor(): Promise<void> {
-		if (this.stagingAudit) {
-			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
-			return;
-		}
 		const editorCmd = this.settingsManager.getExternalEditorCommand();
 		const content = this.editor.getExpandedText?.() ?? this.editor.getText();
 		const release = this.beginUIHold("editor");
 		try {
 			this.ui.stop();
-			const result = await editInExternalEditor({
-				command: editorCmd,
-				content,
-			});
+			const result = await editInExternalEditor({ command: editorCmd, content });
 			if (result.status === "complete") {
-				// Terminal input is stopped, but asynchronous abort/refusal may restore
-				// additional input while the external editor owns the initiating draft.
 				const draft = this.editor.getExpandedText?.() ?? this.editor.getText();
 				const recovered =
 					draft === content
@@ -5283,7 +5169,6 @@ export class InteractiveMode {
 			.filter((msg) => msg.mode === "followUp")
 			.map((msg) => msg.input.text);
 		this.compactionQueuedMessages = [];
-		this.stagingAudit?.("queues-cleared");
 		return {
 			steering: [...steering, ...compactionSteering],
 			followUp: [...followUp, ...compactionFollowUp],
@@ -5311,7 +5196,6 @@ export class InteractiveMode {
 	}
 
 	private restoreQueuedMessagesToEditor(options?: { abort?: boolean; currentText?: string }): number {
-		// Snapshot complete content before clearQueue destroys the native queues.
 		const messages = this.session.agent.getQueuedMessages();
 		const { steering, followUp } = this.clearAllQueues();
 		const allQueued = [...steering, ...followUp];
@@ -5339,7 +5223,6 @@ export class InteractiveMode {
 	private queueCompactionMessage(input: ReceivedInput, mode: "steer" | "followUp"): void {
 		this.confirmUnsentDiscard = false;
 		this.compactionQueuedMessages.push({ input, mode });
-		this.stagingAudit?.("compaction-enqueued");
 		this.editor.addToHistory?.(input.text);
 		this.updatePendingMessagesDisplay();
 		this.showStatus("Queued message for after compaction");
@@ -5366,26 +5249,25 @@ export class InteractiveMode {
 	}
 
 	private async transferCompactionQueue(options?: { willRetry?: boolean }): Promise<void> {
-		if (this.operatorExitRequested || this.compactionQueuedMessages.length === 0) {
-			return;
-		}
-
+		if (this.operatorExitRequested || this.compactionQueuedMessages.length === 0) return;
 		const queuedMessages = [...this.compactionQueuedMessages];
 		for (const message of queuedMessages) this.compactionTransferInputs.add(message);
 		const session = this.session;
 		const pending = new Set(queuedMessages);
 		const restored = new Set<CompactionQueuedMessage>();
+		let detachedPrompt: CompactionQueuedMessage | undefined;
 		const restoreQueue = (error: unknown, failed = [...pending]) => {
-			if (this.operatorExitRequested) return; // The synchronous durable exit snapshot owns these occurrences.
+			// A failed save still leaves these inputs live; only a complete save owns their recovery.
+			if (this.operatorExitInputsSaved) return;
 			const retained = failed.filter((message) => {
 				pending.delete(message);
+				this.compactionTransferInputs.delete(message);
 				if (restored.has(message)) return false;
 				restored.add(message);
 				return true;
 			});
 			if (this.terminalShutdownRequested) {
 				for (const message of retained) this.restoreRejectedInput(message.input.text);
-				this.stagingAudit?.("compaction-terminal-recovered");
 				return;
 			}
 			const restoring = new Set([
@@ -5396,23 +5278,16 @@ export class InteractiveMode {
 				...queuedMessages.filter((message) => restoring.has(message)),
 				...this.compactionQueuedMessages.filter((message) => !restoring.has(message)),
 			];
-			this.stagingAudit?.("compaction-restored");
 			this.updatePendingMessagesDisplay();
 			this.showError(
-				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
+				`Failed to send queued message${queuedMessages.length > 1 ? "s" : ""}: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		};
-
 		this.compactionQueueTransfers++;
-		this.stagingAudit?.("compaction-transfer-start");
 		try {
 			this.compactionQueuedMessages = [];
-			this.stagingAudit?.("compaction-transfer-dequeued");
 			this.updatePendingMessagesDisplay();
 			if (options?.willRetry) {
-				// When retry is pending, queue messages for the retry turn
 				for (const message of queuedMessages) {
 					if (this.isExtensionCommand(message.input.text)) {
 						await this.promptWithRecoveredImages(
@@ -5425,53 +5300,48 @@ export class InteractiveMode {
 							},
 							session,
 						);
-					} else {
-						await this.queueWithRecoveredImages(message, session);
-					}
+					} else await this.queueWithRecoveredImages(message, session);
 					pending.delete(message);
+					this.compactionTransferInputs.delete(message);
 				}
 				this.updatePendingMessagesDisplay();
 				return;
 			}
-
-			// Find first non-extension-command message to use as prompt
 			const firstPromptIndex = queuedMessages.findIndex((message) => !this.isExtensionCommand(message.input.text));
 			if (firstPromptIndex === -1) {
-				// All extension commands - execute them all
 				for (const message of queuedMessages) {
 					await this.promptWithRecoveredImages(
 						message.input,
 						{
 							onInputTransferred: () => {
 								pending.delete(message);
+								this.compactionTransferInputs.delete(message);
 							},
 						},
 						session,
 					);
 					pending.delete(message);
+					this.compactionTransferInputs.delete(message);
 				}
 				return;
 			}
-
-			// Execute any extension commands before the first prompt
 			const preCommands = queuedMessages.slice(0, firstPromptIndex);
 			const firstPrompt = queuedMessages[firstPromptIndex];
 			const rest = queuedMessages.slice(firstPromptIndex + 1);
-
 			for (const message of preCommands) {
 				await this.promptWithRecoveredImages(
 					message.input,
 					{
 						onInputTransferred: () => {
 							pending.delete(message);
+							this.compactionTransferInputs.delete(message);
 						},
 					},
 					session,
 				);
 				pending.delete(message);
+				this.compactionTransferInputs.delete(message);
 			}
-
-			// Start a prompt when idle, or queue it into a run still finishing compaction.
 			let firstTransferred = false;
 			const started = this.promptWithRecoveredImages(
 				firstPrompt.input,
@@ -5484,24 +5354,20 @@ export class InteractiveMode {
 				},
 				session,
 			);
-			// This promise alone owns restoration of its input, even if a later transfer fails.
+			detachedPrompt = firstPrompt;
 			pending.delete(firstPrompt);
 			const promptPromise = started
 				.catch((error) => {
 					restoreQueue(error, firstTransferred ? [] : [firstPrompt]);
 				})
 				.finally(() => {
+					this.compactionTransferInputs.delete(firstPrompt);
 					this.compactionQueueTransfers--;
-					this.stagingAudit?.("compaction-prompt-settled");
 					this.compactionQueueWork.delete(promptPromise);
 					this.scheduleShutdownRecheck();
 				});
 			this.compactionQueueWork.add(promptPromise);
-			// The detached prompt can restore staging after this flush returns.
 			this.compactionQueueTransfers++;
-			this.stagingAudit?.("compaction-prompt-pending");
-
-			// Queue remaining messages
 			for (const message of rest) {
 				if (this.isExtensionCommand(message.input.text)) {
 					await this.promptWithRecoveredImages(
@@ -5509,23 +5375,24 @@ export class InteractiveMode {
 						{
 							onInputTransferred: () => {
 								pending.delete(message);
+								this.compactionTransferInputs.delete(message);
 							},
 						},
 						session,
 					);
-				} else {
-					await this.queueWithRecoveredImages(message, session);
-				}
+				} else await this.queueWithRecoveredImages(message, session);
 				pending.delete(message);
+				this.compactionTransferInputs.delete(message);
 			}
 			this.updatePendingMessagesDisplay();
 			void promptPromise;
 		} catch (error) {
 			restoreQueue(error);
 		} finally {
-			for (const message of queuedMessages) this.compactionTransferInputs.delete(message);
+			// pi#262 / smarty-dev#3155: the detached prompt can outlive this flush before handoff.
+			for (const message of queuedMessages)
+				if (message !== detachedPrompt) this.compactionTransferInputs.delete(message);
 			this.compactionQueueTransfers--;
-			this.stagingAudit?.("compaction-transfer-settled");
 			this.scheduleShutdownRecheck();
 		}
 	}
@@ -5607,6 +5474,7 @@ export class InteractiveMode {
 					steeringMode: this.session.steeringMode,
 					followUpMode: this.session.followUpMode,
 					transport: this.settingsManager.getTransport(),
+					sessionShareDestination: this.settingsManager.getSessionShareDestination(),
 					httpIdleTimeoutMs: this.settingsManager.getHttpIdleTimeoutMs(),
 					cacheWarmingMode: this.settingsManager.getCacheWarmingMode(),
 					thinkingLevel: this.settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL,
@@ -5677,6 +5545,9 @@ export class InteractiveMode {
 					onTransportChange: (transport) => {
 						this.settingsManager.setTransport(transport);
 						this.session.agent.transport = transport;
+					},
+					onSessionShareDestinationChange: (destination) => {
+						this.settingsManager.setSessionShareDestination(destination);
 					},
 					onHttpIdleTimeoutMsChange: (timeoutMs) => {
 						this.settingsManager.setHttpIdleTimeoutMs(timeoutMs);
@@ -5804,8 +5675,7 @@ export class InteractiveMode {
 					},
 					onFullscreenCopyOnSelectChange: (enabled) => {
 						this.settingsManager.setFullscreenCopyOnSelect(enabled);
-						if (this.renderer instanceof TuiAltScreen)
-							this.renderer.setCopyOnSelect(!this.stagingAudit && enabled);
+						if (this.renderer instanceof TuiAltScreen) this.renderer.setCopyOnSelect(enabled);
 					},
 					onFullscreenWheelScrollLinesChange: (lines) => {
 						this.settingsManager.setFullscreenWheelScrollLines(lines);
@@ -6372,10 +6242,6 @@ export class InteractiveMode {
 				initialFilterMode,
 			);
 			selector.onCopy = async (text) => {
-				if (this.stagingAudit) {
-					this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
-					return;
-				}
 				if (!text) {
 					this.showError("Selected entry has no text to copy");
 					return;
@@ -6445,7 +6311,6 @@ export class InteractiveMode {
 				withSession: options?.withSession,
 				projectTrustContextFactory: (cwd) => this.createProjectTrustContext(cwd),
 			});
-		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
 		try {
 			let status = "Resumed session";
 			let result: { cancelled: boolean };
@@ -7266,7 +7131,6 @@ export class InteractiveMode {
 			return;
 		}
 
-		// One cancellation boundary covers the first attempt, the cwd prompt and the retry (pi#132 R4-4).
 		try {
 			this.clearStatusIndicator();
 			let result: { cancelled: boolean };
@@ -7298,10 +7162,6 @@ export class InteractiveMode {
 	}
 
 	private async handleShareCommand(): Promise<void> {
-		if (this.stagingAudit) {
-			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
-			return;
-		}
 		await shareSession({
 			session: this.session,
 			ui: this.ui,
@@ -7331,10 +7191,6 @@ export class InteractiveMode {
 	private async handleCopyCommand(
 		options: { flashConfirmation?: boolean; preferSelection?: boolean } = {},
 	): Promise<void> {
-		if (this.stagingAudit) {
-			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
-			return;
-		}
 		if (
 			options.preferSelection &&
 			this.ui instanceof TuiAltScreen &&
@@ -7641,10 +7497,6 @@ export class InteractiveMode {
 	}
 
 	private handleDebugCommand(): void {
-		if (this.stagingAudit) {
-			this.showError("OWNER_UI_EFFECT_REQUIRES_RECEIVING");
-			return;
-		}
 		const width = this.ui.terminal.columns;
 		const height = this.ui.terminal.rows;
 		const allLines = this.ui.render(width);
@@ -7708,8 +7560,6 @@ export class InteractiveMode {
 			return;
 		}
 
-		// A hook may outlive ordinary replacement. Its result belongs only to the
-		// originating session, before any receiving-session execution, persistence, or UI.
 		if (session !== this.session || session.isDisposed) {
 			this.handleInputAdmissionError(
 				new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "bash was not executed or recorded"),
@@ -7744,6 +7594,7 @@ export class InteractiveMode {
 				result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
 				result.fullOutputPath,
 				result.fullOutputTruncation,
+				result.fullOutputError,
 			);
 
 			// Record the result in session
@@ -7786,6 +7637,7 @@ export class InteractiveMode {
 					result.truncated ? ({ truncated: true, content: result.output } as TruncationResult) : undefined,
 					result.fullOutputPath,
 					result.fullOutputTruncation,
+					result.fullOutputError,
 				);
 			}
 		} catch (error) {
@@ -7811,7 +7663,6 @@ export class InteractiveMode {
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
 		this.cancelUIHolds();
-		this.stagingAudit?.("detached");
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
@@ -7828,8 +7679,6 @@ export class InteractiveMode {
 			this.stopInteractiveTui(fullscreenExitOutput);
 			this.isInitialized = false;
 		}
-		// Ordinary quit stops the terminal before asynchronous session cleanup. Keep
-		// signal ownership until exit so SIGTERM/SIGHUP can still upgrade that wait.
 		if (!this.isShuttingDown) this.unregisterSignalHandlers();
 	}
 }

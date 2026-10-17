@@ -40,8 +40,6 @@ export {
 	type AgentStartEvent,
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
-	type BashSpawnEvent,
-	type BashSpawnEventResult,
 	type BeforeAgentStartEvent,
 	type BeforeAgentStartEventResult,
 	type BoundaryContextPreview,
@@ -83,11 +81,9 @@ export {
 	type SessionBeforeTreeEvent,
 	type SessionBoundaryDraft,
 	type SessionCompactEvent,
-	type SessionReadyEvent,
 	type SessionShutdownEvent,
 	type SessionStartEvent,
 	type SessionTreeEvent,
-	type SubmitUserMessageOptions,
 	type ToolCallEvent,
 	type ToolCallEventResult,
 	type ToolDefinition,
@@ -96,9 +92,16 @@ export {
 	type TurnEndEvent,
 	type TurnEndEventResult,
 	type TurnStartEvent,
-	type UserMessageReceipt,
-	type UserMessageRenderer,
-	type UserMessageRenderOptions,
 	type WorkingIndicatorOptions,
 } from "./extensions/index.ts";
+export { HOST_CAPABILITIES, type HostCapabilities } from "./host-capabilities.ts";
+export { InputAdmissionError, type InputAdmissionErrorCode } from "./input-admission.ts";
+export { ModelPolicyError, type ModelPolicySettings } from "./model-policy.ts";
 export { createSyntheticSourceInfo } from "./source-info.ts";
+export type {
+	SendUserMessageOptions,
+	SendUserMessageResult,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
+} from "./user-message-metadata.ts";
+export { UserMessageMetadataError, type UserMessageMetadataErrorCode } from "./user-message-metadata.ts";

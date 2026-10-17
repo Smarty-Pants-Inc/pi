@@ -38,6 +38,8 @@ export interface BashExecutionMessage {
 	fullOutputPath?: string;
 	/** Present only when the output log at `fullOutputPath` is capped and omits its middle. */
 	fullOutputTruncation?: FullOutputTruncation;
+	/** Masked reason why the output log is unavailable, even when the preview is complete. */
+	fullOutputError?: string;
 	timestamp: number;
 	/** If true, this message is excluded from LLM context (!! prefix) */
 	excludeFromContext?: boolean;
@@ -95,7 +97,9 @@ export function bashExecutionToText(msg: BashExecutionMessage): string {
 	} else if (msg.exitCode !== null && msg.exitCode !== undefined && msg.exitCode !== 0) {
 		text += `\n\nCommand exited with code ${msg.exitCode}`;
 	}
-	if (msg.truncated && msg.fullOutputPath) {
+	if (msg.fullOutputError) {
+		text += `\n\n[Output log unavailable: ${msg.fullOutputError}]`;
+	} else if (msg.truncated && msg.fullOutputPath) {
 		text += msg.fullOutputTruncation
 			? `\n\n[${formatCappedOutputLogNotice(msg.fullOutputPath, msg.fullOutputTruncation)}]`
 			: `\n\n[Output truncated. Full output: ${msg.fullOutputPath}]`;

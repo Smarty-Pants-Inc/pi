@@ -33,6 +33,8 @@ function assistantEnd(stopReason: AssistantMessage["stopReason"], errorMessage?:
 }
 
 const settled: AgentSessionEvent = { type: "agent_settled", outcome: "completed", aborted: false };
+const failed: AgentSessionEvent = { type: "agent_settled", outcome: "error", aborted: false };
+const aborted: AgentSessionEvent = { type: "agent_settled", outcome: "aborted", aborted: true };
 
 const compactionEnd = (
 	reason: "manual" | "threshold" | "overflow",
@@ -48,40 +50,6 @@ const compactionEnd = (
 
 // #10607
 describe("ProgramStatusReporter", () => {
-	// pi#173: reporting is an optional capability of existing downstream terminals.
-	it("tolerates a Terminal without setProgramStatus throughout its lifecycle", () => {
-		const terminal: Terminal = {
-			start: () => {},
-			stop: () => {},
-			drainInput: async () => {},
-			write: () => {},
-			columns: 80,
-			rows: 24,
-			kittyProtocolActive: false,
-			moveBy: () => {},
-			hideCursor: () => {},
-			showCursor: () => {},
-			clearLine: () => {},
-			clearFromCursor: () => {},
-			clearScreen: () => {},
-			setTitle: () => {},
-			setProgress: () => {},
-		};
-		const reporter = new ProgramStatusReporter(
-			() => terminal,
-			() => "Legacy session",
-		);
-		expect(() => {
-			reporter.report();
-			reporter.handleEvent({ type: "agent_start" });
-			reporter.setBlocked("dialog", { kind: "question", message: "Continue?" });
-			reporter.setBlocked("dialog", undefined);
-			reporter.handleEvent(assistantEnd("stop"));
-			reporter.handleEvent(settled);
-			reporter.reset();
-		}).not.toThrow();
-	});
-
 	it("reports idle, working during a run, and done once it settles", () => {
 		const { reporter, reports, send, last } = setup("Fix login");
 		reporter.report();
@@ -103,18 +71,14 @@ describe("ProgramStatusReporter", () => {
 		send({ type: "agent_start" }, assistantEnd("error", "overloaded"), assistantEnd("stop"), settled);
 		expect(last()).toEqual({ state: "done" });
 
-		send({ type: "agent_start" }, assistantEnd("error", "Invalid API key\n{details}"), settled);
+		send({ type: "agent_start" }, assistantEnd("error", "Invalid API key\n{details}"), failed);
 		expect(last()).toEqual({ state: "error", message: "Invalid API key" });
 
-		send({ type: "agent_start" }, assistantEnd("aborted"), {
-			type: "agent_settled",
-			outcome: "aborted",
-			aborted: true,
-		});
+		send({ type: "agent_start" }, assistantEnd("aborted"), aborted);
 		expect(last()).toEqual({ state: "idle" });
 
 		// Aborted after a successful response, for example in an agent_before_settle hook or a retry delay.
-		send({ type: "agent_start" }, assistantEnd("stop"), { type: "agent_settled", outcome: "aborted", aborted: true });
+		send({ type: "agent_start" }, assistantEnd("stop"), aborted);
 		expect(last()).toEqual({ state: "idle" });
 	});
 
@@ -125,7 +89,7 @@ describe("ProgramStatusReporter", () => {
 			assistantEnd("length"),
 			{ type: "compaction_start", reason: "overflow" },
 			compactionEnd("overflow", { errorMessage: "Compaction failed\nstack" }),
-			settled,
+			failed,
 		);
 		expect(last()).toEqual({ state: "error", message: "Compaction failed" });
 

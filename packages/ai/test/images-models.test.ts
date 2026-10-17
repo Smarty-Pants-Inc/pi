@@ -217,6 +217,26 @@ describe("Models with image models", () => {
 		expect(calls[1].options?.apiKey).toBe("explicit");
 	});
 
+	it("keeps an unknown provider's diagnostic fixed until that provider is registered", async () => {
+		// pi#280: paired control distinguishes safe rejection from disabling image dispatch.
+		const models = createModels({ authContext: fakeAuthContext({}) });
+		const model = imageModel("private-provider-name", "model-a");
+		const calls: GenerateCall[] = [];
+		const missing = await models.generateImages(model, context);
+		expect(missing.stopReason).toBe("error");
+		expect(missing.output).toEqual([]);
+		expect(missing.errorMessage).toBe("Unknown provider");
+		expect(calls).toEqual([]);
+
+		models.setProvider(testProvider({ id: model.provider, calls }));
+		const registered = await models.generateImages(model, context);
+		expect(registered.stopReason).toBe("stop");
+		expect(registered.output).toEqual(okResult(model).output);
+		expect(registered.errorMessage).toBeUndefined();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].model).toEqual(model);
+	});
+
 	it("merges provider-resolved env and applies header transforms", async () => {
 		const calls: GenerateCall[] = [];
 		const models = createModels();
@@ -265,8 +285,11 @@ describe("Models with image models", () => {
 
 		const ghost = await models.generateImages(imageModel("ghost", "m"), context);
 		expect(ghost.stopReason).toBe("error");
-		// pi#127: setup diagnostics come from fixed codes, not caller-owned identifiers.
+		// pi#127, pi#280: setup diagnostics are fixed codes, not caller-owned identifiers.
 		expect(ghost.errorMessage).toBe("Unknown provider");
+		const otherGhost = await models.generateImages(imageModel("private-provider-name", "m"), context);
+		expect(otherGhost.stopReason).toBe("error");
+		expect(otherGhost.errorMessage).toBe(ghost.errorMessage);
 
 		// Unconfigured auth is an error, matching stream().
 		const calls: GenerateCall[] = [];

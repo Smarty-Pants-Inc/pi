@@ -319,7 +319,7 @@ const harness = await Harness.open(storage, {
 		compaction: { reserveTokens: 16384 },
 		progress: { partialIntervalMs: 100, outputIntervalMs: 100 },
 		toolExecution: "parallel",
-		contextRetentionMs: 600_000, // idle context expiry is checked lazily on the next task/read event; no idle timer
+		contextRetentionMs: 600_000, // idle conversations keep their context in memory this long (checked lazily where timers cannot be unreferenced)
 		documentRetentionMs: 600_000, // loaded documents nothing observes stay in memory this long after their last use; observed ones always
 		get followUpMode() {
 			return userSettings.followUpMode;
@@ -661,6 +661,23 @@ const usage = await harness.usage(context); // { models: { "openai/gpt-6-sol": U
 | SQLite | `openNodeSqliteStorage(file)` from `@earendil-works/pi-durable/storage/sqlite/node` | One database file. WAL mode with `synchronous = NORMAL`: commits survive process crashes; the newest may be lost on power or host failure. |
 | JSONL | `openNodeJsonlStorage(directory, context)` from `@earendil-works/pi-durable/storage/jsonl/node` | Append-only files in one directory. Pass `{ fsync: true }` to flush before each commit marker. Keeps the whole history in memory too, so memory grows with it; use SQLite for long-running agents. |
 | Cloudflare Durable Object | `openDurableObjectSqliteStorage(ctx.storage)` from `@earendil-works/pi-durable/storage/sqlite/cloudflare` | The SQLite storage of one SQLite-backed Durable Object; commits are its storage transactions. |
+
+SQLite storage can namespace its tables and indexes when sharing a database: pass `{ prefix: "pi_" }` to
+`SqliteStorage.open(database, options)`, `openNodeSqliteStorage(path, options)`, or
+`openDurableObjectSqliteStorage(ctx.storage, options)`. Storage renders the prefixed names into its SQL, so adapters
+need no support. A prefix must be a SQLite identifier and cannot begin with `sqlite_`; a host may reserve more, such
+as `_cf_` in Durable Objects. Changing the prefix does not migrate existing data.
+
+Multiple Pi storages opened through the Cloudflare adapter with the same storage object automatically share an
+operation queue. To share the database with host tables, create an adapter and use it for both Pi and all host queries;
+direct storage calls bypass the queue and may be rolled back with a Pi transaction:
+
+```typescript
+const database = new DurableObjectSqliteDatabase(ctx.storage);
+const piStorage = await SqliteStorage.open(database, { prefix: "pi_" });
+await database.exec("CREATE TABLE IF NOT EXISTS host_notes (text TEXT)");
+await database.run("INSERT INTO host_notes (text) VALUES (?)", text);
+```
 
 One process owns a storage at a time; there is no cross-process locking. The portable SQLite and JSONL cores (`/storage/sqlite`, `/storage/jsonl`) run without Node APIs, for example on Bun or in Cloudflare Durable Objects, given an asynchronous `SqliteDatabase` facade or a `FileSystem` from `@earendil-works/pi-durable/env`.
 

@@ -23,12 +23,6 @@ export function requestSetupError(error: unknown, preserveCode = false): SafeSet
 	return new SafeSetupError("setup_ThrownValue");
 }
 
-/**
- * Auth and request preparation fail with value-free `SafeSetupError` categories.
- * A provider's own setup error keeps its message: the stream's live-secret
- * protection masks it when it is pushed. A `ModelsError` can append a raw cause,
- * and other thrown values are untrusted, so both become fixed categories.
- */
 function setupErrorText(error: unknown): string {
 	try {
 		if (error instanceof SafeSetupError) return new SafeSetupError(error.code).message;
@@ -37,7 +31,7 @@ function setupErrorText(error: unknown): string {
 			if (typeof message === "string" && message) return message;
 		}
 	} catch {
-		// A Proxy trap or hostile accessor: fall through to a fixed category.
+		// A Proxy trap or hostile accessor falls through to a fixed category.
 	}
 	return requestSetupError(error).message;
 }
@@ -91,8 +85,6 @@ export function lazyStream(
 	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
 
-	// Setup can call `protectAssistantMessageStream(outer, ...)` once it has resolved request credentials,
-	// so forwarded events of any provider implementation are masked here too.
 	setup(outer)
 		.then((inner) => forwardStream(outer, inner))
 		.catch((error) => {

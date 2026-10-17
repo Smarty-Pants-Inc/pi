@@ -98,7 +98,7 @@ function buildSSEPayload({
 }
 
 describe("openai-codex streaming", () => {
-	it("streams SSE responses and forwards raw provider events", async () => {
+	it("streams SSE responses and forwards provider event notifications", async () => {
 		const tempDir = mkdtempSync(join(tmpdir(), "pi-codex-stream-"));
 		process.env.PI_CODING_AGENT_DIR = tempDir;
 
@@ -215,7 +215,7 @@ describe("openai-codex streaming", () => {
 
 		expect(sawTextDelta).toBe(true);
 		expect(sawDone).toBe(true);
-		// smarty-dev#5822 C1: one owned notification per event, never the raw event or model.
+		// smarty-dev#5822 C1: one owned notification per event, never raw event or model.
 		expect(providerCalls).toEqual(Array.from({ length: 5 }, () => [{ type: "provider_stream_event" }]));
 	});
 
@@ -1720,7 +1720,7 @@ describe("openai-codex streaming", () => {
 			websocketFailures: 1,
 			sseFallbacks: 1,
 			websocketFallbackActive: true,
-			// smarty-dev#5822 (pi#202 round 2): an owned category, never the error text.
+			// smarty-dev#5822: owned category, never error text.
 			lastWebSocketError: "timeout",
 		});
 	});
@@ -2727,15 +2727,19 @@ describe("openai-codex streaming", () => {
 		expect(codexRequests).toBe(4);
 	});
 
-	it("keeps the SSE error status and JSON body in errorMessage", async () => {
+	// smarty-dev#5822: classify JSON body privately, publish only status.
+	it("keeps the SSE error status without the JSON body in errorMessage", async () => {
 		const body = JSON.stringify({
 			error: { message: "m", type: "invalid_request_error", code: "compaction_affinity_missing" },
 		});
 		const fetchMock = vi.fn(
-			async () => new Response(body, { status: 409, headers: { "content-type": "application/json" } }),
+			async () =>
+				new Response(body, {
+					status: 409,
+					headers: { "content-type": "application/json" },
+				}),
 		);
 		vi.stubGlobal("fetch", fetchMock);
-
 		const model: Model<"openai-codex-responses"> = {
 			id: "gpt-5.1-codex",
 			name: "GPT-5.1 Codex",
@@ -2752,15 +2756,12 @@ describe("openai-codex streaming", () => {
 			systemPrompt: "You are a helpful assistant.",
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		});
-
 		const result = await streamOpenAICodexResponses(model, context, {
 			apiKey: mockToken(),
 			transport: "sse",
 			maxRetries: 0,
 		}).result();
-
 		expect(result.stopReason).toBe("error");
-		// smarty-dev#5822 (pi#202 round 2): the status only; the JSON body is classified, never published.
 		expect(result.errorMessage).toBe("openai-codex API error (409)");
 		expect(fetchMock).toHaveBeenCalledTimes(1);
 	});
@@ -2770,14 +2771,10 @@ describe("openai-codex streaming", () => {
 			async () =>
 				new Response(
 					JSON.stringify({ error: { code: "usage_limit_reached", message: "limit", plan_type: "PLUS" } }),
-					{
-						status: 403,
-						headers: { "content-type": "application/json" },
-					},
+					{ status: 403, headers: { "content-type": "application/json" } },
 				),
 		);
 		vi.stubGlobal("fetch", fetchMock);
-
 		const model: Model<"openai-codex-responses"> = {
 			id: "gpt-5.1-codex",
 			name: "GPT-5.1 Codex",
@@ -2794,13 +2791,11 @@ describe("openai-codex streaming", () => {
 			systemPrompt: "You are a helpful assistant.",
 			messages: [{ role: "user", content: "Say hello", timestamp: Date.now() }],
 		});
-
 		const result = await streamOpenAICodexResponses(model, context, {
 			apiKey: mockToken(),
 			transport: "sse",
 			maxRetries: 3,
 		}).result();
-
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("You have hit your ChatGPT usage limit (plus plan).");
 		expect(fetchMock).toHaveBeenCalledTimes(1);

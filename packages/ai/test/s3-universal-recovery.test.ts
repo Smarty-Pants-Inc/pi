@@ -1,6 +1,4 @@
-// T-C3 (smarty-dev#5822, S3 of #5443): every source is classified from its original error before any text
-// can be suppressed, and the owned decision rides on `AssistantMessage.recovery`. API-key and custom-provider
-// sources get the same structured decision OAuth had; retry, overflow and premature-stream checks read it.
+// T-C3 (smarty-dev#5822, S3 of #5443): classify original errors before suppression for every source.
 import { describe, expect, it } from "vitest";
 import { stream as streamCompletions } from "../src/api/openai-completions.ts";
 import { stream as streamResponses } from "../src/api/openai-responses.ts";
@@ -67,7 +65,6 @@ function jsonError(status: number, body: unknown): Response {
 	return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 }
 
-/** A model-less stream: the universal fallback must classify before publication. */
 async function published(source: AssistantMessage): Promise<AssistantMessage> {
 	const stream = createAssistantMessageEventStream();
 	stream.push({ type: "error", reason: "error", error: source });
@@ -80,7 +77,6 @@ describe("T-C3: universal pre-suppression recovery (smarty-dev#5822)", () => {
 		["context overflow", "This model's maximum context length is 8192 tokens", OVERFLOW],
 		["premature EOF", "stream ended before message_stop", PREMATURE],
 		["quota refusal", "429 insufficient_quota: check your plan and billing details", FINAL],
-		// Not overflow. Main's text rule does not outer-retry a bare Bedrock throttle; that behavior is unchanged.
 		["Bedrock throttle that says too many tokens", "Throttling error: Too many tokens, please wait", FINAL],
 		["Bedrock throttle with retry guidance", "Throttling error: Too many tokens. Try your request again.", RETRYABLE],
 	])("model-less stream classifies %s before publication", async (_name, errorMessage, decision) => {

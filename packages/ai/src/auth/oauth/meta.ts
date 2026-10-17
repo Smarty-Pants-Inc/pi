@@ -55,7 +55,6 @@ async function readJson(response: Response): Promise<Record<string, unknown> | n
 	}
 }
 
-/** Credential endpoint text can echo submitted or issued secrets: keep only the protocol error code. */
 function errorDetail(json: Record<string, unknown> | null, secrets: readonly string[] = []): string {
 	return typeof json?.error === "string" ? `: ${oauthAuthorizationError(json.error, secrets)}` : "";
 }
@@ -175,7 +174,6 @@ async function mintApiKey(identityToken: string, signal: AbortSignal): Promise<O
 	}
 	const apiKey = json?.api_key;
 	if (typeof apiKey !== "string" || !apiKey) {
-		// Never publish a provider action_url: even an https URL can carry a credential.
 		throw new Error("Meta did not issue an API key. Complete setup at https://dev.meta.ai/billing");
 	}
 	return { type: "oauth", refresh: identityToken, access: apiKey, expires: Date.now() + API_KEY_LIFETIME_MS };

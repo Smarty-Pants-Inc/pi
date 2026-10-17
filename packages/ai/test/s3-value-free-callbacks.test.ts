@@ -1,6 +1,5 @@
-// T-C1 (smarty-dev#5822, S3 of #5443): provider callbacks run outside the message projector, so they must
-// receive only Pi-owned values. Every callback argument is serialized at the moment of the call and compared
-// with the exact owned schema; the synthetic credential-shaped values below must never appear.
+// T-C1 (smarty-dev#5822, S3 of #5443): provider callbacks must receive only Pi-owned values.
+// Snapshot every callback argument immediately, before later normalization can touch it.
 import { describe, expect, it } from "vitest";
 import { stream as streamCompletions } from "../src/api/openai-completions.ts";
 import { stream as streamResponses } from "../src/api/openai-responses.ts";
@@ -37,7 +36,6 @@ function sse(events: unknown[]): Response {
 	});
 }
 
-/** Callbacks that snapshot their arguments immediately, before any later normalization can touch them. */
 function capture() {
 	const responses: string[] = [];
 	const events: string[] = [];

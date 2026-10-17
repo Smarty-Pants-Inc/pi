@@ -68,7 +68,7 @@ const context = normalizeContext({
 });
 
 describe("Bedrock provider stream events", () => {
-	// smarty-dev#5822 C1: one owned notification per SDK item, never the item or model.
+	// smarty-dev#5822 C1: one owned notification per SDK item, never item or model.
 	it("notifies once per SDK stream item without provider data", async () => {
 		bedrockMock.streamEvents = [
 			{ messageStart: { role: "assistant" } },
@@ -96,14 +96,14 @@ describe("Bedrock provider stream events", () => {
 		const received: unknown[] = [];
 		const result = await streamBedrock(model, context, {
 			cacheRetention: "none",
-			onProviderStreamEvent: (event) => {
-				received.push(event);
+			onProviderStreamEvent: (item) => {
+				received.push(item);
 			},
 		}).result();
 
 		expect(received).toEqual([{ type: "provider_stream_event" }, { type: "provider_stream_event" }]);
 		expect(result.stopReason).toBe("error");
-		// smarty-dev#5822 C4: the owned category label, not the exception text.
+		// smarty-dev#5822 C4: owned category, not exception text.
 		expect(result.errorMessage).toBe("Internal server error");
 	});
 });

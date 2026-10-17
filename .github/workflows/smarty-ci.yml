@@ -103,9 +103,9 @@ jobs:
         python3 - <<'PY'
         import base64,pathlib
         with pathlib.Path('.local/pack-stage.mjs').open('xb') as f:
-            f.write(base64.b64decode('Ly8gQ0ktb25seSBpbnZvY2F0aW9uIGZyb20gdGhlIGV4YWN0IGNoZWNrb3V0IHJvb3QgYWZ0ZXIgY2hlY2svYnVpbGQgUEFTUy4KLy8gUGxhY2UgdGhpcyBmcm96ZW4gZHJpdmVyIGF0IDxjaGVja291dD4vLmxvY2FsL3BhY2stc3RhZ2UubWpzLiBOZXZlciBydW4gb24gRGV2MS4KaW1wb3J0IGFzc2VydCBmcm9tICJub2RlOmFzc2VydC9zdHJpY3QiOwppbXBvcnQgeyBleGVjRmlsZVN5bmMgfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBjcmVhdGVIYXNoIH0gZnJvbSAibm9kZTpjcnlwdG8iOwppbXBvcnQgeyBleGlzdHNTeW5jLCBta2RpclN5bmMsIHJlYWRGaWxlU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gIm5vZGU6ZnMiOwppbXBvcnQgeyBpc0Fic29sdXRlLCBqb2luLCByZWxhdGl2ZSwgcmVzb2x2ZSB9IGZyb20gIm5vZGU6cGF0aCI7CmltcG9ydCB7IHBhY2tSZWxlYXNlUGFja2FnZXMsIGluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyLCBzbW9rZVRlc3RDb2RpbmdBZ2VudENvbnN1bWVyIH0gZnJvbSAiLi4vc2NyaXB0cy9jb2RpbmctYWdlbnQtY29uc3VtZXIubWpzIjsKaW1wb3J0IHsgZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMgfSBmcm9tICIuLi9zY3JpcHRzL3JlbGVhc2UtcGFja2FnZXMubWpzIjsKCmFzc2VydC5lcXVhbChwcm9jZXNzLmFyZ3YubGVuZ3RoLCAzLCAib25lIGZyZXNoIGFic29sdXRlIG91dHB1dCBkaXJlY3RvcnkgcmVxdWlyZWQiKTsKYXNzZXJ0KGlzQWJzb2x1dGUocHJvY2Vzcy5hcmd2WzJdKSk7CmNvbnN0IHJvb3QgPSBwcm9jZXNzLmN3ZCgpOwphc3NlcnQuZXF1YWwoSlNPTi5wYXJzZShyZWFkRmlsZVN5bmMoam9pbihyb290LCAicGFja2FnZS5qc29uIiksICJ1dGY4IikpLm5hbWUsICJwaS1tb25vcmVwbyIpOwpjb25zdCBvdXQgPSByZXNvbHZlKHByb2Nlc3MuYXJndlsyXSk7CmNvbnN0IHJlbCA9IHJlbGF0aXZlKHJvb3QsIG91dCk7CmFzc2VydChyZWwgPT09ICIuLiIgfHwgcmVsLnN0YXJ0c1dpdGgoIi4uLyIpIHx8IGlzQWJzb2x1dGUocmVsKSwgIm91dHB1dCBtdXN0IGJlIG91dHNpZGUgc291cmNlIik7CmFzc2VydCghZXhpc3RzU3luYyhvdXQpLCAicmV0YWluIGV4aXN0aW5nL3BhcnRpYWwgb3V0cHV0OyBuZXZlciBvdmVyd3JpdGUiKTsKZXhlY0ZpbGVTeW5jKCJnaXQiLCBbImRpZmYiLCAiLS1leGl0LWNvZGUiLCAiSEVBRCIsICItLSJdLCB7IHN0ZGlvOiAiaW5oZXJpdCIgfSk7CmNvbnN0IHNvdXJjZSA9IGV4ZWNGaWxlU3luYygiZ2l0IiwgWyJyZXYtcGFyc2UiLCAiSEVBRCJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpjb25zdCB0cmVlID0gZXhlY0ZpbGVTeW5jKCJnaXQiLCBbInJldi1wYXJzZSIsICJIRUFEXnt0cmVlfSJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpta2RpclN5bmMob3V0LCB7IG1vZGU6IDBvNzAwIH0pOwpjb25zdCB0YXJiYWxscyA9IHBhY2tSZWxlYXNlUGFja2FnZXMoZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMoKSwgam9pbihvdXQsICJ0YXJiYWxscyIpKTsKY29uc3QgY29uc3VtZXIgPSBqb2luKG91dCwgIm5vZGUiKTsKaW5zdGFsbENvZGluZ0FnZW50Q29uc3VtZXIoY29uc3VtZXIsIHRhcmJhbGxzKTsKc21va2VUZXN0Q29kaW5nQWdlbnRDb25zdW1lcihjb25zdW1lcik7CmV4ZWNGaWxlU3luYygiZ2l0IiwgWyJkaWZmIiwgIi0tZXhpdC1jb2RlIiwgIkhFQUQiLCAiLS0iXSwgeyBzdGRpbzogImluaGVyaXQiIH0pOwpjb25zdCBwYWNrYWdlcyA9IFsuLi50YXJiYWxsc10ubWFwKChbbmFtZSwgcGF0aF0pID0+IHsKICBjb25zdCBieXRlcyA9IHJlYWRGaWxlU3luYyhwYXRoKTsKICByZXR1cm4geyBuYW1lLCBwYXRoOiByZWxhdGl2ZShvdXQsIHBhdGgpLCBieXRlczogYnl0ZXMubGVuZ3RoLCBzaGEyNTY6IGNyZWF0ZUhhc2goInNoYTI1NiIpLnVwZGF0ZShieXRlcykuZGlnZXN0KCJoZXgiKSB9Owp9KTsKd3JpdGVGaWxlU3luYyhqb2luKG91dCwgIlNPVVJDRS1BTkQtUEFDS0FHRVMuanNvbiIpLCBKU09OLnN0cmluZ2lmeSh7IHNvdXJjZSwgdHJlZSwgcGxhdGZvcm06IHByb2Nlc3MucGxhdGZvcm0sIGFyY2g6IHByb2Nlc3MuYXJjaCwgbm9kZTogcHJvY2Vzcy52ZXJzaW9uLCBwYWNrYWdlcywgc2NvcGU6ICJOb2RlIFNESy9DTEkgY29uc3VtZXIgc21va2Ugb25seTsgbm90IHByb3ZpZGVyLCBhZmZlY3RlZC1zZXNzaW9uLCBCdW4sIGZsZWV0IG9yIGluc3RhbGxhdGlvbiBhY2NlcHRhbmNlIiB9LCBudWxsLCAyKSArICJcbiIsIHsgZmxhZzogInd4IiwgbW9kZTogMG82MDAgfSk7Cg=='))
+            f.write(base64.b64decode('Ly8gQ0ktb25seSBpbnZvY2F0aW9uIGZyb20gdGhlIGV4YWN0IGNoZWNrb3V0IHJvb3QgYWZ0ZXIgY2hlY2svYnVpbGQgUEFTUy4KLy8gUGxhY2UgdGhpcyBmcm96ZW4gZHJpdmVyIGF0IDxjaGVja291dD4vLmxvY2FsL3BhY2stc3RhZ2UubWpzLiBOZXZlciBydW4gb24gRGV2MS4KaW1wb3J0IGFzc2VydCBmcm9tICJub2RlOmFzc2VydC9zdHJpY3QiOwppbXBvcnQgeyBleGVjRmlsZVN5bmMgfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBjcmVhdGVIYXNoIH0gZnJvbSAibm9kZTpjcnlwdG8iOwppbXBvcnQgeyBleGlzdHNTeW5jLCBta2RpclN5bmMsIHJlYWRGaWxlU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gIm5vZGU6ZnMiOwppbXBvcnQgeyBpc0Fic29sdXRlLCBqb2luLCByZWxhdGl2ZSwgcmVzb2x2ZSB9IGZyb20gIm5vZGU6cGF0aCI7CmltcG9ydCB7IHBhY2tSZWxlYXNlUGFja2FnZXMsIGluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyLCBzbW9rZVRlc3RDb2RpbmdBZ2VudENvbnN1bWVyIH0gZnJvbSAiLi4vc2NyaXB0cy9jb2RpbmctYWdlbnQtY29uc3VtZXIubWpzIjsKaW1wb3J0IHsgZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMgfSBmcm9tICIuLi9zY3JpcHRzL3JlbGVhc2UtcGFja2FnZXMubWpzIjsKCmFzc2VydC5lcXVhbChwcm9jZXNzLmFyZ3YubGVuZ3RoLCAzLCAib25lIGZyZXNoIGFic29sdXRlIG91dHB1dCBkaXJlY3RvcnkgcmVxdWlyZWQiKTsKYXNzZXJ0KGlzQWJzb2x1dGUocHJvY2Vzcy5hcmd2WzJdKSk7CmNvbnN0IHJvb3QgPSBwcm9jZXNzLmN3ZCgpOwphc3NlcnQuZXF1YWwoSlNPTi5wYXJzZShyZWFkRmlsZVN5bmMoam9pbihyb290LCAicGFja2FnZS5qc29uIiksICJ1dGY4IikpLm5hbWUsICJwaS1tb25vcmVwbyIpOwpjb25zdCBvdXQgPSByZXNvbHZlKHByb2Nlc3MuYXJndlsyXSk7CmNvbnN0IHJlbCA9IHJlbGF0aXZlKHJvb3QsIG91dCk7CmFzc2VydChyZWwgPT09ICIuLiIgfHwgcmVsLnN0YXJ0c1dpdGgoIi4uLyIpIHx8IGlzQWJzb2x1dGUocmVsKSwgIm91dHB1dCBtdXN0IGJlIG91dHNpZGUgc291cmNlIik7CmFzc2VydCghZXhpc3RzU3luYyhvdXQpLCAicmV0YWluIGV4aXN0aW5nL3BhcnRpYWwgb3V0cHV0OyBuZXZlciBvdmVyd3JpdGUiKTsKZXhlY0ZpbGVTeW5jKCJnaXQiLCBbImRpZmYiLCAiLS1leGl0LWNvZGUiLCAiSEVBRCIsICItLSJdLCB7IHN0ZGlvOiAiaW5oZXJpdCIgfSk7CmNvbnN0IHNvdXJjZSA9IGV4ZWNGaWxlU3luYygiZ2l0IiwgWyJyZXYtcGFyc2UiLCAiSEVBRCJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpjb25zdCB0cmVlID0gZXhlY0ZpbGVTeW5jKCJnaXQiLCBbInJldi1wYXJzZSIsICJIRUFEXnt0cmVlfSJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpta2RpclN5bmMob3V0LCB7IG1vZGU6IDBvNzAwIH0pOwpjb25zdCB0YXJiYWxscyA9IHBhY2tSZWxlYXNlUGFja2FnZXMoZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMocm9vdCksIGpvaW4ob3V0LCAidGFyYmFsbHMiKSk7CmNvbnN0IGNvbnN1bWVyID0gam9pbihvdXQsICJub2RlIik7Cmluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyKGNvbnN1bWVyLCB0YXJiYWxscyk7CnNtb2tlVGVzdENvZGluZ0FnZW50Q29uc3VtZXIoY29uc3VtZXIpOwpleGVjRmlsZVN5bmMoImdpdCIsIFsiZGlmZiIsICItLWV4aXQtY29kZSIsICJIRUFEIiwgIi0tIl0sIHsgc3RkaW86ICJpbmhlcml0IiB9KTsKY29uc3QgcGFja2FnZXMgPSBbLi4udGFyYmFsbHNdLm1hcCgoW25hbWUsIHBhdGhdKSA9PiB7CiAgY29uc3QgYnl0ZXMgPSByZWFkRmlsZVN5bmMocGF0aCk7CiAgcmV0dXJuIHsgbmFtZSwgcGF0aDogcmVsYXRpdmUob3V0LCBwYXRoKSwgYnl0ZXM6IGJ5dGVzLmxlbmd0aCwgc2hhMjU2OiBjcmVhdGVIYXNoKCJzaGEyNTYiKS51cGRhdGUoYnl0ZXMpLmRpZ2VzdCgiaGV4IikgfTsKfSk7CndyaXRlRmlsZVN5bmMoam9pbihvdXQsICJTT1VSQ0UtQU5ELVBBQ0tBR0VTLmpzb24iKSwgSlNPTi5zdHJpbmdpZnkoeyBzb3VyY2UsIHRyZWUsIHBsYXRmb3JtOiBwcm9jZXNzLnBsYXRmb3JtLCBhcmNoOiBwcm9jZXNzLmFyY2gsIG5vZGU6IHByb2Nlc3MudmVyc2lvbiwgcGFja2FnZXMsIHNjb3BlOiAiTm9kZSBTREsvQ0xJIGNvbnN1bWVyIHNtb2tlIG9ubHk7IG5vdCBwcm92aWRlciwgYWZmZWN0ZWQtc2Vzc2lvbiwgQnVuLCBmbGVldCBvciBpbnN0YWxsYXRpb24gYWNjZXB0YW5jZSIgfSwgbnVsbCwgMikgKyAiXG4iLCB7IGZsYWc6ICJ3eCIsIG1vZGU6IDBvNjAwIH0pOwo='))
         PY
-        printf '%s\n' 'da47a9e55f6a50f53729ec199bb52f27150001b66438cdd3187ed99b73534f78  .local/pack-stage.mjs' | sha256sum --check
+        printf '%s\n' '9079195c71975702fe34ccf91293c3ff6fad0f4b8059edfcb4ce127761ff5eaa  .local/pack-stage.mjs' | sha256sum --check
         cp .local/pack-stage.mjs "$RUNNER_TEMP/pi-emergency/evidence/"
       timeout-minutes: 2
     - name: Disposable Forge system dependencies
@@ -133,6 +133,30 @@ jobs:
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/dependencies.log"
         npm ci --ignore-scripts
         PI_JOB
+    - name: hydrate-pinned-model-data
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/hydrate-pinned-model-data.log"
+        # Hydrate the immutable typed catalog pinned by upstream nix/package.nix.
+        # Never use hydrate:model-data here: that generator reads live provider catalogs.
+        revision="$(python3 -c 'import json,re; r=json.load(open("nix/model-catalog.json"))["revision"]; assert re.fullmatch(r"sha256-[0-9a-f]{64}",r); print(r)')"
+        catalog="$EVIDENCE_DIR/pinned-model-catalog.json"
+        curl --fail --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 \
+          "https://pi.dev/api/models/revisions/${revision}?types=chat,image,classifier" --output "$catalog"
+        printf '%s  %s\n' "${revision#sha256-}" "$catalog" | sha256sum --check
+        node packages/ai/scripts/hydrate-model-catalog.ts "$catalog"
+        git diff --exit-code HEAD --
+        PI_JOB
     - name: public-model-data
       timeout-minutes: 5
       run: |
@@ -147,8 +171,7 @@ jobs:
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/public-model-data.log"
-        # The model data is the committed snapshot (smarty-dev#1034): CI reads no models.dev.
-        # A catalog change arrives as a refresh PR; check:model-data verifies its manifest's sha256s.
+        # Validate the pinned catalog hydrated by the preceding isolated step.
         npm --prefix packages/ai run check:model-data
         git diff --exit-code HEAD --
         cp -a packages/ai/src/providers/data "$EVIDENCE_DIR/model-data"
@@ -330,9 +353,9 @@ jobs:
         python3 - <<'PY'
         import base64,pathlib
         with pathlib.Path('.local/pack-stage.mjs').open('xb') as f:
-            f.write(base64.b64decode('Ly8gQ0ktb25seSBpbnZvY2F0aW9uIGZyb20gdGhlIGV4YWN0IGNoZWNrb3V0IHJvb3QgYWZ0ZXIgY2hlY2svYnVpbGQgUEFTUy4KLy8gUGxhY2UgdGhpcyBmcm96ZW4gZHJpdmVyIGF0IDxjaGVja291dD4vLmxvY2FsL3BhY2stc3RhZ2UubWpzLiBOZXZlciBydW4gb24gRGV2MS4KaW1wb3J0IGFzc2VydCBmcm9tICJub2RlOmFzc2VydC9zdHJpY3QiOwppbXBvcnQgeyBleGVjRmlsZVN5bmMgfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBjcmVhdGVIYXNoIH0gZnJvbSAibm9kZTpjcnlwdG8iOwppbXBvcnQgeyBleGlzdHNTeW5jLCBta2RpclN5bmMsIHJlYWRGaWxlU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gIm5vZGU6ZnMiOwppbXBvcnQgeyBpc0Fic29sdXRlLCBqb2luLCByZWxhdGl2ZSwgcmVzb2x2ZSB9IGZyb20gIm5vZGU6cGF0aCI7CmltcG9ydCB7IHBhY2tSZWxlYXNlUGFja2FnZXMsIGluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyLCBzbW9rZVRlc3RDb2RpbmdBZ2VudENvbnN1bWVyIH0gZnJvbSAiLi4vc2NyaXB0cy9jb2RpbmctYWdlbnQtY29uc3VtZXIubWpzIjsKaW1wb3J0IHsgZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMgfSBmcm9tICIuLi9zY3JpcHRzL3JlbGVhc2UtcGFja2FnZXMubWpzIjsKCmFzc2VydC5lcXVhbChwcm9jZXNzLmFyZ3YubGVuZ3RoLCAzLCAib25lIGZyZXNoIGFic29sdXRlIG91dHB1dCBkaXJlY3RvcnkgcmVxdWlyZWQiKTsKYXNzZXJ0KGlzQWJzb2x1dGUocHJvY2Vzcy5hcmd2WzJdKSk7CmNvbnN0IHJvb3QgPSBwcm9jZXNzLmN3ZCgpOwphc3NlcnQuZXF1YWwoSlNPTi5wYXJzZShyZWFkRmlsZVN5bmMoam9pbihyb290LCAicGFja2FnZS5qc29uIiksICJ1dGY4IikpLm5hbWUsICJwaS1tb25vcmVwbyIpOwpjb25zdCBvdXQgPSByZXNvbHZlKHByb2Nlc3MuYXJndlsyXSk7CmNvbnN0IHJlbCA9IHJlbGF0aXZlKHJvb3QsIG91dCk7CmFzc2VydChyZWwgPT09ICIuLiIgfHwgcmVsLnN0YXJ0c1dpdGgoIi4uLyIpIHx8IGlzQWJzb2x1dGUocmVsKSwgIm91dHB1dCBtdXN0IGJlIG91dHNpZGUgc291cmNlIik7CmFzc2VydCghZXhpc3RzU3luYyhvdXQpLCAicmV0YWluIGV4aXN0aW5nL3BhcnRpYWwgb3V0cHV0OyBuZXZlciBvdmVyd3JpdGUiKTsKZXhlY0ZpbGVTeW5jKCJnaXQiLCBbImRpZmYiLCAiLS1leGl0LWNvZGUiLCAiSEVBRCIsICItLSJdLCB7IHN0ZGlvOiAiaW5oZXJpdCIgfSk7CmNvbnN0IHNvdXJjZSA9IGV4ZWNGaWxlU3luYygiZ2l0IiwgWyJyZXYtcGFyc2UiLCAiSEVBRCJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpjb25zdCB0cmVlID0gZXhlY0ZpbGVTeW5jKCJnaXQiLCBbInJldi1wYXJzZSIsICJIRUFEXnt0cmVlfSJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpta2RpclN5bmMob3V0LCB7IG1vZGU6IDBvNzAwIH0pOwpjb25zdCB0YXJiYWxscyA9IHBhY2tSZWxlYXNlUGFja2FnZXMoZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMoKSwgam9pbihvdXQsICJ0YXJiYWxscyIpKTsKY29uc3QgY29uc3VtZXIgPSBqb2luKG91dCwgIm5vZGUiKTsKaW5zdGFsbENvZGluZ0FnZW50Q29uc3VtZXIoY29uc3VtZXIsIHRhcmJhbGxzKTsKc21va2VUZXN0Q29kaW5nQWdlbnRDb25zdW1lcihjb25zdW1lcik7CmV4ZWNGaWxlU3luYygiZ2l0IiwgWyJkaWZmIiwgIi0tZXhpdC1jb2RlIiwgIkhFQUQiLCAiLS0iXSwgeyBzdGRpbzogImluaGVyaXQiIH0pOwpjb25zdCBwYWNrYWdlcyA9IFsuLi50YXJiYWxsc10ubWFwKChbbmFtZSwgcGF0aF0pID0+IHsKICBjb25zdCBieXRlcyA9IHJlYWRGaWxlU3luYyhwYXRoKTsKICByZXR1cm4geyBuYW1lLCBwYXRoOiByZWxhdGl2ZShvdXQsIHBhdGgpLCBieXRlczogYnl0ZXMubGVuZ3RoLCBzaGEyNTY6IGNyZWF0ZUhhc2goInNoYTI1NiIpLnVwZGF0ZShieXRlcykuZGlnZXN0KCJoZXgiKSB9Owp9KTsKd3JpdGVGaWxlU3luYyhqb2luKG91dCwgIlNPVVJDRS1BTkQtUEFDS0FHRVMuanNvbiIpLCBKU09OLnN0cmluZ2lmeSh7IHNvdXJjZSwgdHJlZSwgcGxhdGZvcm06IHByb2Nlc3MucGxhdGZvcm0sIGFyY2g6IHByb2Nlc3MuYXJjaCwgbm9kZTogcHJvY2Vzcy52ZXJzaW9uLCBwYWNrYWdlcywgc2NvcGU6ICJOb2RlIFNESy9DTEkgY29uc3VtZXIgc21va2Ugb25seTsgbm90IHByb3ZpZGVyLCBhZmZlY3RlZC1zZXNzaW9uLCBCdW4sIGZsZWV0IG9yIGluc3RhbGxhdGlvbiBhY2NlcHRhbmNlIiB9LCBudWxsLCAyKSArICJcbiIsIHsgZmxhZzogInd4IiwgbW9kZTogMG82MDAgfSk7Cg=='))
+            f.write(base64.b64decode('Ly8gQ0ktb25seSBpbnZvY2F0aW9uIGZyb20gdGhlIGV4YWN0IGNoZWNrb3V0IHJvb3QgYWZ0ZXIgY2hlY2svYnVpbGQgUEFTUy4KLy8gUGxhY2UgdGhpcyBmcm96ZW4gZHJpdmVyIGF0IDxjaGVja291dD4vLmxvY2FsL3BhY2stc3RhZ2UubWpzLiBOZXZlciBydW4gb24gRGV2MS4KaW1wb3J0IGFzc2VydCBmcm9tICJub2RlOmFzc2VydC9zdHJpY3QiOwppbXBvcnQgeyBleGVjRmlsZVN5bmMgfSBmcm9tICJub2RlOmNoaWxkX3Byb2Nlc3MiOwppbXBvcnQgeyBjcmVhdGVIYXNoIH0gZnJvbSAibm9kZTpjcnlwdG8iOwppbXBvcnQgeyBleGlzdHNTeW5jLCBta2RpclN5bmMsIHJlYWRGaWxlU3luYywgd3JpdGVGaWxlU3luYyB9IGZyb20gIm5vZGU6ZnMiOwppbXBvcnQgeyBpc0Fic29sdXRlLCBqb2luLCByZWxhdGl2ZSwgcmVzb2x2ZSB9IGZyb20gIm5vZGU6cGF0aCI7CmltcG9ydCB7IHBhY2tSZWxlYXNlUGFja2FnZXMsIGluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyLCBzbW9rZVRlc3RDb2RpbmdBZ2VudENvbnN1bWVyIH0gZnJvbSAiLi4vc2NyaXB0cy9jb2RpbmctYWdlbnQtY29uc3VtZXIubWpzIjsKaW1wb3J0IHsgZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMgfSBmcm9tICIuLi9zY3JpcHRzL3JlbGVhc2UtcGFja2FnZXMubWpzIjsKCmFzc2VydC5lcXVhbChwcm9jZXNzLmFyZ3YubGVuZ3RoLCAzLCAib25lIGZyZXNoIGFic29sdXRlIG91dHB1dCBkaXJlY3RvcnkgcmVxdWlyZWQiKTsKYXNzZXJ0KGlzQWJzb2x1dGUocHJvY2Vzcy5hcmd2WzJdKSk7CmNvbnN0IHJvb3QgPSBwcm9jZXNzLmN3ZCgpOwphc3NlcnQuZXF1YWwoSlNPTi5wYXJzZShyZWFkRmlsZVN5bmMoam9pbihyb290LCAicGFja2FnZS5qc29uIiksICJ1dGY4IikpLm5hbWUsICJwaS1tb25vcmVwbyIpOwpjb25zdCBvdXQgPSByZXNvbHZlKHByb2Nlc3MuYXJndlsyXSk7CmNvbnN0IHJlbCA9IHJlbGF0aXZlKHJvb3QsIG91dCk7CmFzc2VydChyZWwgPT09ICIuLiIgfHwgcmVsLnN0YXJ0c1dpdGgoIi4uLyIpIHx8IGlzQWJzb2x1dGUocmVsKSwgIm91dHB1dCBtdXN0IGJlIG91dHNpZGUgc291cmNlIik7CmFzc2VydCghZXhpc3RzU3luYyhvdXQpLCAicmV0YWluIGV4aXN0aW5nL3BhcnRpYWwgb3V0cHV0OyBuZXZlciBvdmVyd3JpdGUiKTsKZXhlY0ZpbGVTeW5jKCJnaXQiLCBbImRpZmYiLCAiLS1leGl0LWNvZGUiLCAiSEVBRCIsICItLSJdLCB7IHN0ZGlvOiAiaW5oZXJpdCIgfSk7CmNvbnN0IHNvdXJjZSA9IGV4ZWNGaWxlU3luYygiZ2l0IiwgWyJyZXYtcGFyc2UiLCAiSEVBRCJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpjb25zdCB0cmVlID0gZXhlY0ZpbGVTeW5jKCJnaXQiLCBbInJldi1wYXJzZSIsICJIRUFEXnt0cmVlfSJdLCB7IGVuY29kaW5nOiAidXRmOCIgfSkudHJpbSgpOwpta2RpclN5bmMob3V0LCB7IG1vZGU6IDBvNzAwIH0pOwpjb25zdCB0YXJiYWxscyA9IHBhY2tSZWxlYXNlUGFja2FnZXMoZ2V0UHVibGljV29ya3NwYWNlUGFja2FnZXMocm9vdCksIGpvaW4ob3V0LCAidGFyYmFsbHMiKSk7CmNvbnN0IGNvbnN1bWVyID0gam9pbihvdXQsICJub2RlIik7Cmluc3RhbGxDb2RpbmdBZ2VudENvbnN1bWVyKGNvbnN1bWVyLCB0YXJiYWxscyk7CnNtb2tlVGVzdENvZGluZ0FnZW50Q29uc3VtZXIoY29uc3VtZXIpOwpleGVjRmlsZVN5bmMoImdpdCIsIFsiZGlmZiIsICItLWV4aXQtY29kZSIsICJIRUFEIiwgIi0tIl0sIHsgc3RkaW86ICJpbmhlcml0IiB9KTsKY29uc3QgcGFja2FnZXMgPSBbLi4udGFyYmFsbHNdLm1hcCgoW25hbWUsIHBhdGhdKSA9PiB7CiAgY29uc3QgYnl0ZXMgPSByZWFkRmlsZVN5bmMocGF0aCk7CiAgcmV0dXJuIHsgbmFtZSwgcGF0aDogcmVsYXRpdmUob3V0LCBwYXRoKSwgYnl0ZXM6IGJ5dGVzLmxlbmd0aCwgc2hhMjU2OiBjcmVhdGVIYXNoKCJzaGEyNTYiKS51cGRhdGUoYnl0ZXMpLmRpZ2VzdCgiaGV4IikgfTsKfSk7CndyaXRlRmlsZVN5bmMoam9pbihvdXQsICJTT1VSQ0UtQU5ELVBBQ0tBR0VTLmpzb24iKSwgSlNPTi5zdHJpbmdpZnkoeyBzb3VyY2UsIHRyZWUsIHBsYXRmb3JtOiBwcm9jZXNzLnBsYXRmb3JtLCBhcmNoOiBwcm9jZXNzLmFyY2gsIG5vZGU6IHByb2Nlc3MudmVyc2lvbiwgcGFja2FnZXMsIHNjb3BlOiAiTm9kZSBTREsvQ0xJIGNvbnN1bWVyIHNtb2tlIG9ubHk7IG5vdCBwcm92aWRlciwgYWZmZWN0ZWQtc2Vzc2lvbiwgQnVuLCBmbGVldCBvciBpbnN0YWxsYXRpb24gYWNjZXB0YW5jZSIgfSwgbnVsbCwgMikgKyAiXG4iLCB7IGZsYWc6ICJ3eCIsIG1vZGU6IDBvNjAwIH0pOwo='))
         PY
-        printf '%s\n' 'da47a9e55f6a50f53729ec199bb52f27150001b66438cdd3187ed99b73534f78  .local/pack-stage.mjs' | sha256sum --check
+        printf '%s\n' '9079195c71975702fe34ccf91293c3ff6fad0f4b8059edfcb4ce127761ff5eaa  .local/pack-stage.mjs' | sha256sum --check
         cp .local/pack-stage.mjs "$RUNNER_TEMP/pi-emergency/evidence/"
       timeout-minutes: 2
     - name: Disposable Forge system dependencies
@@ -360,6 +383,30 @@ jobs:
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/dependencies.log"
         npm ci --ignore-scripts
         PI_JOB
+    - name: hydrate-pinned-model-data
+      timeout-minutes: 5
+      run: |
+        set -o pipefail
+        env -i PATH="$PATH" HOME="$RUNNER_TEMP/pi-emergency/home" USERPROFILE="$RUNNER_TEMP/pi-emergency/home" \
+          TMPDIR="$RUNNER_TEMP/pi-emergency/tmp" TMP="$RUNNER_TEMP/pi-emergency/tmp" TEMP="$RUNNER_TEMP/pi-emergency/tmp" \
+          XDG_CONFIG_HOME="$RUNNER_TEMP/pi-emergency/home/.config" XDG_CACHE_HOME="$RUNNER_TEMP/pi-emergency/cache" \
+          PI_CODING_AGENT_DIR="$RUNNER_TEMP/pi-emergency/home/.pi/agent" PI_OFFLINE=1 PI_TELEMETRY=0 PI_NO_LOCAL_LLM=1 \
+          AWS_EC2_METADATA_DISABLED=true CI=true GITHUB_ACTIONS=true LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC \
+          GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true \
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-emergency/npm-userconfig" NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-emergency/npm-globalconfig" \
+          NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
+          STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
+          bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/hydrate-pinned-model-data.log"
+        # Hydrate the immutable typed catalog pinned by upstream nix/package.nix.
+        # Never use hydrate:model-data here: that generator reads live provider catalogs.
+        revision="$(python3 -c 'import json,re; r=json.load(open("nix/model-catalog.json"))["revision"]; assert re.fullmatch(r"sha256-[0-9a-f]{64}",r); print(r)')"
+        catalog="$EVIDENCE_DIR/pinned-model-catalog.json"
+        curl --fail --silent --show-error --proto '=https' --tlsv1.2 --connect-timeout 15 --max-time 120 \
+          "https://pi.dev/api/models/revisions/${revision}?types=chat,image,classifier" --output "$catalog"
+        printf '%s  %s\n' "${revision#sha256-}" "$catalog" | sha256sum --check
+        node packages/ai/scripts/hydrate-model-catalog.ts "$catalog"
+        git diff --exit-code HEAD --
+        PI_JOB
     - name: public-model-data
       timeout-minutes: 5
       run: |
@@ -374,8 +421,7 @@ jobs:
           NPM_CONFIG_CACHE="$RUNNER_TEMP/pi-emergency/cache/npm" npm_config_jobs=1 GOMAXPROCS=2 NODE_OPTIONS=--max-old-space-size=4096 \
           STAGE_DIR="$RUNNER_TEMP/pi-emergency/stage" EVIDENCE_DIR="$RUNNER_TEMP/pi-emergency/evidence" \
           bash --noprofile --norc -euo pipefail 2>&1 <<'PI_JOB' | tee "$RUNNER_TEMP/pi-emergency/evidence/public-model-data.log"
-        # The model data is the committed snapshot (smarty-dev#1034): CI reads no models.dev.
-        # A catalog change arrives as a refresh PR; check:model-data verifies its manifest's sha256s.
+        # Validate the pinned catalog hydrated by the preceding isolated step.
         npm --prefix packages/ai run check:model-data
         git diff --exit-code HEAD --
         cp -a packages/ai/src/providers/data "$EVIDENCE_DIR/model-data"

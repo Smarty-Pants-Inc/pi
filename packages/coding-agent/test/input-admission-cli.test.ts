@@ -30,7 +30,6 @@ export default function(pi) {
   for (const boundary of ["turn_end", "agent_before_settle"]) pi.on(boundary, async (_event, ctx) => { if (round4?.includes(boundary)) await held(boundary, ctx); });
   pi.on("user_bash", async (_event, ctx) => { if (round4?.includes("retired-bash")) { await ctx.ui.confirm("bash-held", "release bash", { timeout: 10000 }); if (round4.endsWith("true")) return { result: { output: "retired-handled-result", exitCode: 0, cancelled: false, truncated: false } }; } });
   pi.registerCommand("self-replace", { handler: async (_args, ctx) => { await ctx.newSession(); } });
-  // Synthetic in-memory auth is never read from a credential store or sent over a network.
   pi.registerProvider(faux.provider, { baseUrl: faux.getModel().baseUrl, apiKey: "offline-faux-test-only", api: faux.api, streamSimple: faux.streamSimple, models: faux.models });
   pi.on("session_start", async (_event, ctx) => {
     const start = Number(process.env.PI_START_COUNT || 0) + 1; process.env.PI_START_COUNT = String(start);
@@ -80,7 +79,6 @@ export default function(pi) {
     if (holdShutdown) await ctx.ui.confirm("shutdown-held", "release shutdown", { timeout: 10000 });
   });
 }`;
-
 interface ChildProof {
 	child: ChildProcessWithoutNullStreams;
 	records: RecordLine[];
@@ -93,23 +91,21 @@ interface ChildProof {
 	target: string;
 	stderr(): string;
 }
-
-// smarty-dev#3048: exercise the built package's actual bin entry, not source mocks or paid APIs.
+// smarty-dev#3048: built package bin, faux provider and local SSE only; CI-only.
 describe.skipIf(!existsSync(cli))("installed-style offline input admission", () => {
 	const cleanups: Array<() => Promise<void>> = [];
 	let sequence = 0;
 	afterEach(async () => {
 		while (cleanups.length) await cleanups.pop()?.();
 	});
-
 	async function launch(
 		label: string,
 		mode: "rpc" | "print" = "rpc",
 		native?: { api: "anthropic-messages" | "openai-completions"; baseUrl: string },
 	): Promise<ChildProof> {
 		const temp = mkdtempSync(join(tmpdir(), "pi-admission-cli-"));
-		const extension = join(temp, "admission.mjs");
-		const agentDir = join(temp, "agent");
+		const extension = join(temp, "admission.mjs"),
+			agentDir = join(temp, "agent");
 		mkdirSync(agentDir);
 		writeFileSync(extension, fixture);
 		const target = join(temp, "target.jsonl");
@@ -223,7 +219,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			stderr: () => stderr,
 		};
 	}
-
 	it.each([
 		["steer", "new_session"],
 		["follow_up", "new_session"],
@@ -263,7 +258,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.send({ id: "replace-safe", type: replacementType, sessionPath: p.target });
 		expect(await p.response("replace-safe")).toMatchObject({ success: true, data: { cancelled: false } });
 	});
-
 	it("a late success receipt cannot belong to a disposed outgoing session", async () => {
 		const p = await launch("late-ack-reproduction");
 		p.send({ id: "original", type: "get_state" });
@@ -276,12 +270,10 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		const inputReceipt = await p.response("held");
 		p.send({ id: "after", type: "get_state" });
 		const after = (await p.response("after")).data as RecordLine;
-		// On 2ba9a3ce2: replacement succeeds, then input succeeds, but the new queue is empty.
 		expect(replacement).toMatchObject({ success: false, error: expect.stringContaining("INPUT_ADMISSION_BUSY") });
 		expect(inputReceipt).toMatchObject({ success: true });
 		expect(after).toMatchObject({ sessionId: original.sessionId, pendingMessageCount: 1 });
 	});
-
 	it("handled prompt is accounted before the hook and acknowledged only after handling", async () => {
 		const p = await launch("handled-prompt");
 		p.send({ id: "held", type: "prompt", message: "hold:handled" });
@@ -297,7 +289,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		expect(await p.response("new-safe")).toMatchObject({ success: true });
 		expect(p.records.filter((record) => record.id === "held" && record.type === "response")).toHaveLength(1);
 	});
-
 	it("rejects arrivals during async before-switch rather than acknowledging the outgoing session", async () => {
 		const p = await launch("switch-fence");
 		p.send({ id: "arm", type: "prompt", message: "/hold-switch" });
@@ -314,7 +305,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.release(dialog);
 		expect(await p.response("new")).toMatchObject({ success: true });
 	});
-
 	it("rejects arrivals during async shutdown/dispose and emits no success for them", async () => {
 		const p = await launch("shutdown-fence");
 		p.send({ id: "arm", type: "prompt", message: "/hold-shutdown" });
@@ -331,7 +321,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.release(dialog);
 		expect(await p.exited).toEqual({ code: 0, signal: null });
 	});
-
 	it("SIGTERM aborts admitted input with one authoritative failure, never a late success", async () => {
 		const p = await launch("signal-abort");
 		p.send({ id: "held", type: "follow_up", message: "hold:must-reject" });
@@ -342,7 +331,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
 	});
-
 	it("EOF returns an attachment-preserving receipt for already acknowledged undelivered input", async () => {
 		const p = await launch("eof-receipt");
 		const image = { type: "image", mimeType: "image/png", data: "attachment" };
@@ -354,7 +342,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			["queued-4", "follow_up"],
 		] as const) {
 			p.send({ id, type, message: id, images: [image] });
-			expect(await p.response(id!)).toMatchObject({ success: true });
+			expect(await p.response(id)).toMatchObject({ success: true });
 		}
 		p.child.stdin.end();
 		expect(await p.exited).toEqual({ code: 0, signal: null });
@@ -376,8 +364,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			}),
 		]);
 	});
-
-	// smarty-dev#3048, PR #110 F1: EOF must close admission before joining command work.
+	// smarty-dev#3048 / PR #110 F1: EOF closes admission before joining command work.
 	it.each(["live", "startup"] as const)("EOF aborts non-dialog input during %s draining", async (phase) => {
 		const p = await launch(`eof-nondialog-${phase}`);
 		const image = { type: "image", data: "eof-attachment", mimeType: "image/png" };
@@ -410,8 +397,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			}),
 		]);
 	});
-
-	// smarty-dev#3048, PR #110 F5: mode-owned startup backlog needs correlated refusals.
+	// smarty-dev#3048 / PR #110 F5: correlated startup refusal is exactly once.
 	it("SIGTERM refuses startup commands exactly once before flush and exit", async () => {
 		const p = await launch("startup-signal-refusal");
 		await p.dialog("startup-held");
@@ -423,8 +409,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
 	});
-
-	// smarty-dev#3048, PR #110 F2/S1: never rely on a kill to escape settlement.
+	// smarty-dev#3048 / PR #110 F2/S1: terminal cancellation releases settlement.
 	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
 		"%s cancels a non-dialog settlement and flushes attachment receipts",
 		async (ending) => {
@@ -449,8 +434,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			]);
 		},
 	);
-
-	// smarty-dev#3048, PR #110 R2-1: a refusal must not swap the settlement cancellation owner.
+	// smarty-dev#3048 / PR #110 R2-1: BUSY refusal retains settlement cancellation owner.
 	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
 		"%s after BUSY replacement cancels held settlement",
 		async (ending) => {
@@ -479,8 +463,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			]);
 		},
 	);
-
-	// smarty-dev#3048, PR #110 R2-2/S6: real commands initialize one receiving event owner.
+	// smarty-dev#3048 / PR #110 R2-2/S6: exactly one receiving binding/event owner.
 	it("RPC receiving initialization occurs once and remains fenced until ready", async () => {
 		const p = await launch("single-rebind");
 		await p.marker("binding-1");
@@ -499,7 +482,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.send({ id: "run", type: "prompt", message: "ready" });
 		await p.response("run");
 		await vi.waitFor(() => expect(p.records.filter((record) => record.type === "agent_settled")).toHaveLength(1));
-		for (const role of ["user", "assistant"]) {
+		for (const role of ["user", "assistant"])
 			expect(
 				p.records.filter(
 					(record) =>
@@ -510,10 +493,8 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 						record.message.role === role,
 				),
 			).toHaveLength(1);
-		}
 	});
-
-	// smarty-dev#3048, PR #110 S1/S4: terminal cancellation precedes joining owned operations.
+	// smarty-dev#3048 / PR #110 S1/S4: cancellation precedes owned-operation joins.
 	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
 		"%s cancels noncooperative startup and refuses correlated backlog",
 		async (ending) => {
@@ -593,9 +574,9 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		expect(p.records.filter((record) => record.id === "replace")).toEqual([
 			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
-		expect(p.records.some((record) => record.fatal)).toBe(false);
+		expect(p.records.some((record) => record.type === "fatal")).toBe(false);
 	});
-	// smarty-dev#3048, PR #110 S5: malformed envelopes cannot poison the startup refusal loop.
+	// smarty-dev#3048 / PR #110 S5: malformed startup records cannot poison refusals.
 	it("valid and malformed startup records preserve shutdown accounting", async () => {
 		const p = await launch("startup-malformed");
 		await p.dialog("startup-held");
@@ -611,7 +592,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 		]);
 	});
-	// smarty-dev#3048 / PR #110 R3-1 (security R3-S3): terminal ownership spans replacement.
+	// smarty-dev#3048 / PR #110 R3-1: terminal ownership spans replacement.
 	it.each(["EOF", "SIGTERM", "SIGHUP"] as const)(
 		"round4 %s cancels a retired dispatched command exactly once",
 		async (ending) => {
@@ -635,7 +616,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.send({ id: "self", type: "prompt", message: "/self-replace" });
 		expect(await p.response("self")).toMatchObject({ success: true });
 	});
-	// smarty-dev#3048 / PR #110 R3-2 (security R3-S2): both native boundaries must cancel.
+	// smarty-dev#3048 / PR #110 R3-2: both native settlement boundaries cancel.
 	it.each([
 		["turn_end", "EOF"],
 		["turn_end", "SIGTERM"],
@@ -661,15 +642,13 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
 				expect.objectContaining({
 					messages: [
-						expect.objectContaining({
-							content: [{ type: "text", text: "transformed:boundary-queue" }, image],
-						}),
+						expect.objectContaining({ content: [{ type: "text", text: "transformed:boundary-queue" }, image] }),
 					],
 				}),
 			]);
 		},
 	);
-	// smarty-dev#3048 / PR #110 R5 (security R4-S2): held tool interception hooks cannot block terminal shutdown.
+	// smarty-dev#3048 / PR #110 R5: tool interception must release terminal shutdown.
 	it.each([
 		["tool_call", "EOF"],
 		["tool_call", "SIGTERM"],
@@ -693,9 +672,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect(p.records.filter((record) => record.type === "input_rejected")).toEqual([
 				expect.objectContaining({
 					messages: [
-						expect.objectContaining({
-							content: [{ type: "text", text: "transformed:tool-hook-queue" }, image],
-						}),
+						expect.objectContaining({ content: [{ type: "text", text: "transformed:tool-hook-queue" }, image] }),
 					],
 				}),
 			]);
@@ -703,7 +680,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect(output).not.toContain("late-tool-call-result");
 			expect(output).not.toContain("late-tool-result");
 			expect(output).not.toContain(`late-second-${hook}-handler`);
-			// The tool call is finalized as an aborted error result; nothing from the held hook is applied.
 			expect(p.records.filter((record) => record.type === "tool_execution_end")).toEqual([
 				expect.objectContaining({
 					isError: true,
@@ -714,7 +690,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			]);
 		},
 	);
-	// smarty-dev#3048 / PR #110 R6: built-in producer callbacks must release before joining the run.
+	// smarty-dev#3048 / PR #110 R6: native producer callbacks release before run joins.
 	it.each([
 		["anthropic-messages", "EOF"],
 		["anthropic-messages", "SIGTERM"],
@@ -730,15 +706,14 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 				requests.push(request.url ?? "");
 				request.resume();
 				response.writeHead(200, { "Content-Type": "text/event-stream" });
-				if (api === "anthropic-messages") {
+				if (api === "anthropic-messages")
 					response.write(
 						`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "offline", type: "message", role: "assistant", model: "native", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 1, output_tokens: 0 } } })}\n\n`,
 					);
-				} else {
+				else
 					response.write(
 						`data: ${JSON.stringify({ id: "offline", object: "chat.completion.chunk", created: 1, model: "native", choices: [{ index: 0, delta: { role: "assistant", content: "must-not-normalize" }, finish_reason: null }] })}\n\n`,
 					);
-				}
 			});
 			await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 			cleanups.push(async () => {
@@ -779,8 +754,8 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			const aborted = p.records.findIndex(
 				(record) => record.type === "message_end" && (record.message as RecordLine)?.role === "assistant",
 			);
-			const ended = p.records.findIndex((record) => record.type === "agent_end");
-			const rejected = p.records.findIndex((record) => record.type === "input_rejected");
+			const ended = p.records.findIndex((record) => record.type === "agent_end"),
+				rejected = p.records.findIndex((record) => record.type === "input_rejected");
 			expect(aborted).toBeGreaterThan(-1);
 			expect((p.records[aborted].message as RecordLine).stopReason).toBe("aborted");
 			expect(ended).toBeGreaterThan(aborted);
@@ -789,7 +764,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect(JSON.stringify(p.records)).not.toContain("late-second-provider_stream_event-handler");
 		},
 	);
-	// smarty-dev#3048 / PR #110 R6-1: ordinary abort must retain custody of an idle queue input across nested custom dispatch.
+	// smarty-dev#3048 / PR #110 R6-1: idle queue custody spans nested custom settlement.
 	it.each(["steer", "follow_up"] as const)(
 		"round6 idle %s retains authoritative abort refusal after nested custom settlement",
 		async (entry) => {
@@ -850,7 +825,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			expect(p.records.filter((record) => record.type === "agent_start")).toHaveLength(2);
 		},
 	);
-	// smarty-dev#3048 / PR #110 R5 (security R4-S1): cancelled input handlers cannot acquire fresh admission.
+	// smarty-dev#3048 / PR #110 R5: aborted handlers cannot acquire fresh admission.
 	it("round5 an aborted input handler cannot submit native input after refusal", async () => {
 		const p = await launch("late-send");
 		p.send({ id: "held", type: "prompt", message: "late-send:x" });
@@ -882,7 +857,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		expect(messages).toContain("transformed:fresh");
 		expect(messages).not.toContain("late-sent");
 	});
-	// smarty-dev#3048 / PR #110 R3-9 (security R3-S1): successful acquisition cannot orphan settlement.
+	// smarty-dev#3048 / PR #110 R3-9: acquired replacement cannot orphan overlapping settlement.
 	it.each([
 		["cancelled", "EOF"],
 		["cancelled", "SIGTERM"],
@@ -913,24 +888,32 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			).toEqual({ code: ending === "EOF" ? 0 : ending === "SIGTERM" ? 143 : 129, signal: null });
 		},
 	);
-	// smarty-dev#3048 / PR #110 R3-3 (security R3-S5): overflow itself initiates terminal cancellation.
+	// smarty-dev#3048 / PR #110 R3-3: overflow itself initiates terminal cancellation.
 	it("round4 startup overflow cancels a non-dialog binding before EOF", async () => {
 		const p = await launch("noncooperative-start-overflow");
 		await p.marker("binding-nondialog-held");
-		for (let index = 0; index < 257; index++) p.send({ id: `backlog-${index}`, type: "get_state" });
+		for (let index = 0; index < 257; index++) p.send({ id: `backlog-${index}`, type: "get_messages" });
 		p.child.stdin.end();
 		expect(await Promise.race([p.exited, new Promise((resolve) => setTimeout(() => resolve("hung"), 1800))])).toEqual(
 			{ code: 1, signal: null },
 		);
-		expect(p.records.filter((record) => record.fatal)).toEqual([
-			expect.objectContaining({ error: "RPC startup command queue limit exceeded" }),
+		expect(
+			p.records.filter(
+				(record) => record.command === "parse" && record.error === "RPC startup command queue limit exceeded",
+			),
+		).toEqual([
+			expect.objectContaining({
+				type: "response",
+				success: false,
+				error: "RPC startup command queue limit exceeded",
+			}),
 		]);
 		for (let index = 0; index < 256; index++)
 			expect(p.records.filter((record) => record.id === `backlog-${index}`)).toEqual([
 				expect.objectContaining({ success: false, error: expect.stringContaining("INPUT_ADMISSION_SHUTDOWN") }),
 			]);
 	});
-	// smarty-dev#3048 / PR #110 R3-10 (security R3-S4): no executable or handled result under retired custody.
+	// smarty-dev#3048 / PR #110 R3-10: no executable/handled bash under retired custody.
 	it.each([false, true])("round4 held bash hook is refused after replacement (handled: %s)", async (handled) => {
 		const p = await launch(`retired-bash-${handled}`);
 		const sentinel = resolve(p.target, "..", "bash-started");
@@ -948,7 +931,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.send({ id: "messages", type: "get_messages" });
 		expect((await p.response("messages")).data).toEqual({ messages: [] });
 	});
-	// smarty-dev#3048 / PR #110 R3-8: delivery of empty-text attachments clears native bookkeeping.
+	// smarty-dev#3048 / PR #110 R3-8: consumed empty-text images clear bookkeeping.
 	it.each([
 		["steer", ""],
 		["follow_up", ""],
@@ -972,7 +955,7 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 		p.child.stdin.end();
 		expect(await p.exited).toEqual({ code: 0, signal: null });
 	});
-	// smarty-dev#3048 / PR #110 R3-7: initial binding shutdown needs no incoming command.
+	// smarty-dev#3048 / PR #110 R3-7: startup shutdown needs no incoming command.
 	it("round4 binding-requested shutdown exits with stdin still open", async () => {
 		const p = await launch("binding-shutdown");
 		await p.marker("binding-shutdown-requested");
@@ -980,7 +963,6 @@ describe.skipIf(!existsSync(cli))("installed-style offline input admission", () 
 			{ code: 0, signal: null },
 		);
 	});
-
 	it("print mode uses the same native admission contract before handled short-circuit", async () => {
 		const p = await launch("print", "print");
 		expect(await p.exited).toEqual({ code: 0, signal: null });

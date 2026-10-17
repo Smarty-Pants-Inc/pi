@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Agent, type AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
 	createAssistantMessageEventStream,
@@ -46,7 +46,7 @@ vi.mock("../src/modes/rpc/jsonl.js", () => ({
 	serializeJsonLine: (value: unknown) => `${JSON.stringify(value)}\n`,
 }));
 
-function createAssistantMessage(text: string, overrides?: Partial<AssistantMessage>): AssistantMessage {
+function createAssistantMessage(text: string): AssistantMessage {
 	return {
 		role: "assistant",
 		content: [{ type: "text", text }],
@@ -63,7 +63,6 @@ function createAssistantMessage(text: string, overrides?: Partial<AssistantMessa
 		},
 		stopReason: "stop",
 		timestamp: Date.now(),
-		...overrides,
 	};
 }
 
@@ -90,15 +89,12 @@ async function createRuntimeHost(options: {
 	withAuth: boolean;
 	responseDelayMs: number;
 	model?: Model<any>;
-	failFirstResponse?: boolean;
-	retry?: boolean;
-	extensionFactories?: ExtensionFactory[];
 	extensionsResult?: LoadExtensionsResult;
+	extensionFactories?: ExtensionFactory[];
 }): Promise<{
 	runtimeHost: AgentSessionRuntime;
 	session: AgentSession;
 	sessionManager: SessionManager;
-	rebind: () => Promise<void>;
 	cleanup: () => Promise<void>;
 }> {
 	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
@@ -112,7 +108,6 @@ async function createRuntimeHost(options: {
 		throw new Error("Test model not found");
 	}
 
-	let streamCount = 0;
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: {
@@ -122,17 +117,10 @@ async function createRuntimeHost(options: {
 		},
 		streamFn: (_model, _context, _options) => {
 			const stream = createAssistantMessageEventStream();
-			const shouldFail = options.failFirstResponse === true && streamCount === 0;
-			streamCount++;
 			queueMicrotask(() => {
 				stream.push({ type: "start", partial: createAssistantMessage("") });
 				setTimeout(() => {
-					if (shouldFail) {
-						const message = createAssistantMessage("", { stopReason: "error", errorMessage: "overloaded_error" });
-						stream.push({ type: "error", reason: "error", error: message });
-					} else {
-						stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
-					}
+					stream.push({ type: "done", reason: "stop", message: createAssistantMessage("done") });
 				}, options.responseDelayMs);
 			});
 			return stream;
@@ -141,21 +129,11 @@ async function createRuntimeHost(options: {
 
 	const sessionManager = SessionManager.inMemory();
 	const settingsManager = SettingsManager.create(tempDir, tempDir);
-	if (options.retry) {
-		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } });
-	}
 	const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 	const modelRegistry = await createInMemoryModelRegistry(authStorage);
 	if (options.withAuth) {
 		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 	}
-	const resourceLoader = createTestResourceLoader({
-		extensionsResult:
-			options.extensionsResult ??
-			(options.extensionFactories
-				? await createTestExtensionsResult(options.extensionFactories, tempDir)
-				: undefined),
-	});
 
 	const session = new AgentSession({
 		agent,
@@ -163,48 +141,44 @@ async function createRuntimeHost(options: {
 		settingsManager,
 		cwd: tempDir,
 		modelRuntime: getModelRuntime(modelRegistry),
-		resourceLoader,
+		resourceLoader: createTestResourceLoader({
+			extensionsResult:
+				options.extensionsResult ??
+				(options.extensionFactories
+					? await createTestExtensionsResult(options.extensionFactories, tempDir)
+					: undefined),
+		}),
 	});
 
-	let rebindSession: (() => Promise<void>) | undefined;
 	const runtimeHost = {
 		session,
 		newSession: vi.fn(async () => ({ cancelled: true })),
 		switchSession: vi.fn(async () => ({ cancelled: true })),
 		fork: vi.fn(async () => ({ cancelled: true, selectedText: "" })),
 		dispose: vi.fn(async () => {}),
+		setRebindSession: vi.fn(),
 		setLifecycleCompleteHandler: vi.fn(),
-		setRebindSession: (callback: () => Promise<void>) => {
-			rebindSession = callback;
-		},
 	} as unknown as AgentSessionRuntime;
 
 	return {
+		runtimeHost,
 		session,
 		sessionManager,
-		runtimeHost,
-		rebind: async () => {
-			if (!rebindSession) {
-				throw new Error("RPC rebind callback was not registered");
-			}
-			await rebindSession();
-		},
 		cleanup: async () => {
-			// Remove only listeners installed by this test's RPC host.
 			for (const { signal, listeners } of previousSignals) {
 				for (const listener of process.listeners(signal)) {
 					if (!listeners.includes(listener)) process.off(signal, listener);
 				}
 			}
-			for (const listener of process.stdin.listeners("end") as Array<Parameters<typeof process.on>[1]>) {
-				if (!previousEnd.includes(listener)) process.stdin.off("end", listener);
+			for (const listener of process.stdin.listeners("end")) {
+				if (!previousEnd.includes(listener)) process.stdin.off("end", listener as () => void);
 			}
 			try {
 				await session.abort();
 			} catch {
 				// ignore test cleanup failures
 			}
-			// smarty-dev#3048: queued input must be explicitly recovered, never silently dropped by dispose.
+			// smarty-dev#3048: explicitly recover acknowledged queued input before disposal.
 			session.clearQueue();
 			session.dispose();
 			if (existsSync(tempDir)) {
@@ -216,42 +190,19 @@ async function createRuntimeHost(options: {
 
 async function startRpcMode(options: Parameters<typeof createRuntimeHost>[0]): Promise<{
 	lineHandler: (line: string) => void;
+	runtimeHost: AgentSessionRuntime;
 	session: AgentSession;
 	sessionManager: SessionManager;
-	runtimeHost: AgentSessionRuntime;
 	cleanup: () => Promise<void>;
 }> {
 	rpcIo.outputLines = [];
 	rpcIo.lineHandler = undefined;
 
 	const { runtimeHost, session, sessionManager, cleanup } = await createRuntimeHost(options);
-	const previousEnd = process.stdin.listeners("end");
-	const signals: NodeJS.Signals[] = process.platform === "win32" ? ["SIGTERM"] : ["SIGTERM", "SIGHUP"];
-	const previousSignals = signals.map((signal) => ({ signal, listeners: process.listeners(signal) }));
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
 
-	return {
-		lineHandler: rpcIo.lineHandler!,
-		runtimeHost,
-		session,
-		sessionManager,
-		cleanup: async () => {
-			try {
-				await cleanup();
-			} finally {
-				// These in-process fixtures never exit. Remove only this run's listeners.
-				for (const listener of process.stdin.listeners("end")) {
-					if (!previousEnd.includes(listener)) process.stdin.off("end", listener as () => void);
-				}
-				for (const { signal, listeners } of previousSignals) {
-					for (const listener of process.listeners(signal)) {
-						if (!listeners.includes(listener)) process.off(signal, listener as () => void);
-					}
-				}
-			}
-		},
-	};
+	return { lineHandler: rpcIo.lineHandler!, runtimeHost, session, sessionManager, cleanup };
 }
 
 describe("RPC prompt response semantics", () => {
@@ -300,17 +251,15 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
+	// PR #145: a rejected received envelope produces exactly one correlated refusal.
 	it("serializes a string prompt rejection as failure text", async () => {
 		const { lineHandler, session, cleanup } = await startRpcMode({ withAuth: true, responseDelayMs: 0 });
-		// PR #145: mode input keeps its receipt through the package-private prompt route.
 		const prompt = vi
 			.spyOn(session as unknown as { _promptReceived(input: ReceivedInput): Promise<void> }, "_promptReceived")
 			.mockRejectedValue("plain rejection");
-
 		try {
 			lineHandler(JSON.stringify({ id: "string-rejection", type: "prompt", message: "Hello" }));
-
-			await vi.waitFor(() => {
+			await vi.waitFor(() =>
 				expect(getPromptResponses(rpcIo.outputLines, "string-rejection")).toEqual([
 					{
 						id: "string-rejection",
@@ -319,19 +268,19 @@ describe("RPC prompt response semantics", () => {
 						success: false,
 						error: "plain rejection",
 					},
-				]);
-			});
+				]),
+			);
 		} finally {
 			prompt.mockRestore();
 			await cleanup();
 		}
 	});
 
+	// pi#132: a handled extension command still completes a deferred shutdown without a run.
 	it("shuts down after an extension command requests it without an agent run", async () => {
-		const outputOrder: string[] = [];
+		const order: string[] = [];
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => {
-			outputOrder.push("exit");
-			return undefined;
+			order.push("exit");
 		}) as never);
 		const { lineHandler, runtimeHost, cleanup } = await startRpcMode({
 			withAuth: true,
@@ -339,7 +288,6 @@ describe("RPC prompt response semantics", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.registerCommand("shutdown", {
-						description: "Request shutdown",
 						handler: async (_args, ctx) => {
 							await Promise.resolve();
 							ctx.shutdown();
@@ -350,16 +298,13 @@ describe("RPC prompt response semantics", () => {
 		});
 		rpcIo.onOutputLine = (line) => {
 			const record = JSON.parse(line) as Record<string, unknown>;
-			if (record.id === "extension-shutdown" && record.type === "response" && record.success === true) {
-				outputOrder.push("response");
-			}
+			if (record.id === "extension-shutdown" && record.type === "response" && record.success === true)
+				order.push("response");
 		};
-
 		try {
 			lineHandler(JSON.stringify({ id: "extension-shutdown", type: "prompt", message: "/shutdown" }));
-
 			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
-			expect(outputOrder.slice(0, 2)).toEqual(["response", "exit"]);
+			expect(order.slice(0, 2)).toEqual(["response", "exit"]);
 			expect(parseOutputLines(rpcIo.outputLines).some((record) => record.type === "agent_start")).toBe(false);
 			expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
 		} finally {
@@ -368,7 +313,7 @@ describe("RPC prompt response semantics", () => {
 		}
 	});
 
-	it("defers an extension-requested shutdown until the active agent run settles", async () => {
+	it("defers an extension-requested shutdown until the active run settles", async () => {
 		const exit = vi.spyOn(process, "exit").mockImplementation((() => undefined) as never);
 		const { lineHandler, runtimeHost, session, cleanup } = await startRpcMode({
 			withAuth: true,
@@ -376,7 +321,6 @@ describe("RPC prompt response semantics", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.registerCommand("shutdown", {
-						description: "Request shutdown",
 						handler: async (_args, ctx) => {
 							ctx.shutdown();
 						},
@@ -384,203 +328,20 @@ describe("RPC prompt response semantics", () => {
 				},
 			],
 		});
-
 		try {
 			lineHandler(JSON.stringify({ id: "active-run", type: "prompt", message: "Start" }));
 			await vi.waitFor(() => expect(session.isStreaming).toBe(true));
-
 			lineHandler(JSON.stringify({ id: "live-shutdown", type: "prompt", message: "/shutdown" }));
-			await vi.waitFor(() => {
-				expect(getPromptResponses(rpcIo.outputLines, "live-shutdown")).toMatchObject([{ success: true }]);
-			});
+			await vi.waitFor(() =>
+				expect(getPromptResponses(rpcIo.outputLines, "live-shutdown")).toMatchObject([{ success: true }]),
+			);
 			expect(exit).not.toHaveBeenCalled();
 			expect(runtimeHost.dispose).not.toHaveBeenCalled();
-
 			await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0), { timeout: 2_000 });
 			expect(session.isStreaming).toBe(false);
 			expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
 		} finally {
 			exit.mockRestore();
-			await cleanup();
-		}
-	});
-
-	it("reports RPC input provenance for steering and follow-up commands", async () => {
-		const inputs: Array<{ text: string; source: string }> = [];
-		const { lineHandler, session, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 0,
-			extensionFactories: [
-				(pi) => {
-					pi.on("input", async (event) => {
-						inputs.push({ text: event.text, source: event.source });
-					});
-				},
-			],
-		});
-
-		try {
-			for (const type of ["steer", "follow_up"] as const) {
-				lineHandler(JSON.stringify({ id: type, type, message: `${type} input` }));
-				await vi.waitFor(() => {
-					expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({
-						id: type,
-						type: "response",
-						command: type,
-						success: true,
-						data: { disposition: "queued" },
-					});
-				});
-			}
-			expect(inputs).toEqual([
-				{ text: "steer input", source: "rpc" },
-				{ text: "follow_up input", source: "rpc" },
-			]);
-			expect(session.getSteeringMessages()).toEqual(["steer input"]);
-			expect(session.getFollowUpMessages()).toEqual(["follow_up input"]);
-		} finally {
-			await cleanup();
-		}
-	});
-
-	it.each(["compaction", "tree"] as const)(
-		"defers extension-requested shutdown until non-streaming %s work completes",
-		async (work) => {
-			let releaseStartup = () => {};
-			const startupReleased = new Promise<void>((resolve) => {
-				releaseStartup = resolve;
-			});
-			let workStarted = false;
-			let releaseWork = () => {};
-			const workReleased = new Promise<void>((resolve) => {
-				releaseWork = resolve;
-			});
-			let targetId = "";
-			const order: string[] = [];
-			const exit = vi.spyOn(process, "exit").mockImplementation((() => {
-				order.push("exit");
-				return undefined;
-			}) as never);
-			const { lineHandler, runtimeHost, session, sessionManager, cleanup } = await startRpcMode({
-				withAuth: true,
-				responseDelayMs: 0,
-				extensionFactories: [
-					(pi) => {
-						pi.on("session_start", () => startupReleased);
-						pi.on("session_before_compact", async (event) => {
-							workStarted = true;
-							await workReleased;
-							return {
-								compaction: {
-									summary: "completed compaction",
-									firstKeptEntryId: event.preparation.firstKeptEntryId,
-									tokensBefore: event.preparation.tokensBefore,
-								},
-							};
-						});
-						pi.on("session_before_tree", async () => {
-							workStarted = true;
-							await workReleased;
-							return { summary: { summary: "completed tree summary" } };
-						});
-						pi.registerCommand("tree-work", {
-							handler: async (_args, ctx) => {
-								await ctx.navigateTree(targetId, { summarize: true });
-							},
-						});
-						pi.registerCommand("shutdown", {
-							handler: async (_args, ctx) => ctx.shutdown(),
-						});
-					},
-				],
-			});
-			session.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
-			targetId = sessionManager.appendMessage({ role: "user", content: "history", timestamp: Date.now() });
-			sessionManager.appendMessage(createAssistantMessage("prior answer"));
-			session.agent.state.messages = sessionManager.buildSessionContext().messages;
-			vi.mocked(runtimeHost.dispose).mockImplementation(async (options) => {
-				await options?.beforeShutdown?.();
-				expect(session.isIdle).toBe(true);
-				order.push("dispose");
-			});
-			rpcIo.onOutputLine = (line) => {
-				const record = JSON.parse(line) as Record<string, unknown>;
-				if (record.type === "response" && record.id === "held-work" && record.success === true) {
-					order.push("work response");
-				}
-			};
-
-			try {
-				lineHandler(
-					JSON.stringify(
-						work === "compaction"
-							? { id: "held-work", type: "compact" }
-							: { id: "held-work", type: "prompt", message: "/tree-work" },
-					),
-				);
-				// Dispatch the held operation from the startup backlog, not an already-idle RPC loop.
-				releaseStartup();
-				await vi.waitFor(() => expect(workStarted).toBe(true));
-				expect(session.isStreaming).toBe(false);
-				expect(session.isCompacting).toBe(true);
-				expect(session.isIdle).toBe(false);
-
-				lineHandler(JSON.stringify({ id: "shutdown-held-work", type: "prompt", message: "/shutdown" }));
-				await vi.waitFor(() => {
-					expect(getPromptResponses(rpcIo.outputLines, "shutdown-held-work")).toMatchObject([{ success: true }]);
-				});
-				await sleep(0);
-				expect(exit).not.toHaveBeenCalled();
-				expect(runtimeHost.dispose).not.toHaveBeenCalled();
-
-				releaseWork();
-				await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
-				expect(order).toEqual(["work response", "dispose", "exit"]);
-				expect(getPromptResponses(rpcIo.outputLines, "shutdown-held-work")).toHaveLength(1);
-				expect(runtimeHost.dispose).toHaveBeenCalledTimes(1);
-				expect(session.isIdle).toBe(true);
-				expect(sessionManager.getEntries()).toContainEqual(
-					expect.objectContaining({
-						type: work === "compaction" ? "compaction" : "branch_summary",
-						summary: work === "compaction" ? "completed compaction" : "completed tree summary",
-					}),
-				);
-			} finally {
-				releaseStartup();
-				releaseWork();
-				await session.abort();
-				await sleep(0);
-				await cleanup();
-				exit.mockRestore();
-			}
-		},
-	);
-
-	// pi#132 R5-S3: the success response carries whether a run (and so agent_settled) follows.
-	it("reports the handled or started disposition on the prompt response", async () => {
-		const { lineHandler, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 0,
-			extensionFactories: [
-				(pi) => {
-					pi.on("input", (event) => (event.text === "consume" ? { action: "handled" } : undefined));
-				},
-			],
-		});
-		try {
-			lineHandler(JSON.stringify({ id: "h1", type: "prompt", message: "consume" }));
-			await vi.waitFor(() =>
-				expect(getPromptResponses(rpcIo.outputLines, "h1")).toEqual([
-					expect.objectContaining({ success: true, data: { disposition: "handled" } }),
-				]),
-			);
-			lineHandler(JSON.stringify({ id: "r1", type: "prompt", message: "Hello" }));
-			await vi.waitFor(() =>
-				expect(getPromptResponses(rpcIo.outputLines, "r1")).toEqual([
-					expect.objectContaining({ success: true, data: { disposition: "started" } }),
-				]),
-			);
-		} finally {
 			await cleanup();
 		}
 	});
@@ -602,445 +363,6 @@ describe("RPC prompt response semantics", () => {
 					success: true,
 					data: { disposition: "started" },
 				});
-			});
-		} finally {
-			await cleanup();
-		}
-	});
-
-	it("emits each live message_end after persistence with its history entry ID", async () => {
-		const { lineHandler, session, sessionManager, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 0,
-		});
-		const observedEntryIds: Array<{ entryId: unknown; historyId: string | undefined }> = [];
-		rpcIo.onOutputLine = (line) => {
-			const event = JSON.parse(line) as Record<string, unknown>;
-			if (event.type !== "message_end") return;
-
-			const entryId = event.entryId;
-			const entry = typeof entryId === "string" ? sessionManager.getEntry(entryId) : undefined;
-			const customMessage =
-				typeof event.message === "object" && event.message !== null
-					? (event.message as Record<string, unknown>)
-					: undefined;
-			const matchingEntry =
-				(entry?.type === "message" && JSON.stringify(entry.message) === JSON.stringify(event.message)) ||
-				(entry?.type === "custom_message" &&
-					customMessage?.role === "custom" &&
-					entry.customType === customMessage.customType &&
-					entry.display === customMessage.display &&
-					JSON.stringify(entry.content) === JSON.stringify(customMessage.content));
-			observedEntryIds.push({ entryId, historyId: matchingEntry && entry ? entry.id : undefined });
-		};
-
-		try {
-			lineHandler(JSON.stringify({ id: "entry-id", type: "prompt", message: "Check message entry IDs" }));
-			// v0.87 persists the initial SYSTEM transcript message before the user prompt.
-			await vi.waitFor(() => expect(observedEntryIds).toHaveLength(3));
-			await vi.waitFor(() => expect(session.isStreaming).toBe(false));
-			await session.sendCustomMessage({ customType: "test", content: "Custom message", display: true });
-			await vi.waitFor(() => expect(observedEntryIds).toHaveLength(4));
-
-			for (const { entryId, historyId } of observedEntryIds) {
-				expect(typeof entryId).toBe("string");
-				expect(entryId).toBe(historyId);
-			}
-		} finally {
-			await cleanup();
-		}
-	});
-
-	it("does not expose persisted message IDs outside RPC capture", async () => {
-		const { session, sessionManager, cleanup } = await createRuntimeHost({ withAuth: true, responseDelayMs: 0 });
-		const messages: AgentMessage[] = [];
-		const unsubscribe = session.subscribe((event) => {
-			if (event.type === "message_end") {
-				messages.push(event.message);
-			}
-		});
-
-		try {
-			await session.prompt("Persist without RPC capture");
-
-			expect(messages.map((message) => message.role)).toEqual(["system", "user", "assistant"]);
-			expect(sessionManager.getEntries()).toHaveLength(3);
-			expect(messages.map((message) => session.takeMessageEntryId(message))).toEqual([
-				undefined,
-				undefined,
-				undefined,
-			]);
-		} finally {
-			unsubscribe();
-			await cleanup();
-		}
-	});
-
-	it("does not let a session_start message poison a later RPC ID", async () => {
-		const sessionStartMessages: AgentMessage[] = [];
-		const { runtimeHost, session, sessionManager, cleanup } = await createRuntimeHost({
-			withAuth: true,
-			responseDelayMs: 50,
-			extensionFactories: [
-				(pi) => {
-					pi.on("session_start", async () => {
-						pi.sendMessage({
-							customType: "session-start-reused",
-							content: "Session start message",
-							display: true,
-						});
-						await Promise.resolve();
-					});
-				},
-			],
-		});
-		const unsubscribe = session.subscribe((event) => {
-			if (event.type === "message_end" && event.message.role === "custom") {
-				if (event.message.customType === "session-start-reused") {
-					sessionStartMessages.push(event.message);
-				}
-			}
-		});
-
-		try {
-			void runRpcMode(runtimeHost);
-			await vi.waitFor(() => {
-				expect(rpcIo.lineHandler).toBeDefined();
-				expect(sessionStartMessages).toHaveLength(1);
-			});
-
-			const sessionStartMessage = sessionStartMessages[0];
-			if (!sessionStartMessage || sessionStartMessage.role !== "custom") {
-				throw new Error("Expected the session_start custom message");
-			}
-			const sessionStartEntry = sessionManager
-				.getEntries()
-				.find((entry) => entry.type === "custom_message" && entry.customType === "session-start-reused");
-			if (!sessionStartEntry) {
-				throw new Error("Expected the persisted session_start message");
-			}
-
-			rpcIo.outputLines = [];
-			rpcIo.lineHandler!(JSON.stringify({ id: "reuse-session-start", type: "prompt", message: "Start" }));
-			await vi.waitFor(() => expect(session.isStreaming).toBe(true));
-			session.agent.steer(sessionStartMessage);
-			await vi.waitFor(() => {
-				const customEvents = parseOutputLines(rpcIo.outputLines).filter((event) => {
-					const message = event.message as Record<string, unknown> | undefined;
-					return event.type === "message_end" && message?.customType === "session-start-reused";
-				});
-				expect(customEvents).toHaveLength(1);
-			});
-
-			const customEvent = parseOutputLines(rpcIo.outputLines).find((event) => {
-				const message = event.message as Record<string, unknown> | undefined;
-				return event.type === "message_end" && message?.customType === "session-start-reused";
-			});
-			if (!customEvent) {
-				throw new Error("Expected the rerouted custom message event");
-			}
-			const matchingEntries = sessionManager
-				.getEntries()
-				.filter((entry) => entry.type === "custom_message" && entry.customType === "session-start-reused");
-
-			expect(matchingEntries).toHaveLength(2);
-			expect(customEvent.entryId).toBe(matchingEntries[1]!.id);
-			expect(customEvent.entryId).not.toBe(sessionStartEntry.id);
-		} finally {
-			unsubscribe();
-			await cleanup();
-		}
-	});
-
-	it("clears prior capture state when rebinding to a new RPC session", async () => {
-		const first = await createRuntimeHost({ withAuth: true, responseDelayMs: 0 });
-		const second = await createRuntimeHost({ withAuth: true, responseDelayMs: 0 });
-		let staleMessage: AgentMessage | undefined;
-		const unsubscribe = second.session.subscribe((event) => {
-			if (event.type === "message_end" && event.message.role === "custom") {
-				if (event.message.customType === "prior-rebind") {
-					staleMessage = event.message;
-				}
-			}
-		});
-
-		try {
-			second.session.startMessageEntryIdCapture();
-			await second.session.sendCustomMessage({
-				customType: "prior-rebind",
-				content: "Captured before rebind",
-				display: true,
-			});
-			if (!staleMessage) {
-				throw new Error("Expected the pre-rebind custom message");
-			}
-
-			void runRpcMode(first.runtimeHost);
-			await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
-			(first.runtimeHost as unknown as { session: AgentSession }).session = second.session;
-			await first.rebind();
-
-			expect(second.session.takeMessageEntryId(staleMessage)).toBeUndefined();
-		} finally {
-			unsubscribe();
-			await second.cleanup();
-			await first.cleanup();
-		}
-	});
-
-	it("does not scan long session history for live message entry IDs", async () => {
-		const { lineHandler, sessionManager, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 0,
-		});
-		for (let index = 0; index < 4096; index++) {
-			sessionManager.appendMessage({ role: "user", content: `history ${index}`, timestamp: index });
-		}
-		const getEntries = vi.spyOn(sessionManager, "getEntries");
-		// v0.87 builds the canonical request and compaction context from the session projection.
-		const buildSessionProjection = vi.spyOn(sessionManager, "buildSessionProjection");
-
-		try {
-			lineHandler(JSON.stringify({ id: "long-history", type: "prompt", message: "Live message IDs" }));
-			await vi.waitFor(() => {
-				const messageEnds = parseOutputLines(rpcIo.outputLines).filter((event) => event.type === "message_end");
-				expect(messageEnds).toHaveLength(3);
-			});
-			// smarty-dev#2177: neither live IDs nor canonical projections scan the full entry array.
-			expect(buildSessionProjection).toHaveBeenCalled();
-			expect(getEntries).not.toHaveBeenCalled();
-		} finally {
-			buildSessionProjection.mockRestore();
-			getEntries.mockRestore();
-			await cleanup();
-		}
-	});
-
-	it("emits a persisted ID for a custom message queued during streaming", async () => {
-		const { lineHandler, session, sessionManager, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 50,
-		});
-		const customEvents: Record<string, unknown>[] = [];
-		rpcIo.onOutputLine = (line) => {
-			const event = JSON.parse(line) as Record<string, unknown>;
-			if (
-				event.type === "message_end" &&
-				typeof event.message === "object" &&
-				event.message !== null &&
-				(event.message as Record<string, unknown>).role === "custom"
-			) {
-				customEvents.push(event);
-			}
-		};
-
-		try {
-			lineHandler(JSON.stringify({ id: "stream-custom", type: "prompt", message: "Start" }));
-			await vi.waitFor(() => expect(session.isStreaming).toBe(true));
-			await session.sendCustomMessage({ customType: "queued", content: "Queued custom message", display: true });
-			await vi.waitFor(() => expect(customEvents).toHaveLength(1));
-
-			const entryId = customEvents[0]!.entryId;
-			if (typeof entryId !== "string") {
-				throw new Error("Expected the custom message_end event to include an entryId");
-			}
-			expect(sessionManager.getEntry(entryId)).toMatchObject({
-				type: "custom_message",
-				customType: "queued",
-				content: "Queued custom message",
-			});
-		} finally {
-			await cleanup();
-		}
-	});
-
-	it("keeps a successful retry's persisted assistant message_end before auto_retry_end", async () => {
-		const { lineHandler, sessionManager, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 0,
-			failFirstResponse: true,
-			retry: true,
-		});
-
-		try {
-			lineHandler(JSON.stringify({ id: "retry-order", type: "prompt", message: "Retry" }));
-			await vi.waitFor(() => {
-				expect(
-					parseOutputLines(rpcIo.outputLines).some(
-						(event) => event.type === "auto_retry_end" && event.success === true,
-					),
-				).toBe(true);
-			});
-
-			const events = parseOutputLines(rpcIo.outputLines);
-			const assistantMessageEndIndex = events.findIndex((event) => {
-				if (event.type !== "message_end") return false;
-				const message = event.message as Record<string, unknown> | undefined;
-				return (
-					message?.role === "assistant" && JSON.stringify(message.content) === '[{"type":"text","text":"done"}]'
-				);
-			});
-			if (assistantMessageEndIndex === -1) {
-				throw new Error("Expected the successful assistant message_end event");
-			}
-			const autoRetryEndIndex = events.findIndex(
-				(event) => event.type === "auto_retry_end" && event.success === true,
-			);
-			expect(autoRetryEndIndex).toBeGreaterThan(assistantMessageEndIndex);
-
-			const entryId = events[assistantMessageEndIndex]!.entryId;
-			if (typeof entryId !== "string") {
-				throw new Error("Expected the successful assistant message_end event to include an entryId");
-			}
-			expect(sessionManager.getEntry(entryId)).toMatchObject({
-				type: "message",
-				message: { role: "assistant", content: [{ type: "text", text: "done" }] },
-			});
-		} finally {
-			await cleanup();
-		}
-	});
-
-	it("maps identical queued custom message_end events to distinct entries", async () => {
-		const { lineHandler, session, sessionManager, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 50,
-		});
-		const customMessage = { customType: "duplicate", content: "Queued custom message", display: true };
-
-		try {
-			lineHandler(JSON.stringify({ id: "duplicate-custom", type: "prompt", message: "Start" }));
-			await vi.waitFor(() => expect(session.isStreaming).toBe(true));
-			await session.sendCustomMessage(customMessage, { triggerTurn: false });
-			await session.sendCustomMessage(customMessage, { triggerTurn: false });
-			await vi.waitFor(() => {
-				const customEvents = parseOutputLines(rpcIo.outputLines).filter((event) => {
-					const message = event.message as Record<string, unknown> | undefined;
-					return event.type === "message_end" && message?.role === "custom" && message.customType === "duplicate";
-				});
-				expect(customEvents).toHaveLength(2);
-			});
-
-			const customEvents = parseOutputLines(rpcIo.outputLines).filter((event) => {
-				const message = event.message as Record<string, unknown> | undefined;
-				return event.type === "message_end" && message?.role === "custom" && message.customType === "duplicate";
-			});
-			const entryIds = customEvents.map((event) => event.entryId);
-			for (const entryId of entryIds) {
-				expect(typeof entryId).toBe("string");
-			}
-			expect(new Set(entryIds)).toHaveLength(2);
-
-			const matchingEntries = sessionManager
-				.getEntries()
-				.filter(
-					(entry) =>
-						entry.type === "custom_message" &&
-						entry.customType === customMessage.customType &&
-						entry.content === customMessage.content &&
-						entry.display === customMessage.display,
-				);
-			expect(entryIds).toEqual(matchingEntries.map((entry) => entry.id));
-		} finally {
-			await cleanup();
-		}
-	});
-	it("maps two emissions of the same agent-routed custom object to distinct entries", async () => {
-		const { lineHandler, session, sessionManager, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 50,
-		});
-		const customMessage = {
-			role: "custom" as const,
-			customType: "agent-routed-duplicate",
-			content: "Same custom message",
-			display: true,
-			timestamp: Date.now(),
-		};
-
-		try {
-			lineHandler(JSON.stringify({ id: "agent-routed-duplicate", type: "prompt", message: "Start" }));
-			await vi.waitFor(() => expect(session.isStreaming).toBe(true));
-			session.agent.steer(customMessage);
-			session.agent.steer(customMessage);
-			await vi.waitFor(() => {
-				const customEvents = parseOutputLines(rpcIo.outputLines).filter((event) => {
-					const message = event.message as Record<string, unknown> | undefined;
-					return (
-						event.type === "message_end" &&
-						message?.role === "custom" &&
-						message.customType === customMessage.customType
-					);
-				});
-				expect(customEvents).toHaveLength(2);
-			});
-
-			const customEvents = parseOutputLines(rpcIo.outputLines).filter((event) => {
-				const message = event.message as Record<string, unknown> | undefined;
-				return (
-					event.type === "message_end" &&
-					message?.role === "custom" &&
-					message.customType === customMessage.customType
-				);
-			});
-			const entryIds = customEvents.map((event) => event.entryId);
-			const matchingEntries = sessionManager
-				.getEntries()
-				.filter(
-					(entry) =>
-						entry.type === "custom_message" &&
-						entry.customType === customMessage.customType &&
-						entry.content === customMessage.content &&
-						entry.display === customMessage.display,
-				);
-			expect(entryIds).toEqual(matchingEntries.map((entry) => entry.id));
-			expect(new Set(entryIds)).toHaveLength(2);
-		} finally {
-			await cleanup();
-		}
-	});
-
-	it("writes sendMessage message_end before a following UI notification", async () => {
-		const { lineHandler, cleanup } = await startRpcMode({
-			withAuth: true,
-			responseDelayMs: 0,
-			extensionFactories: [
-				(pi) => {
-					pi.registerCommand("send-and-notify", {
-						description: "Send a custom message and notify",
-						handler: async (_args, ctx) => {
-							pi.sendMessage({
-								customType: "send-before-notify",
-								content: "Custom message",
-								display: true,
-							});
-							ctx.ui.notify("After custom message");
-						},
-					});
-				},
-			],
-		});
-
-		try {
-			lineHandler(JSON.stringify({ id: "send-and-notify", type: "prompt", message: "/send-and-notify" }));
-			await vi.waitFor(() => {
-				const records = parseOutputLines(rpcIo.outputLines);
-				const messageEndIndex = records.findIndex((record) => {
-					const message = record.message as Record<string, unknown> | undefined;
-					return (
-						record.type === "message_end" &&
-						message?.role === "custom" &&
-						message.customType === "send-before-notify"
-					);
-				});
-				const notifyIndex = records.findIndex(
-					(record) =>
-						record.type === "extension_ui_request" &&
-						record.method === "notify" &&
-						record.message === "After custom message",
-				);
-				expect(messageEndIndex).toBeGreaterThanOrEqual(0);
-				expect(notifyIndex).toBeGreaterThan(messageEndIndex);
 			});
 		} finally {
 			await cleanup();

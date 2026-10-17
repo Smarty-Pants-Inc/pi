@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { AssistantMessage, AssistantMessageEvent } from "../src/types.ts";
-import { projectAssistantMessage } from "../src/utils/diagnostics.ts";
+import { projectAssistantMessage } from "../src/utils/assistant-message-snapshot.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 
-// smarty-dev#5443 S2 isolation inside the S3 publication projector (smarty-dev#5822 C2, pi#159):
-// arbitrary values of a published message are copied with isolateValue in one pass per message.
-
+// smarty-dev#5443 S2 / smarty-dev#5822 C2 / pi#159: one isolation pass per published message.
 class HttpError extends Error {
 	status = 429;
 	code = "E_RATE";
@@ -31,7 +29,6 @@ function baseMessage(): AssistantMessage {
 	};
 }
 
-/** Tool arguments are typed as JSON; these tests deliberately pass the wider values isolateValue supports. */
 interface RichArguments {
 	map: Map<unknown, unknown>;
 	set: Set<unknown>;
@@ -68,7 +65,7 @@ async function collect(stream: AssistantMessageEventStream): Promise<AssistantMe
 }
 
 describe("publication projector isolation", () => {
-	it("keeps Map/Set aliases and cycles, Error class and fields, __proto__ data and resizable views in tool arguments", async () => {
+	it("keeps Map/Set aliases and cycles, Error fields, __proto__ data and resizable views in tool arguments", async () => {
 		const { args, shared, buffer } = richArguments();
 		const live = baseMessage();
 		live.content.push({ type: "toolCall", id: "call_1", name: "read", arguments: args as never });
@@ -81,7 +78,6 @@ describe("publication projector isolation", () => {
 		const done = events[1];
 		if (end?.type !== "toolcall_end" || done?.type !== "done") throw new Error("missing events");
 		expect(end.toolCall).toBe(end.partial.content[0]);
-
 		for (const block of [end.toolCall, done.message.content[0]]) {
 			if (block?.type !== "toolCall") throw new Error("missing tool call");
 			const copy = block.arguments as unknown as RichArguments;
@@ -106,13 +102,12 @@ describe("publication projector isolation", () => {
 			expect(copy.tracking.length).toBe(8);
 			copy.direct.n = 2;
 		}
-		// Neither consumer write reached the producer's object, and the two events do not share copies.
 		expect(buffer.byteLength).toBe(4);
 		expect(shared.n).toBe(1);
 		expect(end.toolCall).not.toBe(done.message.content[0]);
 	});
 
-	it("shares one memo across the fields of one message, and never between messages", () => {
+	it("shares one memo across fields of one message, never between messages", () => {
 		const shared = { n: 1 };
 		const live = baseMessage();
 		live.content.push(
@@ -132,15 +127,9 @@ describe("publication projector isolation", () => {
 		expect(first.content[1]).toEqual({ type: "text", text: "t" });
 	});
 
-	it("keeps closed keys: drops scratch fields, diagnostic payloads and failure-time wire metadata", () => {
+	it("drops scratch fields, diagnostic payloads and failure-time wire metadata", () => {
 		const live = baseMessage();
-		live.content.push({
-			type: "toolCall",
-			id: "a",
-			name: "x",
-			arguments: { k: 1 },
-			partialJson: "{",
-		} as never);
+		live.content.push({ type: "toolCall", id: "a", name: "x", arguments: { k: 1 }, partialJson: "{" } as never);
 		live.responseId = "resp_1";
 		live.responseModel = "m";
 		live.diagnostics = [
@@ -154,7 +143,6 @@ describe("publication projector isolation", () => {
 		expect(failed.diagnostics).toHaveLength(1);
 		expect(Object.keys(failed.diagnostics?.[0] ?? {}).sort()).toEqual(["timestamp", "type"]);
 		expect(failed.diagnostics?.[0]?.timestamp).not.toBe(5);
-
 		live.stopReason = "stop";
 		const succeeded = projectAssistantMessage(live, "success");
 		expect(succeeded.responseId).toBe("resp_1");

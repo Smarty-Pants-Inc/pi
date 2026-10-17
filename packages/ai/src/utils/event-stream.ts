@@ -1,6 +1,11 @@
 import { redactOAuthDiagnostic, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
-import { cloneToolCall, type PublicationPhase, projectAssistantMessage, terminalPhase } from "./diagnostics.ts";
+import {
+	cloneToolCall,
+	type PublicationPhase,
+	projectAssistantMessage,
+	terminalPhase,
+} from "./assistant-message-snapshot.ts";
 import { assistantRecovery, ownedRecovery, transferThrottledLimitWait } from "./recovery.ts";
 
 class FifoQueue<T> {
@@ -94,16 +99,9 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 interface StreamProtection {
 	secrets: string[];
 }
-
-// Kept outside the class: new members would break structural compatibility of custom streams.
+// Outside the class to preserve structural compatibility of custom streams.
 const streamProtections = new WeakMap<object, StreamProtection>();
 
-/**
- * Mask the live credential values of a request (see `getRequestDiagnosticSecrets`)
- * in every later event and the final result of `stream`, before any consumer sees
- * them. A provider error, partial event or technical metadata field then cannot
- * publish a reflected key or header. Call again to add values.
- */
 export function protectAssistantMessageStream(
 	stream: AssistantMessageEventStream,
 	secrets: readonly string[] | undefined,
@@ -114,28 +112,18 @@ export function protectAssistantMessageStream(
 	if (protection) protection.secrets.push(...values);
 	else streamProtections.set(stream, { secrets: values });
 }
-
-/** Mask the stream's own published copy in place. */
 function protectMessage(message: AssistantMessage, protection: StreamProtection): void {
 	const { secrets } = protection;
 	if (typeof message.errorMessage === "string")
 		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
 	if (typeof message.rawStopReason === "string")
 		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
-	// The handle id is a provider token that consumers persist and redeem: mask live values only, and
-	// replace the handle instead of rewriting the provider's own object (smarty-dev#5443 T-F6-deferred).
 	const deferred = message.deferred;
 	if (typeof deferred?.id === "string") {
 		const id = redactValues(deferred.id, secrets);
 		if (id !== deferred.id) message.deferred = { ...deferred, id };
 	}
 }
-
-/**
- * Project a message and carry the private throttle wait to the copy. Universal fallback for every source,
- * model-less streams included: a failed message is classified from the producer's original text, before the copy
- * can be masked or its text replaced; a producer's owned decision is kept (smarty-dev#5822 C3).
- */
 function projectMessage(message: AssistantMessage, phase: PublicationPhase): AssistantMessage {
 	const projected = projectAssistantMessage(message, phase);
 	const recovery = message.stopReason === "error" ? assistantRecovery(message) : ownedRecovery(message.recovery);
@@ -143,11 +131,6 @@ function projectMessage(message: AssistantMessage, phase: PublicationPhase): Ass
 	transferThrottledLimitWait(message, projected);
 	return projected;
 }
-
-/**
- * Rebuild an event around its projected message (smarty-dev#5822 C2); producer extras on the event are not
- * copied. Every stream publishes through this, model-less and lazy-forwarding ones included.
- */
 function projectEvent(event: AssistantMessageEvent): AssistantMessageEvent {
 	switch (event.type) {
 		case "done":
@@ -208,7 +191,6 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	readonly #startedAt = Date.now();
 	readonly #startedAtMonotonic = performance.now();
 
-	/** `diagnosticSecrets`: see `protectAssistantMessageStream`. */
 	constructor(diagnosticSecrets?: readonly string[]) {
 		super(
 			(event) => event.type === "done" || event.type === "error",
@@ -233,7 +215,6 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 			if (published.type === "done") protectMessage(published.message, protection);
 			if (published.type === "error") protectMessage(published.error, protection);
 		}
-
 		if (published.type === "done") this.#time(published.message);
 		else if (published.type === "error") this.#time(published.error);
 		super.push(published);

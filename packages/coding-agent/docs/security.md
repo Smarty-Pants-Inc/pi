@@ -81,10 +81,6 @@ Print, JSON, and RPC modes cannot show the built-in trust prompt. If no command-
 
 Use `--approve` or `--no-approve` when an automated run needs an explicit one-time decision.
 
-## Codemode and MCP availability
-
-Codemode is re-enabled after the pi#203 internal repairs, with finite host deadlines, bridge budgets, an owned output directory, and host store quotas. Its tool is registered inactive and nested calls still use the normal tool policy. MCP execution and configuration mutations remain refused pending their own reviewed re-enable. See [Codemode and MCP reviewed re-enable](security-reenable.md) for the affected entry points and remaining requirements.
-
 ## Reduce impact and improve recovery
 
 These practices do not replace isolation, but they reduce exposure or make recovery easier:

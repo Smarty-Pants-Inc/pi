@@ -42,7 +42,7 @@ describe("InteractiveMode /clone", () => {
 
 		expect(fork).toHaveBeenCalledWith("leaf-123", { position: "at" });
 		expect(renderCurrentSessionState).not.toHaveBeenCalled();
-		// smarty-dev#3048 / pi#117 R2-S4: submission already cleared; a late continuation must not clear again.
+		// smarty-dev#3048 / pi#117: do not clear a draft typed during the asynchronous clone.
 		expect(setText).not.toHaveBeenCalled();
 		expect(showStatus).toHaveBeenCalledWith("Cloned to new session");
 		expect(showError).not.toHaveBeenCalled();

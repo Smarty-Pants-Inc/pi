@@ -231,7 +231,7 @@ describe("azure base URL normalization", () => {
 });
 
 describe("azure provider stream events", () => {
-	// smarty-dev#5822 C1: owned notifications only, never the raw event or model.
+	// smarty-dev#5822 C1: owned notifications only, never raw event or model.
 	it("notifies once per parsed event without provider data", async () => {
 		azureMock.streamEvents = [
 			{ type: "response.created", sequence_number: 0, response: { id: "resp_azure" } } as ResponseStreamEvent,

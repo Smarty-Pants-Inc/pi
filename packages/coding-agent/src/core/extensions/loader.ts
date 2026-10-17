@@ -14,20 +14,17 @@ import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../
 import { resolvePath } from "../../utils/paths.ts";
 import { refuseUnreviewedBuiltin } from "../builtin-security-admission.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
-import { createExecCommand, type ExecOptions, execCommand, type OwnedExecScope } from "../exec.ts";
+import type { ExecOptions } from "../exec.ts";
+import { execCommand } from "../exec.ts";
 import { HOST_CAPABILITIES } from "../host-capabilities.ts";
 import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
-import { assertOrdinaryOwner, type OrdinaryOwnerContext } from "../ordinary-owner-context.ts";
-import { createOrdinarySenseExtension, type OrdinarySenseEntry } from "../ordinary-sense.ts";
 import { readPiManifest } from "../pi-manifest.ts";
-import { currentSessionOwnership, ownershipOf, type SessionOwnership } from "../session-ownership.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
 import {
 	assertExtensionMetadataCaller,
 	bindExtensionMetadataCallback,
 	bindExtensionMetadataSource,
-	bindSubmitUserMessageSource,
 } from "../user-message-metadata.ts";
 import type { ModelRouteRequest, VirtualModelDefinition } from "../virtual-models.ts";
 import type {
@@ -45,7 +42,6 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 	ToolRendererResolver,
-	UserMessageRenderer,
 } from "./types.ts";
 
 const require = createRequire(import.meta.url);
@@ -112,7 +108,6 @@ function getAliases(): Record<string, string> {
 
 	_aliases = {
 		"@earendil-works/pi-coding-agent": piCodingAgentEntry,
-		"@earendil-works/pi-coding-agent/ordinary": path.resolve(__dirname, "../..", "ordinary.js"),
 		"@earendil-works/pi-agent-core": piAgentCoreEntry,
 		"@earendil-works/pi-tui": piTuiEntry,
 		"@earendil-works/pi-ai/providers/all": piAiProvidersEntry,
@@ -261,33 +256,13 @@ function useExtensionCacheCwd(cwd: string): ExtensionCacheToken {
  * Create a runtime with throwing stubs for action methods.
  * Runner.bindCore() replaces these with real implementations.
  */
-const runtimeOwners = new WeakMap<
-	ExtensionRuntime,
-	{
-		owner: SessionOwnership | undefined;
-		exec: typeof execCommand;
-	}
->();
-
 export function createExtensionRuntime(): ExtensionRuntime {
-	return createRuntime(currentSessionOwnership());
-}
-
-/** Private host construction; not re-exported by extensions/index. */
-export function createOwnedExtensionRuntime(owner: SessionOwnership, scope?: OwnedExecScope): ExtensionRuntime {
-	if (!owner || ownershipOf(owner.manager) !== owner) throw new Error("OWNER_NATIVE_CONSTRUCTION");
-	return createRuntime(owner, scope);
-}
-
-function createRuntime(owner: SessionOwnership | undefined, scope?: OwnedExecScope): ExtensionRuntime {
-	const exec = createExecCommand(owner, scope);
 	const notInitialized = () => {
 		throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
 	};
 	const state: { staleMessage?: string } = {};
 	const eventBusUnsubscribers = new Set<() => void>();
 	const assertActive = () => {
-		owner?.assertActive();
 		if (state.staleMessage) {
 			throw new Error(state.staleMessage);
 		}
@@ -296,11 +271,6 @@ function createRuntime(owner: SessionOwnership | undefined, scope?: OwnedExecSco
 	const runtime: ExtensionRuntime = {
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
-		submitUserMessage: async (request) => ({
-			status: "rejected",
-			sessionGeneration: typeof request?.sessionGeneration === "string" ? request.sessionGeneration : "",
-			reason: "no_session",
-		}),
 		appendEntry: notInitialized,
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
@@ -365,7 +335,6 @@ function createRuntime(owner: SessionOwnership | undefined, scope?: OwnedExecSco
 		},
 	};
 
-	runtimeOwners.set(runtime, { owner, exec });
 	return runtime;
 }
 
@@ -380,9 +349,6 @@ function createExtensionAPI(
 	cwd: string,
 	eventBus: EventBus,
 ): { api: ExtensionAPI; commit: () => void; discard: () => void } {
-	const binding = runtimeOwners.get(runtime);
-	if (currentSessionOwnership() && !binding?.owner) throw new Error("OWNER_RUNTIME_OWNERSHIP");
-	const execute = binding?.exec ?? execCommand;
 	const pendingFlagValues = new Map<string, boolean | string>();
 	const pendingRuntimeChanges: Array<() => void> = [];
 	const loadingUnsubscribers: Array<() => void> = [];
@@ -391,7 +357,6 @@ function createExtensionAPI(
 		if (state === "failed") {
 			throw new Error(`Extension "${extension.path}" failed to load and its API is no longer active.`);
 		}
-		binding?.owner?.assertActive();
 		runtime.assertActive();
 	};
 	const assertRegistration = () => {
@@ -509,11 +474,6 @@ function createExtensionAPI(
 			);
 		},
 
-		registerUserMessageRenderer(renderer: UserMessageRenderer): void {
-			assertRegistration();
-			extension.userMessageRenderer = bindExtensionMetadataCallback(extension.path, renderer);
-		},
-
 		registerMarkdownTransformer(transformer: MarkdownTransformer): void {
 			assertRegistration();
 			extension.markdownTransformer = bindExtensionMetadataCallback(extension.path, transformer);
@@ -569,24 +529,6 @@ function createExtensionAPI(
 			}
 		},
 
-		async submitUserMessage(request) {
-			const sessionGeneration = typeof request?.sessionGeneration === "string" ? request.sessionGeneration : "";
-			try {
-				assertActive();
-			} catch {
-				return { status: "rejected", sessionGeneration, reason: "session_changed" };
-			}
-			if (!runtime.submitUserMessage) {
-				return { status: "rejected", sessionGeneration, reason: "unsupported" };
-			}
-			// Borrowed API: refuse before the host sees the request, so nothing is admitted or reserved.
-			const metadataOptions = bindSubmitUserMessageSource(extension.path);
-			if (!metadataOptions) {
-				return { status: "rejected", sessionGeneration, reason: "admission_refused" };
-			}
-			return runtime.submitUserMessage(request, metadataOptions);
-		},
-
 		appendEntry(customType: string, data?: unknown): void {
 			assertActive();
 			runtime.appendEntry(customType, data);
@@ -609,13 +551,12 @@ function createExtensionAPI(
 
 		exec(command: string, args: string[], options?: ExecOptions) {
 			assertActive();
-			// A revoked callback refuses here; a live one composes its lineage into the command (#132 R1-S7).
 			const inherited = runtime.inheritedCancellation?.();
 			const signal =
 				inherited && options?.signal
 					? AbortSignal.any([inherited, options.signal])
 					: (inherited ?? options?.signal);
-			return execute(command, args, options?.cwd ?? cwd, { ...options, signal });
+			return execCommand(command, args, options?.cwd ?? cwd, { ...options, signal });
 		},
 
 		getActiveTools(): string[] {
@@ -784,7 +725,6 @@ function cacheFallback(reason: string): true {
 function jitiFsCache(): string | true {
 	const value = process.env.SMARTY_JITI_CACHE_DIR;
 	if (!value) return true;
-	// ponytail: fall back on bad env or Windows (no ACL validation); parents must not be writable by another UID (#10893).
 	if (process.platform === "win32") return cacheFallback("unsupported-platform");
 	if (!path.isAbsolute(value)) return cacheFallback("relative");
 	const dir = path.resolve(value);
@@ -822,7 +762,6 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 			: { alias: getAliases() };
 	const jiti = createJitiImpl(import.meta.url, {
 		moduleCache: false,
-		// ponytail: jiti's env flag is boolean-only; pass the shared cache path explicitly.
 		fsCache: jitiFsCache(),
 		...resolutionOptions,
 	});
@@ -869,11 +808,9 @@ async function initializeExtension(
 ): Promise<Extension> {
 	const extension = createExtension(extensionPath, resolvedPath);
 	const load = createExtensionAPI(extension, runtime, cwd, eventBus);
-	const owner = runtimeOwners.get(runtime)?.owner;
 	try {
 		const invokeFactory = bindExtensionMetadataCallback(extensionPath, factory, true);
-		await (owner ? owner.within(() => invokeFactory(load.api)) : invokeFactory(load.api));
-		owner?.assertActive();
+		await invokeFactory(load.api);
 		load.commit();
 	} catch (error) {
 		load.discard();
@@ -893,15 +830,12 @@ async function loadExtension(
 	const resolvedPath = resolvePath(extensionPath, cwd, { normalizeUnicodeSpaces: true });
 
 	try {
-		const owner = runtimeOwners.get(runtime)?.owner;
-		if (currentSessionOwnership() && !owner) throw new Error("OWNER_RUNTIME_OWNERSHIP");
 		const importModule = bindExtensionMetadataCallback(
 			extensionPath,
 			() => loadExtensionModule(resolvedPath, cacheToken),
 			true,
 		);
-		const factory = await (owner ? owner.within(importModule) : importModule());
-		owner?.assertActive();
+		const factory = await importModule();
 		time(`${extensionPath} module import`, "extensions");
 		if (!factory) {
 			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
@@ -914,110 +848,6 @@ async function loadExtension(
 		const message = err instanceof Error ? err.message : String(err);
 		return { extension: null, error: `Failed to load extension: ${message}` };
 	}
-}
-
-const originalSenseEntries = new WeakMap<OrdinaryOwnerContext, object>();
-const originalSenseLoads = new WeakSet<OrdinaryOwnerContext>();
-const operationalCompositionSpecifier = "@smarty/sense/pi/operational-composition";
-
-/** Check original evaluated namespace identity, never its shape or a supplied verifier. */
-export function assertOriginalSenseEntry(context: OrdinaryOwnerContext, entry: object): void {
-	if (originalSenseEntries.get(context) !== entry) throw new Error("OWNER_SENSE_ORIGINAL_ENTRY_REQUIRED");
-	assertOrdinaryOwner(context);
-}
-
-/** Load only the descriptor-pinned Sense entry with original private ports. */
-export async function loadOwnedSenseExtension(context: OrdinaryOwnerContext): Promise<LoadExtensionsResult> {
-	assertOrdinaryOwner(context);
-	if (originalSenseLoads.has(context)) throw new Error("OWNER_SENSE_ORIGINAL_ENTRY_ONCE");
-	originalSenseLoads.add(context);
-	const extensionPath = context.decision.record.sense.path;
-	const nativeRequire = createRequire(extensionPath);
-	const compositionPath = nativeRequire.resolve(operationalCompositionSpecifier);
-	context.holdSenseCompositionModule(compositionPath);
-	// Native cache only: never fall back to another Jiti copy of the registry.
-	// Original C3 startup admission must cover this same canonical external graph.
-	const composition: unknown = bindExtensionMetadataCallback(
-		extensionPath,
-		() => nativeRequire(compositionPath),
-		true,
-	)();
-	context.checkSenseCompositionModule();
-	if (
-		!composition ||
-		typeof composition !== "object" ||
-		!("receiveOrdinaryOperationalCollector" in composition) ||
-		!("receiveOriginalOperationalCollector" in composition) ||
-		typeof composition.receiveOriginalOperationalCollector !== "function"
-	)
-		throw new Error("OWNER_SENSE_COMPOSITION_MODULE_IDENTITY");
-	const runtime = createOwnedExtensionRuntime(context.owner);
-	const eventBus = createEventBus();
-	const [createJitiImpl, virtualModules] = await context.within(() =>
-		Promise.all([getCreateJiti(), getVirtualModules()]),
-	);
-	context.assertActive();
-	// Same namespace object the extension virtual modules expose as the bundled ordinary entry.
-	const bundledOrdinary = virtualModules["@earendil-works/pi-coding-agent/ordinary"];
-	if (
-		!bundledOrdinary ||
-		typeof bundledOrdinary !== "object" ||
-		!("receiveOrdinaryOperationalCollector" in bundledOrdinary) ||
-		composition.receiveOrdinaryOperationalCollector !== bundledOrdinary.receiveOrdinaryOperationalCollector
-	)
-		throw new Error("OWNER_SENSE_COMPOSITION_MODULE_IDENTITY");
-	const loader = createJitiImpl(import.meta.url, {
-		fsCache: false,
-		moduleCache: false,
-		virtualModules: { ...virtualModules, [operationalCompositionSpecifier]: composition },
-		tryNative: false,
-		alias: {},
-		nativeModules: [],
-		transformModules: [],
-		tsconfigPaths: false,
-	});
-	const loaded: unknown = context.within(
-		bindExtensionMetadataCallback(
-			extensionPath,
-			() =>
-				loader.evalModule(context.readSenseEntry(), {
-					filename: extensionPath,
-					async: false,
-					forceTranspile: true,
-				}),
-			true,
-		),
-	);
-	context.assertActive();
-	if (!loaded || typeof loaded !== "object") throw new Error("OWNER_SENSE_ENTRY_REQUIRED");
-	context.checkSenseCompositionModule();
-	if (
-		!("receiveOriginalOperationalCollector" in loaded) ||
-		loaded.receiveOriginalOperationalCollector !== composition.receiveOriginalOperationalCollector
-	)
-		throw new Error("OWNER_SENSE_COMPOSITION_MODULE_IDENTITY");
-	if (originalSenseEntries.has(context)) throw new Error("OWNER_SENSE_ORIGINAL_ENTRY_ONCE");
-	originalSenseEntries.set(context, loaded);
-	const factory = createOrdinarySenseExtension(context, loaded as OrdinarySenseEntry);
-	const extension = await initializeExtension(
-		factory,
-		extensionPath,
-		extensionPath,
-		context.owner.manager.getCwd(),
-		eventBus,
-		runtime,
-	);
-	context.assertSenseInstalled();
-	if (
-		!extension.tools.has("sense") ||
-		runtime.pendingProviderRegistrations.length ||
-		runtime.pendingNativeProviderRegistrations.length ||
-		runtime.pendingVirtualModelRegistrations.length ||
-		runtime.mcpServers.list().length
-	) {
-		throw new Error("OWNER_SENSE_ENTRY_CONTRACT");
-	}
-	return { extensions: [extension], errors: [], runtime };
 }
 
 /**

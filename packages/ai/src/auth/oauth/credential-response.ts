@@ -25,7 +25,7 @@ function isCredentialLabel(label: string): boolean {
 // Labels whose value is a credential by definition: a bare label without a value ends the diagnostic (fail-closed).
 // API-key labels include prefixed header names such as x-api-key and x-goog-api-key.
 const FAIL_CLOSED_FIELD =
-	/^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]id|authorization|(?:[a-z0-9]+[_-])*api[_-]?key)$/i;
+	/^(?:access[_-]?token|refresh[_-]?token|id[_-]?token|account[_-]?id|chatgpt[_-]account[_-]?id|authorization|(?:[a-z0-9]+[_-])*api[_-]?key)$/i;
 /** Include the active JWT account claim even when a native error echoes it without a field label. */
 export function getOAuthDiagnosticSecrets(
 	token: string | undefined,

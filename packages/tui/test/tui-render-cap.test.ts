@@ -35,6 +35,7 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			clearScreen: noop,
 			setTitle: noop,
 			setProgress: noop,
+			setProgramStatus: noop,
 		};
 		const tick = async () => {
 			now += 10;

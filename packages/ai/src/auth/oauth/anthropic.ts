@@ -74,20 +74,15 @@ async function postJson(
 			signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
 		});
 	} catch {
-		// Native/SDK errors can contain the request or response, even in their cause or stack.
 		throw new Error(`${operation} request failed.`);
 	}
-
 	if (!response.ok) {
-		// Credential endpoint bodies can echo the submitted code or refresh token.
 		await response.body?.cancel().catch(() => undefined);
 		throw new Error(`${operation} request failed. HTTP ${response.status}`);
 	}
-
 	try {
 		return await response.text();
 	} catch {
-		// A body-reader error can quote the credential body; report a fixed, value-free error.
 		throw new Error(`${operation} request failed. HTTP ${response.status}; response body could not be read`);
 	}
 }
@@ -117,7 +112,6 @@ async function exchangeAuthorizationCode(
 	try {
 		tokenData = JSON.parse(responseBody) as { access_token: string; refresh_token: string; expires_in: number };
 	} catch {
-		// The parser's message can quote the credential body; report a fixed, value-free error.
 		throw new Error("Anthropic token exchange returned invalid JSON.");
 	}
 
@@ -250,7 +244,6 @@ async function refreshAnthropicToken(refreshToken: string, signal: AbortSignal):
 			scope?: string;
 		};
 	} catch {
-		// The parser's message can quote the credential body; report a fixed, value-free error.
 		throw new Error("Anthropic token refresh returned invalid JSON.");
 	}
 

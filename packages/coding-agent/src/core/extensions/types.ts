@@ -160,12 +160,7 @@ export type EditorFactory = (tui: TUI, theme: EditorTheme, keybindings: Keybindi
  * Each mode (interactive, RPC, print) provides its own implementation.
  */
 export interface ExtensionUIContext {
-	/**
-	 * Synchronous host-wide UI hold query. Undefined means no hold; otherwise returns one active reason.
-	 * TUI includes native/extension dialogs, custom interactions (including pending factories), and external editors.
-	 * RPC reports dialog while a request awaits a client response; print/JSON report undefined.
-	 * Persistent widgets, headers, footers, and the main editor are not holds. This is a snapshot, not a lock.
-	 */
+	/** Synchronous host-wide hold snapshot, not a lock. Persistent widgets and the main editor are not holds. */
 	holdState(): "dialog" | "custom" | "editor" | undefined;
 
 	/** Show a selector and return the user's choice. */
@@ -343,33 +338,7 @@ export interface CompactOptions {
  */
 export type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
-export interface SubmitUserMessageOptions {
-	registrationEpoch: string;
-	requestId: string;
-	sessionGeneration: string;
-	text: string;
-	deliverAs: "followUp";
-	expandPromptTemplates: false;
-}
-
-export interface UserMessageReceipt {
-	status: "accepted" | "queued" | "rejected";
-	sessionGeneration: string;
-	duplicate?: true;
-	/** First admission generation, only on duplicates of accepted or queued receipts. */
-	admittedSessionGeneration?: string;
-	reason?:
-		| "no_session"
-		| "session_changed"
-		| "payload_mismatch"
-		| "shutting_down"
-		| "admission_refused"
-		| "unsupported";
-}
-
 export interface ExtensionContext {
-	/** Generation of the active user-message session, for external ingress binding. */
-	readonly userMessageSessionGeneration: string;
 	/** UI methods for user interaction */
 	ui: ExtensionUIContext;
 	/** Current run mode. Use "tui" to guard terminal-only UI such as custom components. */
@@ -393,23 +362,15 @@ export interface ExtensionContext {
 	thinkingLevel?: ThinkingLevel;
 	/** Whether the agent is idle (not streaming) */
 	isIdle(): boolean;
-	/**
-	 * Whether `agent_settled` handlers are running. `isIdle()` is already true then. Exactly while this is true,
-	 * `sendUserMessage()` and `sendMessage(..., { triggerTurn: true })` do not start a turn at once: the turn
-	 * starts after the remaining `agent_settled` handlers. It is false once those deferred turns begin.
-	 */
+	/** True while agent_settled handlers run; triggered sends are deferred until they finish. */
 	isSettling(): boolean;
-	/**
-	 * Whether a prompt is in preflight: its input handlers or `before_agent_start` are running and
-	 * its run has not started. `isIdle()` is still true then. An extension that starts a turn by
-	 * itself (a timer, an outside event) can wait until this is false.
-	 */
+	/** True while prompt input or before_agent_start preflight is running, before the run starts. */
 	isPromptPending(): boolean;
 	/** Whether project-local trust is active for this context. */
 	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
 	signal: AbortSignal | undefined;
-	/** @internal Host callback used by the built-in bash tool immediately before execution. */
+	/** @internal Built-in bash execution attestation. */
 	emitBashSpawn?: (event: BashSpawnEvent, signal?: AbortSignal) => Promise<BashSpawnEventResult | undefined>;
 	/** Abort the current agent operation */
 	abort(): void;
@@ -830,19 +791,6 @@ export interface SessionStartEvent {
 	previousSessionFile?: string;
 }
 
-/**
- * Fired once after a /new, /resume or fork replacement publishes its session and lifts the input fence.
- * Unlike `session_start`, `submitUserMessage()` with `sessionGeneration` is admitted here.
- * Not fired on startup, reload, a cancelled or unpublished replacement, or once shutdown is requested or begins.
- */
-export interface SessionReadyEvent {
-	type: "session_ready";
-	/** The replacement that published this session. */
-	reason: "new" | "resume" | "fork";
-	/** Current `userMessageSessionGeneration` when the event was dispatched. */
-	sessionGeneration: string;
-}
-
 /** Fired when the current session metadata changes. */
 export interface SessionInfoChangedEvent {
 	type: "session_info_changed";
@@ -944,7 +892,6 @@ export interface SessionTreeEvent {
 
 export type SessionEvent =
 	| SessionStartEvent
-	| SessionReadyEvent
 	| SessionInfoChangedEvent
 	| SessionBeforeSwitchEvent
 	| SessionBeforeForkEvent
@@ -997,16 +944,13 @@ export interface BeforeProviderHeadersEvent {
 	headers: ProviderHeaders;
 }
 
-/**
- * Fired after a provider response is received and before the response stream is consumed. Carries only the
- * HTTP status, when it is an integer 100-599; response headers are never exposed.
- */
+/** Value-free response notification: only a validated integer HTTP status (100-599), never headers. */
 export interface AfterProviderResponseEvent {
 	type: "after_provider_response";
 	status?: number;
 }
 
-/** Fired once for each parsed provider stream event, before Pi normalizes it. Carries no provider data. */
+/** Value-free notification for a parsed provider stream event before normalization. */
 export interface ProviderStreamEvent {
 	type: "provider_stream_event";
 }
@@ -1114,13 +1058,9 @@ export interface AgentBeforeSettleEvent extends BoundaryState {
 /** Fired after an agent run has fully settled and no automatic retry, compaction, or queued continuation will run. */
 export interface AgentSettledEvent {
 	type: "agent_settled";
-	/**
-	 * How the run ended. `aborted`: the run was cancelled by a user abort (also during retry backoff or
-	 * `agent_before_settle`), an extension that cancelled compaction, or session shutdown. `error`: the run
-	 * ended on a provider, run, or compaction failure. Otherwise `completed`.
-	 */
+	/** Final run result, including cancellation or failure during retry/compaction/settlement. */
 	outcome: AgentActivityOutcome;
-	/** Whether the run ended because it was aborted; equivalent to outcome === "aborted". */
+	/** Equivalent to outcome === "aborted". */
 	aborted: boolean;
 }
 
@@ -1209,7 +1149,6 @@ export interface ToolPartialResultEvent {
 	parentToolCallId?: string;
 }
 
-/** Replace the whole snapshot; omitted result means no change. */
 export interface ToolPartialResultEventResult {
 	partialResult?: AgentToolResult<unknown>;
 }
@@ -1293,24 +1232,20 @@ export type InputEventResult =
 // Tool Events
 // ============================================================================
 
-/** Read-only attestation of built-in bash execution; handlers receive detached snapshots. */
+/** Read-only attestation of built-in bash execution; each handler receives a detached snapshot. */
 export interface BashSpawnEvent {
 	type: "bash_spawn";
 	toolCallId: string;
-	/** The command after all Pi transformations, exactly as passed to the executor. */
 	command: string;
-	/** The resolved local shell path, or undefined for custom backends. */
 	shellPath?: string;
-	/** The resolved local shell arguments, or undefined for custom backends. */
 	shellArgs?: string[];
 	cwd: string;
-	/** A snapshot of the environment passed to the executor. May contain secrets. */
 	env: Readonly<Record<string, string | undefined>>;
 	backend: "local-builtin" | "custom";
 }
 
 export interface BashSpawnEventResult {
-	/** Veto execution. The first veto wins; thrown handler errors also fail closed. */
+	/** First veto wins; thrown handler errors also fail closed. */
 	block?: boolean;
 	reason?: string;
 }
@@ -1665,20 +1600,6 @@ export interface MessageRenderOptions {
 	outputPad: number;
 }
 
-export interface UserMessageRenderOptions {
-	/** Horizontal padding configured by the outputPad setting. */
-	outputPad: number;
-	/** Original user-message timestamp in milliseconds since the Unix epoch. */
-	timestamp: number;
-}
-
-/** Display-only rendering of user text. Return undefined to use Pi's native rendering. */
-export type UserMessageRenderer = (
-	text: string,
-	options: UserMessageRenderOptions,
-	theme: Theme,
-) => Component | undefined;
-
 export interface MarkdownTransformContext {
 	messageType: "user" | "assistant" | "assistant-thinking";
 	isStreaming: boolean;
@@ -1731,7 +1652,7 @@ export type ExtensionHandler<E, R = undefined> = (event: E, ctx: ExtensionContex
  * ExtensionAPI passed to extension factory functions.
  */
 export interface ExtensionAPI {
-	/** Behaviors of the Pi that runs this extension (see HOST_CAPABILITIES). */
+	/** Behaviors of this host (see HOST_CAPABILITIES). */
 	readonly hostCapabilities: HostCapabilities;
 
 	// =========================================================================
@@ -1744,7 +1665,6 @@ export interface ExtensionAPI {
 		handler: ExtensionHandler<ResourcesDiscoverEvent, ResourcesDiscoverResult>,
 	): () => void;
 	on(event: "session_start", handler: ExtensionHandler<SessionStartEvent>): () => void;
-	on(event: "session_ready", handler: ExtensionHandler<SessionReadyEvent>): () => void;
 	on(event: "session_info_changed", handler: ExtensionHandler<SessionInfoChangedEvent>): () => void;
 	on(
 		event: "session_before_switch",
@@ -1864,9 +1784,6 @@ export interface ExtensionAPI {
 	/** Register a custom renderer for CustomMessageEntry. */
 	registerMessageRenderer<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
 
-	/** Register a display-only renderer for user text in the interactive transcript. */
-	registerUserMessageRenderer(renderer: UserMessageRenderer): void;
-
 	/** Register a transformer for user and assistant Markdown before Pi renders it in the interactive transcript. */
 	registerMarkdownTransformer(transformer: MarkdownTransformer): void;
 
@@ -1890,12 +1807,10 @@ export interface ExtensionAPI {
 	 * Send a user message to the agent. Always triggers a turn.
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
 	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
-	 * With metadata, returns one receipt when the input is handled or its user entry is persisted.
-	 * Pi stamps metadataSource from this extension's loader path and execution context.
-	 * Borrowed APIs cannot confer another extension's identity; unbound metadata sends reject.
-	 * Only direct SDK session sends are stamped sdk.
-	 * Consumers must trust metadata only from the source they expect.
-	 * Metadata is snapshotted and deeply frozen before preflight, stored on the entry, and never sent to the model.
+	 * With metadata, returns a receipt when handled or after the user entry is persisted.
+	 * Pi stamps metadataSource from the loader path and execution context. Borrowed APIs cannot confer
+	 * another extension's identity; unbound metadata sends reject. Direct SDK sends are stamped sdk.
+	 * Metadata is snapshotted and deeply frozen before preflight, stored on the entry, never sent to the model.
 	 * Do not await a queued receipt inside a handler that must return before that input can be delivered.
 	 */
 	sendUserMessage(
@@ -1911,15 +1826,6 @@ export interface ExtensionAPI {
 		options: SendUserMessageOptions,
 		// biome-ignore lint/suspicious/noConfusingVoidType: optional metadata preserves legacy void results
 	): void | Promise<SendUserMessageResult>;
-
-	/**
-	 * Submit a caller-correlated literal user message and receive its admission receipt.
-	 * Called inside this extension's execution context, Pi stamps the persisted user entry's
-	 * metadataSource from its loader path. Called from an external callback with no extension
-	 * context, the entry is stamped sdk. Called through a borrowed API from another extension's
-	 * context, it returns rejected/admission_refused without admitting or reserving the request.
-	 */
-	submitUserMessage(options: SubmitUserMessageOptions): Promise<UserMessageReceipt>;
 
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
@@ -2283,15 +2189,6 @@ export type SendMessageHandler = <T = unknown>(
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
 ) => void;
 
-/**
- * Host ingress for submitUserMessage. The loader passes private metadataOptions that carry this
- * extension's metadata source (see bindExtensionMetadataSource); the public API takes one argument.
- */
-export type SubmitUserMessageHandler = (
-	request: SubmitUserMessageOptions,
-	metadataOptions?: SendUserMessageOptions,
-) => Promise<UserMessageReceipt>;
-
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
 export type SetSessionNameHandler = (name: string) => void;
@@ -2371,8 +2268,6 @@ export interface ExtensionRuntimeState {
 export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
-	/** Hosts without receipt ingress may omit this; submitUserMessage then rejects as unsupported. */
-	submitUserMessage?: SubmitUserMessageHandler;
 	appendEntry: AppendEntryHandler;
 	setSessionName: SetSessionNameHandler;
 	getSessionName: GetSessionNameHandler;
@@ -2382,7 +2277,7 @@ export interface ExtensionActions {
 	getSettings: GetSettingsHandler;
 	setActiveTools: SetActiveToolsHandler;
 	refreshTools: RefreshToolsHandler;
-	/** Optional host hook: throws for a revoked callback, else returns its inherited cancellation (pi.exec). */
+	/** Throws for revoked callbacks, otherwise supplies inherited pi.exec cancellation. */
 	inheritedCancellation?: () => AbortSignal | undefined;
 	getCommands: GetCommandsHandler;
 	setModel: SetModelHandler;
@@ -2395,13 +2290,10 @@ export interface ExtensionActions {
  * Required by all modes.
  */
 export interface ExtensionContextActions {
-	/** Optional: hosts without receipt ingress report an empty generation. */
-	getUserMessageSessionGeneration?: () => string;
 	getModel: () => Model<any> | undefined;
 	getScopedModels: () => readonly ScopedModel[];
 	isIdle: () => boolean;
 	isSettling: () => boolean;
-	/** Optional: hosts without prompt preflights report false. */
 	isPromptPending?: () => boolean;
 	isProjectTrusted: () => boolean;
 	getSignal: () => AbortSignal | undefined;
@@ -2466,7 +2358,6 @@ export interface Extension {
 	handlers: Map<string, HandlerFn[]>;
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
-	userMessageRenderer?: UserMessageRenderer;
 	toolRenderers?: ToolRendererResolver[];
 	markdownTransformer?: MarkdownTransformer;
 	entryRenderers?: Map<string, EntryRenderer>;

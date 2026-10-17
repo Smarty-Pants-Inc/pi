@@ -20,6 +20,12 @@ import {
 	type ToolCall,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { raceWithAbortSignal } from "@earendil-works/pi-ai/utils/abort";
+import { classifyProviderFailure, validHttpStatus } from "@earendil-works/pi-ai/utils/recovery";
+
+// A gateway error stream is untrusted: bound both retained bytes and total classification time.
+const MAX_PROXY_ERROR_BYTES = 16 * 1024;
+const MAX_PROXY_ERROR_READ_MS = 5_000;
 
 /**
  * Proxy event types - server sends these with partial field stripped to reduce bandwidth.
@@ -163,10 +169,47 @@ export function streamProxy(
 			});
 
 			if (!response.ok) {
-				// Owned text: the status only. The proxy's status text and error body are never published
-				// (smarty-dev#5822, pi#202 round 3); the status keeps retry classification (e.g. 503).
-				const status = Number.isInteger(response.status) ? response.status : 0;
-				throw new Error(status >= 100 && status <= 599 ? `Proxy error (${status})` : "Proxy error");
+				const status = validHttpStatus(response.status);
+				// Preserve the legacy JSON `error` / status-text fallback privately, never on an Error.
+				let privateText = response.statusText;
+				// The HTTP failure already owns the result; private classification must not stall it (#3155).
+				const deadline = new AbortController();
+				const timeout = setTimeout(() => deadline.abort(), MAX_PROXY_ERROR_READ_MS);
+				const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
+				try {
+					reader = response.body?.getReader();
+					if (reader) {
+						const decoder = new TextDecoder();
+						let text = "";
+						let bytes = 0;
+						while (!signal.aborted) {
+							const { done, value } = await raceWithAbortSignal(reader.read(), signal);
+							if (signal.aborted) break;
+							if (done) {
+								const data = JSON.parse(text + decoder.decode()) as { error?: string } | null;
+								if (data?.error) privateText = `Proxy error: ${data.error}`;
+								break;
+							}
+							bytes += value.byteLength;
+							if (bytes > MAX_PROXY_ERROR_BYTES) break;
+							text += decoder.decode(value, { stream: true });
+						}
+					}
+				} catch {
+					// Body/parser failures and deadlines are private too; the HTTP failure still owns the result.
+				} finally {
+					clearTimeout(timeout);
+					if (reader) {
+						// Do not await cancellation: a gateway may never settle its cancel hook.
+						void reader.cancel().catch(() => {});
+						reader.releaseLock();
+						reader = undefined;
+					}
+				}
+				if (options.signal?.aborted) throw new Error("Request aborted by user");
+				partial.recovery = classifyProviderFailure({ text: privateText, status, provider: model.provider });
+				// Only owned text crosses the catch/publication boundary (smarty-dev#5822, pi#202 CR-4).
+				throw new Error(status === undefined ? "Proxy error" : `Proxy error (${status})`);
 			}
 
 			reader = response.body!.getReader();

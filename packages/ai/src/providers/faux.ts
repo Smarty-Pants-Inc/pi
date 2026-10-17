@@ -273,7 +273,7 @@ function withUsageEstimate(
 		promptCache.set(sessionId, prompt);
 	}
 
-	return {
+	const result: AssistantMessage = {
 		...message,
 		usage: {
 			input,
@@ -284,6 +284,8 @@ function withUsageEstimate(
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 	};
+	transferThrottledLimitWait(message, result);
+	return result;
 }
 
 function splitStringByTokenSize(text: string, minTokenSize: number, maxTokenSize: number): string[] {
@@ -308,7 +310,6 @@ function cloneMessage(message: AssistantMessage, api: string, provider: string, 
 		timestamp: cloned.timestamp ?? Date.now(),
 		usage: cloned.usage ?? DEFAULT_USAGE,
 	};
-	// A scripted throttled limit keeps its private one-shot wait (smarty-dev#5822).
 	transferThrottledLimitWait(message, result);
 	return result;
 }

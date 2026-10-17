@@ -19,7 +19,7 @@ import { closedRawStopReason } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, ProviderDataError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
 import { checkProviderRequest } from "../utils/provider-retry.ts";
@@ -175,7 +175,6 @@ export const stream: StreamFunction<"mistral-conversations", MistralOptions> = (
 				delete (block as { partialArgs?: string }).partialArgs;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			// Classify first, from the untruncated SDK status and body; publish owned text only (smarty-dev#5822).
 			const norm = normalizeProviderError(error, model.provider);
 			output.recovery ??= norm.recovery;
 			output.errorMessage = formatProviderError(norm, "Mistral API error");
@@ -500,7 +499,6 @@ function parseMistralEvent(raw: string): MistralCompletionEvent | typeof MISTRAL
 	try {
 		parsed = JSON.parse(data);
 	} catch {
-		// Parser errors may echo wire bytes; provider data only classifies, never becomes local error text (pi#202).
 		throw new ProviderDataError(data);
 	}
 	if (!isMistralRecord(parsed) || !Array.isArray(parsed.choices)) {
@@ -746,7 +744,7 @@ async function consumeChatStream(
 		const block = output.content[index];
 		if (block.type !== "toolCall") continue;
 		const toolBlock = block as ToolCall & { partialArgs?: string };
-		toolBlock.arguments = parseStreamingJson<ToolCall["arguments"]>(toolBlock.partialArgs);
+		Object.assign(toolBlock, parseToolCallArguments(toolBlock.partialArgs));
 		// Finalize in-place and strip the scratch buffer so replay only
 		// carries parsed arguments.
 		delete toolBlock.partialArgs;
@@ -932,7 +930,6 @@ function mapChatStopReason(reason: string | null): { stopReason: StopReason; err
 			// Mistral reports transient server failures this way; "server error" makes the message retryable.
 			return { stopReason: "error", errorMessage: "Provider stopped with: error (server error)" };
 		default:
-			// A closed value: a provider-chosen finish reason never reaches the text (smarty-dev#5822).
 			return { stopReason: "error", errorMessage: `Provider stopped with: ${closedRawStopReason(reason)}` };
 	}
 }

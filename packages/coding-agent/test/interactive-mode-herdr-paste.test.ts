@@ -313,7 +313,6 @@ test("two quick submits dispatch in keypress order when cuts resolve in reverse"
 	]);
 	expect(editor.getText()).toBe("next");
 	answers[1]!(PAUL);
-	// Let the second cut settle without resolving the first or relying on a wall-clock delay.
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	answers[0]!(PAUL);
 	await submitted(mode, 2);
@@ -360,7 +359,6 @@ test.each([false, true])("submit joins its own dispatch without holding later En
 			}),
 		);
 	};
-
 	send("/scoped-models\r");
 	await vi.waitFor(() => expect(selector).toHaveBeenCalledOnce());
 	send("hello\rnext");
@@ -370,7 +368,6 @@ test.each([false, true])("submit joins its own dispatch without holding later En
 	expect(receiptRecord(getInputReceipt(input)).channel).toBe("keyboard");
 	expect(completed).toEqual(["hello"]);
 	expect(editor.getText()).toBe("next");
-
 	settle();
 	await submissions[0];
 	expect(completed).toEqual(["hello", "/scoped-models"]);
@@ -391,7 +388,6 @@ test("Enter during pending /compact reaches the compaction queue", async () => {
 	await vi.waitFor(() => expect(mode.runtimeHost.session.isCompacting).toBe(true));
 	send("hello\rnext");
 	await vi.waitFor(() => expect(mode.compactionQueuedMessages).toHaveLength(1));
-
 	const queued = mode.compactionQueuedMessages[0]!;
 	expect(queued.mode).toBe("steer");
 	expect(queued.input.text).toBe("hello");

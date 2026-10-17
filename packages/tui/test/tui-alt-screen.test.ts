@@ -1729,8 +1729,7 @@ describe("TuiAltScreen", () => {
 		tui.stop();
 	});
 
-	// pi#175 / smarty-dev#7403: every flash stays up for at least two render windows, so even an 80 ms
-	// flash added just after a frame appears in the trailing frame instead of being coalesced away.
+	// pi#175 / smarty-dev#7403: short flashes must survive the next capped frame.
 	it("shows a short flash in the trailing frame and collapses expired messages", async (t) => {
 		let now = 1000;
 		t.mock.method(performance, "now", () => now);
@@ -1744,7 +1743,7 @@ describe("TuiAltScreen", () => {
 			t.mock.timers.tick(ms);
 			await new Promise<void>((resolve) => process.nextTick(resolve));
 		};
-		// Inspect emitted frames directly; xterm has unrelated asynchronous parser timers.
+		// xterm has unrelated parser timers; inspect the emitted frames directly.
 		const lastFrame = () => {
 			const event = terminal.events.at(-1);
 			return event?.type === "write" ? event.data : "";
@@ -1755,7 +1754,6 @@ describe("TuiAltScreen", () => {
 			await advance(0);
 			await advance(0);
 			assert.strictEqual(renders.mock.calls.length, 1);
-
 			await advance(5);
 			tui.flash("First", 80);
 			tui.flash("Second", 200);
@@ -1769,12 +1767,11 @@ describe("TuiAltScreen", () => {
 			await advance(1);
 			assert.strictEqual(renders.mock.calls.length, 2, "exactly one trailing frame at t=100");
 			let frame = lastFrame();
-			assert.ok(frame.includes(" First "), "an 80 ms flash is still visible in the trailing frame");
+			assert.ok(frame.includes(" First "), "an 80 ms flash is visible in the trailing frame");
 			assert.ok(frame.includes(" Second "));
 			assert.ok(frame.includes(" Third "));
 			assert.ok(frame.indexOf(" First ") < frame.indexOf(" Second "));
 			assert.ok(frame.indexOf(" Second ") < frame.indexOf(" Third "));
-
 			await advance(105);
 			await advance(0);
 			assert.strictEqual(renders.mock.calls.length, 3);

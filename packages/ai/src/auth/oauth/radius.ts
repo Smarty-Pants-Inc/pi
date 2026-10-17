@@ -64,7 +64,6 @@ async function loadRadiusOAuthDiscovery(gateway: string, signal: AbortSignal): P
 
 class OAuthResponseError extends Error {
 	readonly status: number;
-	/** Safe display class only; the protocol decision remains private. */
 	readonly oauthError?: string;
 	readonly #protocolError?: string;
 
@@ -86,7 +85,6 @@ async function readOAuthResponseError(
 	message: string,
 	secrets: readonly string[] = [],
 ): Promise<OAuthResponseError> {
-	// A non-JSON or unreadable body is not shown; the raw `error` value is never retained.
 	const data = await readOAuthCredentialResponse(response, message).catch(() => undefined);
 	const error = data && typeof data === "object" ? (data as { error?: unknown }).error : undefined;
 	return new OAuthResponseError(
@@ -257,7 +255,6 @@ async function loginWithDeviceCode(gateway: string, interaction: ProviderAuthInt
 				if (!(error instanceof OAuthResponseError)) {
 					throw error;
 				}
-				// Display filtering must not turn a valid protocol response into a different poll decision.
 				if (error.matchesCode("authorization_pending")) return { status: "pending" };
 				if (error.matchesCode("slow_down")) return { status: "slow_down" };
 				if (error.matchesCode("expired_token")) {

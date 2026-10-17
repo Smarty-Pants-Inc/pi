@@ -125,8 +125,7 @@ export interface Terminal {
 	 * Report what the program is doing (OSC 7501). Sent only to terminals that support it; the latest
 	 * status is re-sent when support is confirmed or the terminal restarts.
 	 */
-	// ponytail: unlike upstream 1.1.0, keep this optional so existing Terminal implementations compile.
-	setProgramStatus?(status: ProgramStatus): void;
+	setProgramStatus(status: ProgramStatus): void;
 }
 
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;

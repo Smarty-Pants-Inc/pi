@@ -869,16 +869,12 @@ class ModelsImpl implements MutableModels {
 				signal: options?.signal,
 			});
 		} catch (error) {
-			// Auth resolvers/stores can echo credentials, including through a ModelsError cause.
 			throw requestSetupError(error);
 		}
-		if (!resolution) {
-			throw new SafeSetupError("auth");
-		}
+		if (!resolution) throw new SafeSetupError("auth");
 
 		try {
 			const auth = resolution.auth;
-			// Explicit request options win per-field; the Models-only transform runs last.
 			const apiKey = options?.apiKey ?? auth.apiKey;
 			let headers = mergeHeaders(auth.headers, options?.headers);
 			const diagnosticSecrets = getOAuthDiagnosticSecrets(apiKey, headers, [
@@ -893,11 +889,9 @@ class ModelsImpl implements MutableModels {
 			const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
 			const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
 				ProviderRequestOptions<TModel>;
-
 			requestOptions.diagnosticSecrets = diagnosticSecrets;
 			return { requestModel, requestOptions };
 		} catch (error) {
-			// A failed callback is a diagnostic, not the caller's intentional raw-header interface.
 			throw requestSetupError(error);
 		}
 	}
@@ -952,9 +946,7 @@ class ModelsImpl implements MutableModels {
 	): AssistantMessageEventStream {
 		return lazyStream(model, async (outer) => {
 			const provider = this.requireChatProvider(model);
-			if (!provider.fetchDeferred) {
-				throw new SafeSetupError("deferred");
-			}
+			if (!provider.fetchDeferred) throw new SafeSetupError("deferred");
 			const { requestModel, requestOptions } = await this.applyAuth(model, options);
 			protectAssistantMessageStream(outer, requestOptions.diagnosticSecrets);
 			return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
@@ -975,9 +967,7 @@ class ModelsImpl implements MutableModels {
 		options?: ModelsDeferredCancelOptions,
 	): Promise<void> {
 		const provider = this.requireChatProvider(model);
-		if (!provider.cancelDeferred) {
-			throw new SafeSetupError("deferred");
-		}
+		if (!provider.cancelDeferred) throw new SafeSetupError("deferred");
 		const { requestModel, requestOptions } = await this.applyAuth(model, options);
 		try {
 			await provider.cancelDeferred(requestModel, handle, requestOptions);

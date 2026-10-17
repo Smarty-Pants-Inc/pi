@@ -2,6 +2,7 @@ import type OpenAI from "openai";
 import type {
 	Response as OpenAIResponse,
 	Tool as OpenAITool,
+	ResponseConfigurationUpdateItemParam,
 	ResponseCreateParamsStreaming,
 	ResponseInput,
 	ResponseInputContent,
@@ -35,7 +36,7 @@ import { closedRawStopReason } from "../utils/diagnostics.ts";
 import { ProviderDataError } from "../utils/error-body.ts";
 import type { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { notifyProviderStreamEvent } from "../utils/provider-observation.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
@@ -133,6 +134,16 @@ export interface ConvertResponsesMessagesOptions {
 	supportsAdditionalTools?: boolean;
 	supportsToolSearch?: boolean;
 	toolOptions?: ConvertResponsesToolsOptions;
+	/**
+	 * Effort for the reply being generated. When set, the thinking level is sent as
+	 * configuration_update items instead of a changing reasoning.effort, which would invalidate the
+	 * prompt cache. Each item sets the effort from that point on: one goes before every earlier
+	 * reply with the level recorded on it (`providerThinkingLevel`), and one with this effort goes
+	 * at the end. Earlier input therefore never changes. OpenAI documents the item before user
+	 * messages only. After tool results it was verified on gpt-6-luna (October 2026) to be accepted
+	 * and to apply to the next reply.
+	 */
+	configurationUpdateEffort?: string;
 }
 
 export interface ConvertResponsesToolsOptions {
@@ -215,6 +226,12 @@ export function convertResponsesMessages<TApi extends Api>(
 		} satisfies ResponseToolSearchOutputItemParam);
 	};
 	const includeInitialSystemMessage = options?.includeSystemPrompt ?? true;
+	const pushConfigurationUpdate = (effort: string): void => {
+		messages.push({
+			type: "configuration_update",
+			reasoning: { effort: effort as NonNullable<ResponseConfigurationUpdateItemParam.Reasoning["effort"]> },
+		} satisfies ResponseConfigurationUpdateItemParam);
+	};
 	const compat = model.compat as { supportsDeveloperRole?: boolean } | undefined;
 	const instructionRole = model.reasoning && compat?.supportsDeveloperRole !== false ? "developer" : "system";
 
@@ -332,6 +349,13 @@ export function convertResponsesMessages<TApi extends Api>(
 				}
 			}
 			if (output.length === 0) continue;
+			if (
+				options?.configurationUpdateEffort !== undefined &&
+				isSameModel &&
+				msg.providerThinkingLevel !== undefined
+			) {
+				pushConfigurationUpdate(msg.providerThinkingLevel);
+			}
 			messages.push(...output);
 		} else if (msg.role === "toolResult") {
 			const [callId] = msg.toolCallId.split("|");
@@ -353,6 +377,7 @@ export function convertResponsesMessages<TApi extends Api>(
 		}
 		if (!isLeadingSystemMessage) msgIndex++;
 	}
+	if (options?.configurationUpdateEffort !== undefined) pushConfigurationUpdate(options.configurationUpdateEffort);
 
 	return messages;
 }
@@ -440,9 +465,7 @@ export function finalizeResponsesUsage<TApi extends Api>(
 	model: Model<TApi>,
 	options?: OpenAIResponsesStreamOptions,
 ): void {
-	if (response?.id) {
-		output.responseId = response.id;
-	}
+	if (response?.id) output.responseId = response.id;
 	if (response?.usage) {
 		const inputDetails = response.usage.input_tokens_details as
 			| { cached_tokens?: number; cache_write_tokens?: number }
@@ -450,7 +473,6 @@ export function finalizeResponsesUsage<TApi extends Api>(
 		const cachedTokens = inputDetails?.cached_tokens || 0;
 		const cacheWriteTokens = inputDetails?.cache_write_tokens || 0;
 		output.usage = {
-			// OpenAI includes cached and cache-write tokens in input_tokens, so subtract both.
 			input: Math.max(0, (response.usage.input_tokens || 0) - cachedTokens - cacheWriteTokens),
 			output: response.usage.output_tokens || 0,
 			cacheRead: cachedTokens,
@@ -611,10 +633,8 @@ export async function processResponsesStream<TApi extends Api>(
 
 	for await (const event of openaiStream) {
 		try {
-			// Preserve observer origin even when it rejects before the first output is normalized.
 			await notifyProviderStreamEvent(options, output);
 		} catch (error) {
-			// A rejecting observer must not erase provider-reported generation and permit replay.
 			if (
 				event.type === "response.failed" ||
 				event.type === "response.completed" ||
@@ -739,7 +759,7 @@ export async function processResponsesStream<TApi extends Api>(
 				slot?.type === "toolCall" &&
 				slot.block.partialJson !== undefined
 			) {
-				slot.block.arguments = parseStreamingJson(item.arguments || slot.block.partialJson || "{}");
+				Object.assign(slot.block, parseToolCallArguments(item.arguments || slot.block.partialJson));
 				if (item.namespace !== undefined) slot.block.namespace = item.namespace;
 				// Finalize in-place and strip the scratch buffer so replay only
 				// carries parsed arguments.
@@ -769,7 +789,6 @@ export async function processResponsesStream<TApi extends Api>(
 		} else if (event.type === "response.completed" || event.type === "response.incomplete") {
 			finalizeResponse(event.response);
 		} else if (event.type === "error") {
-			// A provider error by origin: the code and message only classify (smarty-dev#5822, pi#202 round 3).
 			throw new ProviderDataError(`${event.code ?? ""}\n${event.message ?? ""}`);
 		} else if (event.type === "response.failed") {
 			sawTerminalResponseEvent = true;
@@ -818,7 +837,6 @@ function mapStopReason(
 			}
 			return {
 				stopReason: "error",
-				// A closed reason only; a provider-chosen value is published as `other` (smarty-dev#5822).
 				errorMessage: incompleteReason
 					? `Response incomplete: ${closedRawStopReason(`incomplete.${incompleteReason}`).replace(/^incomplete\./, "")}`
 					: "Response incomplete without a provider reason",

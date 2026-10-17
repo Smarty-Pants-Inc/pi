@@ -135,7 +135,7 @@ describe.each(stages)("value-free credential diagnostics: $name", (stage) => {
 	});
 });
 
-// pi#127: missing intervals and verifiers without companion codes must also stay private.
+// pi#127: missing intervals and verifiers without companion codes stay private.
 it.each(["initialization", "polling"])("redacts missing fields in %s through Models.login", async (stage) => {
 	vi.stubGlobal(
 		"fetch",

@@ -123,7 +123,7 @@ describe("AssistantMessageEventStream timing", () => {
 		const answer = message(Date.now());
 		await sleep(20);
 		done.push({ type: "done", reason: "stop", message: answer });
-		// smarty-dev#5822 C2: the published copy is timed; the producer's own object is never changed.
+		// smarty-dev#5822 C2: time the published copy, not the producer-owned object.
 		expect((await done.result()).durationMs).toBeGreaterThanOrEqual(15);
 		expect(answer.durationMs).toBeUndefined();
 

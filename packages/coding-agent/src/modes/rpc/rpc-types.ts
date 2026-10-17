@@ -18,19 +18,6 @@ import type { SourceInfo } from "../../core/source-info.ts";
 // RPC Commands (stdin)
 // ============================================================================
 
-export interface RpcBranchEntriesPageRequest {
-	limit: number;
-	before?: string;
-	leafId?: string;
-}
-
-export interface RpcBranchEntriesPage {
-	entries: SessionEntry[];
-	leafId: string | null;
-	nextCursor?: string;
-	complete: boolean;
-}
-
 export type RpcCommand =
 	// Prompting
 	| { id?: string; type: "prompt"; message: string; images?: ImageContent[]; streamingBehavior?: "steer" | "followUp" }
@@ -77,7 +64,6 @@ export type RpcCommand =
 	| { id?: string; type: "clone" }
 	| { id?: string; type: "get_fork_messages" }
 	| { id?: string; type: "get_entries"; since?: string }
-	| ({ id?: string; type: "get_branch_entries_page" } & RpcBranchEntriesPageRequest)
 	| { id?: string; type: "get_tree" }
 	| { id?: string; type: "get_last_assistant_text" }
 	| { id?: string; type: "set_session_name"; name: string }
@@ -143,16 +129,6 @@ export interface RpcInputRejectedEvent {
 // ============================================================================
 // RPC Responses (stdout)
 // ============================================================================
-
-/** Uncorrelated response emitted before RPC startup exits after input overflow. */
-export type RpcFatalErrorResponse = {
-	id?: undefined;
-	type: "response";
-	command: "parse";
-	success: false;
-	fatal: true;
-	error: string;
-};
 
 // Success responses with data
 export type RpcResponse =
@@ -258,13 +234,6 @@ export type RpcResponse =
 	| {
 			id?: string;
 			type: "response";
-			command: "get_branch_entries_page";
-			success: true;
-			data: RpcBranchEntriesPage;
-	  }
-	| {
-			id?: string;
-			type: "response";
 			command: "get_tree";
 			success: true;
 			data: { tree: SessionTreeNode[]; leafId: string | null };
@@ -310,7 +279,6 @@ export type RpcExtensionUIRequest =
 			timeout: number;
 	  }
 	| { type: "extension_ui_request"; id: string; method: "editor"; title: string; prefill?: string; timeout: number }
-	| { type: "extension_ui_request"; id: string; method: "cancel"; targetId: string; timedOut?: true }
 	| {
 			type: "extension_ui_request";
 			id: string;
@@ -340,14 +308,11 @@ export type RpcExtensionUIRequest =
 // Extension UI Commands (stdin)
 // ============================================================================
 
-/** Payload for responding to an extension UI request. */
-export type RpcExtensionUIResponseBody = { value: string } | { confirmed: boolean } | { cancelled: true };
-
 /** Response to an extension UI request */
-export type RpcExtensionUIResponse = RpcExtensionUIResponseBody & {
-	type: "extension_ui_response";
-	id: string;
-};
+export type RpcExtensionUIResponse =
+	| { type: "extension_ui_response"; id: string; value: string }
+	| { type: "extension_ui_response"; id: string; confirmed: boolean }
+	| { type: "extension_ui_response"; id: string; cancelled: true };
 
 // ============================================================================
 // Helper type for extracting command types

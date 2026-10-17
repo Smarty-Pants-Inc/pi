@@ -1,7 +1,5 @@
-// T-N5682 (smarty-dev#5822, S3 of #5443; residual of #5682): numeric canonicalization cannot bypass deletion.
-// A synthetic numeric key is planted as a Number (and an exponent spelling of the same Number) in error codes,
-// nested diagnostic details under unknown keys and under valid diagnostic types, with forged timestamps. No
-// such value has an output path: published diagnostics are rebuilt from owned types and local timestamps only.
+// T-N5682 (smarty-dev#5822, S3 of #5443): numeric canonicalization cannot bypass deletion.
+// Plant numeric credentials in codes and nested diagnostics; rebuild only owned types and local timestamps.
 import { describe, expect, it } from "vitest";
 import { stream as streamPiMessages } from "../src/api/pi-messages.ts";
 import type { AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
@@ -22,7 +20,6 @@ function plantedError(): Error {
 	return Object.assign(error, { code: CANONICAL });
 }
 
-/** Diagnostics an extension, gateway or older producer could put on a message. */
 function plantedDiagnostics(): unknown[] {
 	const nested = { code: CANONICAL, values: [CANONICAL, EXPONENT, KEY, { deeper: [EXPONENT] }] };
 	return [
@@ -55,7 +52,6 @@ function message(): AssistantMessage {
 	};
 }
 
-/** Every key a published diagnostic may carry, and no planted value anywhere in its JSON. */
 function expectOwnedDiagnostics(published: unknown, before: number): void {
 	const diagnostics = (published as AssistantMessage).diagnostics ?? [];
 	for (const diagnostic of diagnostics) {
@@ -69,7 +65,7 @@ function expectOwnedDiagnostics(published: unknown, before: number): void {
 		"pi_messages_rewrite",
 		"anthropic_input_transformations",
 	]);
-	// A producer-supplied count is not Pi's count: it is dropped (pi#202 round 2 P1-1).
+	// A producer-supplied count is not Pi's count (pi#202 round 2 P1-1).
 	expect(diagnostics[2]?.thinkingBlocksDropped).toBeUndefined();
 	const json = JSON.stringify(published);
 	for (const planted of [KEY, String(CANONICAL), String(EXPONENT), "123456789012345"]) {
@@ -116,7 +112,6 @@ describe("T-N5682: numeric values have no diagnostic output path (smarty-dev#582
 		);
 		expectOwnedDiagnostics(result, before);
 		expect(scheduled).toEqual([]);
-		// The planted provider_limit type is still a control: it forbids replay.
 		expect(isRetryableAssistantError(result)).toBe(false);
 	});
 
@@ -147,7 +142,6 @@ describe("T-N5682: numeric values have no diagnostic output path (smarty-dev#582
 		expect(JSON.stringify(result)).not.toContain("123456789012345");
 	});
 
-	// pi#202 round 2 P1-1: a small numeric value a producer puts in the count field is not published.
 	it.each([
 		["push", "push"],
 		["end", "end"],

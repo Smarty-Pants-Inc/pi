@@ -1,7 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stream as streamOpenAICompletions } from "../src/api/openai-completions.ts";
 import type { Model } from "../src/types.ts";
-import { isRetryableAssistantError, throttledLimitWait } from "../src/utils/retry.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const mockState = vi.hoisted(() => ({
@@ -138,79 +137,4 @@ describe("openai-completions provider retries", () => {
 		expect(result.errorMessage).toContain("rate limited");
 		expect(mockState.requestOptions).toEqual([expect.objectContaining({ maxRetries: 0 })]);
 	});
-
-	// smarty-dev#1723: the Node gateway's plan-limit 429. The message with and without the credit URL, so the
-	// "billing" text pattern cannot be what stops the retry. smarty-dev#5822 (pi#202 round 3): the gateway's
-	// own message is never shown; Pi renders owned text from the closed window and a bounded reset time.
-	it.each([
-		"Your 5-hour limit is used up. More at 14:32Z, or add credit: https://billing.smartypants.ai/checkout",
-		"Your 5-hour limit is used up. sk-or-v1-synthetic5822 corp-eu-west-7-tenant-plum",
-	])("does not retry the smarty_limit 429 and shows owned text: %s", async (message) => {
-		const reset = new Date(Date.now() + 60 * 60 * 1000);
-		// The body the gateway sends; the openai SDK puts `body.error` in `error.error`.
-		const body = {
-			error: {
-				type: "smarty_limit",
-				code: "smarty_limit",
-				message,
-				window: "5h",
-				throttled: false,
-				resets_at: reset.toISOString(),
-			},
-		};
-		mockState.requestErrors = [
-			Object.assign(new Error(`429 ${message}`), {
-				status: 429,
-				headers: new Headers({ "retry-after": "1" }),
-				error: body.error,
-			}),
-		];
-
-		const result = await consume({ maxRetries: 2 });
-
-		expect(mockState.requestOptions).toHaveLength(1);
-		expect(result.stopReason).toBe("error");
-		expect(result.errorMessage).toBe(`Your 5-hour limit is used up. More at ${reset.toISOString().slice(11, 16)}Z.`);
-		expect(JSON.stringify(result)).not.toContain("synthetic5822");
-		expect(JSON.stringify(result)).not.toContain("tenant-plum");
-		expect(isRetryableAssistantError(result)).toBe(false);
-	});
-
-	// smarty-net#136: a throttled smarty_limit with a short Retry-After carries a one-shot wait for the agent.
-	// The provider itself still makes one request and the generic retry still refuses it.
-	it.each([
-		{ throttled: true, retryAfter: "10", message: "Flash runs one request at a time.", wait: 10_000 },
-		{ throttled: true, retryAfter: "10", message: "", wait: 10_000 },
-		{ throttled: true, retryAfter: "30", message: "busy", wait: 30_000 },
-		{ throttled: true, retryAfter: "31", message: "busy", wait: undefined },
-		{ throttled: true, retryAfter: undefined, message: "busy", wait: undefined },
-		{ throttled: true, retryAfter: "2.5", message: "busy", wait: undefined },
-		{ throttled: true, retryAfter: "Wed, 21 Oct 2026 07:28:00 GMT", message: "busy", wait: undefined },
-		{ throttled: false, retryAfter: "10", message: "Your 5-hour limit is used up.", wait: undefined },
-	])(
-		"marks the throttled smarty_limit wait only for a short integer Retry-After: %o",
-		async ({ throttled, retryAfter, message, wait }) => {
-			mockState.requestErrors = [
-				Object.assign(new Error(`429 ${message}`), {
-					status: 429,
-					headers: new Headers(retryAfter === undefined ? {} : { "retry-after": retryAfter }),
-					error: { type: "smarty_limit", code: "smarty_limit", message, throttled, window: "5h", resets_at: null },
-				}),
-			];
-
-			const result = await consume({ maxRetries: 2 });
-
-			expect(mockState.requestOptions).toHaveLength(1);
-			// Owned text by the closed throttle flag and window, never the gateway's message.
-			expect(result.errorMessage).toBe(
-				throttled ? "Flash runs one request at a time" : "Your 5-hour limit is used up.",
-			);
-			expect(isRetryableAssistantError(result)).toBe(false);
-			// smarty-dev#5822 N5682: the wait is private and its text owned; the gateway wording is not kept.
-			expect(throttledLimitWait(result)).toEqual(
-				wait === undefined ? undefined : { delayMs: wait, waitMessage: "Flash runs one request at a time" },
-			);
-			expect(result.diagnostics).toEqual([{ type: "provider_limit", timestamp: expect.any(Number) }]);
-		},
-	);
 });

@@ -23,8 +23,6 @@ it.skipIf(process.platform === "win32")("admits exactly one concurrent owner of 
 	try {
 		const first = await Promise.all(children.map(async (child) => (await once(child, "message"))[0]));
 		const results: unknown[] = [];
-		// Both probes happen before either unlink on the unfixed implementation. Delay the second unlink until the
-		// first owner has bound, making the takeover race deterministic rather than relying on scheduling.
 		for (const [i, child] of children.entries()) {
 			if (first[i] === "stale") {
 				const result = once(child, "message");
@@ -60,7 +58,6 @@ it.skipIf(process.platform === "win32")("recovers a lock after its owner is kill
 		const exited = once(child, "exit");
 		child.kill("SIGKILL");
 		await exited;
-
 		const replacement = spawn("acquire");
 		try {
 			assert.equal((await once(replacement, "message"))[0], "held");
@@ -85,7 +82,6 @@ it.skipIf(process.platform === "win32")("admits one owner when two processes rec
 	const exited = once(owner, "exit");
 	owner.kill("SIGKILL");
 	await exited;
-
 	const children = [spawn(), spawn()];
 	try {
 		const first = await Promise.all(children.map(async (child) => (await once(child, "message"))[0]));

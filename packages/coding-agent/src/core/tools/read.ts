@@ -4,11 +4,9 @@ import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { processImage } from "../../utils/image-process.ts";
-import { detectSupportedImageMimeType, detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
+import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
-import { ordinaryOwnerOf } from "../ordinary-owner-context.ts";
-import { currentSessionOwnership } from "../session-ownership.ts";
-import { resolveReadPathAsync, resolveToCwd } from "./path-utils.ts";
+import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
@@ -89,8 +87,6 @@ export function createReadToolDefinition(
 	cwd: string,
 	options?: ReadToolOptions,
 ): ToolDefinition<typeof readSchema, ReadToolDetails | undefined> {
-	const owner = options && ordinaryOwnerOf(options);
-	if (owner && options?.operations) throw new Error("OWNER_TOOL_OPERATIONS");
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	const fallbackResizeOptions = options?.resizeOptions;
 	const ops = options?.operations ?? defaultReadOperations;
@@ -110,10 +106,6 @@ export function createReadToolDefinition(
 			_onUpdate?,
 			ctx?: ExtensionContext,
 		) {
-			if (!owner && currentSessionOwnership()) throw new Error("OWNER_TOOL_BINDING_REQUIRED");
-			owner?.assertActive();
-			if (owner && ctx && (ctx.sessionManager !== owner.owner.manager || ctx.cwd !== cwd))
-				throw new Error("OWNER_TOOL_CONTEXT");
 			return new Promise<{ content: (TextContent | ImageContent)[]; details: ReadToolDetails | undefined }>(
 				(resolve, reject) => {
 					if (signal?.aborted) {
@@ -129,38 +121,22 @@ export function createReadToolDefinition(
 
 					(async () => {
 						try {
-							const absolutePath = owner
-								? resolveToCwd(path, cwd)
-								: await resolveReadPathAsync(path, ctx?.cwd || cwd);
+							const absolutePath = await resolveReadPathAsync(path, ctx?.cwd || cwd);
 							if (aborted) return;
-							let ownedBytes: Buffer | undefined;
-							if (owner) {
-								const target = owner.fileTarget(absolutePath, false);
-								ownedBytes = await owner.owner.readFile(target.root, target.relativePath, signal);
-								owner.assertActive();
-							} else {
-								await ops.access(absolutePath);
-							}
+							// Check if file exists and is readable.
+							await ops.access(absolutePath);
 							if (aborted) return;
-							const mimeType = ownedBytes
-								? detectSupportedImageMimeType(ownedBytes)
-								: ops.detectImageMimeType
-									? await ops.detectImageMimeType(absolutePath)
-									: undefined;
+							const mimeType = ops.detectImageMimeType ? await ops.detectImageMimeType(absolutePath) : undefined;
 							let content: (TextContent | ImageContent)[];
 							let details: ReadToolDetails | undefined;
 							const nonVisionImageNote = getNonVisionImageNote(ctx?.model);
 							if (mimeType) {
 								// Read image as binary.
-								const buffer = ownedBytes ?? (await ops.readFile(absolutePath));
-								// The read grant does not admit an image worker or decoder.
-								if (owner && (autoResizeImages || mimeType === "image/bmp"))
-									throw new Error("OWNER_IMAGE_PROCESSING_SCOPE");
+								const buffer = await ops.readFile(absolutePath);
 								const processed = await processImage(buffer, mimeType, {
 									autoResizeImages,
 									resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
 								});
-								owner?.assertActive();
 								if (!processed.ok) {
 									let textNote = `Read image file [${mimeType}]\n${processed.message}`;
 									if (nonVisionImageNote) textNote += `\n${nonVisionImageNote}`;
@@ -176,7 +152,7 @@ export function createReadToolDefinition(
 								}
 							} else {
 								// Read text content.
-								const buffer = ownedBytes ?? (await ops.readFile(absolutePath));
+								const buffer = await ops.readFile(absolutePath);
 								const textContent = buffer.toString("utf-8");
 								const allLines = textContent.split("\n");
 								const totalFileLines = allLines.length;
@@ -229,10 +205,9 @@ export function createReadToolDefinition(
 							}
 
 							if (aborted) return;
-							owner?.assertActive();
 							signal?.removeEventListener("abort", onAbort);
 							resolve({ content, details });
-						} catch (error: unknown) {
+						} catch (error: any) {
 							signal?.removeEventListener("abort", onAbort);
 							if (!aborted) reject(error);
 						}

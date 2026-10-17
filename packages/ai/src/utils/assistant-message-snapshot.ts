@@ -1,4 +1,6 @@
-import type { AssistantMessage, AssistantMessageEvent, ToolCall } from "../types.ts";
+import type { AssistantMessage, AssistantMessageEvent, TextContent, ThinkingContent, ToolCall } from "../types.ts";
+import { closedRawStopReason, projectAssistantMessageDiagnostics } from "./diagnostics.ts";
+import { transferThrottledLimitWait } from "./recovery.ts";
 
 /**
  * Isolation contract for published assistant-message state.
@@ -244,6 +246,103 @@ export function isolateValue<T>(value: T): T {
 	return isolate(value, graph, seen) as T;
 }
 
+export function cloneTextContent(content: TextContent): TextContent {
+	return {
+		type: "text",
+		text: content.text,
+		...(content.textSignature === undefined ? {} : { textSignature: content.textSignature }),
+	};
+}
+export function cloneThinkingContent(content: ThinkingContent): ThinkingContent {
+	return {
+		type: "thinking",
+		thinking: content.thinking,
+		...(content.thinkingSignature === undefined ? {} : { thinkingSignature: content.thinkingSignature }),
+		...(content.redacted === undefined ? {} : { redacted: content.redacted }),
+	};
+}
+export function cloneToolCall(toolCall: ToolCall): ToolCall {
+	return toolCallWithArguments(toolCall, isolateValue(toolCall.arguments));
+}
+function toolCallWithArguments(toolCall: ToolCall, args: ToolCall["arguments"]): ToolCall {
+	return {
+		type: "toolCall",
+		id: toolCall.id,
+		name: toolCall.name,
+		arguments: args,
+		...(toolCall.thoughtSignature === undefined ? {} : { thoughtSignature: toolCall.thoughtSignature }),
+		...(toolCall.namespace === undefined ? {} : { namespace: toolCall.namespace }),
+		...(toolCall.argumentsError === undefined ? {} : { argumentsError: toolCall.argumentsError }),
+	};
+}
+type AssistantContent = TextContent | ThinkingContent | ToolCall;
+function arbitraryContentValue(block: AssistantContent): unknown {
+	switch (block.type) {
+		case "text":
+		case "thinking":
+			return undefined;
+		case "toolCall":
+			return block.arguments;
+		default:
+			return block;
+	}
+}
+function cloneAssistantContent(block: AssistantContent, isolated: unknown): AssistantContent {
+	switch (block.type) {
+		case "text":
+			return cloneTextContent(block);
+		case "thinking":
+			return cloneThinkingContent(block);
+		case "toolCall":
+			return toolCallWithArguments(block, isolated as ToolCall["arguments"]);
+		default:
+			return isolated as AssistantContent;
+	}
+}
+export type PublicationPhase = "partial" | "success" | "failure";
+const SUCCESS_STOP_REASONS: ReadonlySet<string> = new Set(["stop", "length", "toolUse", "deferred"]);
+export function terminalPhase(message: AssistantMessage): PublicationPhase {
+	if (SUCCESS_STOP_REASONS.has(message.stopReason)) return "success";
+	return message.stopReason === "pending" ? "partial" : "failure";
+}
+
+/** Closed publication shape, with one isolation pass to preserve cross-field aliases and cycles. */
+export function projectAssistantMessage(message: AssistantMessage, phase: PublicationPhase): AssistantMessage {
+	const content = Array.isArray(message.content) ? message.content : [];
+	const isolated = isolateValue({
+		content: content.map(arbitraryContentValue),
+		usage: message.usage,
+		deferred: message.deferred,
+	});
+	const projected: AssistantMessage = {
+		role: "assistant",
+		content: content.map((block, index) => cloneAssistantContent(block, isolated.content[index])),
+		api: message.api,
+		provider: message.provider,
+		model: message.model,
+		usage: isolated.usage,
+		stopReason: message.stopReason,
+		timestamp: message.timestamp,
+	};
+	if (phase === "success") {
+		if (message.responseModel !== undefined) projected.responseModel = message.responseModel;
+		if (message.responseId !== undefined) projected.responseId = message.responseId;
+		if (message.providerThinkingLevel !== undefined) projected.providerThinkingLevel = message.providerThinkingLevel;
+	}
+	if (message.thinkingLevel !== undefined) projected.thinkingLevel = message.thinkingLevel;
+	const diagnostics = projectAssistantMessageDiagnostics(message.diagnostics);
+	if (diagnostics !== undefined) projected.diagnostics = diagnostics;
+	if (message.deferred !== undefined) projected.deferred = isolated.deferred;
+	if (message.errorMessage !== undefined) projected.errorMessage = message.errorMessage;
+	if (message.errorHint === "bedrock_data_retention" || message.errorHint === "chatgpt_usage") {
+		projected.errorHint = message.errorHint;
+	}
+	if (message.rawStopReason !== undefined) projected.rawStopReason = closedRawStopReason(message.rawStopReason);
+	if (message.endTurn !== undefined) projected.endTurn = message.endTurn;
+	if (message.durationMs !== undefined) projected.durationMs = message.durationMs;
+	return projected;
+}
+
 /**
  * Build a `ToolCall` from its declared fields only. `fallback` supplies fields the
  * value lacks or carries with the wrong type, for example the block a
@@ -257,6 +356,7 @@ export function snapshotToolCall(value: unknown, fallback?: ToolCall): ToolCall 
 	};
 	const thoughtSignature = text("thoughtSignature");
 	const namespace = text("namespace");
+	const argumentsError = text("argumentsError");
 	return {
 		type: "toolCall",
 		id: text("id") ?? "",
@@ -266,6 +366,7 @@ export function snapshotToolCall(value: unknown, fallback?: ToolCall): ToolCall 
 		),
 		...(thoughtSignature === undefined ? {} : { thoughtSignature }),
 		...(namespace === undefined ? {} : { namespace }),
+		...(argumentsError === undefined ? {} : { argumentsError }),
 	};
 }
 
@@ -298,6 +399,7 @@ export function snapshotAssistantMessage(message: AssistantMessage): AssistantMe
 	copy.content = Array.isArray(message.content)
 		? message.content.map(snapshotContentBlock)
 		: isolateValue(message.content);
+	transferThrottledLimitWait(message, copy);
 	return copy;
 }
 

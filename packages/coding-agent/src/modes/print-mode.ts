@@ -117,7 +117,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		"abort",
 		() => {
 			// Native disposal cancels the current (possibly rebound) session's tools,
-			// hooks, retries and owned processes before joining and persisting it.
+			// hooks, retries and processes before joining and persisting it.
 			killTrackedDetachedChildren();
 			// The prompt is still joined below; finally observes any disposal failure.
 			void disposeRuntime().catch(() => {});
@@ -259,6 +259,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 				}
 			}
 		}
+
 		// Successful output joins a slow but live reader without the forced-shutdown drain budget (#132 R4-9).
 		// A signal still runs disposeRuntime() with its bounded drainage.
 		await flushRawStdout();

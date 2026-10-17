@@ -1628,7 +1628,7 @@ describe("native input admission v1", () => {
 		const prompt = vi.spyOn(h.session.agent, "prompt").mockImplementation(() => {
 			throw new Error("dispatch failed");
 		});
-		await expect(h.session.prompt("fail", { preflightResult: preflight })).rejects.toThrow("dispatch failed");
+		await expect(h.session.prompt("fail", { onInputTransferred: preflight })).rejects.toThrow("dispatch failed");
 		expect(preflight).not.toHaveBeenCalledWith(true);
 		expect(prompt).toHaveBeenCalledOnce();
 		expect(h.session.inputAdmissionCount).toBe(0);
@@ -2320,6 +2320,7 @@ describe("native input admission v1", () => {
 			options?: PromptOptions,
 		) => Promise<void>;
 		return {
+			// pi#262 / smarty-dev#3155: operator exit joins mode-owned compaction handoffs.
 			compactionQueueWork: new Set<Promise<void>>(),
 			recoveredImages: new Map<string, ImageContent>(),
 			prepareRecoveredInput: Reflect.get(InteractiveMode.prototype, "prepareRecoveredInput") as (
@@ -2378,7 +2379,6 @@ describe("native input admission v1", () => {
 			stop: vi.fn(),
 			isShuttingDown: false,
 			shutdownRequested: false,
-			stagingAudit: () => {},
 		};
 	}
 
@@ -2570,6 +2570,7 @@ describe("native input admission v1", () => {
 		mode.pendingUserInputs.length = 0;
 	});
 
+	// pi#262 / smarty-dev#3155: the refused no-session quit now offers explicit discard consent.
 	it("TUI shutdown refuses admitted input before stopping the terminal", async () => {
 		const held = gate();
 		const h = await setup([

@@ -211,6 +211,73 @@ describe("full output log cap (smarty-dev#11307)", () => {
 		expect(large.content.length).toBeLessThanOrEqual(CAP + MARKER_MAX);
 	});
 
+	// #3155 / TOOLS-CR1: default caps must use the same boundary-aware decoding as custom caps.
+	it("decodes both default-cap UTF-8 cuts when the stored log fits the read budget", async () => {
+		const headText = "a".repeat(FULL_OUTPUT_HEAD_BYTES - 1);
+		const tailText = "c".repeat(FULL_OUTPUT_TAIL_BYTES - 3);
+		const original = Buffer.from(`${headText}\u20ac${"b".repeat(20)}\u{1f600}${tailText}`);
+		const cap = FULL_OUTPUT_HEAD_BYTES + FULL_OUTPUT_TAIL_BYTES;
+		expect(original.length).toBe(cap + 23);
+		// The head retains one byte of the euro sign; the tail starts with three emoji continuations.
+		expect(original[FULL_OUTPUT_HEAD_BYTES - 1]).toBe(0xe2);
+		expect(original[original.length - FULL_OUTPUT_TAIL_BYTES - 1]).toBe(0xf0);
+
+		const diskBefore = getOutputDirectoryBytes();
+		const accumulator = new OutputAccumulator();
+		accumulator.append(original.subarray(0, FULL_OUTPUT_HEAD_BYTES));
+		accumulator.append(original.subarray(FULL_OUTPUT_HEAD_BYTES, original.length - FULL_OUTPUT_TAIL_BYTES));
+		accumulator.append(original.subarray(-FULL_OUTPUT_TAIL_BYTES));
+		accumulator.finish();
+		await accumulator.closeTempFile();
+		const snapshot = accumulator.snapshot();
+		expect(snapshot.fullOutputError).toBeUndefined();
+		expect(snapshot.totalRawBytes).toBe(original.length);
+		expect(snapshot.fullOutputTruncated).toBe(true);
+		expect(snapshot.fullOutputTruncation).toEqual({ totalBytes: original.length, omittedBytes: 23 });
+		const path = snapshot.fullOutputPath as string;
+		const file = readFileSync(path);
+		expect(file.subarray(0, FULL_OUTPUT_HEAD_BYTES).equals(original.subarray(0, FULL_OUTPUT_HEAD_BYTES))).toBe(true);
+		expect(file.subarray(-FULL_OUTPUT_TAIL_BYTES).equals(original.subarray(-FULL_OUTPUT_TAIL_BYTES))).toBe(true);
+		expect(file.subarray(FULL_OUTPUT_HEAD_BYTES, -FULL_OUTPUT_TAIL_BYTES).toString("utf8")).toBe(
+			`\n[... 23 bytes omitted; total ${original.length} bytes ...]\n`,
+		);
+		expect(file.length).toBeLessThanOrEqual(cap + MARKER_MAX);
+		const diskAfter = getOutputDirectoryBytes();
+		expect(diskAfter - diskBefore).toBe(file.length);
+
+		for (const maxBytes of [file.length, Number.MAX_SAFE_INTEGER]) {
+			const full = await accumulator.readFullOutput(maxBytes);
+			expect(full.truncated).toBe(true);
+			expect(full.content).not.toContain("\ufffd");
+			// The decoded result omits four partial-character bytes in addition to the raw log gap.
+			expect(full.content).toBe(`${headText}\n\n[... 27 bytes omitted ...]\n\n${tailText}`);
+			expect(Buffer.byteLength(headText) + Buffer.byteLength(tailText) + 27).toBe(original.length);
+		}
+		expect(readFileSync(path).equals(file)).toBe(true);
+		expect(getOutputDirectoryBytes()).toBe(diskAfter);
+		expect(accumulator.snapshot()).toEqual(snapshot);
+	});
+
+	// #3155 / TOOLS-CR1 positive control: a stored but uncapped log still decodes every original byte.
+	it("keeps uncapped UTF-8 output and raw storage unchanged at the exact read budget", async () => {
+		const text = "snowman \u2603 crab \u{1f980} e\u0301\n";
+		const original = Buffer.from(text);
+		const accumulator = new OutputAccumulator({ maxBytes: 1 });
+		for (const byte of original) accumulator.append(Buffer.from([byte]));
+		accumulator.finish();
+		await accumulator.closeTempFile();
+		const snapshot = accumulator.snapshot();
+		expect(snapshot.fullOutputError).toBeUndefined();
+		expect(snapshot.totalRawBytes).toBe(original.length);
+		expect(snapshot.fullOutputTruncated).toBe(false);
+		expect(snapshot.fullOutputTruncation).toBeUndefined();
+		const path = snapshot.fullOutputPath as string;
+		expect(readFileSync(path).equals(original)).toBe(true);
+		expect(await accumulator.readFullOutput(original.length)).toEqual({ content: text, truncated: false });
+		expect(readFileSync(path).equals(original)).toBe(true);
+		expect(accumulator.snapshot()).toEqual(snapshot);
+	});
+
 	// A multibyte character straddles both log cuts: the head ends inside a 3-byte character and the
 	// tail starts inside a 4-byte character.
 	it("decodes capped log head and tail separately without U+FFFD at either cut", async () => {

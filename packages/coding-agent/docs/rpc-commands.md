@@ -37,7 +37,7 @@ Response:
 {"id": "req-1", "type": "response", "command": "prompt", "success": true, "data": {"disposition": "started"}}
 ```
 
-`data.disposition` is `"handled"` if an extension command or input handler consumed the prompt, `"queued"` if Pi queued it during a run, or `"started"` if Pi accepted it to start a run. This describes the submitted prompt, not independent work started by an extension or a guarantee of completion. A `"handled"` prompt owes no `agent_settled`.
+`data.disposition` is `"handled"` if an extension command or input handler consumed the prompt, `"queued"` if Pi queued it during a run, or `"started"` if Pi accepted it to start a run. This describes the submitted prompt, not independent work started by an extension or a guarantee of completion.
 
 `success: true` means the prompt was accepted, queued, or handled immediately. `success: false` means the prompt was rejected before acceptance. Failures after acceptance are reported through the normal event and message stream, not as a second `response` for the same request id.
 
@@ -150,8 +150,6 @@ If an extension canceled:
 {"type": "response", "command": "new_session", "success": true, "data": {"cancelled": true}}
 ```
 
-Unsafe `new_session`, `switch_session`, `fork`, and `clone` requests fail with `success: false` and an `INPUT_ADMISSION_BUSY` error while input is admitted, submitted in the mode, or queued. After the native fence closes, new input fails with `INPUT_ADMISSION_FENCED`, never a success acknowledgement. See [Native input admission](input-admission.md) for retry and shutdown receipt semantics.
-
 ## State
 
 ### get_state
@@ -179,23 +177,13 @@ Response:
     "sessionId": "abc123",
     "sessionName": "my-feature-work",
     "autoCompactionEnabled": true,
-    "autoCompactionDisabledForProcess": false,
     "messageCount": 5,
-    "pendingMessageCount": 0,
-    "capabilities": {"inputAdmission": 1, "promptPendingVisible": true, "triggeredMessageQueuesBehindPreflight": true},
-    "inputAdmissionCount": 0,
-    "inputsFenced": false,
-    "isIdle": true,
-    "isPromptPending": false
+    "pendingMessageCount": 0
   }
 }
 ```
 
-`capabilities.inputAdmission === 1` advertises native synchronous admission accounting and replacement fencing. `inputAdmissionCount` counts input awaiting actual handoff; it contributes to `pendingMessageCount`, makes `isIdle` false and `isPromptPending` true. `inputsFenced` reports closed admission. See [the versioned contract](input-admission.md).
-
 The `model` field is a full [Model](#model-object) object, or omitted when no model is selected. The `sessionName` field is the display name set via `set_session_name`, or omitted if not set.
-
-`autoCompactionDisabledForProcess` is read-only launch provenance. It is true only when the recognized `--no-auto-compaction` flag successfully applied its process-local override. It defaults to false and cannot be set by RPC request data. The flag does not change saved settings or disable manual compaction. Check `autoCompactionEnabled` for the current effective setting; launch provenance alone does not prove that it remains disabled after later changes.
 
 ### get_messages
 
