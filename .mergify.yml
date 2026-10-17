@@ -13,6 +13,7 @@ queue_rules:
     checks_timeout: 180 min
     merge_method: merge
     queue_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       # release/runtime-a2 (smarty-dev#7403, chief-of-staff): the temporary landed home of the fleet's a2 runtime
       # line (716a6046 + reviewed commits), with main's conditions; Mergify keeps one queue per base. Every commit
       # on it is also on main. Retired when v1.1.0 is installed fleet-wide.
@@ -36,6 +37,7 @@ queue_rules:
       - check-success = smarty-ci
       - -check-failure = smarty-ci
     merge_conditions:
+      - -check-failure = review/security  # a failed security verdict refuses admission, label or not
       - check-success = smarty-ci
       - -check-failure = smarty-ci
 
