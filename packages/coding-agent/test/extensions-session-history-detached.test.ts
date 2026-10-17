@@ -7,7 +7,7 @@ import { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 
-// pi#163 post-merge P2s: extensions share immutable persisted-JSON history snapshots.
+// smarty-dev#11897 / pi#163: every accessor isolates persisted-JSON values without caching payloads.
 it.each([
 	["typed-array", new Uint8Array([1, 255]), { "0": 1, "1": 255 }],
 	["map", new Map([["original", 1]]), {}],
@@ -23,10 +23,28 @@ it.each([
 	expect(Object.getPrototypeOf(first.data)).toBe(Object.prototype);
 	expect(Object.isFrozen(first.data)).toBe(true);
 	expect(Reflect.set(first.data as object, "poisoned", true)).toBe(false);
-	const later = runners[1].createContext().sessionManager.getEntry(id);
-	expect(later).toBe(first);
-	if (later?.type !== "custom") throw new Error("missing later custom entry");
-	expect(later.data).toEqual(expected);
+	for (const runner of runners) {
+		const history = runner.createContext().sessionManager;
+		for (const later of [
+			history.getEntry(id),
+			history.getLeafEntry(),
+			history.getBranch().at(-1),
+			history.getBranch(id).at(-1),
+			history.getEntries().at(-1),
+			history.buildContextEntries().at(-1),
+			history.buildSessionProjection().entries.at(-1)?.sourceEntry,
+			history.getTree()[0].entry,
+		]) {
+			expect(later).not.toBe(first);
+			expect(later).toEqual(first);
+			if (later?.type !== "custom") throw new Error("missing later custom entry");
+			expect(later.data).toEqual(expected);
+			expect(Object.getPrototypeOf(later.data)).toBe(Object.prototype);
+			expect(Object.isFrozen(later.data)).toBe(true);
+			expect(Reflect.set(later.data as object, "poisoned", true)).toBe(false);
+		}
+	}
+	expect(runners[1].createContext().sessionManager.getEntry(id)).toEqual(first);
 });
 
 let tempDir: string | undefined;
@@ -58,6 +76,7 @@ it("extension ctx.sessionManager history reads are deep-detached", async () => {
 		history.getLeafEntry(),
 		history.getEntry(before.entries[0].id),
 		...history.getTree().map((node) => node.entry),
+		...history.buildSessionProjection().entries.map((entry) => entry.sourceEntry),
 	];
 	for (const entry of captured) {
 		if (entry?.type === "message" && entry.message.role === "user" && Array.isArray(entry.message.content)) {
