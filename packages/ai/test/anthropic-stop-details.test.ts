@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
+import Anthropic from "@anthropic-ai/sdk";
 import { describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
-import type { AssistantMessage } from "../src/types.ts";
+import type { AssistantMessage, AssistantMessageEvent } from "../src/types.ts";
 import { projectAssistantMessage } from "../src/utils/diagnostics.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 
@@ -56,6 +57,33 @@ async function recordRefusal(details?: unknown, diagnosticSecrets?: readonly str
 		fetch: async () =>
 			sseResponse({ stop_reason: "refusal", ...(details === undefined ? {} : { stop_details: details }) }),
 	}).result();
+}
+
+async function recordInjectedRefusal(
+	details: unknown,
+	credential: string,
+	diagnosticSecrets?: readonly string[],
+): Promise<{ events: AssistantMessageEvent[]; result: AssistantMessage }> {
+	let authenticated = false;
+	const client = new Anthropic({
+		apiKey: credential,
+		authToken: null,
+		maxRetries: 0,
+		fetch: async (_url, init) => {
+			expect(new Headers(init?.headers).get("x-api-key")).toBe(credential);
+			authenticated = true;
+			return sseResponse({ stop_reason: "refusal", stop_details: details });
+		},
+	});
+	const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+		client,
+		diagnosticSecrets,
+		maxRetries: 0,
+	});
+	const events: AssistantMessageEvent[] = [];
+	for await (const event of stream) events.push(event);
+	expect(authenticated).toBe(true);
+	return { events, result: await stream.result() };
 }
 
 // Record-only diagnostic regression. Keep: untrusted-provider and outbound-context trust boundaries.
@@ -234,6 +262,42 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		const result = await recordRefusal({ explanation: "synthetic-test-key" });
 		expect(result.stopDetailsState).toBe("retained");
 		expect(result.rawStopDetails).toBe(JSON.stringify({ explanation: "***" }));
+	});
+
+	// pi#297 security round 3: credentials held only by an injected authenticated SDK client are unknowable here.
+	it("discards injected-client refusal details and hashes the masked bytes everywhere", async () => {
+		const credential = "live-client-credential";
+		const details = { explanation: credential, context: "diagnostic-secret" };
+		const masked = JSON.stringify({ explanation: credential, context: "***" });
+		const { events, result } = await recordInjectedRefusal(details, credential, ["diagnostic-secret"]);
+		const projected = projectAssistantMessage(result, "failure");
+		const errorEvent = events.find((event) => event.type === "error");
+
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(masked, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(masked, "utf8").digest("hex"));
+		expect(JSON.stringify(result)).not.toContain(credential);
+		expect(errorEvent?.error.stopDetailsState).toBe("discarded");
+		expect(errorEvent?.error.stopDetailsBytes).toBe(Buffer.byteLength(masked, "utf8"));
+		expect(errorEvent?.error.stopDetailsSha256).toBe(createHash("sha256").update(masked, "utf8").digest("hex"));
+		expect(JSON.stringify(events)).not.toContain(credential);
+		expect(projected.stopDetailsState).toBe("discarded");
+		expect(projected.stopDetailsBytes).toBe(Buffer.byteLength(masked, "utf8"));
+		expect(projected.stopDetailsSha256).toBe(createHash("sha256").update(masked, "utf8").digest("hex"));
+		expect(projected).not.toHaveProperty("rawStopDetails");
+		expect(JSON.stringify(projected)).not.toContain(credential);
+	});
+
+	it("discards even small credential-free refusal details from an injected client", async () => {
+		const details = { explanation: "credential-free refusal" };
+		const serialized = JSON.stringify(details);
+		const { result } = await recordInjectedRefusal(details, "live-client-credential");
+
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(serialized, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(serialized, "utf8").digest("hex"));
 	});
 
 	it("retains data that fits the cap after live credential masking", async () => {

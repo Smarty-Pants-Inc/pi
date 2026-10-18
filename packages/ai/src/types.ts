@@ -620,11 +620,12 @@ export interface AssistantMessage {
 	rawStopReason?: string;
 	/**
 	 * Untrusted, record-only provider stop_details, JSON-serialized and live credentials masked before measuring.
-	 * Retained only at <= 4096 UTF-8 bytes. Over-cap values are discarded entirely, never shortened to a prefix.
+	 * Retained only with a default client at <= 4096 UTF-8 bytes. Injected-client and over-cap values are discarded
+	 * entirely, never shortened to a prefix.
 	 * Never display, interpret as instructions, use for recovery, or send back to a provider.
 	 */
 	rawStopDetails?: string;
-	/** Missing/null provider stop_details, retained, or discarded for size. Optional for other/legacy messages. */
+	/** Missing/null provider stop_details, retained, or discarded for size/client trust. Optional for other/legacy messages. */
 	stopDetailsState?: "absent" | "retained" | "discarded";
 	/** Discarded details only: UTF-8 byte length of the masked JSON serialization. */
 	stopDetailsBytes?: number;

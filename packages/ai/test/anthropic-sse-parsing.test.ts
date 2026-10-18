@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Anthropic from "@anthropic-ai/sdk";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -578,8 +579,12 @@ describe("Anthropic raw SSE parsing", () => {
 		expect(result.rawStopReason).toBe("refusal");
 		// The error remains owned text; untrusted provider details are a separate record-only field.
 		expect(result.errorMessage).toBe("The model refused to complete the request");
-		expect(result.stopDetailsState).toBe("retained");
-		expect(result.rawStopDetails).toBe(JSON.stringify({ type: "refusal", category: "cyber", explanation }));
+		// pi#297 security round 3: injected clients never retain raw refusal details, even below the cap.
+		const serialized = JSON.stringify({ type: "refusal", category: "cyber", explanation });
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(serialized, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(serialized, "utf8").digest("hex"));
 		expect(result.content).toEqual([]);
 		expect(JSON.stringify(result.diagnostics ?? [])).not.toContain(explanation);
 	});

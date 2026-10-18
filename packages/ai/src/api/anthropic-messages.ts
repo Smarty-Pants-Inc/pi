@@ -606,6 +606,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 		let pendingStopDetails: unknown;
 		let hasPendingStopDetails = false;
 		let terminalStopReason: string | undefined;
+		let injectedClient = false;
 
 		try {
 			let client: Anthropic;
@@ -615,6 +616,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			if (options?.client) {
 				client = options.client;
+				injectedClient = true;
 				isOAuth = false;
 			} else {
 				const apiKey = options?.apiKey;
@@ -964,6 +966,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 					failure,
 					hasPendingStopDetails ? pendingStopDetails : undefined,
 					getRequestDiagnosticSecrets(model, options),
+					injectedClient,
 				);
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: failure });

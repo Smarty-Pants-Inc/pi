@@ -299,10 +299,11 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 			projected.rawStopDetails = message.rawStopDetails;
 			projected.stopDetailsState = "retained";
 		}
+		// Injected-client details are discarded even below the size cap.
 		if (
 			message.stopDetailsState === "discarded" &&
 			Number.isSafeInteger(message.stopDetailsBytes) &&
-			message.stopDetailsBytes! > MAX_STOP_DETAILS_BYTES &&
+			message.stopDetailsBytes! >= 0 &&
 			typeof message.stopDetailsSha256 === "string" &&
 			/^[a-f0-9]{64}$/.test(message.stopDetailsSha256)
 		) {
