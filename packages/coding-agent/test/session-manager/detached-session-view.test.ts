@@ -390,6 +390,38 @@ describe("detached session snapshots", () => {
 		expect(view.getBranch()).toEqual([]);
 	});
 
+	// pi#291 SEC P2: JavaScript extensions can pass null to select the active leaf.
+	it("extends getBranch(null) with appends through the active-branch cache", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendCustomEntry("first", { value: 1 });
+		const view = detachedSessionView(manager);
+		const before = Reflect.apply(view.getBranch, view, [null]);
+		expect(before).toEqual(manager.getBranch());
+		manager.appendCustomEntry("second", { value: 2 });
+		const after = Reflect.apply(view.getBranch, view, [null]);
+		expect(after).toEqual(manager.getBranch());
+		expect(after).toBe(view.getBranch());
+		expect(after).toHaveLength(2);
+		expect(after[0]).toBe(before[0]);
+		expect(before).toHaveLength(1);
+	});
+
+	// pi#291 SEC P2: non-append mutations must also retire the null active-leaf selection.
+	it("refreshes getBranch(null) after a branch switch", () => {
+		const manager = SessionManager.inMemory();
+		const root = manager.appendCustomEntry("root", {});
+		manager.appendCustomEntry("descendant", {});
+		const view = detachedSessionView(manager);
+		const before = Reflect.apply(view.getBranch, view, [null]);
+		expect(before).toEqual(manager.getBranch());
+		manager.branch(root);
+		const after = Reflect.apply(view.getBranch, view, [null]);
+		expect(after).toEqual(manager.getBranch());
+		expect(after).toBe(view.getBranch());
+		expect(after).toHaveLength(1);
+		expect(before).toHaveLength(2);
+	});
+
 	// smarty-dev#14576 P2-2: exercise actual messages and edits while the spy is active.
 	it("does not serialize unchanged projected messages or context edits", () => {
 		const manager = SessionManager.inMemory();

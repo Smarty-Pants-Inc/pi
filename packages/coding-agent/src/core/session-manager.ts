@@ -645,7 +645,7 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 			getLeafEntry: () => snapshot(source.getLeafEntry()),
 			getEntry: (id: string) => snapshot(source.getEntry(id)),
 			getLabel: manager.getLabel.bind(manager),
-			getBranch: (fromId?: string) => entries("getBranch", fromId),
+			getBranch: (fromId?: string) => entries("getBranch", fromId ?? undefined),
 			buildContextEntries: () => entries("buildContextEntries"),
 			buildSessionProjection: () => {
 				const revision = nativeSource?.revision?.();
