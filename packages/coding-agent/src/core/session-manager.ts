@@ -367,12 +367,19 @@ type DetachedSessionSource = Pick<
 	"getLeafEntry" | "getEntry" | "getBranch" | "buildContextEntries" | "getEntries" | "getTree"
 > & {
 	revision?: () => number;
-	buildDetachedProjection?: () => { projection: SessionProjection; shareable: boolean };
+	buildDetachedProjection?: (
+		appended?: SessionEntry[],
+		previous?: SessionProjection,
+	) => {
+		projection: SessionProjection;
+		shareable: boolean;
+	};
 };
 // Only the detached view may use these native readers, bypassing ownedView's full-history copies.
 const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
 const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
 const detachedSelectionInvalidators = new WeakMap<object, () => void>();
+const detachedSelectionAppenders = new WeakMap<object, (entry: SessionEntry) => void>();
 /** Added selection/wrapper metadata only; immutable native payloads are shared, not copied. */
 const DETACHED_SELECTION_BUDGET = 64 * 1024 * 1024;
 
@@ -506,10 +513,30 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 		const source: DetachedSessionSource = nativeSource ?? manager;
 		const snapshot = snapshotSessionEntry;
 		let selection:
-			| { revision: number; kind: string; fromId?: string; entries?: SessionEntry[]; projection?: SessionProjection }
+			| {
+					revision: number;
+					kind: string;
+					fromId?: string;
+					entries?: SessionEntry[];
+					projection?: SessionProjection;
+					bytes: number;
+					lazy?: boolean;
+			  }
 			| undefined;
-		detachedSelectionInvalidators.set(manager, () => {
+		let appended: SessionEntry[] = [];
+		const invalidate = () => {
 			selection = undefined;
+			appended = [];
+		};
+		detachedSelectionInvalidators.set(manager, invalidate);
+		detachedSelectionAppenders.set(manager, (entry) => {
+			// Edits and compaction change earlier contributions, not just the suffix.
+			if (entry.type === "compaction" || entry.type === "context_edit") invalidate();
+			else if (selection) {
+				// Pending native references share the same admission as the current snapshot.
+				if (selection.bytes + 8 * (appended.length + 1) > DETACHED_SELECTION_BUDGET) invalidate();
+				else appended.push(entry);
+			}
 		});
 		const entries = (kind: "getBranch" | "getEntries" | "buildContextEntries", fromId?: string) => {
 			const revision = nativeSource?.revision?.();
@@ -521,15 +548,54 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 				selection.entries
 			)
 				return selection.entries;
+			// The append hook records only admitted native suffix entries. All replacement/leaf
+			// mutations synchronously retire this state, so no old entry needs visiting here.
+			if (selection?.kind === kind && selection.fromId === fromId && selection.entries && appended.length) {
+				if (fromId !== undefined && revision !== undefined) {
+					selection.revision = revision;
+					appended = [];
+					return selection.entries;
+				}
+				// Preserve exceptional lazy slots as descriptors, never materialize their payloads
+				// into an uncharged retained clone. Ordinary immutable histories copy pointers only.
+				let result: SessionEntry[];
+				if (selection.lazy) {
+					const slots = Object.getOwnPropertyDescriptors(selection.entries as object);
+					slots.length.writable = true;
+					result = Object.defineProperties([], slots);
+				} else result = selection.entries.slice();
+				let bytes = selection.bytes;
+				let lazy = selection.lazy;
+				for (const entry of appended) {
+					bytes += 8 + 128 + 24 * Object.getOwnPropertyNames(entry).length;
+					const index = result.length;
+					if (publishedSessionEntries.has(entry)) result.push(snapshot(entry)!);
+					else {
+						lazy = true;
+						Object.defineProperty(result, index, { enumerable: true, get: () => snapshot(entry)! });
+					}
+				}
+				Object.freeze(result);
+				selection =
+					revision === undefined || bytes > DETACHED_SELECTION_BUDGET
+						? undefined
+						: { revision, kind, entries: result, bytes, lazy };
+				appended = [];
+				return result;
+			}
 			const values = kind === "getBranch" ? source.getBranch(fromId) : source[kind]();
 			if (!nativeSource) return detachedSessionEntries(values);
 			const result = new Array<SessionEntry>(values.length);
-			let bytes = 64 + 8 * values.length + 2 * (fromId?.length ?? 0);
+			let bytes = 128 + 8 * values.length + 2 * (fromId?.length ?? 0);
+			let lazy = false;
 			values.forEach((entry, index) => {
 				// Conservatively charge wrapper slots, array slots and exceptional getter closures.
 				bytes += 128 + 24 * Object.getOwnPropertyNames(entry).length;
 				if (publishedSessionEntries.has(entry)) result[index] = snapshot(entry)!;
-				else Object.defineProperty(result, index, { enumerable: true, get: () => snapshot(entry)! });
+				else {
+					lazy = true;
+					Object.defineProperty(result, index, { enumerable: true, get: () => snapshot(entry)! });
+				}
 			});
 			Object.freeze(result);
 			// Survive idle GC, but only retain a fitting current selection. Native replacement,
@@ -537,8 +603,38 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 			selection =
 				revision === undefined || bytes > DETACHED_SELECTION_BUDGET || (fromId !== undefined && values.length === 0)
 					? undefined
-					: { revision, kind, fromId, entries: result };
+					: { revision, kind, fromId, entries: result, bytes, lazy };
+			appended = [];
 			return result;
+		};
+		const finishProjection = (
+			projection: SessionProjection,
+			shareable: boolean,
+			revision: number | undefined,
+			bytes = 320,
+			start = 0,
+		) => {
+			for (let index = start; index < projection.entries.length; index++) {
+				const projected = projection.entries[index];
+				// Charge every newly retained wrapper and array slot; old immutable contributions
+				// are reused, never traversed, cloned or frozen again on an ordinary append.
+				bytes += 8 + 128 + 24 * Object.getOwnPropertyNames(projected.sourceEntry).length;
+				bytes += 64 + 24 * 2 + 64 + 16 * projected.messages.length;
+				for (const message of projected.messages) bytes += 128 + 24 * Object.getOwnPropertyNames(message).length;
+				freezeDetached(projected.messages);
+				Object.freeze(projected);
+			}
+			Object.freeze(projection.entries);
+			Object.freeze(projection.messages);
+			if (projection.model) Object.freeze(projection.model);
+			Object.freeze(projection);
+			// One current selection (list OR projection), sharing a single 64 MiB admission.
+			selection =
+				!shareable || revision === undefined || bytes > DETACHED_SELECTION_BUDGET
+					? undefined
+					: { revision, kind: "projection", projection, bytes };
+			appended = [];
+			return projection;
 		};
 		view = Object.freeze({
 			getCwd: manager.getCwd.bind(manager),
@@ -559,28 +655,23 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 				if (!nativeSource?.buildDetachedProjection) {
 					return freezeDetached(JSON.parse(JSON.stringify(manager.buildSessionProjection())) as SessionProjection);
 				}
-				const { projection, shareable } = nativeSource.buildDetachedProjection();
-				let bytes = 256 + 8 * (projection.entries.length + projection.messages.length);
-				for (const projected of projection.entries) {
-					// Source wrappers share native immutable payloads; only new metadata is retained.
-					bytes += 128 + 24 * Object.getOwnPropertyNames(projected.sourceEntry).length;
-					bytes += 64 + 24 * 2 + 64 + 8 * projected.messages.length;
-					for (const message of projected.messages) {
-						bytes += 128 + 24 * Object.getOwnPropertyNames(message).length;
-					}
-					freezeDetached(projected.messages);
-					Object.freeze(projected);
+				if (selection?.projection && appended.length) {
+					const previous = selection.projection;
+					const { projection: suffix, shareable } = nativeSource.buildDetachedProjection(appended, previous);
+					return finishProjection(
+						{
+							...suffix,
+							entries: previous.entries.concat(suffix.entries),
+							messages: previous.messages.concat(suffix.messages),
+						},
+						shareable,
+						revision,
+						selection.bytes,
+						previous.entries.length,
+					);
 				}
-				Object.freeze(projection.entries);
-				Object.freeze(projection.messages);
-				if (projection.model) Object.freeze(projection.model);
-				Object.freeze(projection);
-				// One shared 64 MiB admission, not independent list and projection budgets.
-				selection =
-					!shareable || revision === undefined || bytes > DETACHED_SELECTION_BUDGET
-						? undefined
-						: { revision, kind: "projection", projection };
-				return projection;
+				const { projection, shareable } = nativeSource.buildDetachedProjection();
+				return finishProjection(projection, shareable, revision);
 			},
 			getHeader: () => freezeDetached(structuredClone(manager.getHeader())),
 			getEntries: () => entries("getEntries"),
@@ -1383,8 +1474,10 @@ export class SessionManager {
 			getEntry: (id) => this.byId.get(id),
 			getBranch: (fromId) => this.getBranchEntries(fromId),
 			buildContextEntries: () => this.getBranchProjection().contextEntries.slice(),
-			buildDetachedProjection: () => {
-				const { contextEntries, thinkingLevel, model } = this.getBranchProjection();
+			buildDetachedProjection: (appended, previous) => {
+				const { contextEntries, thinkingLevel, model } = appended
+					? { contextEntries: appended, ...getSessionContextSettings(appended, previous) }
+					: this.getBranchProjection();
 				let shareable = true;
 				// Detached wrappers are not native published entries, so projection shares their
 				// immutable message graphs instead of cloning mutable runtime model state.
@@ -1749,6 +1842,8 @@ export class SessionManager {
 			this.fileEntries.push(published);
 			this.byId.set(published.id, published);
 			this.leafId = published.id;
+			this.extendBranchProjection(published);
+			detachedSelectionAppenders.get(this)?.(published);
 			return;
 		}
 		entry = ownSessionEntry(entry);
@@ -1757,6 +1852,7 @@ export class SessionManager {
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this.extendBranchProjection(entry);
+		detachedSelectionAppenders.get(this)?.(entry);
 		this.#persistEntry(entry);
 	}
 
@@ -1868,6 +1964,8 @@ export class SessionManager {
 			this.fileEntries.push(published);
 			this.byId.set(published.id, published);
 			this.leafId = published.id;
+			this.extendBranchProjection(published);
+			detachedSelectionAppenders.get(this)?.(published);
 		} catch (error) {
 			this.#terminalIndexFailure ??= { error, entry: published, bytes: line, nativeWriteAccepted: true };
 			try {
@@ -2441,6 +2539,7 @@ export class SessionManager {
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		detachedSelectionInvalidators.get(this)?.();
 		this.leafId = branchFromId;
 		this.#branchProjection = undefined;
 		this.#releaseColdEntries();
@@ -2453,6 +2552,7 @@ export class SessionManager {
 	 */
 	resetLeaf(): void {
 		this.#ownedJournal?.assertActive();
+		detachedSelectionInvalidators.get(this)?.();
 		this.leafId = null;
 		this.#branchProjection = undefined;
 	}
@@ -2474,6 +2574,7 @@ export class SessionManager {
 		}
 		this.#ownedJournal?.assertActive();
 		const fromId = this.leafId ?? "root";
+		detachedSelectionInvalidators.get(this)?.();
 		if (!this.#ownedJournal) this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
