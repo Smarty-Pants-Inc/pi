@@ -219,40 +219,37 @@ export function closedRawStopReason(value: unknown): string {
 }
 
 const MAX_STOP_DETAILS_BYTES = 4096;
-const STOP_DETAILS_TRUNCATED = "[truncated]";
-
-/** Bound serialized, untrusted stop details without interpreting their contents. */
-export function boundRawStopDetails(value: string): string {
-	const bytes = new TextEncoder().encode(value);
-	if (bytes.length <= MAX_STOP_DETAILS_BYTES) return value;
-	// Streaming decode omits an incomplete final UTF-8 code point instead of adding a replacement character.
-	const prefix = new TextDecoder().decode(bytes.subarray(0, MAX_STOP_DETAILS_BYTES - STOP_DETAILS_TRUNCATED.length), {
-		stream: true,
-	});
-	return prefix + STOP_DETAILS_TRUNCATED;
-}
 
 /** Record opaque provider data only. Missing later deltas must not erase details already received. */
-export function recordAssistantMessageStopDetails(
+export async function recordAssistantMessageStopDetails(
 	message: AssistantMessage,
 	details: unknown,
 	secrets: readonly string[] = [],
-): void {
+): Promise<void> {
 	if (details == null) {
 		message.stopDetailsState ??= "absent";
 		return;
 	}
 	try {
 		const serialized = JSON.stringify(details);
-		if (serialized === undefined) throw new Error("Stop details are not JSON-serializable");
-		// Mask before truncation so cutting across a live credential cannot leave an unmasked prefix.
+		if (serialized === undefined) return;
+		// Size and fingerprint only the masked serialization; never retain a fingerprint of live credentials.
 		const redacted = redactValues(serialized, secrets);
-		message.rawStopDetails = boundRawStopDetails(redacted);
-		message.stopDetailsState = message.rawStopDetails === redacted ? "retained" : "truncated";
+		const bytes = new TextEncoder().encode(redacted);
+		if (bytes.length > MAX_STOP_DETAILS_BYTES) {
+			const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+			message.stopDetailsSha256 = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
+			message.stopDetailsBytes = bytes.length;
+			delete message.rawStopDetails;
+			message.stopDetailsState = "discarded";
+		} else {
+			message.rawStopDetails = redacted;
+			delete message.stopDetailsBytes;
+			delete message.stopDetailsSha256;
+			message.stopDetailsState = "retained";
+		}
 	} catch {
-		// Diagnostic failure must never change the response outcome. No original exception text is retained.
-		message.rawStopDetails = STOP_DETAILS_TRUNCATED;
-		message.stopDetailsState = "truncated";
+		// Diagnostic failure must never change the response outcome. No exception text or partial record is retained.
 	}
 }
 
@@ -272,8 +269,9 @@ export function terminalPhase(message: AssistantMessage): PublicationPhase {
  * private protocol state such as Codex's `responseId` continuation. The copy has a closed key set and snapshot
  * content, usage and diagnostics, so a queued partial cannot pick up later mutations and a consumer cannot
  * mutate adapter state. Wire metadata (`responseId`, `responseModel`, `providerThinkingLevel`) is published only
- * with a successful result, never on a partial or a failed or aborted message. The stream adds the owned recovery
- * decision and carries the private throttle wait (`AssistantMessageEventStream`).
+ * with a successful result, never on a partial or a failed or aborted message, except for the record-only
+ * responseId of an Anthropic refusal. The stream adds the owned recovery decision and carries the private
+ * throttle wait (`AssistantMessageEventStream`).
  */
 export function projectAssistantMessage(message: AssistantMessage, phase: PublicationPhase): AssistantMessage {
 	const content = Array.isArray(message.content) ? message.content : [];
@@ -300,6 +298,15 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 		if (message.responseId !== undefined) projected.responseId = message.responseId;
 		if (message.providerThinkingLevel !== undefined) projected.providerThinkingLevel = message.providerThinkingLevel;
 	}
+	if (
+		phase === "failure" &&
+		message.api === "anthropic-messages" &&
+		message.stopReason === "error" &&
+		message.rawStopReason === "refusal" &&
+		typeof message.responseId === "string"
+	) {
+		projected.responseId = message.responseId;
+	}
 	if (message.thinkingLevel !== undefined) projected.thinkingLevel = message.thinkingLevel;
 	const diagnostics = projectAssistantMessageDiagnostics(message.diagnostics);
 	if (diagnostics !== undefined) projected.diagnostics = diagnostics;
@@ -313,12 +320,23 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 	// Keep the record-only field on failures too; never merge it into error text, content or owned diagnostics.
 	if (message.stopDetailsState === "absent") projected.stopDetailsState = "absent";
 	if (
-		(message.stopDetailsState === "retained" || message.stopDetailsState === "truncated") &&
-		typeof message.rawStopDetails === "string"
+		message.stopDetailsState === "retained" &&
+		typeof message.rawStopDetails === "string" &&
+		new TextEncoder().encode(message.rawStopDetails).length <= MAX_STOP_DETAILS_BYTES
 	) {
-		projected.rawStopDetails = boundRawStopDetails(message.rawStopDetails);
-		projected.stopDetailsState =
-			projected.rawStopDetails === message.rawStopDetails ? message.stopDetailsState : "truncated";
+		projected.rawStopDetails = message.rawStopDetails;
+		projected.stopDetailsState = "retained";
+	}
+	if (
+		message.stopDetailsState === "discarded" &&
+		Number.isSafeInteger(message.stopDetailsBytes) &&
+		message.stopDetailsBytes! > MAX_STOP_DETAILS_BYTES &&
+		typeof message.stopDetailsSha256 === "string" &&
+		/^[a-f0-9]{64}$/.test(message.stopDetailsSha256)
+	) {
+		projected.stopDetailsState = "discarded";
+		projected.stopDetailsBytes = message.stopDetailsBytes;
+		projected.stopDetailsSha256 = message.stopDetailsSha256;
 	}
 	if (message.endTurn !== undefined) projected.endTurn = message.endTurn;
 	if (message.durationMs !== undefined) projected.durationMs = message.durationMs;

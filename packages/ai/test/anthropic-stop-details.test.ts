@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
@@ -35,9 +36,10 @@ function sseResponse(delta: Record<string, unknown>): Response {
 	);
 }
 
-async function recordRefusal(details?: unknown): Promise<AssistantMessage> {
+async function recordRefusal(details?: unknown, diagnosticSecrets?: readonly string[]): Promise<AssistantMessage> {
 	return streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
 		apiKey: "synthetic-test-key",
+		diagnosticSecrets,
 		maxRetries: 0,
 		fetch: async () =>
 			sseResponse({ stop_reason: "refusal", ...(details === undefined ? {} : { stop_details: details }) }),
@@ -66,8 +68,8 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		{
 			name: "over 4 KiB",
 			details: "x".repeat(4095),
-			state: "truncated",
-			raw: `"${"x".repeat(4084)}[truncated]`,
+			state: "discarded",
+			raw: undefined,
 		},
 	])("records $name without changing refusal behavior", async ({ details, state, raw }) => {
 		const baseline = await recordRefusal();
@@ -75,7 +77,16 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		expect(result.errorMessage).toBe("The model refused to complete the request");
 		expect(result.stopDetailsState).toBe(state);
 		expect(result.rawStopDetails).toBe(raw);
-		if (state === "absent") expect(result).not.toHaveProperty("rawStopDetails");
+		if (state !== "retained") expect(result).not.toHaveProperty("rawStopDetails");
+		if (state === "discarded") {
+			const serialized = JSON.stringify(details);
+			expect(result.stopDetailsBytes).toBe(Buffer.byteLength(serialized, "utf8"));
+			expect(result.stopDetailsSha256).toBe(createHash("sha256").update(serialized, "utf8").digest("hex"));
+			expect(JSON.stringify(result)).not.toContain("x".repeat(100));
+		} else {
+			expect(result).not.toHaveProperty("stopDetailsBytes");
+			expect(result).not.toHaveProperty("stopDetailsSha256");
+		}
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
 		for (const key of ["recovery", "errorHint", "diagnostics", "content", "usage"] as const) {
@@ -83,13 +94,38 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		}
 	});
 
-	it("caps multibyte details at 4096 UTF-8 bytes including the marker without splitting a character", async () => {
-		const result = await recordRefusal({ explanation: "😀é".repeat(2000) });
-		expect(result.stopDetailsState).toBe("truncated");
-		expect(result.rawStopDetails).toMatch(/\[truncated\]$/);
-		expect(new TextEncoder().encode(result.rawStopDetails).length).toBeLessThanOrEqual(4096);
-		expect(result.rawStopDetails).not.toContain("�");
+	it("discards multibyte details based on UTF-8 byte size, with no raw value or prefix", async () => {
+		const details = { explanation: "😀é".repeat(800) };
+		const serialized = JSON.stringify(details);
+		expect(serialized.length).toBeLessThan(4096);
+		const result = await recordRefusal(details);
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(serialized, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(serialized, "utf8").digest("hex"));
+		expect(JSON.stringify(result)).not.toContain("😀");
 		expect(result.errorMessage).toBe("The model refused to complete the request");
+	});
+
+	it("keeps the upstream responseId on the refusal error and result, but not on partials", async () => {
+		const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+			apiKey: "synthetic-test-key",
+			maxRetries: 0,
+			fetch: async () => sseResponse({ stop_reason: "refusal", stop_details: { explanation: "untrusted" } }),
+		});
+		let sawError = false;
+		for await (const event of stream) {
+			if (event.type === "error") {
+				sawError = true;
+				expect(event.error.responseId).toBe("msg_test");
+				expect(event.error.rawStopDetails).toBe(JSON.stringify({ explanation: "untrusted" }));
+				expect(event.error.errorMessage).toBe("The model refused to complete the request");
+			} else if ("partial" in event) {
+				expect(event.partial).not.toHaveProperty("responseId");
+			}
+		}
+		expect(sawError).toBe(true);
+		expect((await stream.result()).responseId).toBe("msg_test");
 	});
 
 	it("masks reflected live credentials in the record-only field", async () => {
@@ -98,18 +134,56 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		expect(result.rawStopDetails).toBe(JSON.stringify({ explanation: "***" }));
 	});
 
-	it("masks live credentials before a size cap can cut across them", async () => {
+	it("retains data that fits the cap after live credential masking", async () => {
 		const prefix = "x".repeat(4080);
-		const result = await recordRefusal(`${prefix}synthetic-test-key tail`);
+		const details = `${prefix}synthetic-test-key tail`;
+		expect(Buffer.byteLength(JSON.stringify(details), "utf8")).toBeGreaterThan(4096);
+		const result = await recordRefusal(details);
 		expect(result.stopDetailsState).toBe("retained");
 		expect(result.rawStopDetails).toBe(JSON.stringify(`${prefix}*** tail`));
+		expect(result).not.toHaveProperty("stopDetailsBytes");
+		expect(result).not.toHaveProperty("stopDetailsSha256");
 	});
 
-	it.each(["error", "stop"] as const)(
-		"never sends stored details upstream from a %s assistant message",
-		async (stopReason) => {
+	it("sizes and hashes the masked serialization when it remains over the cap", async () => {
+		const prefix = "x".repeat(5000);
+		const details = `${prefix}synthetic-test-key tail`;
+		const masked = JSON.stringify(`${prefix}*** tail`);
+		const result = await recordRefusal(details);
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(masked, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(masked, "utf8").digest("hex"));
+		expect(result.stopDetailsSha256).not.toBe(createHash("sha256").update(JSON.stringify(details)).digest("hex"));
+	});
+
+	it("discards data expanded beyond the cap by short-credential masking without retaining a prefix", async () => {
+		const prefix = "x".repeat(4087);
+		const details = `${prefix} a a`;
+		const masked = JSON.stringify(`${prefix} *** ***`);
+		expect(Buffer.byteLength(JSON.stringify(details), "utf8")).toBeLessThanOrEqual(4096);
+		expect(Buffer.byteLength(masked, "utf8")).toBeGreaterThan(4096);
+		const result = await recordRefusal(details, ["a"]);
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(masked, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(masked, "utf8").digest("hex"));
+	});
+
+	it.each([
+		{ stopReason: "error", oversized: false },
+		{ stopReason: "stop", oversized: false },
+		{ stopReason: "error", oversized: true },
+		{ stopReason: "stop", oversized: true },
+	] as const)(
+		"never sends stored fields upstream from a $stopReason assistant message (oversized=$oversized)",
+		async ({ stopReason, oversized }) => {
 			const sentinel = "UNTRUSTED_STOP_DETAILS_NOT_CONTEXT";
-			const recorded = await recordRefusal({ explanation: sentinel, fallback_credit_token: sentinel });
+			const recorded = await recordRefusal({
+				explanation: sentinel,
+				fallback_credit_token: sentinel,
+				padding: oversized ? "x".repeat(4096) : "",
+			});
 			// Round-trip the stored message, not just a mapStopReason return value.
 			const stored = JSON.parse(JSON.stringify(recorded)) as AssistantMessage;
 			stored.stopReason = stopReason;
@@ -135,6 +209,10 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 			for (const forbidden of [
 				"rawStopDetails",
 				"stopDetailsState",
+				"stopDetailsBytes",
+				"stopDetailsSha256",
+				"responseId",
+				"msg_test",
 				"stop_details",
 				"fallback_credit_token",
 				sentinel,
@@ -148,7 +226,14 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 			expect(assistantMessages).toEqual(
 				stopReason === "error" ? [] : [{ role: "assistant", content: [{ type: "text", text: "Unchanged reply" }] }],
 			);
-			expect(stored.rawStopDetails).toContain(sentinel);
+			expect(stored.responseId).toBe("msg_test");
+			if (oversized) {
+				expect(stored).not.toHaveProperty("rawStopDetails");
+				expect(stored.stopDetailsState).toBe("discarded");
+				expect(wire).not.toContain(stored.stopDetailsSha256);
+			} else {
+				expect(stored.rawStopDetails).toContain(sentinel);
+			}
 		},
 	);
 });

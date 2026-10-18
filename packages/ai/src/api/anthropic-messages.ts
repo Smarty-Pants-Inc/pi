@@ -865,7 +865,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				} else if (event.type === "message_delta") {
 					const transformations = event.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
-					recordAssistantMessageStopDetails(
+					await recordAssistantMessageStopDetails(
 						output,
 						event.delta.stop_details,
 						getRequestDiagnosticSecrets(model, options),
