@@ -317,26 +317,28 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 		projected.errorHint = message.errorHint;
 	}
 	if (message.rawStopReason !== undefined) projected.rawStopReason = closedRawStopReason(message.rawStopReason);
-	// Keep the record-only field on failures too; never merge it into error text, content or owned diagnostics.
-	if (message.stopDetailsState === "absent") projected.stopDetailsState = "absent";
-	if (
-		message.stopDetailsState === "retained" &&
-		typeof message.rawStopDetails === "string" &&
-		new TextEncoder().encode(message.rawStopDetails).length <= MAX_STOP_DETAILS_BYTES
-	) {
-		projected.rawStopDetails = message.rawStopDetails;
-		projected.stopDetailsState = "retained";
-	}
-	if (
-		message.stopDetailsState === "discarded" &&
-		Number.isSafeInteger(message.stopDetailsBytes) &&
-		message.stopDetailsBytes! > MAX_STOP_DETAILS_BYTES &&
-		typeof message.stopDetailsSha256 === "string" &&
-		/^[a-f0-9]{64}$/.test(message.stopDetailsSha256)
-	) {
-		projected.stopDetailsState = "discarded";
-		projected.stopDetailsBytes = message.stopDetailsBytes;
-		projected.stopDetailsSha256 = message.stopDetailsSha256;
+	// Keep the record-only field on refusal failures only; never merge it into error text, content or owned diagnostics.
+	if (message.api === "anthropic-messages" && message.stopReason === "error" && message.rawStopReason === "refusal") {
+		if (message.stopDetailsState === "absent") projected.stopDetailsState = "absent";
+		if (
+			message.stopDetailsState === "retained" &&
+			typeof message.rawStopDetails === "string" &&
+			new TextEncoder().encode(message.rawStopDetails).length <= MAX_STOP_DETAILS_BYTES
+		) {
+			projected.rawStopDetails = message.rawStopDetails;
+			projected.stopDetailsState = "retained";
+		}
+		if (
+			message.stopDetailsState === "discarded" &&
+			Number.isSafeInteger(message.stopDetailsBytes) &&
+			message.stopDetailsBytes! > MAX_STOP_DETAILS_BYTES &&
+			typeof message.stopDetailsSha256 === "string" &&
+			/^[a-f0-9]{64}$/.test(message.stopDetailsSha256)
+		) {
+			projected.stopDetailsState = "discarded";
+			projected.stopDetailsBytes = message.stopDetailsBytes;
+			projected.stopDetailsSha256 = message.stopDetailsSha256;
+		}
 	}
 	if (message.endTurn !== undefined) projected.endTurn = message.endTurn;
 	if (message.durationMs !== undefined) projected.durationMs = message.durationMs;

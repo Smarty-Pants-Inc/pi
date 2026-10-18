@@ -709,6 +709,9 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
+			let pendingStopDetails: unknown;
+			let hasPendingStopDetails = false;
+			let terminalStopReason: string | undefined;
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				await notifyProviderStreamEvent(options, output);
@@ -865,17 +868,34 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				} else if (event.type === "message_delta") {
 					const transformations = event.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
-					await recordAssistantMessageStopDetails(
-						output,
-						event.delta.stop_details,
-						getRequestDiagnosticSecrets(model, options),
-					);
-					if (event.delta.stop_reason) {
-						output.rawStopReason = event.delta.stop_reason;
-						const stopReasonResult = mapStopReason(event.delta.stop_reason, event.delta.stop_details);
+					// Details can precede the terminal reason; hold them until that reason decides whether they are recordable.
+					if (terminalStopReason === undefined && "stop_details" in event.delta) {
+						if (event.delta.stop_details == null) {
+							if (!hasPendingStopDetails) hasPendingStopDetails = true;
+						} else {
+							pendingStopDetails = event.delta.stop_details;
+							hasPendingStopDetails = true;
+						}
+					}
+					if (event.delta.stop_reason && terminalStopReason === undefined) {
+						terminalStopReason = event.delta.stop_reason;
+						output.rawStopReason = terminalStopReason;
+						const stopReasonResult = mapStopReason(terminalStopReason, event.delta.stop_details);
 						output.stopReason = stopReasonResult.stopReason;
 						if (stopReasonResult.errorMessage) {
 							output.errorMessage = stopReasonResult.errorMessage;
+						}
+						if (terminalStopReason === "refusal") {
+							await recordAssistantMessageStopDetails(
+								output,
+								hasPendingStopDetails ? pendingStopDetails : undefined,
+								getRequestDiagnosticSecrets(model, options),
+							);
+						} else {
+							delete output.rawStopDetails;
+							delete output.stopDetailsState;
+							delete output.stopDetailsBytes;
+							delete output.stopDetailsSha256;
 						}
 					}
 					// Only update usage fields if present (not null).

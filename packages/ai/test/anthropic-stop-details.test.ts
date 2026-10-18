@@ -20,6 +20,10 @@ function sseResponse(delta: Record<string, unknown>): Response {
 		{ type: "message_delta", delta: {}, usage: { output_tokens: 5 } },
 		{ type: "message_stop" },
 	];
+	return createSseResponse(events);
+}
+
+function createSseResponse(events: Array<Record<string, unknown>>): Response {
 	const bytes = new TextEncoder().encode(
 		events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""),
 	);
@@ -36,6 +40,12 @@ function sseResponse(delta: Record<string, unknown>): Response {
 	);
 }
 
+const STOP_DETAILS_FIELDS = ["rawStopDetails", "stopDetailsState", "stopDetailsBytes", "stopDetailsSha256"] as const;
+
+function expectNoStopDetails(message: unknown): void {
+	for (const field of STOP_DETAILS_FIELDS) expect(message).not.toHaveProperty(field);
+}
+
 async function recordRefusal(details?: unknown, diagnosticSecrets?: readonly string[]): Promise<AssistantMessage> {
 	return streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
 		apiKey: "synthetic-test-key",
@@ -48,6 +58,41 @@ async function recordRefusal(details?: unknown, diagnosticSecrets?: readonly str
 
 // Record-only diagnostic regression. Keep: untrusted-provider and outbound-context trust boundaries.
 describe("Anthropic stop details through the provider SSE adapter", () => {
+	it.each(["end_turn", "max_tokens", "tool_use"] as const)(
+		"drops stop details from non-refusal terminal reason %s at the real SSE publication boundary",
+		async (stopReason) => {
+			const details = { explanation: "untrusted provider data", padding: "x".repeat(5000) };
+			const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+				apiKey: "synthetic-test-key",
+				maxRetries: 0,
+				fetch: async () =>
+					createSseResponse([
+						{
+							type: "message_start",
+							message: { id: "msg_test", model: model.id, usage: { input_tokens: 12, output_tokens: 0 } },
+						},
+						// Details can arrive before the terminal reason.
+						{ type: "message_delta", delta: { stop_details: details }, usage: { output_tokens: 5 } },
+						{ type: "message_delta", delta: { stop_reason: stopReason }, usage: { output_tokens: 5 } },
+						{ type: "message_stop" },
+					]),
+			});
+			const events = [];
+			for await (const event of stream) events.push(event);
+			const result = await stream.result();
+
+			for (const event of events) {
+				if (event.type === "done") expectNoStopDetails(event.message);
+				else if (event.type === "error") expectNoStopDetails(event.error);
+				else if ("partial" in event) expectNoStopDetails(event.partial);
+			}
+			expectNoStopDetails(result);
+			expect(result.stopReason).toBe(
+				stopReason === "end_turn" ? "stop" : stopReason === "max_tokens" ? "length" : "toolUse",
+			);
+		},
+	);
+
 	it.each([
 		{ name: "missing", details: undefined, state: "absent", raw: undefined },
 		{ name: "null", details: null, state: "absent", raw: undefined },
