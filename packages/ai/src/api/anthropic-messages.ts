@@ -603,6 +603,10 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			timestamp: Date.now(),
 		};
 
+		let pendingStopDetails: unknown;
+		let hasPendingStopDetails = false;
+		let terminalStopReason: string | undefined;
+
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -706,9 +710,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
-			let pendingStopDetails: unknown;
-			let hasPendingStopDetails = false;
-			let terminalStopReason: string | undefined;
 
 			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
 				await notifyProviderStreamEvent(options, output);
@@ -882,18 +883,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						if (stopReasonResult.errorMessage) {
 							output.errorMessage = stopReasonResult.errorMessage;
 						}
-						if (terminalStopReason === "refusal") {
-							await recordAssistantMessageStopDetails(
-								output,
-								hasPendingStopDetails ? pendingStopDetails : undefined,
-								getRequestDiagnosticSecrets(model, options),
-							);
-						} else {
-							delete output.rawStopDetails;
-							delete output.stopDetailsState;
-							delete output.stopDetailsBytes;
-							delete output.stopDetailsSha256;
-						}
 					}
 					// Only update usage fields if present (not null).
 					// Preserves input_tokens from message_start when proxies omit it in message_delta.
@@ -968,7 +957,16 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			);
 			output.recovery ??= norm.recovery;
 			output.errorMessage = formatProviderError(norm, "Anthropic API error");
-			stream.push({ type: "error", reason: output.stopReason, error: output });
+			// Partials share output; attach record-only details only to the separate terminal failure object.
+			const failure = { ...output };
+			if (terminalStopReason === "refusal") {
+				await recordAssistantMessageStopDetails(
+					failure,
+					hasPendingStopDetails ? pendingStopDetails : undefined,
+					getRequestDiagnosticSecrets(model, options),
+				);
+			}
+			stream.push({ type: "error", reason: output.stopReason, error: failure });
 			stream.end();
 		}
 	})();

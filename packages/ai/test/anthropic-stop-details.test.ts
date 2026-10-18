@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
 import type { AssistantMessage } from "../src/types.ts";
+import { projectAssistantMessage } from "../src/utils/diagnostics.ts";
+import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 
 const model = getModel("anthropic", "claude-haiku-4-5");
 const initialMessages = [{ role: "user" as const, content: "Hello", timestamp: 1 }];
@@ -92,6 +94,61 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 			);
 		},
 	);
+
+	// pi#297 security re-check: late content must not publish terminal-only refusal data.
+	it.each([
+		{ details: undefined, state: "absent" },
+		{ details: { explanation: "untrusted" }, state: "retained" },
+		{ details: "x".repeat(5000), state: "discarded" },
+	])("keeps $state details only on the failure after post-refusal content events", async ({ details, state }) => {
+		const push = vi.spyOn(AssistantMessageEventStream.prototype, "push");
+		try {
+			const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+				apiKey: "synthetic-test-key",
+				maxRetries: 0,
+				fetch: async () =>
+					createSseResponse([
+						{
+							type: "message_start",
+							message: { id: "msg_test", model: model.id, usage: { input_tokens: 12, output_tokens: 0 } },
+						},
+						{ type: "message_delta", delta: { stop_reason: "refusal", stop_details: details } },
+						{ type: "content_block_start", index: 0, content_block: { type: "text", text: "Late" } },
+						{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: " content" } },
+						{ type: "content_block_stop", index: 0 },
+						{ type: "message_stop" },
+					]),
+			});
+			const events = [];
+			for await (const event of stream) events.push(event);
+			const result = await stream.result();
+			expect(events.map((event) => event.type)).toEqual(["start", "text_start", "text_delta", "text_end", "error"]);
+			for (const event of events) {
+				if ("partial" in event) expectNoStopDetails(event.partial);
+				if (event.type === "error") expect(event.error).toEqual(result);
+			}
+			// Inspect the producer's objects too, after completion: no shared partial may acquire the fields later.
+			for (const [event] of push.mock.calls) {
+				if ("partial" in event) expectNoStopDetails(event.partial);
+			}
+			expect(result.stopReason).toBe("error");
+			expect(result.rawStopReason).toBe("refusal");
+			expect(result.errorMessage).toBe("The model refused to complete the request");
+			expect(result.stopDetailsState).toBe(state);
+			if (state === "retained") expect(result.rawStopDetails).toBe(JSON.stringify(details));
+			else expect(result).not.toHaveProperty("rawStopDetails");
+			if (state === "discarded") {
+				const serialized = JSON.stringify(details);
+				expect(result.stopDetailsBytes).toBe(Buffer.byteLength(serialized, "utf8"));
+				expect(result.stopDetailsSha256).toBe(createHash("sha256").update(serialized, "utf8").digest("hex"));
+			}
+			// Defense in depth: even a stored refusal must lose all four fields outside the failure phase.
+			expectNoStopDetails(projectAssistantMessage(result, "partial"));
+			expectNoStopDetails(projectAssistantMessage(result, "success"));
+		} finally {
+			push.mockRestore();
+		}
+	});
 
 	it.each([
 		{ name: "missing", details: undefined, state: "absent", raw: undefined },

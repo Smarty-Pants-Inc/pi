@@ -142,9 +142,9 @@ function assertRefusalRecorderCall(text: string): void {
 	if (
 		!invocation.arguments[0] ||
 		!ts.isIdentifier(invocation.arguments[0]) ||
-		invocation.arguments[0].text !== "output"
+		invocation.arguments[0].text !== "failure"
 	) {
-		throw new Error("recorder must receive output");
+		throw new Error("recorder must receive the terminal failure copy");
 	}
 	function unparenthesize(expression: ts.Expression): ts.Expression {
 		return ts.isParenthesizedExpression(expression) ? unparenthesize(expression.expression) : expression;
@@ -172,6 +172,49 @@ function assertRefusalRecorderCall(text: string): void {
 		}
 	}
 	throw new Error("recorder invocation is not inside the refusal if-branch body");
+}
+
+/** Every record-field projection must be inside a then-branch that requires the failure phase. */
+function assertFailureOnlyStopDetailsProjection(text: string): void {
+	const ast = parseSource(text);
+	const fields = new Set<string>();
+	function requiresFailure(expression: ts.Expression): boolean {
+		if (ts.isParenthesizedExpression(expression)) return requiresFailure(expression.expression);
+		if (!ts.isBinaryExpression(expression)) return false;
+		if (expression.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) {
+			return requiresFailure(expression.left) || requiresFailure(expression.right);
+		}
+		return (
+			expression.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken &&
+			ts.isIdentifier(expression.left) &&
+			expression.left.text === "phase" &&
+			ts.isStringLiteral(expression.right) &&
+			expression.right.text === "failure"
+		);
+	}
+	function visit(node: ts.Node): void {
+		if (
+			ts.isPropertyAccessExpression(node) &&
+			ts.isIdentifier(node.expression) &&
+			node.expression.text === "projected" &&
+			allowedStopDetailsFields.has(node.name.text)
+		) {
+			fields.add(node.name.text);
+			let guarded = false;
+			for (let child: ts.Node = node; child.parent; child = child.parent) {
+				const parent = child.parent;
+				if (ts.isIfStatement(parent) && parent.thenStatement === child && requiresFailure(parent.expression)) {
+					guarded = true;
+					break;
+				}
+			}
+			if (!guarded) throw new Error("stop-details projection is not inside a failure-phase if-branch body");
+		}
+		node.forEachChild(visit);
+	}
+	visit(ast);
+	if (fields.size !== allowedStopDetailsFields.size)
+		throw new Error("expected all four stop-details projection fields");
 }
 
 // pi#297 / Smarty-Pants-Inc/smarty-dev#14961: prove that the boundary guard rejects its own bypasses.
@@ -214,7 +257,24 @@ describe("refusal stop_details AST guard self-tests", () => {
 		);
 	});
 
-	const call = `${recorderName}(output, details);`;
+	const projection = [...allowedStopDetailsFields].map((field) => `projected.${field} = message.${field};`).join("\n");
+	it("accepts projections structurally gated by the failure phase", () => {
+		expect(() =>
+			assertFailureOnlyStopDetailsProjection(`if (phase === "failure" && refusal) { ${projection} }`),
+		).not.toThrow();
+	});
+	it.each([
+		`${projection}`,
+		`if (phase === "failure") { prepare(); } ${projection}`,
+		`if (phase === "failure") { prepare(); } else { ${projection} }`,
+		`if (phase === "failure" || refusal) { ${projection} }`,
+		`if (phase === "partial") { ${projection} }`,
+		`// if (phase === "failure")\n${projection}`,
+	])("rejects projections outside a required failure phase: %s", (text) => {
+		expect(() => assertFailureOnlyStopDetailsProjection(text)).toThrow(/not inside a failure-phase if-branch body/);
+	});
+
+	const call = `${recorderName}(failure, details);`;
 	it.each([
 		`if (terminalStopReason === "refusal") { ${call} }`,
 		`if (("refusal" === (terminalStopReason))) { if (ready) { ${call} } }`,
@@ -321,8 +381,9 @@ describe("smarty-dev#5822 source guard", () => {
 		const recorderCalls = calls("recordAssistantMessageStopDetails").filter(
 			({ file }) => file !== refusalStopDetailsFile,
 		);
-		expect(recorderCalls).toEqual([{ file: "ai/src/api/anthropic-messages.ts", argument: "output" }]);
+		expect(recorderCalls).toEqual([{ file: "ai/src/api/anthropic-messages.ts", argument: "failure" }]);
 		assertRefusalRecorderCall(source("ai/src/api/anthropic-messages.ts"));
+		assertFailureOnlyStopDetailsProjection(diagnostics);
 
 		expect(source("ai/src/utils/event-stream.ts")).not.toContain("redactOAuthDiagnosticValue");
 	});

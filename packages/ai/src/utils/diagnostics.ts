@@ -284,7 +284,12 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 	}
 	if (message.rawStopReason !== undefined) projected.rawStopReason = closedRawStopReason(message.rawStopReason);
 	// Keep the record-only field on refusal failures only; never merge it into error text, content or owned diagnostics.
-	if (message.api === "anthropic-messages" && message.stopReason === "error" && message.rawStopReason === "refusal") {
+	if (
+		phase === "failure" &&
+		message.api === "anthropic-messages" &&
+		message.stopReason === "error" &&
+		message.rawStopReason === "refusal"
+	) {
 		if (message.stopDetailsState === "absent") projected.stopDetailsState = "absent";
 		if (
 			message.stopDetailsState === "retained" &&
