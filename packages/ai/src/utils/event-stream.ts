@@ -1,6 +1,12 @@
 import { redactOAuthDiagnostic, redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../types.ts";
-import { cloneToolCall, type PublicationPhase, projectAssistantMessage, terminalPhase } from "./diagnostics.ts";
+import {
+	boundRawStopDetails,
+	cloneToolCall,
+	type PublicationPhase,
+	projectAssistantMessage,
+	terminalPhase,
+} from "./diagnostics.ts";
 import { assistantRecovery, ownedRecovery, transferThrottledLimitWait } from "./recovery.ts";
 
 class FifoQueue<T> {
@@ -122,6 +128,11 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
 	if (typeof message.rawStopReason === "string")
 		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
+	if (typeof message.rawStopDetails === "string") {
+		const redacted = redactValues(message.rawStopDetails, secrets);
+		message.rawStopDetails = boundRawStopDetails(redacted);
+		if (message.rawStopDetails !== redacted) message.stopDetailsState = "truncated";
+	}
 	// The handle id is a provider token that consumers persist and redeem: mask live values only, and
 	// replace the handle instead of rewriting the provider's own object (smarty-dev#5443 T-F6-deferred).
 	const deferred = message.deferred;

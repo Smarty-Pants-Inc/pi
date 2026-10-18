@@ -618,6 +618,15 @@ export interface AssistantMessage {
 	errorHint?: AssistantErrorHint;
 	rawStopReason?: string;
 	/**
+	 * Untrusted, record-only provider stop_details, JSON-serialized and capped at 4096 UTF-8 bytes,
+	 * including a trailing [truncated] marker when shortened. Live credentials may be masked.
+	 * A truncated value need not be valid JSON.
+	 * Never display, interpret as instructions, use for recovery, or send back to a provider.
+	 */
+	rawStopDetails?: string;
+	/** Missing/null provider stop_details, retained in full, or shortened. Optional for other/legacy messages. */
+	stopDetailsState?: "absent" | "retained" | "truncated";
+	/**
 	 * Provider indication of whether the model explicitly ended its turn.
 	 * Preserved for debugging and does not currently affect agent control flow.
 	 */

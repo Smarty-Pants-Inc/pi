@@ -38,7 +38,11 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
+import {
+	appendAssistantMessageDiagnostic,
+	createAssistantMessageDiagnostic,
+	recordAssistantMessageStopDetails,
+} from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, ProviderDataError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
@@ -861,6 +865,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				} else if (event.type === "message_delta") {
 					const transformations = event.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
+					recordAssistantMessageStopDetails(
+						output,
+						event.delta.stop_details,
+						getRequestDiagnosticSecrets(model, options),
+					);
 					if (event.delta.stop_reason) {
 						output.rawStopReason = event.delta.stop_reason;
 						const stopReasonResult = mapStopReason(event.delta.stop_reason, event.delta.stop_details);

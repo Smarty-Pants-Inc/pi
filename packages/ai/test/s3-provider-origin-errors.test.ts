@@ -2,7 +2,8 @@
 // published text. Errors adapters build from provider data are provider errors by origin, never "local". Each
 // row plants a credential-shaped value and a plain environment value (no pattern can match it) in one provider
 // path and asserts both are absent from errorMessage, the message JSON (the session entry), the events, and the
-// thrown object with its cause, inspect output and stack.
+// thrown object with its cause, inspect output and stack. Refusal stop_details are the explicit record-only
+// exception: the dedicated test below checks that only rawStopDetails can retain that untrusted value.
 import { inspect } from "node:util";
 import { describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
@@ -107,23 +108,6 @@ describe("P1-E: provider text never reaches errorMessage (smarty-dev#5822)", () 
 				.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
 				.join(""),
 		],
-		[
-			"a refusal explanation",
-			[
-				{
-					type: "message_start",
-					message: { id: "m", model: "test-model", usage: { input_tokens: 1, output_tokens: 0 } },
-				},
-				{
-					type: "message_delta",
-					delta: { stop_reason: "refusal", stop_details: { type: "refusal", explanation: PLANTED } },
-					usage: { output_tokens: 1 },
-				},
-				{ type: "message_stop" },
-			]
-				.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
-				.join(""),
-		],
 	])("Anthropic: %s", async (_name, body) => {
 		await collect(
 			streamAnthropic(model("anthropic-messages"), context, {
@@ -132,6 +116,44 @@ describe("P1-E: provider text never reaches errorMessage (smarty-dev#5822)", () 
 				fetch: async () => new Response(body, { headers: { "content-type": "text/event-stream" } }),
 			}),
 		);
+	});
+
+	it("Anthropic: a refusal explanation stays exclusively in the record-only field", async () => {
+		const stream = streamAnthropic(model("anthropic-messages"), context, {
+			apiKey: "k",
+			maxRetries: 0,
+			fetch: async () =>
+				sse(
+					[
+						{
+							type: "message_start",
+							message: { id: "m", model: "test-model", usage: { input_tokens: 1, output_tokens: 0 } },
+						},
+						{
+							type: "message_delta",
+							delta: { stop_reason: "refusal", stop_details: { type: "refusal", explanation: PLANTED } },
+							usage: { output_tokens: 1 },
+						},
+						{ type: "message_stop" },
+					],
+					true,
+				),
+		});
+		for await (const event of stream) {
+			if (event.type === "error") {
+				const { rawStopDetails, ...rest } = event.error;
+				expect(rawStopDetails).toBe(JSON.stringify({ type: "refusal", explanation: PLANTED }));
+				expectPrivate(JSON.stringify({ ...event, error: rest }));
+			} else {
+				expectPrivate(JSON.stringify(event));
+			}
+		}
+		const { rawStopDetails, ...result } = await stream.result();
+		expect(rawStopDetails).toBe(JSON.stringify({ type: "refusal", explanation: PLANTED }));
+		expect(result.stopDetailsState).toBe("retained");
+		expect(result.errorMessage).toBe("The model refused to complete the request");
+		expect(result.stopReason).toBe("error");
+		expectPrivate(JSON.stringify(result));
 	});
 
 	it.each([

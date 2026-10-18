@@ -3,8 +3,10 @@
 // A published diagnostic is rebuilt from a closed list of Pi-owned types and a locally generated timestamp. No
 // provider error, name, stack, cause, error code, nested details or provider timestamp has an output path, so
 // neither a numeric `.code` nor any nested value can carry a credential equivalent into an event, result,
-// callback or session file.
+// callback or session file through diagnostics. The separate rawStopDetails field below is an explicit,
+// bounded, untrusted record-only exception; it is not an owned diagnostic or a recovery input.
 
+import { redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, TextContent, ThinkingContent, ToolCall } from "../types.ts";
 import { isolateValue } from "./assistant-message-snapshot.ts";
 
@@ -216,6 +218,44 @@ export function closedRawStopReason(value: unknown): string {
 	return typeof value === "string" && KNOWN_RAW_STOP_REASONS.has(value) ? value : "other";
 }
 
+const MAX_STOP_DETAILS_BYTES = 4096;
+const STOP_DETAILS_TRUNCATED = "[truncated]";
+
+/** Bound serialized, untrusted stop details without interpreting their contents. */
+export function boundRawStopDetails(value: string): string {
+	const bytes = new TextEncoder().encode(value);
+	if (bytes.length <= MAX_STOP_DETAILS_BYTES) return value;
+	// Streaming decode omits an incomplete final UTF-8 code point instead of adding a replacement character.
+	const prefix = new TextDecoder().decode(bytes.subarray(0, MAX_STOP_DETAILS_BYTES - STOP_DETAILS_TRUNCATED.length), {
+		stream: true,
+	});
+	return prefix + STOP_DETAILS_TRUNCATED;
+}
+
+/** Record opaque provider data only. Missing later deltas must not erase details already received. */
+export function recordAssistantMessageStopDetails(
+	message: AssistantMessage,
+	details: unknown,
+	secrets: readonly string[] = [],
+): void {
+	if (details == null) {
+		message.stopDetailsState ??= "absent";
+		return;
+	}
+	try {
+		const serialized = JSON.stringify(details);
+		if (serialized === undefined) throw new Error("Stop details are not JSON-serializable");
+		// Mask before truncation so cutting across a live credential cannot leave an unmasked prefix.
+		const redacted = redactValues(serialized, secrets);
+		message.rawStopDetails = boundRawStopDetails(redacted);
+		message.stopDetailsState = message.rawStopDetails === redacted ? "retained" : "truncated";
+	} catch {
+		// Diagnostic failure must never change the response outcome. No original exception text is retained.
+		message.rawStopDetails = STOP_DETAILS_TRUNCATED;
+		message.stopDetailsState = "truncated";
+	}
+}
+
 /** Publication phase of a message: in progress, completed successfully, or failed or aborted. */
 export type PublicationPhase = "partial" | "success" | "failure";
 
@@ -270,6 +310,16 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 		projected.errorHint = message.errorHint;
 	}
 	if (message.rawStopReason !== undefined) projected.rawStopReason = closedRawStopReason(message.rawStopReason);
+	// Keep the record-only field on failures too; never merge it into error text, content or owned diagnostics.
+	if (message.stopDetailsState === "absent") projected.stopDetailsState = "absent";
+	if (
+		(message.stopDetailsState === "retained" || message.stopDetailsState === "truncated") &&
+		typeof message.rawStopDetails === "string"
+	) {
+		projected.rawStopDetails = boundRawStopDetails(message.rawStopDetails);
+		projected.stopDetailsState =
+			projected.rawStopDetails === message.rawStopDetails ? message.stopDetailsState : "truncated";
+	}
 	if (message.endTurn !== undefined) projected.endTurn = message.endTurn;
 	if (message.durationMs !== undefined) projected.durationMs = message.durationMs;
 	return projected;
