@@ -31,11 +31,7 @@ queue_rules:
       - or:
           - -label = needs-security-pass
           - check-success = review/security
-      # An automated upstream sync (branch sync/upstream-*, bin/smarty-fork-sync) always waits for
-      # review/security; pi-security-astra acts on those heads (smarty-dev#755, #1004).
-      - or:
-          - -head ~= ^sync/upstream-
-          - check-success = review/security
+      # Upstream syncs (sync/upstream-*) queue like any PR; review/security runs after merge within 24 h (R-no-security-slips, smarty-dev#2264).
       - check-success = smarty-ci
       - -check-failure = smarty-ci
     merge_conditions:
