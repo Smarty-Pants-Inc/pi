@@ -96,12 +96,14 @@ export function lazyStream(
 ): AssistantMessageEventStream {
 	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
+	// Only our private abort outcome may classify cancellation. A real failure
+	// can be the very same object the caller later supplies as signal.reason.
+	const cancelled = Symbol("setup aborted");
 
 	// Setup can call `protectAssistantMessageStream(outer, ...)` once it has resolved request credentials,
 	// so forwarded events of any provider implementation are masked here too.
 	void (async () => {
-		signal?.throwIfAborted();
-		const cancelled = Symbol("setup aborted");
+		if (signal?.aborted) throw cancelled;
 		let onAbort: (() => void) | undefined;
 		const abort = signal
 			? new Promise<typeof cancelled>((resolve) => {
@@ -114,13 +116,13 @@ export function lazyStream(
 			// wins even if abort fires before its await continuation runs.
 			const pending = setup(outer);
 			const inner = await (abort ? Promise.race([pending, abort]) : pending);
-			if (inner === cancelled) throw signal?.reason;
+			if (inner === cancelled) throw cancelled;
 			// Returning a stream is not the same as completing it. Preserve a
 			// completed result, but still cancel a pending, uncooperative source.
 			const completion =
 				abort && hasResult(inner)
 					? Promise.race([inner.result(), abort]).then((outcome) => {
-							if (outcome === cancelled) throw signal?.reason;
+							if (outcome === cancelled) throw cancelled;
 							return outcome;
 						})
 					: undefined;
@@ -130,7 +132,7 @@ export function lazyStream(
 			if (onAbort) signal?.removeEventListener("abort", onAbort);
 		}
 	})().catch((error) => {
-		const aborted = signal?.aborted === true && error === signal.reason;
+		const aborted = error === cancelled;
 		const message = createSetupErrorMessage(model, error, startedAt);
 		if (aborted) {
 			message.stopReason = "aborted";

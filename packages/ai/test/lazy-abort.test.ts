@@ -52,6 +52,54 @@ it("keeps a lazy setup rejection settled before a synchronous abort", async () =
 	});
 });
 
+// pi#298 / smarty-dev#14950: a real failure may also be the later abort reason.
+it.each(["throw", "reject"] as const)("keeps a setup %s when abort uses the same error", async (settlement) => {
+	const controller = new AbortController();
+	const failure = new Error("real setup failure settled before abort");
+	const response = lazyStream(
+		model,
+		() => {
+			if (settlement === "throw") throw failure;
+			return Promise.reject(failure);
+		},
+		controller.signal,
+	);
+	controller.abort(failure);
+	expect(await response.result()).toMatchObject({
+		stopReason: "error",
+		errorMessage: failure.message,
+	});
+	const events = [];
+	for await (const event of response) events.push(event);
+	expect(events).toMatchObject([{ type: "error", reason: "error", error: { errorMessage: failure.message } }]);
+});
+
+// pi#298 / smarty-dev#14950: the inner result race must preserve the same distinction.
+it("keeps an inner result rejection when abort uses the same error", async () => {
+	const controller = new AbortController();
+	const failure = new Error("real inner failure settled before abort");
+	const innerResult = Promise.withResolvers<AssistantMessage>();
+	const observed = Promise.withResolvers<void>();
+	const inner = {
+		async *[Symbol.asyncIterator]() {},
+		result() {
+			observed.resolve();
+			return innerResult.promise;
+		},
+	};
+	const response = lazyStream(model, async () => inner, controller.signal);
+	await observed.promise;
+	innerResult.reject(failure);
+	controller.abort(failure);
+	expect(await response.result()).toMatchObject({
+		stopReason: "error",
+		errorMessage: failure.message,
+	});
+	const events = [];
+	for await (const event of response) events.push(event);
+	expect(events).toMatchObject([{ type: "error", reason: "error", error: { errorMessage: failure.message } }]);
+});
+
 it("keeps an already-completed lazy inner stream across a synchronous abort", async () => {
 	const controller = new AbortController();
 	const inner = createAssistantMessageEventStream();
