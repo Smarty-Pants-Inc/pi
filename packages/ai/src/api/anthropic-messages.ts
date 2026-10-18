@@ -38,11 +38,7 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
-import {
-	appendAssistantMessageDiagnostic,
-	createAssistantMessageDiagnostic,
-	recordAssistantMessageStopDetails,
-} from "../utils/diagnostics.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, ProviderDataError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
@@ -50,6 +46,7 @@ import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { recordAssistantMessageStopDetails } from "../utils/refusal-stop-details.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import {

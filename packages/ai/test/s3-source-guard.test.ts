@@ -105,6 +105,35 @@ describe("smarty-dev#5822 source guard", () => {
 			const literals = [...text.matchAll(/appendAssistantMessageDiagnostic\([^)]*\{/g)];
 			expect({ file, literals: literals.length }).toEqual({ file, literals: 0 });
 		}
+
+		// pi#297 / Smarty-Pants-Inc/smarty-dev#14961: the one deliberate raw stop_details exception is pinned by
+		// module name. It has exactly one exported writer, and that writer may mutate only the four record fields.
+		const refusalStopDetailsFile = "ai/src/utils/refusal-stop-details.ts";
+		const refusalStopDetails = source(refusalStopDetailsFile);
+		expect(refusalStopDetails.match(/\bexport\b/g)).toHaveLength(1);
+		expect(refusalStopDetails).toContain("export async function recordAssistantMessageStopDetails(");
+		const allowedFields = new Set(["rawStopDetails", "stopDetailsState", "stopDetailsBytes", "stopDetailsSha256"]);
+		const writes = [
+			...refusalStopDetails.matchAll(/\bmessage\.([A-Za-z_$][\w$]*)\s*(?:\?\?=|=)/g),
+			...refusalStopDetails.matchAll(/\bdelete\s+message\.([A-Za-z_$][\w$]*)/g),
+		].map((match) => match[1]);
+		expect(new Set(writes)).toEqual(allowedFields);
+
+		const importers = sources
+			.filter(({ file, text }) => file !== refusalStopDetailsFile && text.includes("refusal-stop-details.ts"))
+			.map(({ file }) => file)
+			.sort();
+		expect(importers).toEqual(["ai/src/api/anthropic-messages.ts"]);
+		const recorderCalls = calls("recordAssistantMessageStopDetails").filter(
+			({ file }) => file !== refusalStopDetailsFile,
+		);
+		expect(recorderCalls).toEqual([{ file: "ai/src/api/anthropic-messages.ts", argument: "output" }]);
+		const anthropic = source("ai/src/api/anthropic-messages.ts");
+		const recorderCall = anthropic.indexOf("await recordAssistantMessageStopDetails(");
+		const refusalBranch = anthropic.lastIndexOf('if (terminalStopReason === "refusal")', recorderCall);
+		expect(refusalBranch).toBeGreaterThan(-1);
+		expect(anthropic.slice(refusalBranch, recorderCall)).not.toContain("else");
+
 		expect(source("ai/src/utils/event-stream.ts")).not.toContain("redactOAuthDiagnosticValue");
 	});
 

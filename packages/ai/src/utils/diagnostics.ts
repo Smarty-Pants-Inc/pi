@@ -6,7 +6,6 @@
 // callback or session file through diagnostics. The separate rawStopDetails field below is an explicit,
 // bounded, untrusted record-only exception; it is not an owned diagnostic or a recovery input.
 
-import { redactValues } from "../auth/oauth/credential-response.ts";
 import type { AssistantMessage, TextContent, ThinkingContent, ToolCall } from "../types.ts";
 import { isolateValue } from "./assistant-message-snapshot.ts";
 
@@ -219,39 +218,6 @@ export function closedRawStopReason(value: unknown): string {
 }
 
 const MAX_STOP_DETAILS_BYTES = 4096;
-
-/** Record opaque provider data only. Missing later deltas must not erase details already received. */
-export async function recordAssistantMessageStopDetails(
-	message: AssistantMessage,
-	details: unknown,
-	secrets: readonly string[] = [],
-): Promise<void> {
-	if (details == null) {
-		message.stopDetailsState ??= "absent";
-		return;
-	}
-	try {
-		const serialized = JSON.stringify(details);
-		if (serialized === undefined) return;
-		// Size and fingerprint only the masked serialization; never retain a fingerprint of live credentials.
-		const redacted = redactValues(serialized, secrets);
-		const bytes = new TextEncoder().encode(redacted);
-		if (bytes.length > MAX_STOP_DETAILS_BYTES) {
-			const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-			message.stopDetailsSha256 = Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("");
-			message.stopDetailsBytes = bytes.length;
-			delete message.rawStopDetails;
-			message.stopDetailsState = "discarded";
-		} else {
-			message.rawStopDetails = redacted;
-			delete message.stopDetailsBytes;
-			delete message.stopDetailsSha256;
-			message.stopDetailsState = "retained";
-		}
-	} catch {
-		// Diagnostic failure must never change the response outcome. No exception text or partial record is retained.
-	}
-}
 
 /** Publication phase of a message: in progress, completed successfully, or failed or aborted. */
 export type PublicationPhase = "partial" | "success" | "failure";
