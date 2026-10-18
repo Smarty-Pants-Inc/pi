@@ -183,6 +183,10 @@ async function runLoop(
 	while (true) {
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn) {
+			if (signal?.aborted && lastCompletedTurn) {
+				await endAbortedRun(currentContext, newMessages, config, signal, emit);
+				return;
+			}
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
@@ -222,14 +226,16 @@ async function runLoop(
 			if (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages) break;
 			contextOnlyTurn = false;
 
-			const requestUpdate = await config.prepareRequest?.(
-				{
-					context: currentContext,
-					model: config.model,
-					thinkingLevel: config.reasoning ?? "off",
-				},
-				signal,
-			);
+			const requestUpdate = signal?.aborted
+				? undefined
+				: await config.prepareRequest?.(
+						{
+							context: currentContext,
+							model: config.model,
+							thinkingLevel: config.reasoning ?? "off",
+						},
+						signal,
+					);
 			if (requestUpdate) {
 				currentContext = requestUpdate.context ?? currentContext;
 				config = {
@@ -294,6 +300,11 @@ async function runLoop(
 			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
 			await emit({ type: "turn_end", message, toolResults });
 
+			if (signal?.aborted) {
+				await endAbortedRun(currentContext, newMessages, config, signal, emit);
+				return;
+			}
+
 			if (decision?.action === "end") {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -326,7 +337,56 @@ async function runLoop(
 		break;
 	}
 
+	if (signal?.aborted) {
+		await endAbortedRun(currentContext, newMessages, config, signal, emit);
+		return;
+	}
 	await emit({ type: "agent_end", messages: newMessages });
+}
+
+async function endAbortedRun(
+	context: AgentContext,
+	newMessages: AgentMessage[],
+	config: AgentLoopConfig,
+	signal: AbortSignal,
+	emit: AgentEventSink,
+): Promise<void> {
+	await emit({ type: "turn_start" });
+	const message = await emitAbortedAssistantResponse(context, config, emit);
+	newMessages.push(message);
+	await config.finishTurn?.({ message, toolResults: [], context, newMessages }, signal);
+	await emit({ type: "turn_end", message, toolResults: [] });
+	await emit({ type: "agent_end", messages: newMessages });
+}
+
+async function emitAbortedAssistantResponse(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+): Promise<AssistantMessage> {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		thinkingLevel: config.reasoning ?? "off",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "aborted",
+		errorMessage: "Operation aborted",
+		timestamp: Date.now(),
+	};
+	context.messages.push(message);
+	await emit({ type: "message_start", message: { ...message } });
+	await emit({ type: "message_end", message });
+	return message;
 }
 
 type PendingMessage = {
@@ -429,6 +489,8 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
 ): Promise<AssistantMessage> {
+	if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
+
 	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
 	let messages = context.messages;
 	if (config.transformContext) {
@@ -444,6 +506,8 @@ async function streamAssistantResponse(
 	const resolvedApiKey =
 		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 
+	// Preparation awaits user hooks; cancellation may have arrived while they ran.
+	if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
 	const response = await streamFunction(config.model, llmContext, {
 		...config,
 		apiKey: resolvedApiKey,
