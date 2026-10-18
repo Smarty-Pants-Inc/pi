@@ -72,11 +72,15 @@ function hasResult(
 async function forwardStream(
 	target: AssistantMessageEventStream,
 	source: AsyncIterable<AssistantMessageEvent>,
+	completion?: Promise<AssistantMessage>,
 ): Promise<void> {
 	for await (const event of source) {
+		// A pending source may ignore cancellation. Its terminal must not publish
+		// over an abort that won the result race while iteration was suspended.
+		if (completion && (event.type === "done" || event.type === "error")) await completion;
 		target.push(event);
 	}
-	target.end(hasResult(source) ? await source.result() : undefined);
+	target.end(completion ? await completion : hasResult(source) ? await source.result() : undefined);
 }
 
 /**
@@ -95,22 +99,38 @@ export function lazyStream(
 
 	// Setup can call `protectAssistantMessageStream(outer, ...)` once it has resolved request credentials,
 	// so forwarded events of any provider implementation are masked here too.
-	let setupFailedAfterAbort = false;
 	void (async () => {
 		signal?.throwIfAborted();
-		let inner: AsyncIterable<AssistantMessageEvent>;
+		const cancelled = Symbol("setup aborted");
+		let onAbort: (() => void) | undefined;
+		const abort = signal
+			? new Promise<typeof cancelled>((resolve) => {
+					onAbort = () => resolve(cancelled);
+					signal.addEventListener("abort", onAbort, { once: true });
+				})
+			: undefined;
 		try {
-			inner = await setup(outer);
-		} catch (error) {
-			// Capture whether cancellation had already won when setup rejected. Do not
-			// rewrite a real setup failure merely because its handler ran later.
-			setupFailedAfterAbort = signal?.aborted === true;
-			throw error;
+			// Attach directly to the setup promise: an already-settled outcome
+			// wins even if abort fires before its await continuation runs.
+			const pending = setup(outer);
+			const inner = await (abort ? Promise.race([pending, abort]) : pending);
+			if (inner === cancelled) throw signal?.reason;
+			// Returning a stream is not the same as completing it. Preserve a
+			// completed result, but still cancel a pending, uncooperative source.
+			const completion =
+				abort && hasResult(inner)
+					? Promise.race([inner.result(), abort]).then((outcome) => {
+							if (outcome === cancelled) throw signal?.reason;
+							return outcome;
+						})
+					: undefined;
+			if (completion) await Promise.all([forwardStream(outer, inner, completion), completion]);
+			else await forwardStream(outer, inner);
+		} finally {
+			if (onAbort) signal?.removeEventListener("abort", onAbort);
 		}
-		signal?.throwIfAborted();
-		await forwardStream(outer, inner);
 	})().catch((error) => {
-		const aborted = setupFailedAfterAbort || (signal?.aborted === true && error === signal.reason);
+		const aborted = signal?.aborted === true && error === signal.reason;
 		const message = createSetupErrorMessage(model, error, startedAt);
 		if (aborted) {
 			message.stopReason = "aborted";

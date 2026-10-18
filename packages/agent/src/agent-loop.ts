@@ -9,6 +9,7 @@ import {
 	EventStream,
 	getCurrentTools,
 	getToolStateChanges,
+	lazyStream,
 	normalizeContext,
 	type SystemMessage,
 	type ToolResultMessage,
@@ -532,22 +533,22 @@ async function streamAssistantResponse(
 		const resolvedApiKey =
 			(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 		signal?.throwIfAborted();
-		const pendingResponse = streamFunction(config.model, llmContext, {
-			...config,
-			apiKey: resolvedApiKey,
+		// Register cancellation before invoking StreamFn, and let setup settlement
+		// race it. Do not reinterpret a settled stream or failure at consumption time.
+		response = lazyStream(
+			config.model,
+			() =>
+				Promise.resolve(
+					streamFunction(config.model, llmContext, {
+						...config,
+						apiKey: resolvedApiKey,
+						signal,
+					}),
+				),
 			signal,
-		});
-		if ("then" in pendingResponse) {
-			response = await pendingResponse;
-			// Async StreamFn setup can settle after cancellation, even with a successful stream.
-			signal?.throwIfAborted();
-		} else {
-			// Do not insert a setup await for an already-returned stream. It may have
-			// settled a real result before a later abort microtask runs.
-			response = pendingResponse;
-		}
+		);
 	} catch (error) {
-		if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
+		if (signal?.aborted && error === signal.reason) return emitAbortedAssistantResponse(context, config, emit);
 		throw error;
 	}
 

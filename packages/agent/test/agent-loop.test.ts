@@ -353,6 +353,87 @@ describe("run abort dispatch guard", () => {
 		},
 	);
 
+	// pi#298 / smarty-dev#14950: the rejected promise already exists when abort fires.
+	it("keeps an async StreamFn rejection settled before abort", async () => {
+		const controller = new AbortController();
+		let dispatches = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				const rejected = Promise.reject(new Error("real failure settled before abort"));
+				controller.abort();
+				return rejected;
+			},
+		);
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "real failure settled before abort",
+		});
+	});
+
+	it("keeps a completed async StreamFn result settled before abort without another dispatch", async () => {
+		const controller = new AbortController();
+		let dispatches = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				finishTurn: () => ({ action: "continue" }),
+			},
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				const response = createAssistantMessageEventStream();
+				response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+				const completed = Promise.resolve(response);
+				controller.abort();
+				return completed;
+			},
+		);
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		expect(messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("keeps an abort-caused async StreamFn rejection aborted", async () => {
+		const controller = new AbortController();
+		const entered = Promise.withResolvers<void>();
+		const setup = Promise.withResolvers<ReturnType<typeof createAssistantMessageEventStream>>();
+		let dispatches = 0;
+		const run = runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				entered.resolve();
+				return setup.promise;
+			},
+		);
+		await entered.promise;
+		controller.abort();
+		setup.reject(new Error("setup failed after abort"));
+		const messages = await run;
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			errorMessage: "Operation aborted",
+		});
+	});
+
 	it.each([false, true])("keeps live-signal setup failure=%s unchanged", async (setupFailure) => {
 		const controller = new AbortController();
 		let dispatches = 0;
