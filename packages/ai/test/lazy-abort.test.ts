@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { lazyApi } from "../src/api/lazy.ts";
+import { lazyApi, lazyStream } from "../src/api/lazy.ts";
 import type { AssistantMessage, Model, ProviderStreams } from "../src/types.ts";
 import { createAssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
@@ -16,6 +16,24 @@ const model: Model<"openai-responses"> = {
 	contextWindow: 8192,
 	maxTokens: 2048,
 };
+
+it("keeps a setup failure observed before abort while terminal publication is pending", async () => {
+	const controller = new AbortController();
+	const response = lazyStream(
+		model,
+		async () => {
+			throw new Error("real setup failure");
+		},
+		controller.signal,
+	);
+	// The setup rejection continuation runs first; publication's outer catch runs
+	// after this microtask. A later abort must not replace the original failure.
+	queueMicrotask(() => controller.abort());
+	expect(await response.result()).toMatchObject({
+		stopReason: "error",
+		errorMessage: "real setup failure",
+	});
+});
 
 // Smarty-Pants-Inc/smarty-dev#14950: a lazy module load is another asynchronous dispatch boundary.
 describe.each(["stream", "streamSimple"] as const)("lazyApi.%s cancellation", (method) => {

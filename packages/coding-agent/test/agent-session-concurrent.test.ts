@@ -61,6 +61,9 @@ describe("AgentSession concurrent prompt guard", () => {
 		delete (globalThis as typeof globalThis & { testCommandRuns?: unknown }).testCommandRuns;
 		if (session) {
 			await session.abort();
+			// Abort retains undelivered input for caller recovery; disposal correctly
+			// refuses to discard it implicitly. This test owns the recovered input.
+			session.clearQueue();
 			session.dispose();
 		}
 		if (tempDir && existsSync(tempDir)) {
@@ -166,6 +169,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {});
+		expect(session.getSteeringMessages()).toEqual(["Steering message"]);
 	});
 
 	it("should allow followUp() while streaming", async () => {
@@ -180,6 +184,7 @@ describe("AgentSession concurrent prompt guard", () => {
 		// Cleanup
 		await session.abort();
 		await firstPrompt.catch(() => {});
+		expect(session.getFollowUpMessages()).toEqual(["Follow-up message"]);
 	});
 
 	it("should queue extension-origin steering messages while streaming", async () => {
@@ -287,7 +292,14 @@ describe("AgentSession concurrent prompt guard", () => {
 		await session.abort();
 		await firstPrompt.catch(() => {});
 
-		expect(sawSteeringMessage).toBe(true);
+		// Abort cancels the run, not just the active response. The old assertion
+		// required a post-abort provider request. Instead the queued input remains
+		// recoverable, exactly as it does for direct steering and follow-up above.
+		expect(sawSteeringMessage).toBe(false);
+		expect(session.getSteeringMessages()).toEqual(["Steer from extension"]);
+		expect(session.agent.getQueuedMessages()).toMatchObject([
+			{ role: "user", content: [{ type: "text", text: "Steer from extension" }] },
+		]);
 	});
 
 	it("should allow prompt() after previous completes", async () => {

@@ -95,18 +95,28 @@ export function lazyStream(
 
 	// Setup can call `protectAssistantMessageStream(outer, ...)` once it has resolved request credentials,
 	// so forwarded events of any provider implementation are masked here too.
+	let setupFailedAfterAbort = false;
 	void (async () => {
 		signal?.throwIfAborted();
-		const inner = await setup(outer);
+		let inner: AsyncIterable<AssistantMessageEvent>;
+		try {
+			inner = await setup(outer);
+		} catch (error) {
+			// Capture whether cancellation had already won when setup rejected. Do not
+			// rewrite a real setup failure merely because its handler ran later.
+			setupFailedAfterAbort = signal?.aborted === true;
+			throw error;
+		}
 		signal?.throwIfAborted();
 		await forwardStream(outer, inner);
 	})().catch((error) => {
+		const aborted = setupFailedAfterAbort || (signal?.aborted === true && error === signal.reason);
 		const message = createSetupErrorMessage(model, error, startedAt);
-		if (signal?.aborted) {
+		if (aborted) {
 			message.stopReason = "aborted";
 			message.errorMessage = "Operation aborted";
 		}
-		outer.push({ type: "error", reason: signal?.aborted ? "aborted" : "error", error: message });
+		outer.push({ type: "error", reason: aborted ? "aborted" : "error", error: message });
 		outer.end(message);
 	});
 

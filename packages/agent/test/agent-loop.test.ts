@@ -244,6 +244,70 @@ describe("run abort dispatch guard", () => {
 		expect(events.at(-1)?.type).toBe("agent_end");
 	});
 
+	it("preserves follow-up input returned during abort without dispatching it", async () => {
+		const controller = new AbortController();
+		const queued = createUserMessage("follow-up returned during abort");
+		let dispatches = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				getFollowUpMessages: async () => {
+					controller.abort();
+					return [queued];
+				},
+			},
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				const response = createAssistantMessageEventStream();
+				response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+				return response;
+			},
+		);
+		expect(dispatches).toBe(1);
+		expect(messages).toContain(queued);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	});
+
+	it.each(
+		(["error", "stop"] as const).flatMap((reason) =>
+			(["observer", "microtask"] as const).map((abortAt) => ({ reason, abortAt })),
+		),
+	)("retains a stream $reason that settled before a later $abortAt abort", async ({ reason, abortAt }) => {
+		const controller = new AbortController();
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				if (abortAt === "observer" && event.type === "message_start" && event.message.role === "assistant")
+					controller.abort();
+			},
+			controller.signal,
+			() => {
+				const response = createAssistantMessageEventStream();
+				const final = {
+					...createAssistantMessage([]),
+					stopReason: reason,
+					errorMessage: reason === "error" ? "real provider failure" : undefined,
+				};
+				response.push({ type: "start", partial: createAssistantMessage([]) });
+				if (reason === "error") response.push({ type: "error", reason, error: final });
+				else response.push({ type: "done", reason, message: final });
+				if (abortAt === "microtask") queueMicrotask(() => controller.abort());
+				return response;
+			},
+		);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: reason });
+		expect((messages.at(-1) as AssistantMessage).errorMessage).toBe(
+			reason === "error" ? "real provider failure" : undefined,
+		);
+	});
+
 	it.each(["prepareRequest", "transformContext", "convertToLlm", "getApiKey"] as const)(
 		"does not dispatch when abort fires during %s",
 		async (phase) => {

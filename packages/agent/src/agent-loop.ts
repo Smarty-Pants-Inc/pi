@@ -186,6 +186,12 @@ async function runLoop(
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn) {
 			if (signal?.aborted && lastCompletedTurn) {
+				// A queue provider may have returned input in the same await that observed abort.
+				// Transfer that input to the transcript, but never let the aborted run dispatch it.
+				if (pendingMessages.length > 0) {
+					await appendPendingMessages(currentContext, newMessages, [pendingMessages], emit);
+					pendingMessages = [];
+				}
 				await endAbortedRun(currentContext, newMessages, config, signal, emit);
 				return;
 			}
@@ -310,6 +316,14 @@ async function runLoop(
 			await emit({ type: "turn_end", message, toolResults });
 
 			if (signal?.aborted) {
+				// A completed assistant response already has its terminal message and turn
+				// publication. Shutdown can arrive while an observer is still unwinding; do
+				// not append a second synthetic aborted assistant in that case. Tool turns
+				// still receive the aborted terminal so finalized tool results remain ordered.
+				if (toolCalls.length === 0) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
 				await endAbortedRun(currentContext, newMessages, config, signal, emit);
 				return;
 			}
@@ -518,25 +532,28 @@ async function streamAssistantResponse(
 		const resolvedApiKey =
 			(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
 		signal?.throwIfAborted();
-		response = await streamFunction(config.model, llmContext, {
+		const pendingResponse = streamFunction(config.model, llmContext, {
 			...config,
 			apiKey: resolvedApiKey,
 			signal,
 		});
-		// Async StreamFn setup can settle after cancellation, even with a successful stream.
-		signal?.throwIfAborted();
+		if ("then" in pendingResponse) {
+			response = await pendingResponse;
+			// Async StreamFn setup can settle after cancellation, even with a successful stream.
+			signal?.throwIfAborted();
+		} else {
+			// Do not insert a setup await for an already-returned stream. It may have
+			// settled a real result before a later abort microtask runs.
+			response = pendingResponse;
+		}
 	} catch (error) {
 		if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
 		throw error;
 	}
 
-	// Lazy setup may fail after StreamFn returned. Classify before publishing message_end,
-	// so persistence and every lifecycle observer see cancellation, not a setup failure.
-	const result = async () =>
-		Object.assign(await response.result(), {
-			thinkingLevel: config.reasoning ?? "off",
-			...(signal?.aborted ? { stopReason: "aborted" as const, errorMessage: "Operation aborted" } : {}),
-		});
+	// Lazy setup and providers classify cancellation where it occurs. The signal's
+	// state at consumption cannot tell whether a settled result preceded the abort.
+	const result = async () => Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off" });
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;
@@ -573,6 +590,10 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await result();
+				if (event.type === "error" && event.reason === "aborted") {
+					finalMessage.stopReason = "aborted";
+					finalMessage.errorMessage = "Operation aborted";
+				}
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {
