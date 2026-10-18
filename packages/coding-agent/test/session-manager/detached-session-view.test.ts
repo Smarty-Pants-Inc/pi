@@ -374,9 +374,11 @@ describe("detached session snapshots", () => {
 			const data = entry.data as { nested: { values: number[] } };
 			expect(() => data.nested.values.push(2)).toThrow(TypeError);
 		}
+		const projection = view.buildSessionProjection();
+		expect(view.buildSessionProjection()).toBe(projection);
 		expect(serialize).not.toHaveBeenCalled();
 		serialize.mockRestore();
-		const projected = view.buildSessionProjection().entries[0].sourceEntry;
+		const projected = projection.entries[0].sourceEntry;
 		if (projected.type !== "custom") throw new Error("missing projected JSON");
 		expect(() => (projected.data as { nested: { values: number[] } }).nested.values.push(2)).toThrow(TypeError);
 		manager.appendCustomEntry("second", {});
@@ -386,6 +388,39 @@ describe("detached session snapshots", () => {
 		expect(view.getBranch()).toHaveLength(1);
 		manager.resetLeaf();
 		expect(view.getBranch()).toEqual([]);
+	});
+
+	// smarty-dev#14576 P2-2: exercise actual messages and edits while the spy is active.
+	it("does not serialize unchanged projected messages or context edits", () => {
+		const manager = SessionManager.inMemory();
+		const user = manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		manager.appendCustomMessageEntry("visible", [{ type: "text", text: "custom" }], true, { nested: [1] });
+		manager.appendContextEdit(user, { content: [{ type: "text", text: "edited" }] });
+		const view = detachedSessionView(manager);
+		const serialize = vi.spyOn(JSON, "stringify");
+		const first = view.buildSessionProjection();
+		expect(view.buildSessionProjection()).toBe(first);
+		expect(first.messages).toHaveLength(2);
+		expect((first.messages[0] as { content: unknown }).content).toEqual([{ type: "text", text: "edited" }]);
+		expect(serialize).not.toHaveBeenCalled();
+	});
+
+	it.each(["reload", "rewrite", "cooling"])("invalidates a cached projection synchronously across %s", (operation) => {
+		dir = mkdtempSync(join(tmpdir(), "pi-projection-invalidation-"));
+		const manager = SessionManager.create(dir, dir);
+		const id = manager.appendMessage({ role: "user", content: "original ".repeat(1_000), timestamp: 1 });
+		for (let i = 0; i < 120; i++) manager.appendCustomEntry("old", { i });
+		const view = detachedSessionView(manager);
+		const before = view.buildSessionProjection();
+		expect(view.buildSessionProjection()).toBe(before);
+		if (operation === "reload") manager.setSessionFile(manager.getSessionFile()!);
+		else if (operation === "rewrite") (manager as unknown as { _rewriteFile(): void })._rewriteFile();
+		else manager.appendCompaction("summary", null, 100);
+		const after = view.buildSessionProjection();
+		expect(after).not.toBe(before);
+		expect(after).toEqual(manager.buildSessionProjection());
+		expect(view.buildSessionProjection()).toBe(after);
+		if (operation === "cooling") expect(isColdEntry(manager.getEntry(id)!)).toBe(true);
 	});
 
 	// A shallow frozen keyboard wrapper must not hide an unfrozen nested extension field.
@@ -401,6 +436,54 @@ describe("detached session snapshots", () => {
 		const extra = Reflect.get(value.message, "extra") as { values: number[] };
 		expect(Object.isFrozen(extra.values)).toBe(true);
 		expect(() => extra.values.push(2)).toThrow(TypeError);
+	});
+
+	// smarty-dev#14576 P2-3: never pin an arbitrary unmatched cache key.
+	it("does not retain a large unmatched branch id", () => {
+		const manager = SessionManager.inMemory();
+		manager.appendCustomEntry("one", {});
+		const view = detachedSessionView(manager);
+		const missing = "missing".repeat(6_000_000);
+		const first = view.getBranch(missing);
+		expect(first).toEqual([]);
+		expect(view.getBranch(missing)).not.toBe(first);
+		const small = view.getBranch("missing");
+		expect(view.getBranch("missing")).not.toBe(small);
+	});
+
+	it("invalidates cached lists and projections across reload, rewrite and hot-to-cold replacement", () => {
+		dir = mkdtempSync(join(tmpdir(), "pi-detached-list-invalidation-"));
+		const manager = SessionManager.create(dir, dir);
+		const id = manager.appendMessage({ role: "user", content: "original ".repeat(1_000), timestamp: 1 });
+		for (let i = 0; i < 120; i++) manager.appendCustomEntry("old", { i });
+		const view = detachedSessionView(manager);
+		const hot = view.getEntries();
+		expect(view.getEntries()).toBe(hot);
+		manager.appendCompaction("summary", null, 100);
+		const cold = view.getEntries();
+		expect(cold).not.toBe(hot);
+		expect(cold[0]).toEqual(hot[0]);
+		expect(view.getEntries()).toBe(cold);
+		expect(isColdEntry(manager.getEntry(id)!)).toBe(true);
+		const rewriteProjection = view.buildSessionProjection();
+		const beforeRewrite = view.getEntries();
+		(manager as unknown as { _rewriteFile(): void })._rewriteFile();
+		const rewritten = view.getEntries();
+		expect(rewritten).not.toBe(beforeRewrite);
+		expect(rewritten).toEqual(beforeRewrite);
+		expect(view.buildSessionProjection()).not.toBe(rewriteProjection);
+		const beforeReload = view.getEntries();
+		expect(view.getEntries()).toBe(beforeReload);
+		manager.setSessionFile(manager.getSessionFile()!);
+		expect(view.getEntries()).not.toBe(beforeReload);
+		const reloadProjection = view.buildSessionProjection();
+		manager.setSessionFile(manager.getSessionFile()!);
+		expect(view.getEntries()).not.toBe(beforeReload);
+		expect(view.getEntries()).toEqual(beforeReload);
+		expect(view.buildSessionProjection()).not.toBe(reloadProjection);
+		manager.branch(id);
+		expect(isColdEntry(manager.getEntry(id)!)).toBe(false);
+		expect(view.getEntries()).not.toBe(rewritten);
 	});
 
 	it("freezes deep trees without recursive stack growth", () => {

@@ -29,6 +29,11 @@ it(
 	200_000,
 );
 it(
+	"projects 122,169 unchanged entries twenty times below 3x CPU and 128 MiB, including idle GC",
+	() => probe("large-history-probe.ts", "projection"),
+	200_000,
+);
+it(
 	"keeps a mixed 122k JSON/non-JSON history fast across idle GC",
 	() => probe("large-history-probe.ts", "mixed"),
 	200_000,
@@ -41,5 +46,10 @@ it(
 it(
 	"retires a previously read 32 MiB cold payload below 16 MiB retained",
 	() => probe("retired-history-probe.ts"),
+	200_000,
+);
+it(
+	"retires cached projections of 32 MiB payloads on cooling and new session",
+	() => probe("retired-history-probe.ts", "projection"),
 	200_000,
 );

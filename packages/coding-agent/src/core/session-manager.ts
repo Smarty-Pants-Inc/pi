@@ -1,4 +1,5 @@
 import { isProxy } from "node:util/types";
+import { deserialize, serialize } from "node:v8";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -364,7 +365,10 @@ export type ReadonlySessionManager = Pick<
 type DetachedSessionSource = Pick<
 	ReadonlySessionManager,
 	"getLeafEntry" | "getEntry" | "getBranch" | "buildContextEntries" | "getEntries" | "getTree"
-> & { revision?: () => number };
+> & {
+	revision?: () => number;
+	buildDetachedProjection?: () => { projection: SessionProjection; shareable: boolean };
+};
 // Only the detached view may use these native readers, bypassing ownedView's full-history copies.
 const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
 const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
@@ -378,7 +382,45 @@ export { freezeDetached } from "./turn-receipts.ts";
 // the snapshot. Do not retain a second payload history, bounded or otherwise.
 const publishedSessionEntries = new WeakSet<object>();
 
-// Preserve deliberately supported in-memory non-JSON values and custom serializers.
+// Own native cloneable SDK values (Map/Set, typed arrays, Dates, cycles and BigInt).
+// Accessors/serializers whose native clone changes the wire form are captured as JSON
+// at ingress instead. Refuse unownable values; never fall back to a caller reference.
+function ownSessionEntry<T extends FileEntry>(entry: T): T {
+	let encoded: string | undefined;
+	let serializationError: unknown;
+	try {
+		encoded = JSON.stringify(entry);
+	} catch (error) {
+		serializationError = error;
+	}
+	let owned: T;
+	try {
+		// V8 copies typed-array backing bytes, including views of shared buffers;
+		// direct shared buffers and functions are refused, not shallow-cloned.
+		if (encoded !== undefined && canShareSessionEntry(entry)) owned = JSON.parse(encoded) as T;
+		else {
+			owned = deserialize(serialize(entry)) as T;
+			if (encoded !== undefined && JSON.stringify(owned) !== encoded) owned = JSON.parse(encoded) as T;
+		}
+	} catch (ownershipError) {
+		if (encoded === undefined) {
+			throw new TypeError("Cannot own session entry: value is neither serializable nor cloneable", {
+				cause: new AggregateError([serializationError, ownershipError]),
+			});
+		}
+		owned = JSON.parse(encoded) as T;
+	}
+	// Keep optional undefined top-level slots, but NEVER spread rejected caller values
+	// back over the owned JSON (functions, symbols and serializer-omitted objects).
+	for (const key of Object.keys(entry)) {
+		const slot = Object.getOwnPropertyDescriptor(entry, key)!;
+		if ("value" in slot && slot.value === undefined && !Object.hasOwn(owned, key)) {
+			Object.defineProperty(owned, key, { value: undefined, writable: true, enumerable: true, configurable: true });
+		}
+	}
+	return owned;
+}
+
 // Only owned plain JSON graphs (or our native cold accessors) may be shared by snapshots.
 function canShareSessionEntry(entry: object, cold = false): boolean {
 	const pending: Array<{ value: unknown; leaving?: boolean }> = [{ value: entry }];
@@ -463,7 +505,9 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 		const nativeSource = detachedSessionSources.get(manager);
 		const source: DetachedSessionSource = nativeSource ?? manager;
 		const snapshot = snapshotSessionEntry;
-		let selection: { revision: number; kind: string; fromId?: string; entries: SessionEntry[] } | undefined;
+		let selection:
+			| { revision: number; kind: string; fromId?: string; entries?: SessionEntry[]; projection?: SessionProjection }
+			| undefined;
 		detachedSelectionInvalidators.set(manager, () => {
 			selection = undefined;
 		});
@@ -473,13 +517,14 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 				revision !== undefined &&
 				selection?.revision === revision &&
 				selection.kind === kind &&
-				selection.fromId === fromId
+				selection.fromId === fromId &&
+				selection.entries
 			)
 				return selection.entries;
 			const values = kind === "getBranch" ? source.getBranch(fromId) : source[kind]();
 			if (!nativeSource) return detachedSessionEntries(values);
 			const result = new Array<SessionEntry>(values.length);
-			let bytes = 64 + 8 * values.length;
+			let bytes = 64 + 8 * values.length + 2 * (fromId?.length ?? 0);
 			values.forEach((entry, index) => {
 				// Conservatively charge wrapper slots, array slots and exceptional getter closures.
 				bytes += 128 + 24 * Object.getOwnPropertyNames(entry).length;
@@ -490,7 +535,7 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 			// Survive idle GC, but only retain a fitting current selection. Native replacement,
 			// rewrite and cold release clear it immediately, even with no subsequent view read.
 			selection =
-				revision === undefined || bytes > DETACHED_SELECTION_BUDGET
+				revision === undefined || bytes > DETACHED_SELECTION_BUDGET || (fromId !== undefined && values.length === 0)
 					? undefined
 					: { revision, kind, fromId, entries: result };
 			return result;
@@ -506,8 +551,37 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 			getLabel: manager.getLabel.bind(manager),
 			getBranch: (fromId?: string) => entries("getBranch", fromId),
 			buildContextEntries: () => entries("buildContextEntries"),
-			buildSessionProjection: () =>
-				freezeDetached(JSON.parse(JSON.stringify(manager.buildSessionProjection())) as SessionProjection),
+			buildSessionProjection: () => {
+				const revision = nativeSource?.revision?.();
+				if (revision !== undefined && selection?.revision === revision && selection.projection) {
+					return selection.projection;
+				}
+				if (!nativeSource?.buildDetachedProjection) {
+					return freezeDetached(JSON.parse(JSON.stringify(manager.buildSessionProjection())) as SessionProjection);
+				}
+				const { projection, shareable } = nativeSource.buildDetachedProjection();
+				let bytes = 256 + 8 * (projection.entries.length + projection.messages.length);
+				for (const projected of projection.entries) {
+					// Source wrappers share native immutable payloads; only new metadata is retained.
+					bytes += 128 + 24 * Object.getOwnPropertyNames(projected.sourceEntry).length;
+					bytes += 64 + 24 * 2 + 64 + 8 * projected.messages.length;
+					for (const message of projected.messages) {
+						bytes += 128 + 24 * Object.getOwnPropertyNames(message).length;
+					}
+					freezeDetached(projected.messages);
+					Object.freeze(projected);
+				}
+				Object.freeze(projection.entries);
+				Object.freeze(projection.messages);
+				if (projection.model) Object.freeze(projection.model);
+				Object.freeze(projection);
+				// One shared 64 MiB admission, not independent list and projection budgets.
+				selection =
+					!shareable || revision === undefined || bytes > DETACHED_SELECTION_BUDGET
+						? undefined
+						: { revision, kind: "projection", projection };
+				return projection;
+			},
 			getHeader: () => freezeDetached(structuredClone(manager.getHeader())),
 			getEntries: () => entries("getEntries"),
 			getTree: () => {
@@ -1309,6 +1383,22 @@ export class SessionManager {
 			getEntry: (id) => this.byId.get(id),
 			getBranch: (fromId) => this.getBranchEntries(fromId),
 			buildContextEntries: () => this.getBranchProjection().contextEntries.slice(),
+			buildDetachedProjection: () => {
+				const { contextEntries, thinkingLevel, model } = this.getBranchProjection();
+				let shareable = true;
+				// Detached wrappers are not native published entries, so projection shares their
+				// immutable message graphs instead of cloning mutable runtime model state.
+				const entries = contextEntries.map((entry) => {
+					if (!publishedSessionEntries.has(entry)) shareable = false;
+					return snapshotSessionEntry(entry)!;
+				});
+				// Exceptional native payloads remain owned but not shareable. Their detached
+				// projection copies are returned, never retained as an uncharged payload cache.
+				return {
+					projection: projectSessionContext(entries, thinkingLevel, model ? { ...model } : null),
+					shareable,
+				};
+			},
 			getEntries: () => this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session"),
 			getTree: () =>
 				this.buildTree(this.fileEntries.filter((entry): entry is SessionEntry => entry.type !== "session")),
@@ -1661,9 +1751,7 @@ export class SessionManager {
 			this.leafId = published.id;
 			return;
 		}
-		// Own ordinary JSON before publication, preserving optional undefined entry slots.
-		// In-memory non-JSON data and custom serializers keep their established semantics.
-		if (canShareSessionEntry(entry)) entry = { ...entry, ...JSON.parse(JSON.stringify(entry)) } as SessionEntry;
+		entry = ownSessionEntry(entry);
 		publishSessionEntry(entry, true);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
@@ -2621,10 +2709,7 @@ export class SessionManager {
 
 	/** Create an in-memory session (no file persistence), optionally from entries held outside the filesystem. */
 	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions, entries?: FileEntry[]): SessionManager {
-		// Own JSON graphs one entry at a time; preserve non-JSON in-memory state.
-		const snapshot = entries?.map((entry) =>
-			canShareSessionEntry(entry) ? ({ ...entry, ...JSON.parse(JSON.stringify(entry)) } as FileEntry) : { ...entry },
-		);
+		const snapshot = entries?.map((entry) => ownSessionEntry(entry));
 		return new SessionManager(cwd, "", undefined, false, options, snapshot);
 	}
 

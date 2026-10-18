@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { detachedSessionView, SessionManager } from "../../src/core/session-manager.ts";
 
 assert(global.gc);
+const mode = process.argv[2] ?? "list";
 const gc = () => {
 	global.gc!();
 	global.gc!();
@@ -20,7 +21,8 @@ try {
 		const id = manager.appendCustomEntry("retired", { text: "x".repeat(32 * 1024 * 1024), values: [1] });
 		const view = detachedSessionView(manager);
 		// First select while the 32 MiB graph is hot: a strong cache must be invalidated on cooling.
-		view.getEntries();
+		if (mode === "projection") view.buildSessionProjection();
+		else view.getEntries();
 		for (let i = 0; i < 110; i++) manager.appendCustomEntry("metadata", { i });
 		manager.appendCompaction("checkpoint", null, 100);
 		return { manager, view, id };
@@ -35,12 +37,17 @@ try {
 		assert.equal(data.text.length, 32 * 1024 * 1024);
 		assert(Object.isFrozen(data));
 		assert.throws(() => data.values.push(2), TypeError);
-		retained.view.getEntries();
+		if (mode === "projection") {
+			retained.manager.branch(retained.id);
+			retained.view.buildSessionProjection();
+		} else retained.view.getEntries();
 		retained.manager.newSession();
 	})();
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	const retainedBytes = gc() - baseline;
-	console.log(`REPORT ${JSON.stringify({ mode: "retire", cooledBytes, retainedBytes, budget: 16 * 1024 * 1024 })}`);
+	console.log(
+		`REPORT ${JSON.stringify({ mode: `retire-${mode}`, cooledBytes, retainedBytes, budget: 16 * 1024 * 1024 })}`,
+	);
 	assert(retainedBytes < 16 * 1024 * 1024, `retired history retained ${retainedBytes} bytes`);
 	assert.equal(retained.manager.getEntryCount(), 0);
 	assert.equal(retained.view.getSessionId(), retained.manager.getSessionId());

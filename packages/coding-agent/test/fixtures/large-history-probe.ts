@@ -56,12 +56,23 @@ try {
 	const history = detachedSessionView(manager);
 	const loadedHeap = gc();
 	const consume = () => {
-		const entries = history.getEntries();
+		const projection = mode === "projection" ? history.buildSessionProjection() : undefined;
+		const entries = projection?.entries ?? history.getEntries();
+		if (projection) {
+			assert(Object.isFrozen(projection));
+			assert(Object.isFrozen(projection.messages));
+			assert.equal(projection.messages.length, Math.ceil(count / 1000));
+		}
 		assert.equal(entries.length, expectedCount);
 		assert(Object.isFrozen(entries));
 		let visited = 0;
 		let sum = 0;
-		for (const entry of entries) {
+		for (const value of entries) {
+			const entry = "sourceEntry" in value ? value.sourceEntry : value;
+			if ("sourceEntry" in value) {
+				assert(Object.isFrozen(value));
+				assert(Object.isFrozen(value.messages));
+			}
 			visited++;
 			assert(Object.isFrozen(entry));
 			if (entry.type === "custom") {
@@ -79,6 +90,7 @@ try {
 		// Fitting is determined by charged bytes, not a fixed entry-count cliff.
 		// This selection exceeds 64 MiB of conservative wrapper/array charges.
 		assert.notEqual(history.getEntries(), history.getEntries());
+		assert.notEqual(history.buildSessionProjection(), history.buildSessionProjection());
 		const expected = consume();
 		assert.equal(consume(), expected);
 		await new Promise<void>((resolve) => setImmediate(resolve));
