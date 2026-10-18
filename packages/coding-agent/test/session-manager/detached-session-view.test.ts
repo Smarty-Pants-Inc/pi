@@ -105,7 +105,7 @@ describe("detached session snapshots", () => {
 		expect(data.nested.values).toEqual([1]);
 	});
 
-	it("does not hydrate cold history for list selection and does not cache accessed entries", () => {
+	it("does not hydrate cold selections or reserialize immutable snapshots", () => {
 		dir = mkdtempSync(join(tmpdir(), "pi-detached-lazy-"));
 		const manager = SessionManager.create(dir, dir);
 		const id = manager.appendMessage({ role: "user", content: "cold ".repeat(200_000), timestamp: 1 });
@@ -124,16 +124,16 @@ describe("detached session snapshots", () => {
 		for (const entries of [branch, all, context]) expect(Object.isFrozen(entries)).toBe(true);
 		const first = branch[0];
 		expect(first.id).toBe(id);
-		expect(serialize).toHaveBeenCalledTimes(1);
+		expect(serialize).not.toHaveBeenCalled();
 		const second = branch[0];
-		expect(serialize).toHaveBeenCalledTimes(2);
-		expect(first).not.toBe(second);
+		expect(serialize).not.toHaveBeenCalled();
+		expect(first).toBe(second);
 		expect(first).toEqual(second);
 		expect(Object.isFrozen(first)).toBe(true);
 		expect(isColdEntry(manager.getEntry(id)!)).toBe(true);
 	});
 
-	it("returns fresh frozen per-call snapshots without a native-entry payload cache", () => {
+	it("reuses frozen snapshots without duplicating native payloads", () => {
 		const manager = SessionManager.inMemory();
 		const id = manager.appendMessage({ role: "user", content: [{ type: "text", text: "original" }], timestamp: 1 });
 		const view = detachedSessionView(manager);
@@ -295,6 +295,28 @@ describe("detached session snapshots", () => {
 		expect(view.getEntry(first)).toBeUndefined();
 	});
 
+	// smarty-dev#14576: only the private native reader's revision is a cache contract.
+	it("leaves structural readers lazy and ignores untrusted revision methods", () => {
+		const manager = SessionManager.inMemory();
+		const id = manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		const values = [JSON.parse(JSON.stringify(manager.getEntry(id)))];
+		const revision = vi.fn(() => 0);
+		const source = { ...detachedSessionView(manager), revision, getEntries: () => values };
+		const view = detachedSessionView(source);
+		expect(view.getEntries()).toHaveLength(1);
+		values.push({ ...values[0], id: "second" });
+		expect(view.getEntries()).toHaveLength(2);
+		expect(revision).not.toHaveBeenCalled();
+		const proxy = new Proxy(values[0], {
+			ownKeys: () => {
+				throw new Error("untrusted descriptor trap");
+			},
+		});
+		const proxyView = detachedSessionView({ ...source, getEntries: () => [proxy] });
+		expect(() => proxyView.getEntries()).not.toThrow();
+		expect(() => proxyView.getEntries()[0]).toThrow("untrusted descriptor trap");
+	});
+
 	it("detaches retained tree wrappers from a structural readonly manager", () => {
 		const manager = SessionManager.inMemory();
 		manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
@@ -328,6 +350,57 @@ describe("detached session snapshots", () => {
 		expect(Object.isFrozen(data.values)).toBe(false);
 		expect(data.self).toBe(data);
 		expect(data.values).toEqual([1]);
+	});
+
+	// smarty-dev#14576 P2-1/P2-2: every native history route must share only immutable data.
+	it("does not reserialize unchanged JSON through any history accessor and invalidates selections", () => {
+		const manager = SessionManager.inMemory();
+		const id = manager.appendCustomEntry("json", { nested: { values: [1] } });
+		const view = detachedSessionView(manager);
+		const first = view.getEntries();
+		expect(view.getEntries()).toBe(first);
+		const serialize = vi.spyOn(JSON, "stringify");
+		for (const entry of [
+			view.getEntry(id),
+			view.getLeafEntry(),
+			view.getBranch()[0],
+			view.getBranch(id)[0],
+			view.getEntries()[0],
+			view.buildContextEntries()[0],
+			view.getTree()[0].entry,
+		]) {
+			if (entry?.type !== "custom") throw new Error("missing JSON custom entry");
+			expect(Object.isFrozen(entry)).toBe(true);
+			const data = entry.data as { nested: { values: number[] } };
+			expect(() => data.nested.values.push(2)).toThrow(TypeError);
+		}
+		expect(serialize).not.toHaveBeenCalled();
+		serialize.mockRestore();
+		const projected = view.buildSessionProjection().entries[0].sourceEntry;
+		if (projected.type !== "custom") throw new Error("missing projected JSON");
+		expect(() => (projected.data as { nested: { values: number[] } }).nested.values.push(2)).toThrow(TypeError);
+		manager.appendCustomEntry("second", {});
+		expect(view.getEntries()).toHaveLength(2);
+		expect(first).toHaveLength(1);
+		manager.branch(id);
+		expect(view.getBranch()).toHaveLength(1);
+		manager.resetLeaf();
+		expect(view.getBranch()).toEqual([]);
+	});
+
+	// A shallow frozen keyboard wrapper must not hide an unfrozen nested extension field.
+	it("deeply protects JSON children of already sealed keyboard message wrappers", () => {
+		const manager = SessionManager.inMemory();
+		const id = manager.appendMessage({ role: "user", content: "original", timestamp: 1 });
+		const entry = JSON.parse(JSON.stringify(manager.getEntry(id)));
+		entry.provenance.channel = "keyboard";
+		entry.message.extra = { values: [1] };
+		const imported = SessionManager.inMemory("/synthetic", undefined, [manager.getHeader()!, entry]);
+		const value = detachedSessionView(imported).getEntry(id);
+		if (value?.type !== "message") throw new Error("missing keyboard entry");
+		const extra = Reflect.get(value.message, "extra") as { values: number[] };
+		expect(Object.isFrozen(extra.values)).toBe(true);
+		expect(() => extra.values.push(2)).toThrow(TypeError);
 	});
 
 	it("freezes deep trees without recursive stack growth", () => {

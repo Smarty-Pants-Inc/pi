@@ -1,3 +1,4 @@
+import { isProxy } from "node:util/types";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	type AssistantMessage,
@@ -53,6 +54,7 @@ import {
 	copyEntry,
 	getEntryLocation,
 	isColdEntry,
+	isColdFieldReader,
 	readSessionFileLines,
 	setEntryLocation,
 	toColdEntry,
@@ -362,20 +364,87 @@ export type ReadonlySessionManager = Pick<
 type DetachedSessionSource = Pick<
 	ReadonlySessionManager,
 	"getLeafEntry" | "getEntry" | "getBranch" | "buildContextEntries" | "getEntries" | "getTree"
->;
+> & { revision?: () => number };
 // Only the detached view may use these native readers, bypassing ownedView's full-history copies.
 const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
 const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
+const detachedSelectionInvalidators = new WeakMap<object, () => void>();
+/** Added selection/wrapper metadata only; immutable native payloads are shared, not copied. */
+const DETACHED_SELECTION_BUDGET = 64 * 1024 * 1024;
 
 export { freezeDetached } from "./turn-receipts.ts";
 
-function snapshotSessionEntry(entry: SessionEntry | undefined): SessionEntry | undefined {
-	// Match the persisted JSON form: typed arrays cannot be frozen, and frozen Map/Set
-	// objects still allow mutation. Never retain a detached payload beside native history.
-	return entry ? freezeDetached(JSON.parse(JSON.stringify(entry)) as SessionEntry) : undefined;
+// smarty-dev#11897 / #14576 P2-1/P2-2: the owned, immutable native JSON graph IS
+// the snapshot. Do not retain a second payload history, bounded or otherwise.
+const publishedSessionEntries = new WeakSet<object>();
+
+// Preserve deliberately supported in-memory non-JSON values and custom serializers.
+// Only owned plain JSON graphs (or our native cold accessors) may be shared by snapshots.
+function canShareSessionEntry(entry: object, cold = false): boolean {
+	const pending: Array<{ value: unknown; leaving?: boolean }> = [{ value: entry }];
+	const ancestors = new WeakSet<object>();
+	while (pending.length) {
+		const { value, leaving } = pending.pop()!;
+		if (value === null || value === undefined || typeof value === "string" || typeof value === "boolean") continue;
+		if (typeof value === "number") {
+			if (!Number.isFinite(value)) return false;
+			continue;
+		}
+		if (typeof value !== "object" || isProxy(value)) return false;
+		if (leaving) {
+			ancestors.delete(value);
+			continue;
+		}
+		if (ancestors.has(value)) return false;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== Array.prototype && prototype !== null) return false;
+		if (Object.getOwnPropertySymbols(value).length) return false;
+		ancestors.add(value);
+		pending.push({ value, leaving: true });
+		for (const key of Object.getOwnPropertyNames(value)) {
+			const slot = Object.getOwnPropertyDescriptor(value, key)!;
+			if (!("value" in slot)) {
+				if (!cold || !isColdFieldReader(slot.get)) return false;
+				continue;
+			}
+			if (key === "toJSON" && slot.value !== undefined) return false;
+			if (!slot.enumerable && !(Array.isArray(value) && key === "length") && !(value === entry && key === "toJSON"))
+				return false;
+			pending.push({ value: slot.value });
+		}
+	}
+	return true;
+}
+function publishSessionEntry(entry: SessionEntry, reserveSerializer: boolean): void {
+	sealEntryProvenance(entry, reserveSerializer);
+	if (publishedSessionEntries.has(entry) || !canShareSessionEntry(entry, isColdEntry(entry))) return;
+	const pending: unknown[] = [entry];
+	while (pending.length) {
+		const value = pending.pop();
+		// Provenance sealing can shallow-freeze wrappers before all their children are frozen.
+		if (value === null || typeof value !== "object") continue;
+		// Do not invoke cold accessors. Their reader freezes JSON data on demand.
+		for (const key of Object.keys(value)) {
+			const slot = Object.getOwnPropertyDescriptor(value, key)!;
+			if ("value" in slot) pending.push(slot.value);
+		}
+		Object.freeze(value);
+	}
+	publishedSessionEntries.add(entry);
 }
 
-/** Package-private history selection: isolate on access, without hydrating cold entries. */
+function snapshotSessionEntry(entry: SessionEntry | undefined): SessionEntry | undefined {
+	if (!entry) return undefined;
+	if (!publishedSessionEntries.has(entry)) {
+		// Structural readonly sources have no ownership/immutability contract.
+		return freezeDetached(JSON.parse(JSON.stringify(entry)) as SessionEntry);
+	}
+	// A new small wrapper preserves detachment/entry identity without copying payloads.
+	// Copy descriptors, not values: cold fields must not be read just to select history.
+	return Object.freeze(Object.defineProperties({}, Object.getOwnPropertyDescriptors(entry))) as SessionEntry;
+}
+
+/** Package-private observer selection: do not even allocate wrappers for unread entries. */
 export function detachedSessionEntries(values: SessionEntry[]): SessionEntry[] {
 	const entries = new Array<SessionEntry>(values.length);
 	values.forEach((entry, index) => {
@@ -391,9 +460,41 @@ export function detachedSessionEntries(values: SessionEntry[]): SessionEntry[] {
 export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySessionManager {
 	let view = detachedSessionViews.get(manager);
 	if (!view) {
-		const source = detachedSessionSources.get(manager) ?? manager;
+		const nativeSource = detachedSessionSources.get(manager);
+		const source: DetachedSessionSource = nativeSource ?? manager;
 		const snapshot = snapshotSessionEntry;
-		const entries = detachedSessionEntries;
+		let selection: { revision: number; kind: string; fromId?: string; entries: SessionEntry[] } | undefined;
+		detachedSelectionInvalidators.set(manager, () => {
+			selection = undefined;
+		});
+		const entries = (kind: "getBranch" | "getEntries" | "buildContextEntries", fromId?: string) => {
+			const revision = nativeSource?.revision?.();
+			if (
+				revision !== undefined &&
+				selection?.revision === revision &&
+				selection.kind === kind &&
+				selection.fromId === fromId
+			)
+				return selection.entries;
+			const values = kind === "getBranch" ? source.getBranch(fromId) : source[kind]();
+			if (!nativeSource) return detachedSessionEntries(values);
+			const result = new Array<SessionEntry>(values.length);
+			let bytes = 64 + 8 * values.length;
+			values.forEach((entry, index) => {
+				// Conservatively charge wrapper slots, array slots and exceptional getter closures.
+				bytes += 128 + 24 * Object.getOwnPropertyNames(entry).length;
+				if (publishedSessionEntries.has(entry)) result[index] = snapshot(entry)!;
+				else Object.defineProperty(result, index, { enumerable: true, get: () => snapshot(entry)! });
+			});
+			Object.freeze(result);
+			// Survive idle GC, but only retain a fitting current selection. Native replacement,
+			// rewrite and cold release clear it immediately, even with no subsequent view read.
+			selection =
+				revision === undefined || bytes > DETACHED_SELECTION_BUDGET
+					? undefined
+					: { revision, kind, fromId, entries: result };
+			return result;
+		};
 		view = Object.freeze({
 			getCwd: manager.getCwd.bind(manager),
 			getSessionDir: manager.getSessionDir.bind(manager),
@@ -403,12 +504,12 @@ export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySe
 			getLeafEntry: () => snapshot(source.getLeafEntry()),
 			getEntry: (id: string) => snapshot(source.getEntry(id)),
 			getLabel: manager.getLabel.bind(manager),
-			getBranch: (fromId?: string) => entries(source.getBranch(fromId)),
-			buildContextEntries: () => entries(source.buildContextEntries()),
+			getBranch: (fromId?: string) => entries("getBranch", fromId),
+			buildContextEntries: () => entries("buildContextEntries"),
 			buildSessionProjection: () =>
 				freezeDetached(JSON.parse(JSON.stringify(manager.buildSessionProjection())) as SessionProjection),
 			getHeader: () => freezeDetached(structuredClone(manager.getHeader())),
-			getEntries: () => entries(source.getEntries()),
+			getEntries: () => entries("getEntries"),
 			getTree: () => {
 				const roots = source.getTree();
 				const nodes = new Map<SessionTreeNode, SessionTreeNode>();
@@ -608,32 +709,32 @@ function getSessionContextSettings(
  * Plain custom entries are display/state entries and do not participate in context.
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	let messages: AgentMessage[];
 	if (entry.type === "message") {
 		const message = entry.message;
-		// Session files are parsed without validation; old versions, forks, or
-		// hand-edited files can contain messages with null/missing content.
-		if (message.role === "system" && message.content == null) return [{ ...message, content: "" }];
-		if (
+		// Old or hand-edited files may contain messages with null/missing content.
+		if (message.role === "system" && message.content == null) messages = [{ ...message, content: "" }];
+		else if (
 			(message.role === "user" || message.role === "assistant" || message.role === "toolResult") &&
 			message.content == null
-		) {
-			return [{ ...message, content: [] }];
-		}
-		return [message];
-	}
-	if (entry.type === "custom_message") {
-		return [
+		)
+			messages = [{ ...message, content: [] }];
+		else messages = [message];
+	} else if (entry.type === "custom_message") {
+		messages = [
 			createCustomMessage(entry.customType, entry.content ?? [], entry.display, entry.details, entry.timestamp),
 		];
-	}
-	if (entry.type === "branch_summary" && entry.summary) {
-		return [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
-	}
-	if (entry.type === "compaction") {
+	} else if (entry.type === "branch_summary" && entry.summary) {
+		messages = [createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp)];
+	} else if (entry.type === "compaction") {
 		const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-		return entry.systemMessage ? [entry.systemMessage, summary] : [summary];
-	}
-	return [];
+		messages = entry.systemMessage ? [entry.systemMessage, summary] : [summary];
+	} else return [];
+	// User/keyboard projections retain frozen stored-input semantics. Mutable
+	// non-user model state (e.g. usage edits) must not alias published history.
+	const frozenInput =
+		entry.type === "message" && (entry.message.role === "user" || entry.provenance?.channel === "keyboard");
+	return publishedSessionEntries.has(entry) && !frozenInput ? structuredClone(messages) : messages;
 }
 
 /**
@@ -693,7 +794,7 @@ function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
 function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undefined): AgentMessage[] {
 	const messages = sessionEntryToContextMessages(entry);
 	if (!edit) return messages;
-	const replacement = edit.replacement;
+	const replacement = publishedSessionEntries.has(edit) ? structuredClone(edit.replacement) : edit.replacement;
 	if (replacement === null) return [];
 
 	return messages.map((message) => {
@@ -1203,6 +1304,7 @@ export class SessionManager {
 		this.persist = persist;
 		this.#ownedJournal = ownedJournal;
 		detachedSessionSources.set(this, {
+			revision: () => this.revision(),
 			getLeafEntry: () => (this.leafId ? this.byId.get(this.leafId) : undefined),
 			getEntry: (id) => this.byId.get(id),
 			getBranch: (fromId) => this.getBranchEntries(fromId),
@@ -1317,8 +1419,10 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
 		};
+		detachedSelectionInvalidators.get(this)?.();
 		this.fileEntries = [header];
 		this.#sessionEpoch = {};
+		this.#revisionKey = undefined;
 		this.#branchProjection = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
@@ -1354,6 +1458,8 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		detachedSelectionInvalidators.get(this)?.();
+		this.#revisionKey = undefined;
 		this.#branchProjection = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
@@ -1361,7 +1467,7 @@ export class SessionManager {
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
-			sealEntryProvenance(entry, !this.#ownedJournal);
+			publishSessionEntry(entry, !this.#ownedJournal);
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
 			if (entry.type === "label") {
@@ -1414,10 +1520,11 @@ export class SessionManager {
 				continue;
 			}
 			const rebound = toColdEntry(JSON.parse(line) as SessionEntry, location);
-			sealEntryProvenance(rebound, true);
+			publishSessionEntry(rebound, true);
 			this.fileEntries[i] = rebound;
 			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
 		}
+		detachedSelectionInvalidators.get(this)?.();
 		this.#revisionKey = undefined;
 		this.#branchProjection = undefined;
 	}
@@ -1452,13 +1559,14 @@ export class SessionManager {
 			if (!location) continue;
 			const next = hot.has(entry.id) ? toHotEntry(entry) : isColdEntry(entry) ? entry : toColdEntry(entry, location);
 			if (next === entry) continue;
-			sealEntryProvenance(next, true);
+			publishSessionEntry(next, true);
 			this.fileEntries[i] = next;
 			// With duplicate ids, byId keeps the later entry (as _buildIndex does); only replace that one.
 			if (this.byId.get(next.id) === entry) this.byId.set(next.id, next);
 			changed = true;
 		}
 		if (changed) {
+			detachedSelectionInvalidators.get(this)?.();
 			this.#revisionKey = undefined;
 			this.#branchProjection = undefined;
 		}
@@ -1542,7 +1650,7 @@ export class SessionManager {
 		if (this.#ownedJournal) {
 			this.#ownedJournal.assertWritable();
 			const published = validateOwnedSessionEntry(materializeOwnedEntry(entry), this.#ownedEntryIndex);
-			sealEntryProvenance(published, false);
+			publishSessionEntry(published, false);
 			const line = Buffer.from(`${JSON.stringify(published)}\n`);
 			if (this.#ownedBootstrap) this.#persistOwnedBootstrap();
 			// Publish only the admitted suffix before changing the canonical index or acknowledging the entry.
@@ -1553,7 +1661,10 @@ export class SessionManager {
 			this.leafId = published.id;
 			return;
 		}
-		sealEntryProvenance(entry, true);
+		// Own ordinary JSON before publication, preserving optional undefined entry slots.
+		// In-memory non-JSON data and custom serializers keep their established semantics.
+		if (canShareSessionEntry(entry)) entry = { ...entry, ...JSON.parse(JSON.stringify(entry)) } as SessionEntry;
+		publishSessionEntry(entry, true);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
@@ -1654,7 +1765,7 @@ export class SessionManager {
 		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
 		this.#ownedJournal.assertWritable();
 		const published = validateOwnedSessionEntry(materializeOwnedEntry(entry), this.#ownedEntryIndex);
-		sealEntryProvenance(published, false);
+		publishSessionEntry(published, false);
 		const line = Buffer.from(`${JSON.stringify(published)}\n`);
 		if (this.#ownedBootstrap) {
 			await this.#ownedJournal.commitTerminalAsync(this.#ownedBootstrap);
@@ -1811,7 +1922,7 @@ export class SessionManager {
 			...(note ? { note } : {}),
 		};
 		this._appendEntry(entry);
-		return entry;
+		return this.ownedView(this.byId.get(entry.id) as UsageEntry);
 	}
 
 	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */
@@ -2510,9 +2621,10 @@ export class SessionManager {
 
 	/** Create an in-memory session (no file persistence), optionally from entries held outside the filesystem. */
 	static inMemory(cwd: string = process.cwd(), options?: NewSessionOptions, entries?: FileEntry[]): SessionManager {
-		// Own the containers; _buildIndex detaches and seals reserved metadata.
-		// Unrelated live payloads retain their in-memory representation, not JSON wire semantics.
-		const snapshot = entries?.map((entry) => ({ ...entry }));
+		// Own JSON graphs one entry at a time; preserve non-JSON in-memory state.
+		const snapshot = entries?.map((entry) =>
+			canShareSessionEntry(entry) ? ({ ...entry, ...JSON.parse(JSON.stringify(entry)) } as FileEntry) : { ...entry },
+		);
 		return new SessionManager(cwd, "", undefined, false, options, snapshot);
 	}
 

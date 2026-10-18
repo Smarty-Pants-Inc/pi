@@ -220,7 +220,10 @@ describe("owned fork committed selection", () => {
 		const before = storage.read();
 		const indexed = (Reflect.get(manager, "byId") as Map<string, SessionEntry>).get(first)!;
 		if (indexed.type !== "message") throw new Error("fixture message required");
-		Reflect.set(indexed.message, "role", "user");
+		expect(Reflect.set(indexed.message, "role", "user")).toBe(false);
+		const forged = structuredClone(indexed);
+		Reflect.set(forged.message, "role", "user");
+		(Reflect.get(manager, "byId") as Map<string, SessionEntry>).set(first, forged);
 		const childStorage = childJournal();
 		const child = manager.forkSelected(first, childStorage);
 		expect(child.getEntry(first)).toMatchObject({ message: { role: "system", content: "committed system" } });
@@ -285,9 +288,11 @@ describe("owned fork committed selection", () => {
 		const byId = Reflect.get(manager, "byId") as Map<string, SessionEntry>;
 		const indexed = byId.get(selected)!;
 		if (indexed.type !== "message") throw new Error("fixture message required");
-		Reflect.set(indexed.message, "content", "forged payload");
-		// pi#160: canonical entries are frozen; forge the public index with a reparented shallow copy.
-		byId.set(selected, { ...indexed, parentId: null });
+		expect(Reflect.set(indexed.message, "content", "forged payload")).toBe(false);
+		const forged = structuredClone(indexed);
+		Reflect.set(forged.message, "content", "forged payload");
+		// Canonical payloads are immutable too; inject an independent forged index value.
+		byId.set(selected, { ...forged, parentId: null });
 		expect(byId.get(selected)).toMatchObject({ parentId: null, message: { content: "forged payload" } });
 		(Reflect.get(manager, "labelsById") as Map<string, string>).set(root, "forged label");
 		const read = vi.spyOn(storage, "read");
@@ -442,8 +447,13 @@ describe("incremental owned entry validation", () => {
 		const byId = Reflect.get(manager, "byId") as Map<string, SessionEntry>;
 		const message = byId.get(first)!;
 		if (message.type !== "message") throw new Error("fixture message required");
-		Reflect.set(message.message, "role", "user");
-		Reflect.set(byId.get(state)!, "type", "custom_message");
+		expect(Reflect.set(message.message, "role", "user")).toBe(false);
+		const forgedMessage = structuredClone(message);
+		Reflect.set(forgedMessage.message, "role", "user");
+		byId.set(first, forgedMessage);
+		const forgedState = structuredClone(byId.get(state)!);
+		Reflect.set(forgedState, "type", "custom_message");
+		byId.set(state, forgedState);
 		const before = storage.read();
 		for (const targetId of [first, state])
 			expect(() =>

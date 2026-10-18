@@ -89,7 +89,7 @@ describe("owned receipt materialization and publication", () => {
 		];
 		for (const read of reads) {
 			const entry = read();
-			expect(entry).not.toBe(entries[0]);
+			expect(Object.isFrozen(entry)).toBe(true);
 			expect(entry).toEqual(entries[0]);
 			expect(() => {
 				entry.parentId = "edited";
