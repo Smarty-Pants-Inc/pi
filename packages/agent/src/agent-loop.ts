@@ -32,6 +32,30 @@ import type {
 	StreamFn,
 } from "./types.ts";
 
+const SETUP_ABORTED = Symbol("agent setup aborted");
+
+/** Only this race's private outcome may classify a setup failure as cancellation. */
+async function raceSetupAbort<T>(setup: () => T | PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+	if (signal?.aborted) throw SETUP_ABORTED;
+	let onAbort: (() => void) | undefined;
+	const abort = signal
+		? new Promise<typeof SETUP_ABORTED>((resolve) => {
+				onAbort = () => resolve(SETUP_ABORTED);
+				signal.addEventListener("abort", onAbort, { once: true });
+			})
+		: undefined;
+	try {
+		// Register before invoking setup, then race its promise directly. A settled
+		// rejection wins even if abort(reason) runs before the await continuation.
+		const pending = setup();
+		const outcome = await (abort ? Promise.race([pending, abort]) : pending);
+		if (outcome === SETUP_ABORTED) throw SETUP_ABORTED;
+		return outcome as T;
+	} finally {
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+	}
+}
+
 /** sourceMessage identifies queued input when tool declaration normalization copies it. */
 export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
 
@@ -236,21 +260,24 @@ async function runLoop(
 			contextOnlyTurn = false;
 
 			let requestUpdate: AgentRequestUpdate | undefined;
+			let requestAborted = false;
 			try {
-				const prepared = signal?.aborted
-					? undefined
-					: await config.prepareRequest?.(
+				const prepared = await raceSetupAbort(
+					() =>
+						config.prepareRequest?.(
 							{
 								context: currentContext,
 								model: config.model,
 								thinkingLevel: config.reasoning ?? "off",
 							},
 							signal,
-						);
+						),
+					signal,
+				);
 				requestUpdate = prepared || undefined;
 			} catch (error) {
-				// Routing/preparation may reject because cancellation arrived during its await.
-				if (!signal?.aborted) throw error;
+				if (error !== SETUP_ABORTED) throw error;
+				requestAborted = true;
 			}
 			if (requestUpdate) {
 				currentContext = requestUpdate.context ?? currentContext;
@@ -267,7 +294,9 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			const message = requestAborted
+				? await emitAbortedAssistantResponse(currentContext, config, emit)
+				: await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -520,19 +549,16 @@ async function streamAssistantResponse(
 		// Apply context transform if configured (AgentMessage[] → AgentMessage[]).
 		let messages = context.messages;
 		if (config.transformContext) {
-			messages = await config.transformContext(messages, signal);
-			signal?.throwIfAborted();
+			messages = await raceSetupAbort(() => config.transformContext!(messages, signal), signal);
 		}
 
 		// Convert to LLM-compatible messages (AgentMessage[] → Message[]).
-		const llmMessages = await config.convertToLlm(messages);
-		signal?.throwIfAborted();
+		const llmMessages = await raceSetupAbort(() => config.convertToLlm(messages), signal);
 		const llmContext = normalizeContext({ messages: llmMessages });
 
 		// Resolve API key (important for expiring tokens).
 		const resolvedApiKey =
-			(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
-		signal?.throwIfAborted();
+			(await raceSetupAbort(() => config.getApiKey?.(config.model.provider), signal)) || config.apiKey;
 		// Register cancellation before invoking StreamFn, and let setup settlement
 		// race it. Do not reinterpret a settled stream or failure at consumption time.
 		response = lazyStream(
@@ -548,7 +574,7 @@ async function streamAssistantResponse(
 			signal,
 		);
 	} catch (error) {
-		if (signal?.aborted && error === signal.reason) return emitAbortedAssistantResponse(context, config, emit);
+		if (error === SETUP_ABORTED) return emitAbortedAssistantResponse(context, config, emit);
 		throw error;
 	}
 
