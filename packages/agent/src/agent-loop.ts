@@ -5,6 +5,7 @@
 
 import {
 	type AssistantMessage,
+	type AssistantMessageEventStream,
 	EventStream,
 	getCurrentTools,
 	getToolStateChanges,
@@ -21,6 +22,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
+	AgentRequestUpdate,
 	AgentTool,
 	AgentToolCall,
 	AgentToolCallOutcome,
@@ -226,16 +228,23 @@ async function runLoop(
 			if (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages) break;
 			contextOnlyTurn = false;
 
-			const requestUpdate = signal?.aborted
-				? undefined
-				: await config.prepareRequest?.(
-						{
-							context: currentContext,
-							model: config.model,
-							thinkingLevel: config.reasoning ?? "off",
-						},
-						signal,
-					);
+			let requestUpdate: AgentRequestUpdate | undefined;
+			try {
+				const prepared = signal?.aborted
+					? undefined
+					: await config.prepareRequest?.(
+							{
+								context: currentContext,
+								model: config.model,
+								thinkingLevel: config.reasoning ?? "off",
+							},
+							signal,
+						);
+				requestUpdate = prepared || undefined;
+			} catch (error) {
+				// Routing/preparation may reject because cancellation arrived during its await.
+				if (!signal?.aborted) throw error;
+			}
 			if (requestUpdate) {
 				currentContext = requestUpdate.context ?? currentContext;
 				config = {
@@ -491,30 +500,43 @@ async function streamAssistantResponse(
 ): Promise<AssistantMessage> {
 	if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
 
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
+	let response: AssistantMessageEventStream;
+	try {
+		// Apply context transform if configured (AgentMessage[] → AgentMessage[]).
+		let messages = context.messages;
+		if (config.transformContext) {
+			messages = await config.transformContext(messages, signal);
+			signal?.throwIfAborted();
+		}
+
+		// Convert to LLM-compatible messages (AgentMessage[] → Message[]).
+		const llmMessages = await config.convertToLlm(messages);
+		signal?.throwIfAborted();
+		const llmContext = normalizeContext({ messages: llmMessages });
+
+		// Resolve API key (important for expiring tokens).
+		const resolvedApiKey =
+			(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
+		signal?.throwIfAborted();
+		response = await streamFunction(config.model, llmContext, {
+			...config,
+			apiKey: resolvedApiKey,
+			signal,
+		});
+		// Async StreamFn setup can settle after cancellation, even with a successful stream.
+		signal?.throwIfAborted();
+	} catch (error) {
+		if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
+		throw error;
 	}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	const llmContext = normalizeContext({ messages: llmMessages });
-
-	// Resolve API key (important for expiring tokens)
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
-
-	// Preparation awaits user hooks; cancellation may have arrived while they ran.
-	if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
-	});
-	// Record the requested level, whichever stream function answered.
-	const result = async () => Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off" });
+	// Lazy setup may fail after StreamFn returned. Classify before publishing message_end,
+	// so persistence and every lifecycle observer see cancellation, not a setup failure.
+	const result = async () =>
+		Object.assign(await response.result(), {
+			thinkingLevel: config.reasoning ?? "off",
+			...(signal?.aborted ? { stopReason: "aborted" as const, errorMessage: "Operation aborted" } : {}),
+		});
 
 	let partialMessage: AssistantMessage | null = null;
 	let addedPartial = false;

@@ -82,24 +82,33 @@ async function forwardStream(
 /**
  * Returns a stream synchronously while running async setup (auth resolution,
  * lazy module loading) behind it. Setup failures terminate the stream with an
- * error event.
+ * error event. With a signal, cancelled setup terminates as aborted instead.
+ * Setup implementations must recheck cancellation after their awaits and before dispatch.
  */
 export function lazyStream(
 	model: Model<Api>,
 	setup: (outer: AssistantMessageEventStream) => Promise<AsyncIterable<AssistantMessageEvent>>,
+	signal?: AbortSignal,
 ): AssistantMessageEventStream {
 	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
 
 	// Setup can call `protectAssistantMessageStream(outer, ...)` once it has resolved request credentials,
 	// so forwarded events of any provider implementation are masked here too.
-	setup(outer)
-		.then((inner) => forwardStream(outer, inner))
-		.catch((error) => {
-			const message = createSetupErrorMessage(model, error, startedAt);
-			outer.push({ type: "error", reason: "error", error: message });
-			outer.end(message);
-		});
+	void (async () => {
+		signal?.throwIfAborted();
+		const inner = await setup(outer);
+		signal?.throwIfAborted();
+		await forwardStream(outer, inner);
+	})().catch((error) => {
+		const message = createSetupErrorMessage(model, error, startedAt);
+		if (signal?.aborted) {
+			message.stopReason = "aborted";
+			message.errorMessage = "Operation aborted";
+		}
+		outer.push({ type: "error", reason: signal?.aborted ? "aborted" : "error", error: message });
+		outer.end(message);
+	});
 
 	return outer;
 }
@@ -117,29 +126,47 @@ export interface LazyApiCapabilities {
 export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
 	const api: ProviderStreams = {
 		stream: (model, context, options) =>
-			lazyStream(model, async (outer) => {
-				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
-				return (await load()).stream(model, context, options);
-			}),
+			lazyStream(
+				model,
+				async (outer) => {
+					protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+					const implementation = await load();
+					options?.signal?.throwIfAborted();
+					return implementation.stream(model, context, options);
+				},
+				options?.signal,
+			),
 		streamSimple: (model, context, options) =>
-			lazyStream(model, async (outer) => {
-				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
-				return (await load()).streamSimple(model, context, options);
-			}),
+			lazyStream(
+				model,
+				async (outer) => {
+					protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+					const implementation = await load();
+					options?.signal?.throwIfAborted();
+					return implementation.streamSimple(model, context, options);
+				},
+				options?.signal,
+			),
 	};
 
 	if (capabilities?.fetchDeferred) {
 		api.fetchDeferred = (model, handle, options) =>
-			lazyStream(model, async (outer) => {
-				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
-				const implementation = await load();
-				if (!implementation.fetchDeferred) throw new Error("API does not support deferred responses");
-				return implementation.fetchDeferred(model, handle, options);
-			});
+			lazyStream(
+				model,
+				async (outer) => {
+					protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+					const implementation = await load();
+					options?.signal?.throwIfAborted();
+					if (!implementation.fetchDeferred) throw new Error("API does not support deferred responses");
+					return implementation.fetchDeferred(model, handle, options);
+				},
+				options?.signal,
+			);
 	}
 	if (capabilities?.cancelDeferred) {
 		api.cancelDeferred = async (model, handle, options) => {
 			const implementation = await load();
+			options?.signal?.throwIfAborted();
 			if (!implementation.cancelDeferred) throw new Error("API cannot cancel deferred responses");
 			await implementation.cancelDeferred(model, handle, options);
 		};
