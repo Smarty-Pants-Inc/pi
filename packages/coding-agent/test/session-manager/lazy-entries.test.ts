@@ -2,7 +2,7 @@ import { lstatSync, mkdtempSync, readFileSync, renameSync, rmSync, symlinkSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { isColdEntry } from "../../src/core/session-lazy-entries.ts";
+import { isColdEntry, toColdEntry } from "../../src/core/session-lazy-entries.ts";
 import {
 	buildSessionContext,
 	loadEntriesFromFile,
@@ -60,6 +60,35 @@ function writeLargeSession(): { file: string; compactionId: string } {
 const eagerEntries = (file: string) => loadEntriesFromFile(file).filter((e): e is SessionEntry => e.type !== "session");
 
 describe("lazy session entries", () => {
+	// smarty-dev#14576: the limit is JSONL wire bytes, not payload characters.
+	it.each([65_536, 65_537])("caches only lines at or below 65,536 bytes (line %i)", (length) => {
+		const entry = {
+			type: "custom",
+			id: `boundary-${length}`,
+			parentId: null,
+			timestamp: "t",
+			customType: "boundary",
+			data: { text: "" },
+			extra: { text: "x".repeat(2048) },
+		};
+		entry.data.text = "x".repeat(length - Buffer.byteLength(JSON.stringify(entry)));
+		const line = JSON.stringify(entry);
+		expect(Buffer.byteLength(line)).toBe(length);
+		const file = join(dir, `${length}.jsonl`);
+		writeFileSync(file, `${line}\n`);
+		const cold = toColdEntry(entry, { file, offset: 0, length });
+		expect(isColdEntry(cold)).toBe(true);
+		const first = cold.data;
+		expect(first.text.length).toBe(entry.data.text.length);
+		expect(Object.isFrozen(first)).toBe(true);
+		const second = cold.data;
+		if (length === 65_536) expect(second).toBe(first);
+		else expect(second).not.toBe(first);
+		expect(second).toEqual(first);
+		expect(cold.extra).toEqual(entry.extra);
+		expect(Object.isFrozen(cold.extra)).toBe(true);
+	});
+
 	it("keeps old entries cold and reads the same values as an eager load", () => {
 		const { file } = writeLargeSession();
 		const session = SessionManager.open(file);
