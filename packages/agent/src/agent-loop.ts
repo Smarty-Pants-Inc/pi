@@ -5,10 +5,12 @@
 
 import {
 	type AssistantMessage,
+	type AssistantMessageEventStream,
 	EventStream,
 	getCurrentTools,
 	getToolStateChanges,
 	isolateValue,
+	lazyStream,
 	normalizeContext,
 	type SystemMessage,
 	type ToolResultMessage,
@@ -22,6 +24,7 @@ import type {
 	AgentEvent,
 	AgentLoopConfig,
 	AgentMessage,
+	AgentRequestUpdate,
 	AgentTool,
 	AgentToolCall,
 	AgentToolCallOutcome,
@@ -29,6 +32,30 @@ import type {
 	PrepareNextTurnContext,
 	StreamFn,
 } from "./types.ts";
+
+const SETUP_ABORTED = Symbol("agent setup aborted");
+
+/** Only this race's private outcome may classify a setup failure as cancellation. */
+async function raceSetupAbort<T>(setup: () => T | PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+	if (signal?.aborted) throw SETUP_ABORTED;
+	let onAbort: (() => void) | undefined;
+	const abort = signal
+		? new Promise<typeof SETUP_ABORTED>((resolve) => {
+				onAbort = () => resolve(SETUP_ABORTED);
+				signal.addEventListener("abort", onAbort, { once: true });
+			})
+		: undefined;
+	try {
+		// Register before invoking setup, then race its promise directly. A settled
+		// rejection wins even if abort(reason) runs before the await continuation.
+		const pending = setup();
+		const outcome = await (abort ? Promise.race([pending, abort]) : pending);
+		if (outcome === SETUP_ABORTED) throw SETUP_ABORTED;
+		return outcome as T;
+	} finally {
+		if (onAbort) signal?.removeEventListener("abort", onAbort);
+	}
+}
 
 /** Original input slot, preserved even when tool declaration normalization copies its message. */
 export type AgentMessageOccurrence = { batch: AgentMessage[]; index: number; message: AgentMessage };
@@ -187,6 +214,16 @@ async function runLoop(
 	while (true) {
 		// Inner loop: process tool calls and steering messages
 		while (hasMoreToolCalls || pendingMessages.length > 0 || contextOnlyTurn) {
+			if (signal?.aborted && lastCompletedTurn) {
+				// A queue provider may have returned input in the same await that observed abort.
+				// Transfer that input to the transcript, but never let the aborted run dispatch it.
+				if (pendingMessages.length > 0) {
+					await appendPendingMessages(currentContext, newMessages, [pendingMessages], emit);
+					pendingMessages = [];
+				}
+				await endAbortedRun(currentContext, newMessages, config, signal, emit);
+				return;
+			}
 			let preparedMessages: AgentMessage[] = [];
 			if (lastCompletedTurn) {
 				const nextTurnSnapshot = await config.prepareNextTurn?.(lastCompletedTurn);
@@ -226,14 +263,26 @@ async function runLoop(
 			if (!hasMoreToolCalls && !contextOnlyTurn && !injectedMessages) break;
 			contextOnlyTurn = false;
 
-			const requestUpdate = await config.prepareRequest?.(
-				{
-					context: currentContext,
-					model: config.model,
-					thinkingLevel: config.reasoning ?? "off",
-				},
-				signal,
-			);
+			let requestUpdate: AgentRequestUpdate | undefined;
+			let requestAborted = false;
+			try {
+				const prepared = await raceSetupAbort(
+					() =>
+						config.prepareRequest?.(
+							{
+								context: currentContext,
+								model: config.model,
+								thinkingLevel: config.reasoning ?? "off",
+							},
+							signal,
+						),
+					signal,
+				);
+				requestUpdate = prepared || undefined;
+			} catch (error) {
+				if (error !== SETUP_ABORTED) throw error;
+				requestAborted = true;
+			}
 			if (requestUpdate) {
 				currentContext = requestUpdate.context ?? currentContext;
 				config = {
@@ -249,7 +298,9 @@ async function runLoop(
 			}
 
 			// Stream assistant response
-			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
+			const message = requestAborted
+				? await emitAbortedAssistantResponse(currentContext, config, emit)
+				: await streamAssistantResponse(currentContext, config, signal, emit, streamFunction);
 			newMessages.push(message);
 
 			if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -298,6 +349,19 @@ async function runLoop(
 			const decision = await config.finishTurn?.(lastCompletedTurn, signal);
 			await emit({ type: "turn_end", message, toolResults });
 
+			if (signal?.aborted) {
+				// A completed assistant response already has its terminal message and turn
+				// publication. Shutdown can arrive while an observer is still unwinding; do
+				// not append a second synthetic aborted assistant in that case. Tool turns
+				// still receive the aborted terminal so finalized tool results remain ordered.
+				if (toolCalls.length === 0) {
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+				await endAbortedRun(currentContext, newMessages, config, signal, emit);
+				return;
+			}
+
 			if (decision?.action === "end") {
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -330,7 +394,56 @@ async function runLoop(
 		break;
 	}
 
+	if (signal?.aborted) {
+		await endAbortedRun(currentContext, newMessages, config, signal, emit);
+		return;
+	}
 	await emit({ type: "agent_end", messages: newMessages });
+}
+
+async function endAbortedRun(
+	context: AgentContext,
+	newMessages: AgentMessage[],
+	config: AgentLoopConfig,
+	signal: AbortSignal,
+	emit: AgentEventSink,
+): Promise<void> {
+	await emit({ type: "turn_start" });
+	const message = await emitAbortedAssistantResponse(context, config, emit);
+	newMessages.push(message);
+	await config.finishTurn?.({ message, toolResults: [], context, newMessages }, signal);
+	await emit({ type: "turn_end", message, toolResults: [] });
+	await emit({ type: "agent_end", messages: newMessages });
+}
+
+async function emitAbortedAssistantResponse(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+): Promise<AssistantMessage> {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [],
+		api: config.model.api,
+		provider: config.model.provider,
+		model: config.model.id,
+		thinkingLevel: config.reasoning ?? "off",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "aborted",
+		errorMessage: "Operation aborted",
+		timestamp: Date.now(),
+	};
+	context.messages.push(message);
+	await emit({ type: "message_start", message: { ...message } });
+	await emit({ type: "message_end", message });
+	return message;
 }
 
 type PendingMessage = {
@@ -435,27 +548,44 @@ async function streamAssistantResponse(
 	emit: AgentEventSink,
 	streamFunction: StreamFn,
 ): Promise<AssistantMessage> {
-	// Apply context transform if configured (AgentMessage[] → AgentMessage[])
-	let messages = context.messages;
-	if (config.transformContext) {
-		messages = await config.transformContext(messages, signal);
+	if (signal?.aborted) return emitAbortedAssistantResponse(context, config, emit);
+
+	let response: AssistantMessageEventStream;
+	try {
+		// Apply context transform if configured (AgentMessage[] → AgentMessage[]).
+		let messages = context.messages;
+		if (config.transformContext) {
+			messages = await raceSetupAbort(() => config.transformContext!(messages, signal), signal);
+		}
+
+		// Convert to LLM-compatible messages (AgentMessage[] → Message[]).
+		const llmMessages = await raceSetupAbort(() => config.convertToLlm(messages), signal);
+		const llmContext = normalizeContext({ messages: llmMessages });
+
+		// Resolve API key (important for expiring tokens).
+		const resolvedApiKey =
+			(await raceSetupAbort(() => config.getApiKey?.(config.model.provider), signal)) || config.apiKey;
+		// Register cancellation before invoking StreamFn, and let setup settlement
+		// race it. Do not reinterpret a settled stream or failure at consumption time.
+		response = lazyStream(
+			config.model,
+			() =>
+				Promise.resolve(
+					streamFunction(config.model, llmContext, {
+						...config,
+						apiKey: resolvedApiKey,
+						signal,
+					}),
+				),
+			signal,
+		);
+	} catch (error) {
+		if (error === SETUP_ABORTED) return emitAbortedAssistantResponse(context, config, emit);
+		throw error;
 	}
 
-	// Convert to LLM-compatible messages (AgentMessage[] → Message[])
-	const llmMessages = await config.convertToLlm(messages);
-
-	const llmContext = normalizeContext({ messages: llmMessages });
-
-	// Resolve API key (important for expiring tokens)
-	const resolvedApiKey =
-		(config.getApiKey ? await config.getApiKey(config.model.provider) : undefined) || config.apiKey;
-
-	const response = await streamFunction(config.model, llmContext, {
-		...config,
-		apiKey: resolvedApiKey,
-		signal,
-	});
-	// Record the requested level, whichever stream function answered.
+	// Lazy setup and providers classify cancellation where it occurs. The signal's
+	// state at consumption cannot tell whether a settled result preceded the abort.
 	const result = async () => Object.assign(await response.result(), { thinkingLevel: config.reasoning ?? "off" });
 
 	let partialMessage: AssistantMessage | null = null;
@@ -493,6 +623,10 @@ async function streamAssistantResponse(
 			case "done":
 			case "error": {
 				const finalMessage = await result();
+				if (event.type === "error" && event.reason === "aborted") {
+					finalMessage.stopReason = "aborted";
+					finalMessage.errorMessage = "Operation aborted";
+				}
 				if (addedPartial) {
 					context.messages[context.messages.length - 1] = finalMessage;
 				} else {

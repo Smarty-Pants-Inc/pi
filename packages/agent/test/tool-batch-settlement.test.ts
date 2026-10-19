@@ -240,7 +240,11 @@ describe("tool batch settlement", () => {
 				batch.events.filter((event) => event.type === "tool_execution_end").map((event) => event.toolCallId),
 			).toEqual(["effect", "sibling"]);
 			if (stage) expect(batch.agent.state.errorMessage).toBe(failure.message);
-			expect(batch.requests()).toBe(stage ? 2 : 3);
+			// #280: a late sibling may abort while settlement is unwinding. #298 forbids
+			// the obsolete third physical replay; success/throw remain counterexamples
+			// where an already-settled result still permits the continuation request.
+			const expectedRequests = stage !== undefined || outcome === "cancel" ? 2 : 3;
+			expect(batch.requests()).toBe(expectedRequests);
 		},
 	);
 

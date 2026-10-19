@@ -711,7 +711,9 @@ export class ModelRuntime implements Models {
 	>(model: TModel, options: TOptions | undefined, handle?: DeferredHandle) {
 		this.assertModelAllowed(model, handle);
 		return async () => {
+			options?.signal?.throwIfAborted();
 			const prepared = await this.prepareAuthenticatedRequest(model, options);
+			prepared.options.signal?.throwIfAborted();
 			this.assertModelAllowed(prepared.model, handle);
 			return prepared;
 		};
@@ -729,6 +731,8 @@ export class ModelRuntime implements Models {
 		options: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions<TModel>;
 	}> {
 		const requestGuard = this.providerRequestGuard;
+		options?.signal?.throwIfAborted();
+		requestGuard?.signal.throwIfAborted();
 		const provider = this.models.getProvider(model.provider);
 		if (!provider) throw new SafeSetupError("provider");
 		let resolution: AuthResult | undefined;
@@ -741,6 +745,8 @@ export class ModelRuntime implements Models {
 		} catch (error) {
 			throw requestSetupError(error);
 		}
+		options?.signal?.throwIfAborted();
+		requestGuard?.signal.throwIfAborted();
 		if (!resolution) throw new SafeSetupError("auth");
 
 		const { transformHeaders, ...rawProviderOptions } = options ?? {};
@@ -754,6 +760,8 @@ export class ModelRuntime implements Models {
 		if (transformHeaders) {
 			try {
 				headers = await transformHeaders(headers ?? {});
+				options?.signal?.throwIfAborted();
+				requestGuard?.signal.throwIfAborted();
 			} catch (error) {
 				throw requestSetupError(error);
 			}
@@ -795,12 +803,17 @@ export class ModelRuntime implements Models {
 	): AssistantMessageEventStream {
 		const prepare = this.prepareRequest(model, options as (StreamOptions & ModelsRequestTransforms) | undefined);
 		const transcript = normalizeContext(context);
-		return lazyStream(model, async (outer) => {
-			assertChatModel(model);
-			const prepared = await prepare();
-			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
-			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
-		});
+		return lazyStream(
+			model,
+			async (outer) => {
+				assertChatModel(model);
+				const prepared = await prepare();
+				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
+				prepared.options.signal?.throwIfAborted();
+				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
+			},
+			options?.signal,
+		);
 	}
 
 	complete<TApi extends Api>(
@@ -817,28 +830,39 @@ export class ModelRuntime implements Models {
 		if (isVirtualModel(model)) {
 			// Requests outside the agent loop are routed here. Callers sized them before routing, so
 			// cap the output budget to the routed model.
-			return lazyStream(model, async () => {
-				const route = await this.resolveModel(model, transcript.messages, {
-					reason: "direct",
-					thinkingLevel: options?.reasoning ?? "off",
-					signal: options?.signal,
-				});
-				const { maxTokens: limit } = route.model;
-				const maxTokens = options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
-				const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
-				// Caller credentials were resolved for the virtual model's provider. Another provider
-				// resolves its own, so they are not sent to the wrong vendor.
-				const { apiKey, headers, env, ...rest } = options ?? {};
-				const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
-				return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
-			});
+			return lazyStream(
+				model,
+				async () => {
+					const route = await this.resolveModel(model, transcript.messages, {
+						reason: "direct",
+						thinkingLevel: options?.reasoning ?? "off",
+						signal: options?.signal,
+					});
+					options?.signal?.throwIfAborted();
+					const { maxTokens: limit } = route.model;
+					const maxTokens =
+						options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
+					const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
+					// Caller credentials were resolved for the virtual model's provider. Another provider
+					// resolves its own, so they are not sent to the wrong vendor.
+					const { apiKey, headers, env, ...rest } = options ?? {};
+					const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
+					return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
+				},
+				options?.signal,
+			);
 		}
-		return lazyStream(model, async (outer) => {
-			assertChatModel(model);
-			const prepared = await prepare();
-			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
-			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
-		});
+		return lazyStream(
+			model,
+			async (outer) => {
+				assertChatModel(model);
+				const prepared = await prepare();
+				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
+				prepared.options.signal?.throwIfAborted();
+				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+			},
+			options?.signal,
+		);
 	}
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {
@@ -851,15 +875,20 @@ export class ModelRuntime implements Models {
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
 		const prepare = this.prepareRequest(model, options, handle);
-		return lazyStream(model, async (outer) => {
-			assertChatModel(model);
-			const prepared = await prepare();
-			protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
-			if (!prepared.provider.fetchDeferred) {
-				throw new SafeSetupError("deferred");
-			}
-			return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
-		});
+		return lazyStream(
+			model,
+			async (outer) => {
+				assertChatModel(model);
+				const prepared = await prepare();
+				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
+				if (!prepared.provider.fetchDeferred) {
+					throw new SafeSetupError("deferred");
+				}
+				prepared.options.signal?.throwIfAborted();
+				return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
+			},
+			options?.signal,
+		);
 	}
 
 	async fetchDeferred(
@@ -1123,6 +1152,7 @@ export class ModelRuntime implements Models {
 			state?: unknown;
 		},
 	): Promise<ModelRoute> {
+		options.signal?.throwIfAborted();
 		this.assertModelAllowed(model);
 		const name = `Virtual model ${model.provider}/${model.id}`;
 		const virtual = this.virtualModels.get(model.provider)?.get(model.id);
@@ -1139,6 +1169,7 @@ export class ModelRuntime implements Models {
 			failed: failedModel && failed && { model: failedModel, thinkingLevel: failed.thinkingLevel, message: failed },
 			messages,
 		});
+		options.signal?.throwIfAborted();
 		const target = this.getPhysicalModel(route.model.provider, route.model.id);
 		const routed = `${name} routed to ${route.model.provider}/${route.model.id}`;
 		if (!target) throw new Error(`${routed}, which is not a physical model.`);

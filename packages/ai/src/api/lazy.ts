@@ -66,32 +66,75 @@ function hasResult(
 async function forwardStream(
 	target: AssistantMessageEventStream,
 	source: AsyncIterable<AssistantMessageEvent>,
+	completion?: Promise<AssistantMessage>,
 ): Promise<void> {
 	for await (const event of source) {
+		// A pending source may ignore cancellation. Its terminal must not publish
+		// over an abort that won the result race while iteration was suspended.
+		if (completion && (event.type === "done" || event.type === "error")) await completion;
 		target.push(event);
 	}
-	target.end(hasResult(source) ? await source.result() : undefined);
+	target.end(completion ? await completion : hasResult(source) ? await source.result() : undefined);
 }
 
 /**
  * Returns a stream synchronously while running async setup (auth resolution,
  * lazy module loading) behind it. Setup failures terminate the stream with an
- * error event.
+ * error event. With a signal, cancelled setup terminates as aborted instead.
+ * Setup implementations must recheck cancellation after their awaits and before dispatch.
  */
 export function lazyStream(
 	model: Model<Api>,
 	setup: (outer: AssistantMessageEventStream) => Promise<AsyncIterable<AssistantMessageEvent>>,
+	signal?: AbortSignal,
 ): AssistantMessageEventStream {
 	const startedAt = Date.now();
 	const outer = new AssistantMessageEventStream();
+	// Only our private abort outcome may classify cancellation. A real failure
+	// can be the very same object the caller later supplies as signal.reason.
+	const cancelled = Symbol("setup aborted");
 
-	setup(outer)
-		.then((inner) => forwardStream(outer, inner))
-		.catch((error) => {
-			const message = createSetupErrorMessage(model, error, startedAt);
-			outer.push({ type: "error", reason: "error", error: message });
-			outer.end(message);
-		});
+	// Setup can call `protectAssistantMessageStream(outer, ...)` once it has resolved request credentials,
+	// so forwarded events of any provider implementation are masked here too.
+	void (async () => {
+		if (signal?.aborted) throw cancelled;
+		let onAbort: (() => void) | undefined;
+		const abort = signal
+			? new Promise<typeof cancelled>((resolve) => {
+					onAbort = () => resolve(cancelled);
+					signal.addEventListener("abort", onAbort, { once: true });
+				})
+			: undefined;
+		try {
+			// Attach directly to the setup promise: an already-settled outcome
+			// wins even if abort fires before its await continuation runs.
+			const pending = setup(outer);
+			const inner = await (abort ? Promise.race([pending, abort]) : pending);
+			if (inner === cancelled) throw cancelled;
+			// Returning a stream is not the same as completing it. Preserve a
+			// completed result, but still cancel a pending, uncooperative source.
+			const completion =
+				abort && hasResult(inner)
+					? Promise.race([inner.result(), abort]).then((outcome) => {
+							if (outcome === cancelled) throw cancelled;
+							return outcome;
+						})
+					: undefined;
+			if (completion) await Promise.all([forwardStream(outer, inner, completion), completion]);
+			else await forwardStream(outer, inner);
+		} finally {
+			if (onAbort) signal?.removeEventListener("abort", onAbort);
+		}
+	})().catch((error) => {
+		const aborted = error === cancelled;
+		const message = createSetupErrorMessage(model, error, startedAt);
+		if (aborted) {
+			message.stopReason = "aborted";
+			message.errorMessage = "Operation aborted";
+		}
+		outer.push({ type: "error", reason: aborted ? "aborted" : "error", error: message });
+		outer.end(message);
+	});
 
 	return outer;
 }
@@ -109,29 +152,47 @@ export interface LazyApiCapabilities {
 export function lazyApi(load: () => Promise<ProviderStreams>, capabilities?: LazyApiCapabilities): ProviderStreams {
 	const api: ProviderStreams = {
 		stream: (model, context, options) =>
-			lazyStream(model, async (outer) => {
-				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
-				return (await load()).stream(model, context, options);
-			}),
+			lazyStream(
+				model,
+				async (outer) => {
+					protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+					const implementation = await load();
+					options?.signal?.throwIfAborted();
+					return implementation.stream(model, context, options);
+				},
+				options?.signal,
+			),
 		streamSimple: (model, context, options) =>
-			lazyStream(model, async (outer) => {
-				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
-				return (await load()).streamSimple(model, context, options);
-			}),
+			lazyStream(
+				model,
+				async (outer) => {
+					protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+					const implementation = await load();
+					options?.signal?.throwIfAborted();
+					return implementation.streamSimple(model, context, options);
+				},
+				options?.signal,
+			),
 	};
 
 	if (capabilities?.fetchDeferred) {
 		api.fetchDeferred = (model, handle, options) =>
-			lazyStream(model, async (outer) => {
-				protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
-				const implementation = await load();
-				if (!implementation.fetchDeferred) throw new Error("API does not support deferred responses");
-				return implementation.fetchDeferred(model, handle, options);
-			});
+			lazyStream(
+				model,
+				async (outer) => {
+					protectAssistantMessageStream(outer, getRequestDiagnosticSecrets(model, options));
+					const implementation = await load();
+					options?.signal?.throwIfAborted();
+					if (!implementation.fetchDeferred) throw new Error("API does not support deferred responses");
+					return implementation.fetchDeferred(model, handle, options);
+				},
+				options?.signal,
+			);
 	}
 	if (capabilities?.cancelDeferred) {
 		api.cancelDeferred = async (model, handle, options) => {
 			const implementation = await load();
+			options?.signal?.throwIfAborted();
 			if (!implementation.cancelDeferred) throw new Error("API cannot cancel deferred responses");
 			await implementation.cancelDeferred(model, handle, options);
 		};
