@@ -453,15 +453,20 @@ function nextLineBreakIndex(text: string): number {
 	return Math.min(carriageReturnIndex, newlineIndex);
 }
 
-function consumeLine(text: string): { line: string; rest: string } | null {
+function consumeLine(text: string, final = false): { line: string; rest: string } | null {
 	const lineBreakIndex = nextLineBreakIndex(text);
 	if (lineBreakIndex === -1) {
 		return null;
 	}
 
 	let nextIndex = lineBreakIndex + 1;
-	if (text[lineBreakIndex] === "\r" && text[nextIndex] === "\n") {
-		nextIndex += 1;
+	if (text[lineBreakIndex] === "\r") {
+		if (nextIndex === text.length && !final) {
+			return null;
+		}
+		if (text[nextIndex] === "\n") {
+			nextIndex += 1;
+		}
 	}
 
 	return {
@@ -503,7 +508,7 @@ async function* iterateSseMessages(
 		}
 
 		buffer += decoder.decode();
-		let consumed = consumeLine(buffer);
+		let consumed = consumeLine(buffer, true);
 		while (consumed) {
 			buffer = consumed.rest;
 			const event = decodeSseLine(consumed.line, state);
