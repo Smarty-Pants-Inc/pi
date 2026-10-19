@@ -298,6 +298,10 @@ Extensions can intercept and customize both compaction and branch summarization.
 
 Fired before auto-compaction or `/compact`. Can cancel or provide custom summary. See `SessionBeforeCompactEvent` and `CompactionPreparation` in the types file.
 
+`branchEntries` is a frozen branch selection shared across handlers, with wrappers allocated only for entries a handler reads. Native ordinary JSON entries are owned and deeply frozen once at append/import, so snapshot wrappers share immutable resident data instead of serializing or retaining a second payload history. Cold fields remain lazy and are frozen when read; the single-line reader caches only JSONL records up to 64 KiB. Do not mutate history or rely on entry object identity. The event envelope and `preparation` remain separate per handler (including mutable file-operation sets), while the cancellation signal keeps its original identity.
+
+Extension list reads (`getBranch()`, `getEntries()`, `buildContextEntries()`) reuse one current revision-keyed frozen selection per native view, including across idle garbage collections. Added array/wrapper metadata has a conservative 64 MiB byte-admission cap, not an entry-count cap; oversized selections are returned but not retained. Native replacement, rewrite and cold release invalidate the retained selection immediately. Requesting a list does not hydrate cold payloads. Exceptional in-memory non-JSON values and custom serializers retain their existing detached-on-access behavior, including inside mixed selections. `buildSessionProjection()` copies only finalized active context; non-user model-context messages stay mutable without aliasing immutable published JSON history; unedited user/keyboard-attested projections preserve their frozen stored-input semantics.
+
 ```typescript
 pi.on("session_before_compact", async (event, ctx) => {
   const { preparation, branchEntries, customInstructions, reason, willRetry, signal } = event;

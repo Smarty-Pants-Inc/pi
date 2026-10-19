@@ -53,7 +53,8 @@ describe("session context edits", () => {
 
 		expect(session.getBranch().filter((entry) => entry.type === "message")).toHaveLength(3);
 		expect(session.buildSessionProjection().messages.map((message) => message.role)).toEqual(["user"]);
-		expect((session.getEntry(resultId) as { message: ToolResultMessage }).message).toBe(result);
+		expect((session.getEntry(resultId) as { message: ToolResultMessage }).message).toEqual(result);
+		expect((session.getEntry(resultId) as { message: ToolResultMessage }).message).not.toBe(result);
 	});
 
 	it("replaces only content and lets the latest edit win", () => {

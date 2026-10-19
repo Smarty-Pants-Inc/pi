@@ -82,6 +82,29 @@ describe("plain session append-only persistence", () => {
 		expect(reopened.buildSessionContext()).toEqual(manager.buildSessionContext());
 	});
 
+	// pi#291: immutable native payloads reject the index mutations used by the original fork controls.
+	it("protects indexed payloads and forks committed disk values rather than a forged public index", () => {
+		const manager = SessionManager.create(directory, directory);
+		const first = manager.appendMessage({
+			role: "system",
+			content: "committed system",
+			toolsAdded: [],
+			timestamp: 0,
+		});
+		manager.appendMessage(userMessage("flush"));
+		const indexed = manager.getEntry(first);
+		if (indexed?.type !== "message") throw new Error("fixture message required");
+		expect(Reflect.set(indexed.message, "role", "user")).toBe(false);
+		expect(Reflect.set(indexed.message, "content", "forged payload")).toBe(false);
+		const forged = structuredClone(indexed);
+		Reflect.set(forged.message, "role", "user");
+		Reflect.set(forged.message, "content", "forged payload");
+		const byId = Reflect.get(manager, "byId") as Map<string, typeof indexed>;
+		byId.set(first, forged);
+		const child = SessionManager.forkFrom(manager.getSessionFile()!, directory, directory);
+		expect(child.getEntry(first)).toMatchObject({ message: { role: "system", content: "committed system" } });
+	});
+
 	it("recovers a partial append on reopen and keeps the next appended record separate", () => {
 		const manager = SessionManager.create(directory, directory);
 		const retained = manager.appendMessage(userMessage("retained"));

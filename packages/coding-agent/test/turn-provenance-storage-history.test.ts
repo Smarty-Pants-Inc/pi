@@ -118,7 +118,9 @@ describe("historical records and serializer neighbors", () => {
 			const reopened = SessionManager.open(m.getSessionFile()!);
 			expect(Reflect.get(reopened.getEntry(custom)!, "details")).toEqual({ key: "details", value: "getter" });
 			expect(Reflect.get(reopened.getEntry(state)!, "data")).toEqual({ key: "data", value: "getter" });
-			expect(Reflect.get(m.getEntry(custom)!, "details")).toBe(details);
+			// smarty-dev#14576 P2-1: preserve the key-sensitive wire form, never the caller alias.
+			expect(Reflect.get(m.getEntry(custom)!, "details")).not.toBe(details);
+			expect(Reflect.get(m.getEntry(custom)!, "details")).toEqual({ key: "details", value: "getter" });
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}

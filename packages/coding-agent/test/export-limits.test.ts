@@ -260,14 +260,23 @@ describe("bounded session exports (#11897)", () => {
 		expect(read).not.toHaveBeenCalled();
 	});
 
-	// #3155: both public JSONL receivers must consume the shared prepared snapshot, not raw hooks.
-	it.each(["string", "streaming"] as const)("keeps nested self-return semantics through %s JSONL", (format) => {
+	// #289/#291: append owns the hook's wire result; later caller cycles cannot poison history.
+	it.each(["string", "streaming"] as const)("exports owned self-return data through %s JSONL", (format) => {
 		const sm = SessionManager.inMemory();
 		const hook = vi.fn(function (this: object, _key: string) {
 			return this;
 		});
 		const receiver: Record<string, unknown> = { value: "ok", toJSON: hook };
-		sm.appendCustomEntry("self-return", { payload: receiver });
+		const id = sm.appendCustomEntry("self-return", { payload: receiver });
+		expect(hook.mock.calls).toEqual([["payload"]]);
+		const native = sm.getEntry(id);
+		if (native?.type !== "custom") throw new Error("missing owned entry");
+		const owned = native.data as { payload: { value: string } };
+		expect(owned.payload).not.toBe(receiver);
+		expect(Object.isFrozen(owned.payload)).toBe(true);
+		expect(Object.isFrozen(receiver)).toBe(false);
+		const revision = sm.revision();
+		hook.mockClear();
 		const outputPath = join(directory(), "self-return.jsonl");
 		const serialized =
 			format === "string"
@@ -275,14 +284,82 @@ describe("bounded session exports (#11897)", () => {
 				: fs.readFileSync(exportSessionToJsonl(sm, outputPath), "utf8");
 		const entry = JSON.parse(serialized.trimEnd().split("\n").at(-1)!) as { data: unknown };
 		expect(entry.data).toEqual({ payload: { value: "ok" } });
+		receiver.value = "caller edit";
+		receiver.self = receiver;
+		const later =
+			format === "string"
+				? serializeSessionBranch(sm)
+				: fs.readFileSync(exportSessionToJsonl(sm, outputPath), "utf8");
+		expect(JSON.parse(later.trimEnd().split("\n").at(-1)!)).toEqual(entry);
+		expect(hook).not.toHaveBeenCalled();
+		expect(sm.getEntry(id)).toBe(native);
+		expect(native.data).toBe(owned);
+		expect(owned).toEqual({ payload: { value: "ok" } });
+		expect(sm.revision()).toBe(revision);
+	});
+
+	// #3155: export-only records have no ingress capture. Both real receivers must guard their hooks.
+	it.each(["string", "streaming"] as const)("guards untrusted self-return hooks through %s JSONL", (format) => {
+		const sm = SessionManager.inMemory();
+		const hook = vi.fn(function (this: object, _key: string) {
+			return this;
+		});
+		const receiver: Record<string, unknown> = { value: "ok", toJSON: hook };
+		const trailing = (parentId: string | null, timestamp: string) => [
+			{
+				type: "custom",
+				id: "export-only",
+				parentId,
+				timestamp,
+				customType: "self-return",
+				data: { payload: receiver },
+			},
+		];
+		const outputPath = join(directory(), "untrusted-self-return.jsonl");
+		const serialized =
+			format === "string"
+				? serializeSessionBranch(sm, trailing)
+				: fs.readFileSync(exportSessionToJsonl(sm, outputPath, trailing), "utf8");
+		const entry = JSON.parse(serialized.trimEnd().split("\n").at(-1)!) as { data: unknown };
+		expect(entry.data).toEqual({ payload: { value: "ok" } });
 		expect(hook.mock.calls).toEqual([["payload"]]);
+		expect(receiver).toEqual({ value: "ok", toJSON: hook });
+		expect(Object.isFrozen(receiver)).toBe(false);
 		receiver.self = receiver;
 		hook.mockClear();
+		expect(() =>
+			format === "string" ? serializeSessionBranch(sm, trailing) : exportSessionToJsonl(sm, outputPath, trailing),
+		).toThrow(/circular session data/);
+		expect(hook.mock.calls).toEqual([["payload"], ["self"]]);
+		expect(receiver.self).toBe(receiver);
+		expect(sm.getEntries()).toEqual([]);
+		if (format === "streaming") expect(fs.readFileSync(outputPath, "utf8")).toBe(serialized);
+	});
+
+	// #291: cloneable exceptional native graphs stay owned and still reach the export cycle guard.
+	it.each(["string", "streaming"] as const)("refuses an owned native cycle through %s JSONL", (format) => {
+		const sm = SessionManager.inMemory();
+		const caller: { values: number[]; self?: unknown } = { values: [1] };
+		caller.self = caller;
+		const id = sm.appendCustomEntry("native-cycle", caller);
+		const native = sm.getEntry(id);
+		if (native?.type !== "custom") throw new Error("missing exceptional entry");
+		const owned = native.data as typeof caller;
+		expect(owned).not.toBe(caller);
+		expect(owned.self).toBe(owned);
+		caller.values.push(2);
+		expect(owned.values).toEqual([1]);
+		expect(Object.isFrozen(caller)).toBe(false);
+		const outputPath = join(directory(), "native-cycle.jsonl");
+		fs.writeFileSync(outputPath, "existing");
+		const stringify = vi.spyOn(JSON, "stringify");
 		expect(() => (format === "string" ? serializeSessionBranch(sm) : exportSessionToJsonl(sm, outputPath))).toThrow(
 			/circular session data/,
 		);
-		expect(hook.mock.calls).toEqual([["payload"], ["self"]]);
-		if (format === "streaming") expect(fs.readFileSync(outputPath, "utf8")).toBe(serialized);
+		expect(stringify.mock.calls.every(([value]) => (value as { type: string }).type === "session")).toBe(true);
+		expect(fs.readFileSync(outputPath, "utf8")).toBe("existing");
+		expect(owned.self).toBe(owned);
+		expect(owned.values).toEqual([1]);
 	});
 
 	it("preflights oversized live payloads before HTML custom rendering or stringify", async () => {

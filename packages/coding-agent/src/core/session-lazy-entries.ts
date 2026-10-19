@@ -26,12 +26,20 @@ export interface EntryLocation {
 
 /** Fields whose JSON is shorter than this stay resident. */
 const LAZY_FIELD_MIN_CHARS = 1024;
+/** Never pin a large parsed payload after its session is retired. */
+const MAX_CACHED_LINE_BYTES = 64 * 1024;
 const RESIDENT_KEYS = new Set(["type", "id", "parentId", "timestamp", "provenance"]);
 
 type Json = Record<string, unknown>;
 
 const locations = new WeakMap<object, EntryLocation>();
 const coldEntries = new WeakSet<object>();
+const coldFieldReaders = new WeakSet<object>();
+
+/** Package-private: only native disk readers, never arbitrary SDK getters, can be shared. */
+export function isColdFieldReader(get: unknown): boolean {
+	return typeof get === "function" && coldFieldReaders.has(get);
+}
 /** Entries already checked that have no large field; they stay resident as they are. */
 const smallEntries = new WeakSet<object>();
 let lastRead: { location: EntryLocation; value: Json } | undefined;
@@ -107,7 +115,9 @@ function readEntryLine(location: EntryLocation, id: unknown, maxBytes?: number):
 	) {
 		throw changed();
 	}
-	lastRead = { location, value };
+	// Own JSON.parse data, then freeze once; never expose a mutable cached payload.
+	freezeDetached(value);
+	lastRead = length <= MAX_CACHED_LINE_BYTES ? { location, value } : undefined;
 	return value;
 }
 
@@ -182,14 +192,12 @@ export function toColdEntry<T extends object>(entry: T, location: EntryLocation)
  * context with the loop variables and keep the original (large) message alive.
  */
 function lazyReader(location: EntryLocation, id: unknown, parent: string | undefined, key: string): () => unknown {
-	return () => {
+	const read = () => {
 		const line = readEntryLine(location, id);
-		const value = parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
-		const provenance = line.provenance as { channel?: unknown } | undefined;
-		// The parsed line is cached and shared by consecutive field reads. Never expose mutable
-		// attested content from it; nested custom data/details retain their mutability (pi#160).
-		return provenance?.channel === "keyboard" && key === "content" ? freezeDetached(value) : value;
+		return parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
 	};
+	coldFieldReaders.add(read);
+	return read;
 }
 
 /**
@@ -229,7 +237,8 @@ export function toHotEntry<T extends object>(entry: T, maxBytes?: number): T {
 		throw new TypeError("Cold session entry id must be a string data property");
 	}
 	if (lastRead?.location === location) lastRead = undefined;
-	const hot = readEntryLine(location, id.value, maxBytes);
+	// Parsed payloads are frozen; leave the new entry container open for provenance sealing.
+	const hot = { ...readEntryLine(location, id.value, maxBytes) };
 	lastRead = undefined;
 	setEntryLocation(hot, location);
 	return hot as T;
