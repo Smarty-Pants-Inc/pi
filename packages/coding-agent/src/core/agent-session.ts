@@ -1310,18 +1310,19 @@ export class AgentSession {
 				const projection = this.sessionManager.buildSessionProjection();
 				const canonicalContext = {
 					...request.context,
-					// pi#160 persists detached, deep-frozen plain-data messages, and the projection reuses them.
-					// Request hooks may edit their input in place, so they get a mutable copy; stored history
-					// stays frozen. Unfrozen SDK messages are passed as is (they may not be cloneable).
-					messages: projection.messages.map((message) => {
-						if (!Object.isFrozen(message)) return message;
-						try {
-							return structuredClone(message);
-						} catch {
-							// Frozen SDK messages may contain opaque values; preserve their fitting-request behavior.
-							return message;
-						}
-					}),
+					// Native projections have mutable shells over immutable cached content (#14893).
+					// Only a custom request hook needs a deep mutable copy for nested edits (pi#160).
+					// Without one, reuse the projection without traversing or copying its payloads here.
+					messages: previousPrepareRequest
+						? projection.messages.map((message) => {
+								try {
+									return structuredClone(message);
+								} catch {
+									// Opaque SDK values may not be cloneable; preserve their fitting-request behavior.
+									return message;
+								}
+							})
+						: projection.messages,
 					// Messages declare the provider-visible loadout; context.tools keeps executable implementations.
 					tools: this.agent.state.tools.slice(),
 				};

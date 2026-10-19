@@ -874,6 +874,17 @@ function getSessionContextSettings(
  * Plain custom entries are display/state entries and do not participate in context.
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	const messages = getSessionEntryContextMessages(entry);
+	if (!messages.length) return messages;
+	// User/keyboard projections retain frozen stored-input semantics. Mutable
+	// non-user model state (e.g. usage edits) must not alias published history.
+	const frozenInput =
+		entry.type === "message" && (entry.message.role === "user" || entry.provenance?.channel === "keyboard");
+	return publishedSessionEntries.has(entry) && !frozenInput ? structuredClone(messages) : messages;
+}
+
+/** Internal projection shares owned payloads; the native runtime boundary copies mutable shells. */
+function getSessionEntryContextMessages(entry: SessionEntry): AgentMessage[] {
 	let messages: AgentMessage[];
 	if (entry.type === "message") {
 		const message = entry.message;
@@ -895,11 +906,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
 		messages = entry.systemMessage ? [entry.systemMessage, summary] : [summary];
 	} else return [];
-	// User/keyboard projections retain frozen stored-input semantics. Mutable
-	// non-user model state (e.g. usage edits) must not alias published history.
-	const frozenInput =
-		entry.type === "message" && (entry.message.role === "user" || entry.provenance?.channel === "keyboard");
-	return publishedSessionEntries.has(entry) && !frozenInput ? structuredClone(messages) : messages;
+	return messages;
 }
 
 /**
@@ -956,10 +963,19 @@ function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
-function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undefined): AgentMessage[] {
-	const messages = sessionEntryToContextMessages(entry);
+function projectContextEntry(
+	entry: SessionEntry,
+	edit: ContextEditEntry | undefined,
+	sharePublishedPayloads: boolean,
+): AgentMessage[] {
+	const messages = sharePublishedPayloads
+		? getSessionEntryContextMessages(entry)
+		: sessionEntryToContextMessages(entry);
 	if (!edit) return messages;
-	const replacement = publishedSessionEntries.has(edit) ? structuredClone(edit.replacement) : edit.replacement;
+	const replacement =
+		!sharePublishedPayloads && publishedSessionEntries.has(edit)
+			? structuredClone(edit.replacement)
+			: edit.replacement;
 	if (replacement === null) return [];
 
 	return messages.map((message) => {
@@ -994,6 +1010,7 @@ function projectSessionContext(
 	contextEntries: SessionEntry[],
 	thinkingLevel: string,
 	model: SessionContext["model"],
+	sharePublishedPayloads = false,
 ): SessionProjection {
 	const edits = new Map<string, ContextEditEntry>();
 	for (const entry of contextEntries) {
@@ -1008,7 +1025,7 @@ function projectSessionContext(
 			messages:
 				sourceEntry.type === "compaction" && index > 0
 					? []
-					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id), sharePublishedPayloads),
 		}),
 	);
 	return {
@@ -1440,6 +1457,8 @@ export class SessionManager {
 	private leafId: string | null = null;
 	#sessionEpoch: object = {};
 	#revision = 0;
+	/** One current immutable projection, sharing published payloads rather than a second transcript. */
+	#nativeProjection?: { revision: number; projection: SessionProjection };
 	#branchProjection?: {
 		revision: number;
 		path: SessionEntry[];
@@ -1559,6 +1578,7 @@ export class SessionManager {
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
 		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
+		this.#nativeProjection = undefined;
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			const entries = preloadedFileEntries ?? readEntriesFromFile(this.sessionFile, true);
@@ -1592,6 +1612,7 @@ export class SessionManager {
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
+		this.#nativeProjection = undefined;
 		this.sessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const header: SessionHeader = {
@@ -1621,6 +1642,7 @@ export class SessionManager {
 	}
 
 	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
+		this.#nativeProjection = undefined;
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 
 		if (header) {
@@ -1641,6 +1663,7 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
 		this.#revisionKey = undefined;
 		this.#branchProjection = undefined;
@@ -1690,6 +1713,7 @@ export class SessionManager {
 	 * range. Cold entries are rebound to the new file one line at a time.
 	 */
 	#writeEntries(fd: number, file: string): void {
+		this.#nativeProjection = undefined;
 		let offset = 0;
 		for (let i = 0; i < this.fileEntries.length; i++) {
 			const entry = this.fileEntries[i];
@@ -1728,6 +1752,7 @@ export class SessionManager {
 	 */
 	#releaseColdEntries(): void {
 		if (this.#ownedJournal || !this.persist || !this.flushed) return;
+		this.#nativeProjection = undefined;
 		const hot = new Set<string>();
 		for (const entry of buildContextEntries([], this.leafId, this.byId)) hot.add(entry.id);
 		for (let i = Math.max(0, this.fileEntries.length - RECENT_RESIDENT_ENTRIES); i < this.fileEntries.length; i++) {
@@ -2307,6 +2332,7 @@ export class SessionManager {
 			key.length !== this.fileEntries.length ||
 			key.leafId !== this.leafId
 		) {
+			this.#nativeProjection = undefined;
 			this.#revisionKey = { entries: this.fileEntries, length: this.fileEntries.length, leafId: this.leafId };
 			this.#revision++;
 		}
@@ -2403,6 +2429,7 @@ export class SessionManager {
 
 	/** Ordinary appends extend the cached branch instead of walking old history again. */
 	private extendBranchProjection(entry: SessionEntry): void {
+		this.#nativeProjection = undefined;
 		const cache = this.#branchProjection;
 		const key = this.#revisionKey;
 		if (
@@ -2445,8 +2472,40 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		const { contextEntries, thinkingLevel, model } = this.getBranchProjection();
-		return this.ownedView(projectSessionContext(contextEntries, thinkingLevel, model ? { ...model } : null));
+		const { revision, contextEntries, thinkingLevel, model } = this.getBranchProjection();
+		let projection = this.#nativeProjection?.revision === revision ? this.#nativeProjection.projection : undefined;
+		if (!projection) {
+			projection = projectSessionContext(contextEntries, thinkingLevel, model ? { ...model } : null, true);
+			// A frozen outer entry is not enough: native Map/Set/Date/typed-array/cyclic
+			// graphs deliberately remain readable and mutable, so never freeze or cache them.
+			if (contextEntries.every((entry) => publishedSessionEntries.has(entry))) {
+				freezeDetached(projection);
+				this.#nativeProjection = { revision, projection };
+			}
+		}
+		// The one native-to-runtime boundary: mutable shells and small usage/cost
+		// records, but no traversal or copying of immutable content/details/tools.
+		// Published source entries are already safe to share, including owned journals.
+		const entries = projection.entries.map(({ sourceEntry, messages }) => ({
+			sourceEntry,
+			messages: messages.map((message) => {
+				const runtime = { ...message };
+				if ((runtime.role === "assistant" || runtime.role === "toolResult") && runtime.usage) {
+					runtime.usage = {
+						...runtime.usage,
+						...(runtime.usage.cost ? { cost: { ...runtime.usage.cost } } : {}),
+					};
+				}
+				return runtime;
+			}),
+		}));
+		return {
+			entries,
+			// Flatten the new per-entry messages, preserving identity for runtime entry lookup.
+			messages: entries.flatMap((entry) => entry.messages),
+			thinkingLevel: projection.thinkingLevel,
+			model: projection.model ? { ...projection.model } : null,
+		};
 	}
 
 	buildSessionContext(): SessionContext {
@@ -2539,6 +2598,7 @@ export class SessionManager {
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
 		this.leafId = branchFromId;
 		this.#branchProjection = undefined;
@@ -2552,6 +2612,7 @@ export class SessionManager {
 	 */
 	resetLeaf(): void {
 		this.#ownedJournal?.assertActive();
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
 		this.leafId = null;
 		this.#branchProjection = undefined;
@@ -2574,6 +2635,7 @@ export class SessionManager {
 		}
 		this.#ownedJournal?.assertActive();
 		const fromId = this.leafId ?? "root";
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
 		if (!this.#ownedJournal) this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
@@ -2640,6 +2702,7 @@ export class SessionManager {
 		if (path.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
 		}
+		this.#nativeProjection = undefined;
 
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
 		// Because labels are real tree entries, later entries can be children of labels;
