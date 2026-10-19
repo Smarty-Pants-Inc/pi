@@ -122,6 +122,18 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
 	if (typeof message.rawStopReason === "string")
 		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
+	if (typeof message.rawStopDetails === "string") {
+		const redacted = redactValues(message.rawStopDetails, secrets);
+		message.rawStopDetails = new TextEncoder().encode(redacted).length <= 4096 ? redacted : JSON.stringify("***");
+	}
+	if (
+		message.api === "anthropic-messages" &&
+		message.stopReason === "error" &&
+		message.rawStopReason === "refusal" &&
+		typeof message.responseId === "string"
+	) {
+		message.responseId = redactValues(message.responseId, secrets);
+	}
 	// The handle id is a provider token that consumers persist and redeem: mask live values only, and
 	// replace the handle instead of rewriting the provider's own object (smarty-dev#5443 T-F6-deferred).
 	const deferred = message.deferred;

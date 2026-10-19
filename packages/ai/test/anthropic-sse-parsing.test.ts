@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Anthropic from "@anthropic-ai/sdk";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -597,7 +598,7 @@ describe("Anthropic raw SSE parsing", () => {
 		]);
 	});
 
-	it("preserves refusal stop details from message_delta", async () => {
+	it("records refusal stop details separately from the owned error message", async () => {
 		const model = getModel("anthropic", "claude-fable-5");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "blocked request", timestamp: Date.now() }],
@@ -653,9 +654,16 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
-		// smarty-dev#5822 (pi#202 round 3): owned refusal text; the provider's explanation is not published.
+		// The error remains owned text; untrusted provider details are a separate record-only field.
 		expect(result.errorMessage).toBe("The model refused to complete the request");
-		expect(JSON.stringify(result)).not.toContain(explanation);
+		// pi#297 security round 3: injected clients never retain raw refusal details, even below the cap.
+		const serialized = JSON.stringify({ type: "refusal", category: "cyber", explanation });
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(serialized, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(serialized, "utf8").digest("hex"));
+		expect(result.content).toEqual([]);
+		expect(JSON.stringify(result.diagnostics ?? [])).not.toContain(explanation);
 	});
 
 	it("preserves sensitive stop reasons with a descriptive error message", async () => {
