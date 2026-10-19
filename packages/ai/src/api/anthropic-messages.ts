@@ -46,6 +46,7 @@ import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { recordAssistantMessageStopDetails } from "../utils/refusal-stop-details.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
 import {
@@ -607,6 +608,11 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			timestamp: Date.now(),
 		};
 
+		let pendingStopDetails: unknown;
+		let hasPendingStopDetails = false;
+		let terminalStopReason: string | undefined;
+		let injectedClient = false;
+
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -615,6 +621,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 
 			if (options?.client) {
 				client = options.client;
+				injectedClient = true;
 				isOAuth = false;
 			} else {
 				const apiKey = options?.apiKey;
@@ -866,9 +873,19 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				} else if (event.type === "message_delta") {
 					const transformations = event.input_transformations;
 					if (Array.isArray(transformations)) inputTransformations = transformations;
-					if (event.delta.stop_reason) {
-						output.rawStopReason = event.delta.stop_reason;
-						const stopReasonResult = mapStopReason(event.delta.stop_reason, event.delta.stop_details);
+					// Details can precede the terminal reason; hold them until that reason decides whether they are recordable.
+					if (terminalStopReason === undefined && "stop_details" in event.delta) {
+						if (event.delta.stop_details == null) {
+							if (!hasPendingStopDetails) hasPendingStopDetails = true;
+						} else {
+							pendingStopDetails = event.delta.stop_details;
+							hasPendingStopDetails = true;
+						}
+					}
+					if (event.delta.stop_reason && terminalStopReason === undefined) {
+						terminalStopReason = event.delta.stop_reason;
+						output.rawStopReason = terminalStopReason;
+						const stopReasonResult = mapStopReason(terminalStopReason, event.delta.stop_details);
 						output.stopReason = stopReasonResult.stopReason;
 						if (stopReasonResult.errorMessage) {
 							output.errorMessage = stopReasonResult.errorMessage;
@@ -947,7 +964,17 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			);
 			output.recovery ??= norm.recovery;
 			output.errorMessage = formatProviderError(norm, "Anthropic API error");
-			stream.push({ type: "error", reason: output.stopReason, error: output });
+			// Partials share output; attach record-only details only to the separate terminal failure object.
+			const failure = { ...output };
+			if (terminalStopReason === "refusal") {
+				await recordAssistantMessageStopDetails(
+					failure,
+					hasPendingStopDetails ? pendingStopDetails : undefined,
+					getRequestDiagnosticSecrets(model, options),
+					injectedClient,
+				);
+			}
+			stream.push({ type: "error", reason: output.stopReason, error: failure });
 			stream.end();
 		}
 	})();

@@ -3,7 +3,8 @@
 // A published diagnostic is rebuilt from a closed list of Pi-owned types and a locally generated timestamp. No
 // provider error, name, stack, cause, error code, nested details or provider timestamp has an output path, so
 // neither a numeric `.code` nor any nested value can carry a credential equivalent into an event, result,
-// callback or session file.
+// callback or session file through diagnostics. The separate rawStopDetails field below is an explicit,
+// bounded, untrusted record-only exception; it is not an owned diagnostic or a recovery input.
 
 import type { AssistantMessage, TextContent, ThinkingContent, ToolCall } from "../types.ts";
 import { isolateValue } from "./assistant-message-snapshot.ts";
@@ -216,6 +217,8 @@ export function closedRawStopReason(value: unknown): string {
 	return typeof value === "string" && KNOWN_RAW_STOP_REASONS.has(value) ? value : "other";
 }
 
+const MAX_STOP_DETAILS_BYTES = 4096;
+
 /** Publication phase of a message: in progress, completed successfully, or failed or aborted. */
 export type PublicationPhase = "partial" | "success" | "failure";
 
@@ -232,8 +235,9 @@ export function terminalPhase(message: AssistantMessage): PublicationPhase {
  * private protocol state such as Codex's `responseId` continuation. The copy has a closed key set and snapshot
  * content, usage and diagnostics, so a queued partial cannot pick up later mutations and a consumer cannot
  * mutate adapter state. Wire metadata (`responseId`, `responseModel`, `providerThinkingLevel`) is published only
- * with a successful result, never on a partial or a failed or aborted message. The stream adds the owned recovery
- * decision and carries the private throttle wait (`AssistantMessageEventStream`).
+ * with a successful result, never on a partial or a failed or aborted message, except for the record-only
+ * responseId of an Anthropic refusal. The stream adds the owned recovery decision and carries the private
+ * throttle wait (`AssistantMessageEventStream`).
  */
 export function projectAssistantMessage(message: AssistantMessage, phase: PublicationPhase): AssistantMessage {
 	const content = Array.isArray(message.content) ? message.content : [];
@@ -260,6 +264,15 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 		if (message.responseId !== undefined) projected.responseId = message.responseId;
 		if (message.providerThinkingLevel !== undefined) projected.providerThinkingLevel = message.providerThinkingLevel;
 	}
+	if (
+		phase === "failure" &&
+		message.api === "anthropic-messages" &&
+		message.stopReason === "error" &&
+		message.rawStopReason === "refusal" &&
+		typeof message.responseId === "string"
+	) {
+		projected.responseId = message.responseId;
+	}
 	if (message.thinkingLevel !== undefined) projected.thinkingLevel = message.thinkingLevel;
 	const diagnostics = projectAssistantMessageDiagnostics(message.diagnostics);
 	if (diagnostics !== undefined) projected.diagnostics = diagnostics;
@@ -270,6 +283,35 @@ export function projectAssistantMessage(message: AssistantMessage, phase: Public
 		projected.errorHint = message.errorHint;
 	}
 	if (message.rawStopReason !== undefined) projected.rawStopReason = closedRawStopReason(message.rawStopReason);
+	// Keep the record-only field on refusal failures only; never merge it into error text, content or owned diagnostics.
+	if (
+		phase === "failure" &&
+		message.api === "anthropic-messages" &&
+		message.stopReason === "error" &&
+		message.rawStopReason === "refusal"
+	) {
+		if (message.stopDetailsState === "absent") projected.stopDetailsState = "absent";
+		if (
+			message.stopDetailsState === "retained" &&
+			typeof message.rawStopDetails === "string" &&
+			new TextEncoder().encode(message.rawStopDetails).length <= MAX_STOP_DETAILS_BYTES
+		) {
+			projected.rawStopDetails = message.rawStopDetails;
+			projected.stopDetailsState = "retained";
+		}
+		// Injected-client details are discarded even below the size cap.
+		if (
+			message.stopDetailsState === "discarded" &&
+			Number.isSafeInteger(message.stopDetailsBytes) &&
+			message.stopDetailsBytes! >= 0 &&
+			typeof message.stopDetailsSha256 === "string" &&
+			/^[a-f0-9]{64}$/.test(message.stopDetailsSha256)
+		) {
+			projected.stopDetailsState = "discarded";
+			projected.stopDetailsBytes = message.stopDetailsBytes;
+			projected.stopDetailsSha256 = message.stopDetailsSha256;
+		}
+	}
 	if (message.endTurn !== undefined) projected.endTurn = message.endTurn;
 	if (message.durationMs !== undefined) projected.durationMs = message.durationMs;
 	return projected;
