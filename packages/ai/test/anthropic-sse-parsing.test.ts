@@ -14,6 +14,43 @@ function createSseResponse(events: Array<{ event: string; data: string }>): Resp
 	});
 }
 
+function createSseResponseWithLineEnding(
+	events: Array<{ event: string; data: string }>,
+	lineEnding: "\n" | "\r\n",
+	splitAt?: number,
+): Response {
+	const body = events
+		.map(({ event, data }) => `event: ${event}${lineEnding}data: ${data}${lineEnding}`)
+		.join(lineEnding);
+	if (splitAt === undefined) {
+		return new Response(body, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+	}
+
+	const bytes = new TextEncoder().encode(body);
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(bytes.slice(0, splitAt));
+			controller.enqueue(bytes.slice(splitAt));
+			controller.close();
+		},
+	});
+	return new Response(stream, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+function createFinalCarriageReturnResponse(events: Array<{ event: string; data: string }>): Response {
+	const body = events.map(({ event, data }) => `event: ${event}\rdata: ${data}\r`).join("\r");
+	return new Response(body, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
 const minimalAnthropicEvents = [
 	{
 		event: "message_start",
@@ -110,6 +147,46 @@ function createResponseModelSseResponse(model: string, contentBlock: ResponseCon
 }
 
 describe("Anthropic raw SSE parsing", () => {
+	// Regression test for pi#297.
+	it("keeps CRLF events intact when every byte boundary splits the transport", async () => {
+		const model = getModel("anthropic", "claude-haiku-4-5");
+		const context = normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] });
+		const run = async (response: Response) => {
+			const calls: unknown[][] = [];
+			const result = await streamAnthropic(model, context, {
+				client: createFakeAnthropicClient(response),
+				onProviderStreamEvent: async (...args: unknown[]) => {
+					calls.push(args);
+				},
+			}).result();
+			return { calls, content: result.content, stopReason: result.stopReason, usage: result.usage };
+		};
+
+		const unsplitLf = await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\n"));
+		const unsplitCrlf = await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\r\n"));
+		expect(unsplitCrlf).toEqual(unsplitLf);
+
+		const bytes = new TextEncoder().encode(
+			minimalAnthropicEvents.map(({ event, data }) => `event: ${event}\r\ndata: ${data}\r\n`).join("\r\n"),
+		);
+		for (let splitAt = 1; splitAt < bytes.length; splitAt++) {
+			expect(await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\r\n", splitAt))).toEqual(
+				unsplitCrlf,
+			);
+		}
+	});
+
+	it("parses a final event terminated by a lone carriage return", async () => {
+		const result = await streamAnthropic(
+			getModel("anthropic", "claude-haiku-4-5"),
+			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
+			{ client: createFakeAnthropicClient(createFinalCarriageReturnResponse(minimalAnthropicEvents)) },
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "Hello" }]);
+	});
+
 	// smarty-dev#5822 C1: one Pi-owned notification per parsed event, no raw event or model argument.
 	it("notifies the observer once per parsed provider stream event without provider data", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
