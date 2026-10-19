@@ -118,6 +118,18 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 		message.errorMessage = redactOAuthDiagnostic(message.errorMessage, secrets);
 	if (typeof message.rawStopReason === "string")
 		message.rawStopReason = redactOAuthDiagnostic(message.rawStopReason, secrets);
+	if (typeof message.rawStopDetails === "string") {
+		const redacted = redactValues(message.rawStopDetails, secrets);
+		message.rawStopDetails = new TextEncoder().encode(redacted).length <= 4096 ? redacted : JSON.stringify("***");
+	}
+	if (
+		message.api === "anthropic-messages" &&
+		message.stopReason === "error" &&
+		message.rawStopReason === "refusal" &&
+		typeof message.responseId === "string"
+	) {
+		message.responseId = redactValues(message.responseId, secrets);
+	}
 	const deferred = message.deferred;
 	if (typeof deferred?.id === "string") {
 		const id = redactValues(deferred.id, secrets);
@@ -126,6 +138,37 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 }
 function projectMessage(message: AssistantMessage, phase: PublicationPhase): AssistantMessage {
 	const projected = projectAssistantMessage(message, phase);
+	// The closed snapshot omits failure wire metadata. Keep this record-only exception on refusal failures only,
+	// never on partials/success/abort or in error text, content, owned diagnostics or recovery inputs.
+	if (
+		phase === "failure" &&
+		message.api === "anthropic-messages" &&
+		message.stopReason === "error" &&
+		message.rawStopReason === "refusal"
+	) {
+		if (typeof message.responseId === "string") projected.responseId = message.responseId;
+		if (message.stopDetailsState === "absent") projected.stopDetailsState = "absent";
+		if (
+			message.stopDetailsState === "retained" &&
+			typeof message.rawStopDetails === "string" &&
+			new TextEncoder().encode(message.rawStopDetails).length <= 4096
+		) {
+			projected.rawStopDetails = message.rawStopDetails;
+			projected.stopDetailsState = "retained";
+		}
+		// Injected-client details are discarded even below the size cap.
+		if (
+			message.stopDetailsState === "discarded" &&
+			Number.isSafeInteger(message.stopDetailsBytes) &&
+			message.stopDetailsBytes! >= 0 &&
+			typeof message.stopDetailsSha256 === "string" &&
+			/^[a-f0-9]{64}$/.test(message.stopDetailsSha256)
+		) {
+			projected.stopDetailsState = "discarded";
+			projected.stopDetailsBytes = message.stopDetailsBytes;
+			projected.stopDetailsSha256 = message.stopDetailsSha256;
+		}
+	}
 	const recovery = message.stopReason === "error" ? assistantRecovery(message) : ownedRecovery(message.recovery);
 	if (recovery !== undefined) projected.recovery = recovery;
 	transferThrottledLimitWait(message, projected);

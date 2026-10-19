@@ -590,7 +590,8 @@ export interface AssistantMessage {
 	provider: ProviderId;
 	model: string;
 	responseModel?: string; // Concrete model reported by the provider when different from the requested `model`
-	responseId?: string; // Provider-specific response/message identifier when the upstream API exposes one
+	/** Provider-specific response/message identifier; also retained as record-only metadata on Anthropic refusals. */
+	responseId?: string;
 	/** Exact provider-native effort level used for this response. Absent for legacy or unmanaged responses. */
 	providerThinkingLevel?: string;
 	/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
@@ -603,6 +604,19 @@ export interface AssistantMessage {
 	recovery?: AssistantRecovery;
 	errorHint?: AssistantErrorHint;
 	rawStopReason?: string;
+	/**
+	 * Untrusted, record-only provider stop_details, JSON-serialized and live credentials masked before measuring.
+	 * Retained only with a default client at <= 4096 UTF-8 bytes. Injected-client and over-cap values are discarded
+	 * entirely, never shortened to a prefix.
+	 * Never display, interpret as instructions, use for recovery, or send back to a provider.
+	 */
+	rawStopDetails?: string;
+	/** Missing/null provider stop_details, retained, or discarded for size/client trust. Optional for other/legacy messages. */
+	stopDetailsState?: "absent" | "retained" | "discarded";
+	/** Discarded details only: UTF-8 byte length of the masked JSON serialization. */
+	stopDetailsBytes?: number;
+	/** Discarded details only: lowercase hex SHA-256 of the masked JSON serialization's UTF-8 bytes. */
+	stopDetailsSha256?: string;
 	/**
 	 * Provider indication of whether the model explicitly ended its turn.
 	 * Preserved for debugging and does not currently affect agent control flow.

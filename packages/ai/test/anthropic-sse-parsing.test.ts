@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type Anthropic from "@anthropic-ai/sdk";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
@@ -9,6 +10,35 @@ import type { Model, ToolCall } from "../src/types.ts";
 function createSseResponse(events: Array<{ event: string; data: string }>): Response {
 	const body = events.map(({ event, data }) => `event: ${event}\ndata: ${data}\n`).join("\n");
 	return new Response(body, {
+		status: 200,
+		headers: { "content-type": "text/event-stream" },
+	});
+}
+
+function createSseResponseWithLineEnding(
+	events: Array<{ event: string; data: string }>,
+	lineEnding: "\n" | "\r\n",
+	splitAt?: number,
+): Response {
+	const body = events
+		.map(({ event, data }) => `event: ${event}${lineEnding}data: ${data}${lineEnding}`)
+		.join(lineEnding);
+	if (splitAt === undefined) {
+		return new Response(body, {
+			status: 200,
+			headers: { "content-type": "text/event-stream" },
+		});
+	}
+
+	const bytes = new TextEncoder().encode(body);
+	const stream = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(bytes.slice(0, splitAt));
+			controller.enqueue(bytes.slice(splitAt));
+			controller.close();
+		},
+	});
+	return new Response(stream, {
 		status: 200,
 		headers: { "content-type": "text/event-stream" },
 	});
@@ -110,6 +140,87 @@ function createResponseModelSseResponse(model: string, contentBlock: ResponseCon
 }
 
 describe("Anthropic raw SSE parsing", () => {
+	// Regression test for pi#300 / smarty-dev#14983.
+	it("keeps CRLF events intact when every byte boundary splits the transport", async () => {
+		const model = getModel("anthropic", "claude-haiku-4-5");
+		const context = normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] });
+		const run = async (response: Response) => {
+			const calls: unknown[][] = [];
+			const result = await streamAnthropic(model, context, {
+				client: createFakeAnthropicClient(response),
+				onProviderStreamEvent: async (...args: unknown[]) => {
+					calls.push(args);
+				},
+			}).result();
+			return { calls, content: result.content, stopReason: result.stopReason, usage: result.usage };
+		};
+
+		const unsplitLf = await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\n"));
+		const unsplitCrlf = await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\r\n"));
+		expect(unsplitCrlf).toEqual(unsplitLf);
+		expect(unsplitCrlf.calls).toEqual(Array.from({ length: 6 }, () => [{ type: "provider_stream_event" }]));
+
+		const bytes = new TextEncoder().encode(
+			minimalAnthropicEvents.map(({ event, data }) => `event: ${event}\r\ndata: ${data}\r\n`).join("\r\n"),
+		);
+		for (let splitAt = 1; splitAt < bytes.length; splitAt++) {
+			expect(await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\r\n", splitAt))).toEqual(
+				unsplitCrlf,
+			);
+		}
+	});
+
+	// pi#300: EOF makes a pending CR a complete line ending.
+	it("parses a final event terminated by a lone carriage return", async () => {
+		const body = minimalAnthropicEvents.map(({ event, data }) => `event: ${event}\rdata: ${data}\r`).join("\r");
+		const result = await streamAnthropic(
+			getModel("anthropic", "claude-haiku-4-5"),
+			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
+			{
+				client: createFakeAnthropicClient(new Response(body, { headers: { "content-type": "text/event-stream" } })),
+			},
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "Hello" }]);
+	});
+
+	// pi#300: multiple splits, multiline data, UTF-8 splits and no final newline share the same decoder.
+	it("decodes multiline CRLF data one byte at a time through EOF without duplicate notifications", async () => {
+		const events = minimalAnthropicEvents.map(({ event, data }) => ({
+			event,
+			data: data.replace('"Hello"', '"Hello 😀é"').replace(",", ",\r\ndata: "),
+		}));
+		const body = events.map(({ event, data }) => `event: ${event}\r\ndata: ${data}`).join("\r\n\r\n");
+		const bytes = new TextEncoder().encode(body);
+		const calls: unknown[][] = [];
+		const result = await streamAnthropic(
+			getModel("anthropic", "claude-haiku-4-5"),
+			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
+			{
+				client: createFakeAnthropicClient(
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								for (let offset = 0; offset < bytes.length; offset++)
+									controller.enqueue(bytes.slice(offset, offset + 1));
+								controller.close();
+							},
+						}),
+						{ headers: { "content-type": "text/event-stream" } },
+					),
+				),
+				onProviderStreamEvent: (...args: unknown[]) => {
+					calls.push(args);
+				},
+			},
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "Hello 😀é" }]);
+		expect(calls).toEqual(Array.from({ length: 6 }, () => [{ type: "provider_stream_event" }]));
+	});
+
 	// smarty-dev#5822 C1: one owned notification per event, never the raw event or model.
 	it("notifies once per parsed provider stream event without provider data", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
@@ -520,7 +631,7 @@ describe("Anthropic raw SSE parsing", () => {
 		]);
 	});
 
-	it("preserves refusal stop details from message_delta", async () => {
+	it("records refusal stop details separately from the owned error message", async () => {
 		const model = getModel("anthropic", "claude-fable-5");
 		const context = normalizeContext({
 			messages: [{ role: "user", content: "blocked request", timestamp: Date.now() }],
@@ -576,9 +687,16 @@ describe("Anthropic raw SSE parsing", () => {
 
 		expect(result.stopReason).toBe("error");
 		expect(result.rawStopReason).toBe("refusal");
-		// smarty-dev#5822: the provider's refusal explanation is private.
+		// The error remains owned text; untrusted provider details are a separate record-only field.
 		expect(result.errorMessage).toBe("The model refused to complete the request");
-		expect(JSON.stringify(result)).not.toContain(explanation);
+		// pi#297 security round 3: injected clients never retain raw refusal details, even below the cap.
+		const serialized = JSON.stringify({ type: "refusal", category: "cyber", explanation });
+		expect(result.stopDetailsState).toBe("discarded");
+		expect(result).not.toHaveProperty("rawStopDetails");
+		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(serialized, "utf8"));
+		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(serialized, "utf8").digest("hex"));
+		expect(result.content).toEqual([]);
+		expect(JSON.stringify(result.diagnostics ?? [])).not.toContain(explanation);
 	});
 
 	it("preserves sensitive stop reasons with a descriptive error message", async () => {

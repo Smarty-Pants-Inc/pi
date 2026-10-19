@@ -1,4 +1,6 @@
 // Published diagnostics are rebuilt from Pi-owned fields; provider text stays private.
+// Refusal stop_details are a separate bounded, untrusted record-only exception in event-stream.ts,
+// never an owned diagnostic or a recovery input.
 
 const KNOWN_RAW_STOP_REASONS: ReadonlySet<string> = new Set([
 	"end_turn",
