@@ -102,7 +102,7 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 		expect(requests()).toBe(path === "initial" ? 1 : 2);
 	});
 
-	// Abort is covered below: like upstream, queued input still reaches the aborted run.
+	// Abort is covered below: queued input still reaches the aborted transcript.
 	it.each(["clear", "fail"] as const)(
 		"does not manufacture a provider turn when preparation ends with %s",
 		async (action) => {
@@ -127,7 +127,7 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 		},
 	);
 
-	// smarty-dev#244 (N1): abort must not leave queued input in the queue.
+	// smarty-dev#244 (N1), smarty-dev#14950: transfer queued input without dispatching after abort.
 	it("delivers input queued before an abort once, to the aborted run", async () => {
 		const signals: boolean[] = [];
 		const agent = new Agent({
@@ -145,8 +145,8 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 			},
 		});
 		const message: SystemMessage = { role: "system", content: "queued before abort", timestamp: 2 };
-		agent.finishTurn = () => {
-			if (signals.length === 1) agent[queue](message);
+		agent.finishTurn = ({ message: completed }) => {
+			if (completed.stopReason !== "aborted" && signals.length === 1) agent[queue](message);
 		};
 		agent.prepareNextTurn = async () => {
 			await Promise.resolve();
@@ -156,7 +156,7 @@ describe.each(["steer", "followUp"] as const)("%s transcript transfer", (queue) 
 
 		await agent.prompt("start");
 
-		expect(signals).toEqual([false, true]);
+		expect(signals).toEqual([false]);
 		expect(
 			agent.state.messages.filter((value) => value.role === "system" && value.content === message.content),
 		).toHaveLength(1);

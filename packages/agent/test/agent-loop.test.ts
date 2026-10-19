@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import { describe, expect, it } from "vitest";
+import { lazyStream, requestSetupError } from "../../ai/src/api/lazy.ts";
 import { agentLoop, agentLoopContinue, runAgentLoop, runToolCall } from "../src/agent-loop.ts";
 import { setDefaultStreamFn } from "../src/index.ts";
 import type {
@@ -107,6 +108,360 @@ describe("default stream function compatibility", () => {
 		} finally {
 			setDefaultStreamFn(undefined);
 		}
+	});
+});
+
+// Smarty-Pants-Inc/smarty-dev#14950: cancellation must not become a request setup failure.
+describe("run abort dispatch guard", () => {
+	it.each([
+		{ toolExecution: "parallel", abortAt: "tool" },
+		{ toolExecution: "sequential", abortAt: "tool" },
+		{ toolExecution: "parallel", abortAt: "result" },
+		{ toolExecution: "sequential", abortAt: "result" },
+	] as const)(
+		"preserves a finalized $toolExecution tool result after abort at $abortAt",
+		async ({ toolExecution, abortAt }) => {
+			const controller = new AbortController();
+			const tool: AgentTool = {
+				name: "noop",
+				label: "Noop",
+				description: "Returns a finalized result",
+				parameters: Type.Object({}),
+				async execute() {
+					if (abortAt === "tool") controller.abort();
+					return { content: [{ type: "text", text: "completed" }], details: {} };
+				},
+			};
+			let dispatches = 0;
+			const finished: AssistantMessage["stopReason"][] = [];
+			const events: AgentEvent[] = [];
+			const messages = await runAgentLoop(
+				[createUserMessage("run")],
+				{ messages: [], tools: [tool] },
+				{
+					model: createModel(),
+					convertToLlm: identityConverter,
+					toolExecution,
+					finishTurn: ({ message }) => {
+						finished.push(message.stopReason);
+					},
+				},
+				(event) => {
+					events.push(event);
+					if (abortAt === "result" && event.type === "message_end" && event.message.role === "toolResult")
+						controller.abort();
+				},
+				controller.signal,
+				() => {
+					dispatches++;
+					const response = createAssistantMessageEventStream();
+					const message =
+						dispatches === 1
+							? createAssistantMessage([{ type: "toolCall", id: "t1", name: "noop", arguments: {} }], "toolUse")
+							: createAssistantMessage([{ type: "text", text: "unexpected dispatch" }]);
+					response.push({ type: "done", reason: message.stopReason === "toolUse" ? "toolUse" : "stop", message });
+					return response;
+				},
+			);
+
+			expect(dispatches).toBe(1);
+			expect(messages.at(-2)).toMatchObject({
+				role: "toolResult",
+				toolCallId: "t1",
+				isError: false,
+				content: [{ type: "text", text: "completed" }],
+			});
+			expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted", usage: createUsage() });
+			expect(finished).toEqual(["toolUse", "aborted"]);
+			expect(events.at(-2)).toMatchObject({ type: "turn_end", message: { stopReason: "aborted" } });
+			expect(events.at(-1)).toMatchObject({ type: "agent_end", messages });
+			expect(messages.some((message) => message.role === "assistant" && message.stopReason === "error")).toBe(false);
+		},
+	);
+
+	it.each(["prompt", "continue"] as const)("does not dispatch a pre-aborted %s run", async (kind) => {
+		const controller = new AbortController();
+		controller.abort();
+		let dispatches = 0;
+		const config: AgentLoopConfig = { model: createModel(), convertToLlm: identityConverter };
+		const streamFn = () => {
+			dispatches++;
+			const response = createAssistantMessageEventStream();
+			response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+			return response;
+		};
+		const prompt = createUserMessage("run");
+		const stream =
+			kind === "prompt"
+				? agentLoop([prompt], { messages: [] }, config, controller.signal, streamFn)
+				: agentLoopContinue({ messages: [prompt] }, config, controller.signal, streamFn);
+		const events: AgentEvent[] = [];
+		for await (const event of stream) events.push(event);
+		expect(dispatches).toBe(0);
+		expect((await stream.result()).at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(events.at(-2)).toMatchObject({ type: "turn_end", message: { stopReason: "aborted" } });
+		expect(events.at(-1)?.type).toBe("agent_end");
+	});
+
+	it.each(["steering", "follow-up"] as const)("classifies abort while polling %s after a turn", async (queueKind) => {
+		const controller = new AbortController();
+		let dispatches = 0;
+		const events: AgentEvent[] = [];
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			getSteeringMessages: async () => {
+				if (queueKind === "steering" && dispatches > 0) {
+					controller.abort();
+					return [createUserMessage("queued")];
+				}
+				return [];
+			},
+			getFollowUpMessages: async () => {
+				if (queueKind === "follow-up") controller.abort();
+				return [];
+			},
+		};
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			config,
+			(event) => {
+				events.push(event);
+			},
+			controller.signal,
+			() => {
+				dispatches++;
+				const response = createAssistantMessageEventStream();
+				response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+				return response;
+			},
+		);
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(events.filter((event) => event.type === "turn_start")).toHaveLength(2);
+		expect(events.filter((event) => event.type === "turn_end")).toHaveLength(2);
+		expect(events.at(-1)?.type).toBe("agent_end");
+	});
+
+	it("preserves follow-up input returned during abort without dispatching it", async () => {
+		const controller = new AbortController();
+		const queued = createUserMessage("follow-up returned during abort");
+		let dispatches = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				getFollowUpMessages: async () => {
+					controller.abort();
+					return [queued];
+				},
+			},
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				const response = createAssistantMessageEventStream();
+				response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+				return response;
+			},
+		);
+		expect(dispatches).toBe(1);
+		expect(messages).toContain(queued);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+	});
+
+	it.each(
+		(["error", "stop"] as const).flatMap((reason) =>
+			(["observer", "microtask"] as const).map((abortAt) => ({ reason, abortAt })),
+		),
+	)("retains a stream $reason that settled before a later $abortAt abort", async ({ reason, abortAt }) => {
+		const controller = new AbortController();
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			(event) => {
+				if (abortAt === "observer" && event.type === "message_start" && event.message.role === "assistant")
+					controller.abort();
+			},
+			controller.signal,
+			() => {
+				const response = createAssistantMessageEventStream();
+				const final = {
+					...createAssistantMessage([]),
+					stopReason: reason,
+					errorMessage: reason === "error" ? "real provider failure" : undefined,
+				};
+				response.push({ type: "start", partial: createAssistantMessage([]) });
+				if (reason === "error") response.push({ type: "error", reason, error: final });
+				else response.push({ type: "done", reason, message: final });
+				if (abortAt === "microtask") queueMicrotask(() => controller.abort());
+				return response;
+			},
+		);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: reason });
+		expect((messages.at(-1) as AssistantMessage).errorMessage).toBe(
+			reason === "error" ? "real provider failure" : undefined,
+		);
+	});
+
+	it.each(["prepareRequest", "transformContext", "convertToLlm", "getApiKey"] as const)(
+		"does not dispatch when abort fires during %s",
+		async (phase) => {
+			const controller = new AbortController();
+			const config: AgentLoopConfig = {
+				model: createModel(),
+				convertToLlm: identityConverter,
+			};
+			if (phase === "prepareRequest")
+				config.prepareRequest = async () => {
+					controller.abort();
+				};
+			if (phase === "transformContext")
+				config.transformContext = async (messages) => {
+					controller.abort();
+					return messages;
+				};
+			if (phase === "convertToLlm")
+				config.convertToLlm = async (messages) => {
+					controller.abort();
+					return identityConverter(messages);
+				};
+			if (phase === "getApiKey")
+				config.getApiKey = async () => {
+					controller.abort();
+					return undefined;
+				};
+			let dispatches = 0;
+			const messages = await agentLoop(
+				[createUserMessage("run")],
+				{ messages: [] },
+				config,
+				controller.signal,
+				() => {
+					dispatches++;
+					const response = createAssistantMessageEventStream();
+					response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+					return response;
+				},
+			).result();
+			expect(dispatches).toBe(0);
+			expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		},
+	);
+
+	// pi#298 / smarty-dev#14950: the rejected promise already exists when abort fires.
+	it("keeps an async StreamFn rejection settled before abort", async () => {
+		const controller = new AbortController();
+		let dispatches = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				const rejected = Promise.reject(new Error("real failure settled before abort"));
+				controller.abort();
+				return rejected;
+			},
+		);
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "real failure settled before abort",
+		});
+	});
+
+	it("keeps a completed async StreamFn result settled before abort without another dispatch", async () => {
+		const controller = new AbortController();
+		let dispatches = 0;
+		const messages = await runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{
+				model: createModel(),
+				convertToLlm: identityConverter,
+				finishTurn: () => ({ action: "continue" }),
+			},
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				const response = createAssistantMessageEventStream();
+				response.push({ type: "done", reason: "stop", message: createAssistantMessage([]) });
+				const completed = Promise.resolve(response);
+				controller.abort();
+				return completed;
+			},
+		);
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "stop" });
+		expect(messages.filter((message) => message.role === "assistant")).toHaveLength(1);
+	});
+
+	it("keeps an abort-caused async StreamFn rejection aborted", async () => {
+		const controller = new AbortController();
+		const entered = Promise.withResolvers<void>();
+		const setup = Promise.withResolvers<ReturnType<typeof createAssistantMessageEventStream>>();
+		let dispatches = 0;
+		const run = runAgentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			() => {},
+			controller.signal,
+			() => {
+				dispatches++;
+				entered.resolve();
+				return setup.promise;
+			},
+		);
+		await entered.promise;
+		controller.abort();
+		setup.reject(new Error("setup failed after abort"));
+		const messages = await run;
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+			errorMessage: "Operation aborted",
+		});
+	});
+
+	it.each([false, true])("keeps live-signal setup failure=%s unchanged", async (setupFailure) => {
+		const controller = new AbortController();
+		let dispatches = 0;
+		const messages = await agentLoop(
+			[createUserMessage("run")],
+			{ messages: [] },
+			{ model: createModel(), convertToLlm: identityConverter },
+			controller.signal,
+			(model) => {
+				dispatches++;
+				return lazyStream(model, async () => {
+					if (setupFailure) throw requestSetupError(new Error("setup failed"));
+					const response = createAssistantMessageEventStream();
+					response.push({
+						type: "done",
+						reason: "stop",
+						message: createAssistantMessage([{ type: "text", text: "done" }]),
+					});
+					return response;
+				});
+			},
+		).result();
+		expect(dispatches).toBe(1);
+		expect(messages.at(-1)).toMatchObject(
+			setupFailure
+				? { role: "assistant", stopReason: "error", errorMessage: "request setup failed: Error" }
+				: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+		);
 	});
 });
 
