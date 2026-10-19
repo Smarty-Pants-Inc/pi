@@ -281,13 +281,25 @@ Context derivation:
    fork cut or at an interrupted tail. Drop tool results with no preceding call.
 9. Exclude model-less entries and assistant messages with `aborted`, `error`, or
    `deferred` stop reasons from future provider requests.
-10. Move a system message that only user messages precede to the front. A
-    run's input is committed before generation renders the system prompt, so a
-    transcript, or the range after a compaction or reset, otherwise starts with
-    the input. Providers treat only a leading system message as the initial
-    prompt and tool set; without one, a later tool change rewrites the
-    request's tool list and invalidates the whole prompt cache. Stored entries
-    and `contributions` keep the committed order.
+10. Move the first system message to the front when only user messages
+    precede it, or when it is the baseline's: the first `pi.system` entry after
+    `H`, unless an edit targets it. Generation writes it with every section and
+    tool in effect before the first request after a compaction or reset, and
+    omits the retained `pi.system` entries. Without `H`, the first `pi.system`
+    entry is the baseline unless an earlier entry carries a system message, in
+    its messages or an edit's replacement, even one an edit omits later: only
+    then did generation write it with every section and tool in effect, before
+    the first request or once an agent without any gets one. A run's input
+    is committed before generation renders the system prompt, so the context
+    otherwise starts with the input, or with the kept history, assistant
+    messages included. Providers treat only a leading system message as the
+    initial prompt and tool set; without one, a later tool change rewrites the
+    request's tool list and invalidates the whole prompt cache. Only the first
+    system message moves, so replay gives the same sections and tools. Any other
+    system message with an assistant message before it stays in place, since
+    moving it would change what it means; a retained system message of another
+    kind ahead of the baseline therefore keeps the baseline from leading.
+    Stored entries and `contributions` keep the committed order.
 
 Views carry raw active entries. UI reduction and model-context reduction are
 separate consumers. Older stored history is available through the owning
@@ -1817,9 +1829,7 @@ commits around one effect, but each durable checkpoint is a full replacement.
 `TaskRuntime.commit()` rereads and gates the current durable task on the Session
 line before invoking its callback. It rejects when the invocation has ended, the
 Harness is closing, the task is terminal, or a run invocation's task carries an
-abort mark. No handler commit passes an abort mark; the only write under one is
-the scheduler's internal live partial write of a generation (section 8.3).
-Its `tx.createTask()` defaults to the task's conversation, and every
+abort mark. Its `tx.createTask()` defaults to the task's conversation, and every
 entry it appends records the task as `byTaskId`. When the
 callback returns a state, the runtime replaces the task's state in the same
 commit, so the checkpoint or outcome is atomic with the callback's entries,
@@ -4001,18 +4011,8 @@ The run's inputs live in `pi.live.run`, not in the task input.
 - `afterResponse` observes every terminal message, from `request` or `poll`,
   before classification; a still deferred result is not terminal.
 - Before classifying, the handler stops the partial throttle and awaits any
-  partial commit in flight, so no stale partial lands after the outcome. Unless
-  the stream completed normally without an abort, it then commits a pending
-  partial with answer output. After an abort mark, that commit, or a retry of a
-  regular one the mark rejected, takes the scheduler's internal live partial
-  write: the one write that passes the mark. It is not part of `TaskRuntime` or
-  the package exports, is refused for any task other than a run invocation of a
-  `pi.generation` that owns `pi.live.run`, writes only
-  `pi.live.generation.message` with an assistant message, and never changes
-  the task's state. The abort handler then converts the partial. Every error
-  entry below whose terminal message dropped the answer output of the committed
-  answer-bearing partial takes that partial's content. The terminal message is
-  classified in one commit that also clears the partial:
+  partial commit in flight, so no stale partial lands after the outcome. The
+  terminal message is classified in one commit that also clears the partial:
   - `stop`/`length`: before the commit, the `onYield` chain runs; the first
     `{ continue }` wins. The commit appends the answer and applies the final
     boundary (section 6). With a continuation and no selected user item or

@@ -21,8 +21,7 @@ export function shortenPath(path: unknown): string {
  * OSC 8 file URL for a path. Herdr runs its link handlers on the Herdr server host, which may not be the
  * client's host, so for Herdr the URL names this host (as the OSC 8 spec suggests) and puts the line in the
  * fragment (`#42`, as kitty's hyperlinked grep does). Other terminals get a plain `file:///path`, which every
- * opener accepts; on Windows a host would turn the URL into a UNC path. Pi's own fullscreen click-to-open
- * turns this host's links back into `file:///path` (see `toLocalOpenTarget`).
+ * opener accepts; on Windows a host would turn the URL into a UNC path.
  */
 export function fileLinkUrl(
 	absolutePath: string,
@@ -54,6 +53,24 @@ export function str(value: unknown): string | null {
 	if (typeof value === "string") return value;
 	if (value == null) return "";
 	return null;
+}
+
+function parseLineNumber(value: unknown): number | undefined {
+	if (typeof value === "string" && value.trim() !== "") value = Number(value);
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/** Format finite numbers or numeric strings as a read line range, omitting malformed ranges. */
+export function formatReadLineRange(offset: unknown, limit: unknown): string {
+	// Strict schemas represent omitted optional arguments as null.
+	if (offset == null && limit == null) return "";
+	const start = offset == null ? 1 : parseLineNumber(offset);
+	if (start === undefined) return "";
+	if (limit == null) return `:${start}`;
+	const count = parseLineNumber(limit);
+	if (count === undefined) return "";
+	const end = start + count - 1;
+	return `:${start}${end ? `-${end}` : ""}`;
 }
 
 export function replaceTabs(text: string): string {

@@ -1,4 +1,9 @@
-import { formatThrownValue } from "./diagnostics.ts";
+/** Text shared by model-operation and setup errors; no assistant-publication dependency. */
+export function formatThrownValue(value: unknown): string {
+	if (value instanceof Error) return value.message || value.name;
+	if (typeof value === "string") return value;
+	return String(value);
+}
 
 export type ModelsErrorCode = "model_source" | "model_validation" | "provider" | "stream" | "auth" | "oauth";
 

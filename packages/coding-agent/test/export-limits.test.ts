@@ -3,7 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { exportFromFile, exportSessionToHtml } from "../src/core/export-html/index.ts";
-import { MAX_MATERIALIZED_EXPORT_BYTES, MAX_MATERIALIZED_EXPORT_ENTRIES } from "../src/core/export-limits.ts";
+import {
+	MAX_MATERIALIZED_EXPORT_BYTES,
+	MAX_MATERIALIZED_EXPORT_ENTRIES,
+	prepareExportValueForJson,
+} from "../src/core/export-limits.ts";
 import { exportSessionToJsonl, serializeSessionBranch } from "../src/core/session-export.ts";
 import { type FileEntry, SessionManager } from "../src/core/session-manager.ts";
 
@@ -149,6 +153,213 @@ describe("bounded session exports (#11897)", () => {
 		expect(() => exportSessionToJsonl(sm, join(directory(), "huge.jsonl"))).toThrow(/64 MiB/);
 		// Only the tiny header may be stringified, never the oversized entry.
 		expect(stringify.mock.calls.every(([value]) => (value as { type: string }).type === "session")).toBe(true);
+	});
+
+	it("bounds nested toJSON results after one hook and matches normal JSON serialization", () => {
+		const payload = Buffer.alloc(8);
+		let hookCalls = 0;
+		Object.defineProperty(payload, "toJSON", {
+			value: () => {
+				hookCalls++;
+				return "x".repeat(32);
+			},
+		});
+		const value = { payload };
+		expect(() => prepareExportValueForJson(value, "JSONL", 16)).toThrow(/materialization limit/);
+		expect(hookCalls).toBe(1);
+
+		const expected = JSON.stringify(value);
+		hookCalls = 0;
+		const prepared = prepareExportValueForJson(value, "JSONL", 128);
+		expect(JSON.stringify(prepared)).toBe(expected);
+		expect(hookCalls).toBe(1);
+	});
+
+	// #3155: a hook returning its receiver is not itself a cycle, including repeated references.
+	it("matches native self-returning hooks at root, object and array positions with nested hooks once", () => {
+		const hook = vi.fn(function (this: object, _key: string) {
+			return this;
+		});
+		const nestedHook = vi.fn((key: string) => ({ key, value: "nested" }));
+		const receiver = { value: "ok", nested: { toJSON: nestedHook }, toJSON: hook };
+		const cases: [unknown, string[]][] = [
+			[receiver, [""]],
+			[{ payload: receiver }, ["payload"]],
+			[[receiver], ["0"]],
+			[{ first: receiver, second: receiver }, ["first", "second"]],
+		];
+		for (const [value, keys] of cases) {
+			const expected = JSON.stringify(value);
+			hook.mockClear();
+			nestedHook.mockClear();
+			const prepared = prepareExportValueForJson(value, "JSONL", Buffer.byteLength(expected));
+			expect(JSON.stringify(prepared)).toBe(expected);
+			expect(hook.mock.calls).toEqual(keys.map((key) => [key]));
+			expect(nestedHook.mock.calls).toEqual(keys.map(() => ["nested"]));
+		}
+	});
+
+	// #3155: native stringify still rejects a self data field after applying the hook at each occurrence.
+	it("refuses actual circular self data after a receiver-returning hook", () => {
+		const hook = vi.fn(function (this: object, _key: string) {
+			return this;
+		});
+		const receiver: Record<string, unknown> = { value: "ok", toJSON: hook };
+		receiver.self = receiver;
+		const value = { payload: receiver };
+		expect(() => JSON.stringify(value)).toThrow(/circular/);
+		expect(hook.mock.calls).toEqual([["payload"], ["self"]]);
+		hook.mockClear();
+		expect(() => prepareExportValueForJson(value, "JSONL", 128)).toThrow(/circular session data/);
+		expect(hook.mock.calls).toEqual([["payload"], ["self"]]);
+	});
+
+	// #3155: a nested hook gets the chance to remove a backreference before the native cycle check.
+	it("applies a revisited ancestor's hook before checking its serialized result for cycles", () => {
+		let calls = 0;
+		const hook = vi.fn(function (this: object, _key: string): unknown {
+			return ++calls === 1 ? this : "finished";
+		});
+		const receiver: Record<string, unknown> = { toJSON: hook };
+		receiver.self = receiver;
+		const value = { payload: receiver };
+		const expected = JSON.stringify(value);
+		calls = 0;
+		hook.mockClear();
+		expect(JSON.stringify(prepareExportValueForJson(value, "JSONL", 128))).toBe(expected);
+		expect(hook.mock.calls).toEqual([["payload"], ["self"]]);
+	});
+
+	// #3155: tiny exact-output budgets cover both acceptance and bounded oversized self-return refusal.
+	it("charges a self-returning receiver's exact output bytes before stringify", () => {
+		const hook = vi.fn(function (this: object, _key: string) {
+			return this;
+		});
+		const value = { payload: { text: '雪\n"', toJSON: hook } };
+		const expected = JSON.stringify(value);
+		const bytes = Buffer.byteLength(expected);
+		hook.mockClear();
+		expect(JSON.stringify(prepareExportValueForJson(value, "JSONL", bytes))).toBe(expected);
+		expect(hook.mock.calls).toEqual([["payload"]]);
+		hook.mockClear();
+		const stringify = vi.spyOn(JSON, "stringify");
+		expect(() => prepareExportValueForJson(value, "JSONL", bytes - 1)).toThrow(/materialization limit/);
+		expect(hook.mock.calls).toEqual([["payload"]]);
+		expect(stringify).not.toHaveBeenCalled();
+	});
+
+	// #3155: allowing self-return must not cause serialized accessors to execute.
+	it("rejects an accessor on a self-returning receiver without invoking it", () => {
+		const hook = vi.fn(function (this: object, _key: string) {
+			return this;
+		});
+		const read = vi.fn(() => "must not read");
+		const value = Object.defineProperty({ toJSON: hook }, "field", { enumerable: true, get: read });
+		expect(() => prepareExportValueForJson({ payload: value }, "JSONL", 128)).toThrow(/an accessor property/);
+		expect(hook.mock.calls).toEqual([["payload"]]);
+		expect(read).not.toHaveBeenCalled();
+	});
+
+	// #289/#291: append owns the hook's wire result; later caller cycles cannot poison history.
+	it.each(["string", "streaming"] as const)("exports owned self-return data through %s JSONL", (format) => {
+		const sm = SessionManager.inMemory();
+		const hook = vi.fn(function (this: object, _key: string) {
+			return this;
+		});
+		const receiver: Record<string, unknown> = { value: "ok", toJSON: hook };
+		const id = sm.appendCustomEntry("self-return", { payload: receiver });
+		expect(hook.mock.calls).toEqual([["payload"]]);
+		const native = sm.getEntry(id);
+		if (native?.type !== "custom") throw new Error("missing owned entry");
+		const owned = native.data as { payload: { value: string } };
+		expect(owned.payload).not.toBe(receiver);
+		expect(Object.isFrozen(owned.payload)).toBe(true);
+		expect(Object.isFrozen(receiver)).toBe(false);
+		const revision = sm.revision();
+		hook.mockClear();
+		const outputPath = join(directory(), "self-return.jsonl");
+		const serialized =
+			format === "string"
+				? serializeSessionBranch(sm)
+				: fs.readFileSync(exportSessionToJsonl(sm, outputPath), "utf8");
+		const entry = JSON.parse(serialized.trimEnd().split("\n").at(-1)!) as { data: unknown };
+		expect(entry.data).toEqual({ payload: { value: "ok" } });
+		receiver.value = "caller edit";
+		receiver.self = receiver;
+		const later =
+			format === "string"
+				? serializeSessionBranch(sm)
+				: fs.readFileSync(exportSessionToJsonl(sm, outputPath), "utf8");
+		expect(JSON.parse(later.trimEnd().split("\n").at(-1)!)).toEqual(entry);
+		expect(hook).not.toHaveBeenCalled();
+		expect(sm.getEntry(id)).toBe(native);
+		expect(native.data).toBe(owned);
+		expect(owned).toEqual({ payload: { value: "ok" } });
+		expect(sm.revision()).toBe(revision);
+	});
+
+	// #3155: export-only records have no ingress capture. Both real receivers must guard their hooks.
+	it.each(["string", "streaming"] as const)("guards untrusted self-return hooks through %s JSONL", (format) => {
+		const sm = SessionManager.inMemory();
+		const hook = vi.fn(function (this: object, _key: string) {
+			return this;
+		});
+		const receiver: Record<string, unknown> = { value: "ok", toJSON: hook };
+		const trailing = (parentId: string | null, timestamp: string) => [
+			{
+				type: "custom",
+				id: "export-only",
+				parentId,
+				timestamp,
+				customType: "self-return",
+				data: { payload: receiver },
+			},
+		];
+		const outputPath = join(directory(), "untrusted-self-return.jsonl");
+		const serialized =
+			format === "string"
+				? serializeSessionBranch(sm, trailing)
+				: fs.readFileSync(exportSessionToJsonl(sm, outputPath, trailing), "utf8");
+		const entry = JSON.parse(serialized.trimEnd().split("\n").at(-1)!) as { data: unknown };
+		expect(entry.data).toEqual({ payload: { value: "ok" } });
+		expect(hook.mock.calls).toEqual([["payload"]]);
+		expect(receiver).toEqual({ value: "ok", toJSON: hook });
+		expect(Object.isFrozen(receiver)).toBe(false);
+		receiver.self = receiver;
+		hook.mockClear();
+		expect(() =>
+			format === "string" ? serializeSessionBranch(sm, trailing) : exportSessionToJsonl(sm, outputPath, trailing),
+		).toThrow(/circular session data/);
+		expect(hook.mock.calls).toEqual([["payload"], ["self"]]);
+		expect(receiver.self).toBe(receiver);
+		expect(sm.getEntries()).toEqual([]);
+		if (format === "streaming") expect(fs.readFileSync(outputPath, "utf8")).toBe(serialized);
+	});
+
+	// #291: cloneable exceptional native graphs stay owned and still reach the export cycle guard.
+	it.each(["string", "streaming"] as const)("refuses an owned native cycle through %s JSONL", (format) => {
+		const sm = SessionManager.inMemory();
+		const caller: { values: number[]; self?: unknown } = { values: [1] };
+		caller.self = caller;
+		const id = sm.appendCustomEntry("native-cycle", caller);
+		const native = sm.getEntry(id);
+		if (native?.type !== "custom") throw new Error("missing exceptional entry");
+		const owned = native.data as typeof caller;
+		expect(owned).not.toBe(caller);
+		expect(owned.self).toBe(owned);
+		caller.values.push(2);
+		expect(owned.values).toEqual([1]);
+		expect(Object.isFrozen(caller)).toBe(false);
+		const outputPath = join(directory(), "native-cycle.jsonl");
+		fs.writeFileSync(outputPath, "existing");
+		const stringify = vi.spyOn(JSON, "stringify");
+		expect(() => (format === "string" ? serializeSessionBranch(sm) : exportSessionToJsonl(sm, outputPath))).toThrow(
+			/circular session data/,
+		);
+		expect(stringify.mock.calls.every(([value]) => (value as { type: string }).type === "session")).toBe(true);
+		expect(fs.readFileSync(outputPath, "utf8")).toBe("existing");
+		expect(owned.self).toBe(owned);
+		expect(owned.values).toEqual([1]);
 	});
 
 	it("preflights oversized live payloads before HTML custom rendering or stringify", async () => {

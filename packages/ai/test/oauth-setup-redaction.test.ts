@@ -78,7 +78,6 @@ describe.each([openaiProvider(), openaiCodexProvider()])("setup and escaped diag
 				const result = await request({ transport: "sse", maxRetries: 0, fetch });
 				expect(fetch).toHaveBeenCalledTimes(1);
 				expect(result.output.stopReason).toBe("error");
-				// smarty-dev#5822 (pi#202 round 2): owned text with the status; the body is not published.
 				expect(result.output.errorMessage).toMatch(/ API error \(503\)$/);
 				if (provider.id === "openai") expect(records.length).toBeGreaterThan(0);
 				expectPrivate({ result, records });

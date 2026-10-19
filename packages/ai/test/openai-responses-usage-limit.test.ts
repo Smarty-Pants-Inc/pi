@@ -45,7 +45,7 @@ describe("OpenAI Responses ChatGPT usage limit", () => {
 
 		const errorMessage = await getErrorMessage(response);
 
-		// smarty-dev#5822 (pi#202 round 2): owned text and the owned remedy; the provider code is not published.
+		// smarty-dev#5822: owned text and remedy; the provider code remains private.
 		expect(errorMessage).toBe("OpenAI API error (429)\nCheck your ChatGPT usage: https://chatgpt.com/settings/usage");
 	});
 
@@ -62,7 +62,7 @@ describe("OpenAI Responses ChatGPT usage limit", () => {
 
 		const errorMessage = await getErrorMessage(response);
 
-		// smarty-dev#5822 (pi#202 round 3): owned text and remedy; the stream's code and message are private.
+		// smarty-dev#5822: the stream's code and message remain private.
 		expect(errorMessage).toBe("OpenAI API error\nCheck your ChatGPT usage: https://chatgpt.com/settings/usage");
 	});
 });

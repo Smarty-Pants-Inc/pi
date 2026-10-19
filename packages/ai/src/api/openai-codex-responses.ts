@@ -23,14 +23,11 @@ import type {
 } from "../types.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
 import { combineAbortSignals } from "../utils/abort-signals.ts";
-import {
-	appendAssistantMessageDiagnostic,
-	createAssistantMessageDiagnostic,
-	formatThrownValue,
-} from "../utils/diagnostics.ts";
+import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, ProviderDataError, providerLabel } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
+import { formatThrownValue } from "../utils/models-error.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import {
@@ -76,7 +73,6 @@ const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]
 const WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE = 1009;
 const WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE = "websocket_connection_limit_reached";
 const PREVIOUS_RESPONSE_NOT_FOUND_CODE = "previous_response_not_found";
-/** ChatGPT plan names Pi may show in the usage-limit message; any other value is omitted. */
 const CHATGPT_PLANS: ReadonlySet<string> = new Set([
 	"free",
 	"go",
@@ -87,7 +83,6 @@ const CHATGPT_PLANS: ReadonlySet<string> = new Set([
 	"enterprise",
 	"edu",
 ]);
-/** The longest reset wait Pi shows (one week); a longer or invalid value is omitted. */
 const MAX_USAGE_RESET_MINUTES = 7 * 24 * 60;
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
@@ -382,7 +377,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						if (aborted || (isCodexNonTransportError(error) && !connectionLimitBeforeStart)) {
 							throw error;
 						}
-						// The owned type only; the transport error text stays private (smarty-dev#5822 N5682).
 						appendAssistantMessageDiagnostic(
 							output,
 							createAssistantMessageDiagnostic("provider_transport_failure"),
@@ -460,7 +454,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 						statusText: response.statusText,
 					});
 					const info = await parseErrorResponse(fakeResponse);
-					// The friendly text is owned (closed plan, bounded minutes); everything else is a provider error.
 					if (info.friendlyMessage) throw new Error(info.friendlyMessage);
 					throw new ProviderDataError(`${info.message}\n${errorText}`, response.status);
 				} catch (error) {
@@ -512,7 +505,6 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 				delete (block as { customInput?: unknown }).customInput;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			// Owned text: `<provider> API error (HTTP <status>)`; the body and message only classify (smarty-dev#5822).
 			const norm = normalizeProviderError(error, model.provider, undefined, diagnosticSecrets);
 			output.recovery ??= norm.recovery;
 			output.errorMessage = formatProviderError(norm, `${providerLabel(model.provider)} API error`);
@@ -706,13 +698,7 @@ async function processStream(
 	);
 }
 
-/** The two provider codes Codex acts on, as a closed kind; the provider's code itself is not kept. */
 type CodexApiErrorKind = "connection_limit" | "previous_response_not_found";
-
-/**
- * A Codex error built from provider stream data. A provider error by origin: owned message, private text, no
- * payload or cause (smarty-dev#5822, pi#202 round 3).
- */
 class CodexApiError extends ProviderDataError {
 	readonly kind?: CodexApiErrorKind;
 
@@ -722,17 +708,13 @@ class CodexApiError extends ProviderDataError {
 		else if (code === PREVIOUS_RESPONSE_NOT_FOUND_CODE) this.kind = "previous_response_not_found";
 	}
 }
-
-/** An unparsable Codex frame. A provider error by origin; the frame and parser error stay private. */
 class CodexProtocolError extends ProviderDataError {
 	constructor(privateText: string) {
 		super(privateText, undefined, "CodexProtocolError");
 	}
 }
-
 class ProviderStreamEventCallbackError extends Error {
 	constructor() {
-		// Owned text, and no `cause`: the observer's thrown value is never kept (smarty-dev#5822 C1, pi#202 round 2).
 		super(PROVIDER_STREAM_OBSERVER_FAILED);
 		this.name = "ProviderStreamEventCallbackError";
 	}
@@ -783,9 +765,7 @@ async function* mapCodexEvents(
 			}
 		} catch (error) {
 			if (options?.signal?.aborted) throw error;
-			// The final assistant error must retain this non-transport origin for outer retry callers.
 			markProviderStreamObserverFailure(output);
-			// Retain terminal usage even when the observer prevents shared normalization.
 			if (
 				event.type === "response.failed" ||
 				event.type === "response.done" ||
@@ -800,7 +780,6 @@ async function* mapCodexEvents(
 					applyServiceTierPricing: (usage, serviceTier) => applyServiceTierPricing(usage, serviceTier, model),
 				});
 			}
-			// Keep callback failures out of Codex's WebSocket retry and SSE fallback path.
 			throw new ProviderStreamEventCallbackError();
 		}
 		const type = typeof event.type === "string" ? event.type : undefined;
@@ -813,7 +792,6 @@ async function* mapCodexEvents(
 
 		if (type === "response.failed") {
 			const response = (event as unknown as Extract<ResponseStreamEvent, { type: "response.failed" }>).response;
-			// Keep CodexApiError identity (no transport fallback), but retain the replay barrier.
 			finalizeResponsesUsage(response, output, model, {
 				serviceTier: options?.serviceTier,
 				resolveServiceTier: resolveCodexServiceTier,
@@ -1026,7 +1004,6 @@ function recordWebSocketSseFallback(sessionId: string | undefined): void {
 	stats.websocketFallbackActive = isWebSocketSseFallbackActive(sessionId);
 }
 
-/** Owned category of a WebSocket failure for debug stats; the error's own text never leaves this function. */
 function webSocketErrorCategory(
 	error: unknown,
 ): "api_error" | "protocol_error" | "timeout" | "connection_closed" | "network_error" {
@@ -1044,7 +1021,6 @@ function recordWebSocketFailure(sessionId: string | undefined, error: unknown): 
 
 	const stats = getOrCreateWebSocketDebugStats(sessionId);
 	stats.websocketFailures++;
-	// Debug stats publish an owned category only, never the error text (smarty-dev#5822, pi#202 round 2).
 	stats.lastWebSocketError = webSocketErrorCategory(error);
 	stats.websocketFallbackActive = true;
 }
@@ -1578,8 +1554,6 @@ async function processWebSocketStream(
 	let keepConnection = true;
 	let released = false;
 	const onAbort = () => {
-		// The parser may be suspended at a stream observer. Invalidate and close
-		// the owned connection here, without waiting for parser advancement.
 		keepConnection = false;
 		if (entry) entry.continuation = undefined;
 		if (!released) {
@@ -1676,7 +1650,6 @@ async function parseErrorResponse(response: Response): Promise<{ message: string
 		if (err) {
 			const code = err.code || err.type || "";
 			if (/usage_limit_reached|usage_not_included|rate_limit_exceeded/i.test(code) || response.status === 429) {
-				// Owned text only: a known plan name and a bounded whole number of minutes (smarty-dev#5822).
 				const planType = typeof err.plan_type === "string" ? err.plan_type.toLowerCase() : undefined;
 				const plan = planType && CHATGPT_PLANS.has(planType) ? ` (${planType} plan)` : "";
 				const mins =

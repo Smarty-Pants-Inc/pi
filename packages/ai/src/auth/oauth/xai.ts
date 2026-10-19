@@ -96,7 +96,6 @@ async function postForm(url: string, fields: Record<string, string>, signal: Abo
 }
 
 function requestFailure(action: string, response: OAuthHttpResponse, secrets: readonly string[] = []): Error {
-	// OAuth endpoint text can echo submitted or issued secrets: keep only the protocol error code.
 	const detail =
 		typeof response.body.error === "string" ? oauthAuthorizationError(response.body.error, secrets) : undefined;
 	return new Error(`xAI OAuth ${action} failed (HTTP ${response.status})${detail ? `: ${detail}` : ""}`);

@@ -74,12 +74,10 @@ import {
 } from "@earendil-works/pi-ai/utils/model-operations";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
-import { AuthStorage as DefaultAuthStorage, ReadOnlyAuthStorage } from "./auth-storage.ts";
+import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
 import { ModelConfig } from "./model-config.ts";
 import { ModelPolicyError, type ModelPolicyTarget } from "./model-policy.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
-import { ORDINARY_CREDENTIAL_PLACEHOLDER } from "./ordinary-credential-delivery.ts";
-import { assertOrdinaryOwner, type OrdinaryOwnerContext, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
 import {
 	type AuthStatus,
 	type CompatibilityRequestConfig,
@@ -92,7 +90,6 @@ import {
 } from "./provider-composer.ts";
 import { withPersonalizedCatalog, withRemoteCatalog } from "./remote-catalog-provider.ts";
 import { RuntimeCredentials } from "./runtime-credentials.ts";
-import { currentSessionOwnership } from "./session-ownership.ts";
 import { SettingsManager } from "./settings-manager.ts";
 import {
 	createVirtualModel,
@@ -135,7 +132,7 @@ export interface CreateModelRuntimeOptions {
 	signal?: AbortSignal;
 	/** Skip initial catalog and availability refresh. Static models remain available. */
 	refreshOnCreate?: boolean;
-	/** Settings used for request admission and model listings. Defaults to cwd and the runtime's agent directory. */
+	/** Request/listing policy. Defaults to cwd and the runtime's agent directory. */
 	settingsManager?: SettingsManager;
 }
 
@@ -187,10 +184,9 @@ function mergeHeaders(
 /** Configured pi-ai Models collection used by coding-agent and SDK consumers. */
 export class ModelRuntime implements Models {
 	/** One shared admission guard for an unattended dispatch, including warming and summaries. */
-	providerRequestGuard?: { beforeProviderRequest: () => void; signal: AbortSignal };
-	readonly #ordinaryOwner?: OrdinaryOwnerContext;
-	private readonly models: MutableModels;
+	providerRequestGuard?: Required<Pick<ProviderRequestOptions, "beforeProviderRequest" | "signal">>;
 	private readonly policySettings = new Map<SettingsManager, number>();
+	private readonly models: MutableModels;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
 	private readonly builtins = new Map<string, Provider>();
@@ -222,9 +218,7 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
-		ordinaryOwner?: OrdinaryOwnerContext,
 	) {
-		this.#ordinaryOwner = ordinaryOwner;
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
@@ -236,27 +230,10 @@ export class ModelRuntime implements Models {
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
-		const owner = ordinaryOwnerOf(options);
-		if (!owner && currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
-		if (owner) {
-			assertOrdinaryOwner(owner);
-			options = Object.freeze({ ...options });
-			if (
-				options.credentials ||
-				options.allowModelNetwork !== false ||
-				options.refreshOnCreate !== false ||
-				!(options.modelsStore instanceof InMemoryCodingAgentModelsStore)
-			)
-				throw new Error("OWNER_MODEL_RUNTIME_INPUT");
-		}
-		const credentials = new RuntimeCredentials(
-			options.credentials ??
-				(owner ? new ReadOnlyAuthStorage(options.authPath) : DefaultAuthStorage.create(options.authPath)),
-		);
+		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
-		const config = await (owner ? owner.within(() => ModelConfig.load(modelsPath)) : ModelConfig.load(modelsPath));
-		owner?.assertActive();
+		const config = await ModelConfig.load(modelsPath);
 		const modelsStore =
 			options.modelsStore ??
 			(modelsPath
@@ -282,8 +259,7 @@ export class ModelRuntime implements Models {
 			modelsPath,
 			modelsStore,
 			providers,
-			!owner && process.env.PI_OFFLINE === undefined,
-			owner,
+			process.env.PI_OFFLINE === undefined,
 		);
 		runtime.addModelPolicy(
 			options.settingsManager ??
@@ -310,7 +286,6 @@ export class ModelRuntime implements Models {
 		} finally {
 			if (timeout) clearTimeout(timeout);
 		}
-		owner?.assertActive();
 		return runtime;
 	}
 
@@ -486,16 +461,14 @@ export class ModelRuntime implements Models {
 	}
 
 	getProviders(): readonly Provider[] {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_HANDLE_SCOPE");
 		return this.models.getProviders();
 	}
 
 	getProvider(providerId: string): Provider | undefined {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_HANDLE_SCOPE");
 		return this.models.getProvider(providerId);
 	}
 
-	/** Bind settings until the returned disposer runs, preserving every other registration. */
+	/** Bind settings until disposed, preserving every other registration. */
 	addModelPolicy(settingsManager: SettingsManager): () => void {
 		this.policySettings.set(settingsManager, (this.policySettings.get(settingsManager) ?? 0) + 1);
 		let disposed = false;
@@ -517,7 +490,7 @@ export class ModelRuntime implements Models {
 		if (handle) this.assertModelAllowed({ provider: handle.provider, id: handle.modelId });
 	}
 
-	/** includeDisallowed retains full metadata for explicit selection, never request admission. */
+	/** includeDisallowed keeps explicit-selection metadata, never request admission. */
 	getModels(providerId?: string, options?: { includeDisallowed?: boolean }): readonly Model<Api>[] {
 		const models = this.models.getModels(providerId);
 		return options?.includeDisallowed ? models : models.filter((model) => this.isModelAllowed(model));
@@ -548,47 +521,20 @@ export class ModelRuntime implements Models {
 		providerId?: string,
 		options?: AuthOperationOptions,
 	): Promise<readonly ModelTypeMap[TType][]> {
-		// The ordinary owner may use only its one allowed chat model.
-		if (this.#ordinaryOwner)
-			return type === "chat"
-				? (this.getAvailable(providerId, options) as Promise<readonly ModelTypeMap[TType][]>)
-				: this.getAvailable(providerId, options).then(() => []);
 		return (await this.models.getAvailableOfType(type, providerId, options)).filter((model) =>
 			this.isModelAllowed(model),
 		);
 	}
 
 	async getAllAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly AnyModel[]> {
-		if (this.#ordinaryOwner) return this.getAvailable(providerId, options);
 		return (await this.models.getAllAvailable(providerId, options)).filter((model) => this.isModelAllowed(model));
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {
-		if (this.#ordinaryOwner) {
-			this.#ordinaryOwner.assertCredentialBinding();
-			options?.signal?.throwIfAborted();
-			return providerId === this.#ordinaryOwner.decision.record.provider.provider
-				? { type: "api_key", source: "protected H delivery" }
-				: undefined;
-		}
 		return this.models.checkAuth(providerId, options);
 	}
 
 	async getAvailable(providerId?: string, options?: AuthOperationOptions): Promise<readonly Model<Api>[]> {
-		if (this.#ordinaryOwner) {
-			this.#ordinaryOwner.assertCredentialBinding();
-			options?.signal?.throwIfAborted();
-			const allowed = this.#ordinaryOwner.decision.record.provider;
-			return this.models
-				.getModels(providerId)
-				.filter(
-					(model) =>
-						model.provider === allowed.provider &&
-						model.id === allowed.model &&
-						model.api === allowed.api &&
-						this.isModelAllowed(model),
-				);
-		}
 		if (providerId) {
 			const errorSeq = ++this.availabilityErrorSeq;
 			try {
@@ -607,17 +553,6 @@ export class ModelRuntime implements Models {
 	}
 
 	getAvailableSnapshot(): readonly Model<Api>[] {
-		if (this.#ordinaryOwner) {
-			this.#ordinaryOwner.assertCredentialBinding();
-			const allowed = this.#ordinaryOwner.decision.record.provider;
-			return this.snapshot.all.filter(
-				(model) =>
-					model.provider === allowed.provider &&
-					model.id === allowed.model &&
-					model.api === allowed.api &&
-					this.isModelAllowed(model),
-			);
-		}
 		return this.snapshot.available.filter((model) => this.isModelAllowed(model));
 	}
 
@@ -646,7 +581,6 @@ export class ModelRuntime implements Models {
 
 	/** @internal Compatibility fallback for ModelRegistry when provider auth is unconfigured. */
 	getCompatibilityRequestConfig(model: Model<Api>): CompatibilityRequestConfig {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_HANDLE_SCOPE");
 		return resolveCompatibilityRequestConfig(
 			model,
 			this.config.getProvider(model.provider),
@@ -663,10 +597,6 @@ export class ModelRuntime implements Models {
 	}
 
 	hasConfiguredAuth(providerId: string): boolean {
-		if (this.#ordinaryOwner) {
-			this.#ordinaryOwner.assertCredentialBinding();
-			return providerId === this.#ordinaryOwner.decision.record.provider.provider;
-		}
 		return this.snapshot.configuredProviders.has(providerId);
 	}
 
@@ -676,29 +606,7 @@ export class ModelRuntime implements Models {
 		providerOrModel: string | AnyModel,
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
-		// Auxiliary callers may resolve credentials before entering the stream boundary.
 		if (typeof providerOrModel !== "string") this.assertModelAllowed(providerOrModel);
-		const owner = this.#ordinaryOwner;
-		if (owner) {
-			owner.assertCredentialBinding();
-			const allowed = owner.decision.record.provider;
-			const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
-			if (
-				providerId !== allowed.provider ||
-				(overrides.apiKey !== undefined && overrides.apiKey !== ORDINARY_CREDENTIAL_PLACEHOLDER) ||
-				overrides.env !== undefined ||
-				(typeof providerOrModel !== "string" &&
-					(providerOrModel.id !== allowed.model || providerOrModel.api !== allowed.api))
-			) {
-				throw new Error("OWNER_AUTH_SCOPE");
-			}
-			overrides.signal?.throwIfAborted();
-			// The original transport alone receives the credential at final dispatch.
-			return {
-				auth: { apiKey: ORDINARY_CREDENTIAL_PLACEHOLDER, baseUrl: allowed.baseUrl },
-				source: "protected H delivery",
-			};
-		}
 		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
 		const resolution = await this.models.getAuth(providerOrModel, overrides);
 		if (!resolution) return undefined;
@@ -760,7 +668,6 @@ export class ModelRuntime implements Models {
 	}
 
 	setRuntimeApiKey(providerId: string, apiKey: string, options: AuthOperationOptions = {}): Promise<void> {
-		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.setRuntimeApiKey(providerId, apiKey);
@@ -774,7 +681,6 @@ export class ModelRuntime implements Models {
 	}
 
 	removeRuntimeApiKey(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
-		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			this.credentials.removeRuntimeApiKey(providerId);
@@ -783,17 +689,10 @@ export class ModelRuntime implements Models {
 	}
 
 	listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
-		if (this.#ordinaryOwner) {
-			this.#ordinaryOwner.assertCredentialBinding();
-			options?.signal?.throwIfAborted();
-			return Promise.resolve([]);
-		}
 		return this.credentials.list(options);
 	}
 
 	getProviderAuthStatus(providerId: string): AuthStatus {
-		if (this.#ordinaryOwner)
-			return this.hasConfiguredAuth(providerId) ? { configured: true, source: "runtime" } : { configured: false };
 		if (this.credentials.hasRuntimeApiKey(providerId)) return { configured: true, source: "runtime" };
 		if (this.snapshot.storedProviders.has(providerId)) return { configured: true, source: "stored" };
 		const configured = configuredRequestAuthStatus(
@@ -805,7 +704,7 @@ export class ModelRuntime implements Models {
 		return check ? { configured: true, source: "environment", label: check.source } : { configured: false };
 	}
 
-	/** Synchronous admission, outside stream/operation error conversion and before auth resolution. */
+	/** Synchronous refusal precedes authentication and stream/operation error conversion. */
 	private prepareRequest<
 		TModel extends AnyModel,
 		TOptions extends ProviderRequestOptions<TModel> & ModelsRequestTransforms,
@@ -815,7 +714,6 @@ export class ModelRuntime implements Models {
 			options?.signal?.throwIfAborted();
 			const prepared = await this.prepareAuthenticatedRequest(model, options);
 			prepared.options.signal?.throwIfAborted();
-			// Settings or model identity may change while auth/header transforms are awaiting.
 			this.assertModelAllowed(prepared.model, handle);
 			return prepared;
 		};
@@ -835,11 +733,6 @@ export class ModelRuntime implements Models {
 		const requestGuard = this.providerRequestGuard;
 		options?.signal?.throwIfAborted();
 		requestGuard?.signal.throwIfAborted();
-		const owner = this.#ordinaryOwner;
-		owner?.assertCredentialBinding();
-		owner?.assertNativeTokenReservation();
-		owner?.assertSubmission();
-		owner?.assertPreparedFetch(options?.fetch);
 		const provider = this.models.getProvider(model.provider);
 		if (!provider) throw new SafeSetupError("provider");
 		let resolution: AuthResult | undefined;
@@ -850,7 +743,6 @@ export class ModelRuntime implements Models {
 				signal: options?.signal,
 			});
 		} catch (error) {
-			// Auth resolution and OAuth refresh can echo credentials, also through a ModelsError cause.
 			throw requestSetupError(error);
 		}
 		options?.signal?.throwIfAborted();
@@ -871,7 +763,6 @@ export class ModelRuntime implements Models {
 				options?.signal?.throwIfAborted();
 				requestGuard?.signal.throwIfAborted();
 			} catch (error) {
-				// The transform saw the authenticated headers; its failure is a value-free category.
 				throw requestSetupError(error);
 			}
 			diagnosticSecrets.push(...getOAuthDiagnosticSecrets(apiKey, headers ?? {}));
@@ -881,22 +772,6 @@ export class ModelRuntime implements Models {
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
 		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
-		if (owner) {
-			owner.assertCredentialBinding();
-			owner.assertNativeTokenReservation();
-			owner.assertPreparedFetch(providerOptions.fetch);
-			owner.assertSubmission();
-			const allowed = owner.decision.record.provider;
-			if (
-				this.models.getProvider(model.provider) !== provider ||
-				requestModel.provider !== allowed.provider ||
-				requestModel.id !== allowed.model ||
-				requestModel.api !== allowed.api ||
-				requestModel.baseUrl !== allowed.baseUrl
-			) {
-				throw new Error("OWNER_PREPARED_PROVIDER_IDENTITY");
-			}
-		}
 		return {
 			provider,
 			model: requestModel,
@@ -933,9 +808,8 @@ export class ModelRuntime implements Models {
 			async (outer) => {
 				assertChatModel(model);
 				const prepared = await prepare();
-				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
-				this.#ordinaryOwner?.assertSubmission();
+				prepared.options.signal?.throwIfAborted();
 				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
 			},
 			options?.signal,
@@ -983,9 +857,8 @@ export class ModelRuntime implements Models {
 			async (outer) => {
 				assertChatModel(model);
 				const prepared = await prepare();
-				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
-				this.#ordinaryOwner?.assertSubmission();
+				prepared.options.signal?.throwIfAborted();
 				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
 			},
 			options?.signal,
@@ -1007,11 +880,11 @@ export class ModelRuntime implements Models {
 			async (outer) => {
 				assertChatModel(model);
 				const prepared = await prepare();
-				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 				if (!prepared.provider.fetchDeferred) {
 					throw new SafeSetupError("deferred");
 				}
+				prepared.options.signal?.throwIfAborted();
 				return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
 			},
 			options?.signal,
@@ -1037,12 +910,9 @@ export class ModelRuntime implements Models {
 			assertChatModel(model);
 			const prepared = await prepare();
 			secrets = prepared.options.diagnosticSecrets ?? [];
-			if (!prepared.provider.cancelDeferred) {
-				throw new SafeSetupError("deferred");
-			}
+			if (!prepared.provider.cancelDeferred) throw new SafeSetupError("deferred");
 			await prepared.provider.cancelDeferred(prepared.model, handle, prepared.options as DeferredCancelOptions);
 		} catch (error) {
-			// The rejection is public SDK output: masked message only, never the raw error or its cause.
 			throw protectOperationError(error, secrets);
 		}
 	}
@@ -1100,7 +970,6 @@ export class ModelRuntime implements Models {
 		interaction: AuthInteraction,
 		options?: LoginOptions,
 	): Promise<Credential> {
-		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(interaction.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			const credential = await this.models.login(providerId, type, { ...interaction, signal }, options);
@@ -1110,7 +979,6 @@ export class ModelRuntime implements Models {
 	}
 
 	logout(providerId: string, options: AuthOperationOptions = {}): Promise<void> {
-		if (this.#ordinaryOwner) throw new Error("OWNER_AUTH_CHANGE_REQUIRES_RECEIVING");
 		const signal = operationSignal(options.signal);
 		return this.enqueueCredentialOperation(providerId, signal, async () => {
 			await this.models.logout(providerId, { signal });
@@ -1119,7 +987,6 @@ export class ModelRuntime implements Models {
 	}
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
-		if (this.#ordinaryOwner) throw new Error("OWNER_MODEL_REFRESH_REQUIRES_RECEIVING");
 		this.config = await ModelConfig.load(this.modelsPath);
 		this.configureRadiusProviders();
 		if (options.providers) {
@@ -1163,7 +1030,6 @@ export class ModelRuntime implements Models {
 	}
 
 	registerNativeProvider(provider: Provider): void {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		if (!provider.id.trim()) throw new Error("Provider id must not be empty.");
 		this.extensionProviders.delete(provider.id);
 		this.nativeExtensionProviders.set(provider.id, provider);
@@ -1201,7 +1067,6 @@ export class ModelRuntime implements Models {
 	}
 
 	registerProvider(providerId: string, config: ProviderConfigInput): void {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		// Validate the incoming registration on its own, like the legacy registry:
 		// a broken re-registration must throw without touching the stored config.
 		validateExtensionProvider(providerId, this.builtins.get(providerId), this.config.getProvider(providerId), config);
@@ -1225,7 +1090,6 @@ export class ModelRuntime implements Models {
 	}
 
 	unregisterProvider(providerId: string): void {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		this.extensionProviders.delete(providerId);
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);
@@ -1239,7 +1103,6 @@ export class ModelRuntime implements Models {
 	 * Throws when the id belongs to a physical model of that provider.
 	 */
 	registerVirtualModel(definition: VirtualModelDefinition): void {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		const { provider: providerId, id } = definition;
 		if (!providerId.trim() || !id.trim()) throw new Error("Virtual model provider and id must not be empty.");
 		const existing = this.models.getModel(providerId, id);
@@ -1261,7 +1124,6 @@ export class ModelRuntime implements Models {
 	}
 
 	unregisterVirtualModel(providerId: string, id: string): void {
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		const models = this.virtualModels.get(providerId);
 		if (!models?.delete(id)) return;
 		if (models.size === 0) this.virtualModels.delete(providerId);
@@ -1292,7 +1154,6 @@ export class ModelRuntime implements Models {
 	): Promise<ModelRoute> {
 		options.signal?.throwIfAborted();
 		this.assertModelAllowed(model);
-		if (this.#ordinaryOwner) throw new Error("OWNER_PROVIDER_CHANGE_REQUIRES_RECEIVING");
 		const name = `Virtual model ${model.provider}/${model.id}`;
 		const virtual = this.virtualModels.get(model.provider)?.get(model.id);
 		if (!virtual) throw new Error(`${name} is not registered.`);

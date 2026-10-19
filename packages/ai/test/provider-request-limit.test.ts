@@ -259,7 +259,7 @@ describe("physical provider admission", () => {
 			{
 				env: { AWS_BEDROCK_FORCE_HTTP1: "1", AWS_BEDROCK_SKIP_AUTH: "1", HTTP_PROXY: "", HTTPS_PROXY: "" },
 				beforeProviderRequest: () => {
-					// Pi's own refusal class: its owned text survives the SDK wrapping it (smarty-dev#5822).
+					// Pi's own refusal class: its owned text survives SDK wrapping (smarty-dev#5822).
 					if (admitted === 2) throw new ProviderRequestLimitError(2, 2);
 					admitted++;
 				},

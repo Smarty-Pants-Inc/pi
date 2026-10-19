@@ -8,22 +8,14 @@ import type { AgentSessionRuntimeDiagnostic, AgentSessionServices } from "./agen
 import type {
 	ProjectTrustContext,
 	ReplacedSessionContext,
-	SessionReadyEvent,
 	SessionShutdownEvent,
 	SessionStartEvent,
 } from "./extensions/index.ts";
 import { emitSessionShutdownEvent } from "./extensions/runner.ts";
 import { InputAdmissionError } from "./input-admission.ts";
-import {
-	assertOrdinaryRuntime,
-	bindOrdinaryOptions,
-	type OrdinaryOwnerContext,
-	ordinaryOwnerForFactory,
-	ordinaryOwnerOf,
-} from "./ordinary-owner-context.ts";
 import type { CreateAgentSessionResult } from "./sdk.ts";
 import { assertSessionCwdExists } from "./session-cwd.ts";
-import { assertUnownedSessionManager, SessionManager } from "./session-manager.ts";
+import { SessionManager } from "./session-manager.ts";
 
 /**
  * Result returned by runtime creation.
@@ -96,8 +88,6 @@ export class AgentSessionRuntime {
 	private readonly createRuntime: CreateAgentSessionRuntimeFactory;
 	private _diagnostics: AgentSessionRuntimeDiagnostic[];
 	private _modelFallbackMessage?: string;
-	readonly #owner?: OrdinaryOwnerContext;
-	#ownerDisposal?: Promise<void>;
 	private _disposed = false;
 	private lifecycleActive = false;
 	private lifecycleCompletion?: Promise<void>;
@@ -105,8 +95,6 @@ export class AgentSessionRuntime {
 	private readonly terminalCancellation = new AbortController();
 	private terminalRejection?: (messages: AgentMessage[], session: AgentSession) => void;
 	private releaseReceivingInputs?: () => void;
-	/** Session the current lifecycle published, with its session_start reason, for session_ready. */
-	#published?: { session: AgentSession; reason: SessionReadyEvent["reason"] };
 
 	constructor(
 		_session: AgentSession,
@@ -115,11 +103,6 @@ export class AgentSessionRuntime {
 		_diagnostics: AgentSessionRuntimeDiagnostic[] = [],
 		_modelFallbackMessage?: string,
 	) {
-		const owner = ordinaryOwnerForFactory(createRuntime);
-		assertOrdinaryRuntime(_session.sessionManager, owner, createRuntime);
-		owner?.assertServices(_services);
-		owner?.assertSessionStart(_session);
-		this.#owner = owner;
 		this._session = _session;
 		this._services = _services;
 		this.createRuntime = createRuntime;
@@ -148,7 +131,6 @@ export class AgentSessionRuntime {
 		if (this._disposed) throw new InputAdmissionError("INPUT_ADMISSION_DISPOSED", "runtime is disposed");
 		if (!rejectQueuedInput) this.terminalCancellation.signal.throwIfAborted();
 		this.lifecycleActive = true;
-		this.#published = undefined;
 		this.lifecycleCompletion = new Promise<void>((resolve) => {
 			this.completeLifecycle = resolve;
 		});
@@ -162,27 +144,10 @@ export class AgentSessionRuntime {
 				this.releaseReceivingInputs?.();
 				this.releaseReceivingInputs = undefined;
 				release();
-				const published = this.#published;
-				this.#published = undefined;
 				this.lifecycleActive = false;
 				this.completeLifecycle?.();
 				queueMicrotask(() => {
-					// The mode decides deferred shutdown first. Its shutdown may still be waiting for the
-					// event loop (RPC defers it a macrotask), so a pending request also withholds readiness:
-					// otherwise a session_ready handler could start a turn that the shutdown then waits for.
-					const shutdownPending = this.lifecycleCompleteHandler?.() === true;
-					// smarty-dev#10453: announce the published replacement only once its input fence is gone.
-					// Skip it if shutdown (requested or begun), disposal or another lifecycle (or session) took over.
-					if (
-						!published ||
-						shutdownPending ||
-						this._disposed ||
-						this.lifecycleActive ||
-						this.terminalCancellation.signal.aborted ||
-						this._session !== published.session
-					)
-						return;
-					published.session.emitSessionReady(published.reason);
+					this.lifecycleCompleteHandler?.();
 				});
 			};
 		} catch (error) {
@@ -204,10 +169,7 @@ export class AgentSessionRuntime {
 		return this._modelFallbackMessage;
 	}
 
-	/**
-	 * @internal Recheck mode-owned deferred work only after lifecycle fences release.
-	 * Return true when the mode has a pending shutdown request: the runtime then withholds `session_ready`.
-	 */
+	/** @internal Recheck mode-owned deferred work only after lifecycle fences release. */
 	setLifecycleCompleteHandler(handler?: () => boolean | undefined): void {
 		this.lifecycleCompleteHandler = handler;
 	}
@@ -228,15 +190,10 @@ export class AgentSessionRuntime {
 		this.beforeSessionInvalidate = beforeSessionInvalidate;
 	}
 
-	#captureOutgoing(allowOwned = false): OutgoingSession {
-		if (this.#owner && !allowOwned)
-			throw new Error("OWNER_FRESH_ALLOCATION_REQUIRED: replacement requires separate receiving");
+	#captureOutgoing(allowTerminal = false): OutgoingSession {
 		const session = this.session;
-		if (!allowOwned) session.shutdownSignal?.throwIfAborted();
-		const sessionManager = session.sessionManager;
-		assertOrdinaryRuntime(sessionManager, this.#owner, this.createRuntime);
-		this.#owner?.assertSessionStart(session);
-		return { session, sessionManager };
+		if (!allowTerminal) session.shutdownSignal?.throwIfAborted();
+		return { session, sessionManager: session.sessionManager };
 	}
 
 	#assertIdentity(outgoing: OutgoingSession): void {
@@ -248,7 +205,6 @@ export class AgentSessionRuntime {
 	#assertCurrent(outgoing: OutgoingSession, allowTerminal = false): void {
 		if (!allowTerminal) this.terminalCancellation.signal.throwIfAborted();
 		this.#assertIdentity(outgoing);
-		assertOrdinaryRuntime(outgoing.sessionManager, this.#owner, this.createRuntime);
 	}
 
 	private async emitBeforeSwitch(
@@ -263,11 +219,7 @@ export class AgentSessionRuntime {
 		}
 
 		const result = await raceWithAbortSignal(
-			runner.emit({
-				type: "session_before_switch",
-				reason,
-				targetSessionFile,
-			}),
+			runner.emit({ type: "session_before_switch", reason, targetSessionFile }),
 			this.terminalCancellation.signal,
 		);
 		outgoing.session.shutdownSignal?.throwIfAborted();
@@ -286,11 +238,7 @@ export class AgentSessionRuntime {
 		}
 
 		const result = await raceWithAbortSignal(
-			runner.emit({
-				type: "session_before_fork",
-				entryId,
-				...options,
-			}),
+			runner.emit({ type: "session_before_fork", entryId, ...options }),
 			this.terminalCancellation.signal,
 		);
 		outgoing.session.shutdownSignal?.throwIfAborted();
@@ -302,32 +250,12 @@ export class AgentSessionRuntime {
 		reason: SessionShutdownEvent["reason"],
 		targetSessionFile?: string,
 	): Promise<void> {
-		// Settle any active response first so the aborted turn (including tool
-		// results) is persisted to the outgoing session before it is replaced.
 		this.#assertCurrent(outgoing);
 		outgoing.session.shutdownSignal?.throwIfAborted();
-		try {
-			await this.#teardownOutgoing(outgoing, reason, targetSessionFile);
-		} catch (error) {
-			// Teardown began: a failed replacement keeps the outgoing session's receipt ingress closed.
-			// The teardown failure stays the reported cause.
-			try {
-				outgoing.session.closeUserMessageIngressAfterFailedReplacement();
-			} catch {}
-			throw error;
-		}
-	}
-
-	async #teardownOutgoing(
-		outgoing: OutgoingSession,
-		reason: SessionShutdownEvent["reason"],
-		targetSessionFile?: string,
-	): Promise<void> {
 		await outgoing.session.abort();
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
 		await raceWithAbortSignal(
-			// The dispatch itself carries terminal revocation, so no later observer starts after it (#132 R4-2).
 			emitSessionShutdownEvent(
 				outgoing.session.extensionRunner,
 				{ type: "session_shutdown", reason, targetSessionFile },
@@ -357,10 +285,8 @@ export class AgentSessionRuntime {
 			release();
 		}
 	}
-	/**
-	 * Construct, fence and publish the receiving session, then run `finish` (the caller's post-publication
-	 * work, including withSession) exactly once on every path that publishes it.
-	 */
+
+	/** Construct, fence and publish the receiver, then finish exactly once on every published path. */
 	async #replace(
 		outgoing: OutgoingSession,
 		options: Parameters<CreateAgentSessionRuntimeFactory>[0],
@@ -368,10 +294,7 @@ export class AgentSessionRuntime {
 	): Promise<void> {
 		outgoing.session.shutdownSignal?.throwIfAborted();
 		this.#assertCurrent(outgoing);
-		assertUnownedSessionManager(options.sessionManager);
 		const construction = this.createRuntime(Object.freeze(options));
-		// A non-cooperative factory may finish after cancellation. Never publish it;
-		// observe its result and retire the unpublished session instead.
 		const receiving = construction.then(async (result) => {
 			if (this.terminalCancellation.signal.aborted) {
 				await this.retireUnpublishedSession(result.session);
@@ -387,7 +310,6 @@ export class AgentSessionRuntime {
 		try {
 			outgoing.session.shutdownSignal?.throwIfAborted();
 			this.#assertCurrent(outgoing);
-			assertUnownedSessionManager(session.sessionManager);
 			fencing = true;
 			this.releaseReceivingInputs = await session.fenceInputs();
 			this.terminalCancellation.signal.throwIfAborted();
@@ -400,27 +322,18 @@ export class AgentSessionRuntime {
 			}
 			const recoveredInput: AgentMessage[] = [];
 			if (fencing && !this.terminalCancellation.signal.aborted) {
-				// The outgoing session is already disposed. Take the receiving session's queued input
-				// back and publish the session, so the runtime never keeps a disposed session (pi#163).
 				const release = await session
 					.fenceInputs({ rejectQueuedInput: (messages) => recoveredInput.push(...messages) })
 					.catch(() => undefined);
-				// Terminal shutdown may abort while this fence is pending. Then retire the session below
-				// instead of publishing it, so the captured input still reaches the shutdown receipt.
 				if (this.terminalCancellation.signal.aborted) release?.();
 				else {
-					// If the recovery fence also refused, input is still held outside the queue (for example
-					// mode-owned input). The session stays live, so publish it unfenced rather than retiring it:
-					// retirement would refuse for the same reason and leave the disposed session published.
-					// Without a fence, gate direct admission until the lifecycle releases, so callbacks keep
-					// the fenced path's admission scope and terminal-cancellation race (pi#163 security P2).
+					// A second refusal can be mode-owned input. Publish a live gated receiver, never the disposed sender (pi#163).
 					this.releaseReceivingInputs = release ?? session.gateInputs();
-					this.#publish(session, services, diagnostics, modelFallbackMessage, options.sessionStartEvent);
+					this.#publish(session, services, diagnostics, modelFallbackMessage);
 					let cause = error;
 					try {
 						await finish();
 					} catch (finishError) {
-						// The input is already removed from the queue; a later rejection must still return it.
 						if (recoveredInput.length === 0) throw finishError;
 						cause = finishError;
 					}
@@ -432,7 +345,6 @@ export class AgentSessionRuntime {
 					);
 				}
 			}
-			// No usable receiving session: retire it and return its input with the refusal (pi#132 R4-7).
 			let cause = error;
 			try {
 				await this.retireUnpublishedSession(session, (messages) => recoveredInput.push(...messages));
@@ -447,7 +359,7 @@ export class AgentSessionRuntime {
 				{ cause, recoveredInput },
 			);
 		}
-		this.#publish(session, services, diagnostics, modelFallbackMessage, options.sessionStartEvent);
+		this.#publish(session, services, diagnostics, modelFallbackMessage);
 		await finish();
 	}
 
@@ -456,10 +368,7 @@ export class AgentSessionRuntime {
 		services: AgentSessionServices,
 		diagnostics: AgentSessionRuntimeDiagnostic[],
 		modelFallbackMessage: string | undefined,
-		sessionStartEvent: SessionStartEvent | undefined,
 	): void {
-		const reason = sessionStartEvent?.reason;
-		if (reason === "new" || reason === "resume" || reason === "fork") this.#published = { session, reason };
 		this._session = session;
 		this._services = services;
 		this._diagnostics = diagnostics;
@@ -497,10 +406,7 @@ export class AgentSessionRuntime {
 		try {
 			const beforeResult = await this.emitBeforeSwitch(outgoing, "resume", sessionPath);
 			this.#assertCurrent(outgoing);
-			if (beforeResult.cancelled) {
-				return beforeResult;
-			}
-
+			if (beforeResult.cancelled) return beforeResult;
 			const previousSessionFile = outgoing.session.sessionFile;
 			const sessionManager = SessionManager.open(sessionPath, undefined, options?.cwdOverride);
 			assertSessionCwdExists(sessionManager, this.cwd);
@@ -533,19 +439,13 @@ export class AgentSessionRuntime {
 		try {
 			const beforeResult = await this.emitBeforeSwitch(outgoing, "new");
 			this.#assertCurrent(outgoing);
-			if (beforeResult.cancelled) {
-				return beforeResult;
-			}
-
+			if (beforeResult.cancelled) return beforeResult;
 			const previousSessionFile = outgoing.session.sessionFile;
 			const sessionDir = outgoing.sessionManager.getSessionDir();
 			const sessionManager = outgoing.sessionManager.isPersisted()
 				? SessionManager.create(this.cwd, sessionDir)
 				: SessionManager.inMemory(this.cwd);
-			if (options?.parentSession) {
-				sessionManager.newSession({ parentSession: options.parentSession });
-			}
-
+			if (options?.parentSession) sessionManager.newSession({ parentSession: options.parentSession });
 			await this.teardownCurrent(outgoing, "new", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
 			await this.#replace(
@@ -585,33 +485,22 @@ export class AgentSessionRuntime {
 			const position = options?.position ?? "before";
 			const beforeResult = await this.emitBeforeFork(outgoing, entryId, { position });
 			this.#assertCurrent(outgoing);
-			if (beforeResult.cancelled) {
-				return { cancelled: true };
-			}
+			if (beforeResult.cancelled) return { cancelled: true };
 			let targetLeafId: string | null;
 			let selectedText: string | undefined;
-
 			const selectedEntry = outgoing.sessionManager.getEntry(entryId);
-			if (!selectedEntry) {
-				throw new Error("Invalid entry ID for forking");
-			}
-
-			if (position === "at") {
-				targetLeafId = selectedEntry.id;
-			} else {
-				if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+			if (!selectedEntry) throw new Error("Invalid entry ID for forking");
+			if (position === "at") targetLeafId = selectedEntry.id;
+			else {
+				if (selectedEntry.type !== "message" || selectedEntry.message.role !== "user")
 					throw new Error("Invalid entry ID for forking");
-				}
 				targetLeafId = selectedEntry.parentId;
 				selectedText = extractUserMessageText(selectedEntry.message.content);
 			}
-
 			const previousSessionFile = outgoing.session.sessionFile;
 			if (outgoing.sessionManager.isPersisted()) {
 				const currentSessionFile = outgoing.session.sessionFile;
-				if (!currentSessionFile) {
-					throw new Error("Persisted session is missing a session file");
-				}
+				if (!currentSessionFile) throw new Error("Persisted session is missing a session file");
 				const sessionDir = outgoing.sessionManager.getSessionDir();
 				if (!targetLeafId) {
 					const sessionManager = SessionManager.create(this.cwd, sessionDir);
@@ -630,15 +519,11 @@ export class AgentSessionRuntime {
 					);
 					return { cancelled: false, selectedText };
 				}
-
-				if (!existsSync(currentSessionFile)) {
+				if (!existsSync(currentSessionFile))
 					throw new Error("This session has not been saved yet. Send a message before cloning or forking it.");
-				}
 				const sessionManager = SessionManager.open(currentSessionFile, sessionDir);
 				const forkedSessionPath = sessionManager.createBranchedSession(targetLeafId);
-				if (!forkedSessionPath) {
-					throw new Error("Failed to create forked session");
-				}
+				if (!forkedSessionPath) throw new Error("Failed to create forked session");
 				await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
 				this.#assertCurrent(outgoing);
 				await this.#replace(
@@ -653,15 +538,11 @@ export class AgentSessionRuntime {
 				);
 				return { cancelled: false, selectedText };
 			}
-
 			const sessionManager = outgoing.sessionManager;
 			await this.teardownCurrent(outgoing, "fork", sessionManager.getSessionFile());
 			this.#assertCurrent(outgoing);
-			if (!targetLeafId) {
-				sessionManager.newSession({ parentSession: previousSessionFile });
-			} else {
-				sessionManager.createBranchedSession(targetLeafId);
-			}
+			if (!targetLeafId) sessionManager.newSession({ parentSession: previousSessionFile });
+			else sessionManager.createBranchedSession(targetLeafId);
 			await this.#replace(
 				outgoing,
 				{
@@ -690,35 +571,21 @@ export class AgentSessionRuntime {
 		const releaseInputs = await this.fenceLifecycle(outgoing);
 		try {
 			const resolvedPath = resolvePath(inputPath);
-			if (!existsSync(resolvedPath)) {
-				throw new SessionImportFileNotFoundError(resolvedPath);
-			}
-
+			if (!existsSync(resolvedPath)) throw new SessionImportFileNotFoundError(resolvedPath);
 			const sessionDir = outgoing.sessionManager.getSessionDir();
-			if (!existsSync(sessionDir)) {
-				mkdirSync(sessionDir, { recursive: true });
-			}
-
+			if (!existsSync(sessionDir)) mkdirSync(sessionDir, { recursive: true });
 			let destinationPath = join(sessionDir, basename(resolvedPath));
 			const sourceAlreadyStored = resolve(destinationPath) === resolvedPath;
 			if (!sourceAlreadyStored) {
 				const { name, ext } = parse(destinationPath);
 				let suffix = 1;
-				while (existsSync(destinationPath)) {
-					destinationPath = join(sessionDir, `${name}-${suffix++}${ext}`);
-				}
+				while (existsSync(destinationPath)) destinationPath = join(sessionDir, `${name}-${suffix++}${ext}`);
 			}
 			const beforeResult = await this.emitBeforeSwitch(outgoing, "resume", destinationPath);
 			this.#assertCurrent(outgoing);
-			if (beforeResult.cancelled) {
-				return beforeResult;
-			}
-
+			if (beforeResult.cancelled) return beforeResult;
 			const previousSessionFile = outgoing.session.sessionFile;
-			if (!sourceAlreadyStored) {
-				copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
-			}
-
+			if (!sourceAlreadyStored) copyFileSync(resolvedPath, destinationPath, constants.COPYFILE_EXCL);
 			const sessionManager = SessionManager.open(destinationPath, sessionDir, cwdOverride);
 			assertSessionCwdExists(sessionManager, this.cwd);
 			await this.teardownCurrent(outgoing, "resume", sessionManager.getSessionFile());
@@ -769,27 +636,27 @@ export class AgentSessionRuntime {
 					error: message,
 				});
 			} catch {
-				// A host reporter cannot skip mandatory invalidation. SDK callers retain the diagnostic.
+				/* A reporter cannot skip mandatory invalidation. */
 			}
 		} finally {
 			signal.removeEventListener("abort", beginDeadline);
 			clearTimeout(timer);
 		}
 	}
+
 	async dispose(options?: {
-		/** Operator quit: durably retain unsent input before terminal cancellation. Defaults to false. */
+		/** Operator quit: retain unsent input before terminal cancellation. Defaults to false. */
 		operatorExit?: boolean;
 		/** Explicit operator consent to discard unsent input when no session file exists. */
 		discardUnsentInput?: boolean;
 		/** TUI-owned output, retained until terminal restoration completes. */
 		bufferUnsentInput?: (block: string) => void;
-		/** Terminal owner shutdown, distinct from an ordinary recoverable disposal refusal. */
 		terminal?: boolean;
 		beforeShutdown?: () => Promise<void>;
 		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
 	}): Promise<void> {
 		if (!options?.terminal && !options?.operatorExit) return this.#dispose(options);
-		// Snapshot synchronously while all input owners are still intact. Never cancel on save failure.
+		// Snapshot synchronously while all owners are intact. Never cancel on save/print failure.
 		const releaseOperatorInputs = options.operatorExit
 			? this.session.prepareOperatorExit({
 					discardUnsent: options.discardUnsentInput,
@@ -808,8 +675,6 @@ export class AgentSessionRuntime {
 		this.terminalCancellation.abort(
 			new InputAdmissionError("INPUT_ADMISSION_SHUTDOWN", "runtime lifecycle cancelled for shutdown"),
 		);
-		// Cancellation commits before its publication can throw (#5533): still join and detach,
-		// then report the publication failure.
 		let publicationFailure: { cause: unknown } | undefined;
 		try {
 			this.session.cancelForShutdown();
@@ -828,13 +693,10 @@ export class AgentSessionRuntime {
 		beforeShutdown?: () => Promise<void>;
 		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
 	}): Promise<void> {
-		if (this.#ownerDisposal) return this.#ownerDisposal;
 		if (this.lifecycleActive)
 			throw new InputAdmissionError("INPUT_ADMISSION_BUSY", "runtime lifecycle is in progress");
 		if (this._disposed || this.session.isDisposed) return;
 		const outgoing = this.#captureOutgoing(true);
-		// Terminal cleanup authorization does not depend on a receipt callback.
-		// Without one, empty runtimes may close, but undelivered queues remain owned.
 		const rejectQueuedInput =
 			options?.rejectQueuedInput ??
 			(options?.terminal
@@ -844,40 +706,7 @@ export class AgentSessionRuntime {
 				: undefined);
 		const releaseInputs = await this.fenceLifecycle(outgoing, rejectQueuedInput);
 		try {
-			// Host terminal teardown may await, but it must happen only after admission closes.
 			await options?.beforeShutdown?.();
-			if (this.#owner) {
-				// Publish the shared task before invoking close callbacks. Sealed-owner
-				// terminal persistence checks identity, not active-owner permission.
-				let resolve!: () => void;
-				let reject!: (cause: unknown) => void;
-				this.#ownerDisposal = new Promise<void>((done, failed) => {
-					resolve = done;
-					reject = failed;
-				});
-				try {
-					void this.#owner
-						.close({
-							stop: () => {
-								this.#assertIdentity(outgoing);
-								return outgoing.session.abort();
-							},
-							persist: async () => {
-								this.#assertIdentity(outgoing);
-								await this.waitForShutdownHook(outgoing.session);
-								this.#assertIdentity(outgoing);
-								this.beforeSessionInvalidate?.();
-								this.#assertIdentity(outgoing);
-								outgoing.session.dispose();
-								this._disposed = true;
-							},
-						})
-						.then(resolve, reject);
-				} catch (cause) {
-					reject(cause);
-				}
-				return await this.#ownerDisposal;
-			}
 			await outgoing.session.abort();
 			this.#assertCurrent(outgoing, true);
 			await this.waitForShutdownHook(outgoing.session);
@@ -907,17 +736,17 @@ export async function createAgentSessionRuntime(
 		sessionStartEvent?: SessionStartEvent;
 	},
 ): Promise<AgentSessionRuntime> {
-	const owner = ordinaryOwnerOf(options);
-	const sessionManager = options.sessionManager;
-	assertOrdinaryRuntime(sessionManager, owner, createRuntime);
-	const { cwd, agentDir, sessionStartEvent } = options;
+	const { cwd, agentDir, sessionStartEvent, sessionManager } = options;
 	const retained = Object.freeze({ cwd, agentDir, sessionStartEvent, sessionManager });
 	assertSessionCwdExists(sessionManager, retained.cwd);
-	const { session, services, diagnostics, modelFallbackMessage } = await (owner
-		? owner.within(() => createRuntime(bindOrdinaryOptions(retained, owner)))
-		: createRuntime(retained));
-	assertOrdinaryRuntime(session.sessionManager, owner, createRuntime);
-	return new AgentSessionRuntime(session, services, createRuntime, diagnostics, modelFallbackMessage);
+	const result = await createRuntime(retained);
+	return new AgentSessionRuntime(
+		result.session,
+		result.services,
+		createRuntime,
+		result.diagnostics,
+		result.modelFallbackMessage,
+	);
 }
 
 export {

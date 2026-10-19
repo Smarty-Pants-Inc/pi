@@ -8,7 +8,7 @@ import {
 import { createAssistantMessageDiagnostic } from "../src/utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError } from "../src/utils/error-body.ts";
 
-// pi#127: credentials can cross multiple SDK serialization layers before reaching a diagnostic.
+// pi#127: credentials cross multiple SDK serialization layers before reaching a diagnostic.
 describe("OAuth diagnostic redaction", () => {
 	it.each(["access_token", "refresh_token", "id_token", "account_id", "chatgpt-account-id", "Authorization"])(
 		"redacts %s before truncation and nested serialization",
@@ -25,7 +25,6 @@ describe("OAuth diagnostic redaction", () => {
 				status: 503,
 				body: JSON.stringify({ [field]: secret.repeat(4000) }),
 			});
-			// smarty-dev#5822: the normalized error and its owned text carry no provider body at all.
 			const norm = normalizeProviderError(error);
 			expect(JSON.stringify(norm)).not.toContain(secret);
 			expect(formatProviderError(norm)).toBe("Provider request failed (503)");
@@ -41,7 +40,6 @@ describe("OAuth diagnostic redaction", () => {
 		}
 	});
 
-	// pi#127 / audit-2b P1-1: delimiter escaping is not limited to one JSON layer.
 	it.each(["refresh_token", "access_token", "id_token", "account_id", "chatgpt_account_id", "Authorization"])(
 		"redacts arbitrary escaped delimiters and malformed fragments for %s",
 		(field) => {
@@ -90,14 +88,12 @@ describe("OAuth diagnostic redaction", () => {
 		const result = redactOAuthDiagnosticValue(value, [secret]);
 		expect(JSON.stringify(result)).not.toContain(secret);
 		expect(result).not.toBe(value);
-		// smarty-dev#5822 N5682: a diagnostic has no error or details field to carry a value at all.
 		expect(Object.keys(createAssistantMessageDiagnostic("provider_transport_failure")).sort()).toEqual([
 			"timestamp",
 			"type",
 		]);
 	});
 
-	// pi#150 security round 2: custom credential headers have no fixed name.
 	it.each(["X-Portkey-Api-Key", "X-Custom-Token", "X-Client-Secret", "Cookie", "X-Session-Id", "X-Auth"])(
 		"redacts the value of the custom sensitive header %s",
 		(header) => {
@@ -111,7 +107,7 @@ describe("OAuth diagnostic redaction", () => {
 		},
 	);
 
-	// smarty-dev#4703: configured credentials stay sensitive below the old eight-character cutoff.
+	// smarty-dev#4703: no minimum length for configured credentials.
 	it.each(["x-api-key", "api-key", "proxy-authorization", "cf-aig-authorization"])(
 		"masks nonempty known %s credentials regardless of length",
 		(header) => {
@@ -127,7 +123,6 @@ describe("OAuth diagnostic redaction", () => {
 		},
 	);
 
-	// smarty-dev#4703: mask known short tokens, not their occurrences inside ordinary words.
 	it.each([
 		["a", "the theater theme other normal *** word ***"],
 		["the", "*** theater theme other normal a word ***"],
@@ -141,14 +136,12 @@ describe("OAuth diagnostic redaction", () => {
 		expect(redactOAuthDiagnostic(`Bearer ${secret}`, [secret])).toContain("***");
 	});
 
-	// pi#150 security round 3: one label set classifies headers and masks labels.
 	it("redacts an X-Client-Credential value reflected in an error under its label", () => {
 		const secret = "FAKE_CLIENT_CREDENTIAL_150";
 		const secrets = getRequestDiagnosticSecrets({ headers: { "X-Client-Credential": secret } }, undefined);
 		expect(secrets).toContain(secret);
 		const reflected = `401 {"error":"rejected","X-Client-Credential":"${secret}"} X-Client-Credential: ${secret}`;
 		expect(redactOAuthDiagnostic(reflected, secrets)).not.toContain(secret);
-		// Without the live value, label masking still hides a short one.
 		const labelOnly = redactOAuthDiagnostic('401 {"X-Client-Credential":"c1"} x-client-credential=c2; code=bad');
 		expect(labelOnly).not.toContain("c1");
 		expect(labelOnly).not.toContain("c2");

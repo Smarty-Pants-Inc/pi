@@ -6,7 +6,7 @@ import {
 } from "../src/auth/oauth/credential-response.ts";
 import { normalizeProviderError } from "../src/utils/error-body.ts";
 
-// smarty-dev#4703: a tiny live key must not corrupt owned hints or transport diagnostics.
+// smarty-dev#4703: tiny live keys must not corrupt owned hints or transport diagnostics.
 describe("short known credential token boundaries", () => {
 	it.each(["k", "ck"])("preserves ordinary words with a %s credential", (secret) => {
 		const text = "Check your ChatGPT usage: https://chatgpt.com/settings/usage; socket hang up";
@@ -20,7 +20,6 @@ describe("short known credential token boundaries", () => {
 		}
 	});
 
-	// smarty-dev#4703: raw and encoded tiny values still mask in every reflected credential context.
 	it.each(["k", "ck"])("masks standalone values and URL userinfo for %s", (secret) => {
 		const secrets = getRequestDiagnosticSecrets(undefined, { apiKey: secret });
 		const percent = [...secret].map((char) => `%${char.charCodeAt(0).toString(16)}`).join("");
@@ -46,9 +45,8 @@ describe("short known credential token boundaries", () => {
 		}
 	});
 
-	// smarty-dev#4703: the short rule includes aliases and Unicode letters/numbers, not just ASCII prose.
 	it("preserves embedded short aliases and uses the four-character substring floor", () => {
-		expect(redactValues("draw", ["k"])).toBe("draw"); // "aw" is unpadded Base64(k).
+		expect(redactValues("draw", ["k"])).toBe("draw");
 		expect(redactValues("éko 1k2 _k_", ["k"])).toBe("éko 1k2 _***_");
 		expect(redactValues("theme the", ["the"])).toBe("theme ***");
 		expect(redactValues("xQ7Z9y", ["Q7Z9"])).toBe("x***y");

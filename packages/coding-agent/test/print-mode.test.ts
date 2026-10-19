@@ -75,8 +75,6 @@ function createRuntimeHost(assistantMessage: AssistantMessage): FakeRuntimeHost 
 		prompt: vi.fn(async (_text: string, _options?: PromptOptions) => {}),
 		reload: vi.fn(async () => {}),
 	};
-	// Mode-only output/settlement fixture. Real ingress/persistence is covered by
-	// test/suite/turn-provenance-mode-print.test.ts using the faux harness.
 	bindReceivedInputSession(session as unknown as AgentSession, {
 		prompt: async (input, options) => {
 			if (input.images) await session.prompt(input.text, { ...options, images: input.images });
@@ -140,7 +138,7 @@ describe("runPrintMode", () => {
 		expect(session.extensionRunner.emit).toHaveBeenCalledWith({ type: "session_shutdown", reason: "quit" });
 	});
 
-	// smarty-dev#3200 / PR #114 round 4: settlement is authoritative even with a tool-result tail or length stop.
+	// smarty-dev#3200 / pi#114: settlement is authoritative with a tool-result tail or length stop.
 	it.each([false, true])("returns failure for settled error with tool-result tail: %s", async (toolTail) => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "truncated", stopReason: "length" }));
 		if (toolTail)
@@ -172,7 +170,7 @@ describe("runPrintMode", () => {
 		expect(errorSpy).toHaveBeenCalledWith("Request error");
 	});
 
-	// pi#132 R4-9: a progressing reader slower than the 1000 ms shutdown drain still gets complete successful output.
+	// pi#132: successful output is not constrained by forced-shutdown drainage.
 	it("joins slow successful text output before the forced-shutdown drain budget", async () => {
 		const runtimeHost = createRuntimeHost(createAssistantMessage({ text: "done" }));
 		const written: string[] = [];

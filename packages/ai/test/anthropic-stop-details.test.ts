@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
 import { getModel, normalizeContext } from "../src/compat.ts";
 import type { AssistantMessage, AssistantMessageEvent } from "../src/types.ts";
-import { projectAssistantMessage } from "../src/utils/diagnostics.ts";
+import { projectAssistantMessage } from "../src/utils/assistant-message-snapshot.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 
 const model = getModel("anthropic", "claude-haiku-4-5");
@@ -86,7 +86,7 @@ async function recordInjectedRefusal(
 	return { events, result: await stream.result() };
 }
 
-// Record-only diagnostic regression. Keep: untrusted-provider and outbound-context trust boundaries.
+// pi#297 / smarty-dev#14961. Keep: untrusted-provider and outbound-context trust boundaries.
 describe("Anthropic stop details through the provider SSE adapter", () => {
 	it.each(["end_turn", "max_tokens", "tool_use"] as const)(
 		"drops stop details from non-refusal terminal reason %s at the real SSE publication boundary",
@@ -258,6 +258,30 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		expect((await stream.result()).responseId).toBe("msg_test");
 	});
 
+	// pi#297 / pi#280: preserving a refusal's response ID must not bypass live-value masking.
+	it("masks live credentials reflected in a refusal response ID", async () => {
+		const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+			apiKey: "synthetic-test-key",
+			maxRetries: 0,
+			fetch: async () =>
+				createSseResponse([
+					{
+						type: "message_start",
+						message: {
+							id: "msg_synthetic-test-key",
+							model: model.id,
+							usage: { input_tokens: 12, output_tokens: 0 },
+						},
+					},
+					{ type: "message_delta", delta: { stop_reason: "refusal" } },
+					{ type: "message_stop" },
+				]),
+		}).result();
+		expect(result.stopReason).toBe("error");
+		expect(result.responseId).toBe("msg_***");
+		expect(JSON.stringify(result)).not.toContain("synthetic-test-key");
+	});
+
 	it("masks reflected live credentials in the record-only field", async () => {
 		const result = await recordRefusal({ explanation: "synthetic-test-key" });
 		expect(result.stopDetailsState).toBe("retained");
@@ -270,7 +294,10 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		const details = { explanation: credential, context: "diagnostic-secret" };
 		const masked = JSON.stringify({ explanation: credential, context: "***" });
 		const { events, result } = await recordInjectedRefusal(details, credential, ["diagnostic-secret"]);
-		const projected = projectAssistantMessage(result, "failure");
+		// pi#280: the candidate's narrow exception lives at the stream boundary, after its closed snapshot.
+		const projectedStream = new AssistantMessageEventStream();
+		projectedStream.end(result);
+		const projected = await projectedStream.result();
 		const errorEvent = events.find((event) => event.type === "error");
 
 		expect(result.stopDetailsState).toBe("discarded");
@@ -334,6 +361,103 @@ describe("Anthropic stop details through the provider SSE adapter", () => {
 		expect(result).not.toHaveProperty("rawStopDetails");
 		expect(result.stopDetailsBytes).toBe(Buffer.byteLength(masked, "utf8"));
 		expect(result.stopDetailsSha256).toBe(createHash("sha256").update(masked, "utf8").digest("hex"));
+	});
+
+	// pi#297 / pi#280: details received before the reason survive null and usage-only deltas.
+	it("keeps earlier details when a later null precedes the refusal reason", async () => {
+		const details = { explanation: "earlier opaque data" };
+		const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+			apiKey: "synthetic-test-key",
+			maxRetries: 0,
+			fetch: async () =>
+				createSseResponse([
+					{
+						type: "message_start",
+						message: { id: "msg_test", model: model.id, usage: { input_tokens: 12, output_tokens: 0 } },
+					},
+					{ type: "message_delta", delta: { stop_details: details } },
+					{ type: "message_delta", delta: { stop_details: null } },
+					{ type: "message_delta", delta: { stop_reason: "refusal" } },
+					{ type: "message_stop" },
+				]),
+		}).result();
+		expect(result.stopDetailsState).toBe("retained");
+		expect(result.rawStopDetails).toBe(JSON.stringify(details));
+	});
+
+	// pi#297 / pi#280: a later conflicting delta cannot convert a successful terminal reason into a refusal record.
+	it("uses only the first terminal stop reason", async () => {
+		const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+			apiKey: "synthetic-test-key",
+			maxRetries: 0,
+			fetch: async () =>
+				createSseResponse([
+					{
+						type: "message_start",
+						message: { id: "msg_test", model: model.id, usage: { input_tokens: 12, output_tokens: 0 } },
+					},
+					{ type: "message_delta", delta: { stop_reason: "end_turn" } },
+					{ type: "message_delta", delta: { stop_reason: "refusal", stop_details: "not a refusal" } },
+					{ type: "message_stop" },
+				]),
+		}).result();
+		expect(result.stopReason).toBe("stop");
+		expect(result.rawStopReason).toBe("end_turn");
+		expectNoStopDetails(result);
+	});
+
+	// pi#297 / pi#280: abort after the refusal delta must not create a refusal record, even on the producer object.
+	it("does not attach refusal details when the request aborts after the refusal delta", async () => {
+		const controller = new AbortController();
+		const push = vi.spyOn(AssistantMessageEventStream.prototype, "push");
+		let notifications = 0;
+		try {
+			const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+				apiKey: "synthetic-test-key",
+				maxRetries: 0,
+				signal: controller.signal,
+				onProviderStreamEvent: () => {
+					if (++notifications === 5) controller.abort();
+				},
+				fetch: async () => sseResponse({ stop_reason: "refusal", stop_details: "untrusted" }),
+			});
+			for await (const event of stream) {
+				if (event.type === "error") {
+					expect(event.error.stopReason).toBe("aborted");
+					expect(event.error).not.toHaveProperty("responseId");
+					expectNoStopDetails(event.error);
+				} else if ("partial" in event) expectNoStopDetails(event.partial);
+			}
+			const result = await stream.result();
+			expect(result.stopReason).toBe("aborted");
+			expectNoStopDetails(result);
+			for (const [event] of push.mock.calls) {
+				if (event.type === "error") expectNoStopDetails(event.error);
+				else if ("partial" in event) expectNoStopDetails(event.partial);
+			}
+		} finally {
+			push.mockRestore();
+		}
+	});
+
+	// pi#297 / pi#280: exercise the candidate's real push/end boundary, not only the closed snapshot helper.
+	it.each([
+		{ api: "anthropic-messages", stopReason: "stop", rawStopReason: "refusal" },
+		{ api: "anthropic-messages", stopReason: "aborted", rawStopReason: "refusal" },
+		{ api: "anthropic-messages", stopReason: "error", rawStopReason: "sensitive" },
+		{ api: "other-api", stopReason: "error", rawStopReason: "refusal" },
+	] as const)("drops stored details outside an Anthropic refusal failure: %j", async (terminalFields) => {
+		const recorded = await recordRefusal({ explanation: "untrusted" });
+		const stream = new AssistantMessageEventStream();
+		stream.push({ type: "start", partial: recorded });
+		stream.end({ ...recorded, ...terminalFields });
+		for await (const event of stream) {
+			if ("partial" in event) {
+				expectNoStopDetails(event.partial);
+				expect(event.partial).not.toHaveProperty("responseId");
+			}
+		}
+		expectNoStopDetails(await stream.result());
 	});
 
 	it.each([

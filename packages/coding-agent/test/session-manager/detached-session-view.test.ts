@@ -12,8 +12,8 @@ afterEach(() => {
 	dir = undefined;
 });
 
-// smarty-dev#11897: snapshots keep persisted JSON isolation, not stable entry identity.
-// The real-sized retention/dispatch budgets live in session-history-memory.test.ts.
+// smarty-dev#11897 / pi#289 / pi#291: share owned immutable data, not a second payload history.
+// Real-sized retention/dispatch/reuse budgets live in session-history-{memory,large}.test.ts.
 describe("detached session snapshots", () => {
 	// pi#163 post-merge CODE P2: freezing a non-empty typed array must not break history reads.
 	it("returns the persisted JSON form of typed-array custom data on every history route", () => {

@@ -1,6 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fauxAssistantMessage } from "@earendil-works/pi-ai/compat";
 import { afterEach, expect, it } from "vitest";
 import { detachedSessionView, type FileEntry, SessionManager } from "../../src/core/session-manager.ts";
 
@@ -44,7 +45,7 @@ it("owns message, custom data, details, and context edits without freezing calle
 			revision: manager.revision(),
 		}),
 	).toBe(before);
-	expect(readFileSync(manager.getSessionFile()!)).toEqual(bytes);
+	expect(readFileSync(manager.getSessionFile()!).equals(bytes)).toBe(true);
 	const expected = history.getEntry(custom);
 	for (const entry of [
 		history.getEntry(custom),
@@ -61,8 +62,58 @@ it("owns message, custom data, details, and context edits without freezing calle
 	expect(SessionManager.open(manager.getSessionFile()!).getEntries()).toEqual(history.getEntries());
 	const context = manager.buildSessionProjection().messages[0];
 	if (context.role !== "user" || !Array.isArray(context.content)) throw new Error("missing projected user");
-	if (context.content[0].type === "text") context.content[0].text = "local model view";
+	// smarty-dev#14893 / pi#306: immutable edited payloads are shared; only the runtime shell is mutable.
+	expect(Object.isFrozen(context.content)).toBe(true);
+	const nextContext = manager.buildSessionProjection().messages[0];
+	if (nextContext.role !== "user") throw new Error("missing projected user");
+	expect(nextContext.content).toBe(context.content);
+	const block = context.content[0];
+	if (block.type === "text") {
+		expect(() => {
+			block.text = "local model view";
+		}).toThrow(TypeError);
+	}
+	context.content = "local model view";
+	expect(manager.buildSessionProjection().messages[0]).toMatchObject({
+		role: "user",
+		content: [{ type: "text", text: "edited" }],
+	});
 	expect(JSON.stringify(history.getEntries())).toBe(JSON.stringify(JSON.parse(before).entries));
+});
+
+// pi#291 / #306 / smarty-dev#14893: mutable runtime shells/accounting must not alias frozen stored payloads.
+it("keeps runtime wrappers and accounting mutable while preserving frozen published payloads", () => {
+	const manager = SessionManager.inMemory();
+	manager.appendMessage({ role: "user", content: [{ type: "text", text: "input" }], timestamp: 1 });
+	const assistant = manager.appendMessage(fauxAssistantMessage("answer"));
+	manager.appendMessage({ role: "system", content: "system", toolsAdded: [], timestamp: 2 });
+	manager.appendCustomMessageEntry("visible", [{ type: "text", text: "custom" }], true, { values: [1] });
+	const history = detachedSessionView(manager);
+	const before = JSON.stringify(history.getEntries());
+	const projection = manager.buildSessionProjection();
+	const input = projection.messages.find((message) => message.role === "user")!;
+	expect(Object.isFrozen(input)).toBe(false);
+	expect(Object.isFrozen(input.content)).toBe(true);
+	input.content = "edited input";
+	expect(manager.buildSessionProjection().messages.find((message) => message.role === "user")).toMatchObject({
+		content: [{ type: "text", text: "input" }],
+	});
+	for (const message of projection.messages) {
+		if (message.role === "assistant") {
+			message.usage.input = 99;
+			message.content = [{ type: "text", text: "local answer" }];
+		} else if (message.role === "system") message.content = "local system";
+		else if (message.role === "custom") {
+			message.content = "local custom";
+			expect(() => (message.details as { values: number[] }).values.push(2)).toThrow(TypeError);
+			message.details = { values: [2] };
+		}
+	}
+	expect(JSON.stringify(history.getEntries())).toBe(before);
+	const stored = manager.getEntry(assistant);
+	if (stored?.type !== "message" || stored.message.role !== "assistant") throw new Error("missing assistant");
+	expect(Object.isFrozen(stored.message.usage)).toBe(true);
+	expect(stored.message.content).toEqual([{ type: "text", text: "answer" }]);
 });
 
 // Cold-entry status alone must not bless unrelated caller-defined getters.

@@ -189,8 +189,7 @@ async function restart(
 	return { ...opened, result: await resultText(chat.setup, opened.root) };
 }
 
-// Fork-intended skip: fork admission disabled awaiting review (pi#131).
-describe.skip("durable code mode", () => {
+describe("durable code mode", () => {
 	it("runs a script that calls tools as nested calls, and journals each result before delivering it", async () => {
 		const chat = codemodeChat();
 		chat.holds.block = false;
@@ -761,6 +760,7 @@ describe.skip("durable code mode", () => {
 	it("delivers a result only after its journal commit", async () => {
 		const storage = new ControlledStorage();
 		const seen: string[] = [];
+		const firstExecuted = deferred();
 		const chat = codemodeChat([
 			{
 				name: "first",
@@ -768,6 +768,7 @@ describe.skip("durable code mode", () => {
 					seen.push("first");
 					// The next commit is this result's journal commit: it never lands.
 					storage.failNextCommit(new Error("lost"));
+					firstExecuted.resolve();
 					return 1;
 				},
 			},
@@ -782,11 +783,14 @@ describe.skip("durable code mode", () => {
 		chat.holds.block = false;
 		chat.setup.faux.setResponses([script(`await first(); await second();`), DONE]);
 		const { harness, root } = await openChat(storage, chat.setup);
-		await root.submit({ type: "input", content: "go" }, context);
-		await eventually(() => seen.includes("first"));
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		expect(seen).toEqual(["first"]);
-		await harness.close(context).catch(() => {});
+		try {
+			await root.submit({ type: "input", content: "go" }, context);
+			await firstExecuted.promise;
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(seen).toEqual(["first"]);
+		} finally {
+			await harness.close(context).catch(() => {});
+		}
 	});
 
 	it("refuses to resume when the sandbox's fingerprint or the code mode version changed", async () => {
@@ -913,8 +917,7 @@ describe.skip("durable code mode", () => {
 	});
 });
 
-// Fork-intended skip: fork admission disabled awaiting review (pi#131).
-describe.skip("durable code mode output and tool search", () => {
+describe("durable code mode output and tool search", () => {
 	/** Run `code` once in a chat with a Node environment; the result's content and details. */
 	async function runScript(code: string, chat = codemodeChat()) {
 		chat.holds.block = false;

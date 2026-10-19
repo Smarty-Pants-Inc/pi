@@ -63,7 +63,7 @@ describe("compaction observer history isolation", () => {
 			}).toThrow(TypeError);
 			expect(JSON.stringify(h.sessionManager.getEntries())).toBe(before);
 			expect(h.sessionManager.revision()).toBe(revision);
-			expect(readFileSync(h.sessionManager.getSessionFile()!)).toEqual(bytes);
+			expect(readFileSync(h.sessionManager.getSessionFile()!).equals(bytes)).toBe(true);
 			expect(h.getPendingResponseCount()).toBe(0);
 		} finally {
 			await h.cleanup();

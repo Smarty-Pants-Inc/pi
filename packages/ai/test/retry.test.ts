@@ -16,6 +16,7 @@ const azurePeakLoadError =
 	"The system is currently experiencing high demand and cannot process your request. Your request exceeds the maximum usage size allowed during peak load. For improved capacity reliability, consider switching to Provisioned Throughput.";
 
 describe("provider retry classification", () => {
+	// Fork contract: 2f7bc1365047f8a4361a083c17851512d2d2c6b4; retained by 05ea5a83179db695c07f43ea7241d4775390e170.
 	it.each([
 		"Selected model is at capacity. Please try a different model.",
 		'{"message":"Selected model is at capacity. Please try a different model."}',
@@ -64,6 +65,33 @@ describe("provider retry classification", () => {
 		}
 	});
 
+	// Regression for #10842: keep OpenRouter and gateway provider-wrapper wording.
+	it.each(["Provider returned error", "The upstream provider returned an error"])(
+		"matches provider wrapper failures: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+			expect(
+				isRetryableAssistantError(
+					fauxAssistantMessage("", { stopReason: "error", errorMessage: `insufficient_quota: ${errorMessage}` }),
+				),
+			).toBe(false);
+		},
+	);
+
+	// smarty-dev#1856: local gateway restart.
+	it.each(["connect ECONNREFUSED 127.0.0.1:8317", "read ECONNRESET", "400 unknown provider for model gpt-5"])(
+		"matches local gateway restart failures: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+		},
+	);
+	it.each(["400 invalid request", "insufficient_quota", "insufficient_quota: 400 unknown provider for model gpt-5"])(
+		"keeps non-transient errors non-retryable: %s",
+		(errorMessage) => {
+			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
+		},
+	);
+
 	it("matches explicit provider retry guidance", () => {
 		expect(
 			isRetryableAssistantError(
@@ -90,22 +118,6 @@ describe("provider retry classification", () => {
 		).toBe(true);
 	});
 
-	// Regression for #10842: keep both OpenRouter and gateway provider-error wording.
-	it.each(["Provider returned error", "The upstream provider returned an error"])(
-		"matches provider wrapper failures: %s",
-		(errorMessage) => {
-			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
-			expect(
-				isRetryableAssistantError(
-					fauxAssistantMessage("", {
-						stopReason: "error",
-						errorMessage: `insufficient_quota: ${errorMessage}`,
-					}),
-				),
-			).toBe(false);
-		},
-	);
-
 	it("matches upstream request buffer exhaustion wording", () => {
 		expect(
 			isRetryableAssistantError(
@@ -126,21 +138,6 @@ describe("provider retry classification", () => {
 		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 	});
 
-	// smarty-dev#1856: CLIProxyAPI gateway restart.
-	it.each(["connect ECONNREFUSED 127.0.0.1:8317", "read ECONNRESET", "400 unknown provider for model gpt-5"])(
-		"matches local gateway restart failures: %s",
-		(errorMessage) => {
-			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
-		},
-	);
-
-	it.each(["400 invalid request", "insufficient_quota", "insufficient_quota: 400 unknown provider for model gpt-5"])(
-		"keeps non-transient errors non-retryable: %s",
-		(errorMessage) => {
-			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(false);
-		},
-	);
-
 	it.each(["The pending stream has been canceled", "The pending stream has been canceled (caused by: socket closed)"])(
 		"matches HTTP/2 pending stream cancellation: %s",
 		(errorMessage) => {
@@ -148,6 +145,15 @@ describe("provider retry classification", () => {
 			expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
 		},
 	);
+
+	it.each([
+		// Regression for #10965 (provider unknown, no status code in the message).
+		"The service is temporarily unavailable. Please retry later.",
+		// Bedrock ServiceUnavailableException as formatted by formatBedrockError.
+		"Service unavailable: The service is temporarily unavailable.",
+	])("matches service unavailable wording: %s", (errorMessage) => {
+		expect(isRetryableAssistantError(fauxAssistantMessage("", { stopReason: "error", errorMessage }))).toBe(true);
+	});
 
 	it("matches OpenAI Responses streams that end before terminal events", () => {
 		expect(
@@ -255,6 +261,29 @@ describe("retryAssistantCall", () => {
 		expect(produce).toHaveBeenCalledTimes(4); // 1 initial + 3 retries
 		expect(onRetryScheduled).toHaveBeenCalledTimes(3);
 		expect(onRetryFinished).toHaveBeenCalledWith(false, 3, "terminated");
+	});
+
+	// pi#280: the restored 2f7bc1365 classifier still requires a retry budget and no output.
+	it.each([
+		["empty error", "", "error", 4, 3],
+		["aborted", "", "aborted", 1, 0],
+		["successful stop", "", "stop", 1, 0],
+		["answer output", "visible answer", "error", 1, 0],
+	] as const)("bounds slow_down retries for %s", async (_label, text, stopReason, calls, retries) => {
+		const produce = vi.fn(async () => fauxAssistantMessage(text, { stopReason, errorMessage: "slow_down" }));
+		const onRetryScheduled = vi.fn();
+		const onRetryFinished = vi.fn();
+		const res = await retryAssistantCall(produce, enabled, undefined, { onRetryScheduled, onRetryFinished });
+		expect(res.stopReason).toBe(stopReason);
+		expect(res.content).toEqual([{ type: "text", text }]);
+		expect(produce).toHaveBeenCalledTimes(calls);
+		expect(onRetryScheduled).toHaveBeenCalledTimes(retries);
+		if (retries > 0) {
+			expect(res.recovery).toEqual({ recovery: "retryable", retryable: true });
+			expect(onRetryFinished).toHaveBeenCalledWith(false, retries, "slow_down");
+		} else {
+			expect(onRetryFinished).not.toHaveBeenCalled();
+		}
 	});
 
 	it("reports capped retry delays", async () => {

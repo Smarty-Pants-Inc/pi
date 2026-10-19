@@ -117,7 +117,7 @@ describe("Mistral HTTP transport", () => {
 		expect(callbackPayload?.maxTokens).toBe(123);
 		expect(callbackPayload?.promptMode).toBe("reasoning");
 		expect(callbackPayload?.promptCacheKey).toBe("session-1");
-		// smarty-dev#5822 C1: the status only, never response headers.
+		// smarty-dev#5822 C1: status only, never response headers.
 		expect(callbackResponse).toEqual({ status: 200 });
 
 		const wirePayload = JSON.parse(String(requestInit?.body)) as Record<string, unknown>;
@@ -363,7 +363,7 @@ describe("Mistral HTTP transport", () => {
 		]);
 	});
 
-	// smarty-dev#5822 C1: one owned notification per payload, never the payload or model.
+	// smarty-dev#5822 C1: one owned notification per payload, never payload or model.
 	it("notifies once per parsed SSE payload without provider data", async () => {
 		const model = getModel("mistral", "mistral-large-latest");
 		const context = normalizeContext({
@@ -523,7 +523,7 @@ describe("Mistral HTTP transport", () => {
 		expect(message.content).toEqual([{ type: "thinking", thinking: "xxxxx" }]);
 	});
 
-	// pi#202 / pi#10609: timeout/abort transport changes must not restore wire data in public callbacks or errors.
+	// pi#202 / pi#10609: timeout/abort changes must not restore public wire data.
 	it.each(["http", "malformed SSE", "wire finish reason"])("isolates canaries from %s failures", async (failure) => {
 		const canary = "mistral-private-wire-value-without-a-credential-label";
 		const model = getModel("mistral", "mistral-large-latest");
@@ -560,7 +560,7 @@ describe("Mistral HTTP transport", () => {
 		).not.toContain(canary);
 	});
 
-	// pi#10609: detaching the header deadline must still cancel an owned in-flight body on caller abort.
+	// pi#10609: caller abort must cancel an owned response body after headers.
 	it("cancels the response body when the caller aborts after headers", async () => {
 		const controller = new AbortController();
 		const cancel = vi.fn();
@@ -571,9 +571,7 @@ describe("Mistral HTTP transport", () => {
 				apiKey: "test",
 				signal: controller.signal,
 				fetch: async () =>
-					new Response(new ReadableStream({ cancel }), {
-						headers: { "content-type": "text/event-stream" },
-					}),
+					new Response(new ReadableStream({ cancel }), { headers: { "content-type": "text/event-stream" } }),
 			},
 		);
 		const events = stream[Symbol.asyncIterator]();
@@ -583,7 +581,7 @@ describe("Mistral HTTP transport", () => {
 		expect(cancel).toHaveBeenCalledTimes(1);
 	});
 
-	// pi#202: admission still precedes the native fetch after the header-timeout merge.
+	// pi#202: admission still precedes native fetch after the header-timeout merge.
 	it("does not fetch when request admission is denied", async () => {
 		const fetch = vi.fn<FetchFunction>();
 		const result = await streamMistral(
@@ -602,7 +600,7 @@ describe("Mistral HTTP transport", () => {
 		expect(fetch).not.toHaveBeenCalled();
 	});
 
-	// smarty-dev#5822 (pi#202 round 2): the status is kept; the response body is classified, never published.
+	// smarty-dev#5822: classify the response body privately, publish only status.
 	it("keeps the HTTP status and publishes no response body", async () => {
 		const model = getModel("mistral", "mistral-large-latest");
 		const context = normalizeContext({

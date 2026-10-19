@@ -19,6 +19,7 @@ import type {
 	MermaidRenderingMode,
 	PackageSource,
 	QuietStartup,
+	SessionShareDestination,
 	Settings,
 	ThinkingBudgetsSettings,
 	TransportSetting,
@@ -42,6 +43,7 @@ export type {
 	ProviderRetrySettings,
 	QuietStartup,
 	RetrySettings,
+	SessionShareDestination,
 	Settings,
 	TerminalSettings,
 	ThinkingBudgetsSettings,
@@ -374,14 +376,9 @@ export class SettingsManager {
 			return undefined;
 		});
 
-		// Only a missing file means "no settings". An existing empty file fails to parse like any other
-		// unreadable file, so a model policy can never be bypassed by truncating it.
-		if (content === undefined) {
-			return {};
-		}
+		// Only absence means no settings; empty or non-object JSON must fail closed.
+		if (content === undefined) return {};
 		const settings: unknown = JSON.parse(stripBom(content));
-		// Settings are a JSON object. Any other root (array, null, number, string) is a load error, so a
-		// model policy can never be bypassed by replacing the file's contents with valid non-object JSON.
 		if (typeof settings !== "object" || settings === null || Array.isArray(settings)) {
 			throw new Error("settings file root must be a JSON object");
 		}
@@ -532,7 +529,7 @@ export class SettingsManager {
 		this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
 	}
 
-	/** Apply additional overrides on top of current settings. Model policy overrides can only narrow. */
+	/** Apply overrides; model policies may only narrow prior layers. */
 	applyOverrides(overrides: Partial<Settings>): void {
 		if (overrides.modelPolicy !== undefined) this.modelPolicyOverrides.push(structuredClone(overrides.modelPolicy));
 		this.settings = deepMergeSettings(this.settings, overrides);
@@ -812,6 +809,19 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getSessionShareDestination(): SessionShareDestination {
+		const destination = this.settings.sessionShareDestination;
+		return destination === "gist" || destination === "radius"
+			? destination
+			: SETTINGS_DEFAULTS.sessionShareDestination;
+	}
+
+	setSessionShareDestination(destination: SessionShareDestination): void {
+		this.globalSettings.sessionShareDestination = destination;
+		this.markModified("sessionShareDestination");
+		this.save();
+	}
+
 	getCompactionEnabled(): boolean {
 		return this.settings.compaction?.enabled ?? SETTINGS_DEFAULTS.compaction.enabled;
 	}
@@ -905,10 +915,6 @@ export class SettingsManager {
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? SETTINGS_DEFAULTS.retry.baseDelayMs,
 			maxAgentDelayMs: this.settings.retry?.maxAgentDelayMs ?? SETTINGS_DEFAULTS.retry.maxAgentDelayMs,
 		};
-	}
-
-	getRetryFallbackModel(): string | undefined {
-		return this.settings.retry?.fallbackModel;
 	}
 
 	getHttpIdleTimeoutMs(): number {
@@ -1338,9 +1344,8 @@ export class SettingsManager {
 		return this.settings.enabledModels;
 	}
 
-	/** Match each settings layer independently: project settings cannot widen the global policy. */
+	/** Match each layer independently; project settings cannot widen the global policy. */
 	isModelAllowed(model: ModelPolicyTarget): boolean {
-		// A settings file that failed to parse may hold a policy we can't read: deny rather than run unrestricted.
 		if (this.globalSettingsLoadError || this.projectSettingsLoadError) return false;
 		return (
 			modelPolicyAllows(this.globalSettings.modelPolicy, model) &&

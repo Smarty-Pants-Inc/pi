@@ -29,13 +29,11 @@ vi.mock("../src/modes/rpc/jsonl.ts", () => ({
 	},
 	serializeJsonLine: (value: unknown) => `${JSON.stringify(value)}\n`,
 }));
-
 interface RpcFixture {
 	ui: ExtensionUIContext;
 	respond(response: RpcExtensionUIResponse): void;
 	end(): void;
 }
-
 async function withRpc(test: (fixture: RpcFixture) => Promise<void>): Promise<void> {
 	let ui: ExtensionUIContext | undefined;
 	const harness = await createHarness({
@@ -71,11 +69,7 @@ async function withRpc(test: (fixture: RpcFixture) => Promise<void>): Promise<vo
 	try {
 		await vi.waitFor(() => expect(ui).toBeDefined());
 		if (!ui) throw new Error("RPC UI was not bound");
-		await test({
-			ui,
-			respond: (response) => rpcIo.lineHandler?.(JSON.stringify(response)),
-			end,
-		});
+		await test({ ui, respond: (response) => rpcIo.lineHandler?.(JSON.stringify(response)), end });
 		expect(runError).toBeUndefined();
 	} finally {
 		rpcIo.failOutput = false;
@@ -97,15 +91,15 @@ async function withRpc(test: (fixture: RpcFixture) => Promise<void>): Promise<vo
 	}
 }
 
-describe("RPC UI hold state (smarty-dev#2440, smarty-code#870)", () => {
+// smarty-dev#2440 / smarty-code#870: host UI hold queries are synchronous.
+describe("RPC UI hold state", () => {
 	afterEach(() => {
 		rpcIo.requests = [];
 		rpcIo.lineHandler = undefined;
 		rpcIo.failOutput = false;
 	});
-
 	it.each(["select", "confirm", "input", "editor"] as const)(
-		"tracks pending %s requests on close and client cancel",
+		"tracks pending %s on close and client cancel",
 		async (kind) => {
 			await withRpc(async ({ ui, respond }) => {
 				for (const cancelled of [false, true]) {
@@ -134,7 +128,6 @@ describe("RPC UI hold state (smarty-dev#2440, smarty-code#870)", () => {
 			});
 		},
 	);
-
 	it("keeps simultaneous requests held until the last response", async () => {
 		await withRpc(async ({ ui, respond }) => {
 			const first = ui.input("First");
@@ -151,7 +144,6 @@ describe("RPC UI hold state (smarty-dev#2440, smarty-code#870)", () => {
 			expect(ui.holdState()).toBeUndefined();
 		});
 	});
-
 	it("clears local abort, timeout, EOF and output-error paths", async () => {
 		await withRpc(async ({ ui, end }) => {
 			const controller = new AbortController();
@@ -176,8 +168,7 @@ describe("RPC UI hold state (smarty-dev#2440, smarty-code#870)", () => {
 			expect(ui.holdState()).toBeUndefined();
 		});
 	});
-
-	it("does not hold for notifications, unsupported custom UI, or already-aborted requests", async () => {
+	it("does not hold for notifications, unsupported custom UI or pre-aborted requests", async () => {
 		await withRpc(async ({ ui }) => {
 			ui.notify("notice");
 			expect(ui.holdState()).toBeUndefined();
@@ -192,7 +183,6 @@ describe("RPC UI hold state (smarty-dev#2440, smarty-code#870)", () => {
 		});
 	});
 });
-
 describe("non-UI hold state", () => {
 	it.each(["print", "json"] as const)("reports no holds in %s mode", async (mode) => {
 		const harness = await createHarness();

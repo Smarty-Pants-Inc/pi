@@ -1,20 +1,15 @@
-import { createRequire } from "node:module";
 import { setTimeout as delay } from "node:timers/promises";
 import { fauxAssistantMessage, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import { AuthStorage } from "../../src/core/auth-storage.ts";
-import type { OwnerHost } from "../../src/core/owner-effects.ts";
-import * as ownerEffects from "../../src/core/owner-effects.ts";
 import { createAgentSession } from "../../src/core/sdk.ts";
 import { SessionManager } from "../../src/core/session-manager.ts";
-import { SessionOwnership } from "../../src/core/session-ownership.ts";
 import { SettingsManager } from "../../src/core/settings-manager.ts";
 import { createInMemoryModelRegistry, getModelRuntime } from "../model-runtime-test-utils.ts";
 import { createTestExtensionsResult, createTestResourceLoader } from "../utilities.ts";
 
-// smarty-code#1681: real SDK/AgentSession events, supported pi.appendEntry, and
-// native loaders. Only the owned probe's host/admission construction is isolated.
-const [storage, boundary, directory, operation, selectedFile, addon] = process.argv.slice(2);
-if (!directory || !boundary || !["plain", "owned"].includes(storage)) throw new Error("Invalid child arguments");
+// smarty-code#1681: real SDK/AgentSession events and supported pi.appendEntry.
+const [storage, boundary, directory, operation, selectedFile] = process.argv.slice(2);
+if (!directory || !boundary || storage !== "plain") throw new Error("Invalid child arguments");
 const reopening = operation === "reopen";
 const reply = "A genuine faux-provider streamed reply with several text deltas.";
 const prompt = "Keep this first user message across a crash.";
@@ -37,26 +32,7 @@ async function hold(): Promise<void> {
 	await new Promise<void>(() => {});
 }
 
-let manager: SessionManager;
-if (storage === "plain") {
-	manager = reopening ? SessionManager.open(selectedFile) : SessionManager.create(directory, directory);
-} else {
-	const native = createRequire(import.meta.url)(addon) as {
-		open(directory: string, name: string, existing: boolean): object;
-	};
-	const construct = Reflect.get(ownerEffects, "firstTurnStorageHost") as (
-		native: object,
-		directory: string,
-	) => OwnerHost;
-	const host = construct(native, directory);
-	// Real ownership factories: create and createAllocated share #create,
-	// including the initial header flush. No allocation/admission is claimed.
-	const ownership = reopening
-		? await SessionOwnership.open(host, selectedFile)
-		: SessionOwnership.create(host, directory);
-	manager = ownership.manager;
-}
-
+const manager = reopening ? SessionManager.open(selectedFile) : SessionManager.create(directory, directory);
 const faux = registerFauxProvider({ api: "first-turn-faux", tokenSize: { min: 1, max: 1 } });
 const credentials = AuthStorage.inMemory();
 await credentials.modify(faux.getModel().provider, async () => ({ type: "api_key", key: "faux-key" }));

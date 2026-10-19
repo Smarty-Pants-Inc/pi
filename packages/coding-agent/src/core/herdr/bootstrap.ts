@@ -1,9 +1,10 @@
 /**
  * Enroll as Herdr's input consumer at interactive startup, before any extension loads (smarty-dev#2636).
  *
- * Pi sets raw mode first (Herdr requires it at enroll), holds stdin bytes while enrolling, and waits
- * up to 2 s for the marker. Held bytes are handed to the TUI's terminal through the meter, so nothing
- * typed during startup is lost. Any failed precondition means no epoch: every turn stays `terminal`.
+ * Pi sets raw mode first (Herdr requires it at enroll), holds at most 64 KiB while enrolling, and waits
+ * up to 2 s for the marker. Further input is backpressured until the TUI takes over. Held bytes are
+ * handed to the TUI's terminal through the meter, so startup input is never lost. Failed preconditions
+ * mean no epoch: every turn stays `terminal`.
  */
 import { readFileSync } from "node:fs";
 import type { InputByteMeter } from "@earendil-works/pi-tui";
@@ -14,6 +15,8 @@ import { checkServerTrustRoot, type ServerTrustRoot } from "./server-auth.ts";
 import { SubmitAttestor } from "./submit-attestor.ts";
 
 const MARKER_WAIT_MS = 2000;
+// Bound raw input (including the marker), not just the counter's held or replayable bytes (#3155).
+const MAX_BOOTSTRAP_BYTES = 64 * 1024;
 
 export interface HerdrInputBootstrap {
 	/** Attach to the interactive TUI's terminal before it starts reading. */
@@ -101,21 +104,42 @@ export async function startHerdrInputConsumer(
 	const counter = new EpochByteCounter();
 	counter.hold();
 	const pending: PushResult[] = [];
+	let receivedBytes = 0;
+	const enqueue = (result: PushResult) => {
+		// Holding input returns empty results; do not retain one object per read.
+		if (result.preEpoch.length || result.epoch.length) pending.push(result);
+	};
 	let markerSeen: () => void = () => {};
 	const onData = (chunk: Buffer | string) => {
-		pending.push(counter.push(typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk));
-		if (counter.active) markerSeen();
+		const bytes = typeof chunk === "string" ? Buffer.from(chunk, "utf8") : chunk;
+		const take = Math.min(bytes.length, MAX_BOOTSTRAP_BYTES - receivedBytes);
+		if (take < bytes.length) {
+			// Stop before unshift: the suffix must wait for the TUI, not reenter this listener.
+			stdin.pause();
+			stdin.unshift(bytes.subarray(take));
+		}
+		receivedBytes += take;
+		// Copy a partial read so bootstrap does not retain the unread suffix's backing buffer.
+		enqueue(counter.push(take < bytes.length ? Buffer.from(bytes.subarray(0, take)) : bytes));
+		if (counter.active || receivedBytes === MAX_BOOTSTRAP_BYTES) {
+			stdin.pause();
+			markerSeen();
+		}
 	};
 	stdin.on("data", onData);
 	stdin.resume();
 
 	const enrolled = await enrollHerdrInputConsumer({ socketPath, paneId, trustRoot, timeoutMs: MARKER_WAIT_MS });
 	if (enrolled.ok) {
-		pending.push(counter.arm(enrolled.epoch.nonce));
-		if (!counter.active) {
+		enqueue(counter.arm(enrolled.epoch.nonce));
+		if (!counter.active && receivedBytes < MAX_BOOTSTRAP_BYTES) {
 			await new Promise<void>((resolve) => {
-				markerSeen = resolve;
-				setTimeout(resolve, MARKER_WAIT_MS);
+				const timer = setTimeout(() => markerSeen(), MARKER_WAIT_MS);
+				markerSeen = () => {
+					clearTimeout(timer);
+					markerSeen = () => {};
+					resolve();
+				};
 			});
 		}
 	}
@@ -123,7 +147,7 @@ export async function startHerdrInputConsumer(
 	stdin.pause();
 	if (!enrolled.ok || !counter.active) {
 		if (enrolled.ok) enrolled.epoch.release();
-		pending.push(counter.abandon());
+		enqueue(counter.abandon());
 		stdin.setRawMode(wasRaw);
 		const reason = enrolled.ok ? "no-marker" : enrolled.reason;
 		// Keep what was typed during enrollment: the TUI replays it as ordinary input.

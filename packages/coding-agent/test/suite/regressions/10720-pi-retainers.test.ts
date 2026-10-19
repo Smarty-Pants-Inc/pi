@@ -60,9 +60,12 @@ function userText(message: AgentMessage | undefined): string | undefined {
 	return message.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("");
 }
 
-// pi#160: the stored user message reused by the session projection, which persistence deep-freezes.
+// pi#160 / #306 / smarty-dev#14893: read canonical stored input, not the mutable projection shell.
 function storedUserMessage(harness: Harness): AgentMessage | undefined {
-	return harness.sessionManager.buildSessionProjection().messages.find((message) => message.role === "user");
+	const entry = harness.sessionManager
+		.getEntries()
+		.find((value) => value.type === "message" && value.message.role === "user");
+	return entry?.type === "message" ? entry.message : undefined;
 }
 
 function createLoader(cwd: string): DefaultResourceLoader {
@@ -83,16 +86,40 @@ function createLoader(cwd: string): DefaultResourceLoader {
 async function replacedSessionProbe(): Promise<{
 	first: WeakRef<AgentSession>;
 	runtime: AgentSessionRuntime;
-	cleanup: () => void;
+	cleanup: () => Promise<void>;
 }> {
 	initTheme("dark");
 	const scratch = mkdtempSync(join(tmpdir(), "pi-retainer-"));
 	const loader = createLoader(scratch);
-	let current: Harness = await createHarness({
-		cwd: scratch,
-		resourceLoader: loader,
-		settings: { compaction: { enabled: false } },
-	});
+	let current: Harness;
+	try {
+		current = await createHarness({
+			cwd: scratch,
+			resourceLoader: loader,
+			settings: { compaction: { enabled: false } },
+		});
+	} catch (error) {
+		rmSync(scratch, { recursive: true, force: true });
+		throw error;
+	}
+	// Harness cleanup cancels its session; defer it until the runtime has published its replacement.
+	let retired: Harness | undefined;
+	const cleanupRetired = async () => {
+		const outgoing = retired;
+		retired = undefined;
+		await outgoing?.cleanup();
+	};
+	const cleanupProbeResources = async () => {
+		const outgoing = retired;
+		retired = undefined;
+		const active = current;
+		const cleanups: Promise<void>[] = [active.cleanup()];
+		if (outgoing && outgoing !== active) cleanups.push(outgoing.cleanup());
+		const results = await Promise.allSettled(cleanups);
+		rmSync(scratch, { recursive: true, force: true });
+		const failure = results.find((result) => result.status === "rejected");
+		if (failure?.status === "rejected") throw failure.reason;
+	};
 	const factory: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
 		const next = await createHarness({
 			cwd,
@@ -100,7 +127,7 @@ async function replacedSessionProbe(): Promise<{
 			sessionStartEvent,
 			settings: { compaction: { enabled: false } },
 		});
-		current.cleanup();
+		retired = current;
 		current = next;
 		return {
 			session: next.session,
@@ -128,29 +155,39 @@ async function replacedSessionProbe(): Promise<{
 		},
 		factory,
 	);
-	// Load a misconfigured worker extension from an actual session callback, so a module-evaluation
-	// Error can capture the outgoing session's async stack. Retain its cached diagnostics, not the
-	// bound extension runtime (whose action callbacks intentionally point at the outgoing session).
-	await current.session.reload();
-	const diagnostics = loader.getExtensions().errors;
-	expect(diagnostics).toHaveLength(1);
-	expect(typeof diagnostics[0].error).toBe("string");
-	current.setResponses([fauxAssistantMessage("first reply"), fauxAssistantMessage("second reply")]);
-	await current.session.prompt("first turn");
-	await current.session.prompt("second turn");
-	const first = new WeakRef(current.session);
-	await runtime.newSession();
-	await runtime.newSession();
-	return {
-		first,
-		runtime,
-		cleanup: () => {
-			// Keep the cached failure strings alive throughout the GC assertion.
-			expect(diagnostics).toHaveLength(1);
-			current.cleanup();
-			rmSync(scratch, { recursive: true, force: true });
-		},
-	};
+	try {
+		// Load a misconfigured worker extension from an actual session callback, so a module-evaluation
+		// Error can capture the outgoing session's async stack. Retain its cached diagnostics, not the
+		// bound extension runtime (whose action callbacks intentionally point at the outgoing session).
+		await current.session.reload();
+		const diagnostics = loader.getExtensions().errors;
+		expect(diagnostics).toHaveLength(1);
+		expect(typeof diagnostics[0].error).toBe("string");
+		current.setResponses([fauxAssistantMessage("first reply"), fauxAssistantMessage("second reply")]);
+		await current.session.prompt("first turn");
+		await current.session.prompt("second turn");
+		const first = new WeakRef(current.session);
+		await runtime.newSession();
+		await cleanupRetired();
+		await runtime.newSession();
+		await cleanupRetired();
+		return {
+			first,
+			runtime,
+			cleanup: async () => {
+				// Keep the cached failure strings alive throughout the GC assertion.
+				expect(diagnostics).toHaveLength(1);
+				await cleanupProbeResources();
+			},
+		};
+	} catch (error) {
+		try {
+			await cleanupProbeResources();
+		} catch (cleanupError) {
+			throw new AggregateError([error, cleanupError], "Retainer probe failed and cleanup was incomplete");
+		}
+		throw error;
+	}
 }
 
 describe("Pi session retainers (smarty-dev#10720)", () => {
@@ -180,7 +217,7 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 	});
 
 	// #11897: in-place request-hook edits are not safe to discard after overflow.
-	// pi#160: the projected user message is the frozen persisted one; the hook edits a mutable copy.
+	// pi#160: canonical stored history is frozen; the hook edits a mutable runtime copy.
 	it("detects in-place request-hook edits and sends them unchanged when they fit", async () => {
 		let hookSawFrozen: boolean | undefined;
 		const harness = await createHarness({
@@ -250,7 +287,7 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 		}
 	});
 
-	// pi#160 counterexample: a hook that leaves the frozen projected input untouched keeps it reprojectable.
+	// pi#160 counterexample: a hook that leaves the request input untouched keeps it reprojectable.
 	it("keeps untouched frozen projected input reprojectable", async () => {
 		let expected: string | undefined;
 		const harness = await createHarness({
@@ -446,8 +483,11 @@ describe("Pi session retainers (smarty-dev#10720)", () => {
 			expect(probe.first.deref() === undefined).toBe(true);
 			expect(probe.runtime.session.isDisposed).toBe(false);
 		} finally {
-			await probe.runtime.dispose();
-			probe.cleanup();
+			try {
+				await probe.runtime.dispose();
+			} finally {
+				await probe.cleanup();
+			}
 		}
 	});
 });

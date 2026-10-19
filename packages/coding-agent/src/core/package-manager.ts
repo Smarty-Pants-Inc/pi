@@ -12,7 +12,6 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { isUnreviewedBuiltin, refuseUnreviewedBuiltin } from "./builtin-security-admission.ts";
 
 function getEnv(): NodeJS.ProcessEnv {
 	if (process.platform !== "linux" || Object.keys(process.env).length > 0) {
@@ -49,6 +48,7 @@ import {
 	resolvePath,
 } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import { isUnreviewedBuiltin, refuseUnreviewedBuiltin } from "./builtin-security-admission.ts";
 import { isStdoutTakenOver } from "./output-guard.ts";
 import { type PiManifest, readPiManifest } from "./pi-manifest.ts";
 import type { PackageSource, SettingsManager } from "./settings-manager.ts";

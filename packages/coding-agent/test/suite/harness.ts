@@ -33,7 +33,7 @@ import {
 	createTestResourceLoader,
 } from "../utilities.ts";
 
-// smarty-dev#12837: join every cancelled turn before the next test, including unawaited cleanup calls.
+// smarty-dev#12837: join cancelled turns before the next test, including unawaited cleanup calls.
 const pendingCleanups = new Set<Promise<void>>();
 afterEach(async () => {
 	const pending = [...pendingCleanups];
@@ -123,7 +123,6 @@ export function createTestUiContext(overrides: Partial<ExtensionUIContext> = {})
 
 export interface HarnessOptions {
 	persistSession?: boolean;
-	/** Runtime replacement tests supply the destination cwd and lifecycle metadata. */
 	cwd?: string;
 	sessionStartEvent?: SessionStartEvent;
 	models?: FauxModelDefinition[];
@@ -260,6 +259,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		resourceLoader,
 		baseToolsOverride: toolMap,
 		initialActiveToolNames: options.initialActiveToolNames,
+		usesDefaultTools: options.initialActiveToolNames === undefined,
 		allowedToolNames: options.allowedToolNames,
 		excludedToolNames: options.excludedToolNames,
 		extensionRunnerRef,
@@ -292,9 +292,7 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 		cleanup() {
 			if (cleanupPromise) return cleanupPromise;
 			cleanupPromise = (async () => {
-				// SDK converter tests may replace the initial session; settle the current owner.
 				const currentSession = harness.session;
-				// Fence before cancellation can yield to a hook; keep it closed through terminal disposal.
 				const release = currentSession.gateInputs();
 				try {
 					currentSession.cancelForShutdown();
@@ -312,7 +310,6 @@ export async function createHarness(options: HarnessOptions = {}): Promise<Harne
 				}
 			})();
 			pendingCleanups.add(cleanupPromise);
-			// The shared afterEach observes failures, even when a caller does not await cleanup itself.
 			void cleanupPromise.catch(() => {});
 			return cleanupPromise;
 		},

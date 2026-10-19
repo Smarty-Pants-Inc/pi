@@ -448,12 +448,16 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		expect(SessionManager.open(file, tempDir).buildSessionContext()).toEqual(manager.buildSessionContext());
 	});
 
-	it("exposes manager/disk divergence when an explicit-owner append fails", () => {
+	// Retained exception-safety contract: a pre-write failure must not publish an entry in memory.
+	it("preserves manager and disk state when an explicit-owner append fails", () => {
 		const file = join(tempDir, "explicit.jsonl");
 		writeFileSync(file, "");
 		const manager = SessionManager.open(file, tempDir, tempDir);
 		const retainedId = manager.appendCustomEntry("history", { retained: true });
 		const before = structuredClone(manager.getEntries());
+		const branch = structuredClone(manager.getBranch());
+		const projection = structuredClone(manager.buildSessionProjection());
+		const revision = manager.revision();
 		const header = structuredClone(manager.getHeader());
 		const bytes = readFileSync(file);
 		const retained = join(tempDir, "retained.jsonl");
@@ -466,16 +470,29 @@ describe("SessionManager.setSessionFile with corrupted files", () => {
 		expect(readFileSync(retained)).toEqual(bytes);
 		expect(manager.getHeader()).toEqual(header);
 		expect(manager.getSessionFile()).toBe(file);
-		expect(manager.getEntries().slice(0, before.length)).toEqual(before);
+		expect(manager.getEntries()).toEqual(before);
+		expect(manager.getLeafId()).toBe(retainedId);
+		expect(manager.getBranch()).toEqual(branch);
+		expect(manager.buildSessionProjection()).toEqual(projection);
+		expect(manager.revision()).toBe(revision);
+
+		// Positive control: remove only the injected pre-write fault, then use the same manager.
+		// This does not qualify partial-write or crash recovery.
+		rmSync(file, { recursive: true });
+		renameSync(retained, file);
+		const committed = manager.appendCustomEntry("committed-intent", { once: true });
 		expect(manager.getEntries()).toHaveLength(before.length + 1);
-		const failed = manager.getEntries().at(-1);
-		expect(failed).toMatchObject({
+		expect(manager.getEntry(committed)).toMatchObject({
 			parentId: retainedId,
-			customType: "failed-intent",
+			customType: "committed-intent",
 			data: { once: true },
 		});
-		expect(manager.getLeafId()).toBe(failed?.id);
-		// No second append, replacement manager or attempted repair after ambiguity.
+		expect(manager.getLeafId()).toBe(committed);
+		expect(
+			manager.getEntries().some((entry) => entry.type === "custom" && entry.customType === "failed-intent"),
+		).toBe(false);
+		expect(SessionManager.open(file, tempDir).getEntries()).toEqual(manager.getEntries());
+		expect(readFileSync(file).subarray(0, bytes.length)).toEqual(bytes);
 	});
 
 	it("truncates and rewrites empty file with valid header", () => {

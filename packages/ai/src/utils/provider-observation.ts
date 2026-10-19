@@ -1,35 +1,36 @@
-// Value-free provider callbacks (smarty-dev#5822 C1). Callbacks run outside the message projector, so they
-// receive only Pi-owned values: a validated HTTP status and a fixed stream notification. No raw event, response
-// header, model object or exception text reaches them.
-
+// Value-free callbacks run outside the projector; never pass raw events, headers, models or exceptions.
 import type { AssistantMessage, ProviderResponse, ProviderStreamNotification, StreamOptions } from "../types.ts";
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "./diagnostics.ts";
 import { validHttpStatus } from "./recovery.ts";
 
-/** Diagnostic type of a rejected stream observer. It is a control field: such a failure is never replayed. */
 export const PROVIDER_STREAM_OBSERVER_ERROR = "provider_stream_observer_error";
-
-/** Owned error text of a rejected stream observer; the observer's own exception text is never published. */
 export const PROVIDER_STREAM_OBSERVER_FAILED = "Provider stream observer failed";
-
-/** The response observation: the status only when it is an integer 100-599. */
+export const PROVIDER_RESPONSE_OBSERVER_FAILED = "Provider response observer failed";
 export function providerResponse(status: unknown): ProviderResponse {
 	const valid = validHttpStatus(status);
 	return valid === undefined ? {} : { status: valid };
 }
-
-/** A fresh notification per call, so one observer cannot change what the next one receives. */
 export function providerStreamNotification(): ProviderStreamNotification {
 	return { type: "provider_stream_event" };
 }
-
-/** Record an observer rejection by its owned type only, without exception text, and make it non-retryable. */
 export function markProviderStreamObserverFailure(output: AssistantMessage): void {
 	appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(PROVIDER_STREAM_OBSERVER_ERROR));
 	output.recovery = { retryable: false };
 }
-
-/** Notify the observer of one parsed provider event. A rejection marks `output` and is rethrown. */
+/** Response observation shares the stream observer's terminal, non-replayable recovery. */
+export async function notifyProviderResponse(
+	options: Pick<StreamOptions, "onResponse"> | undefined,
+	output: AssistantMessage,
+	status: unknown,
+): Promise<void> {
+	if (!options?.onResponse) return;
+	try {
+		await options.onResponse(providerResponse(status));
+	} catch {
+		markProviderStreamObserverFailure(output);
+		throw new Error(PROVIDER_RESPONSE_OBSERVER_FAILED);
+	}
+}
 export async function notifyProviderStreamEvent(
 	options: Pick<StreamOptions, "onProviderStreamEvent"> | undefined,
 	output: AssistantMessage,
@@ -38,7 +39,6 @@ export async function notifyProviderStreamEvent(
 	try {
 		await options.onProviderStreamEvent(providerStreamNotification());
 	} catch {
-		// The observer's thrown value is dropped, not kept as `cause` (smarty-dev#5822, pi#202 round 2).
 		markProviderStreamObserverFailure(output);
 		throw new Error(PROVIDER_STREAM_OBSERVER_FAILED);
 	}

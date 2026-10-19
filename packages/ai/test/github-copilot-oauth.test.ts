@@ -741,7 +741,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 		expect(accessTokenPollTimes).toEqual([startTime.getTime() + 5000, startTime.getTime() + 15000]);
 	});
 
-	// pi#150 security round 2: an HTTP-200 poll error can echo the device code or a token.
+	// pi#150 security round 2: HTTP-200 poll errors can echo device codes or tokens.
 	it.each([
 		["echoed-device-code-150", "authorization_error"],
 		["access_denied", "access_denied"],
@@ -768,7 +768,6 @@ describe("GitHub Copilot OAuth device flow", () => {
 			throw new Error(`Unexpected fetch URL: ${url}`);
 		});
 		vi.stubGlobal("fetch", fetchMock);
-
 		const loginPromise = loginGitHubCopilotForTest({ onDeviceCode: () => {}, onPrompt: async () => "" });
 		const outcome = loginPromise.then(
 			() => undefined,

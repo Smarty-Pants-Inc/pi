@@ -99,7 +99,6 @@ describe("audit-2c causes", () => {
 			expectPrivate(await stream.result());
 		},
 	);
-	// pi#127: no credential-shaped keys are present in any of these diagnostics.
 	it.each([openaiProvider(), openaiCodexProvider()])(
 		"masks live values in observer, stop and retry sinks: $id",
 		async (provider) => {
@@ -142,7 +141,6 @@ describe("audit-2c causes", () => {
 				expectPrivate(output);
 				const records: unknown[] = [];
 				await retryAssistantCall(
-					// smarty-dev#5822 C3: the owned decision, not rewritten text, makes a failure retryable.
 					async () => ({
 						...output,
 						errorMessage: `overloaded ${output.errorMessage}`,

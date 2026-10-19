@@ -29,6 +29,7 @@ export class BashExecutionComponent extends Container {
 	private truncationResult?: TruncationResult;
 	private fullOutputPath?: string;
 	private fullOutputTruncation?: FullOutputTruncation;
+	private fullOutputError?: string;
 	private expanded = false;
 	private contentContainer: Container;
 	/** `dim` marks `!!` commands, whose output is excluded from the model context. */
@@ -107,6 +108,7 @@ export class BashExecutionComponent extends Container {
 		truncationResult?: TruncationResult,
 		fullOutputPath?: string,
 		fullOutputTruncation?: FullOutputTruncation,
+		fullOutputError?: string,
 	): void {
 		this.exitCode = exitCode;
 		this.status = cancelled
@@ -117,6 +119,7 @@ export class BashExecutionComponent extends Container {
 		this.truncationResult = truncationResult;
 		this.fullOutputPath = fullOutputPath;
 		this.fullOutputTruncation = fullOutputTruncation;
+		this.fullOutputError = fullOutputError;
 
 		// Stop loader
 		this.loader.stop();
@@ -211,6 +214,11 @@ export class BashExecutionComponent extends Container {
 							: `Output truncated. Full output: ${this.fullOutputPath}`,
 					),
 				);
+			}
+
+			if (this.fullOutputError) {
+				const notice = `[Output log unavailable: ${this.fullOutputError}]`;
+				if (!fullOutput.includes(notice)) statusParts.push(theme.fg("warning", notice));
 			}
 
 			if (statusParts.length > 0) {

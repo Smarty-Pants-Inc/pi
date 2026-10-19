@@ -11,7 +11,7 @@ import { createHarness, getMessageText, type Harness } from "../harness.ts";
 
 vi.mock("child_process", { spy: true });
 vi.mock("node:fs", { spy: true });
-const { existsSync } = await vi.importActual<typeof import("node:fs")>("node:fs");
+const { existsSync } = await vi.importActual<typeof fs>("node:fs");
 
 // Astra PR #140 F1: shell discovery must not execute a PATH/CWD-resolved helper (`which`/`where`) before bash_spawn.
 describe("bash_spawn shell discovery runs nothing before admission", () => {

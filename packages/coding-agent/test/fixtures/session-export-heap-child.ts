@@ -69,7 +69,7 @@ if (mode === "fixed-keys") {
 	const trailing = () => [{ type: "custom", customType: "heavy-buffer-trailing", data: { payload } }];
 	writeSync(1, `EXPORT_READY ${mode} ${BUFFER_BYTES} retainedHeapAfterGc=${retainedHeapAfterGc()}\n`);
 	if (mode === "fixed-buffer") {
-		// The Buffer brand must be refused before its toJSON hook or index enumeration runs.
+		// Nested data-valued hooks run once per attempt; each returned Buffer snapshot is size-bounded.
 		const original = Buffer.prototype.toJSON;
 		let hookCalls = 0;
 		Buffer.prototype.toJSON = function (this: Buffer) {
@@ -78,16 +78,17 @@ if (mode === "fixed-keys") {
 		};
 		const trailingManager = SessionManager.inMemory(scratch);
 		trailingManager.appendMessage({ role: "user", content: "seed input", timestamp: 1 });
-		const builtIn = /plain JSON data; found a built-in object/;
-		expectRefused("live-string", () => serializeSessionBranch(manager), builtIn);
-		expectRefused("live-jsonl", () => exportSessionToJsonl(manager, join(scratch, "live-buffer.jsonl")), builtIn);
-		expectRefused("trailing-string", () => serializeSessionBranch(trailingManager, trailing), builtIn);
-		expectRefused(
-			"trailing-jsonl",
-			() => exportSessionToJsonl(trailingManager, join(scratch, "trailing-buffer.jsonl"), trailing),
-			builtIn,
+		const expectHookRefused = (label: string, run: () => unknown) => {
+			const callsBefore = hookCalls;
+			expectRefused(label, run, /64 MiB/);
+			assert.equal(hookCalls - callsBefore, 1);
+		};
+		expectHookRefused("live-string", () => serializeSessionBranch(manager));
+		expectHookRefused("live-jsonl", () => exportSessionToJsonl(manager, join(scratch, "live-buffer.jsonl")));
+		expectHookRefused("trailing-string", () => serializeSessionBranch(trailingManager, trailing));
+		expectHookRefused("trailing-jsonl", () =>
+			exportSessionToJsonl(trailingManager, join(scratch, "trailing-buffer.jsonl"), trailing),
 		);
-		assert.equal(hookCalls, 0);
 		assert.ok(!existsSync(join(scratch, "live-buffer.jsonl")) && !existsSync(join(scratch, "trailing-buffer.jsonl")));
 		writeSync(1, "FIXED_BUFFER_REFUSED\n");
 	} else {

@@ -22,7 +22,7 @@ const message: AssistantMessage = {
 	stopReason: "stop",
 	timestamp: 1,
 	diagnostics: [
-		// smarty-dev#5822 N5682: Pi's count only, not the provider's transformation paths and reasons.
+		// smarty-dev#5822 N5682: Pi's count only, not provider paths and reasons.
 		{ type: "anthropic_input_transformations", timestamp: 1, thinkingBlocksDropped: 3 },
 	],
 };

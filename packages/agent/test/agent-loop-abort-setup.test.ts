@@ -1,5 +1,5 @@
 import type { Message, Model } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { runAgentLoop } from "../src/agent-loop.ts";
 import type { AgentEvent, AgentLoopConfig } from "../src/types.ts";
 
@@ -69,6 +69,65 @@ describe.each(["prepareRequest", "transformContext", "convertToLlm", "getApiKey"
 				expect(events.at(-1)).toMatchObject({ type: "agent_end", messages });
 			}
 			expect(dispatches).toBe(0);
+		});
+
+		// pi#298 / smarty-dev#14950: caller cancellation must settle without cooperation from setup.
+		it.each(["resolve", "reject"] as const)("ignores an uncooperative late %s after abort", async (settlement) => {
+			const controller = new AbortController();
+			const added = vi.spyOn(controller.signal, "addEventListener");
+			const removed = vi.spyOn(controller.signal, "removeEventListener");
+			const entered = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			let pending: Promise<unknown> | undefined;
+			const blocked = <T>(value: T): Promise<T> => {
+				entered.resolve();
+				const result = release.promise.then(() => value);
+				pending = result;
+				return result;
+			};
+			const config: AgentLoopConfig = {
+				model,
+				prepareRequest: boundary === "prepareRequest" ? () => blocked(undefined) : undefined,
+				transformContext: boundary === "transformContext" ? (messages) => blocked(messages) : undefined,
+				convertToLlm: (messages) =>
+					boundary === "convertToLlm" ? blocked(messages as Message[]) : (messages as Message[]),
+				getApiKey: boundary === "getApiKey" ? () => blocked(undefined) : undefined,
+			};
+			const events: AgentEvent[] = [];
+			let dispatches = 0;
+			const run = runAgentLoop(
+				[{ role: "user", content: "run", timestamp: 1 }],
+				{ messages: [] },
+				config,
+				(event) => {
+					events.push(event);
+				},
+				controller.signal,
+				() => {
+					dispatches++;
+					throw new Error("unexpected dispatch");
+				},
+			);
+			await entered.promise;
+			controller.abort();
+			const messages = await run;
+			expect(messages.at(-1)).toMatchObject({ stopReason: "aborted", errorMessage: "Operation aborted" });
+			const abortListeners = added.mock.calls.filter(([type]) => type === "abort");
+			expect(abortListeners.length).toBeGreaterThan(0);
+			for (const [, listener] of abortListeners) expect(removed).toHaveBeenCalledWith("abort", listener);
+
+			const failure = new Error("late setup rejection");
+			if (settlement === "resolve") release.resolve();
+			else release.reject(failure);
+			if (settlement === "resolve") await pending;
+			else await expect(pending).rejects.toBe(failure);
+			expect(dispatches).toBe(0);
+			expect(
+				events.filter((event) => event.type === "message_end" && event.message.role === "assistant"),
+			).toHaveLength(1);
+			expect(events.filter((event) => event.type === "agent_end")).toHaveLength(1);
+			added.mockRestore();
+			removed.mockRestore();
 		});
 	},
 );

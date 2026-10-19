@@ -140,8 +140,7 @@ test("bash mode shell-quotes file paths and inserts them as arguments", async ()
 	expect(mocks.readClipboardImage).not.toHaveBeenCalled();
 });
 
-// pi#131 round-4 R4-4: an older bash command that finishes resets isBashMode while a newer `!` command
-// is in the editor. The paste must still quote, and must refuse a quoted or escaped insertion point.
+// pi#131 R4-4: an older completed bash command may leave a stale mode flag.
 test.each([
 	["stale mode flag", "!cat ", 5, "'/tmp/a;b.png' /tmp/plain.png"],
 	["open single quote", "!cat '", 6, undefined],
@@ -160,9 +159,7 @@ test.each([
 	const prototype = InteractiveMode.prototype as unknown as {
 		handleClipboardPaste(this: typeof context): Promise<void>;
 	};
-
 	await prototype.handleClipboardPaste.call(context);
-
 	if (expected === undefined) {
 		expect(insertTextAtCursor).not.toHaveBeenCalled();
 		expect(showError).toHaveBeenCalledExactlyOnceWith(

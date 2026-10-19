@@ -1,7 +1,4 @@
-// pi#202 round 2 P1-C and P1-D (smarty-dev#5822): raw provider fields stay private. A credential-shaped value and
-// a plain environment value that no pattern can match are planted in each raw field: the provider message, body,
-// parsed error, OpenRouter `metadata.raw`, finish reason, and an observer's thrown value with its cause. None may
-// appear in the published message (the UI text), its JSON (the session entry), the events or the thrown error.
+// pi#202 round 2 P1-C and P1-D (smarty-dev#5822): raw provider fields stay private.
 import { inspect } from "node:util";
 import { describe, expect, it } from "vitest";
 import { stream as streamMistral } from "../src/api/mistral-conversations.ts";
@@ -32,9 +29,7 @@ function model<TApi extends "openai-completions" | "mistral-conversations">(api:
 	};
 }
 
-async function collect(
-	stream: AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> },
-): Promise<{ result: AssistantMessage; published: string }> {
+async function collect(stream: AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> }) {
 	const events: string[] = [];
 	for await (const event of stream) events.push(JSON.stringify(event));
 	const result = await stream.result();

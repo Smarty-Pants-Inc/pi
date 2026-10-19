@@ -63,14 +63,6 @@ interface ExtensionUIRequest {
 	widgetKey?: string;
 	widgetLines?: string[];
 	text?: string;
-	targetId?: string;
-}
-
-export function isMatchingDialogCancel(
-	activeRequestId: string | null,
-	request: { method: string; targetId?: string },
-): boolean {
-	return request.method === "cancel" && request.targetId === activeRequestId;
 }
 
 // ============================================================================
@@ -317,7 +309,6 @@ async function main() {
 	// These helpers swap between them.
 
 	let activeDialog: Component | null = null;
-	let activeDialogRequestId: string | null = null;
 
 	function setBottomComponent(component: Component): void {
 		root.clear();
@@ -330,7 +321,6 @@ async function main() {
 
 	function showPrompt(): void {
 		activeDialog = null;
-		activeDialogRequestId = null;
 		setBottomComponent(promptInput);
 		tui.setFocus(promptInput.input);
 	}
@@ -399,7 +389,6 @@ async function main() {
 		switch (method) {
 			// Dialog methods: replace prompt with interactive component
 			case "select": {
-				activeDialogRequestId = id;
 				showSelectDialog(req.title ?? "Select", req.options ?? [], (value) => {
 					if (value !== undefined) {
 						send({ type: "extension_ui_response", id, value });
@@ -411,7 +400,6 @@ async function main() {
 			}
 
 			case "confirm": {
-				activeDialogRequestId = id;
 				const title = req.message ? `${req.title}: ${req.message}` : (req.title ?? "Confirm");
 				showSelectDialog(title, ["Yes", "No"], (value) => {
 					send({ type: "extension_ui_response", id, confirmed: value === "Yes" });
@@ -420,7 +408,6 @@ async function main() {
 			}
 
 			case "input": {
-				activeDialogRequestId = id;
 				const title = req.placeholder ? `${req.title} (${req.placeholder})` : (req.title ?? "Input");
 				showInputDialog(title, undefined, (value) => {
 					if (value !== undefined) {
@@ -433,7 +420,6 @@ async function main() {
 			}
 
 			case "editor": {
-				activeDialogRequestId = id;
 				const prefill = req.prefill?.replace(/\n/g, " ");
 				showInputDialog(req.title ?? "Editor", prefill, (value) => {
 					if (value !== undefined) {
@@ -444,10 +430,6 @@ async function main() {
 				});
 				break;
 			}
-
-			case "cancel":
-				if (isMatchingDialogCancel(activeDialogRequestId, req)) showPrompt();
-				break;
 
 			// Fire-and-forget methods: display as notification
 			case "notify": {
@@ -673,9 +655,7 @@ async function main() {
 	tui.start();
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
-	main().catch((err) => {
-		console.error(err);
-		process.exit(1);
-	});
-}
+main().catch((err) => {
+	console.error(err);
+	process.exit(1);
+});

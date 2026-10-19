@@ -162,7 +162,7 @@ interface ActiveRun extends CacheWarmRequest {
 export class CacheWarmer {
 	private run?: ActiveRun;
 	private inactive: CacheWarmingStatus;
-	private readonly models: Pick<ModelRuntime, "streamSimple" | "providerRequestGuard">;
+	private readonly models: Pick<ModelRuntime, "streamSimple">;
 	private readonly sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">;
 	private readonly getMode: () => CacheWarmingMode;
 	/** Lets extensions override `event.action`; failures fall back to pi's decision. */
@@ -171,7 +171,7 @@ export class CacheWarmer {
 	onWarmed?: (entry: UsageEntry) => void;
 
 	constructor(
-		models: Pick<ModelRuntime, "streamSimple" | "providerRequestGuard">,
+		models: Pick<ModelRuntime, "streamSimple">,
 		sessionManager: Pick<SessionManager, "appendUsage" | "getBranch">,
 		getMode: () => CacheWarmingMode,
 		decide: (event: CacheWarmingDecisionEvent) => Promise<CacheWarmingAction> = async (event) => event.action,
@@ -338,10 +338,6 @@ export class CacheWarmer {
 				})
 				.result();
 			if (!this.validateRun(run)) return;
-			if (this.models.providerRequestGuard?.signal.aborted) {
-				this.stop(String(this.models.providerRequestGuard.signal.reason));
-				return;
-			}
 			if (message.stopReason !== "error" && message.stopReason !== "aborted") {
 				const entry = this.sessionManager.appendUsage(
 					"cache_warm",
@@ -353,11 +349,7 @@ export class CacheWarmer {
 				this.onWarmed?.(entry);
 			}
 		} catch {
-			// Ordinary warming failures are best-effort; a dispatch admission failure is terminal.
-			if (this.models.providerRequestGuard?.signal.aborted) {
-				this.stop(String(this.models.providerRequestGuard.signal.reason));
-				return;
-			}
+			// Cache warming is best-effort and must not affect the active agent run.
 		}
 		if (this.run === run) this.schedule(run);
 	}

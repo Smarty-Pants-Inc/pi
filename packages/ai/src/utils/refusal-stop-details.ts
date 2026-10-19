@@ -5,7 +5,7 @@ const MAX_STOP_DETAILS_BYTES = 4096;
 
 /**
  * Record opaque Anthropic refusal data only. The adapter calls this after the terminal refusal reason is known;
- * Mask before measuring. Never retain raw data from injected clients: their complete credentials are unknown.
+ * mask before measuring. Never retain raw data from injected clients: their complete credentials are unknown.
  * Default-client records are byte-bounded and never become an outbound or recovery input.
  */
 export async function recordAssistantMessageStopDetails(

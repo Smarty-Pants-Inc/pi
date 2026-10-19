@@ -103,8 +103,10 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		const sessionManager = SessionManager.inMemory();
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		const authStorage = AuthStorage.inMemory({ anthropic: { type: "api_key", key: "test-key" } });
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		// Set a runtime API key so validation passes
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 
 		session = new AgentSession({
 			agent,
@@ -118,31 +120,22 @@ describe("AgentSession concurrent prompt guard", () => {
 		return session;
 	}
 
-	// Await a real assistant event rather than a fixed sleep under full-suite load.
-	async function startStreamingPrompt() {
-		let unsubscribe = () => {};
-		const started = new Promise<void>((resolve) => {
-			unsubscribe = session.subscribe((event) => {
-				if (event.type === "message_start" && event.message.role === "assistant") resolve();
-			});
-		});
-		const firstPrompt = session.prompt("First message");
-		try {
-			await Promise.race([
-				started,
-				firstPrompt.then(() => {
-					throw new Error("Prompt completed before assistant stream started");
-				}),
-			]);
-			return { firstPrompt };
-		} finally {
-			unsubscribe();
+	// A fixed sleep is not enough under full-suite load; wait until the first prompt is streaming.
+	async function waitForStreaming(timeoutMs = 5000): Promise<void> {
+		const startedAt = Date.now();
+		while (!session.isStreaming) {
+			if (Date.now() - startedAt > timeoutMs) throw new Error("Timed out waiting for streaming");
+			await new Promise((resolve) => setTimeout(resolve, 5));
 		}
 	}
 
 	it("should throw when prompt() called while streaming", async () => {
 		await createSession();
-		const { firstPrompt } = await startStreamingPrompt();
+
+		// Start first prompt (don't await, it will block until abort)
+		const firstPrompt = session.prompt("First message");
+
+		await waitForStreaming();
 
 		// Verify we're streaming
 		expect(session.isStreaming).toBe(true);
@@ -160,7 +153,9 @@ describe("AgentSession concurrent prompt guard", () => {
 	it("should allow steer() while streaming", async () => {
 		await createSession();
 
-		const { firstPrompt } = await startStreamingPrompt();
+		// Start first prompt
+		const firstPrompt = session.prompt("First message");
+		await waitForStreaming();
 
 		// steer should work while streaming
 		await expect(session.steer("Steering message")).resolves.toBe("queued");
@@ -175,7 +170,9 @@ describe("AgentSession concurrent prompt guard", () => {
 	it("should allow followUp() while streaming", async () => {
 		await createSession();
 
-		const { firstPrompt } = await startStreamingPrompt();
+		// Start first prompt
+		const firstPrompt = session.prompt("First message");
+		await waitForStreaming();
 
 		// followUp should work while streaming
 		await expect(session.followUp("Follow-up message")).resolves.toBe("queued");
@@ -241,8 +238,9 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		const sessionManager = SessionManager.inMemory();
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		const authStorage = AuthStorage.inMemory({ anthropic: { type: "api_key", key: "test-key" } });
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 
 		const extensionsResult = await createTestExtensionsResult([
 			(pi) => {
@@ -269,7 +267,8 @@ describe("AgentSession concurrent prompt guard", () => {
 			}
 		});
 
-		const { firstPrompt } = await startStreamingPrompt();
+		const firstPrompt = session.prompt("First message");
+		await waitForStreaming();
 		expect(session.isStreaming).toBe(true);
 
 		const pi = (
@@ -324,8 +323,9 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		const sessionManager = SessionManager.inMemory();
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		const authStorage = AuthStorage.inMemory({ anthropic: { type: "api_key", key: "test-key" } });
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 
 		session = new AgentSession({
 			agent,
@@ -429,8 +429,9 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		const sessionManager = SessionManager.inMemory();
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		const authStorage = AuthStorage.inMemory({ anthropic: { type: "api_key", key: "test-key" } });
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 
 		session = new AgentSession({
 			agent,
@@ -576,8 +577,9 @@ describe("AgentSession concurrent prompt guard", () => {
 
 		const sessionManager = SessionManager.inMemory();
 		const settingsManager = SettingsManager.create(tempDir, tempDir);
-		const authStorage = AuthStorage.inMemory({ anthropic: { type: "api_key", key: "test-key" } });
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
 		const modelRegistry = await createModelRegistry(authStorage, tempDir);
+		await authStorage.modify("anthropic", async () => ({ type: "api_key", key: "test-key" }));
 
 		session = new AgentSession({
 			agent,

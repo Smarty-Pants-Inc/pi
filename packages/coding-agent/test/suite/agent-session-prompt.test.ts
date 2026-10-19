@@ -564,7 +564,7 @@ describe("AgentSession prompt characterization", () => {
 		);
 	});
 
-	// #10267 / smarty-dev#2867: both trigger kinds keep the runner-issued receipts through publication.
+	// #10267 / smarty-dev#2867: both trigger kinds keep runner-issued receipts through publication.
 	it.each(["user", "custom"] as const)("transfers hook receipts exactly once for a %s trigger", async (kind) => {
 		const harness = await createHarness({
 			extensionFactories: [
@@ -747,7 +747,7 @@ describe("AgentSession prompt characterization", () => {
 			expect(JSON.stringify(requests[0].messages)).toContain("context from handler");
 		});
 
-		// #10267 / smarty-dev#3048: admission revocation refuses unpublished input, also for custom triggers.
+		// #10267 / smarty-dev#3048: revocation refuses unpublished input, also for custom triggers.
 		it.each(["user", "custom"] as const)("revokes a %s preflight before publication", async (kind) => {
 			let releaseHandler: () => void = () => {};
 			const handlerStarted = Promise.withResolvers<void>();
@@ -768,7 +768,6 @@ describe("AgentSession prompt characterization", () => {
 			});
 			harnesses.push(harness);
 			harness.setResponses([fauxAssistantMessage("should not complete")]);
-
 			const run =
 				kind === "user"
 					? harness.session.prompt("start")
@@ -782,7 +781,6 @@ describe("AgentSession prompt characterization", () => {
 			await Promise.all([refused, aborted]);
 			releaseHandler();
 			await new Promise<void>((resolve) => setImmediate(resolve));
-
 			expect(harness.session.messages).toEqual([]);
 			expect(
 				harness.sessionManager

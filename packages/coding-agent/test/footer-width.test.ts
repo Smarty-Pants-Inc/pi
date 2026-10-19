@@ -322,7 +322,6 @@ describe("FooterComponent session totals cache", () => {
 		const walks = entries.mock.calls.length;
 		footer.render(120);
 		expect(entries.mock.calls.length).toBe(walks);
-
 		sessionManager.appendMessage(assistant(2000));
 		expect(stripAnsi(footer.render(120).join("\n"))).toContain("↑3.0k");
 		sessionManager.appendSessionInfo("renamed");

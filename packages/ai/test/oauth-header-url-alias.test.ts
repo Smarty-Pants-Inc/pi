@@ -47,7 +47,7 @@ async function diagnostic(headers: Record<string, string>, text: string, origin:
 }
 
 describe("known credential wire and URL aliases", () => {
-	// smarty-dev#4703: derived from fr-au-4703r/header-normalization-probe.mjs.
+	// smarty-dev#4703: header-normalization-probe.mjs.
 	it("masks bare credentials after header whitespace normalization in both header origins", async () => {
 		const samples = [
 			...Array.from({ length: 8 }, (_, i) => "Q7Z9V2B4".slice(0, i + 1)),
@@ -82,7 +82,7 @@ describe("known credential wire and URL aliases", () => {
 		}
 	});
 
-	// smarty-dev#4703: derived from fr-au-4703r/url-alias-sink-probe.mjs.
+	// smarty-dev#4703: url-alias-sink-probe.mjs.
 	it("masks equivalent percent encodings at errorMessage and error-event sinks", async () => {
 		for (const secret of ["é", "/", "Q7", "Q7Z9V2B4", "Q7Z9V2B4L0NG"]) {
 			const canonical = encodeURIComponent(secret);
@@ -104,7 +104,6 @@ describe("known credential wire and URL aliases", () => {
 		}
 	});
 
-	// smarty-dev#4703: URL userinfo has no credential label; it must use the live-value mask.
 	it.each(["Q7", "Q7Z9", "Q7Z9V2B4L0NG"])("masks known credentials in URL userinfo (%s)", async (secret) => {
 		const headers = { "x-api-key": secret };
 		for (const value of [secret, [...secret].map((char) => `%${char.charCodeAt(0).toString(16)}`).join("")]) {
@@ -124,7 +123,6 @@ describe("known credential wire and URL aliases", () => {
 			expect(redactOAuthDiagnostic(`receipt=${alias}`, [secret])).not.toContain(alias);
 	});
 
-	// smarty-dev#4703: retain the carry's malformed-neighbor, mixed-layer and budget assertions.
 	it("canonicalizes mixed Unicode aliases, invalid neighbors and alternating encoding layers", () => {
 		for (const [secret, alias] of [
 			["éQ7", "é%51%37"],

@@ -3,11 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	type AssistantMessage,
-	createAssistantMessageEventStream,
 	fauxAssistantMessage,
 	fauxToolCall,
 	type Message,
-	type Models,
 	type SimpleStreamOptions,
 	type TranscriptContext,
 	Type,
@@ -420,9 +418,9 @@ describe("manual compaction", () => {
 		expect(usage.input).toBeGreaterThan(usageBefore.input);
 		await turn(chat, "next", "done");
 		const agent = chat.faux.agentRequests.at(-1)!.messages;
-		// The next request: the summary, the kept turn, the new input, then one complete system baseline.
-		expect(agent.map((message) => message.role)).toEqual(["user", "user", "assistant", "user", "system"]);
-		expect(agent[4]).toMatchObject({ sections: { preamble: "You are helpful." } });
+		// The next request: one complete system baseline leading the summary, the kept turn, and the new input (#10904).
+		expect(agent.map((message) => message.role)).toEqual(["system", "user", "user", "assistant", "user"]);
+		expect(agent[0]).toMatchObject({ sections: { preamble: "You are helpful." } });
 		await chat.harness.close(context);
 	});
 
@@ -486,9 +484,10 @@ describe("manual compaction", () => {
 		await result(chat, await chat.root.compact(undefined, context));
 		gate.resolve();
 		expect((await input.wait(context)).status).toBe("done");
-		// The continuation request starts with the summary.
+		// The continuation request starts with the new baseline, then the summary, ahead of the kept tool call (#10904).
 		const continuation = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(continuation[0])).toContain("<summary>\nSUMMARY\n</summary>");
+		expect(continuation[0]?.role).toBe("system");
+		expect(userText(continuation[1])).toContain("<summary>\nSUMMARY\n</summary>");
 		expect((await kinds(chat.root)).slice(-4)).toEqual([
 			"pi.tool-result",
 			"pi.compaction",
@@ -1248,65 +1247,9 @@ describe("overflow compaction", () => {
 		const [compaction] = (await allEntries(chat.root)).filter((record) => record.kind === "pi.compaction");
 		expect(compaction).toMatchObject({ data: { reason: "overflow" } });
 		const retry = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(retry[0])).toContain("SUMMARY");
+		expect(retry[0]?.role).toBe("system");
+		expect(userText(retry[1])).toContain("SUMMARY");
 		expect(retry.some((message) => message.role === "assistant" && message.stopReason === "error")).toBe(false);
-		await chat.harness.close(context);
-	});
-
-	// smarty-dev#7480 (pi#174 review): the overflow's terminal message dropped the answer output its stream showed; the
-	// error entry keeps it, and the overflow still compacts and retries.
-	it("keeps streamed answer output the overflow error dropped in its error entry and still compacts", async () => {
-		const base = chatSetup({ models: [{ id: "faux-1", contextWindow: 100_000, maxTokens: 900 }] });
-		const streamSimple: Models["streamSimple"] = (model, request, options) => {
-			const source = base.models.streamSimple(model, request, options);
-			const stream = createAssistantMessageEventStream();
-			void (async () => {
-				for await (const event of source) {
-					stream.push(event.type === "error" ? { ...event, error: { ...event.error, content: [] } } : event);
-				}
-				stream.end();
-			})();
-			return stream;
-		};
-		const setup: ChatSetup = {
-			...base,
-			models: new Proxy(base.models, {
-				get(target, property) {
-					if (property === "streamSimple") return streamSimple;
-					const value = Reflect.get(target, property, target);
-					return typeof value === "function" ? value.bind(target) : value;
-				},
-			}),
-		};
-		const chat = await open({}, setup);
-		await history(chat);
-		chat.setup.settings.compaction = ENABLED;
-		// Far beyond the stream's length: only the finalizer commits the answer partial.
-		chat.setup.settings.progress = { ...chat.setup.settings.progress, partialIntervalMs: 60_000 };
-		chat.faux.summaries.push(summary());
-		const shown = { type: "text" as const, text: "visible answer" };
-		chat.faux.agent.push(fauxAssistantMessage([shown], { stopReason: "error", errorMessage: OVERFLOW }));
-		chat.faux.agent.push(answer("fits"));
-		const input = await chat.root.submit({ type: "input", content: text("u4", 100) }, context);
-		expect((await input.wait(context)).status).toBe("done");
-		const entries = await allEntries(chat.root);
-		expect(entries.slice(-5).map((entry) => entry.kind)).toEqual([
-			"pi.user",
-			"pi.assistant",
-			"pi.compaction",
-			"pi.system",
-			"pi.assistant",
-		]);
-		expect(entries.at(-4)!.model![0]).toMatchObject({
-			stopReason: "error",
-			errorMessage: OVERFLOW,
-			content: [shown],
-		});
-		expect(entries.at(-3)).toMatchObject({ data: { reason: "overflow" } });
-		const retry = chat.faux.agentRequests.at(-1)!.messages;
-		expect(userText(retry[0])).toContain("SUMMARY");
-		expect(retry.some((message) => message.role === "assistant" && message.stopReason === "error")).toBe(false);
-		expect(await live(chat)).toEqual({});
 		await chat.harness.close(context);
 	});
 

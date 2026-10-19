@@ -1,7 +1,5 @@
 # @earendil-works/pi-mcp
 
-> **Fork security admission:** MCP remains disabled pending its own reviewed re-enable. Configuration, `+builtin:mcp`, `-e builtin:mcp`, SDK factory activation, and standalone MCP APIs cannot activate it. Codemode was re-enabled separately after pi#203; that does not enable MCP. See `packages/coding-agent/docs/security-reenable.md`. The MCP examples below describe the deferred feature, not an available admission.
-
 A small, standalone Model Context Protocol client. It does not depend on the official MCP SDK or other pi packages.
 
 The package provides a transport-neutral client core, stdio and Streamable HTTP transports, and an in-memory testing transport.
@@ -110,10 +108,6 @@ await connected;
 ```
 
 Inject `McpOAuthStateStore` into `McpOAuthProvider` for durable credentials. The package does not open a browser or choose where credentials are stored.
-
-Authorization server metadata must name the expected issuer (RFC 8414), and its authorization, token, registration, and revocation endpoints must share the issuer's origin (scheme, host, port). This also applies to a document configured with `authorizationServerMetadataUrl`. For an authorization server that serves endpoints from another origin, pass that origin in `authorizeMcp(provider, { allowedEndpointOrigins: ["https://login.example.com"] })`; otherwise the flow fails with `OAuthEndpointOriginError` before any request to the endpoint. Every endpoint must use https, except on loopback. Allowlist entries must be origins, with an optional trailing `/`; userinfo, other paths, queries, fragments, and non-HTTP(S) schemes are rejected. HTTPS is required except on loopback. Host case and default ports are normalized, and duplicate origins are allowed.
-
-The metadata issuer must match the authorization server identifier exactly, including its path and trailing slash. `skipIssuerValidation` is deprecated and ignored; neither it nor `allowedEndpointOrigins` waives this identity check. To configure a server that advertises the wrong issuer, use `authorizationServerMetadataUrl`; its document's issuer becomes the authorization server identifier, not the document URL.
 
 The OAuth implementation is adapted from the MIT-licensed Model Context Protocol TypeScript SDK v1.29.0. Its license is included under `LICENSES/`.
 

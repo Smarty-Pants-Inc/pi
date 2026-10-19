@@ -115,7 +115,6 @@ function readEntryLine(location: EntryLocation, id: unknown, maxBytes?: number):
 	) {
 		throw changed();
 	}
-	// The one-line cache is also visible through immutable history selections.
 	// Own JSON.parse data, then freeze once; never expose a mutable cached payload.
 	freezeDetached(value);
 	lastRead = length <= MAX_CACHED_LINE_BYTES ? { location, value } : undefined;
@@ -195,8 +194,7 @@ export function toColdEntry<T extends object>(entry: T, location: EntryLocation)
 function lazyReader(location: EntryLocation, id: unknown, parent: string | undefined, key: string): () => unknown {
 	const read = () => {
 		const line = readEntryLine(location, id);
-		const value = parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
-		return value;
+		return parent === undefined ? line[key] : (line[parent] as Json | undefined)?.[key];
 	};
 	coldFieldReaders.add(read);
 	return read;

@@ -44,14 +44,6 @@ function createSseResponseWithLineEnding(
 	});
 }
 
-function createFinalCarriageReturnResponse(events: Array<{ event: string; data: string }>): Response {
-	const body = events.map(({ event, data }) => `event: ${event}\rdata: ${data}\r`).join("\r");
-	return new Response(body, {
-		status: 200,
-		headers: { "content-type": "text/event-stream" },
-	});
-}
-
 const minimalAnthropicEvents = [
 	{
 		event: "message_start",
@@ -148,7 +140,7 @@ function createResponseModelSseResponse(model: string, contentBlock: ResponseCon
 }
 
 describe("Anthropic raw SSE parsing", () => {
-	// Regression test for pi#297.
+	// Regression test for pi#300 / smarty-dev#14983.
 	it("keeps CRLF events intact when every byte boundary splits the transport", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
 		const context = normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] });
@@ -166,6 +158,7 @@ describe("Anthropic raw SSE parsing", () => {
 		const unsplitLf = await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\n"));
 		const unsplitCrlf = await run(createSseResponseWithLineEnding(minimalAnthropicEvents, "\r\n"));
 		expect(unsplitCrlf).toEqual(unsplitLf);
+		expect(unsplitCrlf.calls).toEqual(Array.from({ length: 6 }, () => [{ type: "provider_stream_event" }]));
 
 		const bytes = new TextEncoder().encode(
 			minimalAnthropicEvents.map(({ event, data }) => `event: ${event}\r\ndata: ${data}\r\n`).join("\r\n"),
@@ -177,19 +170,59 @@ describe("Anthropic raw SSE parsing", () => {
 		}
 	});
 
+	// pi#300: EOF makes a pending CR a complete line ending.
 	it("parses a final event terminated by a lone carriage return", async () => {
+		const body = minimalAnthropicEvents.map(({ event, data }) => `event: ${event}\rdata: ${data}\r`).join("\r");
 		const result = await streamAnthropic(
 			getModel("anthropic", "claude-haiku-4-5"),
 			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
-			{ client: createFakeAnthropicClient(createFinalCarriageReturnResponse(minimalAnthropicEvents)) },
+			{
+				client: createFakeAnthropicClient(new Response(body, { headers: { "content-type": "text/event-stream" } })),
+			},
 		).result();
 
 		expect(result.stopReason).toBe("stop");
 		expect(result.content).toEqual([{ type: "text", text: "Hello" }]);
 	});
 
-	// smarty-dev#5822 C1: one Pi-owned notification per parsed event, no raw event or model argument.
-	it("notifies the observer once per parsed provider stream event without provider data", async () => {
+	// pi#300: multiple splits, multiline data, UTF-8 splits and no final newline share the same decoder.
+	it("decodes multiline CRLF data one byte at a time through EOF without duplicate notifications", async () => {
+		const events = minimalAnthropicEvents.map(({ event, data }) => ({
+			event,
+			data: data.replace('"Hello"', '"Hello 😀é"').replace(",", ",\r\ndata: "),
+		}));
+		const body = events.map(({ event, data }) => `event: ${event}\r\ndata: ${data}`).join("\r\n\r\n");
+		const bytes = new TextEncoder().encode(body);
+		const calls: unknown[][] = [];
+		const result = await streamAnthropic(
+			getModel("anthropic", "claude-haiku-4-5"),
+			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
+			{
+				client: createFakeAnthropicClient(
+					new Response(
+						new ReadableStream<Uint8Array>({
+							start(controller) {
+								for (let offset = 0; offset < bytes.length; offset++)
+									controller.enqueue(bytes.slice(offset, offset + 1));
+								controller.close();
+							},
+						}),
+						{ headers: { "content-type": "text/event-stream" } },
+					),
+				),
+				onProviderStreamEvent: (...args: unknown[]) => {
+					calls.push(args);
+				},
+			},
+		).result();
+
+		expect(result.stopReason).toBe("stop");
+		expect(result.content).toEqual([{ type: "text", text: "Hello 😀é" }]);
+		expect(calls).toEqual(Array.from({ length: 6 }, () => [{ type: "provider_stream_event" }]));
+	});
+
+	// smarty-dev#5822 C1: one owned notification per event, never the raw event or model.
+	it("notifies once per parsed provider stream event without provider data", async () => {
 		const model = getModel("anthropic", "claude-haiku-4-5");
 		const calls: unknown[][] = [];
 		const result = await streamAnthropic(
@@ -351,7 +384,7 @@ describe("Anthropic raw SSE parsing", () => {
 		} as unknown as Anthropic;
 
 		await streamAnthropic(
-			getModel("anthropic", "claude-haiku-4-5"),
+			getModel("openrouter", "anthropic/claude-haiku-4.5"),
 			normalizeContext({ messages: [{ role: "user", content: "Hello", timestamp: 1 }] }),
 			{ client, thinkingEnabled: false },
 		).result();
@@ -408,7 +441,7 @@ describe("Anthropic raw SSE parsing", () => {
 			{ client: createFakeAnthropicClient(createSseResponse(events)) },
 		).result();
 
-		// smarty-dev#5822 N5682: Pi's count of the final event's drops, not the provider's paths and reasons.
+		// smarty-dev#5822 N5682: Pi's count, never provider paths or reasons.
 		expect(result.diagnostics).toEqual([
 			{ type: "anthropic_input_transformations", timestamp: expect.any(Number), thinkingBlocksDropped: 1 },
 		]);

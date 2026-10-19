@@ -1,6 +1,4 @@
-// pi#202 round 2 P1-2 (smarty-dev#5822): a non-2xx pi-messages response publishes owned text only. Its message,
-// code, body and status text are classified privately and never reach errorMessage, diagnostics or the event.
-// The values below include a credential-shaped token and plain environment values that no pattern can match.
+// pi#202 / smarty-dev#5822: non-2xx pi-messages publishes owned text; private text only classifies.
 import { describe, expect, it } from "vitest";
 import { stream } from "../src/api/pi-messages.ts";
 import type { AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
@@ -11,7 +9,6 @@ const CREDENTIAL = "sk-ant-api03-synthetic5822round2AAAAAAAAAAAAAAAAAAAA";
 const PLAIN_ENV = "corp-eu-west-7-tenant-plum";
 const PLAIN_CODE = "tenant_plum_quota_lane";
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
-
 const model: Model<"pi-messages"> = {
 	id: "test-model",
 	name: "Test model",
@@ -79,7 +76,6 @@ describe("pi-messages non-2xx responses publish owned text only (smarty-dev#5822
 		expect(quota.result.errorMessage).toBe("Provider request failed (HTTP 429)");
 		expect(quota.result.recovery).toEqual({ retryable: false });
 		expect(isRetryableAssistantError(quota.result)).toBe(false);
-
 		const busy = await run(() => Response.json({ error: { message: "try later", code: "busy" } }, { status: 503 }));
 		expect(busy.result.errorMessage).toBe("Provider request failed (HTTP 503, overloaded)");
 		expect(busy.result.recovery).toEqual({ recovery: "retryable", retryable: true });

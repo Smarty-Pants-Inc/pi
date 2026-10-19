@@ -1,10 +1,8 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test, vi } from "vitest";
-import { findExtensionStackMatches, readCrashLog, recordCrash, takeUnnotifiedCrash } from "../src/core/crash-log.ts";
-
-const ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:[1-9][0-9]{0,14}$/;
+import { describe, expect, test } from "vitest";
+import { findExtensionStackMatches, readCrashLog, takeUnnotifiedCrash } from "../src/core/crash-log.ts";
 
 type StackExtension = Parameters<typeof findExtensionStackMatches>[1][number];
 
@@ -23,6 +21,37 @@ function packageExtension(source: string, baseDir: string, entry = "extensions/i
 		},
 	};
 }
+
+// smarty-dev#5271 / pi#280: returning one notice must not retire unseen crashes.
+describe("pending crash notices", () => {
+	test("keeps the older pending crash for the next notice", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "pi-crash-notices-")), "crashes.json");
+		const now = Date.now();
+		writeFileSync(
+			path,
+			JSON.stringify([
+				{ timestamp: new Date(now - 1000).toISOString(), message: "older" },
+				{ timestamp: new Date(now).toISOString(), message: "newer" },
+			]),
+		);
+		expect(takeUnnotifiedCrash(path, now)?.message).toBe("newer");
+		expect(readCrashLog(path).map((record) => record.notified === true)).toEqual([false, true]);
+		expect(takeUnnotifiedCrash(path, now)?.message).toBe("older");
+		expect(readCrashLog(path).every((record) => record.notified)).toBe(true);
+		expect(takeUnnotifiedCrash(path, now)).toBeUndefined();
+	});
+
+	test("does not announce expired records", () => {
+		const path = join(mkdtempSync(join(tmpdir(), "pi-crash-expired-")), "crashes.json");
+		const now = Date.now();
+		writeFileSync(
+			path,
+			JSON.stringify([{ timestamp: new Date(now - 8 * 24 * 60 * 60 * 1000).toISOString(), message: "old" }]),
+		);
+		expect(takeUnnotifiedCrash(path, now)).toBeUndefined();
+		expect(readCrashLog(path)[0].notified).toBeUndefined();
+	});
+});
 
 describe("extension crash attribution", () => {
 	test("matches stack frames beneath loaded package roots", () => {
@@ -90,68 +119,5 @@ describe("extension crash attribution", () => {
 			"Error: progress 100%\n    at run (file:///Users/reporter/.pi/agent/extensions/local%20memory/worker.ts:4:2)";
 
 		expect(findExtensionStackMatches(stack, [extension])).toEqual([extension.path]);
-	});
-});
-
-describe("crash producer ids (smarty-dev#8981)", () => {
-	test("one process numbers its records <gen>:1, <gen>:2; notifying keeps the ids; a new process has a new gen", async () => {
-		const dir = mkdtempSync(join(tmpdir(), "crash-id-"));
-		const path = join(dir, "crashes.json");
-		try {
-			const first = recordCrash({ kind: "fatal_error", error: new Error("one"), cwd: dir }, path);
-			const second = recordCrash({ kind: "fatal_error", error: new Error("two"), cwd: dir }, path);
-			expect(first?.id).toMatch(ID);
-			expect(second?.id).toMatch(ID);
-			const [gen, seq] = first!.id!.split(":");
-			expect(second!.id).toBe(`${gen}:${Number(seq) + 1}`);
-
-			expect(takeUnnotifiedCrash(path)?.id).toBe(second!.id);
-			expect(readCrashLog(path).map((r) => r.id)).toEqual([first!.id, second!.id]);
-
-			// A fresh module instance stands in for a new producer process: the gen is taken once at module load.
-			vi.resetModules();
-			const fresh = await import("../src/core/crash-log.ts");
-			fresh.recordCrash({ kind: "fatal_error", error: new Error("three"), cwd: dir }, path);
-			const third = readCrashLog(path).at(-1)!;
-			expect(third.message).toBe("three");
-			expect(third.id).toMatch(ID);
-			expect(third.id!.split(":")[0]).not.toBe(gen);
-			expect(third.id!.endsWith(":1")).toBe(true);
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
-	});
-});
-
-describe("crash notice bookkeeping (smarty-dev#5271)", () => {
-	test("marks only the shown crash as notified; older unseen crashes stay pending", () => {
-		const dir = mkdtempSync(join(tmpdir(), "crash-log-"));
-		const path = join(dir, "crashes.json");
-		const now = Date.parse("2026-10-05T08:30:00Z");
-		const record = (timestamp: string, message: string) => ({
-			timestamp,
-			version: "test",
-			kind: "fatal_error" as const,
-			message,
-			stack: null,
-			sessionFile: null,
-		});
-		writeFileSync(
-			path,
-			JSON.stringify([
-				record("2026-10-05T08:09:00Z", "lane A"),
-				record("2026-10-05T08:09:10Z", "lane B"),
-				record("2026-10-05T08:09:20Z", "lane C"),
-			]),
-		);
-		try {
-			expect(takeUnnotifiedCrash(path, now)?.message).toBe("lane C");
-			expect(readCrashLog(path).map((r) => Boolean(r.notified))).toEqual([false, false, true]);
-			expect(takeUnnotifiedCrash(path, now)?.message).toBe("lane B");
-			expect(takeUnnotifiedCrash(path, now)?.message).toBe("lane A");
-			expect(takeUnnotifiedCrash(path, now)).toBeUndefined();
-		} finally {
-			rmSync(dir, { recursive: true, force: true });
-		}
 	});
 });

@@ -76,9 +76,7 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 				if (kind === "observer") return completedSSE();
 				return new Response(
 					`data: ${JSON.stringify({ type: "error", code: "server_error", message: `server_error ${payload}` })}\n\n`,
-					{
-						headers: { "content-type": "text/event-stream" },
-					},
+					{ headers: { "content-type": "text/event-stream" } },
 				);
 			});
 			const output = await models.complete(
@@ -101,8 +99,6 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 			);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
 			expect(output.stopReason).toBe("error");
-			// smarty-dev#5822 C1: an observer failure publishes owned text, not the exception text.
-			// HTTP failures and stream error events publish owned text only (pi#202 rounds 2 and 3).
 			expect(output.errorMessage).toContain(
 				kind === "observer"
 					? "Provider stream observer failed"
@@ -129,9 +125,7 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 				fetch: async () =>
 					new Response(
 						`data: ${JSON.stringify({ type: kind === "failed status" ? "response.failed" : "response.incomplete", response })}\n\n`,
-						{
-							headers: { "content-type": "text/event-stream" },
-						},
+						{ headers: { "content-type": "text/event-stream" } },
 					),
 			},
 		);
@@ -155,13 +149,11 @@ describe.each([openaiCodexProvider(), openaiProvider()])("OAuth provider diagnos
 	});
 });
 
-// pi#127 / B-F1: invalid account header values are echoed by native Headers.set, not a provider response.
+// pi#127 / B-F1: native Headers.set can echo invalid account header values.
 it("redacts a native Codex account header validation error before network I/O", async () => {
 	const invalidAccount = `${account}\nFAKE_INVALID_ACCOUNT_127`;
 	const token = `${Buffer.from('{"alg":"none"}').toString("base64url")}.${Buffer.from(
-		JSON.stringify({
-			"https://api.openai.com/auth": { chatgpt_account_id: invalidAccount },
-		}),
+		JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: invalidAccount } }),
 	).toString("base64url")}.FAKE_SIGNATURE_127`;
 	const { models, model } = await runtime(openaiCodexProvider(), token);
 	const fetchMock = vi.fn(async () => completedSSE());
@@ -171,7 +163,7 @@ it("redacts a native Codex account header validation error before network I/O", 
 	expectRedacted(output, [token, account, "FAKE_INVALID_ACCOUNT_127"]);
 });
 
-// pi#127 / B-F1: successful fallback retains diagnostics and public WebSocket statistics.
+// pi#127 / B-F1: fallback keeps owned diagnostics and value-free WebSocket stats.
 it("redacts WebSocket fallback message, stack, code and stats before a successful SSE start", async () => {
 	vi.stubGlobal(
 		"WebSocket",
@@ -203,7 +195,6 @@ it("redacts WebSocket fallback message, stack, code and stats before a successfu
 	const output = await stream.result();
 	expect(output.stopReason).toBe("stop");
 	expect(events).toContain("start");
-	// smarty-dev#5822 N5682: the owned type only; the transport error text is not published.
 	expect(output.diagnostics).toEqual([{ type: "provider_transport_failure", timestamp: expect.any(Number) }]);
 	expectRedacted(getOpenAICodexWebSocketDebugStats("fake-session-127"));
 });
@@ -238,7 +229,7 @@ it("redacts generic retry text and the final response", async () => {
 	expectRedacted({ events, output });
 });
 
-// pi#127 / B-F2: catch-only protection cannot sanitize the SDK's debug console sink.
+// pi#127 / B-F2: catch protection cannot sanitize SDK console output.
 it.each(["HTTP", "transport", "retry cap", "custom endpoint"])("redacts OAuth SDK %s debug records", async (kind) => {
 	vi.stubEnv("OPENAI_LOG", "debug");
 	const records: unknown[] = [];

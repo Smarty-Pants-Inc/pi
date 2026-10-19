@@ -4,11 +4,9 @@ import { providerHeadersToRecord } from "../utils/headers.ts";
 import { providerResponse } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 
-// Classifier replies are small JSON records. 4 MiB leaves ample room for large answer sets while
-// bounding both success and error bodies, including decompressed bytes. Each attempt, including
-// body consumption, has a 60-second deadline unless the caller supplies timeoutMs.
+// Bound decompressed success and error bodies and include reads in each attempt's deadline.
 const MAX_CLASSIFIER_RESPONSE_BYTES = 4 * 1024 * 1024;
-const DEFAULT_CLASSIFIER_TIMEOUT_MS = 60_000;
+export const DEFAULT_CLASSIFIER_TIMEOUT_MS = 60_000;
 
 /** An HTTP failure in the shape `retryProviderRequest` and `normalizeProviderError` understand. */
 export interface ClassifierHttpError extends Error {
@@ -34,7 +32,7 @@ function timeoutError(timeoutMs: number): ClassifierHttpError {
 	return error;
 }
 
-async function readClassifierBody(label: string, response: Response, signal: AbortSignal): Promise<string> {
+export async function readClassifierBody(label: string, response: Response, signal: AbortSignal): Promise<string> {
 	if (!response.body) {
 		signal.throwIfAborted();
 		return "";
@@ -43,7 +41,6 @@ async function readClassifierBody(label: string, response: Response, signal: Abo
 	const decoder = new TextDecoder();
 	const parts: string[] = [];
 	let bytes = 0;
-	// Custom fetch implementations may not propagate the request signal to their body stream.
 	const onAbort = () => {
 		void reader.cancel(signal.reason).catch(() => {});
 	};
@@ -56,7 +53,6 @@ async function readClassifierBody(label: string, response: Response, signal: Abo
 			if (done) break;
 			bytes += value.byteLength;
 			if (bytes > MAX_CLASSIFIER_RESPONSE_BYTES) {
-				// A plain Error is terminal: provider retries must not repeat an oversized response.
 				throw new Error(`${label} response body exceeds ${MAX_CLASSIFIER_RESPONSE_BYTES} byte limit`);
 			}
 			parts.push(decoder.decode(value, { stream: true }));

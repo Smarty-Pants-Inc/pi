@@ -98,9 +98,10 @@ function normalizeResponse(input: FauxResponseInput): FauxResponse {
 	return input;
 }
 
-function buildUsage(partial?: Partial<Usage>): Usage {
+function buildUsage(partial: Partial<Usage> | undefined, stopReason: StopReason): Usage {
 	const input = partial?.input ?? 100;
-	const output = partial?.output ?? 50;
+	// Empty failed attempts did not generate output; explicit partial usage still wins.
+	const output = partial?.output ?? (stopReason === "error" || stopReason === "aborted" ? 0 : 50);
 	const cacheRead = partial?.cacheRead ?? 0;
 	const cacheWrite = partial?.cacheWrite ?? 0;
 	return {
@@ -157,7 +158,7 @@ function buildAssistantMessage(resp: FauxResponse): AssistantMessage {
 		api: FAUX_API,
 		provider: resp.model?.provider ?? FAUX_PROVIDER,
 		model: resp.model?.id ?? FAUX_MODEL_ID,
-		usage: buildUsage(resp.usage),
+		usage: buildUsage(resp.usage, stopReason),
 		stopReason,
 		errorMessage: resp.error,
 		timestamp: Date.now(),

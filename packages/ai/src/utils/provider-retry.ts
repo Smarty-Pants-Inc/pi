@@ -1,5 +1,7 @@
 import type { ProviderRequestOptions } from "../types.ts";
-import { smartyLimitMessage } from "./error-body.ts";
+import { isSmartyLimitError, ProviderRequestLimitError } from "./recovery.ts";
+
+export { ProviderRequestLimitError } from "./recovery.ts";
 
 const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
 
@@ -26,7 +28,7 @@ function isProviderError(error: unknown): error is ProviderError {
 
 /** Mirrors the pinned OpenAI/Anthropic SDK retry policy; review when either SDK is upgraded. */
 function isRetryableProviderError(error: ProviderError): boolean {
-	if (smartyLimitMessage(error) !== undefined) return false;
+	if (isSmartyLimitError(error)) return false;
 	const shouldRetry = error.headers?.get("x-should-retry");
 	if (shouldRetry === "true") return true;
 	if (shouldRetry === "false") return false;
@@ -72,14 +74,6 @@ function getRetryDelayMs(error: ProviderError, retryIndex: number, maxRetryDelay
 	return exponentialDelay * (1 - Math.random() * 0.25);
 }
 
-/** Terminal, body-free refusal shared by admission and cancellation paths. */
-export class ProviderRequestLimitError extends Error {
-	constructor(requests: number, limit: number) {
-		super(`Provider request limit reached (${requests}/${limit}); no further requests allowed`);
-		this.name = "ProviderRequestLimitError";
-	}
-}
-
 function createAbortError(signal?: AbortSignal): Error {
 	if (signal?.reason instanceof ProviderRequestLimitError) return signal.reason;
 	const error = new Error("Request aborted");
@@ -109,7 +103,6 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
 	});
 }
 
-/** Check cancellation and dispatch admission immediately before a physical attempt. */
 export function checkProviderRequest(options?: Pick<ProviderRequestOptions, "signal" | "beforeProviderRequest">): void {
 	if (options?.signal?.aborted) throw createAbortError(options.signal);
 	options?.beforeProviderRequest?.();
@@ -131,7 +124,7 @@ export async function retryProviderRequest<T>(
 	let retriesRemaining = maxRetries;
 
 	for (;;) {
-		// Admission failures are terminal, not provider errors to retry.
+		// Admission failures are terminal, not provider failures to retry.
 		checkProviderRequest(options);
 		try {
 			// Each retry is a fresh SDK request, so X-Stainless-Retry-Count remains zero.

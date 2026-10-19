@@ -17,7 +17,6 @@ const tmuxAvailable = (() => {
 		return false;
 	}
 })();
-
 const fixture = `import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createFauxCore, fauxAssistantMessage } from ${JSON.stringify(fauxPath)};
@@ -29,7 +28,6 @@ export default function(pi) {
   });
   const faux = createFauxCore({ provider: "tui-admission-faux" });
   faux.setResponses(process.env.PI_PROOF_CASE === "r4-images-retry" ? [fauxAssistantMessage("offline seed answer with enough content to compact"), fauxAssistantMessage("", { stopReason: "error", errorMessage: "context length exceeded" }), fauxAssistantMessage("offline retry answer")] : Array.from({ length: 8 }, () => fauxAssistantMessage("offline terminal answer")));
-  // Synthetic in-memory auth is never read from a credential store or sent over a network.
   pi.registerProvider(faux.provider, { baseUrl: faux.getModel().baseUrl, apiKey: "offline-faux-test-only", api: faux.api, streamSimple: faux.streamSimple, models: faux.models });
   pi.on("session_start", async (_event, ctx) => {
     const count = Number(process.env.PI_START_COUNT || 0) + 1; process.env.PI_START_COUNT = String(count); mark("start-" + count);
@@ -92,37 +90,29 @@ export default function(pi) {
     if (event.text.includes("large-paste-tail") || (event.text.includes("held-A") && event.text !== "held-A")) { writeFileSync(join(dir, "paste-submitted"), event.text); return { action: "handled" }; }
     if (event.text === "queue-image") { mark("image-created"); return { action: "transform", text: "attached-original", images: [{ type: "image", data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=", mimeType: "image/png" }] }; }
     if (event.text.includes("attached-original")) { writeFileSync(join(dir, "image-recovered"), JSON.stringify(event.images ?? null)); return { action: "handled" }; }
-    if (event.text === "shutdown-handled") {
-      ctx.ui.notify("ADMISSION_SHUTDOWN_REQUESTED"); mark("admission-shutdown"); ctx.shutdown(); return { action: "handled" };
-    }
+    if (event.text === "shutdown-handled") { ctx.ui.notify("ADMISSION_SHUTDOWN_REQUESTED"); mark("admission-shutdown"); ctx.shutdown(); return { action: "handled" }; }
   });
   pi.registerCommand("replace-held", { handler: async (_args, ctx) => {
-    const result = await ctx.newSession();
-    ctx.ui.notify("REPLACEMENT_RESULT_CANCELLED=" + result.cancelled); mark("replacement-finished");
+    const result = await ctx.newSession(); ctx.ui.notify("REPLACEMENT_RESULT_CANCELLED=" + result.cancelled); mark("replacement-finished");
   } });
   pi.on("session_before_switch", async (_event, ctx) => {
     if (["shortcut-stale", "replacement-shutdown"].includes(process.env.PI_PROOF_CASE) || process.env.PI_PROOF_CASE.startsWith("r1-bash")) return;
     ctx.ui.setStatus("proof", "REPLACEMENT_FENCE_HELD"); mark("switch-held"); await hold("switch"); return { cancel: true };
   });
   pi.registerShortcut("ctrl+shift+h", { handler: async (ctx) => {
-    const savedNotify = ctx.ui.notify; mark("shortcut-held"); await hold("shortcut");
-    const rejected = [];
-    for (const [name, action] of [["abort", () => ctx.abort()], ["compact", () => ctx.compact()], ["ui", () => savedNotify("STALE_UI_MUTATED_RECEIVING")]]) {
-      try { action(); } catch { rejected.push(name); }
-    }
+    const savedNotify = ctx.ui.notify; mark("shortcut-held"); await hold("shortcut"); const rejected = [];
+    for (const [name, action] of [["abort", () => ctx.abort()], ["compact", () => ctx.compact()], ["ui", () => savedNotify("STALE_UI_MUTATED_RECEIVING")]]) { try { action(); } catch { rejected.push(name); } }
     writeFileSync(join(dir, "shortcut-result"), JSON.stringify(rejected));
   } });
   pi.on("session_shutdown", async (_event, ctx) => { if (process.env.PI_PROOF_CASE === "shutdown-upgrade") { mark("cleanup-held"); await hold("cleanup"); } });
   pi.on("agent_settled", async (_event, ctx) => { ctx.ui.setStatus("proof", "AGENT_SETTLED"); mark("settled"); if (process.env.PI_PROOF_CASE === "busy-settlement") { mark("settlement-held"); await hold("settlement"); } });
 }`;
-
 function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
 }
 function tmux(...args: string[]): string {
 	return execFileSync("tmux", ["-S", socket, ...args], { encoding: "utf8" });
 }
-
 function editorFrame(frame: string): string {
 	const lines = frame.split("\n");
 	const borders = lines.flatMap((line, index) => (/^─{20}/.test(line) ? [index] : []));
@@ -132,7 +122,6 @@ function editorFrame(frame: string): string {
 		.join("\n")
 		.trim();
 }
-
 interface TerminalProof {
 	dir: string;
 	name: string;
@@ -143,12 +132,15 @@ interface TerminalProof {
 	frame(label: string): string;
 	exit(): Promise<number>;
 }
-
-// smarty-dev#3048, PR #110 F4/F6/F8: actual bin + PTY + keyboard dispatch, not prototype mocks.
+const originalImage = {
+	type: "image",
+	mimeType: "image/png",
+	data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+};
+// smarty-dev#3048 / pi#117: built CLI, isolated PTY and real keyboard dispatch, CI-only.
 describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive admission", () => {
 	const proofs: TerminalProof[] = [];
 	afterAll(() => {
-		// This file owns the private socket and every pane on its server.
 		try {
 			tmux("kill-server");
 		} catch {}
@@ -185,7 +177,7 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 				}
 			}
 			p.frame("final");
-			if (evidence) {
+			if (evidence)
 				for (const file of [
 					"shortcut-result",
 					"paste-submitted",
@@ -197,12 +189,10 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 					if (existsSync(join(p.dir, file)))
 						writeFileSync(join(evidence, `tui-${p.name}-${file}.proof`), readFileSync(join(p.dir, file)));
 				}
-			}
 			tmux("kill-session", "-t", p.name);
 			rmSync(p.dir, { recursive: true, force: true });
 		}
 	});
-
 	async function launch(label: string, scenario: string): Promise<TerminalProof> {
 		const dir = mkdtempSync(join(tmpdir(), "pi-admission-tui-"));
 		mkdirSync(join(dir, "agent"));
@@ -337,95 +327,74 @@ await new InteractiveMode(host).run();
 		p.frame("ready");
 		return p;
 	}
-
-	// smarty-dev#3048 / pi#117 R2-S3: recovery finishes while non-overlay custom UI is still mounted.
-	it.each(["normal", "SIGTERM", "SIGHUP"] as const)(
-		"R2-S3: %s dismissal preserves already-recovered original images",
-		async (ending) => {
-			const p = await launch(`r2-custom-${ending}`, `r2-custom-${ending}`);
-			p.submit("run-held");
-			await p.mark("run-held");
-			p.text("queue-image");
-			p.keys("M-Enter");
-			await p.mark("image-created");
-			await vi.waitFor(() => expect(p.frame("r2-original-queued")).toContain("attached-original"));
-			p.text("\x1b[77;6u");
-			await p.mark("custom-mounted");
-			await vi.waitFor(() => expect(p.frame("r2-custom-mounted")).toContain("CUSTOM_MOUNTED"));
-			writeFileSync(join(p.dir, "abort-mounted"), "abort");
-			await p.mark("recovered-mounted");
-			const recovered = JSON.parse(readFileSync(join(p.dir, "mounted-recovery"), "utf8"));
-			expect(recovered.text).toContain("attached-original");
-			expect(recovered.text).toContain("[recovered image");
-			expect(p.frame("r2-recovery-before-dismissal")).toContain("CUSTOM_MOUNTED");
-			if (ending === "normal") {
-				writeFileSync(join(p.dir, "release-run"), "release");
-				await p.mark("settled");
-				writeFileSync(join(p.dir, "close-custom"), "close");
-				await vi.waitFor(() => expect(editorFrame(p.frame("r2-custom-dismissed"))).toContain("attached-original"));
-				p.keys("Enter");
-				await p.mark("image-recovered");
-				expect(JSON.parse(readFileSync(join(p.dir, "image-recovered"), "utf8"))).toEqual([
-					{
-						type: "image",
-						mimeType: "image/png",
-						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
-					},
-				]);
-			} else {
-				process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), ending);
-				expect(await p.exit()).toBe(0);
-				await vi.waitFor(() => {
-					const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
-					const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
-					expect(json).toBeDefined();
-					const receipt = JSON.parse(json!);
-					expect(receipt.text).toBe(recovered.text);
-					expect(receipt.images).toEqual([
-						{
-							type: "image",
-							mimeType: "image/png",
-							data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
-						},
-					]);
-				});
-			}
-		},
-	);
-
-	// smarty-dev#3048 / pi#117 R2-S4: successful replacement must not erase fenced submissions.
-	it.each(["clone", "fork", "extension"] as const)(
-		"R2-S4: successful held %s keeps newer fenced draft",
-		async (kind) => {
-			const p = await launch(`r2-${kind}`, `r2-replacement-${kind}`);
-			p.submit("historical-seed");
+	// pi#117 R2-S3: already-recovered images survive custom UI dismissal or shutdown.
+	it.each(["normal", "SIGTERM", "SIGHUP"] as const)("R2-S3: %s preserves recovered images", async (ending) => {
+		const p = await launch(`r2-custom-${ending}`, `r2-custom-${ending}`);
+		p.submit("run-held");
+		await p.mark("run-held");
+		p.text("queue-image");
+		p.keys("M-Enter");
+		await p.mark("image-created");
+		await vi.waitFor(() => expect(p.frame("r2-original-queued")).toContain("attached-original"));
+		p.text("\x1b[77;6u");
+		await p.mark("custom-mounted");
+		await vi.waitFor(() => expect(p.frame("r2-custom-mounted")).toContain("CUSTOM_MOUNTED"));
+		writeFileSync(join(p.dir, "abort-mounted"), "abort");
+		await p.mark("recovered-mounted");
+		const recovered = JSON.parse(readFileSync(join(p.dir, "mounted-recovery"), "utf8"));
+		expect(recovered.text).toContain("attached-original");
+		expect(recovered.text).toContain("[recovered image");
+		expect(p.frame("r2-recovery-before-dismissal")).toContain("CUSTOM_MOUNTED");
+		if (ending === "normal") {
+			writeFileSync(join(p.dir, "release-run"), "release");
 			await p.mark("settled");
-			p.submit(kind === "extension" ? "/fork-held" : `/${kind}`);
-			if (kind === "fork") {
-				await vi.waitFor(() => expect(p.frame("r2-fork-selector")).toContain("Fork from Message"));
-				p.keys("Enter");
-			}
-			await p.mark("fork-held");
-			p.submit("newer-fenced-draft");
+			writeFileSync(join(p.dir, "close-custom"), "close");
+			await vi.waitFor(() => expect(editorFrame(p.frame("r2-custom-dismissed"))).toContain("attached-original"));
+			p.keys("Enter");
+			await p.mark("image-recovered");
+			expect(JSON.parse(readFileSync(join(p.dir, "image-recovered"), "utf8"))).toEqual([originalImage]);
+		} else {
+			process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), ending);
+			expect(await p.exit()).toBe(0);
 			await vi.waitFor(() => {
-				const frame = p.frame("r2-replacement-fenced");
-				expect(frame).toContain("INPUT_ADMISSION_FENCED");
-				expect(editorFrame(frame)).toContain("newer-fenced-draft");
+				const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+				const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
+				expect(json).toBeDefined();
+				const receipt = JSON.parse(json!);
+				expect(receipt.text).toBe(recovered.text);
+				expect(receipt.images).toEqual([originalImage]);
 			});
-			writeFileSync(join(p.dir, "release-fork"), "release");
-			await p.mark("start-2");
-			if (kind === "extension") await p.mark("extension-fork-finished");
-			await vi.waitFor(() =>
-				expect(p.frame("r2-replacement-complete")).toContain(
-					kind === "clone" ? "Cloned to new session" : "Forked to new session",
-				),
-			);
-			expect(editorFrame(p.frame("r2-newer-draft-retained"))).toContain("newer-fenced-draft");
-		},
-	);
-
-	// pi#117 R1-4: custom cleanup must precede transfer of compaction staging into recovery.
-	it("R1-4: signal with mounted custom interaction preserves staged original image recovery", async () => {
+		}
+	});
+	// pi#117 R2-S4: successful replacement cannot erase newer fenced editor input.
+	it.each(["clone", "fork", "extension"] as const)("R2-S4: held %s keeps newer draft", async (kind) => {
+		const p = await launch(`r2-${kind}`, `r2-replacement-${kind}`);
+		p.submit("historical-seed");
+		await p.mark("settled");
+		p.submit(kind === "extension" ? "/fork-held" : `/${kind}`);
+		if (kind === "fork") {
+			await vi.waitFor(() => expect(p.frame("r2-fork-selector")).toContain("Fork from Message"));
+			p.keys("Enter");
+		}
+		await p.mark("fork-held");
+		p.submit("newer-fenced-draft");
+		await vi.waitFor(() => {
+			const frame = p.frame("r2-replacement-fenced");
+			expect(frame).toContain("INPUT_ADMISSION_FENCED");
+			expect(editorFrame(frame)).toContain("newer-fenced-draft");
+		});
+		writeFileSync(join(p.dir, "release-fork"), "release");
+		await p.mark("start-2");
+		if (kind === "extension") await p.mark("extension-fork-finished");
+		await vi.waitFor(() =>
+			expect(p.frame("r2-replacement-complete")).toContain(
+				kind === "clone" ? "Cloned to new session" : "Forked to new session",
+			),
+		);
+		expect(editorFrame(p.frame("r2-newer-draft-retained"))).toContain("newer-fenced-draft");
+	});
+	// pi#117 R1-4: custom cleanup precedes compaction-stage recovery transfer.
+	it("R1-4: signal with custom UI preserves staged image recovery", async () => {
 		const p = await launch("r1-custom-staging", "r4-custom-staging");
 		p.submit("seed");
 		await p.mark("settled");
@@ -453,17 +422,11 @@ await new InteractiveMode(host).run();
 			expect(json).toBeDefined();
 			const receipt = JSON.parse(json!);
 			expect(receipt.text).toContain("attached-original");
-			expect(receipt.images).toEqual([
-				{
-					type: "image",
-					mimeType: "image/png",
-					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
-				},
-			]);
+			expect(receipt.images).toEqual([originalImage]);
 		});
 	});
-	// pi#117 R1-5: transfer finalizers must recheck latched shutdown after handled input.
-	it("R1-5: handled compaction flush shutdown exits without later activity", async () => {
+	// pi#117 R1-5: a handled flush must recheck latched shutdown.
+	it("R1-5: handled compaction flush shutdown exits", async () => {
 		const p = await launch("r1-flush-shutdown", "r4-flush-shutdown");
 		p.submit("seed");
 		await p.mark("settled");
@@ -475,8 +438,8 @@ await new InteractiveMode(host).run();
 		await p.mark("admission-shutdown");
 		expect(await p.exit()).toBe(0);
 	});
-	// pi#117 R1-6: import cancellation must not clear a newer fenced editor draft.
-	it("R1-6: cancelled import preserves newer draft submitted while fenced", async () => {
+	// pi#117 R1-6: cancelled import and external editing preserve newer recovery.
+	it("R1-6: cancelled import preserves newer fenced draft", async () => {
 		const p = await launch("r1-import-draft", "r1-import");
 		p.submit(`/import ${join(p.dir, "target.jsonl")}`);
 		await vi.waitFor(() => expect(p.frame("import-confirm")).toContain("Replace current session"));
@@ -488,8 +451,7 @@ await new InteractiveMode(host).run();
 		await vi.waitFor(() => expect(p.frame("import-cancelled")).toContain("Import cancelled"));
 		expect(editorFrame(p.frame("import-draft-retained"))).toContain("newer-fenced-draft");
 	});
-	// pi#117 R1-6: asynchronous rejection can recover editor content while external input is stopped.
-	it("R1-6: external editor completion preserves asynchronous admission recovery", async () => {
+	it("R1-6: external editor preserves asynchronous admission recovery", async () => {
 		const p = await launch("r1-external-recovery", "r1-external");
 		p.submit("held-A");
 		await p.mark("input-held");
@@ -503,28 +465,24 @@ await new InteractiveMode(host).run();
 		await vi.waitFor(() => expect(editorFrame(p.frame("external-complete"))).toContain("external-edited"));
 		expect(editorFrame(p.frame("external-recovery-retained"))).toContain("held-A");
 	});
-	// pi#117 R1-7: real native non-owned TUI must not retarget a held bash hook across cwd replacement.
-	it.each(["handled", "executable"])(
-		"R1-7: held TUI bash %s result cannot target receiving cwd or history",
-		async (kind) => {
-			const p = await launch(`r1-bash-${kind}`, `r1-bash-${kind}`);
-			const sentinel = join(p.dir, "bash-sentinel");
-			p.submit(`!pwd > ${sentinel}`);
-			await p.mark("bash-held");
-			p.submit("/replace-bash");
-			await p.mark("bash-replaced");
-			writeFileSync(join(p.dir, "release-bash"), "release");
-			await p.mark("bash-released");
-			await vi.waitFor(() => expect(p.frame("bash-refused")).toContain("INPUT_ADMISSION_DISPOSED"));
-			expect(existsSync(sentinel)).toBe(false);
-			process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
-			expect(await p.exit()).toBe(0);
-			expect(readFileSync(join(p.dir, "bash-history"), "utf8")).not.toContain("retired-handled-result");
-			expect(readFileSync(join(p.dir, "bash-history"), "utf8")).not.toContain("bashExecution");
-		},
-	);
-
-	it("held Enter input refuses replacement and Escape recovery keeps a newer draft", async () => {
+	// pi#117 R1-7: held bash hooks cannot retarget receiving cwd or history.
+	it.each(["handled", "executable"])("R1-7: held bash %s cannot target receiving session", async (kind) => {
+		const p = await launch(`r1-bash-${kind}`, `r1-bash-${kind}`);
+		const sentinel = join(p.dir, "bash-sentinel");
+		p.submit(`!pwd > ${sentinel}`);
+		await p.mark("bash-held");
+		p.submit("/replace-bash");
+		await p.mark("bash-replaced");
+		writeFileSync(join(p.dir, "release-bash"), "release");
+		await p.mark("bash-released");
+		await vi.waitFor(() => expect(p.frame("bash-refused")).toContain("INPUT_ADMISSION_DISPOSED"));
+		expect(existsSync(sentinel)).toBe(false);
+		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
+		expect(await p.exit()).toBe(0);
+		expect(readFileSync(join(p.dir, "bash-history"), "utf8")).not.toContain("retired-handled-result");
+		expect(readFileSync(join(p.dir, "bash-history"), "utf8")).not.toContain("bashExecution");
+	});
+	it("held Enter refuses replacement and Escape keeps a newer draft", async () => {
 		const p = await launch("draft-recovery", "recovery");
 		p.submit("run-held");
 		await p.mark("run-held");
@@ -538,16 +496,13 @@ await new InteractiveMode(host).run();
 		p.keys("Escape");
 		await vi.waitFor(() => {
 			const frame = p.frame("draft-recovered");
-			expect(editorFrame(frame)).toContain("newer-B");
-			expect(editorFrame(frame)).toContain("held-A");
-			expect(editorFrame(frame)).toContain("queued-C");
+			for (const text of ["newer-B", "held-A", "queued-C"]) expect(editorFrame(frame)).toContain(text);
 			expect(frame).toContain("INPUT_ADMISSION_ABORTED");
 		});
 		writeFileSync(join(p.dir, "release-input"), "release");
 		writeFileSync(join(p.dir, "release-run"), "release");
 		await p.mark("settled");
 	});
-
 	it("Alt+Enter and Enter retain editor input while replacement is fenced", async () => {
 		const p = await launch("fenced-follow-up", "recovery");
 		p.submit("run-held");
@@ -569,11 +524,10 @@ await new InteractiveMode(host).run();
 		writeFileSync(join(p.dir, "release-run"), "release");
 		await p.mark("settled");
 	});
-
-	// smarty-dev#3048, PR #110 S2: old shortcuts cannot retarget a receiving session or saved UI.
+	// smarty-dev#3048 / PR #110 S2: stale saved callbacks must not target a replacement.
 	it("held shortcut rejects abort, compact and captured UI after replacement", async () => {
 		const p = await launch("shortcut-stale", "shortcut-stale");
-		p.text("[104;6u");
+		p.text("\x1b[104;6u");
 		await p.mark("shortcut-held");
 		p.submit("/new");
 		await p.mark("start-2");
@@ -587,14 +541,13 @@ await new InteractiveMode(host).run();
 		p.keys("Escape");
 		writeFileSync(join(p.dir, "release-input"), "release");
 	});
-
-	// smarty-dev#3048, PR #110 S3: real signals must latch terminal shutdown during busy ownership.
+	// smarty-dev#3048 / PR #110 S3: terminal requests latch through busy admission/replacement.
 	it.each([
 		["SIGTERM", "admission"],
 		["SIGHUP", "admission"],
 		["SIGTERM", "replacement"],
 		["SIGHUP", "replacement"],
-	] as const)("%s terminates held %s without swallowing the request", async (signal, phase) => {
+	] as const)("%s terminates held %s", async (signal, phase) => {
 		const p = await launch(`signal-${signal}-${phase}`, "signal");
 		p.submit(phase === "admission" ? "held-A" : "/new");
 		await p.mark(phase === "admission" ? "input-held" : "switch-held");
@@ -603,9 +556,7 @@ await new InteractiveMode(host).run();
 		expect(await p.exit()).toBe(0);
 		p.frame("signal-exited");
 	});
-
-	// smarty-dev#3048, PR #110 R2-1/S3: BUSY replacement must retain the active settlement cancellation owner.
-	it("SIGTERM after BUSY replacement cancels the original settlement", async () => {
+	it("SIGTERM after BUSY replacement cancels original settlement", async () => {
 		const p = await launch("busy-settlement", "busy-settlement");
 		p.submit("settlement-run");
 		await p.mark("settlement-held");
@@ -616,8 +567,7 @@ await new InteractiveMode(host).run();
 		expect(await p.exit()).toBe(0);
 		expect(p.frame("settlement-cancelled")).toContain("newer-settlement-draft");
 	});
-	// smarty-dev#3048, PR #110 S3/S11: terminal rejection preserves acknowledged queued image data and newer draft.
-	it("SIGTERM returns complete queued attachments and the editor draft", async () => {
+	it("SIGTERM returns complete queued attachments and newer editor draft", async () => {
 		const p = await launch("signal-queued-image", "recovery-signal-queues");
 		p.submit("run-held");
 		await p.mark("run-held");
@@ -628,29 +578,19 @@ await new InteractiveMode(host).run();
 		p.text("newer-signal-draft");
 		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
 		expect(await p.exit()).toBe(0);
-		const frame = p.frame("queued-image-rejected");
-		expect(frame).toContain("newer-signal-draft");
-		{
-			let receipt: { text: string; images: unknown[] } | undefined;
-			await vi.waitFor(() => {
-				const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
-				const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
-				expect(json).toBeDefined();
-				receipt = JSON.parse(json!) as { text: string; images: unknown[] };
-			});
-			expect(receipt?.text).toContain("attached-original");
-			expect(receipt?.text).toContain("newer-signal-draft");
-			expect(receipt?.images).toEqual([
-				{
-					type: "image",
-					data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
-					mimeType: "image/png",
-				},
-			]);
-			if (evidence) writeFileSync(join(evidence, `tui-${p.name}-recovery.proof.json`), JSON.stringify(receipt));
-		}
+		expect(p.frame("queued-image-rejected")).toContain("newer-signal-draft");
+		let receipt: { text: string; images: unknown[] } | undefined;
+		await vi.waitFor(() => {
+			const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+			const json = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw)?.[1];
+			expect(json).toBeDefined();
+			receipt = JSON.parse(json!);
+		});
+		expect(receipt?.text).toContain("attached-original");
+		expect(receipt?.text).toContain("newer-signal-draft");
+		expect(receipt?.images).toEqual([originalImage]);
+		if (evidence) writeFileSync(join(evidence, `tui-${p.name}-recovery.proof.json`), JSON.stringify(receipt));
 	});
-	// smarty-dev#3048, PR #110 S3: a signal upgrades an ordinary quit already awaiting teardown.
 	it("SIGTERM upgrades an in-progress ordinary shutdown", async () => {
 		const p = await launch("shutdown-upgrade", "shutdown-upgrade");
 		p.submit("/quit");
@@ -659,14 +599,15 @@ await new InteractiveMode(host).run();
 		process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), "SIGTERM");
 		expect(await p.exit()).toBe(0);
 		p.frame("cleanup-cancelled");
-		await vi.waitFor(() => {
-			const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
-			expect(raw).toContain("session_shutdown cleanup incomplete: deadline exceeded 1000 ms");
-		});
+		await vi.waitFor(() =>
+			expect(readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8")).toContain(
+				"session_shutdown cleanup incomplete: deadline exceeded 1000 ms",
+			),
+		);
 	});
-	// smarty-dev#3048, PR #110 R2-3/S10/S8: idle Escape and collapsed bracketed paste must be lossless.
+	// smarty-dev#3048 / PR #110 R2-3: collapsed bracketed paste must survive refusal.
 	it.each(["Enter", "M-Enter", "streaming"] as const)(
-		"%s admission Escape preserves a newer large paste",
+		"%s admission Escape preserves newer large paste",
 		async (key) => {
 			const p = await launch(`paste-${key}`, key === "streaming" ? "recovery-paste" : "idle");
 			if (key === "streaming") {
@@ -696,10 +637,8 @@ await new InteractiveMode(host).run();
 			p.frame("paste-resubmitted");
 		},
 	);
-
-	// smarty-dev#3048, PR #110 R2-4/S9: no later run or keyboard prompt may be needed to exit.
 	it.each(["replacement-shutdown", "initial-shutdown"] as const)(
-		"deferred %s exits without starting a run",
+		"deferred %s exits without a run",
 		async (scenario) => {
 			const p = await launch(scenario, scenario);
 			if (scenario === "replacement-shutdown") {
@@ -711,9 +650,7 @@ await new InteractiveMode(host).run();
 			p.frame("deferred-exited");
 		},
 	);
-
-	// smarty-dev#3048, PR #110 S11: acknowledged image recovery cannot rely on rerunning a transform.
-	it("Escape recovers the original queued image and resubmits it intact", async () => {
+	it("Escape recovers and resubmits original queued image intact", async () => {
 		const p = await launch("queued-image", "recovery");
 		p.submit("run-held");
 		await p.mark("run-held");
@@ -726,16 +663,10 @@ await new InteractiveMode(host).run();
 		await p.mark("settled");
 		p.keys("Enter");
 		await p.mark("image-recovered");
-		expect(JSON.parse(readFileSync(join(p.dir, "image-recovered"), "utf8"))).toEqual([
-			{
-				type: "image",
-				data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
-				mimeType: "image/png",
-			},
-		]);
+		expect(JSON.parse(readFileSync(join(p.dir, "image-recovered"), "utf8"))).toEqual([originalImage]);
 		p.frame("image-resubmitted");
 	});
-	// smarty-dev#3048 / PR #110 R3-4: terminal teardown preserves unsent collapsed paste bytes.
+	// smarty-dev#3048 / PR #110 R3-4: terminal receipt expands idle collapsed paste exactly.
 	it.each(["SIGTERM", "SIGHUP"] as const)("round4 %s returns exact idle collapsed draft", async (signal) => {
 		const p = await launch(`idle-paste-${signal}`, "idle");
 		const paste = `${"unsent-large-paste ".repeat(90)}large-paste-tail`;
@@ -751,8 +682,8 @@ await new InteractiveMode(host).run();
 			expect(JSON.parse(json!).text).toBe(paste);
 		});
 	});
-	// smarty-dev#3048 / PR #110 R3-5: a detached compaction prompt must restore before terminal receipt.
-	it.each(["SIGTERM", "SIGHUP"] as const)("round4 %s recovers held compaction flush input", async (signal) => {
+	// smarty-dev#3048 / PR #110 R3-5: restore held flush input before final receipt.
+	it.each(["SIGTERM", "SIGHUP"] as const)("round4 %s recovers held compaction flush", async (signal) => {
 		const p = await launch(`compaction-flush-${signal}`, "r4-flush-signal");
 		p.submit("seed");
 		await p.mark("settled");
@@ -773,52 +704,43 @@ await new InteractiveMode(host).run();
 			expect(JSON.parse(json!).text).toBe("r4-flush-held");
 		});
 	});
-	// smarty-dev#3048 / PR #110 R3-6 (security R3-S6): original image ownership across every compaction branch.
-	it.each(["manual", "retry"] as const)(
-		"round4 %s compaction preserves first and tail recovered images",
-		async (kind) => {
-			const p = await launch(`images-${kind}`, `r4-images-${kind}`);
-			p.submit("seed");
-			await p.mark("settled");
-			p.submit("run-held");
-			await p.mark("run-held");
-			for (let index = 0; index < 2; index++) {
-				p.text("queue-image");
-				p.keys("M-Enter");
-				await vi.waitFor(() =>
-					expect(p.frame(`image-queued-${index}`).split("attached-original").length).toBeGreaterThan(index + 1),
-				);
-			}
-			p.keys("M-Up");
-			await vi.waitFor(() => expect(editorFrame(p.frame("images-dequeued"))).toContain("[recovered image"));
-			p.text("\x1b[83;6u");
-			await p.mark("split-images");
-			if (kind === "manual") p.text("\x1b[67;6u");
-			writeFileSync(join(p.dir, "release-run"), "release");
-			await p.mark("compaction-held");
-			p.keys("Enter");
-			p.text("\x1b[84;6u");
-			await p.mark("tail-image-ready");
+	// smarty-dev#3048 / PR #110 R3-6: first and tail original image custody across every branch.
+	it.each(["manual", "retry"] as const)("round4 %s compaction preserves first and tail images", async (kind) => {
+		const p = await launch(`images-${kind}`, `r4-images-${kind}`);
+		p.submit("seed");
+		await p.mark("settled");
+		p.submit("run-held");
+		await p.mark("run-held");
+		for (let index = 0; index < 2; index++) {
+			p.text("queue-image");
 			p.keys("M-Enter");
-			await vi.waitFor(() => expect(p.frame("image-compaction-staging")).toContain("Follow-up: tail-image"));
-			writeFileSync(join(p.dir, "release-compaction"), "release");
-			await p.mark("first-image-proof");
-			await p.mark("tail-image-proof");
-			for (const slot of ["first", "tail"]) {
-				const proof = JSON.parse(readFileSync(join(p.dir, `${slot}-image-proof`), "utf8"));
-				expect(proof.text).not.toContain("[recovered image");
-				expect(proof.images).toEqual([
-					{
-						type: "image",
-						data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
-						mimeType: "image/png",
-					},
-				]);
-			}
-			p.frame("image-compaction-transferred");
-		},
-	);
-	// smarty-dev#3048 / PR #110 R3-7: extension-origin no-run completion must retry the latched shutdown.
+			await vi.waitFor(() =>
+				expect(p.frame(`image-queued-${index}`).split("attached-original").length).toBeGreaterThan(index + 1),
+			);
+		}
+		p.keys("M-Up");
+		await vi.waitFor(() => expect(editorFrame(p.frame("images-dequeued"))).toContain("[recovered image"));
+		p.text("\x1b[83;6u");
+		await p.mark("split-images");
+		if (kind === "manual") p.text("\x1b[67;6u");
+		writeFileSync(join(p.dir, "release-run"), "release");
+		await p.mark("compaction-held");
+		p.keys("Enter");
+		p.text("\x1b[84;6u");
+		await p.mark("tail-image-ready");
+		p.keys("M-Enter");
+		await vi.waitFor(() => expect(p.frame("image-compaction-staging")).toContain("Follow-up: tail-image"));
+		writeFileSync(join(p.dir, "release-compaction"), "release");
+		await p.mark("first-image-proof");
+		await p.mark("tail-image-proof");
+		for (const slot of ["first", "tail"]) {
+			const proof = JSON.parse(readFileSync(join(p.dir, `${slot}-image-proof`), "utf8"));
+			expect(proof.text).not.toContain("[recovered image");
+			expect(proof.images).toEqual([originalImage]);
+		}
+		p.frame("image-compaction-transferred");
+	});
+	// smarty-dev#3048 / PR #110 R3-7: extension-origin no-run completion retries latched shutdown.
 	it.each(["extension-input", "compact"] as const)(
 		"round4 no-run %s shutdown exits without another key",
 		async (kind) => {
@@ -837,9 +759,8 @@ await new InteractiveMode(host).run();
 			p.frame("no-run-exited");
 		},
 	);
-
 	it.each(["run-shutdown", "admission-shutdown"] as const)(
-		"extension-requested %s exits the real interactive loop",
+		"extension-requested %s exits real loop",
 		async (scenario) => {
 			const p = await launch(scenario, scenario);
 			p.submit(scenario === "run-shutdown" ? "shutdown-run" : "shutdown-handled");

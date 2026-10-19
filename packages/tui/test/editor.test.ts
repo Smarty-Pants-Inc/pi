@@ -2144,7 +2144,7 @@ describe("Editor component", () => {
 				"[",
 			]) {
 				for (const trigger of ["@", "#", "$", "-"]) {
-					// smarty-dev#7403: unused frame timers must not interfere with the debounce clock.
+					// smarty-dev#7403: unused frame timers must not affect the debounce clock.
 					const tui = createTestTUI();
 					tui.stop();
 					const editor = new Editor(tui, defaultEditorTheme);

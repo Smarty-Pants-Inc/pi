@@ -7,7 +7,7 @@ import { VirtualTerminal } from "./virtual-terminal.ts";
 
 const nextTick = () => new Promise<void>((resolve) => process.nextTick(resolve));
 
-// pi#175 / smarty-dev#7403: stopping the terminal itself must release, then replace, its frame waiter.
+// pi#175 / smarty-dev#7403: stop releases the old waiter, restart creates a fresh one.
 it("VirtualTerminal.stop clears pending render state and releases existing waiters", async () => {
 	const terminal = new VirtualTerminal();
 	terminal.onRenderPending(true);
@@ -21,7 +21,6 @@ it("VirtualTerminal.stop clears pending render state and releases existing waite
 	await oldWaiter;
 	assert.equal(oldResolved, true);
 	await terminal.waitForRender();
-
 	terminal.start(
 		() => {},
 		() => {},
@@ -32,7 +31,7 @@ it("VirtualTerminal.stop clears pending render state and releases existing waite
 		newResolved = true;
 	});
 	await terminal.flush();
-	assert.equal(newResolved, false, "restart must create a fresh pending promise");
+	assert.equal(newResolved, false);
 	terminal.onRenderPending(false);
 	await newWaiter;
 	assert.equal(newResolved, true);
@@ -40,7 +39,7 @@ it("VirtualTerminal.stop clears pending render state and releases existing waite
 });
 
 for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
-	// pi#175 / smarty-dev#7403: exercise requestRender and the real VirtualTerminal frame waiter.
+	// pi#175 / smarty-dev#7403: real requestRender and VirtualTerminal frame waiter.
 	it(`${Renderer.name}: stop with a pending frame, restart and render the latest state`, async (t) => {
 		let now = 1000;
 		t.mock.method(performance, "now", () => now);
@@ -80,7 +79,6 @@ for (const Renderer of [TuiMainScreen, TuiAltScreen]) {
 			await flush();
 			await advance(80);
 			assert.equal(renders.mock.calls.length, 1, "stopped TUI must not render");
-
 			state = "restarted";
 			tui.start();
 			tui.requestRender();

@@ -14,13 +14,10 @@ import { createToolNameMatcher } from "./mcp-servers.ts";
 import { convertToLlm } from "./messages.ts";
 import { findInitialModel } from "./model-resolver.ts";
 import { ModelRuntime } from "./model-runtime.ts";
-import { assertOrdinaryRuntime, bindOrdinaryOptions, ordinaryOwnerOf } from "./ordinary-owner-context.ts";
-import { bindOrdinaryPairedContext } from "./ordinary-request-pair.ts";
 import { mergeProviderAttributionHeaders } from "./provider-attribution.ts";
 import type { ResourceLoader } from "./resource-loader.ts";
 import { DefaultResourceLoader } from "./resource-loader.ts";
-import { assertUnownedSessionManager, getDefaultSessionDir, SessionManager } from "./session-manager.ts";
-import { currentSessionOwnership } from "./session-ownership.ts";
+import { getDefaultSessionDir, SessionManager } from "./session-manager.ts";
 import {
 	applyToolModifiers,
 	DEFAULT_TOOL_NAMES,
@@ -128,11 +125,13 @@ export type {
 	ExtensionContext,
 	ExtensionFactory,
 	InlineExtension,
+	SendUserMessageOptions,
+	SendUserMessageResult,
 	SlashCommandInfo,
 	SlashCommandSource,
-	SubmitUserMessageOptions,
 	ToolDefinition,
-	UserMessageReceipt,
+	UserMessageMetadata,
+	UserMessageMetadataSource,
 } from "./extensions/index.ts";
 export type { PromptTemplate } from "./prompt-templates.ts";
 export type { Skill } from "./skills.ts";
@@ -195,63 +194,7 @@ function getDefaultAgentDir(): string {
  * ```
  */
 export async function createAgentSession(options: CreateAgentSessionOptions = {}): Promise<CreateAgentSessionResult> {
-	const owner = ordinaryOwnerOf(options);
-	if (!owner && currentSessionOwnership()) throw new Error("OWNER_RUNTIME_OWNERSHIP");
-	const suppliedManager = options.sessionManager;
-	if (owner) {
-		if (!suppliedManager) throw new Error("OWNER_RUNTIME_OWNERSHIP");
-		assertOrdinaryRuntime(suppliedManager, owner);
-		// Retain each selected input before callbacks or asynchronous preparation.
-		const {
-			cwd,
-			agentDir,
-			resourceLoader,
-			modelRuntime,
-			settingsManager,
-			model,
-			customTools,
-			scopedModels,
-			noTools,
-			excludeTools,
-			tools,
-			thinkingLevel,
-			sessionStartEvent,
-		} = options;
-		options = Object.freeze({
-			cwd,
-			agentDir,
-			resourceLoader,
-			modelRuntime,
-			settingsManager,
-			model,
-			customTools,
-			scopedModels,
-			noTools,
-			excludeTools,
-			tools: tools?.slice(),
-			thinkingLevel,
-			sessionStartEvent,
-			sessionManager: suppliedManager,
-		});
-		owner.assertSdkInputs(options);
-		const allowed = owner.decision.record.provider;
-		if (
-			!model ||
-			model.provider !== allowed.provider ||
-			model.id !== allowed.model ||
-			model.api !== allowed.api ||
-			model.baseUrl !== allowed.baseUrl ||
-			customTools?.length ||
-			scopedModels?.length ||
-			noTools ||
-			excludeTools?.length ||
-			!options.tools ||
-			options.tools.some((name) => !["read", "write", "edit", "sense"].includes(name))
-		) {
-			throw new Error("OWNER_RUNTIME_SCOPE");
-		}
-	} else if (suppliedManager !== undefined) assertUnownedSessionManager(suppliedManager);
-	const cwd = resolvePath(options.cwd ?? suppliedManager?.getCwd() ?? process.cwd());
+	const cwd = resolvePath(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
 	const agentDir = options.agentDir ? resolvePath(options.agentDir) : getDefaultAgentDir();
 	let resourceLoader = options.resourceLoader;
 
@@ -259,7 +202,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const modelsPath = options.agentDir ? join(agentDir, "models.json") : undefined;
 	const settingsManager = options.settingsManager ?? SettingsManager.create(cwd, agentDir);
 	const modelRuntime = options.modelRuntime ?? (await ModelRuntime.create({ authPath, modelsPath, settingsManager }));
-	const sessionManager = suppliedManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
+	const sessionManager = options.sessionManager ?? SessionManager.create(cwd, getDefaultSessionDir(cwd, agentDir));
 
 	if (!resourceLoader) {
 		resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager });
@@ -271,300 +214,291 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	const existingSession = sessionManager.buildSessionContext();
 	const hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some((entry) => entry.type === "thinking_level_change");
-	// The session manager is read before the model runtime, so an ownership refusal never touches the runtime.
 	const disposeModelPolicy = modelRuntime.addModelPolicy(settingsManager);
+	let unregisterPolicyCleanup: (() => void) | undefined;
+	try {
+		let model = options.model;
+		let modelFallbackMessage: string | undefined;
 
-	let model = options.model;
-	let modelFallbackMessage: string | undefined;
+		// Assistant messages name the physical model that answered, so a virtual selection is only in
+		// model_change entries.
+		const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
+			modelRuntime.getModel(provider, modelId),
+		);
 
-	// Assistant messages name the physical model that answered, so a virtual selection is only in
-	// model_change entries.
-	const sessionModel = getBranchSelection(sessionManager.getBranch(), (provider, modelId) =>
-		modelRuntime.getModel(provider, modelId),
-	);
-
-	// If session has data, try to restore model from it
-	if (!model && hasExistingSession && sessionModel) {
-		const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
-		if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
-			model = restoredModel;
+		// If session has data, try to restore model from it
+		if (!model && hasExistingSession && sessionModel) {
+			const restoredModel = modelRuntime.getModel(sessionModel.provider, sessionModel.modelId);
+			if (restoredModel && modelRuntime.hasConfiguredAuth(restoredModel.provider)) {
+				model = restoredModel;
+			}
+			if (!model) {
+				modelFallbackMessage = `Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`;
+			}
 		}
+
+		// If still no model, use findInitialModel (checks settings default, then provider defaults)
 		if (!model) {
-			modelFallbackMessage = `Could not restore model ${sessionModel.provider}/${sessionModel.modelId}`;
+			const result = await findInitialModel({
+				scopedModels: [],
+				isContinuing: hasExistingSession,
+				defaultProvider: settingsManager.getDefaultProvider(),
+				defaultModelId: settingsManager.getDefaultModel(),
+				defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
+				modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
+				modelRuntime,
+			});
+			model = result.model;
+			if (!model) {
+				modelFallbackMessage = formatNoModelsAvailableMessage();
+			} else if (modelFallbackMessage) {
+				modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+			}
 		}
-	}
 
-	// If still no model, use findInitialModel (checks settings default, then provider defaults)
-	if (!model) {
-		const result = await findInitialModel({
-			scopedModels: [],
-			isContinuing: hasExistingSession,
-			defaultProvider: settingsManager.getDefaultProvider(),
-			defaultModelId: settingsManager.getDefaultModel(),
-			defaultThinkingLevel: settingsManager.getDefaultThinkingLevel(),
-			modelThinkingLevels: settingsManager.getAllModelThinkingLevels(),
-			modelRuntime,
-		});
-		model = result.model;
+		let thinkingLevel = options.thinkingLevel;
+
+		// If session has data, restore thinking level from it
+		if (thinkingLevel === undefined && hasExistingSession) {
+			thinkingLevel = hasThinkingEntry
+				? (existingSession.thinkingLevel as ThinkingLevel)
+				: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
+		}
+
+		// Fall back to per-model override, then global default
+		if (thinkingLevel === undefined && model) {
+			const perModel = settingsManager.getModelThinkingLevel(model.provider, model.id);
+			if (perModel) {
+				thinkingLevel = perModel;
+			}
+		}
+		if (thinkingLevel === undefined) {
+			thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
+		}
+
+		// Clamp to model capabilities
 		if (!model) {
-			modelFallbackMessage = formatNoModelsAvailableMessage();
-		} else if (modelFallbackMessage) {
-			modelFallbackMessage += `. Using ${model.provider}/${model.id}`;
+			thinkingLevel = "off";
+		} else {
+			thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
 		}
-	}
 
-	let thinkingLevel = options.thinkingLevel;
+		const toolListError = options.tools ? getToolListError(options.tools) : undefined;
+		if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
+		const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
+		// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
+		// replacing it, like the `defaultTools` setting.
+		const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
+		const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
+		const allowedToolNames = toolModifiers
+			? options.noTools === "all"
+				? selectedToolNames
+				: undefined
+			: (options.tools ?? (options.noTools === "all" ? [] : undefined));
+		const excludedToolNames = options.excludeTools;
+		const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
+		const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
 
-	// If session has data, restore thinking level from it
-	if (thinkingLevel === undefined && hasExistingSession) {
-		thinkingLevel = hasThinkingEntry
-			? (existingSession.thinkingLevel as ThinkingLevel)
-			: (settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL);
-	}
-
-	// Fall back to per-model override, then global default
-	if (thinkingLevel === undefined && model) {
-		const perModel = settingsManager.getModelThinkingLevel(model.provider, model.id);
-		if (perModel) {
-			thinkingLevel = perModel;
-		}
-	}
-	if (thinkingLevel === undefined) {
-		thinkingLevel = settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL;
-	}
-
-	// Clamp to model capabilities
-	if (!model) {
-		thinkingLevel = "off";
-	} else {
-		thinkingLevel = clampThinkingLevel(model, thinkingLevel) as ThinkingLevel;
-	}
-
-	const toolListError = options.tools ? getToolListError(options.tools) : undefined;
-	if (toolListError) throw new Error(`Invalid tools option: ${toolListError}`);
-	const defaultToolNames = options.noTools ? [] : (settingsManager.getDefaultTools() ?? DEFAULT_TOOL_NAMES);
-	// A `tools` list of only `+name`/`-name` entries changes the default selection instead of
-	// replacing it, like the `defaultTools` setting.
-	const toolModifiers = options.tools?.some(isToolModifier) ? options.tools : undefined;
-	const selectedToolNames = toolModifiers ? applyToolModifiers(defaultToolNames, toolModifiers) : options.tools;
-	const allowedToolNames = toolModifiers
-		? options.noTools === "all"
-			? selectedToolNames
-			: undefined
-		: (options.tools ?? (options.noTools === "all" ? [] : undefined));
-	const excludedToolNames = options.excludeTools;
-	const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
-	const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
-
-	let pairedContext: ReturnType<typeof bindOrdinaryPairedContext> | undefined;
-
-	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
-	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
-		const converted = convertToLlm(messages);
-		// Check setting dynamically so mid-session changes take effect
-		if (!settingsManager.getBlockImages()) {
-			return converted;
-		}
-		// Filter out ImageContent from all messages, replacing with text placeholder
-		return converted.map((msg) => {
-			if (msg.role === "user" || msg.role === "toolResult") {
-				const content = msg.content;
-				if (Array.isArray(content)) {
-					const hasImages = content.some((c) => c.type === "image");
-					if (hasImages) {
-						const filteredContent = content
-							.map((c) =>
-								c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
-							)
-							.filter(
-								(c, i, arr) =>
-									// Dedupe consecutive "Image reading is disabled." texts
-									!(
-										c.type === "text" &&
-										c.text === "Image reading is disabled." &&
-										i > 0 &&
-										arr[i - 1].type === "text" &&
-										(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
-									),
-							);
-						return { ...msg, content: filteredContent };
+		// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
+		const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
+			const converted = convertToLlm(messages);
+			// Check setting dynamically so mid-session changes take effect
+			if (!settingsManager.getBlockImages()) {
+				return converted;
+			}
+			// Filter out ImageContent from all messages, replacing with text placeholder
+			return converted.map((msg) => {
+				if (msg.role === "user" || msg.role === "toolResult") {
+					const content = msg.content;
+					if (Array.isArray(content)) {
+						const hasImages = content.some((c) => c.type === "image");
+						if (hasImages) {
+							const filteredContent = content
+								.map((c) =>
+									c.type === "image" ? { type: "text" as const, text: "Image reading is disabled." } : c,
+								)
+								.filter(
+									(c, i, arr) =>
+										// Dedupe consecutive "Image reading is disabled." texts
+										!(
+											c.type === "text" &&
+											c.text === "Image reading is disabled." &&
+											i > 0 &&
+											arr[i - 1].type === "text" &&
+											(arr[i - 1] as { type: "text"; text: string }).text === "Image reading is disabled."
+										),
+								);
+							return { ...msg, content: filteredContent };
+						}
 					}
 				}
-			}
-			return msg;
-		});
-	};
-
-	const extensionRunnerRef: { current?: ExtensionRunner } = {};
-	const cacheWarmer = new CacheWarmer(
-		modelRuntime,
-		sessionManager,
-		() => settingsManager.getCacheWarmingMode(),
-		async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
-	);
-	// Request-preparation hooks stop waiting on terminal shutdown, like tool interception hooks.
-	let shutdownSignal: AbortSignal | undefined;
-	const buildRequestOptions = (
-		requestModel: Model<any>,
-		options: ModelsSimpleStreamOptions = {},
-	): ModelsSimpleStreamOptions => {
-		const providerRetrySettings = settingsManager.getProviderRetrySettings();
-		const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
-		const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
-		const headerRunner = extensionRunnerRef.current;
-		return {
-			...options,
-			timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
-			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
-			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
-			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-			transformHeaders: async (requestHeaders) => {
-				const headers = mergeProviderAttributionHeaders(
-					requestModel,
-					settingsManager,
-					options.sessionId,
-					requestHeaders,
-				);
-				return headerRunner?.hasHandlers("before_provider_headers")
-					? raceWithAbortSignal(headerRunner.emitBeforeProviderHeaders(headers ?? {}), shutdownSignal)
-					: (headers ?? {});
-			},
+				return msg;
+			});
 		};
-	};
-	// Warm only requests for the selected model. Requests a virtual selection routed, or that an
-	// extension redirected, may not be repeated by the next request, so warming them could be wasted.
-	const cacheContextIsCurrent = (requestModel: Model<any>) => {
-		const messages = agent.state.messages;
-		return () => {
-			const currentModel = agent.state.model;
-			const currentMessages = agent.state.messages;
-			return (
-				currentModel.provider === requestModel.provider &&
-				currentModel.id === requestModel.id &&
-				messages.length <= currentMessages.length &&
-				messages.every((message, index) => currentMessages[index] === message)
+
+		const extensionRunnerRef: { current?: ExtensionRunner } = {};
+		const cacheWarmer = new CacheWarmer(
+			modelRuntime,
+			sessionManager,
+			() => settingsManager.getCacheWarmingMode(),
+			async (event) => extensionRunnerRef.current?.emitCacheWarmingDecision(event) ?? event.action,
+		);
+		// Request-preparation hooks stop waiting on terminal shutdown, like tool hooks.
+		let shutdownSignal: AbortSignal | undefined;
+		const buildRequestOptions = (
+			requestModel: Model<any>,
+			options: ModelsSimpleStreamOptions = {},
+		): ModelsSimpleStreamOptions => {
+			const providerRetrySettings = settingsManager.getProviderRetrySettings();
+			const httpIdleTimeoutMs = settingsManager.getHttpIdleTimeoutMs();
+			const effectiveTimeoutMs = httpIdleTimeoutMs === 0 ? 2147483647 : httpIdleTimeoutMs;
+			const headerRunner = extensionRunnerRef.current;
+			return {
+				...options,
+				timeoutMs: options.timeoutMs ?? providerRetrySettings.timeoutMs ?? effectiveTimeoutMs,
+				websocketConnectTimeoutMs:
+					options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
+				maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
+				maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
+				transformHeaders: async (requestHeaders) => {
+					const headers = mergeProviderAttributionHeaders(
+						requestModel,
+						settingsManager,
+						options.sessionId,
+						requestHeaders,
+					);
+					return headerRunner?.hasHandlers("before_provider_headers")
+						? raceWithAbortSignal(headerRunner.emitBeforeProviderHeaders(headers ?? {}), shutdownSignal)
+						: (headers ?? {});
+				},
+			};
+		};
+		// Warm only requests for the selected model. Requests a virtual selection routed, or that an
+		// extension redirected, may not be repeated by the next request, so warming them could be wasted.
+		const cacheContextIsCurrent = (requestModel: Model<any>) => {
+			const messages = agent.state.messages;
+			return () => {
+				const currentModel = agent.state.model;
+				const currentMessages = agent.state.messages;
+				return (
+					currentModel.provider === requestModel.provider &&
+					currentModel.id === requestModel.id &&
+					messages.length <= currentMessages.length &&
+					messages.every((message, index) => currentMessages[index] === message)
+				);
+			};
+		};
+		const transformProviderPayload = async (payload: unknown) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner?.hasHandlers("before_provider_request")) return payload;
+			return raceWithAbortSignal(runner.emitBeforeProviderRequest(payload), shutdownSignal);
+		};
+		const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
+			const runner = extensionRunnerRef.current;
+			if (!runner?.hasHandlers("after_provider_response")) return;
+			// Value-free notification, never authenticated response headers (smarty-dev#5822 C1).
+			await raceWithAbortSignal(
+				runner.emit(
+					response.status === undefined
+						? { type: "after_provider_response" }
+						: { type: "after_provider_response", status: response.status },
+				),
+				shutdownSignal,
 			);
 		};
-	};
-	const transformProviderPayload = async (payload: unknown) => {
-		const runner = extensionRunnerRef.current;
-		if (!runner?.hasHandlers("before_provider_request")) return payload;
-		return raceWithAbortSignal(runner.emitBeforeProviderRequest(payload), shutdownSignal);
-	};
-	const handleProviderResponse: NonNullable<ModelsSimpleStreamOptions["onResponse"]> = async (response) => {
-		const runner = extensionRunnerRef.current;
-		if (!runner?.hasHandlers("after_provider_response")) return;
-		// Value-free: the validated status only, never response headers (smarty-dev#5822 C1).
-		await raceWithAbortSignal(
-			runner.emit(
-				response.status === undefined
-					? { type: "after_provider_response" }
-					: { type: "after_provider_response", status: response.status },
-			),
-			shutdownSignal,
-		);
-	};
-	const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async () => {
-		const runner = extensionRunnerRef.current;
-		if (!runner?.hasHandlers("provider_stream_event")) return;
-		// The Pi-owned notification only: no raw provider event or model fields (smarty-dev#5822 C1).
-		await runner.emit({ type: "provider_stream_event" });
-	};
-
-	const agent = new Agent({
-		initialState: {
-			systemPrompt: "",
-			model,
-			thinkingLevel,
-			tools: [],
-			messages: existingSession.messages,
-		},
-		convertToLlm: (messages) => {
-			const converted = convertToLlmWithBlockImages(messages);
-			pairedContext?.converted(messages, converted);
-			return converted;
-		},
-		streamFn: async (model, context, options) => {
-			const requestOptions = buildRequestOptions(model, options);
-			// Compaction and summaries use their own routing ids; only session requests
-			// replace the cache entry, so warming restarts from them. Keep warming while
-			// the current transcript still extends the request's prefix. Agent state may
-			// shallow-copy the messages array or refresh the model object without changing
-			// the provider request, so top-level object identity is not a valid cache key.
-			if (options?.sessionId === sessionManager.getSessionId()) {
-				cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
-			}
-			return modelRuntime.streamSimple(model, context, requestOptions);
-		},
-		onPayload: transformProviderPayload,
-		onResponse: handleProviderResponse,
-		onProviderStreamEvent: handleProviderStreamEvent,
-		sessionId: sessionManager.getSessionId(),
-		transformContext: async (messages, signal) => {
-			const selected = pairedContext?.select(messages, signal) ?? messages;
+		const handleProviderStreamEvent: NonNullable<ModelsSimpleStreamOptions["onProviderStreamEvent"]> = async () => {
 			const runner = extensionRunnerRef.current;
-			const transformed = runner
-				? await raceWithAbortSignal(runner.emitContext(selected), shutdownSignal)
-				: selected;
-			pairedContext?.transformed(transformed, signal);
-			return transformed;
-		},
-		steeringMode: settingsManager.getSteeringMode(),
-		followUpMode: settingsManager.getFollowUpMode(),
-		transport: owner?.decision.record.provider.transport ?? settingsManager.getTransport(),
-		thinkingBudgets: settingsManager.getThinkingBudgets(),
-		maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
-	});
+			if (!runner?.hasHandlers("provider_stream_event")) return;
+			await runner.emit({ type: "provider_stream_event" });
+		};
 
-	// Restore missing settings metadata for older sessions.
-	if (hasExistingSession) {
-		if (!hasThinkingEntry) {
+		const agent = new Agent({
+			initialState: {
+				systemPrompt: "",
+				model,
+				thinkingLevel,
+				tools: [],
+				messages: existingSession.messages,
+			},
+			convertToLlm: convertToLlmWithBlockImages,
+			streamFn: async (model, context, options) => {
+				const requestOptions = buildRequestOptions(model, options);
+				// Compaction and summaries use their own routing ids; only session requests
+				// replace the cache entry, so warming restarts from them. Keep warming while
+				// the current transcript still extends the request's prefix. Agent state may
+				// shallow-copy the messages array or refresh the model object without changing
+				// the provider request, so top-level object identity is not a valid cache key.
+				if (options?.sessionId === sessionManager.getSessionId()) {
+					cacheWarmer.start({ model, context, options: requestOptions }, cacheContextIsCurrent(model));
+				}
+				return modelRuntime.streamSimple(model, context, requestOptions);
+			},
+			onPayload: transformProviderPayload,
+			onResponse: handleProviderResponse,
+			onProviderStreamEvent: handleProviderStreamEvent,
+			sessionId: sessionManager.getSessionId(),
+			transformContext: async (messages) => {
+				const runner = extensionRunnerRef.current;
+				if (!runner) return messages;
+				return raceWithAbortSignal(runner.emitContext(messages), shutdownSignal);
+			},
+			steeringMode: settingsManager.getSteeringMode(),
+			followUpMode: settingsManager.getFollowUpMode(),
+			transport: settingsManager.getTransport(),
+			thinkingBudgets: settingsManager.getThinkingBudgets(),
+			maxRetryDelayMs: settingsManager.getProviderRetrySettings().maxRetryDelayMs,
+		});
+
+		// Restore missing settings metadata for older sessions.
+		if (hasExistingSession) {
+			if (!hasThinkingEntry) {
+				sessionManager.appendThinkingLevelChange(thinkingLevel);
+			}
+		} else {
+			// Save initial model and thinking level for new sessions so they can be restored on resume
+			if (model) {
+				sessionManager.appendModelChange(model.provider, model.id);
+			}
 			sessionManager.appendThinkingLevelChange(thinkingLevel);
 		}
-	} else {
-		// Save initial model and thinking level for new sessions so they can be restored on resume
-		if (model) {
-			sessionManager.appendModelChange(model.provider, model.id);
-		}
-		sessionManager.appendThinkingLevelChange(thinkingLevel);
-	}
 
-	const sessionConfig = {
-		agent,
-		sessionManager,
-		settingsManager,
-		cwd,
-		scopedModels: options.scopedModels,
-		resourceLoader,
-		customTools: options.customTools,
-		modelRuntime,
-		cacheWarmer,
-		initialActiveToolNames,
-		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
-		defaultToolModifiers: toolModifiers,
-		allowedToolNames,
-		excludedToolNames,
-		extensionRunnerRef,
-		sessionStartEvent: options.sessionStartEvent,
-	};
-	owner?.assertActive();
-	const session = new AgentSession(owner ? bindOrdinaryOptions(sessionConfig, owner) : sessionConfig);
-	const unregisterPolicyCleanup = registerSessionResourceCleanup((sessionId) => {
-		// Session IDs may be shared by SDK consumers; only release this disposed instance.
-		if (sessionId !== session.sessionId || !session.isDisposed) return;
+		const session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd,
+			scopedModels: options.scopedModels,
+			resourceLoader,
+			customTools: options.customTools,
+			modelRuntime,
+			cacheWarmer,
+			initialActiveToolNames,
+			usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
+			defaultToolModifiers: toolModifiers,
+			allowedToolNames,
+			excludedToolNames,
+			extensionRunnerRef,
+			sessionStartEvent: options.sessionStartEvent,
+		});
+
+		unregisterPolicyCleanup = registerSessionResourceCleanup((sessionId) => {
+			// Session IDs may be shared: release only this disposed instance's registration.
+			if (sessionId !== session.sessionId || !session.isDisposed) return;
+			disposeModelPolicy();
+			unregisterPolicyCleanup?.();
+		});
+		shutdownSignal = session.shutdownSignal;
+		const extensionsResult = resourceLoader.getExtensions();
+
+		return {
+			session,
+			extensionsResult,
+			modelFallbackMessage,
+		};
+	} catch (error) {
+		// Roll back only this construction's lease, including failures before a session exists.
+		unregisterPolicyCleanup?.();
 		disposeModelPolicy();
-		unregisterPolicyCleanup();
-	});
-	shutdownSignal = session.shutdownSignal;
-	owner?.bindSession(session);
-	owner?.installProviderGuard(session);
-	if (owner) pairedContext = bindOrdinaryPairedContext(owner, session, convertToLlmWithBlockImages);
-
-	const extensionsResult = resourceLoader.getExtensions();
-
-	return {
-		session,
-		extensionsResult,
-		modelFallbackMessage,
-	};
+		throw error;
+	}
 }

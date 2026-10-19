@@ -88,7 +88,6 @@ async function startDeviceAuthorization(oauthHost: string, signal: AbortSignal):
 	});
 
 	if (!response.ok) {
-		// Credential endpoint bodies are never diagnostics: they can echo submitted or issued secrets.
 		await response.body?.cancel().catch(() => undefined);
 		throw new Error(`Kimi Code device authorization failed with status ${response.status}`);
 	}

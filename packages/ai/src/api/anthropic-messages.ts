@@ -41,7 +41,7 @@ import type {
 import { appendAssistantMessageDiagnostic, createAssistantMessageDiagnostic } from "../utils/diagnostics.ts";
 import { formatProviderError, normalizeProviderError, ProviderDataError } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
-import { parseJsonWithRepair, parseStreamingJson } from "../utils/json-parse.ts";
+import { parseJsonWithRepair, parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
@@ -63,7 +63,7 @@ import {
 } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampMaxTokensToContext } from "./simple-options.ts";
-import { transformMessages } from "./transform-messages.ts";
+import { splitErrorToolResultImages, transformMessages } from "./transform-messages.ts";
 
 /**
  * Resolve cache retention preference.
@@ -134,6 +134,17 @@ const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
 	return name;
 };
 
+function convertImageBlock(image: ImageContent) {
+	return {
+		type: "image" as const,
+		source: {
+			type: "base64" as const,
+			media_type: image.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
+			data: image.data,
+		},
+	};
+}
+
 /**
  * Convert content blocks to Anthropic API format
  */
@@ -164,14 +175,7 @@ function convertContentBlocks(content: (TextContent | ImageContent)[]):
 				text: sanitizeSurrogates(block.text),
 			};
 		}
-		return {
-			type: "image" as const,
-			source: {
-				type: "base64" as const,
-				media_type: block.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
-				data: block.data,
-			},
-		};
+		return convertImageBlock(block);
 	});
 
 	// If only images (no text), add placeholder text block
@@ -516,7 +520,7 @@ async function* iterateSseMessages(
 			if (event) {
 				yield event;
 			}
-			consumed = consumeLine(buffer);
+			consumed = consumeLine(buffer, true);
 		}
 
 		if (buffer.length > 0) {
@@ -548,7 +552,6 @@ async function* iterateAnthropicEvents(
 
 	for await (const sse of iterateSseMessages(response.body, signal)) {
 		if (sse.event === "error") {
-			// A provider error by origin: its data only classifies (smarty-dev#5822, pi#202 round 3).
 			throw new ProviderDataError(sse.data);
 		}
 
@@ -565,7 +568,6 @@ async function* iterateAnthropicEvents(
 			}
 			yield event;
 		} catch (error) {
-			// A provider error by origin: the frame and parser text only classify (smarty-dev#5822, pi#202 round 3).
 			const message = error instanceof Error ? error.message : String(error);
 			throw new ProviderDataError(
 				`Could not parse Anthropic SSE event ${sse.event}: ${message}; data=${sse.data}; raw=${sse.raw.join("\\n")}`,
@@ -588,14 +590,12 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	const currentTools = getCurrentTools(normalizedContext.messages);
 
 	(async () => {
-		const providerThinkingLevel = model.compat?.supportsMidConvoEffort ? (options?.effort ?? "high") : undefined;
 		const output: AssistantMessage = {
 			role: "assistant",
 			content: [],
 			api: model.api as Api,
 			provider: model.provider,
 			model: model.id,
-			...(providerThinkingLevel === undefined ? {} : { providerThinkingLevel }),
 			usage: {
 				input: 0,
 				output: 0,
@@ -662,12 +662,12 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			for (;;) {
 				options?.signal?.throwIfAborted();
 				const built = buildParams(model, normalizedContext, isOAuth, options, disablePreferredStrictTools);
+				if (built.providerThinkingLevel) output.providerThinkingLevel = built.providerThinkingLevel;
 				let params = built.params;
 				const nextParams = await options?.onPayload?.(params, model);
 				if (nextParams !== undefined) {
 					params = { ...(nextParams as MessageCreateParamsStreaming), stream: true };
 				}
-				// Admission/callback failures are not provider rejections, even if they resemble an APIError.
 				let requestError: unknown;
 				try {
 					response = await retryProviderRequest(
@@ -858,7 +858,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 								partial: output,
 							});
 						} else if (block.type === "toolCall") {
-							block.arguments = parseStreamingJson(block.partialJson);
+							Object.assign(block, parseToolCallArguments(block.partialJson));
 							// Finalize in-place and strip the scratch buffer so replay only
 							// carries parsed arguments.
 							delete (block as { partialJson?: string }).partialJson;
@@ -937,7 +937,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				throw new Error(output.errorMessage || "An unknown error occurred");
 			}
 			if (inputTransformations && inputTransformations.length > 0) {
-				// Publish only Pi's count; the provider's transformation paths and reasons stay here (smarty-dev#5822).
 				const diagnostic = createAssistantMessageDiagnostic("anthropic_input_transformations");
 				diagnostic.thinkingBlocksDropped = inputTransformations.filter(
 					(transformation) => transformation.type === "thinking_dropped",
@@ -954,8 +953,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				delete (block as { partialJson?: string }).partialJson;
 			}
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			// Classify first, from the SDK status and body as well as the message (smarty-dev#5822 C3), then publish
-			// owned text only: a provider response's message and body stay private (pi#202 round 3).
 			const norm = normalizeProviderError(
 				error,
 				model.provider,
@@ -967,12 +964,14 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			// Partials share output; attach record-only details only to the separate terminal failure object.
 			const failure = { ...output };
 			if (terminalStopReason === "refusal") {
-				await recordAssistantMessageStopDetails(
-					failure,
-					hasPendingStopDetails ? pendingStopDetails : undefined,
-					getRequestDiagnosticSecrets(model, options),
-					injectedClient,
-				);
+				if (failure.stopReason === "error") {
+					await recordAssistantMessageStopDetails(
+						failure,
+						hasPendingStopDetails ? pendingStopDetails : undefined,
+						getRequestDiagnosticSecrets(model, options),
+						injectedClient,
+					);
+				}
 			}
 			stream.push({ type: "error", reason: output.stopReason, error: failure });
 			stream.end();
@@ -1209,7 +1208,12 @@ function buildParams(
 	isOAuthToken: boolean,
 	options?: AnthropicOptions,
 	disablePreferredStrictTools = false,
-): { params: MessageCreateParamsStreaming; hasPreferredStrictTools: boolean } {
+): {
+	params: MessageCreateParamsStreaming;
+	hasPreferredStrictTools: boolean;
+	/** Effort of the final effort marker, recorded on the reply so later requests can replay it. */
+	providerThinkingLevel: AnthropicEffort | undefined;
+} {
 	const { cacheControl } = getCacheControl(model, options?.cacheRetention, options?.env);
 	const compat = getAnthropicCompat(model);
 	const initialSystemMessage = getInitialSystemMessage(context.messages);
@@ -1243,22 +1247,23 @@ function buildParams(
 	const initialTools = initialSystemMessage?.toolsAdded ?? [];
 	const nativeToolChanges =
 		compat.supportsMidConvoSystemMessages && compat.supportsMidConvoToolChanges && initialTools.length > 0;
+	const thinkingDisabled =
+		model.reasoning && options?.thinkingEnabled === false && model.thinkingLevelMap?.off !== null;
+	// Effort cannot change between messages while thinking is disabled, so "off" sends no effort markers.
+	const effortMessages = model.compat?.supportsMidConvoEffort === true && !thinkingDisabled;
 	const converted = convertMessages(
 		conversationMessages,
 		isOAuthToken,
 		cacheControl,
 		compat.allowEmptySignature,
-		model.compat?.supportsMidConvoEffort === true ? model.provider : undefined,
+		effortMessages ? model.provider : undefined,
 		nativeToolChanges ? convertToolDefinitions : undefined,
 	);
 	const activeEffort = options?.effort ?? "high";
 	const betaFeatures = getBetaFeatures(model, context, isOAuthToken, nativeToolChanges, options);
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
-		messages:
-			model.compat?.supportsMidConvoEffort === true
-				? insertThinkingLevelMessages(converted, activeEffort)
-				: converted.messages,
+		messages: effortMessages ? insertThinkingLevelMessages(converted, activeEffort) : converted.messages,
 		max_tokens: options?.maxTokens ?? model.maxTokens,
 		stream: true,
 		...(betaFeatures.length > 0 ? { betas: betaFeatures } : {}),
@@ -1315,36 +1320,36 @@ function buildParams(
 		}
 	}
 
-	// Managed effort models always use adaptive thinking so prefix mismatches can
-	// be dropped instead of surfacing as persistent 400 responses.
-	if (model.compat?.supportsMidConvoEffort === true) {
+	if (thinkingDisabled) {
+		// No effort is sent, so the model default applies. Anthropic rejects `block_binding`
+		// with disabled thinking.
+		params.thinking = { type: "disabled" };
+	} else if (effortMessages) {
+		// Managed effort models use adaptive thinking so prefix mismatches can
+		// be dropped instead of surfacing as persistent 400 responses.
 		params.thinking = {
 			type: "adaptive",
 			display: options?.thinkingDisplay ?? "summarized",
 			block_binding: { prefix_mismatch_behavior: "drop_block" },
 		};
 		params.output_config = { effort: "high" };
-	} else if (model.reasoning) {
-		if (options?.thinkingEnabled) {
-			// Default to "summarized" so Opus 4.7 and Mythos Preview behave like
-			// older Claude 4 models (whose API default is also "summarized").
-			const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? "summarized";
-			if (model.compat?.forceAdaptiveThinking === true) {
-				// Adaptive thinking: Claude decides when and how much to think.
-				params.thinking = { type: "adaptive", display };
-				if (options.effort) {
-					params.output_config = { effort: options.effort };
-				}
-			} else {
-				// Budget-based thinking for older models
-				params.thinking = {
-					type: "enabled",
-					budget_tokens: options.thinkingBudgetTokens || 1024,
-					display,
-				};
+	} else if (model.reasoning && options?.thinkingEnabled) {
+		// Default to "summarized" so Opus 4.7 and Mythos Preview behave like
+		// older Claude 4 models (whose API default is also "summarized").
+		const display: AnthropicThinkingDisplay = options.thinkingDisplay ?? "summarized";
+		if (model.compat?.forceAdaptiveThinking === true) {
+			// Adaptive thinking: Claude decides when and how much to think.
+			params.thinking = { type: "adaptive", display };
+			if (options.effort) {
+				params.output_config = { effort: options.effort };
 			}
-		} else if (options?.thinkingEnabled === false && model.thinkingLevelMap?.off !== null) {
-			params.thinking = { type: "disabled" };
+		} else {
+			// Budget-based thinking for older models
+			params.thinking = {
+				type: "enabled",
+				budget_tokens: options.thinkingBudgetTokens || 1024,
+				display,
+			};
 		}
 	}
 
@@ -1368,7 +1373,7 @@ function buildParams(
 		params.fallbacks = allowedFallbackModels.map((fallback) => ({ model: fallback.model }));
 	}
 
-	return { params, hasPreferredStrictTools };
+	return { params, hasPreferredStrictTools, providerThinkingLevel: effortMessages ? activeEffort : undefined };
 }
 
 // Normalize tool call IDs to match Anthropic's required pattern and length
@@ -1376,11 +1381,11 @@ function normalizeToolCallId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
 }
 
-function convertToolResult(msg: ToolResultMessage): ContentBlockParam {
+function convertToolResult(msg: ToolResultMessage, content = msg.content): ContentBlockParam {
 	return {
 		type: "tool_result",
 		tool_use_id: msg.toolCallId,
-		content: convertContentBlocks(msg.content),
+		content: convertContentBlocks(content),
 		is_error: msg.isError,
 	};
 }
@@ -1453,14 +1458,7 @@ function convertMessages(
 							text: sanitizeSurrogates(item.text),
 						};
 					} else {
-						return {
-							type: "image",
-							source: {
-								type: "base64",
-								media_type: item.mimeType as "image/jpeg" | "image/png" | "image/gif" | "image/webp",
-								data: item.data,
-							},
-						};
+						return convertImageBlock(item);
 					}
 				});
 				const filteredBlocks = blocks.filter((b) => {
@@ -1547,9 +1545,17 @@ function convertMessages(
 		} else if (msg.role === "toolResult") {
 			// Collect all consecutive toolResult messages, needed for z.ai Anthropic endpoint.
 			const toolResults: ContentBlockParam[] = [];
+			// Anthropic rejects error tool results that contain anything but text, so their images follow
+			// all tool results of the turn, which must come first in the user message (#10794).
+			const errorImages: ContentBlockParam[] = [];
 			let j = i;
 			while (j < transformedMessages.length && transformedMessages[j].role === "toolResult") {
-				toolResults.push(convertToolResult(transformedMessages[j] as ToolResultMessage));
+				const toolMsg = transformedMessages[j] as ToolResultMessage;
+				const split = splitErrorToolResultImages(toolMsg);
+				toolResults.push(convertToolResult(toolMsg, split?.content));
+				if (split) {
+					errorImages.push({ type: "text", text: split.caption }, ...split.images.map(convertImageBlock));
+				}
 				j++;
 			}
 
@@ -1558,7 +1564,7 @@ function convertMessages(
 
 			params.push({
 				role: "user",
-				content: toolResults,
+				content: [...toolResults, ...errorImages],
 			});
 		}
 	}
@@ -1714,7 +1720,6 @@ function mapStopReason(
 		case "refusal":
 			return {
 				stopReason: "error",
-				// Owned text: the provider's refusal explanation is not published (smarty-dev#5822).
 				errorMessage: "The model refused to complete the request",
 			};
 		case "pause_turn": // Stop is good enough -> resubmit
@@ -1724,7 +1729,7 @@ function mapStopReason(
 		case "sensitive": // Content flagged by safety filters (not yet in SDK types)
 			return { stopReason: "error", errorMessage: "Provider stopped with: sensitive" };
 		default:
-			// Handle unknown stop reasons gracefully (API may add new values); the value itself stays private.
+			// Handle unknown stop reasons gracefully (API may add new values)
 			throw new ProviderDataError(`Unhandled stop reason: ${reason}`);
 	}
 }

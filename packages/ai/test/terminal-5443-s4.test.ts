@@ -1,6 +1,4 @@
-// smarty-dev#5443 slice S4: terminal behavior of pi-messages and protected streams.
-// T-F6-usage (wire usage bound), T-F6-deferred (deferred.id masking),
-// T-F6-error-kind and T-F6-stop (regression matrices).
+// smarty-dev#5443 S4: pi-messages terminal usage, stop/error matrices and deferred.id masking.
 import { describe, expect, it } from "vitest";
 import { stream as streamPiMessages } from "../src/api/pi-messages.ts";
 import type { AssistantMessage, AssistantMessageEvent, Model, Usage } from "../src/types.ts";
@@ -8,10 +6,8 @@ import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 type Fetch = (url: Parameters<typeof globalThis.fetch>[0], init?: RequestInit) => Promise<Response>;
-
 const KEY = "sk-live-5443-s4-reflected-secret";
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 1 }] });
-
 const model: Model<"pi-messages"> = {
 	id: "auto",
 	name: "Auto",
@@ -24,7 +20,6 @@ const model: Model<"pi-messages"> = {
 	contextWindow: 128000,
 	maxTokens: 16384,
 };
-
 const usage: Usage = {
 	input: 10,
 	output: 5,
@@ -33,7 +28,6 @@ const usage: Usage = {
 	totalTokens: 18,
 	cost: { input: 0.1, output: 0.2, cacheRead: 0.01, cacheWrite: 0.02, total: 0.33 },
 };
-
 const zeroUsage: Usage = {
 	input: 0,
 	output: 0,
@@ -43,14 +37,12 @@ const zeroUsage: Usage = {
 	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
 
-/** Raw SSE body, so the wire can carry JSON that a typed event cannot (1e400, strings, null). */
 function sse(lines: string[]): Response {
 	return new Response(lines.map((data) => `data: ${data}\n\n`).join(""), {
 		status: 200,
 		headers: { "content-type": "text/event-stream" },
 	});
 }
-
 async function run(fetch: Fetch, apiKey: string | undefined = "k", signal?: AbortSignal) {
 	const wire: unknown[] = [];
 	const stream = streamPiMessages(model, context, {
@@ -65,7 +57,6 @@ async function run(fetch: Fetch, apiKey: string | undefined = "k", signal?: Abor
 	for await (const event of stream) events.push(event);
 	return { events, result: await stream.result(), wire };
 }
-
 function expectSaneUsage(value: Usage): void {
 	const numbers = [
 		value.input,
@@ -85,7 +76,6 @@ function expectSaneUsage(value: Usage): void {
 		expect(n).toBeGreaterThanOrEqual(0);
 		expect(n).toBeLessThanOrEqual(Number.MAX_SAFE_INTEGER);
 	}
-	// Two turns added together must stay finite (session totals, footer cost).
 	expect(Number.isFinite(value.totalTokens + value.totalTokens)).toBe(true);
 	expect(Number.isFinite(value.cost.total + value.cost.total)).toBe(true);
 }
@@ -94,7 +84,6 @@ describe("T-F6-usage: pi-messages bounds wire usage on terminal events (smarty-d
 	const hostile =
 		'{"input":-5,"output":"7","cacheRead":1e400,"cacheWrite":null,"totalTokens":1e308,"reasoning":-1,' +
 		'"cost":{"input":"0.5","output":-2,"cacheRead":1e400,"cacheWrite":{},"total":1e308},"extra":{"x":1}}';
-
 	it.each([
 		["done", `{"type":"done","reason":"stop","usage":${hostile}}`],
 		["error", `{"type":"error","reason":"error","usage":${hostile},"errorMessage":"x"}`],
@@ -109,7 +98,6 @@ describe("T-F6-usage: pi-messages bounds wire usage on terminal events (smarty-d
 		});
 		expect(Object.keys(result.usage)).not.toContain("extra");
 	});
-
 	it.each([
 		["missing", '{"type":"done","reason":"stop"}'],
 		["null", '{"type":"done","reason":"stop","usage":null}'],
@@ -120,14 +108,13 @@ describe("T-F6-usage: pi-messages bounds wire usage on terminal events (smarty-d
 		expectSaneUsage(result.usage);
 		expect(result.usage.cost).toEqual(zeroUsage.cost);
 	});
-
 	it("keeps valid usage exactly and never hands the wire object to the observer", async () => {
 		const valid = { ...usage, reasoning: 3, cacheWrite1h: 1 };
 		const { result, wire } = await run(async () =>
 			sse([JSON.stringify({ type: "done", reason: "stop", usage: valid })]),
 		);
 		expect(result.usage).toEqual(valid);
-		// smarty-dev#5822 C1: the observer gets the owned notification, never the wire event.
+		// smarty-dev#5822 C1: notification only, never the wire event.
 		expect(wire).toEqual([{ type: "provider_stream_event" }]);
 	});
 });
@@ -140,12 +127,10 @@ describe("T-F6-stop: pi-messages stop matrix (smarty-dev#5443 regression)", () =
 				sse([
 					'{"type":"start"}',
 					JSON.stringify({ type: "done", reason, usage, responseId: "r1" }),
-					// Anything after the terminal event is ignored.
 					JSON.stringify({ type: "error", reason: "error", usage, errorMessage: "late" }),
 				]),
 			);
-			const terminals = events.filter((event) => event.type === "done" || event.type === "error");
-			expect(terminals).toHaveLength(1);
+			expect(events.filter((event) => event.type === "done" || event.type === "error")).toHaveLength(1);
 			expect(events.at(-1)).toMatchObject({ type: "done", reason });
 			expect(result.stopReason).toBe(reason);
 			expect(result.errorMessage).toBeUndefined();
@@ -174,7 +159,6 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 		{
 			name: "HTTP error status",
 			reason: "error",
-			// smarty-dev#5822 (pi#202 round 2): owned status and category, not the backend text.
 			message: /^Provider request failed \(HTTP 503, overloaded\)$/,
 			fetch: async () =>
 				new Response(JSON.stringify({ error: { message: "overloaded", code: "busy" } }), {
@@ -205,7 +189,6 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 		{
 			name: "wire error event",
 			reason: "error",
-			// smarty-dev#5822 (pi#202 round 3): owned text; the wire error text is private.
 			message: /^Provider request failed$/,
 			fetch: async () =>
 				sse([JSON.stringify({ type: "error", reason: "error", usage, errorMessage: "upstream failed" })]),
@@ -227,7 +210,6 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 			},
 		},
 	];
-
 	it.each(cases)("$name ends with exactly one error/$reason event", async (testCase) => {
 		const controller = new AbortController();
 		const fetch: Fetch = async (url, init) => {
@@ -235,8 +217,7 @@ describe("T-F6-error-kind: pi-messages error matrix (smarty-dev#5443 regression)
 			return testCase.fetch(url, init);
 		};
 		const { events, result } = await run(fetch, testCase.apiKey ?? "k", controller.signal);
-		const terminals = events.filter((event) => event.type === "done" || event.type === "error");
-		expect(terminals).toHaveLength(1);
+		expect(events.filter((event) => event.type === "done" || event.type === "error")).toHaveLength(1);
 		expect(events.at(-1)).toMatchObject({ type: "error", reason: testCase.reason });
 		expect(result.stopReason).toBe(testCase.reason);
 		expect(result.errorMessage).toMatch(testCase.message);
@@ -258,7 +239,6 @@ describe("T-F6-deferred: protected streams mask live secrets in deferred.id (sma
 			timestamp: 1,
 		};
 	}
-
 	it.each([
 		["raw", `batch_1:${KEY}`],
 		["URI-encoded", `resp?k=${encodeURIComponent(`Bearer ${KEY}`)}`],
@@ -277,23 +257,19 @@ describe("T-F6-deferred: protected streams mask live secrets in deferred.id (sma
 		expect(published).not.toContain(Buffer.from(KEY).toString("base64url"));
 		expect(result.deferred?.id).toContain("***");
 		expect(result.deferred?.data).toEqual({ keep: "me" });
-		// The provider's own handle object is not rewritten under it.
 		expect(original?.id).toBe(id);
 	});
-
 	it("masks deferred.id when the stream ends with end(result)", async () => {
 		const stream = new AssistantMessageEventStream([KEY]);
 		stream.end(deferredMessage(`late-${KEY}`));
 		expect((await stream.result()).deferred?.id).toBe("late-***");
 	});
-
 	it("keeps an unrelated deferred.id byte for byte", async () => {
 		const stream = new AssistantMessageEventStream([KEY]);
 		const message = deferredMessage("resp_abc%2F123 token=x");
 		const handle = message.deferred;
 		stream.push({ type: "done", reason: "deferred", message });
 		const result = await stream.result();
-		// smarty-dev#5822 C2: a snapshot copy, equal byte for byte, never the producer's object.
 		expect(result.deferred).toEqual(handle);
 		expect(result.deferred).not.toBe(handle);
 		expect(result.deferred?.id).toBe("resp_abc%2F123 token=x");

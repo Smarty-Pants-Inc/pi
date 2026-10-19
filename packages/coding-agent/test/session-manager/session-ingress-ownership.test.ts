@@ -64,7 +64,7 @@ it.each(["collections", "typed-array", "accessor", "serializer", "class"])(
 		]) {
 			expect(entry).toEqual(expected);
 		}
-		expect(readFileSync(manager.getSessionFile()!)).toEqual(disk);
+		expect(readFileSync(manager.getSessionFile()!).equals(disk)).toBe(true);
 	},
 );
 

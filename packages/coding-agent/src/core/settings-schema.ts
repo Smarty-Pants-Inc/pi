@@ -63,11 +63,6 @@ const RetrySettingsSchema = Type.Object({
 	),
 	maxAgentDelayMs: Type.Optional(Type.Number({ default: SETTINGS_DEFAULTS.retry.maxAgentDelayMs })),
 	provider: Type.Optional(ProviderRetrySettingsSchema),
-	fallbackModel: Type.Optional(
-		Type.String({
-			description: "Exact provider/modelId used once after agent retries are exhausted. Off by default.",
-		}),
-	),
 	maxDelayMs: Type.Optional(
 		Type.Number({
 			description: "Legacy retry delay setting. Use provider.maxRetryDelayMs instead.",
@@ -225,6 +220,13 @@ export const SettingsSchema = Type.Object(
 				[Type.Literal("auto"), Type.Literal("sse"), Type.Literal("websocket"), Type.Literal("websocket-cached")],
 				{ default: SETTINGS_DEFAULTS.transport },
 			),
+		),
+		sessionShareDestination: Type.Optional(
+			Type.Union([Type.Literal("auto"), Type.Literal("gist"), Type.Literal("radius")], {
+				description:
+					'Destination used by /share. "auto" uses Radius when authenticated and otherwise creates a GitHub gist.',
+				default: SETTINGS_DEFAULTS.sessionShareDestination,
+			}),
 		),
 		steeringMode: Type.Optional(
 			Type.Union([Type.Literal("all"), Type.Literal("one-at-a-time")], {
@@ -480,6 +482,7 @@ export interface CodemodeSettings extends Static<typeof CodemodeSettingsSchema> 
 export type DefaultProjectTrust = NonNullable<SettingsInput["defaultProjectTrust"]>;
 export type QuietStartup = NonNullable<SettingsInput["quietStartup"]>;
 export type TransportSetting = NonNullable<SettingsInput["transport"]>;
+export type SessionShareDestination = NonNullable<SettingsInput["sessionShareDestination"]>;
 export type PackageSource = Static<typeof PackageSourceSchema>;
 export type FullscreenExitOutput = NonNullable<SettingsInput["fullscreenExitOutput"]>;
 export type TuiMode = NonNullable<SettingsInput["tuiMode"]>;

@@ -9,6 +9,7 @@ import {
 	EventStream,
 	getCurrentTools,
 	getToolStateChanges,
+	isolateValue,
 	lazyStream,
 	normalizeContext,
 	type SystemMessage,
@@ -56,8 +57,11 @@ async function raceSetupAbort<T>(setup: () => T | PromiseLike<T>, signal?: Abort
 	}
 }
 
-/** sourceMessage identifies queued input when tool declaration normalization copies it. */
-export type AgentEventSink = (event: AgentEvent, sourceMessage?: AgentMessage) => Promise<void> | void;
+/** Original input slot, preserved even when tool declaration normalization copies its message. */
+export type AgentMessageOccurrence = { batch: AgentMessage[]; index: number; message: AgentMessage };
+
+/** Only a source belonging to a queue's reserved batch can transfer that queue occurrence. */
+export type AgentEventSink = (event: AgentEvent, source?: AgentMessageOccurrence) => Promise<void> | void;
 
 /**
  * Start an agent loop with a new prompt message.
@@ -444,7 +448,7 @@ async function emitAbortedAssistantResponse(
 
 type PendingMessage = {
 	message: AgentMessage;
-	source?: { batch: AgentMessage[]; index: number; message: AgentMessage };
+	source?: AgentMessageOccurrence;
 };
 
 async function appendPendingMessages(
@@ -459,8 +463,10 @@ async function appendPendingMessages(
 	for (const pending of [batches, []]) {
 		for (const { message, source } of declareToolChanges(context, pending)) {
 			if (source && source.batch[source.index] !== source.message) continue;
-			await emit({ type: "message_start", message }, source?.message);
-			await emit({ type: "message_end", message });
+			await emit({ type: "message_start", message }, source);
+			// A start listener can withdraw this occurrence before the transcript commit.
+			if (source && source.batch[source.index] !== source.message) continue;
+			await emit({ type: "message_end", message }, source);
 			context.messages.push(message);
 			newMessages.push(message);
 			if (source) injected = true;
@@ -481,7 +487,7 @@ async function appendPendingMessages(
  */
 function declareToolChanges(context: AgentContext, batches: AgentMessage[][]): PendingMessage[] {
 	// Keep each original reservation slot alongside its normalized message. The
-	// caller rechecks that slot immediately before transferring it at message_start.
+	// caller rechecks that slot before message_start; queued custody lasts until message_end.
 	const entries: PendingMessage[] = batches.flatMap((batch) =>
 		batch.map((message, index) => ({ message, source: { batch, index, message } })),
 	);
@@ -764,6 +770,7 @@ async function executeToolCallsSequential(
 					emitToolExecutionUpdate(toolCall, emit),
 					config,
 				);
+				failure ??= executed.updateFailure;
 				finalized = await finalizeExecutedToolCall(
 					currentContext,
 					assistantMessage,
@@ -803,6 +810,7 @@ async function executeToolCallsParallel(
 ): Promise<ExecutedToolCallBatch> {
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 	let firstEmissionError: { error: unknown } | undefined;
+	let firstUpdateError: { error: unknown } | undefined;
 	// A finalized outcome belongs to the batch even if its public event fails.
 	// Settle started siblings and publish finalized results, but never start new work after a preflight failure.
 	const emitFinalizedEvent: AgentEventSink = async (event) => {
@@ -864,6 +872,7 @@ async function executeToolCallsParallel(
 				emitToolExecutionUpdate(toolCall, emit),
 				config,
 			);
+			firstUpdateError ??= executed.updateFailure;
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -900,7 +909,10 @@ async function executeToolCallsParallel(
 	return {
 		messages,
 		terminate: shouldTerminateToolBatch(orderedFinalizedCalls),
-		failure: failedExecution?.status === "rejected" ? { error: failedExecution.reason } : firstEmissionError,
+		failure:
+			failedExecution?.status === "rejected"
+				? { error: failedExecution.reason }
+				: (firstUpdateError ?? firstEmissionError),
 	};
 }
 
@@ -921,6 +933,7 @@ type ExecutedToolCallOutcome = {
 	result: AgentToolResult<any>;
 	isError: boolean;
 	durationMs: number;
+	updateFailure?: { error: unknown };
 };
 
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
@@ -950,17 +963,6 @@ function prepareToolCallArguments(tool: AgentTool<any>, toolCall: AgentToolCall)
 	};
 }
 
-const MAX_LISTED_TOOLS = 40;
-
-/** Name the tools valid in this session so the model can correct the call (smarty-dev#1528 K05). */
-export function toolNotFoundMessage(name: string, tools: ReadonlyArray<{ name: string }>): string {
-	const names = [...new Set(tools.map((t) => t.name))].sort();
-	if (names.length === 0) return `Tool ${name} not found. No tools are available in this session.`;
-	const listed = names.slice(0, MAX_LISTED_TOOLS).join(", ");
-	const more = names.length > MAX_LISTED_TOOLS ? `, ... (${names.length - MAX_LISTED_TOOLS} more)` : "";
-	return `Tool ${name} not found. Available tools in this session: ${listed}${more}`;
-}
-
 async function prepareToolCall(
 	currentContext: AgentContext,
 	assistantMessage: AssistantMessage,
@@ -973,7 +975,7 @@ async function prepareToolCall(
 	if (!tool) {
 		return {
 			kind: "immediate",
-			result: createErrorToolResult(toolNotFoundMessage(toolCall.name, currentContext.tools ?? [])),
+			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
 			isError: true,
 		};
 	}
@@ -1052,6 +1054,7 @@ export interface RunToolCallOptions extends ToolCallHooks {
 	/** Passed to the hooks as the current agent context. */
 	context: AgentContext;
 	signal?: AbortSignal;
+	/** Progress publication is best-effort and cannot replace the returned execution outcome. */
 	onUpdate?: ToolUpdateSink;
 }
 
@@ -1081,9 +1084,11 @@ async function executePreparedToolCall(
 	hooks: ToolCallHooks,
 ): Promise<ExecutedToolCallOutcome> {
 	const updateEvents: Promise<void>[] = [];
+	let updateFailure: { error: unknown } | undefined;
 	let acceptingUpdates = true;
 	const startedAt = performance.now();
 	const elapsed = () => Math.round(performance.now() - startedAt);
+	let outcome: ExecutedToolCallOutcome;
 
 	try {
 		const result = await prepared.tool.execute(
@@ -1096,9 +1101,10 @@ async function executePreparedToolCall(
 				// Preserve emission order even when asynchronous transforms finish out of order.
 				const transformed = (async () => {
 					try {
+						// Detach before any await, including absent or undefined transform results.
+						const snapshot = isolateValue(partialResult);
 						return (
-							(await hooks.transformToolUpdate?.(prepared.toolCall, prepared.args, partialResult, signal)) ??
-							partialResult
+							(await hooks.transformToolUpdate?.(prepared.toolCall, prepared.args, snapshot, signal)) ?? snapshot
 						);
 					} catch {
 						// Neither the snapshot nor an error message containing it may cross this boundary.
@@ -1106,25 +1112,33 @@ async function executePreparedToolCall(
 					}
 				})();
 				const previous = updateEvents.at(-1) ?? Promise.resolve();
-				updateEvents.push(previous.then(async () => onUpdate(await transformed)));
+				updateEvents.push(
+					previous.then(async () => {
+						try {
+							await onUpdate(await transformed);
+						} catch (error) {
+							// Keep progress failure separate from the execution outcome. The loop
+							// propagates it after settlement; nested callers still receive the outcome.
+							updateFailure ??= { error };
+						}
+					}),
+				);
 			},
 		);
-		const durationMs = elapsed();
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return { result, isError: result.isError === true, durationMs };
+		outcome = { result, isError: result.isError === true, durationMs: elapsed() };
 	} catch (error) {
-		const durationMs = elapsed();
-		acceptingUpdates = false;
-		await Promise.all(updateEvents);
-		return {
+		outcome = {
 			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
 			isError: true,
-			durationMs,
+			durationMs: elapsed(),
 		};
 	} finally {
 		acceptingUpdates = false;
 	}
+	// Settle progress after capturing execution, never inside its failure conversion.
+	await Promise.all(updateEvents);
+	if (updateFailure) outcome.updateFailure = updateFailure;
+	return outcome;
 }
 
 async function finalizeExecutedToolCall(

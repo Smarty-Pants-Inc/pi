@@ -7,7 +7,7 @@ import { ExtensionRunner } from "../src/core/extensions/runner.ts";
 import { SessionManager } from "../src/core/session-manager.ts";
 import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 
-// smarty-dev#11897 / pi#163: every accessor isolates persisted-JSON values without caching payloads.
+// smarty-dev#11897 / pi#163: exceptional values stay detached without a payload cache.
 it.each([
 	["typed-array", new Uint8Array([1, 255]), { "0": 1, "1": 255 }],
 	["map", new Map([["original", 1]]), {}],

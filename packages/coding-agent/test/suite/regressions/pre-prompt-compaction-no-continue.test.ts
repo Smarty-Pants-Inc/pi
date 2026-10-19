@@ -25,7 +25,7 @@ describe("pre-prompt compaction regression", () => {
 
 	it("compacts length-stop overflow before a new prompt without continuing from an assistant message", async () => {
 		const harness = await createHarness({
-			// #2742: the retained output selects length recovery; the next input must fit.
+			// #2742: retained output selects length recovery; the next input must fit.
 			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
@@ -74,9 +74,10 @@ describe("pre-prompt compaction regression", () => {
 		expect(harness.faux.state.callCount).toBe(1);
 	});
 
+	// smarty-dev#217: retain accepted attachments without acknowledging a model dispatch.
 	it.each(["failed", "aborted"] as const)("retains unsent input after %s compaction", async (outcome) => {
 		const harness = await createHarness({
-			// #2742: the summary request fits even though prior usage selects overflow recovery.
+			// #2742: summary input fits although prior usage selects overflow recovery.
 			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
@@ -107,6 +108,7 @@ describe("pre-prompt compaction regression", () => {
 		const beforeAgentStart = vi.spyOn(harness.session.extensionRunner, "emitBeforeAgentStart");
 		const continueSpy = vi.spyOn(harness.session.agent, "continue");
 		const queue = vi.spyOn(harness.session.agent, "followUp");
+		const transferred = vi.fn();
 		const preflight = vi.fn();
 		const images: ImageContent[] = [{ type: "image", data: "synthetic-image", mimeType: "image/png" }];
 
@@ -114,10 +116,13 @@ describe("pre-prompt compaction regression", () => {
 			harness.session.prompt("pending input", {
 				images,
 				streamingBehavior: "followUp",
+				onInputTransferred: transferred,
 				preflightResult: preflight,
 			}),
 		).rejects.toThrow("Input is retained in the followUp queue");
 
+		// The receiving session owns the retained queue; this is not a turnStarted receipt.
+		expect(transferred).toHaveBeenCalledTimes(1);
 		expect(preflight).not.toHaveBeenCalled();
 		expect(harness.sessionManager.getEntries()).toEqual(before);
 		expect(getUserTexts(harness)).not.toContain("processed:pending input");
@@ -128,7 +133,13 @@ describe("pre-prompt compaction regression", () => {
 				role: "user",
 				content: [{ type: "text", text: "processed:pending input" }, ...images],
 			}),
+			expect.any(Function),
 		);
+		// pi#280: the enqueue callback identifies native custody, not a new owner API.
+		const retained = harness.session.agent.getQueuedMessageOccurrences();
+		expect(retained).toHaveLength(1);
+		expect(retained[0]).toMatchObject({ id: expect.any(Number), mode: "followUp" });
+		expect(retained[0].message).toBe(queue.mock.calls[0][0]);
 		expect(beforeAgentStart).not.toHaveBeenCalled();
 		expect(continueSpy).not.toHaveBeenCalled();
 		expect(harness.faux.state.callCount).toBe(outcome === "failed" ? 1 : 0);
@@ -137,15 +148,20 @@ describe("pre-prompt compaction regression", () => {
 			result: undefined,
 			aborted: outcome === "aborted",
 		});
+
+		// Paired recovery control: taking retained input clears only the queue, not history.
+		expect(harness.session.clearQueue()).toEqual({ steering: [], followUp: ["processed:pending input"] });
+		expect(harness.session.agent.hasQueuedMessages()).toBe(false);
+		expect(harness.session.getFollowUpMessages()).toEqual([]);
+		expect(harness.sessionManager.getEntries()).toEqual(before);
+		expect(transferred).toHaveBeenCalledTimes(1);
 	});
 
-	// pi#74 review F3: a triggered custom message held during this preflight must not restart work
-	// after the compaction stop, and must not carry the retained input into a run.
+	// pi#74 review F3: a custom trigger held by failed preflight must not restart retained input.
 	it.each(["failed", "aborted"] as const)(
 		"keeps a triggered message held before %s compaction queued, with no new run",
 		async (outcome) => {
 			const harness = await createHarness({
-				// #2742: let the summary provider fail instead of failing local summary admission.
 				models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 				settings: { compaction: { enabled: true, keepRecentTokens: 1, reserveTokens: 0 } },
 				extensionFactories: [
@@ -178,7 +194,6 @@ describe("pre-prompt compaction regression", () => {
 
 			await expect(harness.session.prompt("pending input")).rejects.toThrow("Input is retained in the steer queue");
 			await new Promise((resolve) => setTimeout(resolve, 100));
-
 			expect(runPrompt).not.toHaveBeenCalled();
 			expect(harness.faux.state.callCount).toBe(outcome === "failed" ? 1 : 0);
 			expect(getUserTexts(harness)).not.toContain("pending input");

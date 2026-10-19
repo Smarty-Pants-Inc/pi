@@ -19,8 +19,8 @@ afterEach(() => {
 });
 
 describe("Fireworks models", () => {
-	it("registers Inkling via the Anthropic-compatible Messages API", () => {
-		const model = getModel("fireworks", "accounts/fireworks/models/inkling");
+	it("registers non-GLM, non-Kimi-K3 models via Anthropic-compatible Messages API", () => {
+		const model = getModel("fireworks", "accounts/fireworks/models/deepseek-v4p1-flash");
 
 		expect(model).toBeDefined();
 		expect(model.api).toBe("anthropic-messages");
@@ -28,14 +28,6 @@ describe("Fireworks models", () => {
 		expect(model.baseUrl).toBe("https://api.fireworks.ai/inference");
 		expect(model.reasoning).toBe(true);
 		expect(model.input).toEqual(["text", "image"]);
-		expect(model.contextWindow).toBe(1048576);
-		expect(model.maxTokens).toBe(1048576);
-		expect(model.cost).toEqual({
-			input: 1,
-			output: 4.05,
-			cacheRead: 0.17,
-			cacheWrite: 0,
-		});
 	});
 
 	it("aligns GLM 5.3 Fast with GLM 5.3's OpenAI-compatible config", () => {
@@ -127,7 +119,6 @@ describe("Fireworks models", () => {
 	// Regression for #9323: native effort must reach Messages without budget-based fallback.
 	it.each([
 		["accounts/fireworks/models/deepseek-v4p1-flash", ["off", "low", "high", "max"]],
-		["accounts/fireworks/routers/deepseek-flash-latest", ["off", "low", "high", "max"]],
 		["accounts/fireworks/models/qwen3p8-max", ["off", "low", "medium", "xhigh"]],
 		["accounts/fireworks/models/qwen3p8-2p4t-a95b", ["off", "low", "medium", "xhigh"]],
 	] as const)("sends native Messages effort levels for %s", async (modelId, levels) => {
@@ -160,6 +151,8 @@ describe("Fireworks models", () => {
 
 	// Regression for #9323: accepted aliases are not distinct native effort levels.
 	it.each([
+		["accounts/fireworks/models/glm-5p3", ["low", "high", "max"]],
+		["accounts/fireworks/routers/glm-5p3-fast", ["low", "high", "max"]],
 		["accounts/fireworks/models/kimi-k3", ["low", "high", "max"]],
 		["accounts/fireworks/routers/kimi-k3-fast", ["low", "high", "max"]],
 	] as const)("exposes distinct native effort levels for %s", (modelId, levels) => {
@@ -167,7 +160,7 @@ describe("Fireworks models", () => {
 	});
 
 	it("keeps toggle-only Messages models without a verified fallback on budget-based thinking", async () => {
-		const model = getModel("fireworks", "accounts/fireworks/models/inkling");
+		const model = getModel("fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4");
 		expect(model.compat?.forceAdaptiveThinking).toBeUndefined();
 		let payload: Record<string, unknown> | undefined;
 		await streamSimple(
@@ -194,7 +187,7 @@ describe("Fireworks models", () => {
 	});
 
 	it("sets Fireworks-specific compat for session affinity and unsupported tool fields", () => {
-		const model = getModel("fireworks", "accounts/fireworks/models/inkling");
+		const model = getModel("fireworks", "accounts/fireworks/models/nemotron-3-ultra-nvfp4");
 
 		expect(model.compat).toBeDefined();
 		expect(model.compat?.sendSessionAffinityHeaders).toBe(true);

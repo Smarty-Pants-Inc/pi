@@ -2,7 +2,6 @@ import { type Context, copyJson, type Draft, type JsonValue } from "@earendil-wo
 import type {
 	Api,
 	AssistantMessage,
-	AssistantStreamObservation,
 	DeferredHandle,
 	Message,
 	Model,
@@ -11,15 +10,7 @@ import type {
 	ToolCall,
 } from "@earendil-works/pi-ai";
 import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
-import {
-	createAssistantStreamObservation,
-	discardPartialReasoning,
-	hasAssistantAnswerOutput,
-	isReasoningOnlyPrematureStream,
-	isRetryableAssistantError,
-	observeAssistantStreamEvent,
-	retryDelayMs,
-} from "@earendil-works/pi-ai/utils/retry";
+import { isRetryableAssistantError, retryDelayMs } from "@earendil-works/pi-ai/utils/recovery";
 import { getCurrentTools } from "@earendil-works/pi-ai/utils/transcript";
 import { AssistantEntry, ResetEntry, SystemEntry, UserEntry } from "../entries.ts";
 import type { ExecutionEnv } from "../env/index.ts";
@@ -104,13 +95,6 @@ export type GenerationCheckpoint =
 export type GenerationResult = { entryId: EntryId };
 
 type Runtime = TaskRuntime<GenerationInput, GenerationCheckpoint, GenerationResult, GenerationHooks>;
-
-/**
- * The scheduler's one-shot write of the run's live partial past the task's abort mark (smarty-dev#7428, pi#174). The
- * scheduler passes it only to its own dispatch of this task's `request` phase, never through the runtime or a hook, and
- * accepts one call before the phase returns.
- */
-export type AbortMarkPartialWriter = (message: AssistantMessage, context: Context) => Promise<void>;
 type Next = NextTaskState<GenerationCheckpoint, GenerationResult>;
 
 /** What classification needs from the request that produced a message. */
@@ -209,31 +193,15 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				return { status: "running", checkpoint: { phase: "request", ...request } };
 			}, context);
 		},
-		request: async (task, runtime, context, writeUnderAbortMark?: AbortMarkPartialWriter) => {
+		request: async (task, runtime, context) => {
 			const { attempt, compacted, model: ref, thinkingLevel, streamOptions, cutoff } = task.state.checkpoint;
 			const conversationId = runtime.conversationId;
-			let interrupted = false;
-			await runtime.commit(async (tx): Promise<Next | undefined> => {
+			await runtime.commit(async (tx) => {
 				const live = await tx.doc(LiveDoc, conversationId);
-				// A committed partial means this phase crashed mid-stream and its stream observation is gone. The partial is
-				// everything durable observers saw, so it stands in for the observation: answer text or a tool call (even
-				// partial) fails the run instead of resending, which would repeat that output (smarty-dev#6730, pi#171).
-				// Reasoning-only partials are still resent.
-				const partial = live.generation?.message as AssistantMessage | undefined;
-				interrupted = partial !== undefined && hasAssistantAnswerOutput(partial);
 				await convertPartial(tx, live, conversationId);
-				if (interrupted) {
-					const text = "Model response was interrupted after answer output";
-					endRun(tx, live, runtime.taskId, { status: "unanswered", reason: "model_error", detail: text });
-					return {
-						status: "terminal",
-						outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } },
-					};
-				}
 				live.generation = { attempt };
 				return undefined;
 			}, context);
-			if (interrupted) return;
 			const model = runtime.models.getModel(ref.provider, ref.modelId);
 			if (model === undefined) return failNoModel(runtime, ref, context);
 			const view = await runtime.context(conversationId, context, { at: cutoff });
@@ -248,25 +216,9 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 				sessionId: await ensureProviderSessionId(runtime, context),
 				...(thinkingLevel === "off" ? {} : { reasoning: thinkingLevel }),
 			};
-			const { message, observed, saveKeptPartial } = await streamResponse(
-				runtime,
-				model,
-				messages,
-				options,
-				attempt,
-				context,
-				writeUnderAbortMark,
-			);
+			const message = await streamResponse(runtime, model, messages, options, attempt, context);
 			const request = { attempt, compacted, model: ref, cutoff, messages: view.messages };
-			try {
-				await classify(runtime, request, message, context, observed);
-			} catch (error) {
-				// pi#174: an abort mark that landed after the finalizer's signal check rejected the classification commit. The
-				// kept partial of a normal completion is then the only copy of its answer output; it commits under the mark
-				// now, before the phase returns and the writer is revoked, so the abort handler converts it.
-				if (runtime.signal.aborted) await saveKeptPartial();
-				throw error;
-			}
+			await classify(runtime, request, message, context);
 		},
 		retry: async (task, runtime, context) => {
 			const { attempt, compacted, until } = task.state.checkpoint;
@@ -340,11 +292,6 @@ export const GenerationTask = defineTask<GenerationInput, GenerationCheckpoint, 
 		}, context);
 	},
 });
-
-// pi#174: the scheduler hands `request` its abort-mark writer, so no code may replace the phase to capture it.
-Object.freeze(GenerationTask.definition.phases);
-Object.freeze(GenerationTask.definition);
-Object.freeze(GenerationTask);
 
 /** The calls `callIds` of the assistant entry, in the given order. */
 async function readCalls(
@@ -440,11 +387,8 @@ export async function convertPartial(tx: Tx, live: Draft<LiveState>, conversatio
 
 /**
  * Stream one request and return the terminal message. Partials commit as trailing writes at most every
- * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle, awaits that
- * commit, and, unless the stream completed normally without an abort, commits a still pending partial with answer
- * output, so no stale partial lands after the outcome and recovery from a crash before classification, or the abort
- * handler, sees every answer output streamed. A normal completion keeps its pending answer partial uncommitted;
- * `saveKeptPartial` commits it under the abort mark when an abort mark rejects the classification commit.
+ * `progress.partialIntervalMs` (default 100 ms) with one commit in flight; `finally` stops the throttle and awaits that
+ * commit, so no stale partial lands after the outcome.
  */
 async function streamResponse(
 	runtime: Runtime,
@@ -453,63 +397,30 @@ async function streamResponse(
 	options: SimpleStreamOptions,
 	attempt: number,
 	context: Context,
-	writeUnderAbortMark: AbortMarkPartialWriter | undefined,
-): Promise<{
-	message: AssistantMessage;
-	observed: AssistantStreamObservation;
-	saveKeptPartial: () => Promise<void>;
-}> {
+): Promise<AssistantMessage> {
 	const interval = runtime.settings.progress.partialIntervalMs;
-	// The terminal message can drop what the stream showed (smarty-dev#6730).
-	const observed = createAssistantStreamObservation();
-	// smarty-dev#6730: a premature close before answer output is retried and its reasoning dropped, so a partial
-	// without answer output is held until answer output arrives. The terminal commit records it otherwise.
-	const retry = runtime.settings.retry;
-	const holdReasoning = retry.enabled && attempt <= retry.maxRetries;
 	let pending: AssistantMessage | undefined;
-	// The answer partial a normal completion left uncommitted, for `saveKeptPartial`.
-	let kept: AssistantMessage | undefined;
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let inFlight: Promise<void> | undefined;
 	let stopped = false;
-	let completed = false;
-	/**
-	 * Whether the partial committed. `underAbortMark` is only for the abort path's final commit: it takes the scheduler's
-	 * one-shot writer, the one write that passes the abort mark; without it (a dispatch other than the scheduler's) the
-	 * commit is refused.
-	 */
-	const commitPartial = (partial: AssistantMessage, underAbortMark = false): Promise<boolean> => {
-		// Copy synchronously: the provider keeps mutating its partial.
-		const message = copyJson(partial, { omitUndefinedProperties: true });
-		const committed = underAbortMark
-			? writeUnderAbortMark === undefined
-				? Promise.reject(new Error(`Task ${runtime.taskId} has no abort-mark writer`))
-				: writeUnderAbortMark(message as unknown as AssistantMessage, context)
-			: runtime.commit(async (tx) => {
-					const live = await tx.doc(LiveDoc, runtime.conversationId);
-					live.generation ??= { attempt };
-					assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
-					return undefined;
-				}, context);
-		return committed.then(
-			() => true,
-			(error: unknown) => {
-				// Rejections after an abort mark or close are expected; the committed state stays consistent.
-				if (!runtime.signal.aborted) runtime.report(error);
-				return false;
-			},
-		);
-	};
 	const flush = (): void => {
 		timer = undefined;
-		// Once signalled, the partial waits for the commit in `finally`, the only one an abort mark lets pass.
-		if (pending === undefined || stopped || runtime.signal.aborted) return;
 		const partial = pending;
 		pending = undefined;
-		inFlight = commitPartial(partial)
-			.then((saved) => {
-				// An abort mark that landed first rejected it; `finally` commits it unless a newer partial replaced it.
-				if (!saved && runtime.signal.aborted) pending ??= partial;
+		if (partial === undefined || stopped) return;
+		inFlight = (async () => {
+			// Copy synchronously: the provider keeps mutating its partial.
+			const message = copyJson(partial, { omitUndefinedProperties: true });
+			await runtime.commit(async (tx) => {
+				const live = await tx.doc(LiveDoc, runtime.conversationId);
+				live.generation ??= { attempt };
+				assignJson(live.generation as Draft<Record<string, JsonValue>>, "message", message);
+				return undefined;
+			}, context);
+		})()
+			.catch((error: unknown) => {
+				// Rejections after an abort mark or close are expected; the committed state stays consistent.
+				if (!runtime.signal.aborted) runtime.report(error);
 			})
 			.finally(() => {
 				inFlight = undefined;
@@ -519,43 +430,17 @@ async function streamResponse(
 	try {
 		const events = runtime.models.streamSimple(model, { messages: [...messages] }, options);
 		for await (const event of events) {
-			observeAssistantStreamEvent(observed, event);
 			// A partial without content, such as pi-ai's opening `start` event, shows nothing; a deferred response
 			// never gets past it, so it never leaves a partial.
 			if (event.type === "done" || event.type === "error" || event.partial.content.length === 0) continue;
 			pending = event.partial;
-			if (holdReasoning && !observed.answer) continue;
 			if (timer === undefined && inFlight === undefined) timer = setTimeout(flush, interval);
 		}
-		const message = await events.result();
-		completed = message.stopReason !== "error" && message.stopReason !== "aborted";
-		const saveKeptPartial = async (): Promise<void> => {
-			const partial = kept;
-			kept = undefined;
-			if (partial !== undefined) await commitPartial(partial, true);
-		};
-		return { message, observed, saveKeptPartial };
+		return await events.result();
 	} finally {
 		stopped = true;
 		clearTimeout(timer);
 		await inFlight;
-		// pi#171: an abnormal end before the throttle fires (an error, a premature close, an abort, or a thrown stream)
-		// still makes streamed answer output durable before classification, so a crash before the classification commit
-		// recovers it instead of resending. A normal completion commits nothing extra: its classification commit records
-		// the final message. A partial without answer output is left to the classification commit, so the reasoning of a
-		// retried attempt stays held.
-		// smarty-dev#7428: after a task abort, which also skips classification, this commit passes the abort mark, so the
-		// abort handler converts the answer output instead of losing it.
-		const signalled = runtime.signal.aborted;
-		if ((!completed || signalled) && pending !== undefined && hasAssistantAnswerOutput(pending)) {
-			const saved = await commitPartial(pending, signalled);
-			// An abort mark that landed after the check above rejected the regular commit; retry once under the mark.
-			if (!saved && !signalled && runtime.signal.aborted) await commitPartial(pending, true);
-		} else if (pending !== undefined && hasAssistantAnswerOutput(pending)) {
-			// pi#174: a normal completion, the signal clear; its classification commit records the answer, unless an abort
-			// mark lands first.
-			kept = pending;
-		}
 	}
 }
 
@@ -565,7 +450,6 @@ async function classify(
 	request: Request,
 	message: AssistantMessage,
 	context: Context,
-	observed?: AssistantStreamObservation,
 ): Promise<void> {
 	// An abort mark or close: the abort invocation or the reopened run handles the committed state.
 	runtime.signal.throwIfAborted();
@@ -592,22 +476,7 @@ async function classify(
 		}, context);
 		return;
 	}
-	// The retry and compaction policies govern the next attempt, so they are read now rather than pinned at preparation.
-	const settings = runtime.settings;
-	const overflow = message.stopReason === "error" && isContextOverflow(message);
-	const policy = settings.retry;
-	// An overflow is never retried: only a compaction can make the next request fit.
-	const retry =
-		message.stopReason === "error" &&
-		!overflow &&
-		isRetryableAssistantError(message, observed) &&
-		policy.enabled &&
-		attempt <= policy.maxRetries;
-	// smarty-dev#6730: the retry replaces a reasoning-only premature close, so neither afterResponse nor the
-	// transcript keeps its reasoning.
-	const visible =
-		retry && isReasoningOnlyPrematureStream(message, observed) ? discardPartialReasoning(message) : message;
-	await runtime.hooks.each("afterResponse", (hook) => hook(visible, runtime, context));
+	await runtime.hooks.each("afterResponse", (hook) => hook(message, runtime, context));
 	const calls = message.content.filter((content): content is ToolCall => content.type === "toolCall");
 	if (message.stopReason === "toolUse" && calls.length > 0) {
 		return startToolRound(runtime, request, message, calls, context);
@@ -615,6 +484,9 @@ async function classify(
 	if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") {
 		return answer(runtime, message, context);
 	}
+	// The retry and compaction policies govern the next attempt, so they are read now rather than pinned at preparation.
+	const settings = runtime.settings;
+	const overflow = message.stopReason === "error" && isContextOverflow(message);
 	if (overflow && compacted === undefined && settings.compaction.enabled) {
 		const policy = settings.compaction;
 		const view = await runtime.context(conversationId, context, { at: cutoff });
@@ -622,8 +494,7 @@ async function classify(
 			const text = message.errorMessage ?? "Context overflow";
 			await runtime.commit(async (tx): Promise<Next> => {
 				const live = await tx.doc(LiveDoc, conversationId);
-				// smarty-dev#7480: the error entry keeps answer output the terminal message dropped.
-				await appendAssistant(tx, conversationId, withPartialAnswer(message, live));
+				await appendAssistant(tx, conversationId, message);
 				delete live.generation;
 				const child = await createCompaction(tx, conversationId, { reason: "overflow" }, runtime.taskId);
 				const checkpoint = { phase: "prepare", attempt, compacted: child, overflow: text } as const;
@@ -632,10 +503,18 @@ async function classify(
 			return;
 		}
 	}
+	const policy = settings.retry;
+	// An overflow is never retried: only a compaction can make the next request fit.
+	const retry =
+		message.stopReason === "error" &&
+		!overflow &&
+		isRetryableAssistantError(message) &&
+		policy.enabled &&
+		attempt <= policy.maxRetries;
 	const until = retry ? runtime.now() + retryDelayMs(policy, attempt) : 0;
 	await runtime.commit(async (tx): Promise<Next> => {
 		const live = await tx.doc(LiveDoc, conversationId);
-		await appendAssistant(tx, conversationId, withPartialAnswer(visible, live));
+		await appendAssistant(tx, conversationId, message);
 		if (retry) {
 			live.generation = { attempt, retry: { at: until, error: message.errorMessage ?? "" } };
 			const checkpoint = {
@@ -653,16 +532,6 @@ async function classify(
 			outcome: { status: "failed", error: { message: text, detail: { reason: "model_error" } } },
 		};
 	}, context);
-}
-
-/**
- * smarty-dev#7480: a terminal message that dropped the answer output its stream showed takes the content of the
- * committed answer-bearing partial, the content recovery would convert, so the transcript keeps what observers saw.
- */
-function withPartialAnswer(message: AssistantMessage, live: Draft<LiveState>): AssistantMessage {
-	const partial = live.generation?.message as AssistantMessage | undefined;
-	if (partial === undefined || hasAssistantAnswerOutput(message) || !hasAssistantAnswerOutput(partial)) return message;
-	return { ...message, content: (copyJson(partial) as unknown as AssistantMessage).content };
 }
 
 /**

@@ -94,20 +94,6 @@ export function bindExtensionMetadataSource(
 	return bound;
 }
 
-/**
- * Private submitUserMessage route. Unlike send metadata, submit may run from an external callback:
- * - no extension execution context: unbound options, so admission stamps sdk;
- * - the API owner's own execution context: options stamped with its extension source;
- * - another extension's execution context (borrowed API): undefined, the caller refuses before admission.
- */
-export function bindSubmitUserMessageSource(extensionPath: string): SendUserMessageOptions | undefined {
-	const caller = extensionExecution.getStore();
-	if (caller === undefined) return { metadata: {} };
-	if (caller !== extensionPath) return undefined;
-	const metadata = {};
-	return bindExtensionMetadataSource({ metadata }, extensionPath, metadata);
-}
-
 /** Private replacement-context route: capture its extension owner without exposing a selectable source. */
 export function bindExtensionMetadataSender<
 	Sender extends (

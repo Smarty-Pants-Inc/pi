@@ -263,7 +263,7 @@ describe("OpenAI Decisions", () => {
 		expect(result.stopReason).toBe("stop");
 	});
 
-	it("includes the API error body for other HTTP failures", async () => {
+	it("publishes an owned status without the API error body for other HTTP failures", async () => {
 		const result = await classify(model, context, {
 			apiKey: "secret",
 			maxRetries: 0,
@@ -275,11 +275,11 @@ describe("OpenAI Decisions", () => {
 		});
 
 		expect(result.stopReason).toBe("error");
-		// smarty-dev#5822 (pi#202 round 2): owned text with the status; the API error body is not published.
+		// smarty-dev#5822 (pi#202 round 2): owned text with the status, not the API error body.
 		expect(result.errorMessage).toBe("OpenAI Decisions error (400)");
 	});
 
-	// smarty-dev#3155: upstream's shared transport must retain the fork's physical-request admission.
+	// smarty-dev#3155: upstream's shared transport retains physical-request admission.
 	it("admits every physical attempt and masks reflected request credentials", async () => {
 		const beforeProviderRequest = vi.fn(async () => {});
 		let attempts = 0;

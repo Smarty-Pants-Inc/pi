@@ -44,60 +44,19 @@ import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
-	RpcFatalErrorResponse,
 	RpcInputRejectedEvent,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
 } from "./rpc-types.ts";
 
-// ponytail: 256 commands and 16 MiB cover normal startup while bounding untrusted pre-bind input.
+// Bound untrusted pre-bind input while reserving a response path for startup dialogs.
 const MAX_QUEUED_STARTUP_COMMANDS = 256;
 const MAX_STARTUP_INPUT_BYTES = 16 * 1024 * 1024;
-// Preserve a bounded response path when buffered commands fill the queue.
 const MAX_STARTUP_UI_RESPONSE_BYTES = 1024 * 1024;
-// Match Pi's default five-minute idle window while keeping every RPC dialog finite.
 const MAX_RPC_EXTENSION_UI_WAIT_MS = 5 * 60_000;
 const MAX_BUFFERED_STARTUP_BYTES = MAX_STARTUP_INPUT_BYTES - MAX_STARTUP_UI_RESPONSE_BYTES;
-// Keep branch pages well below the gateway's 64 MiB JSONL record limit.
-const BRANCH_PAGE_SERIALIZED_RESPONSE_TARGET_BYTES = 32 * 1024 * 1024;
-const MAX_ISSUED_BRANCH_PAGE_LEAVES = 32;
 const TERMINAL_COMMAND_JOIN_MS = 1000;
-
-// Brent's algorithm detects parent cycles across page boundaries with constant state.
-type BranchPageTraversalState = {
-	tortoiseId: string;
-	power: number;
-	steps: number;
-};
-
-type IssuedBranchPageCursor = {
-	cursor: string;
-	nextEntryId: string;
-	traversal: BranchPageTraversalState;
-};
-
-function advanceBranchPageTraversal(
-	state: BranchPageTraversalState | undefined,
-	entryId: string,
-): BranchPageTraversalState | undefined {
-	if (!state) {
-		return { tortoiseId: entryId, power: 1, steps: 0 };
-	}
-
-	const steps = state.steps + 1;
-	if (entryId === state.tortoiseId) {
-		return undefined;
-	}
-	if (steps === state.power) {
-		return {
-			tortoiseId: entryId,
-			power: Math.min(state.power * 2, Number.MAX_SAFE_INTEGER),
-			steps: 0,
-		};
-	}
-	return { ...state, steps };
-}
 
 // Re-export types for consumers
 export type {
@@ -131,43 +90,8 @@ export async function runRpcMode(
 		}
 	};
 
-	const pendingOutputWrites: Array<() => void> = [];
-	let outputFlushScheduled = false;
-	let flushingOutput = false;
-
-	const flushPendingOutputWrites = () => {
-		flushingOutput = true;
-		try {
-			for (let index = 0; index < pendingOutputWrites.length; index++) {
-				pendingOutputWrites[index]!();
-			}
-		} finally {
-			pendingOutputWrites.length = 0;
-			flushingOutput = false;
-			outputFlushScheduled = false;
-		}
-	};
-
-	const queueOutput = (write: () => void) => {
-		if (flushingOutput || pendingOutputWrites.length > 0) {
-			pendingOutputWrites.push(write);
-		} else {
-			write();
-		}
-	};
-
-	const deferOutput = (write: () => void) => {
-		pendingOutputWrites.push(write);
-		if (!outputFlushScheduled && !flushingOutput) {
-			outputFlushScheduled = true;
-			queueMicrotask(flushPendingOutputWrites);
-		}
-	};
-
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
-		queueOutput(() => {
-			writeRawStdout(serializeJsonLine(obj));
-		});
+		writeRawStdout(serializeJsonLine(obj));
 	};
 
 	const success = <T extends RpcCommand["type"]>(
@@ -191,7 +115,6 @@ export async function runRpcMode(
 		{ resolve: (response: RpcExtensionUIResponse) => void; cancel: () => void }
 	>();
 	let inputEnded = false;
-	const issuedBranchPageCursors = new Map<string, IssuedBranchPageCursor>();
 
 	// Shutdown request flag
 	let shutdownRequested = false;
@@ -224,27 +147,15 @@ export async function runRpcMode(
 				pendingExtensionRequests.delete(id);
 			};
 
-			const resolveDefault = (notifyClient: boolean, timedOut = false) => {
+			const resolveDefault = () => {
 				if (settled) return;
 				settled = true;
 				cleanup();
-				if (notifyClient && !inputEnded) {
-					output({
-						type: "extension_ui_request",
-						id: crypto.randomUUID(),
-						method: "cancel",
-						targetId: id,
-						...(timedOut ? { timedOut: true } : {}),
-					} as RpcExtensionUIRequest);
-				}
 				resolve(defaultValue);
 			};
-			const onAbort = () => {
-				resolveDefault(true);
-			};
+			const onAbort = resolveDefault;
 			opts?.signal?.addEventListener("abort", onAbort, { once: true });
-
-			timeoutId = setTimeout(() => resolveDefault(true, true), timeout);
+			timeoutId = setTimeout(resolveDefault, timeout);
 
 			pendingExtensionRequests.set(id, {
 				resolve: (response: RpcExtensionUIResponse) => {
@@ -253,7 +164,7 @@ export async function runRpcMode(
 					cleanup();
 					resolve(parseResponse(response));
 				},
-				cancel: () => resolveDefault(false),
+				cancel: resolveDefault,
 			});
 			try {
 				output({ type: "extension_ui_request", id, ...request, timeout } as RpcExtensionUIRequest);
@@ -444,21 +355,16 @@ export async function runRpcMode(
 	});
 	runtimeHost.setLifecycleCompleteHandler(() => {
 		void checkShutdownRequested().catch(() => requestShutdown(1));
-		// Shutdown waits a macrotask; report it now so session_ready cannot start a turn first.
 		return shutdownRequested;
 	});
 
 	const rebindSession = async (receiving = runtimeHost.session): Promise<void> => {
-		session.stopMessageEntryIdCapture();
 		unsubscribe?.();
 		unsubscribe = undefined;
 		unsubscribeBackpressure?.();
 		unsubscribeBackpressure = undefined;
-
 		session = receiving;
 		const boundSession = receiving;
-		boundSession.stopMessageEntryIdCapture();
-		issuedBranchPageCursors.clear();
 		await boundSession.bindExtensions({
 			uiContext: createExtensionUIContext(),
 			mode: "rpc",
@@ -498,38 +404,12 @@ export async function runRpcMode(
 		});
 
 		if (runtimeHost.session !== boundSession || boundSession.shutdownSignal.aborted) return;
-		boundSession.startMessageEntryIdCapture();
 		unsubscribe = boundSession.subscribe((event) => {
 			writeRetryNotice(event);
-			const eventSession = boundSession;
-			const writeEvent = (entryId?: string) => {
-				writeRawStdout(
-					serializeJsonLine(entryId !== undefined ? { ...toJsonEvent(event), entryId } : toJsonEvent(event)),
-				);
-				if (event.type === "agent_settled") {
-					void checkShutdownRequested().catch(() => requestShutdown(1));
-				}
-			};
-			const emitEvent = (entryId?: string) => {
-				queueOutput(() => writeEvent(entryId));
-			};
-
-			if (event.type !== "message_end") {
-				emitEvent();
-				return;
+			output(toJsonEvent(event));
+			if (event.type === "agent_settled") {
+				void checkShutdownRequested().catch(() => requestShutdown(1));
 			}
-
-			if (event.message.role === "custom") {
-				const entryId = eventSession.takeMessageEntryId(event.message);
-				if (entryId !== undefined) {
-					emitEvent(entryId);
-					return;
-				}
-			}
-
-			const message = event.message;
-			deferOutput(() => writeEvent(eventSession.takeMessageEntryId(message)));
-			return;
 		});
 		unsubscribeBackpressure = boundSession.agent.subscribe(async () => {
 			await waitForOutputBackpressure();
@@ -625,7 +505,6 @@ export async function runRpcMode(
 			case "new_session": {
 				const options = command.parentSession ? { parentSession: command.parentSession } : undefined;
 				const result = await runtimeHost.newSession(options);
-
 				return success(id, "new_session", result);
 			}
 
@@ -763,8 +642,7 @@ export async function runRpcMode(
 					session.shutdownSignal,
 				);
 
-				// The non-dialog hook can outlive ordinary replacement. Revalidate its captured custody
-				// before either execution or persistence, without switching work to the receiving session.
+				// Revalidate the captured session before execution or persistence after a held hook.
 				if (session !== runtimeHost.session || session.isDisposed)
 					throw new InputAdmissionError(
 						"INPUT_ADMISSION_DISPOSED",
@@ -772,8 +650,8 @@ export async function runRpcMode(
 					);
 				if (session.inputsFenced) throw new InputAdmissionError("INPUT_ADMISSION_FENCED", "bash was not accepted");
 				session.shutdownSignal.throwIfAborted();
-
 				assertCommandSession();
+
 				if (eventResult?.result) {
 					session.recordBashResult(command.command, eventResult.result, {
 						excludeFromContext: command.excludeFromContext,
@@ -811,13 +689,11 @@ export async function runRpcMode(
 
 			case "switch_session": {
 				const result = await runtimeHost.switchSession(command.sessionPath);
-
 				return success(id, "switch_session", result);
 			}
 
 			case "fork": {
 				const result = await runtimeHost.fork(command.entryId);
-
 				return success(id, "fork", { text: result.selectedText, cancelled: result.cancelled });
 			}
 
@@ -827,7 +703,6 @@ export async function runRpcMode(
 					return error(id, "clone", "Cannot clone session: no current entry selected");
 				}
 				const result = await runtimeHost.fork(leafId, { position: "at" });
-
 				return success(id, "clone", { cancelled: result.cancelled });
 			}
 
@@ -847,162 +722,6 @@ export async function runRpcMode(
 					entries = entries.slice(sinceIndex + 1);
 				}
 				return success(id, "get_entries", { entries, leafId: sessionManager.getLeafId() });
-			}
-
-			case "get_branch_entries_page": {
-				if (!Number.isSafeInteger(command.limit) || command.limit < 1 || command.limit > 256) {
-					return error(id, "get_branch_entries_page", "limit must be a safe integer between 1 and 256");
-				}
-
-				const sessionManager = session.sessionManager;
-				const leafId = command.leafId ?? sessionManager.getLeafId();
-				if (leafId === null) {
-					if (command.before !== undefined) {
-						return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
-					}
-					return success(id, "get_branch_entries_page", { entries: [], leafId, complete: true });
-				}
-
-				const leaf = sessionManager.getEntry(leafId);
-				if (!leaf) {
-					return error(id, "get_branch_entries_page", `Leaf not found: ${leafId}`);
-				}
-
-				let current: typeof leaf | undefined = leaf;
-				let traversal: BranchPageTraversalState | undefined;
-				let currentWasPrevisited = false;
-				if (command.before !== undefined) {
-					const cursor = sessionManager.getEntry(command.before);
-					if (!cursor) {
-						return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
-					}
-
-					const issuedCursor = issuedBranchPageCursors.get(leafId);
-					if (issuedCursor?.cursor === command.before && issuedCursor.nextEntryId === cursor.parentId) {
-						issuedBranchPageCursors.delete(leafId);
-						issuedBranchPageCursors.set(leafId, issuedCursor);
-						traversal = issuedCursor.traversal;
-						currentWasPrevisited = true;
-					} else {
-						const visitedAncestorIds = new Set<string>();
-						let ancestor = leaf;
-						while (true) {
-							if (ancestor.parentId === ancestor.id || !visitedAncestorIds.add(ancestor.id)) {
-								return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
-							}
-							traversal = advanceBranchPageTraversal(traversal, ancestor.id);
-							if (!traversal) {
-								return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
-							}
-							if (ancestor.id === cursor.id) {
-								break;
-							}
-							if (!ancestor.parentId) {
-								return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
-							}
-							const parent = sessionManager.getEntry(ancestor.parentId);
-							if (!parent) {
-								return error(id, "get_branch_entries_page", `Cursor not found in branch: ${command.before}`);
-							}
-							if (visitedAncestorIds.has(parent.id)) {
-								return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
-							}
-							ancestor = parent;
-						}
-					}
-
-					current = cursor.parentId ? sessionManager.getEntry(cursor.parentId) : undefined;
-				}
-
-				const completeResponseEnvelopeBytes = Buffer.byteLength(
-					serializeJsonLine(success(id, "get_branch_entries_page", { entries: [], leafId, complete: true })),
-				);
-				const incompleteResponseEnvelopeBytes = Buffer.byteLength(
-					serializeJsonLine(
-						success(id, "get_branch_entries_page", {
-							entries: [],
-							leafId,
-							nextCursor: "",
-							complete: false,
-						}),
-					),
-				);
-				const entries: (typeof leaf)[] = [];
-				const visitedEntryIds = new Set<string>();
-				let serializedEntriesBytes = 0;
-				while (current && entries.length < command.limit) {
-					if (current.parentId === current.id || !visitedEntryIds.add(current.id)) {
-						return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
-					}
-					const serializedEntry = JSON.stringify(current);
-					if (serializedEntry === undefined) {
-						return error(id, "get_branch_entries_page", "Branch entry could not be serialized");
-					}
-					const entryBytes = Buffer.byteLength(serializedEntry);
-					const atRoot = current.parentId === null;
-					const responseEnvelopeBytes = atRoot
-						? completeResponseEnvelopeBytes
-						: incompleteResponseEnvelopeBytes + Buffer.byteLength(JSON.stringify(current.id)) - 2;
-					const candidateEntriesBytes = serializedEntriesBytes + (entries.length > 0 ? 1 : 0) + entryBytes;
-					if (responseEnvelopeBytes + candidateEntriesBytes > BRANCH_PAGE_SERIALIZED_RESPONSE_TARGET_BYTES) {
-						if (entries.length === 0) {
-							return error(
-								id,
-								"get_branch_entries_page",
-								"Branch entry exceeds the 32 MiB serialized response target",
-							);
-						}
-						break;
-					}
-
-					if (!currentWasPrevisited) {
-						traversal = advanceBranchPageTraversal(traversal, current.id);
-						if (!traversal) {
-							return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
-						}
-					}
-					currentWasPrevisited = false;
-					entries.push(current);
-					serializedEntriesBytes = candidateEntriesBytes;
-					if (current.parentId !== null && visitedEntryIds.has(current.parentId)) {
-						return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
-					}
-					if (current.parentId === null) {
-						current = undefined;
-					} else if (entries.length < command.limit) {
-						current = sessionManager.getEntry(current.parentId);
-					}
-				}
-				const complete = current === undefined;
-				entries.reverse();
-				const nextCursorEntry = complete ? undefined : entries[0];
-				const nextCursor = nextCursorEntry?.id;
-				if (complete) {
-					issuedBranchPageCursors.delete(leafId);
-				} else if (nextCursorEntry && nextCursorEntry.parentId !== null && traversal) {
-					const nextTraversal = advanceBranchPageTraversal(traversal, nextCursorEntry.parentId);
-					if (!nextTraversal) {
-						return error(id, "get_branch_entries_page", "Session branch contains a parent cycle");
-					}
-					issuedBranchPageCursors.delete(leafId);
-					issuedBranchPageCursors.set(leafId, {
-						cursor: nextCursorEntry.id,
-						nextEntryId: nextCursorEntry.parentId,
-						traversal: nextTraversal,
-					});
-					if (issuedBranchPageCursors.size > MAX_ISSUED_BRANCH_PAGE_LEAVES) {
-						const oldestLeafId = issuedBranchPageCursors.keys().next().value;
-						if (oldestLeafId !== undefined) {
-							issuedBranchPageCursors.delete(oldestLeafId);
-						}
-					}
-				}
-				return success(id, "get_branch_entries_page", {
-					entries,
-					leafId,
-					...(nextCursor !== undefined ? { nextCursor } : {}),
-					complete,
-				});
 			}
 
 			case "get_tree": {
@@ -1082,39 +801,27 @@ export async function runRpcMode(
 	 */
 	let detachInput = () => {};
 
-	// Read input before session_start handlers can await extension UI. Ordinary
-	// commands wait for the initial bind, while UI responses resolve immediately.
+	// Read before session_start can await extension UI. Ordinary commands wait for binding.
 	let extensionBindingsComplete = false;
 	let initialBindingWork: Promise<void> | undefined;
 	let drainingStartupCommands = false;
-
 	let startupFatal = false;
 	let startupInputCount = 0;
 	let startupInputBytes = 0;
 	let startupCommands: RpcCommand[] = [];
 	const pendingCommandWork = new Set<Promise<void>>();
-	// Keep actual work and its originating owner, not just the cancellable disposition wait.
 	const pendingOperations = new Map<Promise<RpcResponse | undefined>, AgentSession>();
 	const pendingPromptWork = new Map<Promise<void>, AgentSession>();
 
 	const cancelPendingExtensionRequests = () => {
-		for (const pending of [...pendingExtensionRequests.values()]) {
-			pending.cancel();
-		}
+		for (const pending of [...pendingExtensionRequests.values()]) pending.cancel();
 	};
 
 	const failStartupOverflow = () => {
 		if (startupFatal) return;
 		startupFatal = true;
 		inputEnded = true;
-		output({
-			type: "response",
-			command: "parse",
-			success: false,
-			fatal: true,
-			error: "RPC startup command queue limit exceeded",
-		} satisfies RpcFatalErrorResponse);
-		// Keep correlated backlog refusals for shutdown; overflow must cancel binding now.
+		output(error(undefined, "parse", "RPC startup command queue limit exceeded"));
 		detachInput();
 		process.stdin.pause();
 		cancelPendingExtensionRequests();
@@ -1124,16 +831,13 @@ export async function runRpcMode(
 	function shutdown(exitCode = 0): Promise<never> {
 		if (shutdownPromise) return shutdownPromise;
 		shutdownPromise = (async (): Promise<never> => {
-			// Cancel before joining commands or the run; retain subscriptions for final events.
-			for (const owner of new Set([session, ...pendingOperations.values()])) {
-				owner.cancelForShutdown();
-			}
+			// Cancel before joining held work; retain subscriptions for final events.
+			for (const owner of new Set([session, ...pendingOperations.values()])) owner.cancelForShutdown();
 			transportCancellation.abort(session.shutdownSignal.reason);
 			if (inputEnded || startupFatal) {
 				detachInput();
 				process.stdin.pause();
 			}
-			// Protect backlog refusal too: malformed records must never bypass cleanup.
 			try {
 				for (const command of startupCommands.splice(0)) {
 					output(
@@ -1145,12 +849,9 @@ export async function runRpcMode(
 					);
 				}
 				cancelPendingExtensionRequests();
-				// Terminal cancellation/join also covers an active lifecycle transition.
 				await runtimeHost.dispose({
 					terminal: true,
 					beforeShutdown: async () => {
-						// Keep initial bind and already-started non-input command responses intact,
-						// but only join them after native admission/settlement cancellation.
 						try {
 							await initialBindingWork;
 						} catch (cause) {
@@ -1185,25 +886,21 @@ export async function runRpcMode(
 				});
 				await waitForPendingCommandWork(true);
 			} catch (cause) {
-				output({
-					type: "response",
-					command: "parse",
-					success: false,
-					fatal: true,
-					error: `RPC shutdown failed: ${cause instanceof Error ? cause.message : String(cause)}`,
-				} satisfies RpcFatalErrorResponse);
+				output(
+					error(
+						undefined,
+						"parse",
+						`RPC shutdown failed: ${cause instanceof Error ? cause.message : String(cause)}`,
+					),
+				);
 				exitCode = 1;
 			}
-			for (const cleanup of signalCleanupHandlers) {
-				cleanup();
-			}
-			session.stopMessageEntryIdCapture();
+			for (const cleanup of signalCleanupHandlers) cleanup();
 			unsubscribe?.();
 			unsubscribeBackpressure?.();
 			detachInput();
 			process.stdin.pause();
-			// Journal persistence above is independent of delivery to a stalled reader.
-			// Final drainage has its own budget, not the already-aborted terminal signal.
+			// Persistence is independent of delivery to a stalled reader.
 			const drainage = AbortSignal.timeout(1000);
 			try {
 				await raceWithAbortSignal(flushRawStdout(), drainage);
@@ -1233,8 +930,7 @@ export async function runRpcMode(
 			runtimeHost.inputsFenced
 		)
 			return;
-		// Let completing commands publish their one response, but never join held
-		// dispatch before shutdown starts its cancellation and bounded command deadline.
+		// Let completing commands publish their one response before cancellation starts.
 		await new Promise<void>((resolve) => setImmediate(resolve));
 		if (!session.isIdle || session.isSettling || runtimeHost.inputsFenced) return;
 		await shutdown();
@@ -1247,7 +943,6 @@ export async function runRpcMode(
 			dispositionSent = true;
 			output(response);
 		};
-		// Register the owner before dispatch can yield or invoke extension code.
 		const operation = Promise.resolve().then(() => {
 			transportCancellation.signal.throwIfAborted();
 			return handleCommand(command, commandSession, respond);
@@ -1286,8 +981,6 @@ export async function runRpcMode(
 	};
 
 	const waitForPendingCommandWork = async (includePrompts = false): Promise<void> => {
-		// Startup draining waits for command responses, not complete agent runs.
-		// Shutdown also joins aborted prompt work so its correlated refusals are flushed.
 		while (pendingCommandWork.size > 0 || (includePrompts && pendingPromptWork.size > 0)) {
 			await Promise.allSettled([...pendingCommandWork, ...(includePrompts ? pendingPromptWork.keys() : [])]);
 		}
@@ -1295,12 +988,10 @@ export async function runRpcMode(
 
 	const handleInputLine = async (line: string, rawFramedByteLength?: number) => {
 		if (startupFatal) return;
-
 		const isStartupInput = !extensionBindingsComplete || drainingStartupCommands;
 		let inputBytes = 0;
 		let usesStartupResponseReserve = false;
 		if (isStartupInput) {
-			// Reserve raw frame bytes before parsing; invalid UTF-8 can expand when decoded.
 			inputBytes = rawFramedByteLength ?? Buffer.byteLength(line);
 			if (
 				startupInputCount < MAX_QUEUED_STARTUP_COMMANDS &&
@@ -1315,7 +1006,6 @@ export async function runRpcMode(
 				return;
 			}
 		}
-
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(line);
@@ -1334,8 +1024,7 @@ export async function runRpcMode(
 			await waitForOutputBackpressure();
 			return;
 		}
-
-		// UI responses must not wait for session_start to finish binding extensions.
+		// Startup UI responses must not wait for session_start to finish.
 		if (
 			typeof parsed === "object" &&
 			parsed !== null &&
@@ -1356,12 +1045,10 @@ export async function runRpcMode(
 			}
 			return;
 		}
-
 		if (usesStartupResponseReserve) {
 			failStartupOverflow();
 			return;
 		}
-
 		if (
 			typeof parsed !== "object" ||
 			parsed === null ||
@@ -1393,21 +1080,15 @@ export async function runRpcMode(
 			return;
 		}
 		if (
-			command &&
-			typeof command === "object" &&
 			(command.type === "prompt" || command.type === "steer" || command.type === "follow_up") &&
 			typeof command.message === "string"
 		) {
 			receivedCommands.set(command, receiveInput(command.message, command.images));
 		}
-
-		// Once bound, incoming commands may unblock pending startup work.
-		// Startup byte/count limits above still apply until that work settles.
 		if (!extensionBindingsComplete) {
 			startupCommands.push(command);
 			return;
 		}
-
 		await trackCommandInput(command);
 	};
 
@@ -1439,7 +1120,6 @@ export async function runRpcMode(
 	})();
 
 	registerSignalHandlers();
-	// Publish the join before hooks can synchronously close input or overflow it.
 	initialBindingWork = Promise.resolve().then(() => rebindSession());
 	try {
 		await initialBindingWork;
@@ -1448,7 +1128,6 @@ export async function runRpcMode(
 	}
 	if (shutdownPromise) return shutdownPromise;
 	if (startupFatal) return shutdown(1);
-
 	extensionBindingsComplete = true;
 	drainingStartupCommands = true;
 	while (!startupFatal && !shutdownPromise) {
@@ -1461,7 +1140,6 @@ export async function runRpcMode(
 			}
 			await Promise.resolve();
 		}
-		// EOF fences native work before joining potentially held startup input.
 		if (inputEnded) return shutdown();
 		await waitForPendingCommandWork(true);
 		if (startupCommands.length === 0) break;
@@ -1470,11 +1148,7 @@ export async function runRpcMode(
 	drainingStartupCommands = false;
 	startupInputCount = 0;
 	startupInputBytes = 0;
-	if (inputEnded) {
-		requestShutdown();
-	}
-
+	if (inputEnded) requestShutdown();
 	await checkShutdownRequested();
-	// Keep process alive forever
 	return new Promise(() => {});
 }

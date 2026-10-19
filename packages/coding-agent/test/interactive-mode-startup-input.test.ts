@@ -18,7 +18,6 @@ type SubmitContext = {
 	dispatchEditorInput(this: SubmitContext, input: ReceivedInput): Promise<void>;
 	submitEditorInput(this: SubmitContext, input: ReceivedInput): void;
 	flushPendingBashComponents: () => void;
-	/** No Herdr enrollment in these tests (smarty-dev#2636). */
 	captureHerdrSubmit: () => undefined;
 	onInputCallback?: (input: ReceivedInput) => void;
 	pendingUserInputs: ReceivedInput[];
@@ -48,7 +47,6 @@ const interactiveModePrototype = InteractiveMode.prototype as unknown as Interac
 
 function createSubmitContext(): SubmitContext {
 	return {
-		// smarty-dev#3048, PR #110 R2-7: match the native runtime admission contract.
 		runtimeHost: { inputsFenced: false },
 		defaultEditor: {},
 		editor: {

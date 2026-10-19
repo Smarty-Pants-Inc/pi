@@ -6,7 +6,6 @@ import { createInMemoryModelRegistry } from "./model-runtime-test-utils.ts";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ImageContent } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
 import { createEventBus } from "../src/core/event-bus.ts";
@@ -23,7 +22,6 @@ import type {
 	ExtensionFactory,
 	ExtensionUIContext,
 	ProviderConfig,
-	ToolPartialResultEventResult,
 } from "../src/core/extensions/types.ts";
 import { KeybindingsManager, type KeyId } from "../src/core/keybindings.ts";
 import type { ModelRegistry } from "../src/core/model-registry.ts";
@@ -113,110 +111,6 @@ describe("ExtensionRunner", () => {
 		getSystemPrompt: () => "",
 		getScopedModels: () => [],
 	};
-
-	describe("native nested parent lifetime", () => {
-		function makeRunner(executeTool: NonNullable<ExtensionContextActions["executeTool"]>) {
-			const runner = new ExtensionRunner([], createExtensionRuntime(), tempDir, sessionManager, modelRegistry);
-			runner.bindCore(extensionActions, { ...extensionContextActions, executeTool });
-			return runner;
-		}
-		const result = { content: [], details: {} };
-		const outcome = {
-			toolCall: { type: "toolCall" as const, id: "parent/1", name: "child", arguments: {} },
-			result,
-			isError: false,
-		};
-
-		it("rejects retained contexts after parent settlement even without a nested call", async () => {
-			const execute = vi.fn(async () => outcome);
-			const runner = makeRunner(execute);
-			const ctx = runner.createToolContext("parent", undefined);
-			await runner.emitToolResult({
-				type: "tool_result",
-				toolCallId: "parent",
-				toolName: "parent",
-				input: {},
-				...result,
-				isError: false,
-			});
-			await expect(ctx.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
-			expect(execute).not.toHaveBeenCalled();
-		});
-
-		it.each(["tool_execution_end", "agent_end"] as const)(
-			"closes retained contexts at %s without result hooks",
-			async (type) => {
-				const execute = vi.fn(async () => outcome);
-				const runner = makeRunner(execute);
-				const ctx = runner.createToolContext("parent", undefined);
-				if (type === "agent_end") await runner.emit({ type, messages: [] });
-				else await runner.emit({ type, toolCallId: "parent", toolName: "parent", result, isError: false });
-				await expect(ctx.executeTool("child", {})).rejects.toThrow(/closed|settled/i);
-				expect(execute).not.toHaveBeenCalled();
-			},
-		);
-
-		it("does not let a fresh child signal bypass parent cancellation", async () => {
-			const execute = vi.fn(async () => outcome);
-			const runner = makeRunner(execute);
-			const parent = new AbortController();
-			const ctx = runner.createToolContext("parent", parent.signal);
-			parent.abort();
-			await expect(ctx.executeTool("child", {}, { signal: new AbortController().signal })).rejects.toThrow();
-			expect(execute).not.toHaveBeenCalled();
-		});
-
-		it("closes admission and drains accepted children before parent result hooks", async () => {
-			let release!: () => void;
-			const held = new Promise<void>((resolve) => {
-				release = resolve;
-			});
-			const execute = vi.fn(async () => {
-				await held;
-				return outcome;
-			});
-			const runner = makeRunner(execute);
-			const ctx = runner.createToolContext("parent", undefined);
-			const child = ctx.executeTool("child", {});
-			let settled = false;
-			const finalization = runner
-				.emitToolResult({
-					type: "tool_result",
-					toolCallId: "parent",
-					toolName: "parent",
-					input: {},
-					...result,
-					isError: false,
-				})
-				.then(() => {
-					settled = true;
-				});
-			try {
-				await new Promise((resolve) => setTimeout(resolve, 10));
-				expect(settled).toBe(false);
-				await expect(ctx.executeTool("late", {})).rejects.toThrow(/closed|settled/i);
-			} finally {
-				release();
-				await Promise.all([child, finalization]);
-			}
-			expect(execute).toHaveBeenCalledTimes(1);
-		});
-
-		it("composes in-flight parent and child cancellation", async () => {
-			let childSignal: AbortSignal | undefined;
-			const runner = makeRunner(async (_id, _name, _args, options) => {
-				childSignal = options.signal;
-				return outcome;
-			});
-			const parent = new AbortController();
-			const child = new AbortController();
-			const ctx = runner.createToolContext("parent", parent.signal);
-			await ctx.executeTool("child", {}, { signal: child.signal });
-			expect(childSignal?.aborted).toBe(false);
-			parent.abort();
-			expect(childSignal?.aborted).toBe(true);
-		});
-	});
 
 	describe("scopedModels", () => {
 		it("reflects the getScopedModels context action on ctx.scopedModels", async () => {
@@ -527,10 +421,7 @@ describe("ExtensionRunner", () => {
 			expect(result.errors).toEqual([
 				{
 					path: extensionPath,
-					// #11897: keep the loader error expectation message-only, without a stack prefix.
-					error: expect.stringContaining(
-						`Failed to load extension: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
-					),
+					error: `Failed to load extension: Tool "noop" registered by extension "${extensionPath}" must define an object parameter schema.`,
 				},
 			]);
 		});
@@ -646,6 +537,33 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("context creation", () => {
+		it("reflects live settlement and pending prompt state on an existing context", async () => {
+			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
+			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
+			const ctx = runner.createContext();
+			expect(ctx.isSettling()).toBe(false);
+			expect(ctx.isPromptPending()).toBe(false);
+
+			let settling = true;
+			let promptPending = false;
+			runner.bindCore(extensionActions, {
+				...extensionContextActions,
+				isSettling: () => settling,
+				isPromptPending: () => promptPending,
+			});
+			expect(ctx.isSettling()).toBe(true);
+			expect(ctx.isPromptPending()).toBe(false);
+
+			settling = false;
+			promptPending = true;
+			expect(ctx.isSettling()).toBe(false);
+			expect(ctx.isPromptPending()).toBe(true);
+
+			runner.bindCore(extensionActions, extensionContextActions);
+			expect(ctx.isSettling()).toBe(false);
+			expect(ctx.isPromptPending()).toBe(false);
+		});
+
 		it("exposes the current abort signal on ExtensionContext", async () => {
 			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
@@ -816,47 +734,6 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("message and entry renderers", () => {
-		// Refs smarty-dev#5049: user-renderer registration follows existing load order and runtime ownership.
-		it("loads a user renderer, keeps the first extension and drops it when reloaded without registration", async () => {
-			const file = path.join(extensionsDir, "a-user-renderer.ts");
-			fs.writeFileSync(file, `export default function(pi) { pi.registerUserMessageRenderer(() => undefined); }`);
-			fs.writeFileSync(
-				path.join(extensionsDir, "b-user-renderer.ts"),
-				`export default function(pi) { pi.registerUserMessageRenderer(() => undefined); }`,
-			);
-			const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-			const runner = new ExtensionRunner(result.extensions, result.runtime, tempDir, sessionManager, modelRegistry);
-			expect(result.errors).toEqual([]);
-			expect(runner.getUserMessageRenderer()).toBe(result.extensions[0].userMessageRenderer);
-			expect(runner.getUserMessageRenderer()).not.toBe(result.extensions[1].userMessageRenderer);
-			fs.writeFileSync(file, `export default function() {}`);
-			fs.writeFileSync(path.join(extensionsDir, "b-user-renderer.ts"), `export default function() {}`);
-			const reloaded = await discoverAndLoadExtensions([], tempDir, tempDir);
-			const next = new ExtensionRunner(
-				reloaded.extensions,
-				reloaded.runtime,
-				tempDir,
-				sessionManager,
-				modelRegistry,
-			);
-			expect(next.getUserMessageRenderer()).toBeUndefined();
-		});
-
-		it("rejects user-renderer registration after runtime invalidation", async () => {
-			const runtime = createExtensionRuntime();
-			let register: (() => void) | undefined;
-			await loadExtensionFromFactory(
-				(pi) => {
-					register = () => pi.registerUserMessageRenderer(() => undefined);
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			runtime.invalidate("stale renderer runtime");
-			expect(() => register?.()).toThrow("stale renderer runtime");
-		});
-
 		it("gets Markdown transformers in extension load order", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -1046,7 +923,12 @@ describe("ExtensionRunner", () => {
 	it("resolves tool renderers in extension load order, each able to defer to the next", async () => {
 		const runtime = createExtensionRuntime();
 		const eventBus = createEventBus();
-		const renderCall = () => ({ render: () => [], invalidate: () => {} });
+		// pi#280 / smarty-dev#3155: prove source-bound wrappers delegate, not just their shape.
+		const component = { render: () => ["delegated extension renderer"], invalidate: () => {} };
+		const renderCall = vi.fn((_args: unknown, _theme: unknown, _context: unknown) => component);
+		const args = { proof: "renderer arguments" };
+		const theme = {} as never;
+		const context = {} as never;
 		const first = await loadExtensionFromFactory(
 			(pi) => pi.registerToolRenderer((toolName, next) => (toolName === "a" ? { renderCall } : next())),
 			tempDir,
@@ -1061,14 +943,21 @@ describe("ExtensionRunner", () => {
 		);
 		const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
 
-		// pi#187: returned renderer callbacks are source-bound wrappers, not the original functions.
+		// Returned renderer callbacks are source-bound wrappers, not the original functions.
 		const firstRenderers = runner.resolveToolRenderers("a", () => undefined);
 		expect(firstRenderers).toEqual({ renderCall: expect.any(Function) });
-		expect(firstRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
+		const firstComponent = firstRenderers!.renderCall!(args, theme, context);
+		expect(renderCall).toHaveBeenCalledExactlyOnceWith(args, theme, context);
+		expect(firstComponent).toBe(component);
+		expect(firstComponent.render(80)).toEqual(["delegated extension renderer"]);
 		expect(runner.resolveToolRenderers("b", () => undefined)).toEqual({ renderShell: "self" });
 		const baseRenderers = runner.resolveToolRenderers("b", () => ({ renderCall }));
 		expect(baseRenderers).toEqual({ renderCall: expect.any(Function) });
-		expect(baseRenderers!.renderCall!({}, {} as never, {} as never).render(80)).toEqual([]);
+		const baseComponent = baseRenderers!.renderCall!(args, theme, context);
+		expect(renderCall).toHaveBeenCalledTimes(2);
+		expect(renderCall).toHaveBeenNthCalledWith(2, args, theme, context);
+		expect(baseComponent).toBe(component);
+		expect(baseComponent.render(80)).toEqual(["delegated extension renderer"]);
 	});
 
 	describe("boundary chaining", () => {
@@ -1184,77 +1073,6 @@ describe("ExtensionRunner", () => {
 			expect(result.valid).toBe(true);
 		});
 
-		// pi#132 R4-6: input handlers see detached images; a late in-place edit leaves the caller's originals intact.
-		it("detaches input images from handlers before exposure and at transform acceptance", async () => {
-			const runtime = createExtensionRuntime();
-			let seen: ImageContent[] | undefined;
-			let returned: ImageContent[] | undefined;
-			const extension = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("input", (event) => {
-						seen = event.images;
-						returned = [{ type: "image", data: "transformed", mimeType: "image/png" }];
-						return { action: "transform", text: event.text, images: returned };
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
-			const original: ImageContent = { type: "image", data: "original", mimeType: "image/png" };
-			const result = await runner.emitInput("text", [original], "interactive");
-			seen![0]!.data = "late edit";
-			seen![0]!.mimeType = "image/gif";
-			returned![0]!.data = "late transform edit";
-			expect(original).toEqual({ type: "image", data: "original", mimeType: "image/png" });
-			expect(result).toMatchObject({ action: "transform", images: [{ data: "transformed" }] });
-		});
-
-		// pi#132 R4-10: an uncloneable in-place draft is reported and isolated; a later handler can still repair.
-		it("isolates an uncloneable in-place draft and lets a later handler repair", async () => {
-			const runtime = createExtensionRuntime();
-			const poison = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("agent_before_settle", (event) => {
-						event.entries.push({ type: "custom", customType: "poison", data: () => undefined });
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-				"<inline:poison>",
-			);
-			let repairSaw: number | undefined;
-			const repair = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("agent_before_settle", (event) => {
-						repairSaw = event.entries.length;
-						return { entries: [{ type: "custom", customType: "repaired" }] };
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-				"<inline:repair>",
-			);
-			const runner = new ExtensionRunner([poison, repair], runtime, tempDir, sessionManager, modelRegistry);
-			const errors: string[] = [];
-			runner.onError((error) => errors.push(error.error));
-
-			const result = await runner.emitBoundary({ type: "agent_before_settle", outcome: "completed" }, () => ({
-				contextEntries: [],
-				contextMessages: [],
-				llmMessages: [],
-				pendingMessages: [],
-				canContinue: false,
-			}));
-
-			expect(errors).toHaveLength(1);
-			expect(repairSaw).toBe(0);
-			expect(result.entries).toMatchObject([{ type: "custom", customType: "repaired" }]);
-		});
-
 		it("keeps shared mutations made before a handler throws", async () => {
 			const runtime = createExtensionRuntime();
 			const extension = await loadExtensionFromFactory(
@@ -1282,174 +1100,6 @@ describe("ExtensionRunner", () => {
 
 			expect(result.entries).toMatchObject([{ type: "custom", customType: "kept" }]);
 			expect(errors).toEqual(["boundary failed"]);
-		});
-	});
-
-	// smarty-dev#13239: partial snapshots must be transformed before any observer sees them.
-	describe("tool_partial_result chaining", () => {
-		const snapshot = () => ({
-			content: [{ type: "text" as const, text: "synthetic-secret" }],
-			details: { raw: true },
-			structuredContent: { raw: "synthetic-secret" },
-		});
-		const event = () => ({
-			type: "tool_partial_result" as const,
-			toolName: "bash",
-			toolCallId: "parent/1",
-			parentToolCallId: "parent",
-			input: {},
-			partialResult: snapshot(),
-		});
-
-		it("composes whole replacements in extension and registration order", async () => {
-			const runtime = createExtensionRuntime();
-			const seen: unknown[] = [];
-			const first = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("tool_partial_result", (e) => {
-						expect(e.parentToolCallId).toBe("parent");
-						return { partialResult: { content: [{ type: "text", text: "[REDACTED]" }], details: undefined } };
-					});
-					pi.on("tool_partial_result", (e) => {
-						seen.push(e.partialResult);
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const second = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("tool_partial_result", (e) => ({
-						partialResult: { ...e.partialResult, structuredContent: { safe: true } },
-					}));
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const runner = new ExtensionRunner([first, second], runtime, tempDir, sessionManager, modelRegistry);
-			const result = await runner.emitToolPartialResult(event());
-			expect(seen).toEqual([{ content: [{ type: "text", text: "[REDACTED]" }], details: undefined }]);
-			expect(result.partialResult).toEqual({
-				content: [{ type: "text", text: "[REDACTED]" }],
-				details: undefined,
-				structuredContent: { safe: true },
-			});
-		});
-
-		it("isolates input and returned snapshots even for a handler returning void", async () => {
-			const runtime = createExtensionRuntime();
-			let retained: unknown;
-			const extension = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("tool_partial_result", (e) => {
-						retained = e.partialResult;
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
-			const original = event();
-			const result = await runner.emitToolPartialResult(original);
-			expect(result.partialResult).toEqual(original.partialResult);
-			expect(retained).not.toBe(original.partialResult);
-			expect(result.partialResult).not.toBe(retained);
-		});
-
-		it.each([{}, { partialResult: undefined }])("accepts documented no-op objects: %j", async (noop) => {
-			const runtime = createExtensionRuntime();
-			const extension = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("tool_partial_result", () => noop);
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
-			const original = event();
-			const result = await runner.emitToolPartialResult(original);
-			expect(result.partialResult).toEqual(original.partialResult);
-		});
-
-		it.each([false, true])("fails closed without secret-bearing diagnostics (async=%s)", async (asyncFailure) => {
-			const runtime = createExtensionRuntime();
-			let laterCalled = false;
-			const extension = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("tool_partial_result", () => {
-						if (asyncFailure) return Promise.reject(new Error("synthetic-secret"));
-						throw new Error("synthetic-secret");
-					});
-					pi.on("tool_partial_result", () => {
-						laterCalled = true;
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
-			const errors: unknown[] = [];
-			runner.onError((error) => errors.push(error));
-			const result = await runner.emitToolPartialResult(event());
-			expect(JSON.stringify([result, errors])).not.toContain("synthetic-secret");
-			expect(result.partialResult?.content).toEqual([
-				{ type: "text", text: "[REDACTED] Partial tool result withheld: handler failed" },
-			]);
-			expect(result.partialResult?.structuredContent).toBeUndefined();
-			expect(result.partialResult?.details).toBeUndefined();
-			expect(errors).toHaveLength(1);
-			expect(laterCalled).toBe(false);
-		});
-
-		it.each([
-			"null",
-			'"synthetic-secret"',
-			"42",
-			"true",
-			"[]",
-			'{"partialResult":null}',
-			'{"partialResult":42}',
-			'{"partialResult":[]}',
-			'{"partialResult":{}}',
-			'{"partialResult":{"content":null}}',
-		])("withholds malformed JavaScript hook results: %s", async (source) => {
-			const runtime = createExtensionRuntime();
-			let laterCalled = false;
-			const extension = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("tool_partial_result", () => JSON.parse(source) as ToolPartialResultEventResult);
-					pi.on("tool_partial_result", () => {
-						laterCalled = true;
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
-			const errors: unknown[] = [];
-			runner.onError((error) => errors.push(error));
-			const result = await runner.emitToolPartialResult(event());
-			expect(JSON.stringify([result, errors])).not.toContain("synthetic-secret");
-			expect(result.partialResult.content).toEqual([
-				{ type: "text", text: "[REDACTED] Partial tool result withheld: handler failed" },
-			]);
-			expect(result.partialResult.details).toBeUndefined();
-			expect(result.partialResult.structuredContent).toBeUndefined();
-			expect(laterCalled).toBe(false);
-		});
-
-		it("withholds an aborted dispatch rather than falling back to the original snapshot", async () => {
-			const runner = new ExtensionRunner([], createExtensionRuntime(), tempDir, sessionManager, modelRegistry);
-			const controller = new AbortController();
-			controller.abort(new Error("synthetic-secret"));
-			const result = await runner.emitToolPartialResult(event(), controller.signal);
-			expect(JSON.stringify(result)).not.toContain("synthetic-secret");
 		});
 	});
 
@@ -1542,71 +1192,6 @@ describe("ExtensionRunner", () => {
 				details: { source: "ext1" },
 				isError: true,
 			});
-		});
-	});
-
-	// smarty-dev#5377: hook snapshots must clone native Errors faithfully. structuredClone
-	// turned an Error subclass into a plain Error without its name or own fields.
-	describe("native Error isolation", () => {
-		class HttpError extends Error {
-			status = 429;
-			constructor(message: string) {
-				super(message);
-				this.name = "HttpError";
-			}
-		}
-
-		it("gives observer and tool_result handlers a faithful, detached Error clone", async () => {
-			const runtime = createExtensionRuntime();
-			const seen: Array<{ event: string; error: unknown }> = [];
-			const extension = await loadExtensionFromFactory(
-				(pi) => {
-					pi.on("tool_execution_end", (event) => {
-						seen.push({
-							event: event.type,
-							error: (event.result as { details: { error: unknown } }).details.error,
-						});
-					});
-					pi.on("tool_result", (event) => {
-						const error = (event.details as { error: HttpError }).error;
-						seen.push({ event: event.type, error });
-						error.status = 500;
-						return { details: event.details };
-					});
-				},
-				tempDir,
-				createEventBus(),
-				runtime,
-			);
-			const runner = new ExtensionRunner([extension], runtime, tempDir, sessionManager, modelRegistry);
-			const errors: string[] = [];
-			runner.onError((error) => errors.push(error.error));
-			const error = new HttpError("rate limited");
-			const result = { content: [], details: { error } };
-
-			await runner.emit({ type: "tool_execution_end", toolCallId: "c1", toolName: "t", result, isError: true });
-			const chained = await runner.emitToolResult({
-				type: "tool_result",
-				toolCallId: "c1",
-				toolName: "t",
-				input: {},
-				...result,
-				isError: true,
-			});
-
-			expect(errors).toEqual([]);
-			expect(seen.map((entry) => entry.event)).toEqual(["tool_execution_end", "tool_result"]);
-			for (const entry of seen) {
-				expect(entry.error).not.toBe(error);
-				expect(entry.error).toBeInstanceOf(HttpError);
-				expect((entry.error as HttpError).name).toBe("HttpError");
-				expect((entry.error as HttpError).message).toBe("rate limited");
-			}
-			expect((seen[0]!.error as HttpError).status).toBe(429);
-			expect(error.status).toBe(429);
-			const returned = (chained?.details as { error: HttpError } | undefined)?.error;
-			expect(returned).toBeInstanceOf(HttpError);
-			expect(returned?.status).toBe(500);
 		});
 	});
 

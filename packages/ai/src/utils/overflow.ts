@@ -49,7 +49,7 @@ import { assistantRecovery, OVERFLOW_PATTERNS } from "./recovery.ts";
  * 1. Send a request that exceeds the model's context window
  * 2. Check the errorMessage in the response
  * 3. Create a regex pattern that matches the error
- * 4. The pattern should be added to OVERFLOW_PATTERNS in this file, or
+ * 4. The pattern should be added to OVERFLOW_PATTERNS in recovery.ts, or
  *    check the errorMessage yourself before calling this function
  *
  * @param message - The assistant message to check
@@ -57,8 +57,8 @@ import { assistantRecovery, OVERFLOW_PATTERNS } from "./recovery.ts";
  * @returns true if the message indicates a context overflow
  */
 export function isContextOverflow(message: AssistantMessage, contextWindow?: number): boolean {
-	// Case 1: the owned recovery decision, classified from the original error before text suppression
-	// (smarty-dev#5822); messages without one are classified from their error text and provider.
+	// Case 1: the owned decision takes precedence over masked or misleading text.
+	// Legacy errors use the same pre-suppression classifier (smarty-dev#5822, pi#280).
 	if (message.stopReason === "error" && assistantRecovery(message).recovery === "context_length_exceeded") {
 		return true;
 	}

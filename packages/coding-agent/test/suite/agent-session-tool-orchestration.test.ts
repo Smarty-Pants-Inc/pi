@@ -105,12 +105,7 @@ describe("AgentSession tool orchestration", () => {
 			(message): message is ToolResultMessage => message.role === "toolResult",
 		);
 		if (!result) throw new Error("No tool result");
-		expect(result.content).toEqual([
-			{
-				type: "text",
-				text: "helped | echo: hi | Tool run_tools not found. Available tools in this session: echo, run_tools",
-			},
-		]);
+		expect(result.content).toEqual([{ type: "text", text: "helped | echo: hi | Tool run_tools not found" }]);
 		const parent = result.toolCallId;
 		expect(toolCalls).toEqual(["run_tools:top", `helper:${parent}`, `echo:${parent}`]);
 		expect(result.nestedCalls?.calls.map((call) => [call.id, call.name, call.status])).toEqual([
@@ -125,6 +120,7 @@ describe("AgentSession tool orchestration", () => {
 		expect(persisted?.type === "message" && persisted.message).toMatchObject({ nestedCalls: result.nestedCalls });
 	});
 
+	// pi#150: nested descendants settle before parent result publication.
 	it("joins fire-and-forget native children before persisting complete parent provenance", async () => {
 		let retained: ExtensionToolContext | undefined;
 		let child: Promise<unknown> | undefined;
@@ -180,7 +176,6 @@ describe("AgentSession tool orchestration", () => {
 		}
 	});
 
-	// smarty-dev#4506 step 2: exercise the real Codemode path without internal mocks.
 	it("registers codemode and tool_search inactive until they are named", async () => {
 		const extensionFactories = [createCodemodeExtension(), createToolSearchExtension()];
 		const plain = await createHarness({ extensionFactories });
@@ -199,7 +194,7 @@ describe("AgentSession tool orchestration", () => {
 		expect(initial.session.getActiveToolNames()).toEqual(["tool_search"]);
 	});
 
-	// pi#150 review R1: nested calls go through the public session.agent hooks, as model-issued calls do.
+	// pi#150 review R1: nested calls go through public session.agent hooks, like model-issued calls.
 	it("applies a public deny and a public redactor to nested calls, keeping parent attribution", async () => {
 		const extensionCalls: string[] = [];
 		const harness = await createHarness({
@@ -233,13 +228,11 @@ describe("AgentSession tool orchestration", () => {
 			if (context.toolCall.name === "echo") return { ...inner, content: [{ type: "text", text: "[redacted]" }] };
 			return inner;
 		};
-
 		harness.setResponses([
 			fauxAssistantMessage([fauxToolCall("run_tools", {})], { stopReason: "toolUse" }),
 			fauxAssistantMessage("done"),
 		]);
 		await harness.session.prompt("go");
-
 		const result = harness.session.messages.find(
 			(message): message is ToolResultMessage => message.role === "toolResult",
 		);
@@ -264,7 +257,7 @@ describe("AgentSession tool orchestration", () => {
 		]);
 	});
 
-	// pi#150 review R6: tool results are left out of the summary prose, but their nested calls name files.
+	// pi#150 review R6: nested calls still name files omitted from tool-result summary prose.
 	it("keeps the files of nested read, edit and write calls in a branch summary", async () => {
 		const harness = await createHarness({
 			initialActiveToolNames: ["read", "edit", "write"],
@@ -305,7 +298,6 @@ describe("AgentSession tool orchestration", () => {
 			(message): message is ToolResultMessage => message.role === "toolResult",
 		);
 		expect(result?.content).toEqual([{ type: "text", text: "failed: 0" }]);
-
 		const firstUser = harness.sessionManager
 			.getBranch()
 			.find((entry) => entry.type === "message" && entry.message.role === "user");
@@ -330,7 +322,7 @@ describe("AgentSession tool orchestration", () => {
 		expect(result && "nestedCalls" in result).toBe(false);
 	});
 
-	// smarty-dev#12837: a timed-out summarizer must not hold admission or persist a late checkpoint.
+	// smarty-dev#12837: a timed-out summarizer cannot hold admission or persist a late checkpoint.
 	it.each([
 		{ phase: "setup", retry: false },
 		{ phase: "result", retry: false },
@@ -344,7 +336,6 @@ describe("AgentSession tool orchestration", () => {
 		harnesses.push(harness);
 		harness.setResponses([fauxAssistantMessage("done")]);
 		await harness.session.prompt("go");
-
 		const firstUser = harness.sessionManager
 			.getBranch()
 			.find((entry) => entry.type === "message" && entry.message.role === "user");
@@ -378,13 +369,11 @@ describe("AgentSession tool orchestration", () => {
 		const navigation = harness.session.navigateTree(firstUser.id, { summarize: true });
 		await requested.promise;
 		expect(harness.session.isCompacting).toBe(true);
-
 		await expect(harness.cleanup()).resolves.toBeUndefined();
 		await expect(navigation).resolves.toMatchObject({ cancelled: true, aborted: true });
 		expect(requestSignal?.aborted).toBe(true);
 		expect(harness.session.isIdle).toBe(true);
 		expect(() => harness.session.dispose()).not.toThrow();
-
 		setup.resolve(stream);
 		stream.push({ type: "done", reason: "stop", message: fauxAssistantMessage("late summary") });
 		await Promise.resolve();

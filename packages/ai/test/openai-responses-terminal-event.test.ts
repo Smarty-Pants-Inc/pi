@@ -278,7 +278,7 @@ describe("OpenAI Responses terminal event handling", () => {
 		).rejects.toThrow("OpenAI Responses stream completed with an unfinished tool call: bash (call_a|fc_a)");
 	});
 
-	// smarty-dev#5822 C1: one owned notification per event, never the raw event or model.
+	// smarty-dev#5822 C1: one owned notification per event, never raw event or model.
 	it("notifies once per parsed provider stream event without provider data", async () => {
 		const model = createModel();
 		const context = normalizeContext({
@@ -434,7 +434,6 @@ describe("OpenAI Responses terminal event handling", () => {
 		const output = createOutput(model);
 		const stream = new AssistantMessageEventStream();
 
-		// smarty-dev#5822 (pi#202 round 3): a provider error by origin, with owned text only.
 		await expect(processResponsesStream(createFailedEvents(), output, stream, model)).rejects.toThrow(
 			"Provider request failed",
 		);

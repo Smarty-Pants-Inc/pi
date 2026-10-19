@@ -51,7 +51,6 @@ export class WorkingStatusIndicator extends StatusIndicator {
 export class RetryStatusIndicator extends StatusIndicator {
 	private countdown: CountdownTimer | undefined;
 
-	/** `waitMessage` marks the one-shot wait on a throttled provider limit: `Waiting Ns: <waitMessage>`. */
 	constructor(ui: TUI, attempt: number, maxAttempts: number, delayMs: number, waitMessage?: string) {
 		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
 		const retryMessage = (seconds: number) =>

@@ -41,7 +41,7 @@ while True:
         except OSError:
             pass
     if 0 in ready:
-        # Unbuffered: a buffered readline would hide a second queued line from select().
+        # Buffered readline would hide a second queued line from select().
         data = os.read(0, 65536)
         if not data:
             stdin_open = False

@@ -834,7 +834,7 @@ describe("durable length recovery", () => {
 	it("gives a distinct queued follow-up its own length-recovery budget", async () => {
 		let queued = false;
 		const harness = await createHarness({
-			// #2742: input fits; test the separate length-recovery budgets.
+			// #2742: input fits; test separate length-recovery budgets.
 			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: { compaction: { keepRecentTokens: 1, reserveTokens: 0 } },
 			extensionFactories: [
@@ -1042,7 +1042,7 @@ describe("durable length recovery", () => {
 
 	it("keeps omissions and does not retry when recovery compaction fails", async () => {
 		const harness = await createHarness({
-			// #2742: let the length response, not oversized input, select recovery.
+			// #2742: the length response, not oversized input, selects recovery.
 			models: [{ id: "faux-1", contextWindow: 10_000, maxTokens: 100 }],
 			settings: {
 				compaction: { keepRecentTokens: 1, reserveTokens: 0 },

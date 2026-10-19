@@ -18,10 +18,10 @@ const model: Model<"openai-responses"> = {
 	contextWindow: 100000,
 	maxTokens: 4096,
 };
-// Synthetic, non-secret token: the local fetch stub never contacts an authenticated service.
+// Synthetic token; all provider requests use local fetch stubs.
 const codexToken = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "local-test" } })).toString("base64")}.test`;
 
-// smarty-dev#3200: exercise terminal SSE -> adapter -> AssistantMessage -> retry classifier.
+// smarty-dev#3200: terminal SSE -> adapter -> AssistantMessage -> retry classifier.
 describe("Responses terminal usage replay barrier", () => {
 	it.each([
 		{ api: "responses", terminal: "failed", outputTokens: 1 },
@@ -71,7 +71,7 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.content).toEqual([]);
 		expect(calls).toBe(outputTokens > 0 ? 1 : 3);
-		// smarty-dev#5822 C2: a failed publication carries no wire response id.
+		// smarty-dev#5822 C2: failed publication carries no wire response id.
 		expect(result.responseId).toBeUndefined();
 		expect(result.rawStopReason).toBe(terminal === "incomplete" ? "incomplete.server_error" : "failed");
 		expect(result.usage).toMatchObject({
@@ -84,6 +84,7 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.usage.cost.input).toBeGreaterThan(0);
 		expect(isRetryableAssistantError(result)).toBe(outputTokens === 0);
 	});
+
 	// smarty-dev#3200 / PR #114 round 3: a rejecting observer cannot erase reported generation.
 	it.each([
 		{ api: "responses", terminal: "failed" },
@@ -141,7 +142,7 @@ describe("Responses terminal usage replay barrier", () => {
 		);
 		expect(calls).toBe(1);
 		expect(result.stopReason).toBe("error");
-		// smarty-dev#5822 C1: owned observer-failure text, never the observer's exception text.
+		// smarty-dev#5822 C1: owned observer-failure text, not the observer exception.
 		expect(result.errorMessage).toBe("Provider stream observer failed");
 		expect(result.content).toEqual([]);
 		expect(result.responseId).toBeUndefined();
@@ -149,7 +150,8 @@ describe("Responses terminal usage replay barrier", () => {
 		expect(result.usage.cost.output).toBeGreaterThan(0);
 		expect(isRetryableAssistantError(result)).toBe(false);
 	});
-	// smarty-dev#3200 / PR #114 round 4: rejecting first nonterminal output must not look like transport failure.
+
+	// smarty-dev#3200 / PR #114 round 4: rejected nonterminal output must not look like transport failure.
 	it.each(
 		["responses", "codex"].flatMap((api) =>
 			["text", "reasoning-summary", "reasoning-text", "function", "custom"].map((shape) => ({ api, shape })),
@@ -190,14 +192,12 @@ describe("Responses terminal usage replay barrier", () => {
 				events
 					.map((event, sequence_number) => `data: ${JSON.stringify({ ...event, sequence_number })}\n\n`)
 					.join(""),
-				{
-					headers: { "content-type": "text/event-stream" },
-				},
+				{ headers: { "content-type": "text/event-stream" } },
 			);
 		};
 		let rejections = 0;
 		let notifications = 0;
-		// Notifications carry no event data (smarty-dev#5822 C1): reject the third, which is `rejectType`.
+		// smarty-dev#5822 C1: notifications carry no event data; reject the third notification.
 		const onProviderStreamEvent = async () => {
 			if (++notifications === events.length) {
 				rejections++;

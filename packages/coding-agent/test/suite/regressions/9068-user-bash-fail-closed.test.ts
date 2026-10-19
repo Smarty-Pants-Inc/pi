@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentSessionRuntime } from "../../../src/core/agent-session-runtime.ts";
 import type { ExtensionAPI, UserBashEvent, UserBashEventResult } from "../../../src/core/extensions/types.ts";
-import type { ReceivedInput } from "../../../src/core/received-input.ts";
 import { InteractiveMode } from "../../../src/modes/interactive/interactive-mode.ts";
 import { runRpcMode } from "../../../src/modes/rpc/rpc-mode.ts";
 import { createHarness, type Harness } from "../harness.ts";
@@ -120,17 +119,15 @@ type InteractiveBashContext = {
 	defaultEditor: { onSubmit?: (text: string) => Promise<void> | void };
 	editor: { setText(text: string): void; addToHistory?: (text: string) => void };
 	session: Harness["session"];
-	runtimeHost: AgentSessionRuntime;
+	runtimeHost: Pick<AgentSessionRuntime, "session" | "inputsFenced">;
+	options: Record<string, never>;
+	uncaughtCrash(error: Error): never;
 	sessionManager: Harness["sessionManager"];
 	ui: { requestRender(): void };
 	chatContainer: { addChild(component: unknown): void };
 	pendingMessagesContainer: { addChild(component: unknown): void };
 	pendingBashComponents: unknown[];
 	isBashMode: boolean;
-	options: Record<string, never>;
-	captureHerdrSubmit(this: InteractiveBashContext, text: string): unknown;
-	observeSubmitFailure(error: unknown): void;
-	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(command: string, excludeFromContext?: boolean): Promise<void>;
 	showError(message: string): void;
 	updateEditorBorderColor(): void;
@@ -138,8 +135,6 @@ type InteractiveBashContext = {
 
 const interactiveModePrototype = InteractiveMode.prototype as unknown as {
 	setupEditorSubmitHandler(this: InteractiveBashContext): void;
-	captureHerdrSubmit(this: InteractiveBashContext, text: string): unknown;
-	dispatchEditorInput(this: InteractiveBashContext, input: ReceivedInput): Promise<void>;
 	handleBashCommand(this: InteractiveBashContext, command: string, excludeFromContext?: boolean): Promise<void>;
 };
 
@@ -228,18 +223,20 @@ describe("RPC user_bash failure handling (#9068)", () => {
 	});
 });
 
-describe("Interactive user_bash failure handling (#9068)", () => {
-	test.each([
-		["!pwd", false],
-		["!!pwd", true],
-	])("fails closed for %s when a handler returns an empty result", async (input, excludeFromContext) => {
+describe.each([
+	["!pwd", false],
+	["!!pwd", true],
+] as const)("Interactive user_bash failure handling (#9068): %s", (input, excludeFromContext) => {
+	// pi#280: undefined is the paired local-execution control; invalid results and throws stay fail-closed.
+	test.each(["empty", "throw", "undefined"] as const)("handles a %s hook result", async (outcome) => {
 		const events: UserBashEvent[] = [];
 		const harness = await createHarness({
 			extensionFactories: [
 				(pi) => {
 					pi.on("user_bash", async (event) => {
 						events.push(event);
-						return {} as unknown as UserBashEventResult;
+						if (outcome === "throw") throw new Error("Routing failed");
+						return outcome === "empty" ? ({} as unknown as UserBashEventResult) : undefined;
 					});
 				},
 			],
@@ -247,28 +244,26 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 		const executeBash = vi.spyOn(harness.session, "executeBash").mockResolvedValue(localResult);
 		const context: InteractiveBashContext = {
 			defaultEditor: {},
-			// pi#160: clearing moved to submit time; setText is required by EditorComponent.
 			editor: { setText: vi.fn(), addToHistory: vi.fn() },
 			session: harness.session,
-			runtimeHost: createRuntimeHost(harness),
+			runtimeHost: { session: harness.session, inputsFenced: false },
+			options: {},
+			// Keep the real submit failure observer; replace only its process-exit boundary.
+			uncaughtCrash: (error) => {
+				throw error;
+			},
 			sessionManager: harness.sessionManager,
 			ui: { requestRender: vi.fn() },
 			chatContainer: { addChild: vi.fn() },
 			pendingMessagesContainer: { addChild: vi.fn() },
 			pendingBashComponents: [],
 			isBashMode: true,
-			// pi#160: submit captures the Herdr attestation first; with no attestor it returns undefined.
-			options: {},
-			captureHerdrSubmit: interactiveModePrototype.captureHerdrSubmit,
-			// Surface the real submit failure instead of crash-exiting the test process.
-			observeSubmitFailure: (error) => {
-				throw error;
-			},
-			dispatchEditorInput: interactiveModePrototype.dispatchEditorInput,
 			handleBashCommand: interactiveModePrototype.handleBashCommand,
 			showError: vi.fn(),
 			updateEditorBorderColor: vi.fn(),
 		};
+		// pi#280: submit also needs the real capture/dispatch/observer methods, not just handleBashCommand.
+		Object.setPrototypeOf(context, InteractiveMode.prototype);
 		interactiveModePrototype.setupEditorSubmitHandler.call(context);
 
 		try {
@@ -282,7 +277,15 @@ describe("Interactive user_bash failure handling (#9068)", () => {
 					cwd: harness.sessionManager.getCwd(),
 				},
 			]);
-			expect(executeBash).not.toHaveBeenCalled();
+			expect(context.editor.setText).toHaveBeenCalledWith("");
+			expect(context.editor.addToHistory).toHaveBeenCalledWith(input);
+			expect(executeBash).toHaveBeenCalledTimes(outcome === "undefined" ? 1 : 0);
+			if (outcome === "undefined") {
+				expect(executeBash).toHaveBeenCalledWith("pwd", expect.any(Function), {
+					excludeFromContext,
+					operations: undefined,
+				});
+			}
 		} finally {
 			executeBash.mockRestore();
 			harness.cleanup();

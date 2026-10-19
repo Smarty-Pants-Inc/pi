@@ -149,6 +149,7 @@ describe("#6647 compaction retries transient summarization failures", () => {
 			usage: createUsage(10),
 		};
 		const getCallCount = useScriptedStreamFn(harness, [error]);
+
 		vi.useFakeTimers();
 		const failure = expect(harness.session.compact()).rejects.toThrow("terminated");
 		await vi.advanceTimersByTimeAsync(2000);

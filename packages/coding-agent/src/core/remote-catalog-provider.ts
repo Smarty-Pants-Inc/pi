@@ -191,6 +191,7 @@ export function withRemoteCatalog(
 			// without disabling provider discovery, authentication or other networking.
 			if (process.env.PI_REMOTE_CATALOG !== "1") {
 				await context.publish({
+					persist: null,
 					update: () => {
 						dynamicModels = [];
 					},
@@ -294,6 +295,7 @@ export function withPersonalizedCatalog(
 		refreshModels: async (context) => {
 			if (process.env.PI_REMOTE_CATALOG !== "1") {
 				await context.publish({
+					persist: null,
 					update: () => {
 						personalModels = [];
 					},

@@ -2,7 +2,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { type PiMessagesOptions, stream, streamSimple } from "../src/api/pi-messages.ts";
+import { getApiProvider } from "../src/compat.ts";
 import type { Api, AssistantMessageEvent, Context, Model, StopReason } from "../src/types.ts";
+import { isRetryableAssistantError, retryAssistantCall } from "../src/utils/retry.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 type RecordedRequest = {
@@ -165,7 +167,7 @@ describe("pi-messages", () => {
 		});
 	});
 
-	// smarty-dev#5822 C1: one owned notification per wire event, never the event, gateway field or model.
+	// smarty-dev#5822 C1: one owned notification per event, never provider data.
 	it("notifies once per parsed wire event without provider data", async () => {
 		const wireEvents = [
 			{ type: "start" },
@@ -191,7 +193,144 @@ describe("pi-messages", () => {
 		expect(message.content).toEqual([{ type: "text", text: "Hello", textSignature: undefined }]);
 	});
 
-	// smarty-dev#5822 C1: gateway response headers never reach onResponse.
+	// #3155 F3: rejected terminal observers retain normalized accounting, not private wire data or replayability.
+	it.each([
+		["done", true],
+		["error", true],
+		["done", false],
+		["error", false],
+	] as const)("retains %s usage (observer rejects: %s)", async (terminalType, rejectObserver) => {
+		const privateValue = "synthetic-3155-private-provider-value";
+		const wireUsage = {
+			...usage,
+			cacheRead: -1,
+			cacheWrite: Number.MAX_SAFE_INTEGER + 1,
+			reasoning: 2,
+			cacheWrite1h: 3,
+			cost: { ...usage.cost, cacheRead: "invalid", cacheWrite: -1, providerField: privateValue },
+			providerField: privateValue,
+		};
+		const normalizedUsage = {
+			...usage,
+			cacheRead: 0,
+			cacheWrite: Number.MAX_SAFE_INTEGER,
+			reasoning: 2,
+			cacheWrite1h: 3,
+			cost: { ...usage.cost, cacheRead: 0, cacheWrite: 0 },
+		};
+		const wireEvents = [
+			{ type: "start" },
+			{
+				type: terminalType,
+				reason: terminalType === "done" ? "length" : "error",
+				usage: wireUsage,
+				errorMessage: `upstream overloaded ${privateValue}`,
+				responseId: "resp_3155",
+				gatewayField: privateValue,
+			},
+			// Neither terminal path may parse or observe a trailing event.
+			{ type: "done", reason: "stop", usage: { ...usage, input: 999 } },
+		];
+		let fetchCalls = 0;
+		const calls: unknown[][] = [];
+		const events: AssistantMessageEvent[] = [];
+		const produce = async () => {
+			const eventStream = stream(createModel("https://synthetic.invalid/v1"), normalizeContext(context), {
+				apiKey: "synthetic-3155-api-value",
+				fetch: async () => {
+					fetchCalls++;
+					return new Response(wireEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+				},
+				onProviderStreamEvent: async (...args: unknown[]) => {
+					calls.push(args);
+					if (rejectObserver && calls.length === 2) throw new Error(`upstream overloaded ${privateValue}`);
+				},
+			});
+			for await (const event of eventStream) events.push(event);
+			return eventStream.result();
+		};
+		const message = rejectObserver
+			? await retryAssistantCall(produce, { enabled: true, maxRetries: 2, baseDelayMs: 0 }, undefined)
+			: await produce();
+
+		expect(fetchCalls).toBe(1);
+		expect(calls).toEqual([[{ type: "provider_stream_event" }], [{ type: "provider_stream_event" }]]);
+		expect(events.map((event) => event.type)).toEqual(["start", rejectObserver ? "error" : terminalType]);
+		expect(message.usage).toEqual(normalizedUsage);
+		expect(message.stopReason).toBe(rejectObserver ? "error" : terminalType === "done" ? "length" : "error");
+		expect(events[1]).toMatchObject(
+			rejectObserver || terminalType === "error"
+				? { type: "error", reason: "error", error: { usage: normalizedUsage } }
+				: { type: "done", reason: "length", message: { usage: normalizedUsage } },
+		);
+		expect(message).toMatchObject({ api: "pi-messages", model: "auto", provider: "radius" });
+		if (rejectObserver) {
+			expect(message.errorMessage).toBe("Provider stream observer failed");
+			expect(message.recovery).toEqual({ retryable: false });
+			expect(message.diagnostics).toEqual([
+				{ type: "provider_stream_observer_error", timestamp: expect.any(Number) },
+			]);
+			expect(message.responseId).toBeUndefined();
+			expect(isRetryableAssistantError(message)).toBe(false);
+		} else if (terminalType === "done") {
+			expect(message.responseId).toBe("resp_3155");
+			expect(message.errorMessage).toBeUndefined();
+			expect(message.recovery).toBeUndefined();
+		} else {
+			expect(message.errorMessage).toBe("Provider request failed: network or server error");
+			expect(message.recovery).toEqual({ recovery: "retryable", retryable: true });
+			expect(message.responseId).toBeUndefined();
+		}
+		expect(JSON.stringify({ message, events, calls })).not.toContain(privateValue);
+	});
+
+	// #3155 F3: usage on a rejected nonterminal event or an unread terminal is not billable evidence.
+	it("does not fabricate usage or replay after a nonterminal observer rejection", async () => {
+		const wireEvents = [
+			{ type: "start" },
+			{ type: "text_start", contentIndex: 0, usage },
+			{ type: "done", reason: "stop", usage },
+		];
+		let fetchCalls = 0;
+		let notifications = 0;
+		const events: AssistantMessageEvent[] = [];
+		const message = await retryAssistantCall(
+			async () => {
+				const eventStream = stream(createModel("https://synthetic.invalid/v1"), normalizeContext(context), {
+					apiKey: "synthetic-3155-api-value",
+					fetch: async () => {
+						fetchCalls++;
+						return new Response(wireEvents.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""));
+					},
+					onProviderStreamEvent: async () => {
+						if (++notifications === 2) throw new Error("upstream overloaded");
+					},
+				});
+				for await (const event of eventStream) events.push(event);
+				return eventStream.result();
+			},
+			{ enabled: true, maxRetries: 2, baseDelayMs: 0 },
+			undefined,
+		);
+
+		expect(fetchCalls).toBe(1);
+		expect(notifications).toBe(2);
+		expect(events.map((event) => event.type)).toEqual(["start", "error"]);
+		expect(message.stopReason).toBe("error");
+		expect(message.usage).toEqual({
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		expect(message.errorMessage).toBe("Provider stream observer failed");
+		expect(message.recovery).toEqual({ retryable: false });
+		expect(message.diagnostics).toEqual([{ type: "provider_stream_observer_error", timestamp: expect.any(Number) }]);
+		expect(isRetryableAssistantError(message)).toBe(false);
+	});
+
 	it("appends debug=1 and reports only the status via onResponse", async () => {
 		const { baseUrl, requests } = await startServer({
 			headers: { "x-pi-gateway-upstream-provider": "anthropic" },
@@ -224,9 +363,8 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "stale" }).result();
 
 		expect(message.stopReason).toBe("error");
-		// smarty-dev#5822 (pi#202 round 2): owned text; the backend message never reaches errorMessage.
+		// smarty-dev#5822: no backend text, URL, status or body in diagnostics.
 		expect(message.errorMessage).toBe("Provider request failed (HTTP 401, unauthorized)");
-		// smarty-dev#5822 N5682: the owned type only, without the URL, status or body.
 		expect(message.diagnostics).toEqual([{ type: "pi_messages_response_failure", timestamp: expect.any(Number) }]);
 	});
 
@@ -239,7 +377,7 @@ describe("pi-messages", () => {
 		const message = await stream(model, normalizeContext(context), { apiKey: "test-key" }).result();
 
 		expect(message.stopReason).toBe("error");
-		// smarty-dev#5822 (pi#202 round 3): the wire error text only classifies; the published text is owned.
+		// smarty-dev#5822: wire text only classifies; published text is owned.
 		expect(message.errorMessage).toBe("Provider request failed");
 		expect(message.usage).toEqual(usage);
 	});
@@ -272,7 +410,6 @@ describe("pi-messages", () => {
 
 describe("pi-messages api registration", () => {
 	it("is registered as a builtin api provider", async () => {
-		const { getApiProvider } = await import("../src/compat.ts");
 		expect(getApiProvider("pi-messages")).toBeDefined();
 	});
 

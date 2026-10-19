@@ -2,7 +2,6 @@
  * CLI argument parsing and help display
  */
 
-import { isAbsolute, normalize } from "node:path";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import chalk from "chalk";
 import { APP_NAME, CONFIG_DIR_NAME, ENV_AGENT_DIR, ENV_SESSION_DIR } from "../config.ts";
@@ -31,8 +30,6 @@ export interface Args {
 	sessionId?: string;
 	fork?: string;
 	sessionDir?: string;
-	/** Explicit qualified Linux owner profile. Omission leaves owned mode off. */
-	ownerHostProfile?: string;
 	models?: string[];
 	tools?: string[];
 	excludeTools?: string[];
@@ -159,32 +156,6 @@ export function parseArgs(args: string[]): Args {
 			result.fork = args[++i];
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
 			result.sessionDir = args[++i];
-		} else if (arg === "--owner-host-profile") {
-			const profile = args[i + 1];
-			if (
-				profile === undefined ||
-				!isAbsolute(profile) ||
-				normalize(profile) !== profile ||
-				profile === "/" ||
-				/[\x00-\x1f\x7f@]/.test(profile)
-			) {
-				result.diagnostics.push({
-					type: "error",
-					message: "--owner-host-profile requires a canonical absolute file path",
-				});
-			} else {
-				i++;
-				if (result.ownerHostProfile !== undefined) {
-					result.diagnostics.push({ type: "error", message: "--owner-host-profile must be supplied once" });
-				} else {
-					result.ownerHostProfile = profile;
-				}
-			}
-		} else if (arg.startsWith("--owner-host-profile=")) {
-			result.diagnostics.push({
-				type: "error",
-				message: "Use --owner-host-profile followed by a separate absolute path argument",
-			});
 		} else if (arg === "--models" && i + 1 < args.length) {
 			result.models = args[++i]
 				.split(",")
@@ -357,7 +328,6 @@ ${chalk.bold("Options:")}
   --session-id <id>              Use exact project session ID, creating it if missing
   --fork <path|id>               Fork specific session file or partial UUID into a new session
   --session-dir <dir>            Directory for session storage and lookup
-  --owner-host-profile <path>    Explicit qualified Linux owner profile (absolute path; off by default)
   --no-session                   Don't save session (ephemeral)
   --no-auto-compaction           Disable automatic compaction for this run without saving settings
   --max-provider-requests <N>     Cap all physical provider requests in print/JSON mode (default: unlimited)

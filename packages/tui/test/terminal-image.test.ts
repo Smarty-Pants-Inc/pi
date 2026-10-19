@@ -292,6 +292,7 @@ describe("detectCapabilities", () => {
 		});
 	});
 
+	// smarty-dev#2636: explicit Herdr graphics marker and legacy hyperlink-only panes.
 	it("enables Kitty images and hyperlinks with the explicit Herdr marker", () => {
 		assert.deepStrictEqual(
 			withEnv({ TERM_PROGRAM: "herdr", COLORTERM: "truecolor" }, () => detectCapabilities()),

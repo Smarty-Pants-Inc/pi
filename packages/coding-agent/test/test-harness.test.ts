@@ -104,8 +104,7 @@ describe("test harness", () => {
 
 	it("retry on transient error", async () => {
 		harness = await createHarness({
-			// smarty-dev#3200: retry requires no reported generation; faux defaults to 50 output tokens.
-			responses: [{ error: "overloaded_error", usage: { output: 0 } }, "recovered"],
+			responses: [{ error: "overloaded_error" }, "recovered"],
 			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
 		});
 
@@ -119,6 +118,37 @@ describe("test harness", () => {
 		const retryEnds = harness.eventsOfType("auto_retry_end");
 		expect(retryEnds).toHaveLength(1);
 		expect(retryEnds[0].success).toBe(true);
+		// pi#280: the default empty failure must not invent generated output.
+		const failed = harness
+			.eventsOfType("message_end")
+			.find((event) => event.message.role === "assistant" && event.message.stopReason === "error")?.message;
+		expect(failed).toMatchObject({ content: [], usage: { output: 0 }, errorMessage: "overloaded_error" });
+		expect(harness.eventsOfType("agent_end").map((event) => event.willRetry)).toEqual([true, false]);
+		expect(harness.eventsOfType("agent_settled")).toHaveLength(1);
+	});
+
+	// pi#280: paired controls keep the retained no-output retry contract authoritative.
+	it.each([
+		{ label: "reported output tokens", response: { usage: { output: 1 } } },
+		{ label: "partial answer", response: { text: "already visible" } },
+		{ label: "partial reasoning", response: { thinking: "already generated" } },
+	])("does not retry a transient error with $label", async ({ response }) => {
+		harness = await createHarness({
+			responses: [{ error: "overloaded_error", ...response }, "must not run"],
+			settings: { retry: { enabled: true, maxRetries: 3, baseDelayMs: 1 } },
+		});
+
+		await harness.session.prompt("hi");
+
+		expect(harness.faux.callCount).toBe(1);
+		expect(harness.eventsOfType("auto_retry_start")).toEqual([]);
+		expect(harness.eventsOfType("auto_retry_end")).toEqual([]);
+		expect(harness.eventsOfType("agent_end").map((event) => event.willRetry)).toEqual([false]);
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "overloaded_error",
+		});
 	});
 
 	it("custom usage numbers", async () => {

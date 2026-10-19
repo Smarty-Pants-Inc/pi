@@ -1,7 +1,5 @@
 # @earendil-works/pi-codemode
 
-> **Fork security admission:** Codemode is re-enabled after the pi#203 internal repairs (smarty-dev#4506 step 2). The CLI registers `codemode` inactive; enable it with `--tools codemode` or the `defaultTools` setting. SDK factories and standalone sandbox APIs work again. MCP remains refused, including from Codemode scripts. See `packages/coding-agent/docs/security-reenable.md`.
-
 Runs model-written JavaScript in a QuickJS VM (compiled to WebAssembly) where the only capability is calling injected tools. Nested tool calls never enter the LLM context; only the script's output and return value do.
 
 Scripts use `tools`, `ALL_TOOLS`, `text`, `image`, `exit`, `store`, and `load`, and may start with a `// @options:` line. The coding agent uses it for its built-in `codemode` tool. It has no pi dependencies and can be used on its own to expose any functions (remote APIs, MCP servers, application services) to model-written scripts.
@@ -18,11 +16,10 @@ See [Usage on Node and Bun](#usage-on-node-and-bun) and [Usage on Cloudflare Wor
 ## Usage on Node and Bun
 
 ```ts
-import { CodemodeSandbox, DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES } from "@earendil-works/pi-codemode";
+import { CodemodeSandbox } from "@earendil-works/pi-codemode";
 
 const sandbox = new CodemodeSandbox({
 	timeoutMs: 60_000,
-	memoryLimitBytes: DEFAULT_CODEMODE_MEMORY_LIMIT_BYTES, // 256 MiB; callers may only tighten this cap
 	tools: [
 		{
 			name: "read",
@@ -58,9 +55,27 @@ await sandbox.close();
 - `store(key, value)` and `load(key)` read and write JSON values synchronously. See [Store](#store).
 - Nothing else: no timers, `fetch`, `process`, `require`, modules, or `WebAssembly`. `eval` and `Function` work but only produce more code inside the same VM.
 
-The deadline is always finite: a `timeoutMs` above `limits.maxTimeoutMs` (default 30 minutes), `Infinity` included, is clamped to it. `limits` also bounds the characters of each message across the sandbox bridge and of all of them together, the calls one execution may start, and the calls in flight at once (`DEFAULT_CODEMODE_LIMITS`). The worker checks each message before it posts it and the host checks again, so a script over a budget fails with `kind: "limit"` before the host keeps the data. A script that waits on a promise nothing can settle (no tool call pending, and the VM has no timers or I/O) fails right away instead of hanging.
+`timeoutMs: Infinity` disables the deadline; the script then runs until it settles or `signal` aborts it. A script that waits on a promise nothing can settle (no tool call pending, and the VM has no timers or I/O) fails right away instead of hanging.
 
 `memoryLimitBytes` caps the VM's heap. Allocations beyond it fail inside the script as `InternalError: out of memory`.
+
+Aborts, timeouts, and `close()` request worker termination without waiting for the worker to exit. On Bun, a built-in such as a long `String.prototype.indexOf` may not poll QuickJS's interrupt handler, so its worker can keep computing until the built-in returns. Stopping unrefs the worker after requesting termination, because `terminate()` refs it internally. This does not guarantee computation has stopped. On Bun 1.4.0, a pending `terminate()` can still delay host process exit despite `unref()`; cancellation results and `close()` do not wait for it.
+
+Hosts that limit concurrency can track actual worker lifetime with `onWorkerStarted(exited)`, called for each worker started by `execute()` or `start()`. Its promise resolves when that worker exits, not when the script result settles:
+
+```ts
+const workers = new Set<Promise<void>>();
+const sandbox = new CodemodeSandbox({
+	onWorkerStarted(exited) {
+		workers.add(exited);
+		void exited.then(() => workers.delete(exited));
+	},
+});
+```
+
+Keep a concurrency slot occupied until `exited` resolves. `close()` does not wait for these promises.
+
+To enforce an admission limit, pass `acquireWorker()`. It runs synchronously after WASM loading, immediately before each worker is created. Throw to reject the execution without starting a worker; otherwise return a release callback. The sandbox calls it once on actual worker exit or if the worker constructor fails. Share reservation state across sandbox instances, and do not release it when a script result settles.
 
 ## Store
 
@@ -74,7 +89,7 @@ if (result.ok) {
 }
 ```
 
-`load` returns a copy, so mutating it does not change the store. Storing `undefined` deletes the key. A value may be at most `MAX_STORE_VALUE_CHARS` (256 Ki) characters of JSON and all values together at most `MAX_STORE_TOTAL_CHARS` (1 Mi); larger writes throw a `RangeError` inside the script. The host checks the same quotas again on the reported writes, deletions included, and fails the execution with `kind: "limit"` when they do not fit. Before persisting, call `checkCodemodeStoreQuota(current, result.storeWrites)` against the store as it is now, with no `await` between the check and the write, so parallel executions cannot together overfill it.
+`load` returns a copy, so mutating it does not change the store. Storing `undefined` deletes the key. A value may be at most `MAX_STORE_VALUE_CHARS` (256 Ki) characters of JSON and all values together at most `MAX_STORE_TOTAL_CHARS` (1 Mi); larger writes throw a `RangeError` inside the script.
 
 ## Source format
 
@@ -170,7 +185,7 @@ Bind the class with `script_name`. Binding a class exported from the agent's own
 }
 ```
 
-Then replace the sandbox. Tools, options other than `wasm` and `workerUrl`, and results stay the same:
+Then replace the sandbox. Tools, options other than the worker-specific `wasm`, `workerUrl`, `acquireWorker`, and `onWorkerStarted`, and results stay the same:
 
 ```ts
 import type { CodemodeSandboxDurableObject } from "@earendil-works/pi-codemode/cloudflare";
@@ -325,7 +340,7 @@ const run = sandbox.start(code, {
 const result = await run.result;
 ```
 
-A run defaults to the finite `limits.maxTimeoutMs` deadline (30 minutes); a larger `timeoutMs`, including `Infinity`, is clamped to that ceiling. Result numbers must run 1, 2, ... without gaps. The same script, `startedAt`, `seed`, tools (with their `jsName`), globals and store, answered with the same results in the same order, makes the same calls with the same arguments and produces the same output on any VM with the same fingerprint. To end a run with an error the script cannot catch, abort its `signal`.
+A run has no deadline unless `timeoutMs` is given. Result numbers must run 1, 2, ... without gaps. The same script, `startedAt`, `seed`, tools (with their `jsName`), globals and store, answered with the same results in the same order, makes the same calls with the same arguments and produces the same output on any VM with the same fingerprint. To end a run with an error the script cannot catch, abort its `signal`.
 
 ## Results
 
@@ -334,20 +349,11 @@ A run defaults to the finite `limits.maxTimeoutMs` deadline (30 minutes); a larg
 | kind      | meaning                                                                     |
 | --------- | --------------------------------------------------------------------------- |
 | `script`  | the script threw or failed to parse; `stack` points at `codemode.js:<line>` |
-| `timeout` | the deadline expired or the interrupt budget ran out; the VM was stopped    |
-| `aborted` | `options.signal` fired or `close()` was called; the VM was stopped          |
+| `timeout` | the deadline expired or the interrupt budget ran out; VM shutdown was requested |
+| `aborted` | `options.signal` fired or `close()` was called; VM shutdown was requested |
 | `sandbox` | the VM or its transport failed, for example a wasm trap, a missing worker file, or a failed remote |
-| `limit`   | the script went over a `limits` budget or the store quota; the VM was stopped |
 
 `result.output` holds the text and image items in the order the script produced them, also for failed executions. The host keeps all of it until the script ends, so output is limited to `MAX_OUTPUT_CHARS` (16 Mi) characters of text and base64 image data and `MAX_OUTPUT_ITEMS` (100000) items. Past either limit the script fails with a `RangeError`, even if it catches the error. `result.calls` lists every tool call with `status: "ok" | "error" | "cancelled"`. A call that is still running when the script returns (not awaited) is aborted through the tool's `signal` and reported as `cancelled`.
-
-Every backend defaults to a 256 MiB QuickJS heap limit and clamps larger requests to the
-host-owned 256 MiB ceiling. Non-positive and non-finite limits are refused. Remote server
-limits may only tighten this cap; Cloudflare helpers default to 32 MiB. Allocation failures
-return `ok: false` with `out of memory`; a later execution gets a fresh VM. Node workers
-also have V8 `resourceLimits`: the resolved MiB limit plus 48 MiB for old-generation JS,
-and 16 MiB for young-generation JS (64 MiB fixed headroom). Node's guard does not limit
-external/ArrayBuffer or wasm memory; the QuickJS allocator limit remains essential.
 
 ## How it works
 
@@ -363,6 +369,6 @@ The worker keeps script execution off the host thread: QuickJS runs synchronousl
 
 ## Runtime notes
 
-- Works the same on Node and Bun, including memory limits, interrupts, and a catchable `RangeError` for deep recursion (QuickJS's stack guard is enabled; without it the wasm stack overflows and traps).
+- Node and Bun support memory limits, interrupts, and a catchable `RangeError` for deep recursion (QuickJS's stack guard is enabled; without it the wasm stack overflows and traps). Bun may delay worker exit during non-interruptible built-ins; results do not wait for exit.
 - Stack traces use QuickJS frames (`at f (codemode.js:2:31)`), prefixed with `Name: message` like V8. The wrapper prefix shares line 1 with the script, so line numbers are exact; column numbers on line 1 are shifted.
 - QuickJS is an interpreter. Glue code and filtering tool results are fast enough; heavy computation is slower than in V8.

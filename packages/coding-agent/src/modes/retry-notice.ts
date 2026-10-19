@@ -8,10 +8,6 @@ export function writeRetryNotice(event: AgentSessionEvent): void {
 				? `Waiting ${Math.ceil(event.delayMs / 1000)}s: ${event.waitMessage}`
 				: `Retrying (${event.attempt}/${event.maxAttempts}) in ${event.delayMs}ms: ${event.errorMessage}`,
 		);
-	} else if (event.type === "auto_retry_fallback") {
-		console.error(
-			`Failed over from ${event.fromModel} to ${event.toModel} after ${event.attempt} retries: ${event.errorMessage}`,
-		);
 	} else if (event.type === "auto_retry_end" && !event.success) {
 		console.error(`Retry failed after ${event.attempt} retries: ${event.finalError ?? "Unknown error"}`);
 	}

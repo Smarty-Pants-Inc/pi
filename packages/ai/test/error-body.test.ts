@@ -1,7 +1,4 @@
-// Unit tests for the shared provider error normalizer. The SDK shapes (Mistral, openai APIError, @google/genai
-// ApiError, AWS Bedrock ServiceException) still supply the status and the private classification text, but since
-// smarty-dev#5822 (pi#202 round 2) the published text is owned: no provider message or body reaches it.
-
+// smarty-dev#5822: SDK status and private classification text never publish a provider message or body.
 import { describe, expect, it } from "vitest";
 import { formatProviderError, normalizeProviderError, providerErrorText } from "../src/utils/error-body.ts";
 
@@ -82,7 +79,6 @@ describe("formatProviderError (owned text)", () => {
 	it("names the owned recovery class so the text stays classifiable", () => {
 		const overflow = normalizeProviderError(Object.assign(new Error("prompt is too long"), { status: 400 }));
 		expect(formatProviderError(overflow)).toBe("Provider request failed (400): context length exceeded");
-		// A provider response without a status: its parsed error body makes it a provider error, not a local one.
 		const network = normalizeProviderError(
 			Object.assign(new Error(`upstream connect error ${PRIVATE}`), { error: { detail: PRIVATE } }),
 		);
@@ -93,7 +89,7 @@ describe("formatProviderError (owned text)", () => {
 		expect(formatProviderError(premature)).toBe("Provider request failed: stream ended without completing");
 	});
 
-	it("keeps the masked message of a local (Pi or transport) failure, which carries no provider response", () => {
+	it("keeps the masked message of a local failure carrying no provider response", () => {
 		const local = normalizeProviderError(new Error("Request timed out after 50ms"), undefined, undefined, ["k"]);
 		expect(formatProviderError(local, "OpenAI API error")).toBe("Request timed out after 50ms");
 		const masked = normalizeProviderError(new Error("bad header sk-live-5822"), undefined, undefined, [

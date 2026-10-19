@@ -4,7 +4,7 @@
 // representative per tier (Success Criterion 7): a body-blind text provider
 // (openai-completions), a status-only provider (openai-responses), and a
 // body-blind Bedrock provider. Each asserts the resulting errorMessage carries
-// both the HTTP status and the body reason. The image-provider tier is covered
+// the HTTP status as owned text, never the body reason (smarty-dev#5822). The image-provider tier is covered
 // by provider-error-body-passthrough.test.ts; the already-correct happy path
 // (no double body / no duplicated status) is asserted via the shared helper in
 // error-body.test.ts.
@@ -137,7 +137,7 @@ describe("provider error body passthrough (per-tier regression)", () => {
 		openaiMock.parsedBody = { error: "blocked by gateway WAF" };
 	});
 
-	// smarty-dev#5822 (pi#202 round 2): the status is surfaced as owned text; the body only classifies.
+	// smarty-dev#5822: status is owned text; the body only classifies.
 	it("openai-completions (body-blind text) surfaces the status, not the body", async () => {
 		const output = await drainResult(streamOpenAICompletions(completionsModel, context, { apiKey: "test" }));
 
@@ -181,7 +181,7 @@ describe("provider error body passthrough (per-tier regression)", () => {
 		expect(output.errorMessage).toBe("Bedrock request failed (403)");
 	});
 
-	// smarty-dev#5822 C4: a Bedrock service exception publishes only its owned label and status.
+	// smarty-dev#5822 C4: owned label and status, never SDK message or stream body.
 	it("bedrock publishes the owned validation label, not the SDK message or a stream body", async () => {
 		bedrockMock.sendError = Object.assign(
 			new Error(

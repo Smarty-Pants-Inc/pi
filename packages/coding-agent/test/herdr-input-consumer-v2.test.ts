@@ -223,7 +223,6 @@ describe("E' v2 input consumer against a fake Herdr (smarty-dev#2636)", () => {
 		};
 		for (const frame of fake.raw) {
 			expect(frame).not.toContain("epoch_key");
-			// One request per connection: exactly one frame, nothing after it.
 			expect(frame.indexOf("\n")).toBe(frame.length - 1);
 			const request = JSON.parse(frame);
 			expect(Object.keys(request).sort()).toEqual(["id", "method", "params"]);
@@ -279,7 +278,6 @@ describe("E' v2 input consumer against a fake Herdr (smarty-dev#2636)", () => {
 			};
 		};
 		expect(await (await fakeHerdr({ enroll: v1 })).enroll()).toEqual({ ok: false, reason: "malformed" });
-		// A genuine v2 answer that also carries an epoch_key is a downgrade attempt, not v2.
 		const extra = await fakeHerdr({ enroll: (genuine) => ({ ...genuine, epoch_key: "ab".repeat(32) }) });
 		expect(await extra.enroll()).toEqual({ ok: false, reason: "malformed" });
 	});
@@ -291,7 +289,6 @@ describe("E' v2 input consumer against a fake Herdr (smarty-dev#2636)", () => {
 			(g) => ({ ...g, peer: { ...(g.peer as object), pid: 7 } }),
 			(g) => ({ ...g, peer: { ...(g.peer as object), pid: "007" } }),
 			(g) => ({ ...g, tty: { ...(g.tty as object), extra: "1" } }),
-			// Non-canonical base64 (padding stripped) of the genuine signature.
 			(g) => ({ ...g, sig: String(g.sig).replace(/=+$/, "") }),
 			(g) => ({ ...g, sig: randomBytes(63).toString("base64") }),
 		];
@@ -303,13 +300,12 @@ describe("E' v2 input consumer against a fake Herdr (smarty-dev#2636)", () => {
 
 	it("P7: forged client answers after enroll are terminal, and the first ends the epoch", async () => {
 		const forgeries: ((genuine: Record<string, unknown>, params: Record<string, unknown>) => object)[] = [
-			// No signature at all.
-			() => ({ result: "client", principal: PAUL }),
-			// A random 64-byte signature.
+			() => ({
+				result: "client",
+				principal: PAUL,
+			}),
 			() => ({ result: "client", principal: PAUL, sig: randomBytes(64).toString("base64") }),
-			// The genuine enroll signature (reflected).
 			() => ({ result: "client", principal: PAUL, sig: enrollSig }),
-			// A v1 HMAC under a key the replacer chose, as in 6b5724fd.
 			(_genuine, params) => ({
 				result: "client",
 				principal: PAUL,
@@ -397,7 +393,6 @@ describe("E' v2 input consumer against a fake Herdr (smarty-dev#2636)", () => {
 			const answer = await epoch.cut(cutOf(1));
 			expect(answer.result).toBe(cut.result);
 			expect(attestedPrincipal(answer)).toBeUndefined();
-			// A verified answer keeps the epoch.
 			expect((await epoch.cut(cutOf(2))).reason).not.toBe("epoch-ended");
 		}
 	});

@@ -32,10 +32,7 @@ function setup(answer: (request: Omit<CutRequest, "epoch">) => Promise<CutAnswer
 	return { attestor: new SubmitAttestor(counter, epoch, 50), requests };
 }
 
-/**
- * The interactive path: held stdin bytes, the marker, the TUI's metered parser, the default editor and
- * its submit handler, wired as InteractiveMode wires them.
- */
+/** The interactive path: held bytes, marker, metered parser, default editor and submit handler. */
 async function submitThroughEditor(beforeMarker: string, afterMarker: string): Promise<Record<string, unknown>> {
 	const counter = new EpochByteCounter();
 	counter.hold();
@@ -73,15 +70,10 @@ async function submitThroughEditor(beforeMarker: string, afterMarker: string): P
 
 describe("held pre-marker input on the editor path (pi#160 review P1)", () => {
 	it("never labels a draft that holds bytes typed before the marker", async () => {
-		// `x` is outside the epoch, so Herdr's attestation of `hi\r` does not cover the draft `xhi`.
 		expect((await submitThroughEditor("x", "hi\r")).channel).toBe("terminal");
 	});
-
 	it("still labels a draft typed entirely inside the epoch (counterexample)", async () => {
-		expect(await submitThroughEditor("", "hi\r")).toMatchObject({
-			channel: "keyboard",
-			principal: { id: "paul" },
-		});
+		expect(await submitThroughEditor("", "hi\r")).toMatchObject({ channel: "keyboard", principal: { id: "paul" } });
 	});
 });
 
@@ -100,7 +92,6 @@ describe("SubmitAttestor", () => {
 			},
 		]);
 	});
-
 	it("gives an unknown principal or a non-client answer no attribution", async () => {
 		for (const answer of [
 			{ result: "client" },
@@ -114,7 +105,6 @@ describe("SubmitAttestor", () => {
 			expect(record).not.toHaveProperty("principal");
 		}
 	});
-
 	it("still sends the cut for a tainted draft or a discard, but never labels it", async () => {
 		for (const options of [
 			{ tainted: true, kind: "submit" },
@@ -126,19 +116,17 @@ describe("SubmitAttestor", () => {
 			expect(requests[0]!.kind).toBe(options.kind);
 		}
 	});
-
 	it("gives no attribution without a cut offset (no epoch, missing token path)", async () => {
 		const { attestor, requests } = setup(async () => PAUL);
-		const record = receiptRecord(await attestor.capture(undefined, { tainted: false, kind: "submit" }));
-		expect(record.channel).toBe("terminal");
+		expect(receiptRecord(await attestor.capture(undefined, { tainted: false, kind: "submit" })).channel).toBe(
+			"terminal",
+		);
 		expect(requests).toHaveLength(0);
 	});
-
 	it("delivers as terminal when Herdr is slower than the admission wait", async () => {
 		const { attestor } = setup(() => new Promise((resolve) => setTimeout(() => resolve(PAUL), 500)));
 		expect(receiptRecord(await attestor.capture(3, { tainted: false, kind: "submit" })).channel).toBe("terminal");
 	});
-
 	it("numbers cuts in order and refuses a cut that is not ahead of the last", async () => {
 		const { attestor, requests } = setup(async () => PAUL);
 		await attestor.capture(3, { tainted: false, kind: "submit" });

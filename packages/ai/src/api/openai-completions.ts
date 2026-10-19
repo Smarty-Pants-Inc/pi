@@ -54,10 +54,10 @@ import {
 } from "../utils/error-body.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
-import { parseStreamingJson } from "../utils/json-parse.ts";
+import { parseStreamingJson, parseToolCallArguments } from "../utils/json-parse.ts";
 import { getPiUserAgent } from "../utils/pi-user-agent.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
-import { notifyProviderStreamEvent, providerResponse } from "../utils/provider-observation.ts";
+import { notifyProviderResponse, notifyProviderStreamEvent } from "../utils/provider-observation.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
 import { recordThrottledLimitWait } from "../utils/retry.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
@@ -400,7 +400,19 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 					signal: options?.signal,
 				},
 			);
-			await options?.onResponse?.(providerResponse(response.status));
+			try {
+				await notifyProviderResponse(options, output, response.status);
+			} catch (error) {
+				// No iterator has started to own cleanup yet. Do not let body cancellation
+				// delay or replace the owned observer failure after a billable response.
+				try {
+					openaiStream.controller.abort();
+					void response.body?.cancel().catch(() => undefined);
+				} catch {
+					// A custom transport's synchronous cleanup failure is secondary too.
+				}
+				throw error;
+			}
 			stream.push({ type: "start", partial: output });
 
 			interface StreamingToolCallBlock extends ToolCall {
@@ -481,7 +493,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 							});
 						}
 					} else {
-						block.arguments = parseStreamingJson(block.partialArgs);
+						Object.assign(block, parseToolCallArguments(block.partialArgs));
 					}
 					// Finalize in-place and strip the scratch buffers so replay only
 					// carries parsed arguments.
@@ -609,21 +621,8 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				}
 
 				if (choice.delta) {
-					if (
-						choice.delta.content !== null &&
-						choice.delta.content !== undefined &&
-						choice.delta.content.length > 0
-					) {
-						const block = ensureTextBlock();
-						block.text += choice.delta.content;
-						stream.push({
-							type: "text_delta",
-							contentIndex: getContentIndex(block),
-							delta: choice.delta.content,
-							partial: output,
-						});
-					}
-
+					// Handle reasoning before content: some proxies (e.g. LiteLLM) aggregate reasoning and
+					// answer into one delta, and the thinking block must precede the text block.
 					// Some endpoints return reasoning in reasoning_content (llama.cpp),
 					// or reasoning (other openai compatible endpoints)
 					// Use the first non-empty reasoning field to avoid duplication
@@ -657,6 +656,34 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 						}
 					}
 
+					const reasoningDetails = (choice.delta as { reasoning_details?: unknown }).reasoning_details;
+					if (Array.isArray(reasoningDetails)) {
+						for (const detail of reasoningDetails) {
+							if (!isOpenAIReasoningDetail(detail)) continue;
+							ensureThinkingBlock("");
+							streamedReasoningDetails ??= [];
+							// Keep provider replay data in the existing signature slot. OpenRouter streams
+							// reasoning_details as deltas: consecutive text/summary deltas are merged into
+							// logical entries, while encrypted entries remain opaque and discrete.
+							appendOpenAIReasoningDetail(streamedReasoningDetails, detail);
+						}
+					}
+
+					if (
+						choice.delta.content !== null &&
+						choice.delta.content !== undefined &&
+						choice.delta.content.length > 0
+					) {
+						const block = ensureTextBlock();
+						block.text += choice.delta.content;
+						stream.push({
+							type: "text_delta",
+							contentIndex: getContentIndex(block),
+							delta: choice.delta.content,
+							partial: output,
+						});
+					}
+
 					if (choice?.delta?.tool_calls) {
 						for (const toolCall of choice.delta.tool_calls as StreamingToolCallDelta[]) {
 							const block = ensureToolCallBlock(toolCall);
@@ -684,19 +711,6 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 								delta,
 								partial: output,
 							});
-						}
-					}
-
-					const reasoningDetails = (choice.delta as { reasoning_details?: unknown }).reasoning_details;
-					if (Array.isArray(reasoningDetails)) {
-						for (const detail of reasoningDetails) {
-							if (!isOpenAIReasoningDetail(detail)) continue;
-							ensureThinkingBlock("");
-							streamedReasoningDetails ??= [];
-							// Keep provider replay data in the existing signature slot. OpenRouter streams
-							// reasoning_details as deltas: consecutive text/summary deltas are merged into
-							// logical entries, while encrypted entries remain opaque and discrete.
-							appendOpenAIReasoningDetail(streamedReasoningDetails, detail);
 						}
 					}
 				}
@@ -738,18 +752,12 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			const limitMessage = smartyLimitMessage(error);
 			if (limitMessage !== undefined) {
-				// Show the owned limit text (never the gateway's own message), and mark it final so the generic retry
-				// does not retry it (smarty-dev#5822, pi#202 round 3).
-				// A throttled limit with a short Retry-After records the wait privately for the agent's one-shot retry;
-				// the published diagnostic is the owned type only (smarty-dev#5822 N5682).
 				output.errorMessage = limitMessage;
 				output.recovery ??= { retryable: false };
 				const retryAfterSeconds = smartyThrottleRetryAfterSeconds(error);
 				if (retryAfterSeconds !== undefined) recordThrottledLimitWait(output, retryAfterSeconds);
 				appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(PROVIDER_LIMIT_DIAGNOSTIC));
 			} else {
-				// OpenRouter's `metadata.raw` and the provider's message and body are classified privately and
-				// never published; the error text is owned (smarty-dev#5822, pi#202 round 2).
 				const rawMetadata = (error as { error?: { metadata?: { raw?: unknown } } } | undefined)?.error?.metadata
 					?.raw;
 				const norm = normalizeProviderError(
@@ -1618,7 +1626,6 @@ function mapStopReason(reason: ChatCompletionChunk.Choice["finish_reason"] | str
 		default:
 			return {
 				stopReason: "error",
-				// A closed value: a provider-chosen finish_reason never reaches the text (smarty-dev#5822).
 				errorMessage: `Provider finish_reason: ${closedRawStopReason(reason)}`,
 			};
 	}

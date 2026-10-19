@@ -179,7 +179,7 @@ function coldSnapshot(entry: object, parentId: string | null, format: string, li
 }
 
 /**
- * Walk single-entry reads rather than cloning the entire owned branch payload, yielding guarded
+ * Walk single-entry reads rather than copying the entire branch payload, yielding guarded
  * null-prototype snapshots. `budget` returns the caller's current remaining bytes; cold lines
  * longer than it are refused before reading.
  */

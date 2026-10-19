@@ -1,4 +1,3 @@
-import { refuseUnreviewedBuiltin } from "../../core/builtin-security-admission.ts";
 /**
  * Built-in MCP integration.
  *
@@ -31,6 +30,7 @@ import { join, resolve } from "node:path";
 import type { SelectItem } from "@earendil-works/pi-tui";
 import type { TSchema } from "typebox";
 import { getAgentDir } from "../../config.ts";
+import { refuseUnreviewedBuiltin } from "../../core/builtin-security-admission.ts";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,

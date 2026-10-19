@@ -4,7 +4,6 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "..
 
 function createContext(tokens: number | null, compact = vi.fn()): ExtensionContext {
 	return {
-		userMessageSessionGeneration: "trigger-compact-test-generation",
 		mode: "print",
 		hasUI: false,
 		ui: {} as ExtensionContext["ui"],

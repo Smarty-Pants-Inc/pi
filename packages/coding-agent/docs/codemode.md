@@ -1,7 +1,5 @@
 # Codemode
 
-> **Fork security admission:** Codemode is re-enabled after the pi#203 internal repairs (smarty-dev#4506 step 2). The CLI registers `codemode` inactive; enable it with `--tools codemode` or the `defaultTools` setting. SDK factories and standalone sandbox APIs work again. MCP remains refused, including from Codemode scripts. See `packages/coding-agent/docs/security-reenable.md`.
-
 The `codemode` tool lets the model write a JavaScript script that calls pi's other tools and runs non-LLM models, such as classifiers and image models. Only the script's output reaches the model, so a script can run calls in parallel and filter large results before the model sees them. To turn it on, see [Enable codemode](cli.md#enable-codemode).
 
 ## Scripts
@@ -15,7 +13,7 @@ A script may start with an options line. It must be the first line; an options l
 ```
 
 - `max_output_tokens` (default 10000) limits the output. Longer output keeps its start and end, and the full text is written to a temp file whose path is included in the result. A script fails when its output passes 16777216 characters of text and base64 image data or 100000 `text()`, `image()`, and `console` calls; write large data to a file with a tool instead.
-- `timeout_ms` is a hard deadline for the whole script. It defaults to, and cannot exceed, 1800000 (30 minutes). Image generation can take minutes, so do not set a short deadline for scripts that generate images.
+- `timeout_ms` is a hard deadline for the whole script. It is unset by default. Image generation can take minutes, so do not set a short deadline for scripts that generate images.
 
 The result starts with `Script completed` or `Script failed`, the wall time, and the output. Text and image items appear in order, each on its own line. When the output has more than one text item (from `text()` or `return`), each starts with a `==> text N/M <==` line. `console` calls follow in one `<console_output>` block with one line per call. A failed script keeps its partial output, followed by `Script error:` and the error. Tool calls are real: calls made before a failure are not undone. Calls still running when the script ends are cancelled, and unawaited promises are discarded.
 
@@ -57,7 +55,7 @@ While `codemode` is active, `codemode.mode` in [settings](settings.md#tools) dec
 
 `store(key, value)` keeps a JSON value under a string key for later `codemode` calls; storing `undefined` deletes the key. `load(key)` returns the value, or `undefined`. Writes are kept only when the script succeeds: each successful script that stores values appends a `codemode-store` custom entry to the session, so resumed sessions keep the values and each branch sees only the values written on its path.
 
-The store is for small state such as IDs, cursors, or summaries. One value may have at most 262144 characters of JSON and all values together at most 1048576. pi checks the store as it is when the script ends, so writes that no longer fit (for example after a parallel script stored values) are not saved and the call fails. Do not store image data; show images with `image()`, which also saves them to a temp file.
+The store is for small state such as IDs, cursors, or summaries. One value may have at most 262144 characters of JSON and all values together at most 1048576. Do not store image data; show images with `image()`, which also saves them to a temp file.
 
 ## Models
 
@@ -226,5 +224,7 @@ for (const block of result.output) {
 ## Limits
 
 - A script's VM has 256 MB of memory. Running out throws `InternalError: out of memory`; filter or aggregate large data instead of accumulating it.
+- On Bun, stopping a script or reaching its deadline ends the call promptly, but a built-in that does not poll QuickJS's interrupt handler can keep computing in its worker until it returns.
+- At most two codemode workers may be alive across all sessions in one pi process. A cancelled worker occupies its slot until it exits. At capacity, new scripts fail immediately without starting another worker; retry after an existing worker exits.
 - A script that waits on a promise that can never settle (no tool call pending) fails immediately, since there are no timers.
 - Scripts cannot start other `codemode` scripts.

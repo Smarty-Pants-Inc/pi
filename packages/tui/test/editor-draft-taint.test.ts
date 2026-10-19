@@ -41,13 +41,13 @@ describe("Editor draft taint", () => {
 		assert.equal(submitAfter((e) => e.insertTextAtCursor("inserted")).tainted, true);
 		const yanked = submitAfter((e) => {
 			type(e, "word");
-			e.handleInput("\x17"); // Ctrl+W kills the word
-			e.handleInput("\x19"); // Ctrl+Y yanks it back
+			e.handleInput("\x17");
+			e.handleInput("\x19");
 		});
 		assert.deepEqual(yanked, { text: "word", tainted: true });
 		const undone = submitAfter((e) => {
 			type(e, "ab");
-			e.handleInput("\x1f"); // Ctrl+- undo
+			e.handleInput("\x1f");
 		});
 		assert.equal(undone.tainted, true);
 		const marked = submitAfter((e) => {

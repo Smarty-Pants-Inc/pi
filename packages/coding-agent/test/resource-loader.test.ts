@@ -1088,6 +1088,11 @@ export default function(pi: ExtensionAPI) {
 			expect(runner.getCommand("llama")?.description).toBe("built-in llama");
 		});
 
+		// MCP remains refused by the security gate; this retained fixture must never become an opt-in path.
+		const refusedMcpFactory = () => {
+			throw new Error("MCP_SECURITY_REVIEW_REQUIRED");
+		};
+
 		it("should skip built-in extensions disabled in settings", async () => {
 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ extensions: ["-builtin:mcp"] }));
 			const loaded: string[] = [];
@@ -1095,7 +1100,7 @@ export default function(pi: ExtensionAPI) {
 				cwd,
 				agentDir,
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "mcp", builtin: true, factory: refusedMcpFactory },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
@@ -1110,7 +1115,6 @@ export default function(pi: ExtensionAPI) {
 			expect(loaded).toEqual(["llama"]);
 		});
 
-		// MCP is refused before disabledBuiltinExtensions applies (smarty-dev#4506); use a reviewed built-in.
 		it("should skip disabledBuiltinExtensions even when settings or -e enable them", async () => {
 			mkdirSync(join(cwd, ".pi"), { recursive: true });
 			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ extensions: ["+builtin:tool-search"] }));
@@ -1137,14 +1141,12 @@ export default function(pi: ExtensionAPI) {
 			mkdirSync(userExtDir, { recursive: true });
 			writeFileSync(join(userExtDir, "user.ts"), "export default function() {}");
 			mkdirSync(join(cwd, ".pi"), { recursive: true });
-			// A project override gives the built-in project scope, which must not move it ahead.
 			writeFileSync(join(cwd, ".pi", "settings.json"), JSON.stringify({ extensions: ["+builtin:mcp"] }));
 			const loader = new DefaultResourceLoader({
 				cwd,
 				agentDir,
-				extensionFactories: [{ name: "mcp", builtin: true, factory: () => {} }],
+				extensionFactories: [{ name: "mcp", builtin: true, factory: refusedMcpFactory }],
 			});
-			// PR #131: project trust cannot re-enable MCP.
 			const expected = [join(userExtDir, "user.ts")];
 
 			await loader.reload({ resolveProjectTrust: async () => true });
@@ -1161,11 +1163,10 @@ export default function(pi: ExtensionAPI) {
 				noExtensions: true,
 				additionalExtensionPaths: ["builtin:mcp", "builtin:missing"],
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "mcp", builtin: true, factory: refusedMcpFactory },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
-			// PR #131: explicit -e must refuse before either factory runs.
 			await expect(loader.reload()).rejects.toThrow("MCP_SECURITY_REVIEW_REQUIRED");
 			expect(loader.getExtensions().extensions).toEqual([]);
 			expect(loaded).toEqual([]);
@@ -1199,20 +1200,18 @@ export default function(pi: ExtensionAPI) {
 				cwd,
 				agentDir,
 				extensionFactories: [
-					{ name: "mcp", builtin: true, factory: () => void loaded.push("mcp") },
+					{ name: "mcp", builtin: true, factory: refusedMcpFactory },
 					{ name: "plain", factory: () => void loaded.push("plain") },
 					{ name: "llama", builtin: true, factory: () => void loaded.push("llama") },
 				],
 			});
 			await loader.reload({
 				resolveProjectTrust: async ({ extensionsResult }) => {
-					// Built-in extensions wait until project settings are known.
 					expect(extensionsResult.extensions.map((extension) => extension.path)).toEqual(["<inline:plain>"]);
 					return true;
 				},
 			});
 
-			// PR #131: the project override cannot activate the dormant MCP factory.
 			expect(loader.getExtensions().extensions.map((extension) => extension.path)).toEqual(["<inline:plain>"]);
 			expect(loaded).toEqual(["plain"]);
 		});

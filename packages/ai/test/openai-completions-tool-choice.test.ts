@@ -411,19 +411,17 @@ describe("openai-completions tool_choice", () => {
 		}
 
 		for (const provider of ["zai", "zai-coding-cn"] as const) {
-			for (const modelId of ["glm-5.3", "glm-5.3-highspeed"] as const) {
-				const model = getModel(provider, modelId)!;
-				expect(model.compat?.supportsReasoningEffort).toBe(true);
-				expect(model.thinkingLevelMap).toEqual({
-					off: null,
-					minimal: null,
-					low: "low",
-					medium: null,
-					high: "high",
-					xhigh: null,
-					max: "max",
-				});
-			}
+			const glm53 = getModel(provider, "glm-5.3")!;
+			expect(glm53.compat?.supportsReasoningEffort).toBe(true);
+			expect(glm53.thinkingLevelMap).toEqual({
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: null,
+				high: "high",
+				xhigh: null,
+				max: "max",
+			});
 		}
 	});
 
@@ -1108,12 +1106,12 @@ describe("openai-completions tool_choice", () => {
 		]);
 
 		expect(response.content).toHaveLength(6);
-		expect(response.content[0]).toEqual({ type: "text", text: "answer 1 answer 2\n" });
-		expect(response.content[1]).toEqual({
+		expect(response.content[0]).toEqual({
 			type: "thinking",
 			thinking: "think 1 think 2",
 			thinkingSignature: "reasoning_content",
 		});
+		expect(response.content[1]).toEqual({ type: "text", text: "answer 1 answer 2\n" });
 		const readCall = response.content[2];
 		const grepCall = response.content[3];
 		const listCall = response.content[4];
@@ -1311,7 +1309,7 @@ describe("openai-completions tool_choice", () => {
 		const replayedAssistant = params.messages?.find((message) => message.role === "assistant");
 		expect(replayedAssistant).toMatchObject({ role: "assistant", reasoning_content: "" });
 		expect(params.thinking).toEqual({ type: "enabled" });
-		expect(params.reasoning_effort).toBe("high");
+		expect(params.reasoning_effort).toBeUndefined();
 	});
 
 	it("normalizes OpenCode Go reasoning deltas to reasoning_content for replay", async () => {

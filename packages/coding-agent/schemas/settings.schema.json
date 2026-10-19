@@ -50,6 +50,24 @@
       ],
       "default": "auto"
     },
+    "sessionShareDestination": {
+      "anyOf": [
+        {
+          "type": "string",
+          "const": "auto"
+        },
+        {
+          "type": "string",
+          "const": "gist"
+        },
+        {
+          "type": "string",
+          "const": "radius"
+        }
+      ],
+      "description": "Destination used by /share. \"auto\" uses Radius when authenticated and otherwise creates a GitHub gist.",
+      "default": "auto"
+    },
     "steeringMode": {
       "anyOf": [
         {
@@ -173,10 +191,6 @@
               "default": 60000
             }
           }
-        },
-        "fallbackModel": {
-          "type": "string",
-          "description": "Exact provider/modelId used once after agent retries are exhausted. Off by default."
         },
         "maxDelayMs": {
           "type": "number",

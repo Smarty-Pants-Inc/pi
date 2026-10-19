@@ -11,18 +11,11 @@ const user = { role: "user", content: "original", timestamp: 0 } as const;
 const cases: Array<{ event: ExtensionEvent["type"]; invoke: (runner: ExtensionRunner) => Promise<unknown> }> = [
 	{
 		event: "provider_stream_event",
-		invoke: (runner) =>
-			runner.emit({
-				type: "provider_stream_event",
-				data: {},
-				provider: "offline",
-				api: "openai-completions",
-				model: "offline",
-			}),
+		invoke: (runner) => runner.emit({ type: "provider_stream_event" }),
 	},
 	{
 		event: "after_provider_response",
-		invoke: (runner) => runner.emit({ type: "after_provider_response", status: 200, headers: {} }),
+		invoke: (runner) => runner.emit({ type: "after_provider_response", status: 200 }),
 	},
 	{ event: "agent_start", invoke: (runner) => runner.emit({ type: "agent_start" }) },
 	{

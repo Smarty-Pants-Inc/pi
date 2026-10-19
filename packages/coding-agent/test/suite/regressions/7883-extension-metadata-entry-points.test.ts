@@ -1,8 +1,7 @@
 import { EventEmitterAsyncResource } from "node:events";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fauxAssistantMessage, type Provider } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import type { Provider } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { createEventBus } from "../../../src/core/event-bus.ts";
 import {
@@ -16,7 +15,6 @@ import type {
 	SendUserMessageResult,
 	UserMessageMetadata,
 } from "../../../src/core/extensions/types.ts";
-import { UserMessageComponent } from "../../../src/modes/interactive/components/user-message.ts";
 import { createHarness, type Harness } from "../harness.ts";
 
 const extensionPath = "/extensions/fabric-metadata.ts";
@@ -29,36 +27,6 @@ describe("#7883 / pi#187 round 3 extension metadata entry points", () => {
 			await harness.session.waitForIdle();
 			harness.cleanup();
 		}
-	});
-
-	// #7883 / pi#187: real UI rendering used to submit extension-authored metadata as SDK input.
-	it("stamps a user-message renderer send with its extension on receipt and persisted entry", async () => {
-		let receipt: Promise<SendUserMessageResult> | undefined;
-		const harness = await createHarness({
-			persistSession: true,
-			settings: { compaction: { enabled: false } },
-			extensionFactories: [
-				{
-					path: extensionPath,
-					factory: (pi) => {
-						pi.registerUserMessageRenderer(() => {
-							receipt = pi.sendUserMessage("renderer input", { metadata: { wakeCause: "render" } });
-							return new Text("custom user text");
-						});
-					},
-				},
-			],
-		});
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("renderer reply")]);
-		const component = new UserMessageComponent("displayed input", undefined, 1, [], {
-			renderer: harness.session.extensionRunner.getUserMessageRenderer(),
-		});
-		expect(component.render(80).join("\n")).toContain("custom user text");
-		expect(receipt).toBeInstanceOf(Promise);
-		const result = await receipt!;
-		expect(result).toMatchObject({ status: "turnStarted", metadataSource: source });
-		expect(harness.sessionManager.getEntry(result.entryId!)).toMatchObject({ metadataSource: source });
 	});
 
 	// #7883 / pi#187: asynchronous mesh work must inherit the extension's own initialization/event context.
@@ -240,7 +208,6 @@ export default function (pi) { bridge.api = pi; }
 				pi.registerFlag("bound", { type: "boolean", default: true });
 				pi.registerMessageRenderer("bound", submit);
 				pi.registerEntryRenderer("bound", submit);
-				pi.registerUserMessageRenderer(submit);
 				pi.registerMarkdownTransformer(submit);
 				pi.on("agent_start", submit);
 				pi.registerToolRenderer(() => ({ renderCall: submit, renderResult: submit }));
@@ -308,14 +275,13 @@ export default function (pi) { bridge.api = pi; }
 		for (const [name, callback] of [
 			["message renderer", extension.messageRenderers.get("bound")!],
 			["entry renderer", extension.entryRenderers!.get("bound")!],
-			["user renderer", extension.userMessageRenderer!],
 			["markdown transformer", extension.markdownTransformer!],
 			["event handler", extension.handlers.get("agent_start")![0]!],
 			["tool renderer resolver", extension.toolRenderers![1]!],
 			["virtual-model route", runtime.pendingVirtualModelRegistrations[0]!.definition.route],
 		] as const)
 			callbacks.push({ name, callback: callback as (...args: never[]) => unknown });
-		expect(callbacks).toHaveLength(42);
+		expect(callbacks).toHaveLength(41);
 		for (const { name, callback } of callbacks) {
 			receipt = undefined;
 			expectedReceiver = name === "getModels" ? originalNative : undefined;

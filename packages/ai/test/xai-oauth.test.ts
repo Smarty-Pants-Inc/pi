@@ -322,7 +322,7 @@ describe("xAI OAuth device flow", () => {
 		await expect(refreshXaiForTest("old-refresh")).rejects.toThrow("Invalid xAI OAuth response field: access_token");
 	});
 
-	// pi#150: the description is untrusted endpoint text; only the protocol error code is shown.
+	// pi#150: protocol error class only, never untrusted endpoint descriptions.
 	it("surfaces the upstream error code, not its description, on refresh failure", async () => {
 		vi.stubGlobal(
 			"fetch",

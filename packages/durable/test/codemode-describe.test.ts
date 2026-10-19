@@ -65,8 +65,7 @@ describe("code mode description and section", () => {
 		expect(section).not.toContain("## git\n");
 	});
 
-	// Fork-intended skip: fork admission disabled awaiting review (pi#131).
-	it.skip("renders the section from the conversation's callable tools into the system prompt", async () => {
+	it("renders the section from the conversation's callable tools into the system prompt", async () => {
 		const setup = chatSetup();
 		setup.registry.install(createCodemodeExtension({ sandbox: new CodemodeSandbox(), namespaces: [GITHUB] }));
 		setup.registry.install({

@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { renderConfigSchemas } from "../scripts/generate-schemas.ts";
 import { KeybindingsManager } from "../src/core/keybindings.ts";
 import { ModelConfig } from "../src/core/model-config.ts";
-import { InMemorySettingsStorage, SettingsManager } from "../src/core/settings-manager.ts";
+import { SettingsManager } from "../src/core/settings-manager.ts";
 import { SettingsSchema } from "../src/core/settings-schema.ts";
 import { validateThemeJson } from "../src/modes/interactive/theme/theme-schema.ts";
 
@@ -214,29 +214,6 @@ describe("generated configuration schemas", () => {
 				codemode: { inlineBudget: 0 },
 			}),
 		).toBe(true);
-	});
-
-	// Fork preservation: the schema-derived Settings retains fallback and trusted project warming.
-	it("preserves fallbackModel typing, validation and project cache-warming overlays", () => {
-		const validator = Compile(SettingsSchema);
-		expect(validator.Check({ retry: { fallbackModel: "alternate/model" }, cacheWarming: "off" })).toBe(true);
-		expect(validator.Check({ retry: { fallbackModel: 42 } })).toBe(false);
-		const storage = new InMemorySettingsStorage();
-		storage.withLock("global", () =>
-			JSON.stringify({ retry: { fallbackModel: "global/model" }, cacheWarming: "idle" }),
-		);
-		storage.withLock("project", () =>
-			JSON.stringify({ retry: { fallbackModel: "project/model" }, cacheWarming: "off" }),
-		);
-		const manager = SettingsManager.fromStorage(storage);
-		expect(manager.getRetryFallbackModel()).toBe("project/model");
-		expect(manager.getCacheWarmingMode()).toBe("off");
-		manager.setProjectTrusted(false);
-		expect(manager.getRetryFallbackModel()).toBe("global/model");
-		expect(manager.getCacheWarmingMode()).toBe("idle");
-		const schema = JSON.parse(renderConfigSchemas().get("schemas/settings.schema.json") ?? "");
-		expect(schema.properties.retry.properties.fallbackModel.type).toBe("string");
-		expect(schema.properties.cacheWarming.description).toContain("Project settings override global settings.");
 	});
 
 	it("describes legacy settings migrations accurately", () => {

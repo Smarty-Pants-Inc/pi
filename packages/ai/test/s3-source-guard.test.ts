@@ -1,5 +1,5 @@
 // Mechanical source guard for smarty-dev#5822 C1 and C3 (S3 of #5443, acceptance ledger item 3).
-// Read-only: it scans source text and writes nothing.
+// Read-only: source scans and owned-decision controls write nothing.
 import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +7,9 @@ import * as ts from "typescript/unstable/ast";
 import { createVirtualFileSystem } from "typescript/unstable/fs";
 import { API } from "typescript/unstable/sync";
 import { describe, expect, it } from "vitest";
+import type { AssistantMessage } from "../src/types.ts";
+import { isContextOverflow } from "../src/utils/overflow.ts";
+import { classifyProviderFailure, isPrematureStreamError, isRetryableAssistantError } from "../src/utils/recovery.ts";
 
 const packagesDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 
@@ -331,7 +334,6 @@ describe("smarty-dev#5822 source guard", () => {
 
 	it("C3: the stream classifies every error before masking, for every source", () => {
 		const eventStream = source("ai/src/utils/event-stream.ts");
-		// The projector classifies the producer's original message; masking applies only to the projected copy.
 		const projector = eventStream.slice(eventStream.indexOf("function projectMessage("));
 		expect(projector.slice(0, projector.indexOf("\n}"))).toContain("assistantRecovery(message)");
 		const push = eventStream.slice(eventStream.indexOf("override push("));
@@ -340,7 +342,6 @@ describe("smarty-dev#5822 source guard", () => {
 		const end = eventStream.slice(eventStream.indexOf("override end("));
 		expect(end.indexOf("projectMessage(result")).toBeGreaterThan(-1);
 		expect(end.indexOf("projectMessage(result")).toBeLessThan(end.indexOf("protectMessage("));
-		// Every message-carrying event goes through the projector; nothing is published unprojected.
 		expect(push).toContain("super.push(published)");
 		expect(end).toContain("super.end(published)");
 	});
@@ -350,7 +351,6 @@ describe("smarty-dev#5822 source guard", () => {
 			.filter(({ text }) => /extends EventStream<AssistantMessageEvent\b/.test(text))
 			.map(({ file }) => file)
 			.sort();
-		// Proxy, lazy and model-less streams all publish through AssistantMessageEventStream.
 		expect(subclasses).toEqual(["ai/src/utils/event-stream.ts"]);
 	});
 
@@ -360,11 +360,9 @@ describe("smarty-dev#5822 source guard", () => {
 		expect(diagnostics).not.toMatch(/\bcode\??:/);
 		expect(diagnostics).not.toContain("redactOAuthDiagnosticValue");
 		for (const { file, text } of sources) {
-			// Diagnostics are created only through the owned constructor, never as object literals with extra fields.
 			const literals = [...text.matchAll(/appendAssistantMessageDiagnostic\([^)]*\{/g)];
 			expect({ file, literals: literals.length }).toEqual({ file, literals: 0 });
 		}
-
 		// pi#297 / Smarty-Pants-Inc/smarty-dev#14961: the one deliberate raw stop_details exception is pinned by
 		// module name. It has exactly one exported writer, and that writer may mutate only the four record fields.
 		const refusalStopDetailsFile = "ai/src/utils/refusal-stop-details.ts";
@@ -383,7 +381,9 @@ describe("smarty-dev#5822 source guard", () => {
 		);
 		expect(recorderCalls).toEqual([{ file: "ai/src/api/anthropic-messages.ts", argument: "failure" }]);
 		assertRefusalRecorderCall(source("ai/src/api/anthropic-messages.ts"));
-		assertFailureOnlyStopDetailsProjection(diagnostics);
+		// pi#280: projection moved to assistant-message-snapshot.ts; this narrow terminal exception stays in scope
+		// at the stream's shared push/end publication boundary, after the closed snapshot and before masking.
+		assertFailureOnlyStopDetailsProjection(source("ai/src/utils/event-stream.ts"));
 
 		expect(source("ai/src/utils/event-stream.ts")).not.toContain("redactOAuthDiagnosticValue");
 	});
@@ -413,11 +413,77 @@ describe("smarty-dev#5822 source guard", () => {
 	});
 
 	it("C3: retry, premature-stream and overflow checks read the owned decision, not raw text", () => {
+		// pi#280: pure retry consumers moved to recovery.ts to preserve lean entry graphs.
+		const recovery = source("ai/src/utils/recovery.ts");
+		for (const name of ["isRetryableAssistantError", "isPrematureStreamError"]) {
+			const start = recovery.indexOf(`export function ${name}(`);
+			expect(start).toBeGreaterThan(-1);
+			const body = recovery.slice(start, recovery.indexOf("\n}", start) + 2);
+			expect(body).toContain("assistantRecovery(message)");
+			expect(body).not.toMatch(/PATTERNS?\.(?:test|some)\(/);
+			expect(body).not.toMatch(/\.test\(message\.errorMessage/);
+		}
+		const retry = source("ai/src/utils/retry.ts");
+		expect(retry).toMatch(/import \{[^}]*\bisRetryableAssistantError,[^}]*\} from "\.\/recovery\.ts"/);
+		expect(retry).toMatch(/export \{[^}]*\bisPrematureStreamError,[^}]*\} from "\.\/recovery\.ts"/);
+		expect(retry).toContain("assistantRecovery(produced)");
+		expect(retry).toContain("isRetryableAssistantError(response)");
 		for (const file of ["ai/src/utils/retry.ts", "ai/src/utils/overflow.ts"]) {
 			const text = source(file);
-			expect(text).toContain("assistantRecovery(message)");
+			if (file.endsWith("/overflow.ts")) expect(text).toContain("assistantRecovery(message)");
 			expect(text).not.toMatch(/PATTERNS?\.(?:test|some)\(/);
 			expect(text).not.toMatch(/\.test\(message\.errorMessage/);
 		}
 	});
+
+	it("classifies bounded slow_down failures without overriding quota refusal (pi#280)", () => {
+		expect(classifyProviderFailure({ text: "slow_down" })).toEqual({ recovery: "retryable", retryable: true });
+		expect(classifyProviderFailure({ text: "provider: slow_down; retry" })).toEqual({
+			recovery: "retryable",
+			retryable: true,
+		});
+		for (const text of ["not_slow_down_suffix", "slow_down insufficient_quota", "slow_down billing"]) {
+			expect(classifyProviderFailure({ text })).toEqual({ retryable: false });
+		}
+	});
+
+	// pi#280, smarty-dev#5822: paired controls ensure the guard follows real owned decisions,
+	// not merely a helper name or the presence of misleading public diagnostic text.
+	it.each([
+		["prompt is too long; 503; stream ended before message_stop", { retryable: false }, false, false, false],
+		["Provider request failed", { recovery: "context_length_exceeded", retryable: false }, true, false, false],
+		["Provider request failed", { recovery: "retryable", retryable: true }, false, true, false],
+		["Provider request failed", { recovery: "premature_stream", retryable: true }, false, true, true],
+		["prompt is too long", undefined, true, false, false],
+		["invalid request", undefined, false, false, false],
+		["slow_down", undefined, false, true, false],
+		["slow_down", { retryable: false }, false, false, false],
+		["slow_down insufficient_quota", undefined, false, false, false],
+	] as const)(
+		"C3: owned recovery overrides public text %s (%j)",
+		(errorMessage, recovery, overflow, retry, premature) => {
+			const message: AssistantMessage = {
+				role: "assistant",
+				api: "openai-completions",
+				provider: "custom-5822",
+				model: "test-model",
+				content: [],
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "error",
+				errorMessage,
+				recovery,
+				timestamp: 0,
+			};
+			expect(isContextOverflow(message)).toBe(overflow);
+			expect(isRetryableAssistantError(message)).toBe(retry);
+			expect(isPrematureStreamError(message)).toBe(premature);
+		},
+	);
 });

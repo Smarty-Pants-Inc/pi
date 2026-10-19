@@ -27,10 +27,11 @@ import {
 	renameSync,
 	type Stats,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 } from "fs";
 import { readdir, stat } from "fs/promises";
-import { basename, dirname, join, resolve } from "path";
+import { basename, join, resolve } from "path";
 import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
@@ -43,16 +44,8 @@ import {
 	createCustomMessage,
 } from "./messages.ts";
 import {
-	materializeOwnedEntry,
-	type OwnedSessionEntryMetadata,
-	ownedSessionEntryMetadata,
-	parseOwnedSessionEntries,
-	validateOwnedSessionEntry,
-	validateOwnedSessionHeader,
-} from "./owned-session-entries.ts";
-import { isOwnedTerminalWrite, OwnedJournal } from "./owner-effects.ts";
-import {
 	copyEntry,
+	type EntryLocation,
 	getEntryLocation,
 	isColdEntry,
 	isColdFieldReader,
@@ -61,7 +54,6 @@ import {
 	toColdEntry,
 	toHotEntry,
 } from "./session-lazy-entries.ts";
-
 import { bindSessionTurnAppender } from "./session-turn-appender.ts";
 import type { TurnProvenance } from "./turn-provenance.ts";
 import { freezeDetached, receiptRecord, sealEntryProvenance, type TurnReceipt } from "./turn-receipts.ts";
@@ -72,66 +64,6 @@ import type { UserMessageMetadata, UserMessageMetadataSource } from "./user-mess
 const RECENT_RESIDENT_ENTRIES = 100;
 
 export const CURRENT_SESSION_VERSION = 3;
-
-const ownedTerminalPersistence = new WeakMap<SessionManager, () => Promise<void>>();
-type OwnedTerminalAppender = {
-	appendMessage(
-		message: Message | CustomMessage | BashExecutionMessage,
-		receipt?: TurnReceipt,
-		metadata?: UserMessageMetadata,
-		metadataSource?: UserMessageMetadataSource,
-	): Promise<string>;
-	appendCustomMessage<T = unknown>(
-		customType: string,
-		content: string | (TextContent | ImageContent)[],
-		display: boolean,
-		details?: T,
-		receipt?: TurnReceipt,
-	): Promise<string>;
-	appendCustomEntry(type: string, data?: unknown): Promise<string>;
-};
-const ownedTerminalAppenders = new WeakMap<SessionManager, OwnedTerminalAppender>();
-
-/** Private owner lifecycle entry; not exported from the SDK or ordinary API. */
-export function persistOwnedTerminalSession(manager: SessionManager): Promise<void> {
-	const persist = ownedTerminalPersistence.get(manager);
-	if (!persist) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return persist();
-}
-
-/** Private captured route used only by the original owner's terminal callbacks. */
-export function appendOwnedTerminalMessage(
-	manager: SessionManager,
-	message: Message | CustomMessage | BashExecutionMessage,
-	receipt?: TurnReceipt,
-	metadata?: UserMessageMetadata,
-	metadataSource?: UserMessageMetadataSource,
-): Promise<string> {
-	const append = ownedTerminalAppenders.get(manager)?.appendMessage;
-	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(message, receipt, metadata, metadataSource);
-}
-
-/** Private captured route used only by the original owner's terminal callbacks. */
-export function appendOwnedTerminalCustomMessage<T = unknown>(
-	manager: SessionManager,
-	customType: string,
-	content: string | (TextContent | ImageContent)[],
-	display: boolean,
-	details?: T,
-	receipt?: TurnReceipt,
-): Promise<string> {
-	const append = ownedTerminalAppenders.get(manager)?.appendCustomMessage;
-	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(customType, content, display, details, receipt);
-}
-
-/** Private captured route for non-message retained-session entries. */
-export function appendOwnedTerminalEntry(manager: SessionManager, type: string, data?: unknown): Promise<string> {
-	const append = ownedTerminalAppenders.get(manager)?.appendCustomEntry;
-	if (!append) throw new Error("OWNED_JOURNAL_REQUIRED");
-	return append(type, data);
-}
 
 export interface SessionHeader {
 	type: "session";
@@ -375,7 +307,7 @@ type DetachedSessionSource = Pick<
 		shareable: boolean;
 	};
 };
-// Only the detached view may use these native readers, bypassing ownedView's full-history copies.
+// Detached views use constructor-captured canonical readers.
 const detachedSessionSources = new WeakMap<object, DetachedSessionSource>();
 const detachedSessionViews = new WeakMap<object, ReadonlySessionManager>();
 const detachedSelectionInvalidators = new WeakMap<object, () => void>();
@@ -464,8 +396,9 @@ function canShareSessionEntry(entry: object, cold = false): boolean {
 	}
 	return true;
 }
-function publishSessionEntry(entry: SessionEntry, reserveSerializer: boolean): void {
-	sealEntryProvenance(entry, reserveSerializer);
+
+function publishSessionEntry(entry: SessionEntry): void {
+	sealEntryProvenance(entry, true);
 	if (publishedSessionEntries.has(entry) || !canShareSessionEntry(entry, isColdEntry(entry))) return;
 	const pending: unknown[] = [entry];
 	while (pending.length) {
@@ -504,7 +437,7 @@ export function detachedSessionEntries(values: SessionEntry[]): SessionEntry[] {
 
 /**
  * Extension-facing history reads return deep-detached values, so a retained entry edited
- * later cannot change native history, projection, revision or journal bytes (pi#132 R4-3).
+ * later cannot change canonical history, projection, revision or journal bytes (pi#132 R4-3).
  */
 export function detachedSessionView(manager: ReadonlySessionManager): ReadonlySessionManager {
 	let view = detachedSessionViews.get(manager);
@@ -874,6 +807,17 @@ function getSessionContextSettings(
  * Plain custom entries are display/state entries and do not participate in context.
  */
 export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage[] {
+	const messages = getSessionEntryContextMessages(entry);
+	if (!messages.length) return messages;
+	// User/keyboard projections retain frozen stored-input semantics. Mutable
+	// non-user model state (e.g. usage edits) must not alias published history.
+	const frozenInput =
+		entry.type === "message" && (entry.message.role === "user" || entry.provenance?.channel === "keyboard");
+	return publishedSessionEntries.has(entry) && !frozenInput ? structuredClone(messages) : messages;
+}
+
+/** Internal projection shares owned payloads; the native runtime boundary copies mutable shells. */
+function getSessionEntryContextMessages(entry: SessionEntry): AgentMessage[] {
 	let messages: AgentMessage[];
 	if (entry.type === "message") {
 		const message = entry.message;
@@ -895,11 +839,7 @@ export function sessionEntryToContextMessages(entry: SessionEntry): AgentMessage
 		const summary = createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
 		messages = entry.systemMessage ? [entry.systemMessage, summary] : [summary];
 	} else return [];
-	// User/keyboard projections retain frozen stored-input semantics. Mutable
-	// non-user model state (e.g. usage edits) must not alias published history.
-	const frozenInput =
-		entry.type === "message" && (entry.message.role === "user" || entry.provenance?.channel === "keyboard");
-	return publishedSessionEntries.has(entry) && !frozenInput ? structuredClone(messages) : messages;
+	return messages;
 }
 
 /**
@@ -956,10 +896,19 @@ function buildContextEntriesFromPath(path: SessionEntry[]): SessionEntry[] {
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
-function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undefined): AgentMessage[] {
-	const messages = sessionEntryToContextMessages(entry);
+function projectContextEntry(
+	entry: SessionEntry,
+	edit: ContextEditEntry | undefined,
+	sharePublishedPayloads: boolean,
+): AgentMessage[] {
+	const messages = sharePublishedPayloads
+		? getSessionEntryContextMessages(entry)
+		: sessionEntryToContextMessages(entry);
 	if (!edit) return messages;
-	const replacement = publishedSessionEntries.has(edit) ? structuredClone(edit.replacement) : edit.replacement;
+	const replacement =
+		!sharePublishedPayloads && publishedSessionEntries.has(edit)
+			? structuredClone(edit.replacement)
+			: edit.replacement;
 	if (replacement === null) return [];
 
 	return messages.map((message) => {
@@ -994,6 +943,7 @@ function projectSessionContext(
 	contextEntries: SessionEntry[],
 	thinkingLevel: string,
 	model: SessionContext["model"],
+	sharePublishedPayloads = false,
 ): SessionProjection {
 	const edits = new Map<string, ContextEditEntry>();
 	for (const entry of contextEntries) {
@@ -1008,7 +958,7 @@ function projectSessionContext(
 			messages:
 				sourceEntry.type === "compaction" && index > 0
 					? []
-					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id), sharePublishedPayloads),
 		}),
 	);
 	return {
@@ -1440,6 +1390,8 @@ export class SessionManager {
 	private leafId: string | null = null;
 	#sessionEpoch: object = {};
 	#revision = 0;
+	/** One current immutable projection, sharing published payloads rather than a second transcript. */
+	#nativeProjection?: { revision: number; projection: SessionProjection };
 	#branchProjection?: {
 		revision: number;
 		path: SessionEntry[];
@@ -1448,13 +1400,7 @@ export class SessionManager {
 		model: SessionContext["model"];
 	};
 	#revisionKey: { entries: FileEntry[]; length: number; leafId: string | null } | undefined;
-	readonly #ownedJournal?: OwnedJournal;
-	readonly #ownedEntryIndex = new Map<string, OwnedSessionEntryMetadata>();
-	// Undefined means the trusted bootstrap was committed, regardless of public `flushed`.
-	#ownedBootstrap: Buffer | undefined;
-	#ownedTerminalTail: Promise<void> = Promise.resolve();
-	#ownedTerminalPending = 0;
-	#terminalIndexFailure?: { error: unknown; entry: SessionEntry; bytes: Buffer; nativeWriteAccepted: true };
+
 	private constructor(
 		cwd: string,
 		sessionDir: string,
@@ -1462,12 +1408,10 @@ export class SessionManager {
 		persist: boolean,
 		newSessionOptions?: NewSessionOptions,
 		preloadedFileEntries?: FileEntry[],
-		ownedJournal?: OwnedJournal,
 	) {
 		this.cwd = resolvePath(cwd);
 		this.sessionDir = normalizePath(sessionDir);
 		this.persist = persist;
-		this.#ownedJournal = ownedJournal;
 		detachedSessionSources.set(this, {
 			revision: () => this.revision(),
 			getLeafEntry: () => (this.leafId ? this.byId.get(this.leafId) : undefined),
@@ -1479,14 +1423,12 @@ export class SessionManager {
 					? { contextEntries: appended, ...getSessionContextSettings(appended, previous) }
 					: this.getBranchProjection();
 				let shareable = true;
-				// Detached wrappers are not native published entries, so projection shares their
-				// immutable message graphs instead of cloning mutable runtime model state.
+				// Detached wrappers share immutable message graphs, rather than mutable runtime state.
 				const entries = contextEntries.map((entry) => {
 					if (!publishedSessionEntries.has(entry)) shareable = false;
 					return snapshotSessionEntry(entry)!;
 				});
-				// Exceptional native payloads remain owned but not shareable. Their detached
-				// projection copies are returned, never retained as an uncharged payload cache.
+				// Exceptional detached payload copies are returned, never retained as a payload cache.
 				return {
 					projection: projectSessionContext(entries, thinkingLevel, model ? { ...model } : null),
 					shareable,
@@ -1502,43 +1444,6 @@ export class SessionManager {
 			appendCustomMessage: (customType, content, display, details, receipt) =>
 				this.#appendReceivedCustomMessage(customType, content, display, details, receipt),
 		});
-		if (ownedJournal) {
-			ownedTerminalPersistence.set(this, () => this.#persistOwnedTerminal());
-			ownedTerminalAppenders.set(this, {
-				appendMessage: (message, receipt, metadata, metadataSource) =>
-					this.#appendMessageOwnedTerminal(message, receipt, metadata, metadataSource),
-				appendCustomMessage: (customType, content, display, details, receipt) =>
-					this.#appendCustomMessageOwnedTerminal(customType, content, display, details, receipt),
-				appendCustomEntry: (type, data) => this.#appendCustomEntryOwnedTerminal(type, data),
-			});
-			ownedJournal.assertActive();
-			this.sessionFile = ownedJournal.file;
-			this.sessionId = ownedJournal.sessionId;
-			this.persist = true;
-			const bytes = ownedJournal.read();
-			try {
-				this.fileEntries =
-					bytes.length > 0
-						? parseOwnedSessionEntries(bytes, this.sessionId)
-						: [validateOwnedSessionHeader(materializeOwnedEntry(ownedJournal.initialHeader), this.sessionId)];
-				const header = this.fileEntries[0] as SessionHeader;
-				this.cwd = header.cwd;
-				this.flushed = bytes.length > 0;
-				if (bytes.length === 0) this.#ownedBootstrap = Buffer.from(`${JSON.stringify(header)}\n`);
-				for (const entry of this.fileEntries) {
-					if (entry.type !== "session") this.#ownedEntryIndex.set(entry.id, ownedSessionEntryMetadata(entry));
-				}
-				this._buildIndex();
-			} catch (error) {
-				try {
-					ownedJournal.quarantine();
-				} catch (cleanup) {
-					throw new AggregateError([error, cleanup], "OWNER_JOURNAL_QUARANTINE_FAILED", { cause: error });
-				}
-				throw error;
-			}
-			return;
-		}
 		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
 			mkdirSync(this.sessionDir, { recursive: true });
 		}
@@ -1558,7 +1463,7 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
-		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
+		this.#nativeProjection = undefined;
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			const entries = preloadedFileEntries ?? readEntriesFromFile(this.sessionFile, true);
@@ -1588,10 +1493,10 @@ export class SessionManager {
 	}
 
 	newSession(options?: NewSessionOptions): string | undefined {
-		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
 		if (options?.id !== undefined) {
 			assertValidSessionId(options.id);
 		}
+		this.#nativeProjection = undefined;
 		this.sessionId = options?.id ?? createSessionId();
 		const timestamp = new Date().toISOString();
 		const header: SessionHeader = {
@@ -1621,6 +1526,7 @@ export class SessionManager {
 	}
 
 	private _loadEntries(entries: FileEntry[], options?: NewSessionOptions): void {
+		this.#nativeProjection = undefined;
 		const header = entries.find((e) => e.type === "session") as SessionHeader | undefined;
 
 		if (header) {
@@ -1641,6 +1547,7 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
 		this.#revisionKey = undefined;
 		this.#branchProjection = undefined;
@@ -1650,7 +1557,7 @@ export class SessionManager {
 		this.leafId = null;
 		for (const entry of this.fileEntries) {
 			if (entry.type === "session") continue;
-			publishSessionEntry(entry, !this.#ownedJournal);
+			publishSessionEntry(entry);
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
 			if (entry.type === "label") {
@@ -1666,10 +1573,6 @@ export class SessionManager {
 	}
 
 	private _rewriteFile(): void {
-		if (this.#ownedJournal) {
-			this.persistCurrent();
-			return;
-		}
 		if (!this.persist || !this.sessionFile) return;
 		// Cold entries read from the current file while the new one is written, so write a
 		// temporary file and rename it over the old one.
@@ -1677,39 +1580,49 @@ export class SessionManager {
 		const target = existsSync(this.sessionFile) ? realpathSync(this.sessionFile) : this.sessionFile;
 		const temporary = `${target}.${process.pid}.tmp`;
 		const fd = openSync(temporary, "w");
+		let publish: () => void;
 		try {
-			this.#writeEntries(fd, this.sessionFile);
+			publish = this.#writeEntries(fd, this.sessionFile);
 		} finally {
 			closeSync(fd);
 		}
 		renameSync(temporary, target);
+		publish();
 	}
 
 	/**
-	 * Write every entry to `fd` (a new file that becomes `file`) and record each entry's new byte
-	 * range. Cold entries are rebound to the new file one line at a time.
+	 * Write retained entries and an optional pending append without changing canonical memory.
+	 * Prepare cold replacements one line at a time; publish locations/index/cache changes only
+	 * after the caller has closed the file and, for rewrites, renamed it into place.
 	 */
-	#writeEntries(fd: number, file: string): void {
+	#writeEntries(fd: number, file: string, pendingEntry?: SessionEntry): () => void {
+		const written: { entry: FileEntry; location: EntryLocation; rebound?: SessionEntry }[] = [];
 		let offset = 0;
-		for (let i = 0; i < this.fileEntries.length; i++) {
-			const entry = this.fileEntries[i];
+		for (let i = 0; i < this.fileEntries.length + (pendingEntry ? 1 : 0); i++) {
+			const entry = i < this.fileEntries.length ? this.fileEntries[i] : pendingEntry!;
 			const line = JSON.stringify(entry);
 			const length = Buffer.byteLength(line);
 			writeFileSync(fd, `${line}\n`);
 			const location = { file, offset, length };
 			offset += length + 1;
-			if (!isColdEntry(entry)) {
-				setEntryLocation(entry, location);
-				continue;
-			}
-			const rebound = toColdEntry(JSON.parse(line) as SessionEntry, location);
-			publishSessionEntry(rebound, true);
-			this.fileEntries[i] = rebound;
-			if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
+			const rebound = isColdEntry(entry) ? toColdEntry(JSON.parse(line) as SessionEntry, location) : undefined;
+			if (rebound) publishSessionEntry(rebound);
+			written.push({ entry, location, rebound });
 		}
-		detachedSelectionInvalidators.get(this)?.();
-		this.#revisionKey = undefined;
-		this.#branchProjection = undefined;
+		return () => {
+			this.#nativeProjection = undefined;
+			for (const [i, { entry, location, rebound }] of written.entries()) {
+				if (!rebound) {
+					setEntryLocation(entry, location);
+					continue;
+				}
+				this.fileEntries[i] = rebound;
+				if (this.byId.get(rebound.id) === entry) this.byId.set(rebound.id, rebound);
+			}
+			detachedSelectionInvalidators.get(this)?.();
+			this.#revisionKey = undefined;
+			this.#branchProjection = undefined;
+		};
 	}
 
 	/** Append one entry line and record its byte range. */
@@ -1727,7 +1640,8 @@ export class SessionManager {
 	 * Runs after load, compaction and leaf moves; entries appended between runs stay resident.
 	 */
 	#releaseColdEntries(): void {
-		if (this.#ownedJournal || !this.persist || !this.flushed) return;
+		if (!this.persist || !this.flushed) return;
+		this.#nativeProjection = undefined;
 		const hot = new Set<string>();
 		for (const entry of buildContextEntries([], this.leafId, this.byId)) hot.add(entry.id);
 		for (let i = Math.max(0, this.fileEntries.length - RECENT_RESIDENT_ENTRIES); i < this.fileEntries.length; i++) {
@@ -1742,7 +1656,7 @@ export class SessionManager {
 			if (!location) continue;
 			const next = hot.has(entry.id) ? toHotEntry(entry) : isColdEntry(entry) ? entry : toColdEntry(entry, location);
 			if (next === entry) continue;
-			publishSessionEntry(next, true);
+			publishSessionEntry(next);
 			this.fileEntries[i] = next;
 			// With duplicate ids, byId keeps the later entry (as _buildIndex does); only replace that one.
 			if (this.byId.get(next.id) === entry) this.byId.set(next.id, next);
@@ -1757,20 +1671,6 @@ export class SessionManager {
 
 	isPersisted(): boolean {
 		return this.persist;
-	}
-
-	/** Do not silently bind owned storage to the still-unbound ordinary factories. */
-	assertUnownedRuntime(): void {
-		assertUnownedSessionManager(this);
-	}
-
-	static assertUnownedRuntime(manager: unknown): asserts manager is SessionManager {
-		if (manager === null || typeof manager !== "object" || !(#ownedJournal in manager)) {
-			throw new Error("OWNER_RUNTIME_MANAGER_REQUIRED");
-		}
-		if (manager.#ownedJournal) {
-			throw new Error("OWNER_PROFILE_UNAVAILABLE: coherent runtime effect binding is incomplete");
-		}
 	}
 
 	getCwd(): string {
@@ -1794,246 +1694,66 @@ export class SessionManager {
 	}
 
 	/**
-	 * A new session file is created only once the session contains a user or assistant message.
+	 * A new session file is created once it contains a user/assistant message or unsent input.
 	 * Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
 	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
 	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
 	 */
-	private _hasConversation(): boolean {
-		return this.fileEntries.some(
-			(e) =>
-				(e.type === "message" && (e.message.role === "user" || e.message.role === "assistant")) ||
-				(e.type === "custom" && e.customType === UNSENT_INPUT_TYPE),
+	private _hasConversation(pendingEntry?: SessionEntry): boolean {
+		const startsConversation = (entry: FileEntry): boolean =>
+			(entry.type === "message" && (entry.message.role === "user" || entry.message.role === "assistant")) ||
+			(entry.type === "custom" && entry.customType === UNSENT_INPUT_TYPE);
+		return (
+			(pendingEntry !== undefined && startsConversation(pendingEntry)) || this.fileEntries.some(startsConversation)
 		);
 	}
 
 	#persistEntry(entry: SessionEntry): void {
-		if (this.#ownedJournal) {
-			this.persistCurrent();
-			return;
-		}
-		if (!this.persist || !this.sessionFile) return;
+		const file = this.sessionFile;
+		if (!this.persist || !file) return;
 
 		if (!this.flushed) {
-			if (!this._hasConversation()) return;
-			const fd = openSync(this.sessionFile, "wx");
+			if (!this._hasConversation(entry)) return;
+			// A failed wx open owns nothing: never clean up an already existing file.
+			const fd = openSync(file, "wx");
+			let publish: () => void;
+			let closeAttempted = false;
 			try {
-				this.#writeEntries(fd, this.sessionFile);
-			} finally {
+				publish = this.#writeEntries(fd, file, entry);
+				closeAttempted = true;
 				closeSync(fd);
+			} catch (error) {
+				// Preserve the persistence error even if closing or removing our new file fails.
+				if (!closeAttempted) {
+					try {
+						closeSync(fd);
+					} catch {
+						// The write error takes precedence over this cleanup error.
+					}
+				}
+				try {
+					unlinkSync(file);
+				} catch {
+					// Best effort: an unremovable owned file may still block a later retry.
+				}
+				throw error;
 			}
+			publish();
 			this.flushed = true;
 		} else {
-			this.#appendLine(this.sessionFile, entry);
+			this.#appendLine(file, entry);
 		}
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
-		if (this.#ownedTerminalPending) throw new Error("OWNER_TERMINAL_APPEND_BUSY");
-		if (this.#ownedJournal) {
-			this.#ownedJournal.assertWritable();
-			const published = validateOwnedSessionEntry(materializeOwnedEntry(entry), this.#ownedEntryIndex);
-			publishSessionEntry(published, false);
-			const line = Buffer.from(`${JSON.stringify(published)}\n`);
-			if (this.#ownedBootstrap) this.#persistOwnedBootstrap();
-			// Publish only the admitted suffix before changing the canonical index or acknowledging the entry.
-			this.#ownedJournal.append(line);
-			this.#ownedEntryIndex.set(published.id, ownedSessionEntryMetadata(published));
-			this.fileEntries.push(published);
-			this.byId.set(published.id, published);
-			this.leafId = published.id;
-			this.extendBranchProjection(published);
-			detachedSelectionAppenders.get(this)?.(published);
-			return;
-		}
 		entry = ownSessionEntry(entry);
-		publishSessionEntry(entry, true);
+		publishSessionEntry(entry);
+		this.#persistEntry(entry);
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
 		this.extendBranchProjection(entry);
 		detachedSelectionAppenders.get(this)?.(entry);
-		this.#persistEntry(entry);
-	}
-
-	#enqueueOwnedTerminal<T>(operation: () => Promise<T>): Promise<T> {
-		this.#ownedTerminalPending++;
-		const run = this.#ownedTerminalTail.then(operation).finally(() => {
-			this.#ownedTerminalPending--;
-		});
-		// Observe, but do not recover the queue: an unknown write must not replay.
-		this.#ownedTerminalTail = run.then(() => undefined);
-		void this.#ownedTerminalTail.catch(() => {});
-		return run;
-	}
-
-	#appendMessageOwnedTerminal(
-		message: Message | CustomMessage | BashExecutionMessage,
-		receipt?: TurnReceipt,
-		metadata?: UserMessageMetadata,
-		metadataSource?: UserMessageMetadataSource,
-	): Promise<string> {
-		if (this.#terminalIndexFailure)
-			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
-		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal))
-			return Promise.resolve(this.#appendReceivedMessage(message, receipt, metadata, metadataSource));
-		const provenance = message.role === "user" || message.role === "custom" ? receiptRecord(receipt) : undefined;
-		return this.#enqueueOwnedTerminal(async () => {
-			const entry: SessionMessageEntry = {
-				type: "message",
-				id: generateId(this.byId),
-				parentId: this.leafId,
-				timestamp: new Date().toISOString(),
-				message,
-				...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
-				...(provenance ? { provenance } : {}),
-				...(message.role === "user" && metadata !== undefined ? { metadata, metadataSource } : {}),
-			};
-			await this.#appendEntryOwnedTerminal(entry);
-			return entry.id;
-		});
-	}
-
-	#appendCustomMessageOwnedTerminal<T = unknown>(
-		customType: string,
-		content: string | (TextContent | ImageContent)[],
-		display: boolean,
-		details?: T,
-		receipt?: TurnReceipt,
-	): Promise<string> {
-		if (this.#terminalIndexFailure)
-			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
-		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal))
-			return Promise.resolve(this.#appendReceivedCustomMessage(customType, content, display, details, receipt));
-		const provenance = receiptRecord(receipt);
-		return this.#enqueueOwnedTerminal(async () => {
-			const entry: CustomMessageEntry<T> = {
-				type: "custom_message",
-				customType,
-				content,
-				display,
-				details,
-				provenance,
-				...(getUnsentInputTransfer(receipt) ? { unsentInputId: getUnsentInputTransfer(receipt) } : {}),
-				id: generateId(this.byId),
-				parentId: this.leafId,
-				timestamp: new Date().toISOString(),
-			};
-			await this.#appendEntryOwnedTerminal(entry);
-			return entry.id;
-		});
-	}
-
-	#appendCustomEntryOwnedTerminal(type: string, data?: unknown): Promise<string> {
-		if (this.#terminalIndexFailure)
-			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
-		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		if (!isOwnedTerminalWrite(this.#ownedJournal)) return Promise.resolve(this.appendCustomEntry(type, data));
-		return this.#enqueueOwnedTerminal(async () => {
-			const entry: CustomEntry = {
-				type: "custom",
-				customType: type,
-				data,
-				id: generateId(this.byId),
-				parentId: this.leafId,
-				timestamp: new Date().toISOString(),
-			};
-			await this.#appendEntryOwnedTerminal(entry);
-			return entry.id;
-		});
-	}
-
-	async #appendEntryOwnedTerminal(entry: SessionEntry): Promise<void> {
-		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		this.#ownedJournal.assertWritable();
-		const published = validateOwnedSessionEntry(materializeOwnedEntry(entry), this.#ownedEntryIndex);
-		publishSessionEntry(published, false);
-		const line = Buffer.from(`${JSON.stringify(published)}\n`);
-		if (this.#ownedBootstrap) {
-			await this.#ownedJournal.commitTerminalAsync(this.#ownedBootstrap);
-			this.#ownedJournal.assertWritable();
-			this.#ownedBootstrap = undefined;
-			this.flushed = true;
-		}
-		await this.#ownedJournal.appendTerminalAsync(line);
-		try {
-			this.#ownedJournal.assertWritable();
-			this.#ownedEntryIndex.set(published.id, ownedSessionEntryMetadata(published));
-			this.fileEntries.push(published);
-			this.byId.set(published.id, published);
-			this.leafId = published.id;
-			this.extendBranchProjection(published);
-			detachedSelectionAppenders.get(this)?.(published);
-		} catch (error) {
-			this.#terminalIndexFailure ??= { error, entry: published, bytes: line, nativeWriteAccepted: true };
-			try {
-				this.#ownedJournal.quarantine();
-			} catch (cleanup) {
-				throw new AggregateError([error, cleanup], "OWNER_TERMINAL_INDEX_UNKNOWN", { cause: error });
-			}
-			throw error;
-		}
-	}
-
-	#persistOwnedTerminal(): Promise<void> {
-		if (this.#terminalIndexFailure)
-			throw new Error("OWNER_TERMINAL_INDEX_UNKNOWN", { cause: this.#terminalIndexFailure.error });
-		const journal = this.#ownedJournal;
-		if (!journal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		return this.#enqueueOwnedTerminal(async () => {
-			journal.assertWritable();
-			if (!isOwnedTerminalWrite(journal)) throw new Error("OWNER_TERMINAL_STATE");
-			// Every successful owned append already published its suffix. Only an
-			// unflushed header needs a final write; never use the active-only reader.
-			if (this.#ownedBootstrap) {
-				await journal.commitTerminalAsync(this.#ownedBootstrap);
-				journal.assertWritable();
-				this.#ownedBootstrap = undefined;
-				this.flushed = true;
-			}
-		});
-	}
-
-	#persistOwnedBootstrap(): { bytes: number; sha256: string } {
-		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		this.#ownedJournal.assertWritable();
-		if (!this.#ownedBootstrap) return this.#ownedJournal.currentReceipt();
-		const receipt = this.#ownedJournal.commit(this.#ownedBootstrap);
-		this.#ownedBootstrap = undefined;
-		this.flushed = true;
-		return receipt;
-	}
-
-	private encodeOwnedEntries(): Buffer {
-		// The private ordinary fork scratch has a non-enumerable reserved serializer slot.
-		// Exclude that slot there only; owned entries still undergo full descriptor validation.
-		return Buffer.from(
-			`${this.fileEntries
-				.map((entry) => JSON.stringify(materializeOwnedEntry(this.#ownedJournal ? entry : { ...entry })))
-				.join("\n")}\n`,
-		);
-	}
-
-	private ownedView<T>(value: T): T {
-		return this.#ownedJournal ? structuredClone(value) : value;
-	}
-
-	/** Durable owned acknowledgment, including header/control-only sessions. */
-	persistCurrent(): { sessionId: string; file: string; bytes: number; sha256: string } {
-		if (this.#ownedTerminalPending) throw new Error("OWNER_TERMINAL_APPEND_BUSY");
-		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		this.#ownedJournal.assertWritable();
-		const receipt = this.#persistOwnedBootstrap();
-		this.flushed = true;
-		return { sessionId: this.sessionId, file: this.#ownedJournal.file, ...receipt };
-	}
-
-	/** Exclusion is already held by the concrete native capability before any load. */
-	static openOwned(cwd: string, journal: OwnedJournal): SessionManager {
-		OwnedJournal.assertOriginal(journal);
-		return new SessionManager(cwd, dirname(journal.file), undefined, true, undefined, undefined, journal);
 	}
 
 	/** Append a message as child of current leaf, then advance leaf. Returns entry id.
@@ -2108,7 +1828,7 @@ export class SessionManager {
 			...(note ? { note } : {}),
 		};
 		this._appendEntry(entry);
-		return this.ownedView(this.byId.get(entry.id) as UsageEntry);
+		return this.byId.get(entry.id) as UsageEntry;
 	}
 
 	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */
@@ -2272,7 +1992,7 @@ export class SessionManager {
 		return this.leafId;
 	}
 
-	/** @internal Branch IDs and entry tags without copying owned payloads. */
+	/** @internal Branch IDs and entry tags without copying payloads. */
 	getBranchIdentity(): {
 		entries: Array<{ id: string; type: SessionEntry["type"]; customType?: string }>;
 		leafId: string | null;
@@ -2307,6 +2027,7 @@ export class SessionManager {
 			key.length !== this.fileEntries.length ||
 			key.leafId !== this.leafId
 		) {
+			this.#nativeProjection = undefined;
 			this.#revisionKey = { entries: this.fileEntries, length: this.fileEntries.length, leafId: this.leafId };
 			this.#revision++;
 		}
@@ -2314,11 +2035,11 @@ export class SessionManager {
 	}
 
 	getLeafEntry(): SessionEntry | undefined {
-		return this.ownedView(this.leafId ? this.byId.get(this.leafId) : undefined);
+		return this.leafId ? this.byId.get(this.leafId) : undefined;
 	}
 
 	getEntry(id: string): SessionEntry | undefined {
-		return this.ownedView(this.byId.get(id));
+		return this.byId.get(id);
 	}
 
 	/**
@@ -2331,7 +2052,7 @@ export class SessionManager {
 				children.push(entry);
 			}
 		}
-		return this.ownedView(children);
+		return children;
 	}
 
 	/**
@@ -2375,7 +2096,7 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
-		return this.ownedView(this.getBranchEntries(fromId));
+		return this.getBranchEntries(fromId);
 	}
 
 	private getBranchEntries(fromId?: string): SessionEntry[] {
@@ -2398,11 +2119,12 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return this.ownedView(this.getBranchProjection().contextEntries.slice());
+		return this.getBranchProjection().contextEntries.slice();
 	}
 
 	/** Ordinary appends extend the cached branch instead of walking old history again. */
 	private extendBranchProjection(entry: SessionEntry): void {
+		this.#nativeProjection = undefined;
 		const cache = this.#branchProjection;
 		const key = this.#revisionKey;
 		if (
@@ -2445,8 +2167,40 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		const { contextEntries, thinkingLevel, model } = this.getBranchProjection();
-		return this.ownedView(projectSessionContext(contextEntries, thinkingLevel, model ? { ...model } : null));
+		const { revision, contextEntries, thinkingLevel, model } = this.getBranchProjection();
+		let projection = this.#nativeProjection?.revision === revision ? this.#nativeProjection.projection : undefined;
+		if (!projection) {
+			projection = projectSessionContext(contextEntries, thinkingLevel, model ? { ...model } : null, true);
+			// A frozen outer entry is not enough: native Map/Set/Date/typed-array/cyclic
+			// graphs deliberately remain readable and mutable, so never freeze or cache them.
+			if (contextEntries.every((entry) => publishedSessionEntries.has(entry))) {
+				freezeDetached(projection);
+				this.#nativeProjection = { revision, projection };
+			}
+		}
+		// The one native-to-runtime boundary: mutable shells and small usage/cost
+		// records, but no traversal or copying of immutable content/details/tools.
+		// Published source entries are already safe to share.
+		const entries = projection.entries.map(({ sourceEntry, messages }) => ({
+			sourceEntry,
+			messages: messages.map((message) => {
+				const runtime = { ...message };
+				if ((runtime.role === "assistant" || runtime.role === "toolResult") && runtime.usage) {
+					runtime.usage = {
+						...runtime.usage,
+						...(runtime.usage.cost ? { cost: { ...runtime.usage.cost } } : {}),
+					};
+				}
+				return runtime;
+			}),
+		}));
+		return {
+			entries,
+			// Flatten the new per-entry messages, preserving identity for runtime entry lookup.
+			messages: entries.flatMap((entry) => entry.messages),
+			thinkingLevel: projection.thinkingLevel,
+			model: projection.model ? { ...projection.model } : null,
+		};
 	}
 
 	buildSessionContext(): SessionContext {
@@ -2459,12 +2213,17 @@ export class SessionManager {
 	 */
 	getHeader(): SessionHeader | null {
 		const h = this.fileEntries.find((e) => e.type === "session");
-		return this.ownedView(h ? (h as SessionHeader) : null);
+		return h ? (h as SessionHeader) : null;
 	}
 
 	/** Number of session entries (excludes header), without copying them like `getEntries()`. */
 	getEntryCount(): number {
 		return this.byId.size;
+	}
+
+	/** Physical records after the initial header, including duplicate IDs and extra headers. */
+	getPhysicalEntryCount(): number {
+		return this.fileEntries.length - 1;
 	}
 
 	/**
@@ -2473,7 +2232,7 @@ export class SessionManager {
 	 * change the leaf pointer. Entries cannot be modified or deleted.
 	 */
 	getEntries(): SessionEntry[] {
-		return this.ownedView(this.fileEntries.filter((e): e is SessionEntry => e.type !== "session"));
+		return this.fileEntries.filter((e): e is SessionEntry => e.type !== "session");
 	}
 
 	/**
@@ -2535,10 +2294,10 @@ export class SessionManager {
 	 * are not modified or deleted.
 	 */
 	branch(branchFromId: string): void {
-		this.#ownedJournal?.assertActive();
 		if (!this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
 		this.leafId = branchFromId;
 		this.#branchProjection = undefined;
@@ -2551,7 +2310,7 @@ export class SessionManager {
 	 * Use this when navigating to re-edit the first user message.
 	 */
 	resetLeaf(): void {
-		this.#ownedJournal?.assertActive();
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
 		this.leafId = null;
 		this.#branchProjection = undefined;
@@ -2572,10 +2331,9 @@ export class SessionManager {
 		if (branchFromId !== null && !this.byId.has(branchFromId)) {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
-		this.#ownedJournal?.assertActive();
 		const fromId = this.leafId ?? "root";
+		this.#nativeProjection = undefined;
 		detachedSelectionInvalidators.get(this)?.();
-		if (!this.#ownedJournal) this.leafId = branchFromId;
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
 			id: generateId(this.byId),
@@ -2598,48 +2356,12 @@ export class SessionManager {
 	 * Returns the new session file path, or undefined if not persisting.
 	 */
 	createBranchedSession(leafId: string): string | undefined {
-		if (this.#ownedJournal) throw new Error("OWNER_REPLACEMENT_REQUIRED");
-		return this.selectBranchedSession(leafId);
-	}
-
-	/** Select once through the maintained branch/label algorithm into a detached child. */
-	forkSelected(leafId: string | null, journal: OwnedJournal): SessionManager {
-		if (!this.#ownedJournal) throw new Error("OWNED_JOURNAL_REQUIRED");
-		OwnedJournal.assertOriginal(journal);
-		this.#ownedJournal.assertActive();
-		if (journal.sessionId === this.sessionId || journal.file === this.sessionFile || journal.read().length !== 0) {
-			throw new Error("OWNER_FRESH_CHILD_REQUIRED");
-		}
-		const child = SessionManager.openOwned(this.cwd, journal);
-		const header = materializeOwnedEntry({ ...child.getHeader()!, parentSession: this.sessionFile });
-		let selected: FileEntry[];
-		if (leafId === null) {
-			selected = [validateOwnedSessionHeader(header, journal.sessionId)];
-		} else {
-			// An explicit fork imports committed history, not caller-mutable presentation indices.
-			const bytes = this.#ownedJournal.read();
-			const entries = bytes.length > 0 ? parseOwnedSessionEntries(bytes, this.#ownedJournal.sessionId) : undefined;
-			const scratch = SessionManager.inMemory(this.cwd, undefined, entries);
-			scratch.selectBranchedSession(leafId, header);
-			selected = parseOwnedSessionEntries(scratch.encodeOwnedEntries(), journal.sessionId);
-		}
-		child.#ownedBootstrap = Buffer.from(`${selected.map((entry) => JSON.stringify(entry)).join("\n")}\n`);
-		child.#persistOwnedBootstrap();
-		child.fileEntries = selected;
-		child.#sessionEpoch = {};
-		for (const entry of selected) {
-			if (entry.type !== "session") child.#ownedEntryIndex.set(entry.id, ownedSessionEntryMetadata(entry));
-		}
-		child._buildIndex();
-		return child;
-	}
-
-	private selectBranchedSession(leafId: string, selectedHeader?: SessionHeader): string | undefined {
 		const previousSessionFile = this.sessionFile;
 		const path = this.getBranch(leafId);
 		if (path.length === 0) {
 			throw new Error(`Entry ${leafId} not found`);
 		}
+		this.#nativeProjection = undefined;
 
 		// Filter out LabelEntry from path - we'll recreate them from the resolved map.
 		// Because labels are real tree entries, later entries can be children of labels;
@@ -2672,12 +2394,12 @@ export class SessionManager {
 			pathParentId = entry.id;
 		}
 
-		const newSessionId = selectedHeader?.id ?? createSessionId();
-		const timestamp = selectedHeader?.timestamp ?? new Date().toISOString();
+		const newSessionId = createSessionId();
+		const timestamp = new Date().toISOString();
 		const fileTimestamp = timestamp.replace(/[:.]/g, "-");
 		const newSessionFile = join(this.getSessionDir(), `${fileTimestamp}_${newSessionId}.jsonl`);
 
-		const header: SessionHeader = selectedHeader ?? {
+		const header: SessionHeader = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
 			id: newSessionId,
@@ -3020,7 +2742,3 @@ export class SessionManager {
 		}
 	}
 }
-
-/** Captured original validator; an instance method or copied prototype is not a fence. */
-export const assertUnownedSessionManager: (manager: unknown) => asserts manager is SessionManager =
-	SessionManager.assertUnownedRuntime;

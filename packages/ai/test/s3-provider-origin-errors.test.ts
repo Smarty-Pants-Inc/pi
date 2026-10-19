@@ -1,9 +1,5 @@
-// pi#202 round 3 P1-E and P1-F (smarty-dev#5822): provider messages, codes and stop reasons never reach the
-// published text. Errors adapters build from provider data are provider errors by origin, never "local". Each
-// row plants a credential-shaped value and a plain environment value (no pattern can match it) in one provider
-// path and asserts both are absent from errorMessage, the message JSON (the session entry), the events, and the
-// thrown object with its cause, inspect output and stack. Refusal stop_details are the explicit record-only
-// exception: the dedicated test below checks that only rawStopDetails can retain that untrusted value.
+// pi#202 round 3 P1-E and P1-F (smarty-dev#5822): provider-origin errors publish owned text only.
+// pi#297: refusal stop_details are the explicit bounded, untrusted record-only exception, never owned error text.
 import { inspect } from "node:util";
 import { describe, expect, it } from "vitest";
 import { stream as streamAnthropic } from "../src/api/anthropic-messages.ts";
@@ -20,7 +16,7 @@ const CREDENTIAL = "sk-ant-api03-synthetic5822roundthreeDDDDDDDDDDDDDD";
 const PLAIN_ENV = "corp-eu-west-7-tenant-plum";
 const PLANTED = `${PLAIN_ENV} ${CREDENTIAL}`;
 const context = normalizeContext({ messages: [{ role: "user", content: "hi", timestamp: 0 }] });
-// Synthetic, non-secret token: the local fetch stub never contacts an authenticated service.
+// Synthetic token; all provider requests use local fetch stubs.
 const codexToken = `test.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "local-test" } })).toString("base64")}.test`;
 
 function model<TApi extends string>(api: TApi, provider = "custom-5822"): Model<TApi> {
@@ -38,20 +34,13 @@ function model<TApi extends string>(api: TApi, provider = "custom-5822"): Model<
 	};
 }
 
-function sse(events: unknown[], named = false): Response {
-	const body = events
-		.map((event) =>
-			named
-				? `event: ${(event as { type: string }).type}\ndata: ${JSON.stringify(event)}\n\n`
-				: `data: ${JSON.stringify(event)}\n\n`,
-		)
-		.join("");
-	return new Response(body, { headers: { "content-type": "text/event-stream" } });
+function sse(events: unknown[]): Response {
+	return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+		headers: { "content-type": "text/event-stream" },
+	});
 }
 
-async function collect(
-	stream: AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> },
-): Promise<AssistantMessage> {
+async function collect(stream: AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> }) {
 	const published: string[] = [];
 	for await (const event of stream) published.push(JSON.stringify(event));
 	const result = await stream.result();
@@ -118,26 +107,27 @@ describe("P1-E: provider text never reaches errorMessage (smarty-dev#5822)", () 
 		);
 	});
 
+	// pi#297 / smarty-dev#14961: only the record-only field may retain this untrusted value.
 	it("Anthropic: a refusal explanation stays exclusively in the record-only field", async () => {
+		const events = [
+			{
+				type: "message_start",
+				message: { id: "m", model: "test-model", usage: { input_tokens: 1, output_tokens: 0 } },
+			},
+			{
+				type: "message_delta",
+				delta: { stop_reason: "refusal", stop_details: { type: "refusal", explanation: PLANTED } },
+				usage: { output_tokens: 1 },
+			},
+			{ type: "message_stop" },
+		];
 		const stream = streamAnthropic(model("anthropic-messages"), context, {
 			apiKey: "k",
 			maxRetries: 0,
 			fetch: async () =>
-				sse(
-					[
-						{
-							type: "message_start",
-							message: { id: "m", model: "test-model", usage: { input_tokens: 1, output_tokens: 0 } },
-						},
-						{
-							type: "message_delta",
-							delta: { stop_reason: "refusal", stop_details: { type: "refusal", explanation: PLANTED } },
-							usage: { output_tokens: 1 },
-						},
-						{ type: "message_stop" },
-					],
-					true,
-				),
+				new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), {
+					headers: { "content-type": "text/event-stream" },
+				}),
 		});
 		for await (const event of stream) {
 			if (event.type === "error") {
@@ -187,8 +177,7 @@ describe("P1-E: provider text never reaches errorMessage (smarty-dev#5822)", () 
 		);
 	});
 
-	it("Responses: a custom provider label outside the closed form becomes `provider`", async () => {
-		// The configured id stays on `message.provider`; only the owned error prefix uses the closed form.
+	it("Responses: a custom provider label outside the closed form becomes provider", async () => {
 		const result = await streamResponses(model("openai-responses", `Tenant ${PLAIN_ENV}`), context, {
 			apiKey: "k",
 			maxRetries: 0,
@@ -198,7 +187,7 @@ describe("P1-E: provider text never reaches errorMessage (smarty-dev#5822)", () 
 	});
 });
 
-describe("P1-F: errors built from provider data are provider errors by origin (smarty-dev#5822)", () => {
+describe("P1-F: provider-derived errors remain provider errors by origin (smarty-dev#5822)", () => {
 	it.each([
 		["SSE error event", () => sse([{ type: "error", code: PLAIN_ENV, message: PLANTED }])],
 		[

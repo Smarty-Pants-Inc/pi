@@ -1,4 +1,4 @@
-// pi#150 redaction port: the pi#131 round-4 credential P1s (R4-1 Models half, R4-2, R4-3, R4-5) on v1.0.4.
+// pi#150: pi#131 round-4 credential boundaries, serializer composition, model receivers and private grant files.
 import { lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,13 +66,11 @@ describe("R4-3: bounded serializer composition", () => {
 		expectNoKey(masked, [OPAQUE]);
 		expect(masked).toContain("upstream rejected");
 	});
-
 	it("withholds a field that exceeds the decode budget", () => {
 		let text = OPAQUE;
 		for (let i = 0; i < 20; i++) text = encodeURIComponent(JSON.stringify(text));
 		expect(redactOAuthDiagnostic(text, [OPAQUE])).toBe("***");
 	});
-
 	it("keeps an unrelated diagnostic byte for byte", () => {
 		const text = 'HTTP 500 {"detail":"a\\\\b %41 \\u0041"}';
 		expect(redactOAuthDiagnostic(text, [OPAQUE])).toBe(text);
@@ -102,21 +100,26 @@ describe("R4-2: every event and result of a protected stream", () => {
 		partial.errorMessage = `unknown finish reason ${KEY}`;
 		partial.rawStopReason = KEY;
 		stream.push({ type: "text_delta", contentIndex: 0, delta: "x", partial });
-		// A foreign diagnostic is dropped by the owned-schema projection (smarty-dev#5822 N5682).
+		// smarty-dev#5822 N5682: foreign diagnostic payloads are dropped by the owned-schema projection.
 		partial.diagnostics = [
-			{ type: "t", timestamp: 1, details: { reason: `${KEY}`, nested: [encodeURIComponent(KEY)] } },
+			{
+				type: "t",
+				timestamp: 1,
+				details: {
+					reason: KEY,
+					nested: [encodeURIComponent(KEY)],
+				},
+			},
 		] as unknown as AssistantMessage["diagnostics"];
 		stream.push({ type: "done", reason: "stop", message: partial });
 		const { events, result } = await collect(stream);
 		expect(events).toHaveLength(2);
 		expectNoKey({ events, result });
-
 		const ended = new AssistantMessageEventStream();
 		protectAssistantMessageStream(ended, [KEY]);
 		ended.end({ ...partial, errorMessage: `late ${KEY}` });
 		expectNoKey(await ended.result());
 	});
-
 	it("leaves a stream without live secrets untouched", async () => {
 		const stream = new AssistantMessageEventStream();
 		const message = { errorMessage: `authorization header ${KEY}` } as AssistantMessage;
@@ -127,14 +130,16 @@ describe("R4-2: every event and result of a protected stream", () => {
 
 describe("R4-2: provider receivers with a reflected key", () => {
 	it("Mistral HTTP error body", async () => {
-		const model = getModel("mistral", "mistral-large-latest");
 		const { events, result } = await collect(
-			streamMistral(model, context, { apiKey: KEY, maxRetries: 0, fetch: async () => echoResponse() }),
+			streamMistral(getModel("mistral", "mistral-large-latest"), context, {
+				apiKey: KEY,
+				maxRetries: 0,
+				fetch: async () => echoResponse(),
+			}),
 		);
 		expect(result.stopReason).toBe("error");
 		expectNoKey({ events, result });
 	});
-
 	it("pi-messages HTTP error body", async () => {
 		const model = {
 			...getModel("openai", "gpt-4o-mini"),
@@ -143,12 +148,15 @@ describe("R4-2: provider receivers with a reflected key", () => {
 			baseUrl: "https://pi.invalid",
 		} as unknown as Model<"pi-messages">;
 		const { events, result } = await collect(
-			streamPiMessages(model, context, { apiKey: KEY, maxRetries: 0, fetch: async () => echoResponse(500) }),
+			streamPiMessages(model, context, {
+				apiKey: KEY,
+				maxRetries: 0,
+				fetch: async () => echoResponse(500),
+			}),
 		);
 		expect(result.stopReason).toBe("error");
 		expectNoKey({ events, result });
 	});
-
 	it("Azure OpenAI Responses error", async () => {
 		const model = {
 			...getModel("openai", "gpt-4o-mini"),
@@ -157,12 +165,15 @@ describe("R4-2: provider receivers with a reflected key", () => {
 			baseUrl: "https://example.openai.azure.com/openai/v1",
 		} as unknown as Model<"azure-openai-responses">;
 		const { events, result } = await collect(
-			streamAzure(model, context, { apiKey: KEY, maxRetries: 0, fetch: async () => echoResponse() }),
+			streamAzure(model, context, {
+				apiKey: KEY,
+				maxRetries: 0,
+				fetch: async () => echoResponse(),
+			}),
 		);
 		expect(result.stopReason).toBe("error");
 		expectNoKey({ events, result });
 	});
-
 	it("OpenAI Completions unknown finish reason in the first partial event", async () => {
 		const model = getModel("openai", "gpt-4o-mini") as unknown as Model<"openai-completions">;
 		const chunk = {
@@ -177,12 +188,14 @@ describe("R4-2: provider receivers with a reflected key", () => {
 				headers: { "content-type": "text/event-stream" },
 			});
 		const { events, result } = await collect(
-			streamOpenAICompletions({ ...model, api: "openai-completions" }, context, { apiKey: KEY, fetch }),
+			streamOpenAICompletions({ ...model, api: "openai-completions" }, context, {
+				apiKey: KEY,
+				fetch,
+			}),
 		);
 		expect(events.some((event) => event.type === "text_delta")).toBe(true);
 		expectNoKey({ events, result });
 	});
-
 	it("Anthropic successful input-transformation diagnostics", async () => {
 		const sse = [
 			[
@@ -215,13 +228,15 @@ describe("R4-2: provider receivers with a reflected key", () => {
 			},
 		} as unknown as Anthropic;
 		const { events, result } = await collect(
-			streamAnthropic(getModel("anthropic", "claude-haiku-4-5"), context, { apiKey: KEY, client }),
+			streamAnthropic(getModel("anthropic", "claude-haiku-4-5"), context, {
+				apiKey: KEY,
+				client,
+			}),
 		);
 		expect(result.stopReason).toBe("stop");
 		expect(result.diagnostics).toHaveLength(1);
 		expectNoKey({ events, result });
 	});
-
 	it("OpenRouter image generation error result", async () => {
 		const model = {
 			id: "img",
@@ -251,7 +266,6 @@ describe("R4-2: provider receivers with a reflected key", () => {
 		expect(result.stopReason).toBe("error");
 		expectNoKey(result);
 	});
-
 	it("llama.cpp classifier error result", async () => {
 		const model = {
 			id: "cls",
@@ -266,7 +280,9 @@ describe("R4-2: provider receivers with a reflected key", () => {
 			model,
 			{
 				state: { text: "x" },
-				questions: { q: { type: "bool", instructions: "?", criteria: { true: "y", false: "n" } } },
+				questions: {
+					q: { type: "bool", instructions: "?", criteria: { true: "y", false: "n" } },
+				},
 			},
 			{
 				apiKey: KEY,
@@ -324,7 +340,6 @@ describe("R4-1: Models non-chat and cancellation boundaries", () => {
 				},
 			],
 			api: {
-				// A provider's own synchronous setup error that echoes the request key.
 				stream: () => {
 					throw new Error(`bad provider config for ${KEY}`);
 				},
@@ -352,7 +367,6 @@ describe("R4-1: Models non-chat and cancellation boundaries", () => {
 		return { models, image: find("img"), classifier: find("cls"), chat: find("chat") };
 	}
 	const options = { apiKey: KEY, headers: { authorization: `Bearer ${OPAQUE}` } };
-
 	it("masks provider rejections after preparation", async () => {
 		let calls = 0;
 		const { models, image, classifier, chat } = setup((headers) => {
@@ -369,7 +383,6 @@ describe("R4-1: Models non-chat and cancellation boundaries", () => {
 		expectNoKey({ message: (rejection as Error).message, stack: (rejection as Error).stack }, [KEY, OPAQUE]);
 		expect(calls).toBe(3);
 	});
-
 	it("keeps a provider setup error's text but masks the request key", async () => {
 		const { models, chat } = setup(() => {
 			throw new Error("not reached");
@@ -378,7 +391,6 @@ describe("R4-1: Models non-chat and cancellation boundaries", () => {
 		expect(result.errorMessage).toContain("bad provider config");
 		expectNoKey(result, [KEY, OPAQUE]);
 	});
-
 	it("makes header-transform failures value-free", async () => {
 		const { models, image, classifier, chat } = setup(() => {
 			throw new Error("not reached");
@@ -403,7 +415,6 @@ describe("R4-5: pi-ai login grant file", () => {
 		if (dir) rmSync(dir, { recursive: true, force: true });
 		dir = undefined;
 	});
-
 	it.skipIf(process.platform === "win32")("creates 0600 under umask 022 and replaces unsafe files and links", () => {
 		dir = mkdtempSync(join(tmpdir(), "pi150-auth-"));
 		const target = join(dir, "auth.json");
@@ -411,11 +422,9 @@ describe("R4-5: pi-ai login grant file", () => {
 		try {
 			writePrivateAuthFile(target, '{"fake":"grant"}');
 			expect(lstatSync(target).mode & 0o777).toBe(0o600);
-
 			writeFileSync(target, "old", { mode: 0o644 });
 			writePrivateAuthFile(target, '{"fake":"grant2"}');
 			expect(lstatSync(target).mode & 0o777).toBe(0o600);
-
 			const victim = join(dir, "victim");
 			writeFileSync(victim, "untouched", { mode: 0o644 });
 			rmSync(target);

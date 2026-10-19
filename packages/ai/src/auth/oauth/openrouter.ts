@@ -45,7 +45,6 @@ function parseAuthorizationInput(input: string): string | undefined {
 	return value;
 }
 
-/** The key exchange endpoint can echo the submitted code: keep only the protocol error code. */
 function errorDetail(body: JsonObject, secrets: readonly string[]): string | undefined {
 	return typeof body.error === "string" ? oauthAuthorizationError(body.error, secrets) : undefined;
 }

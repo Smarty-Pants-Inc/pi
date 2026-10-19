@@ -181,18 +181,20 @@ export function prepareExportValueForJson(
 		const objectNode = node as object;
 		// Before any reflection: a proxy (live or revoked) could trap every later step.
 		if (isProxy(objectNode)) throw plainJsonError(format, "a proxy");
+		// JSON.stringify calls an own or inherited data-valued toJSON before checking the
+		// holder's brand or enumerating its fields. Guard the replacement at the same depth
+		// and with the same property key before materializing any snapshot. A replacement is
+		// then processed as the already-serialized value, so its own toJSON is not chained.
+		const toJSON = applyToJson ? findJsonHook(objectNode, format) : undefined;
+		if (toJSON) return visit(Reflect.apply(toJSON, node, [key]), depth, key, false);
+		// JSON.stringify omits functions in objects and writes null for array elements;
+		// the root result is rejected below when it remains undefined.
+		if (callable) return undefined;
+		// Track only values being enumerated: a hook may return its receiver, and nested
+		// hooks may replace an ancestor reference with non-circular data before this check.
 		if (ancestors.has(objectNode)) throw new Error("Cannot export circular session data");
 		ancestors.add(objectNode);
 		try {
-			// JSON.stringify calls an own or inherited data-valued toJSON before checking the
-			// holder's brand or enumerating its fields. Guard the replacement at the same depth
-			// and with the same property key before materializing any snapshot. A replacement is
-			// then processed as the already-serialized value, so its own toJSON is not chained.
-			const toJSON = applyToJson ? findJsonHook(objectNode, format) : undefined;
-			if (toJSON) return visit(Reflect.apply(toJSON, node, [key]), depth, key, false);
-			// JSON.stringify omits functions in objects and writes null for array elements;
-			// the root result is rejected below when it remains undefined.
-			if (callable) return undefined;
 			// Intrinsic brands survive prototype replacement; built-ins without toJSON remain refused.
 			if (
 				isAnyArrayBuffer(node) ||

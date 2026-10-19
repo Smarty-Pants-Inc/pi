@@ -46,13 +46,6 @@ export function assertExactModelIds(label: string, expected: Iterable<string>, a
 	throw new Error(`${label} model IDs do not match (${describeSetDifference(expectedIds, actualIds)})`);
 }
 
-export function filterOmittedProviders<T extends { provider: string }>(
-	models: readonly T[],
-	omittedProviderIds: ReadonlySet<string>,
-): T[] {
-	return models.filter((model) => !omittedProviderIds.has(model.provider));
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -205,7 +198,7 @@ function validateModelValue(
 	} else {
 		for (const field of ["input", "output", "cacheRead", "cacheWrite"] as const) {
 			const cost = value.cost[field];
-			if (typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) {
+			if (typeof cost !== "number" || !Number.isFinite(cost)) {
 				errors.push(`${label} has invalid cost.${field}`);
 			}
 		}

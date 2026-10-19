@@ -3,9 +3,7 @@ import {
 	fauxAssistantMessage,
 	fauxThinking,
 	fauxToolCall,
-	recordThrottledLimitWait,
 } from "@earendil-works/pi-ai";
-import { Type } from "typebox";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, type Harness } from "../harness.ts";
 
@@ -26,7 +24,7 @@ describe("stream recovery episode boundaries", () => {
 	])("preserves the output barrier during a synthetic failure: $updateType", async ({ content, updateType }) => {
 		const h = await createHarness({
 			models: [{ id: "primary" }, { id: "alternate" }],
-			settings: { retry: { baseDelayMs: 0, fallbackModel: "faux/alternate" } },
+			settings: { retry: { baseDelayMs: 0 } },
 		});
 		harnesses.push(h);
 		h.setResponses([fauxAssistantMessage(content), fauxAssistantMessage("must not replay")]);
@@ -46,7 +44,6 @@ describe("stream recovery episode boundaries", () => {
 			usage: { output: 0 },
 		});
 		expect(h.eventsOfType("auto_retry_start")).toEqual([]);
-		expect(h.eventsOfType("auto_retry_fallback")).toEqual([]);
 		expect(h.eventsOfType("agent_end")).toMatchObject([{ willRetry: false }]);
 		expect(h.eventsOfType("tool_execution_start")).toEqual([]);
 		expect(h.eventsOfType("agent_settled")).toMatchObject([{ outcome: "error" }]);
@@ -89,144 +86,5 @@ describe("stream recovery episode boundaries", () => {
 		expect(h.faux.state.callCount).toBe(1);
 		expect(h.eventsOfType("auto_retry_start")).toEqual([]);
 		expect(h.eventsOfType("agent_settled")).toMatchObject([{ outcome: "error" }]);
-	});
-
-	it.each([
-		{ errorMessage: disconnect, retries: 2 },
-		{ errorMessage: "503 overloaded", retries: 3 },
-	])(
-		"restores the normal later-request budget after successful fallback: $errorMessage",
-		async ({ errorMessage, retries }) => {
-			let toolCalls = 0;
-			const h = await createHarness({
-				models: [{ id: "primary" }, { id: "alternate" }],
-				settings: { retry: { baseDelayMs: 0, fallbackModel: "faux/alternate" } },
-				tools: [
-					{
-						name: "echo",
-						label: "Echo",
-						description: "Deterministic test tool",
-						parameters: Type.Object({}),
-						execute: async () => {
-							toolCalls++;
-							return { content: [{ type: "text", text: "tool result" }], details: {} };
-						},
-					},
-				],
-			});
-			harnesses.push(h);
-			const requests: string[] = [];
-			h.setResponses(
-				[
-					...Array.from({ length: 3 }, () => emptyError()),
-					fauxAssistantMessage([fauxToolCall("echo", {})], { stopReason: "toolUse" }),
-					...Array.from({ length: retries }, () => emptyError(errorMessage)),
-					fauxAssistantMessage("later request recovered"),
-				].map((response) => (_context, _options, _state, model) => {
-					requests.push(model.id);
-					return response;
-				}),
-			);
-			await h.session.prompt("test");
-			expect(requests).toEqual([
-				"primary",
-				"primary",
-				"primary",
-				...Array.from({ length: retries + 2 }, () => "alternate"),
-			]);
-			expect(toolCalls).toBe(1);
-			expect(h.eventsOfType("auto_retry_start").map((event) => event.attempt)).toEqual([
-				1,
-				2,
-				...Array.from({ length: retries }, (_, i) => i + 1),
-			]);
-			expect(h.eventsOfType("auto_retry_fallback")).toHaveLength(1);
-			expect(h.eventsOfType("auto_retry_end")).toMatchObject([
-				{ success: true, attempt: 2 },
-				{ success: true, attempt: retries },
-			]);
-			expect(h.eventsOfType("agent_settled")).toMatchObject([{ outcome: "completed" }]);
-			expect(h.session.getLastAssistantText()).toBe("later request recovered");
-		},
-	);
-
-	it.each([0, 2])("never throttle-retries the one-shot alternate (maxRetries: %s)", async (maxRetries) => {
-		const h = await createHarness({
-			models: [{ id: "primary" }, { id: "alternate" }],
-			settings: { retry: { maxRetries, baseDelayMs: 0, fallbackModel: "faux/alternate" } },
-		});
-		harnesses.push(h);
-		const throttled = emptyError("one request at a time");
-		throttled.diagnostics = [{ type: "provider_limit", timestamp: Date.now() }];
-		// The one-shot wait is private to Pi, never a diagnostic field (smarty-dev#5822 N5682).
-		recordThrottledLimitWait(throttled, 0);
-		h.setResponses([
-			...Array.from({ length: maxRetries + 1 }, () => emptyError()),
-			throttled,
-			fauxAssistantMessage("must not retry alternate"),
-		]);
-		await h.session.prompt("test");
-		expect(h.faux.state.callCount).toBe(maxRetries + 2);
-		expect(h.eventsOfType("auto_retry_start")).toHaveLength(maxRetries);
-		expect(h.eventsOfType("auto_retry_fallback")).toHaveLength(1);
-		expect(h.eventsOfType("agent_end").at(-1)).toMatchObject({ willRetry: false });
-		expect(h.eventsOfType("auto_retry_end")).toMatchObject([
-			{ success: false, attempt: maxRetries, finalError: "one request at a time" },
-		]);
-		expect(h.eventsOfType("agent_settled")).toMatchObject([{ outcome: "error" }]);
-	});
-
-	it("never compacts and retries an overflowing one-shot alternate", async () => {
-		const h = await createHarness({
-			models: [{ id: "primary" }, { id: "alternate" }],
-			settings: {
-				retry: { baseDelayMs: 0, fallbackModel: "faux/alternate" },
-				compaction: { enabled: true, keepRecentTokens: 1 },
-			},
-		});
-		harnesses.push(h);
-		// Retained history makes overflow compaction possible; a tiny empty session would not exercise it.
-		h.sessionManager.appendMessage({ role: "user", content: "prior context", timestamp: 1 });
-		h.sessionManager.appendMessage(fauxAssistantMessage("previous completed response"));
-		h.session.refreshContext();
-		h.setResponses([
-			...Array.from({ length: 3 }, () => emptyError()),
-			(_context, _options, _state, model) => ({
-				...emptyError("prompt is too long"),
-				provider: model.provider,
-				model: model.id,
-			}),
-			fauxAssistantMessage("must not compact alternate"),
-		]);
-		await h.session.prompt("test");
-		expect(h.faux.state.callCount).toBe(4);
-		expect(h.eventsOfType("compaction_start")).toEqual([]);
-		expect(h.eventsOfType("agent_end").at(-1)).toMatchObject({ willRetry: false });
-		expect(h.eventsOfType("auto_retry_end")).toMatchObject([{ success: false, attempt: 2 }]);
-	});
-
-	it.each(["success", "failure", "cancel"] as const)("closes a zero-retry fallback episode on %s", async (outcome) => {
-		const h = await createHarness({
-			models: [{ id: "primary" }, { id: "alternate" }],
-			settings: { retry: { maxRetries: 0, baseDelayMs: 0, fallbackModel: "faux/alternate" } },
-		});
-		harnesses.push(h);
-		h.setResponses([
-			emptyError(),
-			outcome === "failure" ? emptyError("503 overloaded") : fauxAssistantMessage("recovered"),
-		]);
-		let aborting: Promise<void> | undefined;
-		if (outcome === "cancel")
-			h.session.subscribe((event) => {
-				if (event.type === "auto_retry_fallback") aborting = h.session.abort();
-			});
-		await h.session.prompt("test");
-		await aborting;
-		expect(h.faux.state.callCount).toBe(outcome === "cancel" ? 1 : 2);
-		expect(h.eventsOfType("auto_retry_end")).toMatchObject([{ success: outcome === "success", attempt: 0 }]);
-		expect(h.session.retryAttempt).toBe(0);
-		expect(h.eventsOfType("agent_settled")).toMatchObject([
-			{ outcome: outcome === "success" ? "completed" : outcome === "cancel" ? "aborted" : "error" },
-		]);
 	});
 });

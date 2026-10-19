@@ -45,13 +45,18 @@ try {
 		closeSync(fd);
 	}
 	const manager = SessionManager.open(file);
-	if (mode === "mixed")
-		manager.appendCustomEntry("metadata", {
+	if (mode === "mixed") {
+		const id = manager.appendCustomEntry("metadata", {
 			index: count,
 			nested: { values: [count, count + 1] },
 			text: "x".repeat(128),
-			[Symbol("live-schema")]: true,
+			// Symbols are dropped by ingress ownership; use a native value that actually survives it.
+			liveSchema: new Map([["native", true]]),
 		});
+		const entry = manager.getEntry(id);
+		assert(entry?.type === "custom");
+		assert((entry.data as { liveSchema: unknown }).liveSchema instanceof Map);
+	}
 	const expectedCount = count + (mode === "mixed" ? 1 : 0);
 	const history = detachedSessionView(manager);
 	const loadedHeap = gc();

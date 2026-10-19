@@ -84,7 +84,7 @@ describe("createAgentSession stream options", () => {
 		settings: Partial<Settings>,
 		requestOptions: SimpleStreamOptions = {},
 		extensionFactory?: ExtensionFactory,
-		emitProviderCallbacks = false,
+		emitProviderEvent = false,
 	): Promise<SimpleStreamOptions | undefined> {
 		const model = createModel(api);
 		const settingsManager = SettingsManager.inMemory(settings);
@@ -106,16 +106,11 @@ describe("createAgentSession stream options", () => {
 			headers: { "x-provider": "provider" },
 			streamSimple: (_requestModel, _context, providerOptions) => {
 				capturedOptions = providerOptions;
-				if (!emitProviderCallbacks) return createDoneStream(api);
+				if (!emitProviderEvent) return createDoneStream(api);
 
 				const stream = createAssistantMessageEventStream();
 				void (async () => {
-					try {
-						await providerOptions?.onResponse?.({ status: 200 });
-						await providerOptions?.onProviderStreamEvent?.({ type: "provider_stream_event" });
-					} catch {
-						// A failing forwarder must fail the assertions below, not hang the stream.
-					}
+					await providerOptions?.onProviderStreamEvent?.({ type: "provider_stream_event" });
 					stream.end(createDoneMessage(api));
 				})();
 				return stream;
@@ -135,7 +130,7 @@ describe("createAgentSession stream options", () => {
 		});
 
 		try {
-			if (!emitProviderCallbacks) {
+			if (!emitProviderEvent) {
 				const stream = await session.agent.streamFunction(
 					model,
 					normalizeContext({ messages: [] }),
@@ -273,8 +268,8 @@ describe("createAgentSession stream options", () => {
 		expect(options?.maxRetryDelayMs).toBe(3000);
 	});
 
-	// Regression test for #9784; value-free shapes per smarty-dev#5822 C1.
-	it("forwards value-free provider callbacks to extensions", async () => {
+	// Regression tests for #9784 and the value-free notification contract (smarty-dev#5822).
+	it("forwards value-free provider stream notifications to extensions", async () => {
 		const extensionEvents: unknown[] = [];
 
 		const options = await captureStreamOptions(
@@ -282,9 +277,6 @@ describe("createAgentSession stream options", () => {
 			{},
 			{},
 			(pi) => {
-				pi.on("after_provider_response", (event) => {
-					extensionEvents.push(event);
-				});
 				pi.on("provider_stream_event", (event) => {
 					extensionEvents.push(event);
 				});
@@ -293,10 +285,7 @@ describe("createAgentSession stream options", () => {
 		);
 
 		expect(options?.onProviderStreamEvent).toEqual(expect.any(Function));
-		expect(extensionEvents).toStrictEqual([
-			{ type: "after_provider_response", status: 200 },
-			{ type: "provider_stream_event" },
-		]);
+		expect(extensionEvents).toEqual([{ type: "provider_stream_event" }]);
 	});
 
 	it("runs before_provider_headers on assembled headers without forwarding the transform", async () => {

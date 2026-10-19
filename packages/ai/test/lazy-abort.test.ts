@@ -204,3 +204,114 @@ describe.each(["stream", "streamSimple"] as const)("lazyApi.%s cancellation", (m
 		},
 	);
 });
+
+// pi#298 / smarty-dev#14950: late sources cannot replace cancellation or repeat publication.
+describe("lazy cancellation settlement and forwarding", () => {
+	const completed: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: "completed" }],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		durationMs: 17,
+		timestamp: Date.now(),
+	};
+
+	it.each(["resolve", "reject"] as const)("settles before uncooperative setup's late %s", async (settlement) => {
+		const controller = new AbortController();
+		const added = vi.spyOn(controller.signal, "addEventListener");
+		const removed = vi.spyOn(controller.signal, "removeEventListener");
+		const setup = Promise.withResolvers<ReturnType<typeof createAssistantMessageEventStream>>();
+		const response = lazyStream(model, () => setup.promise, controller.signal);
+		controller.abort();
+		const result = await response.result();
+		expect(result).toMatchObject({ stopReason: "aborted", errorMessage: "Operation aborted" });
+		for (const [, listener] of added.mock.calls) expect(removed).toHaveBeenCalledWith("abort", listener);
+		if (settlement === "resolve") {
+			const inner = createAssistantMessageEventStream();
+			inner.push({ type: "done", reason: "stop", message: completed });
+			setup.resolve(inner);
+		} else setup.reject(new Error("late setup failure"));
+		await setup.promise.catch(() => {});
+		const events = [];
+		for await (const event of response) events.push(event);
+		expect(events).toMatchObject([{ type: "error", reason: "aborted" }]);
+		expect(await response.result()).toBe(result);
+		added.mockRestore();
+		removed.mockRestore();
+	});
+
+	it.each(["stop", "error"] as const)("does not forward a pending source's late %s over abort", async (reason) => {
+		const controller = new AbortController();
+		const source = createAssistantMessageEventStream();
+		const observed = Promise.withResolvers<void>();
+		const response = lazyStream(
+			model,
+			async () => ({
+				[Symbol.asyncIterator]: () => source[Symbol.asyncIterator](),
+				result() {
+					observed.resolve();
+					return source.result();
+				},
+			}),
+			controller.signal,
+		);
+		await observed.promise;
+		controller.abort();
+		if (reason === "stop") source.push({ type: "done", reason, message: completed });
+		else source.push({ type: "error", reason, error: { ...completed, stopReason: reason } });
+		expect(await response.result()).toMatchObject({ stopReason: "aborted", errorMessage: "Operation aborted" });
+		const events = [];
+		for await (const event of response) events.push(event);
+		expect(events).toMatchObject([{ type: "error", reason: "aborted" }]);
+	});
+
+	it.each(["stream", "streamSimple"] as const)(
+		"%s forwards the existing observer once and retains timing",
+		async (method) => {
+			const controller = new AbortController();
+			const added = vi.spyOn(controller.signal, "addEventListener");
+			const cleaned = Promise.withResolvers<void>();
+			const removeEventListener = controller.signal.removeEventListener.bind(controller.signal);
+			const removed = vi
+				.spyOn(controller.signal, "removeEventListener")
+				.mockImplementation((type, listener, options) => {
+					removeEventListener(type, listener, options);
+					cleaned.resolve();
+				});
+			const observer = vi.fn();
+			const dispatch: ProviderStreams["stream"] = (_model, _context, options) => {
+				expect(options?.onProviderStreamEvent).toBe(observer);
+				return lazyStream(model, async () => {
+					await options?.onProviderStreamEvent?.({ type: "provider_stream_event" });
+					const inner = createAssistantMessageEventStream();
+					inner.push({ type: "done", reason: "stop", message: completed });
+					return inner;
+				});
+			};
+			const response = lazyApi(async () => ({ stream: dispatch, streamSimple: dispatch }))[method](
+				model,
+				normalizeContext({ messages: [] }),
+				{ signal: controller.signal, onProviderStreamEvent: observer },
+			);
+			expect(await response.result()).toMatchObject({ stopReason: "stop", durationMs: 17 });
+			const events = [];
+			for await (const event of response) events.push(event);
+			expect(events).toMatchObject([{ type: "done", reason: "stop" }]);
+			expect(observer.mock.calls).toEqual([[{ type: "provider_stream_event" }]]);
+			await cleaned.promise;
+			for (const [, listener] of added.mock.calls) expect(removed).toHaveBeenCalledWith("abort", listener);
+			added.mockRestore();
+			removed.mockRestore();
+		},
+	);
+});

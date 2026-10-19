@@ -9,7 +9,7 @@ function providerError(status: number | undefined, headers?: Record<string, stri
 }
 
 describe("provider request retries", () => {
-	// Regression for Smarty-Pants-Inc/smarty-dev#2751: count physical attempts, not streams.
+	// smarty-dev#2751: count physical attempts, not streams.
 	it("stops a provider retry at exactly N physical requests", async () => {
 		let count = 0;
 		const request = vi.fn(async () => {
@@ -26,7 +26,8 @@ describe("provider request retries", () => {
 		expect(request).toHaveBeenCalledTimes(2);
 		expect(count).toBe(2);
 	});
-	// PR #139 / smarty-dev#2751: ordinary cancellation must not consume admission or dispatch.
+
+	// PR #139 / smarty-dev#2751: ordinary cancellation consumes no admission.
 	it.each([false, true])("normalizes pre-abort with admission %s", async (guarded) => {
 		const controller = new AbortController();
 		controller.abort();
@@ -34,10 +35,7 @@ describe("provider request retries", () => {
 		const beforeProviderRequest = guarded ? vi.fn() : undefined;
 		await expect(
 			retryProviderRequest(request, { signal: controller.signal, beforeProviderRequest }),
-		).rejects.toMatchObject({
-			name: "AbortError",
-			message: "Request aborted",
-		});
+		).rejects.toMatchObject({ name: "AbortError", message: "Request aborted" });
 		expect(request).not.toHaveBeenCalled();
 		if (beforeProviderRequest) expect(beforeProviderRequest).not.toHaveBeenCalled();
 	});
@@ -63,7 +61,7 @@ describe("provider request retries", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	// PR #139: cap refusals remain body-free in every shared cancellation path.
+	// PR #139: cap refusals remain body-free through shared cancellation paths.
 	it.each(["pre-abort", "in-flight", "backoff"] as const)("retains a cap refusal during %s", async (phase) => {
 		vi.useFakeTimers();
 		const controller = new AbortController();
@@ -117,6 +115,32 @@ describe("provider request retries", () => {
 
 		await expect(retryProviderRequest(request, { maxRetries: 2 })).rejects.toBe(error);
 		expect(request).toHaveBeenCalledTimes(1);
+	});
+
+	// pi#280 / smarty-dev#3155: lean recovery ownership must preserve plan-limit retry admission.
+	it.each(["code", "type"])("does not retry a Smarty limit carried by %s, even with x-should-retry", async (field) => {
+		const error = Object.assign(providerError(429, { "x-should-retry": "true", "retry-after-ms": "0" }), {
+			error: { [field]: "smarty_limit", throttled: true },
+		});
+		const request = vi.fn<() => Promise<string>>().mockRejectedValue(error);
+		const beforeProviderRequest = vi.fn();
+
+		await expect(retryProviderRequest(request, { maxRetries: 2, beforeProviderRequest })).rejects.toBe(error);
+		expect(request).toHaveBeenCalledOnce();
+		expect(beforeProviderRequest).toHaveBeenCalledOnce();
+	});
+
+	// pi#280 / smarty-dev#3155: the extracted classifier must not broaden the owned protocol code.
+	it.each(["code", "type"])("does not suppress a provider retry for a non-limit %s", async (field) => {
+		const error = Object.assign(providerError(429, { "x-should-retry": "true", "retry-after-ms": "0" }), {
+			error: { [field]: "smarty_limit_extra" },
+		});
+		const request = vi.fn<() => Promise<string>>().mockRejectedValueOnce(error).mockResolvedValue("ok");
+		const beforeProviderRequest = vi.fn();
+
+		await expect(retryProviderRequest(request, { maxRetries: 1, beforeProviderRequest })).resolves.toBe("ok");
+		expect(request).toHaveBeenCalledTimes(2);
+		expect(beforeProviderRequest).toHaveBeenCalledTimes(2);
 	});
 
 	it("does not retry statuses listed in noRetryStatuses", async () => {

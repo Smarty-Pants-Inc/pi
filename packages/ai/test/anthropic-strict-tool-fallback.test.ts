@@ -220,7 +220,7 @@ describe("Anthropic preferred strict tool fallback", () => {
 		expect(result.diagnostics).toBeUndefined();
 	});
 
-	// pi#202 / pi#10409: SDK retry, strict fallback and final admission all share the guard and value-free sinks.
+	// pi#202 / pi#10409: SDK retry, strict fallback and final admission share the guard and value-free sinks.
 	it.each([2, 3])("guards every attempt and isolates canaries with a physical request budget of %i", async (limit) => {
 		const canary = "private-wire-value-not-a-known-credential-pattern";
 		const order: string[] = [];
@@ -278,7 +278,6 @@ describe("Anthropic preferred strict tool fallback", () => {
 			expect(onResponse).not.toHaveBeenCalled();
 			expect(onProviderStreamEvent).not.toHaveBeenCalled();
 		} else {
-			// Still-allowed success: admission does not turn a recoverable request into a terminal refusal.
 			expect(result.stopReason).toBe("stop");
 			expect(result.responseId).toBe("msg_test");
 			expect(events.map((event) => event.type)).toEqual(["start", "done"]);
