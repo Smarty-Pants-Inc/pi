@@ -5,7 +5,7 @@ import { join } from "node:path";
 import type { Context } from "@earendil-works/chord";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { ToolExecutionApi } from "@earendil-works/pi-durable";
-import type { ExecutionEnv, FileError, Result } from "@earendil-works/pi-durable/env";
+import type { ExecutionEnv, FileError, FileInfo, Result } from "@earendil-works/pi-durable/env";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { createBashTool, createReadTool } from "@earendil-works/pi-durable/tools";
 import { afterAll, describe, expect, it } from "vitest";
@@ -284,23 +284,57 @@ describe("RemoteExecutionEnv against NodeExecutionEnv", () => {
 		"lists names that are not UTF-8 like Node",
 		async () => {
 			const { local, remote, roots } = pair();
-			for (const root of roots) {
-				for (const name of [[0x62], [0x61, 0xff], [0xc3, 0xa9], [0x61, 0xfe, 0x7a], [0x7a]]) {
+			for (const [index, root] of roots.entries()) {
+				const names = [[0x62], [0x61, 0xff], [0xc3, 0xa9], [0x61, 0xfe, 0x7a], [0x7a]];
+				// PR #280: equal directories need not have equal filesystem iteration order.
+				for (const name of index === 0 ? names : names.reverse()) {
 					writeFileSync(Buffer.concat([Buffer.from(`${root}/`), Buffer.from(name)]), "x");
 				}
 			}
 			const results = async (env: ExecutionEnv, root: string) => {
+				// Both full listings lstat decoded names and reject the invalid UTF-8 names, rather than losing them silently.
+				const list = await env.listDir(".", context);
+				expect(normalize(list, root)).toEqual({ ok: false, code: "not_found" });
 				const reader = await env.openDirReader(".", context);
-				const pages: unknown[] = [];
-				if (reader.ok) {
-					for (let done = false; !done; ) {
+				expect(reader.ok).toBe(true);
+				if (!reader.ok) throw reader.error;
+				const pages: Array<{ count: number; done: boolean }> = [];
+				const entries: FileInfo[] = [];
+				try {
+					// Three valid entries at two per page must finish within three calls, even with an empty final page.
+					for (let call = 0; call < 3; call++) {
 						const page = await reader.value.next(2, context);
-						pages.push(page);
-						done = !page.ok || page.value.done;
+						expect(page.ok).toBe(true);
+						if (!page.ok) throw page.error;
+						expect(page.value.entries.length).toBeLessThanOrEqual(2);
+						pages.push({ count: page.value.entries.length, done: page.value.done });
+						entries.push(...page.value.entries);
+						if (page.value.done) break;
 					}
+					// Retain page/done parity separately from entry order: both readers fill pages with valid entries only.
+					expect(pages).toEqual([
+						{ count: 2, done: false },
+						{ count: 1, done: true },
+					]);
+					expect(await reader.value.next(2, context)).toEqual({ ok: true, value: { entries: [], done: true } });
+				} finally {
 					await reader.value.close(context);
 				}
-				return normalize({ list: await env.listDir(".", context), pages }, root);
+				expect(normalize(await reader.value.next(2, context), root)).toEqual({ ok: false, code: "invalid" });
+				// DirReader promises filesystem order, not matching order between different roots. Sort only the complete
+				// entry collection; keep the page transcript, errors and all metadata above/below unchanged.
+				entries.sort((a, b) => Buffer.compare(Buffer.from(a.name), Buffer.from(b.name)));
+				expect(new Set(entries.map((entry) => entry.name)).size).toBe(entries.length);
+				expect(normalize(entries, root)).toEqual(
+					["b", "z", "é"].map((name) => ({
+						name,
+						path: `<root>/${name}`,
+						kind: "file",
+						size: 1,
+						mtimeMs: "mtime",
+					})),
+				);
+				return normalize({ list, pages, entries }, root);
 			};
 			expect(await results(remote, roots[1])).toEqual(await results(local, roots[0]));
 		},

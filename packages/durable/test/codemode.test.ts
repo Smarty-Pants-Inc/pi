@@ -760,6 +760,7 @@ describe("durable code mode", () => {
 	it("delivers a result only after its journal commit", async () => {
 		const storage = new ControlledStorage();
 		const seen: string[] = [];
+		const firstExecuted = deferred();
 		const chat = codemodeChat([
 			{
 				name: "first",
@@ -767,6 +768,7 @@ describe("durable code mode", () => {
 					seen.push("first");
 					// The next commit is this result's journal commit: it never lands.
 					storage.failNextCommit(new Error("lost"));
+					firstExecuted.resolve();
 					return 1;
 				},
 			},
@@ -781,11 +783,14 @@ describe("durable code mode", () => {
 		chat.holds.block = false;
 		chat.setup.faux.setResponses([script(`await first(); await second();`), DONE]);
 		const { harness, root } = await openChat(storage, chat.setup);
-		await root.submit({ type: "input", content: "go" }, context);
-		await eventually(() => seen.includes("first"));
-		await new Promise((resolve) => setTimeout(resolve, 100));
-		expect(seen).toEqual(["first"]);
-		await harness.close(context).catch(() => {});
+		try {
+			await root.submit({ type: "input", content: "go" }, context);
+			await firstExecuted.promise;
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(seen).toEqual(["first"]);
+		} finally {
+			await harness.close(context).catch(() => {});
+		}
 	});
 
 	it("refuses to resume when the sandbox's fingerprint or the code mode version changed", async () => {

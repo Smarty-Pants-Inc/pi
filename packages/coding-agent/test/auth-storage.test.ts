@@ -20,6 +20,8 @@ describe("AuthStorage", () => {
 
 	afterEach(() => {
 		if (existsSync(tempDir)) rmSync(tempDir, { recursive: true });
+		// pi#280: restoreAllMocks does not reset node:fs module spies' frozen BigInt stat results.
+		vi.resetAllMocks();
 		vi.restoreAllMocks();
 	});
 

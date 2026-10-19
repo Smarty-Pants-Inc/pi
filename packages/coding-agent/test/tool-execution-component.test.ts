@@ -8,6 +8,7 @@ import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
 import { createReadTool, createReadToolDefinition } from "../src/core/tools/read.ts";
 import { withBuiltInRenderers } from "../src/core/tools/renderers/index.ts";
+import { truncateTail } from "../src/core/tools/truncate.ts";
 import { createWriteToolDefinition } from "../src/core/tools/write.ts";
 import { ToolExecutionComponent } from "../src/modes/interactive/components/tool-execution.ts";
 import { initTheme, theme } from "../src/modes/interactive/theme/theme.ts";
@@ -217,8 +218,56 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered.match(/Full output:/g)?.length ?? 0).toBe(1);
 		expect(rendered).toMatch(/line-4000[^\n]*\n[^\S\n]*\n \[Full output:/);
 		expect(rendered).not.toMatch(/line-4000[^\n]*\n[^\S\n]*\n[^\S\n]*\n \[Full output:/);
-		expect(rendered).toContain("Truncated: showing 2000 of 4000 lines");
+		// PR #280: terminal wrapping may split the warning after a long private output path.
+		expect(rendered.replace(/\s+/g, " ")).toContain("Truncated: showing 2000 of 4000 lines");
+		expect(rendered.match(/Truncated:/g)?.length ?? 0).toBe(1);
 		expect(rendered).not.toContain("[Showing lines 2001-4000 of 4000. Full output:");
+		const fullOutputPath = result.details?.fullOutputPath;
+		expect(fullOutputPath).toBeTypeOf("string");
+		if (!fullOutputPath) throw new Error("Expected a persisted full-output path");
+		const unwrapped = stripAnsi(component.render(Math.max(200, fullOutputPath.length + 100)).join("\n"));
+		expect(unwrapped).toContain(`[Full output: ${fullOutputPath}. Truncated: showing 2000 of 4000 lines]`);
+		expect(unwrapped.split(fullOutputPath)).toHaveLength(2);
+	});
+
+	// PR #280: reproduce wrapping independently of the host's temporary-directory length.
+	test.each([false, true])("keeps the exact wrapped bash warning once with expanded=%s", (expanded) => {
+		const fullOutputPath = `/${"d".repeat(142)}/pi-bash.log`;
+		const truncation = truncateTail(
+			Array.from({ length: 4000 }, (_, index) => `line-${String(index + 1).padStart(4, "0")}`).join("\n"),
+		);
+		const component = new ToolExecutionComponent(
+			"bash",
+			"tool-bash-wrapped-warning",
+			{ command: "generate output" },
+			{},
+			createBashToolDefinition(process.cwd(), { exposeSessionEnvironment: false }),
+			createFakeTui(),
+			process.cwd(),
+		);
+		component.setExpanded(expanded);
+		component.updateResult({
+			content: [
+				{
+					type: "text",
+					text: `${truncation.content}\n\n[Showing lines 2001-4000 of 4000. Full output: ${fullOutputPath}]`,
+				},
+			],
+			details: { truncation, fullOutputPath },
+			isError: false,
+		});
+
+		const warning = "Truncated: showing 2000 of 4000 lines";
+		const rendered = stripAnsi(component.render(200).join("\n"));
+		expect(rendered).not.toContain(warning);
+		expect(rendered.replace(/\s+/g, " ")).toContain(warning);
+		expect(rendered.match(/Full output:/g)?.length ?? 0).toBe(1);
+		expect(rendered.match(/Truncated:/g)?.length ?? 0).toBe(1);
+		expect(rendered).not.toContain("[Showing lines");
+		expect(rendered).toContain("line-4000");
+		const unwrapped = stripAnsi(component.render(fullOutputPath.length + 100).join("\n"));
+		expect(unwrapped).toContain(`[Full output: ${fullOutputPath}. ${warning}]`);
+		expect(unwrapped.split(fullOutputPath)).toHaveLength(2);
 	});
 
 	// Issue #9628: keep short durations precise and make long shell durations readable.
