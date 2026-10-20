@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Inspect resolved workflow runners, not YAML source text (smarty-dev#3644).
 
-YAML anchors and aliases are rejected, not resolved (smarty-dev#1246): no
-workflow needs them, and an alias can hide a hosted label in runs-on, a
-matrix value, a whole matrix or a whole job.
+Public repositories require standard GitHub-hosted runner labels. YAML anchors
+and aliases remain forbidden so runner selections stay explicit.
 """
 
 import itertools
@@ -189,29 +188,9 @@ def runner_labels(selection, row, groups, resolve=True):
     raise ValueError("unsupported/unresolved runner selection")
 
 
-def check(workflow_dir, allowlist, group_allowlist):
-    # A runner group can be a GitHub-hosted larger-runner group, so a group is
-    # accepted only by name from our self-hosted group list (empty by default),
-    # whatever labels it carries (pi#138). The caller supplies that list from
-    # the trusted base, not the change under test.
-    allowed_groups = set()
-    for number, line in enumerate(group_allowlist.read_text().splitlines(), 1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        if len(line.split()) != 1:
-            raise ValueError(f"{group_allowlist}:{number}: malformed runner group entry: {line}")
-        allowed_groups.add(line.strip())
-    allowed = {}
-    for number, line in enumerate(allowlist.read_text().splitlines(), 1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        fields = line.split()
-        if len(fields) != 4 or not re.fullmatch(r"https://github\.com/\S+#issuecomment-\d+", fields[3]):
-            raise ValueError(f"{allowlist}:{number}: malformed allowlist entry: {line}")
-        key = tuple(fields[:3])
-        if key in allowed:
-            raise ValueError(f"{allowlist}:{number}: duplicate allowlist entry")
-        allowed[key] = 0
+def check(workflow_dir):
+    # Public repositories use standard hosted images only, with no group or
+    # per-job exceptions. Keep matrix resolution and malformed-YAML rejection.
     workflows = sorted([*workflow_dir.glob("*.yml"), *workflow_dir.glob("*.yaml")])
     if not workflows:
         raise ValueError(f"No workflows found in {workflow_dir}")
@@ -234,30 +213,22 @@ def check(workflow_dir, allowlist, group_allowlist):
                     for row in matrix_rows(job):
                         groups = []
                         for label in runner_labels(job["runs-on"], row, groups):
-                            if re.fullmatch(r"(?:ubuntu|windows|macos)-[\w.-]+", label, re.IGNORECASE):
-                                key = (path.name, job_id, label)
-                                if key not in allowed:
-                                    raise ValueError(f"unapproved hosted runner: {label}")
-                                allowed[key] += 1
-                        for group in groups:
-                            if group not in allowed_groups:
-                                raise ValueError(f"runner group not on the self-hosted group allowlist: {group}")
+                            if not re.fullmatch(r"(?:ubuntu-(?:latest|22\.04|24\.04)(?:-arm)?|windows-(?:latest|2022|2025|11-arm)|macos-(?:latest|14|15|15-intel|26|26-intel))", label):
+                                raise ValueError(f"not a standard GitHub-hosted runner: {label}")
+                        if groups:
+                            raise ValueError("runner groups are not standard GitHub-hosted runners")
                 except ValueError as error:
                     print(f"{path}:{job_id}: {error}", file=sys.stderr)
                     failed = True
         except (yaml.YAMLError, ValueError, TypeError, RecursionError) as error:
             print(f"{path}: invalid or unsupported workflow: {error}", file=sys.stderr)
             failed = True
-    for key, uses in allowed.items():
-        if not uses:
-            print(f"unused hosted-runner allowlist entry (remove it): {' '.join(key)}", file=sys.stderr)
-            failed = True
     return 1 if failed else 0
 
 
 if __name__ == "__main__":
     try:
-        sys.exit(check(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])))
+        sys.exit(check(Path(sys.argv[1])))
     except (OSError, ValueError) as error:
         print(error, file=sys.stderr)
         sys.exit(1)
