@@ -1,3 +1,2 @@
-# Self-hosted runner groups that runs-on: {group: ...} may name (pi#138, smarty-dev#1246).
-# Any other group is refused: it may be a GitHub-hosted larger-runner group.
-# Format: one runner group name per line. Empty by default.
+# Retired by runners v2: no runner groups are permitted in this public repo.
+# Standard GitHub-hosted image labels are enforced by no-hosted-runners.py.

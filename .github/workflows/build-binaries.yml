@@ -26,9 +26,9 @@ jobs:
   # a draft release first; cleanup removes the draft if later publishing fails.
   build:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # Forge disposable VM: 2 vCPU / 8 GB; cross-compilation stays serial.
+    # Cross-compilation stays serial on the standard GitHub-hosted image.
     timeout-minutes: 120
-    runs-on: smarty-linux-x64
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     env:
@@ -149,9 +149,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macOS/Windows hosted entries: scripts/ci/hosted-runner-allowlist.txt (smarty-dev#1246).
         runner:
-          - smarty-linux-x64
+          - ubuntu-latest
           - macos-latest
           - windows-latest
     permissions:
@@ -222,7 +221,7 @@ jobs:
   stage-github-release:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
-    runs-on: smarty-linux-x64
+    runs-on: ubuntu-latest
     needs:
       - build
       - smoke-test-binaries
@@ -386,7 +385,7 @@ jobs:
   announce-pi-dev-release:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
-    runs-on: smarty-linux-x64
+    runs-on: ubuntu-latest
     needs: publish-npm
     environment: pi-model-upload
     concurrency:
@@ -443,7 +442,7 @@ jobs:
   publish-github-release:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 10
-    runs-on: smarty-linux-x64
+    runs-on: ubuntu-latest
     needs:
       - stage-github-release
       - publish-npm
@@ -478,7 +477,7 @@ jobs:
 
   cleanup-draft-github-release:
     timeout-minutes: 10
-    runs-on: smarty-linux-x64
+    runs-on: ubuntu-latest
     needs:
       - build
       - stage-github-release

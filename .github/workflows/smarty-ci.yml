@@ -36,10 +36,8 @@ jobs:
     # (smarty-dev#2177); admit them without contributor or bot-author allowlists.
     # Fork source remains excluded from this runner; retired pr-gate.yml stays deleted.
     if: (github.event_name != 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    # Pushes (main, the install artifact; queue drafts), queue-draft PRs and priority-ci PRs use the existing priority pool
-    # (runners-lead, 2026-10-13; push routing smarty-dev#12205). Push events carry no head_ref or labels.
-    runs-on: ${{ (github.event_name == 'push' || startsWith(github.head_ref, 'mergify/merge-queue/') || startsWith(github.head_ref, 'tmp-mergify/merge-queue/') || contains(github.event.pull_request.labels.*.name, 'priority-ci')) && 'smarty-priority' || 'smarty-linux-x64' }}
-    # Forge disposable VMs: 2 vCPU / 8 GB, up to 7 VMs in the shared pool.
+    # The source identity gate below requires Ubuntu 24.04 on x86-64.
+    runs-on: ubuntu-24.04
     timeout-minutes: 150
     steps:
     - name: Install Forge base prerequisites
@@ -51,16 +49,11 @@ jobs:
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         ref: ${{ github.sha }}
-        # The hosted-runner guard reads its approval lists from a trusted base: depth 2
-        # brings a PR's base commit; a merge-queue push needs full history and
-        # origin/main for the merge base (0 = all history and branches).
+        # Preserve the existing qualification-source history depth.
         fetch-depth: ${{ (github.event_name == 'push' && github.ref != 'refs/heads/main') && '0' || '2' }}
         persist-credentials: false
       timeout-minutes: 5
-    - name: Reject unapproved hosted runners
-      env:
-        # Empty on push; the guard then uses the checkout (main) or the merge base with main.
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    - name: Require standard GitHub-hosted runners
       run: bash scripts/ci/no-hosted-runners.sh
     - name: Test hosted-runner guard
       run: bash scripts/ci/test-no-hosted-runners.sh
@@ -265,7 +258,7 @@ jobs:
   emergency-compaction:
     name: Pi emergency compaction regressions
     if: (github.event_name == 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: smarty-linux-x64
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
     - name: Install Forge base prerequisites
