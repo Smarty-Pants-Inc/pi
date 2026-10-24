@@ -783,7 +783,8 @@ function cacheFallback(reason: string): true {
 function jitiFsCache(): string | true {
 	const value = process.env.SMARTY_JITI_CACHE_DIR;
 	if (!value) return true;
-	// ponytail: bad env falls back, not errors; parents must not be writable by another UID (#10893).
+	// ponytail: fall back on bad env or Windows (no ACL validation); parents must not be writable by another UID (#10893).
+	if (process.platform === "win32") return cacheFallback("unsupported-platform");
 	if (!path.isAbsolute(value)) return cacheFallback("relative");
 	const dir = path.resolve(value);
 	let stat: fs.Stats;
@@ -794,7 +795,7 @@ function jitiFsCache(): string | true {
 	}
 	if (stat.isSymbolicLink()) return cacheFallback("symlink");
 	if (!stat.isDirectory()) return cacheFallback("not a directory");
-	if (process.platform !== "win32" && typeof process.getuid === "function") {
+	if (typeof process.getuid === "function") {
 		if (stat.uid !== process.getuid()) return cacheFallback("foreign owner");
 		if ((stat.mode & 0o022) !== 0) return cacheFallback("group-or-other writable");
 	}

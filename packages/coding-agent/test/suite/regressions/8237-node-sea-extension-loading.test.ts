@@ -173,6 +173,33 @@ describe("Node SEA extension loading", () => {
 			}
 		});
 
+		// Regression test for smarty-dev#10875 / pi#227: POSIX mode checks do not validate Windows ACLs.
+		it("falls back to true on Windows for an owned 0700 directory and warns once", async () => {
+			const dir = makeDir("windows-owned", 0o700);
+			// A fresh loader isolates the process-wide warning from the relative-path case above.
+			vi.resetModules();
+			const freshLoader = await vi.importActual<{ loadExtensions: typeof loadExtensions }>(
+				"../../../src/core/extensions/loader.ts",
+			);
+			const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+			process.env.SMARTY_JITI_CACHE_DIR = dir;
+			try {
+				Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+				const first = await freshLoader.loadExtensions(["/cache-probe.ts"], "/");
+				expect(first.errors).toEqual([]);
+				expect((state.createJiti.mock.calls.at(-1)![1] as JitiOptionsProbe).fsCache).toBe(true);
+				expect(first.warnings).toEqual([{ path: "", warning: expect.stringContaining("unsupported-platform") }]);
+				expect(first.warnings![0].warning).not.toContain(dir);
+
+				const second = await freshLoader.loadExtensions(["/cache-probe.ts"], "/");
+				expect(second.errors).toEqual([]);
+				expect((state.createJiti.mock.calls.at(-1)![1] as JitiOptionsProbe).fsCache).toBe(true);
+				expect(second.warnings).toEqual([]);
+			} finally {
+				Object.defineProperty(process, "platform", originalPlatform);
+			}
+		});
+
 		it("falls back to true for a missing directory", async () => {
 			expect(await fsCacheFor(join(root, "missing"))).toBe(true);
 		});
