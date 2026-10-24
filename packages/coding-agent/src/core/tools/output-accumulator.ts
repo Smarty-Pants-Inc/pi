@@ -4,6 +4,10 @@ import { finished } from "node:stream/promises";
 import { createOutputFileStream } from "../../utils/output-files.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, type TruncationResult, truncateTail } from "./truncate.ts";
 
+// ponytail: match Fabric's 8 MiB shell log cap; preserve a useful head and tail, not an unbounded file.
+export const MAX_FULL_OUTPUT_FILE_BYTES = 8 * 1024 * 1024;
+const FULL_OUTPUT_HALF_BYTES = MAX_FULL_OUTPUT_FILE_BYTES / 2;
+
 export interface OutputAccumulatorOptions {
 	maxLines?: number;
 	maxBytes?: number;
@@ -14,6 +18,8 @@ export interface OutputSnapshot {
 	content: string;
 	truncation: TruncationResult;
 	fullOutputPath?: string;
+	totalRawBytes: number;
+	fullOutputTruncated: boolean;
 }
 
 export interface FullOutput {
@@ -55,6 +61,10 @@ export class OutputAccumulator {
 	private tempFilePath: string | undefined;
 	private tempFileStream: WriteStream | undefined;
 	private tempFileCompletion: Promise<Error | undefined> | undefined;
+	private fileHeadBytes = 0;
+	private fileTail: Buffer | undefined;
+	private fileTailBytes = 0;
+	private fileTailOffset = 0;
 
 	constructor(options: OutputAccumulatorOptions = {}) {
 		this.maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
@@ -73,7 +83,7 @@ export class OutputAccumulator {
 
 		if (this.tempFileStream || this.shouldUseTempFile()) {
 			this.ensureTempFile();
-			this.tempFileStream?.write(data);
+			this.appendToTempFile(data);
 		} else if (data.length > 0) {
 			this.rawChunks.push(data);
 		}
@@ -88,6 +98,7 @@ export class OutputAccumulator {
 		if (this.shouldUseTempFile()) {
 			this.ensureTempFile();
 		}
+		this.flushFileTail();
 	}
 
 	snapshot(options: { persistIfTruncated?: boolean } = {}): OutputSnapshot {
@@ -117,6 +128,8 @@ export class OutputAccumulator {
 			content: truncation.content,
 			truncation,
 			fullOutputPath: this.tempFilePath,
+			totalRawBytes: this.totalRawBytes,
+			fullOutputTruncated: this.tempFilePath !== undefined && this.totalRawBytes > MAX_FULL_OUTPUT_FILE_BYTES,
 		};
 	}
 
@@ -134,9 +147,9 @@ export class OutputAccumulator {
 	}
 
 	/**
-	 * The complete output, for callers that can take more than the display snapshot. Call after
-	 * `finish()` and `closeTempFile()`. Output longer than `maxBytes` raw bytes keeps its first and
-	 * last `maxBytes / 2` bytes around an omission marker.
+	 * The saved output, for callers that can take more than the display snapshot. Call after
+	 * `finish()` and `closeTempFile()`. The file itself is capped at MAX_FULL_OUTPUT_FILE_BYTES;
+	 * this reader keeps its first and last `maxBytes / 2` bytes if it exceeds the caller's limit.
 	 */
 	async readFullOutput(maxBytes: number): Promise<FullOutput> {
 		if (!this.tempFilePath) {
@@ -146,10 +159,15 @@ export class OutputAccumulator {
 		try {
 			const size = (await file.stat()).size;
 			if (size <= maxBytes) {
-				return { content: new TextDecoder().decode(await file.readFile()), truncated: false };
+				return {
+					content: new TextDecoder().decode(await file.readFile()),
+					truncated: this.totalRawBytes > MAX_FULL_OUTPUT_FILE_BYTES,
+				};
 			}
-			const headBytes = Math.floor(maxBytes / 2);
-			const tailBytes = maxBytes - headBytes;
+			// A near-cap budget must not sample the saved omission marker as original output.
+			const readBytes = Math.min(maxBytes, MAX_FULL_OUTPUT_FILE_BYTES);
+			const headBytes = Math.floor(readBytes / 2);
+			const tailBytes = readBytes - headBytes;
 			const head = Buffer.alloc(headBytes);
 			const tail = Buffer.alloc(tailBytes);
 			await file.read(head, 0, headBytes, 0);
@@ -160,7 +178,7 @@ export class OutputAccumulator {
 			let tailStart = 0;
 			while (tailStart < tail.length && (tail[tailStart] & 0xc0) === 0x80) tailStart++;
 			const tailText = new TextDecoder().decode(tail.subarray(tailStart));
-			const omitted = size - headBytes - tailBytes;
+			const omitted = this.totalRawBytes - headBytes - tailBytes;
 			return { content: `${headText}\n\n[... ${omitted} bytes omitted ...]\n\n${tailText}`, truncated: true };
 		} finally {
 			await file.close();
@@ -234,6 +252,45 @@ export class OutputAccumulator {
 		);
 	}
 
+	private appendToTempFile(data: Buffer): void {
+		const headBytes = Math.min(data.length, FULL_OUTPUT_HALF_BYTES - this.fileHeadBytes);
+		if (headBytes > 0) {
+			this.tempFileStream?.write(data.subarray(0, headBytes));
+			this.fileHeadBytes += headBytes;
+		}
+		const rest = data.subarray(headBytes);
+		if (rest.length === 0) return;
+		this.fileTail ??= Buffer.allocUnsafe(FULL_OUTPUT_HALF_BYTES);
+		if (rest.length >= FULL_OUTPUT_HALF_BYTES) {
+			rest.copy(this.fileTail, 0, rest.length - FULL_OUTPUT_HALF_BYTES);
+			this.fileTailOffset = 0;
+			this.fileTailBytes = FULL_OUTPUT_HALF_BYTES;
+			return;
+		}
+		const firstBytes = Math.min(rest.length, FULL_OUTPUT_HALF_BYTES - this.fileTailOffset);
+		rest.copy(this.fileTail, this.fileTailOffset, 0, firstBytes);
+		rest.copy(this.fileTail, 0, firstBytes);
+		this.fileTailOffset = (this.fileTailOffset + rest.length) % FULL_OUTPUT_HALF_BYTES;
+		this.fileTailBytes = Math.min(FULL_OUTPUT_HALF_BYTES, this.fileTailBytes + rest.length);
+	}
+
+	private flushFileTail(): void {
+		if (!this.tempFileStream || !this.fileTail || this.fileTailBytes === 0) return;
+		if (this.totalRawBytes > MAX_FULL_OUTPUT_FILE_BYTES) {
+			const omitted = this.totalRawBytes - MAX_FULL_OUTPUT_FILE_BYTES;
+			// Retain raw bytes even if a UTF-8 character straddles a cut; the marker stays on its own line.
+			this.tempFileStream.write(`\n[... ${omitted} bytes omitted; total ${this.totalRawBytes} bytes ...]\n`);
+		}
+		const start = this.fileTailBytes === FULL_OUTPUT_HALF_BYTES ? this.fileTailOffset : 0;
+		const firstBytes = Math.min(this.fileTailBytes, FULL_OUTPUT_HALF_BYTES - start);
+		this.tempFileStream.write(this.fileTail.subarray(start, start + firstBytes));
+		if (firstBytes < this.fileTailBytes) {
+			this.tempFileStream.write(this.fileTail.subarray(0, this.fileTailBytes - firstBytes));
+		}
+		this.fileTail = undefined;
+		this.fileTailBytes = 0;
+	}
+
 	private ensureTempFile(): void {
 		if (this.tempFilePath) {
 			return;
@@ -247,8 +304,9 @@ export class OutputAccumulator {
 			(error: Error) => error,
 		);
 		for (const chunk of this.rawChunks) {
-			this.tempFileStream.write(chunk);
+			this.appendToTempFile(chunk);
 		}
 		this.rawChunks = [];
+		if (this.finished) this.flushFileTail();
 	}
 }
