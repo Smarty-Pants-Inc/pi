@@ -38,6 +38,32 @@ export default function(pi) {
     ctx.ui.setStatus("proof", "OFFLINE_PROOF_READY"); mark("ready");
   });
   let round4RunHeld = false, savedImages = [];
+  if (process.env.PI_PROOF_CASE.startsWith("rfl-")) {
+    let inputFence, fenceCleanup;
+    const releaseFence = () => { inputFence?.release(); inputFence = undefined; clearInterval(fenceCleanup); };
+    // Acquire through the loader-bound keyboard callback, never through prompt admission.
+    pi.registerShortcut("ctrl+shift+b", { handler: async ctx => {
+      if (inputFence) {
+        releaseFence();
+        writeFileSync(join(dir, "fence-released"), JSON.stringify(ctx.getInputState()));
+        return;
+      }
+      if (process.env.PI_PROOF_CASE === "rfl-retained") {
+        inputFence = await ctx.fenceInputs();
+        // Only the private test cleanup uses this gate; ordinary release uses this same shortcut.
+        fenceCleanup = setInterval(() => { if (existsSync(join(dir, "release-fence"))) { releaseFence(); mark("fence-cleanup-released"); } }, 20);
+      } else {
+        await ctx.fenceInputs(); // Intentionally lose the handle before signal shutdown.
+      }
+      writeFileSync(join(dir, "fence-held"), JSON.stringify({ retained: Boolean(inputFence), state: ctx.getInputState(), draft: ctx.ui.getEditorText() }));
+    } });
+    pi.on("agent_settled", (_event, ctx) => {
+      writeFileSync(join(dir, "fence-turn"), JSON.stringify({ calls: faux.state.callCount, entries: ctx.sessionManager.getEntries() }));
+    });
+    pi.on("session_shutdown", (event, ctx) => {
+      writeFileSync(join(dir, "fence-shutdown"), JSON.stringify({ reason: event.reason, retained: Boolean(inputFence), state: ctx.getInputState() }));
+    });
+  }
   pi.registerShortcut("ctrl+shift+m", { handler: async ctx => {
     await ctx.ui.custom((_ui, _theme, _keys, done) => {
       mark("custom-mounted"); let aborted = false;
@@ -81,7 +107,7 @@ export default function(pi) {
     return { compaction: { summary: "offline compacted context", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
   });
   pi.on("agent_start", async (_event, ctx) => {
-    if (process.env.PI_PROOF_CASE.startsWith("recovery") || process.env.PI_PROOF_CASE.startsWith("r2-custom") || round4RunHeld) { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
+    if (process.env.PI_PROOF_CASE.startsWith("recovery") || process.env.PI_PROOF_CASE.startsWith("r2-custom") || process.env.PI_PROOF_CASE === "rfl-lost-signal" || round4RunHeld) { ctx.ui.setStatus("proof", "RUN_HELD"); mark("run-held"); await hold("run"); }
     if (process.env.PI_PROOF_CASE === "run-shutdown") ctx.shutdown();
   });
   pi.on("input", async (event, ctx) => {
@@ -168,6 +194,7 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 				"bash",
 				"editor",
 				"fork",
+				"fence",
 			])
 				writeFileSync(join(p.dir, `release-${gate}`), "release");
 			if (!existsSync(join(p.dir, "exit"))) {
@@ -192,6 +219,12 @@ describe.skipIf(!tmuxAvailable || !existsSync(cli))("built CLI real interactive 
 					"image-recovered",
 					"first-image-proof",
 					"tail-image-proof",
+					"fence-held",
+					"fence-released",
+					"fence-turn",
+					"fence-shutdown",
+					"terminal-before",
+					"terminal-after",
 					"exit",
 				]) {
 					if (existsSync(join(p.dir, file)))
@@ -284,11 +317,17 @@ await new InteractiveMode(host).run();
 		};
 		if (scenario.startsWith("r1-bash") || scenario === "r1-import" || scenario.startsWith("r2-replacement"))
 			args.splice(0, args.length, join(dir, "native-tui.mjs"));
-		const command = `set +m; env -i ${Object.entries(env)
+		const terminalBefore = scenario.startsWith("rfl-")
+			? `stty -g </dev/tty > ${shellQuote(join(dir, "terminal-before"))}; `
+			: "";
+		const terminalAfter = scenario.startsWith("rfl-")
+			? `stty -g </dev/tty > ${shellQuote(join(dir, "terminal-after"))}; `
+			: "";
+		const command = `set +m; ${terminalBefore}env -i ${Object.entries(env)
 			.map(([key, value]) => `${key}=${shellQuote(value)}`)
 			.join(
 				" ",
-			)} nice -n 19 ${shellQuote(process.execPath)} ${args.map(shellQuote).join(" ")} </dev/tty & child=$!; echo "$child" > ${shellQuote(join(dir, "pid"))}; wait "$child"; code=$?; echo "$code" > ${shellQuote(join(dir, "exit"))}; printf '\\nPROOF_EXIT=%s\\n' "$code"`;
+			)} nice -n 19 ${shellQuote(process.execPath)} ${args.map(shellQuote).join(" ")} </dev/tty & child=$!; echo "$child" > ${shellQuote(join(dir, "pid"))}; wait "$child"; code=$?; ${terminalAfter}echo "$code" > ${shellQuote(join(dir, "exit"))}; printf '\\nPROOF_EXIT=%s\\n' "$code"`;
 		writeFileSync(join(dir, "launch.sh"), `${command}\n`);
 		tmux("send-keys", "-t", name, "-l", `bash ${shellQuote(join(dir, "launch.sh"))}`);
 		tmux("send-keys", "-t", name, "Enter");
@@ -337,6 +376,135 @@ await new InteractiveMode(host).run();
 		p.frame("ready");
 		return p;
 	}
+
+	// pi#309, security follow-up P1a: a refused operator exit must not cancel the live runtime.
+	it.each(["ordinary release", "refused Ctrl+D"] as const)(
+		"RFL-P1a: %s with a retained extension fence leaves a usable session",
+		async (ending) => {
+			const p = await launch(`rfl-retained-${ending === "ordinary release" ? "release" : "ctrl-d"}`, "rfl-retained");
+			p.text("\x1b[66;6u");
+			await p.mark("fence-held");
+			const held = JSON.parse(readFileSync(join(p.dir, "fence-held"), "utf8"));
+			expect(held).toEqual({
+				retained: true,
+				state: { inputsFenced: true, inputAdmissionCount: 0, queued: 0, drained: true },
+				draft: "",
+			});
+			expect(editorFrame(p.frame("extension-fence-held"))).toBe("");
+			if (ending === "refused Ctrl+D") {
+				p.keys("C-d");
+				await vi.waitFor(() => expect(p.frame("ctrl-d-refused")).toContain("INPUT_ADMISSION_FENCED"));
+				expect(existsSync(join(p.dir, "exit"))).toBe(false);
+				expect(existsSync(join(p.dir, "fence-shutdown"))).toBe(false);
+				expect(editorFrame(p.frame("ctrl-d-editor-still-empty"))).toBe("");
+			}
+			p.text("\x1b[66;6u");
+			await p.mark("fence-released");
+			expect(JSON.parse(readFileSync(join(p.dir, "fence-released"), "utf8"))).toEqual({
+				inputsFenced: false,
+				inputAdmissionCount: 0,
+				queued: 0,
+				drained: true,
+			});
+			p.submit("fence-live-turn");
+			await p.mark("fence-turn");
+			const turn = JSON.parse(readFileSync(join(p.dir, "fence-turn"), "utf8"));
+			expect(turn.calls).toBe(1);
+			expect(turn.entries).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "message",
+						message: expect.objectContaining({
+							role: "user",
+							content: [{ type: "text", text: "fence-live-turn" }],
+						}),
+					}),
+					expect.objectContaining({
+						type: "message",
+						message: expect.objectContaining({
+							role: "assistant",
+							content: [{ type: "text", text: "offline terminal answer" }],
+							stopReason: "stop",
+						}),
+					}),
+				]),
+			);
+			await vi.waitFor(() => expect(p.frame("released-session-usable")).toContain("offline terminal answer"));
+			expect(editorFrame(p.frame("before-normal-exit"))).toBe("");
+			p.keys("C-d");
+			expect(await p.exit()).toBe(0);
+			expect(JSON.parse(readFileSync(join(p.dir, "fence-shutdown"), "utf8"))).toMatchObject({
+				reason: "quit",
+				retained: false,
+			});
+			p.frame("normal-exit");
+		},
+	);
+
+	// pi#309, security follow-up P1b: a lost extension handle cannot block native signal cleanup.
+	it.each(["SIGTERM", "SIGHUP"] as const)(
+		"RFL-P1b: %s with a lost extension fence restores terminal and exact unsubmitted draft",
+		async (signal) => {
+			const p = await launch(`rfl-lost-${signal}`, "rfl-lost-signal");
+			p.submit("run-held");
+			await p.mark("run-held");
+			p.text("queue-image");
+			p.keys("M-Enter");
+			await p.mark("image-created");
+			await vi.waitFor(() => expect(p.frame("fence-original-image-queued")).toContain("attached-original"));
+			// A native fence requires empty queues. Recover this original attachment into the editor first.
+			p.keys("M-Up");
+			await vi.waitFor(() => expect(editorFrame(p.frame("fence-image-draft"))).toContain("[recovered image"));
+			writeFileSync(join(p.dir, "release-run"), "release");
+			await p.mark("settled");
+			p.text("\x1b[66;6u");
+			await p.mark("fence-held");
+			const held = JSON.parse(readFileSync(join(p.dir, "fence-held"), "utf8"));
+			expect(held.retained).toBe(false);
+			expect(held.state).toEqual({ inputsFenced: true, inputAdmissionCount: 0, queued: 0, drained: true });
+			expect(held.draft).toMatch(/^attached-original\n\n\[recovered image [^\]\r\n]+ image\/png\]$/);
+			const draftLine = `${signal}-unsent-line ${"draft body ".repeat(8)}\n`;
+			const paste = `\n${draftLine.repeat(24)}exact-unsent-tail`;
+			p.text(`\x1b[200~${paste}\x1b[201~`);
+			await vi.waitFor(() => expect(editorFrame(p.frame("fenced-multiline-paste"))).toContain("[paste #"));
+			expect(existsSync(join(p.dir, "fence-shutdown"))).toBe(false);
+			process.kill(Number(readFileSync(join(p.dir, "pid"), "utf8")), signal);
+			expect(await p.exit()).toBe(0);
+			expect(JSON.parse(readFileSync(join(p.dir, "fence-shutdown"), "utf8"))).toEqual({
+				reason: "quit",
+				retained: false,
+				state: { inputsFenced: true, inputAdmissionCount: 0, queued: 0, drained: true },
+			});
+			const terminalBefore = readFileSync(join(p.dir, "terminal-before"), "utf8").trim();
+			expect(terminalBefore).not.toBe("");
+			expect(readFileSync(join(p.dir, "terminal-after"), "utf8").trim()).toBe(terminalBefore);
+			p.frame("lost-fence-signal-exited");
+			await vi.waitFor(() => {
+				const raw = readFileSync(join(evidence ?? p.dir, `tui-${p.name}.ansi.log`), "utf8");
+				const match = /INPUT_ADMISSION_SHUTDOWN: recovered draft (\{[^\r\n]+\})/.exec(raw);
+				expect(match).not.toBeNull();
+				const receipt = JSON.parse(match![1]);
+				expect(receipt).toEqual({
+					text: held.draft + paste,
+					images: [
+						{
+							type: "image",
+							data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a1S8AAAAASUVORK5CYII=",
+							mimeType: "image/png",
+						},
+					],
+				});
+				// Restoration must precede the recovery output, not be repaired by the parent shell.
+				expect(raw.lastIndexOf("\x1b[?2004l", match!.index)).toBeGreaterThan(
+					raw.lastIndexOf("\x1b[?2004h", match!.index),
+				);
+				expect(raw.lastIndexOf("\x1b[?25h", match!.index)).toBeGreaterThan(
+					raw.lastIndexOf("\x1b[?25l", match!.index),
+				);
+				if (evidence) writeFileSync(join(evidence, `tui-${p.name}-recovery.proof.json`), JSON.stringify(receipt));
+			});
+		},
+	);
 
 	// smarty-dev#3048 / pi#117 R2-S3: recovery finishes while non-overlay custom UI is still mounted.
 	it.each(["normal", "SIGTERM", "SIGHUP"] as const)(
