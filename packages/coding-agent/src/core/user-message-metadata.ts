@@ -40,6 +40,11 @@ const sdkSource: UserMessageMetadataSource = Object.freeze({ kind: "sdk" });
 const extensionSources = new WeakMap<SendUserMessageOptions, UserMessageMetadataSource>();
 const extensionExecution = new AsyncLocalStorage<string | undefined>();
 
+/** Internal runner lookup of the existing loader-bound execution identity; not an SDK export. */
+export function getExtensionExecutionPath(): string | undefined {
+	return extensionExecution.getStore();
+}
+
 /** Private loader binding: callbacks retain their registrar, never an invoker's borrowed identity. */
 export function bindExtensionMetadataCallback<Args extends unknown[], Result>(
 	extensionPath: string,

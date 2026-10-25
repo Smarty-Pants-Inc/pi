@@ -28,6 +28,7 @@ import {
 	normalizeBuildSystemPromptOptions,
 } from "../system-prompt.ts";
 import { captureTerminalTurnReceipt, type TurnReceipt } from "../turn-receipts.ts";
+import { getExtensionExecutionPath } from "../user-message-metadata.ts";
 import type { VirtualModelDefinition } from "../virtual-models.ts";
 import { boundaryReceiptSlots, receiveBoundaryEntries } from "./boundary-receipts.ts";
 import type {
@@ -60,6 +61,7 @@ import type {
 	ExtensionError,
 	ExtensionEvent,
 	ExtensionFlag,
+	ExtensionInputFence,
 	ExtensionMode,
 	ExtensionRuntime,
 	ExtensionShortcut,
@@ -392,6 +394,10 @@ export class ExtensionRunner {
 	private isIdleFn: () => boolean = () => true;
 	private isSettlingFn: () => boolean = () => false;
 	private isPromptPendingFn: () => boolean = () => false;
+	private fenceInputsFn: ExtensionContextActions["fenceInputs"];
+	private getInputStateFn: ExtensionContextActions["getInputState"];
+	/** A runner is session-bound; keys are loaded extension instances, not paths or captured contexts. */
+	private inputFences = new WeakMap<Extension, Promise<ExtensionInputFence>>();
 	private isProjectTrustedFn: () => boolean = () => true;
 	private getSignalFn: () => AbortSignal | undefined = () => undefined;
 	private waitForIdleFn: () => Promise<void> = async () => {};
@@ -476,6 +482,12 @@ export class ExtensionRunner {
 		this.isIdleFn = contextActions.isIdle;
 		this.isSettlingFn = contextActions.isSettling;
 		this.isPromptPendingFn = contextActions.isPromptPending ?? (() => false);
+		if (this.fenceInputsFn !== contextActions.fenceInputs || this.getInputStateFn !== contextActions.getInputState) {
+			// A custom SDK host may rebind this runner. Old handles still own their original native closures.
+			this.inputFences = new WeakMap();
+		}
+		this.fenceInputsFn = contextActions.fenceInputs;
+		this.getInputStateFn = contextActions.getInputState;
 		this.isProjectTrustedFn = contextActions.isProjectTrusted;
 		this.getSignalFn = contextActions.getSignal;
 		this.abortFn = contextActions.abort;
@@ -925,6 +937,42 @@ export class ExtensionRunner {
 		return this.runtime.getActiveTools();
 	}
 
+	private acquireInputFence(): Promise<ExtensionInputFence> {
+		if (!this.fenceInputsFn) {
+			return Promise.reject(new Error("Native input fencing is not available in this context"));
+		}
+		const extensionPath = getExtensionExecutionPath();
+		const extension = this.extensions.find((candidate) => candidate.path === extensionPath);
+		// Unbound SDK callbacks have no extension instance. Pass through without borrowing a cached handle.
+		if (!extension) return this.fenceInputsFn();
+		const fences = this.inputFences;
+		const existing = fences.get(extension);
+		if (existing) return existing;
+
+		const { promise, resolve, reject } = Promise.withResolvers<ExtensionInputFence>();
+		// Install before native acquisition: it closes admission synchronously and may reenter observers.
+		fences.set(extension, promise);
+		const refuse = (error: unknown) => {
+			if (fences.get(extension) === promise) fences.delete(extension);
+			reject(error);
+		};
+		try {
+			void this.fenceInputsFn().then(
+				(fence) =>
+					resolve({
+						release: () => {
+							fence.release();
+							if (fences.get(extension) === promise) fences.delete(extension);
+						},
+					}),
+				refuse,
+			);
+		} catch (error) {
+			refuse(error);
+		}
+		return promise;
+	}
+
 	/**
 	 * Create an ExtensionContext for use in event handlers and tool execution.
 	 * Context values are resolved at call time, so changes via bindCore/bindUI are reflected.
@@ -985,6 +1033,17 @@ export class ExtensionRunner {
 			isPromptPending: () => {
 				runner.assertActive();
 				return runner.isPromptPendingFn();
+			},
+			fenceInputs: () => {
+				runner.assertActive();
+				return runner.acquireInputFence();
+			},
+			getInputState: () => {
+				runner.assertActive();
+				if (!runner.getInputStateFn) {
+					throw new Error("Native input state is not available in this context");
+				}
+				return runner.getInputStateFn();
 			},
 			isProjectTrusted: () => {
 				runner.assertActive();
