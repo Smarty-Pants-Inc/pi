@@ -16,6 +16,13 @@ function createContext(tokens: number | null, compact = vi.fn()): ExtensionConte
 		isIdle: () => true,
 		isSettling: () => false,
 		isPromptPending: () => false,
+		// #15310: this fixture has no native input-fence hooks.
+		fenceInputs: async () => {
+			throw new Error("Native input fencing is not available in this context");
+		},
+		getInputState: () => {
+			throw new Error("Native input state is not available in this context");
+		},
 		isProjectTrusted: () => true,
 		signal: undefined,
 		abort: vi.fn(),

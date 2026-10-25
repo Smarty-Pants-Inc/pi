@@ -108,6 +108,8 @@ export type {
 	ExtensionFactory,
 	ExtensionFlag,
 	ExtensionHandler,
+	ExtensionInputFence,
+	ExtensionInputState,
 	ExtensionRuntime,
 	ExtensionShortcut,
 	ExtensionToolContext,

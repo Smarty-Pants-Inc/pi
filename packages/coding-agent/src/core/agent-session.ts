@@ -3363,8 +3363,8 @@ export class AgentSession {
 			);
 	}
 
-	private _assertInputsDrained(): void {
-		if (
+	private get _inputsDrained(): boolean {
+		return !(
 			this._inputAdmissions.size > 0 ||
 			this.isSettling ||
 			this.#pendingModeInput?.() ||
@@ -3376,7 +3376,11 @@ export class AgentSession {
 			this._deferredSettledActions.length > 0 ||
 			this._pendingNextTurnMessages.length > 0 ||
 			this._pendingCustomMessages.length > 0
-		)
+		);
+	}
+
+	private _assertInputsDrained(): void {
+		if (!this._inputsDrained)
 			throw new InputAdmissionError(
 				"INPUT_ADMISSION_BUSY",
 				"settle admitted input or recover queued input before replacement/disposal",
@@ -6396,6 +6400,13 @@ export class AgentSession {
 				isIdle: () => this.isIdle,
 				isSettling: () => this.isSettling,
 				isPromptPending: () => this.isPromptPending,
+				fenceInputs: async () => ({ release: await this.fenceInputs() }),
+				getInputState: () => ({
+					inputsFenced: this.inputsFenced,
+					inputAdmissionCount: this.inputAdmissionCount,
+					queued: this.agent.getQueuedMessages().length,
+					drained: this._inputsDrained,
+				}),
 				isProjectTrusted: () => this.settingsManager.isProjectTrusted(),
 				getSignal: () => this.agent.signal,
 				abort: () => {

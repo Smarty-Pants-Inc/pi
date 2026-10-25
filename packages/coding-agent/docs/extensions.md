@@ -81,6 +81,7 @@ Its `outcome` is `aborted` when the run was cancelled: by a user abort (also dur
 | Add a shortcut or CLI flag | `pi.registerShortcut()` or `pi.registerFlag()` |
 | Send user or custom messages | `pi.sendUserMessage()` or `pi.sendMessage()` |
 | Admit correlated external user input with a receipt | [`pi.submitUserMessage()`](#correlated-user-message-admission) |
+| Fence native input admission and inspect its state | [`ctx.fenceInputs()` and `ctx.getInputState()`](#native-input-fences) |
 | Persist non-context session data | `pi.appendEntry()` |
 | Change active tools, model, or thinking level | Session control methods on `pi` |
 | Add a model provider | `pi.registerProvider()` |
@@ -298,6 +299,47 @@ pi.on("session_ready", (event, ctx) => {
 `sessionGeneration` is the session's current `ctx.userMessageSessionGeneration`, the same value `session_start` saw. Submissions from the handler and from promises or timers it starts are admitted normally. The event is notification-only and not awaited. It does not fire on startup or reload (their `session_start` is not fenced), when `session_before_switch` or `session_before_fork` cancels, when the replacement session was never published, after shutdown or disposal begins, when shutdown was requested (for example `ctx.shutdown()` from `session_start`) before the replacement finished, or when another session replacement started first.
 
 Older hosts never emit `session_ready`; detect with `pi.hostCapabilities?.sessionReadyEvent === true`.
+
+### Native input fences
+
+Detect the running host with `pi.hostCapabilities?.extensionInputFence === 1`, not an extension's separately installed package export. This exposes the existing session fence; it is not an extension permission grant or a sandbox.
+
+```typescript
+const fence = await ctx.fenceInputs();
+try {
+  const state = ctx.getInputState();
+  // Admission is closed across awaited work. Do not submit new input here.
+} finally {
+  fence.release();
+}
+```
+
+`fenceInputs(): Promise<ExtensionInputFence>` takes no options. It invokes native acquisition synchronously, before returning a promise; successful acquisition has already closed admission at that point. The promise resolves only after acquisition succeeds. It never waits for input to drain, starts a drain turn, or exposes `rejectQueuedInput`; extra JavaScript arguments are ignored. The caller owns any bounded retry policy. A fresh acquisition rejects with `InputAdmissionError.code`:
+
+- `INPUT_ADMISSION_BUSY`: native input is not drained. The attempted fence is released; ordinary and custom queues are retained.
+- `INPUT_ADMISSION_FENCED`: another operation already holds the fence; that fence remains held.
+- `INPUT_ADMISSION_DISPOSED`: the session is disposed and stays sealed.
+
+Once shutdown has begun, fresh acquisition can instead reject with the native shutdown cancellation reason. These are native outcomes, not a guarantee that every failure leaves the session unchanged or open: before checking drain, native acquisition rotates receipt-ingress generation and cancels held or undelivered `submitUserMessage()` input. Its submitters receive `rejected/session_changed` receipts; the underlying send operations are aborted with `INPUT_ADMISSION_ABORTED`. This side effect also occurs if acquisition then refuses BUSY. Ordinary and custom queued input is not discarded or transferred.
+
+Calls from the same loaded extension instance in the same session share one in-flight promise and resolve to the same handle while it is held. Pi identifies the caller using the existing loader-bound execution context, including registered callbacks and their async descendants, and matches it to that runner's loaded extension instance. Sharing or capturing a `ctx` does not confer another extension's cached handle. Calls with no matching extension identity (such as unbound SDK callbacks) pass through without handle sharing: repeated acquisition then receives the native `INPUT_ADMISSION_FENCED` refusal. A custom SDK host may omit the optional context-action hooks; `fenceInputs()` then rejects as unavailable and `getInputState()` throws as unavailable rather than returning invented state.
+
+`ExtensionInputFence.release(): void` invokes only its owning native release closure. It is idempotent, cannot release another operation's fence, and never reopens a disposed session. There is no standalone unfence API. Reload or replacement does not auto-release a retained handle; its `release()` remains usable even after the old context is invalidated. A new context cannot recover another runner's owning handle; if the owner loses that handle, restart is required, but a retained owning release remains usable. Replacing a custom runner's bound session hooks resets handle lookup without releasing old handles. Fences are in-memory only, so a new process starts unfenced.
+
+`getInputState(): ExtensionInputState` returns a fresh read-only snapshot:
+
+| Field | Native meaning |
+|---|---|
+| `inputsFenced` | Any session fence is held, or the session is disposed. |
+| `inputAdmissionCount` | Inputs awaiting native handoff, including extension input handlers; not a cumulative counter. |
+| `queued` | Length of both complete native agent queues (steering and follow-up), not display text or pending-admission counts. |
+| `drained` | The same predicate used by the native drained assertion. |
+
+`drained` requires no admissions, active settlement, submitted mode-owned input, native or display queues, preflight-triggered messages, model-switch dispatches, settlement-deferred actions, next-turn messages, or pending custom-context messages. It does not check whether an agent run is active, whether admission is open, or whether the session is disposed. Fencing does not abort or settle an already-active run. Use idle/settlement checks separately when a workflow requires them.
+
+While held, the fence refuses ordinary prompt, steer, follow-up, user-message, and custom-message admission with `INPUT_ADMISSION_FENCED`. The void/fire-and-forget `pi.sendUserMessage()` (without metadata) and `pi.sendMessage()` APIs report native failures through extension runtime error events, not rejected return promises. Session replacement operations and runtime disposal acquire the same native fence and therefore refuse another holder. Direct `AgentSession.dispose()` is different: an idle, drained session can be disposed while fenced and remains sealed after release. Non-owner `AgentSession.reload()` does not acquire this fence and can rebuild extensions while it remains held; owner runtimes retain their existing fresh-allocation restriction. Do not use a fence as a reload or direct-disposal lock.
+
+Both context methods use the existing stale-context guard after runner invalidation. Retain the acquired handle, not an old context, when release must survive reload.
 
 <a id="state-management"></a>
 <a id="persist-state"></a>
