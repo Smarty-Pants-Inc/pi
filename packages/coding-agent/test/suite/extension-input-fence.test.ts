@@ -9,6 +9,7 @@ import type {
 	ExtensionInputFence,
 	ExtensionInputState,
 	SessionReadyEvent,
+	SubmitUserMessageOptions,
 } from "../../src/core/extensions/index.ts";
 import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
 import { InputAdmissionError } from "../../src/core/input-admission.ts";
@@ -95,6 +96,23 @@ describe("extension input fence (#15310)", () => {
 		} finally {
 			actions.delete(name);
 		}
+	}
+
+	function runtimeFor(h: Harness) {
+		return new AgentSessionRuntime(
+			h.session,
+			{
+				cwd: h.tempDir,
+				agentDir: h.tempDir,
+				modelRuntime: h.modelRuntime,
+				settingsManager: h.settingsManager,
+				resourceLoader: h.resourceLoader,
+				diagnostics: [],
+			},
+			async () => {
+				throw new Error("Shutdown must not allocate a replacement session");
+			},
+		);
 	}
 
 	it("exports capability version 1 through the package and the loader-created extension API (spec 1)", async () => {
@@ -236,26 +254,41 @@ describe("extension input fence (#15310)", () => {
 		expect(getUserTexts(h)).toEqual(["drain held admission", "held ordinary input"]);
 	});
 
-	it("deduplicates in-flight and fresh-context acquisition but never reuses a released handle (spec 5)", async () => {
+	// #309 keep reason: data safety. Successful native acquisition must still rotate ingress;
+	// BUSY preservation below must not disable invalidation for a genuinely acquired fence.
+	// https://github.com/Smarty-Pants-Inc/pi/pull/309#issuecomment-6401455682
+	it("deduplicates acquisition, rotates generation only for a fresh fence, and never reuses a released handle (spec 5)", async () => {
 		const h = await setup();
 		const nativeAcquire = vi.spyOn(h.session, "fenceInputs");
+		const initialGeneration = h.session.userMessageSessionGeneration;
 		const first = await inExtension(h, "a", async (ctx) => {
 			const [one, two] = await Promise.all([ctx.fenceInputs(), ctx.fenceInputs()]);
 			expect(two).toBe(one);
 			return one;
 		});
-		expect(await inExtension(h, "a", (ctx) => ctx.fenceInputs())).toBe(first);
-		expect(nativeAcquire).toHaveBeenCalledTimes(1);
-		expect(nativeAcquire).toHaveBeenLastCalledWith();
-		first.release();
-		first.release();
-		expect(h.session.inputsFenced).toBe(false);
-		const second = await inExtension(h, "a", (ctx) => ctx.fenceInputs());
-		expect(second).not.toBe(first);
-		first.release();
-		expect(h.session.inputsFenced).toBe(true);
-		second.release();
-		expect(h.session.inputsFenced).toBe(false);
+		let second: ExtensionInputFence | undefined;
+		try {
+			const firstGeneration = h.session.userMessageSessionGeneration;
+			expect(firstGeneration).not.toBe(initialGeneration);
+			expect(await inExtension(h, "a", (ctx) => ctx.fenceInputs())).toBe(first);
+			expect(h.session.userMessageSessionGeneration).toBe(firstGeneration);
+			expect(nativeAcquire).toHaveBeenCalledTimes(1);
+			expect(nativeAcquire).toHaveBeenLastCalledWith();
+			first.release();
+			first.release();
+			expect(h.session.inputsFenced).toBe(false);
+			expect(h.session.userMessageSessionGeneration).toBe(firstGeneration);
+			second = await inExtension(h, "a", (ctx) => ctx.fenceInputs());
+			expect(second).not.toBe(first);
+			expect(h.session.userMessageSessionGeneration).not.toBe(firstGeneration);
+			first.release();
+			expect(h.session.inputsFenced).toBe(true);
+			second.release();
+			expect(h.session.inputsFenced).toBe(false);
+		} finally {
+			first.release();
+			second?.release();
+		}
 	});
 
 	it("does not hand another extension the owner handle or let its old release clear a new owner (spec 5/6)", async () => {
@@ -360,6 +393,390 @@ describe("extension input fence (#15310)", () => {
 			handle.release();
 		},
 	);
+
+	// #309 keep reason: data safety and recorded real catch. Refused operator quit poisoned the
+	// live runtime; terminal shutdown instead failed before hooks and disposal could run.
+	// https://github.com/Smarty-Pants-Inc/pi/pull/309#issuecomment-6401455682
+	it("refuses operatorExit under an extension fence without side effects, then permits input and a later quit (#309 P1a)", async () => {
+		const shutdowns: string[] = [];
+		const h = await setup([
+			(pi) => {
+				pi.on("session_shutdown", (event) => {
+					shutdowns.push(event.reason);
+				});
+			},
+		]);
+		const runtime = runtimeFor(h);
+		const api = await inExtension(h, "b", (_ctx, pi) => pi);
+		const handle = await inExtension(h, "a", (ctx) => ctx.fenceInputs());
+		// A native queue owner can enqueue after acquisition. Explicit discard consent ensures
+		// the refusal is the extension fence, not the in-memory session's unsaved-input warning.
+		const queuedText = "native queued occurrence\n\u0000☃";
+		h.session.agent.followUp({ role: "user", content: [{ type: "text", text: queuedText }], timestamp: 1 });
+		const native = h.session as unknown as { _inputFence: object | undefined };
+		const fence = native._inputFence;
+		const generation = h.session.userMessageSessionGeneration;
+		const queuedBytes = JSON.stringify(h.session.agent.getQueuedMessageOccurrences());
+		const revision = h.session.queuedInputRevision;
+		const signal = h.session.shutdownSignal;
+		const sideEffects = [
+			vi.spyOn(h.session, "prepareOperatorExit"),
+			vi.spyOn(h.session, "cancelForShutdown"),
+			vi.spyOn(h.session, "abort"),
+			vi.spyOn(h.session, "abortBash"),
+			vi.spyOn(h.session, "clearQueue"),
+		];
+		const beforeShutdown = vi.fn(async () => {});
+		const bufferUnsentInput = vi.fn();
+		const rejectQueuedInput = vi.fn();
+		try {
+			expect(fence).toBeDefined();
+			await expect(
+				runtime.dispose({
+					operatorExit: true,
+					discardUnsentInput: true,
+					beforeShutdown,
+					bufferUnsentInput,
+					rejectQueuedInput,
+				}),
+			).rejects.toMatchObject({ code: "INPUT_ADMISSION_FENCED" });
+			expect(runtime.session).toBe(h.session);
+			expect(h.session.isDisposed).toBe(false);
+			expect(h.session.shutdownSignal).toBe(signal);
+			expect(signal.aborted).toBe(false);
+			expect(native._inputFence).toBe(fence);
+			expect(h.session.userMessageSessionGeneration).toBe(generation);
+			expect(JSON.stringify(h.session.agent.getQueuedMessageOccurrences())).toBe(queuedBytes);
+			expect(h.session.queuedInputRevision).toBe(revision);
+			expect(getUserTexts(h)).toEqual([]);
+			expect(shutdowns).toEqual([]);
+			for (const effect of [...sideEffects, beforeShutdown, bufferUnsentInput, rejectQueuedInput]) {
+				expect(effect).not.toHaveBeenCalled();
+			}
+			expect(await inExtension(h, "a", (ctx) => ctx.fenceInputs())).toBe(handle);
+			handle.release();
+			expect(runtime.inputsFenced).toBe(false);
+			expect(h.session.userMessageSessionGeneration).toBe(generation);
+			h.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("still usable after refused quit")));
+			await h.session.prompt("prompt after refused quit");
+			expect(
+				await api.submitUserMessage({
+					registrationEpoch: "fence-quit-test",
+					requestId: "after-refused-quit",
+					sessionGeneration: generation,
+					text: "submit after refused quit",
+					deliverAs: "followUp",
+					expandPromptTemplates: false,
+				}),
+			).toEqual({ status: "accepted", sessionGeneration: generation });
+			await h.session.waitForIdle();
+			expect(getUserTexts(h)).toEqual(["prompt after refused quit", queuedText, "submit after refused quit"]);
+			expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+			await runtime.dispose({ operatorExit: true });
+			expect(shutdowns).toEqual(["quit"]);
+			expect(signal.aborted).toBe(true);
+			expect(h.session.isDisposed).toBe(true);
+		} finally {
+			handle.release();
+		}
+	});
+
+	// #309 RFL-F1 keep reason: data safety and the frozen-candidate same-turn reproduction.
+	// A lifecycle awaiting a failed native acquisition does not own the extension's fence. The rejecting
+	// variant pins RFL-F3's early ownership: a foreign token never counts as the lifecycle's own.
+	// https://github.com/Smarty-Pants-Inc/pi/pull/309#issuecomment-6401455682
+	it.each(["ordinary", "rejecting ordinary"] as const)(
+		"refuses both same-turn %s disposal and operatorExit under an extension fence (#309 RFL-F1)",
+		async (variant) => {
+			const shutdowns: string[] = [];
+			const h = await setup([
+				(pi) => {
+					pi.on("session_shutdown", (event) => {
+						shutdowns.push(event.reason);
+					});
+				},
+			]);
+			const runtime = runtimeFor(h);
+			const handle = await inExtension(h, "a", (ctx) => ctx.fenceInputs());
+			const disposals: Promise<void>[] = [];
+			try {
+				const queuedText = "same-turn queued occurrence\n\u0000☃";
+				h.session.agent.followUp({ role: "user", content: [{ type: "text", text: queuedText }], timestamp: 1 });
+				const native = h.session as unknown as { _inputFence: object | undefined };
+				const fence = native._inputFence;
+				const generation = h.session.userMessageSessionGeneration;
+				const queuedBytes = JSON.stringify(h.session.agent.getQueuedMessageOccurrences());
+				const transcriptBytes = JSON.stringify(h.session.messages);
+				const revision = h.session.queuedInputRevision;
+				const signal = h.session.shutdownSignal;
+				const state = await inExtension(h, "a", (ctx) => ctx.getInputState());
+				const eventCount = h.events.length;
+				const sideEffects = [
+					vi.spyOn(h.session, "prepareOperatorExit"),
+					vi.spyOn(h.session, "cancelForShutdown"),
+					vi.spyOn(h.session, "abort"),
+					vi.spyOn(h.session, "abortBash"),
+					vi.spyOn(h.session, "clearQueue"),
+				];
+				const beforeShutdown = vi.fn(async () => {});
+				const beforeInvalidate = vi.fn();
+				const bufferUnsentInput = vi.fn();
+				const rejectQueuedInput = vi.fn();
+				const ordinaryRejectQueuedInput = vi.fn();
+				runtime.setBeforeSessionInvalidate(beforeInvalidate);
+				// No await between calls: observe both promises in this turn, before either unwinds.
+				// Discard consent prevents the queue from masking the foreign-fence takeover bug.
+				const ordinary = runtime.dispose(
+					variant === "rejecting ordinary" ? { rejectQueuedInput: ordinaryRejectQueuedInput } : undefined,
+				);
+				disposals.push(ordinary);
+				const operator = runtime.dispose({
+					operatorExit: true,
+					discardUnsentInput: true,
+					beforeShutdown,
+					bufferUnsentInput,
+					rejectQueuedInput,
+				});
+				disposals.push(operator);
+				const outcomes = await Promise.allSettled(disposals);
+				expect(outcomes).toEqual([
+					{ status: "rejected", reason: expect.objectContaining({ code: "INPUT_ADMISSION_FENCED" }) },
+					{ status: "rejected", reason: expect.objectContaining({ code: "INPUT_ADMISSION_FENCED" }) },
+				]);
+				expect(fence).toBeDefined();
+				expect(runtime.session).toBe(h.session);
+				expect(runtime.inputsFenced).toBe(true);
+				expect(h.session.isDisposed).toBe(false);
+				expect(h.session.shutdownSignal).toBe(signal);
+				expect(signal.aborted).toBe(false);
+				expect(native._inputFence).toBe(fence);
+				expect(h.session.userMessageSessionGeneration).toBe(generation);
+				expect(JSON.stringify(h.session.agent.getQueuedMessageOccurrences())).toBe(queuedBytes);
+				expect(JSON.stringify(h.session.messages)).toBe(transcriptBytes);
+				expect(h.session.queuedInputRevision).toBe(revision);
+				expect(await inExtension(h, "a", (ctx) => ctx.getInputState())).toEqual(state);
+				expect(h.events).toHaveLength(eventCount);
+				expect(h.faux.state.callCount).toBe(0);
+				expect(shutdowns).toEqual([]);
+				for (const effect of [
+					...sideEffects,
+					beforeShutdown,
+					beforeInvalidate,
+					bufferUnsentInput,
+					rejectQueuedInput,
+					ordinaryRejectQueuedInput,
+				]) {
+					expect(effect).not.toHaveBeenCalled();
+				}
+				expect(await inExtension(h, "a", (ctx) => ctx.fenceInputs())).toBe(handle);
+				handle.release();
+				expect(native._inputFence).toBeUndefined();
+				expect(runtime.inputsFenced).toBe(false);
+				expect(h.session.userMessageSessionGeneration).toBe(generation);
+				h.setResponses(Array.from({ length: 2 }, () => fauxAssistantMessage("usable after same-turn refusal")));
+				await h.session.prompt("prompt after same-turn refused quit");
+				expect(getUserTexts(h)).toEqual(["prompt after same-turn refused quit", queuedText]);
+				expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+				expect(h.faux.state.callCount).toBeGreaterThan(0);
+				expect(signal.aborted).toBe(false);
+				await runtime.dispose({ operatorExit: true });
+				expect(shutdowns).toEqual(["quit"]);
+				expect(beforeInvalidate).toHaveBeenCalledTimes(1);
+				expect(signal.aborted).toBe(true);
+				expect(h.session.isDisposed).toBe(true);
+			} finally {
+				handle.release();
+				await Promise.allSettled(disposals);
+			}
+		},
+	);
+
+	// #309 RFL-F1 counterexample: real native acquisition succeeds before operator takeover.
+	// Blanket refusal of an active lifecycle would break this supported same-turn quit.
+	// https://github.com/Smarty-Pants-Inc/pi/pull/309#issuecomment-6401455682
+	it("permits same-turn operatorExit after ordinary disposal actually acquires its native fence (#309 RFL-F1)", async () => {
+		const shutdowns: string[] = [];
+		const h = await setup([
+			(pi) => {
+				pi.on("session_shutdown", (event) => {
+					shutdowns.push(event.reason);
+				});
+			},
+		]);
+		const runtime = runtimeFor(h);
+		const native = h.session as unknown as { _inputFence: object | undefined };
+		const initialFence = native._inputFence;
+		const generation = h.session.userMessageSessionGeneration;
+		const prepare = vi.spyOn(h.session, "prepareOperatorExit");
+		const cancel = vi.spyOn(h.session, "cancelForShutdown");
+		const disposals: Promise<void>[] = [];
+		try {
+			const ordinary = runtime.dispose();
+			disposals.push(ordinary);
+			// The native fence and generation change synchronously, without faking ownership
+			// or waiting for the runtime's acquisition continuation to run.
+			const ownedFence = native._inputFence;
+			const ownedGeneration = h.session.userMessageSessionGeneration;
+			const operator = runtime.dispose({ operatorExit: true });
+			disposals.push(operator);
+			const outcomes = await Promise.allSettled(disposals);
+			expect(initialFence).toBeUndefined();
+			expect(ownedFence).toBeDefined();
+			expect(ownedGeneration).not.toBe(generation);
+			expect(outcomes).toEqual([
+				{ status: "fulfilled", value: undefined },
+				{ status: "fulfilled", value: undefined },
+			]);
+			expect(prepare).toHaveBeenCalledTimes(1);
+			expect(cancel).toHaveBeenCalledTimes(1);
+			expect(runtime.session).toBe(h.session);
+			expect(shutdowns).toEqual(["quit"]);
+			expect(h.session.shutdownSignal.aborted).toBe(true);
+			expect(h.session.isDisposed).toBe(true);
+			expect(runtime.inputsFenced).toBe(true);
+			expect(h.session.inputsFenced).toBe(true);
+			expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+			expect(h.faux.state.callCount).toBe(0);
+		} finally {
+			await Promise.allSettled(disposals);
+		}
+	});
+
+	// #309 RFL-F3 keep reason: allowed-case wait cycle from the independent audit. A rejecting ordinary
+	// disposal owns its native fence while abort waits on a noncooperative agent_start. Operator quit
+	// must still reach shutdown cancellation, which releases that wait, instead of joining the abort.
+	// https://github.com/Smarty-Pants-Inc/pi/pull/309#issuecomment-6401455682
+	it("lets same-turn operatorExit cancel an owned rejecting disposal held in agent_start (#309 RFL-F3)", async () => {
+		const entered = gate();
+		const held = gate();
+		const shutdowns: string[] = [];
+		const h = await setup([
+			(pi) => {
+				// Noncooperative: ignores the run's abort signal and only returns on release.
+				pi.on("agent_start", async () => {
+					entered.release();
+					await held.promise;
+				});
+				pi.on("session_shutdown", (event) => {
+					shutdowns.push(event.reason);
+				});
+			},
+		]);
+		const runtime = runtimeFor(h);
+		const native = h.session as unknown as { _inputFence: object | undefined };
+		const prepare = vi.spyOn(h.session, "prepareOperatorExit");
+		const cancel = vi.spyOn(h.session, "cancelForShutdown");
+		const rejectQueuedInput = vi.fn();
+		const bufferUnsentInput = vi.fn();
+		const pending: Promise<unknown>[] = [];
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			h.setResponses([fauxAssistantMessage("must not run after shutdown cancellation")]);
+			pending.push(h.session.prompt("held by noncooperative agent_start"));
+			await entered.promise;
+			expect(h.session.inputAdmissionCount).toBe(0);
+			expect(native._inputFence).toBeUndefined();
+			// No await between calls. The ordinary call installs its real native fence synchronously,
+			// then waits in native abort for the held run.
+			const ordinary = runtime.dispose({ rejectQueuedInput });
+			pending.push(ordinary);
+			const ownedFence = native._inputFence;
+			const operator = runtime.dispose({ operatorExit: true, discardUnsentInput: true, bufferUnsentInput });
+			pending.push(operator);
+			const outcomes = await Promise.race([
+				Promise.allSettled([ordinary, operator]),
+				new Promise<"wait cycle">((resolve) => {
+					timer = setTimeout(() => resolve("wait cycle"), 5000);
+				}),
+			]);
+			expect(ownedFence).toBeDefined();
+			expect(outcomes).toEqual([
+				{ status: "fulfilled", value: undefined },
+				{ status: "fulfilled", value: undefined },
+			]);
+			expect(prepare).toHaveBeenCalledTimes(1);
+			expect(cancel).toHaveBeenCalledTimes(1);
+			// Operator preparation retained the held prompt (in-memory session: buffered, not discarded).
+			expect(bufferUnsentInput).toHaveBeenCalledTimes(1);
+			expect(bufferUnsentInput.mock.calls[0]?.[0]).toContain("held by noncooperative agent_start");
+			expect(rejectQueuedInput).not.toHaveBeenCalled();
+			expect(shutdowns).toEqual(["quit"]);
+			expect(h.session.shutdownSignal.aborted).toBe(true);
+			expect(h.session.isDisposed).toBe(true);
+			expect(runtime.inputsFenced).toBe(true);
+			expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+			expect(h.faux.state.callCount).toBe(0);
+		} finally {
+			clearTimeout(timer);
+			// Explicit terminal shutdown rescues the RED wait cycle so cleanup cannot hang.
+			pending.push(runtime.dispose({ terminal: true }));
+			held.release();
+			await Promise.allSettled(pending);
+		}
+	});
+
+	it("terminal shutdown takes over an extension fence, runs hooks once, and cannot be reopened by release (#309 P1b)", async () => {
+		const entered = gate();
+		const held = gate();
+		const shutdowns: Array<{ reason: string; state: ExtensionInputState; aborted: boolean; disposed: boolean }> = [];
+		const h = await setup([
+			(pi) => {
+				pi.on("session_shutdown", async (event, ctx) => {
+					shutdowns.push({
+						reason: event.reason,
+						state: ctx.getInputState(),
+						aborted: h.session.shutdownSignal.aborted,
+						disposed: h.session.isDisposed,
+					});
+					entered.release();
+					await held.promise;
+				});
+			},
+		]);
+		const runtime = runtimeFor(h);
+		const handle = await inExtension(h, "a", (ctx) => ctx.fenceInputs());
+		const disposing = runtime.dispose({ terminal: true });
+		try {
+			await Promise.race([
+				entered.promise,
+				disposing.then(() => {
+					throw new Error("Terminal disposal completed without entering the shutdown hook");
+				}),
+			]);
+			expect(shutdowns).toEqual([
+				{
+					reason: "quit",
+					state: { inputsFenced: true, inputAdmissionCount: 0, queued: 0, drained: true },
+					aborted: true,
+					disposed: false,
+				},
+			]);
+			handle.release();
+			expect(h.session.inputsFenced).toBe(true);
+			await expect(h.session.followUp("old release during terminal cleanup")).rejects.toMatchObject({
+				code: "INPUT_ADMISSION_FENCED",
+			});
+			held.release();
+			await disposing;
+			expect(h.session.isDisposed).toBe(true);
+			handle.release();
+			await runtime.dispose({ terminal: true });
+			expect(shutdowns).toHaveLength(1);
+			expect(runtime.inputsFenced).toBe(true);
+			expect(h.session.inputsFenced).toBe(true);
+			await expect(h.session.prompt("old release after disposal")).rejects.toMatchObject({
+				code: "INPUT_ADMISSION_SHUTDOWN",
+			});
+			await expect(h.session.followUp("old release after disposal")).rejects.toMatchObject({
+				code: "INPUT_ADMISSION_DISPOSED",
+			});
+			expect(getUserTexts(h)).toEqual([]);
+		} finally {
+			held.release();
+			handle.release();
+			await disposing;
+		}
+	});
 
 	// #309 keep reason: trust boundary. Lifecycle scope permits ordinary input, not taking over
 	// the runtime's native fence. Exercise real replacement, loader-bound handlers and receipt ingress.
@@ -740,88 +1157,256 @@ describe("extension input fence (#15310)", () => {
 		expect(h.session.agent.getQueuedMessages().map(getMessageText)).toEqual(["native steer", "native follow-up"]);
 	});
 
-	it("pins cancellation of held receipt ingress before a BUSY drain refusal (spec 12)", async () => {
+	// #309 keep reason: data safety and recorded real catch. A refused extension fence must not
+	// revoke a held receipt or remove tagged queue occurrences, including duplicate ordinary text.
+	// https://github.com/Smarty-Pants-Inc/pi/pull/309#issuecomment-6401455682
+	it("preserves held receipt ingress on extension BUSY and delivers once (#309 P2)", async () => {
 		const entered = gate();
 		const held = gate();
+		const text = "held receipt ingress\n\u0000☃";
+		let inputCalls = 0;
 		const h = await setup([
 			(pi) => {
 				pi.on("input", async (event) => {
-					if (event.text !== "held receipt ingress") return;
+					if (event.text !== text) return;
+					inputCalls++;
 					entered.release();
 					await held.promise;
 				});
 			},
 		]);
-		await h.session.followUp("ordinary queue survives");
-		const ordinaryBytes = JSON.stringify(h.session.agent.getQueuedMessages());
+		const ordinaryTexts = ["ordinary queue survives\n\u0000☃", "ordinary queue survives\n\u0000☃"];
+		for (const ordinary of ordinaryTexts) await h.session.followUp(ordinary);
+		const queuedBytes = JSON.stringify(h.session.agent.getQueuedMessageOccurrences());
 		const generation = h.session.userMessageSessionGeneration;
-		const ingress = inExtension(h, "b", (_ctx, pi) =>
-			pi.submitUserMessage({
-				registrationEpoch: "fence-test",
-				requestId: "held",
+		const api = await inExtension(h, "b", (_ctx, pi) => pi);
+		const request: SubmitUserMessageOptions = {
+			registrationEpoch: "fence-test",
+			requestId: "held",
+			sessionGeneration: generation,
+			text,
+			deliverAs: "followUp",
+			expandPromptTemplates: false,
+		};
+		h.setResponses(Array.from({ length: 3 }, () => fauxAssistantMessage("held input delivered")));
+		const ingress = api.submitUserMessage(request);
+		const duplicate = api.submitUserMessage({ ...request });
+		let receiptSettlements = 0;
+		for (const receipt of [ingress, duplicate]) {
+			void receipt.then(
+				() => {
+					receiptSettlements++;
+				},
+				() => {
+					receiptSettlements++;
+				},
+			);
+		}
+		let acquired: ExtensionInputFence | undefined;
+		try {
+			await Promise.race([
+				entered.promise,
+				ingress.then(() => {
+					throw new Error("Receipt settled without entering the held input handler");
+				}),
+			]);
+			expect(h.session.inputAdmissionCount).toBe(1);
+			const nativeAcquire = vi.spyOn(h.session, "fenceInputs");
+			await expect(
+				inExtension(h, "a", async (ctx) => {
+					acquired = await ctx.fenceInputs();
+				}),
+			).rejects.toMatchObject({ code: "INPUT_ADMISSION_BUSY" });
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(receiptSettlements).toBe(0);
+			expect(h.session.userMessageSessionGeneration).toBe(generation);
+			expect(h.session.inputAdmissionCount).toBe(1);
+			expect(h.session.inputsFenced).toBe(false);
+			expect(JSON.stringify(h.session.agent.getQueuedMessageOccurrences())).toBe(queuedBytes);
+			expect(h.session.getFollowUpMessages()).toEqual(ordinaryTexts);
+			expect(nativeAcquire).not.toHaveBeenCalled();
+			expect(inputCalls).toBe(1);
+			expect(getUserTexts(h)).toEqual([]);
+			held.release();
+			expect(await ingress).toEqual({ status: "accepted", sessionGeneration: generation });
+			expect(await duplicate).toEqual({
+				status: "accepted",
 				sessionGeneration: generation,
-				text: "held receipt ingress",
-				deliverAs: "followUp",
-				expandPromptTemplates: false,
-			}),
-		);
-		await entered.promise;
-		expect(h.session.inputAdmissionCount).toBe(1);
-		await inExtension(h, "a", async (ctx) => {
-			await expect(ctx.fenceInputs()).rejects.toMatchObject({ code: "INPUT_ADMISSION_BUSY" });
-			expect(ctx.getInputState().inputsFenced).toBe(false);
-		});
-		expect(await ingress).toEqual({ status: "rejected", reason: "session_changed", sessionGeneration: generation });
-		expect(h.session.userMessageSessionGeneration).not.toBe(generation);
-		expect(JSON.stringify(h.session.agent.getQueuedMessages())).toBe(ordinaryBytes);
-		held.release();
-		await new Promise<void>((resolve) => setImmediate(resolve));
-		expect(h.session.inputAdmissionCount).toBe(0);
-		expect(h.session.agent.getQueuedMessages().map(getMessageText)).toEqual(["ordinary queue survives"]);
-		expect(getUserTexts(h)).toEqual([]);
+				duplicate: true,
+				admittedSessionGeneration: generation,
+			});
+			await h.session.waitForIdle();
+			expect(h.session.userMessageSessionGeneration).toBe(generation);
+			expect(h.session.inputAdmissionCount).toBe(0);
+			expect(inputCalls).toBe(1);
+			expect(getUserTexts(h)).toEqual([text, ...ordinaryTexts]);
+			expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+		} finally {
+			acquired?.release();
+			held.release();
+			await Promise.allSettled([ingress, duplicate]);
+			await h.session.waitForIdle();
+		}
 	});
 
-	it("pins cancellation of queued receipt ingress while preserving ordinary follow-ups on BUSY (spec 12)", async () => {
+	it("preserves every queued occurrence on extension BUSY and delivers once (#309 P2)", async () => {
 		const entered = gate();
 		const held = gate();
-		const h = await setup();
+		const text = "queued receipt ingress\n\u0000☃";
+		let inputCalls = 0;
+		const h = await setup([
+			(pi) => {
+				pi.on("input", (event) => {
+					if (event.text === text) inputCalls++;
+				});
+			},
+		]);
+		const api = await inExtension(h, "b", (_ctx, pi) => pi);
 		h.setResponses([
 			async () => {
 				entered.release();
 				await held.promise;
 				return fauxAssistantMessage("active turn complete");
 			},
-			fauxAssistantMessage("ordinary follow-up delivered"),
+			...Array.from({ length: 3 }, () => fauxAssistantMessage("queued input delivered")),
 		]);
 		const run = h.session.prompt("active turn");
-		await entered.promise;
-		await h.session.followUp("ordinary follow-up survives");
-		const ordinaryBytes = JSON.stringify(h.session.agent.getQueuedMessages());
-		const generation = h.session.userMessageSessionGeneration;
-		expect(
-			await inExtension(h, "b", (_ctx, pi) =>
-				pi.submitUserMessage({
-					registrationEpoch: "fence-test",
-					requestId: "queued",
-					sessionGeneration: generation,
-					text: "queued receipt ingress",
-					deliverAs: "followUp",
-					expandPromptTemplates: false,
+		let acquired: ExtensionInputFence | undefined;
+		try {
+			await Promise.race([
+				entered.promise,
+				run.then(() => {
+					throw new Error("Active turn completed without entering the held faux response");
 				}),
-			),
-		).toEqual({ status: "queued", sessionGeneration: generation });
-		expect(h.session.agent.getQueuedMessages().map(getMessageText)).toEqual([
-			"ordinary follow-up survives",
-			"queued receipt ingress",
+			]);
+			const ordinaryTexts = ["ordinary follow-up survives\n\u0000☃", "ordinary follow-up survives\n\u0000☃"];
+			for (const ordinary of ordinaryTexts) await h.session.followUp(ordinary);
+			const generation = h.session.userMessageSessionGeneration;
+			const request: SubmitUserMessageOptions = {
+				registrationEpoch: "fence-test",
+				requestId: "queued",
+				sessionGeneration: generation,
+				text,
+				deliverAs: "followUp",
+				expandPromptTemplates: false,
+			};
+			expect(await api.submitUserMessage(request)).toEqual({ status: "queued", sessionGeneration: generation });
+			const queuedBytes = JSON.stringify(h.session.agent.getQueuedMessageOccurrences());
+			expect(h.session.agent.getQueuedMessages().map(getMessageText)).toEqual([...ordinaryTexts, text]);
+			const nativeAcquire = vi.spyOn(h.session, "fenceInputs");
+			await expect(
+				inExtension(h, "a", async (ctx) => {
+					acquired = await ctx.fenceInputs();
+				}),
+			).rejects.toMatchObject({ code: "INPUT_ADMISSION_BUSY" });
+			expect(h.session.userMessageSessionGeneration).toBe(generation);
+			expect(h.session.inputsFenced).toBe(false);
+			expect(JSON.stringify(h.session.agent.getQueuedMessageOccurrences())).toBe(queuedBytes);
+			expect(h.session.getFollowUpMessages()).toEqual([...ordinaryTexts, text]);
+			expect(nativeAcquire).not.toHaveBeenCalled();
+			const duplicateReceipt = {
+				status: "queued",
+				sessionGeneration: generation,
+				duplicate: true,
+				admittedSessionGeneration: generation,
+			};
+			expect(await api.submitUserMessage({ ...request })).toEqual(duplicateReceipt);
+			expect(JSON.stringify(h.session.agent.getQueuedMessageOccurrences())).toBe(queuedBytes);
+			expect(inputCalls).toBe(1);
+			held.release();
+			await run;
+			expect(getUserTexts(h)).toEqual(["active turn", ...ordinaryTexts, text]);
+			expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+			expect(h.session.userMessageSessionGeneration).toBe(generation);
+			expect(await api.submitUserMessage({ ...request })).toEqual(duplicateReceipt);
+			expect(inputCalls).toBe(1);
+			expect(getUserTexts(h)).toEqual(["active turn", ...ordinaryTexts, text]);
+		} finally {
+			acquired?.release();
+			held.release();
+			await run;
+		}
+	});
+
+	// #309 keep reason: data safety at the extension/native boundary. Native lifecycle fencing
+	// must still cancel held-only ingress and succeed; moving the extension precheck into native breaks it.
+	// https://github.com/Smarty-Pants-Inc/pi/pull/309#issuecomment-6401455682
+	it("retains native lifecycle cancellation of held-only receipt ingress (#309 P2)", async () => {
+		const entered = gate();
+		const held = gate();
+		const returned = gate();
+		const text = "held-only native cancellation\n\u0000☃";
+		let inputCalls = 0;
+		const h = await setup([
+			(pi) => {
+				pi.on("input", async (event) => {
+					if (event.text !== text) return;
+					inputCalls++;
+					entered.release();
+					try {
+						await held.promise;
+					} finally {
+						returned.release();
+					}
+				});
+			},
 		]);
-		await inExtension(h, "a", async (ctx) => {
-			await expect(ctx.fenceInputs()).rejects.toMatchObject({ code: "INPUT_ADMISSION_BUSY" });
-			expect(ctx.getInputState()).toMatchObject({ inputsFenced: false, queued: 1, drained: false });
-		});
-		expect(h.session.userMessageSessionGeneration).not.toBe(generation);
-		expect(JSON.stringify(h.session.agent.getQueuedMessages())).toBe(ordinaryBytes);
-		held.release();
-		await run;
-		expect(getUserTexts(h)).toEqual(["active turn", "ordinary follow-up survives"]);
+		const api = await inExtension(h, "b", (_ctx, pi) => pi);
+		const generation = h.session.userMessageSessionGeneration;
+		const request: SubmitUserMessageOptions = {
+			registrationEpoch: "fence-test",
+			requestId: "held-only-native",
+			sessionGeneration: generation,
+			text,
+			deliverAs: "followUp",
+			expandPromptTemplates: false,
+		};
+		const ingress = api.submitUserMessage(request);
+		const duplicate = api.submitUserMessage({ ...request });
+		let releaseNative: (() => void) | undefined;
+		try {
+			await Promise.race([
+				entered.promise,
+				ingress.then(() => {
+					throw new Error("Receipt settled without entering the native cancellation probe");
+				}),
+			]);
+			expect(h.session.inputAdmissionCount).toBe(1);
+			expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+			releaseNative = await h.session.fenceInputs();
+			const nextGeneration = h.session.userMessageSessionGeneration;
+			expect(nextGeneration).not.toBe(generation);
+			expect(h.session.inputsFenced).toBe(true);
+			expect(h.session.inputAdmissionCount).toBe(0);
+			const cancelled = { status: "rejected", reason: "session_changed", sessionGeneration: generation };
+			expect(await ingress).toEqual(cancelled);
+			expect(await duplicate).toEqual({ ...cancelled, duplicate: true });
+			releaseNative();
+			held.release();
+			await returned.promise;
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(inputCalls).toBe(1);
+			expect(h.session.inputsFenced).toBe(false);
+			expect(h.session.agent.getQueuedMessageOccurrences()).toEqual([]);
+			expect(getUserTexts(h)).toEqual([]);
+			expect(h.faux.state.callCount).toBe(0);
+			h.setResponses([fauxAssistantMessage("fresh native generation reply")]);
+			expect(
+				await api.submitUserMessage({
+					...request,
+					requestId: "after-native-cancellation",
+					sessionGeneration: nextGeneration,
+					text: "fresh input after native cancellation",
+				}),
+			).toEqual({ status: "accepted", sessionGeneration: nextGeneration });
+			await h.session.waitForIdle();
+			expect(getUserTexts(h)).toEqual(["fresh input after native cancellation"]);
+		} finally {
+			releaseNative?.();
+			held.release();
+			await Promise.allSettled([ingress, duplicate]);
+			if (inputCalls > 0) await returned.promise;
+			await h.session.waitForIdle();
+		}
 	});
 });

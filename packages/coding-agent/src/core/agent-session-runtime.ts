@@ -100,6 +100,11 @@ export class AgentSessionRuntime {
 	#ownerDisposal?: Promise<void>;
 	private _disposed = false;
 	private lifecycleActive = false;
+	/**
+	 * Resolves undefined once this lifecycle owns its native fence token, or with the acquisition failure.
+	 * Never joins native abort/drain or lifecycle hooks.
+	 */
+	private lifecycleAcquisition?: Promise<{ error: unknown } | undefined>;
 	private lifecycleCompletion?: Promise<void>;
 	private completeLifecycle?: () => void;
 	private readonly terminalCancellation = new AbortController();
@@ -152,12 +157,23 @@ export class AgentSessionRuntime {
 		this.lifecycleCompletion = new Promise<void>((resolve) => {
 			this.completeLifecycle = resolve;
 		});
+		let completeAcquisition!: (failure?: { error: unknown }) => void;
+		this.lifecycleAcquisition = new Promise((resolve) => {
+			completeAcquisition = resolve;
+		});
 		try {
-			const release = await outgoing.session.fenceInputs({
+			// Native acquisition installs its token synchronously, before abort or drain can yield. A token
+			// that appears in a previously open session is this lifecycle's, so operator exit may cancel the
+			// rejecting abort/drain wait instead of joining it. A foreign fence never satisfies this.
+			const open = !outgoing.session.inputsFenced;
+			const acquiring = outgoing.session.fenceInputs({
 				rejectQueuedInput: rejectQueuedInput
 					? (messages) => rejectQueuedInput(messages, outgoing.session)
 					: undefined,
 			});
+			if (open && outgoing.session.inputsFenced) completeAcquisition();
+			const release = await acquiring;
+			completeAcquisition();
 			return () => {
 				this.releaseReceivingInputs?.();
 				this.releaseReceivingInputs = undefined;
@@ -165,6 +181,7 @@ export class AgentSessionRuntime {
 				const published = this.#published;
 				this.#published = undefined;
 				this.lifecycleActive = false;
+				this.lifecycleAcquisition = undefined;
 				this.completeLifecycle?.();
 				queueMicrotask(() => {
 					// The mode decides deferred shutdown first. Its shutdown may still be waiting for the
@@ -187,6 +204,8 @@ export class AgentSessionRuntime {
 			};
 		} catch (error) {
 			this.lifecycleActive = false;
+			this.lifecycleAcquisition = undefined;
+			completeAcquisition({ error });
 			this.completeLifecycle?.();
 			throw error;
 		}
@@ -789,6 +808,28 @@ export class AgentSessionRuntime {
 		rejectQueuedInput?: (messages: AgentMessage[], session: AgentSession) => void;
 	}): Promise<void> {
 		if (!options?.terminal && !options?.operatorExit) return this.#dispose(options);
+		if (!options.terminal) {
+			// An in-progress attempt is not ownership. Join only until native token ownership is known, so
+			// an owned lifecycle's abort/drain and held hooks remain cancellable, but a failed foreign
+			// acquisition cannot exit.
+			while (this.lifecycleAcquisition) {
+				const acquisition = this.lifecycleAcquisition;
+				const failure = await acquisition;
+				if (
+					failure &&
+					(!(failure.error instanceof InputAdmissionError) || failure.error.code !== "INPUT_ADMISSION_BUSY")
+				)
+					throw failure.error;
+				// BUSY may leave admission open: operator preparation must still save or refuse input.
+				// If a different lifecycle started while awaiting, establish its ownership as well.
+				if (acquisition === this.lifecycleAcquisition) break;
+			}
+			if (!this.lifecycleActive && !this.session.isDisposed && this.session.inputsFenced)
+				throw new InputAdmissionError(
+					"INPUT_ADMISSION_FENCED",
+					"operator exit refused while input admission is fenced",
+				);
+		}
 		// Snapshot synchronously while all input owners are still intact. Never cancel on save failure.
 		const releaseOperatorInputs = options.operatorExit
 			? this.session.prepareOperatorExit({
@@ -819,7 +860,10 @@ export class AgentSessionRuntime {
 			releaseOperatorInputs?.();
 		}
 		if (this.lifecycleActive) await this.lifecycleCompletion;
-		await this.#dispose({ ...options, terminal: true, rejectQueuedInput: this.terminalRejection });
+		// Terminal cleanup may replace a foreign fence; the already-aborted signal must not revoke this scope.
+		await this.session.withFencedInput(() =>
+			this.#dispose({ ...options, terminal: true, rejectQueuedInput: this.terminalRejection }),
+		);
 		if (publicationFailure) throw publicationFailure.cause;
 	}
 
