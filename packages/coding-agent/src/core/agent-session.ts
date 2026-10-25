@@ -6401,7 +6401,14 @@ export class AgentSession {
 				isSettling: () => this.isSettling,
 				isPromptPending: () => this.isPromptPending,
 				// Fence acquisition must not inherit lifecycle admission authority.
-				fenceInputs: async () => ({ release: await this._inputFenceScope.exit(() => this.fenceInputs()) }),
+				fenceInputs: async () => ({
+					release: await this._inputFenceScope.exit(() => {
+						this._shutdownCancellation.signal.throwIfAborted();
+						this._assertInputsOpen();
+						this._assertInputsDrained();
+						return this.fenceInputs();
+					}),
+				}),
 				getInputState: () => ({
 					inputsFenced: this.inputsFenced,
 					inputAdmissionCount: this.inputAdmissionCount,
