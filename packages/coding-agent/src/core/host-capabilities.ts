@@ -11,6 +11,8 @@ export const HOST_CAPABILITIES = Object.freeze({
 	triggeredMessageQueuesBehindPreflight: true as boolean,
 	/** Version 1: synchronous user-input accounting and fail-closed native replacement/disposal fences. */
 	inputAdmission: 1,
+	/** Version 1: ctx.fenceInputs() and ctx.getInputState(). */
+	extensionInputFence: 1,
 	/** `ctx.isPromptPending()` reports user input awaiting handoff; such input makes `ctx.isIdle()` false. */
 	promptPendingVisible: true as boolean,
 	/** `bash_spawn` is emitted immediately before the built-in bash executor runs. */

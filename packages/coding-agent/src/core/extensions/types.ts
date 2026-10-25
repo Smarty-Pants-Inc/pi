@@ -367,6 +367,24 @@ export interface UserMessageReceipt {
 		| "unsupported";
 }
 
+/** A held native input fence. */
+export interface ExtensionInputFence {
+	/** Reopen admission. Idempotent; releases only this fence and never reopens a disposed session. */
+	release(): void;
+}
+
+/** Read-only native input state, read at call time. */
+export interface ExtensionInputState {
+	/** True while any fence is held or the session is disposed. */
+	readonly inputsFenced: boolean;
+	/** Inputs admitted and awaiting native handoff, including extension input handlers. */
+	readonly inputAdmissionCount: number;
+	/** Undelivered messages in both complete native agent queues (steering and follow-up). */
+	readonly queued: number;
+	/** True when the native drained check passes; this is not an agent-idle check. */
+	readonly drained: boolean;
+}
+
 export interface ExtensionContext {
 	/** Generation of the active user-message session, for external ingress binding. */
 	readonly userMessageSessionGeneration: string;
@@ -405,6 +423,17 @@ export interface ExtensionContext {
 	 * itself (a timer, an outside event) can wait until this is false.
 	 */
 	isPromptPending(): boolean;
+	/**
+	 * Close native input admission without waiting for drain. Takes no options and never rejects queues
+	 * through rejectQueuedInput. Calls from this extension's execution context share its held/in-flight handle.
+	 * Fresh acquisition rejects with InputAdmissionError (INPUT_ADMISSION_BUSY, INPUT_ADMISSION_FENCED,
+	 * INPUT_ADMISSION_DISPOSED), or the shutdown cancellation reason once shutdown begins.
+	 * BUSY releases the attempted fence, but native receipt ingress is invalidated even on BUSY.
+	 * A held handle is not auto-released on extension reload; release() remains usable after invalidation.
+	 */
+	fenceInputs(): Promise<ExtensionInputFence>;
+	/** Snapshot of native input state. Hosts without input-fence hooks throw instead of fabricating state. */
+	getInputState(): ExtensionInputState;
 	/** Whether project-local trust is active for this context. */
 	isProjectTrusted(): boolean;
 	/** The current abort signal, or undefined when the agent is not streaming. */
@@ -2403,6 +2432,10 @@ export interface ExtensionContextActions {
 	isSettling: () => boolean;
 	/** Optional: hosts without prompt preflights report false. */
 	isPromptPending?: () => boolean;
+	/** Optional: without this hook, ctx.fenceInputs() rejects as unavailable. */
+	fenceInputs?: () => Promise<ExtensionInputFence>;
+	/** Optional: without this hook, ctx.getInputState() throws as unavailable. */
+	getInputState?: () => ExtensionInputState;
 	isProjectTrusted: () => boolean;
 	getSignal: () => AbortSignal | undefined;
 	abort: () => void;
