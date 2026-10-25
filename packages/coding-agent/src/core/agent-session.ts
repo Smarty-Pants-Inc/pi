@@ -6400,7 +6400,8 @@ export class AgentSession {
 				isIdle: () => this.isIdle,
 				isSettling: () => this.isSettling,
 				isPromptPending: () => this.isPromptPending,
-				fenceInputs: async () => ({ release: await this.fenceInputs() }),
+				// Fence acquisition must not inherit lifecycle admission authority.
+				fenceInputs: async () => ({ release: await this._inputFenceScope.exit(() => this.fenceInputs()) }),
 				getInputState: () => ({
 					inputsFenced: this.inputsFenced,
 					inputAdmissionCount: this.inputAdmissionCount,

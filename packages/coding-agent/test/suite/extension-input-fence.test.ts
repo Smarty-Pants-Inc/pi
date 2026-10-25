@@ -8,15 +8,22 @@ import type {
 	ExtensionFactory,
 	ExtensionInputFence,
 	ExtensionInputState,
+	SessionReadyEvent,
 } from "../../src/core/extensions/index.ts";
 import { HOST_CAPABILITIES } from "../../src/core/host-capabilities.ts";
 import { InputAdmissionError } from "../../src/core/input-admission.ts";
 import { HOST_CAPABILITIES as PUBLIC_HOST_CAPABILITIES } from "../../src/index.ts";
 import { createTestExtensionsResult } from "../utilities.ts";
-import { createHarness, getMessageText, getUserTexts, type Harness } from "./harness.ts";
+import { createHarness, getMessageText, getUserTexts, type Harness, type HarnessOptions } from "./harness.ts";
 
 type ProbeAction = (ctx: ExtensionCommandContext, pi: ExtensionAPI) => Promise<void>;
 type ExtensionName = "a" | "b";
+type LifecycleFenceSnapshot = {
+	fence: object | undefined;
+	generation: string;
+	queuedBytes: string;
+	state: ExtensionInputState;
+};
 
 // smarty-dev#15310: data-safety and extension-identity regressions use real loader-bound callbacks,
 // native AgentSession admission, and faux model turns. Calling commands directly avoids creating
@@ -42,7 +49,10 @@ describe("extension input fence (#15310)", () => {
 		vi.restoreAllMocks();
 	});
 
-	async function setup(extensionFactories: ExtensionFactory[] = []) {
+	async function setup(
+		extensionFactories: ExtensionFactory[] = [],
+		options: Pick<HarnessOptions, "cwd" | "sessionManager" | "sessionStartEvent"> = {},
+	) {
 		const probes: ExtensionFactory[] = (["a", "b"] as const).map((name) => (pi) => {
 			pi.registerCommand(`fence-probe-${name}`, {
 				handler: async (_args, ctx) => {
@@ -54,6 +64,7 @@ describe("extension input fence (#15310)", () => {
 		});
 		const factories = [...probes, ...extensionFactories];
 		const h = await createHarness({
+			...options,
 			extensionFactories: factories,
 			settings: { compaction: { enabled: false }, retry: { enabled: false } },
 		});
@@ -349,6 +360,187 @@ describe("extension input fence (#15310)", () => {
 			handle.release();
 		},
 	);
+
+	// #309 keep reason: trust boundary. Lifecycle scope permits ordinary input, not taking over
+	// the runtime's native fence. Exercise real replacement, loader-bound handlers and receipt ingress.
+	it.each([
+		["session_start", "drained"],
+		["session_start", "busy"],
+		["withSession", "drained"],
+		["withSession", "busy"],
+	] as const)("replacement lifecycle %s refuses fence acquisition while %s (#309)", async (phase, state) => {
+		const entered = gate();
+		const held = gate();
+		const ordinaryTexts = state === "busy" ? ["ordinary\n\u0000☃", "ordinary\n\u0000☃"] : [];
+		const scopedText = "ordinary scoped input after refused acquisition";
+		const errors: Array<{ event: string; error: string }> = [];
+		const starts: string[] = [];
+		const ready: Array<{ event: SessionReadyEvent; sessionFenced: boolean; runtimeFenced: boolean }> = [];
+		let before!: LifecycleFenceSnapshot;
+		let after!: LifecycleFenceSnapshot;
+		let refusal: unknown;
+		let callbackError: unknown;
+		let acquired: ExtensionInputFence | undefined;
+		let scopedAccepted = false;
+		let receiving!: Harness;
+		let runtime!: AgentSessionRuntime;
+		const probe = async (ctx: ExtensionContext) => {
+			try {
+				const session = runtime.session;
+				const native = session as unknown as { _inputFence: object | undefined };
+				for (const text of ordinaryTexts) {
+					await session.followUp(text, [{ type: "image", data: "ordinary-image-bytes", mimeType: "image/png" }]);
+				}
+				const snapshot = (): LifecycleFenceSnapshot => ({
+					fence: native._inputFence,
+					generation: ctx.userMessageSessionGeneration,
+					queuedBytes: JSON.stringify(session.agent.getQueuedMessageOccurrences()),
+					state: ctx.getInputState(),
+				});
+				before = snapshot();
+				try {
+					acquired = await ctx.fenceInputs();
+				} catch (error) {
+					refusal = error;
+				} finally {
+					// A buggy successful acquisition must not strand its handle or suppress cleanup/readiness.
+					acquired?.release();
+				}
+				after = snapshot();
+				await session.followUp(scopedText);
+				scopedAccepted = true;
+			} catch (error) {
+				callbackError = error;
+			} finally {
+				// Runner.emit catches handler exceptions: signal even on failure and assert only in the test.
+				entered.release();
+				await held.promise;
+			}
+		};
+		const lifecycle: ExtensionFactory = (pi) => {
+			pi.on("session_start", async (event, ctx) => {
+				starts.push(event.reason);
+				if (phase === "session_start") {
+					await probe(ctx);
+				}
+			});
+			pi.on("session_ready", (event) => {
+				ready.push({ event, sessionFenced: runtime.session.inputsFenced, runtimeFenced: runtime.inputsFenced });
+			});
+		};
+		const initial = await setup();
+		const services = (h: Harness) => ({
+			cwd: initial.tempDir,
+			agentDir: initial.tempDir,
+			modelRuntime: h.modelRuntime,
+			settingsManager: h.settingsManager,
+			resourceLoader: h.resourceLoader,
+			diagnostics: [],
+		});
+		runtime = new AgentSessionRuntime(initial.session, services(initial), async (options) => {
+			receiving = await setup([lifecycle], options);
+			return {
+				session: receiving.session,
+				services: services(receiving),
+				extensionsResult: receiving.resourceLoader.getExtensions(),
+				diagnostics: [],
+			};
+		});
+		runtime.setRebindSession((session) => session.bindExtensions({ onError: (error) => errors.push(error) }));
+		let replacementSettled = false;
+		// The loader-bound command supplies real extension attribution to withSession as well.
+		const replacing = inExtension(initial, "a", () =>
+			runtime.newSession({ withSession: phase === "withSession" ? probe : undefined }),
+		);
+		void replacing.then(
+			() => {
+				replacementSettled = true;
+			},
+			() => {
+				replacementSettled = true;
+			},
+		);
+		try {
+			// Early replacement completion/rejection fails promptly instead of waiting on a missing handler.
+			await Promise.race([
+				entered.promise,
+				replacing.then(() => {
+					throw new Error("Replacement completed without entering the held lifecycle probe");
+				}),
+			]);
+			expect(acquired).toBeUndefined();
+			expect(refusal).toBeInstanceOf(InputAdmissionError);
+			expect(refusal).toMatchObject({ code: "INPUT_ADMISSION_FENCED" });
+			expect(callbackError).toBeUndefined();
+			expect(starts).toEqual(["new"]);
+			expect(before.fence).toBeDefined();
+			expect(before.state).toEqual({
+				inputsFenced: true,
+				inputAdmissionCount: 0,
+				queued: ordinaryTexts.length,
+				drained: state === "drained",
+			});
+			expect(after.fence).toBe(before.fence);
+			expect(after.generation).toBe(before.generation);
+			expect(after.queuedBytes).toBe(before.queuedBytes);
+			expect(after.state).toEqual(before.state);
+			expect(scopedAccepted).toBe(true);
+			const session = receiving.session;
+			expect(runtime.session).toBe(session);
+			expect(session.inputsFenced).toBe(true);
+			expect(session.userMessageSessionGeneration).toBe(before.generation);
+			expect(session.getFollowUpMessages()).toEqual([...ordinaryTexts, scopedText]);
+			const queuedBytes = JSON.stringify(session.agent.getQueuedMessageOccurrences());
+			await expect(session.followUp("outside direct admission")).rejects.toMatchObject({
+				code: "INPUT_ADMISSION_FENCED",
+			});
+			expect(
+				await inExtension(receiving, "b", (_ctx, pi) =>
+					pi.submitUserMessage({
+						registrationEpoch: "lifecycle-fence-test",
+						requestId: "outside-lifecycle",
+						sessionGeneration: before.generation,
+						text: "outside receipt ingress",
+						deliverAs: "followUp",
+						expandPromptTemplates: false,
+					}),
+				),
+			).toEqual({ status: "rejected", reason: "session_changed", sessionGeneration: before.generation });
+			expect(session.inputsFenced).toBe(true);
+			expect(session.userMessageSessionGeneration).toBe(before.generation);
+			expect(JSON.stringify(session.agent.getQueuedMessageOccurrences())).toBe(queuedBytes);
+			expect(replacementSettled).toBe(false);
+			expect(ready).toEqual([]);
+			held.release();
+			await expect(replacing).resolves.toEqual({ cancelled: false });
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(ready).toEqual([
+				{
+					event: { type: "session_ready", reason: "new", sessionGeneration: before.generation },
+					sessionFenced: false,
+					runtimeFenced: false,
+				},
+			]);
+			expect(errors).toEqual([]);
+			receiving.setResponses(Array.from({ length: 5 }, () => fauxAssistantMessage("ordinary input delivered")));
+			await session.prompt("drain lifecycle queue");
+			expect(getUserTexts(receiving)).toEqual(["drain lifecycle queue", ...ordinaryTexts, scopedText]);
+			const fresh = await inExtension(receiving, "a", (ctx) => ctx.fenceInputs());
+			try {
+				expect(session.inputsFenced).toBe(true);
+				await expect(session.followUp("outside fresh extension fence")).rejects.toMatchObject({
+					code: "INPUT_ADMISSION_FENCED",
+				});
+			} finally {
+				fresh.release();
+			}
+			expect(session.inputsFenced).toBe(false);
+		} finally {
+			held.release();
+			acquired?.release();
+			await replacing;
+		}
+	});
 
 	// smarty-dev#15310: the lead's native-semantics ruling resolves original spec 7/8/11.
 	// Direct disposal seals an idle fenced session and invalidates its runner/context.
