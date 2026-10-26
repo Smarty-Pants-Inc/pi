@@ -58,6 +58,30 @@ export function isRetryableAnthropicMidOutputFallback(message: AssistantMessage)
 	return message.recovery?.recovery === "anthropic_mid_output_fallback" && message.recovery.retryable === true;
 }
 
+/**
+ * An OpenAI-compatible provider overload classified before provider text was masked. This does
+ * not permit an ordinary retry: the session must require partial output, no started tools, the same
+ * physical model/thinking level, one replay per response and a prompt-wide cap.
+ */
+export function isRetryableMidstreamOverload(message: AssistantMessage): boolean {
+	if (
+		(message.api !== "openai-completions" &&
+			message.api !== "openai-responses" &&
+			message.api !== "azure-openai-responses" &&
+			message.api !== "openai-codex-responses") ||
+		message.stopReason !== "error"
+	)
+		return false;
+	if (
+		message.diagnostics?.some(
+			(diagnostic) => diagnostic.type === "provider_stream_observer_error" || diagnostic.type === "provider_limit",
+		)
+	)
+		return false;
+	const recovery = assistantRecovery(message);
+	return recovery.midstream === "overload" && recovery.recovery !== "context_length_exceeded";
+}
+
 /** Empty reasoning signatures are metadata, not output. Even a partial tool call is output. */
 export function hasAssistantOutput(message: AssistantMessage): boolean {
 	return (

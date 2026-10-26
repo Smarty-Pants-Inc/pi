@@ -25,12 +25,18 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
 	// quota/billing error code; the other strings cover common gateway wording.
 	"insufficient_quota",
 	"out of budget",
-	"quota exceeded",
+	"quota[_ ]exceeded",
 	"billing",
 
 	// Sign in with ChatGPT: the subscription's shared usage limit, which resets
 	// after hours rather than seconds.
 	"subscription_sharing_usage_limit_exceeded",
+
+	// Known final gateway/ChatGPT refusals can arrive as streamed codes or error types without a
+	// provider_limit diagnostic. They must win over an accompanying HTTP 5xx (smarty-dev#16938).
+	"\\bsmarty_limit\\b",
+	"\\busage_limit_reached\\b",
+	"\\busage_not_included\\b",
 ]);
 
 const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
@@ -114,6 +120,32 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
 	"subscription_sharing_usage_unavailable",
 	"subscription_sharing_user_unavailable",
 ]);
+
+// smarty-dev#16938: the one-shot mid-output replay is a positive allowlist, separate from ordinary retryability.
+// Only these exact provider error codes/types, or a dedicated HTTP 529, name an overload. A bare 5xx, overload
+// wording in free text and transport failures do not.
+const MIDSTREAM_OVERLOAD_CODES: ReadonlySet<string> = new Set([
+	"server_is_overloaded", // OpenAI
+	"overloaded_error", // Anthropic-shaped errors relayed by OpenAI-compatible gateways
+	"upstream overloaded",
+]);
+
+// Any rate, quota, limit or throttle signal in the text or a code vetoes the replay, even beside an overload code.
+// Word families, not spellings: any "exceeded", usage or credit wording, request/token time windows, RPM/TPM/RPS/QPS,
+// concurrency and exhaustion. The veto is deliberately broad: a false match only leaves the failure final, as it was
+// before this replay existed.
+const MIDSTREAM_RATE_OR_QUOTA_PATTERN =
+	/rate|quota|limit|exceed|throttl|too[\s_-]*many|(?<!\d)429(?!\d)|per[\s_-]*(?:\d+[\s_-]*)?(?:milli|sec|min|hour|day|week|month)|\b[rtq]p[ms]\b|concurren|in[\s_-]*flight|exhaust|slow[\s_-]*down|usage|credit|insufficient/i;
+
+/** A provider overload with no rate/quota signal anywhere and no client-error status (smarty-dev#16938). */
+function isMidstreamOverload(text: string, status: number | undefined, codes: readonly string[]): boolean {
+	// Includes 429: a client-error or rate-limit status contradicts an overload.
+	if (status !== undefined && status < 500) return false;
+	if (MIDSTREAM_RATE_OR_QUOTA_PATTERN.test(text) || codes.some((code) => MIDSTREAM_RATE_OR_QUOTA_PATTERN.test(code))) {
+		return false;
+	}
+	return status === 529 || codes.some((code) => MIDSTREAM_OVERLOAD_CODES.has(code));
+}
 
 const PREMATURE_STREAM_ERROR_PATTERN = buildProviderErrorPattern([
 	// Anthropic SDK/transport early endings (#4433), and Responses early EOF.
@@ -224,6 +256,8 @@ export interface ProviderFailureInput {
 	status?: number;
 	/** Trusted request provider (`model.provider`), never a provider-reported label. */
 	provider?: string;
+	/** Exact provider error code/type values from dedicated fields. Only these can name an overload. */
+	codes?: readonly string[];
 }
 
 /**
@@ -235,11 +269,14 @@ export function classifyProviderFailure(input: ProviderFailureInput): AssistantR
 	const status = validHttpStatus(input.status);
 	if (isOverflowText(text, status, input.provider)) return { recovery: "context_length_exceeded", retryable: false };
 	if (NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.test(text)) return { retryable: false };
-	if (PREMATURE_STREAM_ERROR_PATTERN.test(text)) return { recovery: "premature_stream", retryable: true };
-	if (RETRYABLE_PROVIDER_ERROR_PATTERN.test(text) || (status !== undefined && RETRYABLE_STATUSES.has(status))) {
-		return { recovery: "retryable", retryable: true };
+	const midstream = isMidstreamOverload(text, status, input.codes ?? []) ? { midstream: "overload" as const } : {};
+	if (PREMATURE_STREAM_ERROR_PATTERN.test(text)) {
+		return { recovery: "premature_stream", retryable: true, ...midstream };
 	}
-	return { retryable: false };
+	if (RETRYABLE_PROVIDER_ERROR_PATTERN.test(text) || (status !== undefined && RETRYABLE_STATUSES.has(status))) {
+		return { recovery: "retryable", retryable: true, ...midstream };
+	}
+	return { retryable: false, ...midstream };
 }
 
 /** An HTTP status only from a dedicated status field, and only as an integer 100-599. */
@@ -257,11 +294,12 @@ const RECOVERY_CLASSES: ReadonlySet<string> = new Set<AssistantRecoveryClass>([
 /** Rebuild a recovery decision from its closed fields; anything else is not a decision. */
 export function ownedRecovery(value: unknown): AssistantRecovery | undefined {
 	if (typeof value !== "object" || value === null) return undefined;
-	const { recovery, retryable } = value as Record<string, unknown>;
+	const { recovery, retryable, midstream } = value as Record<string, unknown>;
 	if (typeof retryable !== "boolean") return undefined;
-	if (recovery === undefined) return { retryable };
+	const allowance = midstream === "overload" ? { midstream: "overload" as const } : {};
+	if (recovery === undefined) return { retryable, ...allowance };
 	return typeof recovery === "string" && RECOVERY_CLASSES.has(recovery)
-		? { recovery: recovery as AssistantRecoveryClass, retryable }
+		? { recovery: recovery as AssistantRecoveryClass, retryable, ...allowance }
 		: undefined;
 }
 

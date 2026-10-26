@@ -45,6 +45,7 @@ import {
 	isPrematureStreamError,
 	isRetryableAnthropicMidOutputFallback,
 	isRetryableCodexStreamDisconnect,
+	isRetryableMidstreamOverload,
 	observeAssistantMessage,
 	observeAssistantStreamEvent,
 	type RetryPolicy,
@@ -695,9 +696,12 @@ export class AgentSession {
 	private _codexStreamDisconnectRetryUsed = false;
 	/** One same-model Anthropic fallback replay per response; any failure of that replay is terminal. */
 	private _anthropicFallbackRetryUsed = false;
-	/** Survives successful tool responses and automatic continuations until a user message starts. */
+	/** One same-request overload replay; any failure of the replay is terminal. */
+	private _midstreamOverloadRetryUsed = false;
+	/** Shared mid-output cap: survives tool responses and custom/system continuations until a user message starts. */
 	private _anthropicFallbackPromptRetryCount = 0;
 	private readonly _anthropicFallbackCapRecorded = new WeakSet<AssistantMessage>();
+	private readonly _midstreamOverloadCapRecorded = new WeakSet<AssistantMessage>();
 	/** Sticky until turn_start: synthetic failure messages belong to the same response. */
 	private _assistantToolExecutionStarted = false;
 	private _retryFallbackUsed = false;
@@ -939,6 +943,7 @@ export class AgentSession {
 		if (this._initialActiveToolNames === undefined) this._restoreToolsFromTranscript();
 		this.#ordinaryOwner?.bindSessionAdmission(this, (recheck, enroll) => this.#requestOrdinaryWake(recheck, enroll));
 		this._restoreUnsentInputs();
+		this._restoreMidOutputRetryCount();
 		this.#auditState("session_attached");
 	}
 
@@ -1313,9 +1318,11 @@ export class AgentSession {
 		};
 		this.agent.prepareRequest = async (request, signal) => {
 			const failed = this._failedResponse;
-			// A marker replay repeats the physical request, not a virtual router's next selection.
+			// A mid-output replay repeats the physical request, not a router's or request hook's next selection.
 			const replayRequest =
-				failed && this._anthropicFallbackRetryUsed && isRetryableAnthropicMidOutputFallback(failed)
+				failed &&
+				((this._anthropicFallbackRetryUsed && isRetryableAnthropicMidOutputFallback(failed)) ||
+					this._midstreamOverloadRetryUsed)
 					? { model: requestModel, thinkingLevel: requestThinkingLevel }
 					: undefined;
 			this._failedResponse = undefined;
@@ -1419,7 +1426,9 @@ export class AgentSession {
 			message.stopReason === "aborted"
 				? "aborted"
 				: message.stopReason === "error" ||
-						(this._retryFallbackInFlight && message.stopReason !== "stop" && message.stopReason !== "toolUse")
+						((this._retryFallbackInFlight || this._midstreamOverloadRetryUsed) &&
+							message.stopReason !== "stop" &&
+							message.stopReason !== "toolUse")
 					? "error"
 					: "completed";
 		const messageEntryId = this._findPersistedMessageEntryId(message);
@@ -1478,7 +1487,7 @@ export class AgentSession {
 			const previousDecision = await previousFinishTurn?.(turn, signal);
 			// End an unsuccessful one-shot alternate before truncated tools or queued input
 			// can select a natural next turn. Successful toolUse clears this flag at message_end.
-			if (this._retryFallbackInFlight) return { action: "end" };
+			if (this._retryFallbackInFlight || this._midstreamOverloadRetryUsed) return { action: "end" };
 			if (previousDecision?.action === "end") return previousDecision;
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
@@ -1889,6 +1898,10 @@ export class AgentSession {
 				return;
 			}
 		}
+		// Stamp the actual replay's terminal record before publication and persistence. This is not content.
+		if (event.type === "message_end" && event.message.role === "assistant" && this._midstreamOverloadRetryUsed) {
+			event.message.retry = { count: 1, reason: "midstream_overload" };
+		}
 		// smarty-dev#6730: a premature close after reasoning only is restarted. Drop its held reasoning updates and
 		// the reasoning in its message before listeners, extensions and the session file see the failed attempt, so
 		// it ends like an empty close. Answer output or any other event publishes the held updates first, in order.
@@ -1897,6 +1910,7 @@ export class AgentSession {
 			event.type === "message_end" &&
 			event.message.role === "assistant" &&
 			event.message.stopReason === "error" &&
+			!this._isMidstreamOverloadRetry(event.message) &&
 			this._willRetryAssistantMessage(event.message)
 		) {
 			this._replaceMessageInPlace(event.message, discardPartialReasoning(event.message));
@@ -1927,6 +1941,7 @@ export class AgentSession {
 			this._overflowRecoveryAttempted = false;
 			this._codexStreamDisconnectRetryUsed = false;
 			this._anthropicFallbackRetryUsed = false;
+			this._midstreamOverloadRetryUsed = false;
 			this._anthropicFallbackPromptRetryCount = 0;
 			const messageText = contentText(event.message.content, "");
 			// Empty text is valid for image-only queued input. Delivery is not truthiness.
@@ -2121,12 +2136,18 @@ export class AgentSession {
 					this._codexStreamDisconnectRetryUsed = false;
 					this._anthropicFallbackRetryUsed = false;
 				}
+				if (assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse") {
+					this._midstreamOverloadRetryUsed = false;
+				}
 				const fallbackSucceeded =
 					this._retryFallbackInFlight &&
 					(assistantMsg.stopReason === "stop" || assistantMsg.stopReason === "toolUse");
 				if (
 					fallbackSucceeded ||
-					(assistantMsg.stopReason !== "error" && this._retryAttempt > 0 && !this._retryFallbackInFlight)
+					(assistantMsg.stopReason !== "error" &&
+						this._retryAttempt > 0 &&
+						!this._retryFallbackInFlight &&
+						!this._midstreamOverloadRetryUsed)
 				) {
 					this._emit({
 						type: "auto_retry_end",
@@ -2163,15 +2184,20 @@ export class AgentSession {
 			this._throttleWaitUsed ||
 			this._retryFallbackInFlight ||
 			this._anthropicFallbackRetryUsed ||
+			this._midstreamOverloadRetryUsed ||
 			(this._anthropicFallbackPromptRetryCount >= ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT &&
-				isRetryableAnthropicMidOutputFallback(message))
+				(isRetryableAnthropicMidOutputFallback(message) || this._isMidstreamOverloadRetry(message)))
 		)
 			return false;
 		// Throttled-limit waits keep the plain output rule.
 		if (!this._assistantOutputObserved && !hasAssistantOutput(message) && throttledLimitWait(message)) return true;
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || !this._isRetryableError(message)) return false;
-		if (isRetryableCodexStreamDisconnect(message) || isRetryableAnthropicMidOutputFallback(message))
+		if (
+			isRetryableCodexStreamDisconnect(message) ||
+			isRetryableAnthropicMidOutputFallback(message) ||
+			this._isMidstreamOverloadRetry(message)
+		)
 			return settings.maxRetries > 0;
 		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
@@ -3024,6 +3050,7 @@ export class AgentSession {
 		this._retryFallbackInFlight = false;
 		this._codexStreamDisconnectRetryUsed = false;
 		this._anthropicFallbackRetryUsed = false;
+		this._midstreamOverloadRetryUsed = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -3034,7 +3061,14 @@ export class AgentSession {
 			else await dispatch();
 			while (!this._agentRunAbortRequested && !this._stopAfterCompactionFailure) {
 				const continueAfterRun = await this._handlePostAgentRun();
-				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
+				// An unsuccessful overload replay is terminal, including boundary/system continuations.
+				// Queued input stays retained for a later run, rather than disguising another replay.
+				if (
+					this._agentRunAbortRequested ||
+					this._stopAfterCompactionFailure ||
+					(this._midstreamOverloadRetryUsed && this._failedResponse === undefined)
+				)
+					break;
 				if (!continueAfterRun && !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested || this._stopAfterCompactionFailure) break;
 				const fromQueuedMessages = continueAfterRun === "queuedInput";
@@ -3212,15 +3246,33 @@ export class AgentSession {
 			if (entry) this._emit({ type: "entry_appended", entry });
 		}
 
+		const overloadCapHit =
+			this._anthropicFallbackPromptRetryCount >= ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT &&
+			this._isMidstreamOverloadRetry(message);
+		if (overloadCapHit && !this._midstreamOverloadCapRecorded.has(message)) {
+			const entryId = this.sessionManager.appendCustomEntry("midstream_overload_retry_cap_hit", {
+				requestedProvider: message.provider,
+				requestedModel: message.model,
+				retries: this._anthropicFallbackPromptRetryCount,
+				limit: ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT,
+				reason: "midstream_overload",
+			});
+			this._midstreamOverloadCapRecorded.add(message);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+		}
+
 		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
 		const throttleWaitUsed = this._throttleWaitUsed;
 		const fallbackAttempt = this._retryFallbackInFlight;
 		this._throttleWaitUsed = false;
 		const throttleWait =
 			fallbackCapHit ||
+			overloadCapHit ||
 			fallbackAttempt ||
 			throttleWaitUsed ||
 			this._anthropicFallbackRetryUsed ||
+			this._midstreamOverloadRetryUsed ||
 			this._assistantOutputObserved ||
 			hasAssistantOutput(message)
 				? undefined
@@ -3244,7 +3296,11 @@ export class AgentSession {
 			return false;
 		}
 
-		if ((message.stopReason === "error" && this._retryAttempt > 0) || fallbackAttempt) {
+		if (
+			(message.stopReason === "error" && this._retryAttempt > 0) ||
+			fallbackAttempt ||
+			(this._midstreamOverloadRetryUsed && this._retryAttempt > 0)
+		) {
 			this._emit({
 				type: "auto_retry_end",
 				success: false,
@@ -3259,9 +3315,11 @@ export class AgentSession {
 		const compaction =
 			fallbackAttempt ||
 			this._anthropicFallbackRetryUsed ||
+			this._midstreamOverloadRetryUsed ||
 			(throttleWaitUsed && message.stopReason === "error") ||
 			isRetryableCodexStreamDisconnect(message) ||
-			isRetryableAnthropicMidOutputFallback(message)
+			isRetryableAnthropicMidOutputFallback(message) ||
+			this._isMidstreamOverloadRetry(message)
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -6775,13 +6833,43 @@ export class AgentSession {
 	// Auto-Retry
 	// =========================================================================
 
+	/** A reopen or branch move is not a new user prompt; rebuild the shared cap from raw retry records. */
+	private _restoreMidOutputRetryCount(): void {
+		this._anthropicFallbackPromptRetryCount = 0;
+		for (const entry of [...this.sessionManager.getBranch()].reverse()) {
+			if (entry.type === "message" && entry.message.role === "user") break;
+			if (
+				entry.type === "custom" &&
+				(entry.customType === "anthropic_fallback_retry" || entry.customType === "midstream_overload_retry")
+			) {
+				this._anthropicFallbackPromptRetryCount++;
+			}
+		}
+	}
+
+	/** The new allowance requires observed output; the exact Codex disconnect keeps its existing policy. */
+	private _isMidstreamOverloadRetry(message: AssistantMessage): boolean {
+		return (
+			isRetryableMidstreamOverload(message) &&
+			!isRetryableCodexStreamDisconnect(message) &&
+			(this._assistantOutputObserved || hasAssistantOutput(message)) &&
+			!isContextOverflow(message, (this._modelForMessage(message) ?? this.model)?.contextWindow ?? 0)
+		);
+	}
+
 	/**
 	 * Check if an error is retryable (overloaded, rate limit, server errors).
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
-		// The marker's fresh request is one-shot even if it fails with a different transient error.
-		if (this._anthropicFallbackRetryUsed) return false;
+		// A mid-output replay is one-shot even if it fails with a different transient error.
+		if (this._anthropicFallbackRetryUsed || this._midstreamOverloadRetryUsed) return false;
+		if (this._isMidstreamOverloadRetry(message)) {
+			return (
+				!this._assistantToolExecutionStarted &&
+				this._anthropicFallbackPromptRetryCount < ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT
+			);
+		}
 		// smarty-dev#2890: the owned marker permits partial output, but never started effects or
 		// ordinary/model-fallback retries after the one-shot allowance has been consumed.
 		if (isRetryableAnthropicMidOutputFallback(message)) {
@@ -6858,7 +6946,12 @@ export class AgentSession {
 	 */
 	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
 		const settings = this._getRetrySettings(message);
-		if (!settings.enabled || this._retryFallbackInFlight || this._anthropicFallbackRetryUsed) {
+		if (
+			!settings.enabled ||
+			this._retryFallbackInFlight ||
+			this._anthropicFallbackRetryUsed ||
+			this._midstreamOverloadRetryUsed
+		) {
 			return false;
 		}
 
@@ -6878,6 +6971,29 @@ export class AgentSession {
 				requestedModel: message.model,
 				attempt: this._retryAttempt,
 				retries: this._anthropicFallbackPromptRetryCount,
+			});
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+			return this._waitAndRetry(message, retryDelayMs(settings, 1), this._retryAttempt);
+		}
+
+		if (this._isMidstreamOverloadRetry(message)) {
+			if (
+				settings.maxRetries <= 0 ||
+				this._assistantToolExecutionStarted ||
+				this._anthropicFallbackPromptRetryCount >= ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT
+			) {
+				return false;
+			}
+			this._midstreamOverloadRetryUsed = true;
+			this._anthropicFallbackPromptRetryCount++;
+			this._retryAttempt++;
+			const entryId = this.sessionManager.appendCustomEntry("midstream_overload_retry", {
+				requestedProvider: message.provider,
+				requestedModel: message.model,
+				attempt: this._retryAttempt,
+				retries: this._anthropicFallbackPromptRetryCount,
+				reason: "midstream_overload",
 			});
 			const entry = this.sessionManager.getEntry(entryId);
 			if (entry) this._emit({ type: "entry_appended", entry });
@@ -7384,6 +7500,7 @@ export class AgentSession {
 			// Update finalized context from the canonical session projection.
 			this._refreshFinalizedContext();
 			this._restoreToolsFromTranscript();
+			this._restoreMidOutputRetryCount();
 
 			// Navigation is already committed. Cancel its observer without claiming rollback.
 			try {
