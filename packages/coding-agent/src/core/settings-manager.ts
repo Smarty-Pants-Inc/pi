@@ -1340,6 +1340,19 @@ export class SettingsManager {
 		this.save();
 	}
 
+	getImageRequestBudgetBytes(): number {
+		const requestBudgetBytes = this.settings.images?.requestBudgetBytes;
+		if (
+			requestBudgetBytes !== undefined &&
+			(typeof requestBudgetBytes !== "number" || !Number.isSafeInteger(requestBudgetBytes) || requestBudgetBytes < 1)
+		) {
+			throw new Error(
+				`Invalid images.requestBudgetBytes setting: ${String(requestBudgetBytes)}. Expected a positive safe integer.`,
+			);
+		}
+		return requestBudgetBytes ?? SETTINGS_DEFAULTS.images.requestBudgetBytes;
+	}
+
 	getImageAutoResize(): boolean {
 		return this.settings.images?.autoResize ?? SETTINGS_DEFAULTS.images.autoResize;
 	}

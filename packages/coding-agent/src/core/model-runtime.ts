@@ -5,6 +5,7 @@ import {
 	type ApiStreamOptions,
 	type AssistantImages,
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
 	type AuthCheck,
 	type AuthInteraction,
@@ -22,6 +23,7 @@ import {
 	type CredentialStore,
 	clampThinkingLevel,
 	createModels,
+	createRequestImagesOmittedDiagnostic,
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	type DeferredHandle,
@@ -72,6 +74,7 @@ import {
 	protectOperationError,
 	protectOperationResult,
 } from "@earendil-works/pi-ai/utils/model-operations";
+import { fitRequestImages, RequestTooLargeError } from "@earendil-works/pi-ai/utils/request-size";
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage, ReadOnlyAuthStorage } from "./auth-storage.ts";
@@ -921,6 +924,64 @@ export class ModelRuntime implements Models {
 		};
 	}
 
+	/** Size the adapter's assembled payload after the caller's transform, without changing stored history. */
+	private streamWithImageBudget(
+		transcript: Context,
+		options: StreamOptions,
+		dispatch: (options: StreamOptions) => AssistantMessageEventStream,
+	): AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> } {
+		let imagesOmitted = 0;
+		let bytesSaved = 0;
+		let diagnostic: ReturnType<typeof createRequestImagesOmittedDiagnostic> | undefined;
+		const source = dispatch({
+			...options,
+			onPayload: async (payload, requestModel) => {
+				const transformed = await options.onPayload?.(payload, requestModel);
+				// Session settings are registered after the runtime's default settings. Read them at dispatch
+				// time so changes during a long-running session apply to its next provider turn.
+				const settings = [...this.policySettings.keys()].at(-1);
+				try {
+					const fitted = fitRequestImages(
+						transformed === undefined ? payload : transformed,
+						requestModel,
+						transcript,
+						settings?.getImageRequestBudgetBytes() ?? 12_582_912,
+					);
+					imagesOmitted = Math.max(imagesOmitted, fitted.imagesOmitted);
+					bytesSaved = Math.max(bytesSaved, fitted.bytesSaved);
+					return fitted.payload;
+				} catch (error) {
+					if (error instanceof RequestTooLargeError) {
+						imagesOmitted = Math.max(imagesOmitted, error.imagesOmitted);
+						bytesSaved = Math.max(bytesSaved, error.bytesSaved);
+					}
+					throw error;
+				}
+			},
+		});
+		const terminal = (message: AssistantMessage): AssistantMessage => {
+			if (imagesOmitted === 0) return message;
+			diagnostic ??= createRequestImagesOmittedDiagnostic(imagesOmitted, bytesSaved);
+			return {
+				...message,
+				diagnostics: [
+					...(message.diagnostics ?? []).filter((entry) => entry.type !== "request_images_omitted"),
+					diagnostic,
+				],
+			};
+		};
+		return {
+			async *[Symbol.asyncIterator]() {
+				for await (const event of source) {
+					if (event.type === "done") yield { ...event, message: terminal(event.message) };
+					else if (event.type === "error") yield { ...event, error: terminal(event.error) };
+					else yield event;
+				}
+			},
+			result: async () => terminal(await source.result()),
+		};
+	}
+
 	stream<TApi extends Api>(
 		model: Model<TApi>,
 		context: Context,
@@ -936,7 +997,9 @@ export class ModelRuntime implements Models {
 				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 				this.#ordinaryOwner?.assertSubmission();
-				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
+				return this.streamWithImageBudget(transcript, prepared.options, (budgeted) =>
+					prepared.provider.stream(prepared.model, transcript, budgeted as ApiStreamOptions<TApi>),
+				);
 			},
 			options?.signal,
 		);
@@ -986,7 +1049,9 @@ export class ModelRuntime implements Models {
 				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 				this.#ordinaryOwner?.assertSubmission();
-				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+				return this.streamWithImageBudget(transcript, prepared.options, (budgeted) =>
+					prepared.provider.streamSimple(prepared.model, transcript, budgeted as SimpleStreamOptions),
+				);
 			},
 			options?.signal,
 		);

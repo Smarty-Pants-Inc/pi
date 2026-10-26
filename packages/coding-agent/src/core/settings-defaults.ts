@@ -40,6 +40,7 @@ export const SETTINGS_DEFAULTS = {
 	images: {
 		autoResize: true,
 		blockImages: false,
+		requestBudgetBytes: 12_582_912,
 	},
 	doubleEscapeAction: "tree",
 	treeFilterMode: "default",

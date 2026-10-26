@@ -17,6 +17,7 @@ import { redactOAuthDiagnostic } from "../auth/oauth/credential-response.ts";
 import type { AssistantRecovery } from "../types.ts";
 import { ProviderRequestLimitError } from "./provider-retry.ts";
 import { classifyProviderFailure, validHttpStatus } from "./recovery.ts";
+import { RequestTooLargeError } from "./request-size.ts";
 
 /** Owned values of a provider error: nothing in it is provider text. */
 export interface NormalizedProviderError {
@@ -51,6 +52,14 @@ export function normalizeProviderError(
 	privateText?: string,
 	secrets: readonly string[] = [],
 ): NormalizedProviderError {
+	// This local admission refusal must not become a provider error or token-overflow retry, even if an SDK
+	// attached response metadata. Rebuild its actionable text from owned byte counts, not mutable error text.
+	if (error instanceof RequestTooLargeError) {
+		return {
+			recovery: { retryable: false },
+			localMessage: new RequestTooLargeError(error.requestBytes, error.maxRequestBytes).message,
+		};
+	}
 	// OpenAI's stream errors keep the parsed SSE error body but have no outer HTTP status.
 	// A genuine SDK response status always takes precedence over that body's dedicated status fields.
 	const status =
