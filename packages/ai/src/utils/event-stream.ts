@@ -126,6 +126,15 @@ function protectMessage(message: AssistantMessage, protection: StreamProtection)
 		const redacted = redactValues(message.rawStopDetails, secrets);
 		message.rawStopDetails = new TextEncoder().encode(redacted).length <= 4096 ? redacted : JSON.stringify("***");
 	}
+	for (const record of message.fallback ?? []) {
+		if (typeof record.rawBlock !== "string") continue;
+		const redacted = redactValues(record.rawBlock, secrets);
+		if (new TextEncoder().encode(redacted).length <= 4096) record.rawBlock = redacted;
+		else {
+			delete record.rawBlock;
+			record.blockState = "discarded";
+		}
+	}
 	if (
 		message.api === "anthropic-messages" &&
 		message.stopReason === "error" &&

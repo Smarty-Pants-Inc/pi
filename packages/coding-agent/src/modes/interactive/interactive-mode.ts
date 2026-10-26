@@ -3826,6 +3826,7 @@ export class InteractiveMode {
 
 			case "message_end":
 				if (event.message.role === "user") break;
+				if (event.message.role === "assistant") this.maybeShowModelFallbackNotice(event.message);
 				if (this.streamingComponent && event.message.role === "assistant") {
 					this.streamingMessage = event.message;
 					let errorMessage: string | undefined;
@@ -4278,6 +4279,7 @@ export class InteractiveMode {
 					this.getMarkdownTransformers(),
 				);
 				this.chatContainer.addChild(assistantComponent);
+				this.maybeShowModelFallbackNotice(message);
 				break;
 			}
 			case "toolResult": {
@@ -4431,6 +4433,16 @@ export class InteractiveMode {
 		this.chatContainer.addChild(
 			new ThemedText(() => theme.fg("warning", `${label}: ${formatTokens(tokens)} tokens billed${cost}`), 1, 0),
 		);
+	}
+
+	private maybeShowModelFallbackNotice(message: AssistantMessage): void {
+		if (
+			message.diagnostics?.some(
+				(diagnostic) => diagnostic.type === "anthropic_model_fallback" && (diagnostic.fallbackCount ?? 0) > 0,
+			)
+		) {
+			this.showWarning("Anthropic reported a model fallback.");
+		}
 	}
 
 	private static countDroppedThinkingBlocks(message: AssistantMessage): number {

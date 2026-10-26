@@ -251,6 +251,7 @@ const RECOVERY_CLASSES: ReadonlySet<string> = new Set<AssistantRecoveryClass>([
 	"retryable",
 	"premature_stream",
 	"context_length_exceeded",
+	"anthropic_mid_output_fallback",
 ]);
 
 /** Rebuild a recovery decision from its closed fields; anything else is not a decision. */
