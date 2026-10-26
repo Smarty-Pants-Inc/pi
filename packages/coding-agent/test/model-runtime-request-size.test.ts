@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	type Api,
 	type AssistantMessage,
@@ -8,9 +11,14 @@ import {
 } from "@earendil-works/pi-ai";
 import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import { Type } from "typebox";
-import { describe, expect, it } from "vitest";
-import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { describe, expect, it, vi } from "vitest";
+import type { AgentSession } from "../src/core/agent-session.ts";
+import { createAgentSessionFromServices, createAgentSessionServices } from "../src/core/agent-session-services.ts";
+import { ModelPolicyError, ModelRuntime } from "../src/core/model-runtime.ts";
+import { createAgentSession } from "../src/core/sdk.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
 import { SettingsManager } from "../src/core/settings-manager.ts";
+import { createTestResourceLoader } from "./utilities.ts";
 
 const KiB = 1024;
 const MiB = KiB * KiB;
@@ -81,6 +89,45 @@ async function runtimeFor(api: Api, requestBudgetBytes = 8 * KiB) {
 	if (!catalog) throw new Error(`Missing offline catalog model for ${api}`);
 	const model: Model<Api> = { ...catalog, baseUrl: "https://request-size.invalid/v1" };
 	return { runtime, model, settings };
+}
+
+async function createSession(
+	runtime: ModelRuntime,
+	model: Model<Api>,
+	settingsManager: SettingsManager,
+	cwd: string,
+	path: "sdk" | "services",
+) {
+	const sessionManager = SessionManager.inMemory(cwd);
+	for (const message of history().messages) sessionManager.appendMessage(message);
+	if (path === "services") {
+		const services = await createAgentSessionServices({
+			cwd,
+			agentDir: cwd,
+			modelRuntime: runtime,
+			settingsManager,
+			resourceLoaderOptions: {
+				noExtensions: true,
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				noContextFiles: true,
+				systemPrompt: "Inspect screenshots.",
+			},
+		});
+		return createAgentSessionFromServices({ services, sessionManager, model, tools: [], thinkingLevel: "off" });
+	}
+	return createAgentSession({
+		cwd,
+		agentDir: cwd,
+		modelRuntime: runtime,
+		settingsManager,
+		sessionManager,
+		model,
+		tools: [],
+		thinkingLevel: "off",
+		resourceLoader: createTestResourceLoader(),
+	});
 }
 
 function capture(api: Api) {
@@ -280,6 +327,184 @@ describe("ModelRuntime assembled request size (smarty-dev#16938)", () => {
 		const result = await runtime.completeSimple(model, history(), { apiKey: "offline-key", fetch });
 		expect(result.stopReason).toBe("stop");
 		expect(Buffer.byteLength(bodies[0])).toBeLessThanOrEqual(8 * KiB);
+		expect(result.diagnostics?.[0]).toMatchObject({ type: "request_images_omitted", imagesOmitted: 2 });
+	});
+
+	// smarty-dev#16938: policy registration order must not select another session's image budget.
+	for (const path of ["sdk", "services"] as const) {
+		for (const order of [
+			["A", "B"],
+			["B", "A"],
+		] as const) {
+			it(`${path} isolates shared-runtime budgets with ${order.join(" then ")} registration and live updates`, async () => {
+				const directory = mkdtempSync(join(tmpdir(), "pi-request-size-sessions-"));
+				const { runtime, model } = await runtimeFor("openai-completions", MiB);
+				await runtime.setRuntimeApiKey(model.provider, "offline-key");
+				const { bodies, fetch } = capture(model.api);
+				vi.stubGlobal("fetch", fetch);
+				const settings = {
+					A: SettingsManager.inMemory({
+						images: { requestBudgetBytes: 8 * KiB },
+						compaction: { enabled: false },
+						retry: { enabled: false },
+						cacheWarming: "off",
+					}),
+					B: SettingsManager.inMemory({
+						images: { requestBudgetBytes: MiB },
+						compaction: { enabled: false },
+						retry: { enabled: false },
+						cacheWarming: "off",
+					}),
+				};
+				const sessions = new Map<"A" | "B", AgentSession>();
+				try {
+					for (const name of order) {
+						const { session } = await createSession(runtime, model, settings[name], directory, path);
+						sessions.set(name, session);
+					}
+					for (const round of [0, 1]) {
+						if (round === 1) {
+							settings.A.applyOverrides({ images: { requestBudgetBytes: MiB } });
+							settings.B.applyOverrides({ images: { requestBudgetBytes: 8 * KiB } });
+						}
+						for (const name of ["A", "B"] as const) {
+							const session = sessions.get(name)!;
+							const before = bodies.length;
+							await session.prompt("Compare the screenshots.");
+							expect(bodies).toHaveLength(before + 1);
+							const body = bodies[before];
+							const result = session.messages.at(-1);
+							expect(result).toMatchObject({ role: "assistant", stopReason: "stop" });
+							const trimmed = settings[name].getImageRequestBudgetBytes() === 8 * KiB;
+							if (trimmed) {
+								expect(Buffer.byteLength(body)).toBeLessThanOrEqual(8 * KiB);
+								expect(body).not.toContain(oldImage);
+								expect(result).toMatchObject({
+									diagnostics: [{ type: "request_images_omitted", imagesOmitted: 2 }],
+								});
+							} else {
+								expect(body).toContain(oldImage);
+								expect(Buffer.byteLength(body)).toBeGreaterThan(8 * KiB);
+								expect(result).not.toHaveProperty("diagnostics");
+							}
+							expect(body).toContain(newestImage);
+							expect(body).toContain(userImage);
+							expect(JSON.stringify(session.messages)).toContain(oldImage);
+						}
+					}
+				} finally {
+					for (const session of sessions.values()) session.dispose();
+					vi.unstubAllGlobals();
+					rmSync(directory, { recursive: true, force: true });
+				}
+			});
+		}
+	}
+
+	for (const boundary of ["stream", "streamSimple", "complete", "completeSimple"] as const) {
+		it(`${boundary} keeps its create-time settings as the live default despite later policy registrations`, async () => {
+			const { runtime, model, settings } = await runtimeFor("openai-completions");
+			const later = SettingsManager.inMemory({ images: { requestBudgetBytes: MiB } });
+			const dispose = runtime.addModelPolicy(later);
+			const { bodies, fetch } = capture(model.api);
+			try {
+				for (const budget of [8 * KiB, MiB]) {
+					settings.applyOverrides({ images: { requestBudgetBytes: budget } });
+					later.applyOverrides({ images: { requestBudgetBytes: budget === MiB ? 8 * KiB : MiB } });
+					const response = runtime[boundary](model, history(), { apiKey: "offline-key", fetch });
+					const result = "result" in response ? await response.result() : await response;
+					expect(result.stopReason).toBe("stop");
+					const body = bodies.at(-1)!;
+					if (budget === 8 * KiB) {
+						expect(Buffer.byteLength(body)).toBeLessThanOrEqual(budget);
+						expect(body).not.toContain(oldImage);
+					} else expect(body).toContain(oldImage);
+
+					const explicit = runtime[boundary](model, history(), { apiKey: "offline-key", fetch }, later);
+					const explicitResult = "result" in explicit ? await explicit.result() : await explicit;
+					expect(explicitResult.stopReason).toBe("stop");
+					const explicitBody = bodies.at(-1)!;
+					if (budget === MiB) {
+						expect(Buffer.byteLength(explicitBody)).toBeLessThanOrEqual(8 * KiB);
+						expect(explicitBody).not.toContain(oldImage);
+					} else expect(explicitBody).toContain(oldImage);
+				}
+				later.applyOverrides({ modelPolicy: { allow: [] } });
+				expect(() => runtime[boundary](model, history(), { apiKey: "offline-key", fetch }, settings)).toThrow(
+					ModelPolicyError,
+				);
+				expect(bodies).toHaveLength(4);
+			} finally {
+				dispose();
+			}
+		});
+	}
+
+	it("uses the session's live budget and current provider guard for cache warming", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-request-size-warming-"));
+		const { runtime, model } = await runtimeFor("openai-completions", MiB);
+		await runtime.setRuntimeApiKey(model.provider, "offline-key");
+		const settings = SettingsManager.inMemory({
+			images: { requestBudgetBytes: MiB },
+			compaction: { enabled: false },
+			retry: { enabled: false },
+			cacheWarming: "idle",
+		});
+		const { bodies, fetch } = capture(model.api);
+		vi.stubGlobal("fetch", fetch);
+		vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+		let session: AgentSession | undefined;
+		let dispose: (() => void) | undefined;
+		try {
+			// Synthetic prices make a one-token offline response worth warming without extension overrides.
+			const warmingModel = {
+				...model,
+				cost: { input: 1_000_000, output: 0, cacheRead: 0, cacheWrite: 0 },
+				promptCache: { short: 300 },
+			};
+			({ session } = await createSession(runtime, warmingModel, settings, directory, "sdk"));
+			await session.prompt("Compare the screenshots.");
+			expect(bodies).toHaveLength(1);
+			expect(bodies[0]).toContain(oldImage);
+			const nextWarmAt = session.cacheWarmingStatus?.nextWarmAt;
+			expect(nextWarmAt).toBeGreaterThan(Date.now());
+			settings.applyOverrides({ images: { requestBudgetBytes: 8 * KiB } });
+			dispose = runtime.addModelPolicy(SettingsManager.inMemory({ images: { requestBudgetBytes: MiB } }));
+			const beforeProviderRequest = vi.fn();
+			runtime.providerRequestGuard = { beforeProviderRequest, signal: new AbortController().signal };
+			await vi.advanceTimersByTimeAsync(nextWarmAt! - Date.now());
+			expect(bodies).toHaveLength(2);
+			expect(Buffer.byteLength(bodies[1])).toBeLessThanOrEqual(8 * KiB);
+			expect(bodies[1]).not.toContain(oldImage);
+			expect(bodies[1]).toContain(newestImage);
+			expect(beforeProviderRequest).toHaveBeenCalledTimes(1);
+			expect(session.sessionManager.getBranch().some((entry) => entry.type === "usage")).toBe(true);
+		} finally {
+			session?.dispose();
+			dispose?.();
+			vi.useRealTimers();
+			vi.unstubAllGlobals();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	it("retains explicit request settings through virtual model routing", async () => {
+		const { runtime, model } = await runtimeFor("openai-completions", MiB);
+		await runtime.setRuntimeApiKey(model.provider, "offline-key");
+		runtime.registerVirtualModel({
+			provider: "request-size-router",
+			id: "auto",
+			name: "Request size router",
+			route: () => ({ model, thinkingLevel: "off" }),
+		});
+		const virtual = runtime.getModel("request-size-router", "auto")!;
+		const settings = SettingsManager.inMemory({ images: { requestBudgetBytes: 8 * KiB } });
+		const { bodies, fetch } = capture(model.api);
+		const result = await runtime.completeSimple(virtual, history(), { fetch }, settings);
+		expect(result.stopReason).toBe("stop");
+		expect(bodies).toHaveLength(1);
+		expect(Buffer.byteLength(bodies[0])).toBeLessThanOrEqual(8 * KiB);
+		expect(bodies[0]).not.toContain(oldImage);
 		expect(result.diagnostics?.[0]).toMatchObject({ type: "request_images_omitted", imagesOmitted: 2 });
 	});
 

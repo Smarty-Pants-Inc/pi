@@ -187,13 +187,18 @@ function mergeHeaders(
 	return merged;
 }
 
-/** Configured pi-ai Models collection used by coding-agent and SDK consumers. */
+/**
+ * Configured pi-ai Models collection used by coding-agent and SDK consumers.
+ * Chat methods accept per-request settings as their fourth argument for image budgets, read at dispatch.
+ * Omitted settings use the live create-time settings, independent of later model-policy registrations.
+ */
 export class ModelRuntime implements Models {
 	/** One shared admission guard for an unattended dispatch, including warming and summaries. */
 	providerRequestGuard?: { beforeProviderRequest: () => void; signal: AbortSignal };
 	readonly #ordinaryOwner?: OrdinaryOwnerContext;
 	private readonly models: MutableModels;
 	private readonly policySettings = new Map<SettingsManager, number>();
+	private readonly requestSettings: SettingsManager;
 	private readonly credentials: RuntimeCredentials;
 	private readonly defaultBuiltins: ReadonlyMap<string, Provider>;
 	private readonly builtins = new Map<string, Provider>();
@@ -226,8 +231,10 @@ export class ModelRuntime implements Models {
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
 		ordinaryOwner?: OrdinaryOwnerContext,
+		requestSettings = SettingsManager.inMemory(),
 	) {
 		this.#ordinaryOwner = ordinaryOwner;
+		this.requestSettings = requestSettings;
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
@@ -279,6 +286,12 @@ export class ModelRuntime implements Models {
 			}
 			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
 		});
+		const settingsManager =
+			options.settingsManager ??
+			SettingsManager.create(
+				process.cwd(),
+				options.authPath ? dirname(options.authPath) : modelsPath ? dirname(modelsPath) : getAgentDir(),
+			);
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -287,14 +300,9 @@ export class ModelRuntime implements Models {
 			providers,
 			!owner && process.env.PI_OFFLINE === undefined,
 			owner,
+			settingsManager,
 		);
-		runtime.addModelPolicy(
-			options.settingsManager ??
-				SettingsManager.create(
-					process.cwd(),
-					options.authPath ? dirname(options.authPath) : modelsPath ? dirname(modelsPath) : getAgentDir(),
-				),
-		);
+		runtime.addModelPolicy(settingsManager);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
 		const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
@@ -928,6 +936,7 @@ export class ModelRuntime implements Models {
 	private streamWithImageBudget(
 		transcript: Context,
 		options: StreamOptions,
+		settingsManager: SettingsManager,
 		dispatch: (options: StreamOptions) => AssistantMessageEventStream,
 	): AsyncIterable<AssistantMessageEvent> & { result(): Promise<AssistantMessage> } {
 		let imagesOmitted = 0;
@@ -937,15 +946,12 @@ export class ModelRuntime implements Models {
 			...options,
 			onPayload: async (payload, requestModel) => {
 				const transformed = await options.onPayload?.(payload, requestModel);
-				// Session settings are registered after the runtime's default settings. Read them at dispatch
-				// time so changes during a long-running session apply to its next provider turn.
-				const settings = [...this.policySettings.keys()].at(-1);
 				try {
 					const fitted = fitRequestImages(
 						transformed === undefined ? payload : transformed,
 						requestModel,
 						transcript,
-						settings?.getImageRequestBudgetBytes() ?? 12_582_912,
+						settingsManager.getImageRequestBudgetBytes(),
 					);
 					imagesOmitted = Math.max(imagesOmitted, fitted.imagesOmitted);
 					bytesSaved = Math.max(bytesSaved, fitted.bytesSaved);
@@ -986,6 +992,7 @@ export class ModelRuntime implements Models {
 		model: Model<TApi>,
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
+		settingsManager = this.requestSettings,
 	): AssistantMessageEventStream {
 		const prepare = this.prepareRequest(model, options as (StreamOptions & ModelsRequestTransforms) | undefined);
 		const transcript = normalizeContext(context);
@@ -997,7 +1004,7 @@ export class ModelRuntime implements Models {
 				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 				this.#ordinaryOwner?.assertSubmission();
-				return this.streamWithImageBudget(transcript, prepared.options, (budgeted) =>
+				return this.streamWithImageBudget(transcript, prepared.options, settingsManager, (budgeted) =>
 					prepared.provider.stream(prepared.model, transcript, budgeted as ApiStreamOptions<TApi>),
 				);
 			},
@@ -1009,11 +1016,17 @@ export class ModelRuntime implements Models {
 		model: Model<TApi>,
 		context: Context,
 		options?: ModelsApiStreamOptions<TApi>,
+		settingsManager = this.requestSettings,
 	): Promise<AssistantMessage> {
-		return this.stream(model, context, options).result();
+		return this.stream(model, context, options, settingsManager).result();
 	}
 
-	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
+	streamSimple(
+		model: Model<Api>,
+		context: Context,
+		options?: ModelsSimpleStreamOptions,
+		settingsManager = this.requestSettings,
+	): AssistantMessageEventStream {
 		const prepare = this.prepareRequest(model, options);
 		const transcript = normalizeContext(context);
 		if (isVirtualModel(model)) {
@@ -1036,7 +1049,12 @@ export class ModelRuntime implements Models {
 					// resolves its own, so they are not sent to the wrong vendor.
 					const { apiKey, headers, env, ...rest } = options ?? {};
 					const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
-					return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
+					return this.streamSimple(
+						route.model,
+						context,
+						{ ...rest, ...auth, maxTokens, reasoning },
+						settingsManager,
+					);
 				},
 				options?.signal,
 			);
@@ -1049,7 +1067,7 @@ export class ModelRuntime implements Models {
 				prepared.options.signal?.throwIfAborted();
 				protectAssistantMessageStream(outer, prepared.options.diagnosticSecrets);
 				this.#ordinaryOwner?.assertSubmission();
-				return this.streamWithImageBudget(transcript, prepared.options, (budgeted) =>
+				return this.streamWithImageBudget(transcript, prepared.options, settingsManager, (budgeted) =>
 					prepared.provider.streamSimple(prepared.model, transcript, budgeted as SimpleStreamOptions),
 				);
 			},
@@ -1057,8 +1075,13 @@ export class ModelRuntime implements Models {
 		);
 	}
 
-	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {
-		return this.streamSimple(model, context, options).result();
+	completeSimple(
+		model: Model<Api>,
+		context: Context,
+		options?: ModelsSimpleStreamOptions,
+		settingsManager = this.requestSettings,
+	): Promise<AssistantMessage> {
+		return this.streamSimple(model, context, options, settingsManager).result();
 	}
 
 	streamDeferred(
