@@ -164,12 +164,16 @@ export interface SettingsManagerCreateOptions {
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+	/** Non-fatal storage diagnostics, separate from failures thrown by withLock. */
+	drainErrors?(): SettingsError[];
 }
 
 export interface SettingsError {
 	scope: SettingsScope;
 	path?: string;
 	error: Error;
+	/** A lock permission failure disabled disk writes; reads are still attempted. */
+	kind?: "read-only";
 }
 
 type SettingsPaths = Partial<Record<SettingsScope, string>>;
@@ -185,6 +189,8 @@ function toSettingsError(scope: SettingsScope, error: unknown, path?: string): S
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
 	private projectSettingsPath: string;
+	private readOnlyScopes = new Set<SettingsScope>();
+	private errors: SettingsError[] = [];
 
 	constructor(cwd: string, agentDir: string) {
 		const resolvedCwd = resolvePath(cwd);
@@ -220,6 +226,30 @@ export class FileSettingsStorage implements SettingsStorage {
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
 	}
 
+	private acquireLockSync(scope: SettingsScope, path: string): (() => void) | undefined {
+		if (this.readOnlyScopes.has(scope)) return undefined;
+		try {
+			return this.acquireLockSyncWithRetry(path);
+		} catch (error) {
+			const code =
+				typeof error === "object" && error !== null && "code" in error
+					? String((error as { code?: unknown }).code)
+					: undefined;
+			if (code !== "EROFS" && code !== "EACCES" && code !== "EPERM") throw error;
+			// smarty-dev#4605: a permission failure prevents locking, not necessarily reading.
+			// Never retry writes for this scope, even if its permissions later change.
+			this.readOnlyScopes.add(scope);
+			this.errors.push({ ...toSettingsError(scope, error, path), kind: "read-only" });
+			return undefined;
+		}
+	}
+
+	drainErrors(): SettingsError[] {
+		const drained = this.errors;
+		this.errors = [];
+		return drained;
+	}
+
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
 		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
 		const dir = dirname(path);
@@ -229,19 +259,21 @@ export class FileSettingsStorage implements SettingsStorage {
 			// Only create directory and lock if file exists or we need to write
 			const fileExists = existsSync(path);
 			if (fileExists) {
-				release = this.acquireLockSyncWithRetry(path);
+				release = this.acquireLockSync(scope, path);
 			}
 			const current = fileExists ? readFileSync(path, "utf-8") : undefined;
 			const next = fn(current);
-			if (next !== undefined) {
+			if (next !== undefined && !this.readOnlyScopes.has(scope)) {
 				// Only create directory when we actually need to write
 				if (!existsSync(dir)) {
 					mkdirSync(dir, { recursive: true });
 				}
 				if (!release) {
-					release = this.acquireLockSyncWithRetry(path);
+					release = this.acquireLockSync(scope, path);
 				}
-				writeFileSync(path, next, "utf-8");
+				if (release) {
+					writeFileSync(path, next, "utf-8");
+				}
 			}
 		} finally {
 			if (release) {
@@ -680,7 +712,7 @@ export class SettingsManager {
 	}
 
 	drainErrors(): SettingsError[] {
-		const drained = [...this.errors];
+		const drained = [...this.errors, ...(this.storage.drainErrors?.() ?? [])];
 		this.errors = [];
 		return drained;
 	}
