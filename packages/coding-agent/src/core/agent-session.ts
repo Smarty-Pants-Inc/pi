@@ -43,6 +43,7 @@ import {
 	getCurrentSystemMessage,
 	hasAssistantOutput,
 	isPrematureStreamError,
+	isRetryableAnthropicMidOutputFallback,
 	isRetryableCodexStreamDisconnect,
 	observeAssistantMessage,
 	observeAssistantStreamEvent,
@@ -518,6 +519,7 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 // SDK request windows in total, including retries and backoff, not per attempt.
 const COMPACTION_TIMEOUT_MS = 20 * 60_000;
 const COMPACTION_RETRY_POLICY: RetryPolicy = { enabled: true, maxRetries: 1, baseDelayMs: 2000 };
+const ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT = 3;
 
 // Boolean values retain the continuation decision; failures must not look like
 // a skipped check or successful compaction with nothing queued.
@@ -691,6 +693,11 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	/** One replay of the exact Codex disconnect per request, independent of ordinary retry attempts. */
 	private _codexStreamDisconnectRetryUsed = false;
+	/** One same-model Anthropic fallback replay per response; any failure of that replay is terminal. */
+	private _anthropicFallbackRetryUsed = false;
+	/** Survives successful tool responses and automatic continuations until a user message starts. */
+	private _anthropicFallbackPromptRetryCount = 0;
+	private readonly _anthropicFallbackCapRecorded = new WeakSet<AssistantMessage>();
 	/** Sticky until turn_start: synthetic failure messages belong to the same response. */
 	private _assistantToolExecutionStarted = false;
 	private _retryFallbackUsed = false;
@@ -1249,6 +1256,7 @@ export class AgentSession {
 
 	private _installAgentRequestProjection(): void {
 		let requestModel = this.agent.state.model;
+		let requestThinkingLevel = this.agent.state.thinkingLevel;
 		let canReproject = true;
 		// ponytail: retain only a fixed-size digest, not a second full transcript, between requests (#10720).
 		let canonicalMessagesDigest: string | undefined;
@@ -1305,6 +1313,11 @@ export class AgentSession {
 		};
 		this.agent.prepareRequest = async (request, signal) => {
 			const failed = this._failedResponse;
+			// A marker replay repeats the physical request, not a virtual router's next selection.
+			const replayRequest =
+				failed && this._anthropicFallbackRetryUsed && isRetryableAnthropicMidOutputFallback(failed)
+					? { model: requestModel, thinkingLevel: requestThinkingLevel }
+					: undefined;
 			this._failedResponse = undefined;
 			const prepare = async () => {
 				const projection = this.sessionManager.buildSessionProjection();
@@ -1346,9 +1359,11 @@ export class AgentSession {
 			const prepared = await prepare();
 			const { previous, projection } = prepared;
 			let context = prepared.context;
-			const model = previous?.model ?? this.agent.state.model;
-			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
+			const model = replayRequest?.model ?? previous?.model ?? this.agent.state.model;
+			const thinkingLevel =
+				replayRequest?.thinkingLevel ?? previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			requestModel = model;
+			requestThinkingLevel = thinkingLevel;
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
 
 			// The selection stays in agent state; only this request uses the routed model. A routing
@@ -1391,6 +1406,7 @@ export class AgentSession {
 				}
 			}
 			requestModel = route.model;
+			requestThinkingLevel = route.thinkingLevel;
 			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
 		};
 	}
@@ -1910,6 +1926,8 @@ export class AgentSession {
 			this._ingressQueuedMessages.delete(event.message);
 			this._overflowRecoveryAttempted = false;
 			this._codexStreamDisconnectRetryUsed = false;
+			this._anthropicFallbackRetryUsed = false;
+			this._anthropicFallbackPromptRetryCount = 0;
 			const messageText = contentText(event.message.content, "");
 			// Empty text is valid for image-only queued input. Delivery is not truthiness.
 			// Check steering queue first; ingress input is always a follow-up with an exact display slot.
@@ -2101,6 +2119,7 @@ export class AgentSession {
 				if (assistantMsg.stopReason !== "error") this._throttleWaitUsed = false;
 				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					this._codexStreamDisconnectRetryUsed = false;
+					this._anthropicFallbackRetryUsed = false;
 				}
 				const fallbackSucceeded =
 					this._retryFallbackInFlight &&
@@ -2139,12 +2158,21 @@ export class AgentSession {
 
 	/** Mirrors the post-run retry decision for the run's last assistant message. */
 	private _willRetryAssistantMessage(message: AssistantMessage): boolean {
-		if (this._agentRunAbortRequested || this._throttleWaitUsed || this._retryFallbackInFlight) return false;
+		if (
+			this._agentRunAbortRequested ||
+			this._throttleWaitUsed ||
+			this._retryFallbackInFlight ||
+			this._anthropicFallbackRetryUsed ||
+			(this._anthropicFallbackPromptRetryCount >= ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT &&
+				isRetryableAnthropicMidOutputFallback(message))
+		)
+			return false;
 		// Throttled-limit waits keep the plain output rule.
 		if (!this._assistantOutputObserved && !hasAssistantOutput(message) && throttledLimitWait(message)) return true;
 		const settings = this._getRetrySettings(message);
 		if (!settings.enabled || !this._isRetryableError(message)) return false;
-		if (isRetryableCodexStreamDisconnect(message)) return settings.maxRetries > 0;
+		if (isRetryableCodexStreamDisconnect(message) || isRetryableAnthropicMidOutputFallback(message))
+			return settings.maxRetries > 0;
 		return this._retryAttempt < settings.maxRetries || this._getRetryFallbackModel() !== undefined;
 	}
 
@@ -2995,6 +3023,7 @@ export class AgentSession {
 		this._retryFallbackUsed = false;
 		this._retryFallbackInFlight = false;
 		this._codexStreamDisconnectRetryUsed = false;
+		this._anthropicFallbackRetryUsed = false;
 		this.#auditState("session_run_start");
 		let runFailed = false;
 		try {
@@ -3168,12 +3197,32 @@ export class AgentSession {
 		}
 		if (!message) return this.agent.hasQueuedMessages();
 
+		const fallbackCapHit =
+			this._anthropicFallbackPromptRetryCount >= ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT &&
+			isRetryableAnthropicMidOutputFallback(message);
+		if (fallbackCapHit && !this._anthropicFallbackCapRecorded.has(message)) {
+			const entryId = this.sessionManager.appendCustomEntry("anthropic_fallback_retry_cap_hit", {
+				requestedProvider: message.provider,
+				requestedModel: message.model,
+				retries: this._anthropicFallbackPromptRetryCount,
+				limit: ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT,
+			});
+			this._anthropicFallbackCapRecorded.add(message);
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+		}
+
 		// A throttled provider limit waits and retries once, outside settings.retry; the retry's error is final.
 		const throttleWaitUsed = this._throttleWaitUsed;
 		const fallbackAttempt = this._retryFallbackInFlight;
 		this._throttleWaitUsed = false;
 		const throttleWait =
-			fallbackAttempt || throttleWaitUsed || this._assistantOutputObserved || hasAssistantOutput(message)
+			fallbackCapHit ||
+			fallbackAttempt ||
+			throttleWaitUsed ||
+			this._anthropicFallbackRetryUsed ||
+			this._assistantOutputObserved ||
+			hasAssistantOutput(message)
 				? undefined
 				: throttledLimitWait(message);
 		let retrying: boolean;
@@ -3209,8 +3258,10 @@ export class AgentSession {
 		// Final one-shot failures cannot gain another replay through compaction.
 		const compaction =
 			fallbackAttempt ||
+			this._anthropicFallbackRetryUsed ||
 			(throttleWaitUsed && message.stopReason === "error") ||
-			isRetryableCodexStreamDisconnect(message)
+			isRetryableCodexStreamDisconnect(message) ||
+			isRetryableAnthropicMidOutputFallback(message)
 				? false
 				: await this._checkCompaction(message, true, toolResults);
 		if (compaction === "failed" || compaction === "aborted") {
@@ -6729,6 +6780,16 @@ export class AgentSession {
 	 * Context overflow errors are NOT retryable (handled by compaction instead).
 	 */
 	private _isRetryableError(message: AssistantMessage): boolean {
+		// The marker's fresh request is one-shot even if it fails with a different transient error.
+		if (this._anthropicFallbackRetryUsed) return false;
+		// smarty-dev#2890: the owned marker permits partial output, but never started effects or
+		// ordinary/model-fallback retries after the one-shot allowance has been consumed.
+		if (isRetryableAnthropicMidOutputFallback(message)) {
+			return (
+				!this._assistantToolExecutionStarted &&
+				this._anthropicFallbackPromptRetryCount < ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT
+			);
+		}
 		// smarty-dev#11900: discard this exact partial response once, but never replay executed tools.
 		// Return directly when its allowance is spent so ordinary retries and fallback cannot take over.
 		if (isRetryableCodexStreamDisconnect(message)) {
@@ -6797,8 +6858,30 @@ export class AgentSession {
 	 */
 	private async _prepareRetry(message: AssistantMessage): Promise<boolean> {
 		const settings = this._getRetrySettings(message);
-		if (!settings.enabled || this._retryFallbackInFlight) {
+		if (!settings.enabled || this._retryFallbackInFlight || this._anthropicFallbackRetryUsed) {
 			return false;
+		}
+
+		if (isRetryableAnthropicMidOutputFallback(message)) {
+			if (
+				settings.maxRetries <= 0 ||
+				this._assistantToolExecutionStarted ||
+				this._anthropicFallbackPromptRetryCount >= ANTHROPIC_FALLBACK_PROMPT_RETRY_LIMIT
+			) {
+				return false;
+			}
+			this._anthropicFallbackRetryUsed = true;
+			this._anthropicFallbackPromptRetryCount++;
+			this._retryAttempt++;
+			const entryId = this.sessionManager.appendCustomEntry("anthropic_fallback_retry", {
+				requestedProvider: message.provider,
+				requestedModel: message.model,
+				attempt: this._retryAttempt,
+				retries: this._anthropicFallbackPromptRetryCount,
+			});
+			const entry = this.sessionManager.getEntry(entryId);
+			if (entry) this._emit({ type: "entry_appended", entry });
+			return this._waitAndRetry(message, retryDelayMs(settings, 1), this._retryAttempt);
 		}
 
 		if (isRetryableCodexStreamDisconnect(message)) {
