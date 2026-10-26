@@ -602,12 +602,13 @@ export interface AssistantMessageFallback {
 	/** The provider's content-block index, not an index into Pi's content array. */
 	blockIndex: number;
 	blockState: "retained" | "discarded";
-	/** JSON of a START block with content fields removed and known live credentials masked, at most 4096 UTF-8 bytes.
-	 * Injected-client, SDK-managed federation and over-cap blocks are discarded entirely, never shortened to a prefix.
-	 * This is not content, a recovery input or replay data. MID blocks are never serialized.
+	/** JSON of a START or MID block with content fields removed recursively and known live credentials and their
+	 * encoded aliases masked before measuring, at most 4096 UTF-8 bytes. Injected-client, SDK-managed federation
+	 * and over-cap blocks are discarded entirely, never shortened to a prefix. Recording failures safely discard.
+	 * Terminal-only metadata: never display, interpret as instructions, use for recovery, or replay to a provider.
 	 */
 	rawBlock?: string;
-	/** Discarded START blocks only: byte length and SHA-256 after masking known credentials and removing content. */
+	/** Discarded blocks only, when recording succeeds: byte length and SHA-256 of the masked, content-free JSON. */
 	blockBytes?: number;
 	blockSha256?: string;
 }
@@ -626,7 +627,7 @@ export interface AssistantMessage {
 	/** Pi thinking level the agent loop requested for this response. Absent outside the agent loop and for legacy responses. */
 	thinkingLevel?: ModelThinkingLevel;
 	diagnostics?: AssistantMessageDiagnostic[]; // Redacted provider/runtime diagnostics for failures and recoveries.
-	/** Record-only fallback markers, including start markers; published only on the terminal message. */
+	/** Untrusted record-only START/MID fallback markers; published only on detached terminal messages, never partials. */
 	fallback?: AssistantMessageFallback[];
 	usage: Usage;
 	stopReason: StopReason;

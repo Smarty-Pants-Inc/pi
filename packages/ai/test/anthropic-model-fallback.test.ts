@@ -48,6 +48,12 @@ function sseResponse(events: Record<string, unknown>[]): Response {
 	);
 }
 
+function fallbackPrefix(position: "start" | "mid-output", text = "safe output"): Record<string, unknown>[] {
+	return position === "start"
+		? [messageStart]
+		: [messageStart, { type: "content_block_start", index: 0, content_block: { type: "text", text } }];
+}
+
 async function record(events: Record<string, unknown>[]) {
 	const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
 		apiKey: "synthetic-test-key",
@@ -113,6 +119,7 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 		]);
 		expect(fallbackCount(result)).toBe(2);
 		expect(result.diagnostics).toHaveLength(2);
+		expect(result.diagnostics?.every((diagnostic) => diagnostic.fallbackCount === 1)).toBe(true);
 	});
 
 	it.each([
@@ -141,12 +148,17 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 		expect(result.stopReason).toBe("error");
 		expect(result.errorMessage).toBe("Anthropic performed a mid-output model fallback");
 		expect(result.recovery).toEqual({ recovery: "anthropic_mid_output_fallback", retryable: true });
-		// smarty-dev#2890: full MID raw capture is phase2; READY-1 records only its location and discarded state.
+		// smarty-dev#4605: MID uses the same bounded record-only capture as START, never a location-only record.
 		expect(result.fallback).toEqual([
 			{ position: "start", blockIndex: 0, blockState: "retained", rawBlock: JSON.stringify(marker) },
-			{ position: "mid-output", blockIndex: 7, blockState: "discarded" },
+			{ position: "mid-output", blockIndex: 7, blockState: "retained", rawBlock: JSON.stringify(marker) },
 		]);
 		expect(fallbackCount(result)).toBe(2);
+		expect(
+			result.diagnostics
+				?.filter(({ type }) => type === "anthropic_model_fallback")
+				.map(({ fallbackCount }) => fallbackCount),
+		).toEqual([1, 1]);
 		expect(isRetryableAnthropicMidOutputFallback(result)).toBe(true);
 		// Generic retries must not bypass the session's one-shot/no-started-tool guard, even for empty starts.
 		expect(isRetryableAssistantError(result)).toBe(false);
@@ -187,15 +199,24 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 		},
 	);
 
-	it("masks all known request credentials and removes content recursively before recording", async () => {
-		const secrets = ["synthetic-test-key", "model-header-secret", "request-header-secret", "additional-secret"];
+	it.each(["start", "mid-output"] as const)("masks %s credentials and recursive content", async (position) => {
+		const secrets = [
+			"synthetic-test-key",
+			"model-header-secret+/=?",
+			"request-header-secret+/=?",
+			"additional-secret",
+		];
 		const block = {
 			...marker,
 			content: [{ type: "text", text: "PRIVATE_CONTENT" }],
-			extra: { content: "NESTED_PRIVATE_CONTENT", echo: secrets.join(" ") },
+			extra: {
+				content: "NESTED_PRIVATE_CONTENT",
+				echo: secrets.join(" "),
+				list: [{ content: "ARRAY_PRIVATE_CONTENT", safe: true }],
+			},
 			encoded: [encodeURIComponent(secrets[1]), Buffer.from(secrets[2]).toString("base64")],
 		};
-		const result = await streamAnthropic(
+		const stream = streamAnthropic(
 			{ ...model, headers: { "X-Client-Token": secrets[1] } },
 			normalizeContext({ messages: initialMessages }),
 			{
@@ -205,91 +226,216 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 				maxRetries: 0,
 				fetch: async () =>
 					sseResponse([
-						messageStart,
-						{ type: "content_block_start", index: 0, content_block: block },
+						...fallbackPrefix(position),
+						{ type: "content_block_start", index: 1, content_block: block },
 						...messageEnd,
 					]),
 			},
-		).result();
+		);
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
 		expect(result.fallback?.[0].blockState).toBe("retained");
 		expect(JSON.parse(result.fallback![0].rawBlock!)).toEqual({
 			...marker,
-			extra: { echo: "*** *** *** ***" },
+			extra: { echo: "*** *** *** ***", list: [{ safe: true }] },
 			encoded: ["***", "***"],
 		});
-		for (const forbidden of [...secrets, "PRIVATE_CONTENT", "NESTED_PRIVATE_CONTENT"])
+		for (const forbidden of [
+			...secrets,
+			...block.encoded,
+			"PRIVATE_CONTENT",
+			"NESTED_PRIVATE_CONTENT",
+			"ARRAY_PRIVATE_CONTENT",
+		]) {
 			expect(JSON.stringify(result)).not.toContain(forbidden);
-		expect(result.content).toEqual([]);
+			expect(JSON.stringify(events)).not.toContain(forbidden);
+		}
+		expect(result.content).toEqual(position === "start" ? [] : [{ type: "text", text: "safe output" }]);
+		expect(fallbackCount(result)).toBe(1);
 		expect(JSON.stringify(result.diagnostics)).not.toContain("claude-opus-4-8");
-		expect(result.errorMessage).toBeUndefined();
+		expect(result.errorMessage).toBe(
+			position === "start" ? undefined : "Anthropic performed a mid-output model fallback",
+		);
+		for (const event of events) if ("partial" in event) expect(event.partial).not.toHaveProperty("fallback");
+	});
+
+	// smarty-dev#4605: masking must precede the cap, not discard an otherwise small safe record.
+	it.each(["start", "mid-output"] as const)("measures %s fields after masking a long key", async (position) => {
+		const credential = "synthetic-long-key-".repeat(300);
+		const block = { type: "fallback", echo: credential, encoded: Buffer.from(credential).toString("base64") };
+		expect(Buffer.byteLength(JSON.stringify(block))).toBeGreaterThan(4096);
+		const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+			apiKey: credential,
+			maxRetries: 0,
+			fetch: async () =>
+				sseResponse([
+					...fallbackPrefix(position),
+					{ type: "content_block_start", index: 1, content_block: block },
+					...messageEnd,
+				]),
+		}).result();
+		expect(result.fallback).toEqual([
+			{
+				position,
+				blockIndex: 1,
+				blockState: "retained",
+				rawBlock: '{"type":"fallback","echo":"***","encoded":"***"}',
+			},
+		]);
+		expect(result.stopReason).toBe(position === "start" ? "stop" : "error");
+		expect(fallbackCount(result)).toBe(1);
+	});
+
+	// smarty-dev#4605: serialization failure must not replace the provider outcome or publish partial raw data.
+	it.each(["start", "mid-output"] as const)("safely discards %s serialization failures", async (position) => {
+		const prefix = fallbackPrefix(position)
+			.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+			.join("");
+		const nested = `${'{"nested":'.repeat(20000)}null${"}".repeat(20000)}`;
+		const raw = `${prefix}event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"fallback","extra":${nested}}}\n\n${messageEnd.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("")}`;
+		const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+			apiKey: "synthetic-test-key",
+			maxRetries: 0,
+			fetch: async () => new Response(raw, { headers: { "content-type": "text/event-stream" } }),
+		}).result();
+		expect(result.stopReason).toBe(position === "start" ? "stop" : "error");
+		expect(result.fallback).toEqual([{ position, blockIndex: 1, blockState: "discarded" }]);
+		expect(isRetryableAnthropicMidOutputFallback(result)).toBe(position === "mid-output");
+		expect(fallbackCount(result)).toBe(1);
+	});
+
+	// smarty-dev#4605: counts survive each terminal path; raw fields remain terminal-only and have no authority.
+	it.each([
+		{ position: "start", terminal: "stop" },
+		{ position: "start", terminal: "error" },
+		{ position: "start", terminal: "aborted" },
+		{ position: "mid-output", terminal: "aborted" },
+	] as const)("isolates $position records/counts on $terminal", async ({ position, terminal }) => {
+		const controller = new AbortController();
+		const sentinel = "UNTRUSTED_MARKER_INSTRUCTIONS";
+		const block = { ...marker, errorMessage: sentinel, recovery: { recovery: sentinel, retryable: true } };
+		let observed = 0;
+		const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+			apiKey: "synthetic-test-key",
+			maxRetries: 0,
+			signal: controller.signal,
+			onProviderStreamEvent: () => {
+				if (++observed === (position === "start" ? 2 : 3) && terminal === "aborted") controller.abort();
+			},
+			fetch: async () =>
+				sseResponse([
+					...fallbackPrefix(position),
+					{ type: "content_block_start", index: 1, content_block: block },
+					{
+						type: "message_delta",
+						delta: { stop_reason: terminal === "error" ? "refusal" : "end_turn" },
+						usage: { output_tokens: 5 },
+					},
+					{ type: "message_stop" },
+				]),
+		});
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+		expect(result.stopReason).toBe(terminal);
+		expect(result.fallback).toEqual([
+			{ position, blockIndex: 1, blockState: "retained", rawBlock: JSON.stringify(block) },
+		]);
+		expect(fallbackCount(result)).toBe(1);
+		expect(result.diagnostics?.filter(({ type }) => type === "anthropic_model_fallback")).toEqual([
+			{ type: "anthropic_model_fallback", timestamp: expect.any(Number), fallbackCount: 1 },
+		]);
+		expect(isRetryableAnthropicMidOutputFallback(result)).toBe(false);
+		expect(
+			JSON.stringify({
+				content: result.content,
+				recovery: result.recovery,
+				errorMessage: result.errorMessage,
+				diagnostics: result.diagnostics,
+			}),
+		).not.toContain(sentinel);
+		for (const event of events) {
+			if ("partial" in event) {
+				expect(event.partial).not.toHaveProperty("fallback");
+				expect(JSON.stringify(event.partial)).not.toContain(sentinel);
+			}
+		}
+		expect(events.at(-1)?.type).toBe(terminal === "stop" ? "done" : "error");
 	});
 
 	// smarty-dev#4605: configured federation must not discard known key/header records when auth bypasses it.
-	it.each(["api-key", "header"] as const)(
-		"retains a known %s START credential with federation configured",
-		async (auth) => {
-			const tempDir = mkdtempSync(join(tmpdir(), "pi-fallback-known-auth-"));
-			try {
-				const identityTokenFile = join(tempDir, "identity.jwt");
-				writeFileSync(identityTokenFile, "synthetic.unused.identity");
-				const credential = "synthetic-known-fallback-credential";
-				const paths: string[] = [];
-				const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
-					...(auth === "api-key"
-						? { apiKey: credential }
-						: { headers: { Authorization: `Bearer ${credential}` } }),
-					env: {
-						ANTHROPIC_FEDERATION_RULE_ID: "fdrl_unused",
-						ANTHROPIC_ORGANIZATION_ID: "org-unused",
-						ANTHROPIC_IDENTITY_TOKEN_FILE: identityTokenFile,
-						ANTHROPIC_WORKSPACE_ID: "wrkspc-unused",
-						ANTHROPIC_SERVICE_ACCOUNT_ID: "svcacct-unused",
-					},
-					maxRetries: 0,
-					fetch: async (input, init) => {
-						const request = new Request(input, init);
-						paths.push(new URL(request.url).pathname);
-						expect(request.headers.get(auth === "api-key" ? "x-api-key" : "authorization")).toBe(
-							auth === "api-key" ? credential : `Bearer ${credential}`,
-						);
-						return sseResponse([
-							messageStart,
-							{ type: "content_block_start", index: 0, content_block: { type: "fallback", echo: credential } },
-							...messageEnd,
-						]);
-					},
-				}).result();
-				expect(paths).toEqual(["/v1/messages"]);
-				expect(result.stopReason).toBe("stop");
-				expect(result.fallback).toEqual([
-					{
-						position: "start",
-						blockIndex: 0,
-						blockState: "retained",
-						rawBlock: '{"type":"fallback","echo":"***"}',
-					},
-				]);
-				expect(fallbackCount(result)).toBe(1);
-				expect(JSON.stringify(result)).not.toContain(credential);
-			} finally {
-				rmSync(tempDir, { recursive: true, force: true });
-			}
-		},
-	);
-
 	it.each([
-		{ name: "exact cap", padding: "x".repeat(4064), retained: true },
-		{ name: "over cap", padding: "x".repeat(4065), retained: false },
-		{ name: "multibyte cap", padding: "é".repeat(2050), retained: false },
-	])("bounds the masked, content-free block at $name without retaining a prefix", async ({ padding, retained }) => {
+		{ auth: "api-key", position: "start" },
+		{ auth: "header", position: "start" },
+		{ auth: "api-key", position: "mid-output" },
+		{ auth: "header", position: "mid-output" },
+	] as const)("retains a known $auth $position credential with federation configured", async ({ auth, position }) => {
+		const tempDir = mkdtempSync(join(tmpdir(), "pi-fallback-known-auth-"));
+		try {
+			const identityTokenFile = join(tempDir, "identity.jwt");
+			writeFileSync(identityTokenFile, "synthetic.unused.identity");
+			const credential = "synthetic-known-fallback-credential";
+			const paths: string[] = [];
+			const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
+				...(auth === "api-key" ? { apiKey: credential } : { headers: { Authorization: `Bearer ${credential}` } }),
+				env: {
+					ANTHROPIC_FEDERATION_RULE_ID: "fdrl_unused",
+					ANTHROPIC_ORGANIZATION_ID: "org-unused",
+					ANTHROPIC_IDENTITY_TOKEN_FILE: identityTokenFile,
+					ANTHROPIC_WORKSPACE_ID: "wrkspc-unused",
+					ANTHROPIC_SERVICE_ACCOUNT_ID: "svcacct-unused",
+				},
+				maxRetries: 0,
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					paths.push(new URL(request.url).pathname);
+					expect(request.headers.get(auth === "api-key" ? "x-api-key" : "authorization")).toBe(
+						auth === "api-key" ? credential : `Bearer ${credential}`,
+					);
+					return sseResponse([
+						...fallbackPrefix(position),
+						{ type: "content_block_start", index: 1, content_block: { type: "fallback", echo: credential } },
+						...messageEnd,
+					]);
+				},
+			}).result();
+			expect(paths).toEqual(["/v1/messages"]);
+			expect(result.stopReason).toBe(position === "start" ? "stop" : "error");
+			expect(isRetryableAnthropicMidOutputFallback(result)).toBe(position === "mid-output");
+			expect(result.fallback).toEqual([
+				{
+					position,
+					blockIndex: 1,
+					blockState: "retained",
+					rawBlock: '{"type":"fallback","echo":"***"}',
+				},
+			]);
+			expect(fallbackCount(result)).toBe(1);
+			expect(JSON.stringify(result)).not.toContain(credential);
+		} finally {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(
+		[
+			{ name: "exact cap", padding: "x".repeat(4064), retained: true },
+			{ name: "over cap", padding: "x".repeat(4065), retained: false },
+			{ name: "exact multibyte cap", padding: "é".repeat(2032), retained: true },
+			{ name: "over multibyte cap", padding: `${"é".repeat(2032)}x`, retained: false },
+		].flatMap((testCase) => (["start", "mid-output"] as const).map((position) => ({ ...testCase, position }))),
+	)("bounds $position records at $name", async ({ padding, retained, position }) => {
 		const block = { type: "fallback", padding, content: "EXCLUDED_CONTENT" };
 		const serialized = JSON.stringify({ type: "fallback", padding });
 		const { result } = await record([
-			messageStart,
-			{ type: "content_block_start", index: 0, content_block: block },
+			...fallbackPrefix(position),
+			{ type: "content_block_start", index: 1, content_block: block },
 			...messageEnd,
 		]);
 		const item = result.fallback![0];
+		expect(item.position).toBe(position);
+		expect(result.stopReason).toBe(position === "start" ? "stop" : "error");
 		expect(item.blockState).toBe(retained ? "retained" : "discarded");
 		if (retained) {
 			expect(Buffer.byteLength(serialized)).toBe(4096);
@@ -305,24 +451,24 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 		expect(fallbackCount(result)).toBe(1);
 	});
 
-	it("measures and fingerprints only masked fields after removing content", async () => {
+	it.each(["start", "mid-output"] as const)("fingerprints masked %s fields", async (position) => {
 		const block = { ...marker, content: "PRIVATE_CONTENT", padding: `${"x".repeat(5000)} synthetic-test-key` };
 		const serialized = JSON.stringify({ ...marker, padding: `${"x".repeat(5000)} ***` });
 		const { result } = await record([
-			messageStart,
-			{ type: "content_block_start", index: 0, content_block: block },
+			...fallbackPrefix(position),
+			{ type: "content_block_start", index: 1, content_block: block },
 			...messageEnd,
 		]);
 		expect(result.fallback![0]).toEqual({
-			position: "start",
-			blockIndex: 0,
+			position,
+			blockIndex: 1,
 			blockState: "discarded",
 			blockBytes: Buffer.byteLength(serialized),
 			blockSha256: createHash("sha256").update(serialized).digest("hex"),
 		});
 	});
 
-	it("discards raw markers from an injected client whose credentials are unknown", async () => {
+	it.each(["start", "mid-output"] as const)("discards injected-client %s fields", async (position) => {
 		const credential = "unknown-client-credential";
 		const block = { ...marker, echo: credential, content: "PRIVATE_CONTENT" };
 		const client = new Anthropic({
@@ -332,17 +478,24 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 			fetch: async (_url, init) => {
 				expect(new Headers(init?.headers).get("x-api-key")).toBe(credential);
 				return sseResponse([
-					messageStart,
-					{ type: "content_block_start", index: 0, content_block: block },
+					...fallbackPrefix(position),
+					{ type: "content_block_start", index: 1, content_block: block },
 					...messageEnd,
 				]);
 			},
 		});
-		const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), { client }).result();
+		const stream = streamAnthropic(model, normalizeContext({ messages: initialMessages }), { client });
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of stream) events.push(event);
+		const result = await stream.result();
+		expect(result.stopReason).toBe(position === "start" ? "stop" : "error");
 		expect(result.fallback![0].blockState).toBe("discarded");
 		expect(result.fallback![0]).not.toHaveProperty("rawBlock");
-		expect(result.fallback![0].blockBytes).toBe(Buffer.byteLength(JSON.stringify({ ...marker, echo: credential })));
+		const serialized = JSON.stringify({ ...marker, echo: credential });
+		expect(result.fallback![0].blockBytes).toBe(Buffer.byteLength(serialized));
+		expect(result.fallback![0].blockSha256).toBe(createHash("sha256").update(serialized).digest("hex"));
 		expect(JSON.stringify(result)).not.toContain(credential);
+		expect(JSON.stringify(events)).not.toContain(credential);
 		expect(JSON.stringify(result)).not.toContain("PRIVATE_CONTENT");
 		expect(fallbackCount(result)).toBe(1);
 	});
@@ -431,12 +584,8 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 						position,
 						blockIndex: 1,
 						blockState: "discarded",
-						...(position === "start"
-							? {
-									blockBytes: Buffer.byteLength(serialized),
-									blockSha256: createHash("sha256").update(serialized).digest("hex"),
-								}
-							: {}),
+						blockBytes: Buffer.byteLength(serialized),
+						blockSha256: createHash("sha256").update(serialized).digest("hex"),
 					},
 				]);
 				for (const event of events) if ("partial" in event) expect(event.partial).not.toHaveProperty("fallback");
@@ -446,39 +595,47 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 		},
 	);
 
-	it("keeps a marker/count on observer failure without making the observer error retryable", async () => {
+	it.each(["start", "mid-output"] as const)("counts %s markers before observer failure", async (position) => {
 		let observed = 0;
 		const result = await streamAnthropic(model, normalizeContext({ messages: initialMessages }), {
 			apiKey: "synthetic-test-key",
 			maxRetries: 0,
 			fetch: async () =>
 				sseResponse([
-					messageStart,
-					{ type: "content_block_start", index: 0, content_block: { type: "text", text: "partial" } },
+					...fallbackPrefix(position, "partial"),
 					{ type: "content_block_start", index: 1, content_block: marker },
 				]),
 			onProviderStreamEvent: () => {
-				if (++observed === 3) throw new Error("503 observer failed");
+				if (++observed === (position === "start" ? 2 : 3)) throw new Error("503 observer failed");
 			},
 		}).result();
 		expect(result.stopReason).toBe("error");
-		expect(result.fallback).toEqual([{ position: "mid-output", blockIndex: 1, blockState: "discarded" }]);
+		expect(result.fallback).toEqual([
+			{ position, blockIndex: 1, blockState: "retained", rawBlock: JSON.stringify(marker) },
+		]);
 		expect(fallbackCount(result)).toBe(1);
 		expect(result.diagnostics?.some(({ type }) => type === "provider_stream_observer_error")).toBe(true);
 		expect(isRetryableAnthropicMidOutputFallback(result)).toBe(false);
 	});
 
-	it("publishes detached records through projection, forwarding, and late secret protection", async () => {
-		const { result } = await record([
-			messageStart,
-			{ type: "content_block_start", index: 0, content_block: { ...marker, echo: "late-secret" } },
+	it.each(["start", "mid-output"] as const)("detaches and protects %s records", async (position) => {
+		const { events, result } = await record([
+			...fallbackPrefix(position),
+			{ type: "content_block_start", index: 1, content_block: { ...marker, echo: "late-secret" } },
 			...messageEnd,
 		]);
 		expect(projectAssistantMessage(result, "partial")).not.toHaveProperty("fallback");
 		const forwarded = new AssistantMessageEventStream(["late-secret"]);
-		forwarded.push({ type: "done", reason: "stop", message: result });
+		forwarded.push(
+			position === "start"
+				? { type: "done", reason: "stop", message: result }
+				: { type: "error", reason: "error", error: result },
+		);
 		const published = await forwarded.result();
 		const recordedRaw = published.fallback![0].rawBlock;
+		const terminal = events.at(-1);
+		if (terminal?.type === "done") terminal.message.fallback![0].rawBlock = "mutated terminal event";
+		if (terminal?.type === "error") terminal.error.fallback![0].rawBlock = "mutated terminal event";
 		result.fallback![0].rawBlock = "mutated source";
 		result.fallback!.push({ position: "mid-output", blockIndex: 9, blockState: "discarded" });
 		expect(published.fallback).toHaveLength(1);
@@ -490,13 +647,17 @@ describe("Anthropic model fallback records through the SSE adapter", () => {
 		expect(fallbackCount(copy)).toBe(1);
 	});
 
-	it.each(["stop", "error"] as const)("never replays stored marker metadata from a %s message", async (stopReason) => {
+	it.each(
+		(["stop", "error"] as const).flatMap((stopReason) =>
+			(["start", "mid-output"] as const).map((position) => ({ stopReason, position })),
+		),
+	)("never replays $position/$stopReason records", async ({ stopReason, position }) => {
 		const sentinel = "UNTRUSTED_FALLBACK_NOT_CONTEXT";
 		const { result } = await record([
-			messageStart,
-			{ type: "content_block_start", index: 0, content_block: { ...marker, extra: sentinel } },
-			{ type: "content_block_start", index: 1, content_block: { type: "text", text: "Unchanged reply" } },
-			{ type: "content_block_stop", index: 1 },
+			...fallbackPrefix(position, "Unchanged reply"),
+			{ type: "content_block_start", index: 1, content_block: { ...marker, extra: sentinel } },
+			{ type: "content_block_start", index: 2, content_block: { type: "text", text: "Unchanged reply" } },
+			{ type: "content_block_stop", index: 2 },
 			...messageEnd,
 		]);
 		const stored = JSON.parse(JSON.stringify(result)) as AssistantMessage;
