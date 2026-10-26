@@ -1040,11 +1040,25 @@ function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgen
 	return join(resolvedAgentDir, "sessions", safePath);
 }
 
+function ensureSessionDir(sessionDir: string): void {
+	if (existsSync(sessionDir)) return;
+	try {
+		mkdirSync(sessionDir, { recursive: true });
+	} catch (error) {
+		const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+		if (code === "EROFS" || code === "EACCES" || code === "EPERM") {
+			throw new Error(
+				`Cannot create session directory "${sessionDir}": filesystem is read-only or access is denied (${code}). Use --session-dir <writable-directory> or --no-session to disable session persistence.`,
+				{ cause: error },
+			);
+		}
+		throw error;
+	}
+}
+
 export function getDefaultSessionDir(cwd: string, agentDir: string = getDefaultAgentDir()): string {
 	const sessionDir = getDefaultSessionDirPath(cwd, agentDir);
-	if (!existsSync(sessionDir)) {
-		mkdirSync(sessionDir, { recursive: true });
-	}
+	ensureSessionDir(sessionDir);
 	return sessionDir;
 }
 
@@ -1539,8 +1553,8 @@ export class SessionManager {
 			}
 			return;
 		}
-		if (persist && this.sessionDir && !existsSync(this.sessionDir)) {
-			mkdirSync(this.sessionDir, { recursive: true });
+		if (persist && this.sessionDir) {
+			ensureSessionDir(this.sessionDir);
 		}
 
 		if (sessionFile) {
@@ -2840,9 +2854,7 @@ export class SessionManager {
 		}
 
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(resolvedTargetCwd);
-		if (!existsSync(dir)) {
-			mkdirSync(dir, { recursive: true });
-		}
+		ensureSessionDir(dir);
 
 		// Create new session file with new ID but forked content
 		if (options?.id !== undefined) {

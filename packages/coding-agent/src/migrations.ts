@@ -29,6 +29,8 @@ export function migrateAuthToAuthJson(): string[] {
 
 	const migrated: Record<string, unknown> = {};
 	const providers: string[] = [];
+	let cleanupOauth = false;
+	let settingsWithoutApiKeys: string | undefined;
 
 	// Migrate oauth.json
 	if (existsSync(oauthPath)) {
@@ -38,7 +40,7 @@ export function migrateAuthToAuthJson(): string[] {
 				migrated[provider] = { type: "oauth", ...(cred as object) };
 				providers.push(provider);
 			}
-			renameSync(oauthPath, `${oauthPath}.migrated`);
+			cleanupOauth = true;
 		} catch {
 			// Skip on error
 		}
@@ -57,16 +59,41 @@ export function migrateAuthToAuthJson(): string[] {
 					}
 				}
 				delete settings.apiKeys;
-				writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+				settingsWithoutApiKeys = JSON.stringify(settings, null, 2);
 			}
 		} catch {
 			// Skip on error
 		}
 	}
 
-	if (Object.keys(migrated).length > 0) {
+	if (Object.keys(migrated).length === 0) return [];
+
+	try {
 		mkdirSync(dirname(authPath), { recursive: true });
 		writeFileSync(authPath, JSON.stringify(migrated, null, 2), { mode: 0o600 });
+	} catch {
+		console.error(
+			chalk.yellow(
+				`Warning: Could not write migrated credentials to "${authPath}". Make this location writable and restart to retry. Legacy credentials have not been changed.`,
+			),
+		);
+		return [];
+	}
+
+	// Only clean up legacy inputs after auth.json has been written successfully.
+	if (cleanupOauth) {
+		try {
+			renameSync(oauthPath, `${oauthPath}.migrated`);
+		} catch {
+			// Leave the legacy file in place if cleanup is not permitted.
+		}
+	}
+	if (settingsWithoutApiKeys !== undefined) {
+		try {
+			writeFileSync(settingsPath, settingsWithoutApiKeys);
+		} catch {
+			// Leave the legacy API keys in place if cleanup is not permitted.
+		}
 	}
 
 	return providers;
